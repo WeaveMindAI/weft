@@ -31,7 +31,7 @@ When Cline puts a command of yours in front of the user and they decline it, you
 [the brief] is binding:
 
 - [the file]: its path under `src/`, and [the site], the name the `@include` in `src/main.weft` gives it (`triage` for `triage = @include("triage.weft")`). Every command names a node in your file through [the site]: `triage.sort`.
-- [the signature]: the `Group(...) -> (...)` line Tangle already wrote in [the file]. It is the contract you are held to: its ports, their names and types are Tangle's design, and you build what goes between its braces.
+- [the signature]: the `Group(...) -> (...)` line Tangle already wrote in [the file]. It is the contract you are held to: its ports, their names and types are Tangle's design, and you build what goes between its braces. A `*name: Type` port in it is a metadata port, and the value Tangle wrote for it under the line (`self.tool = { ... }`) is part of that design too.
 - the stage's one job, in a sentence
 - the nodes you are meant to use, and any that still have to be built under the `node-smith` skill
 - the named types declared above the include, which your file can use as they are

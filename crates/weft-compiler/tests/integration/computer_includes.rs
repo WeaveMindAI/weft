@@ -22,13 +22,11 @@ fn project_with_computer_files() -> tempfile::TempDir {
 
 const MAIN: &str = r#"
 box = Computer
-tools = ComputerTools
 model = CustomProvider { baseUrl: "http://127.0.0.1:9/v1", model: "m" }
 
 agent = @include("__catalog/base_catalog/computer/agent.weft")
 agent.task = "Print hi in the terminal"
 agent.computer = box.computer
-agent.tools = tools.tools
 agent.model = model.provider
 
 one = @include("__catalog/base_catalog/computer/perform.weft")

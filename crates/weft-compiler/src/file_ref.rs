@@ -598,6 +598,42 @@ pub(crate) fn resolve_project_file_refs(
             });
         }
     }
+    // A metadata port's value (`self.tool = @file("tool.json", LlmTool)`)
+    // resolves in place too: what a metadata wire writes into an input is
+    // the content, as if typed there. An include's opaque node carries its
+    // file's, resolved the same way. A call site carries a copy of its
+    // body's: the body's is read once, then copied, so a file is read (and
+    // a missing one reported) once whatever the number of sites.
+    let containers = project.groups.iter_mut()
+        .filter(|group| !matches!(group.kind, weft_core::project::GroupKind::Call { .. }))
+        .map(|group| (&mut group.metadata_ports, group.header_span.or(group.span), group.source_file.as_deref(), group.id.as_str()))
+        .chain(project.nodes.iter_mut()
+            .map(|node| (&mut node.metadata_ports, node.header_span.or(node.span), node.source_file.as_deref(), node.id.as_str())));
+    for (ports, owner_span, source_file, owner) in containers {
+        for port in ports.iter_mut() {
+            let span = port.span.or(owner_span).unwrap_or_default();
+            let Some(value) = port.value.as_mut() else { continue };
+            let single = is_one_marker(value);
+            each_value_mut(value, &mut |leaf| {
+                if let Err(msg) = resolve_leaf(leaf, root_fs, home.as_deref(), single) {
+                    errors.push(SourceError::at(span, msg).in_file(source_file).about(owner));
+                }
+            });
+        }
+    }
+    let bodies: std::collections::HashMap<String, Vec<weft_core::project::MetadataPort>> = project.groups.iter()
+        .filter(|group| matches!(group.kind, weft_core::project::GroupKind::Body))
+        .map(|group| (group.id.clone(), group.metadata_ports.clone()))
+        .collect();
+    for group in project.groups.iter_mut() {
+        let weft_core::project::GroupKind::Call { body, .. } = &group.kind else { continue };
+        let Some(read) = bodies.get(body) else { continue };
+        for port in group.metadata_ports.iter_mut() {
+            if let Some(from_body) = read.iter().find(|m| m.name == port.name) {
+                port.value = from_body.value.clone();
+            }
+        }
+    }
 }
 
 /// Resolve the marker one written value holds, in place, the way the

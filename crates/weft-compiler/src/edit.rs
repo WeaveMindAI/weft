@@ -126,6 +126,11 @@ pub enum EditOp {
     /// source token: `true`, `["a","b"]`, `100`, etc. Inserts the field
     /// if missing, replaces it if present.
     SetLoopConfig { loop_id: String, key: String, value: String },
+    /// The value of a group's or a loop's metadata port (`self.port =
+    /// value` in its body, `value` a source token like `SetConfig`'s);
+    /// `None` removes the line. `group` names a group or a loop.
+    // SYNC: SetMetadataValue <-> packages/weft-graph/src/protocol.ts EditOp set_metadata_value
+    SetMetadataValue { group: String, port: String, value: Option<String> },
     /// Remove a loop config field.
     RemoveLoopConfig { loop_id: String, key: String },
 }
@@ -157,6 +162,11 @@ pub struct PortSig {
     /// write some type over the author's declared one. The empty string
     /// is a port written with no type, written back as the bare name.
     pub port_type: String,
+    /// A metadata port (`*name: Type`), in a group's or a loop's outputs.
+    /// Required on the wire for the same reason again: a default would
+    /// rewrite an author's `*tool: LlmTool` as an ordinary output.
+    // SYNC: PortSig.metadata <-> packages/weft-graph/src/protocol.ts EditPortSig.metadata
+    pub metadata: bool,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

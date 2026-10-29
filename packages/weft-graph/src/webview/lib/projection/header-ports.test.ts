@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { copiedPortSigs, declarationProblem, declarationRule, headerPortSigs, headerWorthy, nodeInputRequiredness, partitionRemovals, portDeleteAction, removedPortNames } from './header-ports';
+import { containerInputRequiredness, containerSpelledRequired, copiedPortSigs, declarationProblem, declarationRule, headerPortSigs, headerWorthy, nodeInputRequiredness, partitionRemovals, portDeleteAction, removedPortNames } from './header-ports';
 import { ERROR_PORT, SHOULD_FLOW_PORT } from '../../../protocol';
 
 // The bug this pins: adding one custom output through the editor once
@@ -35,7 +35,7 @@ describe('headerPortSigs', () => {
 	it('a declared override round-trips its DECLARED type, not the rendered one', () => {
 		const p = [{ name: 'response', required: false, optional: true, portType: 'MyThing', declaredType: 'JsonDict' }];
 		expect(headerPortSigs(p, p, defaults, unwired)).toEqual({
-			sigs: [{ name: 'response', required: false, portType: 'JsonDict', rendered: 'MyThing' }],
+			sigs: [{ name: 'response', required: false, portType: 'JsonDict', rendered: 'MyThing', metadata: false }],
 			reverted: [],
 		});
 	});
@@ -47,11 +47,11 @@ describe('headerPortSigs', () => {
 		const prev = [{ name: 'data', required: false, portType: 'T' }];
 		const next = [{ name: 'data', required: false, portType: 'Number' }];
 		expect(headerPortSigs(prev, next, defaults, wired('data'))).toEqual({
-			sigs: [{ name: 'data', required: true, portType: 'Number', rendered: 'Number' }],
+			sigs: [{ name: 'data', required: true, portType: 'Number', rendered: 'Number', metadata: false }],
 			reverted: [],
 		});
 		expect(headerPortSigs(prev, next, defaults, unwired)).toEqual({
-			sigs: [{ name: 'data', required: false, portType: 'Number', rendered: 'Number' }],
+			sigs: [{ name: 'data', required: false, portType: 'Number', rendered: 'Number', metadata: false }],
 			reverted: [],
 		});
 	});
@@ -62,7 +62,7 @@ describe('headerPortSigs', () => {
 		const askedOptional = [{ name: 'prompt', required: false, optional: true, portType: 'String | Number' }];
 		for (const next of [retyped, askedOptional]) {
 			expect(headerPortSigs(prev, next, defaults, unwired).sigs).toEqual([
-				{ name: 'prompt', required: true, portType: 'String | Number', rendered: 'String | Number' },
+				{ name: 'prompt', required: true, portType: 'String | Number', rendered: 'String | Number', metadata: false },
 			]);
 		}
 	});
@@ -70,11 +70,11 @@ describe('headerPortSigs', () => {
 	it('a port the program wrote keeps its own spelling whatever its wiring', () => {
 		const optional = [{ name: 'data', required: false, optional: true, portType: 'Number', declaredType: 'Number' }];
 		expect(headerPortSigs(optional, optional, defaults, wired('data')).sigs).toEqual([
-			{ name: 'data', required: false, portType: 'Number', rendered: 'Number' },
+			{ name: 'data', required: false, portType: 'Number', rendered: 'Number', metadata: false },
 		]);
 		const required = [{ name: 'data', required: true, portType: 'Number', declaredType: 'Number' }];
 		expect(headerPortSigs(required, required, defaults, unwired).sigs).toEqual([
-			{ name: 'data', required: true, portType: 'Number', rendered: 'Number' },
+			{ name: 'data', required: true, portType: 'Number', rendered: 'Number', metadata: false },
 		]);
 	});
 
@@ -86,7 +86,7 @@ describe('headerPortSigs', () => {
 		const prev = [{ name: 'data', required: false, portType: 'String' }];
 		const next = [{ name: 'data', required: true, portType: 'String' }];
 		expect(headerPortSigs(prev, next, defaults, wired('data'))).toEqual({
-			sigs: [{ name: 'data', required: true, portType: 'T', rendered: 'String' }],
+			sigs: [{ name: 'data', required: true, portType: 'T', rendered: 'String', metadata: false }],
 			reverted: [],
 		});
 	});
@@ -95,7 +95,7 @@ describe('headerPortSigs', () => {
 		const prev = [{ name: 'x', required: false, optional: true, portType: 'String', declaredType: 'T' }];
 		const next = [{ name: 'x', required: true, portType: 'String', declaredType: 'T' }];
 		expect(headerPortSigs(prev, next, defaults, unwired)).toEqual({
-			sigs: [{ name: 'x', required: true, portType: 'T', rendered: 'String' }],
+			sigs: [{ name: 'x', required: true, portType: 'T', rendered: 'String', metadata: false }],
 			reverted: [],
 		});
 	});
@@ -106,7 +106,7 @@ describe('headerPortSigs', () => {
 		const prev = [{ name: 'data', required: true, portType: 'String', declaredType: 'T' }];
 		const next = [{ name: 'data', required: false, optional: true, portType: 'String', declaredType: 'T' }];
 		expect(headerPortSigs(prev, next, defaults, unwired)).toEqual({
-			sigs: [{ name: 'data', required: false, portType: 'T', rendered: 'String' }],
+			sigs: [{ name: 'data', required: false, portType: 'T', rendered: 'String', metadata: false }],
 			reverted: [],
 		});
 	});
@@ -121,7 +121,7 @@ describe('headerPortSigs', () => {
 		// Wired, `data?: T` would run without a closed wire's value where
 		// the default skips, so the line stays.
 		expect(headerPortSigs(prev, next, defaults, wired('data'))).toEqual({
-			sigs: [{ name: 'data', required: false, portType: 'T', rendered: 'T' }],
+			sigs: [{ name: 'data', required: false, portType: 'T', rendered: 'T', metadata: false }],
 			reverted: [],
 		});
 		const prevReq = [{ name: 'data', required: true, portType: 'Number', declaredType: 'Number' }];
@@ -135,7 +135,7 @@ describe('headerPortSigs', () => {
 	it('a newly added custom port is written', () => {
 		const next = [{ name: 'haiku', required: false, portType: 'String' }];
 		expect(headerPortSigs([], next, defaults, unwired)).toEqual({
-			sigs: [{ name: 'haiku', required: false, portType: 'String', rendered: 'String' }],
+			sigs: [{ name: 'haiku', required: false, portType: 'String', rendered: 'String', metadata: false }],
 			reverted: [],
 		});
 	});
@@ -148,20 +148,20 @@ describe('headerPortSigs', () => {
 			{ name: 'out', required: true, portType: 'T__out', declaredType: '' },
 		];
 		expect(headerPortSigs([], fresh, defaults, unwired).sigs).toEqual([
-			{ name: 'haiku', required: false, portType: '', rendered: 'T__haiku' },
-			{ name: 'out', required: true, portType: '', rendered: 'T__out' },
+			{ name: 'haiku', required: false, portType: '', rendered: 'T__haiku', metadata: false },
+			{ name: 'out', required: true, portType: '', rendered: 'T__out', metadata: false },
 		]);
 		// Declared with no type and resolved by a wire: still the bare name.
 		const declared = [{ name: 'note', required: true, portType: 'String', declaredType: '' }];
 		expect(headerPortSigs(declared, declared, defaults, wired('note')).sigs).toEqual([
-			{ name: 'note', required: true, portType: '', rendered: 'String' },
+			{ name: 'note', required: true, portType: '', rendered: 'String', metadata: false },
 		]);
 	});
 
 	it('a header type that does not parse is written back as the author typed it', () => {
 		const p = [{ name: 'note', required: true, portType: 'T__note', declaredType: 'Strng' }];
 		expect(headerPortSigs(p, p, defaults, unwired).sigs).toEqual([
-			{ name: 'note', required: true, portType: 'Strng', rendered: 'T__note' },
+			{ name: 'note', required: true, portType: 'Strng', rendered: 'T__note', metadata: false },
 		]);
 	});
 
@@ -179,7 +179,7 @@ describe('headerPortSigs', () => {
 	it('an untouched `x?:` line over an optional catalog port is kept: it means more than the default', () => {
 		const p = [{ name: 'data', required: false, optional: true, portType: 'T', declaredType: 'T' }];
 		expect(headerPortSigs(p, p, defaults, unwired)).toEqual({
-			sigs: [{ name: 'data', required: false, portType: 'T', rendered: 'T' }],
+			sigs: [{ name: 'data', required: false, portType: 'T', rendered: 'T', metadata: false }],
 			reverted: [],
 		});
 	});
@@ -193,7 +193,7 @@ describe('headerPortSigs', () => {
 	it('a declared custom port whose generic got inference-resolved round-trips the authored generic', () => {
 		const p = [{ name: 'x', required: true, portType: 'String', declaredType: 'T' }];
 		expect(headerPortSigs(p, p, defaults, wired('x'))).toEqual({
-			sigs: [{ name: 'x', required: true, portType: 'T', rendered: 'String' }],
+			sigs: [{ name: 'x', required: true, portType: 'T', rendered: 'String', metadata: false }],
 			reverted: [],
 		});
 	});
@@ -204,7 +204,7 @@ describe('headerPortSigs', () => {
 			{ name: 'b', required: true, portType: 'String' },
 		];
 		expect(headerPortSigs(p, p, undefined, unwired)).toEqual({
-			sigs: [{ name: 'a', required: true, portType: 'String', rendered: 'String' }],
+			sigs: [{ name: 'a', required: true, portType: 'String', rendered: 'String', metadata: false }],
 			reverted: [],
 		});
 	});
@@ -221,6 +221,29 @@ describe('nodeInputRequiredness', () => {
 		// A port the program added has no catalog side to require it.
 		expect(nodeInputRequiredness({ name: 'extra', required: true, portType: 'String' }, undefined)).toBe('required');
 	});
+
+	it("reads an include's input as passing through, never as a toggle", () => {
+		expect(nodeInputRequiredness({ name: 'q', required: true, passesThrough: true, portType: 'String' }, undefined)).toBe('passes_through');
+	});
+});
+
+describe("a container's input requiredness", () => {
+	it('passes through, or is what the program wrote', () => {
+		expect(containerInputRequiredness({ name: 'x', required: true, passesThrough: true, portType: 'T' })).toBe('passes_through');
+		// A port the program wrote `x?:` by mistake still passes through:
+		// no gesture may toggle it back and forth.
+		expect(containerInputRequiredness({ name: 'x', required: false, optional: true, passesThrough: true, portType: 'T' })).toBe('passes_through');
+		// A loop's `over` or `carry` port launches its iterations.
+		expect(containerInputRequiredness({ name: 'items', required: true, portType: 'T' })).toBe('required');
+		expect(containerInputRequiredness({ name: 'items', required: false, optional: true, portType: 'T' })).toBe('optional');
+	});
+
+	it('is spelled without `?` whenever it passes through, and on every output', () => {
+		expect(containerSpelledRequired({ name: 'x', required: false, passesThrough: true, portType: 'T' }, 'input')).toBe(true);
+		expect(containerSpelledRequired({ name: 'items', required: false, portType: 'T' }, 'input')).toBe(false);
+		expect(containerSpelledRequired({ name: 'items', required: true, portType: 'T' }, 'input')).toBe(true);
+		expect(containerSpelledRequired({ name: 'out', required: false, portType: 'T' }, 'output')).toBe(true);
+	});
 });
 
 describe('copiedPortSigs', () => {
@@ -231,7 +254,7 @@ describe('copiedPortSigs', () => {
 		// declaration accepts until the round-trip lands.
 		const ports = [{ name: 'x', required: true, portType: 'String', declaredType: 'T' }];
 		expect(copiedPortSigs(ports, defaults)).toEqual([
-			{ name: 'x', required: true, portType: 'T', rendered: 'T' },
+			{ name: 'x', required: true, portType: 'T', rendered: 'T', metadata: false },
 		]);
 	});
 });
@@ -304,7 +327,7 @@ describe('shadow declarations', () => {
 		// author's record and survives every unrelated gesture.
 		const p = [{ name: 'photo', required: true, portType: 'Image', declaredType: 'Image' }];
 		expect(headerPortSigs(p, p, defaults, unwired).sigs).toEqual([
-			{ name: 'photo', required: true, portType: 'Image', rendered: 'Image' },
+			{ name: 'photo', required: true, portType: 'Image', rendered: 'Image', metadata: false },
 		]);
 	});
 });

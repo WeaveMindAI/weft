@@ -1827,6 +1827,8 @@ pub(crate) mod tests {
             optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
+            port_literal_types: Default::default(),
+            metadata_ports: Vec::new(),
             file_refs: Default::default(),
             include_path: None,
             include_contents: None,
@@ -1856,6 +1858,7 @@ pub(crate) mod tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            metadata_wires: Vec::new(),
         };
         let types = collect_node_types(&project);
         assert!(types.contains("Text"), "user catalog type included: {types:?}");
@@ -1904,6 +1907,7 @@ pub(crate) mod tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            metadata_wires: Vec::new(),
         };
         let rows = super::needs_of(&program, &catalog).unwrap();
         let seen: Vec<(&str, &str, Vec<&str>)> =

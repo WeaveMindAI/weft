@@ -1,13 +1,17 @@
 # Do one tool call from a model on a computer, and give back what the model reads as its result.
-Group(call: ToolCall, computer: Infra, session: String) -> (result: String, image: Image, error: String) {
+Group(call: ToolCall, computer: Infra, session: String) -> (result: String, image: Image, error: String, *tools: ActionTools) {
   # Do one tool call on a computer. `session` is the shell session its commands run in (left out, the computer's default one). `result` is what the model reads back: the action's result, or why it failed, a command's output cut to its start and end. `image` is the screenshot or zoom the action took, closed when it took none. `error` carries the failure, closed when the action worked.
   route = RouteComputerCall { call: self.call }
 
-  screen = Group(computer: Infra, shot: Boolean, zoom: ZoomArgs, cursor: Boolean) -> (result: String, image: Image, error: String) {
+  screen = Group(computer: Infra, shot: Boolean, zoom: ZoomArgs, cursor: Boolean) -> (result: String, image: Image, error: String, *tools: ActionTools) {
     # Look at the screen: a screenshot, an enlarged region, or where the mouse is
     shot = Screenshot { computer: self.computer, _should_flow: self.shot }
     zoom = Zoom { computer: self.computer, args: self.zoom }
     cursor = CursorPosition { computer: self.computer, _should_flow: self.cursor }
+    self.tools = {
+      "anthropic": [...shot.tools.anthropic, ...zoom.tools.anthropic, ...cursor.tools.anthropic],
+      "openai": [...shot.tools.openai, ...zoom.tools.openai, ...cursor.tools.openai]
+    }
     self.result = FirstInOrder {
       shot: shot.result
       zoom: zoom.result
@@ -24,13 +28,17 @@ Group(call: ToolCall, computer: Infra, session: String) -> (result: String, imag
   screen.zoom = route.zoom
   screen.cursor = route.cursor
 
-  mouse = Group(computer: Infra, click: ClickArgs, drag: DragArgs, move: MoveArgs, button: MouseButtonArgs, scroll: ScrollArgs) -> (result: String, error: String) {
+  mouse = Group(computer: Infra, click: ClickArgs, drag: DragArgs, move: MoveArgs, button: MouseButtonArgs, scroll: ScrollArgs) -> (result: String, error: String, *tools: ActionTools) {
     # Work the mouse: click, drag, move, press or release a button, scroll
     click = Click { computer: self.computer, args: self.click }
     drag = Drag { computer: self.computer, args: self.drag }
     move = MoveMouse { computer: self.computer, args: self.move }
     button = MouseButton { computer: self.computer, args: self.button }
     scroll = Scroll { computer: self.computer, args: self.scroll }
+    self.tools = {
+      "anthropic": [...click.tools.anthropic, ...drag.tools.anthropic, ...move.tools.anthropic, ...button.tools.anthropic, ...scroll.tools.anthropic],
+      "openai": [...click.tools.openai, ...drag.tools.openai, ...move.tools.openai, ...button.tools.openai, ...scroll.tools.openai]
+    }
     self.result = FirstInOrder {
       click: click.result
       drag: drag.result
@@ -58,10 +66,14 @@ Group(call: ToolCall, computer: Infra, session: String) -> (result: String, imag
   mouse.button = route.mouseButton
   mouse.scroll = route.scroll
 
-  keyboard = Group(computer: Infra, text: TypeArgs, keys: KeyArgs) -> (result: String, error: String) {
+  keyboard = Group(computer: Infra, text: TypeArgs, keys: KeyArgs) -> (result: String, error: String, *tools: ActionTools) {
     # Work the keyboard: type text, press keys
     text = TypeText { computer: self.computer, args: self.text }
     keys = PressKey { computer: self.computer, args: self.keys }
+    self.tools = {
+      "anthropic": [...text.tools.anthropic, ...keys.tools.anthropic],
+      "openai": [...text.tools.openai, ...keys.tools.openai]
+    }
     self.result = FirstInOrder { text: text.result, keys: keys.result, textFailed: text._error, keysFailed: keys._error }.value
     self.error = FirstInOrder { text: text._error, keys: keys._error }.value
   }
@@ -77,7 +89,26 @@ Group(call: ToolCall, computer: Infra, session: String) -> (result: String, imag
     preview: preview.preview
     code: shell.exitCode
   }
-  pause = Wait { seconds: route.wait }
+  pause = Group(seconds: Number) -> (wokeAt: String, error: String, *tools: ActionTools) {
+    # Wait a while. Wait is no computer node, so the tool this group performs is described here
+    # SYNC: wait <-> catalog/computer/styles.rs (WAIT, MOST_SECONDS), catalog/computer/route_computer_call/mod.rs (wait)
+    self.tools = {
+      "anthropic": [{
+        "name": "wait",
+        "description": "Wait for something on the screen to finish (a page loading, an install), then take a screenshot to see it.",
+        "parameters": { "type": "object", "properties": { "duration": { "type": "number", "exclusiveMinimum": 0, "maximum": 300, "description": "Seconds to wait." } }, "required": ["duration"] }
+      }],
+      "openai": [{
+        "name": "wait",
+        "description": "Wait a second for something on the screen to finish, then take a screenshot to see it.",
+        "parameters": { "type": "object", "properties": {}, "required": [] }
+      }]
+    }
+    wait = Wait { seconds: self.seconds }
+    self.wokeAt = wait.wokeAt
+    self.error = wait._error
+  }
+  pause.seconds = route.wait
   unknown = Format(name: String) {
     template: "There is no computer action called {{name}}."
     name: route.other.name
@@ -91,7 +122,7 @@ Group(call: ToolCall, computer: Infra, session: String) -> (result: String, imag
     shellFailed: shell._error
     previewFailed: preview._error
     pause: pause.wokeAt
-    pauseFailed: pause._error
+    pauseFailed: pause.error
     unknown: unknown.text
     unreadable: route._error
   }.value
@@ -102,8 +133,14 @@ Group(call: ToolCall, computer: Infra, session: String) -> (result: String, imag
     keyboard: keyboard.error
     shell: shell._error
     preview: preview._error
-    pause: pause._error
+    pause: pause.error
     unknown: unknown.text
     unreadable: route._error
   }.value
+
+  # Every action this file performs, described once, on the node that performs it.
+  self.tools = {
+    "anthropic": [...screen.tools.anthropic, ...mouse.tools.anthropic, ...keyboard.tools.anthropic, ...shell.tools.anthropic, ...pause.tools.anthropic],
+    "openai": [...screen.tools.openai, ...mouse.tools.openai, ...keyboard.tools.openai, ...shell.tools.openai, ...pause.tools.openai]
+  }
 }

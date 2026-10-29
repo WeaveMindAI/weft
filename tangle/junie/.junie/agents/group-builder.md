@@ -19,7 +19,7 @@ You never wait on a permission prompt. If a command would need the user's approv
 [the brief] arrives with the dispatch, and it is binding:
 
 - [the file]: its path under `src/`, and [the site], the name the `@include` in `src/main.weft` gives it (`triage` for `triage = @include("triage.weft")`). Every command names a node in your file through [the site]: `triage.sort`.
-- [the signature]: the `Group(...) -> (...)` line Tangle already wrote in [the file]. It is the contract you are held to: its ports, their names and types are Tangle's design, and you build what goes between its braces.
+- [the signature]: the `Group(...) -> (...)` line Tangle already wrote in [the file]. It is the contract you are held to: its ports, their names and types are Tangle's design, and you build what goes between its braces. A `*name: Type` port in it is a metadata port, and the value Tangle wrote for it under the line (`self.tool = { ... }`) is part of that design too.
 - the stage's one job, in a sentence
 - the nodes you are meant to use, and any a `node-smith` is still building
 - the named types declared above the include, which your file can use as they are

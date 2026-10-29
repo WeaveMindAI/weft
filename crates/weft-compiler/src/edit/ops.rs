@@ -84,6 +84,7 @@ pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditEr
         UpdateLoopPorts { loop_id, inputs, outputs } => update_container_ports(view, loop_id, inputs, outputs, ContainerKind::Loop),
         SetValueForm { node, key, form } => set_value_form(view, node, key, *form),
         SetLoopConfig { loop_id, key, value } => set_loop_config(view, loop_id, key, value),
+        SetMetadataValue { group, port, value } => set_metadata_value(view, group, port, value.as_deref()),
         RemoveLoopConfig { loop_id, key } => remove_loop_config(view, loop_id, key),
     }
 }
@@ -1865,6 +1866,45 @@ fn set_loop_config(view: &FileView, loop_id: &str, key: &str, value: &str) -> Re
     set_or_insert_field(view.tree(), &decl, key, value)
 }
 
+/// Write the value of a group's or a loop's metadata port: the one
+/// `self.port = ...` line of its body, its value replaced in place (a
+/// reference to another metadata port included), or inserted before the
+/// closing brace; `None` removes the line. Only a port the header declares
+/// `*port: Type` takes one.
+fn set_metadata_value(view: &FileView, id: &str, port: &str, value: Option<&str>) -> Result<(), EditError> {
+    validate_ident("port name", port)?;
+    if let Some(value) = value {
+        reject_uncontained_value(value)?;
+    }
+    let decl = resolve(view, id)?;
+    if !matches!(decl, Decl::Group(_) | Decl::Loop(_)) {
+        return Err(kind_mismatch("SetMetadataValue", id, "Group or Loop", &decl));
+    }
+    if !header_port_decls(&decl).iter().any(|(side, p)| *side == HeaderSide::Metadata && p.name == port) {
+        return Err(EditError::InvalidArgument(format!(
+            "'{port}' is not a metadata port of '{id}': declare it `*{port}: Type` in its header first"
+        )));
+    }
+    let body = decl.body().ok_or_else(|| EditError::ContainerNotFound(id.to_string()))?;
+    let line = body.syntax().children().find(|n| {
+        n.kind() == SyntaxKind::CONNECTION
+            && endpoint_parts(n, 0) == (Some("self".to_string()), Some(port.to_string()))
+    });
+    let tree = view.tree();
+    match (line, value) {
+        (Some(conn), Some(value)) => replace_connection_rhs(tree, &conn, value),
+        (Some(conn), None) => {
+            remove_with_leading_ws(tree, &conn);
+            Ok(())
+        }
+        (None, Some(value)) => {
+            let indent = group_body_indent_decl(&decl);
+            insert_before_close(tree, &body, snippet_elements(&format!("{indent}self.{port} = {value}\n")))
+        }
+        (None, None) => Ok(()),
+    }
+}
+
 /// Remove a loop config field by key. Idempotent.
 fn remove_loop_config(view: &FileView, loop_id: &str, key: &str) -> Result<(), EditError> {
     let lp = resolve_loop(view, loop_id)?;
@@ -2342,7 +2382,17 @@ fn rename_container(
     let tree = view.tree();
     let refs: Vec<_> = view.connections_referencing(&decl).into_iter()
         .chain(view.endpoint_fields_referencing(&decl)).collect();
+    // A value naming it among other things (`self.tools = [...old.tools]`)
+    // is rewritten name by name, the rest of it kept as written.
+    let values = view.values_naming(&decl);
     tree.replace(&id_tok, vec![make_token(id_tok.kind(), new_label)]);
+    for (conn, text, names) in values {
+        let mut renamed = text.clone();
+        for range in names.into_iter().rev() {
+            renamed.replace_range(range, new_label);
+        }
+        replace_connection_rhs(tree, &conn, &renamed)?;
+    }
     for c in refs {
         for ep in current(tree, &c)?.children().filter(|n| n.kind() == SyntaxKind::ENDPOINT) {
             if let Some(t) = ep
@@ -2807,6 +2857,12 @@ fn update_node_ports(
     removed_outputs: &[String],
 ) -> Result<(), EditError> {
     validate_port_sigs(inputs, outputs)?;
+    if let Some(p) = outputs.iter().find(|p| p.metadata) {
+        return Err(EditError::InvalidArgument(format!(
+            "metadata port {:?}: a node's metadata ports are its node type's, declared in its metadata.json",
+            p.name
+        )));
+    }
     let decl = resolve(view, id)?;
     // Editing an INLINE node's port signature: de-inline (wire kept)
     // and rewrite the named decl's header (an inline has none).
@@ -2873,6 +2929,7 @@ fn update_node_ports(
 /// Both halves of every port sig are written into the decl's HEADER, which is
 /// then reparsed, so both are validated at the door: the NAME must be a
 /// single identifier, and the TYPE must actually parse as a type.
+// SYNC: validate_port_sigs (metadata names) <-> packages/weft-graph/src/webview/lib/utils/metadata-ports.ts portNameClash
 fn validate_port_sigs(inputs: &[PortSig], outputs: &[PortSig]) -> Result<(), EditError> {
     for (side, ports) in [("input", inputs), ("output", outputs)] {
         let mut names = std::collections::HashSet::new();
@@ -2889,6 +2946,38 @@ fn validate_port_sigs(inputs: &[PortSig], outputs: &[PortSig]) -> Result<(), Edi
     if let Some(p) = outputs.iter().find(|p| !p.required) {
         return Err(EditError::InvalidArgument(format!(
             "output port {:?} cannot be optional: an output carries no `?`",
+            p.name
+        )));
+    }
+    // A metadata port is written `*name: Type` in an output list, with a
+    // type, and its name is no input's: the header the lowering refuses
+    // otherwise is never authored.
+    if let Some(p) = inputs.iter().find(|p| p.metadata) {
+        return Err(EditError::InvalidArgument(format!(
+            "metadata port {:?} goes in the outputs: a metadata port sits on the output side",
+            p.name
+        )));
+    }
+    if let Some(p) = outputs.iter().find(|p| p.metadata && p.port_type.trim().is_empty()) {
+        return Err(EditError::InvalidArgument(format!("metadata port {:?} needs a type", p.name)));
+    }
+    // The lowering refuses a type variable there (`metadata_port_of`): the
+    // value is written, and nothing wired could say what it holds.
+    if let Some(p) = outputs.iter().find(|p| {
+        p.metadata && weft_core::weft_type::WeftType::try_parse(&p.port_type).is_ok_and(|ty| {
+            let mut vars = std::collections::BTreeSet::new();
+            ty.collect_type_vars(&mut vars);
+            !vars.is_empty()
+        })
+    }) {
+        return Err(EditError::InvalidArgument(format!(
+            "metadata port {:?} needs a concrete type, not one with a type variable",
+            p.name
+        )));
+    }
+    if let Some(p) = outputs.iter().find(|p| p.metadata && inputs.iter().any(|i| i.name == p.name)) {
+        return Err(EditError::InvalidArgument(format!(
+            "metadata port {:?} has the name of an input: rename one",
             p.name
         )));
     }
@@ -3106,6 +3195,28 @@ fn splice_decl(tree: &Tree, decl: &Decl, text: &str) {
 //       (lower_group's carry loop), packages/weft-graph/src/webview/lib/
 //       projection/apply.ts syncLoopCarryInputs
 fn header_in_port_names(decl: &Decl) -> Vec<String> {
+    let ports = header_port_decls(decl);
+    let mut ins: Vec<String> = ports.iter().filter(|(side, _)| *side == HeaderSide::In).map(|(_, p)| p.name.clone()).collect();
+    let outs: Vec<String> = ports.iter().filter(|(side, _)| *side == HeaderSide::Out).map(|(_, p)| p.name.clone()).collect();
+    for carry in read_carry_list(decl) {
+        if outs.contains(&carry) && !ins.contains(&carry) {
+            ins.push(carry);
+        }
+    }
+    ins
+}
+
+/// Where a container's header declares a port.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeaderSide {
+    In,
+    Out,
+    /// A `*name: Type` metadata port of the output list.
+    Metadata,
+}
+
+/// Every port a GROUP's or LOOP's header declares, with where.
+fn header_port_decls(decl: &Decl) -> Vec<(HeaderSide, crate::weft_compiler::ParsedPort)> {
     use crate::cst::SyntaxKind as K;
     let header = match decl {
         Decl::Group(g) => g.header().map(|h| h.syntax().clone()),
@@ -3113,12 +3224,11 @@ fn header_in_port_names(decl: &Decl) -> Vec<String> {
         _ => None,
     };
     let Some(header) = header else { return Vec::new() };
-    let mut ins: Vec<String> = Vec::new();
-    let mut outs: Vec<String> = Vec::new();
+    let mut ports = Vec::new();
     for sig in header.children() {
-        let bucket = match sig.kind() {
-            K::PORT_SIG_IN => &mut ins,
-            K::PORT_SIG_OUT => &mut outs,
+        let side = match sig.kind() {
+            K::PORT_SIG_IN => HeaderSide::In,
+            K::PORT_SIG_OUT => HeaderSide::Out,
             _ => continue,
         };
         for el in sig.children() {
@@ -3128,16 +3238,12 @@ fn header_in_port_names(decl: &Decl) -> Vec<String> {
             let text = el.to_string();
             let text = text.trim().trim_end_matches(',').trim();
             if let Ok(port) = crate::weft_compiler::try_parse_port_decl(text, weft_core::weft_type::PortSide::Input) {
-                bucket.push(port.name);
+                let side = if port.metadata { HeaderSide::Metadata } else { side };
+                ports.push((side, port));
             }
         }
     }
-    for carry in read_carry_list(decl) {
-        if outs.contains(&carry) && !ins.contains(&carry) {
-            ins.push(carry);
-        }
-    }
-    ins
+    ports
 }
 
 /// Split a header string into (`id = Type`, rest-with-sig). The head
@@ -3173,10 +3279,12 @@ fn build_signature(inputs: &[PortSig], outputs: &[PortSig]) -> String {
     let fmt = |p: &PortSig| {
         let ty = p.port_type.as_str();
         let opt = if p.required { "" } else { "?" };
-        if ty.is_empty() { format!("{}{opt}", p.name) } else { format!("{}{opt}: {ty}", p.name) }
+        let star = if p.metadata { "*" } else { "" };
+        if ty.is_empty() { format!("{star}{}{opt}", p.name) } else { format!("{star}{}{opt}: {ty}", p.name) }
     };
     let ins: Vec<String> = inputs.iter().map(fmt).collect();
-    let outs: Vec<String> = outputs.iter().map(fmt).collect();
+    // The metadata ports after the outputs, the order the editor draws them.
+    let outs: Vec<String> = outputs.iter().filter(|p| !p.metadata).chain(outputs.iter().filter(|p| p.metadata)).map(fmt).collect();
     if inputs.is_empty() && outputs.is_empty() {
         String::new()
     } else if outputs.is_empty() {

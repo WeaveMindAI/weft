@@ -1,9 +1,10 @@
 # The two ai/llm RUNTIME mechanisms no node test can reach, in one
 # graph against the real service: a streamed call (deltas ride the
 # `stream` bus and are journaled) and a full tool round trip closed
-# entirely in the graph (forced tool call -> ExecPython extracts the
-# call id -> Chat Message feeds the result back as a role-tool message
-# -> a prompt-less re-entry answers from it). Per-provider wire
+# entirely in the graph (forced tool call -> a Dispatch sends it to the
+# tool group its metadata port describes -> Chat Message feeds the
+# result back as a role-tool message -> a prompt-less re-entry answers
+# from it). Per-provider wire
 # correctness lives in the ai/llm node tests, not here.
 #
 # The TEST stamps the access node's connection (own-key door, from
@@ -33,15 +34,54 @@ live.params = params.params
 out_stream = Debug
 out_stream.data = live.response
 
-# The tool round trip. The first call is FORCED to call the tool; the
-# model's call comes out on toolCalls, ExecPython plays the tool (it
-# answers "Biscuit" and hands back the call id), Chat Message appends
-# the role-tool result to the conversation file, and the second call
-# re-enters with that file alone (no prompt) to answer from the result.
-dog = LlmTool {
-  name: "dog_name",
-  description: "Returns the name of the user's dog."
+# The tool round trip, in the shape an agent takes. The tool is a group
+# that says what it is on its `*tool` metadata port. The first call is
+# FORCED to call it: the model's calls come out on toolCalls, a Loop over
+# them sends each through a Dispatch to the group its metadata port
+# describes (the group plays the tool: it answers "Biscuit" and hands back
+# the call id), and Chat Message appends the role-tool result to the
+# conversation file. The loop hands the tool's description out on a
+# metadata port of its own, which a List gathers into both calls' tools:
+# a wire pointing back up the graph, written in before anything runs. The
+# second call re-enters with the file alone (no prompt) and answers from
+# the result.
+handle = Loop(calls: List[ToolCall]) -> (historyFile: File, *dog: LlmTool) {
+  over: ["calls"]
+  carry: ["historyFile"]
+
+  dog = Group(call: ToolCall) -> (callId: String, result: String, *tool: LlmTool) {
+    self.tool = {
+      "name": "dog_name",
+      "description": "Returns the name of the user's dog.",
+      "parameters": { "type": "object", "properties": {} }
+    }
+    work = ExecPython(call: ToolCall) -> (callId: String, name: String) {
+      code: "return {'callId': call['id'], 'name': 'Biscuit'}"
+    }
+    work.call = self.call
+    self.callId = work.callId
+    self.result = work.name
+  }
+  self.dog = dog.tool
+
+  route = Dispatch
+  route.value = self.calls
+  route.dog = dog.tool
+  dog.call = route.dog
+  unknown = Debug
+  unknown.data = route.otherwise
+
+  answer = ChatHistoryAppend {
+    role: "tool"
+  }
+  answer.historyFile = self.historyFile
+  answer.toolCallId = dog.callId
+  answer.text = dog.result
+  self.historyFile = answer.historyFile
 }
+
+tools = List
+tools.dog = handle.dog
 
 t1 = LlmInference -> (response: String) {
   prompt: "What is my dog's name? Use the dog_name tool to find out.",
@@ -49,26 +89,16 @@ t1 = LlmInference -> (response: String) {
 }
 t1.provider = prov.provider
 t1.params = params.params
-t1.tools = dog.tool
-
-ext = ExecPython(calls: List[ToolCall]) -> (call_id: String) {
-  code: "return {'call_id': calls[0]['id']}"
-}
-ext.calls = t1.toolCalls
-
-answer = ChatHistoryAppend {
-  role: "tool"
-}
-answer.historyFile = t1.historyFile
-answer.toolCallId = ext.call_id
-answer.text = "Biscuit"
+t1.tools = tools.list
+handle.calls = t1.toolCalls
+handle.historyFile = t1.historyFile
 
 t2 = LlmInference -> (response: String) {
   toolChoice: "none"
 }
-t2.historyFile = answer.historyFile
+t2.historyFile = handle.historyFile
 t2.provider = prov.provider
 t2.params = params.params
-t2.tools = dog.tool
+t2.tools = tools.list
 out_tool = Debug
 out_tool.data = t2.response

@@ -1,14 +1,24 @@
 //! RouteComputerCall self-tests: every action in both styles lands on
 //! its port in the one shape, a call that is no computer action goes to
-//! `other`, malformed arguments fail naming the field, and every tool
-//! ComputerTools declares is one this node recognizes.
+//! `other`, malformed arguments fail naming the field, and every tool an
+//! action node describes on its `tools` metadata port is one this node
+//! recognizes.
 
 use serde_json::{json, Value};
 
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{FakeRig, NodeManifest, NodeTest, WeftResult};
 
-use super::super::computer_tools::{declarations, Offered};
-use super::super::styles::Style;
+use super::super::click::ClickNode;
+use super::super::cursor_position::CursorPositionNode;
+use super::super::drag::DragNode;
+use super::super::mouse_button::MouseButtonNode;
+use super::super::move_mouse::MoveMouseNode;
+use super::super::press_key::PressKeyNode;
+use super::super::run_command::RunCommandNode;
+use super::super::screenshot::ScreenshotNode;
+use super::super::scroll::ScrollNode;
+use super::super::type_text::TypeTextNode;
+use super::super::zoom::ZoomNode;
 use super::{route, xdotool_key, RouteComputerCallNode, Routed};
 
 pub fn tests() -> Vec<NodeTest> {
@@ -218,12 +228,22 @@ fn arguments_for(schema: &Value) -> Value {
 }
 
 fn every_declared_tool_is_recognized() -> WeftResult<()> {
-    for style in [Style::Anthropic, Style::OpenAi] {
-        for tool in declarations(style, Offered::ALL) {
-            let name = tool["name"].as_str().expect("a name");
-            let routed = route(&call(name, arguments_for(&tool["parameters"])))
-                .unwrap_or_else(|e| panic!("{style:?} declares {name}, which does not route: {e}"));
-            assert_ne!(routed.port, "other", "{style:?} declares {name}, which is no computer action here");
+    let described = [
+        ScreenshotNode.manifest(), ZoomNode.manifest(), CursorPositionNode.manifest(), ClickNode.manifest(),
+        DragNode.manifest(), MoveMouseNode.manifest(), MouseButtonNode.manifest(), ScrollNode.manifest(),
+        TypeTextNode.manifest(), PressKeyNode.manifest(), RunCommandNode.manifest(),
+    ];
+    for manifest in described {
+        let port = manifest.metadata_ports.iter().find(|p| p.name == "tools")
+            .unwrap_or_else(|| panic!("{} describes its tools", manifest.node_type));
+        let value = port.value.as_ref().expect("a node type writes its metadata port's value");
+        for style in ["anthropic", "openai"] {
+            for tool in value[style].as_array().expect("a list per style") {
+                let name = tool["name"].as_str().expect("a name");
+                let routed = route(&call(name, arguments_for(&tool["parameters"])))
+                    .unwrap_or_else(|e| panic!("{} describes {style} {name}, which does not route: {e}", manifest.node_type));
+                assert_ne!(routed.port, "other", "{} describes {style} {name}, which is no computer action here", manifest.node_type);
+            }
         }
     }
     Ok(())

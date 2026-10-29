@@ -28,5 +28,35 @@
       "type": "String",
       "description": "What happened, in a sentence a model can read back as the tool's result."
     }
+  ],
+  "metadataPorts": [
+    {
+      "name": "tools",
+      "type": "ActionTools",
+      "description": "The tools a model calls this node through, in Anthropic's names and in OpenAI's: gather them up to the LLM node's `tools` through metadata ports.",
+      "value": {
+        "anthropic": [
+          {
+            "description": "Press the left button down where the mouse is and keep it down: with mouse_move and left_mouse_up, a drag made step by step.",
+            "name": "left_mouse_down",
+            "parameters": {
+              "properties": {},
+              "required": [],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Let the left button up where the mouse is.",
+            "name": "left_mouse_up",
+            "parameters": {
+              "properties": {},
+              "required": [],
+              "type": "object"
+            }
+          }
+        ],
+        "openai": []
+      }
+    }
   ]
 }

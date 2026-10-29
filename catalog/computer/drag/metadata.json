@@ -28,5 +28,93 @@
       "type": "String",
       "description": "What happened, in a sentence a model can read back as the tool's result."
     }
+  ],
+  "metadataPorts": [
+    {
+      "name": "tools",
+      "type": "ActionTools",
+      "description": "The tools a model calls this node through, in Anthropic's names and in OpenAI's: gather them up to the LLM node's `tools` through metadata ports.",
+      "value": {
+        "anthropic": [
+          {
+            "description": "Press the left button at start_coordinate, move to coordinate, and release.",
+            "name": "left_click_drag",
+            "parameters": {
+              "properties": {
+                "coordinate": {
+                  "description": "Where it ends as [x, y], pixels from the left and top edges of the last full screenshot.",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "maxItems": 2,
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "start_coordinate": {
+                  "description": "Where the drag starts as [x, y], pixels from the left and top edges of the last full screenshot.",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "maxItems": 2,
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "text": {
+                  "description": "Keys to hold down during the action, joined by + (shift, ctrl+shift).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "start_coordinate",
+                "coordinate"
+              ],
+              "type": "object"
+            }
+          }
+        ],
+        "openai": [
+          {
+            "description": "Press the left button at the first point of path, move through the others, and release at the last.",
+            "name": "drag",
+            "parameters": {
+              "properties": {
+                "keys": {
+                  "description": "Keys to hold down during the action, like [\"SHIFT\"] or [\"CTRL\", \"SHIFT\"].",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "path": {
+                  "items": {
+                    "properties": {
+                      "x": {
+                        "description": "Across, pixels from the left and top edges of the last full screenshot.",
+                        "type": "integer"
+                      },
+                      "y": {
+                        "description": "Down, pixels from the left and top edges of the last full screenshot.",
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "x",
+                      "y"
+                    ],
+                    "type": "object"
+                  },
+                  "minItems": 2,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      }
+    }
   ]
 }

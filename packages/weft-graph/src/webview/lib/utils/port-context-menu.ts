@@ -52,8 +52,8 @@ export type PortMenuItem = PortMenuNote | PortMenuAction;
  *  call `buildPortMenuItems` with their own port + callbacks so the menu
  *  content stays identical across all port surfaces in the graph. */
 /** The side of the port, and with it what only an input has: where
- *  its requiredness stands (`nodeInputRequiredness` for a node input;
- *  a container port is `required` or `optional`) and the ONE writer.
+ *  its requiredness stands (`nodeInputRequiredness` for a node input,
+ *  `containerInputRequiredness` for a container's) and the ONE writer.
  *  Requiredness has no runtime meaning on an output, so an output caller
  *  cannot be handed either (the type forbids it) and an input caller
  *  cannot forget them (the type requires them). The writer makes the
@@ -227,15 +227,23 @@ export function buildPortMenuItems(opts: BuildPortMenuOptions): PortMenuItem[] {
 	// Requiredness rows (inputs only; outputs do not have runtime required
 	// semantics, and only an input caller hands over the writer). One the
 	// node requires cannot be made optional (the compiler refuses `x?:`
-	// there, since the node's code needs it), so it says so. One the
-	// program never wrote changes with its wiring, so it says that, and
-	// offers both written states.
+	// there, since the node's code needs it), so it says so; so does a
+	// container's input that passes through, which has no requiredness
+	// of its own. One the program never wrote changes with its wiring,
+	// so it says that, and offers both written states.
 	if (opts.side === 'input') {
 		const setRequired = opts.onSetRequired;
 		const makeRequired: PortMenuAction = { label: '☑ Make required', onClick: () => setRequired(true) };
 		switch (opts.requiredness) {
 			case 'node_requires':
 				items.push({ label: 'Required: this node’s code needs it.', note: true, color: '#71717a' });
+				break;
+			case 'passes_through':
+				items.push({
+					label: 'Passes its value straight to the nodes inside; it has to be connected only when a node inside needs it.',
+					note: true,
+					color: '#71717a',
+				});
 				break;
 			case 'required':
 				items.push({ label: '☐ Make optional', onClick: () => setRequired(false) });

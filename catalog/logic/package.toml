@@ -1,11 +1,11 @@
 [package]
 name = "logic"
 
-# The control-flow nodes: branching (`Switch`, `FirstInOrder`, `All`,
-# `Not`), runs steering each other by tag (`TagRun`, `StopTagged`), and
-# reading the project's runs (`ListRuns`, `CountRuns`, `GetRunId`,
+# The control-flow nodes: branching (`Switch`, `Dispatch`, `FirstInOrder`,
+# `All`, `Not`), runs steering each other by tag (`TagRun`, `StopTagged`),
+# and reading the project's runs (`ListRuns`, `CountRuns`, `GetRunId`,
 # `GetNodeState`). `regex` is
-# Switch's `matches` test; the steering pair shares `steering.rs`, the
-# runs pair shares `runs.rs`.
+# Switch's `matches` test; Switch and Dispatch share `compare.rs`, the
+# steering pair shares `steering.rs`, the runs pair shares `runs.rs`.
 [dependencies]
 regex = "1"

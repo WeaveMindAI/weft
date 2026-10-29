@@ -1,27 +1,31 @@
 <script lang="ts">
 	import { Handle, Position, NodeResizer, useEdges, type ResizeParams } from "@xyflow/svelte";
 	import { Group, RotateCw, Maximize2, Minimize2, ChevronDown, ChevronRight } from '@lucide/svelte';
-	import { isLoopNodeType, containerHasConfigStrip, ownValue } from "../../types";
-	import type { NodeDataUpdates, PortDefinition, NodeFiring, FieldDefinition } from "../../types";
+	import { isLoopNodeType, containerHasConfigStrip, declaredHomeValue, ownValue } from "../../types";
+	import type { NodeDataUpdates, PortDefinition, NodeFiring, FieldDefinition, MetadataInput } from "../../types";
 	import { isFilledIn } from '../../utils/port-specs';
 	import { getPortTypeColor } from "../../constants/colors";
-	import { GROUP_PORTS_TOP_PX, CONFIG_STRIP_BAR_PX, configStripOpenPx, expandedContainerMinPx } from "../../constants/container-layout";
+	import { GROUP_PORTS_TOP_PX, CONFIG_STRIP_BAR_PX, expandedContainerMinPx } from "../../constants/container-layout";
 	import { openPortMenu, buildPortMenuItems } from '../../utils/port-context-menu';
 	import { classifyInputPort, classifyOutputPort, removeFromOverAndCarry } from '../../utils/loop-port-roles';
 	import { toast } from 'svelte-sonner';
-	import { filledMarkerStyle, portMarkerStyle } from '../../utils/port-marker';
+	import { filledMarkerStyle, portMarkerStyle, requirednessNote } from '../../utils/port-marker';
+	import { containerInputRequiredness } from '../../projection/header-ports';
+	import { metadataRefLabel } from '../../utils/metadata-expr';
+	import MetadataRefChip from './MetadataRefChip.svelte';
+	import CodeEditor from '../CodeEditor.svelte';
+	import MetadataExprView from './MetadataExprView.svelte';
 	import FiringInspector from './FiringInspector.svelte';
 	import FlowDock from './FlowDock.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import { GROUP_COLOR, LOOP_COLOR } from "../../constants/colors";
 	import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, isGatePort, portVar } from "../../../../protocol";
 	import FieldStrip from './FieldStrip.svelte';
-	import { LOOP_CONFIG_FIELDS, fieldForInput, gateField, nextPortLiterals } from '../../utils/input-field';
+	import { fieldForInput, nextPortLiterals } from '../../utils/input-field';
+	import { FIELD_PX, METADATA_VALUE_BOX_PX, configStripOpenPx, containerStripFields, expressionBoxPx, type StripField } from '../../utils/config-strip';
+	import { measureTextWidth, stripFonts } from '../../utils/measure-text';
+	import type { MetadataPort } from "../../../../protocol";
 
-	// Group interface ports cannot take a body-set literal (see the rule
-	// enforced in enrichment's validate_required_ports). Pass an empty set to
-	// portMarkerStyle so they never render as 'empty-dotted'.
-	const noLiteralFilled = new Set<string>();
 
 	/// A boundary port seen from INSIDE the container: the port's colour,
 	/// a size down from the outer handle so the two never read as the
@@ -48,6 +52,19 @@
 			portLiterals?: Record<string, unknown>;
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
+			/// The header's `*name: Type` ports, each with the value the
+			/// body writes, shown in the strip (never on the canvas).
+			metadataPorts?: MetadataPort[];
+			/// The inputs a metadata wire fills from outside (`g.x =
+			/// search.tool`): shown in the strip read-only, with the port
+			/// each comes from.
+			metadataInputs?: Record<string, MetadataInput>;
+			/// The width the box draws at while expanded, which its config
+			/// strip wraps its text in (the editor's sizing, `boxWidth`).
+			boxWidth?: number;
+			/// Take the person to a node or group by its scoped id (a "comes
+			/// from" link). Absent on a view that cannot move.
+			onReveal?: (id: string) => void;
 			onUpdate?: (updates: NodeDataUpdates) => void;
 			/// Flip the gate between `_should_flow` and
 			/// `_should_not_flow`. Its own hook rather than a
@@ -104,6 +121,7 @@
 			|| isFilledIn(ownValue(data.portLiterals as Record<string, unknown> | undefined, SHOULD_NOT_FLOW_PORT))
 	);
 	const outputs = $derived((data.outputs ?? []) as PortDefinition[]);
+	const metadataPorts = $derived(data.metadataPorts ?? []);
 	// Simplified view draws a dot only when an edge attaches to it: structure
 	// is not editable there, so an unwired dot would be pure decoration. The
 	// live edges are the merged __simp_* ones (flow wires collapse onto the
@@ -153,35 +171,94 @@
 	// file records (`configOpen`), so a fresh loop shows the thin bar.
 	const configCollapsed = $derived(!((data.config?.configOpen as boolean) ?? false));
 
-	/// Field definitions for the loop config strip. over and carry no
-	/// longer live in the strip: their values are derived from the per-port
-	/// role chosen via right-click on each port, so the strip only shows
-	/// the remaining settings.
-	const loopFields: FieldDefinition[] = $derived(isLoop ? LOOP_CONFIG_FIELDS : []);
-
 	const portLiterals = $derived((data.portLiterals as Record<string, unknown> | undefined) ?? {});
-	/// One field per interface port carrying a WRITTEN VALUE. A port fed
-	/// by a wire is driven by that wire, so it has no entry here and no
-	/// field: the strip only ever shows values the source actually
-	/// spells out.
-	const portFields: FieldDefinition[] = $derived(
-		Object.keys(portLiterals).map((key) => {
-			if (isGatePort(key)) return gateField(key, 'container');
+	/// The strip's ordinary fields: a loop's settings (over and carry are
+	/// not among them: each port's role is chosen by right-clicking it),
+	/// then one per interface port carrying a WRITTEN VALUE. A port fed by
+	/// a wire is driven by that wire, so it has no field: the strip only
+	/// shows values the source spells out. The layout engine counts the
+	/// same list (`containerStripFields`).
+	const ordinaryFields: FieldDefinition[] = $derived(containerStripFields(id, isLoop, portLiterals, inputs));
+	const metadataInputs = $derived(data.metadataInputs ?? {});
+	/// The inputs filled from code and not wired: a value written on the
+	/// port (`g.x = "hi"`), or one a metadata wire brings. Their markers
+	/// draw filled from code, as a node's do, never as waiting for a wire.
+	const literalFilledPorts: Set<string> = $derived.by(() => {
+		const wired = new Set(edgesState.current.filter((e) => e.target === id && e.targetHandle).map((e) => e.targetHandle));
+		const filled = new Set<string>();
+		for (const name of Object.keys(metadataInputs)) if (!wired.has(name)) filled.add(name);
+		for (const [name, v] of Object.entries(portLiterals)) if (!wired.has(name) && isFilledIn(v)) filled.add(name);
+		return filled;
+	});
+	/// One read-only field per input a metadata wire fills from outside,
+	/// where the ports the source gives a value show. Keyed by the input's
+	/// name, like those: the two never share one (the value is either
+	/// written on the port or brought by the wire).
+	const metadataInputFields: FieldDefinition[] = $derived(
+		Object.keys(metadataInputs).map((key) => {
 			const port = inputs.find((p) => p.name === key);
-			// A container's ports are its header: the compiler refuses a
-			// value on any other name, and the projection throws on one,
-			// so a key with no port here is a broken invariant, not a
-			// field to improvise.
-			if (!port) throw new Error(`'${id}' has a value for '${key}', which is not one of its ports`);
+			if (!port) throw new Error(`'${id}' has a metadata value for '${key}', which is not one of its ports`);
 			return fieldForInput(port);
 		}),
 	);
-	/// Settings first, then the ports the source gave a value: the order
-	/// the loop's source reads in (its braces, then the lines outside).
-	const stripFields: FieldDefinition[] = $derived([...loopFields, ...portFields]);
+	/// One field per metadata port, for the value its body writes
+	/// (`self.tool = { ... }`). Keyed `*name`, the header's own spelling,
+	/// so no metadata port can share a key with a loop setting. Labelled
+	/// with the type as the header spells it: the wire type of a named
+	/// record carries its whole expansion after `=`.
+	const metadataFields: FieldDefinition[] = $derived(metadataPorts.map((m) => ({
+		key: `*${m.name}`,
+		label: `${m.name}: ${m.declaredType ?? m.type.split('=')[0]}`,
+		type: 'code',
+		language: 'json' as const,
+		...(m.description ? { description: m.description } : {}),
+	})));
+	/// The strip fields drawn here rather than by the strip: the metadata
+	/// values and the inputs a metadata wire fills.
+	const customStripKeys = $derived(new Set([...metadataFields, ...metadataInputFields].map((f) => f.key)));
+	/// Settings first, then the ports the source gave a value, then the
+	/// metadata values: the order the loop's source reads in (its braces,
+	/// the lines outside, then its body).
+	const stripFields: FieldDefinition[] = $derived([...ordinaryFields, ...metadataInputFields, ...metadataFields]);
 	const hasConfigStrip = $derived(
-		!data.simplified && containerHasConfigStrip(data.nodeType, portLiterals),
+		!data.simplified && containerHasConfigStrip(data.nodeType, portLiterals, metadataPorts, metadataInputs),
 	);
+	/// The width the strip's text wraps in: the width the box draws at
+	/// (`boxWidth`), the one the layout reserves the strip at too.
+	const stripWidth = $derived(data.boxWidth ?? expandedContainerMinPx(false).w);
+	const stripContent = $derived({
+		scope: id,
+		fields: ordinaryFields,
+		valueOf: (field: StripField) => declaredHomeValue(portLiterals, data.config, field),
+		metadataPorts,
+		metadataInputs,
+	});
+
+	/// A metadata value being typed that is not JSON yet, keyed by port:
+	/// nothing is written until it parses, and the editor says so.
+	let metadataDraftErrors = $state<Record<string, string>>({});
+
+	/// Write a metadata port's value from its editor's text. An emptied
+	/// editor removes the body line, like an emptied field; text that does
+	/// not parse yet writes nothing and says why under the editor.
+	function writeMetadataValue(port: string, text: string) {
+		if (!data.onUpdate) return;
+		const { [port]: _cleared, ...others } = metadataDraftErrors;
+		if (text.trim() === '') {
+			metadataDraftErrors = others;
+			data.onUpdate({ metadataValue: { port, value: null } });
+			return;
+		}
+		let value: unknown;
+		try {
+			value = JSON.parse(text);
+		} catch (e) {
+			metadataDraftErrors = { ...others, [port]: e instanceof Error ? e.message : String(e) };
+			return;
+		}
+		metadataDraftErrors = others;
+		data.onUpdate({ metadataValue: { port, value } });
+	}
 
 	function updateStripField(key: string, value: unknown, portDriven?: boolean) {
 		if (!data.onUpdate) return;
@@ -347,8 +424,13 @@
 			const current = classifyInputPort(port, lc);
 			if (current.conflictReason) return;
 			if (current.role === 'iter') {
+				// Leaving `over`, the port passes through, which the compiler
+				// refuses to see written `x?:`: an iter port written that way
+				// is rewritten `x:` in the same batch.
 				const over = (lc.over as string[] | undefined ?? []).filter(n => n !== portName);
-				data.onUpdate({ config: { ...lc, over } });
+				const newInputs = port.required ? undefined : inputs.map((p: PortDefinition) =>
+					p.name === portName ? { ...p, required: true, passesThrough: true } : { ...p });
+				data.onUpdate({ config: { ...lc, over }, ...(newInputs ? { inputs: newInputs } : {}) });
 			} else if (current.role === 'broadcast') {
 				const over = [...(lc.over as string[] | undefined ?? [])];
 				if (!over.includes(portName)) over.push(portName);
@@ -420,8 +502,8 @@
 				...(side === 'input'
 					? {
 						side,
-						// A container port is always written: `x:` or `x?:`.
-						requiredness: port.required ? 'required' : 'optional',
+						// A container port passes through, or is written `x:` or `x?:`.
+						requiredness: containerInputRequiredness(port),
 						onSetRequired: (required: boolean) => setInputPortRequired(portName, required),
 					}
 					: { side }),
@@ -449,8 +531,11 @@
 		const visibleOutputs = numOutputs + (isLoop ? 1 : 0);
 		const portsBlock = Math.max(visibleInputs, visibleOutputs) * 30 + 24;
 		const headerArea = 44;
+		// The open strip worked out from its content at the box's width,
+		// as the layout engine works it out, so the two never disagree and
+		// nothing is measured.
 		const configArea = hasConfigStrip
-			? (collapsed ? CONFIG_STRIP_BAR_PX : configStripOpenPx(stripFields.length))
+			? (collapsed ? CONFIG_STRIP_BAR_PX : configStripOpenPx(stripContent, stripWidth, measureTextWidth, stripFonts()))
 			: 0;
 		// The chrome only (header, strip, port rows), floored at the
 		// container's own minimum. The layout engine fits the body to the
@@ -480,6 +565,10 @@
 			toast.error(`"done" is a reserved loop output port name (auto-rendered from self.done).`);
 			return;
 		}
+		if (metadataPorts.some((m) => m.name === trimmed)) {
+			toast.error(`"${trimmed}" is a metadata port here: a metadata port's name may be no other port's.`);
+			return;
+		}
 		const currentInputs = [...inputs];
 		const currentOutputs = [...outputs];
 		if (side === 'input') {
@@ -494,7 +583,9 @@
 			}
 			// No type chosen yet: the port holds its own variable, which the
 			// signature writes as the bare name.
-			currentInputs.push({ name: trimmed, portType: portVar('input', trimmed), required: false });
+			// A new input passes through (a group's always, a loop's until
+			// it joins `over`), so it is written `x:`, never `x?:`.
+			currentInputs.push({ name: trimmed, portType: portVar('input', trimmed), required: true, passesThrough: true });
 		} else {
 			if (currentOutputs.some(p => p.name === trimmed)) {
 				toast.error(`Output port "${trimmed}" already exists.`);
@@ -608,6 +699,63 @@
 	/>
 {/snippet}
 
+{#snippet stripCustomField(field: FieldDefinition)}
+	<!-- The metadata fields, laid out as FieldStrip lays out every field (a
+	     label row, then the control), each box at a fixed height that
+	     scrolls, so the strip's size is known before it renders
+	     (`configStripOpenPx`) and never changes under the layout. -->
+	{@const fill = metadataInputs[field.key]}
+	{@const meta = fill ? undefined : metadataPorts.find((m) => `*${m.name}` === field.key)}
+	<div class="space-y-1 nodrag nopan" data-field-key={field.key}>
+		<div class="flex items-center justify-between gap-2" style="min-height: {FIELD_PX.labelRow}px;">
+			<span
+				class="text-[10px] text-muted-foreground font-medium block truncate"
+				style="line-height: {FIELD_PX.labelLine}px;"
+				title={meta?.written ? `${field.label}, gathered from other metadata ports: change it in the code` : field.description ?? field.label}
+			>{field.label}</span>
+			{#if fill}
+				<!-- An input a metadata wire fills from outside: the name reads
+				     as the group's surroundings write it. -->
+				<span class="text-[10px] text-muted-foreground truncate">from <MetadataRefChip ref={fill.from} label={metadataRefLabel(fill.from, data.config?.parentId as string | undefined)} onReveal={data.onReveal} /></span>
+			{:else if meta && metadataDraftErrors[meta.name]}
+				<span class="text-[10px] text-rose-600 truncate" title={metadataDraftErrors[meta.name]}>not JSON yet, nothing written</span>
+			{:else if meta && meta.value === undefined && !meta.written}
+				<span class="text-[10px] text-rose-600 truncate">no value written yet</span>
+			{/if}
+		</div>
+		{#if fill}
+			<!-- Read-only boxes take the wheel always, like the editor's other
+			     read-only scroll boxes; the editable one below takes it once
+			     focused, like every code field. -->
+			<div class="nowheel">
+				<CodeEditor value={fill.value === undefined ? '' : JSON.stringify(fill.value, null, 2)} readonly language="json" height="{METADATA_VALUE_BOX_PX}px" />
+			</div>
+		{:else if meta?.written}
+			<!-- Gathered from other metadata ports: read-only, as the body
+			     writes it, each name a link; the value it resolves to below. -->
+			<!-- As tall as its wrapped text up to a cap, then it scrolls: the
+			     height is worked out (`expressionBoxPx`) and set, so the
+			     layout counts exactly what draws. -->
+			<div class="text-xs px-2 py-1.5 rounded bg-muted font-mono overflow-y-auto overflow-x-hidden nowheel box-border" style="height: {expressionBoxPx(meta.written, id, stripWidth, measureTextWidth, stripFonts())}px;">
+				<MetadataExprView expr={meta.written} scope={id} onReveal={data.onReveal} />
+			</div>
+			<div class="nowheel">
+				<CodeEditor value={meta.value === undefined ? '' : JSON.stringify(meta.value, null, 2)} readonly language="json" height="{METADATA_VALUE_BOX_PX}px" />
+			</div>
+		{:else if meta}
+			<div onfocusin={(e) => e.currentTarget.classList.add('nowheel')} onfocusout={(e) => e.currentTarget.classList.remove('nowheel')}>
+			<CodeEditor
+				value={meta.value === undefined ? '' : JSON.stringify(meta.value, null, 2)}
+				placeholder="the value, as JSON"
+				language="json"
+				height="{METADATA_VALUE_BOX_PX}px"
+				onchange={(text) => writeMetadataValue(meta.name, text)}
+			/>
+			</div>
+		{/if}
+	</div>
+{/snippet}
+
 {#if isExpanded}
 <!-- ═══════════════ EXPANDED: container envelope ═══════════════ -->
 <NodeResizer
@@ -678,6 +826,9 @@
 						idPrefix={id}
 						onUpdate={updateStripField}
 						onClear={(key) => updateStripField(key, null, true)}
+						customFieldKeys={customStripKeys}
+						fixedTextareas
+						renderCustom={stripCustomField}
 					/>
 				</div>
 			{/if}
@@ -716,7 +867,7 @@
 			{/if}
 		{:else}
 		{#each inputs as input}
-			{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, noLiteralFilled, getPortTypeColor(input.portType), 'input', '!relative !inset-auto !transform-none')}
+			{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, literalFilledPorts, getPortTypeColor(input.portType), 'input', '!relative !inset-auto !transform-none')}
 			{@const isGhost = !!input.synthesizedFromCarry}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div class="expanded-port-block group" class:port-ghost={isGhost} oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: input.name, side: 'input', x: e.clientX, y: e.clientY }; }}>
@@ -739,7 +890,7 @@
 						type="target"
 						position={Position.Left}
 						id={input.name}
-						title={input.name}
+						title={requirednessNote(input, false) ?? input.name}
 						style={pMarker.style}
 						class={pMarker.class}
 						oncontextmenu={(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: input.name, side: 'input', x: e.clientX, y: e.clientY }; }}
@@ -821,6 +972,7 @@
 					{/if}
 				</div>
 			</div>
+
 			{#if isLoop && simpDotConnected.loopDone}
 				<div class="expanded-port-block expanded-port-block-right implicit-port" title="self.done (write true to terminate loop)">
 					<div class="expanded-port-label-row expanded-port-label-row-right"><span class="expanded-port-label">done</span><span class="implicit-glyph">∗</span></div>
@@ -833,7 +985,7 @@
 			{/if}
 		{:else}
 		{#each outputs as output}
-			{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, noLiteralFilled, getPortTypeColor(output.portType), 'output', '!relative !inset-auto !transform-none')}
+			{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, literalFilledPorts, getPortTypeColor(output.portType), 'output', '!relative !inset-auto !transform-none')}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div class="expanded-port-block expanded-port-block-right group" oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: output.name, side: 'output', x: e.clientX, y: e.clientY }; }}>
 				<div class="expanded-port-label-row expanded-port-label-row-right">
@@ -942,6 +1094,7 @@
 	<Handle type="source" position={Position.Right} id={SIMPLIFIED_OUT_HANDLE}
 		style="top: 50%; {simplifiedDotStyle(containerColor)}" />
 {/if}
+
 {:else}
 <!-- ═══════════════ COLLAPSED: looks like a regular node ═══════════════ -->
 {@render flowDock(18)}
@@ -1017,7 +1170,7 @@
 			<!-- Input Ports -->
 			<div class="space-y-1 min-w-0 flex-1">
 				{#each inputs as input}
-					{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, noLiteralFilled, getPortTypeColor(input.portType), 'input')}
+					{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, literalFilledPorts, getPortTypeColor(input.portType), 'input')}
 					{@const isGhost = !!input.synthesizedFromCarry}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div class="relative flex items-center gap-1 group pl-3" class:port-ghost={isGhost} oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: input.name, side: 'input', x: e.clientX, y: e.clientY }; }}>
@@ -1025,7 +1178,7 @@
 							type="target"
 							position={Position.Left}
 							id={input.name}
-							title={input.name}
+							title={requirednessNote(input, false) ?? input.name}
 							style="top: 50%; {pMarker.style}"
 							class={pMarker.class}
 							oncontextmenu={(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: input.name, side: 'input', x: e.clientX, y: e.clientY }; }}
@@ -1073,7 +1226,7 @@
 			     middle of the card. -->
 			<div class="space-y-1 text-right flex flex-col items-end min-w-0 flex-1">
 				{#each outputs as output}
-					{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, noLiteralFilled, getPortTypeColor(output.portType), 'output')}
+					{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, literalFilledPorts, getPortTypeColor(output.portType), 'output')}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div class="relative flex items-center gap-1 justify-end group pr-3" oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: output.name, side: 'output', x: e.clientX, y: e.clientY }; }}>
 						<Handle
@@ -1212,6 +1365,13 @@
 		flex-direction: column;
 		gap: 5px;
 		margin-top: 4px;
+	}
+	/* A field may shrink to the strip's width: a flex item is otherwise as
+	   wide as its widest unbreakable content (a long JSON line in a code
+	   box), which pushed every field, and its wrapping text, past the
+	   box's right edge. */
+	.config-fields > :global(*) {
+		min-width: 0;
 	}
 
 	/* `top` comes inline from `portsTop` (container-layout constants), so the

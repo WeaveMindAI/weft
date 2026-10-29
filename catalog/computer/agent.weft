@@ -1,5 +1,5 @@
 # A default agent: a model works a computer, turn after turn, until it answers without asking for an action.
-Group(task: String, computer: Infra, tools: List[JsonDict], model: LlmProvider, agentId: String) -> (answer: String) {
+Group(task: String, computer: Infra, model: LlmProvider, agentId: String) -> (answer: String) {
   # A model works a computer until it answers without asking for an action, for at most 100 turns. Each turn the model reads the conversation, every action it asked for runs on the computer, and the results go back into the conversation; the screenshots those actions took follow in one message. On the last turn the model is not allowed to call a tool, so it always answers, saying where the task stands if it could not finish. Its commands run in a shell session of its own, named after the run (and `agentId`, when set, for several agents in one run), ended when it answers (a run that fails or is stopped first leaves it up until an EndSession or Restart the shell). A command's output reaches the model cut to its start and end. Agents sharing one computer share its screen, so agents working at once each want a computer of their own.
   start = ChatHistoryAppend { role: "user", text: self.task }
 
@@ -15,7 +15,7 @@ Group(task: String, computer: Infra, tools: List[JsonDict], model: LlmProvider, 
     runAlone: run.runId
   }
 
-  turns = Loop(history: File, answer: String, computer: Infra, tools: List[JsonDict], model: LlmProvider, session: String) -> (history: File, answer: String) {
+  turns = Loop(history: File, answer: String, computer: Infra, model: LlmProvider, session: String) -> (history: File, answer: String) {
     # One turn: the model answers or asks for actions, and each action runs on the computer
     carry: ["history", "answer"]
     # The last turn is index 99 (below, in `choice`): change the two together.
@@ -38,12 +38,14 @@ Group(task: String, computer: Infra, tools: List[JsonDict], model: LlmProvider, 
     ask = LlmInference {
       historyFile: self.history
       provider: self.model
-      tools: self.tools
+      # The actions the computer performs, described by the nodes that perform them, in the
+      # names Anthropic's models are trained on; `calls.tools.openai` holds OpenAI's.
+      tools: calls.tools.anthropic
       toolChoice: choice.choice
       params: LlmParams { systemPrompt: @file("__catalog/base_catalog/computer/agent_prompt.md") }.params
     }
 
-    calls = Loop(toolCalls: List[ToolCall], history: File, failed: Boolean, computer: Infra, session: String) -> (history: File, failed: Boolean, images: List[Image | Null], shots: List[Boolean | Null]) {
+    calls = Loop(toolCalls: List[ToolCall], history: File, failed: Boolean, computer: Infra, session: String) -> (history: File, failed: Boolean, images: List[Image | Null], shots: List[Boolean | Null], *tools: ActionTools) {
       # Each action the model asked for this turn, in order. After one fails, the rest are answered without running, so the model sees the failure before it acts again.
       over: ["toolCalls"]
       carry: ["history", "failed"]
@@ -68,6 +70,7 @@ Group(task: String, computer: Infra, tools: List[JsonDict], model: LlmProvider, 
       self.failed = All { failed: act.error }.yes
       self.images = act.image
       self.shots = All { shot: act.image }.yes
+      self.tools = act.tools
     }
     calls.toolCalls = ask.toolCalls
     calls.history = ask.historyFile
@@ -94,7 +97,6 @@ Group(task: String, computer: Infra, tools: List[JsonDict], model: LlmProvider, 
   turns.history = start.historyFile
   turns.answer = ""
   turns.computer = self.computer
-  turns.tools = self.tools
   turns.model = self.model
   turns.session = session.value
 

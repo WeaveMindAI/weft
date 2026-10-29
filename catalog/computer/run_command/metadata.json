@@ -41,5 +41,62 @@
       "type": "Number",
       "description": "The command's exit code: 0 when it succeeded."
     }
+  ],
+  "metadataPorts": [
+    {
+      "name": "tools",
+      "type": "ActionTools",
+      "description": "The tools a model calls this node through, in Anthropic's names and in OpenAI's: gather them up to the LLM node's `tools` through metadata ports.",
+      "value": {
+        "anthropic": [
+          {
+            "description": "Run a command in the computer's shell (bash) and get back its output and its exit code. Your shell keeps its folder and exported variables from one command to the next, so cd and export carry over; commands run one at a time. A long output comes back cut to its start and its end, with a line saying how much was cut: to read another part, run the command again through grep, head, tail or sed -n, or, for a command not safe to run twice, send its output to a file first (cmd > out.txt 2>&1) and read the file in parts. A command that does not end by itself (a server, a watcher) must be started in the background with & and its output sent to a file, or it holds the shell and every later command waits. Windows a command opens appear on the screen. Prefer a command to the mouse and keyboard for anything a command can do.",
+            "name": "bash",
+            "parameters": {
+              "properties": {
+                "command": {
+                  "description": "The command to run.",
+                  "type": "string"
+                },
+                "restart": {
+                  "description": "true starts your shell over first, in the home folder, stopping whatever it runs and whatever its commands left running. Alone, without a command, it only restarts.",
+                  "type": "boolean"
+                },
+                "timeout_secs": {
+                  "description": "Stop the command after this many seconds. Left out, it runs until it ends.",
+                  "type": "number"
+                }
+              },
+              "required": [],
+              "type": "object"
+            }
+          }
+        ],
+        "openai": [
+          {
+            "description": "Run a command in the computer's shell (bash) and get back its output and its exit code. Your shell keeps its folder and exported variables from one command to the next, so cd and export carry over; commands run one at a time. A long output comes back cut to its start and its end, with a line saying how much was cut: to read another part, run the command again through grep, head, tail or sed -n, or, for a command not safe to run twice, send its output to a file first (cmd > out.txt 2>&1) and read the file in parts. A command that does not end by itself (a server, a watcher) must be started in the background with & and its output sent to a file, or it holds the shell and every later command waits. Windows a command opens appear on the screen. Prefer a command to the mouse and keyboard for anything a command can do.",
+            "name": "bash",
+            "parameters": {
+              "properties": {
+                "command": {
+                  "description": "The command to run.",
+                  "type": "string"
+                },
+                "restart": {
+                  "description": "true starts your shell over first, in the home folder, stopping whatever it runs and whatever its commands left running. Alone, without a command, it only restarts.",
+                  "type": "boolean"
+                },
+                "timeout_secs": {
+                  "description": "Stop the command after this many seconds. Left out, it runs until it ends.",
+                  "type": "number"
+                }
+              },
+              "required": [],
+              "type": "object"
+            }
+          }
+        ]
+      }
+    }
   ]
 }

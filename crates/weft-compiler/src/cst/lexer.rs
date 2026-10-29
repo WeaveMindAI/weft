@@ -129,6 +129,7 @@ impl<'a> Lexer<'a> {
             b'.' => Some(SyntaxKind::DOT),
             b'=' => Some(SyntaxKind::EQ),
             b'?' => Some(SyntaxKind::QUESTION),
+            b'*' => Some(SyntaxKind::STAR),
             _ => None,
         };
         if let Some(kind) = single {
@@ -450,6 +451,13 @@ mod tests {
         assert_lossless("g = Group() {\n  x = T {}\n} -> (out: String)\n");
         assert_lossless("\n\n\n  \t \n# trailing comment");
         assert_lossless("a.b = c.d\n");
+        assert_lossless("g = Group() -> (*tool: X) {}\n");
+    }
+
+    #[test]
+    fn a_star_is_its_own_token() {
+        let kinds: Vec<SyntaxKind> = lex("(*tool)").iter().map(|t| t.kind).collect();
+        assert_eq!(kinds, [SyntaxKind::L_PAREN, SyntaxKind::STAR, SyntaxKind::IDENT, SyntaxKind::R_PAREN]);
     }
 
     #[test]

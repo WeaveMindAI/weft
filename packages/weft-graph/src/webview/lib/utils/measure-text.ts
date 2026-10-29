@@ -6,6 +6,8 @@
 // rendered". The canvas + per-font measurements are cached: measuring is cheap
 // and synchronous, so callers stay synchronous.
 
+import type { StripFonts } from './config-strip';
+
 let ctx: CanvasRenderingContext2D | null = null;
 function context(): CanvasRenderingContext2D | null {
   if (ctx) return ctx;
@@ -52,4 +54,27 @@ function fontFamily(): string {
  *  as `text-[Npx]` in the app's default sans family at normal weight). */
 export function nodeLabelFont(sizePx: number): string {
   return `${sizePx}px ${fontFamily()}`;
+}
+
+/** The fonts a container's config strip wraps text in, for working out
+ *  its height (`configStripOpenPx`): a field's label (`text-[10px]
+ *  font-medium`), a checkbox's text (`text-xs`), a gathered metadata
+ *  value's expression (`text-xs font-mono`), and a multiselect's option
+ *  buttons (`text-[10px]`). The mono family is the one the theme paints
+ *  `font-mono` with, read live like the sans one. */
+export function stripFonts(): StripFonts {
+  return {
+    label: `500 ${nodeLabelFont(10)}`,
+    checkbox: nodeLabelFont(12),
+    expression: `12px ${monoFamily()}`,
+    option: nodeLabelFont(10),
+  };
+}
+
+let monoCache: string | null = null;
+function monoFamily(): string {
+  if (monoCache) return monoCache;
+  if (typeof document === 'undefined') return (monoCache = 'monospace');
+  const declared = getComputedStyle(document.documentElement).getPropertyValue('--font-mono').trim();
+  return (monoCache = declared || 'monospace');
 }

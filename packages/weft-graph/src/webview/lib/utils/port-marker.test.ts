@@ -82,3 +82,30 @@ describe('requirednessNote', () => {
 		expect(requirednessNote(port(), true)).toMatch(/^value: required while wired/);
 	});
 });
+
+describe("a container's input that passes through", () => {
+	const through = port({ required: true, passesThrough: true });
+
+	it('draws a ring with a dot in the middle, apart from every requiredness state', () => {
+		const m = portMarkerStyle(through, none, none, '#0af', 'input');
+		expect(m.style).toContain('radial-gradient(circle, #0af 0 2px, white 2.5px)');
+		expect(m.style).toContain('border: 2px solid #0af');
+		expect(m.class).not.toMatch(/border-\d/);
+		for (const other of [port({ required: true }), port({ optional: true })]) {
+			expect(m).not.toEqual(portMarkerStyle(other, none, none, '#0af', 'input'));
+		}
+	});
+
+	it('wins over a @require_one_of group but not over a value written there', () => {
+		expect(portMarkerStyle(through, new Set(['value']), none, '#0af', 'input'))
+			.toEqual(portMarkerStyle(through, none, none, '#0af', 'input'));
+		expect(portMarkerStyle(through, none, new Set(['value']), '#0af', 'input'))
+			.toEqual(portMarkerStyle(port({ required: true }), none, new Set(['value']), '#0af', 'input'));
+	});
+
+	it('says in its hover text that the nodes inside decide', () => {
+		expect(requirednessNote(through, false)).toBe(
+			'value: passes its value straight to the nodes inside; it has to be connected only when a node inside needs it',
+		);
+	});
+});

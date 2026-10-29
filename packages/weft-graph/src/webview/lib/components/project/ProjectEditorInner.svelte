@@ -25,25 +25,29 @@
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import { hasUnpickedAccess, inputsOf, outputRows, outputsOf } from "../../utils/input-field";
 	import { effectiveAccessValue, installPicksVersion, loadInstallPicks } from "./install-picks.svelte";
-	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
+	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates, MetadataInput } from "../../types";
 	import { locatedKey, type Frame } from "../../../../protocol";
 	import { isContainerNodeType, isLoopNodeType, isIncludeNodeType, isScopeBoxNodeType, INCLUDE_NODE_TYPE, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible, typeVarBoundRefuses, portValueFirstForm } from "../../types";
 	import { rowsByCallPath, type RowsByCallPath } from "../../utils/call-path-rows";
 	import InstallSwitch from './InstallSwitch.svelte';
 	import { addressOf } from '../../../../run-spec';
-	import type { EditOp, RunCheck, SourceLocation, TextEdit, TypeParamWire } from "../../../../protocol";
+	import type { EditOp, MetadataPort, RunCheck, SourceLocation, TextEdit, TypeParamWire } from "../../../../protocol";
 	import { LOCAL_INSTALL, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, portVar } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
 	import { updateLayoutEntry, removeLayoutEntryEveryView, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, expandedOf, expandedToWrite, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "../../layout";
-	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_SQUARE_PX, SIMPLIFIED_CARD_MAX_W_PX } from "../../constants/simplified-view";
+	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_SQUARE_PX, SIMPLIFIED_CARD_MAX_W_PX } from "../../constants/simplified-view";
+	import { mergeSimplifiedEdges } from "../../simplified-edges";
+	import { metadataPortSigs } from "../../utils/metadata-ports";
+	import { metadataExprNamesInside, metadataExprSource, metadataRefLabel } from "../../utils/metadata-expr";
+	import { revealPlan } from "../../utils/reveal";
 	import { Boxes } from "@lucide/svelte";
 	import { formatConfigValue } from "../../value-format";
 	import { measureTextWidth, nodeLabelFont } from "../../utils/measure-text";
 	import { foldOps } from "../../projection/apply";
 	import { diffPortLiteralOps, VIEW_KEYS, NON_SOURCE_KEYS } from "../../projection/config-diff";
 	import { classifyUpdate } from "../../projection/update-classify";
-	import { copiedPortSigs, headerPortSigs, headerWorthy, partitionRemovals, portRequired, removedPortNames, type HeaderPortLike } from "../../projection/header-ports";
+	import { containerSpelledRequired, copiedPortSigs, headerPortSigs, headerWorthy, partitionRemovals, removedPortNames, type HeaderPortLike } from "../../projection/header-ports";
 	import { buildSpecMap, deriveInputsFromEntries, deriveOutputsFromEntries, isFilledIn, type PortEntryDef } from "../../utils/port-specs";
 	import { ProjectionEngine } from "../../projection/engine.svelte";
 	import { provideFieldEditorRegistry } from "./field-editor-registry";
@@ -447,7 +451,7 @@
 	});
 
 	// Get the SvelteFlow instance for screenToFlowPosition and the viewport
-	const { screenToFlowPosition, getViewport, setViewport } = useSvelteFlow();
+	const { screenToFlowPosition, getViewport, setViewport, setCenter } = useSvelteFlow();
 	const updateNodeInternals = useUpdateNodeInternals();
 
 	// The canvas: every viewport computation measures it, and a viewport's
@@ -763,55 +767,7 @@
 			}
 
 			// Recompute visibility for all nodes and edges based on ancestor chain
-			if (isExpandToggle) {
-				// Build a lookup: nodeId -> config (for checking expanded state)
-				const nodeById = new Map(nodes.map(n => [n.id, n]));
-
-				// Check if any ancestor of a node is collapsed
-				function isHiddenByAncestor(n: Node): boolean {
-					let pid = (n.data.config as Record<string, string>)?.parentId;
-					while (pid) {
-						const parent = nodeById.get(pid);
-						if (!parent) break;
-						const parentExpanded = (parent.data.config as Record<string, boolean>)?.expanded ?? false;
-						if (!parentExpanded) return true;
-						pid = (parent.data.config as Record<string, string>)?.parentId;
-					}
-					return false;
-				}
-
-				const hiddenNodeIds = new Set<string>();
-				nodes = nodes.map(n => {
-					const rawParentId = (n.data.config as Record<string, string>)?.parentId;
-					if (!rawParentId) return n;
-					const hidden = isHiddenByAncestor(n);
-					if (hidden) hiddenNodeIds.add(n.id);
-					// Check if the direct parent is expanded (for xyflow parentId assignment)
-					const directParent = nodeById.get(rawParentId);
-					const directParentExpanded = directParent ? ((directParent.data.config as Record<string, boolean>)?.expanded ?? false) : false;
-					const xyParentId = directParentExpanded && !hidden ? rawParentId : undefined;
-					// Hidden through xyflow's own flag, never through a display:none
-					// style: a node styled away keeps its last measured size (the
-					// library ignores zero-size measurements), so the Controls
-					// fit-view button, which uses the library's fitView, kept fitting
-					// the phantom boxes of collapsed children at their parent-
-					// relative positions and missed the real graph.
-					if (hidden) {
-						return { ...n, parentId: undefined, hidden: true };
-					}
-					// Visible: restyle through the one sizing ladder, then layer the
-					// xyflow parentId (collapsed-parent children detach to top level).
-					return { ...applyNodeSizing(n, n.data as Record<string, unknown>), parentId: xyParentId, hidden: false };
-				});
-
-				// Hide/show edges touching hidden nodes
-				edges = edges.map(e => {
-					const touchesHidden = hiddenNodeIds.has(e.source) || hiddenNodeIds.has(e.target);
-					if (touchesHidden) return { ...e, hidden: true };
-					if (e.hidden) return { ...e, hidden: false };
-					return e;
-				});
-			}
+			if (isExpandToggle) recomputeVisibility();
 
 			// Expand/collapse: run ELK, then adjust viewport so the toggled node's
 			// top-right corner stays at the same screen position (no node shifting),
@@ -1024,9 +980,13 @@
 						// (`nodeId`), not the bare label, so ports resolve unambiguously
 						// even when two containers share a local label in different scopes.
 						// A container's signature IS its whole surface, so the full
-						// list is written.
+						// list is written, its metadata ports after the outputs: a
+						// header rewrite without them would delete them.
 						const inputs = toPortSigs(nextInputs, 'input');
-						const outputs = toPortSigs(nextOutputs, 'output');
+						const outputs = [
+							...toPortSigs(nextOutputs, 'output'),
+							...metadataPortSigs(foldPorts.metadataPorts),
+						];
 						if (kind === 'Loop') {
 							ops.push({ op: 'update_loop_ports', loopId: nodeId, inputs, outputs });
 						} else {
@@ -1138,6 +1098,18 @@
 					}
 				}
 			}
+			if ('metadataValue' in updates && updates.metadataValue) {
+				// After the header op above, so a port added and given its
+				// value in one gesture is declared before its value is written.
+				// A cleared value removes the body line, like a cleared field.
+				const { port, value } = updates.metadataValue;
+				ops.push({
+					op: 'set_metadata_value',
+					group: nodeId,
+					port,
+					value: value === null || value === undefined ? null : formatConfigValue(value),
+				});
+			}
 
 			// Resize vs collapse/expand are distinct events (see the value-change
 			// classifier above). A TOGGLE flips `expanded` and is handled by the
@@ -1161,6 +1133,11 @@
 			// never dropped regardless of how the update is bundled.
 			const isPureConfigTyping = 'config' in updates && ops.length > 0 && !hasLayout
 				&& !('inputs' in updates) && !('outputs' in updates) && !('label' in updates);
+			// A metadata value is typed into an editor too: its writes
+			// coalesce per port the same way, one op per typing burst.
+			const metadataTyping = updates.metadataValue && Object.keys(updates).length === 1
+				? `meta:${nodeId}:${updates.metadataValue.port}`
+				: undefined;
 			if (isExpandToggle) {
 				// Pure collapse/expand: the ELK pass above records the layout
 				// including the toggled flag; nothing to record here. A toggle
@@ -1173,6 +1150,8 @@
 				// User resize: a new footprint means neighbours reflow, so re-run ELK
 				// (no viewport pin); runAutoOrganize records the layout.
 				void runAutoOrganize(false);
+			} else if (metadataTyping) {
+				recordEdit(ops, undefined, metadataTyping);
 			} else if (isPureConfigTyping) {
 				// Config-value typing: one pending op per node, its value replaced in
 				// place on every keystroke (the projection repaints instantly), sent
@@ -1541,6 +1520,11 @@
 						: n.config,
 					inputs: n.inputs,
 					outputs: n.outputs,
+					// A group's show their values in its config strip; a
+					// node's guard the names its config list may add.
+					metadataPorts: n.metadataPorts,
+					// The width an expanded container draws at (`Sizing`).
+					boxWidth: sizing.boxWidth,
 					// Body-set port values + their written forms, the two-home
 					// twin of `config` (ProjectNode renders these as the
 					// marker-carrying port fields).
@@ -1570,6 +1554,10 @@
 					onToggleGate: createGateToggleHandler(n.id),
 					onSaveFileRef: saveFileRef,
 					onOpenInclude: openInclude,
+					// The inputs a metadata wire fills, shown read-only with
+					// a "comes from" link, which `revealNode` follows.
+					metadataInputs: n.metadataInputs,
+					onReveal: revealNode,
 				},
 				style: sizing.style,
 				hidden: hiddenByCollapsedGroup,
@@ -1663,70 +1651,34 @@
 
 		// Simplified view: every connection between two nodes collapses onto the
 		// single in/out dots, and all the lines between the same pair merge into
-		// ONE edge. Color: the shared type's color if every merged connection is
-		// the same type, else the mixed (TypeVar) color. Self-reference handles
-		// (`__inner`) resolve to the container's own simplified dots so a group's
-		// interface still connects in this view.
+		// ONE edge (`mergeSimplifiedEdges`). Color: the shared type's color if
+		// every merged connection is the same type, else the mixed (TypeVar)
+		// color.
 		if (simplified) {
-			// An edge's source handle attaches to the source node's single OUT dot,
-			// unless the parser marked it `__inner` (an expanded container feeding
-			// one of its own inputs to a child), which attaches to the container's
-			// inner SOURCE dot instead. Symmetrically for targets and the inner
-			// TARGET dot (a child writing the container's output). This keeps a
-			// group's interface wiring visible in simplified view.
-			// xyflow scopes a handle id to its node (it pairs (node, handleId)), so
-			// these are the BARE handle ids the node renders, NOT prefixed with the
-			// node id. The source node's single OUT dot, unless the parser marked
-			// the edge `__inner` (an expanded container feeding its own input to a
-			// child) which uses the inner SOURCE dot. Symmetrically for targets.
-			// `index`/`done` are reserved implicit ports ONLY on loops; a plain Group
-			// may legitimately declare an interface port literally named `index` or
-			// `done`. So the loop-dot special-case is gated on the SOURCE/TARGET node
-			// actually being a loop (read from its nodeType), never inferred from the
-			// handle string alone, or a Group's `index__inner` edge would be routed to
-			// a `__simp_index` dot that a non-loop GroupNode never renders (the edge
-			// would point at a nonexistent handle and vanish).
-			const srcHandleId = (e: typeof projectEdges[0]) => {
-				if (e.sourceHandle === 'index__inner' && isLoopNode(e.source)) return SIMPLIFIED_LOOP_INDEX_HANDLE;
-				return e.sourceHandle?.endsWith('__inner') ? SIMPLIFIED_INNER_SOURCE_HANDLE : SIMPLIFIED_OUT_HANDLE;
-			};
-			const tgtHandleId = (e: typeof projectEdges[0]) => {
-				if (e.targetHandle === 'done__inner' && isLoopNode(e.target)) return SIMPLIFIED_LOOP_DONE_HANDLE;
-				return e.targetHandle?.endsWith('__inner') ? SIMPLIFIED_INNER_TARGET_HANDLE : SIMPLIFIED_IN_HANDLE;
-			};
-			// Merge every connection that lands on the SAME pair of dots into one
-			// edge. The key is the resolved dot ids (not just the node ids) so an
-			// inner and an outer edge between the same two nodes stay distinct.
-			const byPair = new Map<string, { source: string; target: string; sh: string; th: string; types: Set<string> }>();
-			for (const e of projectEdges) {
-				const sh = srcHandleId(e);
-				const th = tgtHandleId(e);
-				// Key includes the node ids (handle ids are bare/shared), so edges
-				// only merge when they land on the SAME dot pair of the SAME nodes.
-				const key = `${e.source}.${sh}->${e.target}.${th}`;
-				let entry = byPair.get(key);
-				if (!entry) { entry = { source: e.source, target: e.target, sh, th, types: new Set() }; byPair.set(key, entry); }
-				// Resolve the connection's type to color the merged edge. A normal
-				// source handle names one of the source node's OUTPUTS; an `__inner`
-				// source (an expanded container feeding its own input to a child) names
-				// one of the container's INPUTS (see dropDanglingPortEdges in apply.ts:
-				// an inner source feeds an IN port). Resolving against the wrong list
-				// returned undefined -> every inner-source edge fell back to 'Any'.
-				const isInnerSrc = e.sourceHandle?.endsWith('__inner') ?? false;
-				const cleanHandle = isInnerSrc ? e.sourceHandle!.slice(0, -'__inner'.length) : e.sourceHandle;
-				const port = (isInnerSrc ? portsIn(e.source) : portsOut(e.source))?.find(p => p.name === cleanHandle);
-				entry.types.add(port?.portType ?? 'Any');
-			}
-			return Array.from(byPair.values()).map(({ source, target, sh, th, types }) => {
+			const merged = mergeSimplifiedEdges(projectEdges, {
+				isLoop: isLoopNode,
+				// A normal source handle names one of the source node's OUTPUTS; an
+				// `__inner` source (an expanded container feeding its own input
+				// to a child) names one of the container's INPUTS (see
+				// dropDanglingPortEdges in apply.ts: an inner source feeds an IN
+				// port). Resolving against the wrong list returned undefined, and
+				// every inner-source edge fell back to 'Any'.
+				sourceType: (e) => {
+					const isInnerSrc = e.sourceHandle?.endsWith('__inner') ?? false;
+					const cleanHandle = isInnerSrc ? e.sourceHandle!.slice(0, -'__inner'.length) : e.sourceHandle;
+					return (isInnerSrc ? portsIn(e.source) : portsOut(e.source))?.find(p => p.name === cleanHandle)?.portType ?? 'Any';
+				},
+			});
+			return merged.map(({ id, source, target, sourceHandle, targetHandle, types }) => {
 				const edgeColor = types.size === 1
 					? (PORT_TYPE_COLORS[[...types][0]] || PORT_TYPE_COLORS.TypeVar)
 					: PORT_TYPE_COLORS.TypeVar;
 				return {
-					id: `simplified:${source}.${sh}->${target}.${th}`,
+					id,
 					source,
 					target,
-					sourceHandle: sh,
-					targetHandle: th,
+					sourceHandle,
+					targetHandle,
 					type: 'custom',
 					animated: false,
 					zIndex: 5,
@@ -2593,7 +2545,10 @@
 		nestingDepth?: number;   // expanded groups stack above their parents
 		simplified?: boolean;    // square nodes, fixed size, no port/config sizing
 	};
-	type Sizing = { type: 'group' | 'groupCollapsed' | 'annotation' | 'project'; zIndex: number; style: string; width?: number; height?: number };
+	/// `boxWidth`: the width an expanded container draws at, which its
+	/// config strip wraps its text in; the strip's height and the room the
+	/// layout leaves for it are both worked out at this one width.
+	type Sizing = { type: 'group' | 'groupCollapsed' | 'annotation' | 'project'; zIndex: number; style: string; width?: number; height?: number; boxWidth?: number };
 	// Simplified-view node sizing: SIZE TO CONTENT, never a pinned size. A bare
 	// node's content is constrained to a square in ProjectNode/GroupNode, so it
 	// measures as a SIMPLIFIED_SQUARE_PX square; a node with a live display (image,
@@ -2622,7 +2577,7 @@
 				// Above the wires (edges sit at 1) so the header wins the click;
 				// nested groups share the level and paint in DOM order, parent
 				// first. The stylesheet pins the same value on the class.
-				return { type: 'group', zIndex: 3, style: `width: ${w}px; height: ${h}px;` };
+				return { type: 'group', zIndex: 3, style: `width: ${w}px; height: ${h}px;`, boxWidth: w };
 			}
 			if (s.simplified) return simplifiedSizing('groupCollapsed');
 			const minW = computeMinNodeWidth(s.inputs, s.outputs);
@@ -2691,7 +2646,7 @@
 		return {
 			...n,
 			type: sizing.type,
-			data: newData,
+			data: { ...newData, boxWidth: sizing.boxWidth },
 			zIndex: sizing.zIndex,
 			style: sizing.style,
 			width: sizing.width,
@@ -2911,6 +2866,7 @@
 				portPositions.set(n.id, portYs);
 			}
 		}
+
 		// Build current node/edge data from SvelteFlow state (not stale project prop)
 		const currentNodes = nodes.map(n => ({
 			id: n.id,
@@ -2921,6 +2877,8 @@
 			parentId: (n.data.config as Record<string, string>)?.parentId,
 			inputs: inputsOf(n.data.inputs),
 			outputs: outputsOf(n.data.outputs),
+			metadataPorts: n.data.metadataPorts as MetadataPort[] | undefined,
+			metadataInputs: n.data.metadataInputs as Record<string, MetadataInput> | undefined,
 			features: { ...(NODE_TYPE_CONFIG[n.data.nodeType as string]?.features || {}), ...((n.data.features as NodeFeatures) || {}) },
 			sourceLine: n.data.sourceLine as number | undefined,
 		}));
@@ -2936,7 +2894,13 @@
 			sourceHandle: e.sourceHandle ?? null,
 			targetHandle: e.targetHandle ?? null,
 		}));
-		return autoOrganize(currentNodes, rawEdges, sizes, portPositions, simplified).then(({ positions, groupSizes }) => {
+		// The width each expanded container draws at, which its strip wraps
+		// in: the layout reserves the strip at the width GroupNode draws it.
+		const boxWidths = new Map<string, number>();
+		for (const n of nodes) {
+			if (typeof n.data.boxWidth === 'number') boxWidths.set(n.id, n.data.boxWidth);
+		}
+		return autoOrganize(currentNodes, rawEdges, sizes, portPositions, simplified, boxWidths).then(({ positions, groupSizes }) => {
 			// The view changed (toggle) or the editor closed while ELK ran: this
 			// result is stale, discard it rather than write the wrong view's layout
 			// or mutate a destroyed component. (layoutVerb is the view identity:
@@ -2954,7 +2918,9 @@
 					const w = groupSize.width;
 					const h = groupSize.height;
 					const newConfig = { ...(updated.data.config as Record<string, unknown>), width: w, height: h };
-					updated = { ...updated, style: `width: ${w}px; height: ${h}px;`, data: { ...updated.data, config: newConfig } };
+					// An expanded container's strip wraps at the width it now draws at.
+					const boxWidth = typeof updated.data.boxWidth === 'number' ? { boxWidth: w } : {};
+					updated = { ...updated, style: `width: ${w}px; height: ${h}px;`, data: { ...updated.data, config: newConfig, ...boxWidth } };
 				}
 				return updated;
 			});
@@ -3343,6 +3309,13 @@
 	function vetoLiteralDrivenTarget(target: string, targetHandle: string | null | undefined): boolean {
 		const targetPort = (targetHandle || 'value').replace(/__inner$/, '');
 		const targetNode = fold.project.nodes.find((n) => n.id === target);
+		// A value a metadata wire brings is the input's driver the same way
+		// (`double-driven-port`), changed only where its port is written.
+		const fill = targetHandle?.endsWith('__inner') ? undefined : targetNode?.metadataInputs?.[targetPort];
+		if (fill) {
+			toast.error(`'${targetPort}' comes from ${metadataRefLabel(fill.from, targetNode?.parentId)}; remove that line in the code first to drive it with an edge.`);
+			return true;
+		}
 		const literal = ownValue(targetNode?.portLiterals as Record<string, unknown> | undefined, targetPort);
 		if (!isFilledIn(literal)) return false;
 		toast.error(`'${targetPort}' is driven by a config assignment; unset it first to drive it with an edge.`);
@@ -3883,6 +3856,106 @@
 		return true;
 	}
 
+	/// Draw every node and wire as the containers' open state says: a node
+	/// any of whose containers is closed is hidden, with the wires touching
+	/// it, and every visible node is restyled and parented to its container
+	/// when that one is open. What a container opening or closing redraws.
+	function recomputeVisibility(): void {
+		// Build a lookup: nodeId -> config (for checking expanded state)
+		const nodeById = new Map(nodes.map(n => [n.id, n]));
+
+		// Check if any ancestor of a node is collapsed
+		function isHiddenByAncestor(n: Node): boolean {
+			let pid = (n.data.config as Record<string, string>)?.parentId;
+			while (pid) {
+				const parent = nodeById.get(pid);
+				if (!parent) break;
+				const parentExpanded = (parent.data.config as Record<string, boolean>)?.expanded ?? false;
+				if (!parentExpanded) return true;
+				pid = (parent.data.config as Record<string, string>)?.parentId;
+			}
+			return false;
+		}
+
+		const hiddenNodeIds = new Set<string>();
+		nodes = nodes.map(n => {
+			const rawParentId = (n.data.config as Record<string, string>)?.parentId;
+			if (!rawParentId) return n;
+			const hidden = isHiddenByAncestor(n);
+			if (hidden) hiddenNodeIds.add(n.id);
+			// Check if the direct parent is expanded (for xyflow parentId assignment)
+			const directParent = nodeById.get(rawParentId);
+			const directParentExpanded = directParent ? ((directParent.data.config as Record<string, boolean>)?.expanded ?? false) : false;
+			const xyParentId = directParentExpanded && !hidden ? rawParentId : undefined;
+			// Hidden through xyflow's own flag, never through a display:none
+			// style: a node styled away keeps its last measured size (the
+			// library ignores zero-size measurements), so the Controls
+			// fit-view button, which uses the library's fitView, kept fitting
+			// the phantom boxes of collapsed children at their parent-
+			// relative positions and missed the real graph.
+			if (hidden) {
+				return { ...n, parentId: undefined, hidden: true };
+			}
+			// Visible: restyle through the one sizing ladder, then layer the
+			// xyflow parentId (collapsed-parent children detach to top level).
+			return { ...applyNodeSizing(n, n.data as Record<string, unknown>), parentId: xyParentId, hidden: false };
+		});
+
+		// Hide/show edges touching hidden nodes
+		edges = edges.map(e => {
+			const touchesHidden = hiddenNodeIds.has(e.source) || hiddenNodeIds.has(e.target);
+			if (touchesHidden) return { ...e, hidden: true };
+			if (e.hidden) return { ...e, hidden: false };
+			return e;
+		});
+	}
+
+	/// Take the person to a node or group by its scoped id, the way a "comes
+	/// from" link asks: every group it sits in opens, it is selected, and the
+	/// view centers on it at the zoom the person has. A node inside an
+	/// include goes to the include's box, all the editor draws of it
+	/// (`revealPlan`). Opening groups is a layout change like any open, one
+	/// undo step, and the layout then makes room.
+	async function revealNode(id: string): Promise<void> {
+		const plan = revealPlan(fold.project.nodes, id);
+		if (!plan) {
+			toast.error(`'${id}' is not drawn in this graph.`);
+			return;
+		}
+		const closed = plan.open
+			.map((g) => nodes.find((n) => n.id === g))
+			.filter((n): n is Node => n !== undefined && !drawnExpanded(!!n.data.pinnedOpen, n.data.config as Record<string, unknown>));
+		selectedNodeId = plan.select;
+		if (closed.length > 0) {
+			// Opened the way a toggle opens a container: drawn open now, and
+			// the reflow records the layout with the open state in it, one
+			// undo step for the whole follow.
+			const opening = new Set(closed.map((n) => n.id));
+			nodes = nodes.map((n) => opening.has(n.id)
+				? applyNodeSizing(n, { ...n.data, config: { ...(n.data.config as Record<string, unknown>), expanded: true } })
+				: n);
+			recomputeVisibility();
+			await tick();
+			const outcome = await runAutoOrganize(false);
+			if (outcome === 'view-changed') {
+				toast.info(`The view changed while '${plan.select}' was being shown: follow the link again to go there.`);
+				return;
+			}
+			if (outcome === 'failed') {
+				toast.error(`Could not lay out the groups opened to show '${plan.select}'.`);
+				return;
+			}
+			if (outcome !== 'applied') return;
+		}
+		const target = nodes.find((n) => n.id === plan.select);
+		if (!target) return;
+		nodes = nodes.map((n) => (n.id === plan.select) !== !!n.selected ? { ...n, selected: n.id === plan.select } : n);
+		stopGroupZoom();
+		const abs = getAbsolutePosition(target);
+		const rect = getNodeRect(target);
+		setCenter(abs.x + rect.width / 2, abs.y + rect.height / 2, { zoom: getViewport().zoom, duration: ZOOM_ANIMATION_MS });
+	}
+
 	function getAbsolutePosition(n: Node): { x: number; y: number } {
 		if (!n.parentId) return { x: n.position.x, y: n.position.y };
 		const parent = nodes.find(p => p.id === n.parentId);
@@ -4075,11 +4148,20 @@
 		// rest of the selection still duplicates: one include card must not
 		// cancel the copies of everything selected beside it.
 		const includesLeftOut: string[] = [];
+		// A group whose metadata port gathers from its own members is left
+		// out the same way: its copy is an empty shell, so the value would
+		// name members the copy does not have.
+		const gatheringLeftOut: string[] = [];
 		try {
 			for (const orig of originals) {
 				const nodeType = orig.data.nodeType as string;
 				if (isIncludeNodeType(nodeType)) {
 					includesLeftOut.push(orig.id);
+					continue;
+				}
+				const gathered = (orig.data.metadataPorts as MetadataPort[] | undefined) ?? [];
+				if (gathered.some((m) => m.written && metadataExprNamesInside(m.written, orig.id))) {
+					gatheringLeftOut.push(orig.id);
 					continue;
 				}
 				const isContainer = orig.type === 'group' || orig.type === 'groupCollapsed';
@@ -4104,11 +4186,23 @@
 					// apply). Then copy the source config AFTER the ports exist.
 					// (Children are NOT deep-copied: the shell duplicates.)
 					const sigInputs = toPortSigs(inputsOf(orig.data.inputs).filter(headerWorthy), 'input');
-					const sigOutputs = toPortSigs(outputsOf(orig.data.outputs), 'output');
+					const origMetadata = orig.data.metadataPorts as MetadataPort[] | undefined;
+					const sigOutputs = [...toPortSigs(outputsOf(orig.data.outputs), 'output'), ...metadataPortSigs(origMetadata)];
 					if (sigInputs.length > 0 || sigOutputs.length > 0) {
 						ops.push(isLoop
 							? { op: 'update_loop_ports', loopId: scopedId, inputs: sigInputs, outputs: sigOutputs }
 							: { op: 'update_group_ports', group: scopedId, inputs: sigInputs, outputs: sigOutputs });
+					}
+					// A metadata port's value is written in the body: a value
+					// written out in full is copied as it is, and a gathered one
+					// (naming only ports outside the group, see above) as the body
+					// writes it, so the copy keeps following the ports it names
+					// rather than freezing what they hold today.
+					for (const m of origMetadata ?? []) {
+						const value = m.written
+							? metadataExprSource(m.written, orig.id)
+							: m.value !== undefined ? formatConfigValue(m.value) : undefined;
+						if (value !== undefined) ops.push({ op: 'set_metadata_value', group: scopedId, port: m.name, value });
 					}
 					if (isLoop) {
 						copyConfig(config, scopedId, true);
@@ -4166,8 +4260,14 @@
 				`An include card is not duplicated (${includesLeftOut.join(', ')}): write another `
 				+ `\`alias = @include("file")\` line in the source to call the file again.`,
 			);
-			if (ops.length === 0) return;
 		}
+		if (gatheringLeftOut.length > 0) {
+			toast.info(
+				`Not duplicated (${gatheringLeftOut.join(', ')}): a metadata port there gathers from the group's own `
+				+ `members, and a copy starts empty, so it would name members it does not have. Copy it in the code.`,
+			);
+		}
+		if (ops.length === 0) return;
 
 		// Select the new copies once the projection rebuilds (they don't exist
 		// in the live `nodes` array yet). Clear the current selection now.
@@ -4210,17 +4310,15 @@
 	// holds: it goes back as the bare name. `rendered` rides along so the
 	// projection keeps showing the type until the reparse.
 	function toPortSigs(ports: HeaderPortLike[], side: 'input' | 'output'): import('../../../../protocol').EditPortSig[] {
-		// portRequired: the ONE missing-value polarity (Rust's serde
-		// default: not required); rendered ports always carry the flag,
-		// so this only matters for a hand-built port object. An OUTPUT
-		// has no optionality at all (the language has no `?` on one, and
-		// the edit server refuses a sig asking for it), so its flag is
-		// never read: whatever a port object says, the sig says `true`.
+		// containerSpelledRequired: an output and an input that passes
+		// through are always `x:`; any other input keeps what the program
+		// wrote (portRequired, Rust's serde default of not required).
 		return (ports ?? []).map(p => ({
 			name: p.name,
-			required: side === 'output' || portRequired(p),
+			required: containerSpelledRequired(p, side),
 			portType: p.portType === portVar(side, p.name) ? '' : p.portType,
 			rendered: p.portType,
+			metadata: false,
 		}));
 	}
 

@@ -352,7 +352,7 @@ impl Joiner<'_, '_> {
     #[allow(clippy::too_many_arguments)]
     fn emit(&mut self, source: &str, source_port: &str, target: &str, target_port: &str, via: Vec<Crossing>, path: Vec<String>, span: Option<Span>, source_file: Option<String>) {
         if self.probing { return; }
-        let id = wire_id(source, source_port, &via, target, target_port);
+        let id = wire_id(source, source_port, &via, target, target_port, &path);
         self.edges.entry(id.clone()).or_insert(Edge {
             id,
             source: source.to_string(),
@@ -367,14 +367,20 @@ impl Joiner<'_, '_> {
     }
 }
 
-/// The id of a wire: its two ends and every group port it passes, so a
-/// body's member wired once per site that calls it has one wire per site.
-pub(crate) fn wire_id(source: &str, source_port: &str, via: &[Crossing], target: &str, target_port: &str) -> String {
+/// The id of a wire: its two ends, every group port it passes, and the keys
+/// each of its legs reads (`path`, the whole wire's), so a body's member
+/// wired once per site that calls it has one wire per site, and two lines
+/// reading different keys of one port into one input are two wires (which
+/// validate then refuses as two drivers), never one silently kept.
+pub(crate) fn wire_id(source: &str, source_port: &str, via: &[Crossing], target: &str, target_port: &str, path: &[String]) -> String {
+    let keys = |keys: &[String]| if keys.is_empty() { String::new() } else { format!(".{}", keys.join(".")) };
     let mut id = format!("e-{source}-{source_port}");
+    let mut read = 0;
     for crossing in via {
         let side = match crossing.side { CrossingSide::In => "in", CrossingSide::Out => "out" };
-        id.push_str(&format!("-{side}:{}:{}", crossing.group, crossing.port));
+        id.push_str(&format!("-{side}:{}:{}{}", crossing.group, crossing.port, keys(&crossing.path)));
+        read += crossing.path.len();
     }
-    id.push_str(&format!("-{target}-{target_port}"));
+    id.push_str(&format!("-{target}-{target_port}{}", keys(path.get(read..).unwrap_or_default())));
     id
 }

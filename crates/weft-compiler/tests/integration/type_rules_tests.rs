@@ -243,7 +243,7 @@ two = @include("lib/f.weft")
 two.x = a.k
 show = Debug
 show.data = two.r
-g = Group(y?: String) -> (o: String) {
+g = Group(y: String) -> (o: String) {
   self.o = self.y
 }
 g.y = one.r
@@ -262,7 +262,7 @@ fn the_gate_rule_asks_every_site_of_an_included_file() {
     std::fs::create_dir(dir.path().join("lib")).expect("mkdir");
     std::fs::write(
         dir.path().join("lib/step.weft"),
-        "Group(x?: String) -> (r: String) {\n  n = ExecPython(v?: String) -> (r: String) { code: \"return {}\" }\n  n.v = self.x\n  self.r = n.r\n}\n",
+        "Group(x: String) -> (r: String) {\n  n = ExecPython(v?: String) -> (r: String) { code: \"return {}\" }\n  n.v = self.x\n  self.r = n.r\n}\n",
     )
     .expect("write");
     let both = r#"
@@ -627,7 +627,7 @@ params.systemPrompt = a.x
 fn the_gate_rule_reads_the_scope_a_node_sits_in() {
     let gated_group = r#"
 seed = Text { value: "x" }
-g = Group(x?: String) -> (o: String) {
+g = Group(x: String) -> (o: String) {
   i = ExecPython(v?: String) -> (r: String) { code: "return {}" }
   i.v = self.x
   self.o = i.r
@@ -673,7 +673,7 @@ my.items = seed.items
     // Not on the output of the same name: nothing writes it, so nothing
     // arrives on it.
     let out_named_alike = r#"
-h = Group(x?: String) -> (x: String) {
+h = Group(x: String) -> (x: String) {
   i = ExecPython(v?: String) -> (r: String) { code: "return {}" }
   i.v = self.x
 }

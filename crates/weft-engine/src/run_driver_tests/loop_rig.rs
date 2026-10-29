@@ -180,6 +180,8 @@
             optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
+            port_literal_types: Default::default(),
+            metadata_ports: Vec::new(),
             file_refs: Default::default(),
             include_path: None,
             include_contents: None,
@@ -240,6 +242,8 @@
             optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
+            port_literal_types: Default::default(),
+            metadata_ports: Vec::new(),
             file_refs: Default::default(),
             include_path: None,
             include_contents: None,
@@ -287,6 +291,8 @@
             optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
+            port_literal_types: Default::default(),
+            metadata_ports: Vec::new(),
             file_refs: Default::default(),
             include_path: None,
             include_contents: None,
@@ -325,6 +331,8 @@
             optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
+            port_literal_types: Default::default(),
+            metadata_ports: Vec::new(),
             file_refs: Default::default(),
             include_path: None,
             include_contents: None,
@@ -1081,6 +1089,8 @@
             optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
+            port_literal_types: Default::default(),
+            metadata_ports: Vec::new(),
             file_refs: Default::default(),
             include_path: None,
             include_contents: None,
@@ -1134,7 +1144,7 @@
             instance_rules: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
-            port_literals: Default::default(), port_literal_spans: Default::default(),
+            port_literals: Default::default(), port_literal_spans: Default::default(), port_literal_types: Default::default(), metadata_ports: Vec::new(),
             file_refs: Default::default(), include_path: None, include_contents: None, source_file: None,
         };
         // LoopOut carries only `{"parentId": ...}` (matches compiler).
@@ -1159,7 +1169,7 @@
             instance_rules: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
-            port_literals: Default::default(), port_literal_spans: Default::default(),
+            port_literals: Default::default(), port_literal_spans: Default::default(), port_literal_types: Default::default(), metadata_ports: Vec::new(),
             file_refs: Default::default(), include_path: None, include_contents: None, source_file: None,
         };
         let body = NodeDefinition {
@@ -1185,7 +1195,7 @@
             instance_rules: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
-            port_literals: Default::default(), port_literal_spans: Default::default(),
+            port_literals: Default::default(), port_literal_spans: Default::default(), port_literal_types: Default::default(), metadata_ports: Vec::new(),
             file_refs: Default::default(), include_path: None, include_contents: None, source_file: None,
         };
         let consumer = NodeDefinition {
@@ -1202,7 +1212,7 @@
             instance_rules: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
-            port_literals: Default::default(), port_literal_spans: Default::default(),
+            port_literals: Default::default(), port_literal_spans: Default::default(), port_literal_types: Default::default(), metadata_ports: Vec::new(),
             file_refs: Default::default(), include_path: None, include_contents: None, source_file: None,
         };
         let edges = vec![

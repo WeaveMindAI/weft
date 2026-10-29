@@ -25,6 +25,10 @@ use weft_core::weft_type::WeftType;
 /// header (`header_span_or_default`); `Span::default()` only for the rare
 /// project-level error with no node to blame.
 pub struct EnrichError {
+    /// The diagnostic code: `enrich` for a node whose ports could not be
+    /// worked out, or the specific code of a check enrich owns (a
+    /// metadata wire's, `crate::metadata`).
+    pub code: &'static str,
     pub span: Span,
     pub message: String,
     /// The file the span's coordinates live in, when the offending node
@@ -41,7 +45,7 @@ pub struct EnrichError {
 impl EnrichError {
     /// The finding this error is, for a caller that reports diagnostics.
     pub fn diagnostic(&self) -> crate::Diagnostic {
-        crate::Diagnostic::at(self.span, crate::Severity::Error, "enrich", self.message.clone())
+        crate::Diagnostic::at(self.span, crate::Severity::Error, self.code, self.message.clone())
             .in_file(self.file.as_deref())
             .about(self.subjects.iter().cloned())
     }
@@ -170,6 +174,7 @@ fn merge_ports<T: AsPort>(
                 match fits(cp_port, &wp_port.port_type) {
                     Ok(()) => merged.port_mut().port_type = wp_port.port_type.clone(),
                     Err(why) => errors.push(EnrichError {
+                        code: "enrich",
                         span,
                         file: file.map(str::to_string),
                         subjects: vec![node_id.to_string()],
@@ -200,7 +205,7 @@ fn merge_ports<T: AsPort>(
             // Not gated by EnrichPolicy: that only forgives unknown node
             // TYPES; a known type rejecting an authored port is a hard
             // authoring error in every mode.
-            errors.push(EnrichError { span, file: file.map(str::to_string), subjects: vec![node_id.to_string()], message: format!(
+            errors.push(EnrichError { code: "enrich", span, file: file.map(str::to_string), subjects: vec![node_id.to_string()], message: format!(
                 "node '{}': declares custom {} port '{}' but node type does not support custom {} ports",
                 node_id,
                 direction.as_str(),
@@ -270,6 +275,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
             // The skip rules read the gate themselves (rule 0); a closure
             // on it is never the required-input rule's to act on.
             optional: true,
+            passes_through: false,
             widget: None,
             default: None,
             label: None,
@@ -293,6 +299,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
             },
             accepts: Accepts::both(),
             optional: true,
+            passes_through: false,
             widget: None,
             default: None,
             label: None,
@@ -313,7 +320,10 @@ pub fn enrich_collecting(
     catalog: &dyn MetadataCatalog,
     policy: EnrichPolicy,
 ) -> Vec<EnrichError> {
-    let mut errors: Vec<EnrichError> = Vec::new();
+    // Metadata wires first: each writes its value into the input it
+    // points at and leaves the program's wires, so everything below sees
+    // a written literal there and no wire (`crate::metadata`).
+    let mut errors: Vec<EnrichError> = crate::metadata::resolve(project, catalog);
     // One [reserved-node-type] error per offending TYPE, not per node:
     // boundary types appear on two nodes per loop, and a project full
     // of loops would otherwise report the same corrupt catalog entry
@@ -369,7 +379,7 @@ pub fn enrich_collecting(
             if catalog.lookup(&node.node_type).is_some()
                 && reported_reserved.insert(node.node_type.clone())
             {
-                errors.push(EnrichError { span: node.header_span_or_default(), file: node.source_file.clone(), subjects: Vec::new(), message: format!(
+                errors.push(EnrichError { code: "enrich", span: node.header_span_or_default(), file: node.source_file.clone(), subjects: Vec::new(), message: format!(
                     "[reserved-node-type] catalog declares '{}' but that name is a built-in language type; rename the catalog node",
                     node.node_type,
                 )});
@@ -385,7 +395,7 @@ pub fn enrich_collecting(
             if catalog.lookup(&node.node_type).is_some()
                 && reported_reserved.insert(node.node_type.clone())
             {
-                errors.push(EnrichError { span: node.header_span_or_default(), file: node.source_file.clone(), subjects: Vec::new(), message: format!(
+                errors.push(EnrichError { code: "enrich", span: node.header_span_or_default(), file: node.source_file.clone(), subjects: Vec::new(), message: format!(
                     "[reserved-node-type] catalog declares '{}' but that name is a reserved language keyword",
                     node.node_type,
                 )});
@@ -400,6 +410,7 @@ pub fn enrich_collecting(
             // wrong, and its type was never a catalog name.
             if policy == EnrichPolicy::Strict && node.include_path.is_none() {
                 errors.push(EnrichError {
+                    code: "enrich",
                     span: node.header_span_or_default(),
                     file: node.source_file.clone(),
                     subjects: vec![node.id.clone()],
@@ -430,6 +441,7 @@ pub fn enrich_collecting(
                 // Optional in the metadata is required once wired, until
                 // the program writes otherwise.
                 optional: false,
+                passes_through: false,
                 // The DECLARED widget only; the type-derived default is
                 // stamped after TypeVar resolution (see the final pass),
                 // so a `T` input resolved to Image gets a file picker.
@@ -496,7 +508,7 @@ pub fn enrich_collecting(
         // in ONE namespace, so this is the whole collision rule.
         for wp in &weft_inputs {
             if catalog_inputs.iter().any(|cp| cp.name == wp.name) && meta.is_compiler_read(&wp.name) {
-                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
+                errors.push(EnrichError { code: "enrich", span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
                     "node '{}': input '{}' of node type {} is read by the compiler to build \
                      the node; it takes an inline value only and cannot be declared as a \
                      port. Write it in the config braces instead",
@@ -529,7 +541,7 @@ pub fn enrich_collecting(
         // so it is refused where it cannot apply.
         for key in &node.optional_ports {
             if !weft_inputs.iter().any(|p| p.name == *key) {
-                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
+                errors.push(EnrichError { code: "enrich", span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
                     "node '{}': '{}?' marks a port optional, but '{}' is not a port this node \
                      creates. Declare optionality on the port itself (`{}?: Type`) instead",
                     node.id, key, key, key,
@@ -542,7 +554,7 @@ pub fn enrich_collecting(
         // required one optional: the node's code is written to need it.
         for wp in &weft_inputs {
             if !wp.required && catalog_inputs.iter().any(|cp| cp.name == wp.name && cp.required) {
-                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
+                errors.push(EnrichError { code: "enrich", span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
                     "node '{}': input '{}' of node type {} is required, and its code needs it: \
                      declare it `{}: {}` without `?`, or drop it from the node's inputs",
                     node.id, wp.name, node.node_type, wp.name, wp.port_type,
@@ -578,12 +590,41 @@ pub fn enrich_collecting(
         let port = weft_core::node::ERROR_PORT;
         if weft_outputs.iter().any(|p| p.name == port) {
             weft_outputs.retain(|p| p.name != port);
-            errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
+            errors.push(EnrichError { code: "enrich", span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
                 "node '{}': '{port}' is the output every node already has for its failures \
                  (wire it to handle them); remove '{port}' from the node's outputs, or give \
                  your own port another name",
                 node.id,
             )});
+        }
+        // A node that pairs its added ports makes the output of each input
+        // the program adds, and an added output the header names with no
+        // type takes the node's type for it, as a created input takes
+        // `customInputType`. A name its own ports already use is no added
+        // input's output; validate refuses it (`unpaired-port`).
+        if meta.features.pairs_added_ports {
+            for input in &weft_inputs {
+                let taken = catalog_inputs.iter().any(|p| p.name == input.name)
+                    || catalog_outputs.iter().any(|p| p.name == input.name)
+                    || weft_outputs.iter().any(|p| p.name == input.name);
+                if !taken {
+                    weft_outputs.push(PortDefinition {
+                        name: input.name.clone(),
+                        port_type: WeftType::port_var(weft_core::weft_type::PortSide::Output, &input.name),
+                        required: true,
+                        description: None,
+                        synthesized_from_carry: false,
+                        declared_type: None,
+                    });
+                }
+            }
+        }
+        if let Some(custom) = &meta.features.custom_output_type {
+            for output in weft_outputs.iter_mut() {
+                if !catalog_outputs.iter().any(|p| p.name == output.name) && output.is_untyped(weft_core::weft_type::PortSide::Output) {
+                    output.port_type = custom.clone();
+                }
+            }
         }
         let output_fits = |catalog: &PortDefinition, declared: &WeftType| {
             meta.output_declaration_fits(&catalog.name, &catalog.port_type, declared)
@@ -612,14 +653,14 @@ pub fn enrich_collecting(
             ty.collect_type_vars(&mut used);
         }
         if let Err(why) = weft_core::weft_type::TypeParam::check_used(&written_params, &used) {
-            errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!("node '{}': {why}", node.id) });
+            errors.push(EnrichError { code: "enrich", span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!("node '{}': {why}", node.id) });
         }
         node.type_params = meta.type_param_list();
         node.type_params.extend(written_params);
         // Each list is acyclic on its own; together they may not be
         // (the type bounds `T` by `T2`, the program `T2` by `T`).
         if let Err(why) = weft_core::weft_type::TypeParam::check_cycles(&node.type_params) {
-            errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!("node '{}': {why}", node.id) });
+            errors.push(EnrichError { code: "enrich", span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!("node '{}': {why}", node.id) });
         }
         // A declared port that narrows a catalog typevar narrows it
         // EVERYWHERE on this node: `Wait(value: String)` pins the `T`
@@ -649,7 +690,7 @@ pub fn enrich_collecting(
         for (var, concrete) in narrowings {
             match settled.iter().find(|(v, _)| *v == var) {
                 Some((_, first)) if *first != concrete => {
-                    errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
+                    errors.push(EnrichError { code: "enrich", span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
                         "node '{}': the declared ports pin type '{var}' to two different types \
                          ({first} and {concrete}); every port that carries '{var}' on one node \
                          has to name the same type",
@@ -704,9 +745,10 @@ pub fn enrich_collecting(
                 // it belongs on the author's screen at build time.
                 Some(spec) => match weft_core::access::spec::publishable_fields(spec) {
                     Ok(_) => node.published_service = Some(spec.clone()),
-                    Err(message) => errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message }),
+                    Err(message) => errors.push(EnrichError { code: "enrich", span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message }),
                 },
                 None => errors.push(EnrichError {
+                    code: "enrich",
                     span: node_span,
                     file: node.source_file.clone(),
                     subjects: vec![node.id.clone()],
@@ -740,6 +782,7 @@ pub fn enrich_collecting(
                 {
                     let span = node.written_span(&input.name).map(|s| s.span).unwrap_or(node_span);
                     errors.push(EnrichError {
+                        code: "enrich",
                         span,
                         file: node.source_file.clone(),
                         subjects: vec![node.id.clone()],
@@ -757,6 +800,7 @@ pub fn enrich_collecting(
                 Some(value) if !weft_core::picks::fills_later(value) => {
                     let span = node.written_span(&input.name).map(|s| s.span).unwrap_or(node_span);
                     errors.push(EnrichError {
+                        code: "enrich",
                         span,
                         file: node.source_file.clone(),
                         subjects: vec![node.id.clone()],
@@ -831,6 +875,31 @@ pub fn enrich_collecting(
             if WeftType::is_compatible(&crate::file_ref::literal_type(&value), &input.port_type) { continue; }
             if let Ok(cast) = input.port_type.cast_value(&value) {
                 group.port_literals.insert(input.name.clone(), cast);
+            }
+        }
+    }
+    // A group's input gets what a node input of its type gets, worked out
+    // from its resolved type: the drivers it takes and the widget the
+    // editor draws a value written there with. A loop's are its
+    // `LoopIn`'s, stamped above, whose types are the ones its iterations
+    // resolve.
+    let loop_inputs: std::collections::HashMap<String, Vec<InputDefinition>> = project.nodes.iter()
+        .filter_map(|n| n.group_boundary.as_ref()
+            .filter(|b| b.role == weft_core::project::GroupBoundaryRole::In)
+            .map(|b| (b.group_id.clone(), n.inputs.clone())))
+        .collect();
+    for group in project.groups.iter_mut() {
+        let boundary = loop_inputs.get(&group.id);
+        for input in group.in_ports.iter_mut() {
+            match boundary.and_then(|inputs| inputs.iter().find(|i| i.name == input.name)) {
+                Some(stamped) => {
+                    input.accepts = stamped.accepts;
+                    input.widget = stamped.widget.clone();
+                }
+                None => {
+                    input.accepts = Accepts::for_type(&input.port_type);
+                    input.widget = Some(Widget::default_for_type(&input.port_type));
+                }
             }
         }
     }
@@ -1062,12 +1131,15 @@ fn resolve_type_vars(project: &mut ProjectDefinition) {
     // constant IS what arrives. A value each instance or install fills
     // later says nothing yet, and neither does an empty list or object
     // about its items (`[]` pins no `T` in `List[T]`; a wire may still).
+    // A constant a metadata wire wrote is of its metadata port's type,
+    // which it states (`port_literal_types`), never the record its JSON
+    // reads as.
     let mut literal_bindings: Vec<(Located, String, WeftType)> = Vec::new();
     for (at, ports) in &typed {
-        let literals = match position.get(&at.id) {
-            Some(&node) => &project.nodes[node].port_literals,
+        let (literals, stated) = match position.get(&at.id) {
+            Some(&node) => (&project.nodes[node].port_literals, &project.nodes[node].port_literal_types),
             None => match graph.group(&at.id) {
-                Some(group) => &group.port_literals,
+                Some(group) => (&group.port_literals, &group.port_literal_types),
                 None => continue,
             },
         };
@@ -1079,7 +1151,7 @@ fn resolve_type_vars(project: &mut ProjectDefinition) {
             if weft_core::picks::fills_later(value) {
                 continue;
             }
-            let literal = crate::file_ref::literal_type(value);
+            let literal = stated.get(name).cloned().unwrap_or_else(|| crate::file_ref::literal_type(value));
             if !literal.contains_unresolved_leaf() {
                 let mut bindings = Vec::new();
                 collect_type_var_bindings(port_type, &literal, &mut bindings);
@@ -1405,6 +1477,7 @@ fn created_input_ports(
             // a file that came from different places name a line in a
             // buffer the line is not in.
             errors.push(EnrichError {
+                code: "enrich",
                 span: wire.span,
                 file: wire.source_file.clone(),
                 subjects: vec![wire.source.clone(), node.id.clone()],
@@ -1431,18 +1504,24 @@ fn created_input_ports(
                 None => (Span::default(), node.source_file.clone()),
             };
             if is_output(key) {
-                errors.push(EnrichError { span, file, subjects: vec![node.id.clone()], message: output_takes_no_value(key) });
+                errors.push(EnrichError { code: "enrich", span, file, subjects: vec![node.id.clone()], message: output_takes_no_value(key) });
                 continue;
             }
             if value.is_null() {
-                errors.push(EnrichError { span, file, subjects: vec![node.id.clone()], message: format!(
+                errors.push(EnrichError { code: "enrich", span, file, subjects: vec![node.id.clone()], message: format!(
                     "node '{}': config key '{}' creates a port, and `null` says nothing about \
                      its type. Declare it (`{}: Type` in the signature) or give it a value",
                     node.id, key, key,
                 )});
                 continue;
             }
-            created.push((span, key.clone(), WeftType::infer(value)));
+            // The node's type for what it creates, as for a wired key; else
+            // the type the value states (a metadata wire's), else the
+            // type its JSON reads as.
+            let port_type = features.custom_input_type.clone()
+                .or_else(|| node.port_literal_types.get(key).cloned())
+                .unwrap_or_else(|| WeftType::infer(value));
+            created.push((span, key.clone(), port_type));
         }
     }
     created.sort_by_key(|(span, _, _)| (span.start_line, span.start_column));

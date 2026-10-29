@@ -1,7 +1,7 @@
 {
   "type": "RouteComputerCall",
   "label": "Route computer call",
-  "description": "Send a model's tool call to the computer action it asks for. It recognizes the call by name in Anthropic's or OpenAI's style (what ComputerTools declares), puts its arguments, translated to the one shape the action nodes take, on that action's port, and closes every other port: wire each port into its action node, and only that node runs. A call that is no computer action comes out on `other`. Arguments a known action cannot use (a coordinate that is not two numbers, a scroll along both axes) fail this node with the tool and the field named; wire `_error` to hand that back to the model as the call's result.",
+  "description": "Send a model's tool call to the computer action it asks for. It recognizes the call by name in Anthropic's or OpenAI's style (the names the action nodes describe on their `tools` metadata port), puts its arguments, translated to the one shape the action nodes take, on that action's port, and closes every other port: wire each port into its action node, and only that node runs. A call that is no computer action comes out on `other`. Arguments a known action cannot use (a coordinate that is not two numbers, a scroll along both axes) fail this node with the tool and the field named; wire `_error` to hand that back to the model as the call's result.",
   "tags": [
     "computer",
     "agent",

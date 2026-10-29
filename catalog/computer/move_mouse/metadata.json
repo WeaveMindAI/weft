@@ -28,5 +28,71 @@
       "type": "String",
       "description": "What happened, in a sentence a model can read back as the tool's result."
     }
+  ],
+  "metadataPorts": [
+    {
+      "name": "tools",
+      "type": "ActionTools",
+      "description": "The tools a model calls this node through, in Anthropic's names and in OpenAI's: gather them up to the LLM node's `tools` through metadata ports.",
+      "value": {
+        "anthropic": [
+          {
+            "description": "Move the mouse without clicking, to hover over something.",
+            "name": "mouse_move",
+            "parameters": {
+              "properties": {
+                "coordinate": {
+                  "description": "Where to move as [x, y], pixels from the left and top edges of the last full screenshot.",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "maxItems": 2,
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "text": {
+                  "description": "Keys to hold down during the action, joined by + (shift, ctrl+shift).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "coordinate"
+              ],
+              "type": "object"
+            }
+          }
+        ],
+        "openai": [
+          {
+            "description": "Move the mouse without clicking, to hover over something.",
+            "name": "move",
+            "parameters": {
+              "properties": {
+                "keys": {
+                  "description": "Keys to hold down during the action, like [\"SHIFT\"] or [\"CTRL\", \"SHIFT\"].",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "x": {
+                  "description": "Where to move, across, pixels from the left and top edges of the last full screenshot.",
+                  "type": "integer"
+                },
+                "y": {
+                  "description": "Where to move, down, pixels from the left and top edges of the last full screenshot.",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      }
+    }
   ]
 }

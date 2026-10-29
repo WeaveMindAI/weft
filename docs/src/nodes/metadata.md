@@ -84,6 +84,7 @@ of [CONTRIBUTING](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#
 | `color` | String | none | Hex, a CSS variable, or a palette token |
 | `inputs` | List | `[]` | Everything the node takes, wired data and written settings alike |
 | `outputs` | List | `[]` | The ports it emits on |
+| `metadataPorts` | List | `[]` | Ports whose value you write here, which no run computes. Go and read [metadataPorts](#metadataports) |
 | `requiresInfra` | Boolean | `false` | The node provisions containers and must implement `provision_infra` |
 | `images` | List[String] | `[]` | Directories under the package root, each holding a Dockerfile to build |
 | `publishes` | String | none | The service whose connection this node hands out itself. Needs an `Access` output too |
@@ -133,6 +134,29 @@ and the loader refuses a `metadata.json` that declares it. For what
 comes out on it, go and read [which failures a program can
 handle](values-and-emission.md#which-failures-a-program-can-handle).
 
+## metadataPorts
+
+A metadata port holds a value written here, by hand, and the node never
+computes it. A wire a program draws from it is a metadata wire: before the
+program runs, the compiler writes the value into the input the wire points at.
+For what that is for, go and read [metadata ports](../language/groups.md#metadata-ports).
+
+```json
+"metadataPorts": [
+  { "name": "tool", "type": "{ name: String }", "description": "What this node is, for a model", "value": { "name": "pick" } }
+]
+```
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `name` | String | **required** | The port name. It may not be the name of another of the node's ports: an input, an output, another metadata port, `_error`, `_should_flow` or `_should_not_flow` |
+| `type` | type string | **required** | What the value is. No type variable: nothing a program wires can tell what one would stand for |
+| `description` | String | none | What the port holds, for people and for the AI builder; `weft describe-nodes` shows it |
+| `value` | any | **required** | The value, which has to fit `type` |
+
+If one of these rules is broken, the node fails to load, and the message
+names the port.
+
 ## features
 
 | Key | Type | Default | What it does |
@@ -149,6 +173,8 @@ handle](values-and-emission.md#which-failures-a-program-can-handle).
 | `addedPortsAreDataKeys` | Boolean | `false` | Set it when the ports a program adds are named after data from outside weft: a path's captures, a query's parameters, a template's ids, the keys of a JSON object it builds. The compiler's `not-camel-case` warning then leaves every port a program adds to the node alone, and still checks the name the program gives the node. The nodes that ship with weft and set it are `Route`, `JsonObject`, `ElevenLabsRunTemplate`, `PostgresExecuteQuery`, `PostgresWatchQuery` and `PostgresUpdateRows` |
 | `join` | Boolean | `false` | Set it when the node meets several branches and goes on with whichever arrived, like `FirstInOrder`. The inputs a program adds are optional (a closure on one does not skip the node), it runs once everything it waits on arrived or closed, and when nothing arrived it closes its output itself. The compiler's `run-undecided` check skips it, so it needs no `_should_flow` even when every wired input is optional |
 | `customInputType` | type string | none | The type every added input takes. Naming one variable makes them all one type |
+| `customOutputType` | type string | none | The type every output a program adds takes, when the program does not give it one. If you name a type variable that one of the node's own inputs uses (`T` on `Dispatch`'s `value`), each added output carries whatever that input received: a router's branches carry what it routes. Needs `canAddOutputPorts` |
+| `pairsAddedPorts` | Boolean | `false` | Set it when each input a program adds should come with an output of the same name: the compiler makes that output, so the program does not have to declare it. An added output with no input of its name, an added output nothing reads, and an added input named after one of the node's own outputs are each the `unpaired-port` error. `Dispatch` sets it: `route.search = search.tool` adds a branch, and `route.search` is where it sends what that branch claims. Needs `canAddInputPorts` and `canAddOutputPorts` |
 | `showDebugPreview` | Boolean | `false` | Render the last output as JSON on the node body |
 | `liveEndpoint` | String | none | The declared endpoint the dispatcher proxies `/live` to |
 | `castPorts` | `{input, output}` | none | Declares the node a checked cast between those two ports |

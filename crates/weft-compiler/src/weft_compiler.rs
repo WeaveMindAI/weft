@@ -138,6 +138,11 @@ pub(crate) struct ParsedPort {
     /// as undeclared. `None` only for a port no header line declares (a
     /// carry-synthesized ghost).
     type_text: Option<String>,
+    /// Declared `*name: Type`: a metadata port, whose value the body
+    /// writes ([`weft_core::project::MetadataPort`]). Only a group's or a
+    /// loop's output list may hold one; the lowering refuses it anywhere
+    /// else.
+    pub(crate) metadata: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +184,11 @@ struct ParsedNode {
     /// The file this node's spans live in, when a full-mode `@include`
     /// spliced it out of another file. None = the compiled source.
     source_file: Option<String>,
+    /// Interface mode only, on an `@include` node: the file's group's
+    /// metadata ports, so a wire leaving one resolves in the editor as it
+    /// does in the build. A node the source declares has none: its type's
+    /// come from the catalog at enrich.
+    metadata_ports: Vec<weft_core::project::MetadataPort>,
 }
 
 /// What lowering a node body produced: the config map plus the per-key
@@ -233,6 +243,10 @@ struct ParsedGroup {
     kind: GroupKind,
     in_ports: Vec<ParsedPort>,
     out_ports: Vec<ParsedPort>,
+    /// The header's `*name: Type` ports, each with the value the body
+    /// writes (`self.name = <literal>`); an include's call site carries
+    /// its body's.
+    metadata_ports: Vec<weft_core::project::MetadataPort>,
     /// `[T: Media]` written after `Group` / `Loop`: bounds on the type
     /// variables its ports use. A loop's two boundary nodes carry them and
     /// share their variables; any other kind keeps them on its definition.
@@ -286,6 +300,16 @@ impl ParsedGroup {
             GroupKind::Loop { loop_config } => loop_config.as_object(),
             _ => None,
         }
+    }
+
+    /// Whether input `port` holds nothing and hands what reaches it to the
+    /// nodes inside ([`InputDefinition::passes_through`]): every port of a
+    /// group or an included file, and a loop's except the ones it iterates
+    /// (`over`) or carries (`carry`), which launch its iterations.
+    // SYNC: ParsedGroup::passes_through <-> packages/weft-graph/src/webview/lib/projection/apply.ts syncPassThrough
+    fn passes_through(&self, port: &str) -> bool {
+        let holds = |key: &str| read_loop_port_list_vetted(self.loop_config(), key).iter().any(|p| p == port);
+        !(holds("over") || holds("carry"))
     }
 
     /// [`Self::loop_config`], to fill while the braces lower.
@@ -668,7 +692,7 @@ fn apply_pending_literals_to_node(
     errors: &mut Vec<SourceError>,
 ) {
     for fill in &inc.pending_literals {
-        if !container_port_declared(&fill.target_id, &fill.port, &node.in_ports, fill.span, errors) {
+        if !container_port_declared(&fill.target_id, &fill.port, &node.in_ports, &node.metadata_ports, fill.span, errors) {
             continue;
         }
         let Some(value) = &fill.value else { continue };
@@ -705,6 +729,7 @@ fn broken_include(inc: &ParsedInclude, errs: Vec<SourceError>) -> (ParsedNode, V
         include_path: Some(inc.path.clone()),
         include_contents: None,
         source_file: None,
+        metadata_ports: Vec::new(),
     };
     let errs = errs.into_iter().map(|e| e.about(&inc.alias)).collect();
     (node, errs)
@@ -888,6 +913,13 @@ fn resolve_one_include(
                     &from_root,
                 )),
                 source_file: None,
+                // The file's metadata ports, the header spelling and the
+                // line stripped as for the ports above. A value the file
+                // gathers from its own members is not known here, where
+                // the file is not opened: `crate::included_metadata_values`
+                // works it out.
+                metadata_ports: group.metadata_ports.iter().cloned()
+                    .map(|mut m| { m.declared_type = None; m.span = None; m.written = None; m }).collect(),
             };
             Ok(IncludeResult::Node(Box::new(node)))
         }
@@ -937,6 +969,11 @@ fn resolve_one_include(
                 kind: GroupKind::Call { body: body_id, runs: None },
                 in_ports: body.in_ports.clone(),
                 out_ports: body.out_ports.clone(),
+                // The body's, value and all: a wire from `site.tool` takes
+                // what the file writes. The header spelling and the line
+                // are the file's, not this one's.
+                metadata_ports: body.metadata_ports.iter().cloned()
+                    .map(|mut m| { m.declared_type = None; m.span = None; m }).collect(),
                 type_params: body.type_params.clone(),
                 nodes: Vec::new(),
                 connections: Vec::new(),
@@ -1349,13 +1386,77 @@ fn literal_config_fill(conn: &crate::cst::SyntaxNode, li: &LineIndex, errors: &m
     let target = conn.children().find(|n| n.kind() == K::ENDPOINT)?;
     let (target_id, port) = endpoint_id_port(&target);
     let span = li.span_of(conn);
-    let value = parse_config_literal(&port, &connection_rhs_text(conn), span, errors);
+    let value = parse_config_literal(&port, &crate::cst::nodes::value_text(conn), span, errors);
     Some(LiteralFill {
         target_id,
         port,
         value,
         span,
     })
+}
+
+/// The port of a `self.port = ...` line, `None` for any other line (a
+/// target with a key, `self.port.key`, is one `lower_connection` refuses).
+fn self_target(conn: &crate::cst::SyntaxNode) -> Option<String> {
+    let target = conn.children().find(|c| c.kind() == crate::cst::SyntaxKind::ENDPOINT)?;
+    if endpoint_overlong(&target) {
+        return None;
+    }
+    match crate::cst::nodes::Endpoint::cast(target)?.parts() {
+        (Some(id), Some(port)) if id == "self" => Some(port),
+        _ => None,
+    }
+}
+
+/// Lower the right side of `self.port = ...` for metadata port `meta`: a
+/// value written out in full lands on `value`, read as any written value
+/// is (a heredoc, a `@file`); one that names other metadata ports
+/// (`inner.tool`, `[...screen.tools, pause.tool]`) lands on `written`, its
+/// names scoped once the body's members are known, and enrich works it
+/// out. An inline node there computes its value during the run, which a
+/// metadata port never takes.
+fn lower_metadata_value(
+    conn: &crate::cst::SyntaxNode,
+    meta: &mut weft_core::project::MetadataPort,
+    span: Span,
+    errors: &mut Vec<SourceError>,
+) {
+    use crate::cst::SyntaxKind as K;
+    let port = meta.name.clone();
+    meta.span = Some(span);
+    if conn.children().any(|c| c.kind() == K::INLINE_EXPR) {
+        errors.push(SourceError::at(
+            span,
+            format!(
+                "metadata port '{port}' takes a value fixed when the program is written, and an inline node \
+                 computes its value during the run: write the value itself, or name another metadata port"
+            ),
+        ));
+        return;
+    }
+    if let Some(source) = conn.children().filter(|c| c.kind() == K::ENDPOINT).nth(1) {
+        let (source, name, path) = crate::cst::nodes::Endpoint::cast(source)
+            .map(|e| e.wire_parts())
+            .unwrap_or((None, None, Vec::new()));
+        meta.written = Some(weft_core::project::MetadataExpr::Port {
+            source: source.unwrap_or_default(),
+            port: name.unwrap_or_default(),
+            path,
+        });
+        return;
+    }
+    let text = crate::cst::nodes::value_text(conn);
+    match crate::metadata::parse_written(&text) {
+        Ok(weft_core::project::MetadataExpr::Literal { .. }) => meta.value = parse_config_literal(&port, &text, span, errors),
+        Ok(written) => meta.written = Some(written),
+        Err(why) => {
+            let mut as_literal = Vec::new();
+            meta.value = parse_config_literal(&port, &text, span, &mut as_literal);
+            if !as_literal.is_empty() {
+                errors.push(SourceError::at(span, format!("the value of metadata port '{port}' does not read: {why}")));
+            }
+        }
+    }
 }
 
 /// Apply a recognized literal fill to a node's config maps (value + a
@@ -1387,11 +1488,16 @@ fn container_port_declared(
     target_id: &str,
     port: &str,
     in_ports: &[ParsedPort],
+    metadata_ports: &[weft_core::project::MetadataPort],
     span: Span,
     errors: &mut Vec<SourceError>,
 ) -> bool {
     if in_ports.iter().any(|p| p.name == port) || weft_core::run::skip::is_gate_port(port) {
         return true;
+    }
+    if metadata_ports.iter().any(|m| m.name == port) {
+        errors.push(SourceError::at(span, metadata_target_message(target_id, port)));
+        return false;
     }
     errors.push(SourceError::at(
         span,
@@ -1403,6 +1509,16 @@ fn container_port_declared(
     false
 }
 
+/// What a line writing INTO a metadata port from outside is told: the one
+/// sentence the lowering and enrich share.
+pub(crate) fn metadata_target_message(owner: &str, port: &str) -> String {
+    format!(
+        "'{owner}.{port}' is a metadata port: its value is written where it is declared \
+         (`self.{port} = ...` in the group's body, or the node type's metadata.json), and a wire \
+         only ever leaves it. To use the value, wire from it (`other.input = {owner}.{port}`)"
+    )
+}
+
 /// Apply a recognized literal fill to a CONTAINER's interface port
 /// (`g.x = "hi"`, `g._should_flow = false`). The value lands on the group,
 /// whose ports these are. A key naming no such port
@@ -1412,7 +1528,7 @@ fn apply_container_literal_fill(
     group: &mut ParsedGroup,
     errors: &mut Vec<SourceError>,
 ) {
-    if !container_port_declared(&fill.target_id, &fill.port, &group.in_ports, fill.span, errors) {
+    if !container_port_declared(&fill.target_id, &fill.port, &group.in_ports, &group.metadata_ports, fill.span, errors) {
         return;
     }
     let Some(value) = &fill.value else { return };
@@ -1451,35 +1567,6 @@ fn lower_top_level_connection(conn: &crate::cst::SyntaxNode, li: &LineIndex, sta
     if let Some(c) = lower_connection(conn, None, li, inline, &mut state.errors) {
         state.connections.push(c);
     }
-}
-
-/// The RHS text of a connection (everything after the `=`), trimmed.
-fn connection_rhs_text(conn: &crate::cst::SyntaxNode) -> String {
-    use crate::cst::SyntaxKind as K;
-    let mut out = String::new();
-    let mut after_eq = false;
-    for el in conn.children_with_tokens() {
-        match &el {
-            rowan::NodeOrToken::Token(t) => {
-                if t.kind() == K::EQ && !after_eq {
-                    after_eq = true;
-                    continue;
-                }
-                if after_eq && t.kind() == K::COMMENT {
-                    continue;
-                }
-                if after_eq {
-                    out.push_str(t.text());
-                }
-            }
-            rowan::NodeOrToken::Node(n) => {
-                if after_eq {
-                    out.push_str(&n.to_string());
-                }
-            }
-        }
-    }
-    out.trim().to_string()
 }
 
 /// Lower one CST declaration into the ParseState (node / group / include),
@@ -1690,15 +1777,17 @@ fn header_id_and_type(header: &crate::cst::SyntaxNode) -> (String, String) {
 }
 
 /// Parse a `(...)` port-signature CST node into ParsedPorts (reusing the pure
-/// `try_parse_port_decl`). Also collects `@require_one_of(...)` markers.
+/// `try_parse_port_decl`), the `*name: Type` metadata ports of an output
+/// list apart. Also collects `@require_one_of(...)` markers.
 fn lower_port_sig(
     sig: &crate::cst::SyntaxNode,
     direction: &str,
     li: &LineIndex,
     errors: &mut Vec<SourceError>,
-) -> (Vec<ParsedPort>, Vec<Vec<String>>) {
+) -> (Vec<ParsedPort>, Vec<weft_core::project::MetadataPort>, Vec<Vec<String>>) {
     use crate::cst::SyntaxKind as K;
     let mut ports = Vec::new();
+    let mut metadata: Vec<weft_core::project::MetadataPort> = Vec::new();
     let mut oor = Vec::new();
     for el in sig.children_with_tokens() {
         match el {
@@ -1742,8 +1831,12 @@ fn lower_port_sig(
                                 ),
                             ));
                         }
-                        if ports.iter().any(|e: &ParsedPort| e.name == p.name) {
+                        if ports.iter().any(|e: &ParsedPort| e.name == p.name) || metadata.iter().any(|m| m.name == p.name) {
                             errors.push(SourceError::at(span, format!("Duplicate {direction} port \"{}\"", p.name)));
+                        } else if p.metadata {
+                            if let Some(port) = metadata_port_of(p, direction, span, errors) {
+                                metadata.push(port);
+                            }
                         } else {
                             ports.push(p);
                         }
@@ -1764,10 +1857,69 @@ fn lower_port_sig(
                     }
                 }
             }
+            // Anything else between the parens that is no punctuation of the
+            // list: a `*` with no name after it, or a character the language
+            // has no use for. Dropping it would leave the header meaning
+            // something other than what was written.
+            rowan::NodeOrToken::Token(t)
+                if !t.kind().is_trivia()
+                    && !matches!(t.kind(), K::L_PAREN | K::R_PAREN | K::COMMA | K::MARKER | K::ARROW) =>
+            {
+                let message = if t.kind() == K::STAR {
+                    "a `*` marks a metadata port and goes right before its name: `*tool: LlmTool`".to_string()
+                } else {
+                    format!("Unexpected '{}' in a port list", t.text())
+                };
+                errors.push(SourceError::at(li.span_of_token(&t), message));
+            }
             _ => {}
         }
     }
-    (ports, oor)
+    (ports, metadata, oor)
+}
+
+/// The metadata port a `*name: Type` declaration makes, or `None` with the
+/// error said: it sits only in an output list, and its type is written and
+/// concrete, since its value is written right here and nothing wired can
+/// pin a variable.
+fn metadata_port_of(
+    port: ParsedPort,
+    direction: &str,
+    span: Span,
+    errors: &mut Vec<SourceError>,
+) -> Option<weft_core::project::MetadataPort> {
+    let name = &port.name;
+    if direction != "out" {
+        errors.push(SourceError::at(
+            span,
+            format!(
+                "`*{name}` declares a metadata port, which sits on the output side: its value is \
+                 written in the body and read from outside. Move it to the outputs (`-> (*{name}: Type)`)"
+            ),
+        ));
+        return None;
+    }
+    let mut vars = std::collections::BTreeSet::new();
+    port.port_type.collect_type_vars(&mut vars);
+    if port.type_error.is_none() && (port.type_text.as_deref() == Some("") || !vars.is_empty()) {
+        errors.push(SourceError::at(
+            span,
+            format!(
+                "metadata port '{name}' needs a concrete type (`*{name}: LlmTool`): its value is \
+                 written in the body, and nothing wired can tell what it holds"
+            ),
+        ));
+        return None;
+    }
+    Some(weft_core::project::MetadataPort {
+        name: port.name,
+        port_type: port.port_type,
+        description: None,
+        value: None,
+        written: None,
+        span: None,
+        declared_type: port.type_text,
+    })
 }
 
 /// Read a loop config port list (`over` or `carry`) at LOWERING time.
@@ -1876,33 +2028,72 @@ fn lower_type_params(
     })
 }
 
-/// Read the input/output port signatures off a HEADER,
-/// returning (in_ports, out_ports, one_of_required).
+/// The ports a HEADER declares.
+struct HeaderPorts {
+    inputs: Vec<ParsedPort>,
+    outputs: Vec<ParsedPort>,
+    /// The `*name: Type` entries of the output list.
+    metadata: Vec<weft_core::project::MetadataPort>,
+    one_of_required: Vec<Vec<String>>,
+}
+
+/// Read the input/output port signatures off a HEADER.
 fn lower_header_ports(
     header: &crate::cst::SyntaxNode,
     li: &LineIndex,
     errors: &mut Vec<SourceError>,
-) -> (Vec<ParsedPort>, Vec<ParsedPort>, Vec<Vec<String>>) {
+) -> HeaderPorts {
     use crate::cst::SyntaxKind as K;
-    let mut in_ports = Vec::new();
-    let mut out_ports = Vec::new();
-    let mut oor = Vec::new();
+    let mut ports = HeaderPorts { inputs: Vec::new(), outputs: Vec::new(), metadata: Vec::new(), one_of_required: Vec::new() };
     for sig in header.children() {
         match sig.kind() {
             K::PORT_SIG_IN => {
-                let (p, o) = lower_port_sig(&sig, "in", li, errors);
-                in_ports = p;
-                oor.extend(o);
+                // An input list's `*` is refused by the lowering, so it
+                // hands back no metadata port.
+                let (p, _, o) = lower_port_sig(&sig, "in", li, errors);
+                ports.inputs = p;
+                ports.one_of_required.extend(o);
             }
             K::PORT_SIG_OUT => {
-                let (p, o) = lower_port_sig(&sig, "out", li, errors);
-                out_ports = p;
-                oor.extend(o);
+                let (p, m, o) = lower_port_sig(&sig, "out", li, errors);
+                ports.outputs = p;
+                ports.metadata = m;
+                ports.one_of_required.extend(o);
             }
             _ => {}
         }
     }
-    (in_ports, out_ports, oor)
+    // One namespace per node or group: `self.x` and `g.x` must never be
+    // ambiguous. An input and an output may share a name (a passthrough's
+    // `value` in and out); a metadata port shares it with neither.
+    let mut kept = Vec::with_capacity(ports.metadata.len());
+    for port in std::mem::take(&mut ports.metadata) {
+        if ports.inputs.iter().any(|p| p.name == port.name) {
+            errors.push(SourceError::at(
+                li.span_of(header),
+                format!("metadata port '{}' has the name of an input: `self.{}` would mean either. Rename one", port.name, port.name),
+            ));
+        } else {
+            kept.push(port);
+        }
+    }
+    ports.metadata = kept;
+    ports
+}
+
+/// A node written in the source declares no metadata port: its type
+/// declares them, in its `metadata.json`.
+fn refuse_node_metadata(ports: &HeaderPorts, span: Span, errors: &mut Vec<SourceError>) {
+    for port in &ports.metadata {
+        errors.push(SourceError::at(
+            span,
+            format!(
+                "`*{}` declares a metadata port, which only a group or a loop writes in its header. \
+                 A node type declares its own in its metadata.json (`metadataPorts`)",
+                port.name
+            ),
+        ));
+    }
 }
 
 /// Lower a NODE_DECL into a ParsedNode (config + ports + spans), synthesizing
@@ -1929,7 +2120,9 @@ fn lower_node(
         return None;
     }
     let id = scoped(parent, &local_id);
-    let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
+    let header_ports = lower_header_ports(header.syntax(), li, errors);
+    refuse_node_metadata(&header_ports, li.span_of(header.syntax()), errors);
+    let HeaderPorts { inputs: in_ports, outputs: out_ports, one_of_required, .. } = header_ports;
     let type_params = lower_type_params(header.syntax(), None, li, errors);
 
     let mut body_out = LoweredBody::default();
@@ -1960,6 +2153,7 @@ fn lower_node(
         include_path: None,
         include_contents: None,
         source_file: None,
+        metadata_ports: Vec::new(),
     })
 }
 
@@ -2166,7 +2360,9 @@ fn lower_inline_expr(
     let anon_id = format!("{host_local}__{field_key}");
     // Ports: the inline expr's PORT_SIG_IN / PORT_SIG_OUT live directly under
     // the INLINE_EXPR (no HEADER sub-node), so read them off the node itself.
-    let (in_ports, out_ports, one_of_required) = lower_header_ports(inline_node, li, errors);
+    let header_ports = lower_header_ports(inline_node, li, errors);
+    refuse_node_metadata(&header_ports, span, errors);
+    let HeaderPorts { inputs: in_ports, outputs: out_ports, one_of_required, .. } = header_ports;
     let type_params = lower_type_params(inline_node, None, li, errors);
 
     // Body config (recurses for nested inline exprs via lower_config_body). The
@@ -2207,6 +2403,7 @@ fn lower_inline_expr(
         optional_ports: body_out.optional_ports,
         include_path: None,
         include_contents: None,
+        metadata_ports: Vec::new(),
         source_file: None,
     });
     inline.connections.push(ParsedConnection {
@@ -2564,7 +2761,8 @@ fn lower_group(
         }
     };
     let id = scoped(parent, &local_id);
-    let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
+    let HeaderPorts { inputs: in_ports, outputs: out_ports, metadata: metadata_ports, one_of_required } =
+        lower_header_ports(header.syntax(), li, errors);
     refuse_scope_one_of("group", &id, &one_of_required, header_span, errors);
     let type_params = lower_type_params(header.syntax(), Some((&in_ports, &out_ports)), li, errors);
 
@@ -2574,6 +2772,7 @@ fn lower_group(
         source_file: None,
         in_ports: Vec::new(),
         out_ports,
+        metadata_ports,
         type_params,
         nodes: Vec::new(),
         connections: Vec::new(),
@@ -2612,7 +2811,8 @@ fn lower_loop(
         return None;
     }
     let id = scoped(parent, &local_id);
-    let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
+    let HeaderPorts { inputs: in_ports, outputs: out_ports, metadata: metadata_ports, one_of_required } =
+        lower_header_ports(header.syntax(), li, errors);
     refuse_scope_one_of("loop", &id, &one_of_required, header_span, errors);
     let type_params = lower_type_params(header.syntax(), Some((&in_ports, &out_ports)), li, errors);
 
@@ -2622,6 +2822,7 @@ fn lower_loop(
         source_file: None,
         in_ports: Vec::new(),
         out_ports,
+        metadata_ports,
         type_params,
         nodes: Vec::new(),
         connections: Vec::new(),
@@ -2950,6 +3151,7 @@ fn lower_grouplike_body_in_scope(
                     // No header line declares this input; the carry OUTPUT
                     // is the source of truth.
                     type_text: None,
+                    metadata: false,
                 });
             }
         }
@@ -2974,6 +3176,23 @@ fn lower_grouplike_body_in_scope(
     // own anon node + edge into this scratch scope, merged below.
     let mut conn_inline = InlineScope::default();
     for cn in conn_nodes {
+        // `self.tool = ...`: the value of one of this container's metadata
+        // ports, never a wire. Any other `self.x = ...` is the ordinary
+        // line it reads as.
+        if let Some(port) = self_target(&cn) {
+            if let Some(meta) = group.metadata_ports.iter_mut().find(|m| m.name == port) {
+                let span = li.span_of(&cn);
+                if meta.value.is_some() || meta.written.is_some() {
+                    errors.push(SourceError::at(
+                        span,
+                        format!("metadata port '{port}' is written twice in '{id}': keep one `self.{port} = ...` line"),
+                    ));
+                } else {
+                    lower_metadata_value(&cn, meta, span, errors);
+                }
+                continue;
+            }
+        }
         let fill = literal_config_fill(&cn, li, errors);
         // A literal targets a local CHILD, which is either a node (fills
         // its config) or a nested container (fills its interface port).
@@ -3024,6 +3243,28 @@ fn lower_grouplike_body_in_scope(
     for conn in &mut group.connections {
         (conn.source_id, conn.source_inner) = rescope_endpoint(&conn.source_id, &id, &local_children);
         (conn.target_id, conn.target_inner) = rescope_endpoint(&conn.target_id, &id, &local_children);
+    }
+    // The ports a metadata value names are scoped the way a wire's ends
+    // are. Its own ports are no value of its own: `self` there is refused.
+    for meta in &mut group.metadata_ports {
+        let Some(written) = &mut meta.written else { continue };
+        let mut inside = false;
+        written.rescope(&mut |source| {
+            let (scoped, inner) = rescope_endpoint(source, &id, &local_children);
+            inside |= inner;
+            scoped
+        });
+        if inside {
+            errors.push(SourceError::at(
+                meta.span.unwrap_or(header_span),
+                format!(
+                    "metadata port '{}' names a port of '{id}' itself (`self.x`): name the member whose \
+                     metadata port it takes, or write the value out",
+                    meta.name
+                ),
+            ));
+            meta.written = None;
+        }
     }
 }
 
@@ -3153,7 +3394,10 @@ fn scoped(parent: Option<&str>, local: &str) -> String {
 /// spells it the same way); `name: Type?` is refused naming the spelling.
 pub(crate) fn try_parse_port_decl(trimmed: &str, side: weft_core::weft_type::PortSide) -> Result<ParsedPort, String> {
     let s = trimmed.trim();
-    let rest = s;
+    let (metadata, rest) = match s.strip_prefix('*') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, s),
+    };
     let (name, port_type, optional, type_text) = if let Some(colon_pos) = rest.find(':') {
         let name = rest[..colon_pos].trim();
         let type_str = rest[colon_pos + 1..].trim();
@@ -3187,6 +3431,7 @@ pub(crate) fn try_parse_port_decl(trimmed: &str, side: weft_core::weft_type::Por
                 // port's variable here would overwrite the author's typo
                 // (and the squiggle pointing at it) on the next ports gesture.
                 type_text: Some(type_str.to_string()),
+                metadata,
             }),
         }
     } else {
@@ -3221,6 +3466,7 @@ pub(crate) fn try_parse_port_decl(trimmed: &str, side: weft_core::weft_type::Por
         synthesized_from_carry: false,
         type_error: None,
         type_text,
+        metadata,
     })
 }
 
@@ -3675,6 +3921,7 @@ fn flatten(state: ParseState, bodies: Bodies, project_id: Uuid, errors: &mut Vec
         defaults: Default::default(),
         given: Default::default(),
         broken: Vec::new(),
+        metadata_wires: Vec::new(),
     }
 }
 
@@ -3718,10 +3965,10 @@ fn collect_group_definitions(
     parent_group_id: Option<String>,
     out: &mut Vec<weft_core::GroupDefinition>,
 ) {
-    let in_ports: Vec<PortDefinition> = group
+    let in_ports: Vec<InputDefinition> = group
         .in_ports
         .iter()
-        .map(|p| PortDefinition {
+        .map(|p| InputDefinition::from_wire_port(PortDefinition {
             name: p.name.clone(),
             port_type: p.port_type.clone(),
             required: p.required,
@@ -3733,6 +3980,10 @@ fn collect_group_definitions(
             // field's contract. Only NODE decl ports carry one.
             declared_type: None,
         })
+        // The header's `?`, as on a node's declared input (refused on a
+        // port that passes through, `check_pass_through_ports`).
+        .with_optional(!p.required)
+        .with_passes_through(group.passes_through(&p.name)))
         .collect();
     let out_ports: Vec<PortDefinition> = group
         .out_ports
@@ -3766,6 +4017,7 @@ fn collect_group_definitions(
         label: None,
         in_ports,
         out_ports,
+        metadata_ports: group.metadata_ports.clone(),
         parent_group_id: parent_group_id.clone(),
         child_group_ids,
         node_ids,
@@ -3776,6 +4028,8 @@ fn collect_group_definitions(
         description: group.description.clone(),
         port_literals: group.port_literals.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         port_literal_spans: group.port_literal_spans.clone(),
+        // Written by enrich, where a metadata wire lands on a port.
+        port_literal_types: Default::default(),
         // A `@file` / `@asset` literal on a port is resolved with the
         // program's other file references (`crate::file_ref`).
         file_refs: Default::default(),
@@ -3823,7 +4077,12 @@ fn flatten_group<'a>(
             calls: match &group.kind { GroupKind::Call { body, .. } => Some(body.clone()), _ => None },
             is_body: matches!(group.kind, GroupKind::Body),
             in_ports: group.in_ports.iter().map(|p| p.name.clone()).collect(),
-            out_ports: group.out_ports.iter().map(|p| p.name.clone()).collect(),
+            // A metadata port is read from outside like an output: a wire
+            // leaving it starts at the group's own port, and enrich
+            // resolves it (`crate::metadata`).
+            out_ports: group.out_ports.iter().map(|p| p.name.clone())
+                .chain(group.metadata_ports.iter().map(|m| m.name.clone()))
+                .collect(),
         });
     }
 
@@ -3882,7 +4141,7 @@ fn push_loop_boundaries(group: &ParsedGroup, nodes: &mut Vec<NodeDefinition>) {
     // for the ports it iterates or threads: with no list to walk, or no
     // seed to carry, there is no iteration to launch.
     let mut in_pt_inputs: Vec<InputDefinition> = group.in_ports.iter().map(|p| {
-        let boundary_required = p.required && (loop_over.contains(&p.name) || loop_carry.contains(&p.name));
+        let boundary_required = p.required && !group.passes_through(&p.name);
         InputDefinition::from_wire_port(PortDefinition {
             name: p.name.clone(),
             port_type: p.port_type.clone(),
@@ -4013,6 +4272,8 @@ fn push_loop_boundaries(group: &ParsedGroup, nodes: &mut Vec<NodeDefinition>) {
         // placed here.
         port_literals: group.port_literals.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         port_literal_spans: group.port_literal_spans.clone(),
+        port_literal_types: Default::default(),
+        metadata_ports: Vec::new(),
         file_refs: Default::default(),
         include_path: None,
         include_contents: None,
@@ -4098,6 +4359,8 @@ fn push_loop_boundaries(group: &ParsedGroup, nodes: &mut Vec<NodeDefinition>) {
         optional_ports: Default::default(),
         port_literals: Default::default(),
         port_literal_spans: Default::default(),
+        port_literal_types: Default::default(),
+        metadata_ports: Vec::new(),
         file_refs: Default::default(),
         include_path: None,
         include_contents: None,
@@ -4126,6 +4389,9 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         })
         // The header's `?`: runs without it even when its wire closed.
         .with_optional(!p.required)
+        // An include's opaque node stands for the file's group, whose
+        // ports pass through.
+        .with_passes_through(pn.include_path.is_some())
     }).collect();
     let outputs = pn.out_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
@@ -4173,6 +4439,10 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         // is known; the parser leaves every body value in `config`.
         port_literals: Default::default(),
         port_literal_spans: Default::default(),
+        port_literal_types: Default::default(),
+        // An include's opaque node carries its file's; every other node
+        // gets its type's from the catalog at enrich.
+        metadata_ports: pn.metadata_ports.clone(),
         file_refs: Default::default(),
         include_path: pn.include_path.clone(),
         include_contents: pn.include_contents.clone(),

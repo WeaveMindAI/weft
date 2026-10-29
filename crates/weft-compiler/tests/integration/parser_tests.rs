@@ -1780,7 +1780,7 @@ grp = Group(data: String) -> (result: String) {
 #[test]
 fn group_outputs_are_never_optional_on_the_wire() {
     let source = r#"
-g = Group(data: String, extra?: String) -> (text: String, body: String) {
+g = Group(data: String, extra: String) -> (text: String, body: String) {
     worker = Template { template: "{{data}}" }
     worker.value = self.data
     self.text = worker.output
@@ -1790,10 +1790,8 @@ g = Group(data: String, extra?: String) -> (text: String, body: String) {
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     let group = result.groups.iter().find(|g| g.id == "g").expect("the group");
     assert!(group.out_ports.iter().all(|p| p.required), "{:?}", group.out_ports);
-    // The declared optionality of the INPUTS is preserved, so the
-    // signature round-trips as written.
-    let required: Vec<(&str, bool)> = group.in_ports.iter().map(|p| (p.name.as_str(), p.required)).collect();
-    assert_eq!(required, vec![("data", true), ("extra", false)]);
+    // The inputs pass through, never required or optional themselves.
+    assert!(group.in_ports.iter().all(|p| p.passes_through), "{:?}", group.in_ports);
 }
 
 #[test]

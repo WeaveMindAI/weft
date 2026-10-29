@@ -44,6 +44,9 @@
       "include": "#number"
     },
     {
+      "include": "#metadata-marker"
+    },
+    {
       "include": "#operator"
     },
     {
@@ -157,6 +160,11 @@
     "number": {
       "name": "constant.numeric.weft",
       "match": "-?\\b[0-9]+(\\.[0-9]+)?\\b"
+    },
+    "metadata-marker": {
+      "$comment": "The `*` before a port name in a group or loop header's output list (`-> (*tool: LlmTool)`), marking a metadata port. Only a `*` followed by a port name and then `?`, `:`, `,` or `)` is one.",
+      "name": "storage.modifier.metadata.weft",
+      "match": "\\*(?=[ \\t]*[A-Za-z_][A-Za-z0-9_-]*[ \\t]*\\??[ \\t]*[:,)])"
     },
     "operator": {
       "name": "keyword.operator.weft",

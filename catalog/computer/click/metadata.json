@@ -28,5 +28,200 @@
       "type": "String",
       "description": "What happened, in a sentence a model can read back as the tool's result."
     }
+  ],
+  "metadataPorts": [
+    {
+      "name": "tools",
+      "type": "ActionTools",
+      "description": "The tools a model calls this node through, in Anthropic's names and in OpenAI's: gather them up to the LLM node's `tools` through metadata ports.",
+      "value": {
+        "anthropic": [
+          {
+            "description": "Click the left mouse button. Aim at the middle of the target, and name it by where it is (the blue Submit button at the bottom right). Left out, coordinate is where the mouse is.",
+            "name": "left_click",
+            "parameters": {
+              "properties": {
+                "coordinate": {
+                  "description": "Where to click as [x, y], pixels from the left and top edges of the last full screenshot.",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "maxItems": 2,
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "text": {
+                  "description": "Keys to hold down during the action, joined by + (shift, ctrl+shift).",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Click the right mouse button, for a context menu. Aim at the middle of the target, and name it by where it is (the blue Submit button at the bottom right). Left out, coordinate is where the mouse is.",
+            "name": "right_click",
+            "parameters": {
+              "properties": {
+                "coordinate": {
+                  "description": "Where to click as [x, y], pixels from the left and top edges of the last full screenshot.",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "maxItems": 2,
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "text": {
+                  "description": "Keys to hold down during the action, joined by + (shift, ctrl+shift).",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Click the middle mouse button. Aim at the middle of the target, and name it by where it is (the blue Submit button at the bottom right). Left out, coordinate is where the mouse is.",
+            "name": "middle_click",
+            "parameters": {
+              "properties": {
+                "coordinate": {
+                  "description": "Where to click as [x, y], pixels from the left and top edges of the last full screenshot.",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "maxItems": 2,
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "text": {
+                  "description": "Keys to hold down during the action, joined by + (shift, ctrl+shift).",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Double-click the left mouse button, to open something or select a word. Aim at the middle of the target, and name it by where it is (the blue Submit button at the bottom right). Left out, coordinate is where the mouse is.",
+            "name": "double_click",
+            "parameters": {
+              "properties": {
+                "coordinate": {
+                  "description": "Where to click as [x, y], pixels from the left and top edges of the last full screenshot.",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "maxItems": 2,
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "text": {
+                  "description": "Keys to hold down during the action, joined by + (shift, ctrl+shift).",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Triple-click the left mouse button, to select a line or a paragraph. Aim at the middle of the target, and name it by where it is (the blue Submit button at the bottom right). Left out, coordinate is where the mouse is.",
+            "name": "triple_click",
+            "parameters": {
+              "properties": {
+                "coordinate": {
+                  "description": "Where to click as [x, y], pixels from the left and top edges of the last full screenshot.",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "maxItems": 2,
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "text": {
+                  "description": "Keys to hold down during the action, joined by + (shift, ctrl+shift).",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "type": "object"
+            }
+          }
+        ],
+        "openai": [
+          {
+            "description": "Click a mouse button. Aim at the middle of the target, and name it by where it is (the blue Submit button at the bottom right).",
+            "name": "click",
+            "parameters": {
+              "properties": {
+                "button": {
+                  "enum": [
+                    "left",
+                    "right",
+                    "wheel",
+                    "back",
+                    "forward"
+                  ],
+                  "type": "string"
+                },
+                "keys": {
+                  "description": "Keys to hold down during the action, like [\"SHIFT\"] or [\"CTRL\", \"SHIFT\"].",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "x": {
+                  "description": "Where to click, across, pixels from the left and top edges of the last full screenshot.",
+                  "type": "integer"
+                },
+                "y": {
+                  "description": "Where to click, down, pixels from the left and top edges of the last full screenshot.",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "button",
+                "x",
+                "y"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Double-click the left mouse button, to open something or select a word.",
+            "name": "double_click",
+            "parameters": {
+              "properties": {
+                "keys": {
+                  "description": "Keys to hold down during the action, like [\"SHIFT\"] or [\"CTRL\", \"SHIFT\"].",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "x": {
+                  "description": "Where to click, across, pixels from the left and top edges of the last full screenshot.",
+                  "type": "integer"
+                },
+                "y": {
+                  "description": "Where to click, down, pixels from the left and top edges of the last full screenshot.",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      }
+    }
   ]
 }

@@ -255,14 +255,14 @@ node's own business, stated in its description. Two catalog examples:
 `FirstInOrder` emits its first input that carried a value, so reordering its
 lines changes which branch wins, and `List` puts its inputs into one list, in port order, and you declare the list's
 type on its output. An optional port (`name?:`) that got nothing is left out.
-If you want several wired values as one list (several `LlmTool`s into
+If you want several wired values as one list (the tools an agent offers, into
 `LlmInference`'s `tools`), that is `List`, never a Python node that returns
 `[a, b]`:
 
 ````weft
-tools = List(search: JsonDict, fetch: JsonDict) -> (list: List[JsonDict]) {
-  search: searchTool.tool
-  fetch: fetchTool.tool
+tools = List -> (list: List[LlmTool]) {
+  search: search.tool     # each tool group's metadata port (Metadata ports, under Groups)
+  fetch: fetch.tool
 }
 ````
 
@@ -285,7 +285,8 @@ switch's `cases`, the access picker) takes an inline typed value only: no
 wire, no `@file`, no `@asset`. The line also works on a [boundary port]. An
 output port never takes a value, on any node: `score.out = "lit"` and
 `out: "lit"` beside a `-> (out: String)` signature are refused, and so is a
-group's own output written from inside (`self.result = "lit"`). A firing
+group's own output written from inside (`self.result = "lit"`); a metadata
+port (under Groups) is the one port whose value is written that way. A firing
 emits on an output; you read it as `node.port`.
 
 ### Multi-line strings
@@ -531,7 +532,9 @@ its outputs back is in that node's description). Write only the ports the type l
 typed with a type variable (`T`, `T2`) gets its type where the node is used:
 from the type you declare on it, or from what is wired to it. A header port
 written with no type, `(x)`, takes the type of what is wired to it. An empty
-body equals no body.
+body equals no body. A group's or a loop's header can also declare a metadata
+port, `*tool: LlmTool`, whose value is written by hand (Metadata ports, under
+Groups).
 
 ## Inline expressions
 
@@ -746,7 +749,10 @@ any kind decides a branch by emitting one (a moderation check's `flagged`, a
 request's `ok`, a lookup's `found`). The standard nodes below implement
 the decision itself, and they are the ones to use. `Switch` tests a value against
 its `cases` config and emits `true` on the winning case's port, closing the
-rest; wire a case port into the branch's `_should_flow`. `FirstInOrder`
+rest; wire a case port into the branch's `_should_flow`. `Dispatch` sends a
+value out of the output of the branch whose `by` field (`name` unless you set
+it) equals the value's, or out of `otherwise` when none does; a model's tool
+calls are routed with it (the agent shape, below). `FirstInOrder`
 does not decide anything, it MERGES: it emits the first of its inputs that
 carried a value, in written order, so alternative paths rejoin into one
 wire. `All` says yes only when every input wired onto it arrived and none
@@ -840,8 +846,49 @@ If you want an agent that calls tools until it is done, the shape is a
 sequential `Loop` that carries the one conversation file: each turn asks the
 model, the tools it asked for run, each result is added to the file in
 place, and the next turn reads the file. The turns stop when the model asks
-for no tool. Which ports carry the file, the tools and the model's tool
-calls is in the descriptions of the AI nodes.
+for no tool. Each tool is a group with a `*tool: LlmTool` metadata port
+(Metadata ports, under Groups), and you wire that port twice: into the `List`
+that feeds the model's `tools`, and into a `Dispatch`, which sends each call
+to the group of the tool it names. The calls arrive as one list, so the
+`Dispatch` and the tool groups sit in a sequential loop over the calls, and
+that loop hands each tool's description out on a metadata port of its own,
+where the `List` can reach it:
+
+````weft
+# inside one turn, beside `ask = LlmInference { ... tools: tools.list }`
+calls = Loop(toolCalls: List[ToolCall], history: File) -> (history: File, *search: LlmTool, *fetch: LlmTool) {
+  over: ["toolCalls"]
+  carry: ["history"]
+
+  # search and fetch are tool groups, each written as under Metadata ports
+  route = Dispatch {
+    value: self.toolCalls   # one call; `by` is "name" unless you set it
+    search: search.tool     # a metadata wire: adds the `search` branch
+    fetch: fetch.tool
+  }
+  search.call = route.search  # the call, when its name is search.tool's name
+  fetch.call = route.fetch
+  unknown = Text { value: "No tool has that name.", _should_flow: route.otherwise }
+
+  reply = ChatHistoryAppend {
+    role: "tool"
+    historyFile: self.history
+    toolCallId: self.toolCalls.id
+    text: FirstInOrder { search: search.result, fetch: fetch.result, unknown: unknown.value }.value
+  }
+  self.history = reply.historyFile
+  self.search = search.tool
+  self.fetch = fetch.tool
+}
+calls.toolCalls = ask.toolCalls
+calls.history = ask.historyFile
+tools = List -> (list: List[LlmTool]) { search: calls.search, fetch: calls.fetch }
+````
+
+`tools` feeds `ask`, which runs before `calls`, yet reads from `calls`: a
+metadata wire never runs, so pointing backwards makes no cycle. A branch
+whose output on `route` nothing reads fails the build. Which ports carry the
+file and the model's tool calls is in the descriptions of the AI nodes.
 
 What runs: a manual run starts ordinary roots within its selection. A trigger
 requires one explicit fire or supplied emitted outputs. `--target <node>` runs
@@ -1028,7 +1075,7 @@ card whose picture is optional:
 ````weft
 look = Route -> (body: { text: String, photo?: Image }) { path: "cards", method: "POST" }
 
-card = Group(text: String, picture?: Image) -> (saved: String) {
+card = Group(text: String, picture: Image) -> (saved: String) {
   store = ExecPython(text: String, shot?: Image) -> (line: String) {
     code: "return {'line': text + (' with a picture' if shot else '')}"
     text: self.text
@@ -1061,8 +1108,8 @@ or is an input of a join node such as `FirstInOrder`, which is optional without 
 required input, or the last member of a `@require_one_of` set that could get a
 value (through any group, loop or included file in between), `weft validate`
 fails with `required-port-unmet`, naming the group's port and the
-input inside that needs it. A `?` on the group's own port changes nothing: the
-node that reads the value is what decides.
+input inside that needs it. A group's own port takes no `?` (the build refuses one with
+`optional-pass-through-port`): the node that reads the value is what decides.
 
 Worked, for the top-level count: a file holding `db = PostgresDatabase`, a
 `cards` group (four nodes inside), a `gallery` group (three nodes inside) and
@@ -1071,6 +1118,45 @@ connected part of four items (the three groups and the database), well inside
 the rule, whatever the groups hold inside; the inside of each group answers
 for itself. Twelve flat nodes all wired to `db` is one part of thirteen, and
 the answer is those three groups, never a wider `main.weft`.
+
+### Metadata ports
+
+Some values of a group are known when you write the program, before any run:
+the description of the tool a group performs is the usual one. A group or a
+loop declares such a value with a `*` in the output list of its header, and
+writes it in its body:
+
+````weft
+search = Group(call: ToolCall) -> (result: String, *tool: LlmTool) {
+  self.tool = {
+    "name": "search",
+    "description": "Search the web and return the top results as text.",
+    "parameters": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
+  }
+  # the nodes that search: they read self.call.arguments and write self.result
+}
+````
+
+The value is written by hand: a literal, or another metadata port
+(`self.tool = inner.tool`, for a group that hands on the one of a group
+inside it), or JSON gathering several of them, where a name stands for that
+port's value and `...name` inside a list for its items (`self.tools =
+[...search.tools, fetch.tool]`); a name reads keys off a value like a wire
+(`act.tools.anthropic`), and the result is held to the port's declared type. A value a run computes (`self.tool = someNode.out`) is refused,
+and so is a metadata port left with no value. A group in an included file
+declares its own in its `Group(...) -> (...)` line, and the include's name
+carries it (`search.tool` for `search = @include("search.weft")`). A node
+type can carry metadata ports too, written in its `metadata.json`;
+`weft describe-nodes --node <Type> --compact` lists them under
+`metadataPorts`. A metadata port's name is none of the inputs or outputs of
+the same group or node.
+
+A wire leaving a metadata port is a metadata wire: the compiler writes the
+value into the input it points at, exactly as if you had typed it there, and
+the wire never runs. It may point backwards in the graph without making a
+cycle, and past that input the value is ordinary data. Nothing wires into a
+metadata port. For one tool wired into both a `List` and a `Dispatch`, go and
+read the agent shape under How a program runs.
 
 ### Included files
 

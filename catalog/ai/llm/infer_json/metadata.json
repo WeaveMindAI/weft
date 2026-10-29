@@ -46,9 +46,8 @@
     },
     {
       "name": "tools",
-      "type": "JsonDict | List[JsonDict]",
-      "accepts": ["wire"],
-      "description": "Tool declarations the model may call: one LLM Tool node's output, or a list of them."
+      "type": "List[LlmTool]",
+      "description": "The tools the model may call, as a List: usually each tool group's `*tool` metadata port wired into it, or an LLM Tool node's `tool`."
     },
     {
       "name": "toolChoice",

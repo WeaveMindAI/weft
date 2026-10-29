@@ -690,6 +690,9 @@ pub fn cut(project: &ProjectDefinition, walked: &Walk, given: &mut Given) -> Res
         defaults: project.defaults,
         given: given.places(),
         broken: Vec::new(),
+        // Only drawn, and a cut is run, never drawn: every value one
+        // carried is already on the input it points at.
+        metadata_wires: Vec::new(),
     })
 }
 

@@ -32,5 +32,26 @@
       "type": "Number",
       "description": "Pixels from the top edge."
     }
+  ],
+  "metadataPorts": [
+    {
+      "name": "tools",
+      "type": "ActionTools",
+      "description": "The tools a model calls this node through, in Anthropic's names and in OpenAI's: gather them up to the LLM node's `tools` through metadata ports.",
+      "value": {
+        "anthropic": [
+          {
+            "description": "Tell where the mouse is, as X=..., Y=....",
+            "name": "cursor_position",
+            "parameters": {
+              "properties": {},
+              "required": [],
+              "type": "object"
+            }
+          }
+        ],
+        "openai": []
+      }
+    }
   ]
 }

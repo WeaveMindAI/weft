@@ -105,7 +105,7 @@ BUTTONS = {"left": "1", "middle": "2", "right": "3", "back": "8", "forward": "9"
 WHEEL = {"up": "4", "down": "5", "left": "6", "right": "7"}
 
 # The most repeats of a key, seconds a key is held, and clicks of one scroll.
-# SYNC: bounds <-> catalog/computer/styles.rs (MOST_REPEATS, MOST_SECONDS, MOST_WHEEL_CLICKS)
+# SYNC: bounds <-> catalog/computer/styles.rs (MOST_REPEATS, MOST_SECONDS, MOST_WHEEL_CLICKS), the `maximum`s in the action nodes' `tools` metadata ports (catalog/computer/*/metadata.json) and perform.weft's `wait`
 MOST_REPEATS = 100
 MOST_SECONDS = 300
 MOST_WHEEL_CLICKS = 100

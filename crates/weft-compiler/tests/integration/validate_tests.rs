@@ -387,6 +387,7 @@ t = Text
         },
         accepts: weft_core::node::Accepts::both(),
         optional: false,
+        passes_through: false,
         widget: None,
         default: None,
         label: None,
@@ -420,6 +421,7 @@ t = Text { value: "ok" }
         },
         accepts: weft_core::node::Accepts::wire_only(),
         optional: false,
+        passes_through: false,
         widget: None,
         default: None,
         label: None,
@@ -3311,7 +3313,7 @@ out = Debug { data: my.results }
     );
     let d = validate(&typo, &catalog());
     assert!(
-        d.iter().any(|e| e.code.as_deref() == Some("unknown-target-port") && e.message.contains("node 'my'")),
+        d.iter().any(|e| e.code.as_deref() == Some("unknown-target-port") && e.message.contains("loop 'my' has no input 'itmes'")),
         "the typo is refused under the loop's name: {d:?}"
     );
     assert!(
@@ -3350,7 +3352,7 @@ out = Debug { data: my.results }
     // nobody.
     let component = parse_enrich(
         r#"
-Group(raw?: String) -> (cleaned: String) {
+Group(raw: String) -> (cleaned: String) {
     s = Text { value: "x" }
     self.cleaned = s.value
 }
@@ -3359,7 +3361,7 @@ Group(raw?: String) -> (cleaned: String) {
     let d = validate(&component, &catalog());
     assert!(
         !d.iter().any(|e| e.code.as_deref() == Some("run-undecided")),
-        "a component's optional input is the includer's to make required: {d:?}"
+        "a component's input is the includer's to connect: {d:?}"
     );
 }
 
@@ -5389,5 +5391,92 @@ sink.data = f.file
     for e in errors(&d) {
         assert!(!e.subjects.is_empty(), "an error with no subjects: {e:?}");
         assert!(e.subjects.iter().all(|s| ids.contains(&s.as_str())), "a subject that is no part: {e:?}");
+    }
+}
+
+/// A `?` on a container's port that passes through is refused: a group's,
+/// and a loop's that it neither iterates nor carries. On a port the loop
+/// iterates, the `?` keeps its meaning.
+#[test]
+fn a_question_mark_on_a_port_that_passes_through_is_refused() {
+    let project = parse_enrich(
+        r#"
+g = Group(x?: String) {
+  d = Debug {}
+  d.data = self.x
+}
+each = Loop(items?: List[String], prefix?: String) -> (results: List[String | Null]) {
+  over: ["items"]
+  t = Text {}
+  t.value = self.items
+  self.results = t.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let refused: Vec<&str> = d.iter()
+        .filter(|e| e.code.as_deref() == Some("optional-pass-through-port"))
+        .map(|e| e.message.as_str())
+        .collect();
+    assert_eq!(refused.len(), 2, "{d:#?}");
+    assert!(refused.iter().any(|m| m.contains("'x'") && m.contains("group 'g'")), "{refused:#?}");
+    assert!(refused.iter().any(|m| m.contains("'prefix'") && m.contains("loop 'each'")), "{refused:#?}");
+}
+
+/// A loop's output is read from outside the loop, as a group's is: read by
+/// the loop's name from anywhere inside it (a node in its body, a group in
+/// it, a loop nested in it, a carried port), the line is refused once.
+#[test]
+fn a_loops_own_output_is_not_read_from_inside_it() {
+    for (source, port) in [
+        (r#"
+each = Loop(items: List[String]) -> (results: List[String | Null]) {
+  over: ["items"]
+  t = Text { value: self.items }
+  self.results = t.value
+  peek = Debug { data: each.results }
+}
+each.items = ["a"]
+"#, "results"),
+        (r#"
+each = Loop(items: List[String]) -> (results: List[String | Null]) {
+  over: ["items"]
+  self.results = self.items
+  g = Group() {
+    peek = Debug { data: each.results }
+  }
+}
+each.items = ["a"]
+"#, "results"),
+        (r#"
+outer = Loop(items: List[String]) -> (results: List[String | Null]) {
+  over: ["items"]
+  self.results = self.items
+  inner = Loop(xs: List[String]) -> (rs: List[String | Null]) {
+    over: ["xs"]
+    self.rs = self.xs
+    peek = Debug { data: outer.results }
+  }
+  inner.xs = ["a"]
+}
+outer.items = ["a"]
+"#, "results"),
+        (r#"
+each = Loop(items: List[String], acc: String) -> (results: List[String | Null], acc: String) {
+  over: ["items"]
+  carry: ["acc"]
+  t = Text { value: self.items }
+  self.results = t.value
+  self.acc = t.value
+  peek = Debug { data: each.acc }
+}
+each.items = ["a"]
+each.acc = ""
+"#, "acc"),
+    ] {
+        let d = validate(&parse_enrich(source), &catalog());
+        let found: Vec<&str> = errors(&d).iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(found.len(), 1, "{source}\n{d:#?}");
+        assert!(found[0].contains(&format!("'self.{port}' is an output of")), "{source}\n{d:#?}");
     }
 }

@@ -1062,3 +1062,73 @@ fn enrich_errors_name_the_node_they_are_about() {
     assert_eq!(errors[0].subjects, vec!["bad".to_string()]);
     assert_eq!(errors[0].diagnostic().subjects, vec!["bad".to_string()]);
 }
+
+/// A group's input, and a loop's, gets the widget a node input of its type
+/// gets, for the editor to draw a value written there: a checkbox for a
+/// Boolean. A loop's is its `LoopIn`'s.
+#[test]
+fn a_container_input_gets_the_widget_of_its_type() {
+    let source = r#"
+g = Group(flag: Boolean, count: Number) {
+  shown = Debug {}
+  shown.data = self.flag
+  more = Debug {}
+  more.data = self.count
+}
+g.flag = true
+g.count = 2
+each = Loop(items: List[String], failed: Boolean) -> (seen: List[String | Null]) {
+  over: ["items"]
+  echo = Text {}
+  echo.value = self.items
+  self.seen = echo.value
+  shown = Debug {}
+  shown.data = self.failed
+}
+each.items = ["a"]
+each.failed = false
+"#;
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &catalog()).expect("enrich");
+    let widget = |group: &str, port: &str| {
+        let group = project.groups.iter().find(|g| g.id == group).expect("group");
+        let input = group.in_ports.iter().find(|p| p.name == port).expect("port");
+        serde_json::to_value(input.widget.as_ref().expect("a widget")).unwrap()["kind"].clone()
+    };
+    assert_eq!(widget("g", "flag"), serde_json::json!("checkbox"));
+    assert_eq!(widget("each", "failed"), serde_json::json!("checkbox"));
+    assert_ne!(widget("g", "count"), serde_json::json!("checkbox"));
+}
+
+/// A group's input passes through, and takes the drivers its resolved
+/// type takes, as a node input does. A loop's passes through unless the
+/// loop iterates or carries it.
+#[test]
+fn a_group_input_passes_through_and_takes_its_types_drivers() {
+    let source = r#"
+g = Group(maybe: String, sure: String) {
+  a = Debug {}
+  a.data = self.maybe
+  b = Debug {}
+  b.data = self.sure
+}
+g.sure = "x"
+each = Loop(items: List[String], prefix: String) -> (results: List[String | Null]) {
+  over: ["items"]
+  t = Text {}
+  t.value = self.items
+  self.results = t.value
+}
+each.items = ["a"]
+each.prefix = "p"
+"#;
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &catalog()).expect("enrich");
+    let group = project.groups.iter().find(|g| g.id == "g").unwrap();
+    let port = |name: &str| group.in_ports.iter().find(|p| p.name == name).unwrap();
+    assert!(port("maybe").passes_through && port("sure").passes_through);
+    assert_eq!(port("sure").accepts, weft_core::node::Accepts::for_type(&port("sure").port_type));
+    let each = project.groups.iter().find(|g| g.id == "each").unwrap();
+    let passes = |name: &str| each.in_ports.iter().find(|p| p.name == name).unwrap().passes_through;
+    assert!(!passes("items") && passes("prefix"));
+}

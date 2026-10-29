@@ -17,6 +17,7 @@
 	import { clampToRange } from '../../utils/input-field';
 	import { emptyToUnset } from '../../value-format';
 	import { fromPickerLocal, toPickerLocal } from '../../utils/datetime-field';
+	import { FIELD_PX, drawsClearButton } from '../../utils/config-strip';
 
 	let {
 		fields,
@@ -34,6 +35,7 @@
 		onReadonlyEdit,
 		onClear,
 		noticeOf,
+		fixedTextareas = false,
 	}: {
 		fields: FieldDefinition[];
 		config: Record<string, unknown>;
@@ -95,6 +97,10 @@
 		/// file-backed field whose file could not be read: the failure is
 		/// shown as a failure, never as content in an editor.
 		noticeOf?: (key: string) => string | undefined;
+		/// A textarea keeps a fixed height and no resize handle: inside a
+		/// container's config strip, whose height the layout works out
+		/// before it draws (`configStripOpenPx`).
+		fixedTextareas?: boolean;
 	} = $props();
 
 	/// Keydown handler for readonly text controls: an editing keystroke
@@ -227,25 +233,32 @@
 		     states); a port-driven row is never file-backed, so it never
 		     inherits a same-named config sibling's lock. -->
 		{@const ro = readonlyKeys?.has(field.key) ?? false}
+		{@const clears = onClear !== undefined && drawsClearButton(field, ownValue(portValues, field.key))}
 		<!-- data-field-key: a parent's right-click menu finds the field by it. -->
 		<div class="space-y-1" data-field-key={field.key}>
-			<div class="flex items-center justify-between">
-				<label id={`${domId(field)}-label`} for={domId(field)} class="text-[10px] text-muted-foreground font-medium block">
+			<div class="flex items-center justify-between" style="min-height: {FIELD_PX.labelRow}px; column-gap: {FIELD_PX.clearGap}px;">
+				<label id={`${domId(field)}-label`} for={domId(field)} class="text-[10px] text-muted-foreground font-medium block min-w-0 break-words" style="line-height: {FIELD_PX.labelLine}px;">
 					{field.label}
 				</label>
+				<!-- Only drawn with something in it: the row's gap stands
+				     between the label and this box even when it is empty,
+				     and a container's strip measures the label at the full
+				     width when no clear button draws (`stripFieldPx`). -->
+				{#if headerBadge || clears}
 				<div class="flex items-center gap-1">
 					{@render headerBadge?.(field)}
-					{#if onClear && field.portDriven && (field.type === 'checkbox' || field.type === 'select')
-						&& portValues && field.key in portValues && portValues[field.key] !== undefined && portValues[field.key] !== null}
+					{#if onClear && clears}
 						<button
 							type="button"
-							class="text-[9px] font-mono px-1 py-0.5 rounded nodrag bg-muted text-muted-foreground hover:text-destructive hover:bg-accent transition-colors"
+							class="text-[9px] font-mono py-0.5 rounded nodrag bg-muted text-muted-foreground hover:text-destructive hover:bg-accent transition-colors"
+							style="width: {FIELD_PX.clearButton}px;"
 							title={`Remove ${field.key} from the source, leaving the port unset.`}
 							aria-label={`Remove ${field.key} from the source`}
 							onclick={(e) => { e.stopPropagation(); onClear(field.key); }}
 						><span aria-hidden="true">&times;</span></button>
 					{/if}
 				</div>
+				{/if}
 			</div>
 
 			{#if noticeOf?.(field.key) !== undefined}
@@ -258,7 +271,7 @@
 					id={domId(field)}
 					readonly={ro}
 					class="text-xs px-2 py-1.5 rounded border-none outline-none font-mono nodrag nopan box-border block w-full {ro ? 'bg-rose-50 text-rose-700' : 'bg-muted'}"
-					style="resize: vertical; min-height: 60px; {fieldHeight(field)}"
+					style={fixedTextareas ? `resize: none; height: ${FIELD_PX.textarea}px;` : `resize: vertical; min-height: 60px; ${fieldHeight(field)}`}
 					placeholder={field.placeholder}
 					value={getDisplayValue(field)}
 					onfocusin={(e) => e.currentTarget.classList.add('nowheel')}
@@ -282,6 +295,7 @@
 					list={`${domId(field)}-options`}
 					readonly={ro}
 					class="w-full text-xs {ro ? 'bg-rose-50 text-rose-700' : 'bg-muted'} px-2 py-1.5 rounded border-none outline-none nodrag"
+					style="height: {FIELD_PX.input}px;"
 					placeholder="(unset)"
 					value={(effectiveValue(field) as string | undefined) ?? ''}
 					onchange={(e) => onUpdate(field.key, emptyToUnset(e.currentTarget.value.trim()), field.portDriven)}
@@ -302,6 +316,7 @@
 					id={domId(field)}
 					disabled={ro}
 					class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none"
+					style="height: {FIELD_PX.input}px;"
 					value={selected ?? ''}
 					onchange={(e) => onUpdate(field.key, e.currentTarget.value, field.portDriven)}
 					onclick={(e) => e.stopPropagation()}
@@ -330,6 +345,7 @@
 							type="button"
 							disabled={ro}
 							class="text-[10px] px-1.5 py-0.5 rounded transition-colors whitespace-nowrap nodrag {isSelected ? 'bg-primary text-primary-foreground' : 'bg-background text-muted-foreground hover:bg-accent'}"
+							style="height: {FIELD_PX.optionRow}px;"
 							onclick={(e) => {
 								e.stopPropagation();
 								const next = isSelected
@@ -347,6 +363,7 @@
 						id={`${domId(field)}-add`}
 						type="text"
 						class="w-full mt-1 text-xs bg-muted px-2 py-1.5 rounded border-none outline-none nodrag"
+						style="height: {FIELD_PX.input}px;"
 						placeholder="Add another, press Enter"
 						onclick={(e) => e.stopPropagation()}
 						onkeydown={(e) => {
@@ -375,7 +392,7 @@
 				{/if}
 				<div class="space-y-1">
 					{#each items as item, i}
-						<div class="group flex items-center gap-1 text-xs bg-muted rounded pl-2 pr-1 py-1">
+						<div class="group flex items-center gap-1 text-xs bg-muted rounded pl-2 pr-1 py-1" style="height: {FIELD_PX.listRow}px;">
 							<span class="flex-1 truncate">{item}</span>
 							{#if !ro}
 								<button
@@ -396,6 +413,7 @@
 						type="text"
 						readonly={ro}
 						class="w-full text-xs {ro ? 'bg-rose-50 text-rose-700' : 'bg-muted'} px-2 py-1.5 rounded border-none outline-none nodrag"
+						style="height: {FIELD_PX.input}px;"
 						placeholder={field.placeholder ?? 'Add one, press Enter'}
 						onclick={(e) => e.stopPropagation()}
 						onkeydown={(e) => {
@@ -409,7 +427,7 @@
 					/>
 				</div>
 			{:else if field.type === 'checkbox'}
-				<label class="flex items-center gap-2 cursor-pointer">
+				<label class="flex items-center gap-2 cursor-pointer" style="min-height: {FIELD_PX.checkboxLine}px;">
 					<input
 						type="checkbox"
 						disabled={ro}
@@ -418,7 +436,11 @@
 						onchange={(e) => onUpdate(field.key, e.currentTarget.checked, field.portDriven)}
 						onclick={(e) => e.stopPropagation()}
 					/>
-					<span class="text-xs text-muted-foreground">{field.description || field.label}</span>
+					<!-- The label row above already names the field: beside the box
+					     only a description, when there is one. -->
+					{#if field.description}
+						<span class="text-xs text-muted-foreground min-w-0 break-words" style="line-height: {FIELD_PX.checkboxLine}px;">{field.description}</span>
+					{/if}
 				</label>
 			{:else if field.type === 'number'}
 				<input
@@ -426,6 +448,7 @@
 					type="number"
 					readonly={ro}
 					class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none nodrag"
+					style="height: {FIELD_PX.input}px;"
 					placeholder={field.placeholder}
 					min={field.min}
 					max={field.max}
@@ -451,6 +474,7 @@
 					step="1"
 					readonly={ro}
 					class="w-full text-xs {ro ? 'bg-rose-50 text-rose-700' : 'bg-muted'} px-2 py-1.5 rounded border-none outline-none nodrag"
+					style="height: {FIELD_PX.input}px;"
 					value={toPickerLocal(effectiveValue(field))}
 					onchange={(e) => saveDatetime(field, e.currentTarget.value)}
 					onclick={(e) => e.stopPropagation()}
@@ -462,6 +486,7 @@
 					type="password"
 					readonly={ro}
 					class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none font-mono nodrag"
+					style="height: {FIELD_PX.input}px;"
 					placeholder={field.placeholder}
 					value={getDisplayValue(field)}
 					onfocus={() => fieldEditor.focus(fieldKey(field), getDisplayValue(field))}
@@ -478,6 +503,7 @@
 					type="text"
 					readonly={ro}
 					class="w-full text-xs {ro ? 'bg-rose-50 text-rose-700' : 'bg-muted'} px-2 py-1.5 rounded border-none outline-none nodrag"
+					style="height: {FIELD_PX.input}px;"
 					placeholder={field.placeholder}
 					value={getDisplayValue(field)}
 					onfocus={() => fieldEditor.focus(fieldKey(field), getDisplayValue(field))}

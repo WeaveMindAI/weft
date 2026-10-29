@@ -22,6 +22,8 @@ import type {
   NodeInstance,
   Edge as V1Edge,
   PortDefinition as V1Port,
+  MetadataInput,
+  MetadataRef,
 } from './lib/types';
 import { instanceFilled, instanceFilledValue } from '../protocol';
 
@@ -108,7 +110,9 @@ export function legsOf(e: HostEdge, loopIds: Set<string>): V1Edge[] {
   const legs: V1Edge[] = [];
   const push = (from: LegEnd, to: LegEnd, path: readonly string[]) => {
     legs.push({
-      id: `e-${from.node}-${from.handle ?? ''}-${to.node}-${to.handle ?? ''}`,
+      // The keys are part of the id, as in the compiler's `wire_id`: two
+      // legs between the same ports reading different keys are two lines.
+      id: `e-${from.node}-${from.handle ?? ''}-${to.node}-${to.handle ?? ''}${path.length > 0 ? `.${path.join('.')}` : ''}`,
       source: from.node,
       target: to.node,
       sourceHandle: from.handle,
@@ -142,6 +146,72 @@ export function legsOfAll(edges: readonly HostEdge[], loopIds: Set<string>): V1E
     }
   }
   return [...byId.values()];
+}
+
+/// Which inputs a metadata wire fills, and from which metadata port, keyed
+/// by the drawn node id the value lands on (a loop's boundary node is its
+/// loop box). The compiler resolves a metadata wire when the program
+/// compiles: it writes the value into the input as a port literal and the
+/// wire never runs, so the editor draws no wire. It shows the input as
+/// filled from that port instead, read-only, with the value the compiler
+/// wrote, which is why the literal leaves `portLiterals` and moves here.
+///
+/// The wire stops where the value lands (a node's input, or a group's or a
+/// loop's input seen from outside), which is the end of its last leg: a
+/// loop's `LoopIn` draws as the loop box, so the fill is keyed on the
+/// loop, whose own `portLiterals` hold the value. Its source
+/// is the port it leaves: a group's own port when the wire starts there
+/// (`via[0]` is that port's crossing), a loop's port when it leaves the
+/// loop's `LoopOut`, otherwise the node's.
+export function metadataFills(
+  wires: readonly HostEdge[],
+  loopIds: Set<string>,
+): Map<string, Record<string, MetadataRef>> {
+  const fills = new Map<string, Record<string, MetadataRef>>();
+  for (const w of wires) {
+    const legs = legsOf(w, loopIds);
+    const last = legs[legs.length - 1];
+    if (!last?.targetHandle) continue;
+    const via0 = w.via?.[0];
+    const from = via0?.group === w.source
+      ? { node: via0.group, handle: via0.port }
+      : nodeEnd(w.source, w.sourceHandle ?? null, 'source', loopIds);
+    if (!from.handle) continue;
+    let ports = fills.get(last.target);
+    if (!ports) fills.set(last.target, (ports = {}));
+    // One driver per input: the compiler refuses a second
+    // (`double-driven-port`), so two here is a broken parse.
+    if (ports[last.targetHandle]) {
+      throw new Error(`host-bridge: two metadata wires fill '${last.target}.${last.targetHandle}'`);
+    }
+    ports[last.targetHandle] = {
+      kind: 'port',
+      source: from.node,
+      port: from.handle,
+      ...(w.path && w.path.length > 0 ? { path: [...w.path] } : {}),
+    };
+  }
+  return fills;
+}
+
+/// A drawn node with the inputs a metadata wire fills (`metadataFills`)
+/// moved out of its written values: each keeps the value the compiler
+/// wrote, read-only, and the port it comes from.
+export function withMetadataInputs(node: NodeInstance, filled: Record<string, MetadataRef> | undefined): NodeInstance {
+  if (!filled) return node;
+  const ports = new Set(Object.keys(filled));
+  const drop = <T>(m: Record<string, T> | undefined): Record<string, T> | undefined =>
+    m && Object.fromEntries(Object.entries(m).filter(([port]) => !ports.has(port)));
+  const metadataInputs: Record<string, MetadataInput> = {};
+  for (const [port, from] of Object.entries(filled)) {
+    metadataInputs[port] = { from, value: node.portLiterals?.[port] };
+  }
+  return {
+    ...node,
+    portLiterals: drop(node.portLiterals),
+    portLiteralSpans: drop(node.portLiteralSpans),
+    metadataInputs,
+  };
 }
 
 function resolveParentGroup(node: HostNode, groupIds: Set<string>): string | undefined {
@@ -237,6 +307,7 @@ function groupToNodeInstance(g: HostGroup): NodeInstance {
     portLiteralSpans: g.portLiteralSpans,
     inputs: g.inPorts.map(copyPort),
     outputs: g.outPorts.map(copyPort),
+    ...(g.metadataPorts ? { metadataPorts: g.metadataPorts.map((m) => ({ ...m })) } : {}),
     features: {},
     ...(g.typeParams ? { typeParams: g.typeParams } : {}),
     scope: parentId ? [parentId] : [],
@@ -276,6 +347,7 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
     sourceLine: n.headerSpan?.startLine ?? n.span?.startLine,
     inputs: n.inputs.map(copyPort),
     outputs: n.outputs.map(copyPort),
+    ...(n.metadataPorts ? { metadataPorts: n.metadataPorts.map((m) => ({ ...m })) } : {}),
     features: n.features,
     ...(n.typeParams ? { typeParams: n.typeParams } : {}),
     requiresInfra: n.requiresInfra,
@@ -293,15 +365,16 @@ export function translateProject(
 ): V1Project {
   const groupIds = new Set(host.groups.map((g) => g.id));
   const loopIds = new Set(host.groups.filter((g) => g.kind === 'loop').map((g) => g.id));
+  const filled = metadataFills(host.metadataWires ?? [], loopIds);
   const structuralNodes: NodeInstance[] = [];
   // Groups first (v1 requires parent-before-child order).
   for (const g of host.groups) {
-    structuralNodes.push(groupToNodeInstance(g));
+    structuralNodes.push(withMetadataInputs(groupToNodeInstance(g), filled.get(g.id)));
   }
   for (const n of host.nodes) {
     // A loop's LoopIn / LoopOut draw as the loop box's two faces.
     if (n.groupBoundary) continue;
-    structuralNodes.push(toV1Node(n, groupIds));
+    structuralNodes.push(withMetadataInputs(toV1Node(n, groupIds), filled.get(n.id)));
   }
   const edges = legsOfAll(host.edges, loopIds);
 

@@ -8,18 +8,11 @@
 // extension, which vite bundles, import the package by name.
 import type { AccessSpecWire, AppRegistration, CredentialOwner } from '../../weft-connect/src/core/wire';
 
-export interface Span {
-  startLine: number;
-  startColumn: number;
-  endLine: number;
-  endColumn: number;
-}
-
 // The input vocabulary (ports, their drivers, the control an input draws)
 // lives in the connect library, whose instance page draws a program's inputs
 // too; the graph protocol names it from there.
-export type { AcceptedForm, Accepts, CodeLanguage, PortDefinition, InputDefinition, Widget } from '../../weft-connect/src/core/wire';
-import type { Accepts, PortDefinition, InputDefinition, Widget } from '../../weft-connect/src/core/wire';
+export type { AcceptedForm, Accepts, CodeLanguage, MetadataExpr, MetadataPort, PortDefinition, InputDefinition, Span, Widget } from '../../weft-connect/src/core/wire';
+import type { Accepts, MetadataPort, PortDefinition, InputDefinition, Span, Widget } from '../../weft-connect/src/core/wire';
 
 /// Source span of one config field plus how it was written. `origin` tells
 /// the editor how to rewrite the field in place: an inline field
@@ -653,6 +646,10 @@ export interface NodeFeaturesWire {
   canAddInputPorts?: boolean;
   canAddOutputPorts?: boolean;
   addedPortsAreDataKeys?: boolean;
+  /// Each added input comes with a same-named output the compiler makes,
+  /// so the node offers no output adder of its own: a person adds the
+  /// input and the output follows.
+  pairsAddedPorts?: boolean;
   isTrigger?: boolean;
   showDebugPreview?: boolean;
   /// Names the endpoint serving the node's `/live` HTTP route the
@@ -698,6 +695,10 @@ export interface NodeDefinition {
   portLiterals?: Record<string, unknown>;
   portLiteralSpans?: Record<string, ConfigFieldSpan>;
   fileRefs?: Record<string, FileRef>;
+  /// The node's metadata ports: its node type's, or on an opaque
+  /// `@include` node, the file's group's. Never drawn on the canvas.
+  // SYNC: NodeDefinition.metadataPorts <-> crates/weft-core/src/project.rs NodeDefinition.metadata_ports
+  metadataPorts?: MetadataPort[];
   /// Set on an opaque `@include` node: the included `.weft` file path. The
   /// editor renders this as an expandable group that navigates into the file.
   includePath?: string;
@@ -832,8 +833,14 @@ export interface GroupDefinition {
   /// segment. The slot exists so a future label syntax needs no wire
   /// change.
   label: string | null;
-  inPorts: PortDefinition[];
+  /// Each as full an input as a node's, the widget for a value written
+  /// on it included (a loop's its `LoopIn`'s).
+  inPorts: InputDefinition[];
   outPorts: PortDefinition[];
+  /// The header's `*name: Type` ports, each with the value the body
+  /// writes (`self.name = ...`).
+  // SYNC: GroupDefinition.metadataPorts <-> crates/weft-core/src/project.rs GroupDefinition.metadata_ports
+  metadataPorts?: MetadataPort[];
   parentGroupId: string | null;
   childGroupIds: string[];
   nodeIds: string[];
@@ -877,6 +884,14 @@ export interface ProjectDefinition {
   // (first plain `# ...` body line). The Rust `ProjectDefinition` mirrors this.
   nodes: NodeDefinition[];
   edges: Edge[];
+  /// The wires that leave a metadata port. The compiler has already
+  /// written each one's value into the input it points at (that input's
+  /// `portLiterals` entry), so none of them runs and the editor draws
+  /// none: it shows each input they fill as filled from that port. Each
+  /// stops where the value lands: a node's input, or a group's port seen
+  /// from outside.
+  // SYNC: ProjectDefinition.metadataWires <-> crates/weft-core/src/project.rs ProjectDefinition.metadata_wires
+  metadataWires?: Edge[];
   groups: GroupDefinition[];
   /// Where a run of a cut is given what it does not compute (the values
   /// are the run's own, never the program's). Absent in a program as
@@ -1026,6 +1041,9 @@ export interface CatalogEntry {
   color?: string;
   inputs: InputSpec[];
   outputs: OutputSpec[];
+  /** The node type's metadata ports, each with its hand-written value. */
+  // SYNC: CatalogEntry.metadataPorts <-> crates/weft-core/src/node.rs NodeMetadata.metadata_ports
+  metadataPorts?: MetadataPort[];
   requiresInfra?: boolean;
   features?: NodeFeaturesWire;
   /** The node's declared inline per-firing display (a media player, a
@@ -2945,7 +2963,13 @@ export type EditOp =
   // SYNC: set_value_form.form <-> crates/weft-compiler/src/edit.rs ValueForm, packages/weft-graph/src/webview/lib/types/index.ts portValueForm.form
   | { op: 'set_value_form'; node: string; key: string; form: 'inline' | 'connection' }
   | { op: 'set_loop_config'; loopId: string; key: string; value: string }
-  | { op: 'remove_loop_config'; loopId: string; key: string };
+  | { op: 'remove_loop_config'; loopId: string; key: string }
+  // Write a group's or a loop's metadata port value: the `self.<port> =
+  // <value>` line of its body (`group` is either's id), rewritten in place
+  // when it exists. `value` is weft literal source text, the encoding
+  // `set_config` uses; null removes the line.
+  // SYNC: EditOp set_metadata_value <-> crates/weft-compiler/src/edit.rs EditOp::SetMetadataValue
+  | { op: 'set_metadata_value'; group: string; port: string; value: string | null };
 
 // SYNC: EditPortSig <-> crates/weft-compiler/src/edit.rs PortSig
 // (`rendered` is projection-only and deliberately absent on the Rust side.)
@@ -2963,6 +2987,13 @@ export interface EditPortSig {
    *  must keep showing the rendered type, exactly as a reparse would);
    *  the server ignores it. */
   rendered?: string;
+  /** A metadata port (`*name: Type` in a container's header). Only in a
+   *  container's `outputs`, which carries them after the ordinary ones,
+   *  the order the header writes them in. Required, like `required` and
+   *  `portType`: an omitted flag would turn a metadata port into an
+   *  ordinary output in the author's header, so the server refuses one. */
+  // SYNC: EditPortSig.metadata <-> crates/weft-compiler/src/edit.rs PortSig.metadata
+  metadata: boolean;
 }
 
 /** A port a gesture returned to its provided shape (projection-only,

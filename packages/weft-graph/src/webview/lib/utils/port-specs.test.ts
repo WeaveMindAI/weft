@@ -33,7 +33,7 @@ describe('entryPortCollisions', () => {
 	};
 	const specMap = buildSpecMap([approve]);
 	const entry = (key: string): PortEntryDef => ({ kind: 'approve_reject', key });
-	const noReserved = { inputs: [], outputs: [] };
+	const noReserved = { inputs: [], outputs: [], metadata: [] };
 
 	it('finds nothing when the entry is alone', () => {
 		expect(entryPortCollisions(entry('send'), [], specMap, noReserved)).toEqual([]);
@@ -65,8 +65,15 @@ describe('entryPortCollisions', () => {
 		// The catalog's own ports and the instance's declared header
 		// ports are reserved per side, matching the compiler's
 		// duplicate-port rule: an input and an output may share a name.
-		const reserved = { inputs: ['sendApproved'], outputs: ['sendRejected'] };
+		const reserved = { inputs: ['sendApproved'], outputs: ['sendRejected'], metadata: [] };
 		expect(entryPortCollisions(entry('send'), [], specMap, reserved)).toEqual(['sendRejected']);
+	});
+
+	it('refuses a metadata port\'s name on either side', () => {
+		// A metadata port shares one name space with both lists, so
+		// `self.x` never means two things.
+		const reserved = { inputs: [], outputs: [], metadata: ['sendApproved'] };
+		expect(entryPortCollisions(entry('send'), [], specMap, reserved)).toEqual(['sendApproved']);
 	});
 
 	it('_should_flow is reserved on the input side of every node', () => {

@@ -18,6 +18,8 @@
 	import { emptyToUnset, isFileRefValue, type WeftFileRefValue } from '../../value-format';
 	import { openPortMenu, buildPortMenuItems, instanceFilledMenuItem, type InstanceFilledToggle } from "../../utils/port-context-menu";
 	import { portMarkerStyle, requirednessNote } from "../../utils/port-marker";
+	import { metadataRefLabel } from "../../utils/metadata-expr";
+	import MetadataRefChip from './MetadataRefChip.svelte';
 	import { isScopeKey } from "../../utils/storage-key";
 	import { nodeIsTrigger } from "../../utils/node-roles";
 	import { declarationRule, nodeInputRequiredness, portDeleteAction } from "../../projection/header-ports";
@@ -56,6 +58,10 @@
 			portLiteralSpans?: Record<string, ConfigFieldSpan>;
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
+			/// The node type's metadata ports (the include's file's, on an
+			/// include card). Never drawn; their names guard the ports the
+			/// node's config list may add.
+			metadataPorts?: import('../../../../protocol').MetadataPort[];
 			features?: NodeFeatures;
 			/// The bounds on the node's type variables, each with what it
 			/// resolved to; absent on a node not parsed yet.
@@ -87,6 +93,12 @@
 			onToggleGate?: () => void;
 			onSaveFileRef?: (path: string, content: string) => void;
 			onOpenInclude?: (path: string, alias: string) => void;
+			/// The inputs a metadata wire fills (`MetadataInput`): shown
+			/// read-only, with the port each comes from.
+			metadataInputs?: Record<string, import('../../types').MetadataInput>;
+			/// Take the person to a node or group by its scoped id (a "comes
+			/// from" link). Absent on a view that cannot move.
+			onReveal?: (id: string) => void;
 			/// A trigger's or an infra node's badge (`on`, `behind`,
 			/// `3 of 5 running`...), from the state the dispatcher computed;
 			/// its detail shows on hover.
@@ -221,13 +233,20 @@
 	 *  home per name, separate from config). */
 	const portLiterals = $derived((data.portLiterals as Record<string, unknown>) ?? {});
 	const portLiteralSpans = $derived(data.portLiteralSpans ?? {});
+	/** The inputs a metadata wire fills: their value is the compiler's,
+	 *  shown read-only with where it comes from, never a field to edit. */
+	const metadataInputs = $derived(data.metadataInputs ?? {});
+	/** The group the node is written in: a "comes from" name reads
+	 *  relative to it, as the source writes it. */
+	const writtenIn = $derived((data.config as Record<string, unknown>)?.parentId as string | undefined);
 
 	/** Input ports satisfied by a body-set literal and no edge. These
 	 *  render with the 'empty-dotted' port marker to signal "filled from
 	 *  code" without changing the declared port type; docking onto one is
 	 *  vetoed until the literal is unset (one driver per port). */
 	const literalFilledPorts: Set<string> = $derived.by(() => {
-		const filled = new Set<string>();
+		// An input a metadata wire fills is filled from code the same way.
+		const filled = new Set<string>(Object.keys(metadataInputs).filter((name) => !wiredInputPorts.has(name)));
 		for (const [name, v] of Object.entries(portLiterals)) {
 			if (wiredInputPorts.has(name)) continue;
 			// The one notion of "has a value" (an empty string counts: the
@@ -434,9 +453,7 @@
 			if (!port) return null;
 			const provided = side === 'input' ? providedInputs : providedOutputs;
 			const derivedNames = side === 'input' ? derivedPortLists.ins : derivedPortLists.outs;
-			const canAddPorts = (side === 'input'
-				? typeConfig.features?.canAddInputPorts
-				: typeConfig.features?.canAddOutputPorts) ?? false;
+			const canAddPorts = side === 'input' ? canAddInputPorts : offersOutputAdder;
 			return buildPortMenuItems({
 				port,
 				...(side === 'input'
@@ -510,6 +527,9 @@
 	 *  COMPLETE list (edits round-trip the full set). */
 	const rowOutputs = $derived(outputRows(outputs));
 	const errorDockState = $derived(errorMarker(id, outputs, edgesState.current));
+	/** The node's metadata ports: no port the config list adds may take
+	 *  one of their names. */
+	const metadataPorts = $derived(data.metadataPorts ?? []);
 
 	// Dynamic min resize height: header + ports + fixed buffer for at least one config line
 	// Accent bar (2) + header row (32) + content padding (16) + label (24) + ports gap (8) + port rows + buffer (100)
@@ -521,6 +541,9 @@
 	// Check if node allows adding ports based on its features
 	const canAddInputPorts = $derived(typeConfig.features?.canAddInputPorts ?? false);
 	const canAddOutputPorts = $derived(typeConfig.features?.canAddOutputPorts ?? false);
+	// A node that pairs its added ports makes each added output from the
+	// input of its name, so a person adds the input and never an output.
+	const offersOutputAdder = $derived(canAddOutputPorts && !(typeConfig.features?.pairsAddedPorts ?? false));
 
 	// The ports each side is PROVIDED (the header aside): catalog
 	// defaults plus the ports the config entry list derives. The one
@@ -662,8 +685,9 @@
 		const keys = new Set<string>();
 		for (const field of displayedFields) {
 			// A field each instance fills shows that, never a control: the
-			// value is the instance's, not the source's.
-			if (EXOTIC_FIELD_TYPES.has(field.type) || instanceFilledField(field)) keys.add(field.key);
+			// value is the instance's, not the source's. A field a metadata
+			// wire fills shows the compiler's value and where it comes from.
+			if (EXOTIC_FIELD_TYPES.has(field.type) || instanceFilledField(field) || metadataInputs[field.key]) keys.add(field.key);
 		}
 		return keys;
 	});
@@ -699,7 +723,7 @@
 	/// an input port's value, and an include's ports (a boundary; the
 	/// mark goes on the node inside).
 	function instanceFilledToggle(key: string): InstanceFilledToggle | null {
-		if (isInclude || key.startsWith('_')) return null;
+		if (isInclude || key.startsWith('_') || metadataInputs[key]) return null;
 		const field = displayedFields.find((f) => f.key === key);
 		if (!field?.portDriven) return null;
 		if (edgesState.current.some((e: Edge) => e.target === id && e.targetHandle === key)) return null;
@@ -1323,6 +1347,7 @@
 		const collisions = entryPortCollisions(entry, others, entryKindByName, {
 			inputs: [...typeConfig.defaultInputs.map((p) => p.name), ...declaredNames(inputs, derivedIns)],
 			outputs: [...typeConfig.defaultOutputs.map((p) => p.name), ...declaredNames(outputs, derivedOuts)],
+			metadata: metadataPorts.map((m) => m.name),
 		});
 		if (collisions.length > 0) {
 			toast.error(`Port name conflict: "${collisions.join('", "')}" already exists. Choose a different name.`);
@@ -1794,6 +1819,7 @@
 			style="top: 50%; z-index: 5; {simplifiedDotStyle(typeConfig.color)}"
 		/>
 	{/if}
+
 {:else}
 
 <!-- Node Resizer - only visible when selected AND expanded -->
@@ -1946,7 +1972,9 @@
 						class="relative flex items-center gap-1 group pl-3"
 						title={!input.required && oneOfRequiredPorts.has(input.name)
 							? `At least one required: ${oneOfRequiredGroups.filter(g => g.includes(input.name)).map(g => g.join(' or ')).join('; ')}`
-							: requirednessNote(input, wiredInputPorts.has(input.name)) ?? input.name}
+							: metadataInputs[input.name]
+								? `${input.name}: comes from ${metadataRefLabel(metadataInputs[input.name].from, writtenIn)}`
+								: requirednessNote(input, wiredInputPorts.has(input.name)) ?? input.name}
 						oncontextmenu={(e) => {
 							e.preventDefault();
 							e.stopPropagation();
@@ -2000,7 +2028,7 @@
 			<div class="space-y-1 text-right flex flex-col items-end min-w-0 flex-1">
 				{#each rowOutputs as output}
 				{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, literalFilledPorts, getPortColor(output.portType), 'output')}
-				{@const outputDeleteAction = portDeleteAction(output, providedOutputs, canAddOutputPorts)}
+				{@const outputDeleteAction = portDeleteAction(output, providedOutputs, offersOutputAdder)}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
 				<div
 					class="relative flex items-center gap-1 justify-end group pr-3"
@@ -2028,7 +2056,7 @@
 					<span class="truncate" title={output.name}>{output.name}</span>
 				</div>
 			{/each}
-				{#if canAddOutputPorts}
+				{#if offersOutputAdder}
 					{#if addingOutputPort}
 						<div class="flex items-center gap-1 justify-end">
 							<input
@@ -2168,6 +2196,11 @@
 								: `Switch ${ref?.path} to pull-only @asset`}
 							onclick={(e) => { e.stopPropagation(); switchFileMarker(field.key); }}
 						><span aria-hidden="true">{ref?.marker === 'asset' ? '🔒' : '📄'}</span> {ref?.path}</button>
+					{:else if metadataInputs[field.key]}
+						<!-- Where a value a metadata wire brings comes from: a
+						     link that takes the person there. -->
+						{@const from = metadataInputs[field.key].from}
+						<span class="text-[10px] text-muted-foreground truncate">from <MetadataRefChip ref={from} label={metadataRefLabel(from, writtenIn)} onReveal={data.onReveal} /></span>
 					{:else if field.portDriven && !isInclude}
 						{@const form = portFieldForm(field.key)}
 						{@const instanceToggle = instanceFilledToggle(field.key)}
@@ -2213,7 +2246,24 @@
 							<label for={`${id}-field-${field.key}`} class="text-[10px] text-muted-foreground font-medium">{field.label}</label>
 							{@render headerBadge(field)}
 						</div>
-						{#if instanceFilledField(field)}
+						{#if metadataInputs[field.key]}
+							<!-- The value the compiler wrote, read-only, in the same box
+							     every code value of a node body takes. A person changes
+							     it where it comes from (the link above). -->
+							<!-- Held at the code fields' height, with their corner
+							     handle: a tool list runs far longer than is worth
+							     showing at once. Read-only, so the wheel always
+							     scrolls it, like the node's other read-only boxes. -->
+							<div class="nodrag nopan nowheel" onclick={(e) => e.stopPropagation()}>
+								<CodeEditor
+									value={metadataInputs[field.key].value === undefined ? '' : JSON.stringify(metadataInputs[field.key].value, null, 2)}
+									readonly
+									language="json"
+									height="120px"
+									resizable
+								/>
+							</div>
+						{:else if instanceFilledField(field)}
 							{@const filled = instanceFilledField(field)}
 							<!-- @instance_filled: each instance gets its own value, on
 							     its own page or through the program; the source holds

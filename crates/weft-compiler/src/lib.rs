@@ -21,8 +21,10 @@
 //!    Every error is collected, never an abort: the build's
 //!    `compile_program` turns the ones about some parts into broken
 //!    parts, the editor's `parse_only` renders around them.
-//! 3. `enrich` fills each node's ports and features from its catalog
-//!    metadata, materializes config-derived and custom ports, and
+//! 3. `enrich` first writes the value of every metadata wire into the
+//!    input it points at and takes the wire out of the program's wires
+//!    (`metadata`), then fills each node's ports and features from its
+//!    catalog metadata, materializes config-derived and custom ports, and
 //!    resolves TypeVars.
 //! 4. `validate` checks the graph (ids, scopes, port types, required
 //!    ports and `@require_one_of`, loops, trigger and infra placement,
@@ -52,6 +54,7 @@ pub mod project;
 pub mod source_name;
 pub mod weft_compiler;
 pub(crate) mod wires;
+pub(crate) mod metadata;
 pub mod cst;
 pub mod edit;
 pub mod file_reader;
@@ -166,6 +169,7 @@ fn parse_only_inner(
     for e in parse_errors {
         diagnostics.push(e.diagnostic("parse"));
     }
+    included_metadata_values(&mut project, fs, catalog);
 
     // Stage 3: enrich (lenient). Unknown types / catalog misses become
     // empty-port placeholders, not aborts. The failures that SURVIVE lenient
@@ -212,6 +216,45 @@ fn parse_only_inner(
     ));
 
     (project, diagnostics)
+}
+
+/// The metadata values an `@include`'s opaque node cannot know from its
+/// file's header: the ones the file gathers from its own members
+/// (`self.tools = [...screen.tools]`). Each such file is compiled whole, as
+/// the build compiles it, once however many `@include`s name it, and its
+/// values are worked out there, so a wire from the include in the editor
+/// writes what the build writes. A file that does not read, or a value it
+/// cannot work out, leaves the value unknown here, and the inputs wired
+/// from it are not reported as missing a driver: what is wrong is said
+/// where it is written, in that file (open it, or build, to see it), as
+/// for anything else inside an include.
+fn included_metadata_values(project: &mut ProjectDefinition, fs: CompileFs, catalog: &dyn MetadataCatalog) {
+    let (Some(root), Some(base)) = (fs.root, fs.base) else { return };
+    let mut worked_out: std::collections::HashMap<String, Vec<weft_core::project::MetadataPort>> = std::collections::HashMap::new();
+    for node in project.nodes.iter_mut() {
+        let Some(path) = &node.include_path else { continue };
+        if node.metadata_ports.iter().all(|port| port.value.is_some()) {
+            continue;
+        }
+        if !worked_out.contains_key(path) {
+            let Ok(file) = fs.reader.resolve_and_read(root, base, std::path::Path::new(path)) else { continue };
+            let body_id = source_name::body_id(&file.file.from_root);
+            let (mut whole, _) = weft_compiler::compile_lenient(
+                file.content.as_str(),
+                project.id,
+                fs.anchored_at(file.file.identity.parent()),
+                weft_compiler::IncludeMode::Full,
+                Some(&body_id),
+            );
+            metadata::resolve(&mut whole, catalog);
+            let ports = whole.groups.into_iter().find(|group| group.id == body_id).map(|group| group.metadata_ports).unwrap_or_default();
+            worked_out.insert(path.clone(), ports);
+        }
+        let ports = &worked_out[path];
+        for port in node.metadata_ports.iter_mut().filter(|port| port.value.is_none()) {
+            port.value = ports.iter().find(|p| p.name == port.name).and_then(|p| p.value.clone());
+        }
+    }
 }
 
 /// Strict sibling of `parse_only`: the full pipeline (lex + parse +
@@ -483,5 +526,6 @@ fn empty_project(project_id: Uuid) -> ProjectDefinition {
         defaults: Default::default(),
         given: Default::default(),
         broken: Vec::new(),
+        metadata_wires: Vec::new(),
     }
 }

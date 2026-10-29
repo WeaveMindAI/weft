@@ -641,6 +641,8 @@ export interface NodeTemplate {
 	requiresInfra: boolean;
 	defaultInputs: PortDefinition[];
 	defaultOutputs: TemplateOutputPort[];
+	/** The node type's metadata ports, each with its hand-written value. */
+	metadataPorts?: import('../../../protocol').MetadataPort[];
 	/** The bound on each type variable the node type's ports use. */
 	typeParams?: import('../../../protocol').TypeParamWire[];
 	features?: NodeFeatures;
@@ -700,6 +702,15 @@ export interface NodeInstance {
 	parentId?: string;
 	inputs: PortDefinition[];
 	outputs: PortDefinition[];
+	/// The ports whose value is written with the program (the wire's
+	/// `metadataPorts`), declared in code only and never drawn on the
+	/// canvas. A group's carry the value its body writes, shown in its
+	/// config strip.
+	metadataPorts?: import('../../../protocol').MetadataPort[];
+	/// The inputs a metadata wire fills, by input name (`MetadataInput`).
+	/// Kept apart from `portLiterals`, which holds only what the program
+	/// writes on the input itself.
+	metadataInputs?: Record<string, MetadataInput>;
 	features: NodeFeatures;
 	/// The bounds on the node's type variables, each with what it
 	/// resolved to (the wire's `typeParams`). A group carries its
@@ -744,6 +755,19 @@ export interface Edge {
 	path?: string[];
 }
 
+/// A metadata port named from somewhere else: the scoped id of the node
+/// or group it belongs to, the port, and the keys read off its value
+/// (`calls.tools.anthropic`). The same shape a gathered value writes it in.
+export type MetadataRef = Extract<import('../../../protocol').MetadataExpr, { kind: 'port' }>;
+
+/// An input a metadata wire fills: the compiler wrote `value` into it when
+/// the program compiled, from the metadata port `from`. Read-only in the
+/// editor: a person changes it where `from` is written.
+export interface MetadataInput {
+	from: MetadataRef;
+	value: unknown;
+}
+
 export interface ProjectDefinition {
 	id: string;
 	// A project carries no name/description: identity is the manifest file name,
@@ -780,6 +804,10 @@ export interface NodeDataUpdates {
 	portValueForm?: { key: string; form: 'inline' | 'connection' };
 	inputs?: PortDefinition[];
 	outputs?: PortDefinition[];
+	/// A container's metadata port value, written in its body
+	/// (`self.<port> = <value>`); null removes the line. Becomes a
+	/// `set_metadata_value` op, after any header change in the same update.
+	metadataValue?: { port: string; value: unknown };
 	/// Set ONLY when the user dragged the resize handle. The host re-runs ELK on a
 	/// resize (neighbours make room), so this must distinguish a real user resize
 	/// from a programmatic dimension write (min-height auto-enforce, a rebuild after
@@ -807,15 +835,21 @@ export function isContainerNodeType(nodeType: unknown): boolean {
 }
 
 /** True iff an expanded container draws its config strip: a loop always
- *  (its knobs live there), and any container carrying values written on
- *  its interface ports. Both the renderer and the layout engine ask
+ *  (its knobs live there), any container carrying values written on its
+ *  interface ports or brought to them by a metadata wire, and any with a
+ *  metadata port (its value shows there). Both the renderer and the layout engine ask
  *  this, so the strip and the space reserved for it cannot disagree. */
 export function containerHasConfigStrip(
 	nodeType: unknown,
 	portLiterals: Record<string, unknown> | undefined,
+	metadataPorts: readonly unknown[] | undefined,
+	metadataInputs: Record<string, unknown> | undefined,
 ): boolean {
 	if (!isContainerNodeType(nodeType)) return false;
-	return isLoopNodeType(nodeType) || Object.keys(portLiterals ?? {}).length > 0;
+	return isLoopNodeType(nodeType)
+		|| Object.keys(portLiterals ?? {}).length > 0
+		|| Object.keys(metadataInputs ?? {}).length > 0
+		|| (metadataPorts?.length ?? 0) > 0;
 }
 
 /** The written form a port value takes on its FIRST write, when no

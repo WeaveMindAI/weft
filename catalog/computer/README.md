@@ -11,14 +11,12 @@ If you only want an agent working a computer, this is the whole program:
 
 ```weft
 box = Computer
-tools = ComputerTools
 anthropic = AnthropicAccess
 model = AnthropicModel { access: anthropic.access, model: "claude-sonnet-5" }
 
 agent = @include("__catalog/base_catalog/computer/agent.weft")
 agent.task = "Find the weather in Paris tomorrow and write it to ~/weather.txt"
 agent.computer = box.computer
-agent.tools = tools.tools
 agent.model = model.provider
 
 out = Debug { data: agent.answer }
@@ -162,25 +160,31 @@ nothing an earlier command left running.
 
 ## How a model's call reaches a node
 
-`ComputerTools` writes the tool declarations for an LLM node's `tools`. They
-copy one vendor's own computer tool, name for name and field for field,
-because that is what the models were trained on: `style: "anthropic"` gives
-Claude's names (`left_click`, `key`, `zoom`, ...), `style: "openai"` gives
-GPT's (`click`, `keypress`, ...), and both add `bash` for the shell. For a
-model that is neither Claude nor GPT, either style works. They are ordinary
+Each action node describes the tools a model calls it through on its `tools`
+metadata port, an `ActionTools` record holding two lists of `LlmTool`. They
+copy each vendor's own computer tool, name for name and field for field,
+because that is what the models were trained on: `anthropic` holds Claude's
+names (`left_click`, `key`, `zoom`, ...), `openai` GPT's (`click`,
+`keypress`, ...), and `RunCommand` adds `bash` for the shell to both. For a
+model that is neither Claude nor GPT, either list works. They are ordinary
 function tools, so they go through any provider, OpenRouter included, which
-refuses the vendors' built-in computer tools. Each action has a switch, all
-on by default, and the screenshot is always declared. Zoom, mouse down and
-up, cursor position, triple clicks, holding a key down, and a wait of a
-chosen length exist only in Anthropic's style; the back and forward buttons
-only in OpenAI's.
+refuses the vendors' built-in computer tools. Zoom, mouse down and up,
+cursor position, triple clicks and holding a key down exist only in
+Anthropic's list; the back and forward buttons only in OpenAI's.
+
+If you want to hand a model the actions you wire, gather their `tools` the
+way `perform.weft` does, in one metadata port of your own
+(`self.tools = { "anthropic": [...click.tools.anthropic, ...], ... }`), and
+wire one list of it into the LLM node's `tools`. An action you leave out is
+one the model is never offered.
 
 `RouteComputerCall` takes one call at a time, so it sits inside a Loop over
 the LLM node's `toolCalls`. It recognizes the call in either style and puts
 its arguments, translated to the one shape the action nodes take, on that
 action's port. Every other port closes, so the one action node wired to the
 port that fired is the one that runs. A call to any other tool comes out on
-`other`, untouched, so you can route your own tools from there.
+`other`, untouched, so you can send it on to your own tools from there
+with a `Dispatch`.
 
 ## The two premade files
 
@@ -197,10 +201,14 @@ result, or why it failed; for a command, its output through `TextPreview`
 closed unless something went wrong, a call to a tool that is not a computer
 action included.
 
+`perform.weft` also hands out, on its `tools` metadata port, every action it
+performs, described in both vendors' names.
+
 `__catalog/base_catalog/computer/agent.weft` takes `task`, `computer`,
-`tools` (only `ComputerTools`' declarations: a call to any other tool counts
-as a failed action), `model`, and an optional `agentId`, and gives back
-`answer`. Its commands run in a session of its own, named after the run's
+`model`, and an optional `agentId`, and gives back
+`answer`. It offers the model the actions in Anthropic's names; if your
+model is a GPT, change `calls.tools.anthropic` to `calls.tools.openai` in
+your copy of the file. Its commands run in a session of its own, named after the run's
 id, or the run's id and `agentId` when that is set, so several agents in one
 run keep apart; it ends its session when it answers. A run that fails or
 is stopped before that leaves the session up, with whatever its commands

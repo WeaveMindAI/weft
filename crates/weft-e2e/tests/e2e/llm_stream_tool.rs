@@ -1,9 +1,10 @@
 //! The two ai/llm RUNTIME mechanisms no node test can reach, against
 //! the real service: LlmStream really streams (the journaled bus
 //! deltas concatenate to the final response), and the tool loop closes
-//! entirely in the graph (a forced tool call comes out on `toolCalls`,
-//! ExecPython plays the tool, Chat Message appends the role-tool
-//! result, and a prompt-less re-entry answers from it). Per-provider
+//! entirely in the graph (a forced tool call comes out on `toolCalls`, a
+//! Dispatch sends it to the tool group whose metadata port described the
+//! tool to the model, Chat Message appends the role-tool result, and a
+//! prompt-less re-entry answers from it). Per-provider
 //! wire correctness is node-tested in ai/llm, never here.
 //!
 //! Spends real money (fractions of a cent on the cheapest model).

@@ -193,8 +193,10 @@ export function deriveOutputsFromEntries(
 // Duplicate detection runs PER SIDE, matching the compiler's rule: a
 // node legitimately has an input and an output sharing a name (a
 // passthrough's `value`/`value`), so crossing the sides would
-// false-positive every one of them.
-// SYNC: entryPortCollisions <-> crates/weft-compiler/src/validate.rs duplicate-port
+// false-positive every one of them. A metadata port's name is the one
+// that crosses: it may be no input's and no output's, so it is reserved
+// on both sides.
+// SYNC: entryPortCollisions <-> crates/weft-compiler/src/validate.rs duplicate-port, crates/weft-compiler/src/validate.rs check_metadata_ports
 export function entryPortCollisions(
 	entry: PortEntryDef,
 	others: PortEntryDef[],
@@ -205,7 +207,7 @@ export function entryPortCollisions(
 	// collision. The language's own ports are reserved on every node
 	// (the gate on the input side, `_error` on the output side), so they
 	// are seeded here rather than left to each caller.
-	reserved: { inputs: string[]; outputs: string[] },
+	reserved: { inputs: string[]; outputs: string[]; metadata: string[] },
 ): string[] {
 	const collide = (
 		added: { name: string }[],
@@ -219,12 +221,12 @@ export function entryPortCollisions(
 		...collide(
 			deriveInputsFromEntries([entry], specMap),
 			deriveInputsFromEntries(others, specMap),
-			[...reserved.inputs, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT],
+			[...reserved.inputs, ...reserved.metadata, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT],
 		),
 		...collide(
 			deriveOutputsFromEntries([entry], specMap),
 			deriveOutputsFromEntries(others, specMap),
-			[...reserved.outputs, ERROR_PORT],
+			[...reserved.outputs, ...reserved.metadata, ERROR_PORT],
 		),
 	];
 }

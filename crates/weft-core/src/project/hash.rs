@@ -215,6 +215,10 @@ pub fn compute_definition_hash(project: &ProjectDefinition) -> anyhow::Result<So
     // placeholder, a port type), and its wording carries line numbers, so
     // moving a broken line would otherwise read as a new program.
     obj.remove("broken");
+    // A metadata wire never runs: its value is already written into the
+    // input it points at (`portLiterals`, hashed with the node), and the
+    // wire itself is only drawn.
+    obj.remove("metadataWires");
     strip_keys(obj.get_mut("nodes"), NODE_HASH_STRIPS);
     strip_keys(obj.get_mut("edges"), EDGE_HASH_STRIPS);
     strip_crossing_spans(obj.get_mut("edges"));
@@ -294,12 +298,16 @@ const NODE_HASH_STRIPS: &[&str] = &[
     "fileRefs",
     "includePath",
     "sourceFile",
+    // What a metadata port holds reaches a run only through the inputs
+    // its wires write into, which are hashed there.
+    "metadataPorts",
 ];
 const EDGE_HASH_STRIPS: &[&str] = &["span", "sourceFile"];
 // `description` is the group's authored `# ...` comment: prose, never
 // the runtime shape, so rewording it must not light a resync. `fileRefs`
 // is a node's own strip, for a literal on a group's port.
-const GROUP_HASH_STRIPS: &[&str] = &["span", "headerSpan", "portLiteralSpans", "sourceFile", "description", "fileRefs"];
+// `metadataPorts` is a node's own strip.
+const GROUP_HASH_STRIPS: &[&str] = &["span", "headerSpan", "portLiteralSpans", "sourceFile", "description", "fileRefs", "metadataPorts"];
 
 /// Strip each wire's crossings of where their legs were written (a
 /// crossing's `span` and `sourceFile`, the same strips as the wire's own):
@@ -590,6 +598,31 @@ mod slice_tests {
             compute_definition_hash(&with_span).unwrap(),
             compute_definition_hash(&shifted).unwrap(),
         );
+    }
+
+    /// A metadata wire and the metadata ports are only drawn: what a run
+    /// reads of them is the literal the wire wrote into its input, which
+    /// moves the hash like any written value.
+    #[test]
+    fn a_metadata_wire_moves_the_hash_only_through_what_it_wrote() {
+        let base = project("a1", "b1", "x1", 0.0);
+        let mut drawn = base.clone();
+        drawn.metadata_wires = base.edges.clone();
+        drawn.nodes[0].metadata_ports.push(crate::project::MetadataPort {
+            name: "tool".into(),
+            port_type: crate::weft_type::WeftType::primitive(crate::weft_type::WeftPrimitive::String),
+            description: None,
+            value: Some(serde_json::json!("about a")),
+            written: None,
+            span: None,
+            declared_type: None,
+        });
+        assert_eq!(compute_definition_hash(&base).unwrap(), compute_definition_hash(&drawn).unwrap());
+        assert_eq!(slice_of(&base, "b"), slice_of(&drawn, "b"));
+        let mut written = drawn.clone();
+        written.nodes[1].port_literals.insert("tool".into(), serde_json::json!("about a"));
+        assert_ne!(compute_definition_hash(&drawn).unwrap(), compute_definition_hash(&written).unwrap());
+        assert_ne!(slice_of(&drawn, "b"), slice_of(&written, "b"));
     }
 
     #[test]

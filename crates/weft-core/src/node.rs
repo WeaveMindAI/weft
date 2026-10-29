@@ -216,6 +216,14 @@ pub struct NodeMetadata {
     /// Output ports.
     #[serde(default)]
     pub outputs: Vec<OutputSpec>,
+    /// Ports whose value is written here, by hand, and never computed by
+    /// a run ([`crate::project::MetadataPort`]): a wire leaving one is a
+    /// metadata wire, and the compiler writes the value into the input it
+    /// points at. Their names share one namespace with the inputs and the
+    /// outputs.
+    // SYNC: NodeMetadata.metadata_ports <-> packages/weft-graph/src/protocol.ts CatalogEntry.metadataPorts
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_ports: Vec<crate::project::MetadataPort>,
     /// Whether this node implements `Node::provision_infra` and needs
     /// dispatcher-driven infrastructure (containers, disks, endpoints).
     /// Explicit flag in metadata.json; mirrored to
@@ -972,6 +980,7 @@ pub const METADATA_PLACES: &[(&[&str], MetadataPlace, &str)] = {
     use MetadataPlace::{Data, NamesAre};
     &[
         (&["inputs", "[]", "default"], Data, "the value an input gets when nothing drives it: the node's data"),
+        (&["metadataPorts", "[]", "value"], Data, "the value a metadata port holds, written by hand: the node's data"),
         (
             &["validate", "**", "equals"],
             Data,
@@ -1336,6 +1345,54 @@ impl NodeMetadata {
                 }
             };
             let _ = port;
+        }
+        // A metadata port's value is written here and wires carry it into
+        // the inputs they point at, before anything runs: it has to be
+        // there, fit its type, and its name has to be one `node.x` reads
+        // unambiguously.
+        for (at, port) in self.metadata_ports.iter().enumerate() {
+            let name = &port.name;
+            if self.inputs.iter().any(|i| i.name == *name)
+                || self.outputs.iter().any(|o| o.name == *name)
+                || self.metadata_ports[..at].iter().any(|m| m.name == *name)
+                || crate::run::skip::is_gate_port(name)
+                || name == ERROR_PORT
+            {
+                return Err(format!(
+                    "metadata port '{name}' has the name of another port of this node: inputs, outputs and \
+                     metadata ports share one set of names"
+                ));
+            }
+            if port.span.is_some() || port.declared_type.is_some() || port.written.is_some() {
+                return Err(format!(
+                    "metadata port '{name}': `span`, `declaredType` and `written` say how a program wrote a \
+                     group's metadata port, and a node type writes none of them; remove them"
+                ));
+            }
+            let mut vars = std::collections::BTreeSet::new();
+            port.port_type.collect_type_vars(&mut vars);
+            if !vars.is_empty() {
+                return Err(format!(
+                    "metadata port '{name}' needs a concrete type: its value is written here, and nothing \
+                     wired can tell what a type variable holds"
+                ));
+            }
+            let Some(value) = &port.value else {
+                return Err(format!("metadata port '{name}' has no `value`: a node type writes it here, by hand"));
+            };
+            port.port_type.validate_value(value).map_err(|why| {
+                format!("metadata port '{name}': its value does not fit its type {}: {why}", port.port_type)
+            })?;
+        }
+        if self.features.pairs_added_ports && !(self.features.can_add_input_ports && self.features.can_add_output_ports) {
+            return Err(
+                "pairsAddedPorts pairs the inputs a program adds with outputs of the same name: declare \
+                 canAddInputPorts and canAddOutputPorts beside it"
+                    .into(),
+            );
+        }
+        if self.features.custom_output_type.is_some() && !self.features.can_add_output_ports {
+            return Err("customOutputType types the outputs a program adds: declare canAddOutputPorts beside it".into());
         }
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for input in &self.inputs {
@@ -1880,11 +1937,13 @@ impl NodeMetadata {
 /// Free-form values (a `default`'s contents, a rule's `equals`
 /// payload, a list source's `where`) keep every key name and every
 /// null they hold.
-pub const COMPACT_KEEP_TOP_LEVEL: [&str; 12] = [
+pub const COMPACT_KEEP_TOP_LEVEL: [&str; 13] = [
     "type",
     "description",
     "inputs",
     "outputs",
+    // Ports a wire leaves like an output's, the value written here.
+    "metadataPorts",
     "requiresInfra",
     "features",
     "validate",
@@ -2548,6 +2607,23 @@ pub struct NodeFeatures {
     /// meeting at an unresolved port.
     #[serde(default, rename = "customInputType", skip_serializing_if = "Option::is_none")]
     pub custom_input_type: Option<WeftType>,
+    /// The type every ADDED output port takes (one a wire reading it
+    /// makes, on a node that accepts custom outputs), the mirror of
+    /// [`Self::custom_input_type`]. `None` leaves an added output its own
+    /// type variable, which only what it feeds can pin. Naming a variable
+    /// one of the node's inputs uses (`T`) types each added output as
+    /// that input: a router's branches carry what it routes.
+    #[serde(default, rename = "customOutputType", skip_serializing_if = "Option::is_none")]
+    pub custom_output_type: Option<WeftType>,
+    /// Each input a program adds to this node comes with an output of the
+    /// same name (typed [`Self::custom_output_type`]): one output per
+    /// input it matches against, made by the compiler, so the program
+    /// never writes it. An added output with no input of its name, and an
+    /// added output nothing reads, are refused at compile time: the value
+    /// sent there would be dropped without a word. The catalog requires
+    /// `canAddInputPorts` and `canAddOutputPorts` beside it.
+    #[serde(default, rename = "pairsAddedPorts", skip_serializing_if = "std::ops::Not::not")]
+    pub pairs_added_ports: bool,
     /// Marks the node as a trigger (fires runs from external
     /// events rather than running as part of a run).
     #[serde(default, rename = "isTrigger", skip_serializing_if = "std::ops::Not::not")]
@@ -4716,6 +4792,80 @@ mod input_semantics_tests {
     use crate::weft_type::{WeftPrimitive, WeftType};
     use serde_json::json;
 
+    /// A node type's metadata port: its value is written by hand, fits its
+    /// concrete type, and its name is none of its other ports'.
+    #[test]
+    fn a_metadata_port_is_written_fits_and_is_named_alone() {
+        let port = |name: &str, ty: &str, value: Option<serde_json::Value>| crate::project::MetadataPort {
+            name: name.into(),
+            port_type: WeftType::parse(ty).expect("type"),
+            description: None,
+            value,
+            written: None,
+            span: None,
+            declared_type: None,
+        };
+        let mut m = metadata_with(vec![]);
+        m.metadata_ports.push(port("tool", "{ name: String }", Some(json!({ "name": "x" }))));
+        m.validate_semantics().expect("a written value of its type");
+
+        m.metadata_ports[0].value = Some(json!({ "name": 3 }));
+        assert!(m.validate_semantics().unwrap_err().contains("does not fit its type"));
+        m.metadata_ports[0].value = None;
+        assert!(m.validate_semantics().unwrap_err().contains("has no `value`"));
+        m.metadata_ports[0] = port("tool", "T", Some(json!(1)));
+        assert!(m.validate_semantics().unwrap_err().contains("concrete type"));
+        m.metadata_ports[0] = port("tool", "String", Some(json!("x")));
+        m.metadata_ports[0].declared_type = Some("String".into());
+        assert!(m.validate_semantics().unwrap_err().contains("remove them"));
+        for taken in ["value", "_should_flow", ERROR_PORT] {
+            let mut m = metadata_with(vec![]);
+            m.outputs.push(OutputSpec { name: "value".into(), port_type: WeftType::Primitive(WeftPrimitive::String), description: None, baked: false, narrowable: None });
+            m.metadata_ports.push(port(taken, "String", Some(json!("x"))));
+            assert!(m.validate_semantics().unwrap_err().contains("share one set of names"), "{taken}");
+        }
+    }
+
+    /// The two features that shape a node's added outputs need it to take
+    /// added outputs at all.
+    #[test]
+    fn paired_and_typed_added_outputs_need_added_ports() {
+        let mut m = metadata_with(vec![]);
+        m.features.pairs_added_ports = true;
+        assert!(m.validate_semantics().unwrap_err().contains("canAddInputPorts and canAddOutputPorts"));
+        m.features.can_add_input_ports = true;
+        m.features.can_add_output_ports = true;
+        m.validate_semantics().expect("pairing with both");
+        m.features.can_add_output_ports = false;
+        m.features.pairs_added_ports = false;
+        m.features.custom_output_type = Some(WeftType::type_var("T"));
+        assert!(m.validate_semantics().unwrap_err().contains("declare canAddOutputPorts"));
+    }
+
+    /// The wire shape of a metadata port and the two features, as a
+    /// `metadata.json` spells them.
+    #[test]
+    fn metadata_ports_and_the_pairing_features_round_trip_their_json() {
+        let written = json!({
+            "type": "Pick",
+            "label": "Pick",
+            "description": "d",
+            "metadataPorts": [{ "name": "tool", "type": "{name: String}", "description": "what", "value": { "name": "x" } }],
+            "features": { "canAddInputPorts": true, "canAddOutputPorts": true, "customOutputType": "T", "pairsAddedPorts": true }
+        });
+        let meta: NodeMetadata = serde_json::from_value(written.clone()).expect("parses");
+        assert_eq!(meta.metadata_ports[0].value, Some(json!({ "name": "x" })));
+        assert!(meta.features.pairs_added_ports);
+        assert_eq!(meta.features.custom_output_type, Some(WeftType::type_var("T")));
+        let back = serde_json::to_value(&meta).expect("serializes");
+        assert_eq!(back["metadataPorts"], written["metadataPorts"]);
+        assert_eq!(back["features"]["customOutputType"], json!("T"));
+        assert_eq!(back["features"]["pairsAddedPorts"], json!(true));
+        // A key a metadata port does not have is a typo, refused.
+        let typo = json!({ "type": "P", "label": "P", "description": "d", "metadataPorts": [{ "name": "t", "type": "String", "valu": "x" }] });
+        assert!(serde_json::from_value::<NodeMetadata>(typo).is_err());
+    }
+
     /// Only an infra node's output is made when its infra is applied, so
     /// only one may be baked.
     #[test]
@@ -6065,7 +6215,8 @@ mod compact_view_tests {
             .keys()
             .map(|k| k.as_str())
             .collect();
-        const SERIALIZED_WHEN_NON_EMPTY: [&str; 12] = [
+        const SERIALIZED_WHEN_NON_EMPTY: [&str; 13] = [
+            "metadataPorts",
             "images",
             "publishes",
             "display",
