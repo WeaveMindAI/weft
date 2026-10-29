@@ -1,8 +1,9 @@
 //! The tool names a model calls to work a computer, as each vendor's
-//! own computer tool names them: `ComputerTools` declares them and
-//! `RouteComputerCall` recognizes them, so the two read the same names
-//! from here. Models were trained on these exact names and fields,
-//! which is why they are copied rather than made up.
+//! own computer tool names them: each action node describes the ones it
+//! performs on its `tools` metadata port, and `RouteComputerCall`
+//! recognizes them from here (its tests hold every described name to a
+//! route). Models were trained on these exact names and fields, which is
+//! why they are copied rather than made up.
 //!
 //! - Anthropic's computer toolset (`computer_toolset_20260801`): one
 //!   tool per action, coordinates as `[x, y]`, modifier keys as `text`
@@ -13,28 +14,9 @@
 //!   own bash tool, for the computer's shell, plus `timeout_secs`, weft's
 //!   own addition, to stop a command after a while.
 
-/// Which vendor's names `ComputerTools` declares. `RouteComputerCall`
-/// needs no style: it recognizes a call in either.
-// SYNC: style options <-> catalog/computer/computer_tools/metadata.json (style)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Style {
-    Anthropic,
-    OpenAi,
-}
-
-impl Style {
-    pub fn parse(name: &str) -> Option<Style> {
-        match name {
-            "anthropic" => Some(Style::Anthropic),
-            "openai" => Some(Style::OpenAi),
-            _ => None,
-        }
-    }
-}
-
 /// The bounds Anthropic's toolset puts on a key's `repeat` and on a
 /// `duration` (a wait, a key held down).
-// SYNC: bounds <-> catalog/computer/computer/images/computer/computer.py (MOST_REPEATS, MOST_SECONDS, MOST_WHEEL_CLICKS)
+// SYNC: bounds <-> catalog/computer/computer/images/computer/computer.py (MOST_REPEATS, MOST_SECONDS, MOST_WHEEL_CLICKS), the `maximum`s in the action nodes' `tools` metadata ports (catalog/computer/*/metadata.json) and perform.weft's `wait`
 pub const MOST_REPEATS: u64 = 100;
 pub const MOST_SECONDS: f64 = 300.0;
 /// The most wheel clicks one scroll takes, a few hundred lines of text:
@@ -51,6 +33,7 @@ pub const PIXELS_PER_WHEEL_CLICK: u64 = 100;
 pub const MOST_SCROLL_PIXELS: u64 = MOST_WHEEL_CLICKS * PIXELS_PER_WHEEL_CLICK;
 
 // Both styles.
+// SYNC: tool names <-> the action nodes' `tools` metadata ports (catalog/computer/*/metadata.json), perform.weft's `wait`
 pub const SCREENSHOT: &str = "screenshot";
 pub const TYPE: &str = "type";
 pub const SCROLL: &str = "scroll";

@@ -405,6 +405,58 @@ export interface PortDefinition {
   declaredType?: string;
 }
 
+/// A source range, as the compiler reports it. Lives here, beside the
+/// ports, because a metadata port carries one.
+export interface Span {
+  startLine: number;
+  startColumn: number;
+  endLine: number;
+  endColumn: number;
+}
+
+/// A metadata port's value written from other metadata ports: JSON in
+/// which a name stands for the named port's value, and `...name` inside a
+/// list for that list's items.
+// SYNC: MetadataExpr <-> crates/weft-core/src/project.rs MetadataExpr
+export type MetadataExpr =
+  | { kind: 'literal'; value: unknown }
+  | { kind: 'port'; source: string; port: string; path?: string[] }
+  | { kind: 'list'; items: { spread?: boolean; value: MetadataExpr }[] }
+  | { kind: 'object'; fields: { key: string; value: MetadataExpr }[] };
+
+/// A port whose value is written when the program is written, never
+/// computed by a run. It sits on the output side of a node or a group,
+/// and is declared in code only; a wire leaving it is a metadata wire, which
+/// the compiler resolves when the program compiles, by writing `value`
+/// into the input the wire points at. A node type declares its own in
+/// `metadata.json`, a group or a loop in its header (`*tool: LlmTool`)
+/// with the value written in its body (`self.tool = { ... }`), in full or
+/// gathered from other metadata ports (`written`).
+// SYNC: MetadataPort <-> crates/weft-core/src/project.rs MetadataPort, packages/weft-graph/src/protocol.ts MetadataPort
+export interface MetadataPort {
+  name: string;
+  /// The type, as a wire type string.
+  type: string;
+  description?: string;
+  /// The value. Absent on a group's until its body writes one, and on an
+  /// included file's opaque node when the file takes it from another
+  /// metadata port.
+  value?: unknown;
+  /// The value as a group's body writes it when it takes part of it from
+  /// other metadata ports (`self.tools = [...screen.tools, pause.tool]`),
+  /// each name scoped to the id it names. Absent on a value written out in
+  /// full, and on a node's.
+  // SYNC: MetadataPort.written <-> crates/weft-core/src/project.rs MetadataPort.written
+  written?: MetadataExpr;
+  /// Where a group's body writes the value, so an edit rewrites it in
+  /// place. Absent on a node's.
+  span?: Span;
+  /// The type as a group's header spells it, which a header rewrite
+  /// writes back (the same contract as `PortDefinition.declaredType`).
+  /// Absent on a node's.
+  declaredType?: string;
+}
+
 /// One INPUT on a node instance, enriched: accepted drivers resolved and
 /// the editor surface (widget/default/label/placeholder) stamped by the
 /// compiler, so the editor never re-derives any of it. The optional
@@ -421,6 +473,14 @@ export interface InputDefinition extends PortDefinition {
   /// in the graph protocol is the one reading).
   // SYNC: InputDefinition.optional <-> crates/weft-core/src/project.rs InputDefinition.optional
   optional?: boolean;
+  /// A container's input that holds nothing: every input of a group or
+  /// an included file, and a loop's except the ones it iterates (`over`)
+  /// or carries (`carry`). It hands what reaches it straight to the nodes
+  /// inside, so it is never required or optional itself (the compiler
+  /// refuses `x?:` on it, and the editor writes it `x:`); whether it must
+  /// be connected is what those nodes need.
+  // SYNC: InputDefinition.passesThrough <-> crates/weft-core/src/project.rs InputDefinition.passes_through
+  passesThrough?: boolean;
   // SYNC: InputDefinition.widget <-> crates/weft-core/src/project.rs InputDefinition.widget
   widget?: Widget;
   default?: unknown;

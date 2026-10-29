@@ -37,6 +37,7 @@ pub enum SyntaxKind {
     DOT,       // .
     EQ,        // =
     QUESTION,  // ? (optional-port marker)
+    STAR,      // * (metadata-port marker, before a name in an output list)
 
     // words / literals
     IDENT,      // node/group/port/field names, type names
@@ -102,7 +103,7 @@ const ALL_KINDS: &[SyntaxKind] = {
     use SyntaxKind::*;
     &[
         WHITESPACE, COMMENT, L_PAREN, R_PAREN, L_BRACE, R_BRACE, ARROW, COLON, COMMA, DOT, EQ,
-        QUESTION, IDENT, STRING, NUMBER, HEREDOC, JSON_VALUE, MARKER, KW_GROUP, KW_LOOP, ERROR,
+        QUESTION, STAR, IDENT, STRING, NUMBER, HEREDOC, JSON_VALUE, MARKER, KW_GROUP, KW_LOOP, ERROR,
         WEFT_FILE, NODE_DECL, GROUP_DECL, LOOP_DECL, INCLUDE_DECL, HEADER, PORT_SIG_IN, PORT_SIG_OUT,
         PORT_DECL, BODY, CONFIG_FIELD, CONNECTION, ENDPOINT, INLINE_EXPR, DIRECTIVE, LABEL_FIELD,
         GROUP_DESC, TYPE_DECL, TYPE_PARAMS,

@@ -60,6 +60,15 @@ describe('buildPortMenuItems', () => {
 		expect(notes(items)).toHaveLength(1);
 	});
 
+	it("a container's input that passes through offers no requiredness toggle, only why", () => {
+		const items = build({ port: { ...port, required: true, passesThrough: true } }, { side: 'input', requiredness: 'passes_through', onSetRequired: () => {} });
+		expect(labels(items)).toEqual([
+			'Passes its value straight to the nodes inside; it has to be connected only when a node inside needs it.',
+			'✎ Type: String',
+		]);
+		expect(notes(items)).toHaveLength(1);
+	});
+
 	it('an input the program wrote `x:` offers to make it optional, writing `x?:`', () => {
 		const written: boolean[] = [];
 		const items = build({ port: { ...port, required: true } }, { side: 'input', requiredness: 'required', onSetRequired: (r) => written.push(r) });

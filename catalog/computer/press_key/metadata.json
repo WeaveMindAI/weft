@@ -29,5 +29,82 @@
       "type": "String",
       "description": "What happened, in a sentence a model can read back as the tool's result."
     }
+  ],
+  "metadataPorts": [
+    {
+      "name": "tools",
+      "type": "ActionTools",
+      "description": "The tools a model calls this node through, in Anthropic's names and in OpenAI's: gather them up to the LLM node's `tools` through metadata ports.",
+      "value": {
+        "anthropic": [
+          {
+            "description": "Press a key or a combination, in xdotool names: Return, Tab, Escape, BackSpace, Up, Page_Down, ctrl+s, alt+Tab, ctrl+shift+t. Shortcuts are surer than the mouse for menus, dropdowns and scrolling.",
+            "name": "key",
+            "parameters": {
+              "properties": {
+                "repeat": {
+                  "description": "How many times to press it.",
+                  "maximum": 100,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "text": {
+                  "description": "The key or combination.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "text"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Hold a key or a combination down for a number of seconds, in xdotool names.",
+            "name": "hold_key",
+            "parameters": {
+              "properties": {
+                "duration": {
+                  "description": "Seconds to hold it.",
+                  "exclusiveMinimum": 0,
+                  "maximum": 300.0,
+                  "type": "number"
+                },
+                "text": {
+                  "description": "The key or combination.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "text",
+                "duration"
+              ],
+              "type": "object"
+            }
+          }
+        ],
+        "openai": [
+          {
+            "description": "Press keys together, like [\"CTRL\", \"S\"] or [\"ENTER\"]. Shortcuts are surer than the mouse for menus, dropdowns and scrolling.",
+            "name": "keypress",
+            "parameters": {
+              "properties": {
+                "keys": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "keys"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      }
+    }
   ]
 }

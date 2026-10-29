@@ -5,9 +5,11 @@
 
 import ELK from 'elkjs/lib/elk.bundled.js';
 import type { NodeInstance, Edge } from './types';
-import { isContainerNodeType, isLoopNodeType, containerHasConfigStrip, acceptsLiteral } from './types';
-import { CONFIG_STRIP_BAR_PX, configStripOpenPx, containerPaddingPx, expandedContainerMinPx } from './constants/container-layout';
-import { LOOP_CONFIG_FIELDS, outputRows } from './utils/input-field';
+import { isContainerNodeType, isLoopNodeType, containerHasConfigStrip, acceptsLiteral, declaredHomeValue } from './types';
+import { CONFIG_STRIP_BAR_PX, containerPaddingPx, expandedContainerMinPx } from './constants/container-layout';
+import { outputRows } from './utils/input-field';
+import { configStripOpenPx, containerStripFields } from './utils/config-strip';
+import { measureTextWidth, stripFonts } from './utils/measure-text';
 import { ERROR_PORT, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, isGatePort } from '../../protocol';
 
 export interface AutoOrganizeResult {
@@ -21,8 +23,14 @@ export async function autoOrganize(
 	nodeSizes?: Map<string, { width: number; height: number }>,
 	portPositions?: Map<string, Map<string, number>>,
 	simplified = false,
+	// The width each expanded container draws at before this layout (its
+	// `boxWidth`), which its config strip wraps its text in.
+	boxWidths?: Map<string, number>,
 ): Promise<AutoOrganizeResult> {
 	const positions = new Map<string, { x: number; y: number }>();
+	// The width each container's strip is measured at: the one it draws at
+	// before this layout, then the one this layout gives it.
+	const stripWidths = new Map(boxWidths ?? []);
 	const groupSizes = new Map<string, { width: number; height: number }>();
 	if (projectNodes.length === 0) return { positions, groupSizes };
 
@@ -317,17 +325,20 @@ export async function autoOrganize(
 		if (simplified) return 0;
 		const node = projectNodes.find(n => n.id === nodeId);
 		const literals = (node as { portLiterals?: Record<string, unknown> } | undefined)?.portLiterals;
-		if (!node || !containerHasConfigStrip(node.nodeType, literals)) return 0;
+		if (!node || !containerHasConfigStrip(node.nodeType, literals, node.metadataPorts, node.metadataInputs)) return 0;
 		const configOpen = (node.config as Record<string, unknown> | undefined)?.configOpen === true;
 		if (!configOpen) return CONFIG_STRIP_BAR_PX;
-		// The open strip grows with its field list: one row per written
-		// port literal, plus the loop knob rows. Same derivation as
-		// GroupNode's stripFields, so the reserved space follows the
-		// rendered strip.
-		const fieldCount =
-			Object.keys(literals ?? {}).length +
-			(isLoopNodeType(node.nodeType) ? LOOP_CONFIG_FIELDS.length : 0);
-		return configStripOpenPx(fieldCount);
+		// The open strip worked out from its content at the width the box
+		// draws at, the same way and at the same width GroupNode sizes it
+		// (`configStripOpenPx`), so the reserved space is the strip drawn.
+		const width = stripWidths.get(nodeId) ?? expandedContainerMinPx(false).w;
+		return configStripOpenPx({
+			scope: nodeId,
+			fields: containerStripFields(nodeId, isLoopNodeType(node.nodeType), literals ?? {}, node.inputs ?? []),
+			valueOf: (field) => declaredHomeValue(literals, node.config, field),
+			metadataPorts: node.metadataPorts,
+			metadataInputs: node.metadataInputs,
+		}, width, measureTextWidth, stripFonts());
 	}
 
 	function paddingForGroup(groupId: string): string {
@@ -875,6 +886,20 @@ export async function autoOrganize(
 			// ELK's own `separateConnectedComponents` splits and packs
 			// the group's independent pieces itself.
 			await layoutScope(groupId, children, padding);
+			// The strip above the children was reserved at the width the
+			// group had before; ELK sizes the group to its children, and at
+			// a new width the strip's text wraps to another height. Laid
+			// out again with the strip at the new width. The width comes
+			// from the children and the side padding, so the second run
+			// keeps it, except when the taller top moves the children
+			// against the group's own ports enough to change the routing;
+			// then the strip is off by its wrap until the next layout.
+			const width = groupSizes.get(groupId)?.width;
+			if (width !== undefined && width !== (stripWidths.get(groupId) ?? expandedContainerMinPx(false).w)) {
+				stripWidths.set(groupId, width);
+				const again = paddingForGroup(groupId);
+				if (again !== padding) await layoutScope(groupId, children, again);
+			}
 		}
 	}
 

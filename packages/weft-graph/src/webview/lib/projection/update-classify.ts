@@ -38,6 +38,7 @@ export function classifyUpdate(
 		: [];
 	const carriesOtherWork = configOps.length > 0
 		|| ('label' in updates) || ('inputs' in updates) || ('outputs' in updates)
+		|| ('metadataValue' in updates)
 		|| ('portLiterals' in updates) || ('portValueForm' in updates);
 	return {
 		configOps,

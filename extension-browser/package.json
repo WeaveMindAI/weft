@@ -2,7 +2,7 @@
   "name": "weft-extension",
   "description": "Human-in-the-loop task manager for weft projects",
   "private": true,
-  "version": "1.0.85",
+  "version": "1.0.86",
   "packageManager": "pnpm@10.34.9",
   "type": "module",
   "scripts": {

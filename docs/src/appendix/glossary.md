@@ -171,6 +171,16 @@ subscriptions. The only tier that tells one kind of event source from another.
 **Meter.** The code that works out what one provider's call really cost. A node
 never states a cost.
 
+**Metadata port.** A port whose value is written in the program and never
+computed by a run: a group writes it in its body (`self.tool = { ... }`), a
+node type in its `metadata.json`. The graph shows a group's in the group's
+Config strip, and a node type's nowhere: neither is a port on the box.
+
+**Metadata wire.** A wire leaving a metadata port. It never runs: the compiler
+writes the value into the input it points at before the run starts, so it may
+point backwards without making a cycle. The graph does not draw it: the input
+it fills shows the value and where it comes from.
+
 **Narrowable output.** An output whose catalog type is broad (say `JsonDict`) and
 which a program may declare narrower where it uses the node:
 `-> (response: Verdict)`.

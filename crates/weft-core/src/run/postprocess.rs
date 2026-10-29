@@ -717,6 +717,8 @@ mod fan_in_tests {
             optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
+            port_literal_types: Default::default(),
+            metadata_ports: Vec::new(),
             file_refs: Default::default(),
             include_path: None,
             include_contents: None,

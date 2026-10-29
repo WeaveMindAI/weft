@@ -18,6 +18,8 @@
 		placeholder = '',
 		readonly = false,
 		minHeight = '80px',
+		height,
+		resizable = false,
 		language,
 		liveValue = false,
 		onchange,
@@ -26,6 +28,15 @@
 		placeholder?: string;
 		readonly?: boolean;
 		minHeight?: string;
+		/// A fixed height: the box does not grow with its content, it
+		/// scrolls. For a box inside something whose size the layout has
+		/// to know before it renders (a container's config strip), or one
+		/// whose content can be far longer than is worth showing at once;
+		/// `minHeight` is ignored then.
+		height?: string;
+		/// With `height`: the corner handle lets the person drag the box
+		/// taller or shorter, the way a node's other fields resize.
+		resizable?: boolean;
 		/// The code widget's declared syntax (metadata `language`). The
 		/// Rust widget always carries one; absence is a malformed state
 		/// and surfaces loudly, never a silent default language.
@@ -232,7 +243,7 @@
 	});
 </script>
 
-<div class="code-editor-wrapper" style="min-height: {minHeight}; resize: vertical; overflow: auto;">
+<div class="code-editor-wrapper" style={height ? `height: ${height}; overflow: auto;${resizable ? ' resize: vertical;' : ''}` : `min-height: ${minHeight}; resize: vertical; overflow: auto;`}>
 	<div bind:this={container} class="editor-container"></div>
 </div>
 

@@ -9,14 +9,19 @@ import { inputIsRequired } from '../../../protocol';
  *    outline, no fill). Overrides the declared required/oneOfRequired state
  *    visually because the value is already provided, but the port type is
  *    unchanged (a user can still wire an edge to override).
+ *  - 'pass-through': a container's input that holds nothing and hands
+ *    its value to the nodes inside (`InputDefinition.passesThrough`): a
+ *    ring with a small dot in the middle. It is neither required nor
+ *    optional itself, so it never draws as one of those.
  */
-export type PortMarkerState = 'full' | 'empty' | 'half' | 'empty-dotted';
+export type PortMarkerState = 'full' | 'empty' | 'half' | 'empty-dotted' | 'pass-through';
 
 /** What an input's requiredness means right now, in words, for its
  *  hover text: null for a required input (its full marker says it), and
  *  for the other two states what a missing value does. An input with
  *  neither flag changes with its wiring, so its text names both halves. */
 export function requirednessNote(port: PortDefinition, isWired: boolean): string | null {
+	if (port.passesThrough) return `${port.name}: passes its value straight to the nodes inside; it has to be connected only when a node inside needs it`;
 	if (port.required) return null;
 	if (port.optional) return `${port.name}: optional, even when wired (if its wire delivers nothing, this node runs without it)`;
 	return isWired
@@ -25,16 +30,19 @@ export function requirednessNote(port: PortDefinition, isWired: boolean): string
 }
 
 /** Pick the marker state for an input port.
- *  A literal fill takes visual precedence over required/oneOfRequired:
- *  if the port has a non-null body-set literal and no edge, it renders
- *  as 'empty-dotted' regardless of declared required state.
+ *  A literal fill takes visual precedence over everything else: if the
+ *  port has a non-null body-set literal and no edge, it renders as
+ *  'empty-dotted' (a value written there is still worth showing). Next a
+ *  port that passes through, which has no requiredness of its own.
  */
 export function inputMarkerState(
 	required: boolean,
 	inOneOfRequired: boolean,
 	isLiteralFilled: boolean = false,
+	passesThrough: boolean = false,
 ): PortMarkerState {
 	if (isLiteralFilled) return 'empty-dotted';
+	if (passesThrough) return 'pass-through';
 	if (required) return 'full';
 	if (inOneOfRequired) return 'half';
 	return 'empty';
@@ -70,7 +78,7 @@ export function portMarkerStyle(
 ): { style: string; class: string } {
 	// Outputs are always `full`, regardless of the port's `required` flag.
 	const state: PortMarkerState = side === 'input'
-		? inputMarkerState(inputIsRequired(port, isWired), oneOfRequiredPorts.has(port.name), literalFilledPorts.has(port.name))
+		? inputMarkerState(inputIsRequired(port, isWired), oneOfRequiredPorts.has(port.name), literalFilledPorts.has(port.name), port.passesThrough === true)
 		: 'full';
 
 	if (state === 'full') return filledMarkerStyle(color, 'port', extraClass);
@@ -80,6 +88,8 @@ export function portMarkerStyle(
 		style = `background: linear-gradient(to right, ${color} 50%, white 50%); ${ring(color)}`;
 	} else if (state === 'empty-dotted') {
 		style = dottedRing(color);
+	} else if (state === 'pass-through') {
+		style = passThroughRing(color);
 	} else {
 		style = `background-color: white; ${ring(color)}`;
 	}
@@ -141,6 +151,14 @@ function ring(color: string): string {
 function dottedRing(color: string): string {
 	return `border: 2px solid transparent; background: linear-gradient(white, white) padding-box, `
 		+ `repeating-conic-gradient(${color} 0deg 22.5deg, transparent 22.5deg 45deg) border-box`;
+}
+
+/** The marker of a port that passes through: the ring every marker
+ *  has, around a white middle holding a small dot in the port's colour.
+ *  The gradient paints the 8px inside the ring, so a 2px dot leaves 2px
+ *  of white between it and the ring, enough to read as a dot at 12px. */
+function passThroughRing(color: string): string {
+	return `background: radial-gradient(circle, ${color} 0 2px, white 2.5px); ${ring(color)}`;
 }
 
 function markerClass(sizeClass: string, extraClass: string): string {

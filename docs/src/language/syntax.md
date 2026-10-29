@@ -137,6 +137,11 @@ Those are fragments: the nodes still need their other required inputs before
 they can run. For narrowing an output like `response`, go and read [saying
 what a broad output holds](types.md#saying-what-a-broad-output-holds).
 
+A group or a loop can also list a metadata port among its outputs, with a `*`
+before the name: `-> (results: String, *tool: LlmTool)`. Its value is written
+in the program instead of made by a run. For what that is for, go and read
+[metadata ports](groups.md#metadata-ports).
+
 ### Optional and required inputs
 
 A node's metadata says which of its inputs it can run without. Where you use
@@ -267,7 +272,8 @@ shout.text = "hello"
 
 Set a group's inputs from outside, as `shout.text` does. `self` means this
 group's own interface. `_should_flow` can go inside the braces too, and when it
-skips a group it skips everything in it.
+skips a group it skips everything in it. The only literal you can write on
+`self` is a metadata port's value: `self.tool = { "name": "search" }`.
 
 Loops work the same way with iteration settings of their own. Go and read
 [groups](groups.md) and [loops](loops.md).

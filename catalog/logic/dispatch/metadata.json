@@ -1,0 +1,49 @@
+{
+  "type": "Dispatch",
+  "label": "Dispatch",
+  "description": "Send a value to whichever branch claims it. Each branch is one input you add plus the output of the same name, which the compiler makes for you. A branch input is usually fed by a metadata port, and the value leaves on the output of the branch whose `by` field equals its own; every other output closes. The usual case is a model's tool calls: each tool is a group with a `*tool` metadata port, `route.search = search.tool` adds the `search` branch, and a call whose `name` is that tool's leaves on `route.search`, into the group. A value no branch claims leaves on `otherwise`, so wire it (to tell the model the tool does not exist, say). Two branches with the same `by` field, or a value or branch without one, fail the node.",
+  "tags": [
+    "flow",
+    "dispatch",
+    "route",
+    "branch",
+    "tool"
+  ],
+  "icon": "Split",
+  "color": "#6366f1",
+  "inputs": [
+    {
+      "name": "value",
+      "type": "T",
+      "required": true,
+      "accepts": [
+        "wire"
+      ],
+      "description": "The record to send on: one tool call from a Loop over an LLM node's `toolCalls`, say."
+    },
+    {
+      "name": "by",
+      "type": "String",
+      "default": "name",
+      "accepts": [
+        "literal"
+      ],
+      "label": "Match on",
+      "description": "The field compared on both sides: the value's and each branch's."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "otherwise",
+      "type": "T",
+      "description": "The value, when no branch's `by` field equals its own. Closed when a branch claims it."
+    }
+  ],
+  "features": {
+    "pure": true,
+    "canAddInputPorts": true,
+    "canAddOutputPorts": true,
+    "customOutputType": "T",
+    "pairsAddedPorts": true
+  }
+}

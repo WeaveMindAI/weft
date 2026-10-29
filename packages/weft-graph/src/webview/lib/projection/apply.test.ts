@@ -507,6 +507,61 @@ describe('loop carry ghost inputs', () => {
 	});
 });
 
+describe("a container input's passesThrough, mirrored before the reparse", () => {
+	const loop = (p: ProjectDefinition) => p.nodes.find((n) => n.id === 'L')!;
+	const start = (): ProjectDefinition => ({
+		id: 'p1',
+		nodes: [node({
+			id: 'L', nodeType: 'Loop', label: 'L',
+			config: { over: ['items'] },
+			inputs: [
+				{ name: 'items', portType: 'List[Number]', required: true },
+				{ name: 'prefix', portType: 'String', required: true, passesThrough: true },
+			],
+		})],
+		edges: [], createdAt: '', updatedAt: '',
+	});
+
+	it('marks every group input, and a new loop input outside `over` and `carry`', () => {
+		const g = applyOpsToProject(fixture(), ops({
+			op: 'update_group_ports', group: 'G',
+			inputs: [{ name: 'x', required: true, portType: 'String' }],
+			outputs: [{ name: 'out', required: true, portType: 'String' }],
+		}), catalog);
+		expect(g.nodes.find((n) => n.id === 'G')!.inputs[0].passesThrough).toBe(true);
+		const l = applyOpsToProject(start(), ops({
+			op: 'update_loop_ports', loopId: 'L',
+			inputs: [
+				{ name: 'items', required: true, portType: 'List[Number]' },
+				{ name: 'prefix', required: true, portType: 'String' },
+				{ name: 'extra', required: true, portType: 'String' },
+			],
+			outputs: [],
+		}), catalog);
+		expect(loop(l).inputs.map((p) => p.passesThrough)).toEqual([undefined, true, true]);
+	});
+
+	it('follows a port into and out of `over`', () => {
+		const into = applyOpsToProject(start(), ops(
+			{ op: 'set_loop_config', loopId: 'L', key: 'over', value: '["items", "prefix"]' },
+		), catalog);
+		expect(loop(into).inputs.map((p) => p.passesThrough)).toEqual([undefined, undefined]);
+		const out = applyOpsToProject(start(), ops(
+			{ op: 'set_loop_config', loopId: 'L', key: 'over', value: '[]' },
+		), catalog);
+		expect(loop(out).inputs.map((p) => p.passesThrough)).toEqual([true, true]);
+	});
+
+	it('reads a container port written `x?:` as optional, as the compiler stamps it', () => {
+		const p = applyOpsToProject(start(), ops({
+			op: 'update_loop_ports', loopId: 'L',
+			inputs: [{ name: 'items', required: false, portType: 'List[Number]' }],
+			outputs: [],
+		}), catalog);
+		expect(loop(p).inputs[0]).toMatchObject({ required: false, optional: true });
+	});
+});
+
 describe('rename validation', () => {
 	it('rejects a rename to an empty label (mirrors the server)', () => {
 		expect(() => applyOpsToProject(fixture(), ops(
@@ -646,5 +701,92 @@ describe('portLiterals projection', () => {
     const folded = foldOps(project, [], catalog);
     const n = folded.project.nodes.find((x) => x.id === 'orc')!;
     expect(n.portLiterals).toEqual({ systemPrompt: 'test' });
+  });
+});
+
+describe('applyOpsToProject: metadata ports and wires', () => {
+  const tool = { name: 'search' };
+  /** Group S declares `*tool: LlmTool` with a written value, and a
+   *  catalog node L carries a metadata port of its own. */
+  function withMetadata(): ProjectDefinition {
+    const p = fixture();
+    p.nodes.push(
+      node({
+        id: 'S', nodeType: 'Group', label: 'S',
+        outputs: [{ name: 'results', portType: 'String', required: true }],
+        metadataPorts: [{ name: 'tool', type: 'LlmTool', declaredType: 'LlmTool', value: tool }],
+      }),
+      node({
+        id: 'list_1', nodeType: 'Debug',
+        inputs: [{ name: 'data', portType: 'T', required: true }, { name: 'search', portType: 'T', required: true }],
+      }),
+    );
+    return p;
+  }
+  const S = (p: ProjectDefinition) => p.nodes.find((n) => n.id === 'S')!;
+
+  it('gives a freshly added node its type\'s metadata ports', () => {
+    const p = applyOpsToProject(fixture(), ops({ op: 'add_node', id: 'lk', nodeType: 'Lookup', parentGroup: null }), {
+      ...catalog,
+      Lookup: { defaultInputs: [], defaultOutputs: [], metadataPorts: [{ name: 'schema', type: 'JsonDict', value: {} }] },
+    });
+    expect(p.nodes.find((n) => n.id === 'lk')!.metadataPorts).toEqual([{ name: 'schema', type: 'JsonDict', value: {} }]);
+  });
+
+  it('splits a header rewrite into outputs and metadata ports, keeping the written value', () => {
+    const p = applyOpsToProject(withMetadata(), ops({
+      op: 'update_group_ports', group: 'S', inputs: [],
+      outputs: [
+        { name: 'results', required: true, portType: 'String', metadata: false },
+        { name: 'tool', required: true, portType: 'LlmTool', metadata: true },
+        { name: 'extra', required: true, portType: 'String', metadata: true },
+      ],
+    }), catalog);
+    expect(S(p).outputs.map((o) => o.name)).toEqual(['results']);
+    expect(S(p).metadataPorts).toEqual([
+      { name: 'tool', type: 'LlmTool', declaredType: 'LlmTool', value: tool },
+      { name: 'extra', type: 'String', declaredType: 'String' },
+    ]);
+  });
+
+  it('drops a removed metadata port', () => {
+    const p = applyOpsToProject(withMetadata(), ops({
+      op: 'update_group_ports', group: 'S', inputs: [],
+      outputs: [{ name: 'results', required: true, portType: 'String', metadata: false }],
+    }), catalog);
+    expect(S(p).metadataPorts).toBeUndefined();
+  });
+
+  it('writes and removes a metadata value', () => {
+    const set = applyOpsToProject(withMetadata(), ops(
+      { op: 'set_metadata_value', group: 'S', port: 'tool', value: '{"name": "find"}' },
+    ), catalog);
+    expect(S(set).metadataPorts![0].value).toEqual({ name: 'find' });
+    const cleared = applyOpsToProject(set, ops({ op: 'set_metadata_value', group: 'S', port: 'tool', value: null }), catalog);
+    expect('value' in S(cleared).metadataPorts![0]).toBe(false);
+  });
+
+  it('refuses a metadata sig where the server refuses one', () => {
+    const sig = { name: 'tool', required: true, portType: 'LlmTool', metadata: true };
+    expect(() => applyOpsToProject(withMetadata(), ops(
+      { op: 'update_group_ports', group: 'S', inputs: [sig], outputs: [] },
+    ), catalog)).toThrow('a metadata port is an output');
+    expect(() => applyOpsToProject(withMetadata(), ops({
+      op: 'update_node_ports', node: 'list_1', inputs: [], outputs: [sig],
+      removedInputs: [], removedOutputs: [], revertedInputs: [], revertedOutputs: [],
+    }), catalog)).toThrow('only a group or a loop declares one');
+  });
+
+  it('leaves a gathered value unknown until the next parse, rather than refusing it', () => {
+    const p = applyOpsToProject(withMetadata(), ops(
+      { op: 'set_metadata_value', group: 'S', port: 'tool', value: '[...other.tools, pause.tool]' },
+    ), catalog);
+    expect('value' in S(p).metadataPorts![0]).toBe(false);
+  });
+
+  it('refuses a value for a metadata port the container does not have', () => {
+    expect(() => applyOpsToProject(withMetadata(), ops(
+      { op: 'set_metadata_value', group: 'S', port: 'nope', value: '1' },
+    ), catalog)).toThrow("'S' has no metadata port 'nope'");
   });
 });

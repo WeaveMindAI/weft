@@ -29,6 +29,7 @@ fn empty_definition() -> weft_core::project::ProjectDefinition {
         groups: Vec::new(),
         given: Default::default(),
         broken: Vec::new(),
+        metadata_wires: Vec::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         defaults: Default::default(),

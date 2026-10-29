@@ -106,3 +106,11 @@ fn both_grammars_comment_on_hash() {
     assert!(grammar("weft.tmLanguage.json").contains(r##""match": "#.*$""##));
     assert!(grammar("highlight-weft.js").contains("HASH_COMMENT_MODE"));
 }
+
+/// A `*` before a port name in a header marks a metadata port (the lexer's
+/// `STAR`), and both grammars paint it.
+#[test]
+fn both_grammars_mark_a_metadata_port() {
+    assert!(grammar("weft.tmLanguage.json").contains("storage.modifier.metadata.weft"));
+    assert!(grammar("highlight-weft.js").contains(r"begin: '\\*(?="));
+}

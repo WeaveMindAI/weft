@@ -147,13 +147,11 @@ async fn the_default_agent_works_the_computer_until_it_answers() -> anyhow::Resu
     project.set_main(&format!(
         r#"
 box = Computer
-tools = ComputerTools
 model = CustomProvider {{ baseUrl: "{}", model: "scripted" }}
 
 agent = @include("__catalog/base_catalog/computer/agent.weft")
 agent.task = "Say what the shell answers to echo hi."
 agent.computer = box.computer
-agent.tools = tools.tools
 agent.model = model.provider
 
 out = Debug {{ data: agent.answer }}

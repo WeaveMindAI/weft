@@ -65,6 +65,27 @@ arrow. You get the keys inside it with their types, and clicking one narrows
 the arrow to that key. **Up one level** goes back and **Read the whole value**
 undoes it.
 
+## Values written by metadata ports
+
+A metadata port is a value fixed in the program, which the compiler copies
+into every input the code wires from it, before anything runs. For what
+metadata ports are for, go and read
+[metadata ports](../language/groups.md#metadata-ports).
+
+The graph draws neither the ports nor the wires from them: both are written
+in the code (`tools.search = search.tool`, or a value gathered from several,
+`self.tools = [...screen.tools, pause.tool]`). What it shows is where each
+value comes from, and it lets you follow it:
+
+- **An input a metadata port fills** shows the value, read-only, with a link
+  such as *from `calls.tools`* beside its name. Click it and the editor takes you to
+  that box, opening the groups it sits in.
+- **A group's metadata ports** show in the **Config** strip at the top of the
+  open group. A value written out in full is a field you can edit there. A
+  value gathered from others is read-only, written the way the code writes
+  it, with each port it names as a link: follow the links down until you
+  reach the box that writes the text itself.
+
 ## Change what a node does
 
 The small arrow in a box's header opens its body, where its fields are: text

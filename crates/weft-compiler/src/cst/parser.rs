@@ -72,6 +72,14 @@ impl<'a> Parser<'a> {
         None
     }
 
+    /// The kind of the first token past the next `skip` tokens that is not
+    /// inline trivia (a line break stops the search and is the answer).
+    fn peek_after_inline_trivia(&self, skip: usize) -> Option<SyntaxKind> {
+        self.tokens[self.pos..].iter().skip(skip)
+            .find(|t| !t.kind.is_trivia() || (t.kind == SyntaxKind::WHITESPACE && t.text.contains('\n')))
+            .map(|t| t.kind)
+    }
+
     /// True if the next significant token is `->`, reachable across at most ONE
     /// line break (the accepted `T(in)\n-> (out)` layout). A blank line (a
     /// whitespace trivia containing 2+ newlines, or two newline-bearing trivia)
@@ -431,66 +439,79 @@ impl<'a> Parser<'a> {
                         break;
                     }
                 }
+                // `*name: Type`: a metadata port. The `*` opens the
+                // PORT_DECL so the lowering reads it with its port; one
+                // followed by no name stays a loose token, which the
+                // lowering reports as stray.
+                SyntaxKind::STAR if matches!(self.peek_after_inline_trivia(1), Some(SyntaxKind::IDENT | SyntaxKind::NUMBER)) => {
+                    self.builder.start_node(SyntaxKind::PORT_DECL.into());
+                    self.bump(); // STAR
+                    self.bump_trivia_inline();
+                    self.bump_port_decl_rest();
+                    self.builder.finish_node();
+                }
                 // A port name should be an IDENT, but a malformed one (e.g.
                 // `1data`, lexed NUMBER-led) must still be captured as a
                 // PORT_DECL so `try_parse_port_decl` rejects it loudly rather
                 // than the bad port being silently dropped.
                 SyntaxKind::IDENT | SyntaxKind::NUMBER => {
-                    // A PORT_DECL: `name [: Type]`. The TYPE can be arbitrarily
-                    // complex (`List[Number]`, `Dict[String, String]`,
-                    // `String | Number`, with `?`), so after the colon we
-                    // consume every token up to the next TOP-LEVEL `,` or `)`
-                    // (bracket-aware via the lexer's balanced JSON_VALUE for
-                    // `[...]`). The full type text is preserved for the lowering
-                    // to re-parse with `WeftType::parse`. The trailing-`?`
-                    // optional marker rides along in that run.
                     self.builder.start_node(SyntaxKind::PORT_DECL.into());
-                    self.bump(); // name
-                    self.bump_trivia_inline();
-                    // `name?` marks the port optional; it may stand alone
-                    // (`name?`) or precede the type (`name?: Type`), so the
-                    // `?` is consumed first and the colon checked after.
-                    // Treating the two as alternatives once left `: Type`
-                    // outside the declaration, where the loop opened a
-                    // second port named after the type.
-                    if self.cur() == Some(SyntaxKind::QUESTION) {
-                        self.bump();
-                        self.bump_trivia_inline();
-                    }
-                    if self.cur() == Some(SyntaxKind::COLON) {
-                        self.bump();
-                        // consume the type run up to a top-level comma/paren.
-                        // A record type (`{ wpm: Number, read_delay: Number }`)
-                        // carries commas of its own, so a comma only ends the
-                        // port outside braces; the brace depth is tracked here
-                        // because `{`/`}` lex as structural tokens.
-                        let mut braces = 0usize;
-                        loop {
-                            match self.cur() {
-                                None => break,
-                                Some(SyntaxKind::L_BRACE) => {
-                                    braces += 1;
-                                    self.bump();
-                                }
-                                Some(SyntaxKind::R_BRACE) if braces > 0 => {
-                                    braces -= 1;
-                                    self.bump();
-                                }
-                                Some(SyntaxKind::R_BRACE) => break, // stray: not ours
-                                Some(SyntaxKind::COMMA) if braces == 0 => break,
-                                // A paren ends the run whatever the brace depth:
-                                // no type carries parens, and an unclosed `{`
-                                // must never swallow the signature's own `)`.
-                                Some(SyntaxKind::R_PAREN) => break,
-                                Some(SyntaxKind::L_PAREN) => break, // nested sig: leave to outer
-                                Some(_) => self.bump(),
-                            }
-                        }
-                    }
+                    self.bump_port_decl_rest();
                     self.builder.finish_node();
                 }
                 // markers (@require_one_of), commas, trivia: keep as-is
                 _ => self.bump(),
+            }
+        }
+    }
+
+    /// The rest of one PORT_DECL, from its name on: `name [?] [: Type]`.
+    /// The TYPE can be arbitrarily complex (`List[Number]`, `Dict[String,
+    /// String]`, `String | Number`), so after the colon every token up to
+    /// the next TOP-LEVEL `,` or `)` is consumed (bracket-aware via the
+    /// lexer's balanced JSON_VALUE for `[...]`). The full type text is
+    /// preserved for the lowering to re-parse with `WeftType::parse`.
+    fn bump_port_decl_rest(&mut self) {
+        self.bump(); // name
+        self.bump_trivia_inline();
+        // `name?` marks the port optional; it may stand alone
+        // (`name?`) or precede the type (`name?: Type`), so the
+        // `?` is consumed first and the colon checked after.
+        // Treating the two as alternatives once left `: Type`
+        // outside the declaration, where the loop opened a
+        // second port named after the type.
+        if self.cur() == Some(SyntaxKind::QUESTION) {
+            self.bump();
+            self.bump_trivia_inline();
+        }
+        if self.cur() == Some(SyntaxKind::COLON) {
+            self.bump();
+            // consume the type run up to a top-level comma/paren.
+            // A record type (`{ wpm: Number, read_delay: Number }`)
+            // carries commas of its own, so a comma only ends the
+            // port outside braces; the brace depth is tracked here
+            // because `{`/`}` lex as structural tokens.
+            let mut braces = 0usize;
+            loop {
+                match self.cur() {
+                    None => break,
+                    Some(SyntaxKind::L_BRACE) => {
+                        braces += 1;
+                        self.bump();
+                    }
+                    Some(SyntaxKind::R_BRACE) if braces > 0 => {
+                        braces -= 1;
+                        self.bump();
+                    }
+                    Some(SyntaxKind::R_BRACE) => break, // stray: not ours
+                    Some(SyntaxKind::COMMA) if braces == 0 => break,
+                    // A paren ends the run whatever the brace depth:
+                    // no type carries parens, and an unclosed `{`
+                    // must never swallow the signature's own `)`.
+                    Some(SyntaxKind::R_PAREN) => break,
+                    Some(SyntaxKind::L_PAREN) => break, // nested sig: leave to outer
+                    Some(_) => self.bump(),
+                }
             }
         }
     }
@@ -1045,6 +1066,21 @@ mod tests {
             .map(|c| c.to_string())
             .collect();
         assert_eq!(ports, ["a: { x: Number, y: Number }", "b: String"]);
+    }
+
+    /// `*name: Type` is one PORT_DECL, the `*` inside it; a `*` with no name
+    /// after it stays a loose token of the list, for the lowering to name.
+    #[test]
+    fn a_metadata_port_is_one_port_decl_with_its_star() {
+        let src = "g = Group(a: String) -> (out: String, * tool: { name: String }, *) {}\n";
+        assert_round_trip(src);
+        let tree = parse(src);
+        let header = tree.children().next().unwrap().children().find(|c| c.kind() == SyntaxKind::HEADER).unwrap();
+        let sig = header.children().find(|c| c.kind() == SyntaxKind::PORT_SIG_OUT).unwrap();
+        let ports: Vec<String> = sig.children().filter(|c| c.kind() == SyntaxKind::PORT_DECL).map(|c| c.to_string()).collect();
+        assert_eq!(ports, ["out: String", "* tool: { name: String }"]);
+        let loose: Vec<SyntaxKind> = sig.children_with_tokens().filter_map(|e| e.into_token()).map(|t| t.kind()).filter(|k| *k == SyntaxKind::STAR).collect();
+        assert_eq!(loose, [SyntaxKind::STAR]);
     }
 
     #[test]

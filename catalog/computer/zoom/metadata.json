@@ -34,5 +34,38 @@
       "type": "Image",
       "description": "The enlarged region, a PNG kept past the run."
     }
+  ],
+  "metadataPorts": [
+    {
+      "name": "tools",
+      "type": "ActionTools",
+      "description": "The tools a model calls this node through, in Anthropic's names and in OpenAI's: gather them up to the LLM node's `tools` through metadata ports.",
+      "value": {
+        "anthropic": [
+          {
+            "description": "See one region of the screen enlarged, to read small text or make out a small control. Coordinates stay those of the full screenshot afterwards.",
+            "name": "zoom",
+            "parameters": {
+              "properties": {
+                "region": {
+                  "description": "[x0, y0, x1, y1], the region's top left and bottom right corners, pixels from the left and top edges of the last full screenshot.",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "maxItems": 4,
+                  "minItems": 4,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "region"
+              ],
+              "type": "object"
+            }
+          }
+        ],
+        "openai": []
+      }
+    }
   ]
 }

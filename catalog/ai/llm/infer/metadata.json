@@ -1,7 +1,7 @@
 {
   "type": "LlmInference",
   "label": "LLM",
-  "description": "AI language model completion: one call to a model, served by a wired provider node, with optional tool calling and a conversation kept in a file. For an agent that calls tools until it is done: run turns in a sequential Loop carrying the conversation file. Each turn takes the file on `historyFile` and the LLM Tools on `tools` (several through a List). When the model asks for tools, `toolCalls` pulses a List[ToolCall], each `{ id, name, arguments }` with `arguments` as raw JSON text; run them in a sequential Loop over `toolCalls` that carries the file, a Switch on the call's `name` (one `equals` case per tool) gating each tool's node, and add each result to the file with a Chat Message node (role tool). The file that loop hands back feeds the next turn, and the turns stop when one answers with no `toolCalls` pulse.",
+  "description": "AI language model completion: one call to a model, served by a wired provider node, with optional tool calling and a conversation kept in a file. For an agent that calls tools until it is done: run turns in a sequential Loop carrying the conversation file. Each turn takes the file on `historyFile` and the tools on `tools`: write each tool as a group declaring a `*tool: LlmTool` metadata port (its name, description and a JSON Schema for its arguments), and wire every group's `tool` into one List. When the model asks for tools, `toolCalls` pulses a List[ToolCall], each `{ id, name, arguments }` with `arguments` as raw JSON text; run them in a sequential Loop over `toolCalls` that carries the file, send each call through a Dispatch whose branches are wired from the same `tool` ports (`route.search = search.tool`), so it reaches the group of the tool it names, and add each result to the file with a Chat Message node (role tool). The file that loop hands back feeds the next turn, and the turns stop when one answers with no `toolCalls` pulse.",
   "tags": [
     "ai",
     "gpt",
@@ -45,9 +45,8 @@
     },
     {
       "name": "tools",
-      "type": "JsonDict | List[JsonDict]",
-      "accepts": ["wire"],
-      "description": "Tool declarations the model may call: one LLM Tool node's output, or a list of them."
+      "type": "List[LlmTool]",
+      "description": "The tools the model may call, as a List: usually each tool group's `*tool` metadata port wired into it, or an LLM Tool node's `tool`."
     },
     {
       "name": "toolChoice",

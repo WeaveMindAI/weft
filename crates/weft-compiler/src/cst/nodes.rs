@@ -549,6 +549,46 @@ impl<'a> FileView<'a> {
         out
     }
 
+    /// Every value written on a container's own port (`self.tools = [...a.tools,
+    /// b.tool]`, a metadata port's gathered value) that names `target`, with
+    /// the value's text (what follows the `=`) and the byte range of each
+    /// name in it that resolves to `target`. A name resolves the way the
+    /// compiler reads it (`crate::metadata`'s `scope_written_names`): a member
+    /// of the container first, then each enclosing scope out, then the top.
+    /// A value that is a single port (`self.tool = a.tool`) is an ENDPOINT,
+    /// which [`Self::connections_referencing`] finds.
+    pub fn values_naming(&self, target: &Decl) -> Vec<(SyntaxNode, String, Vec<std::ops::Range<usize>>)> {
+        let Some(target_scoped) = self.scoped_id_of(target) else { return Vec::new() };
+        let mut all_ids = std::collections::HashSet::new();
+        self.walk_decls(&mut |scoped, _| {
+            all_ids.insert(scoped.to_string());
+        });
+        let mut out = Vec::new();
+        self.walk_connections(&mut |scope, conn| {
+            let mut endpoints = conn.children().filter(|n| n.kind() == SyntaxKind::ENDPOINT).filter_map(Endpoint::cast);
+            let on_self = endpoints.next().is_some_and(|ep| ep.parts().0.as_deref() == Some("self"));
+            if !on_self || endpoints.next().is_some() {
+                return;
+            }
+            let text = value_text(conn);
+            let names: Vec<std::ops::Range<usize>> = value_name_heads(&text)
+                .into_iter()
+                .filter(|range| {
+                    let name = &text[range.clone()];
+                    let resolved = (1..=scope.len()).rev()
+                        .map(|k| format!("{}.{name}", scope[..k].join(".")))
+                        .find(|id| all_ids.contains(id))
+                        .unwrap_or_else(|| name.to_string());
+                    resolved == target_scoped
+                })
+                .collect();
+            if !names.is_empty() {
+                out.push((conn.clone(), text, names));
+            }
+        });
+        out
+    }
+
     /// The local id of a decl for scoped-id composition: its own local id, or the
     /// file's `source_id` for an anonymous group (empty local). This is the one
     /// place the anon-group prefix enters; it must match the id the lowering's
@@ -670,6 +710,62 @@ fn scoped_with(prefix: &[String], local: &str) -> String {
 /// seen from inside). The shared rule is pinned by
 /// `endpoint_resolution_matches_flatten` so the two can't silently diverge.
 /// SYNC: endpoint_resolves_to <-> crates/weft-compiler/src/edit/ops.rs require_endpoint, crates/weft-compiler/src/weft_compiler.rs rescope_endpoint, packages/weft-graph/src/webview/lib/projection/apply.ts resolveEndpoint
+/// What follows a line's `=`, as written, without its comments: the text
+/// the lowering reads as the line's value, and the one a rename rewrites.
+pub(crate) fn value_text(conn: &SyntaxNode) -> String {
+    let mut out = String::new();
+    let mut after_eq = false;
+    for el in conn.children_with_tokens() {
+        if !after_eq {
+            after_eq = el.kind() == SyntaxKind::EQ;
+            continue;
+        }
+        if el.kind() != SyntaxKind::COMMENT {
+            out.push_str(&el.to_string());
+        }
+    }
+    out.trim().to_string()
+}
+
+/// The byte range of every name a written value reads a port of (`a` in
+/// `[...a.tools, {"k": b.c}]`): an identifier outside a string, right
+/// before a `.`, and not itself a port or key after one (a spread's `...`
+/// is no such dot).
+fn value_name_heads(text: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let after_dot = text[..start].ends_with('.') && !text[..start].ends_with("...");
+                if !after_dot && bytes.get(i) == Some(&b'.') {
+                    out.push(start..i);
+                }
+            }
+            // A number, with its fraction and exponent (`1.5e3`).
+            c if c.is_ascii_digit() => {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'.' | b'+' | b'-')) {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
 fn endpoint_resolves_to(ep: &Endpoint, scope: &[String], all_ids: &std::collections::HashSet<String>) -> Option<String> {
     let (id, _) = ep.parts();
     let id = id?;

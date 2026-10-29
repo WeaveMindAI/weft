@@ -30,26 +30,27 @@ a slug per cause.
 
 | Slug | What it found | What to do |
 |---|---|---|
-| `unknown-source-node` | A wire reads from a node that does not exist | Fix the name |
+| `unknown-source-node` | A wire reads from a node that does not exist, or a metadata port's value names one | Fix the name |
 | `unknown-target-node` | A wire writes to a node that does not exist | Fix the name |
-| `unknown-source-port` | A wire reads a port the source does not declare | Fix it; the message lists the real ports |
+| `unknown-source-port` | A wire reads a port the source does not declare, or a metadata port's value names a metadata port its member does not have | Fix it; the message lists the real ports |
 | `unknown-target-port` | A wire writes a port the target does not declare | Same |
 | `duplicate-input-port` | Two wires land on one input | Remove one; the message names the first one's line |
-| `double-driven-port` | An input is both wired and written into the body | Remove one of the two |
+| `double-driven-port` | An input is both wired and written into the body, or takes a written value and a [metadata wire](groups.md#metadata-ports), or two metadata wires | Remove one of the two |
 | `scope-reachability` | A wire crosses a group or loop boundary without going through its ports | Route it through the group's own ports |
-| `deref-path` | The dotted path on a wire cannot be read off the source's type | Fix the path, or change the source type |
-| `type-mismatch` | The source's type does not fit the target's | Change one side, or cast. The message suggests a cast where one exists |
+| `deref-path` | The dotted path on a wire cannot be read off the source's type, or, on a metadata wire, the value written does not hold that key | Fix the path, or change the source type or the value |
+| `type-mismatch` | The source's type does not fit the target's, or a metadata port's value puts `...` before a value that is no list | Change one side, or cast. The message suggests a cast where one exists |
 | `unresolved-typevar` | A connected port still has a type variable nothing pinned down | Connect it to something concrete, or declare the type |
 | `type-bound` | A type variable limited to some types got another one: a `String` into a group declared `Group[T: Media]`, or into `KeepFile`, which takes only a file | Connect a value of a type the limit takes; the message names the limit and what you connected |
 | `cast-not-allowed` | A cast node's two ports are a pair the conversion table does not allow | Pick types the table allows |
-| `graph-cycle` | The wires form a cycle | Iterate with a Loop, or exchange feedback over a bus |
+| `graph-cycle` | The wires form a cycle | Iterate with a Loop, or exchange feedback over a bus. If what goes back is a value you can write in the program, like a tool's description, make it a [metadata port](groups.md#metadata-ports) |
 | `required-port-unmet` | A required input has no wire, no written value and no default. On a group, loop or included file: a port nothing outside connects, whose value a node inside cannot run without (a required input, or the last possible member of a `@require_one_of` set) | Give it one of the three; for a group port, connect or write it from outside |
+| `optional-pass-through-port` | A `?` on a port of a group or an included file, or on a loop port the loop neither iterates nor carries. Such a port passes what reaches it to the nodes inside, so it is never optional itself ([a group input passes through](groups.md#a-group-input-passes-through)) | Remove the `?`; to let a node inside run without the value, write the `?` on that node's input |
 
 ## Values you wrote
 
 | Slug | What it found | What to do |
 |---|---|---|
-| `config-type-mismatch` | A written value does not fit the input's type | Fix the value, or the declared type |
+| `config-type-mismatch` | A written value does not fit the input's type, including one a metadata wire writes there, or a metadata port's value does not fit the port's own type | Fix the value, or the declared type |
 | `input-accepts` | The port does not take this kind of driver: a wire on a literal-only port, a written value on a wire-only port | Use the one it takes; the message lists them |
 | `gate-not-boolean` | A written `_should_flow` or `_should_not_flow` is not a Boolean | Write `true` or `false`, or wire it |
 | `literal-out-of-range` | A written number is outside the input's `min` and `max`, or off its whole-number step | Write a value inside the declared range |
@@ -67,7 +68,8 @@ a slug per cause.
 | Slug | What it found | What to do |
 |---|---|---|
 | `duplicate-node-id` | Two nodes share an id once the graph is flattened | Rename one; the message names the first one's line |
-| `duplicate-port` | A node has two ports of the same name on one side | Rename one |
+| `duplicate-port` | A node has two ports of the same name on one side, or a port the program adds to a node has the name of one of its node type's metadata ports | Rename one |
+| `unpaired-port` | On a node that pairs each added input with an output of its name, like `Dispatch`, one of three things. An added output has no input of its name: add the input, or remove the output. Nothing reads an added output, so what it gets would be dropped: wire it to what handles it. An added input is named after one of the node's own outputs: rename it | The message says which of the three |
 | `reserved-name` | A node or group is named after a node type, so `name.port` would read as an inline node | Rename it |
 | `two-gates` | A node carries both `_should_flow` and `_should_not_flow` | Keep the one that says what you mean |
 | `run-undecided` | Every input wired into a node is declared with `?`, so nothing says when it runs | Gate it with `_should_flow`, drop the `?` from the input it cannot do without, or add `@require_one_of` |
@@ -90,6 +92,19 @@ or a switch's cases.
 | `config-entry-missing-value` | An entry is missing a value that kind requires | Add the key the message names |
 | `duplicate-catch-all` | Two entries match anything, so the second is unreachable | Keep one |
 | `catch-all-not-last` | Entries sit after a catch-all, where nothing can reach them | Move the catch-all last |
+
+## Metadata ports
+
+For what a metadata port is, go and read [metadata ports](groups.md#metadata-ports).
+
+| Slug | What it found | What to do |
+|---|---|---|
+| `metadata-port-not-written` | A group's metadata port has no value | Write it in the body (`self.tool = { ... }`), or take it from another metadata port |
+| `metadata-value-not-literal` | A metadata port's value names a node's output, which only exists once the program runs | Write the value itself, or take it from another metadata port |
+| `metadata-reference-cycle` | Metadata ports take their value from each other, so none has one | Write the value on one of them |
+| `metadata-port-as-target` | A wire goes into a metadata port from outside | Wire from it instead (`other.input = g.tool`) |
+| `metadata-port-read-inside` | A node inside a group is wired from that group's own metadata port (`self.tool`). Like an output, a metadata port is read from outside its group | Read it from outside the group, or take the value inside from where the port gets it |
+| `metadata-into-output` | A metadata port's value goes into an ordinary output of a group | Make that output a metadata port too (`-> (*out: Type)`) |
 
 ## Loops
 

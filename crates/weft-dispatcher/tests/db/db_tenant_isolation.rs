@@ -43,6 +43,7 @@ fn definition(id: Uuid) -> ProjectDefinition {
         defaults: Default::default(),
         given: Default::default(),
         broken: Vec::new(),
+        metadata_wires: Vec::new(),
     }
 }
 

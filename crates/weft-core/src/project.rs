@@ -72,6 +72,18 @@ pub struct ProjectDefinition {
     /// that compiles whole, and in every cut.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub broken: Vec<Broken>,
+    /// The wires that leave a metadata port ([`MetadataPort`]), kept only
+    /// so the editor can say where the value written on an input came
+    /// from. Enrich has already written
+    /// each one's value into the input it points at, so none of them
+    /// runs, and nothing that runs or checks the program's wires ever
+    /// reads this list: a metadata wire may point backwards without
+    /// making a cycle. Each stops where the value lands (a node's input,
+    /// or a group's port seen from outside), so the wires that carry it
+    /// on from there are ordinary ones in `edges`.
+    // SYNC: metadata_wires <-> packages/weft-graph/src/protocol.ts ProjectDefinition.metadataWires
+    #[serde(default, rename = "metadataWires", skip_serializing_if = "Vec::is_empty")]
+    pub metadata_wires: Vec<Edge>,
 }
 
 impl ProjectDefinition {
@@ -360,12 +372,19 @@ pub struct GroupDefinition {
     pub kind: GroupKind,
     /// Optional user-facing label. Defaults to id if missing.
     pub label: Option<String>,
-    /// External input ports (the ports outside the group connects to).
+    /// External input ports (the ports outside the group connects to),
+    /// each as full an input as a node's: the editor draws a value written
+    /// on one with the widget enrich derives from its type.
     #[serde(rename = "inPorts", default)]
-    pub in_ports: Vec<PortDefinition>,
+    pub in_ports: Vec<InputDefinition>,
     /// External output ports.
     #[serde(rename = "outPorts", default)]
     pub out_ports: Vec<PortDefinition>,
+    /// The `*name: Type` ports of the header, each with the value the body
+    /// writes ([`MetadataPort`]). An include's call site carries its body's.
+    // SYNC: GroupDefinition.metadata_ports <-> packages/weft-graph/src/protocol.ts GroupDefinition.metadataPorts
+    #[serde(rename = "metadataPorts", default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_ports: Vec<MetadataPort>,
     /// Parent group id for nested groups. None for top-level groups.
     #[serde(rename = "parentGroupId", default)]
     pub parent_group_id: Option<String>,
@@ -417,6 +436,9 @@ pub struct GroupDefinition {
     // SYNC: port_literal_spans <-> packages/weft-graph/src/protocol.ts GroupDefinition.portLiteralSpans
     #[serde(default, rename = "portLiteralSpans")]
     pub port_literal_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
+    /// The same record a node keeps ([`NodeDefinition::port_literal_types`]).
+    #[serde(default, rename = "portLiteralTypes", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub port_literal_types: std::collections::BTreeMap<String, WeftType>,
     /// `[T: Media]` written after `Group`: bounds on the type variables
     /// its ports use, each with what it resolved to once enrich has run
     /// (a loop's sit on its `LoopIn` and `LoopOut` instead).
@@ -676,6 +698,19 @@ pub struct NodeDefinition {
     // SYNC: port_literal_spans <-> packages/weft-graph/src/protocol.ts NodeDefinition.portLiteralSpans
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "portLiteralSpans")]
     pub port_literal_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
+    /// The type of a `port_literals` entry when the program states it
+    /// rather than the value showing it: a value a metadata wire wrote is
+    /// of its metadata port's type (an `LlmTool`, never the record its
+    /// JSON reads as), so a type variable the port carries binds to that
+    /// type. Every other literal's type is read off the value.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "portLiteralTypes")]
+    pub port_literal_types: std::collections::BTreeMap<String, WeftType>,
+    /// The metadata ports this node carries: its node type's, or on an
+    /// included file's opaque node, the file's group's ([`MetadataPort`]).
+    /// Filled by enrich from the catalog.
+    // SYNC: NodeDefinition.metadata_ports <-> packages/weft-graph/src/protocol.ts NodeDefinition.metadataPorts
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "metadataPorts")]
+    pub metadata_ports: Vec<MetadataPort>,
     /// File-backed config fields, keyed by field name. Present when a field
     /// value came from `@file("path", Type)`. `config` holds the resolved
     /// value; this records the source reference so the editor renders the
@@ -923,6 +958,15 @@ pub struct InputDefinition {
     // SYNC: InputDefinition.optional <-> packages/weft-graph/src/protocol.ts InputDefinition.optional, packages/weft-connect/src/core/wire.ts InputDefinition.optional
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub optional: bool,
+    /// A container's input that holds nothing: a group, an included file,
+    /// or a loop on a port it neither iterates nor carries hands what
+    /// reaches it straight to the nodes inside that read it. It is never
+    /// required or optional itself (a `?` on it is refused); whether it
+    /// must be connected is what those nodes need. Only a container's
+    /// inputs (a group's, an include's opaque node's) set it.
+    // SYNC: InputDefinition.passes_through <-> packages/weft-connect/src/core/wire.ts InputDefinition.passesThrough
+    #[serde(default, rename = "passesThrough", skip_serializing_if = "std::ops::Not::not")]
+    pub passes_through: bool,
     /// The input's effective editor widget (declared, else derived from
     /// the RESOLVED instance type after TypeVar substitution). Always
     /// present after enrich.
@@ -1063,6 +1107,7 @@ impl InputDefinition {
             accepts: Accepts::for_type(&port.port_type),
             port,
             optional: false,
+            passes_through: false,
             widget: None,
             default: None,
             label: None,
@@ -1080,6 +1125,13 @@ impl InputDefinition {
     /// wire closed when `optional` (see [`Self::optional`]).
     pub fn with_optional(mut self, optional: bool) -> Self {
         self.optional = optional;
+        self
+    }
+
+    /// This input, marked as a container's port that hands its value on
+    /// when `passes_through` (see [`Self::passes_through`]).
+    pub fn with_passes_through(mut self, passes_through: bool) -> Self {
+        self.passes_through = passes_through;
         self
     }
 }
@@ -1129,6 +1181,150 @@ pub struct PortDefinition {
     // SYNC: PortDefinition.declared_type <-> packages/weft-graph/src/protocol.ts PortDefinition.declaredType, packages/weft-connect/src/core/wire.ts PortDefinition.declaredType
     #[serde(default, rename = "declaredType", skip_serializing_if = "Option::is_none")]
     pub declared_type: Option<String>,
+}
+
+/// A port whose value is written when the program is written, never
+/// computed by a run: a tool's description on the group that performs
+/// the tool. It sits on the output side of a node or a group, and a wire
+/// leaving it is a metadata wire: the compiler writes the value into the
+/// input the wire points at, exactly as if it had been typed there, and
+/// the wire never runs ([`ProjectDefinition::metadata_wires`]).
+///
+/// One type everywhere: a node type declares its own in `metadata.json`
+/// (`metadataPorts`, the value written there), a group or a loop in its
+/// header (`-> (*tool: LlmTool)`, the value written in its body with
+/// `self.tool = { ... }`), and a node instance carries its type's.
+// SYNC: MetadataPort <-> packages/weft-connect/src/core/wire.ts MetadataPort
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetadataPort {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub port_type: WeftType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The value. A node type always writes it; a group's is `None` until
+    /// enrich works out what its body writes (a literal, or other metadata
+    /// ports gathered, [`Self::written`]), and one with nothing written is
+    /// an error naming the line to add. An included file's opaque node (the
+    /// editor's view of an `@include`) takes the file's from the file
+    /// compiled whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    /// The value as a group's body writes it when part of it comes from
+    /// other metadata ports (`self.tools = [...screen.tools, pause.tool]`),
+    /// each reference already scoped to the id it names. Enrich works the
+    /// value out from it. `None` on a value written out in full, and on a
+    /// node type's.
+    // SYNC: MetadataPort.written <-> packages/weft-connect/src/core/wire.ts MetadataPort.written
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written: Option<MetadataExpr>,
+    /// Where a group's body writes the value (`self.tool = ...`), in the
+    /// group's file, so an edit rewrites it in place. `None` on a node's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<Span>,
+    /// The type as a group's header spells it (the same contract as
+    /// [`PortDefinition::declared_type`]), which a header rewrite writes
+    /// back. `None` on a node's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_type: Option<String>,
+}
+
+/// A metadata port's value written from other metadata ports
+/// ([`MetadataPort::written`]): JSON in which a name stands for the value
+/// of the metadata port it names, and `...name` inside a list stands for
+/// that list's items.
+// SYNC: MetadataExpr <-> packages/weft-connect/src/core/wire.ts MetadataExpr
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MetadataExpr {
+    /// A JSON value written out in full.
+    Literal { value: Value },
+    /// The value of another node's or group's metadata port, with keys
+    /// read off it (`act.tools.anthropic` is port `tools` of `act`, read
+    /// at `anthropic`). `source` is the scoped id.
+    Port {
+        source: String,
+        port: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        path: Vec<String>,
+    },
+    List { items: Vec<MetadataItem> },
+    Object { fields: Vec<MetadataField> },
+}
+
+/// One item of a [`MetadataExpr::List`]: a value, or with `spread` the
+/// items of a list (`...screen.tools`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetadataItem {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spread: bool,
+    pub value: MetadataExpr,
+}
+
+/// One key of a [`MetadataExpr::Object`], in written order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetadataField {
+    pub key: String,
+    pub value: MetadataExpr,
+}
+
+impl MetadataExpr {
+    /// Every metadata port the expression names, in written order.
+    pub fn ports(&self) -> Vec<(&str, &str, &[String])> {
+        let mut out = Vec::new();
+        self.collect_ports(&mut out);
+        out
+    }
+
+    fn collect_ports<'e>(&'e self, out: &mut Vec<(&'e str, &'e str, &'e [String])>) {
+        match self {
+            MetadataExpr::Literal { .. } => {}
+            MetadataExpr::Port { source, port, path } => out.push((source, port, path)),
+            MetadataExpr::List { items } => items.iter().for_each(|item| item.value.collect_ports(out)),
+            MetadataExpr::Object { fields } => fields.iter().for_each(|field| field.value.collect_ports(out)),
+        }
+    }
+
+    /// Every source id the expression names, rewritten by `scope`.
+    pub fn rescope(&mut self, scope: &mut impl FnMut(&str) -> String) {
+        match self {
+            MetadataExpr::Literal { .. } => {}
+            MetadataExpr::Port { source, .. } => *source = scope(source),
+            MetadataExpr::List { items } => items.iter_mut().for_each(|item| item.value.rescope(scope)),
+            MetadataExpr::Object { fields } => fields.iter_mut().for_each(|field| field.value.rescope(scope)),
+        }
+    }
+
+    /// The value, each named port's value read by `port`; `Err` names
+    /// what does not fit (a `...` on a value that is no list).
+    pub fn evaluate<E>(&self, port: &mut impl FnMut(&str, &str, &[String]) -> Result<Value, E>, spread_not_a_list: impl Fn(&MetadataExpr, &Value) -> E + Copy) -> Result<Value, E> {
+        Ok(match self {
+            MetadataExpr::Literal { value } => value.clone(),
+            MetadataExpr::Port { source, port: name, path } => port(source, name, path)?,
+            MetadataExpr::List { items } => {
+                let mut out = Vec::new();
+                for item in items {
+                    let value = item.value.evaluate(port, spread_not_a_list)?;
+                    match (item.spread, value) {
+                        (true, Value::Array(values)) => out.extend(values),
+                        (true, other) => return Err(spread_not_a_list(&item.value, &other)),
+                        (false, value) => out.push(value),
+                    }
+                }
+                Value::Array(out)
+            }
+            MetadataExpr::Object { fields } => {
+                let mut out = serde_json::Map::new();
+                for field in fields {
+                    out.insert(field.key.clone(), field.value.evaluate(port, spread_not_a_list)?);
+                }
+                Value::Object(out)
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1547,6 +1743,7 @@ mod address_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            metadata_wires: Vec::new(),
         };
         let (node, path) = resolve_address(&project, "");
         assert_eq!(node, "");
@@ -1977,6 +2174,8 @@ mod trigger_dependency_tests {
             optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
+            port_literal_types: Default::default(),
+            metadata_ports: Vec::new(),
             file_refs: Default::default(),
             include_path: None,
             include_contents: None,
@@ -2010,6 +2209,7 @@ mod trigger_dependency_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            metadata_wires: Vec::new(),
         }
     }
 
@@ -2222,6 +2422,7 @@ mod project_wire_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            metadata_wires: Vec::new(),
         };
         let v = serde_json::to_value(&p).unwrap();
         assert!(v.get("name").is_none(), "name must not serialize: {v}");
@@ -2254,6 +2455,7 @@ mod project_wire_tests {
             },
             accepts: Accepts::wire_only(),
             optional: false,
+            passes_through: false,
             widget: None,
             default: None,
             label: None,
@@ -2287,6 +2489,8 @@ mod project_wire_tests {
             optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
+            port_literal_types: Default::default(),
+            metadata_ports: Vec::new(),
             file_refs: Default::default(),
             include_path: None,
             include_contents: None,
@@ -2296,7 +2500,7 @@ mod project_wire_tests {
             id: "g".into(),
             kind: GroupKind::Group,
             label: None,
-            in_ports: vec![input.port.clone()],
+            in_ports: vec![input.clone()],
             out_ports: vec![],
             parent_group_id: None,
             child_group_ids: vec![],
@@ -2309,6 +2513,16 @@ mod project_wire_tests {
             port_literals: [("_should_flow".to_string(), Value::Bool(false))].into(),
             file_refs: Default::default(),
             port_literal_spans: Default::default(),
+            port_literal_types: [("x".to_string(), WeftType::primitive(crate::weft_type::WeftPrimitive::String))].into(),
+            metadata_ports: vec![MetadataPort {
+                name: "tool".into(),
+                port_type: WeftType::primitive(crate::weft_type::WeftPrimitive::String),
+                description: None,
+                value: Some(Value::String("x".into())),
+                written: None,
+                span: Some(Span::single_line(2, 0, 9)),
+                declared_type: Some("String".into()),
+            }],
             type_params: Vec::new(),
             place_types: Vec::new(),
         };
@@ -2326,15 +2540,26 @@ mod project_wire_tests {
         let p = ProjectDefinition {
             id: Uuid::nil(),
             nodes: vec![node],
-            edges: vec![edge],
+            edges: vec![edge.clone()],
             groups: vec![group],
             created_at: Utc::now(),
             updated_at: Utc::now(),
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            metadata_wires: vec![edge],
         };
         let v = serde_json::to_value(&p).unwrap();
+        // A metadata port, a metadata wire and a literal's stated type, in
+        // the editor's spelling.
+        assert_eq!(
+            v["groups"][0]["metadataPorts"],
+            serde_json::json!([{ "name": "tool", "type": "String", "value": "x", "span": { "startLine": 2, "startColumn": 0, "endLine": 2, "endColumn": 9 }, "declaredType": "String" }]),
+            "metadataPorts: {v}"
+        );
+        assert_eq!(v["metadataWires"][0]["id"], "e1", "metadataWires: {v}");
+        assert_eq!(v["groups"][0]["portLiteralTypes"]["x"], "String", "portLiteralTypes: {v}");
+        assert!(v["nodes"][0].get("metadataPorts").is_none() && v["nodes"][0].get("portLiteralTypes").is_none(), "empty ones are left off: {v}");
         assert_eq!(v["groups"][0]["portLiterals"]["_should_flow"], false, "portLiterals key: {v}");
         // The renamed keys the TS side depends on:
         assert!(v["nodes"][0].get("nodeType").is_some(), "nodeType key: {v}");
@@ -2371,6 +2596,8 @@ mod project_wire_tests {
         assert_eq!(back.nodes[0].node_type, "Llm");
         assert_eq!(back.groups[0].in_ports.len(), 1);
         assert_eq!(back.nodes[0].header_span, Some(Span::single_line(1, 0, 3)), "headerSpan round-trips");
+        assert_eq!(back.metadata_wires.len(), 1);
+        assert_eq!(back.groups[0].metadata_ports[0].value, Some(Value::String("x".into())));
     }
 
     fn node_with_infra(id: &str, requires_infra: bool) -> NodeDefinition {
@@ -2400,6 +2627,8 @@ mod project_wire_tests {
             optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
+            port_literal_types: Default::default(),
+            metadata_ports: Vec::new(),
             file_refs: Default::default(),
             include_path: None,
             include_contents: None,
@@ -2418,6 +2647,7 @@ mod project_wire_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            metadata_wires: Vec::new(),
         }
     }
 

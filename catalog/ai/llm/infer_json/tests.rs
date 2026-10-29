@@ -151,8 +151,8 @@ async fn tool_turn(rig: FakeRig) -> WeftResult<()> {
             json!({
                 "provider": provider(&rig),
                 "prompt": "grade it",
-                "tools": { "name": "lookup", "description": "look the sender up",
-                           "parameters": { "type": "object", "properties": {} } },
+                "tools": [{ "name": "lookup", "description": "look the sender up",
+                            "parameters": { "type": "object", "properties": {} } }],
             }),
         )
         .await

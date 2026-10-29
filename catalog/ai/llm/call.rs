@@ -202,14 +202,15 @@ pub async fn assemble(ctx: &RunContext) -> WeftResult<LlmCall> {
         cp = cp.with_openrouter_routing(routing);
     }
 
-    // Tools: each wired value is one LlmTool node's `{ name,
-    // description, parameters }` object, handed to the lib verbatim.
-    let tools: Vec<Value> = ctx.inputs.list("tools")?;
+    // Tools: each item is an `LlmTool` record (`{ name, description?,
+    // parameters }`), which is the lib's `ToolDefinition` field for
+    // field, so it decodes straight into one.
+    // SYNC: types.LlmTool (catalog/ai/llm/metadata.json) <->
+    //       MiniLLMLibRS/src/tools/mod.rs ToolDefinition
+    let tools: Vec<ToolDefinition> = ctx.inputs.opt("tools")?.unwrap_or_default();
     let has_tools = !tools.is_empty();
     for tool in tools {
-        let def: ToolDefinition = serde_json::from_value(tool)
-            .map_err(|e| WeftError::Input(format!("a wired tool is not a tool definition: {e}")))?;
-        cp = cp.with_tool(def);
+        cp = cp.with_tool(tool);
     }
     // `toolChoice` declares a default ("auto"), so the bag always holds
     // it; providers reject a tool_choice without tools, so it only

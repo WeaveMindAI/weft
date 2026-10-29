@@ -15,7 +15,7 @@
 
 import type { ProjectDefinition, NodeInstance, Edge, PortDefinition, NodeFeatures } from '../types';
 import { isContainerNodeType, isLoopNodeType, isScopeBoxNodeType, containerKindOf, portValueFirstForm } from '../types';
-import type { EditOp, EditPortSig, RevertedPortSig } from '../../../protocol';
+import type { EditOp, EditPortSig, MetadataPort, RevertedPortSig } from '../../../protocol';
 import { isGatePort } from '../../../protocol';
 import { parseConfigToken } from '../value-format';
 import type { FoldResult, PendingOp } from './types';
@@ -26,6 +26,7 @@ import type { FoldResult, PendingOp } from './types';
 export interface ProjectionCatalogEntry {
   defaultInputs: PortDefinition[];
   defaultOutputs: PortDefinition[];
+  metadataPorts?: MetadataPort[];
   features?: NodeFeatures;
 }
 export type ProjectionCatalog = Record<string, ProjectionCatalogEntry>;
@@ -219,14 +220,14 @@ function mergedSigPort(
   // never carry one (Rust guarantees it absent there).
   stampDeclared: boolean,
 ): PortDefinition {
-  // The sig's `required` is its SPELLING (`x:` or `x?:`), and on a node
-  // a written `x?:` is what `optional` means: the node runs without it
-  // even when wired. A container port has only the two written states,
-  // carried by `required` alone.
+  // The sig's `required` is its SPELLING (`x:` or `x?:`), and a written
+  // `x?:` is what `optional` means, on a node and a container alike: it
+  // runs without the value even when wired (the compiler stamps a
+  // container's ports the same way).
   const { optional: _priorOptional, ...rest } = prior ?? {};
   return {
     ...rest,
-    ...(stampDeclared && !sig.required ? { optional: true } : {}),
+    ...(!sig.required ? { optional: true } : {}),
     name: sig.name,
     required: sig.required,
     // The RENDERED type is what the port shows (a reparse re-runs
@@ -244,12 +245,26 @@ function mergedSigPort(
 }
 
 /** A CONTAINER's signature is its whole surface: the sig list replaces
- *  the rendered list outright. */
+ *  the rendered list outright. Its outputs carry the metadata ports too
+ *  (`metadata: true`), which keep the value the body writes: a header
+ *  rewrite never touches the body line. */
 function updatePorts(node: NodeInstance, inputs: EditPortSig[], outputs: EditPortSig[]): void {
+  // The server's refusals, in its words: a metadata port sits on the
+  // output side, and it always names its type.
+  const inInputs = inputs.find((s) => s.metadata);
+  if (inInputs) throw new Error(`metadata port '${inInputs.name}' among the inputs: a metadata port is an output`);
+  const untyped = outputs.find((s) => s.metadata && s.portType === '');
+  if (untyped) throw new Error(`metadata port '${untyped.name}' has no type`);
   const merge = (sigs: EditPortSig[], existing: PortDefinition[]): PortDefinition[] =>
     sigs.map((sig) => mergedSigPort(sig, existing.find((p) => p.name === sig.name), false));
   node.inputs = merge(inputs, node.inputs);
-  node.outputs = merge(outputs, node.outputs);
+  node.outputs = merge(outputs.filter((s) => !s.metadata), node.outputs);
+  const metadata = outputs.filter((s) => s.metadata).map((sig): MetadataPort => {
+    const { type: _priorType, declaredType: _priorDeclared, ...prior } = node.metadataPorts?.find((m) => m.name === sig.name) ?? {};
+    return { ...prior, name: sig.name, type: sig.rendered ?? sig.portType, declaredType: sig.portType };
+  });
+  if (metadata.length > 0) node.metadataPorts = metadata;
+  else delete node.metadataPorts;
 }
 
 /** A NODE's header is NOT its whole surface (the catalog provides the
@@ -267,6 +282,10 @@ function updateNodePortSurface(
   revertedInputs: RevertedPortSig[],
   revertedOutputs: RevertedPortSig[],
 ): void {
+  // A node's metadata ports are its type's, written in its metadata.json:
+  // no header declares one.
+  const metadata = [...inputs, ...outputs].find((s) => s.metadata);
+  if (metadata) throw new Error(`metadata port '${metadata.name}' on a node: only a group or a loop declares one`);
   const merge = (
     sigs: EditPortSig[],
     existing: PortDefinition[],
@@ -353,6 +372,25 @@ function syncLoopCarryInputs(loop: NodeInstance): void {
       });
     }
   }
+}
+
+/** Mirror the compiler's `passesThrough` stamp on a container's inputs:
+ *  every input of a group, and a loop's except the ones it iterates
+ *  (`over`) or carries (`carry`), which launch its iterations. Re-run
+ *  after anything that changes the inputs or those two lists, so a loop
+ *  port moved into `over` regains its requiredness at once.
+ *  SYNC: syncPassThrough <-> crates/weft-compiler/src/weft_compiler.rs ParsedGroup::passes_through */
+function syncPassThrough(container: NodeInstance): void {
+  const listed = (key: string): string[] => Array.isArray(container.config[key])
+    ? (container.config[key] as unknown[]).filter((v): v is string => typeof v === 'string')
+    : [];
+  const launches = containerKindOf(container.nodeType) === 'Loop'
+    ? new Set([...listed('over'), ...listed('carry')])
+    : new Set<string>();
+  container.inputs = container.inputs.map((p: PortDefinition) => {
+    const { passesThrough: _was, ...rest } = p;
+    return launches.has(p.name) ? rest : { ...rest, passesThrough: true };
+  });
 }
 
 /** Drop edges bound to a port that no longer exists on `node` (mirrors the
@@ -478,6 +516,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
         syncLoopCarryInputs(decl);
         dropDanglingPortEdges(decl, project);
       }
+      if (op.key === 'over' || op.key === 'carry') syncPassThrough(decl);
       return;
     }
     case 'set_per_instance': {
@@ -514,6 +553,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
         parentId: parent?.id,
         inputs: entry.defaultInputs.map((p) => ({ ...p })),
         outputs: entry.defaultOutputs.map((p) => ({ ...p })),
+        ...(entry.metadataPorts ? { metadataPorts: entry.metadataPorts.map((m) => ({ ...m })) } : {}),
         features: entry.features ?? {},
         scope: ancestorChain(project, parent?.id),
       };
@@ -580,7 +620,8 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
         (e) => !(e.target === tgt.id && (e.targetHandle ?? '') === tgt.handle),
       );
       project.edges.push({
-        id: `e-${src.id}-${src.handle}-${tgt.id}-${tgt.handle}`,
+        // The compiler's `wire_id`: the keys read are part of it.
+        id: `e-${src.id}-${src.handle}-${tgt.id}-${tgt.handle}${op.path && op.path.length > 0 ? `.${op.path.join('.')}` : ''}`,
         source: src.id,
         target: tgt.id,
         sourceHandle: src.handle,
@@ -622,6 +663,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
         throw new Error(`UpdateGroupPorts called on '${op.group}' which is not a Group decl`);
       }
       updatePorts(decl, op.inputs, op.outputs);
+      syncPassThrough(decl);
       dropDanglingPortEdges(decl, project);
       return;
     }
@@ -634,7 +676,28 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       // list BEFORE the sweep so a surviving carry's wires stay.
       updatePorts(decl, op.inputs, op.outputs);
       syncLoopCarryInputs(decl);
+      syncPassThrough(decl);
       dropDanglingPortEdges(decl, project);
+      return;
+    }
+    case 'set_metadata_value': {
+      const decl = resolveContainer(project, op.group);
+      const port = decl.metadataPorts?.find((m) => m.name === op.port);
+      if (!port) throw new Error(`'${op.group}' has no metadata port '${op.port}'`);
+      if (op.value === null) {
+        delete port.value;
+        return;
+      }
+      // A value written out in full shows at once. A value gathered from
+      // other metadata ports (`[...other.tools, pause.tool]`, what a
+      // duplicate writes) is no value token: only the compiler resolves
+      // it, so the value stays unknown until the next parse brings it.
+      // The server, not this preview, says whether the text is right.
+      try {
+        port.value = parseConfigToken(op.value);
+      } catch {
+        delete port.value;
+      }
       return;
     }
     case 'set_group_description': {

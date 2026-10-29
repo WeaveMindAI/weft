@@ -4,9 +4,10 @@ name = "computer"
 # A computer a program can work on: the `Computer` infra node runs a
 # machine with a screen and a shell, one node per action works it
 # (`Screenshot`, `Click`, `TypeText`, `RunCommand`, ...), and for a model
-# working it turn after turn, `ComputerTools` describes the actions and
-# `RouteComputerCall` sends each tool call to its action node. The
-# vendor tool names both of those speak are the shared `styles.rs`; the
+# working it turn after turn, each action node describes the tools it
+# performs on its `tools` metadata port and `RouteComputerCall` sends
+# each tool call to its action node. The vendor tool names both of those
+# speak are the shared `styles.rs`; the
 # call every action node makes to the machine is the shared
 # `actions.rs`. `perform.weft` (one tool call on a computer) and
 # `agent.weft` (a default agent) wire all of it, ready to include.

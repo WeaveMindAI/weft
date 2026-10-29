@@ -10,6 +10,7 @@
     "ScrollArgs": "{ x?: Number, y?: Number, direction: String, amount?: Number, modifiers?: String }",
     "TypeArgs": "{ text: String }",
     "KeyArgs": "{ keys: String, repeat?: Number, holdSecs?: Number }",
-    "CommandArgs": "{ command?: String, restart?: Boolean, timeoutSecs?: Number }"
+    "CommandArgs": "{ command?: String, restart?: Boolean, timeoutSecs?: Number }",
+    "ActionTools": "{ anthropic: List[LlmTool], openai: List[LlmTool] }"
   }
 }

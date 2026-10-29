@@ -21,6 +21,7 @@ You never wait on a permission prompt: one you would raise is refused at once (t
 - the node's one job, in a sentence
 - every input port: name, type, required or optional, and `accepts` only when a wire would be a mistake. In `metadata.json` that means `"required": true` on an input the node cannot run without, and the key left off every other input: absent already means optional, so `"required": false` says nothing and reads as though you meant something by it. An output never carries it at all (metadata load refuses one that does).
 - every output port: name and type
+- every metadata port, if it has one: name, type, and its value, written by hand under `metadataPorts` in `metadata.json`
 - the service or API the node wraps, if any
 - anything the surrounding program depends on
 

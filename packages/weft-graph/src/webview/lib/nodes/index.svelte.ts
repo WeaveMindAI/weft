@@ -62,6 +62,7 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		requiresInfra: entry.requiresInfra ?? false,
 		defaultInputs: (entry.inputs ?? []).map(toInputPort),
 		defaultOutputs: (entry.outputs ?? []).map(toOutputPort),
+		...(entry.metadataPorts ? { metadataPorts: entry.metadataPorts } : {}),
 		// The catalog keys bounds by variable; the template carries them
 		// in the instance's wire shape, so one check reads either.
 		...(entry.typeParams

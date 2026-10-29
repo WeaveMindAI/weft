@@ -20,6 +20,8 @@ use serde_json::Value;
 use weft::node::NodeOutput;
 use weft::{node_bail, RunContext, Node, NodeManifest, WeftResult};
 
+use super::compare::same;
+
 #[derive(NodeManifest)]
 pub struct SwitchNode;
 
@@ -91,24 +93,6 @@ impl Test {
     /// value it was handed (a `gt` on a string, `matches` on a number)
     /// simply does not match: the case is not this one.
     fn holds(&self, value: &Value) -> bool {
-        // JSON equality separates `5` from `5.0` (integer vs float
-        // representation), which a case author never means: numbers
-        // compare by VALUE, everything else structurally. Two integers
-        // compare exactly, never through f64: above 2^53 an f64 cannot
-        // tell adjacent integers apart, and message-platform ids are
-        // exactly that large.
-        fn same(a: &Value, b: &Value) -> bool {
-            match (a, b) {
-                (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64()) {
-                    (Some(i), Some(j)) => i == j,
-                    _ => match (x.as_u64(), y.as_u64()) {
-                        (Some(i), Some(j)) => i == j,
-                        _ => x.as_f64() == y.as_f64(),
-                    },
-                },
-                _ => a == b,
-            }
-        }
         match self {
             Self::Equals(expected) => same(value, expected),
             Self::In(options) => options.iter().any(|option| same(value, option)),

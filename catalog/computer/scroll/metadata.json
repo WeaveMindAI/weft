@@ -28,5 +28,101 @@
       "type": "String",
       "description": "What happened, in a sentence a model can read back as the tool's result."
     }
+  ],
+  "metadataPorts": [
+    {
+      "name": "tools",
+      "type": "ActionTools",
+      "description": "The tools a model calls this node through, in Anthropic's names and in OpenAI's: gather them up to the LLM node's `tools` through metadata ports.",
+      "value": {
+        "anthropic": [
+          {
+            "description": "Turn the mouse wheel. A keyboard shortcut (Page_Down, End) is surer where one works, and a scrollbar is hard to hit.",
+            "name": "scroll",
+            "parameters": {
+              "properties": {
+                "coordinate": {
+                  "description": "Where to scroll (the mouse moves there first); left out, where the mouse is as [x, y], pixels from the left and top edges of the last full screenshot.",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "maxItems": 2,
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "scroll_amount": {
+                  "description": "How many clicks of the wheel.",
+                  "maximum": 100,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "scroll_direction": {
+                  "enum": [
+                    "up",
+                    "down",
+                    "left",
+                    "right"
+                  ],
+                  "type": "string"
+                },
+                "text": {
+                  "description": "Keys to hold down during the action, joined by + (shift, ctrl+shift).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scroll_direction",
+                "scroll_amount"
+              ],
+              "type": "object"
+            }
+          }
+        ],
+        "openai": [
+          {
+            "description": "Scroll at a point, by pixels along one axis. A keyboard shortcut (PAGEDOWN, END) is surer where one works.",
+            "name": "scroll",
+            "parameters": {
+              "properties": {
+                "keys": {
+                  "description": "Keys to hold down during the action, like [\"SHIFT\"] or [\"CTRL\", \"SHIFT\"].",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "scroll_x": {
+                  "description": "Pixels to scroll right (negative: left).",
+                  "maximum": 10000,
+                  "minimum": -10000,
+                  "type": "integer"
+                },
+                "scroll_y": {
+                  "description": "Pixels to scroll down (negative: up).",
+                  "maximum": 10000,
+                  "minimum": -10000,
+                  "type": "integer"
+                },
+                "x": {
+                  "description": "Where to scroll, across, pixels from the left and top edges of the last full screenshot.",
+                  "type": "integer"
+                },
+                "y": {
+                  "description": "Where to scroll, down, pixels from the left and top edges of the last full screenshot.",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "x",
+                "y",
+                "scroll_x",
+                "scroll_y"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      }
+    }
   ]
 }

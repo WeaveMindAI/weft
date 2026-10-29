@@ -21,6 +21,7 @@ use serde_json::{Map, Value};
 use weft_core::casing::Casing;
 use weft_core::node::{metadata_place_at, InputSpec, MetadataPlace, NodeMetadata, OutputSpec, PortsFromConfig};
 use weft_core::weft_type::WeftType;
+use weft_core::project::MetadataPort;
 
 /// Port names the LANGUAGE reserves. Every one starts with `_`, which
 /// keeps it out of every node's own namespace, so it is the language's
@@ -86,6 +87,9 @@ pub(crate) fn check_node(meta: &NodeMetadata, inherited: impl Fn(&str) -> bool, 
     if !inherited("outputs") {
         check_outputs(&meta.outputs, out);
     }
+    if !inherited("metadataPorts") {
+        check_metadata_ports(&meta.metadata_ports, out);
+    }
     if !inherited("portsFromConfig") {
         if let Some(pfc) = &meta.ports_from_config {
             check_ports_from_config(pfc, out);
@@ -106,6 +110,9 @@ pub(crate) fn check_defaults_ports(defaults: &Map<String, Value>, out: &mut Vec<
     }
     if let Some(outputs) = parsed::<Vec<OutputSpec>>(defaults, "outputs") {
         check_outputs(&outputs, out);
+    }
+    if let Some(ports) = parsed::<Vec<MetadataPort>>(defaults, "metadataPorts") {
+        check_metadata_ports(&ports, out);
     }
     if let Some(pfc) = parsed::<PortsFromConfig>(defaults, "portsFromConfig") {
         check_ports_from_config(&pfc, out);
@@ -134,6 +141,15 @@ fn check_outputs(outputs: &[OutputSpec], out: &mut Vec<String>) {
             check(out, Casing::Camel, "output", &output.name);
         }
         check_record_fields(out, &output.port_type, false);
+    }
+}
+
+/// A metadata port's name and the record fields of its type. Its value is
+/// the node's data, spelled however that data is.
+fn check_metadata_ports(ports: &[MetadataPort], out: &mut Vec<String>) {
+    for port in ports {
+        check(out, Casing::Camel, "metadata port", &port.name);
+        check_record_fields(out, &port.port_type, false);
     }
 }
 
@@ -275,5 +291,22 @@ mod tests {
                 "metadata key 'some_key' is not camelCase: write 'someKey'",
             ]
         );
+    }
+
+    /// A metadata port's name is the node's to spell; its value is its data,
+    /// spelled however that data is (a JSON Schema's own keys).
+    #[test]
+    fn a_metadata_ports_name_is_checked_and_its_value_is_not() {
+        let document = serde_json::json!({
+            "type": "Search",
+            "label": "Search",
+            "description": "d",
+            "metadataPorts": [{ "name": "tool_spec", "type": "{ name: String, extra: JsonDict }", "value": { "name": "s", "extra": { "additional_properties": false } } }],
+        });
+        assert!(messages(document.clone()).is_empty(), "the value is data");
+        let meta: NodeMetadata = serde_json::from_value(document).expect("parses");
+        let mut found = Vec::new();
+        check_node(&meta, |_| false, &mut found);
+        assert_eq!(found, ["metadata port 'tool_spec' is not camelCase: write 'toolSpec'"]);
     }
 }

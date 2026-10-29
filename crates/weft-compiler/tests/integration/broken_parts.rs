@@ -63,7 +63,7 @@ fn a_broken_include_stops_only_the_fires_that_reach_it() {
 /// file; the second hands it `extra` too, which does.
 #[test]
 fn a_broken_include_inside_an_included_file_leaves_the_rest_of_that_file() {
-    const OUTER: &str = "Group(text: String, extra?: String) -> (out: String, raw: String) {
+    const OUTER: &str = "Group(text: String, extra: String) -> (out: String, raw: String) {
   keep = Format(t: String) { template: \"{{t}}\", t: self.text }
   inner = @include(\"draft.weft\")
   inner.text = self.extra

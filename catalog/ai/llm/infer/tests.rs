@@ -463,8 +463,8 @@ async fn tool_round(rig: FakeRig) -> WeftResult<()> {
             json!({
                 "provider": provider(&rig),
                 "prompt": "what is my dog's name?",
-                "tools": { "name": "dog_name", "description": "the dog's name",
-                           "parameters": { "type": "object", "properties": {} } },
+                "tools": [{ "name": "dog_name", "description": "the dog's name",
+                            "parameters": { "type": "object", "properties": {} } }],
                 "toolChoice": "required",
             }),
         )

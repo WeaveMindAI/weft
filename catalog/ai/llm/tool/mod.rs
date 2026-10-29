@@ -1,11 +1,13 @@
 //! LlmTool: declare one tool the model may call. No inference happens
-//! here. Users wire one or more of these into an LLM node's `tools`
-//! input; when the model decides to call one, the LLM node emits the
-//! calls on its `toolCalls` output, the graph runs the tool's actual
-//! work with its own nodes, and a Chat Message node (role: tool)
-//! appends each result to the history for the next LLM call. The
-//! emitted object is minillmlib's `ToolDefinition` shape verbatim.
-// SYNC: emitted object <-> MiniLLMLibRS/src/tools/mod.rs ToolDefinition
+//! here. Users wire one or more of these into the List feeding an LLM
+//! node's `tools` input; when the model decides to call one, the LLM
+//! node emits the calls on its `toolCalls` output, the graph runs the
+//! tool's actual work with its own nodes, and a Chat Message node
+//! (role: tool) appends each result to the history for the next LLM
+//! call. The emitted object is an `LlmTool` record, which is
+//! minillmlib's `ToolDefinition` shape verbatim.
+// SYNC: emitted object <-> types.LlmTool (catalog/ai/llm/metadata.json) <->
+//       MiniLLMLibRS/src/tools/mod.rs ToolDefinition
 
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};

@@ -75,6 +75,10 @@ empty value, such as a `File` or an `Image`. A seed that is wired but arrives
 as null starts at the zero too, and for a type like `Number | Null` that zero
 is `0`, not null.
 
+A loop can also declare a [metadata port](groups.md#metadata-ports)
+(`*tool: LlmTool`), which is none of the four: it holds one value written
+in the program, never a list.
+
 ## Two implicit ports
 
 `self.index` is a `Number`, readable inside, and it is which iteration you are

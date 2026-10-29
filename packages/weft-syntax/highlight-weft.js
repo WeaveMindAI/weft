@@ -69,6 +69,11 @@
         // The port half of `node.port`.
         { className: 'symbol', begin: '(?<=\\.)' + IDENT },
 
+        // The `*` before a port name in a group or loop header's output list
+        // (`-> (*tool: LlmTool)`), marking a metadata port. Only a `*`
+        // followed by a port name and then `?`, `:`, `,` or `)` is one.
+        { className: 'keyword', begin: '\\*(?=[ \\t]*' + IDENT + '[ \\t]*\\??[ \\t]*[:,)])' },
+
         { className: 'keyword', begin: '\\b(Group|Loop|LoopIn|LoopOut|IncludedGroup|self|type)\\b' },
 
         {

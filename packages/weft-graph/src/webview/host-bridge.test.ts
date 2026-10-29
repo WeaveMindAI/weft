@@ -351,3 +351,218 @@ describe('legsOf: a compiled wire back into the legs a person wrote', () => {
     expect(v1.nodes.map((n) => n.id).sort()).toEqual(['a', 'b', 'l', 'l.m']);
   });
 });
+
+/** A metadata wire's value is written by the compiler into the input it
+ *  points at when the program compiles; the editor draws no wire, and
+ *  shows that input read-only, filled from the port the wire leaves. */
+describe('metadata ports and wires', () => {
+  const tool = { name: 'search', description: 'Search the web.' };
+  const tools = [tool];
+  const host = {
+    id: 'p',
+    groups: [
+      {
+        id: 'search', kind: 'group' as const, label: null,
+        inPorts: [{ name: 'query', portType: 'String', required: true }],
+        outPorts: [{ name: 'results', portType: 'String', required: true }],
+        metadataPorts: [{ name: 'tool', type: 'LlmTool', value: tool, declaredType: 'LlmTool' }],
+        parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
+      },
+      {
+        id: 'agent', kind: 'group' as const, label: null,
+        inPorts: [{ name: 'spec', portType: 'LlmTool', required: true }],
+        outPorts: [],
+        parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
+        portLiterals: { spec: tool, other: 'kept' },
+      },
+      {
+        id: 'calls', kind: 'loop' as const, label: null, loopConfig: {},
+        inPorts: [], outPorts: [],
+        metadataPorts: [{
+          name: 'tools', type: 'ActionTools', value: { anthropic: tools },
+          written: { kind: 'port', source: 'calls.act', port: 'tools' },
+        }],
+        parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
+      },
+    ],
+    nodes: [
+      {
+        id: 'list', nodeType: 'List', label: null, config: {},
+        position: { x: 0, y: 0 }, scope: [], groupBoundary: null,
+        inputs: [{ name: 'search', portType: 'LlmTool', required: true }],
+        outputs: [{ name: 'list', portType: 'List[LlmTool]', required: true }],
+        features: {},
+        portLiterals: { search: tool, separator: ',' },
+        portLiteralSpans: {
+          search: { span: { startLine: 9, startColumn: 1, endLine: 9, endColumn: 30 }, origin: 'connection' as const },
+          separator: { span: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 9 }, origin: 'inline' as const },
+        },
+      },
+      {
+        id: 'ask', nodeType: 'LlmInference', label: null, config: {},
+        position: { x: 0, y: 0 }, scope: [], groupBoundary: null,
+        inputs: [{ name: 'tools', portType: 'List[LlmTool]', required: false }],
+        outputs: [], features: {},
+        portLiterals: { tools },
+      },
+      {
+        id: 'lookup', nodeType: 'Lookup', label: null, config: {},
+        position: { x: 0, y: 0 }, scope: [], groupBoundary: null,
+        inputs: [], outputs: [], features: {},
+        metadataPorts: [{ name: 'schema', type: 'JsonDict', value: { type: 'object' } }],
+      },
+      {
+        id: 'calls__out', nodeType: 'LoopOut', label: null, config: {},
+        position: { x: 0, y: 0 }, scope: [], groupBoundary: { groupId: 'calls', role: 'Out' },
+        inputs: [], outputs: [], features: {},
+      },
+    ],
+    edges: [],
+    metadataWires: [
+      // A group's own metadata port: the wire starts at its crossing.
+      {
+        id: 'm1', source: 'search', sourceHandle: 'tool', target: 'list', targetHandle: 'search',
+        via: [{ group: 'search', port: 'tool', side: 'out' }],
+      },
+      // Into a group's input from outside: it stops at the group's port.
+      {
+        id: 'm2', source: 'search', sourceHandle: 'tool', target: 'agent', targetHandle: 'spec',
+        via: [{ group: 'search', port: 'tool', side: 'out' }, { group: 'agent', port: 'spec', side: 'in' }],
+      },
+      // A loop's metadata port, left through its LoopOut, reading a key.
+      { id: 'm3', source: 'calls__out', sourceHandle: 'tools', target: 'ask', targetHandle: 'tools', path: ['anthropic'] },
+    ],
+  } as unknown as HostProject;
+  const v1 = translateProject(host, 'src', '');
+  const byId = new Map(v1.nodes.map((n) => [n.id, n]));
+
+  it("carries a group's, a loop's and a node's metadata ports onto the drawn node, gathered value included", () => {
+    expect(byId.get('search')?.metadataPorts).toEqual([{ name: 'tool', type: 'LlmTool', value: tool, declaredType: 'LlmTool' }]);
+    expect(byId.get('lookup')?.metadataPorts).toEqual([{ name: 'schema', type: 'JsonDict', value: { type: 'object' } }]);
+    expect(byId.get('calls')?.metadataPorts?.[0].written).toEqual({ kind: 'port', source: 'calls.act', port: 'tools' });
+  });
+
+  it('draws no metadata wire', () => {
+    expect(v1.edges).toEqual([]);
+  });
+
+  it('moves a value a metadata wire brings out of the written values, keeping where it comes from', () => {
+    expect(byId.get('list')?.portLiterals).toEqual({ separator: ',' });
+    expect(Object.keys(byId.get('list')?.portLiteralSpans ?? {})).toEqual(['separator']);
+    expect(byId.get('list')?.metadataInputs).toEqual({
+      search: { from: { kind: 'port', source: 'search', port: 'tool' }, value: tool },
+    });
+  });
+
+  it("fills a group's input from outside, the group keeping its own written values", () => {
+    expect(byId.get('agent')?.portLiterals).toEqual({ other: 'kept' });
+    expect(byId.get('agent')?.metadataInputs?.spec.from).toEqual({ kind: 'port', source: 'search', port: 'tool' });
+  });
+
+  it('names a loop, never its LoopOut, with the keys the wire reads', () => {
+    expect(byId.get('ask')?.metadataInputs).toEqual({
+      tools: { from: { kind: 'port', source: 'calls', port: 'tools', path: ['anthropic'] }, value: tools },
+    });
+    expect(byId.get('ask')?.portLiterals).toEqual({});
+  });
+});
+
+/** A value written on a container's port edits with the control a node
+ *  input of that type gets: the compiler stamps it on the port itself. */
+describe("a container port's widget", () => {
+  it('passes the widget the compiler stamped on the port through', () => {
+    const host = {
+      id: 'p',
+      groups: [{
+        id: 'calls', kind: 'loop' as const, label: null, loopConfig: {},
+        inPorts: [{ name: 'failed', portType: 'Boolean', required: true, widget: { kind: 'checkbox' } }],
+        outPorts: [],
+        parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
+        portLiterals: { failed: false },
+      }],
+      nodes: [],
+      edges: [],
+    } as unknown as HostProject;
+    const loop = translateProject(host, 'src', '').nodes.find((n) => n.id === 'calls')!;
+    expect(loop.inputs.find((p) => p.name === 'failed')?.widget).toEqual({ kind: 'checkbox' });
+  });
+});
+
+/** Whether a container's input hands its value on is the compiler's
+ *  call; the editor draws and writes the port from the flag it stamps. */
+describe("a container input's passesThrough", () => {
+  const host = {
+    id: 'p',
+    groups: [
+      {
+        id: 'g', kind: 'group' as const, label: null,
+        inPorts: [{ name: 'x', portType: 'String', required: true, passesThrough: true }],
+        outPorts: [],
+        parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
+      },
+      {
+        id: 'each', kind: 'loop' as const, label: null, loopConfig: { over: ['items'] },
+        inPorts: [
+          { name: 'items', portType: 'List[String]', required: true },
+          { name: 'prefix', portType: 'String', required: true, passesThrough: true },
+        ],
+        outPorts: [],
+        parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
+      },
+    ],
+    nodes: [{
+      id: 'inc', nodeType: 'IncludedGroup', label: null, config: {},
+      position: { x: 0, y: 0 }, scope: [], groupBoundary: null,
+      inputs: [{ name: 'q', portType: 'String', required: true, passesThrough: true }],
+      outputs: [], features: {},
+    }],
+    edges: [],
+  } as unknown as HostProject;
+  const byId = new Map(translateProject(host, 'src', '').nodes.map((n) => [n.id, n]));
+
+  it('keeps the flag on a group, a loop and an include', () => {
+    expect(byId.get('g')?.inputs[0].passesThrough).toBe(true);
+    expect(byId.get('each')?.inputs.map((p) => p.passesThrough)).toEqual([undefined, true]);
+    expect(byId.get('inc')?.inputs[0].passesThrough).toBe(true);
+  });
+});
+
+describe('a metadata wire into a loop', () => {
+  const tool = { name: 'search' };
+  const host = (wires: unknown[]) => ({
+    id: 'p',
+    groups: [{
+      id: 'calls', kind: 'loop' as const, label: null, loopConfig: {},
+      inPorts: [{ name: 'spec', portType: 'LlmTool', required: true }],
+      outPorts: [],
+      parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
+      portLiterals: { spec: tool },
+    }],
+    nodes: [
+      {
+        id: 'source', nodeType: 'Lookup', label: null, config: {},
+        position: { x: 0, y: 0 }, scope: [], groupBoundary: null,
+        inputs: [], outputs: [], features: {},
+        metadataPorts: [{ name: 'tool', type: 'LlmTool', value: tool }],
+      },
+      {
+        id: 'calls__in', nodeType: 'LoopIn', label: null, config: {},
+        position: { x: 0, y: 0 }, scope: [], groupBoundary: { groupId: 'calls', role: 'In' },
+        inputs: [], outputs: [], features: {},
+      },
+    ],
+    edges: [],
+    metadataWires: wires,
+  }) as unknown as HostProject;
+  const wire = { id: 'm', source: 'source', sourceHandle: 'tool', target: 'calls__in', targetHandle: 'spec' };
+
+  it('fills the loop box, the value read off the loop\'s own written values', () => {
+    const loop = translateProject(host([wire]), 'src', '').nodes.find((n) => n.id === 'calls')!;
+    expect(loop.metadataInputs).toEqual({ spec: { from: { kind: 'port', source: 'source', port: 'tool' }, value: tool } });
+    expect(loop.portLiterals).toEqual({});
+  });
+
+  it('refuses two wires filling one input, which the compiler never gives', () => {
+    expect(() => translateProject(host([wire, { ...wire, id: 'm2' }]), 'src', '')).toThrow("two metadata wires fill 'calls.spec'");
+  });
+});

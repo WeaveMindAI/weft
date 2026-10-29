@@ -4,6 +4,45 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-10-29 (0.2.278)
+
+**If a program hands tools to an LLM node, it may not compile after this
+update.** The `tools` input of `LlmInference`, `LlmInferenceJson` and
+`LlmStream` now takes a `List[LlmTool]`, and the `LlmTool` node hands out
+that type. Three shapes need a change:
+
+- A group that takes the tools as `tools: List[JsonDict]` gets a type
+  mismatch: declare it `tools: List[LlmTool]`.
+- One `LlmTool` wired straight into `tools` now goes through a `List`
+  (`tools = List`, `tools.dog = dog.tool`, then `ask.tools = tools.list`).
+- `ComputerTools` is gone: each computer action node now describes its own
+  tools, and the premade computer agent gathers them itself. Drop the
+  `tools = ComputerTools` and `agent.tools = tools.tools` lines; the agent
+  offers Anthropic's names, and `calls.tools.openai` in a copy of
+  `agent.weft` offers OpenAI's.
+
+Then run `weft resync` in the project.
+
+**A `?` on a group's input no longer compiles.** A group input passes what
+reaches it straight to the nodes inside, so it was never optional itself, and
+the `?` did nothing. The build now refuses it with
+`optional-pass-through-port`: remove the `?` from the group's header (an
+included file's too, and a loop's on any port the loop neither iterates nor
+carries), and if a node inside should run without the value, put the `?` on
+that node's input.
+
+**A group can now describe itself on a metadata port.** Write `*tool:
+LlmTool` in a group's or a loop's outputs and its value in the body
+(`self.tool = { "name": "search", ... }`), or gather it from other metadata
+ports (`self.tools = [...search.tools, fetch.tool]`). A wire from that port is
+written into the input it points at before anything runs, so it may point
+back up the graph without making a cycle. The new `Dispatch` node sends a
+value to the branch that claims it: wire each tool group's `*tool` into a
+`List` for the model's `tools` and into a `Dispatch` inside the loop over
+the model's calls, and each call reaches the group that performs it. For
+the whole picture, go and read [metadata
+ports](https://weavemindai.github.io/weft/language/groups.html#metadata-ports).
+
 ## 2026-10-28 (341192de)
 
 **The folders weft compiles in stop growing with every update.** Each

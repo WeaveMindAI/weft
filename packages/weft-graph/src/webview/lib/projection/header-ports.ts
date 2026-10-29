@@ -26,6 +26,9 @@ export interface HeaderPortLike {
 	required?: boolean;
 	/** The program wrote it `x?:` (inputs only; see `InputDefinition.optional`). */
 	optional?: boolean;
+	/** A container's input that hands its value to the nodes inside
+	 *  (inputs only; see `InputDefinition.passesThrough`). */
+	passesThrough?: boolean;
 	/** The rendered type. Every rendered port carries one. */
 	portType: string;
 	declaredType?: string;
@@ -56,12 +59,16 @@ const meansRequired = (p: HeaderPortLike, wired: boolean): boolean =>
  *  may change it to:
  *   - `node_requires`: the node's metadata requires it, so its code
  *     needs it and the compiler refuses `x?:` on it.
+ *   - `passes_through`: a container's input that hands its value to the
+ *     nodes inside. It has no requiredness of its own (the compiler
+ *     refuses `x?:` on it): the nodes inside decide, so no gesture
+ *     changes it.
  *   - `required` / `optional`: the program wrote it `x:` / `x?:` (every
- *     container port is one of these two).
+ *     other container port is one of these two).
  *   - `wiring`: the metadata calls it optional and the program wrote
  *     nothing: the node runs without it while unwired, and needs it once
  *     wired (a closed wire skips the node). */
-export type InputRequiredness = 'node_requires' | 'required' | 'optional' | 'wiring';
+export type InputRequiredness = 'node_requires' | 'passes_through' | 'required' | 'optional' | 'wiring';
 
 /** A node input's `InputRequiredness`, `provided` being the node type's
  *  own port of that name (absent for a port the program added). */
@@ -69,9 +76,28 @@ export function nodeInputRequiredness(
 	p: HeaderPortLike,
 	provided: HeaderPortLike | undefined,
 ): InputRequiredness {
+	// An include's opaque node is a node whose inputs pass through.
+	if (p.passesThrough) return 'passes_through';
 	if (portRequired(provided)) return 'node_requires';
 	if (portRequired(p)) return 'required';
 	return p.optional ? 'optional' : 'wiring';
+}
+
+/** A container input's `InputRequiredness`: it passes through, or the
+ *  program wrote it `x:` / `x?:`. */
+export function containerInputRequiredness(p: HeaderPortLike): InputRequiredness {
+	if (p.passesThrough) return 'passes_through';
+	return portRequired(p) ? 'required' : 'optional';
+}
+
+/** Whether a CONTAINER's signature spells this port without `?`. An
+ *  output has no optionality at all (the language has no `?` on one,
+ *  and the edit server refuses a sig asking for it), and a port that
+ *  passes through has none of its own (the compiler refuses `x?:` on
+ *  it), so both are always `x:`; any other input keeps what the program
+ *  wrote. */
+export function containerSpelledRequired(p: HeaderPortLike, side: 'input' | 'output'): boolean {
+	return side === 'output' || p.passesThrough === true || portRequired(p);
 }
 
 /** Whether the header spells this port without `?`, chosen so the line
@@ -162,7 +188,7 @@ export function headerPortSigs(
 			reverted.push({ name: p.name, required: portRequired(d), portType: p.portType });
 			continue;
 		}
-		sigs.push({ name: p.name, required: spelledRequired(p, d, isWired), portType, rendered: p.portType });
+		sigs.push({ name: p.name, required: spelledRequired(p, d, isWired), portType, rendered: p.portType, metadata: false });
 	}
 	return { sigs, reverted };
 }

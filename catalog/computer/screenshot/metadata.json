@@ -28,5 +28,36 @@
       "type": "Image",
       "description": "The screenshot, a PNG kept past the run."
     }
+  ],
+  "metadataPorts": [
+    {
+      "name": "tools",
+      "type": "ActionTools",
+      "description": "The tools a model calls this node through, in Anthropic's names and in OpenAI's: gather them up to the LLM node's `tools` through metadata ports.",
+      "value": {
+        "anthropic": [
+          {
+            "description": "Take a screenshot of the whole screen. Take one before you act, and after each action or group of actions, then say in one sentence whether it did what you meant before you go on. Every coordinate you give is a pixel of the last full screenshot.",
+            "name": "screenshot",
+            "parameters": {
+              "properties": {},
+              "required": [],
+              "type": "object"
+            }
+          }
+        ],
+        "openai": [
+          {
+            "description": "Take a screenshot of the whole screen. Take one before you act, and after each action or group of actions, then say in one sentence whether it did what you meant before you go on. Every coordinate you give is a pixel of the last full screenshot.",
+            "name": "screenshot",
+            "parameters": {
+              "properties": {},
+              "required": [],
+              "type": "object"
+            }
+          }
+        ]
+      }
+    }
   ]
 }

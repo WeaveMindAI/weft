@@ -242,11 +242,11 @@ fn inverse_edit_restores_original_for_each_op() {
     );
     assert_reversible(
         "n = Text {\n  value: \"x\"\n}\n",
-        vec![EditOp::UpdateNodePorts { node: "n".into(), inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()) }], outputs: vec![], removed_inputs: vec![], removed_outputs: vec![] }],
+        vec![EditOp::UpdateNodePorts { node: "n".into(), inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()), metadata: false }], outputs: vec![], removed_inputs: vec![], removed_outputs: vec![] }],
     );
     assert_reversible(
         "g = Group() -> () {\n  x = Debug\n}\n",
-        vec![EditOp::UpdateGroupPorts { group: "g".into(), inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()) }], outputs: vec![PortSig { name: "outp".into(), required: true, port_type: ("String".into()) }] }],
+        vec![EditOp::UpdateGroupPorts { group: "g".into(), inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()), metadata: false }], outputs: vec![PortSig { name: "outp".into(), required: true, port_type: ("String".into()), metadata: false }] }],
     );
     assert_reversible(
         "g = Group() -> () {\n  x = Debug\n}\n",
@@ -574,6 +574,22 @@ fn rename_group_updates_header_and_refs() {
     assert!(!out.contains("grp"), "no stale grp: {out}");
 }
 
+/// A gathered value names the renamed group among other things, nested in
+/// the value, from a scope the name resolves through; each name follows the
+/// rename and the rest of the value stays as written. A same-named member
+/// of the gathering group shadows the renamed one and is left alone.
+#[test]
+fn rename_group_rewrites_the_names_inside_a_gathered_value() {
+    let src = "screen = Group() -> (*tools: List[String]) {\n  self.tools = [\"a\"]\n}\n\
+outer = Group() -> (*tools: List[String]) {\n  inner = Group() -> (*tools: List[String], *one: String) {\n    self.tools = [...screen.tools, \"screen.tools\"]\n    self.one = { \"from\": screen.tools }\n  }\n  self.tools = inner.tools\n}\n\
+shadow = Group() -> (*tools: List[String]) {\n  screen = Group() -> (*tools: List[String]) {\n    self.tools = []\n  }\n  self.tools = [...screen.tools]\n}\n";
+    let out = apply(src, vec![EditOp::RenameGroup { group: "screen".into(), new_label: "display".into() }]);
+    parse_ok(&out);
+    assert!(out.contains("self.tools = [...display.tools, \"screen.tools\"]"), "list name renamed, string kept: {out}");
+    assert!(out.contains("self.one = { \"from\": display.tools }"), "object name renamed: {out}");
+    assert!(out.contains("  self.tools = [...screen.tools]\n}"), "the shadowing member is not the renamed group: {out}");
+}
+
 #[test]
 fn rename_group_by_scoped_id_disambiguates_same_local_label() {
     // CONTRACT: RenameGroup carries the group's SCOPED id, so a group is identified
@@ -596,7 +612,7 @@ fn update_group_ports_by_scoped_id_disambiguates_same_local_label() {
     let src = "A = Group() -> () {\n  Inner = Group() -> () {\n    d = Debug {}\n  }\n}\nB = Group() -> () {\n  Inner = Group() -> () {\n    e = Debug {}\n  }\n}\n";
     let out = apply(src, vec![EditOp::UpdateGroupPorts {
         group: "A.Inner".into(),
-        inputs: vec![PortSig { name: "x".into(), required: true, port_type: ("String".into()) }],
+        inputs: vec![PortSig { name: "x".into(), required: true, port_type: ("String".into()), metadata: false }],
         outputs: vec![],
     }]);
     parse_ok(&out);
@@ -769,8 +785,8 @@ fn update_node_ports_rewrites_signature() {
     let src = "g = Group() -> () {\n  x = Text { value: \"a\" }\n}\n";
     let out = apply(src, vec![EditOp::UpdateGroupPorts {
         group: "g".into(),
-        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()) }],
-        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: ("String".into()) }],
+        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()), metadata: false }],
+        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: ("String".into()), metadata: false }],
     }]);
     assert!(out.contains("g = Group(inp: String) -> (outp: String)"), "{out}");
     parse_ok(&out);
@@ -785,7 +801,7 @@ fn update_node_ports_on_node_with_body_preserves_body() {
     let src = "n = Text {\n  value: \"x\"\n}\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
-        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()) }],
+        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()), metadata: false }],
         outputs: vec![],
         removed_inputs: vec![],
         removed_outputs: vec![],
@@ -807,7 +823,7 @@ fn update_node_ports_writes_only_the_custom_surface_and_spares_catalog_wires() {
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
         inputs: vec![],
-        outputs: vec![PortSig { name: "extra".into(), required: true, port_type: ("String".into()) }],
+        outputs: vec![PortSig { name: "extra".into(), required: true, port_type: ("String".into()), metadata: false }],
         removed_inputs: vec![],
         removed_outputs: vec![],
     }]);
@@ -829,7 +845,7 @@ fn update_node_ports_drops_connections_on_removed_ports() {
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
         inputs: vec![],
-        outputs: vec![PortSig { name: "kept".into(), required: true, port_type: ("String".into()) }],
+        outputs: vec![PortSig { name: "kept".into(), required: true, port_type: ("String".into()), metadata: false }],
         removed_inputs: vec![],
         removed_outputs: vec!["removed".into()],
     }]);
@@ -846,7 +862,7 @@ fn update_node_ports_drops_every_fanout_wire_of_a_removed_output() {
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
         inputs: vec![],
-        outputs: vec![PortSig { name: "kept".into(), required: true, port_type: ("String".into()) }],
+        outputs: vec![PortSig { name: "kept".into(), required: true, port_type: ("String".into()), metadata: false }],
         removed_inputs: vec![],
         removed_outputs: vec!["removed".into()],
     }]);
@@ -860,7 +876,7 @@ fn update_node_ports_drops_incoming_connection_on_removed_input() {
     let src = "src1 = Text() -> (value: String)\nn = Text(a: String, b: String)\nn.a = src1.value\nn.b = src1.value\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
-        inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()) }],
+        inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()), metadata: false }],
         outputs: vec![],
         removed_inputs: vec!["b".into()],
         removed_outputs: vec![],
@@ -878,7 +894,7 @@ fn update_node_ports_drops_body_driver_on_removed_input() {
     let src = "src1 = Text() -> (value: String)\nn = Text(a: String, b: String) {\n  b: src1.value\n}\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
-        inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()) }],
+        inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()), metadata: false }],
         outputs: vec![],
         removed_inputs: vec!["b".into()],
         removed_outputs: vec![],
@@ -897,8 +913,8 @@ fn update_node_ports_round_trips_an_unparseable_declared_type() {
     let src = "n = Debug(data?: Strng)\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
-        inputs: vec![PortSig { name: "data".into(), required: false, port_type: ("Strng".into()) }],
-        outputs: vec![PortSig { name: "extra".into(), required: true, port_type: ("String".into()) }],
+        inputs: vec![PortSig { name: "data".into(), required: false, port_type: ("Strng".into()), metadata: false }],
+        outputs: vec![PortSig { name: "extra".into(), required: true, port_type: ("String".into()), metadata: false }],
         removed_inputs: vec![],
         removed_outputs: vec![],
     }]);
@@ -915,8 +931,8 @@ fn update_node_ports_keeps_a_bare_declared_port_bare() {
     let src = "n = Text(x?)\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
-        inputs: vec![PortSig { name: "x".into(), required: false, port_type: ("".into()) }],
-        outputs: vec![PortSig { name: "extra".into(), required: true, port_type: ("String".into()) }],
+        inputs: vec![PortSig { name: "x".into(), required: false, port_type: ("".into()), metadata: false }],
+        outputs: vec![PortSig { name: "extra".into(), required: true, port_type: ("String".into()), metadata: false }],
         removed_inputs: vec![],
         removed_outputs: vec![],
     }]);
@@ -932,7 +948,7 @@ fn update_node_ports_refuses_a_header_breaking_type() {
     let src = "n = Debug(data: String)\n";
     let err = apply_err(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
-        inputs: vec![PortSig { name: "data".into(), required: false, port_type: ("String, fake: T".into()) }],
+        inputs: vec![PortSig { name: "data".into(), required: false, port_type: ("String, fake: T".into()), metadata: false }],
         outputs: vec![],
         removed_inputs: vec![],
         removed_outputs: vec![],
@@ -947,7 +963,7 @@ fn update_node_ports_refuses_a_header_breaking_type() {
     for bad in ["Fn(Int)", "(String | Number)", "Dict[String}", "{a: String]"] {
         let err = apply_err(src, vec![EditOp::UpdateNodePorts {
             node: "n".into(),
-            inputs: vec![PortSig { name: "data".into(), required: false, port_type: (bad.into()) }],
+            inputs: vec![PortSig { name: "data".into(), required: false, port_type: (bad.into()), metadata: false }],
             outputs: vec![],
             removed_inputs: vec![],
             removed_outputs: vec![],
@@ -968,8 +984,8 @@ fn update_node_ports_carries_braces_the_header_can_hold() {
         let out = apply(src, vec![EditOp::UpdateNodePorts {
             node: "n".into(),
             inputs: vec![
-                PortSig { name: "data".into(), required: true, port_type: ok.into() },
-                PortSig { name: "other".into(), required: true, port_type: "String".into() },
+                PortSig { name: "data".into(), required: true, port_type: ok.into(), metadata: false },
+                PortSig { name: "other".into(), required: true, port_type: "String".into(), metadata: false },
             ],
             outputs: vec![],
             removed_inputs: vec![],
@@ -1062,7 +1078,7 @@ fn update_node_ports_ignores_an_unwired_unknown_removed_name() {
     let src = "n = Text(a: String)\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
-        inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()) }],
+        inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()), metadata: false }],
         outputs: vec![],
         removed_inputs: vec!["ghost".into()], removed_outputs: vec![],
     }]);
@@ -1095,8 +1111,8 @@ fn update_group_ports_drops_self_wiring_on_removed_ports() {
     let src = "g = Group(inp: String) -> (outp: String, gone: String) {\n  x = Text(v: String) -> (value: String)\n  x.v = self.inp\n  self.outp = x.value\n  self.gone = x.value\n}\n";
     let out = apply(src, vec![EditOp::UpdateGroupPorts {
         group: "g".into(),
-        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()) }],
-        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: ("String".into()) }],
+        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()), metadata: false }],
+        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: ("String".into()), metadata: false }],
     }]);
     assert!(!out.contains("self.gone"), "removed output's boundary wiring must die: {out}");
     assert!(out.contains("self.outp = x.value"), "kept output wiring survives: {out}");
@@ -1114,8 +1130,8 @@ fn update_loop_ports_keeps_reserved_done_and_index() {
     let src = "l = Loop(items: List[String], extra: String) -> (acc: String) {\n  over: [\n  \"items\"\n]\n  x = Text(v: String, n: Number, e: String) -> (value: String, stop: Boolean)\n  x.v = self.items\n  x.n = self.index\n  x.e = self.extra\n  self.acc = x.value\n  self.done = x.stop\n}\nl2 = Debug { }\nl2.data = l.acc\n";
     let out = apply(src, vec![EditOp::UpdateLoopPorts {
         loop_id: "l".into(),
-        inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[String]".into()) }],
-        outputs: vec![PortSig { name: "acc".into(), required: true, port_type: ("String".into()) }],
+        inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[String]".into()), metadata: false }],
+        outputs: vec![PortSig { name: "acc".into(), required: true, port_type: ("String".into()), metadata: false }],
     }]);
     assert!(out.contains("self.done = x.stop"), "reserved self.done survives: {out}");
     assert!(out.contains("x.n = self.index"), "reserved self.index survives: {out}");
@@ -1136,8 +1152,8 @@ fn carry_to_gather_batch_drops_the_carry_input_and_its_wires() {
         EditOp::SetLoopConfig { loop_id: "l".into(), key: "carry".into(), value: "[]".into() },
         EditOp::UpdateLoopPorts {
             loop_id: "l".into(),
-            inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[Number]".into()) }],
-            outputs: vec![PortSig { name: "acc".into(), required: true, port_type: ("Number".into()) }],
+            inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[Number]".into()), metadata: false }],
+            outputs: vec![PortSig { name: "acc".into(), required: true, port_type: ("Number".into()), metadata: false }],
         },
     ]);
     assert!(!out.contains("l.acc = seed.value"), "the carry input's seed wire must die: {out}");
@@ -1157,8 +1173,8 @@ fn update_loop_ports_keeps_wires_of_a_surviving_carry() {
     let src = "seed = Text() -> (value: Number)\nl = Loop(items: List[Number]) -> (acc: Number) {\n  over: [\n  \"items\"\n]\n  carry: [\n  \"acc\"\n]\n  x = Text(v: Number, a: Number) -> (acc: Number)\n  x.v = self.items\n  x.a = self.acc\n  self.acc = x.acc\n}\nl.acc = seed.value\n";
     let out = apply(src, vec![EditOp::UpdateLoopPorts {
         loop_id: "l".into(),
-        inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[Number]".into()) }],
-        outputs: vec![PortSig { name: "acc".into(), required: true, port_type: ("Number".into()) }],
+        inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[Number]".into()), metadata: false }],
+        outputs: vec![PortSig { name: "acc".into(), required: true, port_type: ("Number".into()), metadata: false }],
     }]);
     assert!(out.contains("l.acc = seed.value"), "surviving carry's seed wire stays: {out}");
     assert!(out.contains("x.a = self.acc"), "surviving carry's body read stays: {out}");
@@ -1174,7 +1190,7 @@ fn update_node_ports_drops_inline_expr_wire_on_removed_input() {
     let src = "n = Debug(a: String, b: String)\nn.a = Upper { text: \"x\" }.out\nn.b = Upper { text: \"y\" }.out\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
-        inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()) }],
+        inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()), metadata: false }],
         outputs: vec![],
         removed_inputs: vec!["b".into()],
         removed_outputs: vec![],
@@ -1225,8 +1241,8 @@ fn update_group_ports_on_anonymous_root_sweeps_self_wiring() {
     let src = "Group(raw: String) -> (outp: String, gone: String) {\n  t = Text(v: String) -> (value: String)\n  t.v = self.raw\n  self.outp = t.value\n  self.gone = t.value\n}\n";
     let out = apply(src, vec![EditOp::UpdateGroupPorts {
         group: "Untitled".into(),
-        inputs: vec![PortSig { name: "raw".into(), required: true, port_type: ("String".into()) }],
-        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: ("String".into()) }],
+        inputs: vec![PortSig { name: "raw".into(), required: true, port_type: ("String".into()), metadata: false }],
+        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: ("String".into()), metadata: false }],
     }]);
     assert!(!out.contains("self.gone"), "removed output's boundary wiring dies on an anon root: {out}");
     assert!(out.contains("self.outp = t.value"), "kept output wiring survives: {out}");
@@ -1686,7 +1702,7 @@ fn every_name_written_into_source_is_guarded() {
         "Untitled",
         &[EditOp::UpdateNodePorts {
             node: "a".into(),
-            inputs: vec![PortSig { name: inject.into(), port_type: "String".into(), required: true }],
+            inputs: vec![PortSig { name: inject.into(), port_type: "String".into(), required: true, metadata: false }],
             outputs: vec![],
             removed_inputs: vec![],
             removed_outputs: vec![],
@@ -1704,6 +1720,7 @@ fn every_name_written_into_source_is_guarded() {
                 name: "p".into(),
                 port_type: ("String) -> ()\nevil = Text {}\nq: (r".into()),
                 required: true,
+                metadata: false,
             }],
             outputs: vec![],
             removed_inputs: vec![],
@@ -1785,7 +1802,7 @@ fn opaque_token_that_would_swallow_the_file_is_refused() {
             "Untitled",
             &[EditOp::UpdateNodePorts {
                 node: "n".into(),
-                inputs: vec![PortSig { name: "p".into(), port_type: (harmful.into()), required: true }],
+                inputs: vec![PortSig { name: "p".into(), port_type: (harmful.into()), required: true, metadata: false }],
                 outputs: vec![],
                 removed_inputs: vec![],
                 removed_outputs: vec![],
@@ -1801,7 +1818,7 @@ fn opaque_token_that_would_swallow_the_file_is_refused() {
                 "Untitled",
                 &[EditOp::UpdateNodePorts {
                     node: "n".into(),
-                    inputs: vec![PortSig { name: "p".into(), port_type: (ok.into()), required: true }],
+                    inputs: vec![PortSig { name: "p".into(), port_type: (ok.into()), required: true, metadata: false }],
                     outputs: vec![],
                     removed_inputs: vec![],
                     removed_outputs: vec![],
@@ -2041,7 +2058,7 @@ fn edit_soak_never_corrupts() {
                 10 => EditOp::MoveNodeScope { node: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
                 11 => EditOp::MoveNodeScope { node: pick(next(), &targets), target_group: None },
                 12 => EditOp::MoveGroupScope { group: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
-                13 => EditOp::UpdateNodePorts { node: pick(next(), &targets), inputs: vec![PortSig { name: "i".into(), required: true, port_type: ("String".into()) }], outputs: vec![], removed_inputs: vec![], removed_outputs: vec![] },
+                13 => EditOp::UpdateNodePorts { node: pick(next(), &targets), inputs: vec![PortSig { name: "i".into(), required: true, port_type: ("String".into()), metadata: false }], outputs: vec![], removed_inputs: vec![], removed_outputs: vec![] },
                 14 => EditOp::SetGroupDescription { group: pick(next(), &targets), description: Some(format!("d{}", next() % 100)) },
                 // Loop ops. Some will fail kind-mismatch checks (the
                 // Group-targeted RenameGroup at arm 9 etc. already do
@@ -2053,7 +2070,7 @@ fn edit_soak_never_corrupts() {
                 17 => EditOp::RenameLoop { loop_id: pick(next(), &targets), new_label: format!("lr{}", next() % 1000) },
                 18 => EditOp::MoveLoopScope { loop_id: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
                 19 => EditOp::MoveLoopScope { loop_id: pick(next(), &targets), target_group: None },
-                20 => EditOp::UpdateLoopPorts { loop_id: pick(next(), &targets), inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[String]".into()) }], outputs: vec![PortSig { name: "results".into(), required: true, port_type: ("List[String | Null]".into()) }] },
+                20 => EditOp::UpdateLoopPorts { loop_id: pick(next(), &targets), inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[String]".into()), metadata: false }], outputs: vec![PortSig { name: "results".into(), required: true, port_type: ("List[String | Null]".into()), metadata: false }] },
                 21 => EditOp::SetLoopConfig { loop_id: pick(next(), &targets), key: "maxIters".into(), value: format!("{}", next() % 100) },
                 _ => EditOp::RemoveLoopConfig { loop_id: pick(next(), &targets), key: "maxIters".into() },
             };
@@ -2089,8 +2106,10 @@ fn editop_wire_shape_round_trips() {
         json!({"op":"rename_group","group":"a","newLabel":"b"}),
         json!({"op":"move_node_scope","node":"n","targetGroup":"g"}),
         json!({"op":"move_group_scope","group":"g","targetGroup":null}),
-        json!({"op":"update_node_ports","node":"n","inputs":[{"name":"i","required":true,"portType":"String"}],"outputs":[],"removedInputs":[],"removedOutputs":[]}),
-        json!({"op":"update_group_ports","group":"g","inputs":[],"outputs":[]}),
+        json!({"op":"update_node_ports","node":"n","inputs":[{"name":"i","required":true,"portType":"String","metadata":false}],"outputs":[],"removedInputs":[],"removedOutputs":[]}),
+        json!({"op":"update_group_ports","group":"g","inputs":[],"outputs":[{"name":"tool","required":true,"portType":"LlmTool","metadata":true}]}),
+        json!({"op":"set_metadata_value","group":"g","port":"tool","value":"{ \"name\": \"x\" }"}),
+        json!({"op":"set_metadata_value","group":"g","port":"tool","value":null}),
         json!({"op":"set_group_description","group":"g","description":"d"}),
         // Loop ops: same wire-contract guarantee as the Group/Node
         // ops above. A serde rename here breaks the webview silently.
@@ -2099,7 +2118,7 @@ fn editop_wire_shape_round_trips() {
         json!({"op":"rename_loop","loopId":"a","newLabel":"b"}),
         json!({"op":"move_loop_scope","loopId":"l","targetGroup":"g"}),
         json!({"op":"move_loop_scope","loopId":"l","targetGroup":null}),
-        json!({"op":"update_loop_ports","loopId":"l","inputs":[{"name":"i","required":true,"portType":"List[String]"}],"outputs":[{"name":"o","required":true,"portType":"List[String | Null]"}]}),
+        json!({"op":"update_loop_ports","loopId":"l","inputs":[{"name":"i","required":true,"portType":"List[String]","metadata":false}],"outputs":[{"name":"o","required":true,"portType":"List[String | Null]","metadata":false}]}),
         json!({"op":"set_loop_config","loopId":"l","key":"parallel","value":"true"}),
         json!({"op":"remove_loop_config","loopId":"l","key":"maxIters"}),
     ];
@@ -2111,6 +2130,9 @@ fn editop_wire_shape_round_trips() {
         let back = serde_json::to_value(&op).unwrap();
         assert_eq!(back, c, "wire shape changed on round-trip");
     }
+    // A port sig always says whether it is a metadata port: an older
+    // editor's sig without the flag is refused, never read as an output.
+    assert!(serde_json::from_value::<EditOp>(json!({"op":"update_group_ports","group":"g","inputs":[],"outputs":[{"name":"o","required":true,"portType":"String"}]})).is_err());
     // The deleted variant must NOT deserialize (guards against its return).
     assert!(serde_json::from_value::<EditOp>(serde_json::json!({"op":"setProjectMeta","name":"x","description":null})).is_err());
 }
@@ -2539,8 +2561,8 @@ fn update_loop_ports_rewrites_signature() {
     let src = "my = Loop() -> () {\n  parallel: true\n}\n";
     let out = apply(src, vec![EditOp::UpdateLoopPorts {
         loop_id: "my".into(),
-        inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[String]".into()) }],
-        outputs: vec![PortSig { name: "results".into(), required: true, port_type: ("List[String | Null]".into()) }],
+        inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[String]".into()), metadata: false }],
+        outputs: vec![PortSig { name: "results".into(), required: true, port_type: ("List[String | Null]".into()), metadata: false }],
     }]);
     parse_ok(&out);
     assert!(out.contains("my = Loop(items: List[String]) -> (results: List[String | Null])"), "{out}");
@@ -2803,7 +2825,7 @@ fn update_ports_inside_loop_body_keeps_layout() {
         EditOp::UpdateNodePorts {
             node: "myLoop.execPython1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "number".into(), required: false, port_type: ("".into()) },
+                crate::edit::PortSig { name: "number".into(), required: false, port_type: ("".into()), metadata: false },
             ],
             outputs: vec![],
             removed_inputs: vec![],
@@ -2828,7 +2850,7 @@ fn update_ports_at_root_does_not_glue_onto_preceding_connection() {
         EditOp::UpdateNodePorts {
             node: "execPython1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("".into()) },
+                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("".into()), metadata: false },
             ],
             outputs: vec![],
             removed_inputs: vec![],
@@ -2850,7 +2872,7 @@ fn update_ports_does_not_double_indent() {
         EditOp::UpdateNodePorts {
             node: "myLoop.execPython1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("".into()) },
+                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("".into()), metadata: false },
             ],
             outputs: vec![],
             removed_inputs: vec![],
@@ -2866,7 +2888,7 @@ fn update_ports_does_not_double_indent() {
         EditOp::UpdateNodePorts {
             node: "myLoop.execPython1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "again".into(), required: false, port_type: ("".into()) },
+                crate::edit::PortSig { name: "again".into(), required: false, port_type: ("".into()), metadata: false },
             ],
             outputs: vec![],
             removed_inputs: vec![],
@@ -3443,7 +3465,7 @@ fn updating_ports_on_an_inline_de_inlines_it() {
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "a__data".into(),
         inputs: vec![],
-        outputs: vec![PortSig { name: "o".into(), required: true, port_type: ("String".into()) }],
+        outputs: vec![PortSig { name: "o".into(), required: true, port_type: ("String".into()), metadata: false }],
         removed_inputs: vec![],
         removed_outputs: vec![],
     }]);
@@ -3873,8 +3895,8 @@ fn add_edge_refuses_a_port_holding_an_explicit_literal_in_either_form() {
 fn port_updates_reject_a_duplicate_port_name_per_side() {
     let src = "g = Group() -> () {\n  x = Text { value: \"a\" }\n}\nn = Text\n";
     let dup = vec![
-        PortSig { name: "a".into(), required: true, port_type: "String".into() },
-        PortSig { name: "a".into(), required: true, port_type: "Number".into() },
+        PortSig { name: "a".into(), required: true, port_type: "String".into(), metadata: false },
+        PortSig { name: "a".into(), required: true, port_type: "Number".into(), metadata: false },
     ];
     let err = apply_err(src, vec![EditOp::UpdateGroupPorts { group: "g".into(), inputs: dup.clone(), outputs: vec![] }]);
     assert!(err.contains("duplicate input port 'a'"), "{err}");
@@ -4005,7 +4027,7 @@ fn set_per_instance_refuses_what_cannot_carry_it() {
 #[test]
 fn update_group_ports_keeps_used_type_params_and_drops_the_rest() {
     let src = "g = Group[T: Image | Video | Audio, T2: List[T]](file: T) -> (out: T2) {\n  x = Debug\n}\n";
-    let sig = |name: &str, ty: &str| PortSig { name: name.into(), required: true, port_type: ty.into() };
+    let sig = |name: &str, ty: &str| PortSig { name: name.into(), required: true, port_type: ty.into(), metadata: false };
     let out = apply(src, vec![EditOp::UpdateGroupPorts {
         group: "g".into(),
         inputs: vec![sig("file", "Image")],
@@ -4024,4 +4046,88 @@ fn update_group_ports_keeps_used_type_params_and_drops_the_rest() {
         outputs: vec![sig("out", "Image")],
     }]);
     assert!(out.starts_with("g = Group(file: Image) -> (out: Image)"), "{out}");
+}
+
+fn sig(name: &str, ty: &str, metadata: bool) -> PortSig {
+    PortSig { name: name.into(), required: true, port_type: ty.into(), metadata }
+}
+
+/// A metadata port is written `*name: Type`, after the ordinary outputs
+/// whatever order the sigs come in.
+#[test]
+fn a_group_signature_writes_its_metadata_ports_after_the_outputs() {
+    let src = "g = Group() -> () {\n  x = Text { value: \"a\" }\n}\n";
+    let out = apply(src, vec![EditOp::UpdateGroupPorts {
+        group: "g".into(),
+        inputs: vec![sig("q", "String", false)],
+        outputs: vec![sig("tool", "LlmTool", true), sig("results", "String", false)],
+    }]);
+    assert!(out.contains("g = Group(q: String) -> (results: String, *tool: LlmTool)"), "{out}");
+    parse_ok(&out);
+    let out = apply("l = Loop() -> () {}\n", vec![EditOp::UpdateLoopPorts {
+        loop_id: "l".into(),
+        inputs: vec![],
+        outputs: vec![sig("tool", "LlmTool", true)],
+    }]);
+    assert!(out.contains("l = Loop() -> (*tool: LlmTool)"), "{out}");
+}
+
+/// The sigs the lowering would refuse are never written.
+#[test]
+fn a_metadata_sig_the_language_refuses_is_refused_at_the_door() {
+    let src = "g = Group() -> () {}\nn = Text\n";
+    let in_inputs = apply_err(src, vec![EditOp::UpdateGroupPorts { group: "g".into(), inputs: vec![sig("tool", "String", true)], outputs: vec![] }]);
+    assert!(in_inputs.contains("goes in the outputs"), "{in_inputs}");
+    let untyped = apply_err(src, vec![EditOp::UpdateGroupPorts { group: "g".into(), inputs: vec![], outputs: vec![sig("tool", "", true)] }]);
+    assert!(untyped.contains("needs a type"), "{untyped}");
+    let clash = apply_err(src, vec![EditOp::UpdateGroupPorts { group: "g".into(), inputs: vec![sig("tool", "String", false)], outputs: vec![sig("tool", "String", true)] }]);
+    assert!(clash.contains("name of an input"), "{clash}");
+    let on_node = apply_err(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(), inputs: vec![], outputs: vec![sig("tool", "String", true)], removed_inputs: vec![], removed_outputs: vec![],
+    }]);
+    assert!(on_node.contains("metadata.json"), "{on_node}");
+}
+
+/// Removing a metadata port from the signature takes its value line and
+/// every wire reading it with it.
+#[test]
+fn removing_a_metadata_port_removes_its_value_and_its_wires() {
+    let src = "g = Group() -> (*tool: String) {\n  self.tool = \"x\"\n}\nl = List\nl.g = g.tool\n";
+    let out = apply(src, vec![EditOp::UpdateGroupPorts { group: "g".into(), inputs: vec![], outputs: vec![] }]);
+    assert!(!out.contains("self.tool"), "{out}");
+    assert!(!out.contains("l.g = g.tool"), "{out}");
+    parse_ok(&out);
+}
+
+/// The value line is written, rewritten in place, and removed.
+#[test]
+fn a_metadata_value_is_set_in_place_and_removed() {
+    let src = "g = Group() -> (*tool: { name: String }) {\n  x = Text { value: \"a\" }\n}\n";
+    let set = |src: &str, value: Option<&str>| apply(src, vec![EditOp::SetMetadataValue {
+        group: "g".into(), port: "tool".into(), value: value.map(str::to_string),
+    }]);
+    let written = set(src, Some("{ \"name\": \"one\" }"));
+    assert!(written.contains("  self.tool = { \"name\": \"one\" }\n}"), "{written}");
+    parse_ok(&written);
+    let rewritten = set(&written, Some("{ \"name\": \"two\" }"));
+    assert_eq!(rewritten.matches("self.tool").count(), 1, "{rewritten}");
+    assert!(rewritten.contains("self.tool = { \"name\": \"two\" }"), "{rewritten}");
+    // A reference to another metadata port is the line too.
+    let referenced = "g = Group() -> (*tool: String) {\n  self.tool = inner.tool\n}\n";
+    let replaced = set(referenced, Some("\"plain\""));
+    assert!(replaced.contains("self.tool = \"plain\"") && !replaced.contains("inner.tool"), "{replaced}");
+    let removed = set(&rewritten, None);
+    assert!(!removed.contains("self.tool"), "{removed}");
+    parse_ok(&removed);
+}
+
+#[test]
+fn a_metadata_value_needs_a_declared_metadata_port_and_a_contained_value() {
+    let src = "g = Group() -> (out: String, *tool: String) {}\nn = Text\n";
+    let err = |port: &str, group: &str, value: &str| apply_err(src, vec![EditOp::SetMetadataValue {
+        group: group.into(), port: port.into(), value: Some(value.into()),
+    }]);
+    assert!(err("out", "g", "\"x\"").contains("not a metadata port"));
+    assert!(err("tool", "n", "\"x\"").contains("not a Group or Loop"));
+    assert!(err("tool", "g", "\"x\" }\nevil = Text {").contains("break out"));
 }

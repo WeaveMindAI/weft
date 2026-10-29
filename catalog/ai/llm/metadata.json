@@ -4,6 +4,7 @@
     "ChatMessage": "{ role: String, content: String | List[ChatContentPart], name?: String, tool_call_id?: String, tool_calls?: List[ToolCall], cache_breakpoint?: Boolean }",
     "ChatContentPart": "{ type: String, text?: String, image_url?: { url: Image, detail?: String, width?: Number, height?: Number }, input_audio?: { data: Audio, format?: String, duration_secs?: Number }, video_url?: { url: Video, duration_secs?: Number, width?: Number, height?: Number } }",
     "ToolCall": "{ id: String, name: String, arguments: String }",
+    "LlmTool": "{ name: String, description?: String, parameters: JsonDict }",
     "LlmProvider": "JsonDict"
   }
 }
