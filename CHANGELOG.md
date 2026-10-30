@@ -4,7 +4,7 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-10-30 (7a1dcb43)
 
 **A NUL character in a run no longer breaks search, or the runs beside it.**
 Text a node picks up from a scraped page or a PDF can hold the invisible NUL
