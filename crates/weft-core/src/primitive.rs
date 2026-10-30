@@ -321,7 +321,7 @@ pub struct RunSnapshot {
     /// at the iteration's frames). `dispatched=true` once
     /// the engine has consumed the kick (the node started at that
     /// location; further kicks at the same location are a no-op).
-    pub kicked: HashMap<crate::frames::FiringLocation, KickedNode>,
+    pub kicked: KickTable,
     /// Wait endings on record before their wait's registration (an
     /// answer the dispatcher wrote while nobody drove the run): the
     /// registration takes its ending from here, so the two rows fold the
@@ -636,14 +636,107 @@ pub struct KickedNode {
     pub port_snapshot: Option<Value>,
     /// Flips to `true` once the engine has dispatched this kick (the
     /// node started at the kick's frames). A second tick that sees
-    /// `dispatched` must NOT re-dispatch.
+    /// `dispatched` must NOT re-dispatch. Changed through the table it
+    /// sits in ([`KickTable::set_dispatched`]), which keeps the kicks
+    /// not dispatched yet.
     #[serde(default)]
-    pub dispatched: bool,
+    dispatched: bool,
     /// The scope this kick belongs to was gated off: the node is
     /// dispatched straight into a `ScopeSkipped` skip, so every node
     /// inside a scope that did not run says so in the journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_skipped: Option<String>,
+}
+
+impl KickedNode {
+    /// A kick not dispatched yet.
+    pub fn new(firing: bool, payload: Option<Value>, port_snapshot: Option<Value>, scope_skipped: Option<String>) -> Self {
+        Self { firing, payload, port_snapshot, dispatched: false, scope_skipped }
+    }
+
+    pub fn dispatched(&self) -> bool {
+        self.dispatched
+    }
+
+    /// What the body of the node this kick dispatches reads as its wake
+    /// (`ctx.wake`): the firing trigger's payload (`null` for a fire with
+    /// an empty body), or the payload a manual run set on a plain root.
+    pub fn wake_payload(&self) -> Option<Value> {
+        if self.firing {
+            Some(self.payload.clone().unwrap_or(Value::Null))
+        } else {
+            self.payload.clone()
+        }
+    }
+}
+
+/// A run's kicks, by where they fire, and which of them are not
+/// dispatched yet: what every turn of a drive dispatches from, without
+/// walking the kicks it dispatched before (a loop body's roots are kicked
+/// once per iteration). A kick's `dispatched` changes only here
+/// ([`Self::set_dispatched`]), which keeps the two in step.
+#[derive(Debug, Clone, Default)]
+pub struct KickTable {
+    kicks: HashMap<crate::frames::FiringLocation, KickedNode>,
+    undispatched: std::collections::BTreeSet<crate::frames::FiringLocation>,
+}
+
+impl KickTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The kick at `at`, made by `kick` when there is none. Answers it,
+    /// and whether it was just made: a later kick at a kicked location
+    /// keeps the first one (first writer wins), and only changes what the
+    /// caller changes on the answer.
+    pub fn kick(&mut self, at: crate::frames::FiringLocation, kick: impl FnOnce() -> KickedNode) -> (&mut KickedNode, bool) {
+        match self.kicks.entry(at) {
+            std::collections::hash_map::Entry::Occupied(found) => (found.into_mut(), false),
+            std::collections::hash_map::Entry::Vacant(free) => {
+                let made = kick();
+                if !made.dispatched {
+                    self.undispatched.insert(free.key().clone());
+                }
+                (free.insert(made), true)
+            }
+        }
+    }
+
+    /// The kick at `at`, to change anything but whether it is dispatched.
+    pub fn get_mut(&mut self, at: &crate::frames::FiringLocation) -> Option<&mut KickedNode> {
+        self.kicks.get_mut(at)
+    }
+
+    /// Mark the kick at `at` dispatched (its node started there), or not
+    /// (it is to be dispatched again). Nothing when there is no kick there.
+    pub fn set_dispatched(&mut self, at: &crate::frames::FiringLocation, dispatched: bool) {
+        let Some(kick) = self.kicks.get_mut(at) else { return };
+        kick.dispatched = dispatched;
+        if dispatched {
+            self.undispatched.remove(at);
+        } else {
+            self.undispatched.insert(at.clone());
+        }
+    }
+
+    /// Where the kicks not dispatched yet are, in place order.
+    pub fn undispatched(&self) -> impl Iterator<Item = &crate::frames::FiringLocation> {
+        self.undispatched.iter()
+    }
+
+    /// Whether a kick is not dispatched yet.
+    pub fn any_undispatched(&self) -> bool {
+        !self.undispatched.is_empty()
+    }
+}
+
+/// Read like the map it holds. Changes go through the table's own methods.
+impl std::ops::Deref for KickTable {
+    type Target = HashMap<crate::frames::FiringLocation, KickedNode>;
+    fn deref(&self) -> &Self::Target {
+        &self.kicks
+    }
 }
 
 // ----- Loop instance snapshot ----------------------------------------

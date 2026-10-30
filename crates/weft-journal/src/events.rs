@@ -177,7 +177,7 @@ pub enum RunEvent {
     },
 
     /// A node was absorbed into a dispatch: the pending pulses at its
-    /// location marked Absorbed, a Running `NodeFiring` opened. What
+    /// location absorbed, a Running `NodeFiring` opened. What
     /// the firing received is not on the row: it is the pulses the
     /// fold absorbs at this point (every pending pulse at the node and
     /// frames, minus the items on its generator ports, which its live

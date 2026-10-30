@@ -211,9 +211,14 @@ kept](../language/triggers-and-routes.md#how-a-run-is-kept).
 again (go and read [what happens when something
 dies](../running/architecture.md#what-happens-when-something-dies)).
 
-**A durable run carries on in another worker.** Each node's start (except a
-pure node's, below) is on record before its body runs, so the next worker
-knows exactly which nodes were running when the first one went away. weft cannot tell how much of such a
+**A durable run carries on in another worker.** The same goes for a durable
+run whose worker is alive but cannot reach the broker to write its record for
+over a minute: the worker stops its nodes and hands the run back (for how, go
+and read [when a write of the record
+fails](../running/the-journal.md#when-a-write-of-the-record-fails)). Each node's
+start (except a pure node's, below) is on record before its body runs, so the
+next worker knows exactly which nodes were running when the first one went
+away. weft cannot tell how much of such a
 node's work already happened, so the next worker fails it and says why:
 
 ```text

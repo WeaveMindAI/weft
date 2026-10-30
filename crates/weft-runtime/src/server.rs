@@ -283,4 +283,68 @@ mod tests {
         let body = axum::body::to_bytes(answer.into_body(), usize::MAX).await.unwrap();
         assert_eq!(serde_json::from_slice::<PassFailed>(&body).unwrap(), failed);
     }
+
+    /// One request that runs long inside a single poll (a handler folding
+    /// a huge record inline) leaves the rest of the process answering:
+    /// on the runtime every weft process runs on
+    /// ([`weft_core::process_runtime::build`]), another worker picks up the
+    /// sockets. On a runtime with the LIFO slot on, `/health` waited for the
+    /// whole spin. Timed on the server: a `/health` must be answered while
+    /// the spin still runs, however loaded the machine is.
+    #[test]
+    fn a_request_that_runs_long_in_one_poll_freezes_nothing_else() {
+        const SPIN: std::time::Duration = std::time::Duration::from_millis(3000);
+        type Times = std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>;
+        let (spun, answered): (Times, Times) = Default::default();
+        let server = weft_core::process_runtime::build().unwrap();
+        let addr = server.block_on({
+            let (spun, answered) = (spun.clone(), answered.clone());
+            async move {
+                let app = Router::new()
+                    .route("/spin", axum::routing::get(move || async move {
+                        let until = std::time::Instant::now() + SPIN;
+                        while std::time::Instant::now() < until {
+                            std::hint::spin_loop();
+                        }
+                        spun.lock().unwrap().push(std::time::Instant::now());
+                        "spun"
+                    }))
+                    .route("/health", axum::routing::get(move || async move {
+                        answered.lock().unwrap().push(std::time::Instant::now());
+                        "ok"
+                    }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                tokio::spawn(serve(listener, app));
+                addr
+            }
+        });
+        // The caller is another process: a runtime of its own.
+        let caller = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        caller.block_on(async {
+            async fn call(addr: std::net::SocketAddr, path: &str) {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                stream.write_all(format!("GET {path} HTTP/1.1\r\nhost: weft\r\nconnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                let mut answer = String::new();
+                stream.read_to_string(&mut answer).await.unwrap();
+                assert!(answer.starts_with("HTTP/1.1 200"), "{path}: {answer}");
+            }
+            // Several spins, each probed while it runs: a scheduling
+            // order that lets one through would not let them all.
+            for round in 0..3 {
+                let spin = tokio::spawn(call(addr, "/spin"));
+                tokio::time::sleep(SPIN / 10).await;
+                for _ in 0..3 {
+                    call(addr, "/health").await;
+                    tokio::time::sleep(SPIN / 10).await;
+                }
+                spin.await.unwrap();
+                let spun = spun.lock().unwrap()[round];
+                let answered = std::mem::take(&mut *answered.lock().unwrap());
+                assert_eq!(answered.len(), 3);
+                assert!(answered.iter().all(|at| *at < spun), "a /health waited for the {SPIN:?} spin to end");
+            }
+        });
+    }
 }

@@ -64,16 +64,21 @@ pub struct WriterSettings {
     /// way) before a run handing more waits for room. Weighed with
     /// [`RunEvent::held_bytes`].
     pub queue_bytes: usize,
+    /// How long a batch with no answer is sent again for, in all
+    /// ([`RESEND_FOR`]; the environment does not change it).
+    pub resend_for: Duration,
 }
 
 impl Default for WriterSettings {
     /// Four lanes; a 2 ms gather; 64 MiB waiting, what Restate gives the
-    /// same buffer (its `self_proposal_queue_memory_limit`).
+    /// same buffer (its `self_proposal_queue_memory_limit`); a batch with
+    /// no answer sent again for [`RESEND_FOR`].
     fn default() -> Self {
         Self {
             lanes: 4,
             gather: Duration::from_millis(2),
             queue_bytes: 64 << 20,
+            resend_for: RESEND_FOR,
         }
     }
 }
@@ -116,7 +121,8 @@ pub const BATCH_RUNS: usize = 1000;
 /// How long a batch with no answer is sent again for: at first and at most
 /// between tries, and in all. The broker is the install's own service, and
 /// one out of reach this long is down, so the runs of the batch stop on it
-/// like on any failed write.
+/// like on any failed write, except that a durable one is handed back to
+/// be carried on from what landed ([`DriveJournal::must_hand_back`]).
 const RESEND_FIRST: Duration = Duration::from_millis(100);
 const RESEND_LONGEST: Duration = Duration::from_secs(5);
 const RESEND_FOR: Duration = Duration::from_secs(60);
@@ -169,7 +175,7 @@ impl WorkerJournal {
             })
             .collect();
         for lane in &lanes {
-            io.spawn(lane_loop(lane.clone(), record.clone(), budget.clone(), settings.gather));
+            io.spawn(lane_loop(lane.clone(), record.clone(), budget.clone(), settings.gather, settings.resend_for));
         }
         Arc::new(Self { lanes, record, budget })
     }
@@ -528,13 +534,14 @@ impl RunLog {
         self.poison.get().map(|why| anyhow::anyhow!("an earlier record write of this run failed: {why}"))
     }
 
-    /// Stop this run's writes for `why` (the first reason is kept). A run
-    /// that already let go of its handle has nobody left to hear that, so
-    /// it is said here, naming the run. `true` when the run let go with its
+    /// Stop this run's writes for `why` (the first reason is kept), a write
+    /// that got no answer when `unanswered` (see [`Poison`]). A run that
+    /// already let go of its handle has nobody left to hear that, so it is
+    /// said here, naming the run. `true` when the run let go with its
     /// ending handed, which will now never be written, so the writer has
     /// the broker end it ([`give_up`]) when the run is still this worker's.
-    fn fail(&self, why: String) -> bool {
-        let Stopped::Unheard { ending_handed } = self.poison.set(why.clone()) else { return false };
+    fn fail(&self, why: String, unanswered: bool) -> bool {
+        let Stopped::Unheard { ending_handed } = self.poison.set(why.clone(), unanswered) else { return false };
         tracing::error!(
             target: "weft_engine::journal",
             run_id = %self.run_id, error = %why,
@@ -584,7 +591,7 @@ struct Taken {
 
 /// A lane's task: wait for runs, gather when nobody waits, send one batch,
 /// answer, and again; until the writer is dropped and nothing is left.
-async fn lane_loop(lane: Arc<Lane>, record: Arc<dyn RecordClient>, budget: Arc<Budget>, gather: Duration) {
+async fn lane_loop(lane: Arc<Lane>, record: Arc<dyn RecordClient>, budget: Arc<Budget>, gather: Duration, resend_for: Duration) {
     loop {
         loop {
             let woken = lane.wake.notified();
@@ -619,7 +626,7 @@ async fn lane_loop(lane: Arc<Lane>, record: Arc<dyn RecordClient>, budget: Arc<B
         let taken = take_batch(&lane, &budget);
         if !taken.is_empty() {
             let (body, head_runs, programs) = frame(&lane, &taken);
-            let answer = send(record.as_ref(), body).await;
+            let answer = send(record.as_ref(), body, resend_for).await;
             if let Ok(answer) = &answer {
                 let went_in = |at: usize| matches!(answer.fates.get(at), Some(Fate::Accepted | Fate::AlreadyApplied));
                 lane.programs_on_record.lock().expect("record writer")
@@ -741,14 +748,14 @@ fn frame(lane: &Lane, taken: &[Taken]) -> (Vec<u8>, usize, Vec<(usize, String)>)
     (weft_journal::frame::encode(&head, rows.iter().map(Vec::as_slice)), runs, births)
 }
 
-/// Send `body` until it is answered, within [`RESEND_FOR`]. A batch sent
+/// Send `body` until it is answered, within `resend_for`. A batch sent
 /// again lands once (see the module doc).
-async fn send(record: &dyn RecordClient, body: Vec<u8>) -> Result<BatchAnswer, BatchError> {
+async fn send(record: &dyn RecordClient, body: Vec<u8>, resend_for: Duration) -> Result<BatchAnswer, BatchError> {
     let started = tokio::time::Instant::now();
     let mut wait = RESEND_FIRST;
     loop {
         match record.record_batch(body.clone()).await {
-            Err(BatchError::Unanswered(e)) if started.elapsed() < RESEND_FOR => {
+            Err(BatchError::Unanswered(e)) if started.elapsed() < resend_for => {
                 tracing::warn!(
                     target: "weft_engine::journal",
                     error = %format!("{e:#}"), retry_in_ms = wait.as_millis() as u64,
@@ -775,37 +782,45 @@ fn answered(taken: &[Taken], runs: usize, answer: Result<BatchAnswer, BatchError
                     // Neither is this worker's to end: the run is another's.
                     Fate::BornElsewhere => {
                         run.born_elsewhere.store(true, Ordering::Release);
-                        run.fail(format!("another worker bore run {} first; it is that worker's", run.run_id));
+                        run.fail(format!("another worker bore run {} first; it is that worker's", run.run_id), false);
                     }
                     Fate::ProjectRemoving => {
-                        run.fail(format!(
-                            "run {} was not started: {}",
-                            run.run_id,
-                            weft_core::projects::PROJECT_BEING_REMOVED
-                        ));
+                        run.fail(
+                            format!("run {} was not started: {}", run.run_id, weft_core::projects::PROJECT_BEING_REMOVED),
+                            false,
+                        );
                     }
                     Fate::Refused => {
-                        run.fail(format!(
-                            "this worker no longer drives run {} (another worker took it, it ended, or its project was removed); nothing more of it is recorded",
-                            run.run_id
-                        ));
+                        run.fail(
+                            format!(
+                                "this worker no longer drives run {} (another worker took it, it ended, or its project was removed); nothing more of it is recorded",
+                                run.run_id
+                            ),
+                            false,
+                        );
                     }
                 }
             }
             return Vec::new();
         }
-        Ok(answer) => format!("the record answered a batch of {runs} runs with {} fates", answer.fates.len()),
-        Err(e) => e.to_string(),
+        Ok(answer) => (format!("the record answered a batch of {runs} runs with {} fates", answer.fates.len()), false),
+        Err(e) => (e.to_string(), matches!(e, BatchError::Unanswered(_))),
     };
-    tracing::error!(target: "weft_engine::journal", error = %why, runs, "a batch of records failed; the runs it held stop");
-    taken.iter().filter(|taken| taken.run.fail(why.clone())).map(|taken| taken.run.clone()).collect()
+    let (why, unanswered) = why;
+    tracing::error!(target: "weft_engine::journal", error = %why, runs, unanswered, "a batch of records failed; the runs it held stop");
+    taken.iter().filter(|taken| taken.run.fail(why.clone(), unanswered)).map(|taken| taken.run.clone()).collect()
 }
 
 
 /// Why a run's record can no longer be trusted, once it can't: the first
 /// reason is kept, and whoever waits for it hears it at once. Whether the
 /// run let go of its handle is kept beside it, under one lock, so a
-/// failure is heard by the run or said by the writer, exactly once.
+/// failure is heard by the run or said by the writer, exactly once. So is
+/// whether the failed write got no answer at all (the broker out of reach
+/// past [`RESEND_FOR`]) rather than a refusal: what lands of a run is then
+/// still a prefix of what it handed, since nothing after the unanswered
+/// batch is ever sent, which is what a durable run is carried on from
+/// ([`DriveJournal::must_hand_back`]).
 struct Poison {
     state: Mutex<PoisonState>,
     heard: tokio::sync::watch::Sender<bool>,
@@ -814,6 +829,8 @@ struct Poison {
 #[derive(Default)]
 struct PoisonState {
     why: Option<String>,
+    /// The write that set `why` got no answer.
+    unanswered: bool,
     /// The run let go of its handle ([`DriveJournal::leave`]).
     let_go: bool,
     /// The run's ending was handed: its record ends with it.
@@ -835,13 +852,14 @@ impl Poison {
         Self { state: Mutex::new(PoisonState::default()), heard: tokio::sync::watch::Sender::new(false) }
     }
 
-    fn set(&self, why: String) -> Stopped {
+    fn set(&self, why: String, unanswered: bool) -> Stopped {
         let stopped = {
             let mut state = self.state.lock().expect("record writer");
             if state.why.is_some() {
                 return Stopped::Already;
             }
             state.why = Some(why);
+            state.unanswered = unanswered;
             if state.let_go { Stopped::Unheard { ending_handed: state.ending_handed } } else { Stopped::Heard }
         };
         self.heard.send_replace(true);
@@ -850,6 +868,11 @@ impl Poison {
 
     fn get(&self) -> Option<String> {
         self.state.lock().expect("record writer").why.clone()
+    }
+
+    /// The write that stopped the run got no answer.
+    fn unanswered(&self) -> bool {
+        self.state.lock().expect("record writer").unanswered
     }
 
     fn ending_handed(&self) {
@@ -906,7 +929,9 @@ pub enum Leaving {
 /// drive stops at its next turn ([`Self::is_poisoned`]), and a drive idling
 /// on a long node hears it at once ([`Self::poisoned`]). The run's ending
 /// is then the broker's to write ([`WorkerJournal::give_up`]): the drive
-/// asks for it, or the writer does once the run let go.
+/// asks for it, or the writer does once the run let go. A durable run
+/// whose write got no answer at all is handed back instead
+/// ([`Self::must_hand_back`]).
 pub struct DriveJournal {
     writer: Arc<WorkerJournal>,
     run: Arc<RunLog>,
@@ -926,6 +951,18 @@ impl DriveJournal {
     /// A write failed since the drive began.
     pub fn is_poisoned(&self) -> bool {
         self.run.poison.get().is_some()
+    }
+
+    /// The run is to be handed back rather than ended: it is durable, and
+    /// a write of it got no answer within [`RESEND_FOR`]. Its record is a
+    /// prefix of what it handed, whether or not that batch landed, which
+    /// is the state a crash leaves and the one durable resume is built
+    /// for: the drive stops its nodes, the run lets go of this worker
+    /// (`LetGo::HandedBack`), and the worker that picks it up carries it
+    /// on, failing every node its record shows started and not ended. A
+    /// fast run is not built to survive that, and ends failed.
+    pub fn must_hand_back(&self) -> bool {
+        self.run.keeping == Keeping::Durable && self.run.poison.unanswered()
     }
 
     /// Answers once a write of this run failed: what a drive waiting on
@@ -998,7 +1035,7 @@ impl DriveJournal {
             anyhow::bail!("run {} already handed its ending; nothing after it is recorded", self.run.run_id);
         }
         let fail = |why: String| -> anyhow::Result<Vec<RunEvent>> {
-            self.run.fail(why.clone());
+            self.run.fail(why.clone(), false);
             anyhow::bail!(why)
         };
         {
@@ -1254,6 +1291,43 @@ mod tests {
         drive.record_event(&started(run, "a"), Some("w")).await.unwrap();
         assert!(drive.flush().await.is_err());
         assert!(drive.is_poisoned());
+        assert!(!drive.must_hand_back(), "a fast run is not built to survive it");
+    }
+
+    /// A durable run whose broker stays out of reach past the resend
+    /// budget is to be handed back, not ended: its record is a prefix of
+    /// what it handed, and nobody asks the broker to end it. Beside it, on
+    /// the same lanes, a fast run stops as it always did.
+    #[tokio::test(start_paused = true)]
+    async fn a_durable_run_out_of_reach_too_long_is_handed_back() {
+        let record = Arc::new(FakeRecord::default());
+        record.unanswered(usize::MAX);
+        let writer = writer(&record, WriterSettings::default());
+        let (durable_run, durable_drive) = durable(&writer);
+        let (fast_run, fast_drive) = fast(&writer);
+        durable_drive.record_event(&started(durable_run, "a"), Some("w")).await.unwrap();
+        fast_drive.record_event(&started(fast_run, "a"), Some("w")).await.unwrap();
+        let started_at = tokio::time::Instant::now();
+        assert!(durable_drive.flush().await.is_err());
+        assert!(started_at.elapsed() >= RESEND_FOR, "the batch was sent again for the whole budget first");
+        assert!(fast_drive.flush().await.is_err());
+        assert!(durable_drive.must_hand_back());
+        assert!(fast_drive.is_poisoned() && !fast_drive.must_hand_back());
+        assert!(durable_drive.leave(Leaving::CarriesOn).await.is_err(), "nothing more of it is written");
+        assert!(record.gave_up().is_empty(), "nobody asked the broker to end a run");
+        assert!(record.events(durable_run).is_empty());
+    }
+
+    /// A write the broker refused is an answer: a durable run it stops is
+    /// not handed back.
+    #[tokio::test]
+    async fn a_durable_run_whose_write_is_refused_is_not_handed_back() {
+        let record = Arc::new(FakeRecord::default());
+        record.refuse_batches(1);
+        let (run, drive) = durable(&writer(&record, WriterSettings::default()));
+        drive.record_event(&started(run, "a"), Some("w")).await.unwrap();
+        assert!(drive.flush().await.is_err());
+        assert!(drive.is_poisoned() && !drive.must_hand_back());
     }
 
     /// A drive waiting on something else hears its record fail at once.

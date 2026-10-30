@@ -256,6 +256,7 @@ pub fn emit(
         .replace("{{left_out_record_path}}", weft_core::builds::LEFT_OUT_RECORD_PATH)
         .replace("{{cache_gc_script}}", CACHE_GC_SCRIPT_NAME)
         .replace("{{cargo_messages}}", CARGO_MESSAGES_PATH)
+        .replace("{{worker_rustflags}}", weft_core::builds::WORKER_RUSTFLAGS)
         .replace(
             "{{install_builder_base}}",
             &render_builder_base(base.manager),
@@ -731,6 +732,7 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 /// knows what to mark used.
 const CARGO_BUILD_RUN_FRAGMENT: &str = concat!(
     "ENV CARGO_TARGET_DIR=/cache/target\n",
+    "ENV RUSTFLAGS=\"{{worker_rustflags}}\"\n",
     "ARG WEFT_COMPILE_CACHE=kept\n",
     "RUN --mount=type=cache,id=weft-worker-cargo-registry,target=/root/.cargo/registry,sharing=locked \\\n",
     "    --mount=type=cache,id=weft-worker-target-{{worker_cache_key}},target=/cache/target,sharing=locked \\\n",

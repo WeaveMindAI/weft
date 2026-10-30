@@ -167,10 +167,11 @@ async fn round(pool: &db::Pool, programs: &mut Programs, pending: Pending) -> an
     let ids = pending.take(&tx).await?;
     for run_id in &ids {
         let record = weft_journal::record::read_record(&tx, *run_id, None).await?;
-        let entry = match record.events(*run_id) {
+        let id = *run_id;
+        let entry = match weft_journal::on_blocking_pool(move || record.events(id)).await {
             Ok(events) => {
                 let program = started_on(&tx, programs, *run_id, &events).await?;
-                Entry::of(*run_id, &events, program.as_deref().map(ProjectGraph::new).as_ref())
+                weft_journal::on_blocking_pool(move || Entry::of(id, &events, program.as_deref().map(ProjectGraph::new).as_ref())).await
             }
             Err(e) => {
                 tracing::warn!(target: "weft_dispatcher::search", %run_id, error = %e, "a run's record does not read; it is not searchable");

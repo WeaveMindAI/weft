@@ -76,6 +76,8 @@ pub mod run_flags;
 pub mod run_settings;
 pub mod run_spec;
 #[cfg(feature = "runtime")]
+pub mod process_runtime;
+#[cfg(feature = "runtime")]
 pub mod seeding;
 // The predicate submodule is wire-pure and always available (the
 // `SignalSpec` wire type in `primitive` carries `Vec<Predicate>`); the

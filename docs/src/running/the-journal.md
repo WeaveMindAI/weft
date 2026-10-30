@@ -115,14 +115,25 @@ nothing is dropped. For what that
 does to new calls, go and read [when a worker is
 full](architecture.md#when-a-worker-is-full).
 
-## Why a failed write stops the run
+## When a write of the record fails
 
-If a write fails (the broker refuses it, or a minute of sending it again gets
-no answer), the runs whose rows were in it end as failed. A write that got no
-answer is safe to send again, because the record takes a batch sent twice only
-once. A journal missing rows the worker thinks it wrote would rebuild a different run:
-a node whose start was lost but whose values landed would run again and spend
-twice.
+If the broker refuses a write, the runs whose rows were in it end as failed.
+
+If a write gets no answer, the worker sends it again for a minute. That is
+safe, because the record takes a batch sent twice only once. After the minute
+it gives up on that write, and then:
+
+- a fast run ends as failed;
+- a durable run is handed back, and another worker carries it on from the rows
+  that did land.
+
+Either way the run writes nothing after the write that failed. A record with a
+hole in it would rebuild a different run: a node whose start was lost but whose
+values landed would run again and spend twice. So what landed is always the
+run's first rows, in order, which is the record a worker that died leaves
+behind, and a durable run carries on from it the same way. A node whose start
+landed and whose end did not is failed rather than run again (for that, go and
+read [when the worker dies mid-run](../nodes/durable-execution.md#when-the-worker-dies-mid-run)).
 
 ## How long a run is kept
 

@@ -966,7 +966,10 @@ mod tests {
         assert!(!m.layout().seed_cache().join(".weft-seeded").exists() && !target.join(".weft-seeded").exists(), "the marks are beside the caches, never in them");
         for c in &calls[..2] {
             assert_eq!(c.cwd, ctx.join("crate"));
-            assert_eq!(c.env, vec![("CARGO_TARGET_DIR".to_string(), target.display().to_string())]);
+            assert_eq!(c.env, vec![
+                ("CARGO_TARGET_DIR".to_string(), target.display().to_string()),
+                ("RUSTFLAGS".to_string(), weft_core::builds::WORKER_RUSTFLAGS.to_string()),
+            ]);
         }
         assert_eq!(calls[0].args[..3], ["build", "--release", "--manifest-path"]);
         assert_eq!(calls[0].stdout, Some(ctx.join("cargo-messages.json")), "cargo's messages are what the sweep reads");

@@ -10,11 +10,10 @@
 //! never started, so the fix (an unwired input, a producer that never
 //! fires, a gate nothing feeds) reads off the message.
 
-use std::collections::HashMap;
 use std::fmt;
 
 use crate::frames::{FiringLocation, LoopFrames};
-use crate::primitive::KickedNode;
+use crate::primitive::KickTable;
 use crate::project::scopes::ScopeCopy;
 use crate::project::{ProgramIndex, ProjectDefinition};
 use crate::pulse::PulseTable;
@@ -63,7 +62,7 @@ pub fn stuck_report(
     program_idx: &ProgramIndex,
     pulses: &PulseTable,
     scopes: &ScopeTable,
-    kicked: &HashMap<FiringLocation, KickedNode>,
+    kicked: &KickTable,
 ) -> StuckReport {
     let mut firings = Vec::new();
     for node in &project.nodes {
@@ -104,8 +103,8 @@ pub fn stuck_report(
         }
     }
     let waiting_scopes = crate::run::scope::waiting_copies(program_idx, scopes);
-    let mut unstarted: Vec<FiringLocation> = kicked.iter().filter(|(_, kick)| !kick.dispatched).map(|(at, _)| at.clone()).collect();
-    unstarted.sort_by(|a, b| (&a.node_id, &a.frames).cmp(&(&b.node_id, &b.frames)));
+    // In place order already: the table keeps them sorted.
+    let unstarted: Vec<FiringLocation> = kicked.undispatched().cloned().collect();
     StuckReport { firings, waiting_scopes, unstarted }
 }
 
@@ -268,10 +267,9 @@ mod tests {
         let p = project(vec![node("src", &[]), node("sink", &["value"])], &[("src", "sink", "value")]);
         let idx = ProgramIndex::build(&p);
         let run_id = uuid::Uuid::new_v4();
-        let mut absorbed = pulse(run_id, vec![], "sink", "value");
-        absorbed.status = crate::pulse::PulseStatus::Absorbed;
         let mut pulses = PulseTable::new();
-        pulses.insert("sink".into(), vec![absorbed]);
+        pulses.insert("sink".into(), vec![pulse(run_id, vec![], "sink", "value")]);
+        pulses.absorb("sink", |_| true);
         assert!(stuck_report(&p, &idx, &pulses, &Default::default(), &Default::default()).firings.is_empty());
     }
 }

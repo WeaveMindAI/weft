@@ -175,9 +175,8 @@ pub async fn wake(state: &DispatcherState, actor: &Actor, run_id: RunId, node: &
     // only when something asks which: one wait, with no iteration named,
     // is the one.
     let iterations = if waits.len() > 1 || iteration.is_some() {
-        let mut folds = crate::projection::reconstruct_run(state, run_id).await.map_err(failed("the run's record"))?;
-        let fold = folds.remove(&run_id).ok_or_else(|| super::internal("the run's record", "its own fold is missing"))?;
-        Some(crate::node_state::wait_iterations(&fold.current_snapshot(), &place))
+        let (_, snapshot) = crate::projection::run_snapshot(state, run_id).await.map_err(failed("the run's record"))?;
+        Some(crate::node_state::wait_iterations(&snapshot, &place))
     } else {
         None
     };
@@ -465,8 +464,9 @@ async fn replay_events(state: &DispatcherState, run_id: RunId, project_id: uuid:
         }
         None => found,
     };
-    let rows: Vec<weft_journal::RunEvent> = raw_events.iter().map(|r| r.event.clone()).collect();
-    let inheritance = match crate::projection::run_inheritance(state, &rows, &program).await {
+    // What the run inherits is named by its birth, its first row.
+    let birth: Vec<weft_journal::RunEvent> = raw_events.iter().take(1).map(|r| r.event.clone()).collect();
+    let inheritance = match crate::projection::run_inheritance(state, &birth, &program).await {
         Ok(chain) => chain,
         Err(reason) => {
             corruptions.push((weft_core::primitive::CorruptionSite::UndecodableRow, reason));
@@ -474,11 +474,15 @@ async fn replay_events(state: &DispatcherState, run_id: RunId, project_id: uuid:
         }
     };
     let mut projector = crate::projection::RunProjector::new(run_id, program, project_id).with_inheritance(inheritance);
-    let mut out: Vec<LiveEvent> = Vec::new();
-    for record in raw_events {
-        let projected = projector.project(&record.event);
-        out.extend(crate::events::IdentifiedEvent { event_id: record.event_id, event: () }.project(|()| projected));
-    }
+    let mut out: Vec<LiveEvent> = weft_journal::on_blocking_pool(move || {
+        let mut out = Vec::new();
+        for record in raw_events {
+            let projected = projector.project(&record.event);
+            out.extend(crate::events::IdentifiedEvent { event_id: record.event_id, event: () }.project(|()| projected));
+        }
+        out
+    })
+    .await;
     // A run parked now says so after its history: parking writes no
     // record row, and a reader that takes the history before the live
     // events (`weft wait --waiting-for-input`) learns here that it waits.
@@ -757,8 +761,17 @@ pub async fn costs(state: &DispatcherState, actor: &Actor, project_id: uuid::Uui
             let conn = state.pg_pool.get().await.map_err(failed("costs"))?;
             weft_journal::record::read_record(&conn, run_id, None).await.map_err(failed("cost record"))?
         };
-        let events = record.events(run_id).map_err(failed("cost record"))?;
-        reported.push(events.into_iter().map(move |event| (run_id, event, instance.clone())));
+        // The run row keeps only the run's total, so the figures are
+        // read off the record, decoded off the call threads, keeping
+        // only its costs.
+        let costs = weft_journal::on_blocking_pool(move || {
+            record.events(run_id).map(|events| {
+                events.into_iter().filter(|event| matches!(event, weft_journal::RunEvent::CostReported { .. })).collect::<Vec<_>>()
+            })
+        })
+        .await
+        .map_err(failed("cost record"))?;
+        reported.push(costs.into_iter().map(move |event| (run_id, event, instance.clone())));
     }
     for (run_id, event, instance) in reported.into_iter().flatten() {
         let weft_journal::RunEvent::CostReported { node_id, frames, service, model, amount_usd, origin, at_unix, .. } = event else {

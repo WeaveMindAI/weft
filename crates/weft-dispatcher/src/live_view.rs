@@ -123,7 +123,10 @@ impl Views {
             weft_journal::record::read_record(&conn, run_id, after).await?
         };
         let Some(last) = record.rows.last().map(|row| row.seq) else { return Ok(()) };
-        let rows = match record.decode(run_id) {
+        // Decoding and folding a run first seen here reads its whole
+        // record: off this task, which every watched run shares, and off
+        // the threads serving calls.
+        let rows = match weft_journal::on_blocking_pool(move || record.decode(run_id)).await {
             Ok(rows) => rows,
             Err(reason) => {
                 // The run paints only what needs no program from here on;
@@ -152,12 +155,20 @@ impl Views {
             Some(live) => live,
             None => LiveRun { project_id, projector: open_projection(state, run_id, project_id, &rows).await?, painted: -1, last_row_at: Instant::now() },
         };
-        let mut ended = false;
-        for row in &rows {
-            ended |= row.event.is_run_terminal();
-            for event in crate::events::IdentifiedEvent::recorded(row.seq, row.index, ()).project(|()| live.projector.project(&row.event)) {
-                state.events.publish_local(event).await;
+        let mut projector = live.projector;
+        let (projector, painted, ended) = weft_journal::on_blocking_pool(move || {
+            let mut painted = Vec::new();
+            let mut ended = false;
+            for row in &rows {
+                ended |= row.event.is_run_terminal();
+                painted.extend(crate::events::IdentifiedEvent::recorded(row.seq, row.index, ()).project(|()| projector.project(&row.event)));
             }
+            (projector, painted, ended)
+        })
+        .await;
+        live.projector = projector;
+        for event in painted {
+            state.events.publish_local(event).await;
         }
         live.painted = last;
         live.last_row_at = Instant::now();

@@ -35,14 +35,14 @@
 //! record carries is the engine's clock on one side and the row's
 //! `at_unix` on the other.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::frames::{FiringLocation, Located, LoopFrames};
-use crate::primitive::{KickedNode, Phase};
+use crate::primitive::{KickTable, KickedNode, Phase};
 use crate::project::scopes::ScopeCopy;
 use crate::project::graph::GraphView;
 use crate::project::{CrossingSide, Given, GivenOrigin, GivenPort, GroupDefinition, NodeDefinition, ProgramIndex, ProjectDefinition};
@@ -104,6 +104,13 @@ impl ScopeTable {
     /// Every copy decided, in order.
     pub fn iter(&self) -> impl Iterator<Item = (&ScopeCopy, &ScopeRecord)> {
         self.copies.iter()
+    }
+
+    /// Whether some copy of `scope` is decided: one look in the ordered
+    /// table (its copies sort together, the copy at no frames first),
+    /// however many copies the run decided.
+    fn decided_any(&self, scope: &str) -> bool {
+        self.copies.range(ScopeCopy::new(scope, Vec::new())..).next().is_some_and(|(copy, _)| copy.scope == scope)
     }
 
     fn decide(&mut self, copy: ScopeCopy, state: ScopeState, at: u64) {
@@ -189,7 +196,7 @@ pub struct TablePass {
     /// What the copies sent and closed, what stand-ins sent, and the
     /// handed streams' items.
     pub emissions: Vec<PulseEmission>,
-    /// Pending pulses the run will never take, now Absorbed: inside a
+    /// Pending pulses the run will never take, now absorbed: inside a
     /// copy that did not run, or on a gate already decided.
     pub absorbed: Vec<Uuid>,
     /// Pending pulses into a trigger at Fire, removed from the table.
@@ -214,7 +221,7 @@ pub fn settle_table(
     now: u64,
     pulses: &mut PulseTable,
     scopes: &mut ScopeTable,
-    kicked: &mut HashMap<FiringLocation, KickedNode>,
+    kicked: &mut KickTable,
 ) -> TablePass {
     let mut pass = TablePass::default();
     scopes.start(program_idx);
@@ -247,7 +254,7 @@ fn decide_ready_copies(
     now: u64,
     pulses: &mut PulseTable,
     scopes: &mut ScopeTable,
-    kicked: &mut HashMap<FiringLocation, KickedNode>,
+    kicked: &mut KickTable,
     emissions: &mut Vec<PulseEmission>,
 ) -> Vec<(ScopeCopy, ScopeState)> {
     let mut decided = Vec::new();
@@ -361,7 +368,7 @@ fn open(
     now: u64,
     pulses: &mut PulseTable,
     scopes: &mut ScopeTable,
-    kicked: &mut HashMap<FiringLocation, KickedNode>,
+    kicked: &mut KickTable,
     emissions: &mut Vec<PulseEmission>,
 ) {
     scopes.open(program_idx, copy, now);
@@ -425,7 +432,7 @@ fn kick_unfed_members(
     program_idx: &ProgramIndex,
     scope: &str,
     frames: &LoopFrames,
-    kicked: &mut HashMap<FiringLocation, KickedNode>,
+    kicked: &mut KickTable,
 ) {
     let roots = starting_members(project, program_idx, Some(scope), frames);
     kick_scope(kicked, &roots, frames, None);
@@ -467,7 +474,7 @@ fn take_down(
     now: u64,
     pulses: &mut PulseTable,
     scopes: &mut ScopeTable,
-    kicked: &mut HashMap<FiringLocation, KickedNode>,
+    kicked: &mut KickTable,
     emissions: &mut Vec<PulseEmission>,
 ) -> Vec<(ScopeCopy, ScopeState)> {
     scopes.decide(copy.clone(), ScopeState::Skipped { reason: reason.clone() }, now);
@@ -495,7 +502,7 @@ fn tell_inside(
     copy: &ScopeCopy,
     now: u64,
     scopes: &mut ScopeTable,
-    kicked: &mut HashMap<FiringLocation, KickedNode>,
+    kicked: &mut KickTable,
 ) -> Vec<(ScopeCopy, ScopeState)> {
     let inside = program_idx.scopes().inside(copy);
     let mut decided = Vec::new();
@@ -523,7 +530,7 @@ pub fn open_iteration(
     body_frames: &LoopFrames,
     now: u64,
     scopes: &mut ScopeTable,
-    kicked: &mut HashMap<FiringLocation, KickedNode>,
+    kicked: &mut KickTable,
 ) {
     scopes.open(program_idx, &ScopeCopy::new(loop_id, body_frames.clone()), now);
     kick_unfed_members(project, program_idx, loop_id, body_frames, kicked);
@@ -547,7 +554,7 @@ pub fn tear_down_loop(
     now: u64,
     pulses: &mut PulseTable,
     scopes: &mut ScopeTable,
-    kicked: &mut HashMap<FiringLocation, KickedNode>,
+    kicked: &mut KickTable,
 ) -> TablePass {
     let mut pass = TablePass::default();
     if matches!(reason, SkipReason::ScopeSkipped { .. }) {
@@ -599,7 +606,7 @@ fn send_given(
     run_id: RunId,
     pulses: &mut PulseTable,
     scopes: &mut ScopeTable,
-    kicked: &HashMap<FiringLocation, KickedNode>,
+    kicked: &KickTable,
     emissions: &mut Vec<PulseEmission>,
 ) -> bool {
     let mut sent = false;
@@ -731,11 +738,7 @@ fn mark_given(pulse: &mut Pulse, origin: GivenOrigin) {
 
 /// Absorb the pending pulses on `copy`'s gate: a decision takes them.
 fn absorb_gate(pulses: &mut PulseTable, copy: &ScopeCopy, run_id: RunId) {
-    if let Some(bucket) = pulses.get_mut(&copy.scope) {
-        for pulse in bucket.iter_mut().filter(|p| p.status.is_pending() && p.run_id == run_id && p.frames == copy.frames) {
-            pulse.absorb();
-        }
-    }
+    pulses.absorb(&copy.scope, |p| p.run_id == run_id && p.frames == copy.frames);
 }
 
 /// Absorb every pending pulse the run will never take: one at a node
@@ -749,24 +752,19 @@ fn absorb_spent(program_idx: &ProgramIndex, project: &ProjectDefinition, pulses:
     if scopes.copies.is_empty() {
         return absorbed;
     }
-    let decided_scopes: BTreeSet<&str> = scopes.copies.keys().map(|copy| copy.scope.as_str()).collect();
-    for (target, bucket) in pulses.iter_mut() {
-        let node = program_idx.node(project, target);
-        let can_hold = match node {
+    let can_hold: Vec<String> = pulses.iter()
+        .filter(|(target, bucket)| !bucket.is_empty() && match program_idx.node(project, target) {
             Some(node) => node.scope.iter().any(|scope| scopes.skipped.contains(scope)),
-            None => decided_scopes.contains(target.as_str()),
-        };
-        if !can_hold { continue; }
-        for pulse in bucket.iter_mut().filter(|p| p.status.is_pending()) {
-            let spent = match node {
-                Some(node) => matches!(scope_permission(program_idx, node, &pulse.frames, scopes), ScopePermission::Skipped(_)),
-                None => scopes.copies.contains_key(&ScopeCopy::new(target.clone(), pulse.frames.clone())),
-            };
-            if spent {
-                pulse.absorb();
-                absorbed.push(pulse.id);
-            }
-        }
+            None => scopes.decided_any(target),
+        })
+        .map(|(target, _)| target.clone())
+        .collect();
+    for target in can_hold {
+        let node = program_idx.node(project, &target);
+        absorbed.extend(pulses.absorb(&target, |pulse| match node {
+            Some(node) => matches!(scope_permission(program_idx, node, &pulse.frames, scopes), ScopePermission::Skipped(_)),
+            None => scopes.copies.contains_key(&ScopeCopy::new(target.clone(), pulse.frames.clone())),
+        }));
     }
     absorbed
 }
@@ -777,7 +775,7 @@ fn absorb_spent(program_idx: &ProgramIndex, project: &ProjectDefinition, pulses:
 /// there (a trigger's fire) keeps its payload and takes the verdict. A
 /// copy's opening, a loop's launch and every teardown come through here.
 pub fn kick_scope(
-    kicked: &mut HashMap<FiringLocation, KickedNode>,
+    kicked: &mut KickTable,
     roots: &[String],
     frames: &LoopFrames,
     skipped_by: Option<&str>,
@@ -788,18 +786,12 @@ pub fn kick_scope(
         // second write at a kicked location only marks it skipped
         // (`skipped_by`) and keeps the rest (a firing trigger's wake
         // payload and port snapshot).
-        kicked
-            .entry(FiringLocation::new(root.clone(), frames.clone()))
-            .and_modify(|kick| {
-                if let Some(scope) = skipped_by { kick.scope_skipped = Some(scope.into()); }
-            })
-            .or_insert_with(|| KickedNode {
-                firing: false,
-                payload: None,
-                port_snapshot: None,
-                dispatched: false,
-                scope_skipped: skipped_by.map(str::to_string),
-            });
+        let (kick, made) = kicked.kick(FiringLocation::new(root.clone(), frames.clone()), || {
+            KickedNode::new(false, None, None, skipped_by.map(str::to_string))
+        });
+        if let (false, Some(scope)) = (made, skipped_by) {
+            kick.scope_skipped = Some(scope.into());
+        }
     }
 }
 
@@ -857,7 +849,7 @@ mod tests {
         given: Given,
         pulses: PulseTable,
         scopes: ScopeTable,
-        kicked: HashMap<FiringLocation, KickedNode>,
+        kicked: KickTable,
     }
 
     impl Run {
@@ -869,7 +861,7 @@ mod tests {
         fn given(mut project: ProjectDefinition, given: Given) -> Self {
             project.given = given.places();
             let index = ProgramIndex::build(&project);
-            Self { project, index, given, pulses: PulseTable::default(), scopes: ScopeTable::default(), kicked: HashMap::new() }
+            Self { project, index, given, pulses: PulseTable::default(), scopes: ScopeTable::default(), kicked: KickTable::new() }
         }
 
         fn settle(&mut self, phase: Phase) -> TablePass {
@@ -892,6 +884,29 @@ mod tests {
         fn kick(&self, node: &str, frames: LoopFrames) -> Option<&KickedNode> {
             self.kicked.get(&FiringLocation::new(node, frames))
         }
+    }
+
+    /// Whether a scope has a copy decided answers what a walk over every
+    /// copy would, whatever the copies' frames, beside scopes whose names
+    /// sort right next to it.
+    #[test]
+    fn a_scope_with_a_copy_decided_is_found_without_walking_the_copies() {
+        let mut table = ScopeTable::default();
+        let walked = |table: &ScopeTable, scope: &str| table.iter().any(|(copy, _)| copy.scope == scope);
+        let names = ["g", "g.inner", "f", "h", "gg"];
+        for name in names {
+            assert_eq!(table.decided_any(name), walked(&table, name));
+        }
+        for index in 0..50 {
+            table.decide(ScopeCopy::new("g.inner", vec![Frame::Loop { index }]), ScopeState::Open, 0);
+        }
+        table.decide(ScopeCopy::new("gg", vec![Frame::Loop { index: 3 }, Frame::Loop { index: 1 }]), ScopeState::Open, 0);
+        for name in names {
+            assert_eq!(table.decided_any(name), walked(&table, name), "{name}");
+        }
+        assert!(!table.decided_any("g") && table.decided_any("g.inner") && table.decided_any("gg"));
+        table.decide(ScopeCopy::new("g", vec![]), ScopeState::Open, 0);
+        assert!(table.decided_any("g"));
     }
 
     /// `flag -> g._should_flow`; `g` holds `m`, which has no input.
@@ -917,7 +932,8 @@ mod tests {
         assert_eq!(pass.decided, vec![(ScopeCopy::new("g", vec![]), ScopeState::Open)]);
         let kick = run.kick("g.m", vec![]).expect("the member starts with the copy");
         assert_eq!(kick.scope_skipped, None);
-        assert!(run.pulses["g"].iter().all(|pulse| !pulse.status.is_pending()), "the decision took the gate's value");
+        assert!(run.pulses["g"].is_empty(), "the decision took the gate's value off its wire");
+        assert_eq!(run.pulses.all_absorbed().filter(|pulse| pulse.target_node == "g").count(), 1, "the gate's value is taken");
     }
 
     /// A false or closed gate takes the copy down: everything inside is
@@ -976,7 +992,8 @@ mod tests {
         let at_sink: Vec<&Pulse> = run.pulses["sink"].iter().collect();
         assert!(at_sink.len() == 1 && at_sink[0].closed && at_sink[0].status.is_pending(), "{at_sink:?}");
         assert_eq!(run.kick("g.r", vec![]).and_then(|kick| kick.scope_skipped.as_deref()), Some("g"));
-        assert!(run.pulses["g.r"].iter().all(|pulse| !pulse.status.is_pending()), "a pulse inside a copy that did not run is absorbed");
+        assert!(run.pulses["g.r"].is_empty(), "a pulse inside a copy that did not run leaves its wire");
+        assert_eq!(run.pulses.all_absorbed().filter(|pulse| pulse.target_node == "g.r").count(), 1, "a pulse inside a copy that did not run is absorbed");
     }
 
     /// A scope nothing reaches from outside opens with the run.

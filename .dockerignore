@@ -7,7 +7,7 @@
 # root: it uses the staged `.weft-base-context/` dir as its own context.
 #
 # The runtime Dockerfile COPIES: rust-toolchain.toml, Cargo.toml,
-# Cargo.lock, crates/, catalog/ and the builder base's recipe under
+# Cargo.lock, .cargo/config.toml, crates/, catalog/ and the builder base's recipe under
 # deploy/docker/. deploy/ is kept so the Dockerfile referenced with `-f`
 # is inside the context too.
 #
@@ -22,6 +22,7 @@
 !rust-toolchain.toml
 !Cargo.toml
 !Cargo.lock
+!.cargo/config.toml
 !crates/
 !deploy/
 # The runtime image carries the standard library a version compiles

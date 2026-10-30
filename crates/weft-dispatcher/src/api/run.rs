@@ -340,19 +340,14 @@ pub fn cancel_terminal_events(
                 Arc::new(program.clone()),
                 events,
             );
-            for (node_id, firings) in &snapshot.firings {
-                for e in firings {
-                    if e.status.is_terminal() {
-                        continue;
-                    }
-                    writes.push(RunEvent::NodeCancelled {
-                        run_id,
-                        node_id: node_id.clone(),
-                        frames: e.frames.clone(),
-                        reason: reason.clone(),
-                        at_unix: now,
-                    });
-                }
+            for e in snapshot.firings.open() {
+                writes.push(RunEvent::NodeCancelled {
+                    run_id,
+                    node_id: e.node_id.clone(),
+                    frames: e.frames.clone(),
+                    reason: reason.clone(),
+                    at_unix: now,
+                });
             }
         }
         // No program: a run that never ran a node body (a node

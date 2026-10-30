@@ -288,22 +288,14 @@ impl Startable {
     /// stand-ins send) and what its scopes decide at once go out on the
     /// drive's first pass over its scopes (`weft_core::run::scope::settle_table`),
     /// as a fold of its birth sends and decides them.
-    pub(crate) fn opening(&self, payload: &Value) -> HashMap<FiringLocation, weft_core::primitive::KickedNode> {
-        self.kicks_with(payload)
-            .into_iter()
-            .map(|kick| {
-                (
-                    FiringLocation::new(kick.node, kick.frames),
-                    weft_core::primitive::KickedNode {
-                        firing: kick.firing,
-                        payload: kick.payload,
-                        port_snapshot: kick.port_snapshot,
-                        dispatched: false,
-                        scope_skipped: None,
-                    },
-                )
-            })
-            .collect()
+    pub(crate) fn opening(&self, payload: &Value) -> weft_core::primitive::KickTable {
+        let mut kicked = weft_core::primitive::KickTable::new();
+        for kick in self.kicks_with(payload) {
+            kicked.kick(FiringLocation::new(kick.node, kick.frames), || {
+                weft_core::primitive::KickedNode::new(kick.firing, kick.payload, kick.port_snapshot, None)
+            });
+        }
+        kicked
     }
 }
 
@@ -630,15 +622,18 @@ pub(crate) mod tests {
         );
         let folded = weft_journal::fold_to_snapshot(run_id, program.project.clone(), &birth);
         assert!(folded.corruptions.is_empty(), "{:?}", folded.corruptions);
-        let kicks = |kicked: &HashMap<FiringLocation, weft_core::primitive::KickedNode>| {
+        let kicks = |kicked: &weft_core::primitive::KickTable| {
             let mut kicks: Vec<(String, String)> =
                 kicked.iter().map(|(at, kick)| (format!("{at:?}"), serde_json::to_string(kick).unwrap())).collect();
             kicks.sort();
             kicks
         };
         assert_eq!(kicks(&kicked), kicks(&folded.kicked));
+        // On their wires and taken, each said apart.
         let wires = |pulses: &PulseTable| -> Vec<String> {
-            let mut wires: Vec<String> = pulses.values().flatten().map(|pulse| format!("{pulse:?}")).collect();
+            let mut wires: Vec<String> = pulses.values().flatten().map(|pulse| format!("{pulse:?}"))
+                .chain(pulses.all_absorbed().map(|pulse| format!("absorbed {pulse:?}")))
+                .collect();
             wires.sort();
             wires
         };
@@ -702,15 +697,15 @@ pub(crate) mod tests {
             for _ in 0..next(6) {
                 let (node, port) = targets[next(targets.len() as u64) as usize];
                 let id = uuid::Uuid::from_u128(u128::from(next(u64::MAX)));
-                let mut pulse = if next(4) == 0 {
+                let pulse = if next(4) == 0 {
                     weft_core::pulse::Pulse::closure(id, run_id, Vec::new(), node, port)
                 } else {
                     weft_core::pulse::Pulse::new(id, run_id, Vec::new(), node, port, Arc::new(json!("x")))
                 };
-                if next(3) == 0 {
-                    pulse.absorb();
-                }
                 pulses.entry(node.to_string()).or_default().push(pulse);
+                if next(3) == 0 {
+                    pulses.absorb(node, |pulse| pulse.id == id);
+                }
             }
             let asked: Vec<(String, Vec<uuid::Uuid>)> = program.ready(&pulses, &Default::default()).into_iter().map(|(id, group)| (id, group.pulse_ids)).collect();
             let scanned: Vec<(String, Vec<uuid::Uuid>)> = weft_core::run::find_ready_nodes(&project, &pulses, &program.index, &Default::default())

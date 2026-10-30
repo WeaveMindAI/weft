@@ -347,20 +347,27 @@ mod tests {
     /// (pulse and record ids are minted by the fold, so they are left
     /// out).
     fn said(snap: &RunSnapshot) -> serde_json::Value {
-        let mut firings = serde_json::to_value(&snap.firings).unwrap();
-        for records in firings.as_object_mut().unwrap().values_mut() {
-            for record in records.as_array_mut().unwrap() {
+        let firings: BTreeMap<&String, Vec<serde_json::Value>> = snap
+            .firings
+            .iter()
+            .map(|(node, records)| (node, records.values().map(|record| {
+                let mut record = serde_json::to_value(record).unwrap();
                 record.as_object_mut().unwrap().remove("id");
-            }
-        }
+                record
+            }).collect()))
+            .collect();
         let pulses: BTreeMap<&String, Vec<(&String, &serde_json::Value, bool)>> = snap
             .pulses
             .iter()
             .map(|(node, bucket)| (node, bucket.iter().map(|p| (&p.target_port, p.value.as_ref(), p.closed)).collect()))
             .collect();
+        let mut absorbed: Vec<(&String, &String, &serde_json::Value, bool)> =
+            snap.pulses.all_absorbed().map(|p| (&p.target_node, &p.target_port, p.value.as_ref(), p.closed)).collect();
+        absorbed.sort_by_key(|row| serde_json::to_string(row).unwrap());
         json!({
-            "firings": firings,
+            "firings": serde_json::to_value(firings).unwrap(),
             "pulses": serde_json::to_value(pulses).unwrap(),
+            "absorbed": serde_json::to_value(absorbed).unwrap(),
             "corruptions": snap.corruptions.len(),
             "kicked": snap.kicked.len(),
         })

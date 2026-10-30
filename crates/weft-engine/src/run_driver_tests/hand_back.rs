@@ -246,6 +246,110 @@
         assert_eq!(gate_starts, 1, "a node cut short is not run again");
     }
 
+    /// Says it started, sends once it is let through, then holds for good.
+    struct Talker {
+        started: Arc<tokio::sync::Notify>,
+        through: Arc<tokio::sync::Notify>,
+    }
+    test_manifest!(Talker, "Talker");
+    #[async_trait]
+    impl Node for Talker {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            self.started.notify_one();
+            self.through.notified().await;
+            ctx.pulse_downstream(NodeOutput::new().set("value", json!("said"))).await?;
+            std::future::pending().await
+        }
+    }
+
+    /// `project` with its gate a [`Talker`].
+    fn talking(project: &ProjectDefinition) -> ProjectDefinition {
+        let mut project = project.clone();
+        project.nodes[0].node_type = "Talker".into();
+        project
+    }
+
+    fn talker_nodes(started: Arc<tokio::sync::Notify>, through: Arc<tokio::sync::Notify>) -> Arc<dyn weft_core::NodeCatalog> {
+        catalog(vec![("Talker", Box::new(Talker { started, through })), ("Sink", Box::new(Sink))])
+    }
+
+    /// A run of [`talking`] kept `keeping`, whose record's broker goes out
+    /// of reach for good once the gate started and before it sends (its
+    /// batches are sent again for a tenth of a second, then given up):
+    /// what its drive ended with, and the record that landed.
+    async fn drive_until_the_record_is_out_of_reach(
+        project: &ProjectDefinition,
+        keeping: weft_core::run_settings::Keeping,
+    ) -> (RunId, anyhow::Result<RunOutcome>, Arc<MemJournal>) {
+        let run_id = weft_core::new_run_id();
+        let mut birth = birth(project, run_id);
+        if let RunEvent::RunStarted { settings, .. } = &mut birth[0] {
+            *settings = weft_core::run_settings::RunSettings::new(keeping, true).unwrap();
+        }
+        let journal = Arc::new(MemJournal::default());
+        let (started_gate, through) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        let nodes = talker_nodes(started_gate.clone(), through.clone());
+        let run_clients = super::engine_test_rig::clients_writing(
+            journal.clone(),
+            crate::journal_writer::WriterSettings { resend_for: std::time::Duration::from_millis(100), ..Default::default() },
+        );
+        let run = born(&run_clients, run_id, &birth).await;
+        let drive = {
+            let project = Arc::new(project.clone());
+            tokio::spawn(async move {
+                run_on(project, nodes, &run_clients, run_id, run, birth, CancellationFlag::new_arc(), None, None)
+                    .await
+                    .map(|drove| drove.outcome)
+            })
+        };
+        started_gate.notified().await;
+        journal.out_of_reach.store(true, std::sync::atomic::Ordering::SeqCst);
+        through.notify_one();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), drive).await.expect("the drive hung").unwrap();
+        journal.out_of_reach.store(false, std::sync::atomic::Ordering::SeqCst);
+        (run_id, outcome, journal)
+    }
+
+    /// A durable run whose record can no longer be written (its broker out
+    /// of reach past the resend budget) is handed back, not failed: its
+    /// running node is stopped, nothing ends the run, and the next worker
+    /// carries it on from what landed, failing the node whose end never
+    /// landed rather than running it again.
+    #[tokio::test]
+    async fn a_durable_run_whose_record_cannot_be_written_is_handed_back() {
+        let project = talking(&project());
+        let (run_id, outcome, journal) = drive_until_the_record_is_out_of_reach(&project, weft_core::run_settings::Keeping::Durable).await;
+        assert!(matches!(outcome, Ok(RunOutcome::HandedBack)), "{outcome:?}");
+        let events = journal.events_of(run_id);
+        assert!(started(&events, "gate"), "the gate's start landed before the broker went");
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::PortEmitted { .. })), "what it sent after never landed");
+        assert!(!events.iter().any(RunEvent::is_run_terminal), "nothing ended the run: {events:?}");
+
+        let next_clients = clients(journal.clone());
+        let rows = journal.events_of(run_id);
+        let run = handle(&next_clients, run_id, &rows, 1, Default::default());
+        let nodes = talker_nodes(Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        run_on(Arc::new(project), nodes, &next_clients, run_id, run, rows, CancellationFlag::new_arc(), None, None)
+            .await
+            .unwrap();
+        next_clients.writer.written().await;
+        let events = journal.events_of(run_id);
+        assert!(events.iter().any(|e| matches!(e, RunEvent::NodeFailed { node_id, .. } if node_id == "gate")), "the cut node is failed");
+        let gate_starts = events.iter().filter(|e| matches!(e, RunEvent::NodeStarted { node_id, .. } if node_id == "gate")).count();
+        assert_eq!(gate_starts, 1, "a node cut short is not run again");
+        assert!(events.iter().any(RunEvent::is_run_terminal), "the next worker ended it");
+    }
+
+    /// A fast run whose record can no longer be written is not built to
+    /// survive it: its drive fails, and the broker is asked to end it.
+    #[tokio::test]
+    async fn a_fast_run_whose_record_cannot_be_written_fails() {
+        let (run_id, outcome, journal) = drive_until_the_record_is_out_of_reach(&talking(&project()), weft_core::run_settings::Keeping::Fast).await;
+        assert!(outcome.is_err(), "{outcome:?}");
+        let events = journal.events_of(run_id);
+        assert!(events.iter().any(|e| matches!(e, RunEvent::RunFailed { .. })), "the broker ended it: {events:?}");
+    }
+
     /// A run asked to leave that cannot be suspended carries on as if
     /// nothing was asked, past the hand-back's deadline: it gets as far as
     /// it can before the process goes.
