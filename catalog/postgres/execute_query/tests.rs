@@ -10,16 +10,27 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use weft::{FakeRig, Node, NodeManifest, NodeMetadata, NodeTest, RunContext, WeftResult, WeftType};
+use weft::{FakeRig, Node, NodeManifest, NodeMetadata, NodeTest, RunContext, WeftError, WeftResult, WeftType};
 
-use tokio_postgres::types::Type;
+use tokio_postgres::types::{Kind, Type};
 
-use super::super::postgres::{opens_transaction, params_of, placeholders, plan, quote_ident, spell_parameters, Plan, Statement};
+use super::super::postgres::{
+    carry, moment_from_bytes, numeric_from_bytes, opens_transaction, params_of, placeholders, plan, quote_ident,
+    readable, single, spell_parameters, vector_from_bytes, Carry, Plan, Scalar, Statement, WrittenBy,
+};
 use super::{answer, emit, PostgresExecuteQueryNode};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::basic("params_map_every_json_shape", params_map),
+        NodeTest::basic("a_json_list_binds_as_jsonb_or_as_its_text_by_the_placeholder", json_params),
+        NodeTest::basic("only_the_columns_a_node_reads_are_carried", carried_types),
+        NodeTest::basic("a_column_it_cannot_read_refuses_with_a_cast_hint", unreadable_column),
+        NodeTest::basic("a_script_refusal_says_what_already_ran", script_refusals),
+        NodeTest::basic("numeric_reads_every_legal_value", numeric_values),
+        NodeTest::basic("infinite_dates_and_timestamps_read_as_postgres_spells_them", infinite_moments),
+        NodeTest::basic("vectors_read_from_pgvector_binary_form", vector_bytes),
+        NodeTest::basic("a_real_reads_back_as_the_number_written", single_floats),
         NodeTest::basic("identifiers_quote_and_refuse_empty", idents),
         NodeTest::basic("placeholders_become_positions_in_first_use_order", placeholder_order),
         NodeTest::basic("placeholders_leave_quotes_comments_and_dollar_bodies_alone", placeholder_quoting),
@@ -260,6 +271,194 @@ fn params_map() -> WeftResult<()> {
         .to_sql_checked(&Type::INT8, &mut buf)
         .expect("binds as int8");
     assert_eq!(i64::from_be_bytes(buf[..].try_into().expect("8 bytes")), exact);
+    Ok(())
+}
+
+/// pgvector's types, as the driver describes a column of one: an
+/// extension type, known by name, with whatever id the database gave it.
+fn extension_type(name: &str) -> Type {
+    Type::new(name.into(), 16_385, Kind::Simple, "public".into())
+}
+
+/// A JSON list or object binds by the placeholder it meets: jsonb against
+/// json and jsonb, its JSON text against anything else (which is how a
+/// list of numbers writes a pgvector column), and a refusal against a
+/// Postgres array, as before.
+fn json_params() -> WeftResult<()> {
+    let list = params_of(&[json!([0.1, 0.2, 3])]).remove(0);
+    let mut buf = bytes::BytesMut::new();
+    list.to_sql_checked(&extension_type("vector"), &mut buf).expect("binds to a vector");
+    assert_eq!(&buf[..], b"[0.1,0.2,3]", "sent as the text pgvector parses");
+    assert!(matches!(list.encode_format(&extension_type("vector")), tokio_postgres::types::Format::Text));
+
+    let mut buf = bytes::BytesMut::new();
+    list.to_sql_checked(&Type::JSONB, &mut buf).expect("binds to jsonb");
+    assert_eq!(buf[0], 1, "jsonb's binary form opens with its version byte");
+    assert_eq!(&buf[1..], b"[0.1,0.2,3]");
+    assert!(matches!(list.encode_format(&Type::JSONB), tokio_postgres::types::Format::Binary));
+    assert!(binds(json!({ "a": 1 }), &Type::JSON), "an object binds as json");
+
+    for ty in [Type::INT4_ARRAY, Type::TEXT_ARRAY] {
+        let mut buf = bytes::BytesMut::new();
+        let Err(err) = params_of(&[json!([1, 2])])[0].to_sql_checked(&ty, &mut buf) else {
+            panic!("a list is not a {ty} column's text");
+        };
+        assert!(err.to_string().contains("{1,2,3}"), "names the form that binds: {err}");
+    }
+    assert!(binds(json!("{1,2}"), &Type::INT4_ARRAY), "the array's own text, as a string, binds");
+    Ok(())
+}
+
+/// What a node can read is decided by the column's type alone, and
+/// pgvector's types by their name.
+fn carried_types() -> WeftResult<()> {
+    assert_eq!(carry(&Type::TEXT), Some(Carry::One(Scalar::Text)));
+    assert_eq!(carry(&Type::VARCHAR), Some(Carry::One(Scalar::Text)));
+    assert_eq!(carry(&Type::JSONB), Some(Carry::One(Scalar::Json)));
+    assert_eq!(carry(&Type::INT4_ARRAY), Some(Carry::List(Scalar::Int4)));
+    assert_eq!(carry(&Type::TIMESTAMPTZ_ARRAY), Some(Carry::List(Scalar::Timestamptz)));
+    assert_eq!(carry(&extension_type("vector")), Some(Carry::Vector));
+    assert_eq!(carry(&extension_type("halfvec")), Some(Carry::HalfVector));
+    assert_eq!(carry(&extension_type("sparsevec")), None, "sparsevec is not read");
+    assert_eq!(carry(&Type::POINT), None);
+    assert_eq!(carry(&Type::INTERVAL), None);
+    let vectors = Type::new("_vector".into(), 16_390, Kind::Array(extension_type("vector")), "public".into());
+    assert_eq!(carry(&vectors), None, "an array of vectors is not read");
+    // An enum travels as its label's text, and the extension types the
+    // driver reads as a string are known by name.
+    let mood = Type::new("mood".into(), 16_500, Kind::Enum(vec!["sad".into(), "ok".into()]), "public".into());
+    assert_eq!(carry(&mood), Some(Carry::One(Scalar::Text)), "an enum reads as text");
+    let moods = Type::new("_mood".into(), 16_501, Kind::Array(mood), "public".into());
+    assert_eq!(carry(&moods), Some(Carry::List(Scalar::Text)), "an array of an enum reads as a list of text");
+    for name in ["citext", "ltree", "lquery", "ltxtquery"] {
+        assert_eq!(carry(&extension_type(name)), Some(Carry::One(Scalar::Text)), "{name} reads as text");
+    }
+    Ok(())
+}
+
+/// A query whose answer holds a column no node can read is refused
+/// before it runs, as the author's mistake, naming the cast that fixes
+/// it in their own query.
+fn unreadable_column() -> WeftResult<()> {
+    let sparse = extension_type("sparsevec");
+    let fine = readable([("id", &Type::INT4), ("embedding", &extension_type("vector"))]);
+    assert!(fine.is_ok(), "every column is carried");
+    let err = readable([("id", &Type::INT4), ("weights", &sparse)]).expect_err("sparsevec refuses").refusal(WrittenBy::Author);
+    assert!(matches!(err, WeftError::Input(_)), "the program's mistake: {err:?}");
+    let err = err.to_string();
+    assert!(err.contains("'weights'") && err.contains("sparsevec"), "{err}");
+    assert!(err.contains("before it ran") && err.contains("\"weights\"::text"), "{err}");
+    Ok(())
+}
+
+/// A script's last statement is prepared after the statements before it
+/// ran, so its refusal says they ran; a statement of a script run in one
+/// transaction says which one it was and that the transaction rolled
+/// back.
+fn script_refusals() -> WeftResult<()> {
+    let column = readable([("id", &Type::INT4), ("weights", &extension_type("sparsevec"))]).expect_err("sparsevec refuses");
+
+    let err = column.in_script();
+    assert!(matches!(err, WeftError::Input(_)), "the program's mistake: {err:?}");
+    let err = err.to_string();
+    assert!(err.contains("already ran") && err.contains("the last one was refused before it ran"), "{err}");
+    assert!(err.contains("'weights'") && err.contains("sparsevec") && err.contains("\"weights\"::text"), "{err}");
+    assert!(!err.contains("the statement was refused"), "not as if nothing ran: {err}");
+
+    let err = column.in_step(3);
+    assert!(matches!(err, WeftError::Input(_)), "the program's mistake: {err:?}");
+    let err = err.to_string();
+    assert!(err.contains("statement 3 of the script") && err.contains("the transaction was rolled back"), "{err}");
+    assert!(err.contains("'weights'") && err.contains("sparsevec") && err.contains("\"weights\"::text"), "{err}");
+    Ok(())
+}
+
+/// The bytes of a hex string, for a value as a real server sent it.
+fn hex(text: &str) -> Vec<u8> {
+    (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).expect("hex")).collect()
+}
+
+/// `numeric` in binary form maps for every legal value: the bytes are
+/// what `numeric_send` answered on a Postgres 17 server for each value.
+fn numeric_values() -> WeftResult<()> {
+    for (sent, value) in [
+        ("0000000000000000", json!(0.0)),
+        ("00010000000000000001", json!(1.0)),
+        ("000200004000000100011388", json!(-1.5)),
+        ("0003000100000003000109291a7c", json!(12345.678)),
+        ("0001ffff000000040001", json!(0.0001)),
+        ("0001fffb000000140001", json!(1e-20)),
+        // 34 significant digits, past what a fixed-point decimal holds:
+        // the nearest double.
+        (
+            "000a000800000001000109291a85007b11d722c509291a85007b1388",
+            json!(123456789012345678901234567890123.5),
+        ),
+        // NaN, Infinity, -Infinity: no JSON number, so null.
+        ("00000000c0000000", Value::Null),
+        ("00000000d0000020", Value::Null),
+        ("00000000f0000020", Value::Null),
+        // 1 with weight 100 is 10^400, past a double's range.
+        ("00010064000000000001", Value::Null),
+    ] {
+        assert_eq!(numeric_from_bytes(&hex(sent)), Ok(value), "{sent}");
+    }
+    assert!(numeric_from_bytes(&hex("000100")).is_err(), "shorter than the header");
+    assert!(numeric_from_bytes(&hex("0002000000000000")).is_err(), "fewer digits than declared");
+    assert!(numeric_from_bytes(&hex("00010000000000002710")).is_err(), "a digit past 9999");
+    Ok(())
+}
+
+/// Postgres stores `infinity` and `-infinity` in a date or a timestamp as
+/// the ends of its integer; they read as those words, and every other
+/// value as before.
+fn infinite_moments() -> WeftResult<()> {
+    let read = |ty: &Type, raw: &[u8]| moment_from_bytes(ty, raw).map_err(|e| e.to_string());
+    for ty in [Type::TIMESTAMPTZ, Type::TIMESTAMP] {
+        assert_eq!(read(&ty, &hex("7fffffffffffffff")).as_deref(), Ok("infinity"), "{ty}");
+        assert_eq!(read(&ty, &hex("8000000000000000")).as_deref(), Ok("-infinity"), "{ty}");
+    }
+    assert_eq!(read(&Type::DATE, &hex("7fffffff")).as_deref(), Ok("infinity"));
+    assert_eq!(read(&Type::DATE, &hex("80000000")).as_deref(), Ok("-infinity"));
+    // Microseconds and days since 2000-01-01.
+    assert_eq!(read(&Type::TIMESTAMPTZ, &0i64.to_be_bytes()).as_deref(), Ok("2000-01-01T00:00:00+00:00"));
+    assert_eq!(read(&Type::TIMESTAMP, &1_500_000i64.to_be_bytes()).as_deref(), Ok("2000-01-01 00:00:01.500"));
+    assert_eq!(read(&Type::DATE, &(-1i32).to_be_bytes()).as_deref(), Ok("1999-12-31"));
+    Ok(())
+}
+
+/// pgvector's binary form: the dimension count, 16 unused bits, then
+/// each element big-endian (a float for a vector, a half for a halfvec).
+fn vector_bytes() -> WeftResult<()> {
+    let mut raw = vec![0, 3, 0, 0];
+    for v in [1.0f32, -2.5, 0.1] {
+        raw.extend_from_slice(&v.to_be_bytes());
+    }
+    assert_eq!(vector_from_bytes(&raw, false), Ok(vec![1.0, -2.5, 0.1]));
+    assert_eq!(vector_from_bytes(&[0, 0, 0, 0], false), Ok(vec![]), "no dimensions is an empty list");
+
+    // 1.0, -2.5, the smallest subnormal half, 65504 (the largest half).
+    let raw = [0, 4, 0, 0, 0x3c, 0x00, 0xc1, 0x00, 0x00, 0x01, 0x7b, 0xff];
+    assert_eq!(vector_from_bytes(&raw, true), Ok(vec![1.0, -2.5, 2f32.powi(-24), 65504.0]));
+    // 0x2e66 is the half nearest 0.1.
+    assert_eq!(vector_from_bytes(&[0, 1, 0, 0, 0x2e, 0x66], true), Ok(vec![0.099975586]));
+
+    // A length that disagrees with the declared dimensions is refused,
+    // never read partly.
+    assert!(vector_from_bytes(&[0, 3], false).is_err(), "shorter than the header");
+    assert!(vector_from_bytes(&[0, 2, 0, 0, 0, 0, 0, 0], false).is_err(), "one float short");
+    assert!(vector_from_bytes(&[0, 1, 0, 0, 0x3c, 0x00, 0x3c], true).is_err(), "a stray byte");
+    assert!(vector_from_bytes(&[0xff, 0xff, 0, 0], false).is_err(), "a negative dimension count");
+    Ok(())
+}
+
+/// A real comes back written the shortest way that is the same float,
+/// not widened to a double's digits.
+fn single_floats() -> WeftResult<()> {
+    assert_eq!(single(0.1), json!(0.1));
+    assert_eq!(single(-2.5), json!(-2.5));
+    assert_eq!(single(1e-7), json!(1e-7));
+    assert_eq!(single(f32::NAN), Value::Null, "JSON has no NaN");
     Ok(())
 }
 

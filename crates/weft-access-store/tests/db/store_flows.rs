@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::json;
-use weft_task_store::db::{self, Client as _, Pool};
+use weft_task_store::db::{self, Client as _, JsonText, Pool};
 
 use weft_access_store::{
     begin_oauth, complete_oauth, connect_direct, delete_grant, list_grants, lookup,
@@ -2335,7 +2335,8 @@ async fn a_instances_connection_and_values_stay_theirs(pool: Pool) {
         TENANT_A,
         PROJECT_1,
         &ada,
-        &[pick("post", adas.id, "fakestatic"), pick("reply", adas.id, "fakestatic"), plain("read", serde_json::json!("s-1"))],
+        // A plain value keeps what the person typed exactly, a NUL included.
+        &[pick("post", adas.id, "fakestatic"), pick("reply", adas.id, "fakestatic"), plain("read", serde_json::json!("s-\u{0}1"))],
         &[],
     )
     .await
@@ -2346,7 +2347,7 @@ async fn a_instances_connection_and_values_stay_theirs(pool: Pool) {
     assert_eq!(nodes(adas_values.clone()), vec!["post", "read", "reply"]);
     assert_eq!(adas_values["post"]["account"]["id"], serde_json::json!(adas.id));
     assert!(adas_values["post"]["account"].get("identity").is_some(), "a connection value reads back as its handle");
-    assert_eq!(adas_values["read"]["sheet"], serde_json::json!("s-1"));
+    assert_eq!(adas_values["read"]["sheet"], serde_json::json!("s-\u{0}1"));
     assert!(instance_values(&pool, TENANT_B, PROJECT_1, &ada).await.unwrap().is_empty(), "another tenant reads nothing");
     let clear = [("reply".to_string(), "account".to_string())];
     change_instance_values(&conn, TENANT_A, PROJECT_1, &ada, &[], &clear).await.unwrap();
@@ -3096,7 +3097,7 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
     pool.execute(
         "INSERT INTO instance_value (tenant_id, project_id, instance_id, node, field, value, grant_id) \
          VALUES ($1, $2, 'alice', 'mail', 'access', $3, $4)",
-        &[&TENANT_A, &PROJECT_1, &json!({"id": oldest.to_string(), "identity": "me@example.com"}), &oldest],
+        &[&TENANT_A, &PROJECT_1, &JsonText(json!({"id": oldest.to_string(), "identity": "me@example.com"})), &oldest],
     )
     .await
     .unwrap();
@@ -3116,7 +3117,7 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
     .unwrap();
     pool.execute(
         "INSERT INTO access_connect_result (state, tenant_id, result_json) VALUES ('result-1', $1, $2)",
-        &[&TENANT_A, &json!({"grant": {"id": older.to_string(), "service": "fakeoauth"}})],
+        &[&TENANT_A, &JsonText(json!({"grant": {"id": older.to_string(), "service": "fakeoauth"}}))],
     )
     .await
     .unwrap();
@@ -3143,7 +3144,7 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
     assert_eq!(still, 1, "another account's row is not touched");
     let pick: uuid::Uuid = pool.scalar("SELECT grant_id FROM install_pick", &[]).await.unwrap();
     assert_eq!(pick, newest);
-    let (value_grant, value): (uuid::Uuid, serde_json::Value) =
+    let (value_grant, JsonText(value)): (uuid::Uuid, JsonText<serde_json::Value>) =
         pool.one("SELECT grant_id, value FROM instance_value", &[]).await.unwrap();
     assert_eq!((value_grant, value["id"].clone()), (newest, json!(newest.to_string())));
     let upgrading: Option<uuid::Uuid> =
@@ -3151,7 +3152,7 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
     assert_eq!(upgrading, Some(newest));
     let picking: uuid::Uuid = pool.scalar("SELECT access_id FROM access_picker", &[]).await.unwrap();
     assert_eq!(picking, newest);
-    let parked: serde_json::Value =
+    let JsonText(parked): JsonText<serde_json::Value> =
         pool.scalar("SELECT result_json FROM access_connect_result", &[]).await.unwrap();
     assert_eq!(parked, json!({"grant": {"id": newest.to_string(), "service": "fakeoauth"}}));
     let subscribed: uuid::Uuid = pool.scalar("SELECT access_id FROM signal_subscription", &[]).await.unwrap();

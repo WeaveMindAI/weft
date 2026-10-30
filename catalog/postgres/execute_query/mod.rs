@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use weft::{Access, RunContext, Node, NodeManifest, NodeOutput, WeftResult};
 
-use super::postgres::{connect, plan, ports_read, Plan, Statement};
+use super::postgres::{connect, plan, ports_read, Plan, Statement, WrittenBy};
 
 #[derive(NodeManifest)]
 pub struct PostgresExecuteQueryNode;
@@ -80,7 +80,7 @@ impl Node for PostgresExecuteQueryNode {
 
         let mut client = connect(&ctx, &account).await?;
         let rows = match plan {
-            Plan::Query { sql, names } => client.query_json(&sql, &names, &bind(&names)).await?,
+            Plan::Query { sql, names } => client.query_json(&sql, &names, &bind(&names), WrittenBy::Author).await?,
             Plan::Script { head, last } => client.script_json(&head, &last).await?,
             Plan::Steps(steps) => {
                 let bound: Vec<(Statement, Vec<Value>)> =

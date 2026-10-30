@@ -161,7 +161,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- to value: what its infra setup sent out on them, or the
             -- infra pushed since. A run that reads only these does not
             -- run the node.
-            baked_json          JSONB NOT NULL DEFAULT '{}'::jsonb,
+            baked_json          TEXT NOT NULL DEFAULT '{}',
             -- The hash of its place's infra in the build its last apply
             -- came from (`BuiltProgram::infra_places`), copied from the
             -- apply command as it lands: what tells whether it is behind

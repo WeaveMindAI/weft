@@ -27,6 +27,8 @@ anyhow = { workspace = true }
 axum = { workspace = true, optional = true }
 http-body = { version = "1", optional = true }
 async-trait = { workspace = true }
+# Rewriting a statement's text parameters without NUL (`db::text`).
+bytes = { workspace = true }
 futures = { workspace = true }
 # Asking a quick tunnel its address (`install_address`).
 reqwest = { workspace = true }

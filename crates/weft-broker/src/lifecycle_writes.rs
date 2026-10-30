@@ -9,7 +9,7 @@
 //! the thin scope-checked HTTP wrappers around these.
 
 use anyhow::Context as _;
-use weft_task_store::db::{Client, Param, Pool, Row, Transaction};
+use weft_task_store::db::{Client, JsonText, Param, Pool, Row, Transaction};
 
 use weft_broker_client::lifecycle_command::{
     command_reaches_copy, live_lease_exists, ownable_project, owns_project_predicate, supervisor_work,
@@ -999,10 +999,40 @@ pub async fn record_event(
          FROM project p WHERE p.id = $2 \
          FOR KEY SHARE OF p \
          RETURNING id",
-        &[&tenant_id, &project_id, &node_id, &kind, payload, &instance.map(|i| i.as_str())],
+        &[&tenant_id, &project_id, &node_id, &kind, &JsonText(payload), &instance.map(|i| i.as_str())],
     )
     .await
     .context("record infra_event")
+}
+
+/// Set `values` over what copy `instance` of infra node `place` of
+/// `project` baked before, the rest kept; `false` when the copy has no
+/// row. Merged here, on the locked row: Postgres reads no JSON holding a
+/// NUL character, and a baked value may hold one.
+pub async fn save_baked(
+    pool: &Pool,
+    project: uuid::Uuid,
+    place: &str,
+    instance: Option<&str>,
+    values: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let baked: Option<JsonText<std::collections::BTreeMap<String, serde_json::Value>>> = tx
+        .scalar_opt(
+            "SELECT baked_json FROM infra_node WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3 FOR UPDATE",
+            &[&project, &place, &instance],
+        )
+        .await?;
+    let Some(JsonText(mut baked)) = baked else { return Ok(false) };
+    baked.extend(values.clone());
+    tx.execute(
+        "UPDATE infra_node SET baked_json = $4 WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
+        &[&project, &place, &instance, &JsonText(&baked)],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Decode one `infra_lifecycle_command` row into the typed
@@ -1411,8 +1441,7 @@ pub async fn complete_command(
         owns = owns_project_predicate("$4", "project_id"),
         key = weft_task_store::unanswered::commands_key_sql("project_id"),
     );
-    let message = req.error.as_deref().map(weft_task_store::unanswered::pg_text);
-    let written: i64 = pool.scalar(&sql, &[&outcome.as_str(), &message.as_deref(), &req.command_id, &req.replica]).await?;
+    let written: i64 = pool.scalar(&sql, &[&outcome.as_str(), &req.error.as_deref(), &req.command_id, &req.replica]).await?;
     if written > 0 {
         return Ok(FencedWrite::Applied);
     }

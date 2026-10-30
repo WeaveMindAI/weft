@@ -9,7 +9,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use weft_task_store::db::{self, Client, FromRow, Pool, Row};
+use weft_task_store::db::{self, Client, FromRow, JsonText, Pool, Row};
 
 use weft_core::access::client::{authed_client, base_client, resolve_steps, RefusalKind};
 use weft_core::access::spec::{
@@ -1143,7 +1143,7 @@ pub async fn finish_picker(
              ON CONFLICT (state) DO NOTHING",
             pruned = pruning("access_connect_result", "$4"),
         ),
-        &[&state, &tenant, &result_json, &cutoff],
+        &[&state, &tenant, &JsonText(&result_json), &cutoff],
     )
     .await?;
     tx.commit().await?;
@@ -1343,7 +1343,7 @@ pub async fn complete_oauth(
         Ok(done) => serde_json::json!({ "grant": done.grant }),
         Err(e) => serde_json::json!({ "error": e.to_string() }),
     };
-    pool.execute("UPDATE access_connect_result SET result_json = $2 WHERE state = $1 AND result_json = 'null'::jsonb", &[&state, &result_json])
+    pool.execute("UPDATE access_connect_result SET result_json = $2 WHERE state = $1 AND result_json = 'null'", &[&state, &JsonText(&result_json)])
         .await?;
     outcome
 }
@@ -1363,15 +1363,15 @@ pub async fn take_connect_result(
     state: &str,
 ) -> anyhow::Result<Option<Value>> {
     let cutoff = chrono::Utc::now() - CONNECT_TTL;
-    let row: Option<Value> = pool
+    let row: Option<JsonText<Value>> = pool
         .scalar_opt(
             "DELETE FROM access_connect_result
-             WHERE state = $1 AND tenant_id = $2 AND result_json <> 'null'::jsonb AND created_at >= $3
+             WHERE state = $1 AND tenant_id = $2 AND result_json <> 'null' AND created_at >= $3
              RETURNING result_json",
             &[&state, &tenant, &cutoff],
         )
         .await?;
-    if let Some(outcome) = row {
+    if let Some(JsonText(outcome)) = row {
         return Ok(Some(outcome));
     }
     let live: bool = pool
@@ -1453,7 +1453,7 @@ async fn complete_oauth_inner(
                            pkce_verifier, door, upgrade_grant_id, redirect_uri, created_at, instance_id
              ), in_flight AS (
                  INSERT INTO access_connect_result (state, tenant_id, result_json, created_at)
-                 SELECT $1::text, tenant_id, 'null'::jsonb, now() FROM claimed
+                 SELECT $1::text, tenant_id, 'null', now() FROM claimed
              )
              SELECT * FROM claimed",
                 pruned = pruning("access_connect_result", "$2"),
@@ -2398,16 +2398,18 @@ pub async fn write_pushed_values(
 ) -> anyhow::Result<()> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
-    let copy: Option<(String, Option<String>, Value)> = tx
+    /// node, instance, what it baked.
+    type CopyRow = (String, Option<String>, JsonText<BTreeMap<String, Value>>);
+    let copy: Option<CopyRow> = tx
         .opt(
             "SELECT node_id, instance_id, baked_json FROM infra_node WHERE project_id = $1 AND copy_id = $2 FOR UPDATE",
             &[&project_id, &copy_id],
         )
         .await?;
-    let Some((node_id, instance_id, baked)) = copy else {
+    let Some((node_id, instance_id, JsonText(mut baked))) = copy else {
         return Err(AccessError::Invalid(format!("infra copy {copy_id} is no longer running here, so nothing it says changed can be written")).into());
     };
-    if let Some(stray) = values.outputs.keys().find(|port| baked.get(port.as_str()).is_none()) {
+    if let Some(stray) = values.outputs.keys().find(|port| !baked.contains_key(port.as_str())) {
         return Err(AccessError::Invalid(format!("{node_id} has no baked output '{stray}', so the value its infrastructure sent for it has nowhere to go")).into());
     }
     if !values.connection.is_empty() {
@@ -2448,9 +2450,12 @@ pub async fn write_pushed_values(
         .await?;
     }
     if !values.outputs.is_empty() {
+        // Merged here, on the row locked above: Postgres reads no JSON
+        // holding a NUL character, and a baked value may hold one.
+        baked.extend(values.outputs.clone());
         tx.execute(
-            "UPDATE infra_node SET baked_json = baked_json || $3::jsonb WHERE project_id = $1 AND copy_id = $2",
-            &[&project_id, &copy_id, &db::Json(&values.outputs)],
+            "UPDATE infra_node SET baked_json = $3 WHERE project_id = $1 AND copy_id = $2",
+            &[&project_id, &copy_id, &JsonText(&baked)],
         )
         .await?;
     }
@@ -2609,7 +2614,7 @@ pub async fn change_instance_values(
                 &instance.as_str(),
                 &write.node,
                 &write.field,
-                &write.value,
+                &JsonText(&write.value),
                 &write.connection.as_ref().map(|c| c.grant_id),
             ],
         )
@@ -2636,7 +2641,7 @@ pub async fn instance_values(
     instance: &weft_core::instance::InstanceId,
 ) -> anyhow::Result<weft_core::instance::InstanceValues> {
     /// node, field, value, the connection it names, that connection's identity.
-    type ValueRow = (String, String, Value, Option<uuid::Uuid>, Option<String>);
+    type ValueRow = (String, String, JsonText<Value>, Option<uuid::Uuid>, Option<String>);
     let rows: Vec<ValueRow> = db
         .all(
             "SELECT v.node, v.field, v.value, v.grant_id, g.identity FROM instance_value v
@@ -2646,7 +2651,7 @@ pub async fn instance_values(
         )
         .await?;
     let mut values = weft_core::instance::InstanceValues::new();
-    for (node, field, value, grant_id, identity) in rows {
+    for (node, field, JsonText(value), grant_id, identity) in rows {
         let value = match grant_id {
             Some(id) => connection_handle(id, identity.as_deref()),
             None => value,

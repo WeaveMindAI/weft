@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::db::{Client, Pool, Row};
+use crate::db::{Client, JsonText, Pool, Row};
 
 /// How long a claim is valid before another process can steal it, at this
 /// install's pace (`weft_core::time_scale`): 60 seconds in real time.
@@ -141,7 +141,10 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             dedup_key TEXT,
             run_id UUID,
             tenant_id TEXT NOT NULL,
-            payload JSONB NOT NULL,
+            -- The task's JSON as text (`db::JsonText`), like `result` and
+            -- `progress`: what a node or a service handed it must come
+            -- back exactly.
+            payload TEXT NOT NULL,
             claimed_by TEXT,
             -- Until when the claim holds without a heartbeat. NULL on a
             -- claim that rests on a run (`claim_rests_on`).
@@ -152,10 +155,10 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             -- long as that run goes (`weft_dispatcher::lapses`).
             claim_rests_on UUID,
             attempts INTEGER NOT NULL DEFAULT 0,
-            result JSONB,
+            result TEXT,
             -- Where a running task says it is, for whoever follows it
             -- (`set_progress`); its kind's own shape.
-            progress JSONB,
+            progress TEXT,
             error TEXT,
             created_at_unix BIGINT NOT NULL,
             completed_at_unix BIGINT
@@ -212,7 +215,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         // which the lock lasts.
         r#"CREATE OR REPLACE FUNCTION weft_enqueue_dedup(
                 p_id UUID, p_kind TEXT, p_project UUID, p_dedup TEXT, p_run UUID,
-                p_tenant TEXT, p_payload JSONB, p_now BIGINT,
+                p_tenant TEXT, p_payload TEXT, p_now BIGINT,
                 OUT task_id UUID, OUT inserted BOOLEAN
             ) AS $$
             BEGIN
@@ -276,7 +279,7 @@ pub async fn enqueue(pool: &Pool, spec: NewTask) -> Result<Uuid> {
             &spec.dedup_key.as_deref(),
             &spec.run_id,
             &spec.tenant_id.as_str(),
-            &spec.payload,
+            &JsonText(&spec.payload),
             &unix_now(),
         ],
     )
@@ -319,7 +322,7 @@ pub async fn enqueue_dedup_in(db: &impl Client, spec: NewTask) -> Result<DedupOu
                 &dedup_key,
                 &spec.run_id,
                 &spec.tenant_id.as_str(),
-                &spec.payload,
+                &JsonText(&spec.payload),
                 &unix_now(),
             ],
         )
@@ -466,7 +469,7 @@ pub async fn store_result_partial(
             r#"UPDATE task
                SET result = $1
                WHERE id = $2 AND claimed_by = $3 AND status = 'claimed'"#,
-            &[result, &task_id, &replica],
+            &[&JsonText(result), &task_id, &replica],
         )
         .await?;
     if updated == 0 {
@@ -483,8 +486,8 @@ pub async fn store_result_partial(
 /// the row outlives claims (only pruning deletes
 /// it), so a re-claim reads a prior claim's recorded outcome here.
 pub async fn stored_result(pool: &Pool, task_id: Uuid) -> Result<Option<Value>> {
-    let result: Option<Option<Value>> = pool.scalar_opt("SELECT result FROM task WHERE id = $1", &[&task_id]).await?;
-    Ok(result.flatten())
+    let result: Option<Option<JsonText<Value>>> = pool.scalar_opt("SELECT result FROM task WHERE id = $1", &[&task_id]).await?;
+    Ok(result.flatten().map(|result| result.0))
 }
 
 /// `update` (an `UPDATE task ... ` that makes rows terminal) wrapped so
@@ -513,7 +516,7 @@ pub async fn complete(
                 "UPDATE task SET status = 'complete', completed_at_unix = $2, claimed_until_unix = NULL, result = $1 \
                  WHERE id = $3 AND claimed_by = $4 AND status = 'claimed'",
             ),
-            &[&result, &unix_now(), &task_id, &replica],
+            &[&JsonText(&result), &unix_now(), &task_id, &replica],
         )
         .await?;
     crate::announce::committed(pool);
@@ -570,13 +573,13 @@ pub async fn fail(
 /// Say where task `task_id` is now, for whoever follows it ([`progress`]):
 /// its kind's own shape, replacing what it said before.
 pub async fn set_progress(pool: &Pool, task_id: Uuid, progress: &Value) -> Result<()> {
-    pool.execute("UPDATE task SET progress = $1 WHERE id = $2", &[progress, &task_id]).await?;
+    pool.execute("UPDATE task SET progress = $1 WHERE id = $2", &[&JsonText(progress), &task_id]).await?;
     Ok(())
 }
 
 /// Where task `task_id` last said it is ([`set_progress`]), when it said.
 pub async fn progress(pool: &Pool, task_id: Uuid) -> Result<Option<Value>> {
-    Ok(pool.scalar_opt::<Option<Value>>("SELECT progress FROM task WHERE id = $1", &[&task_id]).await?.flatten())
+    Ok(pool.scalar_opt::<Option<JsonText<Value>>>("SELECT progress FROM task WHERE id = $1", &[&task_id]).await?.flatten().map(|progress| progress.0))
 }
 
 /// Outcome of `wait_for_terminal`. The dispatcher's task executor
@@ -630,7 +633,8 @@ pub(crate) async fn peek(pool: &Pool, task_id: Uuid) -> Result<Option<TaskOutcom
 fn row_to_outcome(row: Row) -> Result<TaskOutcome> {
     let status_str: String = row.try_get("status")?;
     let status = TaskStatus::parse(&status_str).ok_or_else(|| anyhow::anyhow!("bad status {status_str}"))?;
-    Ok(TaskOutcome { status, result: row.try_get("result")?, error: row.try_get("error")? })
+    let result: Option<JsonText<Value>> = row.try_get("result")?;
+    Ok(TaskOutcome { status, result: result.map(|result| result.0), error: row.try_get("error")? })
 }
 
 /// Decode a `task` row. Every column propagates its decode error
@@ -651,7 +655,7 @@ fn row_to_task(row: Row) -> Result<Task> {
         run_id: row.try_get("run_id")?,
         tenant_id: row.try_get("tenant_id")?,
         attempts: row.try_get("attempts")?,
-        payload: row.try_get("payload")?,
+        payload: row.try_get::<_, JsonText<Value>>("payload")?.0,
     })
 }
 

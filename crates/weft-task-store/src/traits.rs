@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::db::{Client as _, Json, Pool};
+use crate::db::{Client as _, JsonText, Pool};
 use crate::pg_signal::PgSignalWatch;
 use crate::tasks::{DedupOutcome, NewTask, TaskOutcome};
 
@@ -146,7 +146,7 @@ impl PostgresInfraReader {
         node_id: &str,
         instance: Option<&weft_core::instance::InstanceId>,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
-        let saved: Option<Json<std::collections::BTreeMap<String, serde_json::Value>>> = self
+        let saved: Option<JsonText<std::collections::BTreeMap<String, serde_json::Value>>> = self
             .pool
             .scalar_opt(
                 "SELECT baked_json FROM infra_node WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",

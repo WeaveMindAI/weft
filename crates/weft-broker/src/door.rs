@@ -237,8 +237,8 @@ fn armed_entry(row: &Row, node_id: &str, caller: bool) -> anyhow::Result<DoorEnt
     Ok(DoorEntry::Armed(Box::new(ArmedEntry {
         spec,
         auth_kind: row.try_get("auth_kind")?,
-        auth_config: row.try_get::<_, Option<Value>>("auth_config")?,
-        port_snapshot: row.try_get::<_, Option<Value>>("port_snapshot")?,
+        auth_config: row.try_get::<_, Option<db::JsonText<Value>>>("auth_config")?.map(|json| json.0),
+        port_snapshot: row.try_get::<_, Option<db::JsonText<Value>>>("port_snapshot")?.map(|json| json.0),
         definition_hash,
         binary_hash,
         source_version,

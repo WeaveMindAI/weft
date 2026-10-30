@@ -4840,7 +4840,6 @@ impl RuntimeStore {
              end or its tenant running short of space tries it again"
         );
         let reap_error = format!("{error:#}");
-        let reap_error: &str = &weft_task_store::unanswered::pg_text(&reap_error);
         self.pool
             .execute("UPDATE runtime_file SET reap_error = $2, progressed_at_unix = 0 WHERE key = $1 AND status = 'reaping'", &[&key, &reap_error])
             .await

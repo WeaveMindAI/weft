@@ -571,6 +571,22 @@ async fn a_run_whose_program_does_not_read_is_indexed_by_its_words(pool: Pool) {
     assert_eq!(found_carrying(&store, "ada@example.com").await, vec![healthy]);
 }
 
+/// A run whose record carries NUL characters (a scraped page in a node's
+/// output) is indexed like any other: the search finds it by the words
+/// around them, its queue drains, and the run beside it is found too.
+#[weft_db_macros::test]
+async fn a_run_carrying_nul_characters_is_indexed(pool: Pool) {
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let scraped = ended_run_carrying(&store, project, "scraped\u{0}page").await;
+    let clean = ended_run_carrying(&store, project, "clean@example.com").await;
+    assert_eq!(found_carrying(&store, "scrapedpage").await, vec![scraped], "found by the words around the NUL");
+    let queued: i64 = pool.scalar("SELECT count(*) FROM run_search_queue", &[]).await.unwrap();
+    assert_eq!(queued, 0, "the queue drained");
+    assert_eq!(found_carrying(&store, "clean@example.com").await, vec![clean]);
+}
+
 /// One ended run of `project`, whose record carries `word`.
 async fn ended_run_carrying(store: &PostgresStore, project: Uuid, word: &str) -> weft_core::RunId {
     let run_id = start_run(store, project, weft_core::run::RunKind::Project).await;

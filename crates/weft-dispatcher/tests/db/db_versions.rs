@@ -144,6 +144,20 @@ async fn runs_round_trip_and_list_in_recording_order(pool: Pool) {
     );
 }
 
+/// A run started with values holding NUL characters (a page pasted as a
+/// starting value) starts, and its spec reads back exactly.
+#[weft_db_macros::test]
+async fn a_spec_holding_nul_reads_back_exactly(pool: Pool) {
+    let (store, projects, versions) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let v = version(project, &manifest(&[("main.weft", "aaa")]), None, None, 1);
+    versions.upsert_version(&v).await.unwrap();
+    let spec = RunSpec { name: "pasted".into(), caller: vec![json!({ "page": "a\u{0}b" })], ..Default::default() };
+    let run = start_run(&store, project, &v.id, None, Some(&spec), 5).await;
+    assert_eq!(versions.run(run).await.unwrap().expect("found").spec, Some(spec));
+}
+
 /// A head lives on a working copy, moved by a stamp, a run and a switch,
 /// compare-and-set. The activated versions are read off the trigger
 /// activations: a build leaves them alone, and a deactivation clears them.

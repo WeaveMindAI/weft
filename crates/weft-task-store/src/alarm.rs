@@ -9,7 +9,7 @@
 //! anything is due.
 
 use anyhow::Result;
-use crate::db::{Client as _, FromRow, Pool, Row};
+use crate::db::{Client as _, FromRow, JsonText, Pool, Row};
 
 pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
     name: "alarm",
@@ -29,7 +29,9 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             set_for_unix_ms BIGINT NOT NULL,
             role TEXT NOT NULL,
             path TEXT NOT NULL,
-            body JSONB NOT NULL,
+            -- As its JSON text (`db::JsonText`): it carries the signal's
+            -- state, which quotes what an outside service answered.
+            body TEXT NOT NULL,
             -- Deliveries claimed, whatever became of them: how long the
             -- next try waits.
             attempts INTEGER NOT NULL DEFAULT 0,
@@ -66,7 +68,7 @@ impl FromRow for AlarmRow {
             set_for_unix_ms: row.try_get("set_for_unix_ms")?,
             role: row.try_get("role")?,
             path: row.try_get("path")?,
-            body: row.try_get("body")?,
+            body: row.try_get::<_, JsonText<serde_json::Value>>("body")?.0,
             attempts: row.try_get("attempts")?,
             answered: row.try_get("answered")?,
         })
@@ -86,7 +88,7 @@ pub async fn set(
     pool.execute(
         "INSERT INTO alarm (name, key, at_unix_ms, set_for_unix_ms, role, path, body) \
          VALUES ($1, $2, $3, $3, $4, $5, $6) ON CONFLICT (name) DO NOTHING",
-        &[&name, &key, &at_unix_ms, &role, &path, body],
+        &[&name, &key, &at_unix_ms, &role, &path, &JsonText(body)],
     )
     .await?;
     Ok(())

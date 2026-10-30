@@ -144,3 +144,26 @@ async fn a_dry_picker_prunes_and_looks_at_its_earliest_claim_lapse(pool: Pool) {
     let left: Vec<Uuid> = pool.scalars("SELECT id FROM task ORDER BY id", &[]).await.unwrap();
     assert_eq!(left, vec![held, deduped, plain], "the next dry pass prunes what aged since");
 }
+
+/// A task's payload, result and progress hold whatever a node or a
+/// service handed them, NUL characters included, and read back exactly;
+/// its error is written without them rather than refused.
+#[weft_db_macros::test]
+async fn a_task_keeps_nul_characters_exactly_and_drops_them_from_its_error(pool: Pool) {
+    setup(&pool).await;
+    let mut spec = dispatcher_task("t1");
+    spec.payload = json!({ "page": "a\u{0}b" });
+    let task_id = tasks::enqueue(&pool, spec).await.expect("enqueue a payload holding NUL");
+    let claimed = claimed_task(&pool, "disp-1").await.expect("claim").expect("the task");
+    assert_eq!(claimed.payload, json!({ "page": "a\u{0}b" }));
+    tasks::set_progress(&pool, task_id, &json!({ "at": "\u{0}" })).await.expect("say where it is");
+    assert_eq!(tasks::progress(&pool, task_id).await.expect("read"), Some(json!({ "at": "\u{0}" })));
+    tasks::complete(&pool, task_id, "disp-1", json!({ "said": "x\u{0}y" })).await.expect("complete with NUL");
+    assert_eq!(tasks::stored_result(&pool, task_id).await.expect("read"), Some(json!({ "said": "x\u{0}y" })));
+
+    let failing = tasks::enqueue(&pool, dispatcher_task("t2")).await.expect("enqueue");
+    claimed_task(&pool, "disp-1").await.expect("claim").expect("the task");
+    tasks::fail(&pool, failing, "disp-1", "broke\u{0}here".into()).await.expect("fail with NUL");
+    let error: Option<String> = pool.scalar("SELECT error FROM task WHERE id = $1", &[&failing]).await.unwrap();
+    assert_eq!(error.as_deref(), Some("brokehere"));
+}

@@ -20,7 +20,7 @@ use weft_core::project::ProjectDefinition;
 use weft_core::projects::PROJECT_BEING_REMOVED;
 use weft_core::run_settings::KeepFor;
 use weft_core::RunId;
-use weft_task_store::db::{self, Client, FromRow, Json, Row};
+use weft_task_store::db::{self, Client, FromRow, Json, JsonText, Row};
 
 use crate::events::RunEvent;
 use crate::traits::JournalRow;
@@ -216,9 +216,6 @@ impl Outcome {
 pub struct Ending {
     pub at: i64,
     pub outcome: Outcome,
-    // Left out when absent: the batch reads each as a key of this JSON
-    // (`weft_record_batch`), and a JSON `null` would land on the row as a
-    // value instead of no value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -428,7 +425,10 @@ pub async fn record_batch(
     let mut skipped = Vec::with_capacity(head.runs.len());
     let mut wrote = Vec::with_capacity(head.runs.len());
     let mut born = Vec::with_capacity(head.runs.len());
-    let mut ended = Vec::with_capacity(head.runs.len());
+    let mut ended_at = Vec::with_capacity(head.runs.len());
+    let mut outcomes = Vec::with_capacity(head.runs.len());
+    let mut errors = Vec::with_capacity(head.runs.len());
+    let mut cancel_causes = Vec::with_capacity(head.runs.len());
     let mut row_run = Vec::new();
     let mut row_seq = Vec::new();
     let mut resolved_run = Vec::new();
@@ -443,7 +443,11 @@ pub async fn record_batch(
         skipped.push(run.written.skipped);
         wrote.push(run.wrote_files);
         born.push(&run.born);
-        ended.push(&run.written.ended);
+        let ended = run.written.ended.as_ref();
+        ended_at.push(ended.map(|ending| ending.at));
+        outcomes.push(ended.map(|ending| ending.outcome.as_str()));
+        errors.push(ended.and_then(|ending| ending.error.as_deref()));
+        cancel_causes.push(ended.and_then(|ending| ending.cancel_cause.as_ref()).map(JsonText));
         for seq in run.first_seq..run.first_seq + i32::try_from(run.row_sizes.len())? {
             row_run.push(ordinal);
             row_seq.push(seq);
@@ -458,7 +462,8 @@ pub async fn record_batch(
     let answered: Vec<RecordedRow> = db
         .all(
             "SELECT o_run_id, o_fate, o_project_id, o_tell_end, o_keep_until, o_unwatched FROM weft_record_batch(\
-             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, \
+             $23, $24, $25)",
             &[
                 &writer,
                 &tenant,
@@ -474,7 +479,10 @@ pub async fn record_batch(
                 &skipped,
                 &wrote,
                 &Json(&born),
-                &Json(&ended),
+                &ended_at,
+                &outcomes,
+                &errors,
+                &cancel_causes,
                 &row_run,
                 &row_seq,
                 &rows,
@@ -561,14 +569,14 @@ pub async fn insert_queued_in(db: &impl Client, queued: &Queued<'_>) -> anyhow::
     // started once the mark is in would outlive the take-down.
     // Each value is cast: a `$n` in the SELECT list of an INSERT has no
     // type of its own to be prepared with.
-    let spec = queued.spec.map(serde_json::to_value).transpose()?;
+    let spec = queued.spec.map(JsonText);
     let inserted = db
         .execute(
             "INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, entry_node, instance_id, \
                  fired_by, source_version, definition_hash, binary_hash, seed_of, stale, spec, example, state, \
                  epoch, last_seq, attempts, watch_end, started_at, skipped, cost_micro_usd, keep_for, cut_from, spec_version) \
              SELECT $1::uuid, $2::uuid, $3::text, $4::text, $5::text, $6::text, $7::boolean, $8::text, $9::text, $10::text, \
-                 $11::text, $12::text, $13::text, $14::uuid, $15::text[], $16::jsonb, $17::text, 'queued', \
+                 $11::text, $12::text, $13::text, $14::uuid, $15::text[], $16::text, $17::text, 'queued', \
                  0, 0, 0, $18::boolean, $19::bigint, $20::integer, $21::bigint, $22::bigint, $23::text, $24::integer \
              WHERE EXISTS (SELECT 1 FROM project WHERE id = $2 AND NOT removing) \
              ON CONFLICT (run_id) DO NOTHING",
@@ -698,7 +706,7 @@ pub struct Locked {
     /// (`run.cancel_requested`): the worker that drives it ends it for
     /// this, and whoever lets go of it must not leave it waiting with the
     /// ask unread.
-    pub cancel_requested: Option<Json<CancelCause>>,
+    pub cancel_requested: Option<JsonText<CancelCause>>,
 }
 
 impl FromRow for Locked {
@@ -807,7 +815,7 @@ pub async fn append_locked_in(
                 &ended.map(|ending| ending.at),
                 &ended.map(|ending| ending.outcome.as_str()),
                 &ended.and_then(|ending| ending.error.as_deref()),
-                &ended.and_then(|ending| ending.cancel_cause.as_ref()).map(Json),
+                &ended.and_then(|ending| ending.cancel_cause.as_ref()).map(JsonText),
             ],
         )
         .await?;
@@ -951,7 +959,7 @@ pub struct Claimed {
 /// What a claim reads off the run row: its new epoch, its attempts, its
 /// program, and a cancel already asked for. All but the cancel are there
 /// exactly when the run was claimed, which a run of no program never is.
-type ClaimedRow = (Option<i32>, Option<i32>, Option<String>, Option<Json<CancelCause>>);
+type ClaimedRow = (Option<i32>, Option<i32>, Option<String>, Option<JsonText<CancelCause>>);
 
 /// Until when a run claimed or born by a worker at `now` counts as
 /// delivered to that worker though its lease is not written yet

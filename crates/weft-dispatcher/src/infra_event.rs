@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use serde_json::Value;
-use weft_task_store::db::{self, Client as _, Pool};
+use weft_task_store::db::{self, Client as _, JsonText, Pool};
 
 // One source of truth for the `(kind, payload)` wire contract:
 // `weft-broker-client::protocol::{InfraEventKind, InfraEvent}`.
@@ -46,7 +46,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- shared copy, or for a project-wide event.
             instance_id   TEXT,
             kind        TEXT NOT NULL,
-            payload     JSONB NOT NULL,
+            -- As its JSON text (`db::JsonText`): a failure's reason quotes
+            -- what the infra said.
+            payload     TEXT NOT NULL,
             at_unix     BIGINT NOT NULL
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_event_chrono ON infra_event(id)"#,
@@ -85,7 +87,7 @@ pub async fn insert(
              (tenant_id, project_id, node_id, kind, payload, at_unix) \
              VALUES ($1, $2, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT) \
              RETURNING id",
-            &[&tenant_id, &project_id, &node_id, &kind.as_str(), &payload],
+            &[&tenant_id, &project_id, &node_id, &kind.as_str(), &JsonText(&payload)],
         )
         .await?)
 }
@@ -94,10 +96,12 @@ pub async fn insert(
 /// dispatcher cannot read is an error naming it: a newer supervisor wrote
 /// a shape this dispatcher does not know.
 pub async fn read(pool: &Pool, id: i64) -> Result<Option<InfraEventRow>> {
-    let row: Option<(String, uuid::Uuid, Option<String>, String, Value, i64)> = pool
+    /// tenant, project, node, kind, payload, when.
+    type EventRow = (String, uuid::Uuid, Option<String>, String, JsonText<Value>, i64);
+    let row: Option<EventRow> = pool
         .opt("SELECT tenant_id, project_id, node_id, kind, payload, at_unix FROM infra_event WHERE id = $1", &[&id])
         .await?;
-    let Some((tenant_id, project_id, node_id, kind_str, payload, at_unix)) = row else { return Ok(None) };
+    let Some((tenant_id, project_id, node_id, kind_str, JsonText(payload), at_unix)) = row else { return Ok(None) };
     let kind = InfraEventKind::parse(&kind_str)
         .ok_or_else(|| anyhow::anyhow!("infra_event row id={id} has unknown kind '{kind_str}'. Upgrade the dispatcher."))?;
     let event = InfraEvent::from_kind_and_payload(kind, &payload)

@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use weft_task_store::db::{Client, Pool};
+use weft_task_store::db::{Client, JsonText, Pool};
 use weft_core::run_settings::{KeepFor, Keeping, RunSettings};
 use weft_dispatcher::store::{Lost, RunStore};
 use weft_journal::frame::{Batch, BatchHead, RunHead};
@@ -289,6 +289,49 @@ async fn a_run_is_born_carried_on_and_ended_by_its_batches(pool: Pool) {
     assert_eq!(row(&pool, run).await, ("running".into(), Some("w1".into()), 1, 2, 250_000));
     assert_eq!(send(&pool, "w1", "w1:0", &[part(run, 1, 3, vec![vec![completed(run)]])]).await, [Fate::Accepted]);
     assert_eq!(row(&pool, run).await, ("ended".into(), None, 1, 3, 250_000));
+}
+
+/// A run that ends on text holding NUL characters (a node's error built
+/// from a scraped page, a cancel whose detail quotes one) ends like any
+/// other, and so does every run beside it in the batch: its error is
+/// written without them, its cause exactly as it was.
+#[weft_db_macros::test]
+async fn an_ending_holding_nul_characters_refuses_no_run_of_its_batch(pool: Pool) {
+    schema(&pool).await;
+    let (failed, cancelled, clean, going) =
+        (weft_core::new_run_id(), weft_core::new_run_id(), weft_core::new_run_id(), weft_core::new_run_id());
+    let fails = RunEvent::RunFailed { run_id: failed, error: "page\0text".into(), at_unix: 3 };
+    let cause = weft_core::run::CancelCause::Runtime { detail: "health said \0 broken".into() };
+    let cancels = RunEvent::RunCancelled { run_id: cancelled, reason: cause.to_string(), cause: Some(cause.clone()), at_unix: 3 };
+    let fates = send(&pool, "w1", "w1:0", &[part(going, 1, 0, vec![vec![birth(going, Keeping::Fast)]])]).await;
+    assert_eq!(fates, [Fate::Accepted]);
+    let going_ends = RunEvent::RunFailed { run_id: going, error: "carried\0on".into(), at_unix: 4 };
+    let fates = send(
+        &pool,
+        "w1",
+        "w1:0",
+        &[
+            part(failed, 1, 0, vec![vec![birth(failed, Keeping::Fast), fails]]),
+            part(cancelled, 1, 0, vec![vec![birth(cancelled, Keeping::Fast), cancels]]),
+            part(clean, 1, 0, vec![vec![birth(clean, Keeping::Fast), completed(clean)]]),
+            part(going, 1, 1, vec![vec![going_ends]]),
+        ],
+    )
+    .await;
+    assert_eq!(fates, [Fate::Accepted, Fate::Accepted, Fate::Accepted, Fate::Accepted]);
+    assert_eq!(ending(&pool, failed).await, ("failed".into(), Some("pagetext".into()), None));
+    assert_eq!(ending(&pool, cancelled).await, ("cancelled".into(), None, Some(cause)));
+    assert_eq!(ending(&pool, clean).await, ("completed".into(), None, None));
+    assert_eq!(ending(&pool, going).await, ("failed".into(), Some("carriedon".into()), None));
+}
+
+/// How a run's row says it ended: its outcome, error and cause.
+async fn ending(pool: &Pool, run_id: weft_core::RunId) -> (String, Option<String>, Option<weft_core::run::CancelCause>) {
+    let (outcome, error, cause): (String, Option<String>, Option<JsonText<weft_core::run::CancelCause>>) = pool
+        .one("SELECT outcome, error, cancel_cause FROM run WHERE run_id = $1 AND state = 'ended'", &[&run_id])
+        .await
+        .expect("the run ended");
+    (outcome, error, cause.map(|cause| cause.0))
 }
 
 /// A batch sent again after its answer was lost changes nothing and says

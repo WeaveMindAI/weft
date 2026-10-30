@@ -144,7 +144,7 @@ async fn a_run_asked_to_stop_is_queued_when_its_worker_parks_it(pool: Pool) {
     heard.listen([weft_task_store::runs::RUN_QUEUED_CHANNEL]).await.unwrap();
     let run_id = driven_by(&pool, "w1").await;
     let cause = weft_core::run::CancelCause::Run { by: weft_core::new_run_id(), tag: Some("user_7".into()) };
-    pool.execute("UPDATE run SET cancel_requested = $2 WHERE run_id = $1", &[&run_id, &db::Json(&cause)]).await.unwrap();
+    pool.execute("UPDATE run SET cancel_requested = $2 WHERE run_id = $1", &[&run_id, &db::JsonText(&cause)]).await.unwrap();
     // The birth's own queueing was announced before the listener could
     // have missed it; drain it so only the let-go's is left to hear.
     while tokio::time::timeout(std::time::Duration::from_millis(200), heard.notified()).await.is_ok() {}
@@ -205,6 +205,20 @@ async fn an_answer_handed_to_a_run_that_parks_reaches_its_record(pool: Pool) {
     assert!(weft_task_store::parked_fires::answers_for(&pool, run_id).await.unwrap().is_empty(), "taken once");
 }
 
+/// An answer holding NUL characters (a person pasted a scraped page) is
+/// handed to its run and taken exactly as it was given.
+#[weft_db_macros::test]
+async fn an_answer_holding_nul_reaches_its_run_exactly(pool: Pool) {
+    schema(&pool).await;
+    let run_id = driven_by(&pool, "w1").await;
+    let answer = weft_core::primitive::WaitAnswer::Given { value: serde_json::json!({ "pasted": "a\u{0}b" }) };
+    let mut conn = pool.get().await.unwrap();
+    let tx = conn.transaction().await.unwrap();
+    weft_task_store::parked_fires::hand_answer_in(&tx, "form", run_id, &answer).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(weft_task_store::parked_fires::answers_for(&pool, run_id).await.unwrap(), vec![("form".to_string(), answer)]);
+}
+
 /// After its line may have missed some, a worker reads the cancels and the
 /// answers of every run it drives in one call: its own runs only, answers
 /// oldest first.
@@ -214,7 +228,7 @@ async fn one_recheck_reads_the_cancels_and_answers_of_every_run_a_worker_drives(
     let cancelled = driven_by(&pool, "w1").await;
     let answered = driven_by(&pool, "w1").await;
     let elsewhere = driven_by(&pool, "w2").await;
-    pool.execute("UPDATE run SET cancel_requested = $2 WHERE run_id = $1", &[&cancelled, &db::Json(weft_core::run::CancelCause::User)])
+    pool.execute("UPDATE run SET cancel_requested = $2 WHERE run_id = $1", &[&cancelled, &db::JsonText(weft_core::run::CancelCause::User)])
         .await
         .unwrap();
     let mut conn = pool.get().await.unwrap();
@@ -242,7 +256,7 @@ async fn a_previous_release_worker_still_reads_its_cancels(pool: Pool) {
     driven_by(&pool, "w1").await;
     let elsewhere = driven_by(&pool, "w2").await;
     for run in [cancelled, elsewhere] {
-        pool.execute("UPDATE run SET cancel_requested = $2 WHERE run_id = $1", &[&run, &db::Json(weft_core::run::CancelCause::User)])
+        pool.execute("UPDATE run SET cancel_requested = $2 WHERE run_id = $1", &[&run, &db::JsonText(weft_core::run::CancelCause::User)])
             .await
             .unwrap();
     }

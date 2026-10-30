@@ -1,7 +1,7 @@
 {
   "type": "PostgresUpdateRows",
   "label": "Postgres: Update Rows",
-  "description": "Update the rows matching a SQL condition, setting columns from a JSON object, and emit the changed rows. The condition's parameters are the node's own inline-declared input ports, read by name, as in Postgres: Query: `PostgresUpdateRows(email: String) { where: \"email = $email\" }`. Unreachable database or a broken constraint: catchable by `_error`. `count` is every changed row; `rows` holds as many of them as fit the 100 KB a wire carries, and `truncated` says when some were left out. A syntax error in `where`, an unknown column, or a `$name` with no port of that name: always fails the run.",
+  "description": "Update the rows matching a SQL condition, setting columns from a JSON object, and emit the changed rows. A `vector` or `halfvec` column takes a list of numbers and comes back as one. A table with a column the node cannot read back (`sparsevec`, `point`, ...) is refused before any row changes; update it with Postgres: Query instead. A changed value it cannot read back (a two-dimensional array in an `int4[]` column) undoes the update, so no row changes. The condition's parameters are the node's own inline-declared input ports, read by name, as in Postgres: Query: `PostgresUpdateRows(email: String) { where: \"email = $email\" }`. Unreachable database or a broken constraint: catchable by `_error`. `count` is every changed row; `rows` holds as many of them as fit the 100 KB a wire carries, and `truncated` says when some were left out. A syntax error in `where`, an unknown column, a column it cannot read back, or a `$name` with no port of that name: always fails the run.",
   "tags": [
     "postgres",
     "database",

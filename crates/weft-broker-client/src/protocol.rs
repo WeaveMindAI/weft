@@ -1078,7 +1078,8 @@ pub struct SupervisorEventRecordResponse {
 // Typed infra_event surface
 // =================================================================
 //
-// The wire format for `infra_event` is `(kind: TEXT, payload: JSONB)`.
+// The wire format for `infra_event` is `(kind: TEXT, payload: TEXT)`,
+// the payload its JSON text.
 // The supervisor writes rows; the dispatcher's `infra_event_bridge`
 // reads them and converts each row into a typed `DispatcherEvent`
 // for SSE consumers. The bridge needs a stable contract on:
@@ -1110,7 +1111,7 @@ wire_enum! {
 /// stored in the DB row drives which arm is selected.
 ///
 /// **No `Serialize` / `Deserialize` on the outer enum**: the wire
-/// format is `(kind: TEXT, payload: JSONB)` in two columns, NOT a
+/// format is `(kind: TEXT, payload: TEXT)` in two columns, NOT a
 /// tagged JSON blob. Callers go through `into_record()` /
 /// `from_kind_and_payload()` exclusively; deriving serde here would
 /// create a different shape and let a future caller silently emit
@@ -1954,7 +1955,7 @@ pub struct SignalRowWire {
     /// `next_fire_at_unix_ms` across listener restarts; other stateful
     /// kinds use the same channel for whatever state they need to
     /// survive a restart. The `signal.kind_state` column is
-    /// `JSONB NOT NULL DEFAULT '{}'::jsonb`, so the broker always
+    /// `TEXT NOT NULL DEFAULT '{}'` (its JSON text), so the broker always
     /// emits a value; missing on the wire is schema drift.
     pub kind_state: Value,
     /// The kind_state write-fence version the row is at (the
