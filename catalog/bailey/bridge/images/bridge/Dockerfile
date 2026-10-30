@@ -1,4 +1,4 @@
-FROM node:24-alpine
+FROM node:25-alpine
 
 RUN apk add --no-cache git
 # Node 24 = active LTS in 2026 (Node 22 enters EOL April 2027).
