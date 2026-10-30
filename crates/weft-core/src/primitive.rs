@@ -677,7 +677,7 @@ impl KickedNode {
 /// ([`Self::set_dispatched`]), which keeps the two in step.
 #[derive(Debug, Clone, Default)]
 pub struct KickTable {
-    kicks: HashMap<crate::frames::FiringLocation, KickedNode>,
+    kicks: std::collections::HashMap<crate::frames::FiringLocation, KickedNode>,
     undispatched: std::collections::BTreeSet<crate::frames::FiringLocation>,
 }
 
@@ -733,7 +733,7 @@ impl KickTable {
 
 /// Read like the map it holds. Changes go through the table's own methods.
 impl std::ops::Deref for KickTable {
-    type Target = HashMap<crate::frames::FiringLocation, KickedNode>;
+    type Target = std::collections::HashMap<crate::frames::FiringLocation, KickedNode>;
     fn deref(&self) -> &Self::Target {
         &self.kicks
     }
