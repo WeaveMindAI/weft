@@ -31,7 +31,7 @@
       },
       "default": "json",
       "label": "Message shape",
-      "description": "What each message is, both ways: `json` (`inbound: Generator[JsonDict]` or a record type, or `Generator[Image]` to store a `data:` URL or base64 message), `text` (`Generator[String]`), `bytes` (each binary frame stored, `Generator[File]`)."
+      "description": "What each message is, both ways: `json` (`inbound: Generator[JsonDict]`, a record type, `Generator[Json]` for any JSON value (a list, a bare string or number), or `Generator[Image]` to store a `data:` URL or base64 message), `text` (`Generator[String]`), `bytes` (each binary frame stored, `Generator[File]`)."
     },
     {
       "name": "auth",
@@ -141,7 +141,7 @@
     {
       "name": "inbound",
       "type": "Generator[JsonDict]",
-      "narrowable": "Generator[JsonDict | String | File]",
+      "narrowable": "Generator[JsonDict | Json | File]",
       "description": "One item per caller message, in order; ends when the caller disconnects. Each message is held to the item type declared here (matching `dataType`). A second reader needs a custom node using the ctx (inbound is broadcast there)."
     }
   ],
@@ -167,11 +167,11 @@
         "kind": "all",
         "of": [
           { "kind": "not", "of": { "kind": "config_in_set", "field": "dataType", "values": ["text", "bytes"] } },
-          { "kind": "not", "of": { "kind": "output_type_fits", "port": "inbound", "within": "Generator[JsonDict | File]" } }
+          { "kind": "not", "of": { "kind": "output_type_fits", "port": "inbound", "within": "Generator[JsonDict | Json | File]" } }
         ]
       },
       "then": {
-        "message": "Socket '{id}' takes json messages, each one JSON object (or a picture as a `data:` URL or base64): declare `inbound` as `Generator[<a record type or JsonDict>]` or `Generator[Image]`, or set `dataType` to the shape the messages have.",
+        "message": "Socket '{id}' takes json messages, each one JSON value (or a picture as a `data:` URL or base64): declare `inbound` as `Generator[<a record type, JsonDict, or Json for any JSON value>]` or `Generator[Image]`, or set `dataType` to the shape the messages have.",
         "level": "structural",
         "severity": "error",
         "field": "dataType"

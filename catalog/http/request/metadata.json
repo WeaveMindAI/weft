@@ -100,8 +100,8 @@
     {
       "name": "body",
       "type": "JsonDict | String",
-      "narrowable": true,
-      "description": "A text response up to 100 KB: a JSON object as a dict, anything else as its raw text. Absent when the response came out on `file`; with `file` unwired, a bigger text response fails the node instead."
+      "narrowable": "Json",
+      "description": "A text response up to 100 KB, held to the type declared here: a JSON list or object the type takes comes out as itself (an object by default, a list or an object with `-> (body: Json)`), anything else as its raw text while the type takes text, and a type that takes no text (a record, `List[...]`, `Number`) gets the parsed JSON, checked against it. Absent when the response came out on `file`; with `file` unwired, a bigger text response fails the node instead."
     },
     {
       "name": "file",

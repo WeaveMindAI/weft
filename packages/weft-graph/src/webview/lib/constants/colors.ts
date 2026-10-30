@@ -11,6 +11,7 @@ export const PORT_TYPE_COLORS: Record<string, string> = {
 	Blob: '#9e7c5a',     // Warm brown (catch-all stored file)
 	List: '#5a8a8a',     // Monokai teal
 	Dict: '#7c6f9f',     // Monokai purple
+	Json: '#948aad',     // Lighter Dict purple (any JSON value)
 	TypeVar: '#6366f1',  // Indigo
 	Bus: '#d97706',      // Amber-600 (live-channel signal)
 	Access: '#0d9488',   // Teal-600 (credential grant)
@@ -37,6 +38,7 @@ function colorForParsed(t: WeftType): string {
 		case 'list': return PORT_TYPE_COLORS.List;
 		case 'dict': return PORT_TYPE_COLORS.Dict;
 		case 'json_dict': return PORT_TYPE_COLORS.Dict;
+		case 'json': return PORT_TYPE_COLORS.Json;
 		case 'union': return colorForParsed(t.types[0]);
 		// A record colors like the generic object types; a named type
 		// colors as its body, so e.g. a media-bodied name reads as media.

@@ -116,6 +116,7 @@ export function extractPrimitives(t: WeftType): WeftPrimitive[] {
 		case 'list': return extractPrimitives(t.inner);
 		case 'dict': return extractPrimitives(t.value);
 		case 'json_dict': return [];
+		case 'json': return [];
 		case 'bus': return [];
 		case 'access': return [];
 		case 'infra': return [];
@@ -156,6 +157,9 @@ export function isCompatible(source: WeftType, target: WeftType): boolean {
 	if (source.kind === 'json_dict' && target.kind === 'json_dict') return true;
 	if (source.kind === 'json_dict' && target.kind === 'dict') return true;
 	if (source.kind === 'dict' && target.kind === 'json_dict') return true;
+	// Json takes every JSON-made type, at any depth; Json itself flows
+	// only into Json (and a union or a variable holding it).
+	if (target.kind === 'json') return fitsJson(source);
 	// A bus connects only to a bus; payloads are not type-checked.
 	if (source.kind === 'bus' && target.kind === 'bus') return true;
 	if (source.kind === 'access' && target.kind === 'access') return true;
@@ -220,6 +224,35 @@ export function isCompatible(source: WeftType, target: WeftType): boolean {
 	}
 	if (target.kind === 'named') return false;
 	return false;
+}
+
+/** Is every value of this type made only of JSON, so it fits a `Json`
+ *  port? Text, numbers, booleans and null are; a list, a dict or a
+ *  record is when what it holds is; a union when every member is; a
+ *  declared name when its body is. A stored file, a bus, a stream, an
+ *  access or an infra handle is not. A type variable answers yes, as it
+ *  does for every compatibility question. */
+// SYNC: fitsJson <-> crates/weft-core/src/weft_type.rs WeftType::fits_json
+function fitsJson(t: WeftType): boolean {
+	switch (t.kind) {
+		case 'primitive':
+			return t.value === 'String' || t.value === 'Number' || t.value === 'Boolean'
+				|| t.value === 'Null' || t.value === 'Empty';
+		case 'list': return fitsJson(t.inner);
+		case 'dict': return fitsJson(t.value);
+		case 'union': return t.types.every(fitsJson);
+		case 'record': return t.fields.every((f) => fitsJson(f.ty));
+		case 'named': return fitsJson(t.body);
+		case 'json_dict':
+		case 'json':
+		case 'typevar':
+			return true;
+		case 'bus':
+		case 'access':
+		case 'infra':
+		case 'generator':
+			return false;
+	}
 }
 
 /** May an author declare `declared` on a port whose type can be at

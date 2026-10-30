@@ -185,7 +185,7 @@ read-only (you can still move, expand, and collapse).".
 - **Read a key off a wire**: right-click a wire whose value is a record and
   pick a field, one level at a time ("Up one level", "Read the whole value"
   to go back). The wire turns dotted with the path at its end; in source it
-  is `t.n = s.out.profile.wpm`. A `JsonDict` or scalar value offers nothing
+  is `t.n = s.out.profile.wpm`. A `JsonDict`, `Json` or scalar value offers nothing
   and says to declare the shape or Cast first.
 - **Metadata ports**: not drawn, and nor are metadata wires: both are
   written in the code. An input a metadata wire fills shows the value,

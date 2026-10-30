@@ -28,6 +28,7 @@ Generator[String]
 | `List[T]` | Any number of `T` |
 | `Dict[String, V]` | Text keys, and values all of type `V`. `Dict[Number, String]` is refused, and the message suggests `List[{key: Number, value: String}]` |
 | `JsonDict` | An object whose values nobody checked |
+| `Json` | Any JSON value: text, a number, a boolean, null, or a list or object of those, at any depth. For a value whose shape you cannot know, like what a device answers to an arbitrary command. A stored file, a stream or a connection is never one |
 | `{ a: String, b?: Number }` | A record, with `?` marking a field that may be missing |
 | `{ a: String, .. }` | An open record: a record that also takes keys it does not name, and drops them |
 | `A \| B` | Either one |
@@ -50,6 +51,9 @@ the file is, which is why a `String` holding a URL is not an `Image`.
 | `Record` | `JsonDict` | Yes. A record forgets itself |
 | `JsonDict` | `Record` | **No.** Use a `Cast`, which checks the shape |
 | `Dict[String, V]` | `JsonDict` | Yes, and back |
+| Anything made of JSON (text, numbers, booleans, null, `JsonDict`, and lists, dicts and records of those) | `Json` | Yes, at any depth: `List[List[Number]]` fits |
+| A file, `Bus`, `Access`, `Infra`, `Generator[T]`, or a type holding one | `Json` | **No** |
+| `Json` | anything but `Json` | **No.** Use a `Cast`, which checks the value |
 | `Record` | `Record` | Every field you have must be declared on the target (unless the target ends with `..`), every required field it wants must be required on yours, and the types must match |
 | `A` | `A \| B` | Yes |
 | `A \| B` | `A` | Only if **both** `A` and `B` fit `A` |
@@ -174,7 +178,8 @@ conversion exists at all.
 |---|---|---|
 | `String` | `Number`, `Boolean` | Parsed |
 | `String` | `List`, `Dict`, `JsonDict`, a record, a named type | Parsed as JSON, then held to the target's shape |
-| Anything not a file or a live handle | `String` | Turned into text |
+| Anything not a file or a live handle | `String` | Turned into text: a list or an object becomes its JSON |
+| `Json` | Anything made of JSON | Checked at run time: a `Json` holding a list casts into `List[Number]` when every item is a number |
 | `Number` | `Boolean` | 1 and 0 |
 | Any object shape | A record or a named type | Checked against the declared structure at run time |
 | Any object shape | A file type | The marker is checked, including that its kind matches |

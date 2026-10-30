@@ -654,8 +654,8 @@ impl LiveCallerConnection {
             return;
         }
         self.record.connected(self.config.protocol);
-        if let Some(http) = &self.http_request {
-            self.record.inbound(&http.body);
+        if let Some(body) = self.http_request.as_ref().and_then(|http| http.body.as_ref()) {
+            self.record.inbound(body);
         }
     }
 
@@ -1228,11 +1228,12 @@ pub(crate) fn new_connection(
         Protocol::Websocket => Some(InboundLog::new(config.inbound_window)),
         Protocol::Http => None,
     };
-    // The HTTP request a node reads: the handshake beside the body. A
-    // WebSocket carries no body, so it exposes the handshake alone.
-    let http_request = http_body.map(|body| {
-        Arc::new(HttpRequestParts { request: (*handshake).clone(), body })
-    });
+    // The HTTP request a node reads: the handshake beside the body it
+    // sent, if any. A WebSocket carries no body, so it exposes the
+    // handshake alone.
+    debug_assert!(config.protocol == Protocol::Http || http_body.is_none(), "a socket carries no body");
+    let http_request = (config.protocol == Protocol::Http)
+        .then(|| Arc::new(HttpRequestParts { request: (*handshake).clone(), body: http_body }));
     let conn = Arc::new(LiveCallerConnection {
         config,
         outbound: outbound.clone(),
@@ -1273,10 +1274,10 @@ fn chunk_to_bytes(chunk: &OutboundChunk) -> Vec<u8> {
     }
 }
 
-/// Decode raw inbound bytes into an `InboundMessage` per the declared
-/// data type. JSON parses (fails loud on bad JSON; an EMPTY body is
-/// `null`, what a bodiless GET honestly carries); text is UTF-8
-/// (lossless required); bytes pass through.
+/// Decode raw inbound bytes (a socket message, an HTTP body that is
+/// there: [`decode_http_body`]) into an `InboundMessage` per the declared data
+/// type. JSON parses (fails loud on bad JSON; an EMPTY message is
+/// `null`); text is UTF-8 (lossless required); bytes pass through.
 fn decode_inbound(data_type: DataType, raw: &[u8]) -> Result<InboundMessage, String> {
     match data_type {
         DataType::Json if raw.iter().all(u8::is_ascii_whitespace) => {
@@ -1823,7 +1824,7 @@ async fn handle_connect(
     }
     let run_id = born.run_id;
     let http_body = match &opening {
-        Opening::Http(body) => Some(body.clone()),
+        Opening::Http(body) => body.clone(),
         Opening::Socket(_) => None,
     };
     let (conn, outbound, inbound) = new_connection(config.clone(), run_id, handshake, http_body, born.sink);
@@ -1868,21 +1869,35 @@ fn run_id_value(run_id: RunId) -> axum::http::HeaderValue {
     axum::http::HeaderValue::from_str(&run_id.to_string()).expect("a uuid is a valid header value")
 }
 
-/// What a call brings besides its opening request.
+/// What a call brings besides its opening request: an HTTP call its body
+/// (`None` when it sent none), a socket its upgrade.
 enum Opening {
-    Http(InboundMessage),
+    Http(Option<InboundMessage>),
     Socket(WebSocketUpgrade),
 }
 
 /// Read an HTTP call's body under the route's cap and decode it as the
-/// route's data type. A refusal is the caller's answer.
-async fn read_body(config: &CallerRuntimeConfig, body: axum::body::Body) -> Result<InboundMessage, Response> {
+/// route's data type, `None` when the call sent none (an empty body, or
+/// only whitespace on a json route, which is no JSON value). A refusal is
+/// the caller's answer.
+async fn read_body(config: &CallerRuntimeConfig, body: axum::body::Body) -> Result<Option<InboundMessage>, Response> {
     let limit = config.max_inbound_bytes;
     let bytes = axum::body::to_bytes(body, limit as usize)
         .await
         .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, format!("request body exceeds {limit} bytes")).into_response())?;
     weft_core::caller::check_inbound_size(bytes.len() as u64, limit).map_err(|e| (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response())?;
-    decode_inbound(config.data_type, &bytes).map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())
+    decode_http_body(config.data_type, &bytes).map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())
+}
+
+/// An HTTP call's body as the route's data type reads it, `None` when the
+/// call sent none: no bytes, or only whitespace on a json route (no JSON
+/// value is blank). A body that is `null` is a value, and decodes as one.
+fn decode_http_body(data_type: DataType, raw: &[u8]) -> Result<Option<InboundMessage>, String> {
+    let blank = raw.is_empty() || (data_type == DataType::Json && raw.iter().all(u8::is_ascii_whitespace));
+    if blank {
+        return Ok(None);
+    }
+    decode_inbound(data_type, raw).map(Some)
 }
 
 /// An HTTP call's answer, on the call's own task: the run is polled here
@@ -3262,7 +3277,7 @@ mod tests {
             http_cfg(),
             run_id,
             Arc::new(LiveRequest { method: "POST".into(), path: "chat/room7".into(), ..Default::default() }),
-            Some(InboundMessage::Json(serde_json::Value::Null)),
+            None,
             sink.clone(),
         );
         let failing = conn.clone();
@@ -3480,7 +3495,7 @@ mod tests {
             assert_eq!(parts.request.method, "POST");
             assert_eq!(parts.request.path, "chat/room7");
             assert_eq!(conn.handshake().path, "chat/room7");
-            assert_eq!(parts.body, InboundMessage::Json(serde_json::json!({"text": "hi"})));
+            assert_eq!(parts.body, Some(InboundMessage::Json(serde_json::json!({"text": "hi"}))));
             http.respond(OutboundChunk::Text("seen".into())).await.unwrap();
         })
         .await;
@@ -3583,7 +3598,7 @@ mod tests {
             http_cfg(),
             RunId::nil(),
             Arc::new(LiveRequest::default()),
-            Some(InboundMessage::Json(serde_json::Value::Null)),
+            None,
             sink,
         );
         conn.send_chunk(None, OutboundChunk::Text("a".into())).await.unwrap();
@@ -3640,11 +3655,24 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_json_body_decodes_to_null() {
+    fn an_empty_json_message_decodes_to_null() {
         assert_eq!(decode_inbound(DataType::Json, b"").unwrap(), InboundMessage::Json(serde_json::Value::Null));
         assert_eq!(decode_inbound(DataType::Json, b" \n").unwrap(), InboundMessage::Json(serde_json::Value::Null));
         assert!(decode_inbound(DataType::Json, b"nope").is_err());
         assert_eq!(decode_inbound(DataType::Text, b"").unwrap(), InboundMessage::Text(String::new()));
+    }
+
+    /// A call that sent no body reads as none on every data type, told
+    /// apart from a json body that is `null`, which is a value.
+    #[test]
+    fn a_call_with_no_body_carries_none() {
+        for data_type in [DataType::Json, DataType::Text, DataType::Bytes] {
+            assert_eq!(decode_http_body(data_type, b"").unwrap(), None, "{data_type:?}");
+        }
+        assert_eq!(decode_http_body(DataType::Json, b" \n").unwrap(), None);
+        assert_eq!(decode_http_body(DataType::Json, b"null").unwrap(), Some(InboundMessage::Json(serde_json::Value::Null)));
+        assert_eq!(decode_http_body(DataType::Text, b" ").unwrap(), Some(InboundMessage::Text(" ".into())));
+        assert!(decode_http_body(DataType::Json, b"nope").is_err());
     }
 
     // `receive()` waits indefinitely, with no deadline, and `inbound.close()`
@@ -3695,7 +3723,7 @@ mod tests {
             cfg,
             run_id,
             Arc::new(LiveRequest { method: "POST".into(), path: "feed".into(), ..Default::default() }),
-            Some(InboundMessage::Json(serde_json::Value::Null)),
+            None,
             sink.clone(),
         );
         let run: futures::future::BoxFuture<'static, ()> = Box::pin(program(conn.clone()));
@@ -3871,9 +3899,8 @@ mod tests {
     /// then what the wire would carry, in order. Also checks the record
     /// says exactly that, and names `extra` chunks as never received.
     async fn sent_to_a_stalled_caller(cfg: CallerRuntimeConfig, extra: usize) -> Vec<i64> {
-        let http_body = (cfg.protocol == Protocol::Http).then_some(InboundMessage::Json(serde_json::Value::Null));
         let record = Arc::new(RecordingSink::default());
-        let (conn, outbound, _) = new_connection(cfg, RunId::nil(), Arc::new(LiveRequest::default()), http_body, record.clone());
+        let (conn, outbound, _) = new_connection(cfg, RunId::nil(), Arc::new(LiveRequest::default()), None, record.clone());
         for n in 0..(OUTBOUND_BUFFER + extra) as i64 {
             conn.send_chunk(None, OutboundChunk::Json(serde_json::json!(n))).await.expect("a drop mode never waits or fails");
         }
@@ -3922,7 +3949,7 @@ mod tests {
                 let record = Arc::new(RecordingSink::default());
                 let (conn, outbound, _) = new_connection(
                     cfg, RunId::nil(), Arc::new(LiveRequest::default()),
-                    Some(InboundMessage::Json(serde_json::Value::Null)), record.clone(),
+                    None, record.clone(),
                 );
                 for n in 0..10 {
                     conn.send_chunk(None, OutboundChunk::Json(serde_json::json!(n))).await.unwrap();
@@ -3955,9 +3982,8 @@ mod tests {
             for protocol in [Protocol::Http, Protocol::Websocket] {
                 for backpressure in [Backpressure::DropOldest, Backpressure::DropNewest] {
                     let cfg = CallerRuntimeConfig { protocol, backpressure, ..ws_cfg() };
-                    let http_body = (protocol == Protocol::Http).then_some(InboundMessage::Json(serde_json::Value::Null));
                     let record = Arc::new(RecordingSink::default());
-                    let (conn, outbound, _) = new_connection(cfg, RunId::nil(), Arc::new(LiveRequest::default()), http_body, record.clone());
+                    let (conn, outbound, _) = new_connection(cfg, RunId::nil(), Arc::new(LiveRequest::default()), None, record.clone());
                     // The caller: reads one, then lets a few sends go by.
                     let reader = tokio::spawn(async move {
                         let mut carried = Vec::new();
@@ -3992,8 +4018,7 @@ mod tests {
         async fn body() {
             for protocol in [Protocol::Http, Protocol::Websocket] {
                 let cfg = CallerRuntimeConfig { protocol, backpressure: Backpressure::Block, ..ws_cfg() };
-                let http_body = (protocol == Protocol::Http).then_some(InboundMessage::Json(serde_json::Value::Null));
-                let (conn, outbound, _) = new_connection(cfg, RunId::nil(), Arc::new(LiveRequest::default()), http_body, Arc::new(RecordingSink::default()));
+                let (conn, outbound, _) = new_connection(cfg, RunId::nil(), Arc::new(LiveRequest::default()), None, Arc::new(RecordingSink::default()));
                 for n in 0..OUTBOUND_BUFFER as i64 {
                     conn.send_chunk(None, OutboundChunk::Json(serde_json::json!(n))).await.unwrap();
                 }

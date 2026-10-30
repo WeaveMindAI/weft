@@ -11,7 +11,7 @@
 //!     (`ctx.wake`) fans onto the fixed ports, and the body, read off
 //!     the caller handle, lands whole on `body`, held to the type the
 //!     program declared there (`-> (body: Signup)`, `JsonDict` when it
-//!     declared none): a picture it carries in a file-typed place is
+//!     declared none, `Json` for a body of any JSON shape): a picture it carries in a file-typed place is
 //!     stored on the way in, an open record drops the keys it does not
 //!     declare, and a body that does not fit is answered `400` naming
 //!     what is wrong, before anything downstream runs. A port the
@@ -65,39 +65,38 @@ impl Node for RouteNode {
         // feed it back through the connection call, because that would
         // put a caller trigger's field name in the language, where no
         // node's vocabulary belongs.
-        let body = match &parts.body {
-            InboundMessage::Json(v) if v.is_null() => fired_body(&ctx)?,
-            other => other.clone(),
-        };
         let data_type = ctx.caller_data_type().unwrap_or_default();
+        let body = match &parts.body {
+            Some(body) => Some(body.clone()),
+            None => fired_body(&ctx, data_type)?,
+        };
         let declared = ctx.output_type("body")?;
         let body = match (data_type, body) {
             // A request with no body at all, which is every GET, leaves
-            // `body` closed: the request ports below still fire, and a
-            // GET is an ordinary way to call a route.
-            (DataType::Json, InboundMessage::Json(Value::Null)) => None,
-            // A json body is ONE object, the shape a declared record (or
-            // `JsonDict`) holds: anything else is the caller's mistake.
-            (DataType::Json, InboundMessage::Json(other)) if !other.is_object() => {
-                let why = format!(
-                    "the body has to be a json object, and the request sent {}",
-                    wire::kind_of(&other)
-                );
-                return refuse(&http, data_type, why).await;
-            }
-            (DataType::Json, message @ InboundMessage::Json(_))
-            | (DataType::Text, message @ InboundMessage::Text(_))
-            | (DataType::Bytes, message @ InboundMessage::Bytes(_)) => {
+            // `body` closed whatever the route's `dataType`: the request
+            // ports below still fire, and a GET is an ordinary way to
+            // call a route.
+            (_, None) => None,
+            // A json body that is `null` is a value: it flows on a body
+            // whose type takes Null (`Json`, `Signup | Null`), and on any
+            // other it is nothing arrived, as a null is on any port.
+            (DataType::Json, Some(InboundMessage::Json(Value::Null))) if !declared.contains_null() => None,
+            // Whatever JSON the body is, the declared type decides
+            // whether it fits: `JsonDict` or a record wants an object,
+            // `Json` takes a list or a bare number too.
+            (DataType::Json, Some(message @ InboundMessage::Json(_)))
+            | (DataType::Text, Some(message @ InboundMessage::Text(_)))
+            | (DataType::Bytes, Some(message @ InboundMessage::Bytes(_))) => {
                 let content_type = request.header("content-type");
                 match wire::take_message(&ctx, message, content_type, "body", &declared).await? {
                     Ok(body) => Some(body),
                     Err(why) => return refuse(&http, data_type, why).await,
                 }
             }
-            // The other shapes: a fired run whose body is text on a
-            // json route or an object on a text one (a live connection
-            // reads the body as the route's dataType already).
-            (data_type, other) => {
+            // The other shapes: a fired run whose body is no string on a
+            // text route (a live connection reads the body as the
+            // route's dataType already).
+            (data_type, Some(other)) => {
                 let why = format!(
                     "this route takes a {} body, and the request sent {}",
                     data_type.as_wire_str(),
@@ -149,18 +148,21 @@ async fn refuse(http: &weft::caller::HttpCaller, data_type: DataType, why: Strin
 /// the question where it belongs: only this node knows that its `body`
 /// field means the request's body.
 ///
-/// A string is a text body, an object is a json one. Anything else is
-/// refused by the fire payload contract before this runs, against the
-/// type the metadata declares, so a bytes route is not fireable: its
-/// body has no declared type a fire payload can carry.
-fn fired_body(ctx: &RunContext) -> WeftResult<InboundMessage> {
+/// The route's `dataType` says what the fired value is, as it says for
+/// a live call: on a json route any value is the JSON body (a string
+/// too), on a text route a string is the text and anything else is the
+/// author's mistake, answered below. A bytes route is not fireable: a
+/// fire payload is JSON, and bytes never travel in one. `None` when the
+/// payload names no body; a `body` of `null` is none too, as a null is
+/// in any optional field of a fire payload.
+fn fired_body(ctx: &RunContext, data_type: DataType) -> WeftResult<Option<InboundMessage>> {
     let Some(body) = ctx.wake.opt::<Value>("body")? else {
-        return Ok(InboundMessage::Json(Value::Null));
+        return Ok(None);
     };
-    Ok(match body {
-        Value::String(text) => InboundMessage::Text(text),
-        other => InboundMessage::Json(other),
-    })
+    Ok(Some(match (data_type, body) {
+        (DataType::Text, Value::String(text)) => InboundMessage::Text(text),
+        (_, other) => InboundMessage::Json(other),
+    }))
 }
 
 fn shape_of(message: &InboundMessage) -> &'static str {

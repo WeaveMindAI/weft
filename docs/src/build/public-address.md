@@ -106,6 +106,12 @@ Once the tunnel is up, `weft daemon start` fetches the page at your address
 through it. If the service in step 2 is wrong, the start fails and says so,
 naming the value it expects.
 
+The install remembers that tunnel, so a later `weft daemon start` or `weft
+daemon restart` from a shell that sets neither variable opens the same one
+again. If you set both, they win, and the install remembers the new ones. To
+go back to a quick tunnel, run `./setup.sh --no-public-url`, then
+`./setup.sh --public-url` with neither variable set.
+
 ## Close it
 
 ```bash

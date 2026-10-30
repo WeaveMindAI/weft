@@ -69,7 +69,8 @@ What you declare on `body` depends on the body shape the [route] is set to
   it does not name; put `..` before its closing brace to drop them instead
   (`{ email: String, .. }`). A key the caller may leave out is written `?`
   (`nick?: String`), and when it is missing the wire from `hello.body.nick`
-  closes. `body: JsonDict` takes any object unchecked. If the caller's body
+  closes. `body: JsonDict` takes any object unchecked, and `body: Json` a
+  body of any shape (a list, a bare value). If the caller's body
   spells a key in snake_case, spell the field the same way (`{ user_id:
   String }`): record fields keep any spelling. If your own frontend sends the
   body, name its keys camelCase, like every field weft writes.
@@ -150,7 +151,9 @@ found = Reply { body: lookup.body, status: lookup.status }
 
 A `GET` route has no body: declare nothing on `body` and read the other
 ports. A `text` route: `say = Route -> (body: String) { path: "say",
-dataType: "text" }`, and the `Reply` body must be a `String`.
+dataType: "text" }`, and the `Reply` body must be a `String`. A request that
+carries no body closes `body`, whatever the `dataType`, and a json body that is `null` comes out on a `body` whose type takes `Null`
+(`Json` does) and closes it on any other.
 
 If the answer has a different shape from what came in, the [answer] node says
 which with `answerAs`: `json`, `text` or `bytes`, and empty follows the
@@ -567,7 +570,8 @@ graph does instead of a script whose whole body is `return {...}`.
 What a socket adds over a [route] is `inbound`: a `Generator` carrying one
 item per message the caller sends, ended when the caller disconnects. You
 declare its item type on the arrow to match the body shape (a record when
-you will read keys off it, `Generator[String]` for plain text,
+you will read keys off it, `Generator[Json]` for messages of any shape,
+`Generator[String]` for plain text,
 `Generator[File]` for uploads); an undeclared `inbound` wired anywhere is a
 compile error. A `Loop` over it runs
 once per message, in order.

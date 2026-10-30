@@ -15,6 +15,7 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("setup_registers_the_socket_signal", setup_registers),
         NodeTest::fake("each_message_is_one_item_of_inbound", messages_yield),
+        NodeTest::fake("inbound_declared_json_takes_any_json_message", any_json_messages),
         NodeTest::fake("a_bytes_socket_stores_each_frame", bytes_frames),
         NodeTest::fake("a_picture_in_a_json_message_is_stored", inline_picture),
         NodeTest::fake("a_message_that_does_not_fit_is_refused_back_and_the_session_goes_on", misfit_refused),
@@ -75,6 +76,30 @@ async fn messages_yield(rig: FakeRig) -> WeftResult<()> {
     // The rig folds every yield into the port's array, in order; the
     // scripted stream running dry is the caller disconnecting.
     assert_eq!(outcome.outputs["inbound"], json!([{ "text": "one" }, { "text": "two" }]));
+    Ok(())
+}
+
+/// A device that answers whatever shape it likes: declared `Json`, every
+/// message comes through as it was sent, a list of lists and a bare
+/// string as much as an object.
+async fn any_json_messages(rig: FakeRig) -> WeftResult<()> {
+    let request = request();
+    rig.wake(serde_json::to_value(&request).expect("request serializes"));
+    let conn = ws_caller(
+        DataType::Json,
+        request,
+        vec![
+            InboundMessage::Json(json!([[1, "a"], [2, "b"]])),
+            InboundMessage::Json(json!("ok")),
+            InboundMessage::Json(json!(42)),
+            InboundMessage::Json(json!({ "x": 1 })),
+        ],
+    );
+    rig.attach_caller(conn.clone());
+    rig.output_type("inbound", WeftType::parse("Generator[Json]").expect("parses"));
+    let outcome = rig.run(&SocketNode, json!({ "path": "chat/{room}" })).await.ok()?;
+    assert_eq!(outcome.outputs["inbound"], json!([[[1, "a"], [2, "b"]], "ok", 42, { "x": 1 }]));
+    assert!(conn.chunks().is_empty(), "nothing was refused: {:?}", conn.chunks());
     Ok(())
 }
 

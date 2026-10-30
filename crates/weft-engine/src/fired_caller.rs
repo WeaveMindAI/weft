@@ -53,7 +53,7 @@ impl FiredCaller {
     /// The request is the one the fire payload described. There is no
     /// body and never can be: nobody sent anything, so nothing came in,
     /// nothing is recorded as coming in, and the request the node reads
-    /// carries an empty one. What the author typed as a body reaches
+    /// carries none. What the author typed as a body reaches
     /// the trigger as its wake payload and is read there, by the node
     /// that knows which of its own fields that is.
     pub fn open(
@@ -64,10 +64,7 @@ impl FiredCaller {
     ) -> Arc<Self> {
         let caller = Arc::new(Self {
             config,
-            parts: Arc::new(HttpRequestParts {
-                request,
-                body: InboundMessage::Json(serde_json::Value::Null),
-            }),
+            parts: Arc::new(HttpRequestParts { request, body: None }),
             record: CallerRecord::new(run_id, journal),
             started: AtomicBool::new(false),
             terminated: tokio::sync::watch::Sender::new(false),
@@ -321,15 +318,15 @@ mod tests {
 
     /// The node asks for the request through the same call a real
     /// caller serves, which is what lets the trigger run its ordinary
-    /// code offline. It gets the request line, and an empty body:
-    /// nobody sent one. That emptiness is the node's cue to look at its
+    /// code offline. It gets the request line, and no body: nobody
+    /// sent one. That absence is the node's cue to look at its
     /// own wake payload, where the author's typed body actually is.
     #[test]
     fn the_request_arrives_with_no_body_behind_it() {
         let rows = Arc::new(Rows::default());
         let parts = caller(&rows).http_request().expect("an http caller has request parts");
         assert_eq!(parts.request.method, "POST");
-        assert_eq!(parts.body, InboundMessage::Json(serde_json::Value::Null));
+        assert_eq!(parts.body, None);
     }
 
     /// The rules a real connection enforces are enforced here too, so a

@@ -80,7 +80,7 @@
           className: 'type',
           begin:
             '\\b(String|Number|Boolean|Null|Image|Video|Audio|Blob|Empty|Media|File' +
-            '|List|Dict|JsonDict|Bus|Access|Infra|Generator)\\b',
+            '|List|Dict|JsonDict|Json|Bus|Access|Infra|Generator)\\b',
         },
 
         { className: 'literal', begin: '\\b(true|false)\\b' },

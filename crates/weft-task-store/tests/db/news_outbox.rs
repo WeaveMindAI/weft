@@ -187,7 +187,10 @@ async fn refused_news_never_travels_with_new_news_nor_holds_it_up(pool: Pool) {
     weft_task_store::announce::tell_news_through(&pool, bus.clone());
     until("the news after the refused batch told", async || bus.told() == vec![vec![after]]).await;
     until("the refusal written down", async || refusal_written(&pool).await).await;
-    assert_eq!((waiting(&pool).await, refused(&pool).await), (100, 100), "the refused batch waits, marked refused");
+    // The bus hears a batch before the teller takes it out, so the news
+    // after the refused batch can still be in the table here.
+    until("the news after the refused batch taken out", async || waiting(&pool).await == 100).await;
+    assert_eq!(refused(&pool).await, 100, "the refused batch waits, marked refused");
 
     let later = tell(&pool, 103).await;
     weft_task_store::announce::news_written(&pool);

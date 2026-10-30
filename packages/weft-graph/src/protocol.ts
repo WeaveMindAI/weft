@@ -70,7 +70,7 @@ export const ALL_PRIMITIVE_TYPES: WeftPrimitive[] = [
 /** The type names that are not primitives but still mean something to
  *  the type language: no declared type may take one. */
 // SYNC: CONTAINER_AND_SPECIAL_TYPES <-> crates/weft-core/src/weft_type.rs CONTAINER_AND_SPECIAL_TYPES
-const CONTAINER_AND_SPECIAL_TYPES = ['List', 'Dict', 'JsonDict', 'Bus', 'Access', 'Infra', 'Generator'];
+const CONTAINER_AND_SPECIAL_TYPES = ['List', 'Dict', 'JsonDict', 'Json', 'Bus', 'Access', 'Infra', 'Generator'];
 
 // SYNC: NAMED_UNIONS <-> crates/weft-core/src/weft_type.rs WeftType::UNION_ALIASES
 /** Named union aliases. The ONE table both name resolution (parse) and
@@ -104,6 +104,12 @@ export type WeftType =
   // it, and the parser refuses any other key).
   | { kind: 'dict'; value: WeftType }
   | { kind: 'json_dict' }
+  // Any value made only of JSON (text, numbers, booleans, null, and
+  // lists or objects of those at any depth). Not an Any: a file, bus,
+  // stream, access or infra never fits. Every JSON-made type flows in;
+  // a Json value flows out only into Json (narrowing is the Cast node's).
+  // SYNC: json <-> crates/weft-core/src/weft_type.rs WeftType::Json
+  | { kind: 'json' }
   // A message-bus handle: an in-process channel between co-alive nodes.
   // A Bus output connects only to a Bus input; the payloads are not
   // type-checked. Wires only (a live runtime handle takes no literal).
@@ -358,6 +364,7 @@ function parseSingleType(s: string): WeftType {
     return { kind: 'record', fields, open };
   }
   if (s === 'JsonDict') return { kind: 'json_dict' };
+  if (s === 'Json') return { kind: 'json' };
   if (s === 'Bus') return { kind: 'bus' };
   if (s === 'Access') return { kind: 'access' };
   if (s === 'Infra') return { kind: 'infra' };
@@ -510,7 +517,7 @@ export function weftTypesEqual(a: WeftType, b: WeftType): boolean {
     case 'typevar':
       return b.kind === 'typevar' && a.name === (b as Extract<WeftType, { kind: 'typevar' }>).name;
     default:
-      // json_dict / bus / access / infra carry no payload.
+      // json_dict / json / bus / access / infra carry no payload.
       return true;
   }
 }
@@ -558,6 +565,7 @@ function renderType(t: WeftType, wire: boolean): string {
     case 'list': return `List[${renderType(t.inner, wire)}]`;
     case 'dict': return `Dict[String, ${renderType(t.value, wire)}]`;
     case 'json_dict': return 'JsonDict';
+    case 'json': return 'Json';
     case 'bus': return 'Bus';
     case 'access': return 'Access';
     case 'infra': return 'Infra';

@@ -4,6 +4,47 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-10-30 (0.2.279)
+
+**Run `weft resync` in every project with a trigger on after this update.**
+A trigger now reads as behind when anything in front of it changes (a node
+whose value feeds one of its inputs or its gate), since that runs at its setup
+and a resync is what runs it again. Before, only an edit to what its fires
+run did. Every trigger that is on reads as behind once after the update,
+because its fingerprint is now worked out over both.
+
+**A new type, `Json`, holds any JSON value**: text, a number, a boolean, null,
+or a list or object of those at any depth. Every type made of JSON fits into
+it (`List[List[Number]]` does); a file, a stream or a connection never does,
+and a `Json` value goes into anything narrower only through a `Cast`. A
+`Route`'s `body` and a `Socket`'s `inbound` items can now be declared `Json`
+(or `List[...]`) to take a body or a message that is a list or a bare value;
+the default stays `JsonDict`. A request with no body (a `GET`, or a fire with
+no `body`) now closes `body` on a `text` or `bytes` route too, where it used to
+arrive as an empty text or an empty file, and a json body that is `null` is now
+a value: it comes out on a `body` declared `Json` (or `... | Null`), and
+closes `body` otherwise. A json route now refuses a body that does not fit
+with the type's own message (`body does not fit JsonDict: ...`), and a fired
+run's string body on a json route is a JSON string, held to the type like any
+other. `LlmInferenceJson`'s `response` can be declared any JSON-made type, and
+`HttpRequest`'s `body` too: declared `Json`, a JSON list comes out as the
+list, and declared a type that takes no text (a record, `List[...]`), the
+response is parsed and a wrong shape fails naming the field. `HttpRequest`
+now refuses a response carrying a stored-file object.
+
+**A `Cast` into `String` turns a list or an object into its JSON text.** The
+build allowed it before, but the run then failed.
+
+**An install remembers its named tunnel.** A `weft daemon start` or `restart`
+from a shell without `WEFT_PUBLIC_TUNNEL_TOKEN` and
+`WEFT_PUBLIC_TUNNEL_HOSTNAME` used to replace your stable address with a quick
+tunnel; it now opens the named tunnel the install last ran. If a start says
+the install's record has no hostname (one an older weft wrote), run
+`./setup.sh --public-url` once from the checkout whose `.env.local` names the
+tunnel. To go back to a quick tunnel, run `./setup.sh --no-public-url`, then
+`./setup.sh --public-url`. Each named tunnel's container is made again once,
+on the first start after the update.
+
 ## 2026-10-30 (7a1dcb43)
 
 **A NUL character in a run no longer breaks search, or the runs beside it.**

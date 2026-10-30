@@ -5,9 +5,10 @@
 //! wiring the output into a port of a concrete type, which the
 //! compiler works it out from (a `value` it cannot pin is its
 //! `unresolved-typevar`). The conversion itself is
-//! `WeftType::cast_value`: the same rules the compiler's literal
-//! lenience applies, so text parses into scalars and JSON structures,
-//! scalars stringify, and an object claiming a declared
+//! `WeftType::cast_requested`: the rules the compiler's literal
+//! lenience applies, so text parses into scalars and JSON structures and
+//! scalars stringify, plus the one a written value never gets (a list
+//! or an object into text is its JSON), and an object claiming a declared
 //! custom type is validated against its structure with a field-level
 //! error when it does not fit. Impossible pairs never reach this body
 //! (the compiler's `cast-not-allowed` check refuses them).
@@ -35,7 +36,7 @@ impl Node for CastNode {
         // The compiler refuses a connected output whose variable nothing
         // pinned, so the type is resolved here.
         let target = ctx.output_type("value")?;
-        match target.cast_value(&value) {
+        match target.cast_requested(&value) {
             Ok(cast) => ctx.pulse_downstream(NodeOutput::new().set("value", cast)).await,
             Err(e) => node_bail!("cannot cast the value into {target}: {e}"),
         }

@@ -762,7 +762,10 @@ pub trait CallerConnection: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpRequestParts {
     pub request: LiveRequest,
-    pub body: InboundMessage,
+    /// `None` when the request carried no body (every GET, an empty POST,
+    /// a fired run, which has no connection): told apart from a json body
+    /// that is `null`, which is a value.
+    pub body: Option<InboundMessage>,
 }
 
 /// Author-facing ergonomic wrapper. An enum over the two protocol
@@ -1214,7 +1217,8 @@ struct FakeCallerInner {
     inbound: std::collections::VecDeque<InboundMessage>,
     /// The scripted handshake (`with_handshake`); empty by default.
     handshake: Arc<LiveRequest>,
-    /// The scripted HTTP body returned inside `http_request`.
+    /// The scripted HTTP body returned inside `http_request`; `None` is a
+    /// request that carried none.
     http_body: Option<InboundMessage>,
 }
 
@@ -1257,7 +1261,8 @@ impl FakeCallerConnection {
         self.inner.lock().expect("fake caller poisoned").handshake = Arc::new(request);
     }
 
-    /// Script the HTTP body `http_request` hands out beside the handshake.
+    /// Script the HTTP body `http_request` hands out beside the handshake;
+    /// unscripted, the request carries none.
     pub fn set_http_body(&self, body: InboundMessage) {
         self.inner.lock().expect("fake caller poisoned").http_body = Some(body);
     }
@@ -1472,11 +1477,7 @@ impl CallerConnection for FakeCallerConnection {
                 protocol: self.config.protocol.as_wire_str(),
             });
         }
-        let body = g
-            .http_body
-            .clone()
-            .ok_or_else(|| CallerError::Transport("no http body scripted".into()))?;
-        Ok(Arc::new(HttpRequestParts { request: (*g.handshake).clone(), body }))
+        Ok(Arc::new(HttpRequestParts { request: (*g.handshake).clone(), body: g.http_body.clone() }))
     }
 
     fn inbound_now_offset(&self) -> u64 {
@@ -1765,7 +1766,7 @@ mod tests {
         let CallerHandle::Http(http) = handle else { unreachable!() };
         let parts = http.request_parts().unwrap();
         assert_eq!(parts.request, req);
-        assert_eq!(parts.body, InboundMessage::Json(serde_json::json!({"text": "hi"})));
+        assert_eq!(parts.body, Some(InboundMessage::Json(serde_json::json!({"text": "hi"}))));
     }
 
     #[test]
@@ -1795,7 +1796,7 @@ mod tests {
         assert!(v.get("params").is_none(), "empty maps are omitted on the wire");
         assert_eq!(serde_json::from_value::<LiveRequest>(v).unwrap(), req);
 
-        let parts = HttpRequestParts { request: req, body: InboundMessage::Text("t".into()) };
+        let parts = HttpRequestParts { request: req, body: Some(InboundMessage::Text("t".into())) };
         let back: HttpRequestParts = serde_json::from_value(serde_json::to_value(&parts).unwrap()).unwrap();
         assert_eq!(back, parts);
 

@@ -13,7 +13,7 @@ use weft::signal::DataType;
 use weft::{FakeRig, NodeTest, WeftResult, WeftType};
 
 use super::RouteNode;
-use crate::testing::{http_caller, request};
+use crate::testing::{http_caller, http_caller_without_body, request};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -36,10 +36,13 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("bare_base64_is_typed_by_its_bytes_and_held_to_its_field", bare_base64),
         NodeTest::fake("an_optional_picture_is_held_to_its_kind_and_typed_by_its_bytes", optional_picture),
         NodeTest::fake("a_fired_body_of_the_wrong_shape_is_answered_400", fired_body_of_the_wrong_shape),
-        NodeTest::fake("a_json_body_that_is_not_an_object_is_answered_400", json_body_not_an_object),
+        NodeTest::fake("a_json_body_its_declared_type_does_not_take_is_answered_400", json_body_not_an_object),
+        NodeTest::fake("a_body_declared_json_takes_any_json_value", json_body_any_json),
         NodeTest::fake("a_request_with_no_body_still_serves_its_ports", json_body_absent),
         NodeTest::fake("a_fired_runs_body_comes_from_its_wake", fired_body_comes_from_the_wake),
         NodeTest::fake("a_fired_text_body_comes_from_its_wake", fired_text_body_comes_from_the_wake),
+        NodeTest::fake("a_request_with_no_body_closes_body_on_any_route", fired_without_a_body),
+        NodeTest::fake("a_null_body_flows_where_the_type_takes_null_and_closes_body_elsewhere", null_body),
         NodeTest::fake("a_run_with_no_caller_fails_loud", no_caller),
     ]
 }
@@ -484,40 +487,82 @@ async fn optional_picture(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// A fired run whose body is text on a json route is the author's
+/// A fired run whose body is an object on a text route is the author's
 /// mistake in what they fired, answered like a caller's.
 async fn fired_body_of_the_wrong_shape(rig: FakeRig) -> WeftResult<()> {
     let request = request();
     let mut wake = serde_json::to_value(&request).expect("request serializes");
-    wake["body"] = json!("hello there");
+    wake["body"] = json!({ "text": "hello there" });
     rig.wake(wake);
-    let conn = http_caller(DataType::Json, request, InboundMessage::Json(Value::Null));
+    let conn = http_caller_without_body(DataType::Text, request);
     rig.attach_caller(conn.clone());
-    let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
-    let (status, error) = refusal(&conn);
-    assert_eq!(status, 400);
-    assert!(error.contains("takes a json body") && error.contains("sent text"), "{error}");
+    rig.output_type("body", ty("String"));
+    let outcome = rig
+        .run(&RouteNode, json!({ "path": "chat/{room}", "dataType": "text" }))
+        .await
+        .ok()?;
+    assert_eq!(conn.heads().first().map(|head| head.status), Some(400));
+    match conn.chunks().first() {
+        Some(OutboundChunk::Text(error)) => {
+            assert!(error.contains("takes a text body") && error.contains("sent json"), "{error}")
+        }
+        other => panic!("a text route answers text, got {other:?}"),
+    }
     assert!(outcome.outputs.is_empty());
     Ok(())
 }
 
-/// A json body is one object. A list used to leave every port silent and
-/// the caller with no answer; now the caller hears what is wrong.
+/// The body's declared type decides what JSON it takes: the default
+/// `JsonDict` is one object, so a list (live) or a bare string (fired)
+/// is answered 400 naming the type, before anything downstream runs.
 async fn json_body_not_an_object(rig: FakeRig) -> WeftResult<()> {
     let conn = call(&rig, DataType::Json, InboundMessage::Json(json!([1, 2, 3])));
     let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
     let (status, error) = refusal(&conn);
     assert_eq!(status, 400);
-    assert!(error.contains("a list"), "{error}");
-    assert!(error.contains("json object"), "{error}");
+    assert!(error.contains("body does not fit JsonDict"), "{error}");
     assert!(outcome.outputs.is_empty());
+
+    let request = request();
+    let mut wake = serde_json::to_value(&request).expect("request serializes");
+    wake["body"] = json!("hello there");
+    rig.wake(wake);
+    let conn = http_caller_without_body(DataType::Json, request);
+    rig.attach_caller(conn.clone());
+    let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
+    let (status, error) = refusal(&conn);
+    assert_eq!(status, 400);
+    assert!(error.contains("body does not fit JsonDict"), "{error}");
+    assert!(outcome.outputs.is_empty());
+    Ok(())
+}
+
+/// Declared `Json`, a body is whatever JSON the caller sent: a list of
+/// lists from a live call, a bare string from a fired run.
+async fn json_body_any_json(rig: FakeRig) -> WeftResult<()> {
+    let conn = call(&rig, DataType::Json, InboundMessage::Json(json!([[1, "a"], [2, "b"]])));
+    rig.output_type("body", ty("Json"));
+    let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
+    assert_eq!(outcome.outputs["body"], json!([[1, "a"], [2, "b"]]));
+    assert!(conn.heads().is_empty(), "nothing refused");
+
+    let request = request();
+    let mut wake = serde_json::to_value(&request).expect("request serializes");
+    wake["body"] = json!("hello there");
+    rig.wake(wake);
+    rig.attach_caller(http_caller_without_body(DataType::Json, request));
+    let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
+    assert_eq!(outcome.outputs["body"], json!("hello there"));
     Ok(())
 }
 
 /// No body at all is not a bad body. It is how every GET arrives, so the
 /// request ports still fire and `body` closes.
 async fn json_body_absent(rig: FakeRig) -> WeftResult<()> {
-    let conn = call(&rig, DataType::Json, InboundMessage::Json(Value::Null));
+    let request = request();
+    rig.wake(serde_json::to_value(&request).expect("request serializes"));
+    let conn = http_caller_without_body(DataType::Json, request);
+    rig.attach_caller(conn.clone());
     rig.output_type("body", ty("{ email: String }"));
     let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
     assert!(outcome.outputs.get("body").is_none(), "no body, so `body` closes");
@@ -539,7 +584,7 @@ async fn fired_body_comes_from_the_wake(rig: FakeRig) -> WeftResult<()> {
     wake["body"] = json!({ "userId": "u-1", "text": "hi" });
     rig.wake(wake);
     // No connection body, exactly as a fired run arrives.
-    rig.attach_caller(http_caller(DataType::Json, request, InboundMessage::Json(Value::Null)));
+    rig.attach_caller(http_caller_without_body(DataType::Json, request));
     rig.output_type("body", ty("{ userId: String, text: String }"));
     let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
     assert_eq!(outcome.outputs["body"], json!({ "userId": "u-1", "text": "hi" }));
@@ -555,13 +600,53 @@ async fn fired_text_body_comes_from_the_wake(rig: FakeRig) -> WeftResult<()> {
     let mut wake = serde_json::to_value(&request).expect("request serializes");
     wake["body"] = json!("hello there");
     rig.wake(wake);
-    rig.attach_caller(http_caller(DataType::Text, request, InboundMessage::Json(Value::Null)));
+    rig.attach_caller(http_caller_without_body(DataType::Text, request));
     rig.output_type("body", ty("String"));
     let outcome = rig
         .run(&RouteNode, json!({ "path": "chat/{room}", "dataType": "text" }))
         .await
         .ok()?;
     assert_eq!(outcome.outputs["body"], json!("hello there"));
+    Ok(())
+}
+
+/// A request with no body (a GET, or a fire with no `body` in its
+/// payload) closes `body` on a text or a bytes route as on a json one,
+/// and the request ports still fire.
+async fn fired_without_a_body(rig: FakeRig) -> WeftResult<()> {
+    for (data_type, field, declared) in [(DataType::Text, "text", "String"), (DataType::Bytes, "bytes", "Image")] {
+        let request = request();
+        rig.wake(serde_json::to_value(&request).expect("request serializes"));
+        let conn = http_caller_without_body(data_type, request);
+        rig.attach_caller(conn.clone());
+        rig.output_type("body", ty(declared));
+        let outcome = rig
+            .run(&RouteNode, json!({ "path": "chat/{room}", "dataType": field }))
+            .await
+            .ok()?;
+        assert!(outcome.outputs.get("body").is_none(), "{field}: no body, so `body` closes");
+        assert_eq!(outcome.outputs["path"], json!("chat/room7"), "{field}: the request still arrives");
+        assert!(conn.heads().is_empty(), "{field}: nothing refused");
+    }
+    Ok(())
+}
+
+/// A json body that is `null` is a value, apart from no body at all: a
+/// body declared `Json` (which takes null) carries it on, and the default
+/// `JsonDict`, which takes no null, closes as for nothing.
+async fn null_body(rig: FakeRig) -> WeftResult<()> {
+    let conn = call(&rig, DataType::Json, InboundMessage::Json(Value::Null));
+    rig.output_type("body", ty("Json"));
+    let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
+    assert_eq!(outcome.outputs.get("body"), Some(&Value::Null), "the null is the body: {:?}", outcome.outputs);
+    assert!(conn.heads().is_empty(), "nothing refused");
+
+    let conn = call(&rig, DataType::Json, InboundMessage::Json(Value::Null));
+    rig.output_type("body", ty("JsonDict"));
+    let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
+    assert!(outcome.outputs.get("body").is_none(), "a null where no null is taken closes `body`");
+    assert_eq!(outcome.outputs["path"], json!("chat/room7"), "and the request still arrives");
+    assert!(conn.heads().is_empty(), "nothing refused");
     Ok(())
 }
 

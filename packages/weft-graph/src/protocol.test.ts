@@ -32,7 +32,7 @@ describe('typeReferencesFile', () => {
 	});
 
 	it('rejects text types, including ones containing a file-kind substring', () => {
-		for (const t of ['String', 'Number', 'JsonDict', 'List[String]', 'ImageMeta', 'Filename']) {
+		for (const t of ['String', 'Number', 'JsonDict', 'Json', 'List[Json]', 'List[String]', 'ImageMeta', 'Filename']) {
 			expect(typeReferencesFile(t), t).toBe(false);
 		}
 	});
@@ -247,6 +247,7 @@ describe('tryParseWeftType leaves only declarable unknown names to the compiler'
 		);
 		expect(refusal('List=String').error).toBe('`List=String`: `List` is not a type name: `List` is reserved by the type language');
 		expect(refusal('Media=String').error).toBe('`Media=String`: `Media` is not a type name: `Media` is reserved by the type language');
+		expect(refusal('Json=String').error).toBe('`Json=String`: `Json` is not a type name: `Json` is reserved by the type language');
 		expect(refusal('Kind=Verdict').unknownName).toBe(true);
 	});
 });

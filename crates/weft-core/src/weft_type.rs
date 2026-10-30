@@ -67,7 +67,7 @@ macro_rules! define_primitives {
 // crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm),
 // packages/weft-graph/src/protocol.ts CONTAINER_AND_SPECIAL_TYPES
 pub const CONTAINER_AND_SPECIAL_TYPES: &[&str] =
-    &["List", "Dict", "JsonDict", "Bus", "Access", "Infra", "Generator"];
+    &["List", "Dict", "JsonDict", "Json", "Bus", "Access", "Infra", "Generator"];
 
 define_primitives!(
     String,
@@ -689,6 +689,16 @@ pub struct RecordField {
     pub optional: bool,
 }
 
+/// Which door a cast goes through, the one thing the two disagree on:
+/// a value written into a port never turns a structure into text, and
+/// the Cast node, asked outright, does. See [`WeftType::cast_value`] and
+/// [`WeftType::cast_requested`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CastDoor {
+    Literal,
+    Requested,
+}
+
 /// What a file control offers for a port: the file type it picks (and
 /// writes into `@asset(..., <Type>)`), and whether the port holds
 /// several files rather than one.
@@ -717,6 +727,17 @@ pub enum WeftType {
     /// Compatible with any Dict[String, V] in both directions.
     /// Use for raw API responses where the shape is unknown or too complex to declare.
     JsonDict,
+    /// Any value made only of JSON: a string, a number, a boolean,
+    /// null, or a list or object of those at any depth. For a value
+    /// whose shape the program cannot know (a device's answer to an
+    /// arbitrary command, a body the sender decides). Not an Any: a
+    /// stored file, a bus, a stream, an access or an infra handle is
+    /// no JSON value and never fits. Every JSON-made type flows in
+    /// ([`WeftType::fits_json`]); a `Json` value flows out only into
+    /// `Json` (narrowing it is the Cast node's job, which checks the
+    /// value).
+    // SYNC: WeftType::Json <-> packages/weft-graph/src/protocol.ts WeftType 'json'
+    Json,
     /// A message-bus handle: an in-process channel between co-alive
     /// nodes. A `Bus` output connects only to a `Bus` input; message
     /// payloads are not type-checked by the language (the envelope is the
@@ -795,6 +816,7 @@ impl PartialEq for WeftType {
                 a.len() == b.len() && a.iter().all(|m| b.contains(m))
             }
             (WeftType::JsonDict, WeftType::JsonDict) => true,
+            (WeftType::Json, WeftType::Json) => true,
             (WeftType::Bus, WeftType::Bus) => true,
             (WeftType::Access, WeftType::Access) => true,
             (WeftType::Infra, WeftType::Infra) => true,
@@ -1101,6 +1123,7 @@ impl WeftType {
             // reference files, but nothing about the port value itself
             // is a file to cast or pick, so it sits with Bus here.
             WeftType::JsonDict
+            | WeftType::Json
             | WeftType::Bus
             | WeftType::Access
             | WeftType::Infra
@@ -1171,7 +1194,7 @@ impl WeftType {
     /// data, not a skip signal).
     pub fn contains_null(&self) -> bool {
         match self {
-            WeftType::Primitive(WeftPrimitive::Null) => true,
+            WeftType::Primitive(WeftPrimitive::Null) | WeftType::Json => true,
             WeftType::Union(types) => types.iter().any(|t| t.contains_null()),
             WeftType::Named { body, .. } => body.contains_null(),
             _ => false,
@@ -1181,7 +1204,7 @@ impl WeftType {
     /// The canonical zero value for this type: what an unwired,
     /// unseeded port of this type defaults to. Number -> 0, String ->
     /// "", Boolean -> false, List -> [], Dict/JsonDict -> {}. Types with
-    /// no literal default (Null/Empty, Media, Bus, and unresolved
+    /// no literal default (Null/Empty, Json, Media, Bus, and unresolved
     /// TypeVar) default to JSON null, the universal
     /// "no value". For a union, the zero value of its first NON-null
     /// variant (so an optional `Number?` = `Number | Null` zeroes to 0,
@@ -1217,7 +1240,9 @@ impl WeftType {
                 }
             }
             WeftType::Named { body, .. } => body.zero_value(),
-            WeftType::Bus
+            // Any JSON value is one, and none is more neutral than null.
+            WeftType::Json
+            | WeftType::Bus
             | WeftType::Access
             | WeftType::Infra
             | WeftType::Generator(_)
@@ -1254,6 +1279,9 @@ impl WeftType {
             (WeftType::JsonDict, WeftType::JsonDict) => true,
             (WeftType::JsonDict, WeftType::Dict(_)) => true,
             (WeftType::Dict(_), WeftType::JsonDict) => true,
+            // Json takes every JSON-made type, at any depth; Json itself
+            // flows only into Json (and a union or a variable holding it).
+            (src, WeftType::Json) => src.fits_json(),
             // A bus connects only to a bus; payloads are not type-checked.
             (WeftType::Bus, WeftType::Bus) => true,
             // An access connects only to an access; the KIND/service is
@@ -1329,6 +1357,32 @@ impl WeftType {
             // the unions handled Named -> Named).
             (_, WeftType::Named { .. }) => false,
             _ => false,
+        }
+    }
+
+    /// Is every value of this type made only of JSON, so it fits a
+    /// `Json` port? Text, numbers, booleans and null are; a list, a dict
+    /// or a record is when what it holds is; a union when every member
+    /// is; a declared name when its body is. A stored file, a bus, a
+    /// stream, an access or an infra handle is not. A type variable
+    /// answers yes, as it does for every compatibility question.
+    // SYNC: fits_json <-> packages/weft-graph/src/webview/lib/types/index.ts fitsJson
+    fn fits_json(&self) -> bool {
+        match self {
+            WeftType::Primitive(p) => matches!(
+                p,
+                WeftPrimitive::String
+                    | WeftPrimitive::Number
+                    | WeftPrimitive::Boolean
+                    | WeftPrimitive::Null
+                    | WeftPrimitive::Empty
+            ),
+            WeftType::List(inner) | WeftType::Dict(inner) => inner.fits_json(),
+            WeftType::Union(members) => members.iter().all(Self::fits_json),
+            WeftType::Record { fields, .. } => fields.iter().all(|f| f.ty.fits_json()),
+            WeftType::Named { body, .. } => body.fits_json(),
+            WeftType::JsonDict | WeftType::Json | WeftType::TypeVar(_) => true,
+            WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_) => false,
         }
     }
 
@@ -1509,8 +1563,24 @@ impl WeftType {
     ///   the result is an AMBIGUOUS cast, refused loudly naming the
     ///   readings (never silently picked by declaration order);
     /// - Null, Bus, TypeVar, and file types never cast
-    ///   (a file value is a marker, not convertible data).
+    ///   (a file value is a marker, not convertible data);
+    /// - a list or an object never becomes text here: one written where
+    ///   text is wanted is a mistake far more often than a wish. The
+    ///   Cast node, asked outright, does it ([`Self::cast_requested`]).
     pub fn cast_value(&self, value: &serde_json::Value) -> Result<serde_json::Value, std::string::String> {
+        self.cast_through(value, CastDoor::Literal)
+    }
+
+    /// Cast a JSON value into this type the way the Cast node does: the
+    /// rules of [`Self::cast_value`], plus a list or an object into
+    /// `String` (at any depth) is its JSON text, the one conversion
+    /// [`Self::cast_allowed`] grants a program that asks for it and a
+    /// written value never gets.
+    pub fn cast_requested(&self, value: &serde_json::Value) -> Result<serde_json::Value, std::string::String> {
+        self.cast_through(value, CastDoor::Requested)
+    }
+
+    fn cast_through(&self, value: &serde_json::Value, door: CastDoor) -> Result<serde_json::Value, std::string::String> {
         use serde_json::Value;
         // Exact fit: hand it back untouched (preserves the written form).
         if Self::is_compatible(&Self::infer(value), self) {
@@ -1570,18 +1640,21 @@ impl WeftType {
             WeftType::Primitive(WeftPrimitive::String) => match value {
                 Value::Number(n) => Ok(Value::String(n.to_string())),
                 Value::Bool(b) => Ok(Value::String(b.to_string())),
+                Value::Array(_) | Value::Object(_) if door == CastDoor::Requested => {
+                    Ok(Value::String(value.to_string()))
+                }
                 _ => Err(format!("no cast from {} into String", Self::infer(value))),
             },
             WeftType::List(inner) => match value {
                 Value::Array(items) => items
                     .iter()
-                    .map(|v| inner.cast_value(v))
+                    .map(|v| inner.cast_through(v, door))
                     .collect::<Result<Vec<_>, _>>()
                     .map(Value::Array),
                 Value::String(s) => {
                     let parsed: Value = serde_json::from_str(s.trim())
                         .map_err(|e| format!("{s:?} is not valid JSON: {e}"))?;
-                    self.cast_value(&parsed)
+                    self.cast_through(&parsed, door)
                 }
                 _ => Err(format!("no cast from {} into {self}", Self::infer(value))),
             },
@@ -1589,14 +1662,14 @@ impl WeftType {
                 Value::Object(map) => {
                     let mut out = serde_json::Map::new();
                     for (k, v) in map {
-                        out.insert(k.clone(), v_ty.cast_value(v)?);
+                        out.insert(k.clone(), v_ty.cast_through(v, door)?);
                     }
                     Ok(Value::Object(out))
                 }
                 Value::String(s) => {
                     let parsed: Value = serde_json::from_str(s.trim())
                         .map_err(|e| format!("{s:?} is not valid JSON: {e}"))?;
-                    self.cast_value(&parsed)
+                    self.cast_through(&parsed, door)
                 }
                 _ => Err(format!("no cast from {} into {self}", Self::infer(value))),
             },
@@ -1633,7 +1706,7 @@ impl WeftType {
                                 }
                             }
                             Some(v) => {
-                                let cast = field.ty.cast_value(v).map_err(|e| {
+                                let cast = field.ty.cast_through(v, door).map_err(|e| {
                                     format!("field {:?}: {e}", field.name)
                                 })?;
                                 out.insert(field.name.clone(), cast);
@@ -1648,7 +1721,7 @@ impl WeftType {
                 Value::String(s) => {
                     let parsed: Value = serde_json::from_str(s.trim())
                         .map_err(|e| format!("{s:?} is not valid JSON: {e}"))?;
-                    self.cast_value(&parsed)
+                    self.cast_through(&parsed, door)
                 }
                 _ => Err(format!("no cast from {} into {self}", Self::infer(value))),
             },
@@ -1656,7 +1729,7 @@ impl WeftType {
             // of the named type (nominal-ness lives in the type system,
             // values carry no name tag).
             WeftType::Named { body, .. } => body
-                .cast_value(value)
+                .cast_through(value, door)
                 .map_err(|e| format!("not a valid {self}: {e}")),
             // Exact compatibility was tried above; now EVERY member's
             // cast. One success (or several agreeing) wins; members
@@ -1664,10 +1737,22 @@ impl WeftType {
             // both readings, so the writer disambiguates instead of the
             // compiler guessing.
             WeftType::Union(members) => {
-                let successes: Vec<(&WeftType, serde_json::Value)> = members
-                    .iter()
-                    .filter_map(|m| m.cast_value(value).ok().map(|v| (m, v)))
-                    .collect();
+                // A list or an object turned into its JSON text is the
+                // reading of last resort, at any depth: every member is
+                // tried the literal way first, and only when none takes
+                // the value is the text allowed (`String | List[String]`
+                // handed `[1, 2]` is `["1", "2"]`, and a declared name
+                // over `String | Number` beside it changes nothing).
+                let readings = |door: CastDoor| -> Vec<(&WeftType, serde_json::Value)> {
+                    members
+                        .iter()
+                        .filter_map(|m| m.cast_through(value, door).ok().map(|v| (m, v)))
+                        .collect()
+                };
+                let mut successes = readings(CastDoor::Literal);
+                if successes.is_empty() && door == CastDoor::Requested {
+                    successes = readings(CastDoor::Requested);
+                }
                 match successes.as_slice() {
                     [] => Err(format!("no member of {self} can cast {}", Self::infer(value))),
                     [(_, v)] => Ok(v.clone()),
@@ -1696,7 +1781,7 @@ impl WeftType {
     /// The Cast node's compile-time conversion table: may a value of
     /// `source` be CAST (converted / runtime-validated) into `target`?
     /// The one table the compiler's validate pass consults; the runtime
-    /// side of the same door is [`Self::cast_value`], so a pair allowed
+    /// side of the same door is [`Self::cast_requested`], so a pair allowed
     /// here either converts or fails loudly at run time with a
     /// field-level message, and a pair refused here dies at compile
     /// time (`JsonDict -> Number` is nonsense, not a runtime surprise).
@@ -1710,9 +1795,12 @@ impl WeftType {
     ///   structures emit JSON; stored files, buses, and accesses do
     ///   not stringify);
     /// - `Number` <-> `Boolean` (1/0);
-    /// - any generic or declared object shape (JsonDict, Dict, List,
-    ///   Record, Named) -> a `Record` or `Named` target: the checked
-    ///   claim, validated against the declared structure at run time.
+    /// - any generic or declared object shape (JsonDict, Json, Dict,
+    ///   List, Record, Named) -> a `Record` or `Named` target: the
+    ///   checked claim, validated against the declared structure at run
+    ///   time;
+    /// - `Json` -> any JSON-made type (a `Json` value may be any of
+    ///   them; the run-time cast checks this one is).
     ///
     /// Unresolved endpoints answer Ok: `unresolved-typevar` owns those.
     pub fn cast_allowed(source: &WeftType, target: &WeftType) -> Result<(), std::string::String> {
@@ -1752,6 +1840,7 @@ impl WeftType {
             matches!(
                 t,
                 WeftType::JsonDict
+                    | WeftType::Json
                     | WeftType::Dict(_)
                     | WeftType::List(_)
                     | WeftType::Record { .. }
@@ -1777,6 +1866,9 @@ impl WeftType {
             // a plain object holding its marker; the cast checks the
             // marker (and that its kind is the target's) at run time.
             (s, t) if t.is_file_valued() => object_shaped(s),
+            // A Json value may already be any JSON-made type; the cast
+            // checks at run time that this one is.
+            (WeftType::Json, t) => t.fits_json(),
             // Container targets from container sources lean on the
             // runtime cast's recursion (List[String] -> List[Number]).
             (WeftType::List(s_inner), WeftType::List(t_inner)) => {
@@ -1948,6 +2040,9 @@ impl WeftType {
             WeftType::JsonDict => {
                 if value.is_object() { Ok(()) } else { mismatch(path) }
             }
+            // Every JSON value is one, and like JsonDict nothing inside
+            // is held to anything.
+            WeftType::Json => Ok(()),
             WeftType::Record { fields, open } => {
                 let Value::Object(map) = value else { return mismatch(path) };
                 if !open {
@@ -2166,6 +2261,7 @@ impl WeftType {
             | WeftType::Access
             | WeftType::Infra
             | WeftType::Generator(_) => value.is_object(),
+            WeftType::Json => true,
             WeftType::Union(members) => members.iter().any(|m| m.shallow_matches(value)),
             WeftType::Named { body, .. } => body.shallow_matches(value),
             WeftType::TypeVar(_) => false,
@@ -2393,6 +2489,7 @@ fn parse_single_type(s: &str) -> Result<WeftType, std::string::String> {
 
     match s {
         "JsonDict" => return Ok(WeftType::JsonDict),
+        "Json" => return Ok(WeftType::Json),
         "Bus" => return Ok(WeftType::Bus),
         "Access" => return Ok(WeftType::Access),
         "Infra" => return Ok(WeftType::Infra),
@@ -2594,6 +2691,7 @@ impl WeftType {
                 }
             }
             WeftType::JsonDict => out.push_str("JsonDict"),
+            WeftType::Json => out.push_str("Json"),
             WeftType::Bus => out.push_str("Bus"),
             WeftType::Access => out.push_str("Access"),
             WeftType::Infra => out.push_str("Infra"),

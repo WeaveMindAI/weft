@@ -397,7 +397,9 @@ triggers on and the change rebuilt the code, it is refused (next paragraph);
 when only the graph changed, it goes through and leaves every instance on
 the old version. `weft resync` moves only the triggers that are on and
 behind the build. A trigger is behind when the part of the program its
-fires run, or that part's code, changed since it was turned on. With none
+fires run, or that part's code, or anything in front of it (a node feeding
+its inputs or its gate, which runs at its setup) changed since it was turned
+on. With none
 behind it says so and succeeds,
 and it never turns on a trigger that is off: it names the `weft activate
 --trigger <node>` that would.

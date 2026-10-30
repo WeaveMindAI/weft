@@ -29,13 +29,37 @@ triggers share, like the schema all their tables live in, is written once and
 wired to each of them; two copies of `create extension if not exists` racing
 each other is how one of them fails on a duplicate key.
 
-So after changing one, `weft resync`. Until then your listener carries on with
+If you want something done once before the triggers listen, like creating the
+table they write to, wire it in front of them. A gate is enough, since any
+value but `false` lets the trigger through:
+
+```weft
+pg = PostgresDatabase {}
+
+schema = PostgresExecuteQuery {
+  account: pg.access
+  query: "create table if not exists cards (id text primary key, title text)"
+}
+
+add = Route { path: "cards", method: "POST" }
+add._should_flow = schema.rows
+
+list = Route { path: "cards", method: "GET" }
+list._should_flow = schema.rows
+```
+
+`schema` runs once, at `weft activate`, before either route listens, and if it
+fails the activation is cancelled. A request never runs it again.
+
+So after changing anything in front of a trigger, `weft resync`. Until then
+`weft status` shows the trigger as behind, and your listener carries on with
 what it registered. weft tells you when a bake is stale:
 
 ```text
 the code changed since trigger 'inbound' was last prepared, so its bake is
-stale. Prepare it again: `weft bake` does it without listening, `weft activate`
-does it and listens
+stale. Prepare it again: `weft bake` does it and changes nothing that listens;
+if the trigger is off, `weft activate` does it and turns it on; if it is on,
+`weft resync` brings it onto the new build and prepares it there
 ```
 
 ## Answering on a URL
@@ -68,7 +92,13 @@ does not fit is answered `400` naming what is wrong, and no node after `post`
 runs. A body carrying a key that `Card` does not declare is answered `400`
 too. If callers may
 send more than you read, end the type with `..`; for what that does, go and
-read [what fits into what](types.md#what-fits-into-what). A request with no body, like a `GET`, closes `body`.
+read [what fits into what](types.md#what-fits-into-what). If callers send JSON
+of any shape, a list or a bare number as well as an object, declare
+`-> (body: Json)`. A request with no body, like a `GET`, closes `body`,
+whatever the route's `dataType`. A json body that is `null` is a value: it
+comes out on a `body` whose type takes `Null` (`Json` does), and closes
+`body` on any other, the way a `null` counts as nothing on a port that does
+not take it.
 
 If you want part of the path as a value, capture it with `{name}` and declare
 an output of the same name:

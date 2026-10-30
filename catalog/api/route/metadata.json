@@ -50,7 +50,7 @@
       },
       "default": "json",
       "label": "Body shape",
-      "description": "Body shape. `json`: the body is one JSON object on `body` (a record type or `JsonDict`); anything else is answered 400. `text`: the whole body is a String on `body` (declare `-> (body: String)`). `bytes`: the body is stored and its stored-file value lands on `body` (declare `File`, or `Image`, which is checked against the bytes). Reply and Stream answer in this shape unless their `answerAs` says otherwise."
+      "description": "Body shape. `json`: the body is JSON on `body`, held to the type declared there (a record type or `JsonDict` takes one object, `Json` any JSON value); one that does not fit is answered 400. `text`: the whole body is a String on `body` (declare `-> (body: String)`). `bytes`: the body is stored and its stored-file value lands on `body` (declare `File`, or `Image`, which is checked against the bytes). Reply and Stream answer in this shape unless their `answerAs` says otherwise."
     },
     {
       "name": "auth",
@@ -160,8 +160,8 @@
     {
       "name": "body",
       "type": "JsonDict",
-      "narrowable": "JsonDict | String | File",
-      "description": "The request body, held to the type declared here: a record or `JsonDict` for `json`, `String` for `text`, a file kind for `bytes`. A body that does not fit is answered 400 naming the field. Closed when the request carries no body (a GET)."
+      "narrowable": "JsonDict | Json | File",
+      "description": "The request body, held to the type declared here: a record, `JsonDict` or `Json` for `json`, `String` for `text`, a file kind for `bytes`. A body that does not fit is answered 400 naming the field. Closed when the request carries no body (a GET)."
     }
   ],
   "claimsRoute": {
@@ -177,7 +177,7 @@
     "headers?": "List[List[String]]",
     "caller?": "JsonDict",
     "baseUrl?": "String",
-    "body?": "JsonDict | String"
+    "body?": "Json"
   },
   "features": {
     "pure": true,
@@ -192,11 +192,11 @@
         "kind": "all",
         "of": [
           { "kind": "not", "of": { "kind": "config_in_set", "field": "dataType", "values": ["text", "bytes"] } },
-          { "kind": "not", "of": { "kind": "output_type_fits", "port": "body", "within": "JsonDict" } }
+          { "kind": "not", "of": { "kind": "output_type_fits", "port": "body", "within": "JsonDict | Json" } }
         ]
       },
       "then": {
-        "message": "Route '{id}' takes a json body, which is one JSON object: declare `body` as a record type or `JsonDict`, or set `dataType` to the shape the body has.",
+        "message": "Route '{id}' takes a json body: declare `body` as a record type or `JsonDict` for one JSON object, or `Json` for any JSON value, or set `dataType` to the shape the body has.",
         "level": "structural",
         "severity": "error",
         "field": "dataType"

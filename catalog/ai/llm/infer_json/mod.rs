@@ -4,7 +4,8 @@
 //! what differs is `response`: the reply is repaired with the lib's
 //! JSON repairer (the streaming transport skips the lib's own
 //! post-processing, so the node applies it), parsed, and held to the
-//! type the program declared on `response` (a narrowable `JsonDict`).
+//! type the program declared on `response` (`JsonDict` unless the
+//! program declares any JSON-made type there).
 //!
 //! The answer is checked BEFORE the turn is written to the
 //! conversation file: an answer that is not JSON, or does not fit the
