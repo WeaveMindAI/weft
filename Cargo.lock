@@ -1000,7 +1000,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
 dependencies = [
  "digest 0.10.7",
- "spin",
+ "spin 0.10.1",
 ]
 
 [[package]]
@@ -2836,7 +2836,7 @@ dependencies = [
  "nix",
  "once_cell",
  "smallvec",
- "spin",
+ "spin 0.10.1",
  "symbolic-demangle",
  "tempfile",
  "thiserror 2.0.21",
@@ -3748,6 +3748,15 @@ name = "spin"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
+dependencies = [
+ "lock_api 0.4.14",
+]
+
+[[package]]
+name = "spin"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0134f9043ed38b087ac4f7d4af44c79e2c9e5094421fe3164f435ce585953b10"
 dependencies = [
  "lock_api 0.4.14",
 ]
@@ -5354,7 +5363,7 @@ dependencies = [
  "objc2-core-foundation",
  "once_cell",
  "p256",
- "phf_shared 0.11.3",
+ "phf_shared 0.13.1",
  "rand_core 0.6.4",
  "regex-automata",
  "regex-syntax",
@@ -5366,7 +5375,7 @@ dependencies = [
  "sha2",
  "slab",
  "smallvec",
- "spin",
+ "spin 0.12.3",
  "stable_deref_trait",
  "subtle",
  "syn 2.0.119",
