@@ -921,13 +921,20 @@ pub async fn give_up_in(db: &impl Client, run_id: RunId, owner: &str, why: &str)
     let at_unix = unix_now() as u64;
     // A record that does not read still ends: the run's ending is what
     // matters most, and the charges it may leave open are said lost.
-    let mut writes = match read_record(db, run_id, None).await?.events(run_id) {
-        Ok(record) => crate::fold::unpriced_charges_closed(
-            run_id,
-            &record,
-            "the run's record could not be written, so it ended before the job was read back",
-            at_unix,
-        ),
+    let record = read_record(db, run_id, None).await?;
+    let mut writes = match crate::on_blocking_pool(move || {
+        record.events(run_id).map(|record| {
+            crate::fold::unpriced_charges_closed(
+                run_id,
+                &record,
+                "the run's record could not be written, so it ended before the job was read back",
+                at_unix,
+            )
+        })
+    })
+    .await
+    {
+        Ok(writes) => writes,
         Err(e) => {
             tracing::error!(
                 target: "weft_journal::record", %run_id, error = %e,

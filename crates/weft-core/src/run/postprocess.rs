@@ -211,10 +211,10 @@ pub(crate) fn emit_value_on_edge(
     let target_handle = edge.target_port();
     let id = pulse_id(emission_id, &edge.id, false);
 
-    let bucket = pulses.entry(edge.target.clone()).or_default();
-    if bucket.iter().any(|p| p.id == id) {
+    if pulses.landed(&edge.target, id) {
         return;
     }
+    let bucket = pulses.entry(edge.target.clone()).or_default();
     let already_present_same_value = !super::ready::edge_targets_generator(program_idx, edge)
         && bucket.iter().any(|p| {
             p.status.is_pending()
@@ -439,10 +439,10 @@ pub(crate) fn emit_closure_on_edge(
     let generator_target = super::ready::edge_targets_generator(program_idx, edge);
     let id = pulse_id(emission_id, &edge.id, true);
 
-    let bucket = pulses.entry(edge.target.clone()).or_default();
-    if bucket.iter().any(|p| p.id == id) {
+    if pulses.landed(&edge.target, id) {
         return;
     }
+    let bucket = pulses.entry(edge.target.clone()).or_default();
     let already_present = bucket.iter().any(|p| {
         p.status.is_pending()
             && p.run_id == run_id

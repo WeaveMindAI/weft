@@ -22,6 +22,21 @@ pub use fold::{fold_to_snapshot, unpriced_charges_closed, unpriced_cost, ChargeB
 pub use seed::{fold_seeded, seed_chain, LiveFold, SeedChain};
 pub use traits::{BatchError, JournalClient, JournalRow, Position, RecordClient};
 
+/// Run `work`, which decodes or folds a run's whole record, on tokio's
+/// blocking pool, and answer what it answers. A long run's record is real
+/// work, and a thread that serves calls never does it: every reader of a whole
+/// record, in the dispatcher and the broker, comes through here. A panic
+/// in `work` carries on in the caller, as if it had run there.
+pub async fn on_blocking_pool<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(answer) => answer,
+        Err(e) => match e.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            Err(e) => panic!("record work on the blocking pool was cancelled (the runtime is shutting down): {e}"),
+        },
+    }
+}
+
 /// The channel a run's new rows are announced on (by the broker after a
 /// batch of records commits, at most every few milliseconds; by the
 /// dispatcher after it writes a run nobody drives): the live view reads

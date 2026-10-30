@@ -1413,8 +1413,14 @@ struct Args {{
     resume_when_caller_leaves: bool,
 }}
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {{
+// The runtime every weft process runs on (`weft_core::process_runtime`):
+// a node body that runs long in one poll leaves the worker's door and
+// its lease answering.
+fn main() -> anyhow::Result<()> {{
+    weft_core::process_runtime::build()?.block_on(serve_worker())
+}}
+
+async fn serve_worker() -> anyhow::Result<()> {{
     // Colours only on a terminal: a platform's log collector keeps the
     // escape codes as text.
     tracing_subscriber::fmt()

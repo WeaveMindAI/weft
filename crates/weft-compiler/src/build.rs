@@ -967,6 +967,7 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path) -> BuildResul
     let mut rendered = std::fs::read_to_string(&template_path).map_err(BuildError::Io)?;
     for (token, value) in [
         ("{{target_cache_key}}", builder_base_cache_key(weft_root)?),
+        ("{{worker_rustflags}}", weft_core::builds::WORKER_RUSTFLAGS.to_string()),
         ("{{install_build_system_packages}}", install_packages),
         ("{{build_env_lines}}", env_lines),
     ] {
@@ -1326,6 +1327,7 @@ pub fn build_node_test_binaries(
         .args(["build", "--workspace", "--message-format=json-render-diagnostics"])
         .current_dir(&workspace.root)
         .env("CARGO_TARGET_DIR", &workspace.target_dir)
+        .env("RUSTFLAGS", weft_core::builds::WORKER_RUSTFLAGS)
         .stderr(std::process::Stdio::inherit())
         .output()
         .map_err(|e| {

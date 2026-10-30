@@ -427,10 +427,10 @@ pub fn inheritable_nodes(project: &ProjectDefinition, snapshot: &RunSnapshot) ->
     let index = ProgramIndex::build(project);
     let mut eligible: HashSet<Located> = HashSet::new();
     let mut unfinished: HashSet<Located> = HashSet::new();
-    for (id, records) in &snapshot.firings {
-        for record in records {
+    for (id, records) in snapshot.firings.iter() {
+        for record in records.values() {
             let place = Located::at(id, &record.frames);
-            if matches!(record.status, NodeFiringStatus::Completed | NodeFiringStatus::Skipped) {
+            if matches!(record.status(), NodeFiringStatus::Completed | NodeFiringStatus::Skipped) {
                 eligible.insert(place);
             } else {
                 unfinished.insert(place);
@@ -450,8 +450,8 @@ pub fn inheritable_nodes(project: &ProjectDefinition, snapshot: &RunSnapshot) ->
             let members = members_in(&g, &group.id, &at.path);
             let complete = complete_loop(project, &index, snapshot, &group.id, &at.frames())
                 && members.iter().all(|member| snapshot.firings.get(&member.id).is_none_or(|records|
-                    records.iter().filter(|record| Located::at(&member.id, &record.frames) == *member)
-                        .all(|record| matches!(record.status, NodeFiringStatus::Completed | NodeFiringStatus::Skipped))));
+                    records.values().filter(|record| Located::at(&member.id, &record.frames) == *member)
+                        .all(|record| matches!(record.status(), NodeFiringStatus::Completed | NodeFiringStatus::Skipped))));
             for member in members {
                 if complete { eligible.insert(member); } else { eligible.remove(&member); }
             }
@@ -475,9 +475,9 @@ fn complete_loop(project: &ProjectDefinition, index: &ProgramIndex, snapshot: &R
     let entry = loop_in_id(group);
     if scope_skipped_at(project, index, snapshot, &entry, frames) { return true; }
     let Some(records) = snapshot.firings.get(&entry) else { return false };
-    let Some(record) = records.iter().find(|record| &record.frames == frames) else { return false };
-    if record.status == NodeFiringStatus::Skipped { return true; }
-    if record.status != NodeFiringStatus::Completed { return false; }
+    let Some(record) = records.get(frames) else { return false };
+    if record.status() == NodeFiringStatus::Skipped { return true; }
+    if record.status() != NodeFiringStatus::Completed { return false; }
     let key = crate::primitive::LoopInstanceKey { group_id: group.into(), parent_frames: frames.clone(), run_id: snapshot.run_id };
     let Some(instance) = snapshot.loop_runtime.get(&key) else { return false };
     if instance.terminated.is_none_or(|reason| matches!(reason,
@@ -516,8 +516,8 @@ fn groups_around(project: &ProjectDefinition, group: &str) -> Vec<String> {
 /// loop's `LoopOut` fires per iteration and is checked here; a loop's
 /// `LoopIn` fires at its parent's frames and is the parent's to check.
 fn scope_settled(project: &ProjectDefinition, index: &ProgramIndex, snapshot: &RunSnapshot, scope: &str, frames: &LoopFrames) -> bool {
-    let settled_at = |id: &str| snapshot.firings.get(id).is_some_and(|records| records.iter().any(|record|
-        &record.frames == frames && matches!(record.status, NodeFiringStatus::Completed | NodeFiringStatus::Skipped)));
+    let settled_at = |id: &str| snapshot.firings.get(id).and_then(|records| records.get(frames))
+        .is_some_and(|record| matches!(record.status(), NodeFiringStatus::Completed | NodeFiringStatus::Skipped));
     for node in &project.nodes {
         if !index.admits(&node.id, frames) || index.stands_in(&node.id, frames) { continue; }
         let own_out = node.node_type == crate::project::boundary_types::LOOP_OUT

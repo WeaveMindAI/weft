@@ -37,7 +37,7 @@
 //! `LoopStreamEnded`, `LoopTerminated`), calling the same functions,
 //! so a resumed worker holds the instance the live one held.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -247,10 +247,12 @@ pub struct LoopInstance {
     /// port that received only closures (or was never wired) would
     /// produce no outward pulse, deadlocking downstream.
     pub gather_ports: Vec<String>,
-    /// Iterations the engine has launched body work for.
-    pub launched: Vec<u32>,
+    /// Iterations the engine has launched body work for. A set, so a
+    /// launch and a `LoopOut` ask about their own index without walking
+    /// every iteration before it.
+    pub launched: BTreeSet<u32>,
     /// Iterations whose `LoopOut` has fired.
-    pub out_fired: Vec<u32>,
+    pub out_fired: BTreeSet<u32>,
     /// Per gather-port, the per-index slot. `Closed` means the body
     /// closed that port at that iteration (assembled outward list gets
     /// `null` there).
@@ -286,8 +288,8 @@ impl LoopInstance {
             source,
             iter_cap,
             gather_ports,
-            launched: Vec::new(),
-            out_fired: Vec::new(),
+            launched: BTreeSet::new(),
+            out_fired: BTreeSet::new(),
             gather_lists: HashMap::new(),
             carry_values: HashMap::new(),
             outer_input: HashMap::new(),
@@ -307,7 +309,7 @@ impl LoopInstance {
     /// must find its successor already launched and go idle, never
     /// jump past in-flight iterations to a fresh index).
     pub fn next_index(&self) -> u32 {
-        self.launched.iter().copied().max().map(|m| m + 1).unwrap_or(0)
+        self.launched.last().map_or(0, |m| m + 1)
     }
 
 }
@@ -399,9 +401,7 @@ impl LoopRuntime {
     /// Record an iteration launch.
     pub fn record_launched(&mut self, key: &LoopInstanceKey, index: u32) {
         if let Some(inst) = self.instances.get_mut(key) {
-            if !inst.launched.contains(&index) {
-                inst.launched.push(index);
-            }
+            inst.launched.insert(index);
         }
     }
 
@@ -458,7 +458,7 @@ impl LoopRuntime {
         if inst.terminated.is_some() || inst.out_fired.contains(&index) {
             return Ok(false);
         }
-        inst.out_fired.push(index);
+        inst.out_fired.insert(index);
         for (port, slot) in gather_writes {
             inst.gather_lists.entry(port).or_default().insert(index, slot);
         }
@@ -1203,7 +1203,7 @@ pub fn launch_iteration(
     program_idx: &ProgramIndex,
     pulses: &mut PulseTable,
     scopes: &mut crate::run::scope::ScopeTable,
-    kicked: &mut HashMap<crate::frames::FiringLocation, crate::primitive::KickedNode>,
+    kicked: &mut crate::primitive::KickTable,
     now: u64,
 ) -> Result<IterationLaunch, String> {
     let group_id = key.group_id.as_str();
@@ -1596,8 +1596,8 @@ mod tests {
         assert!(err.contains("'history'"), "{err}");
         assert!(err.contains("because 'ask' failed: the model answered 500"), "names the node that broke: {err}");
         let inst = rt.get(&k).expect("instance");
-        assert_eq!(inst.out_fired, vec![0, 1], "the firing is recorded");
-        assert_eq!(inst.launched, vec![0, 1], "no next iteration launched");
+        assert_eq!(inst.out_fired, std::collections::BTreeSet::from([0, 1]), "the firing is recorded");
+        assert_eq!(inst.launched, std::collections::BTreeSet::from([0, 1]), "no next iteration launched");
         assert_eq!(*inst.carry_values["history"], serde_json::json!(["hi"]));
         // A crash-resume replay of the same firing decides the same way.
         assert!(rt.record_loop_out(&loop_project(), &k, 1, HashMap::new(), carry, Some(false)).is_err());
@@ -2155,7 +2155,7 @@ mod tests {
         let input = bag(&[("items", serde_json::json!([10, 20])), ("acc", serde_json::json!(5))]);
         let firing = instantiate(&mut rt, def(&project, "lp__in"), &project, &FiringInput { input: input.clone(), ..Default::default() }, &Vec::new(), Uuid::nil()).unwrap();
         let mut scopes = crate::run::scope::ScopeTable::default();
-        let mut kicked = HashMap::new();
+        let mut kicked = crate::primitive::KickTable::new();
         let launch = launch_iteration(&mut rt, &firing.key, 1, None, &project, &program_idx, &mut pulses, &mut scopes, &mut kicked, 3).unwrap();
         assert_eq!(launch.body_frames, vec![Frame::Loop { index: 1 }]);
         // The launch opens the iteration's copy of the loop, which kicks
@@ -2168,7 +2168,7 @@ mod tests {
         assert_eq!(value("item"), Some(serde_json::json!(20)), "the over slice at the index");
         assert_eq!(value("acc"), Some(serde_json::json!(5)), "the current carry");
         assert!(add.iter().all(|p| p.frames == launch.body_frames));
-        assert_eq!(rt.get(&firing.key).unwrap().launched, vec![1]);
+        assert_eq!(rt.get(&firing.key).unwrap().launched, std::collections::BTreeSet::from([1]));
         // The same launch replayed puts nothing new on the wires.
         let before = pulses["add"].len();
         launch_iteration(&mut rt, &firing.key, 1, None, &project, &program_idx, &mut pulses, &mut scopes, &mut kicked, 4).unwrap();

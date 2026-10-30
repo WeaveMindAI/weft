@@ -1069,9 +1069,7 @@ mod tests {
             defaults: Default::default(), given: Default::default(), broken: Vec::new(), metadata_wires: Vec::new(),
         };
         let index = ProgramIndex::build(&project);
-        let kick = crate::primitive::KickedNode {
-            firing: false, payload: None, port_snapshot: None, dispatched: false, scope_skipped: None,
-        };
+        let kick = crate::primitive::KickedNode::new(false, None, None, None);
         let group = super::kicked_group(&node, &kick, &vec![], project.id, &project, &index, &Default::default());
         assert!(group.skip.is_none(), "{:?}", group.skip);
         assert!(!group.received.input.contains_key("p"), "the marker waits for the instance's value");
@@ -1097,9 +1095,7 @@ mod tests {
         given.inputs.insert(Located::top("k"), [("a".into(), json!("handed in"))].into());
         project.given = given.places();
         let index = ProgramIndex::build(&project);
-        let kick = crate::primitive::KickedNode {
-            firing: false, payload: None, port_snapshot: None, dispatched: false, scope_skipped: None,
-        };
+        let kick = crate::primitive::KickedNode::new(false, None, None, None);
         let group = super::kicked_group(&node, &kick, &vec![], project.id, &project, &index, &given);
         assert!(group.skip.is_none(), "{:?}", group.skip);
         assert_eq!(*group.received.input["a"], json!("handed in"));

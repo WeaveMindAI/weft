@@ -47,14 +47,14 @@ use weft_core::run::loop_runtime::{
 };
 use weft_core::run::ready::owned_bag;
 use weft_core::run::{
-    check_completion, firing_at, firing_at_mut,
+    check_completion, firing_at, firing_at_mut, set_firing_status,
     postprocess::{close_unmentioned_downstream, postprocess_output, OutputBag},
     NodeFiring, NodeFiringStatus, NodeFiringTable,
 };
 use weft_core::generator::{StreamEnd, DEFAULT_MAX_BUFFERED_ITEMS};
 use weft_core::liveness::FiringLocation;
 use weft_core::node::NodeOutput;
-use weft_core::primitive::RunSnapshot;
+use weft_core::primitive::{KickedNode, RunSnapshot};
 use weft_core::project::ProgramIndex;
 use weft_core::pulse::{PulseStatus, PulseTable};
 use weft_core::cancellation::CancellationFlag;
@@ -189,7 +189,7 @@ pub(crate) enum StartsFrom {
     /// Born here from a plan (`crate::plan`): its roots kicked as the plan
     /// makes them (`crate::plan::Startable::opening`), its birth already
     /// handed to its record. Nothing is folded.
-    Plan { born_with: BornWith, kicked: HashMap<FiringLocation, weft_core::primitive::KickedNode> },
+    Plan { born_with: BornWith, kicked: weft_core::primitive::KickTable },
     /// Carried on from its record, as the worker's claim read it: folded.
     Record(Vec<RunEvent>),
 }
@@ -242,7 +242,7 @@ pub(crate) struct Drove {
     pub(crate) pulses: PulseTable,
     pub(crate) firings: NodeFiringTable,
     pub(crate) loop_runtime: LoopRuntime,
-    pub(crate) kicked: HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    pub(crate) kicked: weft_core::primitive::KickTable,
     pub(crate) scopes: ScopeTable,
 }
 
@@ -311,21 +311,43 @@ pub(crate) async fn run_one_observed(
     // the pump to hand them over.
     bus_coordinator.shutdown().await;
     drop(bus_coordinator);
+    // A durable run whose record stopped being written (a write got no
+    // answer, `DriveJournal::must_hand_back`) after the drive's last look
+    // can end no way but handed back: nothing after that write lands, its
+    // ending included. Decided here, before its spend and its caller's
+    // last words, so both go the way a hand-back's do. A write of the
+    // ending itself that goes unanswered is only known once it was tried
+    // (`end_run`): the caller has heard the ending by then, and a held
+    // answer is refused for want of its record.
+    let drove = match drove {
+        Ok(drove) if journal.must_hand_back() && !drove.outcome.pauses() => {
+            tracing::info!(
+                target: "weft_engine::run_driver",
+                %run_id, outcome = ?drove.outcome,
+                "the run's record could not be written; handing the run back"
+            );
+            Ok(Drove { outcome: RunOutcome::HandedBack, ..drove })
+        }
+        drove => drove,
+    };
     // Its spend: every figure still being worked out lands before the
     // ending. A charge still open is a call that spent and whose amount no
     // response stated yet. A run that pauses lets go of it, its opening on
     // record for the drive that picks the run up (`reopen_charges`); a run
     // that ended books it as the unknown it is, those this drive reopened
-    // from its record included. A run whose record lane is poisoned never
-    // carries on (the broker ends it, `end_run`), so it books them unknown
-    // too: those writes fail loudly on the poisoned lane, and the broker's
-    // give-up books whatever its record leaves open
-    // (`weft_journal::unpriced_charges_closed`). A call whose answer is
+    // from its record included. A durable run handed back because its
+    // record could not be written lets go of them the same way: what its
+    // record holds is what the next worker reopens. Any other run whose
+    // record lane is poisoned never carries on (the broker ends it,
+    // `end_run`), so it books them unknown too: those writes fail loudly
+    // on the poisoned lane, and the broker's give-up books whatever its
+    // record leaves open (`weft_journal::unpriced_charges_closed`). A call
+    // whose answer is
     // still being read holds this wait, and the metering tap bounds it: it
     // cuts an answer silent for its limit, or any answer once the run is
     // cancelled (`crate::metering::ANSWER_SILENCE_LIMIT`).
     let lets_go = drove.as_ref().is_ok_and(|drove| drove.outcome.pauses());
-    let closing = if lets_go && !journal.is_poisoned() {
+    let closing = if lets_go && (!journal.is_poisoned() || journal.must_hand_back()) {
         crate::metering::Closing::Release
     } else {
         crate::metering::Closing::Unknown("the run ended before the job was read back".into())
@@ -341,7 +363,7 @@ pub(crate) async fn run_one_observed(
     let ended = end_run(&clients.writer, &journal, run_id, replica, drove).await;
     if let Some(conn) = held {
         conn.release_answer().await;
-        hang_up(conn, lets_go, hand_back).await;
+        hang_up(conn, ended.as_ref().is_ok_and(|drove| drove.outcome.pauses()), hand_back).await;
     }
     ended
 }
@@ -427,10 +449,13 @@ async fn hang_up(conn: &crate::caller_conn::LiveCallerConnection, lets_go: bool,
 /// pauses waits for its whole record and writes no ending; a run that
 /// ended (or whose drive failed, ended Failed naming why) hands its ending
 /// over, a durable one waiting for it. When a write of the run failed,
-/// its record is behind and this worker can write nothing more of it: the
-/// broker ends it Failed after the last row that landed
-/// (`WorkerJournal::give_up`), unless another worker bore it (whose run
-/// it is).
+/// its record is behind and this worker can write nothing more of it: a
+/// durable run whose write got no answer is handed back from the prefix
+/// that landed (`DriveJournal::must_hand_back`), its ending unwritten,
+/// for the worker that picks it up; any other run, and a drive that
+/// failed (a panic), is ended Failed by the broker after the last row
+/// that landed (`WorkerJournal::give_up`), unless another worker bore it
+/// (whose run it is).
 async fn end_run(
     writer: &crate::journal_writer::WorkerJournal,
     journal: &DriveJournal,
@@ -444,6 +469,17 @@ async fn end_run(
         Err(e) => hand_ending(journal, &RunEvent::RunFailed { run_id, error: format!("{e:#}"), at_unix: now_unix() }, replica).await,
     };
     let Err(unwritten) = written else { return drove };
+    let drove = match drove {
+        Ok(drove) if journal.must_hand_back() => {
+            tracing::warn!(
+                target: "weft_engine::run_driver",
+                %run_id, error = %format!("{unwritten:#}"),
+                "the run's record could not be written; it is handed back to be carried on from what landed"
+            );
+            return Ok(Drove { outcome: RunOutcome::HandedBack, ..drove });
+        }
+        drove => drove,
+    };
     let why = match &drove {
         Ok(drove) => format!("the run ended ({:?}) but its record could not be written: {unwritten:#}", drove.outcome),
         Err(e) => format!("{e:#}; and its record could not be written: {unwritten:#}"),
@@ -505,7 +541,10 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// The run's fold of its own record: what an answer to one of its waits
 /// is read through, made the first time one is (a run born from a plan
-/// starts with none) and fed only the rows that landed since.
+/// starts with none) and fed only the rows that landed since. Folding a
+/// long run's record, and copying its state out, is real work: both run
+/// on the blocking pool (`weft_journal::on_blocking_pool`), never on the
+/// threads that serve the worker's door and keep its lease.
 pub(crate) struct RunFold {
     run_id: RunId,
     project: Arc<ProjectDefinition>,
@@ -515,10 +554,20 @@ pub(crate) struct RunFold {
 }
 
 impl RunFold {
-    /// The fold of a run that starts from `record` (a claim's).
-    fn of_record(run_id: RunId, project: Arc<ProjectDefinition>, chain: weft_journal::SeedChain, record: &[RunEvent]) -> anyhow::Result<Self> {
-        let live = weft_journal::LiveFold::start(run_id, project.clone(), &chain, record)?;
-        Ok(Self { run_id, project, chain, live: Some(live) })
+    /// The fold of a run that starts from `record` (a claim's), and the
+    /// state it holds (see [`checked_snapshot`]).
+    async fn of_record(
+        run_id: RunId,
+        project: Arc<ProjectDefinition>,
+        chain: weft_journal::SeedChain,
+        record: Vec<RunEvent>,
+    ) -> anyhow::Result<(Self, RunSnapshot)> {
+        weft_journal::on_blocking_pool(move || {
+            let live = weft_journal::LiveFold::start(run_id, project.clone(), &chain, &record)?;
+            let snap = checked_snapshot(run_id, &live)?;
+            Ok((Self { run_id, project, chain, live: Some(live) }, snap))
+        })
+        .await
     }
 
     /// No fold yet: a run born from a plan, which inherits nothing.
@@ -526,18 +575,30 @@ impl RunFold {
         Self { run_id, project, chain: Default::default(), live: None }
     }
 
-    /// The fold caught up with `record`, the run's whole record so far.
-    fn caught_up(&mut self, record: &[RunEvent]) -> anyhow::Result<&weft_journal::LiveFold> {
-        match &mut self.live {
-            Some(live) => live.catch_up(record)?,
-            None => self.live = Some(weft_journal::LiveFold::start(self.run_id, self.project.clone(), &self.chain, record)?),
-        }
-        Ok(self.live.as_ref().expect("just made"))
-    }
-
-    /// The fold as it stands (see [`checked_snapshot`]).
-    fn snapshot(&self) -> anyhow::Result<RunSnapshot> {
-        checked_snapshot(self.run_id, self.live()?)
+    /// Catch the fold up with `record`, the run's whole record so far,
+    /// and answer the state it then holds (see [`checked_snapshot`]).
+    async fn caught_up(&mut self, record: Vec<RunEvent>) -> anyhow::Result<RunSnapshot> {
+        let (run_id, project, chain, live) = (self.run_id, self.project.clone(), std::mem::take(&mut self.chain), self.live.take());
+        // A fold that refused rows keeps them, so every later snapshot
+        // refuses the same way (`checked_snapshot`).
+        let (chain, live, snap) = weft_journal::on_blocking_pool(move || {
+            let (live, caught) = match live {
+                Some(mut live) => {
+                    let caught = live.catch_up(&record);
+                    (Some(live), caught)
+                }
+                None => match weft_journal::LiveFold::start(run_id, project, &chain, &record) {
+                    Ok(live) => (Some(live), Ok(())),
+                    Err(e) => (None, Err(e)),
+                },
+            };
+            let snap = caught.and_then(|()| checked_snapshot(run_id, live.as_ref().expect("a fold that caught up exists")));
+            (chain, live, snap)
+        })
+        .await;
+        self.chain = chain;
+        self.live = live;
+        snap
     }
 
     /// What the firing of `record`, being resumed, sent before it
@@ -575,16 +636,17 @@ impl RunFold {
 /// Record the answers waiting for the run's waits as its own
 /// `SuspensionResolved`s, and catch the run's fold up with its record,
 /// which then holds everything the run did since its fold last looked (the
-/// waits it registered among it) and the answers last. The broker hands
-/// an answer until the batch that records it commits (which takes it off
-/// its queue), so they are on record before anything asks again.
+/// waits it registered among it) and the answers last. Answers the state
+/// the fold then holds. The broker hands an answer until the batch that
+/// records it commits (which takes it off its queue), so they are on
+/// record before anything asks again.
 async fn take_answers(
     journal: &DriveJournal,
     fold: &mut RunFold,
     run_id: RunId,
     replica: &str,
     answers: Vec<weft_broker_client::protocol::RunAnswer>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RunSnapshot> {
     let at_unix = now_unix();
     let resolved: Vec<RunEvent> = answers
         .into_iter()
@@ -593,7 +655,7 @@ async fn take_answers(
     JournalClient::record_events(journal, &resolved, Some(replica)).await?;
     journal.flush().await?;
     let record = JournalClient::events_for_run_id(journal, run_id).await?;
-    fold.caught_up(&record).map(|_| ())
+    fold.caught_up(record).await
 }
 
 /// Put the answers to suspended nodes on the run's record and resume, in
@@ -609,14 +671,14 @@ async fn resume_answered(
     answers: Vec<weft_broker_client::protocol::RunAnswer>,
     firings: &NodeFiringTable,
     pulses: &mut PulseTable,
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    kicked: &mut weft_core::primitive::KickTable,
     awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
 ) -> anyhow::Result<()> {
     if answers.is_empty() {
         return Ok(());
     }
-    take_answers(journal, fold, run_id, replica, answers).await?;
-    let resumed = resume_resolved_suspensions_in_place(fold, firings, pulses, kicked, awaited_sequences)?;
+    let snap = take_answers(journal, fold, run_id, replica, answers).await?;
+    let resumed = resume_resolved_suspensions_in_place(snap, firings, pulses, kicked, awaited_sequences)?;
     if resumed > 0 {
         tracing::info!(
             target: "weft_engine::resume",
@@ -668,7 +730,7 @@ async fn drive_run_id(
     // `LoopIterationLaunched`. The scheduler dispatches each
     // not-yet-dispatched kick once at its own frames; the payload for
     // the firing trigger threads through to the `ctx.wake` bag.
-    let mut kicked: HashMap<FiringLocation, weft_core::primitive::KickedNode> = HashMap::new();
+    let mut kicked = weft_core::primitive::KickTable::new();
     // What the run decided about its scopes (`weft_core::run::scope`):
     // no row of its own, the fold decides the same from the same rows.
     let mut scopes = ScopeTable::default();
@@ -703,13 +765,11 @@ async fn drive_run_id(
                 projects.fetch_definition(id, &hash).await?
                     .map(Arc::new).ok_or_else(|| anyhow::anyhow!("seed definition {hash} is missing from project {id}"))
             }).await?;
-            let fold = RunFold::of_record(run_id, project_arc.clone(), chain, &events)?;
-            drop(events);
-            let snap = fold.snapshot()?;
+            let (fold, snap) = RunFold::of_record(run_id, project_arc.clone(), chain, events).await?;
             let crashed = apply_snapshot(
                 &program, snap, &mut pulses, &mut firings, &mut kicked, &mut scopes, &mut awaited_sequences,
                 &mut loop_runtime,
-            );
+            )?;
             // A run claimed with its cancel waiting ends every open firing
             // Cancelled below, a body a dead drive left behind included.
             if !cancellation.is_cancelled() {
@@ -739,7 +799,7 @@ async fn drive_run_id(
         return Ok(Drove { outcome: RunOutcome::Cancelled { cause }, pulses, firings, loop_runtime, kicked, scopes });
     }
 
-    let mut outcome = drive(
+    let outcome = drive(
         &program,
         catalog.as_ref(),
         run_id,
@@ -769,7 +829,22 @@ async fn drive_run_id(
         hand_back,
         hold,
     )
-    .await?;
+    .await;
+    // A durable run whose record write got no answer is handed back, also
+    // when the failed write surfaced as an error from inside a turn (a
+    // write the turn waited on) rather than at its top: its record is a
+    // prefix of what it did either way (`DriveJournal::must_hand_back`).
+    let mut outcome = match outcome {
+        Err(e) if drive_journal.must_hand_back() => {
+            tracing::info!(
+                target: "weft_engine::run_driver",
+                %run_id, error = %format!("{e:#}"),
+                "the run's record could not be written; handing the run back"
+            );
+            RunOutcome::HandedBack
+        }
+        outcome => outcome?,
+    };
 
     // A route's caller is still waiting and nothing was ever sent: the
     // graph closed every path to its answer (a skipped Reply). That is a
@@ -880,10 +955,11 @@ async fn hand_back_overdue(hand_back: Option<&HandBack>) {
     }
 }
 
-/// The run's hand-back is overdue: the nodes still running stop where
-/// they are, what they said before that is applied (and goes on record),
-/// and the run is handed back. Their records stay open, so the next
-/// worker fails each one as cut short.
+/// The run is handed back now (its hand-back is overdue, or its record
+/// could not be written, `why`): the nodes still running stop where they
+/// are, what they said before that is applied (and goes on record when it
+/// still can), and the run is handed back. Their records stay open, so
+/// the next worker fails each one as cut short.
 #[allow(clippy::too_many_arguments)]
 async fn cut_short(
     bodies: &mut Bodies,
@@ -898,12 +974,13 @@ async fn cut_short(
     replica: &str,
     waiting: &mut HashMap<String, FiringLocation>,
     stream_rt: &mut StreamRuntime,
+    why: &str,
 ) -> RunOutcome {
     tracing::info!(
         target: "weft_engine::run_driver",
         run_id = %run_id,
         in_flight = bodies.len(),
-        "the hand-back is overdue; stopping the nodes still running"
+        "{why}; handing the run back and stopping the nodes still running"
     );
     // A body that already ended is reaped first, so one that panicked
     // still gets its failure, naming the panic, before the rest stop.
@@ -1112,9 +1189,7 @@ fn resolved_waiting_locations(
     awaited_sequences: &HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
 ) -> std::collections::HashSet<FiringLocation> {
     firings
-        .values()
-        .flat_map(|v| v.iter())
-        .filter(|e| e.status == NodeFiringStatus::WaitingForInput)
+        .waiting()
         .filter_map(|e| {
             let token = e.callback_id.as_deref()?;
             let seq = awaited_sequences.get(&FiringLocation::new(e.node_id.clone(), e.frames.clone()))?;
@@ -1133,7 +1208,8 @@ fn resolved_waiting_locations(
 /// location: a kicked entry node (no inbound pulses) gets `dispatched`
 /// reset so the kick-synthesis path re-fires it; every other location
 /// gets the exact pulse IDs its dispatch consumed (`pulses_absorbed`)
-/// flipped Absorbed → Pending so the dispatch loop re-fires it. In both
+/// put back on their wires, pending (`PulseTable::unabsorb`), so the
+/// dispatch loop re-fires it. In both
 /// cases the non-terminal firing record stays, so the dispatch loop ships
 /// `NodeResumed` (not a duplicate `NodeStarted`). One un-absorb mechanic,
 /// shared by both resume paths.
@@ -1147,55 +1223,51 @@ fn resolved_waiting_locations(
 /// absorption of its pulses (the producer already resumed and moved
 /// on), and its gate resolves exactly once. Do not "fix" this by
 /// re-arming gates here; a re-armed gate has no waiter.
+///
+/// Refused when a firing's record names a pulse the table does not hold
+/// as taken there: the run's state does not hold together, and running
+/// the node on part of its inputs would be wrong.
 fn redispatch_locations(
     to_un_absorb: &std::collections::HashSet<FiringLocation>,
     pulses: &mut PulseTable,
     firings: &NodeFiringTable,
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
-) {
-    for (loc, info) in kicked.iter_mut() {
-        if info.dispatched && to_un_absorb.contains(loc) {
-            info.dispatched = false;
+    kicked: &mut weft_core::primitive::KickTable,
+) -> anyhow::Result<()> {
+    for loc in to_un_absorb {
+        if kicked.get(loc).is_some_and(|kick| kick.dispatched()) {
+            kicked.set_dispatched(loc, false);
         }
     }
 
-    let mut un_absorb_ids: HashMap<String, std::collections::HashSet<uuid::Uuid>> = HashMap::new();
-    for firings in firings.values() {
-        for e in firings {
-            let key = FiringLocation::new(e.node_id.clone(), e.frames.clone());
-            if to_un_absorb.contains(&key) && !e.status.is_terminal() {
-                un_absorb_ids
-                    .entry(e.node_id.clone())
-                    .or_default()
-                    .extend(e.pulses_absorbed.iter().copied());
-            }
+    // In order, so the pulses go back on their wires the same way on
+    // every resume.
+    let mut locations: Vec<&FiringLocation> = to_un_absorb.iter().collect();
+    locations.sort();
+    for loc in locations {
+        let Some(record) = firings.get(&loc.node_id).and_then(|records| records.get(&loc.frames)) else { continue };
+        if !record.status().is_terminal() {
+            pulses
+                .unabsorb(&loc.node_id, &record.pulses_absorbed)
+                .map_err(|why| anyhow::anyhow!("the run cannot resume at frames {:?}: {why}", loc.frames))?;
         }
     }
-
-    for (node_id, ids) in un_absorb_ids {
-        if let Some(bucket) = pulses.get_mut(&node_id) {
-            for p in bucket.iter_mut() {
-                if p.status == weft_core::pulse::PulseStatus::Absorbed && ids.contains(&p.id) {
-                    p.status = weft_core::pulse::PulseStatus::Pending;
-                }
-            }
-        }
-    }
+    Ok(())
 }
 
 /// Returns the firings a dead worker left running, which the caller
 /// fails (`fail_crashed_firings`): a node that may have acted outside its
-/// run never runs twice by itself.
+/// run never runs twice by itself. Refused when the run's state does not
+/// hold together (`redispatch_locations`).
 fn apply_snapshot(
     program: &crate::plan::ProgramTables,
     snap: RunSnapshot,
     pulses: &mut PulseTable,
     firings: &mut NodeFiringTable,
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    kicked: &mut weft_core::primitive::KickTable,
     scopes: &mut ScopeTable,
     awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
     loop_runtime: &mut LoopRuntime,
-) -> Vec<CrashedFiring> {
+) -> anyhow::Result<Vec<CrashedFiring>> {
     *pulses = snap.pulses;
     *firings = snap.firings;
     *kicked = snap.kicked;
@@ -1252,8 +1324,8 @@ fn apply_snapshot(
     let mut run_again: std::collections::HashSet<FiringLocation> =
         std::collections::HashSet::new();
     let mut crashed: Vec<CrashedFiring> = Vec::new();
-    for e in firings.values().flat_map(|v| v.iter()) {
-        if e.status != NodeFiringStatus::Running {
+    for e in firings.open() {
+        if e.status() != NodeFiringStatus::Running {
             continue;
         }
         let loc = FiringLocation::new(e.node_id.clone(), e.frames.clone());
@@ -1271,8 +1343,8 @@ fn apply_snapshot(
     let to_un_absorb: std::collections::HashSet<FiringLocation> =
         resume_locations.union(&run_again).cloned().collect();
 
-    redispatch_locations(&to_un_absorb, pulses, firings, kicked);
-    crashed
+    redispatch_locations(&to_un_absorb, pulses, firings, kicked)?;
+    Ok(crashed)
 }
 
 /// A firing a dead worker left running (see `apply_snapshot`).
@@ -1349,14 +1421,12 @@ async fn fail_crashed_firings(
 /// about firings a dead worker left Running is deliberately omitted:
 /// mid-flight a Running firing is a live task, not a dead one).
 fn resume_resolved_suspensions_in_place(
-    fold: &RunFold,
+    snap: RunSnapshot,
     firings: &NodeFiringTable,
     pulses: &mut PulseTable,
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    kicked: &mut weft_core::primitive::KickTable,
     awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
 ) -> anyhow::Result<usize> {
-    let snap = fold.snapshot()?;
-
     // Which parked nodes have their CURRENT suspension resolved now?
     // Computed against the FRESHLY-FOLDED sequences (the live map is
     // stale mid-drive, which is exactly why this path exists), NOT the
@@ -1379,7 +1449,7 @@ fn resume_resolved_suspensions_in_place(
 
     // Re-dispatch them as resumes (kicked-reset + pulse un-absorb), the
     // same mechanic the boot-time path uses.
-    redispatch_locations(&resume_locations, pulses, firings, kicked);
+    redispatch_locations(&resume_locations, pulses, firings, kicked)?;
 
     Ok(resume_locations.len())
 }
@@ -1404,7 +1474,7 @@ async fn drive(
     answering: Option<&Arc<crate::caller_conn::LiveCallerConnection>>,
     pulses: &mut PulseTable,
     firings: &mut NodeFiringTable,
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    kicked: &mut weft_core::primitive::KickTable,
     scopes: &mut ScopeTable,
     mut awaited_sequences: HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
     loop_runtime: &mut LoopRuntime,
@@ -1496,14 +1566,24 @@ async fn drive(
     // How long the run has been quiet: every running node waiting, and one
     // of those waits ended only from outside (see the stuck-check below).
     let mut hold_clock = crate::outside_waits::HoldClock::new(clients.clock.as_ref(), run_id, settings.hold_secs());
-    loop {
+    'turn: loop {
         // Poison checkpoint: a journal write failed somewhere since
         // the last iteration. The journal is now a strict prefix of
         // the live state; driving further would compound the
         // divergence (every later refold rebuilds a different world).
-        // Stop here: the error becomes the run's Failed terminal
-        // (`run_one`), which is the only end this run gets,
+        // A durable run whose write got no answer at all is handed back
+        // from that prefix, the way a crash leaves it, and the next
+        // worker carries it on (`DriveJournal::must_hand_back`). Any other
+        // failed write stops the drive: the error becomes the run's Failed
+        // terminal (`run_one`), which is the only end this run gets,
         // since nothing respawns a run whose task failed.
+        if drive_journal.must_hand_back() {
+            return Ok(cut_short(
+                &mut bodies, &task_tx, &mut task_rx, run_id, project, program_idx, pulses, firings, journal, replica,
+                &mut waiting, &mut stream_rt, "its record could not be written",
+            )
+            .await);
+        }
         stop_if_poisoned(drive_journal, run_id)?;
 
         // Cancellation checkpoint. Checked at the TOP of every
@@ -1634,7 +1714,7 @@ async fn drive(
         if draining && overdue {
             return Ok(cut_short(
                 &mut bodies, &task_tx, &mut task_rx, run_id, project, program_idx, pulses, firings, journal, replica,
-                &mut waiting, &mut stream_rt,
+                &mut waiting, &mut stream_rt, "the hand-back is overdue",
             )
             .await);
         }
@@ -1653,42 +1733,24 @@ async fn drive(
         });
         // Work this worker leaves for the next one: what is ready, and a
         // kick not dispatched yet.
-        let held_back = draining && (!ready.is_empty() || kicked.values().any(|kick| !kick.dispatched));
+        let held_back = draining && (!ready.is_empty() || kicked.any_undispatched());
         if draining {
             ready.clear();
         }
-        // The kicked map drives two things this turn:
-        //
-        // 1. Wake payloads: every dispatch of a kicked node at frames=[]
-        //    needs to see the wake event's payload. This INCLUDES
-        //    resumes: a kicked node that parked on a wait and is
-        //    re-dispatched once that wait resolves replays its body,
-        //    and the body's `ctx.wake` bag MUST still hold what the
-        //    listener delivered. So populate `kick_payloads` for
-        //    EVERY kicked node, not just first-dispatch.
-        //
-        // 2. First-dispatch synthesis: a not-yet-dispatched kick that
-        //    has no pulse-driven ReadyGroup at frames=[] gets a
-        //    synthesized one so the scheduler picks it up. After the
-        //    synthesis (or after we observe a pulse-driven group at
-        //    the same key), flip `dispatched=true` so the next tick
-        //    doesn't double-fire.
-        let mut kick_payloads: HashMap<FiringLocation, Value> = HashMap::new();
-        for (loc, info) in kicked.iter_mut().filter(|_| !draining) {
-            // The FIRING trigger always gets a wake delivery, even when
-            // the fire's body was empty (a bare ping journals `null`);
-            // a non-firing kick only carries one when a manual-run mock
-            // set a real payload on a plain root.
-            if info.firing {
-                kick_payloads.insert(loc.clone(), info.payload.clone().unwrap_or(Value::Null));
-            } else if let Some(payload) = info.payload.clone() {
-                kick_payloads.insert(loc.clone(), payload);
-            }
-            if info.dispatched {
-                continue;
-            }
+        // A kick not dispatched yet that has no pulse-driven ReadyGroup at
+        // its location gets a synthesized one so the scheduler picks it
+        // up. After the synthesis (or after we observe a pulse-driven
+        // group at the same key), it is marked dispatched so the next tick
+        // doesn't double-fire. Only the kicks not dispatched yet are
+        // looked at: a long loop leaves one dispatched kick per iteration
+        // of each body root behind it. (What a kicked node's body reads
+        // as its wake is read off its kick at the dispatch below, a
+        // resume's included.)
+        let to_dispatch: Vec<FiringLocation> = if draining { Vec::new() } else { kicked.undispatched().cloned().collect() };
+        for loc in to_dispatch {
             let node = program.node(&loc.node_id)
                 .ok_or_else(|| anyhow::anyhow!("kick names unknown node '{}'", loc.node_id))?;
+            let info = kicked.get_mut(&loc).expect("an undispatched kick is in the table");
             // A kick a scope's teardown left (`scope_skipped`) is decided
             // already: it dispatches into its skip whatever the copies
             // around it say (a loop torn down before any iteration tells
@@ -1705,8 +1767,8 @@ async fn drive(
             // location already covers the node (the entry node also
             // received a regular pulse, and every wired port of it was
             // satisfied), let the pulse-driven dispatch run; we just
-            // flip `dispatched`. Either way, the payload is in
-            // `kick_payloads` so the dispatch sees it.
+            // mark it dispatched. Either way the dispatch reads the
+            // kick's payload.
             let already_in_ready = ready
                 .iter()
                 .any(|(rid, g)| *rid == loc.node_id && g.frames == loc.frames);
@@ -1714,17 +1776,7 @@ async fn drive(
                 // Synthesize a ReadyGroup at the kick's frames from the
                 // node's written constants (and a firing trigger's port
                 // snapshot): `kicked_group` is the one derivation, shared
-                // with the fold. A kick naming a node the
-                // project does not have is a corrupt compiled shape;
-                // fail the drive loudly instead of parking the kick
-                // forever.
-                let Some(def) = program.node(&loc.node_id) else {
-                    return Err(anyhow::anyhow!(
-                        "kick: node '{}' is not in the project definition; corrupt compiled \
-                         project shape",
-                        loc.node_id
-                    ));
-                };
+                // with the fold.
                 // A kick reads its own writing and, for a fired
                 // trigger, its baked ports.
                 // Nothing waiting on a wire feeds it: a kick absorbs no
@@ -1734,10 +1786,10 @@ async fn drive(
                 // phase (`settle_table`).
                 ready.push((
                     loc.node_id.clone(),
-                    weft_core::run::ready::kicked_group(def, info, &loc.frames, run_id, project, program_idx, given),
+                    weft_core::run::ready::kicked_group(node, info, &loc.frames, run_id, project, program_idx, given),
                 ));
             }
-            info.dispatched = true;
+            kicked.set_dispatched(&loc, true);
         }
         if !ready.is_empty() {
             // Once per batch of ready nodes in every run: a line a person reads only while
@@ -1806,7 +1858,7 @@ async fn drive(
             let resuming = match firing_at(firings, &node_id, group.run_id, &group.frames) {
                 None => None,
                 Some(record) => {
-                    let resumes = match record.status {
+                    let resumes = match record.status() {
                         NodeFiringStatus::WaitingForInput => resolved_waiters.contains(&loc),
                         NodeFiringStatus::Running => !bodies.runs(&loc),
                         _ => false,
@@ -1817,7 +1869,7 @@ async fn drive(
                              is {} with its {}; one run fires a node once per frames (engine \
                              invariant violated)",
                             group.frames,
-                            record.status.as_str(),
+                            record.status().as_str(),
                             if bodies.runs(&loc) { "body running" } else { "inputs taken" },
                         ));
                     }
@@ -1862,13 +1914,7 @@ async fn drive(
                 .copied()
                 .filter(|id| !deferred.contains(id))
                 .collect();
-            if let Some(bucket) = pulses.get_mut(&node_id) {
-                for p in bucket.iter_mut() {
-                    if absorbed_now.contains(&p.id) && p.status == weft_core::pulse::PulseStatus::Pending {
-                        p.absorb();
-                    }
-                }
-            }
+            pulses.absorb(&node_id, |p| absorbed_now.contains(&p.id));
             // A run dispatch DELIVERS the absorbed values (any waiting
             // producer resumes); a skip dispatch consumes them with no
             // delivery ever possible, so its waiting producers fail
@@ -1894,9 +1940,8 @@ async fn drive(
             // A resume continues the record (WaitingForInput back to
             // Running); a first dispatch opens it.
             if is_resume {
-                let record = firing_at_mut(firings, &node_id, group.run_id, &group.frames)
+                let record = set_firing_status(firings, &node_id, group.run_id, &group.frames, NodeFiringStatus::Running)
                     .expect("a resumed firing has its record (read above)");
-                record.status = NodeFiringStatus::Running;
                 // Extend `pulses_absorbed` with this resume dispatch's
                 // newly-absorbed pulses, exactly as the fold does on
                 // `NodeResumed` (it absorbs every pulse pending at the
@@ -1906,7 +1951,7 @@ async fn drive(
                 // resume path (`resume_resolved_suspensions_in_place`)
                 // relies on when it reads `pulses_absorbed` straight from
                 // the live record. The matching fold-side flip (the pulses
-                // marked Absorbed in the table) is what makes a
+                // absorbed in the table) is what makes a
                 // refold-after-stall NOT re-fire this node. Both sides
                 // must stay in lockstep.
                 for id in &absorbed_now {
@@ -1922,27 +1967,12 @@ async fn drive(
                 // reader of `callback_id` on a Running record.
                 record.callback_id = None;
             } else {
-                let record = NodeFiring {
-                    id: uuid::Uuid::new_v4(),
-                    received: group.received.clone(),
-                    skip_reason: group.skip.clone(),
-                    node_id: node_id.clone(),
-                    status: NodeFiringStatus::Running,
-                    pulses_absorbed: absorbed_now.clone(),
-                    error: group.error.clone(),
-                    gave_up_wait: false,
-                    callback_id: None,
-                    started_at: now_unix(),
-                    completed_at: None,
-                    cost_usd: 0.0,
-                    logs: Vec::new(),
-                    mentioned_ports: Default::default(),
-                    closed_output_ports: Default::default(),
-                    run_id: group.run_id,
-                    frames: group.frames.clone(),
-                    inherited_from: None,
-                };
-                firings.entry(node_id.clone()).or_default().push(record);
+                let mut record = NodeFiring::started(
+                    &node_id, group.frames.clone(), group.run_id, group.received.clone(), absorbed_now.clone(), now_unix(),
+                );
+                record.skip_reason = group.skip.clone();
+                record.error = group.error.clone();
+                firings.insert(record);
             }
 
             // Ship the lifecycle event NOW, before any branch. Every
@@ -2179,7 +2209,12 @@ async fn drive(
                 .into_iter()
                 .map(|edge| edge.source_handle.as_deref().unwrap_or("default").to_string())
                 .collect();
-            let wake_payload = kick_payloads.remove(&FiringLocation::new(node_id.clone(), group.frames.clone()));
+            // Every dispatch of a kicked node sees the wake it was kicked
+            // with, a resume's too: a kicked node that parked on a wait
+            // and runs again once it is answered replays its body, and
+            // the body's `ctx.wake` must still hold what the listener
+            // delivered.
+            let wake_payload = kicked.get(&FiringLocation::new(node_id.clone(), group.frames.clone())).and_then(KickedNode::wake_payload);
             let mut runner = RunnerHandle::new(
                 project.id,
                 group.run_id,
@@ -2334,6 +2369,9 @@ async fn drive(
             // one write. A pure body starts at once in a durable run too:
             // it does nothing outside the run, so a crash before its start
             // is on record runs it again with nothing to undo.
+            if drive_journal.must_hand_back() {
+                continue 'turn;
+            }
             stop_if_poisoned(drive_journal, run_id)?;
             let on_record = (drive_journal.keeping().is_durable() && !node_def.features.pure).then(|| drive_journal.clone());
             let body = async move {
@@ -2757,6 +2795,9 @@ async fn drive(
         // The drive waits for news, not for its own rows, which keep
         // going out in the background; a failed one stops it. A held
         // answer does not wait for the news either.
+        if drive_journal.must_hand_back() {
+            continue 'turn;
+        }
         stop_if_poisoned(drive_journal, run_id)?;
         let_answer_go(answering);
         let on_wait_change = waits.wait_notified();
@@ -2931,12 +2972,7 @@ fn unwind(
 
 /// The tokens the run's suspended nodes wait on, by their records.
 fn suspended_tokens(firings: &NodeFiringTable) -> std::collections::HashSet<&str> {
-    firings
-        .values()
-        .flat_map(|v| v.iter())
-        .filter(|e| e.status == NodeFiringStatus::WaitingForInput)
-        .filter_map(|e| e.callback_id.as_deref())
-        .collect()
+    firings.waiting().filter_map(|e| e.callback_id.as_deref()).collect()
 }
 
 /// `delivered` with the run instance's values in `node`'s `@instance_filled`
@@ -3057,7 +3093,7 @@ pub(crate) async fn handle_loop_boundary_firing(
     replica: &str,
     loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    kicked: &mut weft_core::primitive::KickTable,
     scopes: &mut ScopeTable,
 ) -> Result<(), String> {
     use weft_core::primitive::LoopTerminationReason;
@@ -3118,7 +3154,7 @@ pub(crate) async fn handle_loop_boundary_firing(
         let (already_launched, inst_terminated) = loop_runtime
             .get(&key)
             .map(|inst| (inst.launched.clone(), inst.terminated.is_some()))
-            .unwrap_or((Vec::new(), false));
+            .unwrap_or_default();
         let to_launch: Vec<u32> = if inst_terminated {
             Vec::new()
         } else if firing.is_stream {
@@ -3291,7 +3327,7 @@ pub(crate) async fn launch_iteration(
     index: u32,
     stream_item: Option<LoopStreamItem>,
     loop_runtime: &mut LoopRuntime,
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    kicked: &mut weft_core::primitive::KickTable,
     scopes: &mut ScopeTable,
 ) -> Result<(), String> {
     let stream_pulse = stream_item.as_ref().map(|item| item.pulse.to_string());
@@ -3752,7 +3788,7 @@ async fn handle_node_skip(
     program_idx: &ProgramIndex,
     pulses: &mut PulseTable,
     firings: &mut NodeFiringTable,
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    kicked: &mut weft_core::primitive::KickTable,
     scopes: &mut ScopeTable,
     journal: &dyn JournalClient,
     replica: &str,
@@ -3889,7 +3925,7 @@ async fn cancel_cleanup(
     journal: &dyn JournalClient,
     replica: &str,
     loop_runtime: &mut LoopRuntime,
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    kicked: &mut weft_core::primitive::KickTable,
     scopes: &mut ScopeTable,
     stream_rt: &mut StreamRuntime,
     // The cause in words, what every cancelled record carries as its
@@ -3938,7 +3974,7 @@ async fn cancel_cleanup(
 async fn cancel_open_firings(
     firings: &mut NodeFiringTable,
     pulses: &mut PulseTable,
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    kicked: &mut weft_core::primitive::KickTable,
     scopes: &mut ScopeTable,
     loop_runtime: &mut LoopRuntime,
     run_id: RunId,
@@ -3950,15 +3986,7 @@ async fn cancel_open_firings(
     phase: weft_core::context::Phase,
     given: &weft_core::project::Given,
 ) {
-    let open: Vec<FiringLocation> = firings
-        .iter()
-        .flat_map(|(node_id, firings)| {
-            firings
-                .iter()
-                .filter(|e| e.run_id == run_id && !e.status.is_terminal())
-                .map(move |e| FiringLocation::new(node_id.clone(), e.frames.clone()))
-        })
-        .collect();
+    let open: Vec<FiringLocation> = firings.open().map(|e| FiringLocation::new(e.node_id.clone(), e.frames.clone())).collect();
     for loc in open {
         let mentioned = mentioned_ports(firings, &loc.node_id, run_id, &loc.frames);
         mark_cancelled(firings, &loc.node_id, run_id, &loc.frames, reason);
@@ -4068,7 +4096,7 @@ async fn route_stream_pulses(
     replica: &str,
     stream_rt: &mut StreamRuntime,
     loop_runtime: &mut LoopRuntime,
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    kicked: &mut weft_core::primitive::KickTable,
     scopes: &mut ScopeTable,
 ) -> usize {
     // Scan phase: decide an action per routable pulse.
@@ -4532,7 +4560,7 @@ async fn launch_stream_iteration(
     item: LoopStreamItem,
     loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    kicked: &mut weft_core::primitive::KickTable,
     scopes: &mut ScopeTable,
 ) -> Result<(), String> {
     let pulse = item.pulse;
@@ -4607,10 +4635,7 @@ async fn settle_rehydrated_stream_ends(
         if matches!(end, StreamEnd::Finished) {
             let items_pending = pulses.get(&loop_in_id).is_some_and(|bucket| {
                 bucket.iter().any(|p| {
-                    p.run_id == run_id
-                        && p.frames == key.parent_frames
-                        && p.target_port == port
-                        && p.status.in_flight()
+                    p.run_id == run_id && p.frames == key.parent_frames && p.target_port == port
                 })
             });
             if items_pending {
@@ -4781,8 +4806,7 @@ fn check_generator_buffer_cap(
                 .map(|b| {
                     b.iter()
                         .filter(|p| {
-                            p.status.in_flight()
-                                && p.run_id == run_id
+                            p.run_id == run_id
                                 && &p.frames == frames
                                 && p.target_port == handle
                                 && !p.closed
@@ -5210,7 +5234,7 @@ fn firing_already_terminal(
     run_id: RunId,
     frames: &weft_core::frames::LoopFrames,
 ) -> bool {
-    firing_at(firings, node_id, run_id, frames).is_some_and(|e| e.status.is_terminal())
+    firing_at(firings, node_id, run_id, frames).is_some_and(|e| e.status().is_terminal())
 }
 
 fn mark_waiting(
@@ -5220,8 +5244,7 @@ fn mark_waiting(
     frames: &weft_core::frames::LoopFrames,
     token: &str,
 ) {
-    if let Some(e) = firing_at_mut(firings, node_id, run_id, frames) {
-        e.status = NodeFiringStatus::WaitingForInput;
+    if let Some(e) = set_firing_status(firings, node_id, run_id, frames, NodeFiringStatus::WaitingForInput) {
         e.callback_id = Some(token.to_string());
     }
 }
@@ -5235,7 +5258,7 @@ async fn terminate(
     program_idx: &ProgramIndex,
     pulses: &PulseTable,
     firings: &mut NodeFiringTable,
-    kicked: &HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    kicked: &weft_core::primitive::KickTable,
     scopes: &ScopeTable,
     waiting: &HashMap<String, FiringLocation>,
 ) -> anyhow::Result<RunOutcome> {
@@ -5252,7 +5275,7 @@ async fn terminate(
     let completion = check_completion(pulses, firings);
     // Everything that ran ended, and a node the run kicked never started
     // (its scope never decided): the run did not do what it was asked.
-    if completion.is_some() && kicked.values().any(|kick| !kick.dispatched) {
+    if completion.is_some() && kicked.any_undispatched() {
         let report = report();
         tracing::warn!(target: "weft_engine", %report, "a kicked node never started");
         return Ok(RunOutcome::Stuck { report });
@@ -5284,25 +5307,21 @@ async fn terminate(
 }
 
 fn waiting_count(firings: &NodeFiringTable) -> usize {
-    firings
-        .values()
-        .flat_map(|v| v.iter())
-        .filter(|e| e.status == NodeFiringStatus::WaitingForInput)
-        .count()
+    firings.waiting().count()
 }
 
 // ---------- Mutation helpers ----------
 
-/// The earliest failure in the table (by completion time, node id as
-/// tie-break): the run's failure. The table is a map of per-node lists,
-/// so a plain "first hit wins" scan would not pick the root cause the
-/// user should see.
+/// The earliest failure in the table (by completion time, then node id,
+/// then the order the node's firings started in: two iterations failing
+/// in one second name the one that started first): the run's failure.
+/// A plain "first hit wins" scan would not pick the root cause the user
+/// should see.
 fn first_failed(firings: &NodeFiringTable) -> Option<&NodeFiring> {
-    firings
-        .values()
-        .flat_map(|v| v.iter())
-        .filter(|e| e.status == NodeFiringStatus::Failed)
-        .min_by_key(|e| (e.completed_at.unwrap_or(u64::MAX), e.node_id.clone()))
+    firings.failed().min_by_key(|e| {
+        let started = firings.get(&e.node_id).and_then(|records| records.get_index_of(&e.frames));
+        (e.completed_at.unwrap_or(u64::MAX), e.node_id.clone(), started)
+    })
 }
 
 /// The run's failure reason from its failed `record`: the node, named the
@@ -5323,8 +5342,7 @@ fn mark_completed(
     run_id: RunId,
     frames: &weft_core::frames::LoopFrames,
 ) {
-    if let Some(e) = firing_at_mut(firings, node_id, run_id, frames) {
-        e.status = NodeFiringStatus::Completed;
+    if let Some(e) = set_firing_status(firings, node_id, run_id, frames, NodeFiringStatus::Completed) {
         e.completed_at = Some(now_unix());
     }
 }
@@ -5337,8 +5355,7 @@ fn mark_failed(
     err: &str,
     gave_up_wait: bool,
 ) {
-    if let Some(e) = firing_at_mut(firings, node_id, run_id, frames) {
-        e.status = NodeFiringStatus::Failed;
+    if let Some(e) = set_firing_status(firings, node_id, run_id, frames, NodeFiringStatus::Failed) {
         e.completed_at = Some(now_unix());
         e.error = Some(err.to_string());
         e.gave_up_wait = gave_up_wait;
@@ -5352,8 +5369,7 @@ fn mark_skipped(
     frames: &weft_core::frames::LoopFrames,
     reason: &weft_core::run::skip::SkipReason,
 ) {
-    if let Some(e) = firing_at_mut(firings, node_id, run_id, frames) {
-        e.status = NodeFiringStatus::Skipped;
+    if let Some(e) = set_firing_status(firings, node_id, run_id, frames, NodeFiringStatus::Skipped) {
         e.completed_at = Some(now_unix());
         // A skip is the firing's whole outcome (decided before the body
         // ran, or the body's wait skipped by a person), so a port's
@@ -5375,8 +5391,7 @@ fn mark_cancelled(
     frames: &weft_core::frames::LoopFrames,
     reason: &str,
 ) {
-    if let Some(e) = firing_at_mut(firings, node_id, run_id, frames) {
-        e.status = NodeFiringStatus::Cancelled;
+    if let Some(e) = set_firing_status(firings, node_id, run_id, frames, NodeFiringStatus::Cancelled) {
         e.completed_at = Some(now_unix());
         e.error = Some(reason.to_string());
         e.callback_id = None;

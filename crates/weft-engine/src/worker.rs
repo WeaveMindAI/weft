@@ -461,11 +461,16 @@ impl Worker {
         outcome.map(|_| ())
     }
 
-    /// Let go of a run whose whole record is written, for `why`, asking
-    /// until the broker answers: until then this worker owns the run on
-    /// record, and nothing else may pick it up. An outage is asked about
-    /// again; any other refusal is the broker's answer, and fails the
-    /// drive with it, since asking again would hear the same.
+    /// Let go of a run whose record is written (whole, or for a durable
+    /// run handed back because a write got no answer, the part that
+    /// landed), for `why`, asking until the broker answers: until then this
+    /// worker owns the run on record, and nothing else may pick it up. An
+    /// outage is asked about again. The broker saying the run is not this
+    /// worker's is the let-go done already: an earlier ask whose answer was
+    /// lost, or the run taken from this worker meanwhile (its lease lapsed
+    /// while the broker was out of reach and another worker took it on, or
+    /// it ended). Any other refusal is the broker's answer, and fails the drive
+    /// with it, since asking again would hear the same.
     async fn let_go(&self, run_id: RunId, why: weft_broker_client::protocol::LetGo) -> Result<()> {
         // Whether an earlier ask may have landed with its answer lost.
         let mut maybe_landed = false;
@@ -473,10 +478,12 @@ impl Worker {
         loop {
             match self.clients.runs.let_go(run_id, why).await {
                 Ok(()) => return Ok(()),
-                // The run is another worker's now: the earlier ask landed,
-                // and the worker that took its resume owns it.
-                Err(e) if maybe_landed && broker_conflict(&e) => {
-                    tracing::info!(target: "weft_engine::worker", %run_id, "the run was let go of by an earlier ask whose answer was lost");
+                Err(e) if broker_conflict(&e) => {
+                    if maybe_landed {
+                        tracing::info!(target: "weft_engine::worker", %run_id, "the run was let go of by an earlier ask whose answer was lost");
+                    } else {
+                        tracing::info!(target: "weft_engine::worker", %run_id, ?why, "the run is no longer this worker's to let go of (another worker took it on, or it ended)");
+                    }
                     return Ok(());
                 }
                 Err(e) if broker_outage(&e) => {

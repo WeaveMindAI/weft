@@ -124,6 +124,15 @@ pub enum BuildRecipe {
 /// The file in a host build's context that says how to build it.
 pub const HOST_RECIPE_FILE: &str = "host-recipe.json";
 
+/// The compiler flags every build of a project's worker (and of a
+/// package's node tests) runs with, on every builder: what lets its tokio
+/// runtime turn the LIFO slot off (`crate::process_runtime`). Set as
+/// `RUSTFLAGS` where the build starts, whatever the builder: the worker
+/// images (`weft_compiler::worker_image`), the builder base that seeds
+/// their compile cache, a host build, a node-test build.
+// SYNC: WORKER_RUSTFLAGS <-> deploy/docker/worker-builder-base.Dockerfile ({{worker_rustflags}}), .cargo/config.toml (weft's own builds)
+pub const WORKER_RUSTFLAGS: &str = "--cfg tokio_unstable";
+
 /// The lock beside `shared`, the folder of crates every host build on a
 /// machine shares: held shared by every build from before it stages into
 /// the folder until it is compiled, and alone by whatever removes from it,

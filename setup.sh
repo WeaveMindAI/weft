@@ -1152,6 +1152,13 @@ install_binary() { # src dest
   }
 }
 
+# cargo, run from the checkout: cargo reads its config (the checkout's
+# .cargo/config.toml, which weft-runtime refuses to build without) from
+# the folder it runs in, never from where --manifest-path points.
+cargo_in_checkout() {
+  (cd "${here}" && cargo "$@")
+}
+
 # Build the CLI and the runtime from this checkout into target/<profile>
 # (sets target_dir). Sources can change WHILE this script runs (an AI
 # session editing in parallel with a reinstall is the everyday case
@@ -1178,7 +1185,7 @@ build_cli_from_source() {
     # function as a condition, where errexit is off, and a failed build
     # would otherwise go on to install whatever an earlier one left.
     spin "cargo build ${release_flag:+${release_flag} }-p weft-cli -p weft-runtime" \
-      cargo build ${release_flag} --manifest-path "${here}/Cargo.toml" -p weft-cli -p weft-runtime \
+      cargo_in_checkout build ${release_flag} -p weft-cli -p weft-runtime \
       || return 1
     if [[ ! -x "${target_dir}/weft" || ! -x "${target_dir}/weft-runtime" ]]; then
       fail "build output missing: ${target_dir}/weft or ${target_dir}/weft-runtime"
@@ -1192,7 +1199,7 @@ build_cli_from_source() {
     # recheck FAILURE from dying silently under `set -e` (the
     # assignment's status is cargo's), with the captured output shown
     # instead of discarded.
-    recheck_out="$(cargo build ${release_flag} --manifest-path "${here}/Cargo.toml" -p weft-cli -p weft-runtime 2>&1)" || {
+    recheck_out="$(cargo_in_checkout build ${release_flag} -p weft-cli -p weft-runtime 2>&1)" || {
       fail "the freshness recheck build failed (a source edit landed mid-build?)"
       printf '%s\n' "${recheck_out}" >&2
       exit 1

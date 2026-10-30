@@ -1995,7 +1995,7 @@ mod tests {
     /// The table a run of `resolved` holds after its first pass.
     fn first_pass(resolved: &Resolved) -> (crate::pulse::PulseTable, crate::run::scope::ScopeTable, std::collections::HashMap<Located, ()>) {
         let index = crate::project::ProgramIndex::build(&resolved.program);
-        let (mut pulses, mut scopes, mut kicked) = (Default::default(), Default::default(), std::collections::HashMap::new());
+        let (mut pulses, mut scopes, mut kicked) = (Default::default(), Default::default(), crate::primitive::KickTable::new());
         crate::run::scope::settle_table(&resolved.program, &index, &resolved.given, crate::context::Phase::Fire,
             uuid::Uuid::nil(), 1, &mut pulses, &mut scopes, &mut kicked);
         let kicked = kicked.keys().map(|at| (Located::at(&at.node_id, &at.frames), ())).collect();

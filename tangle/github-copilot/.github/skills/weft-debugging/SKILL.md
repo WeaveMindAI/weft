@@ -113,7 +113,7 @@ node and the wrong value.
    naming the `weft connect` that picks it, and a node error saying it has
    no connection picked is the same [the runtime tier] gap, not a source bug: you pick a stored connection yourself (`weft connect
    --node <id> --grant <grant>`) or send the user to the node's Connect
-   button / `weft connect` in their terminal, then run again. A failure saying `the worker running '<node>' went away while it was running` means the worker of a durable run died while that node was running: weft does not run a node again once its start is on
+   button / `weft connect` in their terminal, then run again. A failure saying `the worker running '<node>' went away while it was running` means the worker of a durable run died while that node was running, or could not reach weft's broker to write the run's record for over a minute and handed the run on to another worker: weft does not run a node again once its start is on
    record, because what it did may have partly happened. Check what it did outside (the email, the row, the post), then, if it has to happen again, start a run at that node by hand: `weft run --from <node>=<inputs>`, with the inputs from `weft events <run-id> --node <node> --full`. If the message says `went away while it was reading a stream` instead, the items it read are gone from the stream, so `--from` cannot hand them back: check what it did, then run the whole run again.
 3. **A value is wrong, not failed.** Work upstream from the output: open the
    run, look at the top-level groups, find the first whose output is already

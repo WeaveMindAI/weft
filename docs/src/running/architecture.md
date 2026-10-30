@@ -247,7 +247,10 @@ section of `weft.toml` says how that image is built:
   Dockerfile weft uses instead of its own. It has to keep the `{{...}}`
   placeholders weft's own Dockerfile uses, and if it drops
   `{{install_runtime_system_packages}}`, the cloud refuses every program
-  whose nodes need a program installed.
+  whose nodes need a program installed. It also has to keep the line
+  `ENV RUSTFLAGS="{{worker_rustflags}}"` before its `cargo build`, as
+  weft's own does: without it the worker does not compile, and the build
+  log names the flag.
 - `package_manager`: how your nodes' needs are installed on it (`apt`,
   `dnf`, `apk` or `brew`). weft guesses it from the image's name, so if the
   name does not say Debian, Ubuntu, Alpine, a Red Hat family distro, Python
@@ -795,9 +798,10 @@ If you would rather not wait for an old worker to exit, `kill -9 <pid>`
 stops it now, and the runs still on it end as if it had died; the daemon's
 log (`~/.local/share/weft/runtime.log`) names each such worker with its pid.
 
-If a worker cannot get a batch of records written (the broker errors or never
-answers), the runs in that batch end failed (for why, go and read [why a
-failed write stops the run](the-journal.md#why-a-failed-write-stops-the-run)).
+If a worker cannot get a batch of records written, the runs in that batch end
+failed, except a durable run whose batch got no answer at all, which is handed
+back to another worker (for both, go and read [when a write of the record
+fails](the-journal.md#when-a-write-of-the-record-fails)).
 
 If a worker freezes or loses its connection to the broker, it stops reporting,
 and its runs go the way a dead worker's do: about 30 seconds later a durable

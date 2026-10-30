@@ -335,7 +335,10 @@ async fn build(toolchain: &dyn Toolchain, machine: &MachineLayout, held: &Held, 
     }
     let messages = b.context_dir.join("cargo-messages.json");
     let target = target_dir.display().to_string();
-    let env = vec![("CARGO_TARGET_DIR".to_string(), target.clone())];
+    let env = vec![
+        ("CARGO_TARGET_DIR".to_string(), target.clone()),
+        ("RUSTFLAGS".to_string(), weft_core::builds::WORKER_RUSTFLAGS.to_string()),
+    ];
     let release = target_dir.join("release");
     let step = |program: PathBuf, args: Vec<String>, stdout: Option<PathBuf>| HostCommand {
         program,

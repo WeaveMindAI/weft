@@ -11,6 +11,7 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse as _, Response};
 use axum::routing::post;
 use axum::Router;
 
@@ -140,25 +141,36 @@ async fn own_run(state: &BrokerState, caller: &CallerIdentity, run_id: weft_core
     Ok(())
 }
 
+/// `answer` as the JSON body of the call's answer, written on the blocking
+/// pool: an answer that carries a run's whole record (a long run's is many
+/// megabytes once encoded) is never written on a thread serving calls.
+async fn whole_record_answer<T: serde::Serialize + Send + 'static>(answer: T) -> Result<Response, (StatusCode, String)> {
+    let body = weft_journal::on_blocking_pool(move || serde_json::to_vec(&answer))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write the answer: {e}")))?;
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response())
+}
+
 /// `POST /v1/journal/record_of`: see [`RecordOfRequest`].
-async fn record_of(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, Json(req): Json<RecordOfRequest>) -> Resp<RecordOfResponse> {
+async fn record_of(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, Json(req): Json<RecordOfRequest>) -> Result<Response, (StatusCode, String)> {
     worker(&caller)?;
     own_run(&state, &caller, req.run_id).await?;
     let record = weft_journal::record::read_record(&state.pool, req.run_id, None)
         .await
         .map_err(|e| unavailable_or_internal(e.context("read a run's record")))?;
-    Ok(Json(RecordOfResponse { record }))
+    whole_record_answer(RecordOfResponse { record }).await
 }
 
 /// `POST /v1/run/claim`: see [`RunClaimRequest`]. The claim is the
 /// project's own: a run of another project is not queued for this worker.
-async fn run_claim(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, Json(req): Json<RunClaimRequest>) -> Resp<RunClaimResponse> {
+async fn run_claim(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, Json(req): Json<RunClaimRequest>) -> Result<Response, (StatusCode, String)> {
     let (_, project, replica) = worker(&caller)?;
     let conn = state.pool.get().await.map_err(|e| unavailable_or_internal(e.into()))?;
     let claimed = weft_journal::record::claim(&conn, req.run_id, project, replica)
         .await
         .map_err(|e| unavailable_or_internal(e.context("claim a run")))?;
-    Ok(Json(RunClaimResponse { claimed }))
+    drop(conn);
+    whole_record_answer(RunClaimResponse { claimed }).await
 }
 
 /// `POST /v1/run/answers`: see [`RunAnswersRequest`]. Only the worker

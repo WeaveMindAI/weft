@@ -47,8 +47,18 @@ enum AgentCommand {
     Host,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+// jemalloc hands freed memory back to the system, as it does for every
+// worker (`weft_engine::Jemalloc`): with the system allocator a daemon
+// that folded a few huge records kept every peak (gigabytes, until a
+// restart).
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+fn main() -> anyhow::Result<()> {
+    weft_core::process_runtime::build()?.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     weft_core::net::install_crypto_provider();
     let args = Args::parse();
     let config = match &args.command {

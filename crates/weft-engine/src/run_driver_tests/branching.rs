@@ -177,14 +177,14 @@
         let pending: Vec<String> = snap
             .pulses
             .iter()
-            .flat_map(|(n, b)| b.iter().filter(|p| p.status.in_flight()).map(move |p| format!("{n}.{}@{:?}", p.target_port, p.frames)))
+            .flat_map(|(n, b)| b.iter().map(move |p| format!("{n}.{}@{:?}", p.target_port, p.frames)))
             .collect();
         assert!(pending.is_empty(), "a completed run folds with pulses in flight: {pending:?}");
         let open: Vec<String> = snap
             .firings
             .values()
-            .flat_map(|v| v.iter())
-            .filter(|e| !e.status.is_terminal())
+            .flat_map(|v| v.values())
+            .filter(|e| !e.status().is_terminal())
             .map(|e| format!("{}@{:?}", e.node_id, e.frames))
             .collect();
         assert!(open.is_empty(), "a completed run folds with open records: {open:?}");
@@ -1245,7 +1245,7 @@
         assert_eq!(*seen.lock().unwrap(), vec!["payload".to_string()], "the root's value reached deep");
         let snap = fold(rooted_group_project(), &events);
         let kick = snap.kicked.get(&FiringLocation::new("seed", vec![])).expect("the opening kicked the root");
-        assert!(kick.dispatched && kick.scope_skipped.is_none(), "{kick:?}");
+        assert!(kick.dispatched() && kick.scope_skipped.is_none(), "{kick:?}");
         assert_eq!(snapshot_scope(&snap, "g"), Some(ScopeState::Open));
     }
 
@@ -1320,7 +1320,7 @@
             .kicked
             .get(&FiringLocation::new("seed", vec![]))
             .expect("the opening kicked the root of a scope an absence opened");
-        assert!(kick.dispatched && kick.scope_skipped.is_none(), "{kick:?}");
+        assert!(kick.dispatched() && kick.scope_skipped.is_none(), "{kick:?}");
         assert_eq!(snapshot_scope(&snap, "g"), Some(ScopeState::Open));
     }
 
@@ -1666,7 +1666,7 @@
         let (outcome, events) = drive(project, cat, &["source"]).await;
         assert!(matches!(outcome, RunOutcome::Cancelled { .. }), "{outcome:?}");
         let snap = fold(project_again, &events);
-        assert_eq!(snap.firings["deep"][0].status, NodeFiringStatus::Cancelled);
+        assert_eq!(snap.firings["deep"][0].status(), NodeFiringStatus::Cancelled);
         for scope in ["outer", "outer.inner"] {
             assert_eq!(snapshot_scope(&snap, scope), Some(ScopeState::Open), "{scope}");
         }
@@ -1717,12 +1717,12 @@
         for member in ["lone", "both"] {
             let records = &snap.firings[member];
             assert_eq!(records.len(), 1, "{member} fires once: {records:?}");
-            assert_eq!(records[0].status, NodeFiringStatus::Skipped, "{member}");
+            assert_eq!(records[0].status(), NodeFiringStatus::Skipped, "{member}");
         }
         let in_flight: Vec<String> = snap
             .pulses
             .iter()
-            .flat_map(|(n, b)| b.iter().filter(|p| p.status.in_flight()).map(move |p| format!("{n}.{}", p.target_port)))
+            .flat_map(|(n, b)| b.iter().map(move |p| format!("{n}.{}", p.target_port)))
             .collect();
         assert!(in_flight.is_empty(), "nothing is left for a member to take: {in_flight:?}");
         assert_eq!(

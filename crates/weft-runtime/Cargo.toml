@@ -46,6 +46,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
+# The process's allocator, the one every worker runs on
+# (`weft_engine::Jemalloc`): it hands freed memory back to the system.
+tikv-jemallocator = { workspace = true }
 weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]

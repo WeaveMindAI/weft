@@ -69,6 +69,9 @@
         pub(super) events: StdMutex<Vec<RunEvent>>,
         /// How many batches the writer sent.
         pub(crate) batches: std::sync::atomic::AtomicUsize,
+        /// While set, a batch reaches nothing and gets no answer: the
+        /// broker is out of reach.
+        pub(crate) out_of_reach: std::sync::atomic::AtomicBool,
     }
     impl MemJournal {
         /// Put `events` on record as they are: a run's record (or a seed's)
@@ -98,6 +101,9 @@
     impl weft_journal::RecordClient for MemJournal {
         async fn record_batch(&self, batch: Vec<u8>) -> Result<weft_journal::frame::BatchAnswer, weft_journal::BatchError> {
             self.batches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.out_of_reach.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(weft_journal::BatchError::Unanswered(anyhow::anyhow!("the broker is out of reach")));
+            }
             let (_, runs) = crate::test_record::decode_batch(&batch);
             let fates = runs.iter().map(|_| weft_journal::record::Fate::Accepted).collect();
             self.events.lock().unwrap().extend(runs.into_iter().flat_map(|(_, events)| events));
@@ -441,9 +447,9 @@
         chain: &weft_journal::SeedChain,
         live: &Drove,
     ) {
-        /// One pulse as compared: node, id, status, closed, close
-        /// error, frames, port, value (as its JSON text, so the row
-        /// orders totally).
+        /// One pulse as compared: node, id, status (`absorbed` for a pulse
+        /// taken off its wire), closed, close error, frames, port, value
+        /// (as its JSON text, so the row orders totally).
         type PulseRow = (String, uuid::Uuid, String, bool, Option<weft_core::pulse::Failure>, Vec<u32>, String, String, bool, Option<uuid::Uuid>);
         /// One record as compared: node, frames, status, error,
         /// suspension token, absorbed pulses.
@@ -483,22 +489,23 @@
         };
         let pulses = |table: &PulseTable| -> Vec<PulseRow> {
             let mut v: Vec<_> = table
-                .iter()
-                .flat_map(|(node, bucket)| {
-                    bucket.iter().map(move |p| {
-                        (
-                            node.clone(),
-                            p.id,
-                            format!("{:?}", p.status),
-                            p.closed,
-                            p.failure.clone(),
-                            p.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect::<Vec<_>>(),
-                            p.target_port.clone(),
-                            p.value.to_string(),
-                            p.provided,
-                            p.inherited_from,
-                        )
-                    })
+                .values()
+                .flatten()
+                .map(|p| (p, format!("{:?}", p.status)))
+                .chain(table.all_absorbed().map(|p| (p, "absorbed".to_string())))
+                .map(|(p, status)| {
+                    (
+                        p.target_node.clone(),
+                        p.id,
+                        status,
+                        p.closed,
+                        p.failure.clone(),
+                        p.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect::<Vec<_>>(),
+                        p.target_port.clone(),
+                        p.value.to_string(),
+                        p.provided,
+                        p.inherited_from,
+                    )
                 })
                 .collect();
             v.sort();
@@ -520,7 +527,7 @@
             table
                 .iter()
                 .flat_map(|(node, recs)| {
-                    recs.iter().map(move |r| {
+                    recs.values().map(move |r| {
                         let mut absorbed = r.pulses_absorbed.clone();
                         absorbed.sort();
                         let mut closed_outputs: Vec<_> = r.closed_output_ports.iter().cloned().collect();
@@ -528,7 +535,7 @@
                         (
                             node.clone(),
                             r.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect::<Vec<_>>(),
-                            r.status.clone(),
+                            r.status(),
                             r.error.clone(),
                             r.callback_id.clone(),
                             absorbed,
@@ -554,10 +561,8 @@
                     gathers.sort();
                     let mut gather_ports = inst.gather_ports.clone();
                     gather_ports.sort();
-                    let mut launched = inst.launched.clone();
-                    launched.sort_unstable();
-                    let mut out_fired = inst.out_fired.clone();
-                    out_fired.sort_unstable();
+                    let launched: Vec<u32> = inst.launched.iter().copied().collect();
+                    let out_fired: Vec<u32> = inst.out_fired.iter().copied().collect();
                     (
                         key.group_id.clone(),
                         key.parent_frames.iter().map(|f| f.loop_index().expect("loop frame")).collect(),
@@ -578,14 +583,14 @@
             v
         };
         assert_eq!(loops(&live.loop_runtime), loops(&snap.loop_runtime), "the loop instances differ between the run and the fold");
-        let kicks = |kicked: &HashMap<FiringLocation, weft_core::primitive::KickedNode>| -> Vec<KickRow> {
+        let kicks = |kicked: &weft_core::primitive::KickTable| -> Vec<KickRow> {
             let mut v: Vec<KickRow> = kicked
                 .iter()
                 .map(|(loc, k)| {
                     (
                         loc.node_id.clone(),
                         loc.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect(),
-                        k.dispatched,
+                        k.dispatched(),
                         k.firing,
                         k.payload.as_ref().map(|v| v.to_string()),
                         k.port_snapshot.as_ref().map(|v| v.to_string()),

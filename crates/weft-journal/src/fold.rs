@@ -45,7 +45,7 @@ use weft_core::primitive::{
 };
 use weft_core::project::scopes::ScopeCopy;
 use weft_core::project::{loop_in_id, loop_out_id, GivenOrigin, GivenPort, ProgramIndex, NodeDefinition, ProjectDefinition};
-use weft_core::pulse::{Failure, PulseStatus};
+use weft_core::pulse::Failure;
 use weft_core::RunId;
 
 use crate::events::RunEvent;
@@ -135,7 +135,7 @@ impl Fold {
                 firings: Default::default(),
                 suspensions: HashMap::new(),
                 loop_runtime: loop_runtime::LoopRuntime::new(),
-                kicked: HashMap::new(),
+                kicked: Default::default(),
                 pending_deliveries: HashMap::new(),
                 awaited_sequences: HashMap::new(),
                 corruptions: Vec::new(),
@@ -197,7 +197,7 @@ impl Fold {
         // The records at one place: the node's firings under that
         // place's calls, at every loop iteration.
         let records_at = |snap: &RunSnapshot, place: &Located| -> Vec<weft_core::run::NodeFiring> {
-            snap.firings.get(&place.id).into_iter().flatten()
+            snap.firings.get(&place.id).into_iter().flat_map(|records| records.values())
                 .filter(|record| Located::at(&place.id, &record.frames) == *place).cloned().collect()
         };
         for place in places {
@@ -208,7 +208,7 @@ impl Fold {
             anyhow::ensure!(reusable.contains(place), "seed {} has no complete reusable result for '{place}'", source.run_id());
             anyhow::ensure!(!source.snap.inherited_origins.contains_key(place),
                 "seed result '{place}' must name its original run, not intermediate run {}", source.run_id());
-            anyhow::ensure!(records.iter().all(|record| matches!(record.status, NodeFiringStatus::Completed | NodeFiringStatus::Skipped)),
+            anyhow::ensure!(records.iter().all(|record| matches!(record.status(), NodeFiringStatus::Completed | NodeFiringStatus::Skipped)),
                 "cannot inherit unfinished or unsuccessful result '{place}' from {}", source.run_id());
             anyhow::ensure!(records.iter().all(|record| record.completed_at.is_some()), "seed result '{place}' has no completion time");
             anyhow::ensure!(records.iter().all(|record| record.inherited_from.is_none()),
@@ -225,7 +225,9 @@ impl Fold {
             for record in &records {
                 if let Some(output) = source.outputs.get(&record.id) { self.outputs.insert(record.id, output.clone()); }
             }
-            self.snap.firings.entry(place.id.clone()).or_default().extend(records);
+            for record in records {
+                self.snap.firings.insert(record);
+            }
         }
         for (location, entries) in &source.snap.awaited_sequences {
             if places.contains(&Located::at(&location.node_id, &location.frames)) { self.snap.awaited_sequences.insert(location.clone(), entries.clone()); }
@@ -314,23 +316,14 @@ impl Fold {
                 // payload and `dispatched` flag are authoritative; a later
                 // kick carrying a different payload is a writer-level bug
                 // the fold must not paper over by silently merging.
-                self.snap
-                    .kicked
-                    .entry(FiringLocation::new(node_id.clone(), frames.clone()))
-                    .and_modify(|kick| {
-                        if *firing && !kick.firing {
-                            kick.firing = true;
-                            kick.payload = payload.clone();
-                            kick.port_snapshot = port_snapshot.clone();
-                        }
-                    })
-                    .or_insert_with(|| KickedNode {
-                        firing: *firing,
-                        payload: payload.clone(),
-                        port_snapshot: port_snapshot.clone(),
-                        dispatched: false,
-                        scope_skipped: None,
-                    });
+                let (kick, made) = self.snap.kicked.kick(FiringLocation::new(node_id.clone(), frames.clone()), || {
+                    KickedNode::new(*firing, payload.clone(), port_snapshot.clone(), None)
+                });
+                if !made && *firing && !kick.firing {
+                    kick.firing = true;
+                    kick.payload = payload.clone();
+                    kick.port_snapshot = port_snapshot.clone();
+                }
             }
             RunEvent::PortEmitted { emission_id, node_id, frames, port, value, .. } => {
                 // An emission belongs to a firing: a row about one the
@@ -352,7 +345,7 @@ impl Fold {
                         });
                         // An output is mentioned even without a wire;
                         // a later seeded run can connect a consumer to it.
-                        self.record_mut(node_id, record_id)
+                        self.record_at_mut(node_id, frames)
                             .expect("`firing_record_id` found this record and nothing removes records")
                             .mentioned_ports
                             .extend(mentioned);
@@ -367,10 +360,10 @@ impl Fold {
                 }
             }
             RunEvent::PortClosed { emission_id, node_id, frames, port, .. } => {
-                let Some(record_id) = self.firing_record_id(node_id, frames, CorruptionSite::PortClosed, ev) else {
+                if self.firing_record_id(node_id, frames, CorruptionSite::PortClosed, ev).is_none() {
                     return effects;
-                };
-                self.close_port(record_id, node_id, frames, port, *emission_id, ev, &mut effects);
+                }
+                self.close_port(node_id, frames, port, *emission_id, ev, &mut effects);
             }
             RunEvent::PulsesConsumed { node_id, pulse_ids, .. } => {
                 // The take path's durability: REMOVE the consumed
@@ -433,7 +426,7 @@ impl Fold {
                 // whole (absorbing its pulses into no record would strand
                 // them for the resume-time un-absorb).
                 if let Some(record) = self.record_at(node_id, frames) {
-                    let what = if record.status.is_terminal() { "already ended" } else { "already open" };
+                    let what = if record.status().is_terminal() { "already ended" } else { "already open" };
                     self.report(
                         CorruptionSite::NodeLifecycle,
                         format!("{}: a firing is {what} at these frames, and a node fires once per frames", describe(ev)),
@@ -442,48 +435,24 @@ impl Fold {
                 }
                 let received = self.receiving(node_id, frames);
                 let absorbed = self.absorb_pending(node_id, frames, false);
-                if let Some(k) = self.snap.kicked.get_mut(&FiringLocation::new(node_id.clone(), frames.clone())) {
-                    k.dispatched = true;
-                }
-                {
-                    self.snap.firings.entry(node_id.clone()).or_default().push(NodeFiring {
-                        id: Uuid::new_v4(),
-                        received,
-                        skip_reason: None,
-                        node_id: node_id.clone(),
-                        status: NodeFiringStatus::Running,
-                        pulses_absorbed: absorbed,
-                        error: None,
-                        gave_up_wait: false,
-                        callback_id: None,
-                        started_at: *at_unix,
-                        completed_at: None,
-                        cost_usd: 0.0,
-                        logs: Vec::new(),
-                        mentioned_ports: Default::default(),
-                        closed_output_ports: Default::default(),
-                        run_id,
-                        frames: frames.clone(),
-                        inherited_from: None,
-                    });
-                }
+                self.snap.kicked.set_dispatched(&FiringLocation::new(node_id.clone(), frames.clone()), true);
+                self.snap.firings.insert(NodeFiring::started(node_id, frames.clone(), run_id, received, absorbed, *at_unix));
             }
             RunEvent::NodeSuspended { node_id, frames, token, .. } => {
                 // A suspension of a firing the journal never opened is
                 // corruption like every other lifecycle row: dropped
                 // quietly, the record would read Running and a resume
                 // would re-run a body that is parked on a signal.
-                let Some(record_id) = self.firing_record_id(node_id, frames, CorruptionSite::NodeLifecycle, ev) else {
+                if self.firing_record_id(node_id, frames, CorruptionSite::NodeLifecycle, ev).is_none() {
                     return effects;
-                };
-                if let Some(e) = self.record_mut(node_id, record_id) {
-                    e.status = NodeFiringStatus::WaitingForInput;
+                }
+                if let Some(e) = self.snap.firings.set_status(node_id, frames, NodeFiringStatus::WaitingForInput) {
                     e.callback_id = Some(token.clone());
                 }
             }
             RunEvent::NodeResumed { node_id, frames, token, .. } => {
-                // Flip the pending pulses at the location to Absorbed,
-                // exactly as the NodeStarted arm does. The live resume
+                // Absorb the pending pulses at the location, exactly as
+                // the NodeStarted arm does. The live resume
                 // dispatch absorbs them in RAM; if the fold left them
                 // Pending, a refold on a fresh worker would hold the
                 // node's record terminal (Completed) yet a Pending pulse
@@ -491,17 +460,16 @@ impl Fold {
                 // (which keys purely on Pending pulses, ignoring the
                 // record) would re-fire the node: double run on
                 // every respawn. The un-absorb path (`redispatch_locations`)
-                // also assumes resume-time pulses were folded Absorbed
-                // before it flips them back. A resume of a firing the
+                // also assumes resume-time pulses were folded absorbed
+                // before it puts them back. A resume of a firing the
                 // journal never opened is corruption, skipped whole:
                 // pulses absorbed into no record could never be given
                 // back.
-                let Some(record_id) = self.firing_record_id(node_id, frames, CorruptionSite::NodeLifecycle, ev) else {
+                if self.firing_record_id(node_id, frames, CorruptionSite::NodeLifecycle, ev).is_none() {
                     return effects;
-                };
+                }
                 let absorbed = self.absorb_pending(node_id, frames, false);
-                if let Some(e) = self.record_mut(node_id, record_id) {
-                    e.status = NodeFiringStatus::Running;
+                if let Some(e) = self.snap.firings.set_status(node_id, frames, NodeFiringStatus::Running) {
                     e.callback_id = None;
                     for id in absorbed {
                         if !e.pulses_absorbed.contains(&id) {
@@ -822,10 +790,10 @@ impl Fold {
     pub fn final_outputs(&self) -> Value {
         let mut obj = serde_json::Map::new();
         let boundary = |id: &str| self.project.nodes.iter().any(|n| n.id == id && n.group_boundary.is_some());
-        for (node_id, firings) in &self.snap.firings {
+        for (node_id, firings) in self.snap.firings.iter() {
             if boundary(node_id) { continue; }
             let mut last_by_place: BTreeMap<Located, &weft_core::run::NodeFiring> = BTreeMap::new();
-            for firing in firings.iter().filter(|e| e.status == NodeFiringStatus::Completed) {
+            for firing in firings.values().filter(|e| e.status() == NodeFiringStatus::Completed) {
                 last_by_place.insert(Located::at(node_id, &firing.frames), firing);
             }
             for (place, last) in last_by_place {
@@ -960,25 +928,15 @@ impl Fold {
         effects.scopes.extend(pass.decided);
     }
 
-    /// Mark every pending pulse at `(node, frames)` Absorbed and return
+    /// Absorb every pending pulse at `(node, frames)` and return
     /// their ids, minus the items on the node's generator ports when
     /// `include_generator` is false (a run dispatch leaves those for
     /// its live feed; a skip absorbs everything).
     fn absorb_pending(&mut self, node_id: &str, frames: &LoopFrames, include_generator: bool) -> Vec<Uuid> {
         let generator_ports = self.program_idx.stream_inputs(node_id);
-        let mut absorbed = Vec::new();
-        if let Some(bucket) = self.snap.pulses.get_mut(node_id) {
-            for p in bucket.iter_mut() {
-                if p.status == PulseStatus::Pending
-                    && &p.frames == frames
-                    && (include_generator || !generator_ports.contains(&p.target_port))
-                {
-                    p.absorb();
-                    absorbed.push(p.id);
-                }
-            }
-        }
-        absorbed
+        self.snap.pulses.absorb(node_id, |p| {
+            &p.frames == frames && (include_generator || !generator_ports.contains(&p.target_port))
+        })
     }
 
     /// A port of a running firing closed (the body's own close, or a
@@ -987,7 +945,6 @@ impl Fold {
     #[allow(clippy::too_many_arguments)]
     fn close_port(
         &mut self,
-        record_id: Uuid,
         node_id: &str,
         frames: &LoopFrames,
         port: &str,
@@ -1004,12 +961,10 @@ impl Fold {
                     id: emission_id, node: node_id.into(), frames: frames.clone(),
                     port: port.into(), value: None, error: None,
                 });
-                self.record_mut(node_id, record_id)
-                    .expect("`firing_record_id` found this record and nothing removes records")
-                    .mentioned_ports
-                    .insert(port.to_string());
-                self.record_mut(node_id, record_id).expect("record exists")
-                    .closed_output_ports.insert(port.to_string());
+                let record = self.record_at_mut(node_id, frames)
+                    .expect("`firing_record_id` found this record and nothing removes records");
+                record.mentioned_ports.insert(port.to_string());
+                record.closed_output_ports.insert(port.to_string());
                 true
             }
             Err(e) => {
@@ -1045,9 +1000,9 @@ impl Fold {
     ) {
         let run_id = self.snap.run_id;
         let Some(def) = self.node_def(node_id, ev) else { return };
-        let Some(record_id) = self.firing_record_id(node_id, frames, CorruptionSite::NodeLifecycle, ev) else {
+        if self.firing_record_id(node_id, frames, CorruptionSite::NodeLifecycle, ev).is_none() {
             return;
-        };
+        }
         // A skip decided before the body ran is the whole group's
         // consumption: whatever was left pending for its feeds (a
         // stream's items) goes with it. A body that ran and ended
@@ -1057,7 +1012,7 @@ impl Fold {
         // for any ended consumer.
         if status == NodeFiringStatus::Skipped && skip_reason != Some(&SkipReason::WaitSkipped) {
             let more = self.absorb_pending(node_id, frames, true);
-            if let Some(e) = self.record_mut(node_id, record_id) {
+            if let Some(e) = self.record_at_mut(node_id, frames) {
                 for id in more {
                     if !e.pulses_absorbed.contains(&id) {
                         e.pulses_absorbed.push(id);
@@ -1065,8 +1020,8 @@ impl Fold {
                 }
             }
         }
-        let e = self.record_mut(node_id, record_id).expect("`firing_record_id` found this record and nothing removes records");
-        e.status = status.clone();
+        let e = self.snap.firings.set_status(node_id, frames, status)
+            .expect("`firing_record_id` found this record and nothing removes records");
         e.skip_reason = skip_reason.cloned();
         e.completed_at = Some(at_unix);
         if let Some(err) = error {
@@ -1191,12 +1146,6 @@ impl Fold {
 
     fn record_at_mut(&mut self, node_id: &str, frames: &LoopFrames) -> Option<&mut NodeFiring> {
         firing_at_mut(&mut self.snap.firings, node_id, self.snap.run_id, frames)
-    }
-
-    /// The record `firing_record_id` named, by id within its node's
-    /// own records (a record never moves between nodes).
-    fn record_mut(&mut self, node_id: &str, record_id: Uuid) -> Option<&mut NodeFiring> {
-        self.snap.firings.get_mut(node_id)?.iter_mut().find(|e| e.id == record_id)
     }
 
     fn parse_ids(&mut self, ids: &[String], site: CorruptionSite) -> Vec<Uuid> {
@@ -1390,6 +1339,7 @@ pub fn fold_to_snapshot<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weft_core::run::NodeFiringTable;
     use serde_json::json;
     use weft_core::frames::Frame;
     use weft_core::pulse::PulseStatus;
@@ -1534,6 +1484,13 @@ mod tests {
             port_snapshot: None,
             at_unix: 0,
         }
+    }
+
+    /// The one pulse absorbed at `node`.
+    fn only_absorbed<'a>(snap: &'a RunSnapshot, node: &str) -> &'a weft_core::pulse::Pulse {
+        let absorbed: Vec<_> = snap.pulses.all_absorbed().filter(|p| p.target_node == node).collect();
+        assert_eq!(absorbed.len(), 1, "one pulse absorbed at {node}: {absorbed:?}");
+        absorbed[0]
     }
 
     fn pending<'a>(snap: &'a RunSnapshot, node: &str) -> Vec<&'a weft_core::pulse::Pulse> {
@@ -1689,10 +1646,10 @@ mod tests {
         }
         let snap = fold.snapshot();
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
-        let a = &snap.pulses["a"][0];
+        assert!(snap.pulses["a"].is_empty(), "the start took a's pulse off its wire");
+        let a = only_absorbed(snap, "a");
         let b = &snap.pulses["b"][0];
         let c = &snap.pulses["c"][0];
-        assert_eq!(a.status, PulseStatus::Absorbed);
         assert_eq!(b.status, PulseStatus::Pending);
         assert_eq!(c.status, PulseStatus::Pending);
         assert!(Arc::ptr_eq(&a.value, &b.value) && Arc::ptr_eq(&b.value, &c.value), "one allocation");
@@ -1725,12 +1682,14 @@ mod tests {
         ];
         let snap = fold_to_snapshot(run_id(), project, &events);
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
-        for n in ["a", "b", "c"] {
+        for n in ["a", "c"] {
             assert_eq!(snap.pulses[n].len(), 1, "{n} got a closure");
             assert!(snap.pulses[n][0].closed);
         }
-        assert_eq!(snap.pulses["b"][0].status, PulseStatus::Absorbed);
-        assert_eq!(snap.firings["b"][0].status, NodeFiringStatus::Skipped);
+        assert!(snap.pulses["b"].is_empty(), "the skip took b's closure off its wire");
+        let b = only_absorbed(&snap, "b");
+        assert!(b.closed);
+        assert_eq!(snap.firings["b"][0].status(), NodeFiringStatus::Skipped);
         assert!(pending(&snap, "b").is_empty());
         // `a` and `c` never started: their closures wait for the
         // scheduler.
@@ -1865,7 +1824,7 @@ mod tests {
         assert!(!loop_in.contains(&item1), "the launched item left the LoopIn's bucket");
         assert_eq!(loop_in.len(), 1, "the second item still waits there");
         let inst = snap.loop_runtime.get(&lp_key()).expect("instance");
-        assert_eq!(inst.launched, vec![0]);
+        assert_eq!(inst.launched, std::collections::BTreeSet::from([0]));
         let ended = snap.loop_runtime.stream_instances_with_recorded_end();
         assert_eq!(ended.len(), 1);
         assert!(matches!(&ended[0].2, weft_core::generator::StreamEnd::Failed { error } if error == "upstream broke"));
@@ -2029,7 +1988,7 @@ mod tests {
             let snap = fold_to_snapshot(run_id(), fan_out_project(), &events);
             assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
             let record = &snap.firings["src"][0];
-            assert_eq!(record.status, NodeFiringStatus::Failed);
+            assert_eq!(record.status(), NodeFiringStatus::Failed);
             assert_eq!(record.gave_up_wait, gave_up_wait);
         }
     }
@@ -2220,15 +2179,18 @@ mod tests {
     /// recorded, so the peek-then-remove order is what the row rests on.
     #[test]
     fn a_refused_launch_leaves_its_pulse_and_records_no_iteration() {
+        // A second value on the LoopIn's list port, landing after its
+        // start took the first: a pulse still on its wire for the launch
+        // to name.
         let e1 = Uuid::new_v4();
         let items = weft_core::run::emission::pulse_id(e1, "feed.items->lp__in.items", false);
         let events = vec![
             started("feed", vec![], 0),
-            emitted(e1, "feed", vec![], "items", json!([10, 20, 30])),
+            emitted(Uuid::new_v4(), "feed", vec![], "items", json!([10, 20, 30])),
             emitted(Uuid::new_v4(), "feed", vec![], "seed", json!(1)),
-            completed("feed", vec![], 0),
             started("lp__in", vec![], 1),
             loop_row_instantiated(),
+            emitted(e1, "feed", vec![], "items", json!([10, 20, 30])),
             RunEvent::LoopIterationLaunched {
                 run_id: run_id(),
                 group_id: "lp".into(),
@@ -2247,6 +2209,32 @@ mod tests {
         assert!(pending(&snap, "add").is_empty(), "no body pulse was put on a wire");
     }
 
+    /// A launch naming a pulse a start already took launches nothing: an
+    /// item is taken once, by the launch that names it while it is still
+    /// on its wire.
+    #[test]
+    fn a_launch_naming_a_taken_pulse_is_corruption() {
+        let e1 = Uuid::new_v4();
+        let items = weft_core::run::emission::pulse_id(e1, "feed.items->lp__in.items", false);
+        let events = vec![
+            started("feed", vec![], 0),
+            emitted(e1, "feed", vec![], "items", json!([10, 20, 30])),
+            emitted(Uuid::new_v4(), "feed", vec![], "seed", json!(1)),
+            completed("feed", vec![], 0),
+            started("lp__in", vec![], 1),
+            loop_row_instantiated(),
+            RunEvent::LoopIterationLaunched {
+                run_id: run_id(), group_id: "lp".into(), parent_frames: vec![], index: 0,
+                stream_pulse: Some(items.to_string()), at_unix: 1,
+            },
+        ];
+        let snap = fold_to_snapshot(run_id(), loop_project(false), &events);
+        assert_eq!(snap.corruptions.len(), 1, "{:?}", snap.corruptions);
+        assert!(snap.corruptions[0].reason.contains("does not hold"), "{}", snap.corruptions[0].reason);
+        assert!(snap.pulses.absorbed(items).is_some(), "the start's take stands");
+        assert!(snap.loop_runtime.get(&lp_key()).expect("instance").launched.is_empty());
+    }
+
     /// A loop resumed between instantiation and its first LoopOut
     /// rebuilds the instance from the LoopIn's pulses: the outer input,
     /// the carry seed, and iteration 0's body pulses (the slice, the
@@ -2257,7 +2245,7 @@ mod tests {
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
         let inst = snap.loop_runtime.get(&lp_key()).expect("instance");
         assert_eq!(inst.iter_cap, Some(3));
-        assert_eq!(inst.launched, vec![0]);
+        assert_eq!(inst.launched, std::collections::BTreeSet::from([0]));
         assert_eq!(*inst.carry_values["acc"], json!(1));
         assert_eq!(*inst.outer_input["items"], json!([10, 20, 30]));
         assert!(!inst.outer_input.contains_key("_should_flow"));
@@ -2290,7 +2278,7 @@ mod tests {
         let snap = fold_to_snapshot(run_id(), loop_project(false), &events);
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
         let inst = snap.loop_runtime.get(&lp_key()).expect("instance");
-        assert_eq!(inst.out_fired, vec![0]);
+        assert_eq!(inst.out_fired, std::collections::BTreeSet::from([0]));
         assert_eq!(*inst.carry_values["acc"], json!(11));
         let add1: Vec<_> = pending(&snap, "add").into_iter().filter(|p| p.frames == vec![frame(1)]).collect();
         assert_eq!(*add1.iter().find(|p| p.target_port == "acc").unwrap().value, json!(11), "iteration 1 carries the write");
@@ -2319,7 +2307,12 @@ mod tests {
         let eligible = weft_core::seeding::inheritable_nodes(&definition, &snap);
         assert!(["lp__in", "add", "lp__out"].iter().all(|node| eligible.contains(&Located::top(*node))));
         let mut missing_iteration = snap.clone();
-        missing_iteration.firings.get_mut("add").unwrap().retain(|record| record.frames != vec![frame(1)]);
+        missing_iteration.firings = NodeFiringTable::new();
+        for record in snap.firings.values().flat_map(|records| records.values()) {
+            if !(record.node_id == "add" && record.frames == vec![frame(1)]) {
+                missing_iteration.firings.insert(record.clone());
+            }
+        }
         let eligible = weft_core::seeding::inheritable_nodes(&definition, &missing_iteration);
         assert!(["lp__in", "add", "lp__out"].iter().all(|node| !eligible.contains(&Located::top(*node))), "one missing iteration invalidates the whole loop");
         // Replaying the terminal row puts nothing on the wires twice.
@@ -2431,8 +2424,8 @@ mod tests {
         let snap = fold_to_snapshot(run_id(), loop_project(true), &events);
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
         let inst = snap.loop_runtime.get(&lp_key()).expect("instance");
-        assert_eq!(inst.launched, vec![0, 1, 2]);
-        assert_eq!(inst.out_fired, vec![2]);
+        assert_eq!(inst.launched, std::collections::BTreeSet::from([0, 1, 2]));
+        assert_eq!(inst.out_fired, std::collections::BTreeSet::from([2]));
         let lanes: HashSet<u32> = pending(&snap, "add").iter().map(|p| p.frames[0].loop_index().expect("a loop frame")).collect();
         assert_eq!(lanes, [0, 1].into_iter().collect(), "lanes 0 and 1 still wait; lane 2 absorbed");
         // A closed write records as Closed, a null slot in the list.
@@ -2456,7 +2449,7 @@ mod tests {
         ];
         let snap = fold_to_snapshot(run_id(), fan_out_project(), &events);
         let kick = snap.kicked.get(&FiringLocation::new("src", Vec::new())).expect("kick survives fold");
-        assert!(kick.dispatched, "NodeStarted at root frames consumed the kick");
+        assert!(kick.dispatched(), "NodeStarted at root frames consumed the kick");
         assert_eq!(kick.payload.as_ref(), Some(&payload));
     }
 
@@ -2505,7 +2498,7 @@ mod tests {
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
         let firings = &snap.firings["a"];
         assert_eq!(firings.len(), 1, "one record per (node, frames)");
-        assert_eq!(firings[0].status, NodeFiringStatus::Completed);
+        assert_eq!(firings[0].status(), NodeFiringStatus::Completed);
         assert!(snap.suspensions.is_empty(), "suspensions cleared after resume+complete");
         assert!(snap.pending_deliveries.is_empty());
         assert_eq!(ended, vec![EndedWait { at: FiringLocation::new("a", vec![]), token, end: AwaitEnd::Answered { value: json!("approved") } }], "the answer ends the wait, once");
@@ -2525,10 +2518,10 @@ mod tests {
             RunEvent::NodeResumed { run_id: run_id(), node_id: "a".into(), frames: vec![], token: None, at_unix: 0 },
         ];
         let snap = fold_to_snapshot(run_id(), fan_out_project(), &events);
-        let a = &snap.pulses["a"][0];
-        assert_eq!(a.status, PulseStatus::Absorbed);
+        assert!(snap.pulses["a"].is_empty());
+        let a = only_absorbed(&snap, "a");
         assert_eq!(snap.firings["a"][0].pulses_absorbed, vec![a.id]);
-        assert_eq!(snap.firings["a"][0].status, NodeFiringStatus::Running);
+        assert_eq!(snap.firings["a"][0].status(), NodeFiringStatus::Running);
     }
 
     /// A node fires once per frames: a second `NodeStarted` where the
@@ -2549,9 +2542,9 @@ mod tests {
         assert_eq!(sites, vec![CorruptionSite::NodeLifecycle], "{:?}", snap.corruptions);
         assert!(snap.corruptions[0].reason.contains("already ended"), "{:?}", snap.corruptions[0]);
         assert_eq!(snap.firings["src"].len(), 1, "the second start opened nothing");
-        assert_eq!(snap.firings["src"][0].status, NodeFiringStatus::Completed);
-        assert_eq!(snap.pulses["a"].len(), 1, "one closure, from the one firing");
-        assert_eq!(snap.pulses["a"][0].status, PulseStatus::Absorbed);
+        assert_eq!(snap.firings["src"][0].status(), NodeFiringStatus::Completed);
+        assert!(snap.pulses["a"].is_empty(), "a's start took the closure");
+        assert!(only_absorbed(&snap, "a").closed, "one closure, from the one firing");
     }
 
     /// A stream take removes the pulse from the table (no tombstone),
@@ -2852,7 +2845,7 @@ mod tests {
         let again = fold.apply(&loop_row_out_fired(0));
         assert_eq!(again.loop_out_done, None, "a firing already held records nothing");
         assert!(fold.snapshot().corruptions.is_empty(), "{:?}", fold.snapshot().corruptions);
-        assert_eq!(fold.snapshot().loop_runtime.get(&lp_key()).unwrap().out_fired, vec![0]);
+        assert_eq!(fold.snapshot().loop_runtime.get(&lp_key()).unwrap().out_fired, std::collections::BTreeSet::from([0]));
     }
 
     /// The dispatcher's cancel row ends the firing and sweeps what it
@@ -2864,7 +2857,7 @@ mod tests {
             RunEvent::NodeCancelled { run_id: run_id(), node_id: "src".into(), frames: vec![], reason: "stopped".into(), at_unix: 1 },
         ];
         let snap = fold_to_snapshot(run_id(), fan_out_project(), &events);
-        assert_eq!(snap.firings["src"][0].status, NodeFiringStatus::Cancelled);
+        assert_eq!(snap.firings["src"][0].status(), NodeFiringStatus::Cancelled);
         for node in ["a", "b", "c"] {
             let got = pending(&snap, node);
             assert_eq!(got.len(), 1, "{node}");
@@ -2999,5 +2992,120 @@ mod tests {
         let ended = [record, closing].concat();
         assert_eq!(ChargeBook::of_record(&ended).into_open().count(), 0, "every charge is closed");
         assert!(unpriced_charges_closed(run_id(), &ended, "again", 8).is_empty());
+    }
+
+    /// A sequential loop over a stream whose body is two nodes, `fmt` then
+    /// `tag`: the shape of a long research run.
+    fn long_loop_project() -> Arc<ProjectDefinition> {
+        project(
+            vec![
+                node("gen", "T", &[], &[("rows", "Generator[Number]")], &[], Value::Null, Value::Null),
+                node(
+                    "lp__in",
+                    "LoopIn",
+                    &[("rows", "Generator[Number]", true), ("_should_flow", "Boolean", false)],
+                    &[("rows", "Number"), ("index", "Number")],
+                    &[],
+                    json!({ "groupId": "lp", "role": "In" }),
+                    json!({ "parallel": false, "over": ["rows"], "carry": [] }),
+                ),
+                node("fmt", "T", &[("item", "Number", true)], &[("text", "String")], &["lp"], Value::Null, Value::Null),
+                node("tag", "T", &[("text", "String", true)], &[("res", "String")], &["lp"], Value::Null, Value::Null),
+                node(
+                    "lp__out",
+                    "LoopOut",
+                    &[("res", "String", false), ("done", "Boolean", false)],
+                    &[("res", "List[String]")],
+                    &[],
+                    json!({ "groupId": "lp", "role": "Out" }),
+                    json!({ "parentId": null }),
+                ),
+                node("sink", "T", &[("res", "List[String]", true)], &[], &[], Value::Null, Value::Null),
+            ],
+            vec![
+                edge("gen", "rows", "lp__in", "rows"),
+                edge("lp__in", "rows", "fmt", "item"),
+                edge("fmt", "text", "tag", "text"),
+                edge("tag", "res", "lp__out", "res"),
+                edge("lp__out", "res", "sink", "res"),
+            ],
+        )
+    }
+
+    /// The rows of a run of `long_loop_project` over `n` items: the
+    /// stream hands out one item per pull, so each comes out just before
+    /// the iteration that takes it, and the iterations run one after the
+    /// other.
+    fn long_loop_rows(n: u32) -> Vec<RunEvent> {
+        let text = json!("x".repeat(64));
+        let launched = |index: u32, item: Uuid| RunEvent::LoopIterationLaunched {
+            run_id: run_id(), group_id: "lp".into(), parent_frames: vec![], index,
+            stream_pulse: Some(item.to_string()), at_unix: 1,
+        };
+        let mut rows = vec![started_run(), started("gen", vec![], 0), started("lp__in", vec![], 1), loop_row_instantiated()];
+        for i in 0..n {
+            let emission = Uuid::new_v4();
+            let item = weft_core::run::emission::pulse_id(emission, "gen.rows->lp__in.rows", false);
+            rows.extend([
+                emitted(emission, "gen", vec![], "rows", json!(i)),
+                launched(i, item),
+                started("fmt", vec![frame(i)], 2),
+                emitted(Uuid::new_v4(), "fmt", vec![frame(i)], "text", text.clone()),
+                completed("fmt", vec![frame(i)], 2),
+                started("tag", vec![frame(i)], 3),
+                emitted(Uuid::new_v4(), "tag", vec![frame(i)], "res", text.clone()),
+                completed("tag", vec![frame(i)], 3),
+                started("lp__out", vec![frame(i)], 4),
+                loop_row_out_fired(i),
+                completed("lp__out", vec![frame(i)], 4),
+            ]);
+        }
+        rows.extend([
+            completed("gen", vec![], 5),
+            RunEvent::LoopStreamEnded { run_id: run_id(), group_id: "lp".into(), parent_frames: vec![], end: weft_core::generator::StreamEnd::Finished, at_unix: 5 },
+            RunEvent::LoopTerminated { run_id: run_id(), group_id: "lp".into(), parent_frames: vec![], reason: LoopTerminationReason::OverExhausted, at_unix: 5 },
+            completed("lp__in", vec![], 5),
+        ]);
+        rows
+    }
+
+    /// The fastest of three folds of `rows`, and the snapshot it left.
+    fn time_fold(rows: &[RunEvent]) -> (std::time::Duration, RunSnapshot) {
+        let mut best = None;
+        let mut snap = None;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let folded = fold_to_snapshot(run_id(), long_loop_project(), rows);
+            let took = start.elapsed();
+            best = Some(best.map_or(took, |best: std::time::Duration| best.min(took)));
+            snap = Some(folded);
+        }
+        (best.expect("three folds ran"), snap.expect("three folds ran"))
+    }
+
+    /// What one row costs the fold does not grow with how long the run
+    /// already is: a run three times longer folds in about three times the
+    /// time. Every per-row lookup (the firing a row is about, the pulses a
+    /// start absorbs, the scopes a pass looks at) used to walk everything
+    /// the run had done so far, so three times the rows took nine times
+    /// the time. A ratio, so it holds on a slow machine as on a fast one.
+    #[test]
+    fn folding_a_run_costs_the_same_per_row_however_long_it_is() {
+        let n = 1500;
+        let short = long_loop_rows(n);
+        let long = long_loop_rows(3 * n);
+        let (short_took, snap) = time_fold(&short);
+        assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
+        let (long_took, snap) = time_fold(&long);
+        assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
+        let sink = pending(&snap, "sink");
+        assert_eq!(sink.len(), 1, "the loop ended and handed its list on");
+        assert_eq!(sink[0].value.as_array().map(Vec::len), Some(3 * n as usize));
+        let ratio = long_took.as_secs_f64() / short_took.as_secs_f64();
+        assert!(
+            ratio < 5.0,
+            "{} rows folded in {short_took:?}, {} rows in {long_took:?}: {ratio:.1} times the time for 3 times the rows",
+            short.len(), long.len(),
+        );
     }
 }

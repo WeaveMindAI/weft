@@ -121,7 +121,9 @@ Any other section fails the build, with an error naming the node type and the
 key.
 
 `[build.env]` only sets variables. If you need build logic, write a build
-script.
+script. The compiler flags (`RUSTFLAGS`) are weft's to set for every worker
+build, so a node that sets them here is refused; if your package's code needs
+a flag of its own, its build script prints it (`cargo:rustc-cfg=...`).
 
 ## What a node needs from the machine
 

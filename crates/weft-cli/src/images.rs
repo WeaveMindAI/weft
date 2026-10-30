@@ -280,7 +280,7 @@ fn runtime_source_hash() -> Result<Sha256> {
         .map_err(|e| anyhow::anyhow!("runtime image crate closure: {e}"))?;
     let mut inputs: Vec<(String, PathBuf)> =
         closure.iter().map(|name| (format!("crates/{name}"), root.join("crates").join(name))).collect();
-    for rel in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
+    for rel in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"] {
         inputs.push((rel.to_string(), root.join(rel)));
     }
     inputs.push((RUNTIME_DOCKERFILE.to_string(), root.join("deploy/docker").join(RUNTIME_DOCKERFILE)));

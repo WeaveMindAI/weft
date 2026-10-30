@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
@@ -97,11 +97,13 @@ impl std::fmt::Display for Failure {
     }
 }
 
+/// Where a pulse still on its wire stands. A pulse a dispatch, a skip or
+/// a decision took is out of its bucket altogether, among the table's
+/// absorbed pulses ([`PulseTable::absorb`]): where it sits is what says it
+/// was taken, so no status says it a second time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PulseStatus {
     Pending,
-    /// A supplied emission waiting for its source's enclosing group gate.
-    Gated,
     /// Handed to a LIVE in-process sink (a running consumer's generator
     /// feed, a loop's stream queue) but not yet taken. Invisible to
     /// readiness (the consumer is already running; a re-dispatch would
@@ -111,21 +113,11 @@ pub enum PulseStatus {
     /// taking it went down with the worker and is failed, never run
     /// again).
     Routed,
-    /// Consumed by a dispatch, a take, or cancellation and never read
-    /// again.
-    Absorbed,
 }
 
 impl PulseStatus {
     pub fn is_pending(&self) -> bool {
         matches!(self, PulseStatus::Pending)
-    }
-
-    /// Still in flight: not yet absorbed. Pending AND routed pulses are
-    /// work the run has not finished (a routed item sits in a
-    /// live sink awaiting its take).
-    pub fn in_flight(&self) -> bool {
-        !matches!(self, PulseStatus::Absorbed)
     }
 }
 
@@ -197,17 +189,23 @@ impl Pulse {
         }
     }
 
-    /// Mark this pulse as absorbed. Absorbed pulses are never reused.
-    pub fn absorb(&mut self) {
-        self.status = PulseStatus::Absorbed;
-    }
 }
 
-/// Pending values plus bounded per-stream consumption history. Removing an
-/// item frees its payload without forgetting that this stream supplied data.
+/// A run's pulses. A bucket per target node holds the pulses still in
+/// flight there (pending, or routed to a live sink), in the order they
+/// landed: what
+/// every turn of the live engine and every row of the fold walks, so its
+/// size never grows with what the run already took. A taken pulse leaves
+/// its bucket for the absorbed pulses, kept by id: a firing run again
+/// after a refold takes its pulses back from there ([`Self::unabsorb`]),
+/// and a pulse landing a second time (a replayed row) is known as landed
+/// ([`Self::landed`]). A stream item a consumer took is removed outright
+/// ([`Self::remove_consumed`]), which frees its payload; only that the
+/// stream supplied data is remembered.
 #[derive(Debug, Clone, Default)]
 pub struct PulseTable {
     buckets: BTreeMap<String, Vec<Pulse>>,
+    absorbed: HashMap<uuid::Uuid, Pulse>,
     consumed_streams: HashSet<(RunId, crate::frames::FiringLocation, String)>,
 }
 
@@ -228,6 +226,70 @@ impl PulseTable {
         }
         bucket.retain(|p| !ids.contains(&p.id));
     }
+
+    /// Take the pending pulses at `node` that `taken` picks: each leaves
+    /// the bucket, absorbed (a dispatch took it, a skip or a decision
+    /// consumed it, or the run will never take it). Answers their ids, in
+    /// the order they landed.
+    pub fn absorb(&mut self, node: &str, mut taken: impl FnMut(&Pulse) -> bool) -> Vec<uuid::Uuid> {
+        let Some(bucket) = self.buckets.get_mut(node) else { return Vec::new() };
+        let mut ids = Vec::new();
+        let mut kept = Vec::with_capacity(bucket.len());
+        for pulse in bucket.drain(..) {
+            if pulse.status.is_pending() && taken(&pulse) {
+                ids.push(pulse.id);
+                self.absorbed.insert(pulse.id, pulse);
+            } else {
+                kept.push(pulse);
+            }
+        }
+        *bucket = kept;
+        ids
+    }
+
+    /// Put the absorbed pulses `ids` at `node` back on their wire,
+    /// pending: a firing run again after a refold takes them again. One
+    /// already back on its wire there (the firing was put back by an
+    /// earlier call and has not run yet) stays as it is. Refused, moving
+    /// nothing, when one of them is neither: the firing's record and the
+    /// table disagree about what it took, and running it on part of its
+    /// inputs would be wrong.
+    pub fn unabsorb(&mut self, node: &str, ids: &[uuid::Uuid]) -> Result<(), String> {
+        let on_wire = |id: &uuid::Uuid| {
+            self.buckets.get(node).is_some_and(|bucket| bucket.iter().any(|pulse| pulse.id == *id && pulse.status.is_pending()))
+        };
+        let taken = |id: &uuid::Uuid| self.absorbed.get(id).is_some_and(|pulse| pulse.target_node == node);
+        let missing: Vec<&uuid::Uuid> = ids.iter().filter(|id| !taken(id) && !on_wire(id)).collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "the firing of '{node}' took pulses {missing:?}, which the run's table holds neither as taken there nor on its wire"
+            ));
+        }
+        for id in ids {
+            if let Some(mut pulse) = self.absorbed.remove(id) {
+                pulse.status = PulseStatus::Pending;
+                self.buckets.entry(node.to_string()).or_default().push(pulse);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the pulse `id` landed at `node`, in flight or absorbed
+    /// (a stream item a consumer took is forgotten).
+    pub fn landed(&self, node: &str, id: uuid::Uuid) -> bool {
+        self.absorbed.get(&id).is_some_and(|pulse| pulse.target_node == node)
+            || self.buckets.get(node).is_some_and(|bucket| bucket.iter().any(|pulse| pulse.id == id))
+    }
+
+    /// The absorbed pulse `id`, if it is one.
+    pub fn absorbed(&self, id: uuid::Uuid) -> Option<&Pulse> {
+        self.absorbed.get(&id)
+    }
+
+    /// Every absorbed pulse, in no particular order.
+    pub fn all_absorbed(&self) -> impl Iterator<Item = &Pulse> {
+        self.absorbed.values()
+    }
 }
 
 impl Deref for PulseTable {
@@ -241,7 +303,7 @@ impl DerefMut for PulseTable {
 
 impl<const N: usize> From<[(String, Vec<Pulse>); N]> for PulseTable {
     fn from(values: [(String, Vec<Pulse>); N]) -> Self {
-        Self { buckets: BTreeMap::from(values), consumed_streams: HashSet::new() }
+        Self { buckets: BTreeMap::from(values), ..Self::default() }
     }
 }
 
@@ -265,5 +327,30 @@ mod tests {
 
         let plain = serde_json::to_value(Pulse::closure(uuid::Uuid::nil(), uuid::Uuid::nil(), vec![], "sink", "in")).unwrap();
         assert!(plain.get("failure").is_none(), "a plain closure carries no failure field");
+    }
+
+    /// A taken pulse leaves its bucket and is still known: by id, as
+    /// landed (a replay of it adds nothing), and back on its wire once a
+    /// firing that runs again takes it back.
+    #[test]
+    fn an_absorbed_pulse_leaves_its_bucket_and_can_come_back() {
+        let pulse = |n: u128, port: &str| Pulse::new(uuid::Uuid::from_u128(n), RunId::nil(), vec![], "sink", port, Arc::new(json!(n as u64)));
+        let mut table = PulseTable::new();
+        table.entry("sink".into()).or_default().extend([pulse(1, "a"), pulse(2, "b"), pulse(3, "a")]);
+        let taken = table.absorb("sink", |p| p.target_port == "a");
+        assert_eq!(taken, vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(3)]);
+        assert_eq!(table["sink"].iter().map(|p| p.id).collect::<Vec<_>>(), vec![uuid::Uuid::from_u128(2)]);
+        assert!(table.absorbed(uuid::Uuid::from_u128(1)).is_some());
+        assert!(table.landed("sink", uuid::Uuid::from_u128(3)) && table.landed("sink", uuid::Uuid::from_u128(2)));
+        assert!(!table.landed("elsewhere", uuid::Uuid::from_u128(3)), "landed where it landed only");
+        assert!(table.absorb("sink", |p| p.target_port == "a").is_empty(), "nothing pending is left there");
+        assert!(table.unabsorb("elsewhere", &[uuid::Uuid::from_u128(3)]).is_err());
+        assert!(table.unabsorb("sink", &[uuid::Uuid::from_u128(3), uuid::Uuid::from_u128(9)]).is_err(), "9 never landed");
+        assert!(table.absorbed(uuid::Uuid::from_u128(3)).is_some(), "a refused un-absorb moves nothing");
+        table.unabsorb("sink", &[uuid::Uuid::from_u128(3), uuid::Uuid::from_u128(1)]).unwrap();
+        table.unabsorb("sink", &[uuid::Uuid::from_u128(3), uuid::Uuid::from_u128(1)]).expect("putting back what is back already changes nothing");
+        assert_eq!(table["sink"].iter().map(|p| (p.id.as_u128(), p.status)).collect::<Vec<_>>(),
+            vec![(2, PulseStatus::Pending), (3, PulseStatus::Pending), (1, PulseStatus::Pending)]);
+        assert_eq!(table.all_absorbed().count(), 0);
     }
 }

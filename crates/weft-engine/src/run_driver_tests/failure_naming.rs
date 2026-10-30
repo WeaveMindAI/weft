@@ -27,38 +27,22 @@
         .unwrap()
     }
 
-    fn failed(node_id: &str, frames: Vec<Frame>, error: &str) -> NodeFiring {
-        NodeFiring {
-            id: uuid::Uuid::new_v4(),
-            received: Default::default(),
-            skip_reason: None,
-            node_id: node_id.into(),
-            status: NodeFiringStatus::Failed,
-            pulses_absorbed: Vec::new(),
-            error: Some(error.into()),
-            gave_up_wait: false,
-            callback_id: None,
-            started_at: 1,
-            completed_at: Some(2),
-            cost_usd: 0.0,
-            logs: Vec::new(),
-            mentioned_ports: Default::default(),
-            closed_output_ports: Default::default(),
-            run_id: uuid::Uuid::new_v4(),
-            frames,
-            inherited_from: None,
-        }
+    /// The table of one firing of `node_id` at `frames` that failed with
+    /// `error`.
+    fn failed(node_id: &str, frames: Vec<Frame>, error: &str) -> NodeFiringTable {
+        let mut firings = NodeFiringTable::new();
+        let mut record = NodeFiring::started(node_id, frames.clone(), uuid::Uuid::new_v4(), Default::default(), Vec::new(), 1);
+        record.error = Some(error.into());
+        record.completed_at = Some(2);
+        firings.insert(record);
+        firings.set_status(node_id, &frames, NodeFiringStatus::Failed);
+        firings
     }
 
     #[test]
     fn a_failed_node_in_an_included_file_is_named_by_its_address() {
         let project = project_with_an_include();
-        let mut firings = NodeFiringTable::new();
-        firings.entry("Api.answer".into()).or_default().push(failed(
-            "Api.answer",
-            vec![Frame::Call { site: "cards".into() }],
-            "storage denied",
-        ));
+        let firings = failed("Api.answer", vec![Frame::Call { site: "cards".into() }], "storage denied");
         assert_eq!(
             first_failed(&firings).map(|record| failure_of(&project, record)).as_deref(),
             Some("cards.answer: storage denied")

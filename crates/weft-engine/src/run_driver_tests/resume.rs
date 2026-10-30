@@ -118,7 +118,7 @@
         )
     }
 
-    type Applied = (PulseTable, NodeFiringTable, HashMap<FiringLocation, weft_core::primitive::KickedNode>, Vec<FiringLocation>);
+    type Applied = (PulseTable, NodeFiringTable, weft_core::primitive::KickTable, Vec<FiringLocation>);
 
     /// The tables `apply_snapshot` leaves, and the firings it hands back
     /// to be failed.
@@ -128,28 +128,31 @@
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
         let mut pulses = PulseTable::default();
         let mut firings = NodeFiringTable::default();
-        let mut kicked = HashMap::new();
+        let mut kicked = weft_core::primitive::KickTable::new();
         let mut awaited = HashMap::new();
         let mut loops = LoopRuntime::new();
         let program = crate::plan::ProgramTables::new(project.clone());
         let crashed = apply_snapshot(
             &program, snap, &mut pulses, &mut firings, &mut kicked, &mut ScopeTable::default(), &mut awaited, &mut loops,
-        );
+        )
+        .expect("the snapshot resumes");
         (pulses, firings, kicked, crashed.into_iter().map(|firing| firing.loc).collect())
     }
 
-    fn apply(events: &[RunEvent]) -> (PulseTable, NodeFiringTable, HashMap<FiringLocation, weft_core::primitive::KickedNode>) {
+    fn apply(events: &[RunEvent]) -> (PulseTable, NodeFiringTable, weft_core::primitive::KickTable) {
         let (pulses, firings, kicked, crashed) = apply_with_crashed(events);
         assert!(crashed.is_empty(), "no node is left running in these fixtures: {crashed:?}");
         (pulses, firings, kicked)
     }
 
-    fn pulse_status(pulses: &PulseTable, node: &str, pid: &str) -> weft_core::pulse::PulseStatus {
-        pulses
-            .get(node)
-            .and_then(|b| b.iter().find(|p| p.id.to_string() == pid))
-            .map(|p| p.status)
-            .expect("pulse present")
+    /// Whether pulse `pid` at `node` is taken (absorbed) rather than
+    /// pending on its wire; it is one of the two.
+    fn taken(pulses: &PulseTable, node: &str, pid: &str) -> bool {
+        let id: uuid::Uuid = pid.parse().expect("a pulse id");
+        let pending = pulses.get(node).is_some_and(|b| b.iter().any(|p| p.id == id && p.status.is_pending()));
+        let absorbed = pulses.absorbed(id).is_some_and(|p| p.target_node == node);
+        assert!(pending != absorbed, "pulse {pid} is either pending at '{node}' or taken there");
+        absorbed
     }
 
     /// Project with a real stream edge plus a LoopIn boundary that
@@ -207,8 +210,9 @@
         let mut firings = NodeFiringTable::default();
         apply_snapshot(
             &crate::plan::ProgramTables::new(project.clone()), snap, &mut pulses, &mut firings,
-            &mut HashMap::new(), &mut ScopeTable::default(), &mut HashMap::new(), &mut LoopRuntime::new(),
+            &mut weft_core::primitive::KickTable::new(), &mut ScopeTable::default(), &mut HashMap::new(), &mut LoopRuntime::new(),
         )
+        .expect("the snapshot resumes")
         .into_iter()
         .map(|firing| (firing.loc, firing.consumed_a_stream))
         .collect()
@@ -285,9 +289,8 @@
     fn parked_on_unresolved_second_await_does_not_redispatch() {
         let (pid, events) = two_await_events();
         let (pulses, _, _) = apply(&events);
-        assert_eq!(
-            pulse_status(&pulses, "n", &pid),
-            weft_core::pulse::PulseStatus::Absorbed,
+        assert!(
+            taken(&pulses, "n", &pid),
             "current suspension (t1) is unresolved; un-absorbing would livelock the boot"
         );
     }
@@ -302,9 +305,8 @@
             at_unix: 0,
         });
         let (pulses, _, _) = apply(&events);
-        assert_eq!(
-            pulse_status(&pulses, "n", &pid),
-            weft_core::pulse::PulseStatus::Pending,
+        assert!(
+            !taken(&pulses, "n", &pid),
             "current suspension (t1) resolved; the node must re-dispatch"
         );
     }
@@ -330,7 +332,7 @@
     fn a_crashed_kicked_node_is_failed_not_refired() {
         let (_, _, kicked, crashed) = apply_with_crashed(&kick_events());
         assert_eq!(crashed, vec![FiringLocation::new("n", vec![])]);
-        assert!(kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched);
+        assert!(kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched());
     }
 
     #[test]
@@ -343,7 +345,7 @@
             at_unix: 0,
         });
         let (_, _, kicked) = apply(&events);
-        assert!(kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched);
+        assert!(kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched());
     }
 
     /// A kicked node parked on a still-pending suspension must NOT
@@ -357,7 +359,7 @@
         events.push(suspended("tk"));
         let (_, _, kicked) = apply(&events);
         assert!(
-            kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched,
+            kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched(),
             "pending suspension: no re-dispatch churn"
         );
         events.push(RunEvent::SuspensionResolved {
@@ -368,7 +370,7 @@
         });
         let (_, _, kicked) = apply(&events);
         assert!(
-            !kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched,
+            !kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched(),
             "resolved suspension: kick synthesis must re-fire the node"
         );
     }

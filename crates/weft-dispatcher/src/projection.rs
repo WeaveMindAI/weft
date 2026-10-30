@@ -782,8 +782,9 @@ pub async fn run_logs(
         let Some(RunEvent::RunStarted { seed: Some(seed), .. }) = rows.first() else { return Ok(Vec::new()); };
         let program = run_program(state, run_id).await?;
         anyhow::ensure!(program.program().is_some(), "inherited logs need the run's original program");
+        let seed = seed.clone();
         let chain = run_inheritance(state, &rows, &program).await.map_err(anyhow::Error::msg)?;
-        Ok::<_, anyhow::Error>(inherited_logs(&chain, seed))
+        Ok::<_, anyhow::Error>(weft_journal::on_blocking_pool(move || inherited_logs(&chain, &seed)).await)
     }.await;
     match inherited {
         Ok(inherited) => logs.extend(inherited),
@@ -812,7 +813,25 @@ pub async fn reconstruct_run(
     let rows = state.runs.events_log(run_id).await?;
     let mut chain = run_inheritance(state, &rows, &found).await.map_err(anyhow::Error::msg)?;
     chain.ancestors.push(weft_journal::seed::Ancestor { run_id, project: program, rows });
-    chain.materialize()
+    weft_journal::on_blocking_pool(move || chain.materialize()).await
+}
+
+/// Where run `run_id` stands, and the program it runs (its cut, for a run
+/// of a cut): its record folded on top of what it inherits, without the
+/// output history [`reconstruct_run`] keeps for a seed. What a reader of
+/// its nodes' states needs.
+pub async fn run_snapshot(
+    state: &crate::state::DispatcherState,
+    run_id: weft_core::RunId,
+) -> anyhow::Result<(Arc<ProjectDefinition>, weft_core::primitive::RunSnapshot)> {
+    let found = run_program(state, run_id).await?;
+    let program = found.program()
+        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no readable original program"))?;
+    let rows = state.runs.events_log(run_id).await?;
+    let chain = run_inheritance(state, &rows, &found).await.map_err(anyhow::Error::msg)?;
+    let folded = program.clone();
+    let snapshot = weft_journal::on_blocking_pool(move || weft_journal::fold_seeded(run_id, folded, &chain, &rows)).await?;
+    Ok((program, snapshot))
 }
 
 /// The program a run runs, for the readers that fold its

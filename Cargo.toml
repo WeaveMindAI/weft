@@ -26,6 +26,12 @@ members = [
     "crates/weft-workspace-hack",
 ]
 
+[workspace.lints.rust]
+# Set for the whole workspace by .cargo/config.toml (every weft process's
+# runtime turns tokio's LIFO slot off, `weft_core::process_runtime`, which
+# tokio keeps behind it).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
+
 [workspace.lints.clippy]
 # CI runs clippy with -D warnings, so what is allowed is POLICY and it
 # lives here, once. Doc comments in this workspace are long-form prose;
@@ -50,8 +56,9 @@ result_large_err = "allow"
 # the everyday loop (cargo test, backtraces, logs) never reads
 # variable values out of a debugger; line tables keep every backtrace
 # line-accurate. A step-debugging session opts back in per invocation
-# (RUSTFLAGS="-C debuginfo=2" cargo test ...; expect a cold rebuild
-# and big binaries while it is set).
+# (RUSTFLAGS="--cfg tokio_unstable -C debuginfo=2" cargo test ...: a
+# RUSTFLAGS of its own replaces .cargo/config.toml's, whose flag weft
+# needs; expect a cold rebuild and big binaries while it is set).
 [profile.dev]
 debug = "line-tables-only"
 
@@ -98,6 +105,9 @@ tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Bounded in-memory caches (the broker's key and token caches).
 lru = "0.19"
+# Insertion-ordered maps: a run's firings per node, found by their frames
+# (`weft_core::run::firing`).
+indexmap = "2"
 cron = "0.17"
 getrandom = "0.4"
 

@@ -421,7 +421,7 @@
             crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
         handle_loop_boundary_firing(
             loop_in, &group, &lp.project, &program_idx, pulses, journal,
-            "test-instance", rt, &mut stream_rt, &mut std::collections::HashMap::new(), &mut ScopeTable::default(),
+            "test-instance", rt, &mut stream_rt, &mut weft_core::primitive::KickTable::new(), &mut ScopeTable::default(),
         )
         .await
         .expect("LoopIn firing");
@@ -502,7 +502,7 @@
             crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
         handle_loop_boundary_firing(
             loop_out, &group, &lp.project, &program_idx, pulses, journal,
-            "test-instance", rt, &mut stream_rt, &mut std::collections::HashMap::new(), &mut ScopeTable::default(),
+            "test-instance", rt, &mut stream_rt, &mut weft_core::primitive::KickTable::new(), &mut ScopeTable::default(),
         )
         .await
         .expect("LoopOut firing");
@@ -1387,8 +1387,8 @@
         let key = LoopInstanceKey { group_id: lp.group_id.clone(), parent_frames: Vec::new(), run_id: uuid::Uuid::nil() };
         let rt2 = rehydrate(&lp, &bag, &events);
         let inst = rt2.get(&key).expect("the instance is rebuilt");
-        assert_eq!(inst.out_fired, vec![0, 1]);
-        assert_eq!(inst.launched, vec![0, 1, 2]);
+        assert_eq!(inst.out_fired, std::collections::BTreeSet::from([0, 1]));
+        assert_eq!(inst.launched, std::collections::BTreeSet::from([0, 1, 2]));
         assert_eq!(*inst.carry_values["acc"], serde_json::json!("AB"), "the carry is the last write");
         assert_eq!(inst.gather_lists["results"].len(), 2, "both gathered writes are back");
         assert_eq!(inst.gather_lists["results"][&0], weft_core::run::loop_runtime::LoopWrite::Value(Arc::new(serde_json::json!("a"))));
@@ -1401,7 +1401,7 @@
         let journal2 = CapturingJournal::default();
         fire_loop_in(&lp, bag, &mut rt2, &mut pulses2, &journal2).await;
         assert!(pulses2.get(&lp.body_id).map(|b| b.is_empty()).unwrap_or(true), "nothing relaunched: {pulses2:?}");
-        assert_eq!(rt2.get(&key).unwrap().launched, vec![0, 1, 2]);
+        assert_eq!(rt2.get(&key).unwrap().launched, std::collections::BTreeSet::from([0, 1, 2]));
     }
 
     /// Done-driven loop with carry: body writes self.done = true at iter 2.
@@ -1474,7 +1474,7 @@
             crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
         handle_loop_boundary_firing(
             loop_out, &group, &lp.project, &program_idx, pulses, journal,
-            "test-instance", rt, &mut stream_rt, &mut std::collections::HashMap::new(), &mut ScopeTable::default(),
+            "test-instance", rt, &mut stream_rt, &mut weft_core::primitive::KickTable::new(), &mut ScopeTable::default(),
         )
         .await
     }
@@ -1497,7 +1497,7 @@
         assert!(err.contains("iteration 1") && err.contains("'acc'"), "{err}");
         assert!(err.contains("because 'ask' failed: the model answered 500"), "names the node that broke: {err}");
         let key = LoopInstanceKey { group_id: lp.group_id.clone(), parent_frames: Vec::new(), run_id: uuid::Uuid::nil() };
-        assert_eq!(rt.get(&key).unwrap().launched, vec![0, 1], "iteration 2 never launches");
+        assert_eq!(rt.get(&key).unwrap().launched, std::collections::BTreeSet::from([0, 1]), "iteration 2 never launches");
     }
 
     /// A carried value closed with no failure (a branch not taken, a

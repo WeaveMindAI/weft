@@ -153,6 +153,10 @@ COPY .weft-warmup /work
 COPY project-nodes /weft/project-nodes
 COPY worker-builder-base-split.sh /usr/local/bin/weft-split-artifacts
 {{build_env_lines}}
+# The flags every worker build runs with, so what this compiles is what
+# a project's build reuses.
+# SYNC: {{worker_rustflags}} <-> crates/weft-core/src/builds.rs (WORKER_RUSTFLAGS)
+ENV RUSTFLAGS="{{worker_rustflags}}"
 # SYNC: weft-builder-base-target- <-> crates/weft-compiler/src/build.rs (BUILDER_BASE_CACHE_MOUNT_ID_PREFIX)
 RUN --mount=type=cache,id=weft-builder-base-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=weft-builder-base-target-{{target_cache_key}},target=/cache/target,sharing=locked \

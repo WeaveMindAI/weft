@@ -217,9 +217,14 @@ async fn cancel_unowned_in(
     program: Option<&weft_core::ProjectDefinition>,
     cause: &weft_core::run::CancelCause,
 ) -> anyhow::Result<usize> {
-    let events = weft_journal::record::read_record(tx, run_id, None).await?.events(run_id).map_err(anyhow::Error::msg)?;
+    let record = weft_journal::record::read_record(tx, run_id, None).await?;
     let now = crate::lease::now_unix() as u64;
-    let writes = crate::api::run::cancel_terminal_events(run_id, &events, program, cause, now)?;
+    let (program, cause) = (program.cloned(), cause.clone());
+    let writes = weft_journal::on_blocking_pool(move || {
+        let events = record.events(run_id).map_err(anyhow::Error::msg)?;
+        crate::api::run::cancel_terminal_events(run_id, &events, program.as_ref(), &cause, now)
+    })
+    .await?;
     let node_cancellations = writes.iter().filter(|write| matches!(write, RunEvent::NodeCancelled { .. })).count();
     match weft_journal::record::append_locked_in(tx, run_id, locked, &writes, weft_journal::record::DISPATCHER, Then::Stays).await? {
         Appended::At(_) => Ok(node_cancellations),
@@ -1112,7 +1117,7 @@ impl RunStore for PostgresStore {
     ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<RunEvent>>, Vec<String>)> {
         let conn = self.pool.get().await?;
         let record = weft_journal::record::read_record(&conn, run_id, None).await?;
-        let (rows, bad) = record.decode_lossy(run_id);
+        let (rows, bad) = weft_journal::on_blocking_pool(move || record.decode_lossy(run_id)).await;
         Ok((rows.into_iter().map(|row| crate::events::IdentifiedEvent::recorded(row.seq, row.index, row.event)).collect(), bad))
     }
 
@@ -1293,17 +1298,20 @@ impl RunStore for PostgresStore {
         let conn = self.pool.get().await?;
         let record = weft_journal::record::read_record(&conn, run_id, None).await?;
         let written_at: Vec<(i32, i64)> = conn.all("SELECT seq, written_at FROM run_log WHERE run_id = $1", &[&run_id]).await?;
-        let mut entries: Vec<LogEntry> = Vec::new();
-        for row in &record.rows {
-            match weft_journal::stored::decode(run_id, &row.events, row.events_version) {
-                Ok(events) => entries.extend(events.iter().flat_map(LogEntry::from_event)),
-                Err(e) => {
-                    let at = written_at.iter().find(|(seq, _)| *seq == row.seq).map_or(0, |(_, at)| *at);
-                    entries.push(LogEntry::corrupt_row(at as u64, e));
+        Ok(weft_journal::on_blocking_pool(move || {
+            let mut entries: Vec<LogEntry> = Vec::new();
+            for row in &record.rows {
+                match weft_journal::stored::decode(run_id, &row.events, row.events_version) {
+                    Ok(events) => entries.extend(events.iter().flat_map(LogEntry::from_event)),
+                    Err(e) => {
+                        let at = written_at.iter().find(|(seq, _)| *seq == row.seq).map_or(0, |(_, at)| *at);
+                        entries.push(LogEntry::corrupt_row(at as u64, e));
+                    }
                 }
             }
-        }
-        Ok(LogEntry::tail(entries, limit))
+            LogEntry::tail(entries, limit)
+        })
+        .await)
     }
 
     async fn list_runs(&self, tenant: &str, query: &RunListQuery) -> anyhow::Result<RunPage> {

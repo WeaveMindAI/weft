@@ -41,10 +41,8 @@ pub async fn read(state: &DispatcherState, project_id: uuid::Uuid, run_id: RunId
         .or_why(run_id)
         .map_err(|why| (StatusCode::CONFLICT, why))?;
     let place = state_place(&program, spelled).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
-    let mut folds = crate::projection::reconstruct_run(state, run_id).await.map_err(internal("the run's record"))?;
-    let fold = folds.remove(&run_id).ok_or_else(|| internal("the run's record")(anyhow::anyhow!("its own fold is missing")))?;
-    let snapshot = fold.current_snapshot();
-    if !in_run(fold.project(), &snapshot, &place) {
+    let (cut, snapshot) = crate::projection::run_snapshot(state, run_id).await.map_err(internal("the run's record"))?;
+    if !in_run(&cut, &snapshot, &place) {
         return Err((StatusCode::BAD_REQUEST, format!("run {run_id} runs only part of its program, and '{spelled}' is not in that part")));
     }
     let seen = seen_at(&program, &snapshot, &place);
@@ -129,7 +127,7 @@ fn node_seen(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Locate
             _ => None,
         })
     };
-    match firing.status {
+    match firing.status() {
         // A wait the worker holds leaves its firing running: the wait on
         // record with no ending says it waits all the same.
         NodeFiringStatus::Running => match pending_wait() {
@@ -167,8 +165,8 @@ fn loop_seen(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Locate
             let error = boundaries
                 .iter()
                 .chain(members.iter().map(|member| &member.id))
-                .flat_map(|id| snapshot.firings.get(id).into_iter().flatten())
-                .filter(|f| f.status == NodeFiringStatus::Failed && (f.frames == parent_frames || inside(&f.frames)))
+                .flat_map(|id| snapshot.firings.get(id).into_iter().flat_map(|records| records.values()))
+                .filter(|f| f.status() == NodeFiringStatus::Failed && (f.frames == parent_frames || inside(&f.frames)))
                 .min_by_key(|f| f.completed_at)
                 .and_then(|f| f.error.clone());
             Seen { status: NodeStatus::Failed, waiting_on: None, error }
