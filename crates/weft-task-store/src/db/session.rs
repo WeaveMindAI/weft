@@ -3,10 +3,11 @@
 //! before any pool exists (`crate::budget`).
 
 use async_trait::async_trait;
-use futures::StreamExt as _;
+use futures::{StreamExt as _, TryStreamExt as _};
 use tokio::sync::mpsc;
 use tokio_postgres::{AsyncMessage, Notification, Row};
 
+use super::text::nul_free;
 use super::{Client, Error, Param, Result};
 
 /// How long opening a session may take, sign-in included.
@@ -89,11 +90,11 @@ fn quoted(name: &str) -> String {
 #[async_trait]
 impl Client for Session {
     async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>> {
-        Ok(self.client.query(sql, params).await?)
+        Ok(self.client.query_raw(sql, nul_free(params)).await?.try_collect().await?)
     }
 
     async fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<u64> {
-        Ok(self.client.execute(sql, params).await?)
+        Ok(self.client.execute_raw(sql, nul_free(params)).await?)
     }
 
     async fn batch_execute(&self, sql: &str) -> Result<()> {

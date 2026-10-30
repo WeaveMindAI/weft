@@ -146,6 +146,21 @@ async fn a_kind_state_claim_has_one_winner(pool: Pool) {
     assert_eq!((row.kind_state, row.kind_state_seq), (state(1), at + 1));
 }
 
+/// What a kind keeps of an outside service's answer (a polled body
+/// holding NUL characters) is written and read back exactly, and so is
+/// what its holder says about the connection.
+#[weft_db_macros::test]
+async fn a_kind_state_holding_nul_reads_back_exactly(pool: Pool) {
+    schema(&pool).await;
+    project(&pool, ACTIVE).await;
+    signal(&pool, "tick", ACTIVE, ProjectStatus::Active).await;
+    let polled = serde_json::json!({ "delta": ["row\u{0}one"], "last_failure": "502: \u{0}" });
+    let at = signal_held(&pool, "tick").await.unwrap().unwrap().kind_state_seq;
+    assert!(write_kind_state(&pool, "tick", &polled, at).await.unwrap());
+    let row = signal_held(&pool, "tick").await.unwrap().unwrap();
+    assert_eq!(row.kind_state, polled);
+}
+
 /// A held signal: a row a holder takes.
 async fn held_signal(pool: &Pool, token: &str, project_id: uuid::Uuid, status: ProjectStatus) {
     signal(pool, token, project_id, status).await;

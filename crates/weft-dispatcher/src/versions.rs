@@ -275,7 +275,7 @@ type RunTuple = (
     String,
     Option<uuid::Uuid>,
     Vec<String>,
-    Option<serde_json::Value>,
+    Option<String>,
     weft_core::stored::Version,
     String,
     Option<String>,
@@ -303,7 +303,7 @@ fn run_from(row: RunTuple) -> anyhow::Result<RunRow> {
         seed_run_id,
         stale,
         spec: spec
-            .map(|spec| RunSpec::STORED.decode(spec, spec_version))
+            .map(|spec| RunSpec::STORED.decode(spec.as_str(), spec_version))
             .transpose()
             .map_err(|e| e.at(format_args!("run {run_id}'s spec")))?,
         definition_hash,

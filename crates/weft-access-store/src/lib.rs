@@ -298,7 +298,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             instance_id TEXT NOT NULL,
             node TEXT NOT NULL,
             field TEXT NOT NULL,
-            value JSONB NOT NULL,
+            -- As its JSON text (`db::JsonText`): a value a person typed
+            -- comes back exactly.
+            value TEXT NOT NULL,
             grant_id UUID REFERENCES access_grant(id) ON DELETE CASCADE,
             set_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (project_id, instance_id, node, field)
@@ -391,7 +393,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         CREATE TABLE IF NOT EXISTS access_connect_result (
             state TEXT PRIMARY KEY,
             tenant_id TEXT NOT NULL,
-            result_json JSONB NOT NULL,
+            -- As its JSON text (`db::JsonText`), `null` while the flow is
+            -- still out: it quotes what the provider answered.
+            result_json TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE INDEX IF NOT EXISTS access_connect_result_created
@@ -433,7 +437,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             token_sealed TEXT NOT NULL,
             -- Values the provider's subscribe answer captured
             -- (resource id, anything the unsubscribe call needs).
-            captures_json JSONB NOT NULL DEFAULT '{}',
+            -- As its JSON text (`db::JsonText`), what the provider sent.
+            captures_json TEXT NOT NULL DEFAULT '{}',
             expires_at TIMESTAMPTZ,
             -- The instance whose signal this is, when the connection is
             -- theirs: stopping the channel signs in as them.
@@ -563,13 +568,13 @@ const EXCLUSIVE_FOLD: weft_task_store::DataStep = weft_task_store::DataStep {
              WHERE a.id = g.id OR a.id IN (SELECT gone FROM access_grant_fold WHERE keep = g.id))
          WHERE g.id IN (SELECT keep FROM access_grant_fold);
         UPDATE install_pick p SET grant_id = f.keep FROM access_grant_fold f WHERE p.grant_id = f.gone;
-        UPDATE instance_value v SET grant_id = f.keep, value = replace(v.value::text, f.gone::text, f.keep::text)::jsonb
+        UPDATE instance_value v SET grant_id = f.keep, value = replace(v.value, f.gone::text, f.keep::text)
           FROM access_grant_fold f WHERE v.grant_id = f.gone;
         UPDATE access_connect c SET upgrade_grant_id = f.keep FROM access_grant_fold f WHERE c.upgrade_grant_id = f.gone;
         UPDATE access_picker p SET access_id = f.keep FROM access_grant_fold f WHERE p.access_id = f.gone;
         UPDATE signal_subscription s SET access_id = f.keep FROM access_grant_fold f WHERE s.access_id = f.gone;
-        UPDATE access_connect_result r SET result_json = replace(r.result_json::text, f.gone::text, f.keep::text)::jsonb
-          FROM access_grant_fold f WHERE strpos(r.result_json::text, f.gone::text) > 0;
+        UPDATE access_connect_result r SET result_json = replace(r.result_json, f.gone::text, f.keep::text)
+          FROM access_grant_fold f WHERE strpos(r.result_json, f.gone::text) > 0;
         DO $$
         BEGIN
             -- The signal table is the dispatcher's group's, which a

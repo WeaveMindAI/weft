@@ -678,15 +678,11 @@ pub async fn infra_bake(
     if phase.as_deref() != Some(weft_core::context::Phase::InfraSetup.as_str()) {
         return Err((StatusCode::FORBIDDEN, "only an infra setup saves what an infra node bakes".into()));
     }
-    let written = state
-        .pool
-        .execute(
-            "UPDATE infra_node SET baked_json = baked_json || $4 WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
-            &[&run.project, &req.place, &req.instance.as_ref().map(|i| i.as_str()), &db::Json(&req.values)],
-        )
+    let instance = req.instance.as_ref().map(|i| i.as_str());
+    let saved = crate::lifecycle_writes::save_baked(&state.pool, run.project, &req.place, instance, &req.values)
         .await
-        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("save what an infra node baked")))?;
-    if written == 0 {
+        .map_err(|e| unavailable_or_internal(e.context("save what an infra node baked")))?;
+    if !saved {
         return Err((StatusCode::CONFLICT, format!("{} has no infra copy here to save what it baked with", req.place)));
     }
     Ok(Json(serde_json::json!({})))
@@ -1459,7 +1455,7 @@ async fn write_apply_row(
            AND {owns} \
          ON CONFLICT (project_id, node_id, instance_id) DO UPDATE SET \
             baked_json         = CASE WHEN infra_node.status = 'terminating' \
-                                      THEN '{{}}'::jsonb ELSE infra_node.baked_json END, \
+                                      THEN '{{}}' ELSE infra_node.baked_json END, \
             copy_id            = EXCLUDED.copy_id, \
             status             = EXCLUDED.status, \
             failure_stage      = NULL, \
@@ -2109,7 +2105,7 @@ pub async fn signal_fire_target(
     if caller.role != Role::Listener {
         return Err((StatusCode::FORBIDDEN, "listener only".into()));
     }
-    let row: Option<(uuid::Uuid, bool, Option<serde_json::Value>)> = state
+    let row: Option<(uuid::Uuid, bool, Option<String>)> = state
         .pool
         .opt(
             "SELECT s.project_id, s.is_resume, p.api_address FROM signal s LEFT JOIN project p ON p.id = s.project_id WHERE s.token = $1",
@@ -2120,7 +2116,7 @@ pub async fn signal_fire_target(
     let Some((project_id, is_resume, address)) = row else { return Ok(Json(None)) };
     // Only an address that serves: one the project's front could not open
     // says why instead.
-    let address = match address.map(serde_json::from_value::<weft_core::projects::ProjectAddress>).transpose() {
+    let address = match address.as_deref().map(serde_json::from_str::<weft_core::projects::ProjectAddress>).transpose() {
         Ok(Some(weft_core::projects::ProjectAddress::Serving { url })) => Some(url),
         Ok(Some(weft_core::projects::ProjectAddress::Unavailable { .. }) | None) => None,
         Err(e) => {

@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::db::{Client, FromRow, Pool, Row};
+use crate::db::{Client, FromRow, JsonText, Pool, Row};
 
 /// The channel an event parked for a trigger is announced on, with its
 /// project's id, and an answer handed to a run a worker drives, with that
@@ -40,8 +40,9 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             -- handed over twice is born once.
             fire_id UUID NOT NULL UNIQUE,
             -- What the trigger wakes with: every event waits here already
-            -- processed by its kind (`/process`).
-            payload JSONB NOT NULL,
+            -- processed by its kind (`/process`), as its JSON text
+            -- (`db::JsonText`): it must come back exactly.
+            payload TEXT NOT NULL,
             -- Who sent it, for a trigger somebody outside calls.
             caller TEXT,
             -- How many times it waited for room to run, and the moment
@@ -346,7 +347,7 @@ pub async fn park(pool: &Pool, token: &str, waiting: &Waiting, held_by: Option<&
             &[
                 &token,
                 &waiting.fire_id,
-                &waiting.payload,
+                &JsonText(&waiting.payload),
                 &waiting.caller,
                 &count(waiting.attempts),
                 &waiting.not_before,
@@ -480,7 +481,7 @@ pub async fn hand_answer_in(tx: &impl Client, token: &str, run_id: weft_core::Ru
     tx.execute(
         "INSERT INTO parked_fire (token, fire_id, payload, attempts, not_before, is_resume, run_id, skipped) \
          VALUES ($1, $2, $3, 0, 0, TRUE, $4, $5)",
-        &[&token, &uuid::Uuid::new_v4(), &value, &run_id, &skipped],
+        &[&token, &uuid::Uuid::new_v4(), &JsonText(&value), &run_id, &skipped],
     )
     .await?;
     Ok(())
@@ -501,9 +502,9 @@ pub fn handed_answers_sql(runs: &str) -> String {
 /// run's record holds them (`weft_record_batch` deletes the answers a
 /// batch resolves).
 pub async fn answers_for(db: &impl Client, run_id: weft_core::RunId) -> anyhow::Result<Vec<(String, weft_core::primitive::WaitAnswer)>> {
-    let rows: Vec<(weft_core::RunId, String, Value, bool, i64)> =
+    let rows: Vec<(weft_core::RunId, String, JsonText<Value>, bool, i64)> =
         db.all(&format!("{} ORDER BY seq", handed_answers_sql("$1")), &[&run_id]).await?;
-    Ok(rows.into_iter().map(|(_, token, payload, skipped, _)| (token, stored_answer(payload, skipped))).collect())
+    Ok(rows.into_iter().map(|(_, token, payload, skipped, _)| (token, stored_answer(payload.0, skipped))).collect())
 }
 
 struct HeadRow {
@@ -526,7 +527,7 @@ impl FromRow for HeadRow {
             token: row.try_get("token")?,
             seq: row.try_get("seq")?,
             fire_id: row.try_get("fire_id")?,
-            payload: row.try_get("payload")?,
+            payload: row.try_get::<_, JsonText<Value>>("payload")?.0,
             caller: row.try_get("caller")?,
             attempts: row.try_get("attempts")?,
             not_before: row.try_get("not_before")?,

@@ -8,7 +8,7 @@
 use weft_task_store::db::{Client as _, Pool};
 
 use weft_broker::lifecycle_writes::{
-    cancels_for, claim_next, complete_command, health_state, issue_command, record_event, set_health_state, set_status,
+    cancels_for, claim_next, complete_command, health_state, issue_command, record_event, save_baked, set_health_state, set_status,
     set_waiting, sync_ownership, unowned_work_waiting, write_units, FencedWrite, IssuedCommand,
 };
 use weft_broker_client::protocol::{
@@ -1472,4 +1472,24 @@ async fn a_command_still_draining_is_not_handed_to_the_supervisor(pool: Pool) {
     pool.execute("UPDATE infra_lifecycle_command SET drains = FALSE WHERE id = $1", &[&draining]).await.unwrap();
     assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(draining));
     assert_eq!(claim_next(&pool, OWNER, &[draining]).await.unwrap().map(|c| c.id), None, "{behind} waits for it");
+}
+
+/// What an infra setup bakes is set over what its copy baked before, the
+/// rest kept, a value holding a NUL character exactly as it was; a copy
+/// with no row saves nothing.
+#[weft_db_macros::test]
+async fn a_bake_holding_nul_merges_over_what_was_baked(pool: Pool) {
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    node_row(&pool, "running", serde_json::json!({})).await;
+    let first = [("address".to_string(), serde_json::json!("db:5432")), ("user".to_string(), serde_json::json!("app"))].into();
+    assert!(save_baked(&pool, PROJECT, NODE, None, &first).await.unwrap());
+    let second = [("address".to_string(), serde_json::json!("db:\u{0}1"))].into();
+    assert!(save_baked(&pool, PROJECT, NODE, None, &second).await.unwrap());
+    let baked: weft_task_store::db::JsonText<serde_json::Value> = pool
+        .scalar("SELECT baked_json FROM infra_node WHERE project_id = $1 AND node_id = $2", &[&PROJECT, &NODE])
+        .await
+        .unwrap();
+    assert_eq!(baked.0, serde_json::json!({ "address": "db:\u{0}1", "user": "app" }));
+    assert!(!save_baked(&pool, PROJECT, "nowhere", None, &second).await.unwrap(), "no copy, nothing saved");
 }

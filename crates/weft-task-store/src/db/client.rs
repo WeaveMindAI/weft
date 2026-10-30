@@ -2,9 +2,11 @@
 //! database, whatever it holds (a pool, a connection, a transaction).
 
 use async_trait::async_trait;
+use futures::TryStreamExt as _;
 use tokio_postgres::types::FromSql;
 use tokio_postgres::Row;
 
+use super::text::nul_free;
 use super::{Conn, Error, Param, Pool, Result};
 
 /// Something statements run on: a [`Pool`] (each statement on whichever
@@ -150,12 +152,12 @@ impl Client for Pool {
 impl Client for Conn {
     async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>> {
         let statement = self.object.prepare_cached(sql).await?;
-        Ok(self.object.query(&statement, params).await?)
+        Ok(self.object.query_raw(&statement, nul_free(params)).await?.try_collect().await?)
     }
 
     async fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<u64> {
         let statement = self.object.prepare_cached(sql).await?;
-        Ok(self.object.execute(&statement, params).await?)
+        Ok(self.object.execute_raw(&statement, nul_free(params)).await?)
     }
 
     async fn batch_execute(&self, sql: &str) -> Result<()> {
@@ -167,12 +169,12 @@ impl Client for Conn {
 impl Client for Transaction<'_> {
     async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>> {
         let statement = self.tx.prepare_cached(sql).await?;
-        Ok(self.tx.query(&statement, params).await?)
+        Ok(self.tx.query_raw(&statement, nul_free(params)).await?.try_collect().await?)
     }
 
     async fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<u64> {
         let statement = self.tx.prepare_cached(sql).await?;
-        Ok(self.tx.execute(&statement, params).await?)
+        Ok(self.tx.execute_raw(&statement, nul_free(params)).await?)
     }
 
     async fn batch_execute(&self, sql: &str) -> Result<()> {

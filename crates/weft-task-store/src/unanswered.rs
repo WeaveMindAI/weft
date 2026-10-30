@@ -376,7 +376,7 @@ async fn write(
                 write = write_sql("SELECT $1::text AS callee, $2::text AS label, $3::text AS error, $5::bigint AS lasted_ms", "$4::boolean"),
                 alerted = alerted_sql("written"),
             ),
-            &[&callee.key(), &label, &pg_text(error).as_ref(), &stopped, &i64::try_from(lasted.as_millis()).unwrap_or(i64::MAX)],
+            &[&callee.key(), &label, &error, &stopped, &i64::try_from(lasted.as_millis()).unwrap_or(i64::MAX)],
         )
         .await?;
     Ok(Alerts::of(alerted))
@@ -384,7 +384,7 @@ async fn write(
 
 /// SQL: the statement that writes down one failure per row of the query
 /// `rows`, whose columns are `callee` (`Callee::key`), `label`, `error`
-/// (free of NUL bytes, [`pg_text`]) and `lasted_ms` (how long the failure
+/// and `lasted_ms` (how long the failure
 /// had lasted when first written, [`failed_for`]), with `stopped` the SQL
 /// boolean of whether weft stopped retrying them ([`gave_up`]). The one
 /// definition of how a failure is written, alert mark included: the
@@ -617,16 +617,6 @@ pub async fn alert_after(pool: &Pool, after: Option<std::time::Duration>) -> Res
         }
     }
     Ok(())
-}
-
-/// `text` as Postgres stores it: without NUL bytes, which a `TEXT`
-/// column refuses. For an error written down, where losing the byte
-/// loses nothing a person reads and refusing the write loses the error.
-pub fn pg_text(text: &str) -> std::borrow::Cow<'_, str> {
-    match text.contains('\0') {
-        true => std::borrow::Cow::Owned(text.replace('\0', "")),
-        false => std::borrow::Cow::Borrowed(text),
-    }
 }
 
 /// What `callee` held up is resolved: it is no longer shown.

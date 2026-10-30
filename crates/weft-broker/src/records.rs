@@ -208,13 +208,13 @@ async fn run_rechecked(State(state): State<Arc<BrokerState>>, AuthedCaller(calle
 /// answers oldest first, in one statement. The runs are the worker's own
 /// by the read itself (`owner`), so no run is checked one by one.
 pub async fn rechecked(pool: &Pool, replica: &str, project: uuid::Uuid) -> anyhow::Result<RunRecheckedResponse> {
-    type Row = (weft_core::RunId, Option<db::Json<weft_core::run::CancelCause>>, Option<String>, Option<serde_json::Value>, bool);
+    type Row = (weft_core::RunId, Option<db::JsonText<weft_core::run::CancelCause>>, Option<String>, Option<db::JsonText<serde_json::Value>>, bool);
     let sql = format!(
         "WITH mine AS ( \
              SELECT run_id, cancel_requested FROM run \
              WHERE owner = $1 AND project_id = $2 AND state = 'running' \
          ) \
-         SELECT m.run_id, m.cancel_requested, NULL::text AS token, NULL::jsonb AS payload, FALSE AS skipped, 0::bigint AS seq \
+         SELECT m.run_id, m.cancel_requested, NULL::text AS token, NULL::text AS payload, FALSE AS skipped, 0::bigint AS seq \
              FROM mine m WHERE m.cancel_requested IS NOT NULL \
          UNION ALL \
          SELECT a.run_id, NULL, a.token, a.payload, a.skipped, a.seq \
@@ -230,7 +230,7 @@ pub async fn rechecked(pool: &Pool, replica: &str, project: uuid::Uuid) -> anyho
             (None, Some(token), Some(payload)) => rechecked.answers.push(RunAnswerOf {
                 run_id,
                 token,
-                answer: weft_task_store::parked_fires::stored_answer(payload, skipped),
+                answer: weft_task_store::parked_fires::stored_answer(payload.0, skipped),
             }),
             (cause, token, payload) => {
                 anyhow::bail!("a recheck row of {run_id} is neither a cancel nor an answer: {cause:?} {token:?} {payload:?}")
@@ -267,7 +267,7 @@ async fn previous_release_run_cancels(State(state): State<Arc<BrokerState>>, Aut
 /// The cancels waiting for every run `replica` drives in `project`, as the
 /// previous release answered them.
 pub async fn previous_release_cancels(pool: &Pool, replica: &str, project: uuid::Uuid) -> anyhow::Result<PreviousReleaseCancels> {
-    let rows: Vec<(weft_core::RunId, db::Json<weft_core::run::CancelCause>)> = pool
+    let rows: Vec<(weft_core::RunId, db::JsonText<weft_core::run::CancelCause>)> = pool
         .all(
             "SELECT run_id, cancel_requested FROM run \
              WHERE owner = $1 AND project_id = $2 AND state = 'running' AND cancel_requested IS NOT NULL",

@@ -10,7 +10,7 @@
 //! holder keeps pushing ahead of itself fires because it stopped (it
 //! died), which frees it ([`release`]).
 
-use weft_task_store::db::{Client as _, Pool, Row};
+use weft_task_store::db::{Client as _, JsonText, Pool, Row};
 use weft_broker_client::protocol::{
     HeldNow, HeldServing, SignalAuthKind, SignalHoldResponse, SignalRowWire, SignalSurfaceKind, ACTIVATION_LISTENS,
     SIGNAL_ACTIVATION_JOIN, STILL_HELD_BY,
@@ -48,9 +48,9 @@ pub async fn signal_held(pool: &Pool, token: &str) -> anyhow::Result<Option<Sign
 pub async fn write_kind_state(pool: &Pool, token: &str, kind_state: &serde_json::Value, from_seq: i64) -> anyhow::Result<bool> {
     let written = pool
         .execute(
-            "UPDATE signal SET kind_state = $2::jsonb, kind_state_seq = $3 + 1 \
+            "UPDATE signal SET kind_state = $2, kind_state_seq = $3 + 1 \
              WHERE token = $1 AND kind_state_seq = $3",
-            &[&token, kind_state, &from_seq],
+            &[&token, &JsonText(kind_state), &from_seq],
         )
         .await?;
     Ok(written > 0)
@@ -91,11 +91,10 @@ pub async fn hold(
     let said: Vec<&HeldNow> = holding.iter().filter(|h| h.serving.is_some() && kept.contains(&h.token)).collect();
     if !said.is_empty() {
         let said_tokens: Vec<&str> = said.iter().map(|h| h.token.as_str()).collect();
-        let servings: Vec<serde_json::Value> =
-            said.iter().filter_map(|h| h.serving.as_ref()).map(serde_json::to_value).collect::<Result<_, _>>()?;
+        let servings: Vec<JsonText<&HeldServing>> = said.iter().filter_map(|h| h.serving.as_ref()).map(JsonText).collect();
         tx.execute(
             "UPDATE signal r SET serving = x.serving \
-             FROM unnest($1::text[], $2::jsonb[]) AS x(token, serving) WHERE r.token = x.token",
+             FROM unnest($1::text[], $2::text[]) AS x(token, serving) WHERE r.token = x.token",
             &[&said_tokens, &servings],
         )
         .await?;
@@ -266,15 +265,11 @@ fn decode(r: Row) -> anyhow::Result<SignalRowWire> {
         mount_path: r.try_get("mount_path")?,
         mount_methods: r.try_get("mount_methods")?,
         auth_kind,
-        auth_config: r.try_get("auth_config")?,
-        kind_state: r.try_get("kind_state")?,
+        auth_config: r.try_get::<_, Option<JsonText<serde_json::Value>>>("auth_config")?.map(|json| json.0),
+        kind_state: r.try_get::<_, JsonText<serde_json::Value>>("kind_state")?.0,
         kind_state_seq: r.try_get("kind_state_seq")?,
         holds: r.try_get("holds")?,
-        serving: r
-            .try_get::<_, Option<serde_json::Value>>("serving")?
-            .map(serde_json::from_value::<HeldServing>)
-            .transpose()
-            .map_err(|e| anyhow::anyhow!("corrupt signal.serving: {e}"))?,
+        serving: r.try_get::<_, Option<JsonText<HeldServing>>>("serving")?.map(|serving| serving.0),
         generation: r.try_get("generation")?,
         held_failed: r.try_get("held_failed")?,
     })

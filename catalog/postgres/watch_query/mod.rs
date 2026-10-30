@@ -30,7 +30,7 @@ use weft::context::PendingBus;
 use weft::signal::poll_endpoint::MIN_POLL_INTERVAL_SECS;
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::postgres::{connect_alone, connect_listening, mistake, plan, query_json, ListenEvent, Plan};
+use super::postgres::{connect_alone, connect_listening, mistake, plan, query_json, ListenEvent, Plan, WrittenBy};
 
 #[derive(NodeManifest)]
 pub struct PostgresWatchQueryNode;
@@ -87,7 +87,7 @@ impl Node for PostgresWatchQueryNode {
         let conn = ctx.open(&account).await?;
         // With a channel the one connection both queries and listens;
         // without one, a plain dial.
-        let (client, mut notifications) = match &channel {
+        let (mut client, mut notifications) = match &channel {
             Some(channel) => {
                 let (client, rx) = connect_listening(&ctx, &conn, channel).await?;
                 (client, Some(rx))
@@ -104,7 +104,7 @@ impl Node for PostgresWatchQueryNode {
         let mut last_rows: Option<Vec<Value>> = None;
         let mut last_row: Option<Value> = None;
         loop {
-            let rows = query_json(&client, &sql, &names, &values).await?;
+            let rows = query_json(&mut client, &sql, &names, &values, WrittenBy::Author).await?;
             let row = first_row(&rows);
             if changed(last_rows.as_deref(), rows.as_slice()) {
                 if let Some(bus) = &mut rows_bus {

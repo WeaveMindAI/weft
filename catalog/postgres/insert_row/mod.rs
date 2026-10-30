@@ -7,7 +7,7 @@ use serde_json::Value;
 use weft::node::NodeOutput;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::postgres::{connect, mistake, quote_ident};
+use super::postgres::{connect, mistake, quote_ident, WrittenBy};
 
 /// The INSERT for a table and its column names: quoted identifiers,
 /// one placeholder per column, RETURNING *.
@@ -54,8 +54,10 @@ impl Node for PostgresInsertRowNode {
         let mut client = connect(&ctx, &account).await?;
         // No port names: this node writes the SQL itself, so its `$1`
         // is nothing the author typed and there is no cast they could
-        // add to it.
-        let rows = client.query_json(&sql, &[], &params).await?;
+        // add to it. A column it could not read back is refused before
+        // the row is written, and a stored value it could not read back
+        // undoes the insert.
+        let rows = client.query_json(&sql, &[], &params, WrittenBy::Node).await?;
         // `RETURNING *` answers exactly one row for one inserted row;
         // none means the insert was discarded (a rule or trigger on
         // the table), and inventing an empty row would send a

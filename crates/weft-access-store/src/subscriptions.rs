@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::Value;
-use weft_task_store::db::{Client as _, Pool};
+use weft_task_store::db::{Client as _, JsonText, Pool};
 
 use weft_core::access::client::{run_connect_call as core_run_connect_call, ConnectCallError, RefusalKind};
 use weft_core::access::events::{
@@ -27,7 +27,7 @@ use weft_core::access::spec::{AnswerReader, ConnectCall};
 
 use crate::flows::{apply_captures, AnswerOf};
 use crate::resolve::resolve_event_source;
-use crate::{values_of, AccessError};
+use crate::AccessError;
 
 /// One stored subscription, as the receiver and the renewal loop
 /// read it.
@@ -195,7 +195,7 @@ where
                 &req.access_id,
                 &req.signal_token,
                 &crate::seal_str(&minted_token),
-                &serde_json::to_value(&captures)?,
+                &JsonText(&captures),
                 &expires_at,
                 &req.for_instance.as_ref().map(|m| m.project_id),
                 &req.for_instance.as_ref().map(|m| m.instance.as_str()),
@@ -371,7 +371,7 @@ type SubscriptionRow = (
     uuid::Uuid,
     String,
     String,
-    Value,
+    JsonText<BTreeMap<String, String>>,
     Option<chrono::DateTime<chrono::Utc>>,
     Option<uuid::Uuid>,
     Option<String>,
@@ -397,7 +397,7 @@ fn row_to_subscription(
         access_id,
         signal_token,
         token: crate::open_str(&token_sealed)?,
-        captures: values_of(&captures_json),
+        captures: captures_json.0,
         expires_at,
     })
 }

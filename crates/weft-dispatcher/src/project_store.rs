@@ -526,14 +526,14 @@ impl PostgresProjectStore {
 /// The project's resync under way, its row locked for the rest of the
 /// caller's transaction; `None` when none is.
 async fn held_resync(conn: &impl Client, id: uuid::Uuid) -> anyhow::Result<Option<ResyncPlan>> {
-    let row: Option<(serde_json::Value, weft_core::stored::Version, Option<uuid::Uuid>)> = conn
+    let row: Option<(String, weft_core::stored::Version, Option<uuid::Uuid>)> = conn
         .opt(
             "SELECT resync, resync_version, resync_driver FROM project \
              WHERE id = $1 AND transition = 'resyncing' AND resync IS NOT NULL FOR UPDATE",
             &[&id],
         )
         .await?;
-    row.map(|(json, version, driver)| ResyncPlan::stored(id, json, version, driver)).transpose()
+    row.map(|(json, version, driver)| ResyncPlan::stored(id, json.as_str(), version, driver)).transpose()
 }
 
 /// Project `id`'s registered program `hash`, read on `conn` (a caller's
@@ -558,8 +558,8 @@ pub(crate) async fn program_in(conn: &impl Client, id: uuid::Uuid, hash: &str) -
 /// (`ResyncPlan::STORED`): its drive, into `resync_driver`.
 pub const RESYNC_FILLS: &[weft_task_store::documents::Fill] = &[weft_task_store::documents::Fill {
     from: 1,
-    sql: "UPDATE project SET resync_driver = (resync->>'driver')::uuid \
-          WHERE resync_version = 1 AND resync ? 'driver'",
+    sql: "UPDATE project SET resync_driver = (resync::jsonb->>'driver')::uuid \
+          WHERE resync_version = 1 AND resync::jsonb ? 'driver'",
 }];
 
 /// The `project` + `project_definition` tables. The canonical CREATEs
@@ -617,7 +617,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- request the build came from, which the maintenance lift
                 -- builds again on a newer weft (`crate::maintenance`). NULL
                 -- for a build an older weft registered, which kept none.
-                running_build_inputs JSONB,
+                -- As its JSON text (`db::JsonText`): its assets are keyed
+                -- by `FileRef::resolution_key`, which holds a NUL.
+                running_build_inputs TEXT,
                 -- The version `running_build_inputs` was written at
                 -- (`BuildInputs::STORED`).
                 running_build_inputs_version INTEGER NOT NULL,
@@ -660,8 +662,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- person gave it up (`given_up`: when, and the triggers it
                 -- left down, which `weft status` shows), kept as that
                 -- drive's record until the next resync. Its drive is never in
-                -- it (it lives in `resync_driver`).
-                resync JSONB,
+                -- it (it lives in `resync_driver`). As its JSON text
+                -- (`db::JsonText`): why it stopped quotes the failure.
+                resync TEXT,
                 -- The version `resync` was written at (`ResyncPlan::STORED`).
                 resync_version INTEGER NOT NULL,
                 -- Its drive (`ResyncPlan::driver`): what every write of the
@@ -677,8 +680,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- cannot (`weft_core::projects::ProjectAddress`, written by
                 -- `crate::front`): what `weft status` shows and where the
                 -- listener hands the project's events. NULL while nothing
-                -- of the project takes work.
-                api_address JSONB,
+                -- of the project takes work. As its JSON text
+                -- (`db::JsonText`): why it cannot quotes the failure.
+                api_address TEXT,
                 -- The order of the project's build asks: each build request
                 -- takes the next one as it arrives, before it compiles
                 -- (`next_build_ask`), from this row, so every replica
@@ -768,8 +772,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             implementations JSONB NOT NULL,
             -- The node packages the worker's build left out because they
             -- did not compile (weft_core::builds::LeftOutPackage list):
-            -- a run whose cut uses one of their types is refused.
-            left_out JSONB NOT NULL DEFAULT '[]',
+            -- a run whose cut uses one of their types is refused. As its
+            -- JSON text (`db::JsonText`): each quotes the compiler.
+            left_out TEXT NOT NULL DEFAULT '[]',
             -- Where that build's log is read, for their full errors.
             worker_log TEXT,
             -- What each node type the worker holds needs from the machine
@@ -1006,7 +1011,7 @@ impl ProjectStoreOps for PostgresProjectStore {
                         &id,
                         &binary,
                         &encoded,
-                        &serde_json::to_value(&code.left_out)?,
+                        &db::JsonText(&code.left_out),
                         &code.worker_log,
                         &serde_json::to_value(&code.node_needs)?,
                     ],
@@ -1033,7 +1038,7 @@ impl ProjectStoreOps for PostgresProjectStore {
                 &[
                     &id,
                     &source.map(|source| serde_json::to_value(source.manifest)).transpose()?,
-                    &source.and_then(|source| source.inputs).map(serde_json::to_value).transpose()?,
+                    &source.and_then(|source| source.inputs).map(db::JsonText),
                     &weft_core::builds::BuildInputs::STORED.version(),
                 ],
             )
@@ -1049,13 +1054,13 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn running_build(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::builds::VersionSource>> {
-        let row: Option<(Option<serde_json::Value>, Option<serde_json::Value>, weft_core::stored::Version)> = self
+        let row: Option<(Option<serde_json::Value>, Option<String>, weft_core::stored::Version)> = self
             .pool
             .opt("SELECT running_source, running_build_inputs, running_build_inputs_version FROM project WHERE id = $1", &[&id])
             .await?;
         let Some((Some(manifest), Some(inputs), version)) = row else { return Ok(None) };
         let inputs = weft_core::builds::BuildInputs::STORED
-            .decode(inputs, version)
+            .decode(inputs.as_str(), version)
             .map_err(|e| e.at(format_args!("project {id}'s running build")))?;
         let manifest = serde_json::from_value(manifest).map_err(|e| anyhow::anyhow!("project {id}'s running source does not read: {e}"))?;
         Ok(Some(weft_core::builds::VersionSource { manifest, inputs }))
@@ -1074,7 +1079,7 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn running_program(&self, id: uuid::Uuid) -> anyhow::Result<Option<RunningProgram>> {
-        let row: Option<(String, String, serde_json::Value, serde_json::Value, Option<String>, serde_json::Value)> = self
+        let row: Option<(String, String, serde_json::Value, db::JsonText<Vec<weft_core::builds::LeftOutPackage>>, Option<String>, serde_json::Value)> = self
             .pool
             .opt(
                 "SELECT p.running_definition_hash, p.running_binary_hash, c.implementations, c.left_out, c.worker_log, c.node_needs \
@@ -1087,7 +1092,7 @@ impl ProjectStoreOps for PostgresProjectStore {
             identity: weft_core::project::hash::ProgramIdentity {
                 definition_hash, binary_hash, implementations: serde_json::from_value(implementations)?,
             },
-            left_out: serde_json::from_value(left_out)?,
+            left_out: left_out.0,
             worker_log,
             node_needs: serde_json::from_value(node_needs)?,
         })).transpose()
@@ -1318,7 +1323,7 @@ impl ProjectStoreOps for PostgresProjectStore {
     async fn resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::ResyncState>> {
         // Whether a task of its drive is pending or claimed, and where that
         // task last said it is (NULL until it says).
-        let row: Option<(serde_json::Value, weft_core::stored::Version, Option<uuid::Uuid>, bool, Option<serde_json::Value>)> = self
+        let row: Option<(String, weft_core::stored::Version, Option<uuid::Uuid>, bool, Option<db::JsonText<serde_json::Value>>)> = self
             .pool
             .opt(
                 "WITH driving AS ( \
@@ -1331,9 +1336,9 @@ impl ProjectStoreOps for PostgresProjectStore {
             )
             .await?;
         row.map(|(json, version, driver, driven, progress)| {
-            let plan = ResyncPlan::stored(id, json, version, driver)?;
+            let plan = ResyncPlan::stored(id, json.as_str(), version, driver)?;
             let progress = match progress.filter(|_| driven) {
-                Some(progress) => serde_json::from_value(progress)
+                Some(progress) => serde_json::from_value(progress.0)
                     .map_err(|e| anyhow::anyhow!("project {id}'s resync task says where it is in a shape this weft does not read: {e}"))?,
                 None => Default::default(),
             };
@@ -1343,7 +1348,7 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn drive(&self, id: uuid::Uuid, driver: uuid::Uuid) -> anyhow::Result<Option<(crate::task_kinds::resync::ResyncPlan, bool)>> {
-        let row: Option<(serde_json::Value, weft_core::stored::Version, bool)> = self
+        let row: Option<(String, weft_core::stored::Version, bool)> = self
             .pool
             .opt(
                 "SELECT resync, resync_version, transition = 'resyncing' FROM project \
@@ -1352,7 +1357,7 @@ impl ProjectStoreOps for PostgresProjectStore {
             )
             .await?;
         let Some((json, version, under_way)) = row else { return Ok(None) };
-        let plan = ResyncPlan::stored(id, json, version, Some(driver))?;
+        let plan = ResyncPlan::stored(id, json.as_str(), version, Some(driver))?;
         // A person gave it up: no drive of it goes on.
         Ok(plan.given_up.is_none().then_some((plan, under_way)))
     }
@@ -1381,7 +1386,7 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn stopped_resyncs(&self) -> anyhow::Result<Vec<(uuid::Uuid, anyhow::Result<crate::task_kinds::resync::ResyncPlan>)>> {
-        let rows: Vec<(uuid::Uuid, serde_json::Value, weft_core::stored::Version, Option<uuid::Uuid>)> = self
+        let rows: Vec<(uuid::Uuid, String, weft_core::stored::Version, Option<uuid::Uuid>)> = self
             .pool
             .all(
                 "SELECT id, resync, resync_version, resync_driver FROM project WHERE transition = 'resyncing' AND resync IS NOT NULL",
@@ -1390,7 +1395,7 @@ impl ProjectStoreOps for PostgresProjectStore {
             .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, json, version, driver)| (id, ResyncPlan::stored(id, json, version, driver)))
+            .map(|(id, json, version, driver)| (id, ResyncPlan::stored(id, json.as_str(), version, driver)))
             .filter(|(_, plan)| plan.as_ref().map_or(true, |plan| plan.stopped.is_some()))
             .collect())
     }
@@ -1434,14 +1439,14 @@ impl ProjectStoreOps for PostgresProjectStore {
     async fn give_up_unreadable_resync(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
-        let row: Option<(serde_json::Value, weft_core::stored::Version, Option<uuid::Uuid>)> = tx
+        let row: Option<(db::JsonText<serde_json::Value>, weft_core::stored::Version, Option<uuid::Uuid>)> = tx
             .opt(
                 "SELECT resync, resync_version, resync_driver FROM project \
                  WHERE id = $1 AND transition = 'resyncing' AND resync IS NOT NULL FOR UPDATE",
                 &[&id],
             )
             .await?;
-        let Some((document, version, driver)) = row else { return Ok(false) };
+        let Some((db::JsonText(document), version, driver)) = row else { return Ok(false) };
         let error = match ResyncPlan::stored(id, document.clone(), version, driver) {
             Ok(_) => return Ok(false),
             Err(e) => e,
@@ -1458,11 +1463,11 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn given_up_resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::GivenUp>> {
-        let row: Option<(serde_json::Value, weft_core::stored::Version, Option<uuid::Uuid>)> = self
+        let row: Option<(String, weft_core::stored::Version, Option<uuid::Uuid>)> = self
             .pool
             .opt("SELECT resync, resync_version, resync_driver FROM project WHERE id = $1 AND resync IS NOT NULL", &[&id])
             .await?;
-        row.map(|(json, version, driver)| Ok(ResyncPlan::stored(id, json, version, driver)?.given_up))
+        row.map(|(json, version, driver)| Ok(ResyncPlan::stored(id, json.as_str(), version, driver)?.given_up))
             .transpose()
             .map(Option::flatten)
     }

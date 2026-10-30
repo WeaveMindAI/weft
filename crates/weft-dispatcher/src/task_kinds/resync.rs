@@ -114,7 +114,7 @@ impl ResyncPlan {
     /// `version`, and its drive from `resync_driver`.
     pub fn stored(
         project: uuid::Uuid,
-        json: serde_json::Value,
+        json: impl weft_core::stored::Raw,
         version: weft_core::stored::Version,
         driver: Option<uuid::Uuid>,
     ) -> anyhow::Result<ResyncPlan> {
@@ -141,7 +141,7 @@ impl ResyncPlan {
         sql: &str,
         more: &[weft_task_store::db::Param<'_>],
     ) -> weft_task_store::db::Result<u64> {
-        let json = weft_task_store::db::Json(self);
+        let json = weft_task_store::db::JsonText(self);
         let version = Self::STORED.version();
         let row: [weft_task_store::db::Param<'_>; 4] = [&project, &json, &version, &self.driver];
         let params: Vec<_> = row.into_iter().chain(more.iter().copied()).collect();

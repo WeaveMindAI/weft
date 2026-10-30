@@ -116,7 +116,7 @@ async fn a_database_an_older_weft_filled_boots_and_every_row_reads(pool: Pool) {
     weft_core::project::ProjectDefinition::STORED.decode(json.as_str(), version).expect("the program reads");
 
     // The resync's drive moved to its own column.
-    let (plan, plan_version, driver): (Value, i32, Option<uuid::Uuid>) =
+    let (weft_task_store::db::JsonText(plan), plan_version, driver): (weft_task_store::db::JsonText<Value>, i32, Option<uuid::Uuid>) =
         pool.one("SELECT resync, resync_version, resync_driver FROM project WHERE id = $1", &[&project_id]).await.unwrap();
     assert_eq!(driver.map(|d| d.to_string()).as_deref(), resync["driver"].as_str());
     assert!(plan.get("driver").is_none(), "{plan}");

@@ -49,6 +49,7 @@ mod loops;
 mod maintenance;
 mod metering_edges;
 mod node_crash;
+mod nul_text;
 mod openrouter;
 mod openrouter_chat;
 mod openrouter_custom;

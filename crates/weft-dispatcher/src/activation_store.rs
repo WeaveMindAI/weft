@@ -842,7 +842,7 @@ struct HeldProject {
 }
 
 /// [`HeldProject`] as its row reads.
-type HeldRow = (String, Option<serde_json::Value>, weft_core::stored::Version, Option<uuid::Uuid>, bool);
+type HeldRow = (String, Option<String>, weft_core::stored::Version, Option<uuid::Uuid>, bool);
 
 /// Lock and read the project row in the caller's transaction; `None`
 /// when there is no such project.
@@ -851,7 +851,7 @@ async fn hold_project(tx: &Transaction<'_>, project_id: uuid::Uuid) -> anyhow::R
         .opt("SELECT transition, resync, resync_version, resync_driver, removing FROM project WHERE id = $1 FOR UPDATE", &[&project_id])
         .await?;
     row.map(|(transition, resync, version, driver, removing)| {
-        let resync = resync.map(|json| crate::task_kinds::resync::ResyncPlan::stored(project_id, json, version, driver)).transpose()?;
+        let resync = resync.map(|json| crate::task_kinds::resync::ResyncPlan::stored(project_id, json.as_str(), version, driver)).transpose()?;
         Ok(HeldProject { transition, resync, removing })
     })
     .transpose()

@@ -10,7 +10,9 @@
 //! type the query infers for its placeholder (a text column takes it
 //! as it is; `$when::timestamptz`, a uuid column, a numeric column each
 //! parse it the way a quoted literal is parsed), a bool as bool, null
-//! as SQL NULL against any column, and an object or array as jsonb. A
+//! as SQL NULL against any column, and an object or array as jsonb
+//! against a json or jsonb placeholder and as its JSON text against any
+//! other (so a list of numbers writes a pgvector column). A
 //! number binds to whichever numeric column it is compared with or
 //! written to (the integers, the floats, and `numeric` within the range
 //! a fixed-point decimal holds), refusing a value the column cannot
@@ -51,11 +53,11 @@ pub fn refusal(message: String, e: &tokio_postgres::Error) -> WeftError {
     }
 }
 use tokio_postgres::config::SslMode;
-use tokio_postgres::types::{ToSql, Type};
-use tokio_postgres::{Config, Row};
+use tokio_postgres::types::{FromSql, Kind, ToSql, Type};
+use tokio_postgres::{Config, GenericClient, Row};
 
 use weft::access::OpenedConnection;
-use weft::{RunContext, NodeErrExt, WeftError, WeftResult};
+use weft::{RunContext, WeftError, WeftResult};
 
 /// Where and how to dial, read off the connection. Pure, so the
 /// vocabulary and every refusal are testable without a database.
@@ -329,9 +331,11 @@ impl Pooled {
         self.client.as_mut().expect("a pooled client is held until it is dropped")
     }
 
-    /// [`query_json`] on this client.
-    pub async fn query_json(&mut self, sql: &str, names: &[String], params: &[Value]) -> WeftResult<Vec<Value>> {
-        query_json(self.sending([sql]), sql, names, params).await
+    /// [`query_json`] on this client. Only `sql` is noted: the
+    /// transaction `query_json` opens around a node's own write ends on
+    /// every path (committed, or rolled back by the driver when dropped).
+    pub async fn query_json(&mut self, sql: &str, names: &[String], params: &[Value], by: WrittenBy) -> WeftResult<Vec<Value>> {
+        query_json(self.sending([sql]), sql, names, params, by).await
     }
 
     /// [`script_json`] on this client.
@@ -769,6 +773,52 @@ impl ToSql for SqlNumber {
     tokio_postgres::types::to_sql_checked!();
 }
 
+/// A JSON object or list, bound as jsonb against a json or jsonb
+/// placeholder and as its JSON text, in TEXT format, against any other.
+///
+/// The text form is what lets a list of numbers write a pgvector column:
+/// `[0.1,0.2]` is exactly the text a `vector` or `halfvec` parses, and
+/// any other type that cannot parse it refuses it in the database, before
+/// anything is written. A Postgres array placeholder (`int4[]`) is the
+/// exception: its text is `{1,2}`, never `[1,2]`, so a list there is
+/// refused here, naming the string form that does bind.
+#[derive(Debug)]
+struct SqlJson(Value);
+
+impl ToSql for SqlJson {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        match *ty {
+            Type::JSON | Type::JSONB => self.0.to_sql(ty, out),
+            _ if matches!(ty.kind(), Kind::Array(_)) => Err(format!(
+                "a JSON list or object cannot be bound to a {ty} column; pass the array as a \
+                 string in Postgres's own form, such as \"{{1,2,3}}\""
+            )
+            .into()),
+            _ => {
+                out.extend_from_slice(self.0.to_string().as_bytes());
+                Ok(tokio_postgres::types::IsNull::No)
+            }
+        }
+    }
+
+    fn accepts(_: &Type) -> bool {
+        true
+    }
+
+    fn encode_format(&self, ty: &Type) -> tokio_postgres::types::Format {
+        match *ty {
+            Type::JSON | Type::JSONB => tokio_postgres::types::Format::Binary,
+            _ => tokio_postgres::types::Format::Text,
+        }
+    }
+
+    tokio_postgres::types::to_sql_checked!();
+}
+
 /// One JSON value as a boxed SQL parameter (see the module doc for
 /// the mapping).
 fn param_of(value: &Value) -> Box<dyn ToSql + Sync + Send> {
@@ -777,7 +827,7 @@ fn param_of(value: &Value) -> Box<dyn ToSql + Sync + Send> {
         Value::Bool(b) => Box::new(*b),
         Value::Number(n) => Box::new(SqlNumber(n.clone())),
         Value::String(s) => Box::new(SqlText(s.clone())),
-        other => Box::new(other.clone()),
+        other => Box::new(SqlJson(other.clone())),
     }
 }
 
@@ -795,78 +845,382 @@ pub fn quote_ident(name: &str) -> WeftResult<String> {
     Ok(format!("\"{}\"", name.replace('"', "\"\"")))
 }
 
-/// One answered cell as JSON. Every common Postgres type maps; a type
-/// this shim does not carry is a loud error naming the fix (cast to
-/// text in the query), never a silently wrong value.
-fn cell_of(row: &Row, i: usize) -> WeftResult<Value> {
-    let ty = row.columns()[i].type_();
-    let name = row.columns()[i].name();
-    let v = match *ty {
-        Type::BOOL => row.try_get::<_, Option<bool>>(i).map(|v| json!(v)),
-        Type::INT2 => row.try_get::<_, Option<i16>>(i).map(|v| json!(v)),
-        Type::INT4 => row.try_get::<_, Option<i32>>(i).map(|v| json!(v)),
-        Type::INT8 => row.try_get::<_, Option<i64>>(i).map(|v| json!(v)),
-        Type::FLOAT4 => row.try_get::<_, Option<f32>>(i).map(|v| json!(v)),
-        Type::FLOAT8 => row.try_get::<_, Option<f64>>(i).map(|v| json!(v)),
+/// A scalar type a column can come back as, and so how its cells are
+/// read into JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scalar {
+    Bool,
+    Int2,
+    Int4,
+    Int8,
+    Float4,
+    Float8,
+    Numeric,
+    Text,
+    Json,
+    Uuid,
+    Timestamptz,
+    Timestamp,
+    Date,
+}
+
+impl Scalar {
+    /// An enum travels as its label's text, and `citext` and ltree's
+    /// types come from extensions, so they have no fixed type id and are
+    /// known by name: all of them read as text ([`PgText`]).
+    fn of(ty: &Type) -> Option<Self> {
+        Some(match *ty {
+            Type::BOOL => Self::Bool,
+            Type::INT2 => Self::Int2,
+            Type::INT4 => Self::Int4,
+            Type::INT8 => Self::Int8,
+            Type::FLOAT4 => Self::Float4,
+            Type::FLOAT8 => Self::Float8,
+            Type::NUMERIC => Self::Numeric,
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => Self::Text,
+            _ if matches!(ty.kind(), Kind::Enum(_)) => Self::Text,
+            _ if matches!(ty.kind(), Kind::Simple)
+                && matches!(ty.name(), "citext" | "ltree" | "lquery" | "ltxtquery") =>
+            {
+                Self::Text
+            }
+            Type::JSON | Type::JSONB => Self::Json,
+            Type::UUID => Self::Uuid,
+            Type::TIMESTAMPTZ => Self::Timestamptz,
+            Type::TIMESTAMP => Self::Timestamp,
+            Type::DATE => Self::Date,
+            _ => return None,
+        })
+    }
+}
+
+/// How the cells of a column of some type are read into JSON. [`carry`]
+/// is the one answer to "can a node read this column": [`readable`]
+/// refuses a statement before it runs when a column has none, and
+/// [`cell_of`] reads every cell by it, so the two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carry {
+    /// One value of that scalar type.
+    One(Scalar),
+    /// An array of it (`array_agg`, a `text[]` column), as a JSON list,
+    /// each element read the way its scalar column would be. One
+    /// dimension: that is what `Vec` reads. A deeper array is a value of
+    /// the same type, so it passes [`readable`] and the driver refuses it
+    /// with its own message while reading; a node's own write undoes
+    /// itself then ([`query_json`]).
+    List(Scalar),
+    /// A pgvector `vector`, as a JSON list of numbers.
+    Vector,
+    /// A pgvector `halfvec`, as a JSON list of numbers.
+    HalfVector,
+}
+
+/// How a column of type `ty` is read, or `None` when no node can read it.
+///
+/// pgvector's types come from an extension, so they have no fixed type
+/// id the way the built-in ones do, and are known by name.
+pub fn carry(ty: &Type) -> Option<Carry> {
+    match ty.kind() {
+        Kind::Array(element) => Scalar::of(element).map(Carry::List),
+        Kind::Simple if ty.name() == "vector" => Some(Carry::Vector),
+        Kind::Simple if ty.name() == "halfvec" => Some(Carry::HalfVector),
+        _ => Scalar::of(ty).map(Carry::One),
+    }
+}
+
+/// Who wrote the SQL a statement runs, which decides what a refusal
+/// over a column no node can read tells the author to do, and whether
+/// the statement runs in a transaction of its own ([`query_json`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrittenBy {
+    /// The author, in the node's query: a cast in that query fixes it.
+    /// Run as written, since a statement of the author's may be one
+    /// Postgres refuses inside a transaction (`VACUUM`, `CREATE INDEX
+    /// CONCURRENTLY`).
+    Author,
+    /// The node itself (an insert or update it builds, answering
+    /// `RETURNING *`): there is no query of the author's to cast in, and
+    /// the write commits only once its answer is read.
+    Node,
+}
+
+/// A statement's columns, each with how it is read. The only way to turn
+/// rows into JSON, and only [`readable`] makes one, so no row is decoded
+/// past a column nobody checked.
+#[derive(Debug)]
+pub struct Readable(Vec<Carry>);
+
+/// A column of a type no node reads, found when its statement was
+/// prepared, before it ran. Worded by whoever knows where the statement
+/// sits; every wording is an input error, since the fix is the program
+/// or the table, never something a run can route around.
+#[derive(Debug)]
+pub struct Unreadable {
+    pub column: String,
+    pub ty: Type,
+}
+
+impl Unreadable {
+    /// What is wrong, for a statement the author wrote.
+    fn what(&self) -> String {
+        format!("column '{}' has type {}, which this node does not carry", self.column, self.ty)
+    }
+
+    /// The column as SQL names it, always quoted: a bare name may fold to
+    /// another, split, or be a word Postgres reads as something else
+    /// (`user` is the signed-in role), so the fix a refusal suggests runs
+    /// as it is copied.
+    fn spelled(&self) -> String {
+        format!("\"{}\"", self.column.replace('"', "\"\""))
+    }
+
+    /// The fix, for a statement the author wrote.
+    fn cast(&self) -> String {
+        format!("cast it in the query (e.g. {}::text)", self.spelled())
+    }
+
+    /// The refusal of a statement that runs on its own: nothing ran.
+    pub fn refusal(&self, by: WrittenBy) -> WeftError {
+        WeftError::Input(match by {
+            WrittenBy::Author => {
+                format!("{}, so the statement was refused before it ran; {}", self.what(), self.cast())
+            }
+            WrittenBy::Node => format!(
+                "the table's column '{name}' has type {ty}, which this node cannot read back, \
+                 so nothing was written. Do the write with Postgres: Query instead, returning \
+                 that column cast to a type it reads (`RETURNING {spelled}::text`)",
+                name = self.column,
+                spelled = self.spelled(),
+                ty = self.ty
+            ),
+        })
+    }
+
+    /// The refusal of a script's last statement ([`script_json`]): the
+    /// statements before it have already run by the time it is prepared.
+    pub fn in_script(&self) -> WeftError {
+        WeftError::Input(format!(
+            "postgres: the statements before the script's last one already ran (a transaction \
+             the script opened is rolled back), and the last one was refused before it ran: \
+             its {}; {}",
+            self.what(),
+            self.cast()
+        ))
+    }
+
+    /// The refusal of statement `number` (from 1) of a script run in one
+    /// transaction ([`steps_json`]).
+    pub fn in_step(&self, number: usize) -> WeftError {
+        WeftError::Input(format!(
+            "postgres: statement {number} of the script: {}, so it was refused before it ran; {} \
+             (the transaction was rolled back)",
+            self.what(),
+            self.cast()
+        ))
+    }
+}
+
+/// How each column of a statement is read, refusing the statement when
+/// one of them cannot be. Postgres says what columns a statement answers
+/// when it is prepared, before it runs, so this is checked before anything
+/// is written. It checks TYPES; a value of a readable type that still
+/// cannot be read (a two-dimensional array) is caught while reading, and
+/// a node's own write rolls back then ([`query_json`]).
+pub fn readable<'a>(columns: impl IntoIterator<Item = (&'a str, &'a Type)>) -> Result<Readable, Unreadable> {
+    let mut carried = Vec::new();
+    for (name, ty) in columns {
+        let Some(how) = carry(ty) else {
+            return Err(Unreadable { column: name.to_string(), ty: ty.clone() });
+        };
+        carried.push(how);
+    }
+    Ok(Readable(carried))
+}
+
+impl Readable {
+    /// Answered rows as JSON objects keyed by column name, or what could
+    /// not be read.
+    fn rows(&self, rows: &[Row]) -> Result<Vec<Value>, String> {
+        rows.iter()
+            .map(|row| {
+                let mut obj = Map::new();
+                for (i, how) in self.0.iter().enumerate() {
+                    let name = row.columns()[i].name();
+                    let cell = cell_of(row, i, *how).map_err(|e| format!("column '{name}': {}", pg_detail(&e)))?;
+                    obj.insert(name.to_string(), cell);
+                }
+                Ok(Value::Object(obj))
+            })
+            .collect()
+    }
+}
+
+/// One answered cell as JSON, read the way its column's [`Carry`] says.
+fn cell_of(row: &Row, i: usize, how: Carry) -> Result<Value, tokio_postgres::Error> {
+    match how {
+        Carry::One(scalar) => one(row, i, scalar),
+        Carry::List(scalar) => list(row, i, scalar),
+        Carry::Vector => row.try_get::<_, Option<PgVector<false>>>(i).map(|v| json!(v.map(|v| v.0))),
+        Carry::HalfVector => row.try_get::<_, Option<PgVector<true>>>(i).map(|v| json!(v.map(|v| v.0))),
+    }
+}
+
+/// One scalar cell as JSON (`null` for NULL).
+fn one(row: &Row, i: usize, scalar: Scalar) -> Result<Value, tokio_postgres::Error> {
+    match scalar {
+        Scalar::Bool => row.try_get::<_, Option<bool>>(i).map(|v| json!(v)),
+        Scalar::Int2 => row.try_get::<_, Option<i16>>(i).map(|v| json!(v)),
+        Scalar::Int4 => row.try_get::<_, Option<i32>>(i).map(|v| json!(v)),
+        Scalar::Int8 => row.try_get::<_, Option<i64>>(i).map(|v| json!(v)),
+        Scalar::Float4 => row.try_get::<_, Option<f32>>(i).map(|v| v.map_or(Value::Null, single)),
+        Scalar::Float8 => row.try_get::<_, Option<f64>>(i).map(|v| json!(v)),
         // A node that can WRITE a numeric column has to be able to
-        // read one: `insert_row` answers with the row it just stored,
-        // so a missing arm here means writing the row and then failing
-        // on the way out.
-        //
-        // Carried as an ordinary JSON number, which is a double, so a
-        // value with more significant digits than a double holds
-        // arrives rounded. Anything that has to survive exactly is
-        // cast to text in the query and comes back as a string.
-        Type::NUMERIC => row.try_get::<_, Option<rust_decimal::Decimal>>(i).map(|v| {
-            use rust_decimal::prelude::ToPrimitive;
-            json!(v.and_then(|d| d.to_f64()))
-        }),
-        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
-            row.try_get::<_, Option<String>>(i).map(|v| json!(v))
+        // read one: `insert_row` answers with the row it just stored.
+        Scalar::Numeric => row.try_get::<_, Option<PgNumeric>>(i).map(|v| v.map_or(Value::Null, |n| n.0)),
+        Scalar::Text => row.try_get::<_, Option<PgText>>(i).map(|v| json!(v.map(|t| t.0))),
+        Scalar::Json => row.try_get::<_, Option<Value>>(i).map(|v| v.unwrap_or(Value::Null)),
+        Scalar::Uuid => row.try_get::<_, Option<uuid::Uuid>>(i).map(|v| json!(v)),
+        Scalar::Timestamptz | Scalar::Timestamp | Scalar::Date => {
+            row.try_get::<_, Option<PgMoment>>(i).map(|v| json!(v.map(|m| m.0)))
         }
-        Type::JSON | Type::JSONB => {
-            row.try_get::<_, Option<Value>>(i).map(|v| v.unwrap_or(Value::Null))
-        }
-        Type::UUID => row.try_get::<_, Option<uuid::Uuid>>(i).map(|v| json!(v)),
-        Type::TIMESTAMPTZ => row
-            .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(i)
-            .map(|v| json!(v.map(|t| t.to_rfc3339()))),
-        Type::TIMESTAMP => row
-            .try_get::<_, Option<chrono::NaiveDateTime>>(i)
-            .map(|v| json!(v.map(|t| t.to_string()))),
-        Type::DATE => row
-            .try_get::<_, Option<chrono::NaiveDate>>(i)
-            .map(|v| json!(v.map(|d| d.to_string()))),
-        // An array (`array_agg`, a `text[]` column) comes back as a JSON
-        // list, each element read the way its scalar column would be.
-        // One dimension: that is what `Vec` reads, and a deeper array is
-        // refused by the driver with its own message.
-        Type::BOOL_ARRAY => array(row, i, |v: bool| json!(v)),
-        Type::INT2_ARRAY => array(row, i, |v: i16| json!(v)),
-        Type::INT4_ARRAY => array(row, i, |v: i32| json!(v)),
-        Type::INT8_ARRAY => array(row, i, |v: i64| json!(v)),
-        Type::FLOAT4_ARRAY => array(row, i, |v: f32| json!(v)),
-        Type::FLOAT8_ARRAY => array(row, i, |v: f64| json!(v)),
-        Type::NUMERIC_ARRAY => array(row, i, |v: rust_decimal::Decimal| {
-            use rust_decimal::prelude::ToPrimitive;
-            json!(v.to_f64())
-        }),
-        Type::TEXT_ARRAY | Type::VARCHAR_ARRAY | Type::BPCHAR_ARRAY | Type::NAME_ARRAY => {
-            array(row, i, |v: String| json!(v))
-        }
-        Type::JSON_ARRAY | Type::JSONB_ARRAY => array(row, i, |v: Value| v),
-        Type::UUID_ARRAY => array(row, i, |v: uuid::Uuid| json!(v)),
-        Type::TIMESTAMPTZ_ARRAY => array(row, i, |v: chrono::DateTime<chrono::Utc>| json!(v.to_rfc3339())),
-        Type::TIMESTAMP_ARRAY => array(row, i, |v: chrono::NaiveDateTime| json!(v.to_string())),
-        Type::DATE_ARRAY => array(row, i, |v: chrono::NaiveDate| json!(v.to_string())),
-        _ => {
-            mistake!(
-                "column '{name}' has type {ty}, which this node does not carry; cast it in \
-                 the query (e.g. {name}::text)"
-            );
-        }
+    }
+}
+
+/// One array cell as a JSON list, each element read the way [`one`]
+/// reads its scalar.
+fn list(row: &Row, i: usize, scalar: Scalar) -> Result<Value, tokio_postgres::Error> {
+    match scalar {
+        Scalar::Bool => array(row, i, |v: bool| json!(v)),
+        Scalar::Int2 => array(row, i, |v: i16| json!(v)),
+        Scalar::Int4 => array(row, i, |v: i32| json!(v)),
+        Scalar::Int8 => array(row, i, |v: i64| json!(v)),
+        Scalar::Float4 => array(row, i, single),
+        Scalar::Float8 => array(row, i, |v: f64| json!(v)),
+        Scalar::Numeric => array(row, i, |v: PgNumeric| v.0),
+        Scalar::Text => array(row, i, |v: PgText| json!(v.0)),
+        Scalar::Json => array(row, i, |v: Value| v),
+        Scalar::Uuid => array(row, i, |v: uuid::Uuid| json!(v)),
+        Scalar::Timestamptz | Scalar::Timestamp | Scalar::Date => array(row, i, |v: PgMoment| json!(v.0)),
+    }
+}
+
+/// A cell [`carry`] reads as text: the text types, an enum's label, and
+/// the extension types `citext`, `ltree`, `lquery` and `ltxtquery`, each
+/// read the way the driver reads it as a string (ltree's types open with
+/// a version byte it strips). `String` itself would not do: it accepts no
+/// enum.
+struct PgText(String);
+
+impl<'a> FromSql<'a> for PgText {
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        <&str as FromSql>::from_sql(ty, raw).map(|s| Self(s.to_string()))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        carry(ty) == Some(Carry::One(Scalar::Text))
+    }
+}
+
+/// A `numeric` cell as JSON ([`numeric_from_bytes`]).
+struct PgNumeric(Value);
+
+impl<'a> FromSql<'a> for PgNumeric {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(numeric_from_bytes(raw)?))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
+}
+
+/// A `numeric` value in binary form, as Postgres's `numeric_send` writes
+/// it, as a JSON number: eight bytes of header, each a big-endian 16-bit
+/// word (how many digits follow, the weight of the first one, the sign,
+/// the display scale), then the digits, each 0 to 9999, base 10000. The
+/// value is the sum of digit `i` times 10000 to the power `weight - i`.
+///
+/// Every legal value maps, which a fixed-point decimal type cannot do (it
+/// refuses NaN, the infinities and anything past about 28 significant
+/// digits). A finite value arrives as the nearest double, so one with more
+/// significant digits than a double holds arrives rounded: anything that
+/// has to survive exactly is cast to text in the query and comes back as a
+/// string. NaN, `Infinity` and `-Infinity` (sign words 0xC000, 0xD000 and
+/// 0xF000), which JSON has no number for, are `null`, as a double's are,
+/// and so is a value past a double's range (about 1.8e308).
+pub fn numeric_from_bytes(raw: &[u8]) -> Result<Value, String> {
+    let word = |at: usize| u16::from_be_bytes([raw[at], raw[at + 1]]);
+    if raw.len() < 8 {
+        return Err(format!("a numeric value of {} bytes is shorter than its header", raw.len()));
+    }
+    let count = word(0) as i16;
+    let weight = i32::from(word(2) as i16);
+    let negative = match word(4) {
+        0x0000 => false,
+        0x4000 => true,
+        0xC000 | 0xD000 | 0xF000 => return Ok(Value::Null),
+        sign => return Err(format!("a numeric value has the unknown sign word {sign:#06x}")),
     };
-    v.node_err("postgres: read a cell")
+    if count < 0 || raw.len() != 8 + count as usize * 2 {
+        return Err(format!("a numeric value declares {count} digits but carries {} bytes of them", raw.len() - 8));
+    }
+    // The digits written out in decimal, four characters each, and the
+    // power of ten the last of them stands for: the digits `12 3400` with
+    // weight 0 are `000123400e-4`, which is 12.34. A double's parser
+    // rounds that text to the nearest double, however many digits it
+    // holds.
+    let mut text = String::from(if negative { "-0" } else { "0" });
+    for at in (8..raw.len()).step_by(2) {
+        let digit = word(at);
+        if digit > 9999 {
+            return Err(format!("a numeric value carries the digit {digit}, past 9999"));
+        }
+        text.push_str(&format!("{digit:04}"));
+    }
+    let exponent = 4 * (weight - (i32::from(count) - 1));
+    let value: f64 = format!("{text}e{exponent}").parse().map_err(|e| format!("a numeric value read as {text}: {e}"))?;
+    Ok(serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number))
+}
+
+/// A `timestamptz`, `timestamp` or `date` cell as its text
+/// ([`moment_from_bytes`]).
+struct PgMoment(String);
+
+impl<'a> FromSql<'a> for PgMoment {
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        moment_from_bytes(ty, raw).map(Self)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::TIMESTAMPTZ | Type::TIMESTAMP | Type::DATE)
+    }
+}
+
+/// A `timestamptz` (`2026-09-16T22:14:48.601019+00:00`), `timestamp`
+/// (`2026-09-16 22:14:48.601019`) or `date` (`2026-09-16`) in binary form
+/// as text. Postgres also stores `infinity` and `-infinity` in each, as
+/// the largest and smallest value of its integer (microseconds since 2000
+/// for the timestamps, days since 2000 for a date), which no calendar type
+/// reads; they come back as those two words, Postgres's own spelling. A
+/// moment past year 262143, which Postgres holds and chrono does not, is
+/// refused as unreadable.
+pub fn moment_from_bytes(ty: &Type, raw: &[u8]) -> Result<String, Box<dyn std::error::Error + Sync + Send>> {
+    let infinite = match raw.len() {
+        8 if raw == i64::MAX.to_be_bytes() => Some("infinity"),
+        8 if raw == i64::MIN.to_be_bytes() => Some("-infinity"),
+        4 if raw == i32::MAX.to_be_bytes() => Some("infinity"),
+        4 if raw == i32::MIN.to_be_bytes() => Some("-infinity"),
+        _ => None,
+    };
+    if let Some(word) = infinite {
+        return Ok(word.to_string());
+    }
+    Ok(match *ty {
+        Type::TIMESTAMPTZ => chrono::DateTime::<chrono::Utc>::from_sql(ty, raw)?.to_rfc3339(),
+        Type::TIMESTAMP => chrono::NaiveDateTime::from_sql(ty, raw)?.to_string(),
+        Type::DATE => chrono::NaiveDate::from_sql(ty, raw)?.to_string(),
+        _ => return Err(format!("{ty} is not a date or a timestamp").into()),
+    })
 }
 
 /// One array cell as a JSON list (`null` for a NULL array, `null` for a
@@ -882,17 +1236,68 @@ fn array<'a, T: tokio_postgres::types::FromSql<'a>>(
     })
 }
 
-/// Answered rows as JSON objects keyed by column name.
-pub fn rows_to_json(rows: &[Row]) -> WeftResult<Vec<Value>> {
-    rows.iter()
-        .map(|row| {
-            let mut obj = Map::new();
-            for i in 0..row.columns().len() {
-                obj.insert(row.columns()[i].name().to_string(), cell_of(row, i)?);
-            }
-            Ok(Value::Object(obj))
-        })
-        .collect()
+/// A single-precision float as the JSON number written the shortest way
+/// that reads back as the same float: `0.1`, where widening it to a
+/// double would print `0.10000000149011612`. A NaN or an infinity, which
+/// JSON has no number for, is `null`, as a double's is.
+pub fn single(v: f32) -> Value {
+    json!(v.to_string().parse::<f64>().expect("a float's own text parses back"))
+}
+
+/// A pgvector value: a `vector` when `HALF` is false, a `halfvec` when
+/// it is true, read from the binary form the extension sends.
+struct PgVector<const HALF: bool>(Vec<Value>);
+
+impl<'a, const HALF: bool> FromSql<'a> for PgVector<HALF> {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(vector_from_bytes(raw, HALF)?.into_iter().map(single).collect()))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        carry(ty) == Some(if HALF { Carry::HalfVector } else { Carry::Vector })
+    }
+}
+
+/// The numbers of a pgvector value in binary form, as pgvector's
+/// `vector_send` and `halfvec_send` write it: the dimension count as a
+/// big-endian 16-bit integer, 16 unused bits, then each element
+/// big-endian, a 32-bit float for a `vector` and a 16-bit IEEE half for a
+/// `halfvec` (`half`). Anything whose length does not match the dimension
+/// count it declares is refused, never read partly.
+pub fn vector_from_bytes(raw: &[u8], half: bool) -> Result<Vec<f32>, String> {
+    let kind = if half { "halfvec" } else { "vector" };
+    let Some((head, body)) = raw.split_first_chunk::<4>() else {
+        return Err(format!("a {kind} value of {} bytes is shorter than its header", raw.len()));
+    };
+    let dim = i16::from_be_bytes([head[0], head[1]]);
+    let width = if half { 2 } else { 4 };
+    if dim < 0 || body.len() != dim as usize * width {
+        return Err(format!(
+            "a {kind} value declares {dim} dimensions but carries {} bytes of them",
+            body.len()
+        ));
+    }
+    Ok(if half {
+        body.chunks_exact(2).map(|b| half_to_f32(u16::from_be_bytes([b[0], b[1]]))).collect()
+    } else {
+        body.chunks_exact(4).map(|b| f32::from_be_bytes([b[0], b[1], b[2], b[3]])).collect()
+    })
+}
+
+/// An IEEE 754 half-precision float (1 sign bit, 5 exponent bits, 10
+/// fraction bits) widened to a single. Every half is exactly a single,
+/// so nothing is rounded.
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+    let exponent = i32::from((bits >> 10) & 0x1f);
+    let fraction = f32::from(bits & 0x3ff);
+    match exponent {
+        // Subnormal: no implicit leading 1.
+        0 => sign * fraction * 2f32.powi(-24),
+        31 if fraction == 0.0 => sign * f32::INFINITY,
+        31 => f32::NAN,
+        e => sign * (1.0 + fraction / 1024.0) * 2f32.powi(e - 15),
+    }
 }
 
 /// A driver refusal said back in the author's own words.
@@ -967,23 +1372,77 @@ pub fn spell_parameters(detail: &str, names: &[String]) -> String {
 /// a refusal naming a position can be said back naming the port. Empty
 /// for a node that writes its own SQL: there the numbering is the
 /// node's, or the author's own `$1` in a `where`, and rewriting either
-/// would point at something that is not there.
+/// would point at something that is not there. `by` says who wrote the
+/// SQL, which decides how a column no node can read is refused.
+///
+/// A statement the node wrote runs in a transaction of its own and
+/// commits only once every row it answered is read, so a write whose
+/// answer cannot be read back is never left stored for a retry to store
+/// twice. The transaction ends on every path (the commit, or the
+/// `ROLLBACK` the driver queues when it is dropped unfinished, which
+/// reaches the server before anything sent after it), so it is not one
+/// [`Pooled`] has to roll back for the next run.
 pub async fn query_json(
-    client: &tokio_postgres::Client,
+    client: &mut tokio_postgres::Client,
     sql: &str,
     names: &[String],
     params: &[Value],
+    by: WrittenBy,
 ) -> WeftResult<Vec<Value>> {
+    let failed = |failed: Failed| match failed {
+        Failed::Server(e) => refusal(
+            format!("postgres: run the query: {}", spell_parameters(&pg_detail(&e), names)),
+            &e,
+        ),
+        Failed::Unreadable(column) => column.refusal(by),
+        Failed::Cell(e) => match by {
+            WrittenBy::Author => weft::error::node_error(format!("postgres: read a cell: {e}")),
+            WrittenBy::Node => weft::error::node_error(format!(
+                "postgres: read the row back: {e}. The write was rolled back, so nothing was written"
+            )),
+        },
+    };
+    match by {
+        WrittenBy::Author => query_checked(&*client, sql, params).await.map_err(failed),
+        WrittenBy::Node => {
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| weft::error::node_error(format!("postgres: begin the write: {}", pg_detail(&e))))?;
+            let rows = query_checked(&tx, sql, params).await.map_err(failed)?;
+            // A deferred constraint is checked here, so a refusal stays
+            // the database's answer the program can handle.
+            tx.commit().await.map_err(|e| refusal(format!("postgres: commit the write: {}", pg_detail(&e)), &e))?;
+            Ok(rows)
+        }
+    }
+}
+
+/// Why [`query_checked`] answered no rows. Each caller words it, since
+/// only the caller knows what had already run.
+enum Failed {
+    /// The server refused the statement, preparing or running it.
+    Server(tokio_postgres::Error),
+    /// A column it answers has a type no node reads; it never ran.
+    Unreadable(Unreadable),
+    /// It ran, and a value it answered could not be read.
+    Cell(String),
+}
+
+/// Prepare `sql`, refuse it when a column it answers cannot be read
+/// ([`readable`]), and only then run it and read its rows, so a
+/// statement that writes never writes and then fails on the way out
+/// over a column's type. Preparing is a step running the SQL text takes
+/// anyway, so the check costs no extra round trip.
+async fn query_checked(client: &(impl GenericClient + Sync), sql: &str, params: &[Value]) -> Result<Vec<Value>, Failed> {
+    let statement = client.prepare(sql).await.map_err(Failed::Server)?;
+    let readable =
+        readable(statement.columns().iter().map(|c| (c.name(), c.type_()))).map_err(Failed::Unreadable)?;
     let boxed = params_of(params);
     let refs: Vec<&(dyn ToSql + Sync)> =
         boxed.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
-    let rows = client.query(sql, &refs).await.map_err(|e| {
-        refusal(
-            format!("postgres: run the query: {}", spell_parameters(&pg_detail(&e), names)),
-            &e,
-        )
-    })?;
-    rows_to_json(&rows)
+    let rows = client.query(&statement, &refs).await.map_err(Failed::Server)?;
+    readable.rows(&rows).map_err(Failed::Cell)
 }
 
 /// How one firing runs, decided from the query text alone, BEFORE
@@ -1351,10 +1810,7 @@ async fn steps_json(
         .map_err(|e| weft::error::node_error(format!("postgres: begin the transaction: {}", pg_detail(&e))))?;
     let mut last: Vec<Value> = Vec::new();
     for (index, (statement, params)) in steps.iter().enumerate() {
-        let boxed = params_of(params);
-        let refs: Vec<&(dyn ToSql + Sync)> =
-            boxed.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
-        let rows = tx.query(statement.sql.as_str(), &refs).await.map_err(|e| {
+        let failed = |e: tokio_postgres::Error| {
             refusal(
                 format!(
                     "postgres: statement {} of the script: {} (the transaction was rolled back)",
@@ -1363,8 +1819,24 @@ async fn steps_json(
                 ),
                 &e,
             )
-        })?;
-        last = rows_to_json(&rows)?;
+        };
+        // Only the last statement's rows are answered, so only its
+        // columns have to be ones a node can read.
+        if index + 1 == steps.len() {
+            last = query_checked(&tx, &statement.sql, params).await.map_err(|f| match f {
+                Failed::Server(e) => failed(e),
+                Failed::Unreadable(column) => column.in_step(index + 1),
+                Failed::Cell(e) => weft::error::node_error(format!(
+                    "postgres: statement {} of the script: read a cell: {e} (the transaction was rolled back)",
+                    index + 1
+                )),
+            })?;
+        } else {
+            let boxed = params_of(params);
+            let refs: Vec<&(dyn ToSql + Sync)> =
+                boxed.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
+            tx.execute(statement.sql.as_str(), &refs).await.map_err(failed)?;
+        }
     }
     tx.commit()
         .await
@@ -1392,8 +1864,8 @@ async fn script_json(
     if !head.is_empty() {
         run_script_head(client, &head.join(";\n")).await?;
     }
-    let rows = client.query(last, &[]).await.map_err(|e| {
-        refusal(
+    query_checked(client, last, &[]).await.map_err(|f| match f {
+        Failed::Server(e) => refusal(
             format!(
                 "postgres: the last statement of the script: {}. Its rows are the ones this \
                  node answers, so it runs on its own and has to be one Postgres can prepare; \
@@ -1402,9 +1874,12 @@ async fn script_json(
                 pg_detail(&e)
             ),
             &e,
-        )
-    })?;
-    rows_to_json(&rows)
+        ),
+        Failed::Unreadable(column) => column.in_script(),
+        Failed::Cell(e) => weft::error::node_error(format!(
+            "postgres: every statement of the script ran, and what the last one answered could not be read: {e}"
+        )),
+    })
 }
 
 /// The leading statements, whole, for their effects only: nothing

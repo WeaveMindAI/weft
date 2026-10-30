@@ -31,7 +31,7 @@ impl CopyStatus {
 
 /// One `infra_node` row as [`statuses`] reads it: node, instance,
 /// status, last apply, saved bake.
-type CopyRow = (String, Option<String>, String, Option<i64>, crate::db::Json<std::collections::BTreeMap<String, serde_json::Value>>);
+type CopyRow = (String, Option<String>, String, Option<i64>, crate::db::JsonText<std::collections::BTreeMap<String, serde_json::Value>>);
 
 /// Every copy of `project_id`'s infra nodes and its status.
 pub async fn statuses(pool: &crate::db::Pool, project_id: uuid::Uuid) -> anyhow::Result<Vec<CopyStatus>> {

@@ -1373,9 +1373,20 @@ fn owner_of(thing: &Thing) -> Owner {
 /// A function whose arguments changed, the one function of its name on each
 /// side, is the same function replaced, in the expand part
 /// ([`replaced_function`]), where an add beside the old one would make
-/// every call ambiguous until the contract part dropped the old. A NOT NULL column with no default in `backfills`
-/// is added holding the value given there on the rows already in its
-/// table, a default the contract part then drops.
+/// every call ambiguous until the contract part dropped the old.
+///
+/// A NOT NULL column with no default in `backfills` is added holding the
+/// value given there on the rows already in its table, a default the
+/// contract part then drops.
+///
+/// Postgres refuses to change the type of a column a trigger holds
+/// (`UPDATE OF` it, or `WHEN` it), so a column whose type changes takes
+/// down every trigger of its table that holds it, in its own statement,
+/// and every one the canonical DDL has holding it is put back where
+/// triggers are planned, after every column and function, filed with the
+/// table so it runs in the same file as the change, and making first a
+/// function the plan makes for it ([`Retyped`]): a trigger added holding
+/// it arrives there, and one removed leaves with the take-down.
 pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfills: &[Backfill]) -> anyhow::Result<Vec<Planned>> {
     let key = |t: &Thing| (t.kind.clone(), t.table.clone(), t.name.clone());
     let (old, mut plan) = apply_renames(old, renames)?;
@@ -1401,6 +1412,7 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
     let old_tables: std::collections::HashSet<&str> =
         old.iter().map(|t| t.table.as_str()).collect();
     let replaced = replaced_functions(old, new);
+    let retyped = Retyped::of(old, new, &old_by);
     // A column's NOT NULL constraint (Postgres names one per NOT NULL
     // column) arrives with the statement that adds the column or makes it
     // NOT NULL: one of its own would be a second, which fails, or a no-op
@@ -1414,7 +1426,10 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
             })
     };
     let mut created: std::collections::HashSet<&str> = Default::default();
-    for thing in new {
+    // Types first: a column or a table may be made of a type added in the
+    // same plan, and things otherwise come in name order of their kind.
+    let types_first = new.iter().filter(|t| t.kind == "type").chain(new.iter().filter(|t| t.kind != "type"));
+    for thing in types_first {
         if backs_constraint(thing) || implied_not_null(thing) {
             continue;
         }
@@ -1443,6 +1458,10 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
             plan.push(Planned { owner: owner_of(thing), part: Part::Expand, stmt: added_whole(thing) });
             continue;
         }
+        if retyped.puts_up(thing) {
+            plan.push(Planned { owner: Owner::Table(thing.table.clone()), part: Part::Expand, stmt: retyped.put_up(thing, new, &old_by) });
+            continue;
+        }
         match old_by.get(&key(thing)) {
             None => match replaced.get(&key(thing)) {
                 Some(was) => plan.push(Planned { owner: owner_of(thing), part: Part::Expand, stmt: replaced_function(was, thing) }),
@@ -1452,7 +1471,7 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
                 }
             },
             Some(was) if was.body != thing.body => {
-                plan.extend(changed(was, thing).into_iter().map(|(part, stmt)| Planned { owner: owner_of(thing), part, stmt }))
+                plan.extend(changed(was, thing, &retyped).into_iter().map(|(part, stmt)| Planned { owner: owner_of(thing), part, stmt }))
             }
             Some(_) => {}
         }
@@ -1486,7 +1505,7 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
             }
             continue;
         }
-        if new_by.contains_key(&key(thing)) || replaced.values().any(|was| key(was) == key(thing)) {
+        if new_by.contains_key(&key(thing)) || replaced.values().any(|was| key(was) == key(thing)) || retyped.holds_retyped(thing) {
             continue;
         }
         // A column's NOT NULL constraint (Postgres names one per NOT NULL
@@ -1515,6 +1534,108 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
     // DROP would then fail on a trigger that is gone.
     plan.extend(dropped_functions);
     Ok(plan)
+}
+
+/// The columns whose type changes, and the triggers taken down before
+/// and put back after ([`plan_migration`]).
+struct Retyped<'t> {
+    /// `(table, column)` of each column whose type changes.
+    columns: std::collections::HashSet<(String, String)>,
+    old: &'t [Thing],
+}
+
+impl<'t> Retyped<'t> {
+    fn of(old: &'t [Thing], new: &[Thing], old_by: &HashMap<(String, String, String), Thing>) -> Self {
+        let columns = new
+            .iter()
+            .filter(|now| now.kind == "column")
+            .filter(|now| {
+                old_by
+                    .get(&(now.kind.clone(), now.table.clone(), now.name.clone()))
+                    .is_some_and(|was| column_parts(&was.body).ty != column_parts(&now.body).ty)
+            })
+            .map(|now| (now.table.clone(), now.name.clone()))
+            .collect();
+        Retyped { columns, old }
+    }
+
+    /// Whether `trigger` holds a column of its table whose type changes.
+    fn holds_retyped(&self, trigger: &Thing) -> bool {
+        trigger.kind == "trigger"
+            && self.columns.iter().any(|(table, column)| *table == trigger.table && mentions(&trigger.body, column))
+    }
+
+    /// The statement putting `trigger` back. It goes in its table's
+    /// group's file, which may run before the file of the group declaring
+    /// the function it calls; so a function made in the same plan (added,
+    /// or made again because its arguments changed) is made here first too.
+    /// Postgres prints a function as `CREATE OR REPLACE`, so its own
+    /// statement making it again, before or after this one, changes nothing.
+    fn put_up(&self, trigger: &Thing, new: &[Thing], old_by: &HashMap<(String, String, String), Thing>) -> String {
+        let made = trigger_function(&trigger.body).and_then(|called| {
+            new.iter().find(|f| {
+                // A trigger function takes no arguments, so its name read
+                // back is `called()`, whatever overloads stand beside it.
+                f.kind == "function" && f.name == format!("{called}()") && !old_by.contains_key(&(f.kind.clone(), f.table.clone(), f.name.clone()))
+            })
+        });
+        let mut lines: Vec<String> = made.map(|f| format!("{};", f.body)).into_iter().collect();
+        lines.push(format!("DROP TRIGGER IF EXISTS {} ON {};\n{};", trigger.name, trigger.table, trigger.body));
+        lines.join("\n")
+    }
+
+    /// Whether `trigger`, as the canonical DDL has it, is put back after a
+    /// retype instead of being planned on its own: it holds a retyped
+    /// column, or a trigger of its name was taken down (so a change of its
+    /// own, which drops it first, would find it gone).
+    fn puts_up(&self, trigger: &Thing) -> bool {
+        self.holds_retyped(trigger)
+            || (trigger.kind == "trigger"
+                && self.old.iter().any(|was| was.table == trigger.table && was.name == trigger.name && self.holds_retyped(was)))
+    }
+
+    /// `alter`, the statement retyping `table.column`, after the drop of
+    /// every trigger holding the column as the database holds it. `IF
+    /// EXISTS`: two columns of one table retyped in one plan take the same
+    /// trigger down each in turn.
+    fn around(&self, table: &str, column: &str, alter: String) -> String {
+        let downs: Vec<String> = self
+            .old
+            .iter()
+            .filter(|t| t.kind == "trigger" && t.table == table && mentions(&t.body, column))
+            .map(|t| format!("DROP TRIGGER IF EXISTS {} ON {};", t.name, t.table))
+            .collect();
+        if downs.is_empty() {
+            return alter;
+        }
+        let mut lines = vec!["-- Postgres changes no type of a column a trigger holds: they come down before it, and go back up once every column and function is in.".to_string()];
+        lines.extend(downs);
+        lines.push(alter);
+        lines.join("\n")
+    }
+}
+
+/// The function a trigger's definition calls, as `pg_get_triggerdef`
+/// prints it (`EXECUTE FUNCTION name(...)`, or `EXECUTE PROCEDURE` from
+/// an older server), unquoted.
+fn trigger_function(body: &str) -> Option<String> {
+    let rest = body.split_once("EXECUTE FUNCTION ").or_else(|| body.split_once("EXECUTE PROCEDURE "))?.1;
+    let name = rest.split('(').next()?.trim();
+    Some(match name.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+        Some(quoted) => quoted.replace("\"\"", "\""),
+        None => name.to_string(),
+    })
+}
+
+/// Whether `body` names `name` as a whole identifier: a trigger holding a
+/// column names it in its `UPDATE OF` list or its `WHEN`. A name that
+/// only happens to match (a column called like the trigger's function)
+/// takes a trigger down and up for nothing, which costs nothing.
+fn mentions(body: &str, name: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    body.match_indices(name).any(|(at, _)| {
+        body[..at].chars().next_back().is_none_or(|c| !is_word(c)) && body[at + name.len()..].chars().next().is_none_or(|c| !is_word(c))
+    })
 }
 
 /// The functions `new` holds under arguments `old` does not, each the one
@@ -1962,7 +2083,7 @@ fn set_not_null(table: &str, column: &str) -> String {
 /// enum label, a trigger, a column's type or default, a dropped NOT NULL)
 /// in the expand part, what tightens (a constraint, a unique index, a new
 /// NOT NULL) in the contract part.
-fn changed(was: &Thing, now: &Thing) -> Vec<(Part, String)> {
+fn changed(was: &Thing, now: &Thing, retyped: &Retyped<'_>) -> Vec<(Part, String)> {
     match now.kind.as_str() {
         // CREATE OR REPLACE cannot change what a function returns nor rename
         // its parameters: one whose signature changed is dropped first (no
@@ -2031,12 +2152,13 @@ fn changed(was: &Thing, now: &Thing) -> Vec<(Part, String)> {
                 // real conversion (a date out of a string, a unit change)
                 // wants a different USING, which is why this one is spelled
                 // out rather than hidden.
-                out.push((Part::Expand, format!(
+                let alter = format!(
                     "-- {}.{} was {old_ty}. The cast below is a plain one; if the rows \
                      already there\n-- need converting differently, change the USING.\n\
                      ALTER TABLE {} ALTER COLUMN {} TYPE {ty} USING {}::{ty};",
                     now.table, now.name, now.table, now.name, now.name
-                )));
+                );
+                out.push((Part::Expand, retyped.around(&now.table, &now.name, alter)));
             }
             if old_default != default {
                 out.push((Part::Expand, match &default {
@@ -2856,6 +2978,90 @@ mod tests {
         let plan: Vec<String> = plan_migration(&[was], std::slice::from_ref(&renamed), &[], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         assert_eq!(plan, [format!("DROP FUNCTION f(integer);\n{};", renamed.body)]);
     }
+    /// A column whose type changes takes every trigger of its table that
+    /// holds it down in its own statement, and each trigger the canonical
+    /// DDL has holding it goes back up after every column and function of
+    /// the plan (a column it names may be added in the same plan), filed with
+    /// the table: one kept, one changed to name an added column, one added
+    /// holding it, and one removed (taken down there, never dropped again).
+    /// A trigger that holds another column is left alone.
+    #[test]
+    fn a_retyped_column_takes_the_triggers_holding_it_down_and_up() {
+        use super::{plan_migration, Owner, Part, Thing};
+        let column = |name: &str, ty: &str| Thing { kind: "column".into(), table: "t".into(), name: name.into(), body: format!("{ty} null=YES default=-") };
+        let trigger = |name: &str, body: &str| Thing { kind: "trigger".into(), table: "t".into(), name: name.into(), body: body.into() };
+        let function = Thing { kind: "function".into(), table: String::new(), name: "g()".into(), body: "CREATE OR REPLACE FUNCTION public.g()".into() };
+        let kept = trigger("t_on_doc", "CREATE TRIGGER t_on_doc AFTER UPDATE OF state, doc ON public.t FOR EACH ROW EXECUTE FUNCTION f()");
+        let widened = trigger("t_on_doc", "CREATE TRIGGER t_on_doc AFTER UPDATE OF state, doc, zz ON public.t FOR EACH ROW EXECUTE FUNCTION f()");
+        let gone = trigger("t_when_doc", "CREATE TRIGGER t_when_doc AFTER UPDATE ON public.t FOR EACH ROW WHEN ((new.doc IS DISTINCT FROM old.doc)) EXECUTE FUNCTION f()");
+        let added = trigger("t_doc_again", "CREATE TRIGGER t_doc_again AFTER UPDATE OF doc ON public.t FOR EACH ROW EXECUTE FUNCTION f()");
+        let other = trigger("t_on_docs", "CREATE TRIGGER t_on_docs AFTER UPDATE OF docs ON public.t FOR EACH ROW EXECUTE FUNCTION f()");
+        let old = [column("doc", "jsonb"), kept, gone, other.clone()];
+        let new = [column("doc", "text"), column("zz", "text"), function, widened.clone(), added.clone(), other];
+        let plan = plan_migration(&old, &new, &[], &[]).unwrap();
+        let stmts: Vec<&str> = plan.iter().map(|p| p.stmt.as_str()).collect();
+        assert!(plan.iter().all(|p| p.part == Part::Expand), "{stmts:?}");
+        let at = |what: &str| stmts.iter().position(|s| s.contains(what)).unwrap_or_else(|| panic!("no {what} in {stmts:#?}"));
+        let alter = at("ALTER TABLE t ALTER COLUMN doc TYPE text USING doc::text;");
+        let downs = &stmts[alter];
+        assert!(downs.find("DROP TRIGGER IF EXISTS t_on_doc ON t;") < downs.find("ALTER TABLE t ALTER COLUMN doc"), "{downs}");
+        assert!(downs.find("DROP TRIGGER IF EXISTS t_when_doc ON t;") < downs.find("ALTER TABLE t ALTER COLUMN doc"), "{downs}");
+        let after = at("ADD COLUMN zz").max(at("FUNCTION public.g()"));
+        for up in [&widened.body, &added.body] {
+            let put = at(up);
+            assert!(put > alter && put > after, "{up} goes up after every column and function: {stmts:#?}");
+            assert!(plan[put].owner == Owner::Table("t".into()), "filed with the table");
+            assert_eq!(stmts.iter().filter(|s| s.contains(up.as_str())).count(), 1, "planned once: {stmts:#?}");
+        }
+        assert!(!stmts.iter().any(|s| s.contains("t_on_docs")), "a trigger on another column stays up: {stmts:#?}");
+        assert_eq!(stmts.iter().filter(|s| s.contains("t_when_doc")).count(), 1, "a removed trigger only comes down: {stmts:#?}");
+    }
+
+    /// A trigger put back after a type change makes the function it calls
+    /// first when the plan makes that function (its own file may run
+    /// later); one whose body alone changes is replaced in place and left
+    /// to its own statement.
+    #[test]
+    fn a_retyped_columns_trigger_makes_a_function_made_with_it() {
+        use super::{plan_migration, Thing};
+        let column = |ty: &str| Thing { kind: "column".into(), table: "t".into(), name: "doc".into(), body: format!("{ty} null=YES default=-") };
+        let function = |body: &str| Thing { kind: "function".into(), table: String::new(), name: "f()".into(), body: body.into() };
+        let trigger = |call: &str| Thing {
+            kind: "trigger".into(),
+            table: "t".into(),
+            name: "t_on_doc".into(),
+            body: format!("CREATE TRIGGER t_on_doc AFTER UPDATE OF doc ON t FOR EACH ROW EXECUTE FUNCTION {call}"),
+        };
+        let made = "CREATE OR REPLACE FUNCTION f() two";
+        let put_up = |old: &[Thing], new: &[Thing]| -> String {
+            let plan = plan_migration(old, new, &[], &[]).unwrap();
+            plan.into_iter().map(|p| p.stmt).find(|s| s.contains("CREATE TRIGGER t_on_doc")).expect("the trigger goes back up")
+        };
+        let old = [column("jsonb"), trigger("g()")];
+        for call in ["f()", "\"f\"()"] {
+            let stmt = put_up(&old, &[column("text"), function(made), trigger(call)]);
+            assert!(stmt.find(made) < stmt.find("CREATE TRIGGER"), "the function comes first: {stmt}");
+        }
+        let old = [column("jsonb"), function("CREATE OR REPLACE FUNCTION f() one"), trigger("f()")];
+        let stmt = put_up(&old, &[column("text"), function(made), trigger("f()")]);
+        assert!(!stmt.contains(made), "a body replaced in place is left to its own statement: {stmt}");
+    }
+
+    /// A type added in a plan is made before the columns and tables made
+    /// of it.
+    #[test]
+    fn an_added_type_comes_before_what_is_made_of_it() {
+        use super::{plan_migration, Thing};
+        let mood = Thing { kind: "type".into(), table: String::new(), name: "mood".into(), body: "sad,happy".into() };
+        let column = |table: &str, ty: &str| Thing { kind: "column".into(), table: table.into(), name: "m".into(), body: format!("{ty} null=YES default=-") };
+        let old = [column("t", "text")];
+        let new = [column("t", "mood"), column("fresh", "mood"), mood];
+        let plan: Vec<String> = plan_migration(&old, &new, &[], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
+        let at = |what: &str| plan.iter().position(|s| s.contains(what)).unwrap_or_else(|| panic!("no {what} in {plan:#?}"));
+        let made = at("CREATE TYPE mood");
+        assert!(made < at("ALTER COLUMN m TYPE mood") && made < at("CREATE TABLE fresh"), "{plan:#?}");
+    }
+
     /// A function whose arguments changed, alone under its name on both
     /// sides, is replaced in the expand part; an overload added beside one
     /// the canonical DDL keeps is only added.

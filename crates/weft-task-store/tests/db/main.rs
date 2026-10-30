@@ -9,6 +9,7 @@ mod claims;
 mod documents;
 mod leases;
 mod news_outbox;
+mod nul;
 mod schema_guard;
 mod signals;
 mod support;

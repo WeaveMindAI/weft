@@ -1430,7 +1430,7 @@ async fn a_cancel_ends_a_waiting_run_and_asks_a_driven_one_to_stop(pool: Pool) {
     assert!(news_of(&pool, waiting).await.is_empty(), "a run nobody drives makes no news");
     assert_eq!(written.node_cancellations, None);
     assert_eq!(run_column::<String>(&pool, "state", driven).await.as_deref(), Some("running"), "its worker ends it");
-    let asked: Option<serde_json::Value> = run_column(&pool, "cancel_requested", driven).await;
+    let asked: Option<String> = run_column(&pool, "cancel_requested", driven).await;
     assert!(asked.is_some());
     assert_eq!(store.events_log(driven).await.unwrap().len(), 1, "nothing written into a record its worker writes");
 }
@@ -1458,13 +1458,14 @@ async fn a_cancel_queues_the_last_call_of_each_wait_that_carries_one(pool: Pool)
 
     let written = store.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
     assert_eq!((written.removed.len(), written.cancel_calls), (2, 1));
-    let tasks: Vec<(String, Option<String>, Option<Uuid>, serde_json::Value)> =
+    type TaskRow = (String, Option<String>, Option<Uuid>, weft_task_store::db::JsonText<serde_json::Value>);
+    let tasks: Vec<TaskRow> =
         pool.all("SELECT kind, dedup_key, run_id, payload FROM task WHERE kind = 'cancel_call'", &[]).await.unwrap();
     assert_eq!(tasks.len(), 1, "{tasks:?}");
     let (_, dedup, task_run, payload) = &tasks[0];
     assert_eq!(dedup.as_deref(), Some(weft_task_store::kinds::cancel_call_key("tok-calling").as_str()));
     assert_eq!(*task_run, Some(run));
-    let call: weft_core::signal::listener_protocol::CancelCallRequest = serde_json::from_value(payload.clone()).unwrap();
+    let call: weft_core::signal::listener_protocol::CancelCallRequest = serde_json::from_value(payload.0.clone()).unwrap();
     assert_eq!(call.token, "tok-calling");
     assert_eq!(call.spec.on_cancel, Some(weft_core::signal::CancelCall::put("https://queue.example/requests/7/cancel")));
 
@@ -1506,7 +1507,7 @@ async fn a_cancel_queues_the_last_call_of_each_wait_that_carries_one(pool: Pool)
     kept.run_id = Some(finished);
     store.signal_insert(&kept).await.expect("a wait of a run that ends on its own");
     pool.execute(
-        "UPDATE run SET state = 'ended', outcome = 'completed', cancel_requested = '\"user\"'::jsonb WHERE run_id = $1",
+        "UPDATE run SET state = 'ended', outcome = 'completed', cancel_requested = '\"user\"' WHERE run_id = $1",
         &[&finished],
     )
     .await
@@ -2995,7 +2996,7 @@ async fn a_rewritten_held_row_lets_its_holder_go(pool: Pool) {
     .await
     .unwrap();
     store.signal_insert(&held_signal("sse", id, 1)).await.unwrap();
-    let (held_by, serving, held_failed, holds): (Option<String>, Option<serde_json::Value>, Option<String>, bool) =
+    let (held_by, serving, held_failed, holds): (Option<String>, Option<String>, Option<String>, bool) =
         pool.one("SELECT held_by, serving, held_failed, holds FROM signal WHERE token = 'sse'", &[]).await.unwrap();
     assert_eq!((held_by, serving, held_failed, holds), (None, None, None, true), "a rewrite is let go of and tried again");
     let second = store.signal_get("sse").await.unwrap().unwrap().generation;
@@ -3226,7 +3227,7 @@ async fn what_an_infra_says_changed_is_written_where_its_node_put_it(pool: Pool)
     seed_project(&projects, project, "bin-A").await;
     pool.execute(
         "INSERT INTO infra_node (project_id, node_id, copy_id, status, baked_json, health_rules_json_version) VALUES ($1, 'db', 'c1', 'running', $2, 1)",
-        &[&project, &json!({ "address": "db:5432" })],
+        &[&project, &json!({ "address": "db:5432" }).to_string()],
     )
     .await
     .unwrap();
@@ -3259,9 +3260,10 @@ async fn what_an_infra_says_changed_is_written_where_its_node_put_it(pool: Pool)
         weft_access_store::open_json(&sealed).unwrap()["password"].as_str().unwrap().to_string()
     };
     let baked = || async {
-        pool.scalar::<serde_json::Value>("SELECT baked_json FROM infra_node WHERE project_id = $1 AND node_id = 'db'", &[&project])
+        pool.scalar::<weft_task_store::db::JsonText<serde_json::Value>>("SELECT baked_json FROM infra_node WHERE project_id = $1 AND node_id = 'db'", &[&project])
             .await
             .unwrap()
+            .0
     };
 
     let reset = weft_core::infra::bake::PushedValues {
@@ -3271,6 +3273,11 @@ async fn what_an_infra_says_changed_is_written_where_its_node_put_it(pool: Pool)
     weft_access_store::write_pushed_values(&pool, project, "c1", &reset).await.unwrap();
     assert_eq!(password().await, "p2", "the connection holds the new password");
     assert_eq!(baked().await, json!({ "address": "db:6543" }));
+    // A value holding NUL characters is kept exactly, the others beside it.
+    let odd = weft_core::infra::bake::PushedValues { outputs: [("address".to_string(), json!("db:\u{0}1"))].into(), ..Default::default() };
+    weft_access_store::write_pushed_values(&pool, project, "c1", &odd).await.unwrap();
+    assert_eq!(baked().await, json!({ "address": "db:\u{0}1" }));
+    weft_access_store::write_pushed_values(&pool, project, "c1", &reset).await.unwrap();
 
     // Only what the node handed weft can change, and nothing is written
     // when any of it is refused.
@@ -3399,7 +3406,7 @@ async fn a_run_refused_three_times_ends_with_why(pool: Pool) {
     // What the delivery then does, through `cancel_run_id`.
     store.cancel_run(run, None, &refused_cause(RefusedBy::Worker, "the worker answered 500")).await.unwrap();
     assert_eq!(run_column::<String>(&pool, "state", run).await.as_deref(), Some("ended"));
-    let cause: serde_json::Value = run_column(&pool, "cancel_cause", run).await.unwrap();
+    let cause: String = run_column(&pool, "cancel_cause", run).await.unwrap();
     assert!(cause.to_string().contains("its worker refused it 3 times: the worker answered 500"), "{cause}");
     assert_eq!(refused(&pool, run).await.unwrap(), None, "an ended run is not refused again");
 }
@@ -3927,7 +3934,7 @@ async fn a_resync_shows_what_it_waits_for_and_a_stop_on_the_database_is_taken_up
     let stop = Stopped { status: 500, error: "busy".into(), at_unix, waits_for: Some(ResyncWait::Database), build_cannot_run: false };
     assert!(projects.write_resync(id, &ResyncPlan { stopped: Some(stop.clone()), ..plan.clone() }).await.unwrap());
     pool.execute("UPDATE task SET status = 'failed', completed_at_unix = $2 WHERE id = $1", &[&driving, &at_unix]).await.unwrap();
-    let stored: String = pool.scalar("SELECT resync->'stopped'->>'waits_for' FROM project WHERE id = $1", &[&id]).await.unwrap();
+    let stored: String = pool.scalar("SELECT resync::jsonb->'stopped'->>'waits_for' FROM project WHERE id = $1", &[&id]).await.unwrap();
     assert_eq!(stored, "database");
     let held = projects.resync(id).await.unwrap().expect("still held");
     assert_eq!(held.progress, ResyncProgress::default(), "a task that ended says nothing of where it is");
@@ -3974,7 +3981,7 @@ async fn a_resync_whose_plan_no_longer_reads_is_given_up_for_its_project_alone(p
         };
         projects.try_begin_resyncing(id, &plan, task(TENANT, id, plan.driver)).await.unwrap().expect("entered");
     }
-    pool.execute("UPDATE project SET resync = '{\"owners\": 7}'::jsonb WHERE id = $1", &[&broken]).await.unwrap();
+    pool.execute("UPDATE project SET resync = '{\"owners\": 7}' WHERE id = $1", &[&broken]).await.unwrap();
     let listed = |projects: weft_dispatcher::ProjectStore| async move {
         let mut listed: Vec<(Uuid, bool)> =
             projects.stopped_resyncs().await.unwrap().into_iter().map(|(id, plan)| (id, plan.is_ok())).collect();

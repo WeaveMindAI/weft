@@ -163,9 +163,9 @@ pub(crate) async fn let_go_if_idle(state: &DispatcherState, project: uuid::Uuid)
 
 /// The project's address, as its front last answered it.
 pub(crate) async fn address(state: &DispatcherState, project: uuid::Uuid) -> anyhow::Result<Option<ProjectAddress>> {
-    let kept: Option<serde_json::Value> =
+    let kept: Option<String> =
         state.pg_pool.scalar_opt("SELECT api_address FROM project WHERE id = $1", &[&project]).await?.flatten();
-    kept.map(|kept| serde_json::from_value(kept).map_err(|e| anyhow::anyhow!("project {project}'s address: {e}"))).transpose()
+    kept.map(|kept| serde_json::from_str(&kept).map_err(|e| anyhow::anyhow!("project {project}'s address: {e}"))).transpose()
 }
 
 /// Which failures [`serve_all`] logs.
@@ -223,7 +223,7 @@ where
 
 /// Keep `address` as the project's; whether it changed.
 async fn keep(state: &DispatcherState, project: uuid::Uuid, address: Option<&ProjectAddress>) -> anyhow::Result<bool> {
-    let kept = address.map(serde_json::to_value).transpose()?;
+    let kept = address.map(weft_task_store::db::JsonText);
     let changed = state
         .pg_pool
         .execute("UPDATE project SET api_address = $2 WHERE id = $1 AND api_address IS DISTINCT FROM $2", &[&project, &kept])

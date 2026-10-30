@@ -4,6 +4,27 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-10-30 (7a1dcb43)
+
+**A NUL character in a run no longer breaks search, or the runs beside it.**
+Text a node picks up from a scraped page or a PDF can hold the invisible NUL
+character, which Postgres refuses. One run carrying it made every later
+`weft runs --search` and `--through` fail with `invalid byte sequence for
+encoding "UTF8": 0x00`, and if it ended on an error holding one, the other
+runs ending in the same batch were stopped with it. Now an error, a reason or
+a search entry is written without the character, and a value that has to come
+back exactly (a payload, an answer, a run's starting values, a trigger's
+state) keeps it. An install that is already stuck searches again after
+`./setup.sh`.
+
+**The Postgres nodes read and write pgvector columns.** A `vector` or
+`halfvec` column reads back as a list of numbers, and a list of numbers
+writes into one. PostgresInsertRow and PostgresUpdateRows check that they can
+read every column of the table back before they write, so a column they
+cannot read (a `sparsevec`, for example) refuses the write instead of storing
+the row and then failing. A `real` column now reads as `0.1` instead of
+`0.10000000149011612`.
+
 ## 2026-10-29 (0.2.278)
 
 **If a program hands tools to an LLM node, it may not compile after this
