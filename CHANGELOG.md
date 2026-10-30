@@ -4,6 +4,37 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-10-30 (671e50f4)
+
+**Long runs open quickly, and weft keeps answering while they do.** Opening a
+long run in the editor, `weft events`, `weft logs` and `weft node-state` took
+longer the longer the run was: a run of 135,000 events took close to a minute,
+and the whole of weft stopped answering meanwhile. The same run now opens in
+about three seconds, and everything else keeps answering. A long loop no
+longer slows down the further it gets either.
+
+**weft gives memory back.** It used to keep the memory of its largest replay
+until it was restarted; it now returns it within seconds.
+
+**A durable run carries on when its worker loses weft's broker.** If a worker
+cannot write a durable run's record for over a minute, the run now moves to
+another worker and carries on from what was recorded, the way it does when a
+worker dies, instead of failing. A fast run still fails.
+
+**Every project's worker compiles from scratch once** after this update.
+
+**If you build weft yourself, or customize how workers build:**
+
+- weft now builds with `--cfg tokio_unstable`, which the checkout's
+  `.cargo/config.toml` sets, so build from the checkout (`./setup.sh` does). A
+  `RUSTFLAGS` of your own replaces that setting: add `--cfg tokio_unstable` to
+  it.
+- A custom worker Dockerfile template (`[build.worker] dockerfile_template`)
+  has to keep the line `ENV RUSTFLAGS="{{worker_rustflags}}"` before its
+  `cargo build`.
+- A node can no longer set `RUSTFLAGS` in its `deps.toml` `[build.env]`: a
+  flag its code needs goes in its build script (`cargo:rustc-cfg=...`).
+
 ## 2026-10-30 (0.2.279)
 
 **Run `weft resync` in every project with a trigger on after this update.**
