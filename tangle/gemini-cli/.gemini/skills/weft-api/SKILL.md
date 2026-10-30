@@ -64,8 +64,9 @@ declare an output of its name (below).
 The type you put on `body` follows the body shape the [route] is set to
 (`dataType` in the source, "Body shape" in the editor):
 
-- an object body (`json`, the default): a record, or `JsonDict` to take any
-  object. If you declare a record, the body is checked against it before the
+- an object body (`json`, the default): a record, `JsonDict` to take any
+  object, or `Json` to take a body of any shape (a list, a bare value). If
+  you declare a record, the body is checked against it before the
   run starts, and one that does not fit is answered `400` naming the field,
   with nothing downstream run. A key the record does not declare is refused
   too, unless the record ends with `..` (`{ email: String, .. }`), which
@@ -79,7 +80,9 @@ The type you put on `body` follows the body shape the [route] is set to
 - a binary body (`bytes`): it is stored, and the [stored-file value] arrives
   on `body`, declared `File`, or `Image` to have the bytes checked.
 
-`body` closes on a request that carries none, a `GET` say.
+`body` closes on a request that carries none, a `GET` say, whatever the
+`dataType`, and a json body that is `null` comes out on a `body` whose type takes `Null`
+(`Json` does) and closes it on any other.
 
 Declare the capture as an output, and read it as `card.id`:
 
@@ -576,7 +579,8 @@ graph does instead of a script whose whole body is `return {...}`.
 What a socket adds over a [route] is `inbound`: a `Generator` carrying one
 item per message the caller sends, ended when the caller disconnects. You
 declare its item type on the arrow to match the body shape (a record when
-you will read keys off it, `Generator[String]` for plain text,
+you will read keys off it, `Generator[Json]` for messages of any shape,
+`Generator[String]` for plain text,
 `Generator[File]` for uploads); an undeclared `inbound` wired anywhere is a
 compile error. A `Loop` over it runs
 once per message, in order.

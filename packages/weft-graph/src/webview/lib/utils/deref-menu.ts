@@ -10,7 +10,7 @@ export interface DerefKey {
 
 /// The keys a wire could read one level below `path`, given the source
 /// port's type text: the fields of the record found there, in declared
-/// order. `null` when that level has no keys (a `JsonDict`, a scalar, a
+/// order. `null` when that level has no keys (a `JsonDict`, a `Json`, a scalar, a
 /// type that does not parse), which is when the menu says to declare
 /// the shape or Cast first.
 export function derefKeys(sourceType: string, path: string[]): DerefKey[] | null {
@@ -42,7 +42,7 @@ export function derefType(sourceType: string, path: string[]): Deref {
 }
 
 /// Walk `path` down a type. A record whose fields cannot be read (a
-/// `JsonDict`, a scalar) ends the walk with nothing, and so does a key
+/// `JsonDict`, a `Json`, a scalar) ends the walk with nothing, and so does a key
 /// the record does not have.
 function typeAt(ty: WeftType | null, path: string[]): WeftType | null {
 	for (const key of path) {

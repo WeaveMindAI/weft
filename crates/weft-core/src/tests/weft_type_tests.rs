@@ -2398,3 +2398,153 @@ fn an_unresolved_leaf_takes_any_value_inside_a_checked_shape() {
     let e = ty("{ score: Number }").conform_value(json!({})).unwrap_err();
     assert!(e.contains("missing required field \"score\""), "{e}");
 }
+
+// ── Json ─────────────────────────────────────────────────────────────
+
+#[test]
+fn json_parses_displays_and_is_a_reserved_name() {
+    for written in ["Json", "List[Json]", "Generator[Json]", "Json | Null", "Dict[String, Json]"] {
+        let parsed = ty(written);
+        assert_eq!(parsed.to_string(), written);
+        assert_eq!(WeftType::parse(&parsed.wire_string()), Some(parsed));
+    }
+    assert_eq!(ty("Json"), WeftType::Json);
+    assert_ne!(ty("Json"), WeftType::JsonDict);
+    assert!(TypeRegistry::build(&[("Json".into(), "String".into(), "test".into())]).is_err(), "Json is the language's");
+}
+
+/// Every JSON-made type flows into `Json`, at any depth; nothing that is
+/// a file, a live handle or an access does, wherever it sits.
+#[test]
+fn every_json_made_type_fits_json_and_nothing_else_does() {
+    let json = WeftType::Json;
+    let fits = |s: &str| WeftType::is_compatible(&ty(s), &json);
+    for source in [
+        "String",
+        "Number",
+        "Boolean",
+        "Null",
+        "Empty",
+        "JsonDict",
+        "Json",
+        "Dict[String, Number]",
+        "Dict[String, List[JsonDict]]",
+        "List[String]",
+        "List[List[List[Number | String]]]",
+        "{ a: String, b?: List[Number] }",
+        "{ a: String, .. }",
+        "String | Number | Null",
+        "List[T]",
+        "T",
+    ] {
+        assert!(fits(source), "{source} fits Json");
+    }
+    let named = WeftType::Named { name: "Rows".into(), body: Box::new(ty("List[List[Number]]")) };
+    assert!(WeftType::is_compatible(&named, &json), "a name falls away into its shape");
+    for source in [
+        "Image",
+        "Blob",
+        "Media",
+        "File",
+        "Bus",
+        "Access",
+        "Infra",
+        "Generator[Json]",
+        "Generator[String]",
+        "List[Image]",
+        "Dict[String, Audio]",
+        "{ pic: Image }",
+        "String | Image",
+        "List[List[Bus]]",
+    ] {
+        assert!(!fits(source), "{source} is not JSON");
+    }
+    let named_file = WeftType::Named { name: "Photo".into(), body: Box::new(ty("Image")) };
+    assert!(!WeftType::is_compatible(&named_file, &json));
+}
+
+/// Json flows out only into Json: anything narrower is a claim about the
+/// shape, which is the Cast node's to check.
+#[test]
+fn json_flows_only_into_json() {
+    let json = WeftType::Json;
+    for target in ["Json", "T", "String | Json", "Json | Null"] {
+        assert!(WeftType::is_compatible(&json, &ty(target)), "Json into {target}");
+    }
+    for target in ["JsonDict", "String", "Number", "Null", "List[Json]", "Dict[String, Json]", "{ a: String, .. }"] {
+        assert!(!WeftType::is_compatible(&json, &ty(target)), "Json into {target} needs a Cast");
+    }
+    let named = WeftType::Named { name: "Rows".into(), body: Box::new(ty("Json")) };
+    assert!(!WeftType::is_compatible(&json, &named), "nothing unnamed flows into a name");
+    // A narrowable output whose ceiling holds Json takes any JSON-made
+    // stream item; a stream wired to a stream stays invariant.
+    let ceiling = ty("Generator[JsonDict | Json | File]");
+    for declared in ["Generator[JsonDict]", "Generator[String]", "Generator[List[List[Number]]]", "Generator[{ pic: Image }]"] {
+        assert!(WeftType::fits_within(&ty(declared), &ceiling), "{declared}");
+    }
+    assert!(!WeftType::is_compatible(&ty("Generator[String]"), &ty("Generator[Json]")));
+}
+
+#[test]
+fn json_takes_any_json_value_at_run_time() {
+    use serde_json::json;
+    let json_type = WeftType::Json;
+    for value in [json!([[1, "a"], [2]]), json!("text"), json!(3.5), json!(null), json!(true), json!({ "a": [1] })] {
+        assert!(json_type.validate_value(&value).is_ok(), "{value}");
+        assert_eq!(json_type.conform_value(value.clone()).unwrap(), value, "held as it is");
+    }
+    assert!(json_type.contains_null(), "null is a JSON value, so it is data on a Json port");
+    assert_eq!(json_type.zero_value(), json!(null));
+    assert!(!json_type.references_file());
+    // Inside a shape, the shape is still held.
+    assert!(ty("List[Json]").validate_value(&json!("not a list")).is_err());
+    assert!(ty("{ raw: Json }").validate_value(&json!({})).is_err(), "a required field is still required");
+}
+
+/// The Cast node narrows Json into any JSON-made type, checking the
+/// value at run time; a file target or a stream never comes from Json.
+#[test]
+fn a_cast_narrows_json_and_checks_the_value() {
+    use serde_json::json;
+    let json_type = WeftType::Json;
+    for target in ["String", "Number", "Boolean", "JsonDict", "List[List[Number]]", "Dict[String, Json]", "{ id: String }"] {
+        assert!(WeftType::cast_allowed(&json_type, &ty(target)).is_ok(), "Json -> {target}");
+    }
+    let named = WeftType::Named { name: "Ticket".into(), body: Box::new(ty("{ id: String }")) };
+    assert!(WeftType::cast_allowed(&json_type, &named).is_ok());
+    assert!(WeftType::cast_allowed(&json_type, &ty("Generator[Json]")).is_err());
+    assert!(WeftType::cast_allowed(&json_type, &ty("Bus")).is_err());
+    assert!(WeftType::cast_allowed(&ty("Image"), &json_type).is_err(), "a file never becomes Json");
+
+    let record = ty("{ id: String, n?: Number }");
+    assert_eq!(record.cast_requested(&json!({ "id": "a" })).unwrap(), json!({ "id": "a" }));
+    let e = record.cast_requested(&json!([1, 2])).unwrap_err();
+    assert!(e.contains("no cast from List"), "{e}");
+    let e = record.cast_requested(&json!({ "n": 1 })).unwrap_err();
+    assert!(e.contains("missing required field \"id\""), "{e}");
+    assert_eq!(ty("List[List[Number]]").cast_requested(&json!([[1], [2, 3]])).unwrap(), json!([[1], [2, 3]]));
+    assert!(ty("JsonDict").cast_requested(&json!([1])).is_err(), "a list is no object");
+    // Into Json itself, any JSON value passes; a stored file does not.
+    assert_eq!(json_type.cast_value(&json!([1, "a"])).unwrap(), json!([1, "a"]));
+    assert!(json_type.cast_value(&file_url("image/png")).is_err());
+}
+
+/// The Cast node turns a structure into its JSON text when asked; a
+/// value written into a String port never is.
+#[test]
+fn only_a_requested_cast_turns_a_structure_into_text() {
+    use serde_json::json;
+    let text = ty("String");
+    assert_eq!(text.cast_requested(&json!({ "a": [1, 2] })).unwrap(), json!(r#"{"a":[1,2]}"#));
+    assert_eq!(ty("List[String]").cast_requested(&json!([[1], "x"])).unwrap(), json!(["[1]", "x"]));
+    assert!(text.cast_value(&json!({ "a": 1 })).is_err());
+    // In a union, the text is the last resort: a member taking the
+    // structure as it is wins, and the text comes out only when none can.
+    assert_eq!(ty("String | List[String]").cast_requested(&json!([1, 2])).unwrap(), json!(["1", "2"]));
+    assert_eq!(ty("String | List[Number]").cast_requested(&json!(["1", "2"])).unwrap(), json!([1.0, 2.0]));
+    assert_eq!(ty("String | Number").cast_requested(&json!({ "a": 1 })).unwrap(), json!(r#"{"a":1}"#));
+    let label = WeftType::Named { name: "Label".into(), body: Box::new(ty("String | Number")) };
+    let target = WeftType::union(vec![label, ty("List[String]")]);
+    assert_eq!(target.cast_requested(&json!([1, 2])).unwrap(), json!(["1", "2"]), "a name over a union with text in it waits too");
+    assert!(WeftType::cast_allowed(&ty("JsonDict"), &text).is_ok(), "the compile-time table grants it");
+}

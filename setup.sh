@@ -117,7 +117,8 @@
 #                   install. The management API is never on it.
 #                   Persisted across runs, per install: a branch's
 #                   install opens its own (its own named tunnel when the
-#                   checkout's .env.local names one, else a quick one).
+#                   checkout's .env.local names one, else the named one
+#                   it last opened, else a quick one).
 #   --no-public-url close it again.
 #
 # Browser-target flags (default: every browser):

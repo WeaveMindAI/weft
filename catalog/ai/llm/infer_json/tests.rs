@@ -37,6 +37,12 @@ fn answer_rules() -> WeftResult<()> {
     assert!(why.starts_with("the model's answer does not fit Verdict") && why.contains("extra"), "a closed record refuses an undeclared key: {why}");
     let why = parse_answer("[1, 2]", &dict).unwrap_err();
     assert!(why.starts_with("the model's answer does not fit JsonDict"), "a list is no JSON object: {why}");
+    // Declared `Json`, any JSON answer is one; a list type holds the items.
+    let any = WeftType::parse("Json").expect("Json parses");
+    assert_eq!(parse_answer("[[1, \"a\"], 2]", &any), Ok(json!([[1, "a"], 2])));
+    assert_eq!(parse_answer("\"done\"", &any), Ok(json!("done")));
+    let tags = WeftType::parse("List[String]").expect("parses");
+    assert_eq!(parse_answer(r#"["a", "b"]"#, &tags), Ok(json!(["a", "b"])));
     // A file object in an answer is refused whatever the declared type.
     let pic = WeftType::parse("{ pic: Image }").expect("parses");
     let why = parse_answer(

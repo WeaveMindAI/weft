@@ -12,6 +12,7 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("text_parses_into_the_declared_number", text_to_number),
         NodeTest::fake("a_scalar_stringifies_into_declared_text", scalar_to_text),
+        NodeTest::fake("a_structure_becomes_its_json_text", structure_to_text),
         NodeTest::fake("an_impossible_value_fails_loud", impossible_value),
         NodeTest::fake("a_stored_file_marker_casts_into_its_kind_and_no_other", file_marker),
     ]
@@ -49,6 +50,18 @@ async fn scalar_to_text(rig: FakeRig) -> WeftResult<()> {
     rig.output_type("value", WeftType::parse("String").expect("String parses"));
     let outcome = rig.run(&CastNode, json!({ "value": 42.5 })).await.ok()?;
     assert_eq!(outcome.outputs["value"], json!("42.5"));
+    Ok(())
+}
+
+/// Asked for text, a list or an object comes out as its JSON, at any
+/// depth (a written value never gets this; the literal cast refuses).
+async fn structure_to_text(rig: FakeRig) -> WeftResult<()> {
+    rig.output_type("value", WeftType::parse("String").expect("String parses"));
+    let outcome = rig.run(&CastNode, json!({ "value": [[1, "a"], { "b": true }] })).await.ok()?;
+    assert_eq!(outcome.outputs["value"], json!(r#"[[1,"a"],{"b":true}]"#));
+    rig.output_type("value", WeftType::parse("List[String]").expect("parses"));
+    let outcome = rig.run(&CastNode, json!({ "value": [{ "a": 1 }, "x"] })).await.ok()?;
+    assert_eq!(outcome.outputs["value"], json!([r#"{"a":1}"#, "x"]));
     Ok(())
 }
 

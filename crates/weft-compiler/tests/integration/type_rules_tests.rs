@@ -461,7 +461,7 @@ fn a_narrowable_output_takes_a_fitting_type_and_a_fixed_one_only_its_own() {
     assert!(enrich_errors.is_empty(), "{enrich_errors:?}");
     assert_eq!(output_type(&project, "r", "body"), ty("{ email: String, .. }"));
 
-    let (_, enrich_errors, _) = check("r = Route -> (body: Number) { path: \"signup\" }\n");
+    let (_, enrich_errors, _) = check("r = Route -> (body: Access) { path: \"signup\" }\n");
     assert!(enrich_errors.iter().any(|e| e.contains("widest type")), "{enrich_errors:?}");
 
     let (_, enrich_errors, _) = check("r = Route -> (path: Number) { path: \"signup\" }\n");
@@ -476,8 +476,13 @@ fn a_route_body_type_must_suit_its_data_type() {
     assert!(message_of(&d, "rule-structural").contains("text body"), "{d:?}");
     let (_, _, d) = check("r = Route -> (body: String) { path: \"say\", method: \"POST\", dataType: \"text\" }\n");
     assert!(!codes(&d).contains(&"rule-structural"), "{d:?}");
-    let (_, _, d) = check("r = Route -> (body: String) { path: \"say\", method: \"POST\" }\n");
+    let (_, _, d) = check("r = Route -> (body: Image) { path: \"say\", method: \"POST\" }\n");
     assert!(message_of(&d, "rule-structural").contains("json body"), "{d:?}");
+    // A json body may be any JSON, a list or a bare value too, once declared so.
+    for body in ["Json", "List[List[Number]]", "String"] {
+        let (_, _, d) = check(&format!("r = Route -> (body: {body}) {{ path: \"say\", method: \"POST\" }}\n"));
+        assert!(!codes(&d).contains(&"rule-structural"), "{body}: {d:?}");
+    }
 }
 
 /// A port added to a route reads the path capture of its name, so one

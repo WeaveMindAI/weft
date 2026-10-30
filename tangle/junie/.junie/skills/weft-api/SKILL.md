@@ -65,7 +65,8 @@ What to declare on `body` follows the body shape the [route] is set to
 (`dataType` in the source, "Body shape" in the editor):
 
 - `json` (the default), an object body: declare a record type, or
-  `JsonDict` to take any object unchecked. The record is checked before the
+  `JsonDict` to take any object unchecked, or `Json` for a body of any shape
+  (a list, a bare value). The record is checked before the
   run starts, and a body that does not fit it is answered `400` naming the
   field, with nothing downstream run. A key the record does not declare is
   refused too, unless the record ends with `..` (`{ email: String, .. }`),
@@ -78,7 +79,9 @@ What to declare on `body` follows the body shape the [route] is set to
 - `bytes`: the body is stored and its [stored-file value] lands on `body`,
   declared `File`, or `Image`, which is checked against the bytes.
 
-A request with no body (a `GET`) closes `body`.
+A request with no body (a `GET`) closes `body`, whatever the `dataType`, and
+a json body that is `null` comes out on a `body` whose type takes `Null`
+(`Json` does) and closes it on any other.
 
 Declare the capture as an output, and read it as `card.id`:
 
@@ -576,7 +579,8 @@ graph does instead of a script whose whole body is `return {...}`.
 What a socket adds over a [route] is `inbound`: a `Generator` carrying one
 item per message the caller sends, ended when the caller disconnects. You
 declare its item type on the arrow to match the body shape (a record when
-you will read keys off it, `Generator[String]` for plain text,
+you will read keys off it, `Generator[Json]` for messages of any shape,
+`Generator[String]` for plain text,
 `Generator[File]` for uploads); an undeclared `inbound` wired anywhere is a
 compile error. A `Loop` over it runs
 once per message, in order.

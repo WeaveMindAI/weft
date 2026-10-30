@@ -607,11 +607,14 @@ fn fire_cut(project: &ProjectDefinition, trigger: &str, saved: &crate::infra::ba
 /// is behind the source, and what infra it depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriggerCut {
-    /// The definition hash of the cut a fire of the trigger runs, every
-    /// infra place it reads only through baked outputs standing in (the
-    /// way a fire runs it once they are saved), so it is a function of
-    /// the source alone. A trigger that is on whose fingerprint differs
-    /// from the source's is behind it.
+    /// The hash over the two programs the trigger runs: the cut a fire
+    /// runs, every infra place it reads only through baked outputs
+    /// standing in (the way a fire runs it once they are saved), and the
+    /// cut its setup runs, everything in front of it (which no fire
+    /// runs: the walk stops at the fired trigger). A function of the
+    /// source alone. A trigger that is on whose fingerprint differs from
+    /// the source's is behind it, so an edit to what feeds it reads as
+    /// behind too, and a resync, which sets it up again, runs that edit.
     pub fingerprint: String,
     /// The infra places (spelled the way the program writes them) the
     /// trigger depends on, sorted: every infra place its fires run, and
@@ -639,7 +642,11 @@ pub fn trigger_cut(project: &ProjectDefinition, trigger: &str) -> Result<Trigger
     // The places read baked stand in, as a fire's do: the cut says so, and
     // they are no infra the trigger's fires run.
     let FireCut { fired, program, .. } = fire_cut(project, trigger, &bakeable)?;
-    let fingerprint = crate::project::hash::compute_definition_hash(&program).map_err(|e| format!("hash the cut of '{trigger}': {e:#}"))?;
+    let (setup, _) = setup_cut(project, std::slice::from_ref(&fired))?;
+    let hash = |cut: &ProjectDefinition| {
+        crate::project::hash::compute_definition_hash(cut).map_err(|e| format!("hash the cut of '{trigger}': {e:#}"))
+    };
+    let fingerprint = crate::project::hash::sha256_hex(format!("fire {}\nsetup {}", hash(&program)?, hash(&setup)?).as_bytes());
     let g = ProjectGraph::new(project);
     // What its registration holds: the address it reads off the infra
     // feeding its inputs, along the wires. A wire into a gate only decides
@@ -1812,8 +1819,8 @@ mod tests {
         assert_eq!(trigger_cut(&project, "hear").unwrap().depends_on, vec!["db".to_string(), "queue".to_string()]);
     }
 
-    /// A trigger's fingerprint moves with what its fires run, and only
-    /// with that: an edit elsewhere leaves it where it was.
+    /// A trigger's fingerprint moves with what its fires run, and an edit
+    /// to another trigger's fires leaves it where it was.
     #[test]
     fn a_triggers_fingerprint_moves_with_its_own_cut_only() {
         let before = two_triggers();
@@ -1823,6 +1830,25 @@ mod tests {
         assert_eq!(fingerprint(&before, "hear"), fingerprint(&edited, "hear"), "an edit outside its cut");
         assert_ne!(fingerprint(&before, "tick"), fingerprint(&edited, "tick"), "an edit inside its cut");
         assert_eq!(fingerprint(&before, "hear"), fingerprint(&before.clone(), "hear"), "a function of the source alone");
+    }
+
+    /// What runs in front of a trigger runs at its setup, never at a
+    /// fire (a schema made before the trigger listens, say): editing it
+    /// moves that trigger's fingerprint, so the trigger reads as behind
+    /// and a resync sets it up again. Another trigger's stays put.
+    #[test]
+    fn a_triggers_fingerprint_moves_with_what_its_setup_runs() {
+        let mut before = two_triggers();
+        before.nodes.push(serde_json::from_value(node("schema", &[], &[], &["rows"], false)).unwrap());
+        before.edges.push(serde_json::from_value(wire("schema", "rows", "hear", "_should_flow")).unwrap());
+        let fingerprint = |project: &ProjectDefinition, trigger: &str| trigger_cut(project, trigger).unwrap().fingerprint;
+        let mut edited = before.clone();
+        edited.nodes.iter_mut().find(|n| n.id == "schema").unwrap().config =
+            serde_json::from_value(json!({ "query": "create table if not exists t (id int)" })).unwrap();
+        assert_ne!(fingerprint(&before, "hear"), fingerprint(&edited, "hear"), "an edit in front of the trigger");
+        assert_eq!(fingerprint(&before, "tick"), fingerprint(&edited, "tick"), "an edit in front of another trigger");
+        let fire = |project: &ProjectDefinition| fire_cut(project, "hear", &Default::default()).unwrap().program;
+        assert!(fire(&edited).nodes.iter().all(|n| n.id != "schema"), "a fire never runs it");
     }
 
     /// `--group` on a group inside another: the inner group runs inside

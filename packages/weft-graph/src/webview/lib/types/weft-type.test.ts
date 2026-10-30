@@ -1081,6 +1081,100 @@ describe('JsonDict', () => {
 	});
 });
 
+// ── Json tests ──────────────────────────────────────────────────────
+
+describe('Json', () => {
+	const T = (s: string) => {
+		const t = parseWeftType(s);
+		if (!t) throw new Error(`${s} did not parse`);
+		return t;
+	};
+
+	it('parses Json, alone and nested', () => {
+		expect(T('Json')).toEqual({ kind: 'json' });
+		expect(T('List[Json]')).toEqual({ kind: 'list', inner: { kind: 'json' } });
+	});
+
+	it('displays and round-trips', () => {
+		for (const s of ['Json', 'List[Json]', 'Dict[String, Json]', '{a: Json, b?: Json}']) {
+			expect(weftTypeToString(T(s)), s).toBe(s);
+			expect(weftTypeToString(T(weftTypeToWireString(T(s)))), s).toBe(s);
+		}
+		// An alias renders under its name only as the whole union, so
+		// `File` beside another member prints as its members (as in Rust).
+		const stream = T('Generator[Json | File]');
+		expect(weftTypeToString(stream)).toBe('Generator[Json | Image | Video | Audio | Blob]');
+		expect(weftTypesEqual(T(weftTypeToWireString(stream)), stream)).toBe(true);
+	});
+
+	it('equals only Json', () => {
+		expect(weftTypesEqual(T('Json'), T('Json'))).toBe(true);
+		expect(weftTypesEqual(T('Json'), T('JsonDict'))).toBe(false);
+		expect(weftTypesEqual(T('JsonDict'), T('Json'))).toBe(false);
+	});
+
+	it('takes every JSON-made type', () => {
+		for (const s of [
+			'String', 'Number', 'Boolean', 'Null', 'JsonDict', 'Json', 'Empty',
+			'Dict[String, Number]', 'Dict[String, List[JsonDict]]',
+			'List[String]', 'List[List[List[Number]]]',
+			'{ a: String, b?: Number }', '{ a: List[Boolean], .. }',
+			'String | Number | Null', 'List[String] | JsonDict',
+			'Profile={ name: String }', 'Score=Number',
+			'T', 'List[T]', '{ a: T }',
+		]) {
+			expect(isWeftTypeCompatible(s, 'Json'), s).toBe(true);
+		}
+		expect(isCompatible(inferTypeFromValue({ a: [1, { b: null }], c: 'x' }), T('Json'))).toBe(true);
+	});
+
+	it('refuses what is not JSON, at any depth', () => {
+		for (const s of [
+			'Bus', 'Access', 'Infra', 'Generator[String]', 'Generator[Json]',
+			'Image', 'Video', 'Audio', 'Blob', 'Media', 'File',
+			'List[Image]', 'Dict[String, Bus]', '{ a: String, b: Audio }', '{ a?: File }',
+			'String | Image', 'List[List[Blob]]', 'Pic=Image', 'Wrapped={ p: Media }',
+		]) {
+			expect(isWeftTypeCompatible(s, 'Json'), s).toBe(false);
+		}
+	});
+
+	it('flows out only into Json, a variable, or a union holding Json', () => {
+		for (const s of ['Json', 'T', 'String | Json', 'Json | Null']) {
+			expect(isWeftTypeCompatible('Json', s), s).toBe(true);
+		}
+		for (const s of [
+			'JsonDict', 'String', 'Number', 'Null', '{ a: String }', '{ a?: String, .. }', 'List[Json]',
+			'Dict[String, Json]', 'String | Number', 'Profile={ name: String }', 'File',
+		]) {
+			expect(isWeftTypeCompatible('Json', s), s).toBe(false);
+		}
+	});
+
+	it('nests like any type inside containers', () => {
+		expect(isWeftTypeCompatible('List[Json]', 'List[Json]')).toBe(true);
+		expect(isWeftTypeCompatible('List[Number]', 'List[Json]')).toBe(true);
+		expect(isWeftTypeCompatible('List[Json]', 'List[Number]')).toBe(false);
+		expect(isWeftTypeCompatible('{ a: Number }', '{ a: Json }')).toBe(true);
+		expect(isWeftTypeCompatible('{ a: Json }', '{ a: Number }')).toBe(false);
+	});
+
+	it('streams narrow item-wise within Generator[Json | File]', () => {
+		const bound = T('Generator[Json | File]');
+		for (const s of ['Generator[JsonDict]', 'Generator[String]', 'Generator[List[List[Number]]]', 'Generator[Image]', 'Generator[Json]']) {
+			expect(fitsWithin(T(s), bound), s).toBe(true);
+		}
+		expect(fitsWithin(T('Generator[Bus]'), bound)).toBe(false);
+		expect(fitsWithin(T('JsonDict'), bound)).toBe(false);
+		// Wiring one stream into another stays invariant.
+		expect(isCompatible(T('Generator[String]'), bound)).toBe(false);
+	});
+
+	it('colors and leaves: no primitive leaf', () => {
+		expect(extractPrimitives(T('Json'))).toEqual([]);
+	});
+});
+
 describe('inferTypeFromValue no typevars', () => {
 	it('empty array infers List[Empty]', () => {
 		const t = inferTypeFromValue([]);

@@ -120,8 +120,8 @@ project has the thing to show, or they ask.
    with the other side, so a Slack trigger subscribes with Slack right
    then, and it fails loudly there rather than leaving a dead trigger.
    Because those values went to the provider, a trigger's settings are
-   frozen at that moment: change one and the live listener carries on
-   with what it registered until they run `weft resync`. While they are
+   frozen at that moment: change one, or a box feeding it, and the live
+   listener carries on with what it registered until they run `weft resync`. While they are
    still building, `weft bake` prepares a trigger without switching the
    listening on. A run started by a trigger only walks that trigger's
    path.

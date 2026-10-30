@@ -44,6 +44,14 @@ pub fn http_caller(
     conn
 }
 
+/// A connected fake HTTP caller speaking `data_type` whose request
+/// carries no body (a GET, or a fired run).
+pub fn http_caller_without_body(data_type: DataType, request: LiveRequest) -> Arc<FakeCallerConnection> {
+    let conn = FakeCallerConnection::connected(config(Protocol::Http, data_type));
+    conn.set_handshake(request);
+    conn
+}
+
 /// A connected fake WebSocket caller speaking `data_type`, with the
 /// given opening request and scripted messages; the script running dry
 /// is the caller disconnecting.
@@ -67,9 +75,6 @@ pub fn caller_skipping_unmade_chunks(protocol: Protocol, data_type: DataType) ->
         error_mode: ErrorMode::DropChunk,
         ..config(protocol, data_type)
     });
-    if protocol == Protocol::Http {
-        conn.set_http_body(InboundMessage::Json(serde_json::Value::Null));
-    }
     conn
 }
 

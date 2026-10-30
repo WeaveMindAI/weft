@@ -10,7 +10,7 @@ use reqwest::Method;
 use serde_json::Value;
 
 use weft::storage::{self, diff::is_text_mime, KeepTtl, StorageScope};
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, StorageHandle, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, StorageHandle, WeftError, WeftResult, WeftType};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
@@ -123,8 +123,18 @@ async fn text_out(
     mime: &str,
     filename: &str,
 ) -> WeftResult<NodeOutput> {
-    let body = text_body(&raw);
+    let body = text_body(&raw, &ctx.output_type("body")?);
     let Some(weight) = storage::over_wire(&body) else {
+        // A stored-file object names a key or an address: taken from a
+        // server's answer, it would point the program at a file of this
+        // project, or have the worker fetch any URL. Stored whole on
+        // `file` below, the same text is only bytes.
+        if weft::storage::media::holds_file_marker(&body) {
+            weft::node_bail!(
+                "the response carries a stored-file object, which a response never may: a file comes back \
+                 on `file`, as the bytes it is"
+            );
+        }
         return Ok(out.set("body", body));
     };
     if !ctx.is_output_wired("file") {
@@ -140,12 +150,23 @@ async fn text_out(
     Ok(out.set("file", file))
 }
 
-/// A text body as the `body` output, declared `JsonDict | String`: a
-/// JSON OBJECT stays a dict; anything else (an array, a scalar, text
-/// that is not JSON) is the verbatim string.
-fn text_body(raw: &str) -> Value {
-    match serde_json::from_str::<Value>(raw) {
-        Ok(v @ Value::Object(_)) => v,
-        _ => Value::String(raw.to_string()),
+/// A text body as the `body` output, read the way the type declared on
+/// `body` asks: a JSON list or object the type takes comes out as that
+/// structure (an object under the default `JsonDict | String`, a list or
+/// an object under `Json`); anything else is the verbatim text while the
+/// type takes text (an array under the default, `"done"` with its quotes,
+/// every response under `String`); and a type that takes no text gets the
+/// parsed JSON, which the emit holds to it, so a response of the wrong
+/// shape fails naming the field (`-> (body: Verdict)` meeting
+/// `{"score": "high"}`).
+fn text_body(raw: &str, declared: &WeftType) -> Value {
+    let text = Value::String(raw.to_string());
+    let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+        return text;
+    };
+    let as_structure = (parsed.is_object() || parsed.is_array()) && declared.accepts_runtime_value(&parsed);
+    if !as_structure && declared.accepts_runtime_value(&text) {
+        return text;
     }
+    parsed
 }

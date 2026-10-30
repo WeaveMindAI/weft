@@ -398,12 +398,15 @@ fn public_url_file(install: &Install) -> PathBuf {
     install.dir.join("public-url")
 }
 
-/// The file holding the token of the install's named tunnel, the one its
-/// tunnel container reads. A start writes it when it opens a named tunnel
-/// and removes it when it closes one; a tunnel that went away otherwise
-/// (its container removed by hand, its install's folder left behind)
-/// leaves it, so [`refuse_a_shared_tunnel`] trusts it only beside a
-/// tunnel container.
+/// The install's record of its named tunnel ([`tunnel_record`]), which
+/// is also the env file its tunnel container reads. A start writes it
+/// when it opens a named tunnel, and a later start with neither
+/// variable set opens that tunnel again from it; closing the address
+/// (`--no-public-url`) removes it. A tunnel that went away otherwise (its
+/// container removed by hand, its install's folder left behind) leaves
+/// it, so [`refuse_a_shared_tunnel`] trusts it only beside a tunnel
+/// container.
+// SYNC: tunnel.env <-> scripts/scrub-old-install.sh (keep: kept across a scrub)
 fn tunnel_env_file(install: &Install) -> PathBuf {
     install.dir.join("tunnel.env")
 }
@@ -437,9 +440,23 @@ fn remove_if_present(path: &Path) -> Result<()> {
     }
 }
 
+/// The variable `tunnel.env` hands cloudflared its token in.
+const TUNNEL_TOKEN_KEY: &str = "TUNNEL_TOKEN";
+
+/// The variable `tunnel.env` keeps the tunnel's hostname in, for the
+/// next start. The container gets it too and cloudflared ignores it: it
+/// reads only its own variables (`TUNNEL_HOSTNAME` would be its
+/// `--hostname`, so the key is weft's own).
+const RECORDED_HOSTNAME_KEY: &str = "WEFT_PUBLIC_TUNNEL_HOSTNAME";
+
 /// The line of a tunnel's env file carrying its token.
 fn tunnel_env_line(token: &str) -> String {
-    format!("TUNNEL_TOKEN={token}\n")
+    format!("{TUNNEL_TOKEN_KEY}={token}\n")
+}
+
+/// The whole of `tunnel.env` for `tunnel`: its token, then its hostname.
+fn tunnel_record(tunnel: &NamedTunnel) -> String {
+    format!("{}{RECORDED_HOSTNAME_KEY}={}\n", tunnel_env_line(&tunnel.token), tunnel.hostname)
 }
 
 /// Refuse to start `install`'s named tunnel on `token` while another
@@ -457,20 +474,17 @@ async fn refuse_a_shared_tunnel(install: &Install, token: &str) -> Result<()> {
         if other.dir == install.dir {
             continue;
         }
-        let file = tunnel_env_file(&other);
-        let env = match std::fs::read_to_string(&file) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
-        };
+        let Some(record) = read_tunnel_record(&tunnel_env_file(&other))? else { continue };
         let container = container_state(&other.tunnel_container()).await?.is_some();
-        others.push(OtherTunnel { install: other, env, container });
+        others.push(OtherTunnel { install: other, token: record.token, container });
     }
     let holders = tunnel_token_holders(token, &others);
     for stale in holders.stale {
         eprintln!(
             "warning: {} holds the same WEFT_PUBLIC_TUNNEL_TOKEN, but install '{}' has no tunnel container ({}), so \
-             nothing runs on it; ignoring the file (a start of that install rewrites or removes it)",
+             nothing runs on it; ignoring the file. That install's next start with neither variable set opens the \
+             tunnel the file records, and is refused while this one runs it: give it a tunnel of its own, or close its address with \
+             ./setup.sh --no-public-url in its checkout",
             tunnel_env_file(stale).display(),
             stale.id.label_value(),
             stale.tunnel_container()
@@ -482,21 +496,25 @@ async fn refuse_a_shared_tunnel(install: &Install, token: &str) -> Result<()> {
             "install '{}' cannot open its named tunnel: install '{}' already runs a tunnel on the same \
              WEFT_PUBLIC_TUNNEL_TOKEN (container {}, token in {}), and two installs on one tunnel would each get a \
              random share of its callers. Give this checkout a tunnel of its own (its own WEFT_PUBLIC_TUNNEL_TOKEN and \
-             WEFT_PUBLIC_TUNNEL_HOSTNAME in its .env.local), or set neither there for a quick tunnel; the token \
-             may also come from the shared .env, where the two lines do not belong",
+             WEFT_PUBLIC_TUNNEL_HOSTNAME in its .env.local, then ./setup.sh --public-url), or for a quick tunnel set \
+             neither there and run ./setup.sh --no-public-url then ./setup.sh --public-url (until --no-public-url, \
+             this install opens the tunnel it last ran again, from {}); the token may also come from the shared \
+             .env, where the two lines do not belong",
             install.id.label_value(),
             holder.id.label_value(),
             holder.tunnel_container(),
-            tunnel_env_file(holder).display()
+            tunnel_env_file(holder).display(),
+            tunnel_env_file(install).display()
         ),
     }
 }
 
-/// Another install's tunnel as [`refuse_a_shared_tunnel`] finds it: its
-/// `tunnel.env`'s text, and whether its tunnel container exists.
+/// Another install's tunnel as [`refuse_a_shared_tunnel`] finds it: the
+/// token its `tunnel.env` records, and whether its tunnel container
+/// exists.
 struct OtherTunnel {
     install: Install,
-    env: String,
+    token: Option<String>,
     container: bool,
 }
 
@@ -509,9 +527,8 @@ struct TokenHolders<'a> {
 }
 
 fn tunnel_token_holders<'a>(token: &str, others: &'a [OtherTunnel]) -> TokenHolders<'a> {
-    let line = tunnel_env_line(token);
     let mut holders = TokenHolders { running: None, stale: Vec::new() };
-    for other in others.iter().filter(|o| o.env.lines().any(|l| l.trim() == line.trim())) {
+    for other in others.iter().filter(|o| o.token.as_deref() == Some(token)) {
         match other.container {
             true => holders.running = holders.running.or(Some(&other.install)),
             false => holders.stale.push(&other.install),
@@ -521,13 +538,58 @@ fn tunnel_token_holders<'a>(token: &str, others: &'a [OtherTunnel]) -> TokenHold
 }
 
 /// The operator's named tunnel (a stable hostname): its Cloudflare token
-/// and the https hostname it routes. Both or neither.
-fn named_tunnel_config() -> Result<Option<(String, String)>> {
-    let token = std::env::var("WEFT_PUBLIC_TUNNEL_TOKEN").ok().filter(|v| !v.is_empty());
-    let hostname = std::env::var("WEFT_PUBLIC_TUNNEL_HOSTNAME").ok().filter(|v| !v.is_empty());
-    match (token, hostname) {
-        (Some(token), Some(hostname)) => Ok(Some((token, canonical_tunnel_hostname(&hostname)?))),
-        (None, None) => Ok(None),
+/// and the https hostname it routes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NamedTunnel {
+    token: String,
+    hostname: String,
+}
+
+/// A named tunnel's two settings as one source holds them, an empty
+/// value counting as unset.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TunnelSettings {
+    token: Option<String>,
+    hostname: Option<String>,
+}
+
+impl TunnelSettings {
+    /// What the environment of this command sets (the CLI loaded the
+    /// checkout's `.env.local` and `.env` into it, when it runs in one).
+    fn from_env() -> Self {
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        Self { token: var("WEFT_PUBLIC_TUNNEL_TOKEN"), hostname: var("WEFT_PUBLIC_TUNNEL_HOSTNAME") }
+    }
+}
+
+/// What the install recorded at `path` (`tunnel.env`), or `None` when it
+/// recorded no named tunnel.
+fn read_tunnel_record(path: &Path) -> Result<Option<TunnelSettings>> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    Ok(Some(tunnel_record_of(&body)))
+}
+
+/// The settings a `tunnel.env`'s text records: the one reading of the
+/// file, for its own install's start and for another's shared-token check.
+fn tunnel_record_of(body: &str) -> TunnelSettings {
+    let mut values = weft_core::infra::env_file_values(body);
+    let mut take = |key: &str| values.remove(key).filter(|v| !v.is_empty());
+    TunnelSettings { token: take(TUNNEL_TOKEN_KEY), hostname: take(RECORDED_HOSTNAME_KEY) }
+}
+
+/// The named tunnel a start opens: the one the environment sets (both
+/// variables, or neither), else the one the install recorded at `record`
+/// when it last opened one, else none (a quick tunnel). A record missing
+/// either setting (one an older weft wrote kept only the token) is
+/// refused, naming the file: no hostname is guessed.
+fn named_tunnel(env: TunnelSettings, recorded: Option<TunnelSettings>, record: &Path) -> Result<Option<NamedTunnel>> {
+    match (env.token, env.hostname) {
+        (Some(token), Some(hostname)) => return Ok(Some(NamedTunnel { token, hostname: canonical_tunnel_hostname(&hostname)? })),
+        (None, None) => {}
         (Some(_), None) => anyhow::bail!(
             "WEFT_PUBLIC_TUNNEL_TOKEN is set but WEFT_PUBLIC_TUNNEL_HOSTNAME is not; set both \
              (the hostname the tunnel's Cloudflare config routes to weft)"
@@ -536,6 +598,22 @@ fn named_tunnel_config() -> Result<Option<(String, String)>> {
             "WEFT_PUBLIC_TUNNEL_HOSTNAME is set but WEFT_PUBLIC_TUNNEL_TOKEN is not; set both \
              (the token from the tunnel's Cloudflare dashboard page)"
         ),
+    }
+    let Some(recorded) = recorded else { return Ok(None) };
+    let fix = "run ./setup.sh --public-url from the checkout with WEFT_PUBLIC_TUNNEL_TOKEN and WEFT_PUBLIC_TUNNEL_HOSTNAME \
+               in its .env.local, or set both for this command; for a quick tunnel instead, ./setup.sh --no-public-url \
+               then ./setup.sh --public-url";
+    match (recorded.token, recorded.hostname) {
+        (Some(token), Some(hostname)) => {
+            let hostname = canonical_tunnel_hostname(&hostname)
+                .with_context(|| format!("the hostname of this install's named tunnel, recorded in {}; {fix}", record.display()))?;
+            Ok(Some(NamedTunnel { token, hostname }))
+        }
+        (Some(_), None) => anyhow::bail!(
+            "{} records this install's named tunnel without its hostname (a weft from before it kept the hostname wrote it); {fix}",
+            record.display()
+        ),
+        (None, _) => anyhow::bail!("{} records this install's named tunnel without its {TUNNEL_TOKEN_KEY}; {fix}", record.display()),
     }
 }
 
@@ -1257,14 +1335,14 @@ async fn reconcile_tunnel(install: &Install, ports: Ports) -> Result<Option<Tunn
         remove_if_present(&tunnel_env_file(install))?;
         return Ok(None);
     }
-    let named = named_tunnel_config()?;
+    let env_file = tunnel_env_file(install);
+    let named = named_tunnel(TunnelSettings::from_env(), read_tunnel_record(&env_file)?, &env_file)?;
     let (network, origin) = tunnel_origin(ports);
     let label = format!("{}={}", weft_core::infra::INSTALL_LABEL, install.id.label_value());
     let mut args: Vec<String> = ["run", "-d", "--name", &name, "--restart", "unless-stopped", "--network", &network, "--label", &label]
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let env_file = tunnel_env_file(install);
     // Machine-wide, from the check that no other install runs this token
     // until this install's connector runs on it: two starts at once
     // would otherwise both pass the check. Held to the end of this call.
@@ -1275,15 +1353,16 @@ async fn reconcile_tunnel(install: &Install, ports: Ports) -> Result<Option<Tunn
         ),
         None => None,
     };
-    match &named {
-        Some((token, _)) => {
-            refuse_a_shared_tunnel(install, token).await?;
-            write_private(&env_file, &tunnel_env_line(token))?;
-            args.extend(["--env-file".into(), env_file.display().to_string()]);
-        }
-        // A quick tunnel holds no token; a file left from a named one
-        // would claim this install still runs it.
-        None => remove_if_present(&env_file)?,
+    // With no named tunnel there is no record ([`named_tunnel`] opens the
+    // recorded one), so nothing claims this install runs one.
+    if let Some(tunnel) = &named {
+        refuse_a_shared_tunnel(install, &tunnel.token).await?;
+        write_private(&env_file, &tunnel_record(tunnel))?;
+        // The container reads the token from the file once, when it is
+        // made, so the token's fingerprint goes in its arguments: a new
+        // token makes it again ([`ensure_container`]).
+        let token = format!("weft.tunnel-token={}", weft_core::project::hash::sha256_hex(tunnel.token.as_bytes()));
+        args.extend(["--label".into(), token, "--env-file".into(), env_file.display().to_string()]);
     }
     let metrics = QuickTunnelMetrics::on(ports.tunnel_metrics, cfg!(target_os = "linux"));
     if named.is_none() {
@@ -1308,7 +1387,7 @@ async fn reconcile_tunnel(install: &Install, ports: Ports) -> Result<Option<Tunn
     });
     ensure_container(&name, &args, &install.dir, published).await?;
     let tunnel = match named {
-        Some((_, hostname)) => Tunnel { url: hostname, named: true, metrics: None },
+        Some(NamedTunnel { hostname, .. }) => Tunnel { url: hostname, named: true, metrics: None },
         None => Tunnel { url: quick_tunnel_url(&name, &metrics.url).await?, named: false, metrics: Some(metrics.url) },
     };
     Ok(Some(tunnel))
@@ -2195,12 +2274,13 @@ mod tests {
     /// same, matches nothing.
     #[test]
     fn another_install_running_the_same_tunnel_token_is_found() {
-        let other = |name: Option<&str>, env: String, container: bool| OtherTunnel { install: install(name), env, container };
+        let other = |name: Option<&str>, env: String, container: bool| OtherTunnel { install: install(name), token: tunnel_record_of(&env).token, container };
         let others = [
             other(Some("deploy"), tunnel_env_line("tok-b"), true),
             other(None, format!("# kept by weft\n{}", tunnel_env_line("tok-a")), true),
             other(Some("gone"), tunnel_env_line("tok-a"), false),
             other(Some("old"), tunnel_env_line("tok-c"), false),
+            other(Some("kept"), tunnel_record(&NamedTunnel { token: "tok-d".into(), hostname: "https://d.example.com".into() }), true),
         ];
         let label = |i: Option<&Install>| i.map(|i| i.id.label_value().to_string());
         let labels = |v: Vec<&Install>| v.into_iter().map(|i| i.id.label_value().to_string()).collect::<Vec<_>>();
@@ -2209,6 +2289,7 @@ mod tests {
         assert_eq!(label(tunnel_token_holders("tok-b", &others).running), Some("deploy".into()));
         let c = tunnel_token_holders("tok-c", &others);
         assert_eq!((label(c.running), labels(c.stale)), (None, vec!["old".to_string()]), "a file whose container is gone blocks nothing");
+        assert_eq!(label(tunnel_token_holders("tok-d", &others).running), Some("kept".into()), "a whole record holds its token too");
         assert_eq!(tunnel_token_holders("tok", &others), TokenHolders { running: None, stale: vec![] });
         assert_eq!(tunnel_token_holders("tok-a", &[]), TokenHolders { running: None, stale: vec![] });
     }
@@ -2301,6 +2382,63 @@ mod tests {
         assert_eq!(ports(&named).unwrap(), picked, "and kept by it");
         let moved = moved_by_env(Ports::DEFAULT, |n| (n == "WEFT_TUNNEL_METRICS_PORT").then(|| "15117".to_string())).unwrap();
         assert_eq!(moved.tunnel_metrics, 15117);
+    }
+
+    /// The named tunnel a start opens: the environment's when it sets
+    /// both (over any record), the recorded one when it sets neither, a
+    /// quick tunnel when there is neither. One variable alone is refused,
+    /// and so is a record missing either setting, naming the file.
+    #[test]
+    fn a_start_opens_the_named_tunnel_the_environment_sets_else_the_recorded_one() {
+        let record = Path::new("/i/tunnel.env");
+        let set = |token: Option<&str>, hostname: Option<&str>| TunnelSettings {
+            token: token.map(str::to_string),
+            hostname: hostname.map(str::to_string),
+        };
+        let tunnel = |token: &str, hostname: &str| Some(NamedTunnel { token: token.into(), hostname: hostname.into() });
+        let kept = Some(set(Some("tok-kept"), Some("https://kept.example.com")));
+        let env = set(Some("tok-env"), Some("https://env.example.com/"));
+        assert_eq!(named_tunnel(env.clone(), kept.clone(), record).unwrap(), tunnel("tok-env", "https://env.example.com"), "the environment wins");
+        assert_eq!(named_tunnel(env, None, record).unwrap(), tunnel("tok-env", "https://env.example.com"));
+        assert_eq!(named_tunnel(TunnelSettings::default(), kept, record).unwrap(), tunnel("tok-kept", "https://kept.example.com"));
+        assert_eq!(named_tunnel(TunnelSettings::default(), None, record).unwrap(), None, "a quick tunnel");
+        for alone in [set(Some("tok-env"), None), set(None, Some("https://env.example.com"))] {
+            let e = named_tunnel(alone.clone(), None, record).unwrap_err().to_string();
+            assert!(e.contains("set both"), "{alone:?}: {e}");
+        }
+        let older = named_tunnel(TunnelSettings::default(), Some(set(Some("tok-kept"), None)), record).unwrap_err().to_string();
+        assert!(older.contains("/i/tunnel.env") && older.contains("without its hostname") && older.contains("./setup.sh --public-url"), "{older}");
+        let no_token = named_tunnel(TunnelSettings::default(), Some(set(None, Some("https://kept.example.com"))), record).unwrap_err().to_string();
+        assert!(no_token.contains("/i/tunnel.env") && no_token.contains("TUNNEL_TOKEN"), "{no_token}");
+        let bad = named_tunnel(TunnelSettings::default(), Some(set(Some("tok-kept"), Some("http://kept.example.com"))), record).unwrap_err();
+        assert!(format!("{bad:#}").contains("/i/tunnel.env"), "{bad:#}");
+    }
+
+    /// The record a named tunnel leaves reads back as what was written,
+    /// only its owner may read it (it holds the token), and the token's
+    /// line is the one the container and the shared-tunnel check read. No
+    /// file is no record; one that cannot be read is an error naming it.
+    #[test]
+    fn the_tunnel_record_reads_back_what_a_start_wrote() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tunnel.env");
+        assert_eq!(read_tunnel_record(&path).unwrap(), None);
+        let tunnel = NamedTunnel { token: "eyJh=b==".into(), hostname: "https://weft.example.com".into() };
+        write_private(&path, &tunnel_record(&tunnel)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.lines().any(|l| l == tunnel_env_line("eyJh=b==").trim()), "{body}");
+        let read = read_tunnel_record(&path).unwrap();
+        assert_eq!(read, Some(TunnelSettings { token: Some(tunnel.token.clone()), hostname: Some(tunnel.hostname.clone()) }));
+        assert_eq!(named_tunnel(TunnelSettings::default(), read, &path).unwrap(), Some(tunnel));
+        let older = dir.path().join("older.env");
+        std::fs::write(&older, tunnel_env_line("tok")).unwrap();
+        assert_eq!(read_tunnel_record(&older).unwrap(), Some(TunnelSettings { token: Some("tok".into()), hostname: None }));
+        let unreadable = dir.path().join("a-folder");
+        std::fs::create_dir(&unreadable).unwrap();
+        let e = read_tunnel_record(&unreadable).unwrap_err().to_string();
+        assert!(e.contains("a-folder"), "{e}");
     }
 
     #[test]

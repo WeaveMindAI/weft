@@ -72,8 +72,8 @@
     {
       "name": "response",
       "type": "JsonDict",
-      "narrowable": true,
-      "description": "The answer parsed as JSON, holding the type declared here (`-> (response: Verdict)`), JsonDict when none is. Absent on a turn that only called tools."
+      "narrowable": "Json",
+      "description": "The answer parsed as JSON, holding the type declared here (`-> (response: Verdict)`, `List[String]`, or `Json` for any JSON at all), JsonDict when none is. Absent on a turn that only called tools."
     },
     {
       "name": "historyFile",

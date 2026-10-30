@@ -1,4 +1,4 @@
-//! HttpRequest self-tests: the body's declared union stays honest, a
+//! HttpRequest self-tests: the body is held to its declared type, a
 //! binary body arrives intact as a file, and a connection's key rides
 //! the header it names.
 
@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use weft::access::client::{resolve_steps, AppliedStep};
-use weft::{AccessSpec, FakeRig, NodeTest, WeftError, WeftResult};
+use weft::{AccessSpec, FakeRig, NodeTest, WeftError, WeftResult, WeftType};
 
 use super::HttpRequestNode;
 
@@ -15,6 +15,10 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("a_json_object_body_stays_a_dict", object_body),
         NodeTest::fake("a_non_object_body_is_the_verbatim_text", text_body),
+        NodeTest::fake("a_json_array_body_is_its_text_unless_the_declared_type_takes_it", array_body),
+        NodeTest::fake("a_type_that_takes_text_keeps_a_json_scalar_as_its_text", scalar_body),
+        NodeTest::fake("a_body_of_the_wrong_shape_fails_naming_the_field", wrong_shape_body),
+        NodeTest::fake("a_stored_file_object_in_a_response_is_refused", file_marker_body),
         NodeTest::fake("a_refusal_status_still_emits", refusal_status),
         NodeTest::fake("method_headers_and_body_ride_the_request", request_shape),
         NodeTest::fake("a_bad_method_fails_the_run_even_with_error_wired", bad_method_wired),
@@ -88,6 +92,68 @@ async fn text_body(rig: FakeRig) -> WeftResult<()> {
         .await
         .ok()?;
     assert_eq!(outcome.outputs["body"], json!("just text"), "non-JSON stays verbatim text");
+    Ok(())
+}
+
+/// The default `JsonDict | String` has no place for a list, so a JSON
+/// array arrives as its text; declared `Json` (or a list type), the same
+/// response is the list itself.
+async fn array_body(rig: FakeRig) -> WeftResult<()> {
+    let array = r#"[[1, "a"], [2, "b"]]"#;
+    rig.respond_raw("GET", "/rows", 200, "application/json", array.as_bytes().to_vec());
+    let request = json!({ "url": "https://api.example/rows", "method": "GET" });
+    let outcome = rig.run(&HttpRequestNode, request.clone()).await.ok()?;
+    assert_eq!(outcome.outputs["body"], json!(array), "the default type keeps the text");
+    rig.output_type("body", WeftType::parse("Json").expect("parses"));
+    let outcome = rig.run(&HttpRequestNode, request.clone()).await.ok()?;
+    assert_eq!(outcome.outputs["body"], json!([[1, "a"], [2, "b"]]), "Json takes the list");
+    rig.output_type("body", WeftType::parse("List[List[Number | String]]").expect("parses"));
+    let outcome = rig.run(&HttpRequestNode, request).await.ok()?;
+    assert_eq!(outcome.outputs["body"], json!([[1, "a"], [2, "b"]]), "a list type takes it too");
+    Ok(())
+}
+
+/// A JSON string or number is still text to a type that takes text:
+/// `"done"` keeps its quotes under the default and under `Json`, so what
+/// the server sent is what arrives. A type that takes no text gets it
+/// parsed.
+async fn scalar_body(rig: FakeRig) -> WeftResult<()> {
+    rig.respond_raw("GET", "/state", 200, "application/json", br#""done""#.to_vec());
+    rig.respond_raw("GET", "/count", 200, "application/json", b"42".to_vec());
+    let at = |path: &str| json!({ "url": format!("https://api.example{path}"), "method": "GET" });
+    let outcome = rig.run(&HttpRequestNode, at("/state")).await.ok()?;
+    assert_eq!(outcome.outputs["body"], json!(r#""done""#));
+    rig.output_type("body", WeftType::parse("Json").expect("parses"));
+    let outcome = rig.run(&HttpRequestNode, at("/count")).await.ok()?;
+    assert_eq!(outcome.outputs["body"], json!("42"));
+    rig.output_type("body", WeftType::parse("Number").expect("parses"));
+    let outcome = rig.run(&HttpRequestNode, at("/count")).await.ok()?;
+    assert_eq!(outcome.outputs["body"], json!(42));
+    Ok(())
+}
+
+/// Declared a record, a response of the wrong shape fails the node naming
+/// the field, never as "text where a record was wanted".
+async fn wrong_shape_body(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("GET", "/verdict", json!({ "score": "high" }));
+    rig.output_type("body", WeftType::parse("{ score: Number }").expect("parses"));
+    let err = rig
+        .run(&HttpRequestNode, json!({ "url": "https://api.example/verdict", "method": "GET" }))
+        .await
+        .failure()?;
+    assert!(err.contains(".score: expected Number"), "{err}");
+    Ok(())
+}
+
+/// A server answering with a stored-file object cannot point the program
+/// at a file of this project: the node refuses it.
+async fn file_marker_body(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("GET", "/pic", json!({ "__weft_image__": { "key": "another/run/key", "mimeType": "image/png" } }));
+    let err = rig
+        .run(&HttpRequestNode, json!({ "url": "https://api.example/pic", "method": "GET" }))
+        .await
+        .failure()?;
+    assert!(err.contains("stored-file object"), "{err}");
     Ok(())
 }
 

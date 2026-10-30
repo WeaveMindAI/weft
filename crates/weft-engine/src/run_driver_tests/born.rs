@@ -378,7 +378,7 @@
             config,
             run_id,
             std::sync::Arc::new(Default::default()),
-            Some(weft_core::caller::InboundMessage::Json(serde_json::Value::Null)),
+            None,
             sink.clone(),
         );
         // The caller's side: what it hears, and what was on record then.

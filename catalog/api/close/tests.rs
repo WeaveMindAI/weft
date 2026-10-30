@@ -13,7 +13,7 @@ use weft::signal::DataType;
 use weft::{FakeRig, NodeTest, WeftResult};
 
 use super::CloseNode;
-use crate::testing::{http_caller, ws_caller};
+use crate::testing::{http_caller, http_caller_without_body, ws_caller};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -34,7 +34,7 @@ pub fn tests() -> Vec<NodeTest> {
 /// The 304 case: an ending with no body still has a head, so it can
 /// carry the caching header the next request will send back.
 async fn http_headers_bodiless(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(conn.clone());
     rig.run(&CloseNode, json!({ "status": 304, "headers": { "etag": "\"abc123\"" } })).await.ok()?;
     assert_eq!(
@@ -45,7 +45,7 @@ async fn http_headers_bodiless(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn http_headers_after_stream(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     conn.send_chunk(None, OutboundChunk::Json(json!("first"))).await?;
     rig.attach_caller(conn.clone());
     let err = rig
@@ -59,7 +59,7 @@ async fn http_headers_after_stream(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn http_reason_body(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(conn.clone());
     rig.run(&CloseNode, json!({ "status": 404, "reason": "nothing to sweep" })).await.ok()?;
     assert_eq!(
@@ -86,7 +86,7 @@ async fn http_reason_default_status(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn http_reason_on_204(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(conn.clone());
     let err = rig.run(&CloseNode, json!({ "status": 204, "reason": "gone" })).await.result.expect_err("a 204 carries no body").to_string();
     assert!(err.contains("204") && err.contains("reason"), "{err}");
@@ -95,7 +95,7 @@ async fn http_reason_on_204(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn http_reason_after_stream(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     conn.send_chunk(None, OutboundChunk::Text("part".into())).await.map_err(weft::node_error)?;
     rig.attach_caller(conn.clone());
     let err = rig.run(&CloseNode, json!({ "reason": "late" })).await.result.expect_err("the response already went out").to_string();
@@ -104,7 +104,7 @@ async fn http_reason_after_stream(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn code_on_route(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(conn.clone());
     let err = rig.run(&CloseNode, json!({ "code": 4001 })).await.result.expect_err("a close code means a socket").to_string();
     assert!(err.contains("code") && err.contains("Route"), "{err}");
@@ -130,7 +130,7 @@ async fn socket_close(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn http_bodiless(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(conn.clone());
     rig.run(&CloseNode, json!({ "status": 404 })).await.ok()?;
     assert_eq!(
@@ -144,7 +144,7 @@ async fn http_bodiless(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn http_after_stream(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     // Something already went out (a Stream's chunk): the head is committed.
     conn.send_chunk(None, OutboundChunk::Text("part".into())).await.map_err(weft::node_error)?;
     rig.attach_caller(conn.clone());

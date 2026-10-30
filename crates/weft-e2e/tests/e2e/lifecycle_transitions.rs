@@ -633,6 +633,55 @@ async fn a_deploy_brings_up_to_date_only_what_is_on_and_running() -> anyhow::Res
     project.finish().await
 }
 
+/// A node in front of a trigger runs at the trigger's setup and never at
+/// a fire, so an edit to it is what puts the trigger behind: `weft status`
+/// (which reads the source) shows it, and `weft resync` sets the trigger
+/// up again, running the edited node, so the trigger then listens with
+/// what the node gives now.
+#[tokio::test]
+async fn an_edit_in_front_of_a_trigger_puts_it_behind_and_a_resync_runs_it() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("lifecycle", disp.clone()).await?;
+    let pid = project.id();
+    let feed = SseFake::start().await?;
+    project.add_node_from_fixture("human_form", "test_sse_trigger")?;
+    project.set_main(&graph_named_in_front(&feed, "first"))?;
+    project.activate().await?;
+    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+
+    project.set_main(&graph_named_in_front(&feed, "second"))?;
+    let s = status::ProjectStatus(serde_json::from_str(&project.weft(&["status", "--json"]).await?)?);
+    anyhow::ensure!(s.trigger_state("a", None) == "behind", "the edit in front of `a` puts it behind: {:?}", s.trigger("a"));
+    let said = summary_of(&project.weft(&["resync", "--running", "wait", "--json"]).await?);
+    anyhow::ensure!(said.contains("resynced") && said.contains("'a'"), "the resync takes `a` up: {said:?}");
+    status::wait_until(&disp, &pid, "`a` back on", STATUS_DEADLINE, |s| s.trigger_state("a", None) == "on").await?;
+
+    // It listens for the event the edited node names now.
+    let before = run::runs(&disp, &pid).await?;
+    let run_id = fire_until_run(&feed, &disp, &pid, "second", &before).await?;
+    SettledRun::observe(&disp, run_id).await?.completed()?.assert_input("a_out", "data", &json!("go"))?;
+
+    project.weft(&["deactivate", "--door", "refuse", "--held", "drop", "--running", "cancel"]).await?;
+    project.finish().await
+}
+
+/// Graph: trigger `a` listening on `feed` for the event a Text node in
+/// front of it names, into a Debug.
+fn graph_named_in_front(feed: &SseFake, event: &str) -> String {
+    format!(
+        "pick = Text {{\n\
+         \x20 value: \"{event}\"\n\
+         }}\n\
+         a = TestSseTrigger -> (value: String) {{\n\
+         \x20 url: \"{url}\"\n\
+         }}\n\
+         a.event_name = pick.value\n\
+         a_out = Debug\n\
+         a_out.data = a.value\n",
+        url = feed.url(),
+    )
+}
+
 /// Graph: triggers `a` and `b`, each on its own feed into a Debug, and
 /// two MiniServices `svc` and `db`, each into a Debug, every branch apart
 /// from the others. `changed` renames both events and makes both services

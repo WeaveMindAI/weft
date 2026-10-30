@@ -12,7 +12,7 @@ use weft::{FakeRig, NodeTest, WeftResult};
 
 use super::StreamNode;
 use crate::framing::{ndjson_line, sse_event, Format};
-use crate::testing::{caller_skipping_unmade_chunks, http_caller, ws_caller};
+use crate::testing::{caller_skipping_unmade_chunks, http_caller, http_caller_without_body, ws_caller};
 use weft::signal::Protocol;
 
 pub fn tests() -> Vec<NodeTest> {
@@ -61,7 +61,7 @@ fn failed_bus(rig: &FakeRig, messages: &[serde_json::Value]) -> WeftResult<serde
 /// A redirect is one answer that ends the exchange, so a Stream refuses
 /// it and names the node that sends one; nothing goes out.
 async fn redirect_refused(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(conn.clone());
     let bus = closed_bus(&rig, &[json!("a")])?;
     let err = rig.run(&StreamNode, json!({ "bus": bus, "answerAs": "redirect" })).await.failure()?;
@@ -74,7 +74,7 @@ async fn redirect_refused(rig: FakeRig) -> WeftResult<()> {
 /// connection writes as the format's error marker, and `done` stays
 /// absent: a cut answer never reads as a whole one.
 async fn failed_mid_stream(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(conn.clone());
     let bus = failed_bus(&rig, &[json!("hel")])?;
     let outcome = rig.run(&StreamNode, json!({ "bus": bus, "format": "sse" })).await.ok()?;
@@ -89,7 +89,7 @@ async fn failed_mid_stream(rig: FakeRig) -> WeftResult<()> {
 /// Nothing went out yet: the failure is the whole answer (a real error
 /// status, written by the connection), and no head or chunk precedes it.
 async fn failed_before_a_message(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(conn.clone());
     let bus = failed_bus(&rig, &[])?;
     rig.run(&StreamNode, json!({ "bus": bus, "format": "ndjson" })).await.ok()?;
@@ -116,7 +116,7 @@ async fn failed_on_a_socket(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn sse_stream(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(conn.clone());
     let bus = closed_bus(&rig, &[json!("hel"), json!("lo")])?;
     let outcome = rig
@@ -148,7 +148,7 @@ async fn sse_stream(rig: FakeRig) -> WeftResult<()> {
 /// framed the same way so the caller reads one stream and not two. It
 /// used to be inexpressible, and the way round it was writing a node.
 async fn first_then_bus(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(conn.clone());
     let bus = closed_bus(&rig, &[json!("hel")])?;
     rig.run(&StreamNode, json!({ "bus": bus, "format": "ndjson", "first": { "id": 7 } }))
@@ -165,7 +165,7 @@ async fn first_then_bus(rig: FakeRig) -> WeftResult<()> {
     );
 
     // Without it the response is the bus alone, byte for byte.
-    let plain = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let plain = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(plain.clone());
     let bus = closed_bus(&rig, &[json!("hel")])?;
     rig.run(&StreamNode, json!({ "bus": bus, "format": "ndjson" })).await.ok()?;
@@ -181,7 +181,7 @@ async fn raw_stream(rig: FakeRig) -> WeftResult<()> {
     // connection layer bounds on every socket whatever the framing, so
     // raw is watched like the rest and streams payloads exactly as they
     // are.
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(conn.clone());
     let bus = closed_bus(&rig, &[json!({ "n": 1 }), json!("t")])?;
     rig.run(&StreamNode, json!({ "bus": bus, "status": 202 })).await.ok()?;
@@ -194,7 +194,7 @@ async fn raw_stream(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn empty_stream(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(conn.clone());
     let bus = closed_bus(&rig, &[])?;
     rig.run(&StreamNode, json!({ "bus": bus, "format": "ndjson" })).await.ok()?;

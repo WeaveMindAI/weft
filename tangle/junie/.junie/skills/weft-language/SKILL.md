@@ -79,7 +79,7 @@ If you want one key of a record value, keep going with dots
 `speed.wpm = reader.profile.stats.wpm`). Still one wire; the compiler checks
 every key against the record type at that level and the wire carries the
 last key's type. Only a record type has keys to read: a source typed
-`JsonDict`, a `Dict[String, String]` (a route's `query` or `headers`) or a
+`JsonDict` or `Json`, a `Dict[String, String]` (a route's `query` or `headers`) or a
 scalar has none (`deref-path`), and nothing reads one for you. Narrow the
 source port to the shape it carries (next), or cast it to a record type
 first. At run time a `?` key found absent (or `null`) closes that
@@ -90,8 +90,10 @@ wire alone; a required key absent fails the firing.
 A port's type is a contract, and on the arrow where you use the node you
 may write a TIGHTER one: on any input, and on an output the node marks
 `narrowable` in its metadata (a query's `rows`, a model's JSON `response`, a
-request's `body`), where only the program knows what shape comes out. Every
-other output takes no type but its own. The compiler checks yours and refuses
+request's `body`, a socket's `inbound` items), where only the program knows
+what shape comes out; the last three take any JSON-made type, `Json`
+included. Every other output takes no type but its own. The compiler checks
+yours and refuses
 one that does not fit, naming the port (`node 'ask': output port 'query' is
 declared Dict[String, Number], but Route always gives it Dict[String,
 String]: only an output its node marks narrowable takes the type the program
@@ -137,7 +139,7 @@ route runs. A record refuses a key it does not declare, so either declare
 every key the caller may send, optional ones with `?`, or end the record
 with `..` (`{ email: String, .. }`), which drops the keys it does not
 declare. A cast to a record is just as strict: an undeclared key fails the
-cast.
+cast. If callers may send a list or a bare value, declare `-> (body: Json)`.
 
 For a single row, the query node also has `row`, which carries the first row
 and closes when the query answered none. It narrows the same way, and then
@@ -469,7 +471,8 @@ rather than memorising.
 Everything UPSTREAM of a trigger is the trigger's setup program, and weft
 runs that program once, at activation. On a fire the trigger reads none of
 it: a fired trigger's inputs come from its bake, so nothing upstream runs
-again.
+again. Edit any node in that setup and `weft status` shows the trigger as
+behind until `weft resync` runs the setup again on the new build.
 
 Any wire into the trigger puts the producer there, not only the gate. The
 gate is just the wire with nothing else to say:
@@ -507,7 +510,9 @@ entirely.
 
 That second one has a limit: setup that several triggers SHARE (the schema
 every included file's tables live in) is written once, in the file that
-includes them, and each included file takes its result as a port. Every
+includes them, and each included file takes its result as a port. In one
+file it is one node wired into each trigger's gate (`add._should_flow =
+schema.rows`, then `list._should_flow = schema.rows`). Every
 trigger's setup runs at activation as one program, and two nodes that do not
 depend on each other run at the same time, so two files each carrying their
 own `create extension if not exists pgcrypto` race each other and one of
@@ -600,6 +605,7 @@ with instances takes; `weft-members` adds the shape for several people.
 | unions | `String \| Number`, `Number \| Null` |
 | records | `{ role: String, name?: String }`, strict: undeclared keys refused |
 | opaque | `JsonDict`, compatible with any `Dict[String, V]` both ways |
+| any JSON | `Json`: text, a number, a boolean, null, or a list or object of those at any depth, for a value whose shape the program cannot know (what a device answers to an arbitrary command). Every JSON-made type fits into it (`List[List[Number]]`, a record of JSON fields, `JsonDict`); a file, `Bus`, `Generator[..]`, `Access` or `Infra` never does |
 | type variables | `T`, `T2`, unified across a node's ports, pinned by what is wired to the port or by the type the program declares on it (`Cast`'s output is `T2`: `-> (value: Card)` pins it, and so does the port it feeds); one nothing pins is `unresolved-typevar` |
 | live handles | `Bus`, `Generator[T]`, `Access`; never literals |
 
@@ -697,7 +703,8 @@ and the compiler checks that pair against weft's conversion table
 (`cast-not-allowed` for impossible pairs); record and named targets are
 validated at run time, errors name the offending field. The standard
 node that implements it is `Cast`, the one to use:
-`card = Cast() -> (value: Card)`.
+`card = Cast() -> (value: Card)`. A cast into `String` turns a list or an
+object into its JSON text.
 
 Reach for it when a value has to CHANGE type while it travels, and only
 then. It is not how you put a type on a value: a port you declare already
@@ -722,7 +729,9 @@ A file that really is audio passes through untouched; one that is not fails
 the cast loudly, naming what it got.
 
 Compatibility: identical types; unions member-wise; `JsonDict` with any
-string dict; a named type only with the same name (a `JsonDict` into it is
+string dict; any JSON-made type into `Json`, and a `Json` into anything
+narrower only through a cast, which checks the value; a named type only
+with the same name (a `JsonDict` into it is
 `type-mismatch`, and the door is a cast, which checks the shape; a group that
 carries an `LlmProvider` declares its port `LlmProvider`, never `JsonDict`);
 containers element-wise; type variables unify. Everything else is

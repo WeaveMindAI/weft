@@ -24,10 +24,10 @@
 #     and every named install under installs/ (the question lists them).
 #
 # What it keeps: your project folders (the source is the record of your
-# projects; `weft run` registers them again), the `--public-url` choice,
+# projects; `weft run` registers them again), the `--public-url` choice
+# and the named tunnel it last opened (token and hostname, in tunnel.env),
 # the assistant you picked for `weft new`, cargo's target/ and the
-# BuildKit cache. A named tunnel needs nothing kept: its token is read
-# from WEFT_PUBLIC_TUNNEL_TOKEN at every start.
+# BuildKit cache.
 #
 # Usage:
 #   scripts/scrub-old-install.sh [--yes] [--kind]
@@ -57,11 +57,11 @@ hint() { :; }
 . "${here}/lib/weft-cleanup.sh"
 
 # The files under the data directory that are the person's own choices,
-# not the install's state: whether the tunnel is on, and the assistant
-# `weft new` sets up.
-# SYNC: <-> crates/weft-cli/src/commands/daemon.rs (public_url_marker),
+# not the install's state: whether the tunnel is on and which named one
+# it opens, and the assistant `weft new` sets up.
+# SYNC: <-> crates/weft-cli/src/commands/daemon.rs (public_url_marker, tunnel_env_file),
 #       crates/weft-cli/src/commands/new.rs (default-assistants)
-keep=(public-url-enabled default-assistants)
+keep=(public-url-enabled tunnel.env default-assistants)
 
 if ! command -v docker >/dev/null 2>&1 || ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
   echo "docker is not reachable, so nothing weft left in it can be removed; start docker and run this again" >&2

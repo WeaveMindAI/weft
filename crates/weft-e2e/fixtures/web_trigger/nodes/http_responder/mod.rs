@@ -35,9 +35,10 @@ impl Node for LiveHttpResponderNode {
         // Read what the caller sent (decoded per the signal's data type).
         let req = http.request_parts()?;
         let echoed = match &req.body {
-            InboundMessage::Json(v) => v.clone(),
-            InboundMessage::Text(s) => Value::String(s.clone()),
-            InboundMessage::Bytes(b) => json!({ "bytes": b.len() }),
+            None => Value::Null,
+            Some(InboundMessage::Json(v)) => v.clone(),
+            Some(InboundMessage::Text(s)) => Value::String(s.clone()),
+            Some(InboundMessage::Bytes(b)) => json!({ "bytes": b.len() }),
         };
 
         // Stream two progress chunks, then the final body. Streaming is a
