@@ -81,6 +81,29 @@ fn scoped_aliases_with_the_same_name_are_distinct_asset_contracts() {
     assert_ne!(image.resolution_key(), audio.resolution_key());
 }
 
+/// A path may hold any character, a separator's included, so two
+/// references whose paths differ only by one (a NUL, a quote, a comma, a
+/// suffix spelled like a type) never share a key, and the key keeps the
+/// path exactly as written.
+#[test]
+fn paths_differing_by_any_character_are_distinct_keys() {
+    let string = || WeftType::Primitive(WeftPrimitive::String);
+    let refs = [
+        asset_ref("a", string()),
+        asset_ref("a\u{0}", string()),
+        asset_ref("a\u{0}String", string()),
+        asset_ref("a\"", string()),
+        asset_ref("a,", string()),
+        asset_ref("a, String", string()),
+        asset_ref("a", WeftType::Primitive(WeftPrimitive::Image)),
+    ];
+    let keys: std::collections::BTreeSet<_> = refs.iter().map(FileRef::resolution_key).collect();
+    assert_eq!(keys.len(), refs.len(), "{keys:?}");
+    for r in &refs {
+        assert_eq!(r.resolution_key().path, r.path);
+    }
+}
+
 #[test]
 fn marker_with_bracketed_type_containing_comma() {
     // The comma inside Dict[String, Number] must not be read as the
@@ -467,7 +490,7 @@ mod markers_in_a_list {
     use serde_json::json;
     use weft_core::project::{NodeDefinition, ProjectDefinition};
 
-    fn image_key(path: &str) -> String {
+    fn image_key(path: &str) -> weft_core::project::ResolutionKey {
         super::asset_ref(path, super::WeftType::Primitive(super::WeftPrimitive::Image)).resolution_key()
     }
 

@@ -50,7 +50,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             project_id        UUID NOT NULL,
             node_id           TEXT,
             verb              TEXT NOT NULL,
-            spec_json         JSONB,
+            -- As its JSON text (`db::JsonText`): an apply's carries the
+            -- spec a node built.
+            spec_json         TEXT,
             issued_by_replica     TEXT NOT NULL,
             issued_at_unix    BIGINT NOT NULL,
             claimed_by_replica    TEXT,
@@ -176,8 +178,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- armed again when the units it saw then change, a command
             -- touches the project, or the rule stops holding.
             gave_up_at_unix      BIGINT,
-            -- The copy's units the health loop saw when it gave up.
-            gave_up_seen         JSONB,
+            -- The copy's units the health loop saw when it gave up, as
+            -- their JSON text (`db::JsonText`): what the platform said of
+            -- them.
+            gave_up_seen         TEXT,
             last_error           TEXT,
             -- The command its action queued (infra_lifecycle_command.id)
             -- that no look has seen end yet, and when it counts as failed
@@ -349,7 +353,7 @@ pub async fn issue_lifecycle(
                 &node_id,
                 &teardown.verb().as_str(),
                 &force,
-                &spec_json,
+                &spec_json.map(db::JsonText),
                 &waits,
                 &issued_by_replica,
                 &instance_id,
@@ -456,7 +460,7 @@ async fn issue_upgrade_in(
              (tenant_id, project_id, verb, spec_json, issued_by_replica, issued_at_unix, instance_id) \
              VALUES ($1, $2, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT, $6) \
              RETURNING id",
-            &[&tenant_id, &project_id, &InfraLifecycleVerb::Upgrade.as_str(), &db::Json(work), &issued_by_replica, &instance],
+            &[&tenant_id, &project_id, &InfraLifecycleVerb::Upgrade.as_str(), &db::JsonText(work), &issued_by_replica, &instance],
         )
         .await?;
     Ok(Issued::Commands(vec![id]))
@@ -551,13 +555,21 @@ impl TakeDownCommands {
 /// still holds its claim. `false` when it does not (another process took it
 /// over): the caller stops there.
 pub async fn mark_upgrade_stopped(pool: &Pool, command_id: i64, replica: &str) -> Result<bool> {
-    let res = pool
-        .execute(
-            "UPDATE infra_lifecycle_command SET spec_json = jsonb_set(spec_json, '{stopped}', 'true') \
-             WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
+    // Read and written back under the row's lock, in Rust: Postgres reads
+    // no JSON holding a NUL character, and the column is text.
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let work: Option<db::JsonText<UpgradeWork>> = tx
+        .scalar_opt(
+            "SELECT spec_json FROM infra_lifecycle_command \
+             WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL FOR UPDATE",
             &[&command_id, &replica],
         )
         .await?;
+    let Some(db::JsonText(mut work)) = work else { return Ok(false) };
+    work.stopped = true;
+    let res = tx.execute("UPDATE infra_lifecycle_command SET spec_json = $2 WHERE id = $1", &[&command_id, &db::JsonText(&work)]).await?;
+    tx.commit().await?;
     Ok(res > 0)
 }
 

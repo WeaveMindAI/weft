@@ -20,6 +20,7 @@ use crate::run::emission::{pulse_id, PulseEmission};
 use crate::frames::LoopFrames;
 use crate::project::{Edge, ProgramIndex, ProjectDefinition};
 use crate::pulse::{Failure, Pulse, PulseTable};
+use crate::record_ref::{Step, ValueRef};
 use crate::RunId;
 
 
@@ -40,6 +41,26 @@ pub type OutputBag = BTreeMap<String, Arc<Value>>;
 pub fn postprocess_output(
     node_id: &str,
     output: &OutputBag,
+    emission_id: Uuid,
+    run_id: RunId,
+    frames: &LoopFrames,
+    project: &ProjectDefinition,
+    pulses: &mut PulseTable,
+    program_idx: &ProgramIndex,
+    emissions: &mut Vec<PulseEmission>,
+) -> WeftResult<HashSet<String>> {
+    postprocess_output_kept(node_id, output, &BTreeMap::new(), emission_id, run_id, frames, project, pulses, program_idx, emissions)
+}
+
+/// [`postprocess_output`], knowing where the run's record keeps each
+/// port's value (`kept`, by port; a port missing from it is not known):
+/// every pulse it puts on a wire carries where its value is kept
+/// (`Pulse::origin`), a wire with a key path the part it reads.
+#[allow(clippy::too_many_arguments)]
+pub fn postprocess_output_kept(
+    node_id: &str,
+    output: &OutputBag,
+    kept: &BTreeMap<String, Arc<ValueRef>>,
     emission_id: Uuid,
     run_id: RunId,
     frames: &LoopFrames,
@@ -83,6 +104,7 @@ pub fn postprocess_output(
             )));
         };
         mentioned.insert(port_name.clone());
+        let origin = kept.get(port_name);
         for edge in outgoing.iter().filter(|e| e.source_handle.as_deref() == Some(port_name.as_str())) {
             let delivered = if edge.path.is_empty() {
                 Some(value.clone())
@@ -102,7 +124,8 @@ pub fn postprocess_output(
                     }
                 }
             };
-            deliveries.push(Delivery { edge, port: port_name.as_str(), value: delivered });
+            let origin = origin.map(|origin| part_on_wire(origin, edge));
+            deliveries.push(Delivery { edge, port: port_name.as_str(), value: delivered, origin });
         }
     }
 
@@ -154,7 +177,7 @@ pub fn postprocess_output(
     for d in deliveries {
         match d.value {
             Some(value) => emit_value_on_edge(
-                program_idx, node_id, d.edge, d.port, value, emission_id, run_id, frames, pulses, emissions,
+                program_idx, node_id, d.edge, d.port, value, d.origin, emission_id, run_id, frames, pulses, emissions,
             ),
             None => emit_closure_on_edge(
                 program_idx, node_id, d.edge, d.port, emission_id, run_id, frames, None, pulses, emissions,
@@ -178,6 +201,16 @@ struct Delivery<'a> {
     edge: &'a Edge,
     port: &'a str,
     value: Option<Arc<Value>>,
+    origin: Option<Arc<ValueRef>>,
+}
+
+/// Where the record keeps what `edge` delivers of a value kept at
+/// `origin`: the value itself, or the part its key path reads.
+pub(crate) fn part_on_wire(origin: &Arc<ValueRef>, edge: &Edge) -> Arc<ValueRef> {
+    if edge.path.is_empty() {
+        return origin.clone();
+    }
+    Arc::new(origin.as_ref().clone().part(edge.path.iter().map(|key| Step::Key(key.clone())).collect()))
 }
 
 /// Put a value on ONE edge. Fan-in policy:
@@ -200,6 +233,7 @@ pub(crate) fn emit_value_on_edge(
     edge: &Edge,
     port: &str,
     value: Arc<Value>,
+    origin: Option<Arc<ValueRef>>,
     emission_id: Uuid,
     run_id: RunId,
     frames: &LoopFrames,
@@ -228,7 +262,7 @@ pub(crate) fn emit_value_on_edge(
         return;
     }
 
-    let pulse = Pulse::new(
+    let mut pulse = Pulse::new(
         id,
         run_id,
         frames.clone(),
@@ -236,6 +270,7 @@ pub(crate) fn emit_value_on_edge(
         target_handle.to_string(),
         value,
     );
+    pulse.origin = origin;
     emissions.push(PulseEmission {
         pulse: pulse.clone(),
         source_node: source_node.to_string(),
@@ -571,8 +606,8 @@ mod fan_in_tests {
         let frames: LoopFrames = Vec::new();
 
         let project = direct_project();
-        emit_value_on_edge(&ProgramIndex::build(&project), "src1", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), run_id, &frames, &mut pulses, &mut emissions);
-        emit_value_on_edge(&ProgramIndex::build(&project), "src2", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), run_id, &frames, &mut pulses, &mut emissions);
+        emit_value_on_edge(&ProgramIndex::build(&project), "src1", outgoing_refs[0], "out", Arc::new(json!(42)), None, emission(), run_id, &frames, &mut pulses, &mut emissions);
+        emit_value_on_edge(&ProgramIndex::build(&project), "src2", outgoing_refs[0], "out", Arc::new(json!(42)), None, emission(), run_id, &frames, &mut pulses, &mut emissions);
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");
         let pending: Vec<_> = consumer_bucket
@@ -629,7 +664,7 @@ mod fan_in_tests {
             &ProgramIndex::build(&project), "src1", "out", emission(), run_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
         emit_value_on_edge(
-            &ProgramIndex::build(&project), "src2", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), run_id, &frames, &mut pulses, &mut emissions,
+            &ProgramIndex::build(&project), "src2", outgoing_refs[0], "out", Arc::new(json!(42)), None, emission(), run_id, &frames, &mut pulses, &mut emissions,
         );
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");
@@ -655,7 +690,7 @@ mod fan_in_tests {
 
         let project = direct_project();
         emit_value_on_edge(
-            &ProgramIndex::build(&project), "src1", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), run_id, &frames, &mut pulses, &mut emissions,
+            &ProgramIndex::build(&project), "src1", outgoing_refs[0], "out", Arc::new(json!(42)), None, emission(), run_id, &frames, &mut pulses, &mut emissions,
         );
         let emissions_before = emissions.len();
         emit_closure_on_outgoing(

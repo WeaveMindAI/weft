@@ -366,23 +366,49 @@ impl RunStore for FakeStore {
         Ok(Appended::At(0))
     }
 
-    async fn events_log_lossy(
-        &self,
-        run_id: RunId,
-    ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<RunEvent>>, Vec<String>)> {
-        // In-memory events are typed, so nothing can fail to decode. Each
-        // event is its own row here.
-        let events = self
-            .inner
-            .lock()
-            .unwrap()
+    async fn record_page(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<weft_journal::record::RawRecord> {
+        // Each event is its own row here, and a page is a couple of rows,
+        // so every reader of a record crosses page edges in its tests.
+        const PAGE: usize = 2;
+        let g = self.inner.lock().unwrap();
+        let rows = g
             .events
             .iter()
             .filter(|e| e.run_id() == run_id)
             .enumerate()
-            .map(|(seq, event)| crate::events::IdentifiedEvent::recorded(seq as i32, 0, event.clone()))
+            .map(|(seq, event)| (seq as i32, event))
+            .filter(|(seq, _)| after.is_none_or(|after| *seq > after))
+            .take(PAGE)
+            .map(|(seq, event)| weft_journal::record::RunLogRow::of(seq, std::slice::from_ref(event)))
             .collect();
-        Ok((events, Vec::new()))
+        Ok(weft_journal::record::RawRecord { rows })
+    }
+
+    async fn written_past(&self, past: &[(RunId, Option<i32>)]) -> anyhow::Result<Vec<RunId>> {
+        let mut written = Vec::new();
+        for (run_id, after) in past {
+            if !self.record_page(*run_id, *after).await?.rows.is_empty() {
+                written.push(*run_id);
+            }
+        }
+        Ok(written)
+    }
+
+    async fn record_first_row(&self, run_id: RunId) -> anyhow::Result<Option<weft_journal::record::RunLogRow>> {
+        Ok(self.record_page(run_id, None).await?.rows.into_iter().next())
+    }
+
+    async fn record_rows(&self, run_id: RunId, seqs: &[i32]) -> anyhow::Result<weft_journal::record::RawRecord> {
+        let g = self.inner.lock().unwrap();
+        let rows = g
+            .events
+            .iter()
+            .filter(|e| e.run_id() == run_id)
+            .enumerate()
+            .filter(|(seq, _)| seqs.contains(&(*seq as i32)))
+            .map(|(seq, event)| weft_journal::record::RunLogRow::of(seq as i32, std::slice::from_ref(event)))
+            .collect();
+        Ok(weft_journal::record::RawRecord { rows })
     }
 
     async fn queue_run(&self, queued: Queued<'_>, _for_activation: bool) -> anyhow::Result<bool> {

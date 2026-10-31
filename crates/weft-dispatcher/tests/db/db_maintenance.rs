@@ -247,7 +247,7 @@ async fn the_lift_rebuilds_from_the_version_the_running_build_came_from(pool: Po
 
     let request = VersionSource {
         manifest: [("main.weft".to_string(), "sha256:aa".to_string())].into(),
-        inputs: BuildInputs { node_set: NodeSet::Referenced, assets: [("text:readme".to_string(), json!("hello"))].into() },
+        inputs: BuildInputs { node_set: NodeSet::Referenced, assets: [(weft_core::project::ResolutionKey { path: "readme.txt".into(), ty: "String".into() }, json!("hello"))].into() },
     };
     let worker = "reg:5000/weft-worker:rebuilt";
     let images = [PlannedImage {

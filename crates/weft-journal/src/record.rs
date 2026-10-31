@@ -10,9 +10,10 @@
 //!   lock at `last_seq + 1` ([`append_unowned_in`]);
 //! - a worker claiming a queued run ([`claim`]).
 //!
-//! The run's row is derived from its events where it can be (its costs,
-//! its skips, its ending: [`Written`]), by whoever writes them, in the
-//! same statement, so it never disagrees with its log.
+//! The run's row is derived from its events where it can be (its skips,
+//! its ending: [`Written`]), and so are its cost rows (`crate::costs`), by
+//! whoever writes them, in the same statement or transaction, so neither
+//! ever disagrees with its log.
 
 use serde::{Deserialize, Serialize};
 use weft_core::run::CancelCause;
@@ -22,6 +23,7 @@ use weft_core::run_settings::KeepFor;
 use weft_core::RunId;
 use weft_task_store::db::{self, Client, FromRow, Json, JsonText, Row};
 
+use crate::costs::{Cost, CostColumns};
 use crate::events::RunEvent;
 use crate::traits::JournalRow;
 
@@ -68,12 +70,19 @@ pub struct StoredProgram {
     pub project_json_version: weft_core::stored::Version,
 }
 
+/// Its program goes into JSONB (`weft_record_batch`'s `p_programs`) as one
+/// JSON string, so a NUL in a node's value is the escaped text `\\u0000`
+/// there, never a NUL; the rest is hashes and ids.
+impl weft_task_store::db::JsonbSafe for StoredProgram {}
+
 impl StoredProgram {
     /// `program`, of `project_id`, under the hash it is read back by.
     pub fn of(project_id: uuid::Uuid, program: &ProjectDefinition) -> anyhow::Result<Self> {
         Ok(Self {
             project_id,
             definition_hash: weft_core::project::hash::compute_definition_hash(program)?,
+            // A string, not the program's JSON itself: a NUL in a node's
+            // value must stay escaped text inside the JSONB it goes into.
             project_json: serde_json::to_string(program)?,
             project_json_version: ProjectDefinition::STORED.version(),
         })
@@ -156,22 +165,22 @@ impl RawRecord {
     pub fn decode(&self, run_id: RunId) -> Result<Vec<JournalRow>, String> {
         let (decoded, bad) = self.decode_lossy(run_id);
         match bad.into_iter().next() {
-            Some(reason) => Err(reason),
+            Some((_, reason)) => Err(reason),
             None => Ok(decoded),
         }
     }
 
     /// The record's events for DISPLAY: every row that decodes, and the
-    /// reason of each row that does not, naming it, so a reader shows
-    /// what exists and says what it cannot.
-    pub fn decode_lossy(&self, run_id: RunId) -> (Vec<JournalRow>, Vec<String>) {
+    /// place (`seq`) and reason of each row that does not, so a reader
+    /// shows what exists and says what it cannot, where it sits.
+    pub fn decode_lossy(&self, run_id: RunId) -> (Vec<JournalRow>, Vec<(i32, String)>) {
         let mut decoded = Vec::new();
         let mut bad = Vec::new();
         for row in &self.rows {
             match crate::stored::decode(run_id, &row.events, row.events_version) {
                 Ok(events) => decoded
                     .extend(events.into_iter().enumerate().map(|(index, event)| JournalRow { seq: row.seq, index: index as u32, event })),
-                Err(reason) => bad.push(reason),
+                Err(reason) => bad.push((row.seq, reason)),
             }
         }
         (decoded, bad)
@@ -238,49 +247,39 @@ impl Ending {
 }
 
 /// What a write of a run's events says about the run besides its rows:
-/// what its metered calls cost, how many firings it skipped, its ending,
-/// and the answers it took (so the waiting answers go, `parked_fire`).
-/// Read off the events by whoever writes them, so a run's row and its log
-/// never disagree.
+/// the costs its metered calls reported (each a row of `run_cost`,
+/// `crate::costs`), how many firings it skipped, its ending, and the
+/// answers it took (so the waiting answers go, `parked_fire`). Read off
+/// the events by whoever writes them, so a run's row and its log never
+/// disagree.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Written {
-    pub cost_micro_usd: i64,
+    pub costs: Vec<Cost>,
     pub skipped: i32,
     pub ended: Option<Ending>,
     pub resolved: Vec<String>,
 }
 
 impl Written {
-    /// What `events`, all of one run, say.
+    /// What `events`, one write of one run, say. A run has one ending: a
+    /// second one in its record would be a writer's bug, and the first
+    /// stands.
     pub fn of(events: &[RunEvent]) -> Self {
-        let mut written = Self::default();
-        written.add(events);
-        written
-    }
-
-    /// Add what `events` say to what this already holds. A run has one
-    /// ending: a second one in its record would be a writer's bug, and the
-    /// first stands.
-    pub fn add(&mut self, events: &[RunEvent]) {
+        let mut written = Self { costs: Cost::all_of(events), ..Self::default() };
         for event in events {
             match event {
-                RunEvent::CostReported { amount_usd: Some(usd), .. } => self.cost_micro_usd += micro_usd(*usd),
-                RunEvent::NodeSkipped { .. } => self.skipped += 1,
+                RunEvent::NodeSkipped { .. } => written.skipped += 1,
                 RunEvent::SuspensionResolved { token, .. } | RunEvent::SuspensionSkipped { token, .. } => {
-                    self.resolved.push(token.clone())
+                    written.resolved.push(token.clone())
                 }
                 _ => {}
             }
-            if self.ended.is_none() {
-                self.ended = Ending::of(event);
+            if written.ended.is_none() {
+                written.ended = Ending::of(event);
             }
         }
+        written
     }
-}
-
-/// `usd` in micro-dollars, the unit a run's cost total is kept in.
-pub fn micro_usd(usd: f64) -> i64 {
-    (usd * 1_000_000.0).round() as i64
 }
 
 /// The columns a run's row is born with, read off its birth (its
@@ -311,6 +310,10 @@ pub struct Born {
     /// column, NOT NULL with no default, is still bound by every writer.
     pub spec_version: weft_core::stored::Version,
 }
+
+/// Ids, names weft checked and hashes, nothing a node or a person handed
+/// over as a value: it goes into JSONB (`p_born`).
+impl weft_task_store::db::JsonbSafe for Born {}
 
 impl Born {
     /// The row `birth` makes, kept for `keep_for` once it ended; `None`
@@ -421,7 +424,7 @@ pub async fn record_batch(
     let mut epochs = Vec::with_capacity(head.runs.len());
     let mut first = Vec::with_capacity(head.runs.len());
     let mut last = Vec::with_capacity(head.runs.len());
-    let mut costs = Vec::with_capacity(head.runs.len());
+    let mut costs = CostColumns::default();
     let mut skipped = Vec::with_capacity(head.runs.len());
     let mut wrote = Vec::with_capacity(head.runs.len());
     let mut born = Vec::with_capacity(head.runs.len());
@@ -439,7 +442,9 @@ pub async fn record_batch(
         epochs.push(run.epoch);
         first.push(run.first_seq);
         last.push(run.first_seq + i32::try_from(run.row_sizes.len())? - 1);
-        costs.push(run.written.cost_micro_usd);
+        for cost in &run.written.costs {
+            costs.push(ordinal, run.first_seq, cost);
+        }
         skipped.push(run.written.skipped);
         wrote.push(run.wrote_files);
         born.push(&run.born);
@@ -459,38 +464,40 @@ pub async fn record_batch(
     }
     let rows: Vec<&[u8]> = batch.rows.clone();
     let now = unix_now();
+    let delivered = delivered_until(now);
+    let (born, programs) = (Json(&born), Json(&head.programs));
+    let mut params: Vec<db::Param<'_>> = vec![
+        &writer,
+        &tenant,
+        &lane,
+        &now,
+        &delivered,
+        &head.durable,
+        &ids,
+        &epochs,
+        &first,
+        &last,
+        &skipped,
+        &wrote,
+        &born,
+        &ended_at,
+        &outcomes,
+        &errors,
+        &cancel_causes,
+        &row_run,
+        &row_seq,
+        &rows,
+        &resolved_run,
+        &resolved_token,
+    ];
+    params.extend(costs.params());
+    params.extend([&programs as db::Param<'_>, &head.events_version]);
     let answered: Vec<RecordedRow> = db
         .all(
             "SELECT o_run_id, o_fate, o_project_id, o_tell_end, o_keep_until, o_unwatched FROM weft_record_batch(\
              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, \
-             $23, $24, $25)",
-            &[
-                &writer,
-                &tenant,
-                &lane,
-                &now,
-                &delivered_until(now),
-                &head.durable,
-                &ids,
-                &epochs,
-                &first,
-                &last,
-                &costs,
-                &skipped,
-                &wrote,
-                &Json(&born),
-                &ended_at,
-                &outcomes,
-                &errors,
-                &cancel_causes,
-                &row_run,
-                &row_seq,
-                &rows,
-                &resolved_run,
-                &resolved_token,
-                &Json(&head.programs),
-                &head.events_version,
-            ],
+             $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37)",
+            &params,
         )
         .await?;
     anyhow::ensure!(
@@ -574,10 +581,10 @@ pub async fn insert_queued_in(db: &impl Client, queued: &Queued<'_>) -> anyhow::
         .execute(
             "INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, entry_node, instance_id, \
                  fired_by, source_version, definition_hash, binary_hash, seed_of, stale, spec, example, state, \
-                 epoch, last_seq, attempts, watch_end, started_at, skipped, cost_micro_usd, keep_for, cut_from, spec_version) \
+                 epoch, last_seq, attempts, watch_end, started_at, skipped, keep_for, cut_from, spec_version) \
              SELECT $1::uuid, $2::uuid, $3::text, $4::text, $5::text, $6::text, $7::boolean, $8::text, $9::text, $10::text, \
                  $11::text, $12::text, $13::text, $14::uuid, $15::text[], $16::text, $17::text, 'queued', \
-                 0, 0, 0, $18::boolean, $19::bigint, $20::integer, $21::bigint, $22::bigint, $23::text, $24::integer \
+                 0, 0, 0, $18::boolean, $19::bigint, $20::integer, $21::bigint, $22::text, $23::integer \
              WHERE EXISTS (SELECT 1 FROM project WHERE id = $2 AND NOT removing) \
              ON CONFLICT (run_id) DO NOTHING",
             &[
@@ -601,7 +608,6 @@ pub async fn insert_queued_in(db: &impl Client, queued: &Queued<'_>) -> anyhow::
                 &queued.watch_end,
                 &born.started_at,
                 &written.skipped,
-                &written.cost_micro_usd,
                 &born.keep_for,
                 &born.cut_from,
                 &weft_core::run_spec::RunSpec::STORED.version(),
@@ -632,6 +638,7 @@ pub async fn insert_queued_in(db: &impl Client, queued: &Queued<'_>) -> anyhow::
         ],
     )
     .await?;
+    crate::costs::insert_in(db, run_id, 0, &written.costs).await?;
     notify_queued_in(db, born.project_id).await?;
     Ok(true)
 }
@@ -743,7 +750,8 @@ pub async fn lock_in(db: &impl Client, run_id: RunId) -> anyhow::Result<Option<L
 /// Write `events` into the record of `run_id`, which nobody drives,
 /// at `last_seq + 1`, on the caller's transaction, and move the run as
 /// `then` says (an ending in `events` ends it whatever `then` says). Its
-/// costs, skips and ending go on its row in the same statement. `writer`
+/// skips and ending go on its row, and its costs into `run_cost`, in the
+/// same transaction. `writer`
 /// is who the record says wrote it. Refused when a worker drives the run
 /// (its owner writes its record) or it already ended. The write is
 /// announced through the outbox: the caller pokes it once its transaction
@@ -787,6 +795,7 @@ pub async fn append_locked_in(
         .await?;
     }
     let written = Written::of(events);
+    crate::costs::insert_in(db, run_id, seq, &written.costs).await?;
     let ended = written.ended.as_ref();
     let state = match (ended, then) {
         (Some(_), _) => "ended",
@@ -799,18 +808,17 @@ pub async fn append_locked_in(
     // retention.
     let (tell_end, erased_later): (bool, bool) = db
         .one(
-            "UPDATE run SET last_seq = $2, state = $3, cost_micro_usd = cost_micro_usd + $4, skipped = skipped + $5, \
-                 ended_at = $6, outcome = $7, error = $8, cancel_cause = $9, keep_until = $6 + keep_for, \
-                 delivered_until = NULL, busy_since = CASE WHEN $6::bigint IS NULL THEN busy_since END, \
-                 waited_on_workers = waited_on_workers AND $6::bigint IS NULL, \
-                 holds_signals = ($6::bigint IS NOT NULL AND EXISTS (SELECT 1 FROM signal s WHERE s.run_id = $1)) \
+            "UPDATE run SET last_seq = $2, state = $3, skipped = skipped + $4, \
+                 ended_at = $5, outcome = $6, error = $7, cancel_cause = $8, keep_until = $5 + keep_for, \
+                 delivered_until = NULL, busy_since = CASE WHEN $5::bigint IS NULL THEN busy_since END, \
+                 waited_on_workers = waited_on_workers AND $5::bigint IS NULL, \
+                 holds_signals = ($5::bigint IS NOT NULL AND EXISTS (SELECT 1 FROM signal s WHERE s.run_id = $1)) \
              WHERE run_id = $1 \
-             RETURNING $6::bigint IS NOT NULL AND (watch_end OR holds_signals), $6::bigint IS NOT NULL AND keep_for IS NOT NULL",
+             RETURNING $5::bigint IS NOT NULL AND (watch_end OR holds_signals), $5::bigint IS NOT NULL AND keep_for IS NOT NULL",
             &[
                 &run_id,
                 &if events.is_empty() { locked.last_seq } else { seq },
                 &state,
-                &written.cost_micro_usd,
                 &written.skipped,
                 &ended.map(|ending| ending.at),
                 &ended.map(|ending| ending.outcome.as_str()),
@@ -921,20 +929,23 @@ pub async fn give_up_in(db: &impl Client, run_id: RunId, owner: &str, why: &str)
     let at_unix = unix_now() as u64;
     // A record that does not read still ends: the run's ending is what
     // matters most, and the charges it may leave open are said lost.
-    let record = read_record(db, run_id, None).await?;
-    let mut writes = match crate::on_blocking_pool(move || {
-        record.events(run_id).map(|record| {
-            crate::fold::unpriced_charges_closed(
-                run_id,
-                &record,
-                "the run's record could not be written, so it ended before the job was read back",
-                at_unix,
-            )
-        })
+    let read = fold_pages(|after| read_page(db, run_id, after), None, Ok(crate::fold::ChargeBook::default()), move |book: &mut Result<crate::fold::ChargeBook, String>, page| {
+        if let Ok(open) = book {
+            match page.decode(run_id) {
+                Ok(rows) => rows.iter().for_each(|row| open.apply(&row.event)),
+                Err(e) => *book = Err(e),
+            }
+        }
+        Ok(())
     })
-    .await
-    {
-        Ok(writes) => writes,
+    .await?;
+    let mut writes = match read {
+        Ok(book) => crate::fold::unpriced_charges_closed(
+            run_id,
+            book,
+            "its worker gave the run up, so it ended before the job was read back",
+            at_unix,
+        ),
         Err(e) => {
             tracing::error!(
                 target: "weft_journal::record", %run_id, error = %e,
@@ -952,15 +963,14 @@ pub async fn give_up_in(db: &impl Client, run_id: RunId, owner: &str, why: &str)
 
 /// A queued run as the worker that claimed it starts from: how it is
 /// fenced (its epoch, which its batches carry), how many times it was
-/// handed to a worker, its program, a cancel already waiting for it, and
-/// its whole record.
+/// handed to a worker, its program, and a cancel already waiting for it.
+/// Its record the worker reads after, page by page ([`read_page`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claimed {
     pub epoch: i32,
     pub attempts: i32,
     pub definition_hash: String,
     pub cancel_requested: Option<CancelCause>,
-    pub record: RawRecord,
 }
 
 /// What a claim reads off the run row: its new epoch, its attempts, its
@@ -1022,17 +1032,123 @@ pub async fn claim(db: &impl Client, run_id: RunId, project_id: uuid::Uuid, owne
     let (Some(epoch), Some(attempts), Some(definition_hash), cancel_requested) = claimed else {
         anyhow::bail!("run {run_id} runs no program, so no worker can claim it");
     };
-    let record = read_record(db, run_id, None).await?;
-    Ok(Some(Claimed { epoch, attempts, definition_hash, cancel_requested: cancel_requested.map(|cause| cause.0), record }))
+    Ok(Some(Claimed { epoch, attempts, definition_hash, cancel_requested: cancel_requested.map(|cause| cause.0) }))
 }
 
-/// The record of `run_id`: its rows after `after` (every row when
-/// `None`).
-pub async fn read_record(db: &impl Client, run_id: RunId, after: Option<i32>) -> anyhow::Result<RawRecord> {
+/// The most rows one page of a record holds ([`read_page`]): enough that
+/// a long run of small rows reads in few trips, few enough that a page
+/// of them decoded stays small next to what a reader keeps.
+pub const PAGE_ROWS: i64 = 512;
+
+/// The most stored bytes one page of a record holds ([`read_page`]). One
+/// row is one write, which can weigh as much as a whole batch of a
+/// worker's writes (`weft_broker_client::protocol::JOURNAL_RECORD_BODY_LIMIT`),
+/// so a page is cut by weight as well as by count; a single row heavier
+/// than this is a page of its own.
+pub const PAGE_BYTES: i64 = 8 * 1024 * 1024;
+
+/// One page of the record of `run_id`: its rows after `after` (from its
+/// first when `None`), in order, as many as fit in [`PAGE_ROWS`] and
+/// [`PAGE_BYTES`], always one at least while any is left. Empty once
+/// none is. Every reader of a whole record reads it page by page
+/// ([`fold_pages`]), so none holds more than a page of it raw.
+pub async fn read_page(db: &impl Client, run_id: RunId, after: Option<i32>) -> anyhow::Result<RawRecord> {
+    read_rows_after(db, run_id, after, PAGE_ROWS).await
+}
+
+/// Which runs of `past` have a row after the one named beside them (any
+/// row when `None`), in one query however many runs it names.
+pub async fn written_past(db: &impl Client, past: &[(RunId, Option<i32>)]) -> anyhow::Result<Vec<RunId>> {
+    let (runs, after): (Vec<RunId>, Vec<i32>) = past.iter().map(|(run, after)| (*run, after.unwrap_or(-1))).unzip();
+    db.scalars(
+        "SELECT w.run_id FROM unnest($1::uuid[], $2::int[]) AS w(run_id, after) \
+         WHERE EXISTS (SELECT 1 FROM run_log l WHERE l.run_id = w.run_id AND l.seq > w.after)",
+        &[&runs, &after],
+    )
+    .await
+    .map_err(Into::into)
+}
+
+/// The first row of `run_id`'s record, which holds its birth first; `None`
+/// for a run with no record.
+pub async fn read_first_row(db: &impl Client, run_id: RunId) -> anyhow::Result<Option<RunLogRow>> {
+    Ok(read_rows_after(db, run_id, None, 1).await?.rows.into_iter().next())
+}
+
+/// At most `rows` rows of `run_id`'s record after `after`, cut at
+/// [`PAGE_BYTES`] ([`read_page`]).
+async fn read_rows_after(db: &impl Client, run_id: RunId, after: Option<i32>, rows: i64) -> anyhow::Result<RawRecord> {
+    // The weight is the row's stored size (`pg_column_size`, read
+    // without fetching the value): the events are compressed already, so
+    // it is what the row costs to carry.
     let rows: Vec<(i32, Vec<u8>, weft_core::stored::Version)> = db
-        .all("SELECT seq, events, events_version FROM run_log WHERE run_id = $1 AND seq > $2 ORDER BY seq", &[&run_id, &after.unwrap_or(-1)])
+        .all(
+            "SELECT seq, events, events_version FROM ( \
+                 SELECT seq, events, events_version, \
+                        sum(pg_column_size(events)) OVER (ORDER BY seq) - pg_column_size(events) AS before \
+                 FROM (SELECT seq, events, events_version FROM run_log \
+                       WHERE run_id = $1 AND seq > $2 ORDER BY seq LIMIT $3) next \
+             ) page WHERE before < $4 ORDER BY seq",
+            &[&run_id, &after.unwrap_or(-1), &rows, &PAGE_BYTES],
+        )
         .await?;
     Ok(RawRecord { rows: rows.into_iter().map(|(seq, events, events_version)| RunLogRow { seq, events, events_version }).collect() })
+}
+
+/// The rows of `run_id`'s record at `seqs`, raw, in order: those that
+/// exist (a run erased has none). What a reader resolving the values an
+/// event names reads (`weft_core::record_ref::ValueRef`): the rows that
+/// keep them, and no other.
+pub async fn read_rows(db: &impl Client, run_id: RunId, seqs: &[i32]) -> anyhow::Result<RawRecord> {
+    let rows: Vec<(i32, Vec<u8>, weft_core::stored::Version)> = db
+        .all("SELECT seq, events, events_version FROM run_log WHERE run_id = $1 AND seq = ANY($2) ORDER BY seq", &[&run_id, &seqs])
+        .await?;
+    Ok(RawRecord { rows: rows.into_iter().map(|(seq, events, events_version)| RunLogRow { seq, events, events_version }).collect() })
+}
+
+/// One page of a run's record, raw ([`RawRecord`]) or decoded (its
+/// rows): what [`fold_pages`] walks a record by.
+pub trait RecordPage: Send + 'static {
+    /// The page's last row; `None` for the empty page past the record's end.
+    fn last_seq(&self) -> Option<i32>;
+}
+
+impl RecordPage for RawRecord {
+    fn last_seq(&self) -> Option<i32> {
+        self.rows.last().map(|row| row.seq)
+    }
+}
+
+impl RecordPage for Vec<JournalRow> {
+    fn last_seq(&self) -> Option<i32> {
+        self.last().map(|row| row.seq)
+    }
+}
+
+/// Read a run's record after `after` page by page (`read` answers the
+/// page after a row, as [`read_page`] does, raw or decoded), handing each
+/// page to `step` with `state` on the blocking pool, and answer the state
+/// once the record is read: whatever the record's length, a reader holds
+/// one page of it plus what it keeps. A page `step` refuses ends the read
+/// with its error. Every reader of a record page by page walks it here,
+/// so how pages follow one another (the next one after the last row of
+/// this one, an empty one past the end) lives once.
+pub async fn fold_pages<S, Page, Read, Fut, Step>(mut read: Read, after: Option<i32>, mut state: S, step: Step) -> anyhow::Result<S>
+where
+    S: Send + 'static,
+    Page: RecordPage,
+    Read: FnMut(Option<i32>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Page>>,
+    Step: Fn(&mut S, Page) -> anyhow::Result<()> + Clone + Send + 'static,
+{
+    let mut after = after;
+    loop {
+        let page = read(after).await?;
+        let Some(last) = page.last_seq() else { return Ok(state) };
+        let step = step.clone();
+        state = crate::on_blocking_pool(move || step(&mut state, page).map(|()| state)).await?;
+        after = Some(last);
+    }
 }
 
 fn unix_now() -> i64 {
@@ -1106,12 +1222,12 @@ mod tests {
         let (rows, bad) = record.decode_lossy(run_id);
         assert_eq!(rows.iter().map(|row| (row.seq, row.index)).collect::<Vec<_>>(), [(2, 0)]);
         assert!(matches!(rows[0].event, RunEvent::RunCompleted { at_unix: 2, .. }));
-        assert_eq!(bad.len(), 1);
+        assert_eq!(bad.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(), [1], "the bad row is named by its place");
     }
 
     /// A write's costs, skips, answers and ending are read off its events;
-    /// a cost nobody could put a figure on adds nothing, and the first
-    /// ending stands.
+    /// a cost nobody could put a figure on is kept as unknown, and the
+    /// first ending stands.
     #[test]
     fn a_write_says_what_its_events_say() {
         let run_id = run();
@@ -1144,7 +1260,7 @@ mod tests {
             RunEvent::RunCompleted { run_id, at_unix: 4 },
         ];
         let written = Written::of(&events);
-        assert_eq!(written.cost_micro_usd, 250_000);
+        assert_eq!(written.costs.iter().map(|cost| (cost.index, cost.amount_usd)).collect::<Vec<_>>(), [(0, Some(0.25)), (1, None)]);
         assert_eq!(written.skipped, 1);
         assert_eq!(written.resolved, vec!["t".to_string()]);
         assert_eq!(written.ended, Some(Ending { at: 3, outcome: Outcome::Failed, error: Some("boom".into()), cancel_cause: None }));

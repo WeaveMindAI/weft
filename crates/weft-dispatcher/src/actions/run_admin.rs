@@ -16,18 +16,16 @@
 use std::collections::HashMap;
 
 use axum::http::StatusCode;
-use weft_core::instance::InstanceId;
 use weft_core::program::runs::{EventsRequest, LogsRequest, OutputsRequest, RunList, RunStopped, WakeRequest};
 use weft_core::program::{
     CleanOutcome, CleanRequest, CostFilter, CostRecord, DeletedRun, NodeState, ParkedWait, ResolvedRun, RunDetail, RunEvents, RunFilter, RunLogs,
     RunPage, RunStatus, RunSummary, StillGoing, MAX_RUNS_PAGE,
 };
 use weft_core::RunId;
-use weft_task_store::db::Client as _;
 
 use super::{failed, Actor, Refused};
 use crate::api::run::{cancel_run_id, clean_run, list_query};
-use crate::events::{DispatcherEvent, LiveEvent};
+use crate::events::DispatcherEvent;
 use crate::state::DispatcherState;
 use crate::store::{RunListQuery, RunOwner};
 
@@ -427,124 +425,433 @@ pub async fn node_state(state: &DispatcherState, actor: &Actor, run_id: RunId, n
     crate::node_state::read(state, owner.project_id, run_id, node).await
 }
 
-/// A run's journaled history through the same projection as live events.
-/// Terminals come from the journal, never a synthesized second completion;
-/// a run parked now ends its replay with `RunParked`, the one event about
-/// where it stands rather than what it did.
-pub async fn replay(state: &DispatcherState, actor: &Actor, run_id: RunId) -> Result<Vec<LiveEvent>, Refused> {
-    let owner = authorize(state, actor, run_id).await?;
-    replay_events(state, run_id, owner.project_id).await
+/// A JSON answer written as it is read: its body's chunks, in order. A
+/// chunk that is an error cuts the body short, which its reader meets as
+/// an answer that did not finish (the status went out with the first
+/// chunk).
+pub type Streamed = tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>;
+
+/// How many chunks of a streamed answer wait for a slow reader before the
+/// read of the record pauses for it.
+const STREAM_AHEAD: usize = 16;
+
+/// How the events of a run's history name the values they show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Values {
+    /// By where the record keeps each (`weft_core::record_ref::ValueRef`):
+    /// the editor, which fetches a value when it shows it.
+    ByReference,
+    /// Written in: a reader that wants the values (`weft freeze`, the CLI
+    /// following a run).
+    Written,
 }
 
-/// The rows [`replay`] answers, for a run the actor was held to.
-async fn replay_events(state: &DispatcherState, run_id: RunId, project_id: uuid::Uuid) -> Result<Vec<LiveEvent>, Refused> {
-    // The full record, folded over the run's program through the SAME
-    // projection the live view runs (`crate::live_view`), so replay and
-    // live cannot drift; bus and caller events ride along.
-    // Lossy read: the inspector renders what exists, and every row
-    // that no longer decodes lands below as its own JournalCorruption
-    // entry, naming `weft clean`, instead of taking the response down.
-    let (raw_events, unreadable_rows) = state.runs.events_log_lossy(run_id).await.map_err(failed("replay: read the journal"))?;
-    // Only the database itself fails the read; a program that cannot
-    // be found paints the run as unreadable, the way the live bridge
-    // does for the same journal, and names `weft clean` below.
-    // Everything the reader must be TOLD about this run, with the site
-    // that places it on screen.
-    let mut corruptions: Vec<(weft_core::primitive::CorruptionSite, String)> =
-        unreadable_rows.into_iter().map(|reason| (weft_core::primitive::CorruptionSite::UndecodableRow, reason)).collect();
-    let found = crate::projection::run_program(state, run_id).await.map_err(failed("replay: look up the run's program"))?;
-    let program = match found.unpaintable() {
-        // The reason travels with the run, at its own site: a row
-        // that no longer decodes is one missing value, a missing
-        // program is every value at once and belongs beside the run
-        // rather than inside a node.
-        Some((site, reason)) => {
-            corruptions.push((site, reason.to_string()));
-            found.without_reason()
-        }
-        None => found,
-    };
-    // What the run inherits is named by its birth, its first row.
-    let birth: Vec<weft_journal::RunEvent> = raw_events.iter().take(1).map(|r| r.event.clone()).collect();
-    let inheritance = match crate::projection::run_inheritance(state, &birth, &program).await {
-        Ok(chain) => chain,
-        Err(reason) => {
-            corruptions.push((weft_core::primitive::CorruptionSite::UndecodableRow, reason));
-            weft_journal::SeedChain::default()
-        }
-    };
-    let mut projector = crate::projection::RunProjector::new(run_id, program, project_id).with_inheritance(inheritance);
-    let mut out: Vec<LiveEvent> = weft_journal::on_blocking_pool(move || {
-        let mut out = Vec::new();
-        for record in raw_events {
-            let projected = projector.project(&record.event);
-            out.extend(crate::events::IdentifiedEvent { event_id: record.event_id, event: () }.project(|()| projected));
-        }
-        out
+impl Values {
+    /// `with_values=true` on a URL asks for the values written in.
+    pub fn asked(with_values: Option<bool>) -> Self {
+        if with_values == Some(true) { Self::Written } else { Self::ByReference }
+    }
+}
+
+/// `event` as its reader asked for it ([`Values`]).
+pub fn encoded(event: weft_core::live_event::ShownEvent, values: Values) -> anyhow::Result<Vec<u8>> {
+    let crate::events::IdentifiedEvent { event_id, event } = event;
+    Ok(match values {
+        Values::ByReference => serde_json::to_vec(&crate::events::IdentifiedEvent { event_id, event: event.by_reference() })?,
+        Values::Written => serde_json::to_vec(&crate::events::IdentifiedEvent { event_id, event: written(event)? })?,
     })
-    .await;
-    // A run parked now says so after its history: parking writes no
-    // record row, and a reader that takes the history before the live
-    // events (`weft wait --waiting-for-input`) learns here that it waits.
-    let summary = state.runs.run_summary(run_id).await.map_err(failed("replay: read the run's status"))?;
-    if summary.is_some_and(|summary| summary.status == RunStatus::WaitingForInput) {
-        out.push(crate::events::IdentifiedEvent::transient(DispatcherEvent::RunParked { run_id, project_id }));
+}
+
+/// `event` with every value it names written in, each read off the
+/// projection that painted it, which holds them all.
+fn written(event: weft_core::live_event::DispatcherEvent<weft_core::record_ref::Shown>) -> anyhow::Result<DispatcherEvent<serde_json::Value>> {
+    event
+        .with_values(&mut |at| Err(weft_core::record_ref::Unresolved::Broken(format!("the projection holds no value at {at:?}"))))
+        .map_err(anyhow::Error::from)
+}
+
+/// A JSON array written to a [`Streamed`] answer an element at a time:
+/// a page of elements as a run's record is painted, then what comes
+/// after.
+struct JsonArray {
+    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    values: Values,
+    started: bool,
+}
+
+impl JsonArray {
+    fn chunk(&mut self, event: weft_core::live_event::ShownEvent) -> anyhow::Result<bytes::Bytes> {
+        let mut chunk = Vec::new();
+        chunk.push(if self.started { b',' } else { b'[' });
+        self.started = true;
+        chunk.extend(encoded(event, self.values)?);
+        Ok(chunk.into())
     }
-    // A row the fold could not apply is painted as its corruption, at
-    // the row, by the projector; the rows that never decoded follow.
-    for (site, reason) in corruptions {
-        out.push(crate::events::IdentifiedEvent::transient(DispatcherEvent::JournalCorruption { run_id, project_id, site, reason }));
+
+    /// The array's end: `]`, or `[]` for one that got no element.
+    fn end(&self) -> bytes::Bytes {
+        bytes::Bytes::from_static(if self.started { b"]" } else { b"[]" })
     }
-    Ok(out)
+}
+
+impl JsonArray {
+    /// Send `page`, a run of elements, unless it is empty.
+    async fn send(&self, page: Vec<u8>) -> anyhow::Result<()> {
+        if page.is_empty() {
+            return Ok(());
+        }
+        self.tx.send(Ok(page.into())).await.map_err(|_| anyhow::anyhow!("the reader left"))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::painting::Sink for JsonArray {
+    type Page = Vec<u8>;
+
+    fn page(&mut self, events: Vec<weft_core::live_event::ShownEvent>) -> anyhow::Result<Vec<u8>> {
+        let mut page = Vec::new();
+        for event in events {
+            page.extend(self.chunk(event)?);
+        }
+        Ok(page)
+    }
+
+    async fn deliver(&mut self, page: Vec<u8>) -> anyhow::Result<()> {
+        self.send(page).await
+    }
+}
+
+/// Write `answer` to a [`Streamed`] answer from a task of its own, cutting
+/// the body short on its error.
+fn streamed<F>(answer: impl FnOnce(tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>) -> F) -> Streamed
+where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(STREAM_AHEAD);
+    let written = answer(tx.clone());
+    tokio::spawn(async move {
+        if let Err(e) = written.await {
+            tracing::warn!(target: "weft_dispatcher::api", error = %format!("{e:#}"), "a streamed answer was cut short");
+            let _ = tx.send(Err(std::io::Error::other(format!("{e:#}")))).await;
+        }
+    });
+    rx
+}
+
+/// A run's journaled history through the same projection as live events,
+/// as a JSON array written as the record is read. Terminals come from the
+/// journal, never a synthesized second completion; a run parked now ends
+/// its replay with `RunParked`, the one event about where it stands rather
+/// than what it did. Its values named as `values` says.
+pub async fn replay(state: &DispatcherState, actor: &Actor, run_id: RunId, values: Values) -> Result<Streamed, Refused> {
+    let owner = authorize(state, actor, run_id).await?;
+    let project_id = owner.project_id;
+    // Only the database itself fails the read; a program that cannot be
+    // found paints the run as unreadable at its first row, the way the
+    // live view does for the same record, naming `weft clean`.
+    let projector = crate::painting::open(state, run_id, project_id).await.map_err(failed("replay: look up the run's program"))?;
+    let state = state.clone();
+    Ok(streamed(move |tx| async move {
+        let array = JsonArray { tx: tx.clone(), values, started: false };
+        let (_, mut array) = crate::painting::paint(&*state.runs, run_id, crate::painting::Painting::new(projector), array).await?;
+        if let Some(event) = crate::painting::parked_now(&state, run_id, project_id).await? {
+            let chunk = array.chunk(event)?;
+            tx.send(Ok(chunk)).await.map_err(|_| anyhow::anyhow!("the reader left"))?;
+        }
+        tx.send(Ok(array.end())).await.map_err(|_| anyhow::anyhow!("the reader left"))?;
+        Ok(())
+    }))
 }
 
 /// A run's events the way a person reads them (`weft events`): the
-/// replay's rows, kept by `request` and spelled, both against the program
-/// the run was started on, never whatever program its project holds now.
-/// So a node renamed or moved since is found by the name it had in that
-/// run, and its rows print under that name. A name that program does not
-/// have is refused naming the run. When the program cannot be read, the
-/// rows name their nodes by id and say why, and only a node filter, which
-/// cannot be read without it, is refused.
-pub async fn events(state: &DispatcherState, actor: &Actor, run_id: RunId, request: EventsRequest) -> Result<RunEvents, Refused> {
+/// replay's rows with their values written in, kept by `request` and
+/// spelled, both against the program the run was started on, never
+/// whatever program its project holds now. So a node renamed or moved
+/// since is found by the name it had in that run, and its rows print under
+/// that name. A name that program does not have is refused naming the
+/// run. When the program cannot be read, the rows name their nodes by id
+/// and say why, and only a node filter, which cannot be read without it,
+/// is refused. Written as the record is read: `{"events":[...],"total":N}`,
+/// with `"unspelled"` last when the rows name nodes by id.
+pub async fn events(state: &DispatcherState, actor: &Actor, run_id: RunId, request: EventsRequest) -> Result<Streamed, Refused> {
     let owner = authorize(state, actor, run_id).await?;
     let lookup = crate::projection::registered_program(state, run_id, &owner).await.map_err(failed("read the run's program"))?;
-    let rows = replay_events(state, run_id, owner.project_id).await?;
-    events_answer(run_id, &lookup, &rows, request)
+    let writer = EventsWriter::new(run_id, &lookup, request)?;
+    let projector = crate::painting::open(state, run_id, owner.project_id).await.map_err(failed("events: look up the run's program"))?;
+    let state = state.clone();
+    let project_id = owner.project_id;
+    Ok(streamed(move |tx| async move {
+        tx.send(Ok(bytes::Bytes::from_static(b"{\"events\":"))).await.map_err(|_| anyhow::anyhow!("the reader left"))?;
+        let sink = EventsSink { writer, array: JsonArray { tx: tx.clone(), values: Values::Written, started: false } };
+        let (_, EventsSink { mut writer, mut array }) = crate::painting::paint(&*state.runs, run_id, crate::painting::Painting::new(projector), sink).await?;
+        let parked = crate::painting::parked_now(&state, run_id, project_id).await?;
+        for row in writer.rows(parked.into_iter().collect())? {
+            let chunk = array.chunk_row(&row)?;
+            tx.send(Ok(chunk)).await.map_err(|_| anyhow::anyhow!("the reader left"))?;
+        }
+        let mut tail = array.end().to_vec();
+        tail.extend(format!(",\"total\":{}", writer.total).into_bytes());
+        if let Some(why) = &writer.unspelled {
+            tail.extend(b",\"unspelled\":");
+            tail.extend(serde_json::to_vec(why)?);
+        }
+        tail.push(b'}');
+        tx.send(Ok(tail.into())).await.map_err(|_| anyhow::anyhow!("the reader left"))?;
+        Ok(())
+    }))
 }
 
-/// [`events`] once the run's program and rows are read: pure, so how a
-/// name is read against the run's own program is pinned without a
-/// database.
-fn events_answer(run_id: RunId, lookup: &crate::projection::ProgramLookup, rows: &[LiveEvent], request: EventsRequest) -> Result<RunEvents, Refused> {
-    use weft_core::live_event::spelled::{parse_iteration, spell_row, EventsFilter};
-    let program = lookup.or_why(run_id);
-    // Indexed once for the request: every row is spelled through it, so a
-    // lookup per row is constant time, not a scan of the program.
-    let graph = program.as_deref().map(weft_core::project::graph::ProjectGraph::new);
-    let iteration =
-        request.iteration.as_deref().map(parse_iteration).transpose().map_err(|why| (StatusCode::BAD_REQUEST, why))?.unwrap_or_default();
-    let filter = match &request.node {
-        Some(spelled) => {
-            let (graph, named) = named_in_run(graph.as_ref().map_err(|why| *why), run_id, spelled)?;
-            EventsFilter::at(graph, named, request.kind, iteration)
-        }
-        None => EventsFilter::anywhere(request.kind, iteration),
+/// [`events`] for a program's call (`weft.runs.events`): the same rows,
+/// collected into one answer. A program's call is answered whole, and the
+/// node that asked holds the answer whole, so collecting it here holds no
+/// more than the asker does.
+async fn events_answered(state: &DispatcherState, actor: &Actor, run_id: RunId, request: EventsRequest) -> Result<RunEvents, Refused> {
+    let owner = authorize(state, actor, run_id).await?;
+    let lookup = crate::projection::registered_program(state, run_id, &owner).await.map_err(failed("read the run's program"))?;
+    let writer = EventsWriter::new(run_id, &lookup, request)?;
+    let projector = crate::painting::open(state, run_id, owner.project_id).await.map_err(failed("events: look up the run's program"))?;
+    let collect = Collected { writer, rows: Vec::new() };
+    let (_, Collected { mut writer, mut rows }) = crate::painting::paint(&*state.runs, run_id, crate::painting::Painting::new(projector), collect)
+        .await
+        .map_err(failed("events: read the run's record"))?;
+    let parked = crate::painting::parked_now(state, run_id, owner.project_id).await.map_err(failed("events: read the run's status"))?;
+    rows.extend(writer.rows(parked.into_iter().collect()).map_err(failed("events: an event"))?);
+    Ok(RunEvents { total: writer.total, events: rows, unspelled: writer.unspelled })
+}
+
+impl JsonArray {
+    /// [`Self::chunk`] for a row already written out.
+    fn chunk_row(&mut self, row: &serde_json::Value) -> anyhow::Result<bytes::Bytes> {
+        let mut chunk = Vec::new();
+        chunk.push(if self.started { b',' } else { b'[' });
+        self.started = true;
+        chunk.extend(serde_json::to_vec(row)?);
+        Ok(chunk.into())
     }
-    .map_err(|why| (StatusCode::BAD_REQUEST, why))?;
-    let mut events = Vec::new();
-    for row in rows {
-        let wire = serde_json::to_value(row).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("an event: {e}")))?;
-        if !filter.keeps(&row.event, &wire) {
-            continue;
+}
+
+/// [`events`]' rows going out as they are painted.
+struct EventsSink {
+    writer: EventsWriter,
+    array: JsonArray,
+}
+
+#[async_trait::async_trait]
+impl crate::painting::Sink for EventsSink {
+    type Page = Vec<u8>;
+
+    fn page(&mut self, events: Vec<weft_core::live_event::ShownEvent>) -> anyhow::Result<Vec<u8>> {
+        let mut page = Vec::new();
+        for row in self.writer.rows(events)? {
+            page.extend(self.array.chunk_row(&row)?);
         }
-        match &graph {
-            Ok(graph) => events.extend(spell_row(wire, graph)),
-            Err(_) => events.push(wire),
+        Ok(page)
+    }
+
+    async fn deliver(&mut self, page: Vec<u8>) -> anyhow::Result<()> {
+        self.array.send(page).await
+    }
+}
+
+/// [`events_answered`]' rows, collected.
+struct Collected {
+    writer: EventsWriter,
+    rows: Vec<serde_json::Value>,
+}
+
+#[async_trait::async_trait]
+impl crate::painting::Sink for Collected {
+    type Page = ();
+
+    fn page(&mut self, events: Vec<weft_core::live_event::ShownEvent>) -> anyhow::Result<()> {
+        self.rows.extend(self.writer.rows(events)?);
+        Ok(())
+    }
+
+    async fn deliver(&mut self, (): ()) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// What [`events`] keeps and how it spells it, a batch of rows at a time:
+/// pure, so how a name is read against the run's own program is pinned
+/// without a database.
+struct EventsWriter {
+    filter: weft_core::live_event::spelled::EventsFilter,
+    /// The run's program, every row spelled through it; `None` when it
+    /// cannot be read.
+    program: Option<std::sync::Arc<weft_core::ProjectDefinition>>,
+    unspelled: Option<String>,
+    /// How many events the run has, before the filters.
+    total: usize,
+}
+
+impl EventsWriter {
+    fn new(run_id: RunId, lookup: &crate::projection::ProgramLookup, request: EventsRequest) -> Result<Self, Refused> {
+        use weft_core::live_event::spelled::{parse_iteration, EventsFilter};
+        let program = lookup.or_why(run_id);
+        let iteration =
+            request.iteration.as_deref().map(parse_iteration).transpose().map_err(|why| (StatusCode::BAD_REQUEST, why))?.unwrap_or_default();
+        let filter = match &request.node {
+            Some(spelled) => {
+                let graph = program.as_deref().map(weft_core::project::graph::ProjectGraph::new);
+                let (graph, named) = named_in_run(graph.as_ref().map_err(|why| *why), run_id, spelled)?;
+                EventsFilter::at(graph, named, request.kind, iteration)
+            }
+            None => EventsFilter::anywhere(request.kind, iteration),
+        }
+        .map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+        let unspelled = lookup.unpaintable().map(|(_, why)| why.to_string());
+        Ok(Self { filter, program: program.ok(), unspelled, total: 0 })
+    }
+
+    /// The rows `events` are, values written in and spelled, that the
+    /// filter keeps. The program is indexed once per batch: every row is
+    /// spelled through it, so a lookup per row is constant time, not a
+    /// scan of the program.
+    fn rows(&mut self, events: Vec<weft_core::live_event::ShownEvent>) -> anyhow::Result<Vec<serde_json::Value>> {
+        let graph = self.program.as_deref().map(weft_core::project::graph::ProjectGraph::new);
+        let mut rows = Vec::new();
+        for crate::events::IdentifiedEvent { event_id, event } in events {
+            self.total += 1;
+            let event = written(event)?;
+            let wire = serde_json::to_value(crate::events::IdentifiedEvent { event_id, event: &event })?;
+            if !self.filter.keeps(&event, &wire) {
+                continue;
+            }
+            match &graph {
+                Some(graph) => rows.extend(weft_core::live_event::spelled::spell_row(wire, graph)),
+                None => rows.push(wire),
+            }
+        }
+        Ok(rows)
+    }
+}
+
+/// How many references one values request may name: an editor asks for
+/// the values one screen shows.
+const MAX_VALUE_REFS: usize = 4096;
+
+/// How deep one reference may nest parts and lists: a loop's gathered list
+/// of parts of rows is three deep, and loops inside loops add one each.
+const MAX_VALUE_REF_DEPTH: usize = 32;
+
+/// Refuse a values request naming more references than
+/// [`MAX_VALUE_REFS`], or one nesting deeper than [`MAX_VALUE_REF_DEPTH`]:
+/// checked before anything walks the references or reads the database.
+fn within_value_limits(refs: &[weft_core::record_ref::ValueRef]) -> Result<(), Refused> {
+    if refs.len() > MAX_VALUE_REFS {
+        return Err((StatusCode::BAD_REQUEST, format!("a values request names {} references; at most {MAX_VALUE_REFS} are read at once", refs.len())));
+    }
+    if let Some(at) = refs.iter().position(|at| at.deeper_than(MAX_VALUE_REF_DEPTH)) {
+        return Err((StatusCode::BAD_REQUEST, format!("reference {at} nests deeper than {MAX_VALUE_REF_DEPTH} parts and lists")));
+    }
+    Ok(())
+}
+
+/// The values some events of run `run_id` name (`POST /runs/{id}/values`),
+/// each read off the record row that keeps it, or said gone when the
+/// run's record no longer exists. A reference may read another run's record
+/// (a seeded run's inherited value is kept in the run it came from), of
+/// the same project only. Only the rows the references name are read.
+pub async fn values(state: &DispatcherState, actor: &Actor, run_id: RunId, refs: Vec<weft_core::record_ref::ValueRef>) -> Result<weft_core::program::ValuesAnswer, Refused> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use weft_core::record_ref::ValueRef;
+    within_value_limits(&refs)?;
+    let owner = authorize(state, actor, run_id).await?;
+    // Every row each run is read at, and whether its birth is.
+    let mut rows: BTreeMap<RunId, BTreeSet<i32>> = BTreeMap::new();
+    let mut births: BTreeSet<RunId> = BTreeSet::new();
+    fn bases(at: &ValueRef, rows: &mut BTreeMap<RunId, BTreeSet<i32>>, births: &mut BTreeSet<RunId>) {
+        match at {
+            ValueRef::Row { run, seq, .. } => {
+                rows.entry(*run).or_default().insert(*seq);
+            }
+            ValueRef::Given { run, .. } => {
+                births.insert(*run);
+            }
+            ValueRef::Part { of, .. } => bases(of, rows, births),
+            ValueRef::List { items } => items.iter().for_each(|item| bases(item, rows, births)),
+            ValueRef::Written { .. } => {}
         }
     }
-    let unspelled = lookup.unpaintable().map(|(_, why)| why.to_string());
-    Ok(RunEvents { total: rows.len(), events, unspelled })
+    refs.iter().for_each(|at| bases(at, &mut rows, &mut births));
+    let runs: BTreeSet<RunId> = rows.keys().copied().chain(births.iter().copied()).collect();
+    // The runs whose record exists: a row missing from one of them is a
+    // reference the record disagrees with, a run erased is gone.
+    let mut existing: BTreeSet<RunId> = [run_id].into();
+    for other in runs.iter().filter(|other| **other != run_id) {
+        // One of another project is never read.
+        match state.runs.run_owner(*other).await.map_err(failed("values: read a run's row"))? {
+            Some(found) if found.project_id != owner.project_id => {
+                return Err((StatusCode::NOT_FOUND, format!("a value names run {other}, which is not of the project run {run_id} is")));
+            }
+            Some(_) => {
+                existing.insert(*other);
+            }
+            None => {}
+        }
+    }
+    // What each row kept, by its place, and what each birth was given.
+    let mut kept: std::collections::HashMap<(RunId, i32, u32), weft_journal::RunEvent> = std::collections::HashMap::new();
+    for (run, seqs) in rows {
+        let seqs: Vec<i32> = seqs.into_iter().collect();
+        let record = state.runs.record_rows(run, &seqs).await.map_err(failed("values: read the record"))?;
+        let decoded = weft_journal::on_blocking_pool(move || record.decode(run)).await.map_err(|why| (StatusCode::INTERNAL_SERVER_ERROR, why))?;
+        kept.extend(decoded.into_iter().map(|row| ((run, row.seq, row.index), row.event)));
+    }
+    let mut born: std::collections::HashMap<RunId, weft_journal::RunEvent> = std::collections::HashMap::new();
+    for run in births {
+        let birth = crate::projection::run_birth(state, run).await.map_err(failed("values: read a run's birth"))?.map_err(|why| (StatusCode::INTERNAL_SERVER_ERROR, why))?;
+        if let Some(birth) = birth {
+            born.insert(run, birth.event);
+        }
+    }
+    Ok(weft_core::program::ValuesAnswer { values: resolved(&refs, &existing, &kept, &born) })
+}
+
+/// What each of `refs` reads, given the runs whose record exists
+/// (`existing`), the events the record rows they name keep (`kept`, by run
+/// and place) and the births of the runs they name a given value of
+/// (`born`). A run whose record is not there is gone; a row or a birth
+/// missing from a record that is there is a reference the record disagrees
+/// with. Pure, so how a reference reads is pinned without a database.
+fn resolved(
+    refs: &[weft_core::record_ref::ValueRef],
+    existing: &std::collections::BTreeSet<RunId>,
+    kept: &std::collections::HashMap<(RunId, i32, u32), weft_journal::RunEvent>,
+    born: &std::collections::HashMap<RunId, weft_journal::RunEvent>,
+) -> Vec<weft_core::program::KeptValue> {
+    use weft_core::program::KeptValue;
+    use weft_core::record_ref::{Unresolved, ValueRef};
+    // `None` only for a run whose record is gone; a run that exists and
+    // misses what the reference names is broken.
+    let missing = |run: &RunId, what: String| -> Result<Option<std::sync::Arc<serde_json::Value>>, Unresolved> {
+        if existing.contains(run) { Err(Unresolved::Broken(what)) } else { Ok(None) }
+    };
+    let mut read = |at: &ValueRef| -> Result<Option<std::sync::Arc<serde_json::Value>>, Unresolved> {
+        match at {
+            ValueRef::Row { run, seq, index } => match kept.get(&(*run, *seq, *index)) {
+                None => missing(run, format!("run {run}'s record has no event at {seq}:{index}")),
+                Some(event) => Ok(Some(event.value_kept().ok_or_else(|| Unresolved::Broken(format!("the event at {seq}:{index} of run {run} keeps no value")))?)),
+            },
+            ValueRef::Given { run, place, port, side } => match born.get(run) {
+                None => missing(run, format!("run {run}'s record has no birth")),
+                Some(birth) => Ok(Some(birth.given_value(place, port, *side).ok_or_else(|| Unresolved::Broken(format!("run {run} was given nothing at {place}'s '{port}'")))?)),
+            },
+            other => Err(Unresolved::Broken(format!("{other:?} is read through what it is made of"))),
+        }
+    };
+    refs.iter()
+        .map(|at| match at.resolve(&mut read) {
+            Ok(value) => KeptValue::Value { value: std::sync::Arc::unwrap_or_clone(value) },
+            Err(gone @ Unresolved::Gone(_)) => KeptValue::Gone { gone: format!("{gone}: its keep time ran out, or it was cleaned") },
+            // A part the value does not have (a reference the editor took
+            // off another, a key the wire found absent), or a record and a
+            // reference that disagree: said for this value alone.
+            Err(Unresolved::Broken(broken)) => KeptValue::Broken { broken },
+        })
+        .collect()
 }
 
 /// What `spelled` names in the program `run_id` was started on
@@ -734,77 +1041,15 @@ pub async fn delete(state: &DispatcherState, actor: &Actor, run_id: RunId) -> Re
     Ok(DeletedRun { project: project_id, swept })
 }
 
-/// Cost records of the project's runs, filtered: the `CostReported`
-/// events of the records of the runs the filter can reach (its run, its
-/// instance, and the runs still going or ended since its `since`). The
-/// run's instance is its run row's, born with the run and never changed.
+/// Cost records of the project's runs, filtered: the rows of `run_cost`
+/// (one per cost a run's record reports) the filter reaches, in the order
+/// the runs started and each run's record's, every filter in the query
+/// (`weft_journal::costs::list`). A cost's instance is its run's, born
+/// with the run and never changed.
 pub async fn costs(state: &DispatcherState, actor: &Actor, project_id: uuid::Uuid, filter: &CostFilter) -> Result<Vec<CostRecord>, Refused> {
     actor.may_act_on(state, project_id).await?;
-    let runs: Vec<(RunId, Option<String>)> = state
-        .pg_pool
-        .all(
-            "SELECT run_id, instance_id FROM run \
-             WHERE project_id = $1 \
-               AND ($2::text IS NULL OR instance_id = $2) \
-               AND ($3::uuid IS NULL OR run_id = $3) \
-               AND ($4::bigint IS NULL OR ended_at IS NULL OR ended_at >= $4) \
-             ORDER BY started_at, run_id",
-            &[&project_id, &filter.instance.as_ref().map(|m| m.as_str()), &filter.run, &filter.since_unix.map(|s| s as i64)],
-        )
-        .await
-        .map_err(failed("costs"))?;
     let project = state.projects.project(project_id).await.map_err(failed("project"))?;
-    let mut out = Vec::new();
-    let mut reported = Vec::new();
-    for (run_id, instance) in runs {
-        let record = {
-            let conn = state.pg_pool.get().await.map_err(failed("costs"))?;
-            weft_journal::record::read_record(&conn, run_id, None).await.map_err(failed("cost record"))?
-        };
-        // The run row keeps only the run's total, so the figures are
-        // read off the record, decoded off the call threads, keeping
-        // only its costs.
-        let costs = weft_journal::on_blocking_pool(move || {
-            record.events(run_id).map(|events| {
-                events.into_iter().filter(|event| matches!(event, weft_journal::RunEvent::CostReported { .. })).collect::<Vec<_>>()
-            })
-        })
-        .await
-        .map_err(failed("cost record"))?;
-        reported.push(costs.into_iter().map(move |event| (run_id, event, instance.clone())));
-    }
-    for (run_id, event, instance) in reported.into_iter().flatten() {
-        let weft_journal::RunEvent::CostReported { node_id, frames, service, model, amount_usd, origin, at_unix, .. } = event else {
-            continue;
-        };
-        if filter.since_unix.is_some_and(|since| at_unix < since) {
-            continue;
-        }
-        let node = match &project {
-            Some(project) => {
-                let call_path: Vec<String> = weft_core::frames::call_path(&frames).into_iter().map(str::to_string).collect();
-                weft_core::project::address_of(project, &node_id, &call_path)
-            }
-            None => node_id,
-        };
-        if filter.node.as_deref().is_some_and(|n| n != node) || filter.service.as_deref().is_some_and(|s| s != service) {
-            continue;
-        }
-        if filter.paid_by.as_ref().is_some_and(|paid_by| !paid_by.covers(&origin)) {
-            continue;
-        }
-        out.push(CostRecord {
-            run: run_id,
-            instance: instance.map(InstanceId::new).transpose().map_err(failed("cost row instance"))?,
-            node,
-            service,
-            model,
-            amount_usd,
-            paid_by: origin,
-            at_unix,
-        });
-    }
-    Ok(out)
+    weft_journal::costs::list(&state.pg_pool, project_id, project.as_ref(), filter).await.map_err(failed("costs"))
 }
 
 // ----- a program's calls on runs ------------------------------------------
@@ -844,7 +1089,7 @@ pub(crate) async fn program_call(
             super::answered(&serde_json::Value::Null)
         }
         RunCall::Logs { run, request } => super::answered(&logs(state, actor, *run, request).await?),
-        RunCall::Events { run, request } => super::answered(&events(state, actor, *run, request.clone()).await?),
+        RunCall::Events { run, request } => super::answered(&events_answered(state, actor, *run, request.clone()).await?),
         RunCall::Outputs { run, request } => super::answered(&outputs(state, actor, *run, request).await?),
         RunCall::Detail { run } => super::answered(&detail(state, actor, *run).await?),
         RunCall::Resolve { prefix } => super::answered(&resolve(state, actor, prefix).await?),
@@ -1077,10 +1322,10 @@ mod events_tests {
 
     /// What the run recorded, under the program it ran (`moved` false): its
     /// start, and `insights` completing under the site `setup`.
-    fn rows() -> Vec<LiveEvent> {
+    fn rows() -> Vec<weft_core::live_event::ShownEvent> {
         let project_id = uuid::Uuid::nil();
         [
-            DispatcherEvent::RunCompleted { run_id: RUN, project_id, outputs: serde_json::Value::Null, at_unix: 1 },
+            DispatcherEvent::<serde_json::Value>::RunCompleted { run_id: RUN, project_id, outputs: None, at_unix: 1 },
             serde_json::from_value(serde_json::json!({
                 "kind": "node_completed", "runId": RUN, "projectId": project_id, "node": "@src:setup.stages.insights",
                 "frames": [{"site": "setup"}], "output": {"text": "hi"}, "atUnix": 1
@@ -1088,8 +1333,16 @@ mod events_tests {
             .unwrap(),
         ]
         .into_iter()
+        .map(|event| event.map_values(&mut |value| weft_core::record_ref::Shown::of(None, &std::sync::Arc::new(value))))
         .map(crate::events::IdentifiedEvent::transient)
         .collect()
+    }
+
+    /// The answer [`events`] writes for `rows`, collected.
+    fn events_answer(run_id: RunId, lookup: &ProgramLookup, rows: Vec<weft_core::live_event::ShownEvent>, request: EventsRequest) -> Result<RunEvents, Refused> {
+        let mut writer = EventsWriter::new(run_id, lookup, request)?;
+        let events = writer.rows(rows).map_err(failed("events"))?;
+        Ok(RunEvents { total: writer.total, events, unspelled: writer.unspelled })
     }
 
     fn by_node(node: &str) -> EventsRequest {
@@ -1102,19 +1355,19 @@ mod events_tests {
     #[test]
     fn a_node_moved_since_is_found_by_its_old_name_on_the_old_run() {
         let ran = ProgramLookup::Found(program(false));
-        let answer = events_answer(RUN, &ran, &rows(), by_node("setup.stages.insights")).unwrap();
+        let answer = events_answer(RUN, &ran, rows(), by_node("setup.stages.insights")).unwrap();
         assert_eq!(answer.total, 2);
         assert_eq!(answer.events.len(), 1, "{:?}", answer.events);
         assert_eq!(answer.events[0]["node"], "setup.stages.insights");
         // The name it has now is no name of that run's program, and the
         // refusal says whose program it was read against.
-        let (status, why) = events_answer(RUN, &ran, &rows(), by_node("setup.stages.brains.insights")).unwrap_err();
+        let (status, why) = events_answer(RUN, &ran, rows(), by_node("setup.stages.brains.insights")).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(why.contains(&format!("the program run {RUN} ran")) && why.contains("unknown node"), "{why}");
         // Read against the program as it is now, the old name is what
         // misses: the reading this action never does.
         let now = ProgramLookup::Found(program(true));
-        assert!(events_answer(RUN, &now, &rows(), by_node("setup.stages.insights")).is_err());
+        assert!(events_answer(RUN, &now, rows(), by_node("setup.stages.insights")).is_err());
     }
 
     /// A program that cannot be read leaves the rows by id, saying why, and
@@ -1122,11 +1375,11 @@ mod events_tests {
     #[test]
     fn an_unreadable_program_shows_ids_and_refuses_a_node_filter() {
         let gone = ProgramLookup::ProgramGone("the code this run ran is no longer recorded".into());
-        let all = events_answer(RUN, &gone, &rows(), EventsRequest::default()).unwrap();
+        let all = events_answer(RUN, &gone, rows(), EventsRequest::default()).unwrap();
         assert_eq!(all.events.len(), 2);
         assert_eq!(all.events[1]["node"], "@src:setup.stages.insights");
         assert!(all.unspelled.as_deref().is_some_and(|why| why.contains("no longer recorded")));
-        let (status, _) = events_answer(RUN, &gone, &rows(), by_node("setup.stages.insights")).unwrap_err();
+        let (status, _) = events_answer(RUN, &gone, rows(), by_node("setup.stages.insights")).unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
     }
 
@@ -1137,10 +1390,122 @@ mod events_tests {
     fn an_iteration_needs_a_node_in_a_loop() {
         let ran = ProgramLookup::Found(program(false));
         let anywhere = EventsRequest { iteration: Some("3".into()), ..EventsRequest::default() };
-        let (status, why) = events_answer(RUN, &ran, &rows(), anywhere).unwrap_err();
+        let (status, why) = events_answer(RUN, &ran, rows(), anywhere).unwrap_err();
         assert!(status == StatusCode::BAD_REQUEST && why.contains("needs --node"), "{why}");
         let outside = EventsRequest { iteration: Some("3".into()), ..by_node("setup.stages.insights") };
-        let (status, why) = events_answer(RUN, &ran, &rows(), outside).unwrap_err();
+        let (status, why) = events_answer(RUN, &ran, rows(), outside).unwrap_err();
         assert!(status == StatusCode::BAD_REQUEST && why.contains("is in no loop"), "{why}");
+    }
+}
+
+#[cfg(test)]
+mod streamed_tests {
+    use super::*;
+    use std::sync::Arc;
+    use weft_core::live_event::{IdentifiedEvent, ShownEvent};
+    use weft_core::record_ref::{Position, Shown, ValueRef};
+
+    const RUN: RunId = RunId::from_u128(0x77);
+
+    fn started(seq: i32, value: serde_json::Value) -> ShownEvent {
+        let kept = Arc::new(ValueRef::Row { run: RUN, seq: seq - 1, index: 0 });
+        let event = DispatcherEvent::NodeStarted {
+            run_id: RUN, node: "n".into(), frames: vec![],
+            input: [("in".to_string(), Shown::of(Some(&kept), &Arc::new(value)))].into(),
+            closed_ports: vec![], provided_ports: vec![], inherited_ports: Default::default(), inherited_from: None,
+            project_id: uuid::Uuid::nil(), at_unix: 1,
+        };
+        IdentifiedEvent::projected(Position { seq, index: 0 }, [event]).next().unwrap()
+    }
+
+    /// An array written a chunk at a time is, byte for byte, the array
+    /// written whole, by reference and with the values written in alike.
+    #[test]
+    fn an_array_written_in_chunks_is_the_array_written_whole() {
+        let events = vec![started(1, serde_json::json!("a")), started(2, serde_json::json!({ "big": [1, 2, 3] })), started(3, serde_json::Value::Null)];
+        for values in [Values::ByReference, Values::Written] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let mut array = JsonArray { tx, values, started: false };
+            let mut body = Vec::new();
+            for event in events.clone() {
+                body.extend(array.chunk(event).unwrap());
+            }
+            body.extend(array.end());
+            let whole = match values {
+                Values::ByReference => serde_json::to_vec(&events.iter().cloned().map(|e| IdentifiedEvent { event_id: e.event_id, event: e.event.by_reference() }).collect::<Vec<_>>()).unwrap(),
+                Values::Written => serde_json::to_vec(&events.iter().cloned().map(|e| IdentifiedEvent { event_id: e.event_id, event: written(e.event).unwrap() }).collect::<Vec<_>>()).unwrap(),
+            };
+            assert_eq!(String::from_utf8(body).unwrap(), String::from_utf8(whole).unwrap(), "{values:?}");
+        }
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let empty = JsonArray { tx, values: Values::ByReference, started: false };
+        assert_eq!(&empty.end()[..], b"[]");
+    }
+
+    /// The values a run's events name read back off the rows that keep
+    /// them, parts read off them, lists made of them; a row the record no
+    /// longer holds, or a part a value does not have, said for that value
+    /// alone.
+    #[test]
+    fn references_read_back_off_the_rows_that_keep_them() {
+        use weft_core::program::KeptValue;
+        let emitted = weft_journal::RunEvent::PortEmitted {
+            run_id: RUN, emission_id: uuid::Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(),
+            value: Arc::new(serde_json::json!({ "text": "hi", "items": [1, 2] })), at_unix: 1,
+        };
+        let kept = [((RUN, 3, 0), emitted)].into();
+        let born = Default::default();
+        let row = ValueRef::Row { run: RUN, seq: 3, index: 0 };
+        let refs = vec![
+            row.clone(),
+            row.clone().part(vec![weft_core::record_ref::Step::Key("items".into()), weft_core::record_ref::Step::Item(1)]),
+            ValueRef::List { items: vec![row.clone().part(vec![weft_core::record_ref::Step::Key("text".into())]), ValueRef::Written { value: Arc::new(serde_json::json!(0)) }] },
+            ValueRef::Row { run: RUN, seq: 9, index: 0 },
+            row.part(vec![weft_core::record_ref::Step::Key("nope".into())]),
+        ];
+        let existing = [RUN].into();
+        let answer = resolved(&refs, &existing, &kept, &born);
+        assert_eq!(answer[0], KeptValue::Value { value: serde_json::json!({ "text": "hi", "items": [1, 2] }) });
+        assert_eq!(answer[1], KeptValue::Value { value: serde_json::json!(2) });
+        assert_eq!(answer[2], KeptValue::Value { value: serde_json::json!(["hi", 0]) });
+        assert!(matches!(&answer[3], KeptValue::Broken { broken } if broken.contains("no event at 9:0")), "a row missing from a record that exists: {:?}", answer[3]);
+        assert!(matches!(&answer[4], KeptValue::Broken { broken } if broken.contains("no key 'nope'")), "{:?}", answer[4]);
+        assert_eq!(serde_json::to_value(&answer[4]).unwrap()["broken"].as_str().map(|_| ()), Some(()), "a broken value says why under `broken`");
+    }
+
+    /// Only a run whose record is gone reads as gone, a row of it or its
+    /// birth alike; the same references into a run that exists are broken.
+    #[test]
+    fn only_an_erased_run_reads_as_gone() {
+        use weft_core::program::KeptValue;
+        let erased = uuid::Uuid::from_u128(0xe);
+        let refs = vec![
+            ValueRef::Row { run: erased, seq: 1, index: 0 },
+            ValueRef::Given { run: erased, place: weft_core::frames::Located::top("src"), port: "out".into(), side: weft_core::record_ref::GivenSide::Output },
+            ValueRef::Given { run: RUN, place: weft_core::frames::Located::top("src"), port: "out".into(), side: weft_core::record_ref::GivenSide::Output },
+        ];
+        let answer = resolved(&refs, &[RUN].into(), &Default::default(), &Default::default());
+        for gone in &answer[..2] {
+            assert!(matches!(gone, KeptValue::Gone { gone } if gone.contains("no longer holds") && gone.contains("cleaned")), "{gone:?}");
+        }
+        assert!(matches!(&answer[2], KeptValue::Broken { broken } if broken.contains("has no birth")), "{:?}", answer[2]);
+        assert_eq!(serde_json::to_value(&answer[0]).unwrap()["gone"].as_str().map(|_| ()), Some(()), "a gone value says why under `gone`");
+    }
+
+    /// A request naming more references than the cap, or one nesting
+    /// deeper than the cap, is refused naming the limit; one at the caps
+    /// is read.
+    #[test]
+    fn a_values_request_past_its_limits_is_refused() {
+        let row = ValueRef::Row { run: RUN, seq: 1, index: 0 };
+        assert!(within_value_limits(&vec![row.clone(); MAX_VALUE_REFS]).is_ok());
+        let (status, why) = within_value_limits(&vec![row.clone(); MAX_VALUE_REFS + 1]).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(why.contains(&MAX_VALUE_REFS.to_string()), "{why}");
+        let nested = |depth: usize| (1..depth).fold(row.clone(), |inner, _| ValueRef::List { items: vec![inner] });
+        assert!(within_value_limits(&[nested(MAX_VALUE_REF_DEPTH)]).is_ok());
+        let (status, why) = within_value_limits(&[row.clone(), nested(MAX_VALUE_REF_DEPTH + 1)]).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(why.contains("reference 1") && why.contains(&MAX_VALUE_REF_DEPTH.to_string()), "{why}");
     }
 }

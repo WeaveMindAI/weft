@@ -247,10 +247,7 @@ section of `weft.toml` says how that image is built:
   Dockerfile weft uses instead of its own. It has to keep the `{{...}}`
   placeholders weft's own Dockerfile uses, and if it drops
   `{{install_runtime_system_packages}}`, the cloud refuses every program
-  whose nodes need a program installed. It also has to keep the line
-  `ENV RUSTFLAGS="{{worker_rustflags}}"` before its `cargo build`, as
-  weft's own does: without it the worker does not compile, and the build
-  log names the flag.
+  whose nodes need a program installed.
 - `package_manager`: how your nodes' needs are installed on it (`apt`,
   `dnf`, `apk` or `brew`). weft guesses it from the image's name, so if the
   name does not say Debian, Ubuntu, Alpine, a Red Hat family distro, Python

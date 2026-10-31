@@ -286,6 +286,7 @@ async fn follow_version(
 /// itself when anything else answered, the install's own 500 or 502
 /// included: that one does not lift by waiting (its database refusing for
 /// good, its storage down), and looking again on it would follow forever.
+// SYNC: look_again_after <-> extension-vscode/src/dispatcher.ts (worthTryingAgain)
 pub(crate) fn look_again_after(e: anyhow::Error) -> Result<String> {
     use reqwest::StatusCode;
     let busy = crate::client::refusal(&e).is_some_and(|refused| {

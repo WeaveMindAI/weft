@@ -1152,9 +1152,9 @@ install_binary() { # src dest
   }
 }
 
-# cargo, run from the checkout: cargo reads its config (the checkout's
-# .cargo/config.toml, which weft-runtime refuses to build without) from
-# the folder it runs in, never from where --manifest-path points.
+# cargo, run from the checkout: rustup picks the toolchain (the
+# checkout's rust-toolchain.toml) from the folder cargo runs in, never
+# from where --manifest-path points.
 cargo_in_checkout() {
   (cd "${here}" && cargo "$@")
 }

@@ -37,14 +37,15 @@
 //! `LoopStreamEnded`, `LoopTerminated`), calling the same functions,
 //! so a resumed worker holds the instance the live one held.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::run::emission::{iteration_launch_emission, loop_termination_emission, PulseEmission};
-use crate::run::postprocess::{postprocess_output, OutputBag};
+use crate::run::postprocess::{postprocess_output_kept, OutputBag};
+use crate::record_ref::{Step, ValueRef};
 use crate::run::ready::{FiringInput, InputBag};
 use crate::frames::{Frame, LoopFrames};
 use crate::generator::{StreamBuffer, StreamEnd};
@@ -220,11 +221,93 @@ impl LoopStreamState {
 }
 
 /// One buffered stream item: the pulse that carried it (absorbed at
-/// launch) plus its value, shared with the pulse.
+/// launch) plus its value, shared with the pulse, and where the run's
+/// record keeps it when the pulse knew (`Pulse::origin`).
 #[derive(Debug, Clone)]
 pub struct LoopStreamItem {
     pub pulse: Uuid,
     pub value: Arc<Value>,
+    pub origin: Option<Arc<ValueRef>>,
+}
+
+/// A set of iteration indices, kept as the runs of consecutive ones: a
+/// loop launches and finishes its iterations mostly in order, so however
+/// many it ran, the set is a run or a few.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Indices {
+    /// The runs, as `(first, last)` both included, in order, never
+    /// touching one another.
+    runs: Vec<(u32, u32)>,
+    len: usize,
+}
+
+impl Indices {
+    /// Add `index`; answers whether it was not there yet.
+    pub fn insert(&mut self, index: u32) -> bool {
+        // The first run that ends at or after `index`, or touches it.
+        let at = self.runs.partition_point(|&(_, last)| last.checked_add(1).is_some_and(|next| next < index));
+        match self.runs.get(at).copied() {
+            Some((first, last)) if first <= index && index <= last => return false,
+            Some((first, last)) if index.checked_add(1) == Some(first) => self.runs[at] = (index, last),
+            Some((first, last)) if last.checked_add(1) == Some(index) => {
+                self.runs[at] = (first, index);
+                // It may now touch the next run.
+                if let Some(&(next_first, next_last)) = self.runs.get(at + 1) {
+                    if index.checked_add(1) == Some(next_first) {
+                        self.runs[at] = (first, next_last);
+                        self.runs.remove(at + 1);
+                    }
+                }
+            }
+            _ => self.runs.insert(at, (index, index)),
+        }
+        self.len += 1;
+        true
+    }
+
+    pub fn contains(&self, index: &u32) -> bool {
+        let at = self.runs.partition_point(|&(_, last)| last < *index);
+        self.runs.get(at).is_some_and(|&(first, _)| first <= *index)
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// How many runs of consecutive indices the set holds.
+    pub fn runs(&self) -> usize {
+        self.runs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The highest index in the set.
+    pub fn last(&self) -> Option<u32> {
+        self.runs.last().map(|&(_, last)| last)
+    }
+
+    /// Every index, in order.
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.runs.iter().flat_map(|&(first, last)| first..=last)
+    }
+}
+
+impl std::fmt::Debug for Indices {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.runs.iter().map(|&(first, last)| first..=last)).finish()
+    }
+}
+
+impl<const N: usize> From<[u32; N]> for Indices {
+    fn from(indices: [u32; N]) -> Self {
+        let mut set = Self::default();
+        for index in indices {
+            set.insert(index);
+        }
+        set
+    }
 }
 
 /// A single live loop. Engine code reads/writes through
@@ -250,12 +333,13 @@ pub struct LoopInstance {
     /// Iterations the engine has launched body work for. A set, so a
     /// launch and a `LoopOut` ask about their own index without walking
     /// every iteration before it.
-    pub launched: BTreeSet<u32>,
+    pub launched: Indices,
     /// Iterations whose `LoopOut` has fired.
-    pub out_fired: BTreeSet<u32>,
+    pub out_fired: Indices,
     /// Per gather-port, the per-index slot. `Closed` means the body
     /// closed that port at that iteration (assembled outward list gets
-    /// `null` there).
+    /// `null` there). Emptied when the loop ends cleanly: the items
+    /// move into the list it hands on ([`LoopRuntime::emit_outward`]).
     pub gather_lists: HashMap<String, BTreeMap<u32, LoopWrite>>,
     /// Current carry-port values. Initial values seeded from outer-in;
     /// updated on each successful LoopOut carry-write.
@@ -272,6 +356,20 @@ pub struct LoopInstance {
     /// a failure, exactly as a node outside any loop would.
     pub outer_closed_failures: BTreeMap<String, Failure>,
     pub terminated: Option<LoopTerminationReason>,
+    /// Where the run's record keeps the values above, for the ones whose
+    /// origin the firings that brought them knew (`FiringInput::origins`):
+    /// what the pulses a launch and the outward emit put on the wires
+    /// carry. Empty on a live engine.
+    pub origins: LoopOrigins,
+}
+
+/// Where the run's record keeps a loop's values ([`LoopInstance::origins`]),
+/// keyed as the values are.
+#[derive(Debug, Clone, Default)]
+pub struct LoopOrigins {
+    pub outer: HashMap<String, Arc<ValueRef>>,
+    pub carry: HashMap<String, Arc<ValueRef>>,
+    pub gather: HashMap<String, BTreeMap<u32, Arc<ValueRef>>>,
 }
 
 impl LoopInstance {
@@ -288,14 +386,49 @@ impl LoopInstance {
             source,
             iter_cap,
             gather_ports,
-            launched: BTreeSet::new(),
-            out_fired: BTreeSet::new(),
+            launched: Indices::default(),
+            out_fired: Indices::default(),
             gather_lists: HashMap::new(),
             carry_values: HashMap::new(),
             outer_input: HashMap::new(),
             outer_closed_failures: BTreeMap::new(),
             terminated: None,
+            origins: LoopOrigins::default(),
         }
+    }
+
+    /// Drop the values this loop held, once it ended: for a run folded
+    /// to SHOW it, where an ended loop's values were put on the wires
+    /// already and nothing reads them again (a replayed row finds the
+    /// loop ended and does nothing, `LoopRuntime::terminate`).
+    pub fn shed_values(&mut self) {
+        self.gather_lists.clear();
+        self.carry_values.clear();
+        self.outer_input.clear();
+        self.origins = LoopOrigins::default();
+    }
+
+    /// Where the record keeps what the loop sends out as it ends (see
+    /// [`LoopRuntime::emit_outward`]): a gathered port's list item by item
+    /// when an item's origin is known, a carried port's value.
+    fn outward_origins(&self, count: u32) -> BTreeMap<String, Arc<ValueRef>> {
+        let mut out = BTreeMap::new();
+        for port in &self.gather_ports {
+            let Some(kept) = self.origins.gather.get(port).filter(|kept| !kept.is_empty()) else { continue };
+            let slots = self.gather_lists.get(port);
+            let items = (0..count)
+                .map(|i| match (kept.get(&i), slots.and_then(|m| m.get(&i)).and_then(LoopWrite::as_value)) {
+                    (Some(origin), _) => origin.as_ref().clone(),
+                    (None, Some(value)) => ValueRef::Written { value: value.clone() },
+                    (None, None) => ValueRef::Written { value: Arc::new(Value::Null) },
+                })
+                .collect();
+            out.insert(port.clone(), Arc::new(ValueRef::List { items }));
+        }
+        for (port, origin) in &self.origins.carry {
+            out.insert(port.clone(), origin.clone());
+        }
+        out
     }
 
     /// The next iteration index to launch: one past the highest
@@ -331,6 +464,10 @@ pub enum LoopAdvance {
         reason: LoopTerminationReason,
         gather: HashMap<String, Vec<Option<Arc<Value>>>>,
         carry: HashMap<String, Arc<Value>>,
+        /// Where the record keeps each outward value, when known
+        /// ([`LoopInstance::origins`]): what [`emit_loop_outward`] puts
+        /// on the wires with them.
+        origins: BTreeMap<String, Arc<ValueRef>>,
     },
     /// Nothing to do (this firing did not advance the loop).
     Idle,
@@ -340,6 +477,22 @@ pub enum LoopAdvance {
 #[derive(Debug, Default, Clone)]
 pub struct LoopRuntime {
     instances: HashMap<LoopInstanceKey, LoopInstance>,
+    /// What happened to the loops' iterations since it was last taken
+    /// ([`Self::take_news`]), when someone reads it ([`Self::report`]):
+    /// how a run that forgets finished iterations
+    /// (`crate::run::forget::Forgetting`) learns which to look at.
+    news: Option<Vec<LoopNews>>,
+}
+
+/// One thing that happened to a loop's iterations ([`LoopRuntime::take_news`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopNews {
+    /// Iteration `index` of the loop at `key` was launched.
+    Launched(LoopInstanceKey, u32),
+    /// Iteration `index`'s `LoopOut` fired.
+    OutFired(LoopInstanceKey, u32),
+    /// The loop at `key` ended, every iteration with it.
+    Ended(LoopInstanceKey),
 }
 
 impl LoopRuntime {
@@ -349,6 +502,24 @@ impl LoopRuntime {
 
     pub fn get(&self, key: &LoopInstanceKey) -> Option<&LoopInstance> {
         self.instances.get(key)
+    }
+
+    /// From now on, keep what happens to the loops' iterations until it
+    /// is taken ([`Self::take_news`]).
+    pub fn report(&mut self) {
+        self.news.get_or_insert_with(Vec::new);
+    }
+
+    /// What happened to the loops' iterations since the last take, in
+    /// order; nothing when nobody asked for it ([`Self::report`]).
+    pub fn take_news(&mut self) -> Vec<LoopNews> {
+        self.news.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    fn tell(&mut self, news: LoopNews) {
+        if let Some(told) = &mut self.news {
+            told.push(news);
+        }
     }
 
     pub fn get_mut(&mut self, key: &LoopInstanceKey) -> Option<&mut LoopInstance> {
@@ -394,14 +565,20 @@ impl LoopRuntime {
 
     /// Iterate every live instance. Used by the cancel path to walk
     /// every loop's outward port and emit closures.
+    /// Drop every instance `gone` picks: a reader that only shows the run
+    /// is done with a loop inside an iteration once the iteration is.
+    pub fn forget(&mut self, mut gone: impl FnMut(&LoopInstanceKey) -> bool) {
+        self.instances.retain(|key, _| !gone(key));
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&LoopInstanceKey, &LoopInstance)> {
         self.instances.iter()
     }
 
     /// Record an iteration launch.
     pub fn record_launched(&mut self, key: &LoopInstanceKey, index: u32) {
-        if let Some(inst) = self.instances.get_mut(key) {
-            inst.launched.insert(index);
+        if self.instances.get_mut(key).is_some_and(|inst| inst.launched.insert(index)) {
+            self.tell(LoopNews::Launched(key.clone(), index));
         }
     }
 
@@ -441,12 +618,16 @@ impl LoopRuntime {
     /// - `carry_writes`: `Value(v)` updates the carry; `Closed` keeps
     ///   the previous value (a failed closure fails the loop, which
     ///   [`Self::record_loop_out`] decides; the value is kept here).
+    ///
+    /// `origins`, by port, says where the record keeps a written value
+    /// ([`LoopOutWrites::origins`]); a live engine knows none.
     pub fn apply_loop_out_writes(
         &mut self,
         key: &LoopInstanceKey,
         index: u32,
         gather_writes: HashMap<String, LoopWrite>,
         carry_writes: HashMap<String, LoopWrite>,
+        origins: HashMap<String, Arc<ValueRef>>,
     ) -> Result<bool, String> {
         let inst = self.instances.get_mut(key).ok_or_else(|| {
             format!(
@@ -460,13 +641,23 @@ impl LoopRuntime {
         }
         inst.out_fired.insert(index);
         for (port, slot) in gather_writes {
+            if let Some(origin) = origins.get(&port).filter(|_| slot.as_value().is_some()) {
+                inst.origins.gather.entry(port.clone()).or_default().insert(index, origin.clone());
+            }
             inst.gather_lists.entry(port).or_default().insert(index, slot);
         }
         for (port, slot) in carry_writes {
             if let LoopWrite::Value(v) = slot {
+                // A carry whose new value's origin is not known has none,
+                // never the previous value's.
+                match origins.get(&port) {
+                    Some(origin) => inst.origins.carry.insert(port.clone(), origin.clone()),
+                    None => inst.origins.carry.remove(&port),
+                };
                 inst.carry_values.insert(port, v);
             }
         }
+        self.tell(LoopNews::OutFired(key.clone(), index));
         Ok(true)
     }
 
@@ -501,7 +692,9 @@ impl LoopRuntime {
             .iter()
             .filter_map(|(port, write)| write.failure().map(|failure| (port.clone(), failure.clone())))
             .min_by(|(a, _), (b, _)| a.cmp(b));
-        self.apply_loop_out_writes(key, index, gather_writes, carry_writes)?;
+        // The live engine writes the record rather than reading it, so it
+        // knows no value's origin.
+        self.apply_loop_out_writes(key, index, gather_writes, carry_writes, HashMap::new())?;
         let inst = self.instances.get_mut(key).expect("checked by apply_loop_out_writes");
         // A LoopOut firing arriving after termination (cancellation, a
         // peer iteration that already raced to done, an out-of-band
@@ -571,9 +764,11 @@ impl LoopRuntime {
                     return Ok(LoopAdvance::Idle);
                 }
                 if let Some((pulse, value)) = st.buf.pop() {
+                    // Buffered by the live engine only (the fold launches
+                    // each item off its pulse), which knows no origin.
                     return Ok(LoopAdvance::LaunchNext {
                         index: next,
-                        stream_item: Some(LoopStreamItem { pulse, value }),
+                        stream_item: Some(LoopStreamItem { pulse, value, origin: None }),
                     });
                 }
                 let end = st.buf.end().cloned();
@@ -852,21 +1047,26 @@ impl LoopRuntime {
         // contiguous launched (partial launch failure) still produces
         // a list whose indices align with the journal.
         let count = inst.next_index();
+        let origins = inst.outward_origins(count);
+        // The loop ended, and nothing reads what it gathered again: the
+        // items leave it for the list it hands on, so the list can take
+        // each item instead of copying it ([`emit_loop_outward`]).
+        let mut gathered = std::mem::take(&mut inst.gather_lists);
         let mut gather: HashMap<String, Vec<Option<Arc<Value>>>> = HashMap::new();
         // Walk every DECLARED gather port (not just keys present in
         // `gather_lists`). A port no iteration touched produces a
         // list of `None`s of length `count`; downstream sees a real
         // list and not a missing-pulse deadlock.
         for port in &inst.gather_ports {
-            let slots = inst.gather_lists.get(port);
-            let mut out_list = Vec::with_capacity(count as usize);
-            for i in 0..count {
-                out_list.push(slots.and_then(|m| m.get(&i)).and_then(|w| w.as_value().cloned()));
-            }
+            let mut slots = gathered.remove(port).unwrap_or_default();
+            let out_list = (0..count).map(|i| match slots.remove(&i) {
+                Some(LoopWrite::Value(value)) => Some(value),
+                Some(LoopWrite::Closed { .. }) | None => None,
+            }).collect();
             gather.insert(port.clone(), out_list);
         }
         let carry = inst.carry_values.clone();
-        Ok(LoopAdvance::EmitOutward { reason, gather, carry })
+        Ok(LoopAdvance::EmitOutward { reason, gather, carry, origins })
     }
 
     /// Mark the instance at `key` terminated with `reason`. `false`
@@ -888,6 +1088,7 @@ impl LoopRuntime {
             return Ok(false);
         }
         inst.terminated = Some(reason);
+        self.tell(LoopNews::Ended(key.clone()));
         Ok(true)
     }
 
@@ -915,6 +1116,9 @@ impl LoopRuntime {
                 inst.terminated = Some(LoopTerminationReason::Cancelled);
                 cancelled.push(inst.key.clone());
             }
+        }
+        for key in &cancelled {
+            self.tell(LoopNews::Ended(key.clone()));
         }
         cancelled
     }
@@ -1164,6 +1368,18 @@ pub fn instantiate(
         loop_runtime.ensure(key.clone(), config.clone(), source, iter_cap, gather_ports);
     if first_instantiation {
         let inst = loop_runtime.get_mut(&key).expect("just ensured");
+        // A value's origin rides with it while the value is the one the
+        // origin names: a carry seeded from its type's zero has none.
+        for port in input.keys() {
+            if let Some(origin) = received.origins.get(port) {
+                inst.origins.outer.insert(port.clone(), origin.clone());
+            }
+        }
+        for (port, v) in &seed_carry {
+            if let Some(origin) = received.origins.get(port).filter(|_| input.get(port).is_some_and(|given| Arc::ptr_eq(given, v))) {
+                inst.origins.carry.insert(port.clone(), origin.clone());
+            }
+        }
         inst.outer_input = input.into_iter().collect();
         inst.outer_closed_failures = received.closed_failures.clone();
         for (port, v) in seed_carry {
@@ -1212,6 +1428,9 @@ pub fn launch_iteration(
     })?;
     let body_frames = iteration_frames(&key.parent_frames, index);
     let mut output: OutputBag = OutputBag::new();
+    // Where the record keeps each value the iteration gets, when known
+    // (`LoopInstance::origins`); the index is kept nowhere.
+    let mut kept: BTreeMap<String, Arc<ValueRef>> = BTreeMap::new();
     if let Some(item) = &stream_item {
         let LoopItemSource::Stream(st) = &inst.source else {
             return Err(format!(
@@ -1219,6 +1438,9 @@ pub fn launch_iteration(
             ));
         };
         output.insert(st.port.clone(), item.value.clone());
+        if let Some(origin) = &item.origin {
+            kept.insert(st.port.clone(), origin.clone());
+        }
     }
     for (port, value) in &inst.outer_input {
         if inst.config.over.contains(port) {
@@ -1240,9 +1462,15 @@ pub fn launch_iteration(
                 )
             })?;
             output.insert(port.clone(), Arc::new(elem));
+            if let Some(origin) = inst.origins.outer.get(port) {
+                kept.insert(port.clone(), Arc::new(origin.as_ref().clone().part(vec![Step::Item(u64::from(index))])));
+            }
         } else if !inst.config.carry.contains(port) {
             // Broadcast input: the same shared value every iteration.
             output.insert(port.clone(), value.clone());
+            if let Some(origin) = inst.origins.outer.get(port) {
+                kept.insert(port.clone(), origin.clone());
+            }
         }
     }
     // Carry values: read current carry on the inside-out side per
@@ -1250,6 +1478,10 @@ pub fn launch_iteration(
     // runtime; what reaches here is always a real value.
     for (port, value) in &inst.carry_values {
         output.insert(port.clone(), value.clone());
+        match inst.origins.carry.get(port) {
+            Some(origin) => kept.insert(port.clone(), origin.clone()),
+            None => kept.remove(port),
+        };
     }
     // Implicit `self.index`.
     output.insert("index".to_string(), Arc::new(serde_json::json!(index)));
@@ -1257,8 +1489,8 @@ pub fn launch_iteration(
     let loop_in_id = crate::project::loop_in_id(group_id);
     let emission_id = iteration_launch_emission(group_id, &key.parent_frames, index);
     let mut emissions = Vec::new();
-    let mentioned = postprocess_output(
-        &loop_in_id, &output, emission_id, key.run_id, &body_frames, project, pulses, program_idx,
+    let mentioned = postprocess_output_kept(
+        &loop_in_id, &output, &kept, emission_id, key.run_id, &body_frames, project, pulses, program_idx,
         &mut emissions,
     )
     .map_err(|e| e.to_string())?;
@@ -1291,6 +1523,9 @@ pub struct LoopOutWrites {
     pub gather_writes: HashMap<String, LoopWrite>,
     pub carry_writes: HashMap<String, LoopWrite>,
     pub done_vote: Option<bool>,
+    /// Where the record keeps each written value, when the firing knew
+    /// (`FiringInput::origins`).
+    pub origins: HashMap<String, Arc<ValueRef>>,
 }
 
 /// Classify a `LoopOut` firing's bag into its writes. THE one reading
@@ -1374,7 +1609,10 @@ pub fn classify_loop_out(
             node_def.id,
         ));
     }
-    Ok(LoopOutWrites { gather_writes, carry_writes, done_vote })
+    let origins = gather_writes.keys().chain(carry_writes.keys())
+        .filter_map(|port| received.origins.get(port).map(|origin| (port.clone(), origin.clone())))
+        .collect();
+    Ok(LoopOutWrites { gather_writes, carry_writes, done_vote, origins })
 }
 
 /// Put a terminated loop's outward payload on the wires: the assembled
@@ -1382,10 +1620,14 @@ pub fn classify_loop_out(
 /// the parent frame stack. Nothing partial ships on failure
 /// (postprocess pre-validates before touching state); the caller then
 /// closes the outward surface instead ([`close_loop_outward`]).
+///
+/// `kept` says where the record keeps each outward value, when known
+/// (`LoopAdvance::EmitOutward::origins`).
 pub fn emit_loop_outward(
     key: &LoopInstanceKey,
     gather: HashMap<String, Vec<Option<Arc<Value>>>>,
     carry: HashMap<String, Arc<Value>>,
+    kept: &BTreeMap<String, Arc<ValueRef>>,
     project: &ProjectDefinition,
     program_idx: &ProgramIndex,
     pulses: &mut PulseTable,
@@ -1394,10 +1636,11 @@ pub fn emit_loop_outward(
     let mut output = OutputBag::new();
     for (port, slots) in gather {
         // The assembled list is a new value: one element per
-        // iteration, a null where the iteration closed the port.
+        // iteration, a null where the iteration closed the port. An item
+        // nothing else holds any more moves into it.
         let arr: Vec<Value> = slots
             .into_iter()
-            .map(|v| v.map(|v| (*v).clone()).unwrap_or(Value::Null))
+            .map(|v| v.map(Arc::unwrap_or_clone).unwrap_or(Value::Null))
             .collect();
         output.insert(port, Arc::new(Value::Array(arr)));
     }
@@ -1405,9 +1648,10 @@ pub fn emit_loop_outward(
         output.insert(port, v);
     }
     let mut emissions = Vec::new();
-    postprocess_output(
+    postprocess_output_kept(
         &loop_out_id,
         &output,
+        kept,
         loop_termination_emission(&key.group_id, &key.parent_frames),
         key.run_id,
         &key.parent_frames,
@@ -1471,6 +1715,42 @@ fn loop_address(project: &ProjectDefinition, key: &LoopInstanceKey) -> String {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// The set answers what a set of every index would, whatever order
+    /// the indices come in, and keeps runs: a loop's iterations in order
+    /// are one run however many there are.
+    #[test]
+    fn indices_answer_as_a_set_and_keep_runs() {
+        let mut set = Indices::default();
+        let mut plain = std::collections::BTreeSet::new();
+        // A fixed scramble of 0..300 with repeats, and the extremes.
+        let mut next = 7u64;
+        for _ in 0..2_000 {
+            next = next.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let index = ((next >> 33) % 300) as u32;
+            assert_eq!(set.insert(index), plain.insert(index), "{index}");
+        }
+        for index in [u32::MAX, 0, u32::MAX - 1] {
+            assert_eq!(set.insert(index), plain.insert(index), "{index}");
+        }
+        assert_eq!(set.iter().collect::<Vec<_>>(), plain.iter().copied().collect::<Vec<_>>());
+        assert_eq!(set.len(), plain.len());
+        assert_eq!(set.last(), plain.last().copied());
+        for index in 0..320 {
+            assert_eq!(set.contains(&index), plain.contains(&index), "{index}");
+        }
+
+        let mut in_order = Indices::default();
+        for index in 0..100_000 {
+            in_order.insert(index);
+        }
+        assert_eq!((in_order.runs.len(), in_order.len()), (1, 100_000));
+        let mut gaps = Indices::from([1, 3, 5]);
+        assert_eq!(gaps.runs.len(), 3);
+        gaps.insert(2);
+        gaps.insert(4);
+        assert_eq!(gaps.runs, vec![(1, 5)], "filling the gaps joins the runs");
+    }
 
     fn key() -> LoopInstanceKey {
         LoopInstanceKey {
@@ -1596,8 +1876,8 @@ mod tests {
         assert!(err.contains("'history'"), "{err}");
         assert!(err.contains("because 'ask' failed: the model answered 500"), "names the node that broke: {err}");
         let inst = rt.get(&k).expect("instance");
-        assert_eq!(inst.out_fired, std::collections::BTreeSet::from([0, 1]), "the firing is recorded");
-        assert_eq!(inst.launched, std::collections::BTreeSet::from([0, 1]), "no next iteration launched");
+        assert_eq!(inst.out_fired, Indices::from([0, 1]), "the firing is recorded");
+        assert_eq!(inst.launched, Indices::from([0, 1]), "no next iteration launched");
         assert_eq!(*inst.carry_values["history"], serde_json::json!(["hi"]));
         // A crash-resume replay of the same firing decides the same way.
         assert!(rt.record_loop_out(&loop_project(), &k, 1, HashMap::new(), carry, Some(false)).is_err());
@@ -1782,7 +2062,7 @@ mod tests {
     }
 
     fn item(v: i64) -> LoopStreamItem {
-        LoopStreamItem { pulse: Uuid::new_v4(), value: Arc::new(serde_json::json!(v)) }
+        LoopStreamItem { pulse: Uuid::new_v4(), value: Arc::new(serde_json::json!(v)), origin: None }
     }
 
     #[test]
@@ -2168,7 +2448,7 @@ mod tests {
         assert_eq!(value("item"), Some(serde_json::json!(20)), "the over slice at the index");
         assert_eq!(value("acc"), Some(serde_json::json!(5)), "the current carry");
         assert!(add.iter().all(|p| p.frames == launch.body_frames));
-        assert_eq!(rt.get(&firing.key).unwrap().launched, std::collections::BTreeSet::from([1]));
+        assert_eq!(rt.get(&firing.key).unwrap().launched, Indices::from([1]));
         // The same launch replayed puts nothing new on the wires.
         let before = pulses["add"].len();
         launch_iteration(&mut rt, &firing.key, 1, None, &project, &program_idx, &mut pulses, &mut scopes, &mut kicked, 4).unwrap();
@@ -2212,7 +2492,7 @@ mod tests {
         gather.insert("res".to_string(), vec![Some(Arc::new(serde_json::json!(1))), None]);
         let mut carry = HashMap::new();
         carry.insert("acc".to_string(), Arc::new(serde_json::json!(9)));
-        emit_loop_outward(&k, gather, carry, &project, &program_idx, &mut pulses).unwrap();
+        emit_loop_outward(&k, gather, carry, &BTreeMap::new(), &project, &program_idx, &mut pulses).unwrap();
         let sink = pending_at(&pulses, "sink");
         let value = |port: &str| sink.iter().find(|p| p.target_port == port).map(|p| (*p.value).clone());
         assert_eq!(value("res"), Some(serde_json::json!([1, null])), "a closed slot is a null in the list");

@@ -510,7 +510,9 @@ export interface NodeFiring {
 	callbackId?: string;
 	startedAt: number;
 	completedAt?: number;
-	input?: unknown;
+	/// Each input port's value, by where the run's record keeps it: read
+	/// back when shown (`run-values.svelte.ts`).
+	input?: Record<string, import('../../../protocol').ValueRef>;
 	/// Wired input ports that arrived as CLOSURE markers for this
 	/// firing (the upstream frame stack terminated without firing them).
 	/// Disjoint from the keys of `input`; the inspector renders these
@@ -519,7 +521,8 @@ export interface NodeFiring {
 	closedPorts?: string[];
 	/// Why this firing did not run, on a skipped one.
 	skipReason?: import('../../../protocol').SkipReason;
-	output?: unknown;
+	/// Each output port's value, by where the run's record keeps it.
+	output?: Record<string, import('../../../protocol').ValueRef>;
 	costUsd: number;
 	/// Portion of a container's total belonging to reused member firings.
 	inheritedCostUsd?: number;
@@ -593,7 +596,9 @@ export interface RunState {
 	 *  selects on; shown on the run in the inspector. */
 	tags: string[];
 	terminal?: RunTerminal;
-	nodeOutputs: Record<string, unknown>;
+	/// Each node's last output, by port, by where the run's record keeps
+	/// each value (a debug preview reads it back when shown).
+	nodeOutputs: Record<string, Record<string, import('../../../protocol').ValueRef>>;
 	nodeFirings: NodeFiringTable;
 	/** Full bus log per `busId` (in arrival order). The inspector
 	 *  renders one IRC-style panel per bus a node participates in. */

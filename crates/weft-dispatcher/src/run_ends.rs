@@ -218,10 +218,10 @@ async fn finish_trigger_setup(state: &DispatcherState, ending: &Flagged) -> anyh
     if !state.bakes.is_trigger_setup_pending(run_id).await? {
         return Ok(());
     }
-    let (rows, bad) = state.runs.events_log_lossy(run_id).await?;
-    let read = match bad.into_iter().next() {
-        Some(reason) => Capture::Unreadable(anyhow::Error::msg(reason)),
-        None => {
+    // A trigger setup's record is a few rows, read whole.
+    let read = match state.runs.readable_events(run_id).await? {
+        Err(reason) => Capture::Unreadable(anyhow::Error::msg(reason)),
+        Ok(rows) => {
             let events = rows.into_iter().map(|row| row.event).collect::<Vec<_>>();
             let program = state.run_program_identity(&events).await;
             capture(&events, program)?

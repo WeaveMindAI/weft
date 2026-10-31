@@ -15,9 +15,10 @@
 //!
 //! Statements run through [`Client`], on a [`Pool`], a [`Conn`] taken from
 //! one, a [`Transaction`] or a [`Session`]. Every text value a statement
-//! binds goes without its NUL characters, which Postgres refuses, and a
-//! value that must read back exactly is kept as [`JsonText`] (both in
-//! `text`'s module doc).
+//! binds goes without its NUL characters, which Postgres refuses, a
+//! value that must read back exactly is kept as [`JsonText`], and only a
+//! value that can hold no NUL goes into `JSONB` ([`Json`]) (all
+//! three in `text`'s module doc).
 
 mod client;
 mod session;
@@ -35,8 +36,8 @@ use deadpool_postgres::{Manager, ManagerConfig, PoolError, RecyclingMethod};
 
 pub use client::{Client, FromRow, Transaction};
 pub use session::Session;
-pub use text::JsonText;
-pub use tokio_postgres::types::{FromSql, Json, ToSql};
+pub use text::{Json, JsonText, JsonbSafe, Names, Plain, WeftMade};
+pub use tokio_postgres::types::{FromSql, ToSql};
 pub use tokio_postgres::error::DbError;
 pub use tokio_postgres::{Config, Notification, Row};
 

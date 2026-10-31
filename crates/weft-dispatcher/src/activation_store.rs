@@ -725,7 +725,7 @@ type LifecycleRow = (
     Option<String>,
     Option<i64>,
     Option<uuid::Uuid>,
-    Option<serde_json::Value>,
+    Option<db::Json<serde_json::Value>>,
     weft_core::stored::Version,
     Option<String>,
     Option<String>,
@@ -756,7 +756,7 @@ fn row_to_activation(row: LifecycleRow) -> anyhow::Result<Activation> {
     ) = row;
     let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("trigger_activation.instance_id: {e}"))?;
     let program = program
-        .map(|program| ProgramIdentity::STORED.decode(program, program_version))
+        .map(|program| ProgramIdentity::STORED.decode(program.0, program_version))
         .transpose()
         .map_err(|e| e.at(format_args!("the activation of {trigger}")))?;
     Ok(Activation {

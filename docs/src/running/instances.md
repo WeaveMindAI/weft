@@ -414,6 +414,11 @@ instance, node, service, run, who paid (`paid_by`) or `since` (unix seconds):
 let spent = ctx.costs().instance("user-42").service("openrouter").since(month_start).list().await?;
 ```
 
+A run's costs are deleted with the run, so `ctx.costs()` only sees the runs
+weft still keeps. If you add up a month of spending, as the example above does,
+keep runs for at least a month. For how long runs are kept by default and how to
+change it, go and read [how long a run is kept](the-journal.md#how-long-a-run-is-kept).
+
 ## Taking something down from a run
 
 A program's `stop`, `terminate`, `upgrade` and `deactivate` calls each take a

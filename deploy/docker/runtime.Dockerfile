@@ -30,8 +30,6 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /build
 COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
-# The build's flags (weft-runtime refuses to build without them).
-COPY .cargo ./.cargo
 COPY crates ./crates
 
 # sharing=locked: two builds of this image at once (a second `weft daemon

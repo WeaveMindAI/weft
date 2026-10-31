@@ -182,11 +182,11 @@ impl PostgresInfraReader {
         // not available", which would send the node chasing an endpoint
         // that is really there. Only a name the object does not hold is
         // the legitimate `None`.
-        let endpoints: Value = row.try_get("endpoints_json")?;
+        let endpoints = row.try_get::<_, JsonText<Value>>("endpoints_json")?.0;
         let Some(url) = entry_in(&endpoints, "endpoints_json", endpoint_name)? else {
             return Ok(None);
         };
-        let public_paths: Value = row.try_get("public_paths_json")?;
+        let public_paths = row.try_get::<_, JsonText<Value>>("public_paths_json")?.0;
         let public_path = entry_in(&public_paths, "public_paths_json", endpoint_name)?;
         Ok(Some(StoredEndpoint { url, public_path }))
     }

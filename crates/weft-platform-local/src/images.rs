@@ -907,6 +907,12 @@ mod tests {
         /// fake toolchain runs it, in lane 0) writes the program and
         /// `record`.
         fn request(&self, b: &LocalImageBuilder, hash: &str, record: &[u8]) -> BuildRequest {
+            self.tagged_request(b, hash, record, None)
+        }
+
+        /// [`Self::request`], for a build whose nodes' `[build.env]` has
+        /// the tag `cache_tag`.
+        fn tagged_request(&self, b: &LocalImageBuilder, hash: &str, record: &[u8], cache_tag: Option<&str>) -> BuildRequest {
             let ctx = std::env::temp_dir().join(format!("weft-host-{}", uuid::Uuid::new_v4().simple()));
             let recipe = HostRecipe {
                 crate_dir: ctx.join("crate"),
@@ -915,15 +921,18 @@ mod tests {
                 left_out_record: ctx.join("crate/left-out.json"),
                 seed_lock: ctx.join("seed.lock"),
                 binary_name: "weft-worker".into(),
+                build_env: [("RUSTFLAGS".to_string(), "--cfg from_a_node".to_string())].into(),
+                build_env_set_by: [("RUSTFLAGS".to_string(), ["Native".to_string()].into())].into(),
+                cache_tag: cache_tag.map(str::to_string),
             };
             for dir in [&recipe.crate_dir, &recipe.isolate_dir] {
                 std::fs::create_dir_all(dir).unwrap();
             }
             std::fs::write(&recipe.seed_lock, "# lock").unwrap();
             std::fs::write(ctx.join(HOST_RECIPE_FILE), serde_json::to_vec(&recipe).unwrap()).unwrap();
-            let isolate = self.layout().lane_cache(0).join("release/weft-isolate");
+            let isolate = self.layout().lane_cache(0, cache_tag).join("release/weft-isolate");
             self.toolchain.makes(&isolate, &recipe.left_out_record, record);
-            self.toolchain.makes(&isolate, self.layout().lane_cache(0).join("release/weft-worker"), b"\x7fELF");
+            self.toolchain.makes(&isolate, self.layout().lane_cache(0, cache_tag).join("release/weft-worker"), b"\x7fELF");
             BuildRequest {
                 name: format!("b-{hash}"),
                 project_id: uuid::Uuid::from_u128(1),
@@ -957,19 +966,23 @@ mod tests {
         assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(br#"{"packages":[]}"#.to_vec()) });
         let calls = m.toolchain.calls.lock().clone();
         let programs: Vec<String> = calls.iter().map(|c| c.program.display().to_string()).collect();
-        let target = m.layout().lane_cache(0);
+        let target = m.layout().lane_cache(0, None);
         assert_eq!(programs, ["cargo".to_string(), target.join("release/weft-isolate").display().to_string(), "cp".to_string()]);
         // With no seed on the machine (its standard worker came prebuilt),
         // the first lane to finish becomes it.
         assert_eq!(calls[2].args, ["-a".to_string(), format!("{}/.", target.display()), m.layout().seed_cache().display().to_string()]);
-        assert!(m.layout().seed_mark().is_file() && m.layout().lane_mark(0).is_file());
+        assert!(m.layout().seed_mark().is_file() && m.layout().lane_mark(0, None).is_file());
         assert!(!m.layout().seed_cache().join(".weft-seeded").exists() && !target.join(".weft-seeded").exists(), "the marks are beside the caches, never in them");
         for c in &calls[..2] {
             assert_eq!(c.cwd, ctx.join("crate"));
-            assert_eq!(c.env, vec![
-                ("CARGO_TARGET_DIR".to_string(), target.display().to_string()),
-                ("RUSTFLAGS".to_string(), weft_core::builds::WORKER_RUSTFLAGS.to_string()),
-            ]);
+            assert_eq!(
+                c.env,
+                vec![
+                    ("RUSTFLAGS".to_string(), "--cfg from_a_node".to_string()),
+                    ("CARGO_TARGET_DIR".to_string(), target.display().to_string()),
+                ],
+                "the nodes' build variables reach cargo itself, as an image's ENV lines do"
+            );
         }
         assert_eq!(calls[0].args[..3], ["build", "--release", "--manifest-path"]);
         assert_eq!(calls[0].stdout, Some(ctx.join("cargo-messages.json")), "cargo's messages are what the sweep reads");
@@ -980,6 +993,38 @@ mod tests {
         gone(&ctx).await;
     }
 
+    /// A build whose nodes set `[build.env]` compiles in its lane's cache
+    /// for their tag, beside the one builds setting nothing share: seeded
+    /// from the seed when that is whole, marked warm on its own, and never
+    /// made the seed itself.
+    #[tokio::test]
+    async fn a_build_with_its_own_build_env_compiles_in_a_cache_of_its_own() {
+        let m = HostMachine::new();
+        let tag = "0123456789abcdef";
+        let b = m.builder("one");
+        let h = b.start(m.tagged_request(&b, "abc", b"{}", Some(tag))).await.unwrap();
+        assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) });
+        let calls = m.toolchain.calls.lock().clone();
+        let target = m.layout().lane_cache(0, Some(tag));
+        let programs: Vec<String> = calls.iter().map(|c| c.program.display().to_string()).collect();
+        assert_eq!(programs, ["cargo".to_string(), target.join("release/weft-isolate").display().to_string()], "no seed is made from it");
+        assert!(calls[0].env.contains(&("CARGO_TARGET_DIR".to_string(), target.display().to_string())));
+        assert!(m.layout().lane_mark(0, Some(tag)).is_file() && !m.layout().lane_mark(0, None).exists());
+        assert!(!m.layout().seed_mark().exists());
+
+        std::fs::create_dir_all(m.layout().seed_cache()).unwrap();
+        host_build::mark_seed(&m.layout()).unwrap();
+        let other = "fedcba9876543210";
+        m.toolchain.calls.lock().clear();
+        let h = b.start(m.tagged_request(&b, "def", b"{}", Some(other))).await.unwrap();
+        assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) });
+        let calls = m.toolchain.calls.lock().clone();
+        let target = m.layout().lane_cache(0, Some(other));
+        assert_eq!(calls[0].program, std::path::Path::new("cp"));
+        assert_eq!(calls[0].args, ["-a".to_string(), format!("{}/.", m.layout().seed_cache().display()), target.display().to_string()], "a cold cache of its own starts from the seed");
+        assert!(m.layout().lane_mark(0, Some(other)).is_file());
+    }
+
     /// After a build, its lane, the seed and the shared crates keep only
     /// what some program on the machine was built from: another program's
     /// stay, and what no program used goes.
@@ -987,7 +1032,7 @@ mod tests {
     async fn a_build_leaves_its_caches_only_what_programs_on_the_machine_use() {
         let m = HostMachine::new();
         let (kept, dropped) = ("00000000000000a1", "00000000000000b2");
-        for cache in [m.layout().lane_cache(0), m.layout().seed_cache()] {
+        for cache in [m.layout().lane_cache(0, None), m.layout().seed_cache()] {
             for hash in [kept, dropped] {
                 let rlib = cache.join(format!("release/deps/libpkg_x-{hash}.rlib"));
                 std::fs::create_dir_all(rlib.parent().unwrap()).unwrap();
@@ -995,7 +1040,7 @@ mod tests {
             }
         }
         host_build::mark_seed(&m.layout()).unwrap();
-        host_build::mark_lane(&m.layout(), 0).unwrap();
+        host_build::mark_lane(&m.layout(), 0, None).unwrap();
         std::fs::create_dir_all(m.program_dir("other")).unwrap();
         let used = host_build::Used { units: [kept.to_string()].into(), crates: ["pkg_kept-1".to_string()].into() };
         std::fs::write(m.program_dir("other").join(host_build::USED_FILE), serde_json::to_vec(&used).unwrap()).unwrap();
@@ -1005,7 +1050,7 @@ mod tests {
         let b = m.builder("one");
         let h = b.start(m.request(&b, "abc", b"{}")).await.unwrap();
         assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) });
-        for cache in [m.layout().lane_cache(0), m.layout().seed_cache()] {
+        for cache in [m.layout().lane_cache(0, None), m.layout().seed_cache()] {
             let deps = cache.join("release/deps");
             assert!(deps.join(format!("libpkg_x-{kept}.rlib")).exists(), "{}: another program's piece stays", cache.display());
             assert!(!deps.join(format!("libpkg_x-{dropped}.rlib")).exists(), "{}: a piece no program used goes", cache.display());
@@ -1095,12 +1140,12 @@ mod tests {
         let b = m.builder_with("one", Arc::new(FirstCopyFails { inner: m.toolchain.clone(), failed: Default::default() }));
         let h = b.start(m.request(&b, "abc", b"{}")).await.unwrap();
         assert!(matches!(settled(&b, &h).await, BuildStatus::Failed { .. }));
-        assert!(!m.layout().lane_mark(0).exists(), "a lane whose copy failed is not warm");
+        assert!(!m.layout().lane_mark(0, None).exists(), "a lane whose copy failed is not warm");
         let h = b.start(m.request(&b, "abc", b"{}")).await.unwrap();
         assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) });
         let copies = m.toolchain.calls.lock().iter().filter(|c| c.program == std::path::Path::new("cp")).count();
         assert_eq!(copies, 2, "copied again");
-        assert!(m.layout().lane_mark(0).is_file());
+        assert!(m.layout().lane_mark(0, None).is_file());
     }
 
     /// A lane that finished a build is warm even when it could not become
@@ -1113,7 +1158,7 @@ mod tests {
         let h = b.start(m.request(&b, "abc", b"{}")).await.unwrap();
         assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) }, "a seed that cannot be made costs only speed");
         assert!(!m.layout().seed_mark().exists(), "no seed was made");
-        assert!(m.layout().lane_mark(0).is_file(), "the lane is warm");
+        assert!(m.layout().lane_mark(0, None).is_file(), "the lane is warm");
     }
 
     /// A toolchain whose commands never end, as a long compile.

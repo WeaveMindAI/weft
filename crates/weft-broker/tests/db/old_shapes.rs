@@ -104,6 +104,27 @@ async fn an_old_shaped_caller_verify_is_answered_naming_the_resync(pool: Pool) {
     assert!(body.contains("/v1/caller/verify: invalid type: map, expected a sequence"), "{body}");
 }
 
+/// A worker of an older weft read a claimed run's record whole, from the
+/// claim's answer or by asking for all of it; both of its calls are
+/// answered naming the resync, before anything is claimed or read.
+#[weft_db_macros::test]
+async fn an_older_workers_claim_and_record_read_are_answered_naming_the_resync(pool: Pool) {
+    let router = broker(pool).await;
+    let run_id = uuid::Uuid::from_u128(9);
+    for (path, missing) in [("/v1/run/claim", "reads"), ("/v1/journal/record_of", "after")] {
+        let call = Request::post(path)
+            .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+            .header("x-weft-replica", "worker-1")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "run_id": run_id }).to_string()))
+            .unwrap();
+        let (status, body) = answer(&router, call).await;
+        assert_eq!(status, weft_broker_client::protocol::UNREADABLE_SHAPE, "{path}: {body}");
+        assert!(body.contains("run `weft resync` on its project"), "{path}: {body}");
+        assert!(body.contains(&format!("{path}: missing field `{missing}`")), "{path}: {body}");
+    }
+}
+
 /// A caller the broker does not know learns nothing of the shapes: its
 /// token is refused first.
 #[weft_db_macros::test]

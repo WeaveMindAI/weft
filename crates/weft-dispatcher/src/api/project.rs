@@ -141,8 +141,9 @@ pub async fn referenced_images_query(
     // skipped, mirroring the `<> ''` convention of the worker-hash arms
     // (a blank matches no image; keeping it would only launder a
     // buggy-writer blank into the set).
-    let tag_rows: Vec<(uuid::Uuid, serde_json::Value)> = db.all("SELECT id, infra_image_tags_json FROM project", &[]).await?;
-    for (project_id, tags) in tag_rows {
+    let tag_rows: Vec<(uuid::Uuid, weft_task_store::db::JsonText<serde_json::Value>)> =
+        db.all("SELECT id, infra_image_tags_json FROM project", &[]).await?;
+    for (project_id, weft_task_store::db::JsonText(tags)) in tag_rows {
         let by_node = weft_broker_client::protocol::decode_infra_image_tags(
             tags,
             &format!("project={project_id}"),
@@ -463,7 +464,7 @@ pub(crate) async fn infra_setup_in_flight(
 /// the run is queued watched).
 pub struct InfraSetupRun {
     pub(crate) run_id: weft_core::RunId,
-    events: tokio::sync::broadcast::Receiver<crate::events::LiveEvent>,
+    events: crate::events::Follower,
     heard: weft_task_store::pg_signal::Subscription,
     project_id: uuid::Uuid,
 }
@@ -3812,8 +3813,10 @@ pub(crate) async fn run_trigger_setup(
             }
         }
     }
-    let events = state.runs.events_log(run_id).await
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read trigger setup: {error:#}")))?;
+    // A trigger setup's record is a few rows, read whole.
+    let events: Vec<weft_journal::RunEvent> = state.runs.events_log(run_id).await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read trigger setup: {error:#}")))?
+        .into_iter().map(|row| row.event).collect();
     let program = state.run_program_identity(&events).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))?;
     let mut bake = crate::store::TriggerBake::from_events(&events, &program)

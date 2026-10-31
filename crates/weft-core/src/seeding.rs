@@ -484,7 +484,7 @@ fn complete_loop(project: &ProjectDefinition, index: &ProgramIndex, snapshot: &R
         crate::primitive::LoopTerminationReason::Failed | crate::primitive::LoopTerminationReason::Cancelled)) { return false; }
     instance.launched.iter().all(|index_launched| {
         let mut iteration = frames.clone();
-        iteration.push(crate::frames::Frame::Loop { index: *index_launched });
+        iteration.push(crate::frames::Frame::Loop { index: index_launched });
         scope_settled(project, index, snapshot, group, &iteration)
     })
 }

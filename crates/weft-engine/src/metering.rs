@@ -1397,7 +1397,7 @@ pub(crate) mod tests {
             self.events.lock().unwrap().push(event.clone());
             Ok(())
         }
-        async fn events_for_run_id(&self, _run_id: RunId) -> anyhow::Result<Vec<weft_journal::RunEvent>> {
+        async fn record_page(&self, _run_id: RunId, _after: Option<i32>) -> anyhow::Result<Vec<weft_journal::JournalRow>> {
             unreachable!("metering tests only write")
         }
     }

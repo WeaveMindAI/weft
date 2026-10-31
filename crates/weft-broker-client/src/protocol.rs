@@ -154,12 +154,19 @@ pub const BATCH_FATES: &str = "project_removing";
 /// such ports.
 pub const JOURNAL_RECORD_BODY_LIMIT: usize = 64 * weft_core::storage::MAX_WIRE_VALUE_BYTES;
 
-/// `POST /v1/journal/record_of`: the whole record of a run of the calling
-/// worker's project, raw, for a worker folding a run it reads (a seed
-/// ancestor).
+/// `POST /v1/journal/record_of`: one page of the record of a run of the
+/// calling worker's project, raw (`weft_journal::record::read_page`): its
+/// rows after `after`, from its first when `null`, empty once none is
+/// left. A worker reads a record a page at a time (a run it claimed, its
+/// fold catching up after answers, a seed ancestor), so no answer carries
+/// a long run whole. `after` is always sent, `null` included: a worker
+/// built by an older weft, which asked for a whole record, is refused
+/// naming `weft resync`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordOfRequest {
     pub run_id: RunId,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub after: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,11 +177,24 @@ pub struct RecordOfResponse {
 // ---------- Runs ----------
 
 /// `POST /v1/run/claim`: the calling worker claims a queued run of its
-/// project, the one it was handed (`weft_journal::record::claim`), and
-/// reads its record in the same trip. `None` when it is not queued.
+/// project, the one it was handed (`weft_journal::record::claim`). `None`
+/// when it is not queued. Its record the worker reads after, a page at a
+/// time ([`RecordOfRequest`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunClaimRequest {
     pub run_id: RunId,
+    /// How the worker reads the claimed run's record. Always sent: a
+    /// worker built by an older weft, which read the record whole from
+    /// the claim's answer, sends none and is refused naming `weft resync`.
+    pub reads: RecordReads,
+}
+
+/// How a worker reads the record of a run it claimed ([`RunClaimRequest`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordReads {
+    /// A page at a time, after the claim ([`RecordOfRequest`]).
+    ByPage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2499,6 +2519,24 @@ mod wire_enum_roundtrips {
 mod supervisor_protocol_tests {
     use super::*;
     use serde_json::json;
+
+    /// A worker of an older weft asked for a whole record and claimed
+    /// a run to get its record in the answer; neither call of its reads
+    /// as this release's, so the broker refuses both naming the resync.
+    #[test]
+    fn the_older_record_and_claim_calls_do_not_read() {
+        let run_id = uuid::Uuid::from_u128(0xc2);
+        let claim = serde_json::to_value(RunClaimRequest { run_id, reads: RecordReads::ByPage }).unwrap();
+        assert_eq!(claim, json!({ "run_id": run_id, "reads": "by_page" }));
+        assert_eq!(serde_json::from_value::<RunClaimRequest>(claim).unwrap().reads, RecordReads::ByPage);
+        let old_claim = serde_json::from_value::<RunClaimRequest>(json!({ "run_id": run_id })).unwrap_err();
+        assert!(old_claim.to_string().contains("missing field `reads`"), "{old_claim}");
+
+        let first = serde_json::to_value(RecordOfRequest { run_id, after: None }).unwrap();
+        assert_eq!(first, json!({ "run_id": run_id, "after": null }));
+        let old_record = serde_json::from_value::<RecordOfRequest>(json!({ "run_id": run_id })).unwrap_err();
+        assert!(old_record.to_string().contains("missing field `after`"), "{old_record}");
+    }
 
     #[test]
     fn publish_access_round_trip() {

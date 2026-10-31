@@ -183,22 +183,17 @@ impl StandIn {
     /// answers a caller serves (`RunStarted::stand_in`): its request
     /// is the firing kick's payload. `None` for any other run: a caller on
     /// the line was on the worker that bore its run, and none follows it.
-    fn of(events: &[RunEvent]) -> Result<Option<Self>> {
-        let Some(spec) = events.iter().find_map(|event| match event {
-            RunEvent::RunStarted { stand_in, .. } => stand_in.as_deref().cloned(),
-            _ => None,
-        }) else {
+    /// `birth` is the run's birth, `firing_payload` what its firing kick
+    /// was given (`ClaimedRecord::firing_payload`).
+    fn of(birth: &RunEvent, firing_payload: Option<&serde_json::Value>) -> Result<Option<Self>> {
+        let RunEvent::RunStarted { stand_in: Some(spec), .. } = birth else {
             return Ok(None);
         };
-        let payload = events
-            .iter()
-            .find_map(|event| match event {
-                RunEvent::NodeKicked { firing: true, payload, .. } => Some(payload.clone().unwrap_or_default()),
-                _ => None,
-            })
+        let payload = firing_payload
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("a run started by hand through a caller's trigger has no firing kick to serve"))?;
         let request = serde_json::from_value(payload).context("the firing kick of a run started by hand through a caller's trigger is not a request")?;
-        Ok(Some(Self { spec, request }))
+        Ok(Some(Self { spec: (**spec).clone(), request }))
     }
 
     /// The exchange its run serves through the stand-in, recorded on the
@@ -342,18 +337,47 @@ impl Worker {
         drive.await.map(Some).context("the drive panicked outside its guard")
     }
 
-    /// Carry on a run this worker just claimed, from its record.
+    /// Carry on a run this worker just claimed, from its record, read a
+    /// page at a time.
     async fn carry_on(
         &self,
         run_id: RunId,
         claimed: weft_journal::record::Claimed,
         registered: Registered,
     ) -> Result<()> {
-        let next_seq = claimed.record.rows.last().map_or(0, |row| row.seq + 1);
-        let first = claimed.record.events(run_id).map_err(anyhow::Error::msg);
-        let settings = first.as_ref().ok().and_then(|events| birth_settings(events)).unwrap_or_default();
+        let record = &**self.clients.writer.record();
         let project = self.plans.project(&self.clients, &claimed.definition_hash).await;
+        // A record this worker cannot read, a program it cannot fetch, or a
+        // stand-in it cannot serve still ends the run: it is this worker's
+        // now.
         let keep_for = project.as_ref().map_or(weft_core::run_settings::KeepFor::WEFT_DEFAULT, |project| project.defaults.keep_for());
+        // A program that cannot be fetched is why the record cannot be read.
+        let read = match project {
+            Ok(project) => {
+                let program = self.plans.program(&project, &claimed.definition_hash);
+                crate::run_driver::ClaimedRecord::read(|run, after| weft_journal::decoded_page(record, run, after), &*self.clients.project, run_id, program.project.clone())
+                    .await
+                    .map(|read| (program, read))
+            }
+            Err(e) => Err(e),
+        };
+        let (settings, next_seq, read) = match read {
+            Ok((program, read)) => (birth_settings(&read.birth), read.last_seq + 1, Ok((program, read))),
+            // The record is read again on this rare path only, in one
+            // pass: where its rows end (the run's ending goes after them)
+            // and the charges it leaves open. When that pass fails too,
+            // the broker ends the run after its last row and books what it
+            // leaves open, as for any run whose ending cannot be written.
+            Err(e) => match Leftovers::of(record, run_id).await {
+                Ok(left) => (None, left.last_seq.map_or(0, |last| last + 1), Err((e, left.charges))),
+                Err(again) => {
+                    let why = format!("{e:#}; and reading its record again to end it failed too: {again:#}");
+                    self.clients.writer.give_up(run_id, &why).await;
+                    return Err(anyhow::anyhow!(why));
+                }
+            },
+        };
+        let settings = settings.unwrap_or_default();
         let journal = self.clients.writer.run(RunSpec {
             run_id,
             settings,
@@ -363,30 +387,31 @@ impl Worker {
             redaction: Default::default(),
             program: None,
         });
-        // A record this worker cannot read, a program it cannot fetch, or a
-        // stand-in it cannot serve still ends the run: it is this worker's
-        // now.
-        let opened = project.and_then(|project| {
-            let events = first?;
-            let exchange = StandIn::of(&events)?.map(|stand_in| stand_in.exchange(run_id, journal.clone(), &self.replica)).transpose()?;
-            let program = self.plans.program(&project, &claimed.definition_hash);
-            Ok((program, events, exchange))
-        });
-        let (program, events, exchange) = match opened {
+        // What fails here still books the charges the record leaves open:
+        // read with it, or in the pass above.
+        let opened = match read {
+            Ok((program, read)) => {
+                let exchange = StandIn::of(&read.birth, read.firing_payload.as_ref()).and_then(|stand_in| {
+                    stand_in.map(|stand_in| stand_in.exchange(run_id, journal.clone(), &self.replica)).transpose()
+                });
+                match exchange {
+                    Ok(exchange) => Ok((program, read, exchange)),
+                    Err(e) => Err((e, read.charges)),
+                }
+            }
+            Err(failed) => Err(failed),
+        };
+        let (program, read, exchange) = match opened {
             Ok(opened) => opened,
-            Err(e) => {
-                // Read again on this rare path only (the drive takes the
-                // events it read); a record that does not decode is the
-                // error itself, and leaves nothing to book.
-                let record = claimed.record.events(run_id).ok();
-                return Err(crate::run_driver::fail_run(&self.clients.writer, &journal, run_id, &self.replica, record.as_deref(), e).await);
+            Err((e, charges)) => {
+                return Err(crate::run_driver::fail_run(&self.clients.writer, &journal, run_id, &self.replica, Some(charges), e).await);
             }
         };
         self.drive(RunStart {
             run_id,
             journal,
             program,
-            starts_from: StartsFrom::Record(events),
+            starts_from: StartsFrom::Record(Box::new(read)),
             exchange,
             registered,
             slot: None,
@@ -502,12 +527,37 @@ impl Worker {
     }
 }
 
-/// How the run whose record begins with `events` is kept, from its birth.
-fn birth_settings(events: &[RunEvent]) -> Option<weft_core::run_settings::RunSettings> {
-    events.iter().find_map(|event| match event {
+/// How the run born with `birth` is kept.
+fn birth_settings(birth: &RunEvent) -> Option<weft_core::run_settings::RunSettings> {
+    match birth {
         RunEvent::RunStarted { settings, .. } => Some(*settings),
         _ => None,
-    })
+    }
+}
+
+/// What a run's record leaves behind for a worker that cannot carry it
+/// on: where its rows end, and the charges it leaves open.
+struct Leftovers {
+    /// The last row; `None` for a record with none.
+    last_seq: Option<i32>,
+    /// The charges opened in every row that decodes: a row that does not
+    /// (often why the record cannot be carried on) costs only the charges
+    /// it would have opened, never the ones the others did.
+    charges: weft_journal::ChargeBook,
+}
+
+impl Leftovers {
+    /// Run `run_id`'s, read from `record` a page at a time, in one pass.
+    async fn of(record: &dyn weft_journal::RecordClient, run_id: RunId) -> Result<Self> {
+        let start = Self { last_seq: None, charges: Default::default() };
+        weft_journal::record::fold_pages(|after| record.record_of(run_id, after), None, start, move |left: &mut Self, page| {
+            left.last_seq = weft_journal::record::RecordPage::last_seq(&page);
+            let (rows, _) = page.decode_lossy(run_id);
+            rows.iter().for_each(|row| left.charges.apply(&row.event));
+            Ok(())
+        })
+        .await
+    }
 }
 
 impl Worker {
@@ -1119,10 +1169,11 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
     // The door ticks while this worker owns anything on record: a run it
     // drives that does more than wait outside, or a record still on its
     // way. With only waiting runs, it vouches for the worker until the
-    // earliest of their waits gives up, and sleeps.
+    // earliest of their waits gives up, and sleeps. It ticks on the io
+    // runtime, apart from the threads node bodies run on.
     let lease = weft_core::time_scale::scaled_secs(weft_task_store::worker_door::WORKER_LEASE_SECS);
     let under_way = worker.clone();
-    door.start_ticks(Box::new(move || under_way.under_way(lease)));
+    door.start_ticks(&worker.clients.io, Box::new(move || under_way.under_way(lease)));
     // It lives as long as the process.
     spawn_line_watch(worker.line_watch());
     // What the runs share goes once nothing used it for the idle window.
@@ -2039,7 +2090,7 @@ mod tests {
     async fn a_run_registered_while_the_door_sleeps_on_waiting_runs_wakes_it() {
         let (worker, broker) = worker_firing(|_, _| {});
         let (cancels, holds) = (worker.cancels.clone(), worker.holds.clone());
-        worker.door.start_ticks(Box::new(move || crate::door::UnderWay::of(true, cancels.count(), holds.quiet(), 15)));
+        worker.door.start_ticks(&tokio::runtime::Handle::current(), Box::new(move || crate::door::UnderWay::of(true, cancels.count(), holds.quiet(), 15)));
         let waiting = worker.cancels.claim(uuid::Uuid::from_u128(1)).expect("a fresh run");
         let quiet = worker.holds.of(uuid::Uuid::from_u128(1), None);
         quiet.quiet(Some(crate::run_holds::Quiet { until: 5_000, can_pause: false }));
@@ -2064,7 +2115,7 @@ mod tests {
     async fn a_stopping_worker_stops_vouching_and_ticks_while_it_lives() {
         let (worker, broker) = worker_firing(|_, _| {});
         let under_way = worker.clone();
-        worker.door.start_ticks(Box::new(move || under_way.under_way(15)));
+        worker.door.start_ticks(&tokio::runtime::Handle::current(), Box::new(move || under_way.under_way(15)));
         let waiting = worker.cancels.claim(uuid::Uuid::from_u128(1)).expect("a fresh run");
         let quiet = worker.holds.of(uuid::Uuid::from_u128(1), None);
         quiet.quiet(Some(crate::run_holds::Quiet { until: 5_000, can_pause: false }));
@@ -2247,8 +2298,8 @@ mod tests {
             self.through.acquire().await.expect("the gate stays").forget();
             self.record.record_batch(batch).await
         }
-        async fn record_of(&self, run_id: RunId) -> anyhow::Result<weft_journal::record::RawRecord> {
-            self.record.record_of(run_id).await
+        async fn record_of(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<weft_journal::record::RawRecord> {
+            self.record.record_of(run_id, after).await
         }
         async fn give_up(&self, run_id: RunId, why: String) -> Result<(), weft_journal::BatchError> {
             self.record.give_up(run_id, why).await
@@ -2262,7 +2313,7 @@ mod tests {
     async fn a_worker_stops_once_the_records_of_its_waiting_runs_are_written() {
         let gate = Arc::new(GatedRecord { record: Arc::new(MemJournal::default()), through: tokio::sync::Semaphore::new(0) });
         let mut clients = clients(Arc::new(MemJournal::default()));
-        clients.writer = crate::journal_writer::WorkerJournal::start(gate.clone(), Default::default(), &crate::context::io_runtime().expect("the io runtime starts"));
+        clients.writer = crate::journal_writer::WorkerJournal::start(gate.clone(), Default::default(), &clients.io);
         let line = crate::context::TestLine::new();
         clients.line = line.clone();
         let worker = worker_with(clients);

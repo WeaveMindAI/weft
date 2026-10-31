@@ -54,11 +54,8 @@ enum AgentCommand {
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-fn main() -> anyhow::Result<()> {
-    weft_core::process_runtime::build()?.block_on(run())
-}
-
-async fn run() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     weft_core::net::install_crypto_provider();
     let args = Args::parse();
     let config = match &args.command {

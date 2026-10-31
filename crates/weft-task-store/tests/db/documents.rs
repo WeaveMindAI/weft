@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 use weft_core::stored::{Kind, Op};
-use weft_task_store::db::{Client as _, Pool, Transaction};
+use weft_task_store::db::{Client as _, Json, Pool, Transaction};
 use weft_task_store::documents::{Encoding, Fill, Rederived};
 use weft_task_store::{apply_documents, Document};
 
@@ -81,7 +81,7 @@ async fn tables(pool: &Pool, rows: i32) {
     .unwrap();
     for n in 0..rows {
         let owner = if n % 2 == 0 { "even" } else { "odd" };
-        pool.execute("INSERT INTO probe_doc (owner, n, body) VALUES ($1, $2, $3)", &[&owner, &n, &json!({ "a": n })])
+        pool.execute("INSERT INTO probe_doc (owner, n, body) VALUES ($1, $2, $3::text::jsonb)", &[&owner, &n, &json!({ "a": n }).to_string()])
             .await
             .unwrap();
     }
@@ -90,7 +90,9 @@ async fn tables(pool: &Pool, rows: i32) {
 }
 
 async fn bodies(pool: &Pool) -> Vec<(Value, i32)> {
-    pool.all("SELECT body, body_version FROM probe_doc WHERE body IS NOT NULL ORDER BY owner, n", &[]).await.unwrap()
+    let rows: Vec<(Json<Value>, i32)> =
+        pool.all("SELECT body, body_version FROM probe_doc WHERE body IS NOT NULL ORDER BY owner, n", &[]).await.unwrap();
+    rows.into_iter().map(|(Json(body), version)| (body, version)).collect()
 }
 
 async fn recorded(pool: &Pool, table: &str) -> i32 {
@@ -117,7 +119,7 @@ async fn rows_from_before_the_column_was_registered_take_every_step_once(pool: P
     );
     assert_eq!(recorded(&pool, "probe_doc").await, 3);
     assert_eq!(rederived(&pool).await, 1);
-    let null: (Option<Value>, i32) =
+    let null: (Option<Json<Value>>, i32) =
         pool.one("SELECT body, body_version FROM probe_doc WHERE owner = 'none'", &[]).await.unwrap();
     assert_eq!(null, (None, 1));
     // At today's version a second boot changes nothing.
@@ -209,8 +211,13 @@ async fn a_fill_moves_a_value_out_before_its_step_drops_it(pool: Pool) {
     .await
     .unwrap();
     apply_documents(&pool, &[&MOVING_DOC]).await.unwrap();
-    let rows: Vec<(Option<String>, Value, i32)> =
-        pool.all("SELECT owner, body, body_version FROM probe_moving ORDER BY id", &[]).await.unwrap();
+    let rows: Vec<(Option<String>, Value, i32)> = pool
+        .all::<(Option<String>, Json<Value>, i32)>("SELECT owner, body, body_version FROM probe_moving ORDER BY id", &[])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(owner, Json(body), version)| (owner, body, version))
+        .collect();
     assert_eq!(
         rows,
         vec![(Some("ann".into()), json!({ "x": 1 }), 2), (Some("bob".into()), json!({}), 2)]
@@ -257,8 +264,13 @@ async fn a_column_recorded_below_today_is_carried_from_there(pool: Pool) {
         .await
         .unwrap();
     apply_documents(&pool, &[&RECORDED_AT_TWO]).await.unwrap();
-    let rows: Vec<(String, Value, i32)> =
-        pool.all("SELECT owner, body, body_version FROM probe_doc WHERE body IS NOT NULL ORDER BY owner", &[]).await.unwrap();
+    let rows: Vec<(String, Value, i32)> = pool
+        .all::<(String, Json<Value>, i32)>("SELECT owner, body, body_version FROM probe_doc WHERE body IS NOT NULL ORDER BY owner", &[])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(owner, Json(body), version)| (owner, body, version))
+        .collect();
     assert_eq!(rows, vec![("two".into(), json!({ "b": 1, "c": true }), 3)]);
     assert_eq!(recorded(&pool, "probe_doc").await, 3);
 }

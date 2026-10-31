@@ -25,8 +25,8 @@ async fn a_projects_head_becomes_its_program_copys(pool: Pool) {
     let manifest = json!({ "main.weft": "a".repeat(64) });
     let (version, run) = ("v1".to_string(), uuid::Uuid::new_v4());
     pool.execute(
-        "INSERT INTO project_version (id, project_id, parent_id, manifest, label, created_at) VALUES ($1, $2, NULL, $3, NULL, 1)",
-        &[&version, &with_head, &manifest],
+        "INSERT INTO project_version (id, project_id, parent_id, manifest, label, created_at) VALUES ($1, $2, NULL, $3::text::jsonb, NULL, 1)",
+        &[&version, &with_head, &manifest.to_string()],
     )
     .await
     .unwrap();

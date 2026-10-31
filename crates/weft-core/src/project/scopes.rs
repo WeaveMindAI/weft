@@ -238,6 +238,11 @@ impl ScopeIndex {
         }
     }
 
+    /// The sites that call the included body `body`.
+    pub fn sites_calling<'a>(&'a self, body: &'a str) -> impl Iterator<Item = &'a Scope> + 'a {
+        self.scopes.values().filter(move |scope| matches!(&scope.kind, ScopeKind::Call { body: called } if called == body))
+    }
+
     /// The scope with this id.
     pub fn get(&self, id: &str) -> Option<&Scope> {
         self.scopes.get(id)

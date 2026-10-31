@@ -2,17 +2,41 @@
 
 /** Minimal SSE subscription handle. `EventSource` is a browser global
  *  that VS Code's Node-based extension host doesn't ship, so we roll a
- *  tiny client on top of `fetch` + ReadableStream (Node 18+). We only
- *  parse `data:` lines (no `event:` / `id:` / `retry:` yet) because
- *  the dispatcher only emits `data:` and blank-line delimiters. */
+ *  tiny client on top of `fetch` + ReadableStream (Node 18+). We parse
+ *  `data:` lines and the `event:` name (no `id:` / `retry:`): the
+ *  dispatcher emits those and blank-line delimiters. */
 export interface SseSubscription {
     close: () => void;
+}
+
+/** The answer a stream's open got instead of the stream: its status, and
+ *  whether the install gave it itself or the platform or gateway in front
+ *  of it did. */
+// SYNC: INSTALL_ANSWER_HEADER <-> crates/weft-core/src/install.rs INSTALL_ANSWER_HEADER
+export const INSTALL_ANSWER_HEADER = 'x-weft-install';
+
+export class SseRefused extends Error {
+    constructor(url: string, readonly status: number, readonly fromInstall: boolean) {
+        super(`SSE ${url}: ${status}`);
+    }
+}
+
+/** Whether a stream that could not be opened again is worth trying again:
+ *  nothing answered, the platform in front of the install said it is down,
+ *  starting or rate limiting, or the install answered `503`, its word for
+ *  "nothing of this ran, the same request goes through later" (its
+ *  database busy, for one). Anything else the install says itself (the
+ *  run is gone, the key is refused) stays said. */
+// SYNC: worthTryingAgain <-> crates/weft-core/src/install.rs (asks_again), crates/weft-cli/src/client.rs (busy_answer), crates/weft-cli/src/commands/ensure.rs (look_again_after)
+export function worthTryingAgain(err: unknown): boolean {
+    if (!(err instanceof SseRefused)) return true;
+    return err.fromInstall ? err.status === 503 : [429, 502, 503, 504].includes(err.status);
 }
 
 function subscribeSse(
     url: string,
     headers: Record<string, string>,
-    onData: (data: string) => void,
+    onData: (data: string, event: string | undefined) => void,
     onError?: (err: unknown) => void,
     onClosed?: () => void,
     onOpen?: () => void,
@@ -26,7 +50,7 @@ function subscribeSse(
                 signal: controller.signal,
             });
             if (!res.ok || !res.body) {
-                throw new Error(`SSE ${url}: ${res.status}`);
+                throw new SseRefused(url, res.status, res.headers.has(INSTALL_ANSWER_HEADER));
             }
             if (!closed) onOpen?.();
             const reader = res.body.getReader();
@@ -47,11 +71,12 @@ function subscribeSse(
                 while ((sep = buf.indexOf('\n\n')) !== -1) {
                     const raw = buf.slice(0, sep);
                     buf = buf.slice(sep + 2);
-                    const dataLines = raw
-                        .split('\n')
+                    const lines = raw.split('\n');
+                    const dataLines = lines
                         .filter((l) => l.startsWith('data:'))
                         .map((l) => l.slice(5).replace(/^ /, ''));
-                    if (dataLines.length > 0) onData(dataLines.join('\n'));
+                    const event = lines.find((l) => l.startsWith('event:'))?.slice(6).replace(/^ /, '');
+                    if (dataLines.length > 0) onData(dataLines.join('\n'), event);
                 }
             }
         } catch (err) {
@@ -226,7 +251,7 @@ export class DispatcherClient {
    *  leaving the UI stuck forever. */
   subscribe(
     path: string,
-    onEvent: (ev: { data: string }) => void,
+    onEvent: (ev: { data: string; event?: string }) => void,
     handlers?: {
       onError?: (err: unknown) => void;
       onClosed?: () => void;
@@ -248,7 +273,7 @@ export class DispatcherClient {
     return subscribeSse(
       this.url(path),
       this.headers(),
-      (data) => onEvent({ data }),
+      (data, event) => onEvent({ data, event }),
       onError,
       handlers?.onClosed,
       handlers?.onOpen,

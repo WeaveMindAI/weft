@@ -10,7 +10,7 @@
 // client, and VS Code's is the default only because `acquireVsCodeApi` being
 // present is a reliable way to detect it.
 
-import type { HostMessage, StoredFileDownload, WebviewMessage } from '../protocol';
+import type { HostMessage, StoredFileDownload, ValuesAnswer, ValuesRequest, WebviewMessage } from '../protocol';
 
 /// The seam each consumer implements: deliver a `WebviewMessage` to the host,
 /// and call `receive` for every `HostMessage` the host emits. `dispose` tears
@@ -213,6 +213,15 @@ async function storageCall<T = unknown>(path: string, body: unknown): Promise<T>
   }));
   if (reply.error !== undefined) throw new Error(reply.error);
   return reply.result as T;
+}
+
+/// Read back the values some events of run `runId` name (`request`),
+/// through the host (`readValues`). Resolves to the dispatcher's answer
+/// (each value, in order); rejects when they could not be read at all.
+export async function readValues(runId: string, request: ValuesRequest): Promise<ValuesAnswer> {
+  const reply = await hostRequest('valuesRead', (requestId) => ({ kind: 'readValues', requestId, runId, ...request }));
+  if ('error' in reply) throw new Error(reply.error);
+  return { values: reply.values };
 }
 
 /// Drive one access-store verb through the host: `method` + the route

@@ -131,17 +131,17 @@ fn image_ref(path: &str) -> FileRef {
 }
 
 /// The map key a ref of `path` declared `ty` resolves under.
-fn key_of(path: &str, ty: WeftPrimitive) -> String {
+fn key_of(path: &str, ty: WeftPrimitive) -> weft_core::project::ResolutionKey {
     FileRef { path: path.into(), ty: WeftType::Primitive(ty), marker: weft_core::project::FileMarker::Asset }
         .resolution_key()
 }
-fn image_key(path: &str) -> String {
+fn image_key(path: &str) -> weft_core::project::ResolutionKey {
     key_of(path, WeftPrimitive::Image)
 }
-fn audio_key(path: &str) -> String {
+fn audio_key(path: &str) -> weft_core::project::ResolutionKey {
     key_of(path, WeftPrimitive::Audio)
 }
-fn blob_key(path: &str) -> String {
+fn blob_key(path: &str) -> weft_core::project::ResolutionKey {
     key_of(path, WeftPrimitive::Blob)
 }
 

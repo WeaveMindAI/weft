@@ -94,7 +94,7 @@ impl TierArg {
 pub fn main(catalog: &'static dyn NodeCatalog) -> ExitCode {
     tracing_subscriber_init();
     let args = Args::parse();
-    let runtime = match weft_core::process_runtime::build() {
+    let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("start tokio runtime: {e}");

@@ -29,7 +29,20 @@ use weft_task_store::db::Pool;
 use tokio::sync::{broadcast, RwLock};
 
 /// The event types are weft-core's, so the CLI reads the same rows.
-pub use weft_core::live_event::{DispatcherEvent, IdentifiedEvent, LiveEvent};
+pub use weft_core::live_event::{DispatcherEvent, EventId, IdentifiedEvent, LiveEvent, ShownEvent};
+
+/// One item of a project's queue of events: what one paint of one run put
+/// on the screen (`crate::live_view`, a page of its record's rows), or one
+/// announcement. The queue holds a fixed number of items, so a burst of a
+/// fast run takes one place in it however many events it holds.
+pub type Batch = Arc<[ShownEvent]>;
+
+/// How many items a project's queue holds for its slowest follower. A
+/// follower that falls further behind is told it lagged
+/// ([`broadcast::error::RecvError::Lagged`]): a run's follower catches up
+/// from the record (`crate::api::events::run_stream`), the others look at
+/// the database.
+const QUEUE: usize = 256;
 
 /// LISTEN channel name. Single channel for all cross-process events;
 /// receivers route by `project_id` themselves.
@@ -37,7 +50,7 @@ pub use weft_core::live_event::{DispatcherEvent, IdentifiedEvent, LiveEvent};
 
 #[derive(Clone)]
 pub struct EventBus {
-    inner: Arc<RwLock<HashMap<uuid::Uuid, broadcast::Sender<LiveEvent>>>>,
+    inner: Arc<RwLock<HashMap<uuid::Uuid, broadcast::Sender<Batch>>>>,
     /// Postgres pool used by `publish` for NOTIFY. `None` for tests
     /// or single-process contexts where the cross-process channel isn't
     /// wired; in that case `publish` skips the NOTIFY step and
@@ -75,11 +88,16 @@ impl EventBus {
         Ok(bus)
     }
 
-    pub async fn subscribe_project(&self, project_id: uuid::Uuid) -> broadcast::Receiver<LiveEvent> {
+    pub async fn subscribe_project(&self, project_id: uuid::Uuid) -> Follower {
+        Follower::of(self.subscribe_batches(project_id).await)
+    }
+
+    /// [`Self::subscribe_project`], a batch at a time.
+    pub async fn subscribe_batches(&self, project_id: uuid::Uuid) -> broadcast::Receiver<Batch> {
         let mut inner = self.inner.write().await;
         inner
             .entry(project_id)
-            .or_insert_with(|| broadcast::channel(256).0)
+            .or_insert_with(|| broadcast::channel(QUEUE).0)
             .subscribe()
     }
 
@@ -92,8 +110,18 @@ impl EventBus {
     /// Push to local subscribers only. Used by the live view and the infra
     /// event bridge, which every process runs for its own subscribers (the
     /// cross-process fanout for them is the database itself).
-    pub async fn publish_local(&self, event: LiveEvent) {
-        self.publish_local_inner(&event).await;
+    pub async fn publish_local(&self, event: ShownEvent) {
+        let project_id = event.event.project_id();
+        self.send(project_id, Arc::from([event])).await;
+    }
+
+    /// Push one paint's events, all of `project_id`, to local subscribers
+    /// as one item (the live view's pages).
+    pub async fn publish_batch(&self, project_id: uuid::Uuid, events: Vec<ShownEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        self.send(project_id, Arc::from(events)).await;
     }
 
     /// Push locally AND issue NOTIFY so sibling processes receive it.
@@ -105,7 +133,7 @@ impl EventBus {
     /// identity across history and live delivery.
     pub async fn publish(&self, event: DispatcherEvent) {
         let event = IdentifiedEvent::transient(event);
-        self.publish_local_inner(&event).await;
+        self.send(event.event.project_id(), Arc::from([IdentifiedEvent { event_id: event.event_id, event: event.event.clone().shown() }])).await;
         let Some(pool) = &self.pool else {
             return;
         };
@@ -134,13 +162,40 @@ impl EventBus {
         }
     }
 
-    async fn publish_local_inner(&self, event: &LiveEvent) {
+    async fn send(&self, project_id: uuid::Uuid, batch: Batch) {
         let inner = self.inner.read().await;
-        if let Some(tx) = inner.get(&event.event.project_id()) {
+        if let Some(tx) = inner.get(&project_id) {
             // broadcast::Sender::send errors only when there are
             // no live receivers; that's a normal idle state (no
             // SSE clients subscribed), not a failure to discard.
-            let _ = tx.send(event.clone());
+            let _ = tx.send(batch);
+        }
+    }
+}
+
+/// A follower of one project's events, an event at a time out of the
+/// batches its queue holds ([`Batch`]).
+pub struct Follower {
+    rx: broadcast::Receiver<Batch>,
+    batch: Option<Batch>,
+    next: usize,
+}
+
+impl Follower {
+    pub fn of(rx: broadcast::Receiver<Batch>) -> Self {
+        Self { rx, batch: None, next: 0 }
+    }
+
+    /// The next event; `Lagged` when batches were dropped before this
+    /// follower read them (how many), `Closed` when the bus is gone.
+    pub async fn recv(&mut self) -> Result<ShownEvent, broadcast::error::RecvError> {
+        loop {
+            if let Some(event) = self.batch.as_ref().and_then(|batch| batch.get(self.next)) {
+                self.next += 1;
+                return Ok(event.clone());
+            }
+            self.batch = Some(self.rx.recv().await?);
+            self.next = 0;
         }
     }
 }
@@ -156,7 +211,9 @@ async fn relay_sibling_events(mut heard: weft_task_store::pg_signal::Subscriptio
         match heard.next().await {
             Ok(weft_task_store::pg_signal::Heard::Signal { channel, payload }) if channel == weft_task_store::runs::EVENTS_CHANNEL => {
                 match serde_json::from_str::<LiveEvent>(&payload) {
-                    Ok(event) => bus.publish_local_inner(&event).await,
+                    // An announced event carries no value at hand: the
+                    // events announced this way name none.
+                    Ok(event) => bus.send(event.event.project_id(), Arc::from([IdentifiedEvent { event_id: event.event_id, event: event.event.shown() }])).await,
                     Err(e) => tracing::warn!(
                         target: "weft_dispatcher::events",
                         error = %e,

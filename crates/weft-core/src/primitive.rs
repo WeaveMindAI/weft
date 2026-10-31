@@ -308,6 +308,10 @@ pub struct RunSnapshot {
     pub inherited_origins: std::collections::BTreeMap<crate::frames::Located, RunId>,
     pub pulses: crate::pulse::PulseTable,
     pub firings: crate::run::NodeFiringTable,
+    /// What the run's tables forget once nothing can need it
+    /// (`crate::run::forget`), for a holder that forgets; `None` for one
+    /// that keeps everything (a seed's reconstruction, a node's states).
+    pub forgetting: Option<crate::run::forget::Forgetting>,
     pub suspensions: HashMap<String, SuspensionInfo>,
     /// Every loop instance, as the fold drove it from the loop rows.
     /// A resumed worker takes it over as its own runtime.
@@ -455,18 +459,31 @@ pub enum AwaitedEntryKind {
 
 /// How a past `ctx.await_signal` ended. The first ending on record
 /// stands: an answer that comes after a wait was given up is ignored.
+/// `V` is how the answer is held: the value itself, or, in an event that
+/// names it, where the record keeps it (`crate::live_event::DispatcherEvent`).
 // SYNC: AwaitEnd <-> extension-vscode/src/runFollower.ts AwaitEnd
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum AwaitEnd {
+pub enum AwaitEnd<V = Value> {
     /// Its answer arrived (`SuspensionResolved`).
-    Answered { value: Value },
+    Answered { value: V },
     /// The run held it in its worker and gave it up
     /// (`SuspensionGaveUp`): the call failed with `error`.
     GaveUp { error: String },
     /// A person skipped it (`SuspensionSkipped`): the call ends its node's
     /// firing skipped ([`crate::error::WeftError::WaitSkipped`]).
     Skipped,
+}
+
+impl<V> AwaitEnd<V> {
+    /// The same ending with its answer held as `f` makes it.
+    pub fn map<W>(self, f: impl FnOnce(V) -> W) -> AwaitEnd<W> {
+        match self {
+            Self::Answered { value } => AwaitEnd::Answered { value: f(value) },
+            Self::GaveUp { error } => AwaitEnd::GaveUp { error },
+            Self::Skipped => AwaitEnd::Skipped,
+        }
+    }
 }
 
 /// What answers a wait: a value, or a person skipping it (the `/skip`
@@ -728,6 +745,13 @@ impl KickTable {
     /// Whether a kick is not dispatched yet.
     pub fn any_undispatched(&self) -> bool {
         !self.undispatched.is_empty()
+    }
+
+    /// Drop every kick `gone` picks: a reader that only shows the run is
+    /// done with a kick once nothing can fire where it is.
+    pub fn forget(&mut self, mut gone: impl FnMut(&crate::frames::FiringLocation) -> bool) {
+        self.kicks.retain(|at, _| !gone(at));
+        self.undispatched.retain(|at| self.kicks.contains_key(at));
     }
 }
 

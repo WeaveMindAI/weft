@@ -431,7 +431,7 @@ fn decode_row(r: &db::Row) -> Result<ClaimedCommand> {
     let verb_str: String = r.try_get("verb")?;
     let verb = InfraLifecycleVerb::parse(&verb_str)
         .ok_or_else(|| anyhow::anyhow!("unknown verb '{verb_str}' on id={id}"))?;
-    let spec_json: Option<serde_json::Value> = r.try_get("spec_json")?;
+    let spec_json = r.try_get::<_, Option<db::JsonText<serde_json::Value>>>("spec_json")?.map(|spec| spec.0);
     let instance_id: Option<String> = r.try_get("instance_id")?;
     let every_copy: bool = r.try_get("every_copy")?;
     let copies = weft_core::instance::Copies::from_columns(instance_id.clone(), every_copy)

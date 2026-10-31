@@ -161,24 +161,49 @@ pub trait RunStore: Send + Sync {
         then: weft_journal::record::Then,
     ) -> anyhow::Result<weft_journal::record::Appended>;
 
-    /// A run's whole record for DISPLAY: a row that does not decode comes
-    /// back as its error text instead of failing the read, so the
-    /// inspector renders what exists and names the rows it cannot. The
-    /// one required read; [`RunStore::events_log`] is derived from it.
-    async fn events_log_lossy(
-        &self,
-        run_id: RunId,
-    ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<RunEvent>>, Vec<String>)>;
+    /// One page of a run's record, raw: its rows after `after` (from its
+    /// first when `None`), as `weft_journal::record::read_page` cuts them,
+    /// empty once none is left. The one required read: every reader of a
+    /// record reads it a page at a time ([`fold_record`]), so none holds a
+    /// long run whole.
+    async fn record_page(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<weft_journal::record::RawRecord>;
 
-    /// The same record for STATE-REBUILDING (a cancel's per-node rows, a
-    /// setup's bake): a row that no longer decodes fails the WHOLE read,
-    /// naming the run and `weft clean`, because a fold over a partial
-    /// record rebuilds a state that never existed.
-    async fn events_log(&self, run_id: RunId) -> anyhow::Result<Vec<RunEvent>> {
-        let (events, bad) = self.events_log_lossy(run_id).await?;
-        match bad.into_iter().next() {
-            Some(reason) => Err(anyhow::Error::msg(reason)),
-            None => Ok(events.into_iter().map(|record| record.event).collect()),
+    /// Which runs of `past` got a row after the one named beside them (any
+    /// row when `None`), in one read however many it names
+    /// (`weft_journal::record::written_past`).
+    async fn written_past(&self, past: &[(RunId, Option<i32>)]) -> anyhow::Result<Vec<RunId>>;
+
+    /// The first row of a run's record, raw, which holds its birth first
+    /// (`weft_journal::record::read_first_row`); `None` without a record.
+    async fn record_first_row(&self, run_id: RunId) -> anyhow::Result<Option<weft_journal::record::RunLogRow>>;
+
+    /// The rows of a run's record at `seqs`, raw: those that exist
+    /// (`weft_journal::record::read_rows`).
+    async fn record_rows(&self, run_id: RunId, seqs: &[i32]) -> anyhow::Result<weft_journal::record::RawRecord>;
+
+    /// A run's whole record, each event with its place, for a reader that
+    /// keeps every event: a trigger setup, whose record is a few rows by
+    /// construction. A row that no longer decodes fails the WHOLE
+    /// read, naming the run and `weft clean`, because a fold over a
+    /// partial record rebuilds a state that never existed.
+    async fn events_log(&self, run_id: RunId) -> anyhow::Result<Vec<weft_journal::JournalRow>> {
+        self.readable_events(run_id).await?.map_err(anyhow::Error::msg)
+    }
+
+    /// [`Self::events_log`], telling the database failing (the outer
+    /// error: asking again may work) from a row that no longer decodes
+    /// (the inner one, naming the row: it never will).
+    async fn readable_events(&self, run_id: RunId) -> anyhow::Result<Result<Vec<weft_journal::JournalRow>, String>> {
+        let mut rows = Vec::new();
+        let mut after = None;
+        loop {
+            let page = self.record_page(run_id, after).await?;
+            let Some(last) = page.rows.last().map(|row| row.seq) else { return Ok(Ok(rows)) };
+            match weft_journal::on_blocking_pool(move || page.decode(run_id)).await {
+                Ok(decoded) => rows.extend(decoded),
+                Err(reason) => return Ok(Err(reason)),
+            }
+            after = Some(last);
         }
     }
 
@@ -246,12 +271,13 @@ pub trait RunStore: Send + Sync {
     /// The LAST `limit` log lines of a run, oldest first: every event
     /// `LogEntry::from_event` projects (node log lines and the failures
     /// its record holds), in the order they were written
-    /// (`LogEntry::tail`). The tail, not the head: a run that wrote more
+    /// (`LogTail`). The tail, not the head: a run that wrote more
     /// lines than the limit went wrong at the END, and a head would cut
-    /// off exactly the failure the reader came for. A DISPLAY read, like
-    /// `events_log_lossy`: a row that no longer decodes is an `error` line
-    /// naming it and `weft clean` (`LogEntry::corrupt_row`), so the lines
-    /// that survive still read.
+    /// off exactly the failure the reader came for. A DISPLAY read: a row
+    /// that no longer decodes is an `error` line naming it and `weft
+    /// clean` (`LogEntry::corrupt_row`), so the lines that survive still
+    /// read. The record is read a page at a time and only the tail is
+    /// kept, so a long run's log costs `limit` lines of memory.
     async fn logs_for(&self, run_id: RunId, limit: u32) -> anyhow::Result<Vec<LogEntry>>;
 
     /// A page of `tenant`'s runs, newest first, matching `query`'s filters
@@ -927,6 +953,90 @@ impl SignalToken {
 }
 
 /// One line of a run's log. A `LogLine` a node
+/// The last `limit` lines of a log fed in record order, in written order
+/// ([`LogEntry::in_written_order`]), holding only those `limit` lines
+/// however many are fed.
+pub struct LogTail {
+    limit: usize,
+    /// The latest lines seen, earliest on top so it is the one to drop.
+    kept: std::collections::BinaryHeap<std::cmp::Reverse<Written>>,
+    /// How many lines were fed: the record order that breaks a tie of the
+    /// written order, as the stable sort did.
+    fed: u64,
+}
+
+/// A line with where it sorts: its written order, then its record order.
+struct Written {
+    key: (u64, u64, u64),
+    entry: LogEntry,
+}
+
+impl PartialEq for Written {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for Written {}
+
+impl PartialOrd for Written {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Written {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+impl LogTail {
+    pub fn new(limit: u32) -> Self {
+        Self { limit: limit as usize, kept: std::collections::BinaryHeap::new(), fed: 0 }
+    }
+
+    pub fn push(&mut self, entry: LogEntry) {
+        let key = (entry.written_at_ms, entry.seq.unwrap_or(u64::MAX), self.fed);
+        self.fed += 1;
+        if self.limit == 0 {
+            return;
+        }
+        self.kept.push(std::cmp::Reverse(Written { key, entry }));
+        if self.kept.len() > self.limit {
+            self.kept.pop();
+        }
+    }
+
+    /// The lines kept, earliest written first.
+    pub fn into_entries(self) -> Vec<LogEntry> {
+        let mut kept: Vec<Written> = self.kept.into_iter().map(|std::cmp::Reverse(line)| line).collect();
+        kept.sort();
+        kept.into_iter().map(|line| line.entry).collect()
+    }
+}
+
+/// One page of run `run_id`'s record after row `after` (from its first
+/// when `None`), decoded, empty once none is left: how a seed's ancestor is
+/// read (`weft_journal::SeedChain::materialize`). A row that no longer
+/// decodes fails the read, naming it.
+pub async fn decoded_page(runs: &dyn RunStore, run_id: RunId, after: Option<i32>) -> anyhow::Result<Vec<weft_journal::JournalRow>> {
+    let page = runs.record_page(run_id, after).await?;
+    weft_journal::on_blocking_pool(move || page.decode(run_id)).await.map_err(anyhow::Error::msg)
+}
+
+/// Read run `run_id`'s record after `after` from `runs` a page at a time
+/// (`weft_journal::record::fold_pages`), handing each page with `state`
+/// to `step` on the blocking pool; answers the state once the record is
+/// read.
+pub async fn fold_record<S, Step>(runs: &dyn RunStore, run_id: RunId, after: Option<i32>, state: S, step: Step) -> anyhow::Result<S>
+where
+    S: Send + 'static,
+    Step: Fn(&mut S, weft_journal::record::RawRecord) -> anyhow::Result<()> + Clone + Send + 'static,
+{
+    weft_journal::record::fold_pages(|after| runs.record_page(run_id, after), after, state, step).await
+}
+
 /// wrote is one; so is every failure the journal recorded about the
 /// run (a node failing, a port refusing a value, the run failing or
 /// being cancelled), projected here as an `error` / `warn` line so
@@ -970,11 +1080,9 @@ impl LogEntry {
     /// what the real read does. The cut is made after the sort, so it is
     /// the last lines the run wrote.
     pub fn tail(entries: Vec<LogEntry>, limit: u32) -> Vec<LogEntry> {
-        let mut entries = Self::in_written_order(entries);
-        if entries.len() > limit as usize {
-            entries.drain(..entries.len() - limit as usize);
-        }
-        entries
+        let mut tail = LogTail::new(limit);
+        entries.into_iter().for_each(|entry| tail.push(entry));
+        tail.into_entries()
     }
 
     /// The end of a second, where a row with no millisecond clock

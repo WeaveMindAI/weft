@@ -595,10 +595,17 @@ impl Door {
     /// before the run goes on record, and the run counts as this worker's
     /// for one lease length until that tick lands
     /// (`weft_journal::record::delivered_until`).
-    pub fn start_ticks(self: &Arc<Self>, under_way: WorkUnderWay) {
+    ///
+    /// The loop runs on `on`, a worker's io runtime (`EngineClients::io`):
+    /// a node body that holds the threads serving calls for long delays
+    /// none of its ticks, so the lease never lapses under a slow body.
+    /// Everything the loop does is short and answers wherever it runs: the
+    /// door's limits and `under_way` are plain locks, and the tick is a
+    /// call on the broker's line.
+    pub fn start_ticks(self: &Arc<Self>, on: &tokio::runtime::Handle, under_way: WorkUnderWay) {
         let door = Arc::downgrade(self);
         let ticking = self.ticking.clone();
-        tokio::spawn(async move {
+        on.spawn(async move {
             let every_second = weft_core::time_scale::scaled(ticks::TICK_EVERY);
             let mut every = tokio::time::interval_at(tokio::time::Instant::now() + every_second, every_second);
             every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

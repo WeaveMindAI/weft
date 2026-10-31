@@ -12,13 +12,16 @@
 	import ValueCard from './ValueCard.svelte';
 	import FileCard from './FileCard.svelte';
 
-	let { payload, closedPorts = [], noteFor = undefined, empty = 'No data' }: {
+	let { payload, closedPorts = [], errors = {}, noteFor = undefined, empty = 'No data' }: {
 		/// The payload: a dict of port name to value in the normal case,
 		/// a bare value for a node whose payload is not keyed.
 		payload: unknown;
 		/// Ports that closed without a value. Each gets a greyed card
 		/// saying so, after the ports that did carry one.
 		closedPorts?: string[];
+		/// Ports whose value could not be shown, with why. Each gets an
+		/// error card, after the ports that did carry one.
+		errors?: Record<string, string>;
 		/// Where a port's value came from when it did not travel a wire
 		/// in this run (a value given to the run, the seed run).
 		noteFor?: (port: string) => string | undefined;
@@ -52,7 +55,10 @@
 	{:else if bare}
 		<ValueCard label="value" value={payload} />
 	{/if}
-	{#if nothing && closedPorts.length === 0}
+	{#each Object.entries(errors) as [port, error]}
+		<ValueCard label={port} {error} />
+	{/each}
+	{#if nothing && closedPorts.length === 0 && Object.keys(errors).length === 0}
 		<div class="px-1 py-2 text-xs text-zinc-400 italic">{empty}</div>
 	{/if}
 	{#each closedPorts as port}

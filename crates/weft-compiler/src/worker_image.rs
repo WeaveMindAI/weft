@@ -191,7 +191,7 @@ pub fn emit(
 
     let mut build_packages = collect_stage_packages(needs, &base, NeedStage::Build)?;
     let runtime_packages = collect_stage_packages(needs, &base, NeedStage::Run)?;
-    let build_env = collect_build_env(catalog, referenced, &|node_type, source_dir| {
+    let NodesBuildEnv { vars: build_env, cache_tag, .. } = collect_build_env(catalog, referenced, &|node_type, source_dir| {
         node_catalog_path(node_type, source_dir, project_root)
     })?;
 
@@ -214,13 +214,15 @@ pub fn emit(
     let template = match &build.dockerfile_template {
         Some(rel) => {
             let path = project_root.join(rel);
-            std::fs::read_to_string(&path).map_err(|e| {
+            let template = std::fs::read_to_string(&path).map_err(|e| {
                 BuildError::Build(format!(
                     "read custom Dockerfile template {}: {}",
                     path.display(),
                     e
                 ))
-            })?
+            })?;
+            refuse_retired_placeholder(&path, &template)?;
+            template
         }
         None => {
             if use_prebuilt_base {
@@ -241,9 +243,13 @@ pub fn emit(
     // The compile cache is per builder: artifacts from a from-scratch
     // builder stage on `base.raw` must not meet those of the prebuilt
     // debian base (same rust target, different C toolchain and headers).
+    // And per `[build.env]`: the sweep after each build keeps only what
+    // that build used, so a project with its own `RUSTFLAGS` sharing the
+    // cache with one without would compile the whole tree again each time
+    // the two take turns.
     let builder = if builder_base_out.is_some() { "builder-base" } else { base.raw.as_str() };
     let weft_root = crate::build::resolve_weft_root()?;
-    let worker_cache_key = crate::hash::compute_worker_cache_key(&weft_root, builder)
+    let worker_cache_key = crate::hash::compute_worker_cache_key(&weft_root, builder, cache_tag.as_deref())
         .map_err(|e| BuildError::Build(format!("worker compile cache key: {e}")))?;
 
     let body = template
@@ -256,7 +262,6 @@ pub fn emit(
         .replace("{{left_out_record_path}}", weft_core::builds::LEFT_OUT_RECORD_PATH)
         .replace("{{cache_gc_script}}", CACHE_GC_SCRIPT_NAME)
         .replace("{{cargo_messages}}", CARGO_MESSAGES_PATH)
-        .replace("{{worker_rustflags}}", weft_core::builds::WORKER_RUSTFLAGS)
         .replace(
             "{{install_builder_base}}",
             &render_builder_base(base.manager),
@@ -297,6 +302,29 @@ pub fn emit(
     })
 }
 
+/// The placeholder the 2026-10-30 (671e50f4) release had every custom
+/// template carry before its `cargo build` (`ENV RUSTFLAGS="..."`). weft
+/// no longer sets compiler flags for a worker build, so nothing fills it:
+/// left in, it would reach cargo as literal text.
+const RETIRED_RUSTFLAGS_PLACEHOLDER: &str = "{{worker_rustflags}}";
+
+/// Refuses a custom template that still carries the retired placeholder,
+/// naming the line to delete.
+fn refuse_retired_placeholder(path: &Path, template: &str) -> BuildResult<()> {
+    let Some((number, line)) =
+        template.lines().enumerate().find(|(_, line)| line.contains(RETIRED_RUSTFLAGS_PLACEHOLDER))
+    else {
+        return Ok(());
+    };
+    Err(BuildError::Build(format!(
+        "{}:{}: `{}` uses {RETIRED_RUSTFLAGS_PLACEHOLDER}, which weft no longer fills (worker builds take no \
+         flags from weft any more): delete that line",
+        path.display(),
+        number + 1,
+        line.trim()
+    )))
+}
+
 impl WorkerDockerfile {
     /// Of `needs` (what each node type the image holds needs), the ones
     /// the image does not install, which the machine its worker runs on
@@ -335,7 +363,8 @@ impl BuilderStage {
             packages: collect_stage_packages(needs, &base, NeedStage::Build)?,
             env: collect_build_env(catalog, referenced, &|node_type, source_dir| {
                 node_catalog_path(node_type, source_dir, project_root)
-            })?,
+            })?
+            .vars,
         })
     }
 
@@ -379,6 +408,43 @@ fn collect_stage_packages(needs: &NodeNeeds, base: &BaseImage, stage: NeedStage)
     Ok(packages.into_iter().collect())
 }
 
+/// The `[build.env]` of a build's nodes, merged ([`collect_build_env`]).
+pub(crate) struct NodesBuildEnv {
+    /// What reaches cargo, `{{catalog_path}}` expanded.
+    pub vars: std::collections::BTreeMap<String, String>,
+    /// The node types that set each variable (one value, however many).
+    pub set_by: std::collections::BTreeMap<String, BTreeSet<String>>,
+    /// What tells this build's compile caches apart from the ones every
+    /// build whose nodes set nothing shares: a short hash of each variable,
+    /// the node type that sets it, and its value as that node declares it;
+    /// `None` when the nodes declare none. Two builds share a tagged cache
+    /// only when the same node types declare the same values.
+    ///
+    /// Every variable counts, not only the ones cargo reads itself. Cargo
+    /// names the files of a unit compiled with other `RUSTFLAGS` or
+    /// `CARGO_PROFILE_*` values by another hash, so they sit beside the
+    /// others, but a cache swept down to what its last build used (a worker
+    /// image's) loses them at the next build without them. And a crate
+    /// whose build script watches a variable (`cargo:rerun-if-env-changed`,
+    /// as the `cc` crate does for `CC` and `CFLAGS`, and `pkg-config` for
+    /// `PKG_CONFIG_PATH`) compiles again in place, with every crate above
+    /// it, each time the value changes. No list can name every variable a
+    /// build script watches.
+    ///
+    /// The values are hashed as declared, `{{catalog_path}}` unexpanded: a
+    /// host build expands it to the node's folder in its package crate,
+    /// named by the node's content, so a hash of the expansion would start
+    /// a new cache at every edit of the node and leave the old one behind.
+    /// The setter is hashed so that one template two different nodes
+    /// declare, which expands to two different folders, never shares a
+    /// cache. Two builds of one node type at different contents (or, in an
+    /// image, at different places in their projects) still share one, and
+    /// see two expansions in it: the crate whose build script watches the
+    /// variable compiles again in place, as it does after any edit of that
+    /// node.
+    pub cache_tag: Option<String>,
+}
+
 /// Collect and substitute `[build.env]` across referenced nodes.
 /// `{{catalog_path}}` expands to `node_path(node_type, source_dir)`: the
 /// node's directory where the build compiles it (its in-container path
@@ -389,11 +455,13 @@ pub(crate) fn collect_build_env(
     catalog: &FsCatalog,
     referenced: &BTreeSet<String>,
     node_path: &dyn Fn(&str, &Path) -> BuildResult<String>,
-) -> BuildResult<std::collections::BTreeMap<String, String>> {
+) -> BuildResult<NodesBuildEnv> {
     let mut merged: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    let mut first_setter: std::collections::BTreeMap<String, String> =
+    // Each variable's first setter and its value as that node declares it.
+    let mut declared: std::collections::BTreeMap<String, (String, String)> =
         std::collections::BTreeMap::new();
+    let mut set_by: std::collections::BTreeMap<String, BTreeSet<String>> = std::collections::BTreeMap::new();
 
     for node_type in referenced {
         let Some(deps) = catalog
@@ -416,7 +484,7 @@ pub(crate) fn collect_build_env(
             let resolved = v.replace("{{catalog_path}}", &catalog_path);
             if let Some(existing) = merged.get(k) {
                 if existing != &resolved {
-                    let other = first_setter.get(k).cloned().unwrap_or_default();
+                    let other = declared.get(k).map(|(setter, _)| setter.clone()).unwrap_or_default();
                     return Err(BuildError::Build(format!(
                         "[build.env] conflict on '{k}': '{other}' sets '{existing}', \
                          '{node_type}' sets '{resolved}'"
@@ -424,11 +492,29 @@ pub(crate) fn collect_build_env(
                 }
             } else {
                 merged.insert(k.clone(), resolved.clone());
-                first_setter.insert(k.clone(), node_type.clone());
+                declared.insert(k.clone(), (node_type.clone(), v.clone()));
             }
+            set_by.entry(k.clone()).or_default().insert(node_type.clone());
         }
     }
-    Ok(merged)
+    Ok(NodesBuildEnv { cache_tag: build_env_cache_tag(&declared), vars: merged, set_by })
+}
+
+/// [`NodesBuildEnv::cache_tag`] of each variable's setter and its value as
+/// that node declares it.
+fn build_env_cache_tag(declared: &std::collections::BTreeMap<String, (String, String)>) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if declared.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    for (name, (setter, value)) in declared {
+        for part in [name, setter, value] {
+            hasher.update(part.as_bytes());
+            hasher.update(b"\0");
+        }
+    }
+    Some(hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect())
 }
 
 /// Compute the in-container path for a node's source dir. The docker
@@ -680,7 +766,8 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 /// - on a builder that keeps its BuildKit caches (`weft build-images`
 ///   run on one machine again and again) compiles into a persistent
 ///   cache per `{{worker_cache_key}}` (`hash::compute_worker_cache_key`:
-///   the build environment and the builder), seeded ONCE from the baked
+///   the build environment, the builder and the nodes' `[build.env]`),
+///   seeded ONCE from the baked
 ///   `/weft/target` (the marker file records a complete seed; a build
 ///   interrupted mid-copy seeds again). After that, cargo's own
 ///   fingerprints decide what compiles: a `pkg_<name>` crate whose
@@ -732,7 +819,6 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 /// knows what to mark used.
 const CARGO_BUILD_RUN_FRAGMENT: &str = concat!(
     "ENV CARGO_TARGET_DIR=/cache/target\n",
-    "ENV RUSTFLAGS=\"{{worker_rustflags}}\"\n",
     "ARG WEFT_COMPILE_CACHE=kept\n",
     "RUN --mount=type=cache,id=weft-worker-cargo-registry,target=/root/.cargo/registry,sharing=locked \\\n",
     "    --mount=type=cache,id=weft-worker-target-{{worker_cache_key}},target=/cache/target,sharing=locked \\\n",
@@ -976,6 +1062,50 @@ mod tests {
 
     fn nothing_baked() -> BuilderStage {
         BuilderStage { packages: Vec::new(), env: Default::default() }
+    }
+
+    /// The `[build.env]` tag tells builds apart by what their nodes
+    /// declare and which node declares it: none when they declare nothing,
+    /// another for another value, another for the same template another
+    /// node declares (it expands to that node's folder), the same wherever
+    /// the build puts the node; and a project's worker image compiles in
+    /// the cache its tag names.
+    #[test]
+    fn the_build_env_names_the_compile_cache_by_what_the_nodes_declare() {
+        let temp = tempfile::tempdir().unwrap();
+        for (dir, ty, env) in [
+            ("plain", "Plain", None),
+            ("native", "Native", Some("RUSTFLAGS = \"-C target-cpu=native\"")),
+            ("v3", "V3", Some("RUSTFLAGS = \"-C target-cpu=x86-64-v3\"")),
+            ("vips", "Vips", Some("PKG_CONFIG_PATH = \"{{catalog_path}}/pkgconfig\"")),
+            ("heif", "Heif", Some("PKG_CONFIG_PATH = \"{{catalog_path}}/pkgconfig\"")),
+        ] {
+            let at = temp.path().join("nodes").join(dir);
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(at.join("metadata.json"), format!(r#"{{"type": "{ty}", "label": "{ty}", "description": "d", "inputs": [], "outputs": []}}"#)).unwrap();
+            std::fs::write(at.join("mod.rs"), "// impl\n").unwrap();
+            if let Some(env) = env {
+                std::fs::write(at.join("deps.toml"), format!("[build.env]\n{env}\n")).unwrap();
+            }
+        }
+        let catalog = FsCatalog::discover(&temp.path().join("nodes")).unwrap();
+        let referenced = |ty: &str| BTreeSet::from([ty.to_string()]);
+        let tag = |ty: &str, at: &str| collect_build_env(&catalog, &referenced(ty), &|_, _| Ok(at.to_string())).unwrap().cache_tag;
+        assert_eq!(tag("Plain", "/a"), None);
+        let (native, v3, vips) = (tag("Native", "/a").unwrap(), tag("V3", "/a").unwrap(), tag("Vips", "/a").unwrap());
+        assert!(native != v3 && native != vips && v3 != vips);
+        assert_eq!(tag("Vips", "/b").unwrap(), vips, "where the node sits is no part of it");
+        assert_ne!(tag("Heif", "/a").unwrap(), vips, "one template, declared by two nodes, names two folders");
+
+        let mount = |ty: &str| {
+            let build = WorkerBuildSection { base_image: None, dockerfile_template: None, package_manager: None };
+            let out = emit(&build, temp.path(), &catalog, &referenced(ty), &NodeNeeds::new(), "worker_test", "weft-builder-base:cafebabe", &nothing_baked()).unwrap();
+            let at = out.body.find(WORKER_CACHE_MOUNT_ID_PREFIX).unwrap() + WORKER_CACHE_MOUNT_ID_PREFIX.len();
+            out.body[at..at + 16].to_string()
+        };
+        assert_eq!(mount("Plain"), crate::hash::compute_worker_cache_key(&crate::build::resolve_weft_root().unwrap(), "builder-base", None).unwrap());
+        assert_ne!(mount("Native"), mount("Plain"));
+        assert_ne!(mount("Native"), mount("V3"));
     }
 
     #[test]
@@ -1228,6 +1358,40 @@ mod tests {
         assert!(out.body.contains("FROM weft-builder-base:cafebabe AS builder"));
         assert!(!out.writes_left_out_record, "a custom template builds its own way and keeps no record");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A custom template still carrying the compiler-flags placeholder
+    /// weft no longer fills is refused, naming the line to delete, rather
+    /// than handing cargo the placeholder as literal flags.
+    #[test]
+    fn custom_template_with_the_retired_rustflags_line_is_refused() {
+        use crate::project::WorkerBuildSection;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Dockerfile.tpl"),
+            "FROM {{base_image}}\nENV RUSTFLAGS=\"{{worker_rustflags}}\"\nRUN cargo build\n",
+        )
+        .expect("write template");
+        let build = WorkerBuildSection {
+            base_image: None,
+            dockerfile_template: Some("Dockerfile.tpl".into()),
+            package_manager: None,
+        };
+        let Err(err) = emit(
+            &build,
+            dir.path(),
+            &weft_catalog::FsCatalog::empty(),
+            &std::collections::BTreeSet::new(),
+            &NodeNeeds::new(),
+            "worker_test",
+            "weft-builder-base:cafebabe",
+            &nothing_baked(),
+        ) else {
+            panic!("a template with the retired placeholder renders");
+        };
+        let err = err.to_string();
+        assert!(err.contains("Dockerfile.tpl:2"), "{err}");
+        assert!(err.contains("ENV RUSTFLAGS=\"{{worker_rustflags}}\"") && err.contains("delete that line"), "{err}");
     }
 
     /// Default debian runtime + no custom template: prebuilt base

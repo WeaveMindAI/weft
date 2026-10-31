@@ -91,7 +91,7 @@ impl FromRow for ListedRow {
             project_id: row.try_get("project_id")?,
             identity: row.try_get("identity")?,
             label: row.try_get("label")?,
-            granted_scopes: row.try_get("granted_scopes")?,
+            granted_scopes: row.try_get::<_, db::Json<Value>>("granted_scopes")?.0,
             permissions_verified: row.try_get("permissions_verified")?,
             owner: row.try_get("owner")?,
             door: row.try_get("door")?,
@@ -157,15 +157,20 @@ pub async fn list_grants(
 /// door, a browser consent): each such app lists the install's OAuth
 /// callback at its provider, so it must be told when that callback moves.
 pub async fn own_sign_in_services(pool: &Pool, tenant: &str) -> anyhow::Result<Vec<String>> {
-    Ok(pool
-        .scalars(
-            "SELECT DISTINCT service FROM access_grant
-             WHERE tenant_id = $1 AND door = 'own' AND registration_sealed IS NOT NULL
-               AND spec_json -> 'acquisition' -> 'grant' ->> 'kind' = 'authorization_code'
-             ORDER BY service",
+    let rows: Vec<(uuid::Uuid, String, JsonText<Value>, weft_core::stored::Version)> = pool
+        .all(
+            "SELECT id, service, spec, spec_version FROM access_grant
+             WHERE tenant_id = $1 AND door = 'own' AND registration_sealed IS NOT NULL",
             &[&tenant],
         )
-        .await?)
+        .await?;
+    let mut services = std::collections::BTreeSet::new();
+    for (id, service, JsonText(spec), version) in rows {
+        if crate::spec_of(format_args!("connection {id}"), spec, version)?.needs_browser_consent() {
+            services.insert(service);
+        }
+    }
+    Ok(services.into_iter().collect())
 }
 
 /// The `WITH` clause that deletes `table`'s rows past their life (made
@@ -475,8 +480,8 @@ pub(crate) fn provider_account_of(
 
 /// The plain value-NAMES column written beside every sealed values
 /// map, so the editor's list never needs the store to open a row.
-pub(crate) fn value_names_of(values: &BTreeMap<String, String>) -> Value {
-    Value::Array(values.keys().map(|k| Value::String(k.clone())).collect())
+pub(crate) fn value_names_of(values: &BTreeMap<String, String>) -> Vec<&str> {
+    values.keys().map(String::as_str).collect()
 }
 
 /// Everything one grant INSERT needs. The single write path for every
@@ -623,9 +628,9 @@ async fn write_grant(
     // INSERT below can never be quietly left stale on a re-publish
     // (which nothing would catch: the answer returned to the caller
     // reports the new value while the row keeps the old one).
-    // SYNC: the exclusive key <-> crate::GROUP's access_grant_exclusive index, exclusive_row
+    // SYNC: the exclusive key <-> crate::GROUP's access_grant_one_exclusive index, exclusive_row
     let exclusive_key = "(tenant_id, service, identity, client_id, instance_id, project_id)
-               WHERE published_by_node IS NULL AND client_id IS NOT NULL AND spec_json->>'grants' = 'exclusive'";
+               WHERE published_by_node IS NULL AND client_id IS NOT NULL AND exclusive";
     let exclusive = grant.spec.grants == GrantCoexistence::Exclusive && grant.registration.is_some();
     let lands_on = if grant.published_by_node.is_some() {
         Some((
@@ -653,8 +658,9 @@ async fn write_grant(
               DO UPDATE SET
                  registration_sealed = EXCLUDED.registration_sealed,
                  client_id = EXCLUDED.client_id,
-                 spec_json = EXCLUDED.spec_json,
-                 spec_json_version = EXCLUDED.spec_json_version,
+                 spec = EXCLUDED.spec,
+                 spec_version = EXCLUDED.spec_version,
+                 exclusive = EXCLUDED.exclusive,
                  events_recipe_hash = EXCLUDED.events_recipe_hash,
                  values_sealed = EXCLUDED.values_sealed,
                  value_names = EXCLUDED.value_names,
@@ -674,15 +680,15 @@ async fn write_grant(
     };
     let sql = format!(
         "INSERT INTO access_grant
-           (id, tenant_id, service, registration_sealed, client_id, project_id, spec_json,
+           (id, tenant_id, service, registration_sealed, client_id, project_id, spec,
             events_recipe_hash, values_sealed, value_names, granted_scopes,
             permissions_verified, owner, door, label, identity, provider_account, expires_at,
-            published_by_node, instance_id, spec_json_version, token_lifetime_secs, created_at)
+            published_by_node, instance_id, spec_version, token_lifetime_secs, created_at, exclusive)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                 $18, $19, $20, $21, $22, COALESCE($23, now())){upsert}
+                 $18, $19, $20, $21, $22, COALESCE($23, now()), $24){upsert}
          RETURNING id, granted_scopes"
     );
-    let written: Option<(uuid::Uuid, Value)> = db
+    let written: Option<(uuid::Uuid, db::Json<Value>)> = db
         .opt(
             &sql,
             &[
@@ -692,11 +698,11 @@ async fn write_grant(
                 &registration_snapshot(grant.registration)?,
                 &grant.registration.as_ref().map(|r| r.client_id.clone()),
                 &grant.project_id,
-                &serde_json::to_value(grant.spec)?,
+                &JsonText(grant.spec),
                 &crate::resolve::events_recipe_hash(&grant.spec.events),
                 &crate::seal_json(&serde_json::to_value(&grant.values)?)?,
-                &value_names_of(&grant.values),
-                &serde_json::to_value(&grant.granted)?,
+                &db::Json(db::Names(&value_names_of(&grant.values))),
+                &db::Json(db::Names(&grant.granted)),
                 &grant.verified,
                 &owner_str(&owner),
                 &door_str(grant.door),
@@ -709,10 +715,11 @@ async fn write_grant(
                 &weft_core::AccessSpec::STORED.version(),
                 &lifetime_secs,
                 &moved.map(|m| m.created_at),
+                &(grant.spec.grants == GrantCoexistence::Exclusive),
             ],
         )
         .await?;
-    let Some((id, granted)) = written else { return Ok(None) };
+    let Some((id, db::Json(granted))) = written else { return Ok(None) };
     grant.granted = scopes_of(&granted);
     let label = grant.label.clone();
     Ok(Some(completed(id, grant, label)))
@@ -746,23 +753,24 @@ async fn rotate_grant(
         "UPDATE access_grant
          SET values_sealed = $3, value_names = $4, granted_scopes = {union},
              permissions_verified = $6, identity = $7, label = $8, door = $9,
-             expires_at = $10, spec_json = $11, registration_sealed = $12,
+             expires_at = $10, spec = $11, registration_sealed = $12,
              client_id = $13, provider_account = $14, events_recipe_hash = $15,
-             project_id = $16, spec_json_version = $17, token_lifetime_secs = $18, owner = $19,
+             project_id = $16, spec_version = $17, token_lifetime_secs = $18, owner = $19,
+             exclusive = $22,
              renewal_claimed_until = NULL, reconnects = reconnects + 1, updated_at = now()
          WHERE id = $1 AND tenant_id = $2 AND service = $21 AND {owned}
          RETURNING granted_scopes",
         union = granted_union_sql("$5"),
         owned = same_owner_sql("$20", "$16"),
     );
-    let rotated: db::Result<Option<Value>> = pool
+    let rotated: db::Result<Option<db::Json<Value>>> = pool
         .scalar_opt(
             &sql,
             &[
                 &id,
                 &tenant,
                 &crate::seal_json(&serde_json::to_value(&grant.values)?)?,
-                &value_names_of(&grant.values),
+                &db::Json(db::Names(&value_names_of(&grant.values))),
                 &grant.granted,
                 &grant.verified,
                 &grant.identity,
@@ -770,7 +778,7 @@ async fn rotate_grant(
                 &door_str(grant.door),
                 &expires_at,
                 // The recipe as this weft writes it, whatever shape the row kept it in.
-                &serde_json::to_value(grant.spec)?,
+                &JsonText(grant.spec),
                 // Re-consent carries the current app; write it through so a later
                 // refresh uses the app this consent actually used, not the one the
                 // row was first created with.
@@ -784,17 +792,18 @@ async fn rotate_grant(
                 &owner_str(&owner),
                 &grant.instance.as_ref().map(|m| m.as_str()),
                 &service,
+                &(grant.spec.grants == GrantCoexistence::Exclusive),
             ],
         )
         .await;
     let rotated = match rotated {
-        // SYNC: access_grant_exclusive <-> crate::GROUP's index, exclusive_row, insert_grant
-        Err(e) if e.as_db_error().and_then(|db| db.constraint()) == Some("access_grant_exclusive") => {
+        // SYNC: access_grant_one_exclusive <-> crate::GROUP's index, exclusive_row, insert_grant
+        Err(e) if e.as_db_error().and_then(|db| db.constraint()) == Some("access_grant_one_exclusive") => {
             return Err(signed_in_as_another(pool, tenant, service, &grant).await);
         }
         rotated => rotated?,
     };
-    let Some(granted) = rotated else {
+    let Some(db::Json(granted)) = rotated else {
         return Err(AccessError::NotFound.into());
     };
     grant.granted = scopes_of(&granted);
@@ -843,7 +852,7 @@ fn granted_union_sql(param: &str) -> String {
 /// account, so a row made through another app is never this one. The
 /// database holds one at most: [`insert_grant`] lands a second sign-in on
 /// it.
-// SYNC: the exclusive key <-> crate::GROUP's access_grant_exclusive index, insert_grant
+// SYNC: the exclusive key <-> crate::GROUP's access_grant_one_exclusive index, insert_grant
 pub(crate) async fn exclusive_row(
     db: &impl Client,
     tenant: &str,
@@ -858,7 +867,7 @@ pub(crate) async fn exclusive_row(
             "SELECT id FROM access_grant
              WHERE tenant_id = $1 AND service = $2 AND identity IS NOT DISTINCT FROM $3 AND client_id = $4
                AND instance_id IS NOT DISTINCT FROM $5 AND project_id IS NOT DISTINCT FROM $6
-               AND published_by_node IS NULL AND spec_json->>'grants' = 'exclusive'",
+               AND published_by_node IS NULL AND exclusive",
             &[&tenant, &service, &identity, &client_id, &instance.map(|m| m.as_str()), &project_id],
         )
         .await?)
@@ -1032,8 +1041,8 @@ pub async fn begin_picker(
             &req.service,
             &req.script,
             &req.code,
-            &serde_json::to_value(&req.mime_types)?,
-            &serde_json::to_value(&req.grants)?,
+            &db::Json(db::Names(&req.mime_types)),
+            &db::Json(db::Names(&req.grants)),
             &req.for_instance.as_ref().map(|m| m.project_id),
             &req.for_instance.as_ref().map(|m| m.instance.as_str()),
             &(chrono::Utc::now() - CONNECT_TTL),
@@ -1047,14 +1056,14 @@ pub async fn begin_picker(
 /// dead past the TTL like a pending consent, and deleted when found so.
 pub async fn load_picker(pool: &Pool, state: &str) -> anyhow::Result<PickerSession> {
     #[allow(clippy::type_complexity)]
-    let row: Option<(String, uuid::Uuid, String, String, String, Value, chrono::DateTime<chrono::Utc>, Option<uuid::Uuid>, Option<String>)> =
+    let row: Option<(String, uuid::Uuid, String, String, String, db::Json<Value>, chrono::DateTime<chrono::Utc>, Option<uuid::Uuid>, Option<String>)> =
         pool.opt(
             "SELECT tenant_id, access_id, service, script, code, mime_types, created_at, project_id, instance_id
              FROM access_picker WHERE state = $1",
             &[&state],
         )
         .await?;
-    let Some((tenant, access_id, service, script, code, mime_types, created_at, project_id, instance_id)) = row else {
+    let Some((tenant, access_id, service, script, code, db::Json(mime_types), created_at, project_id, instance_id)) = row else {
         return Err(AccessError::Invalid(
             "this picker link is unknown or expired; open the picker again from the editor"
                 .into(),
@@ -1106,14 +1115,14 @@ pub async fn finish_picker(
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
     #[allow(clippy::type_complexity)]
-    let row: Option<(String, uuid::Uuid, Value, Option<uuid::Uuid>, Option<String>)> = tx
+    let row: Option<(String, uuid::Uuid, db::Json<Value>, Option<uuid::Uuid>, Option<String>)> = tx
         .opt(
             "DELETE FROM access_picker WHERE state = $1 AND created_at >= $2
              RETURNING tenant_id, access_id, grants, project_id, instance_id",
             &[&state, &cutoff],
         )
         .await?;
-    let Some((tenant, access_id, grants, project_id, instance)) = row else {
+    let Some((tenant, access_id, db::Json(grants), project_id, instance)) = row else {
         return Err(AccessError::Invalid(
             "this picker link is unknown, already used, or expired; open the picker again from the editor".into(),
         )
@@ -1308,8 +1317,8 @@ pub async fn begin_oauth(
             &spec.service,
             &crate::seal_json(&serde_json::to_value(registration)?)?,
             &req.project_id,
-            &serde_json::to_value(spec)?,
-            &serde_json::to_value(&requested)?,
+            &JsonText(spec),
+            &db::Json(db::Names(&requested)),
             &verifier.as_deref().map(crate::seal_str),
             &door_str(req.door),
             &req.upgrade_grant_id,
@@ -1436,8 +1445,8 @@ async fn complete_oauth_inner(
         String,
         String,
         Option<uuid::Uuid>,
-        Value,
-        Value,
+        JsonText<Value>,
+        db::Json<Value>,
         Option<String>,
         String,
         Option<uuid::Uuid>,
@@ -1466,8 +1475,8 @@ async fn complete_oauth_inner(
         service,
         registration_sealed,
         project_id,
-        spec_json,
-        ticked_json,
+        JsonText(spec_json),
+        db::Json(ticked_json),
         verifier,
         door,
         upgrade_grant_id,
@@ -2336,7 +2345,7 @@ async fn publish_grant_in(
     let identity = resolve_identity(&spec, &values)?;
     let current: Option<Published> = db
         .opt(
-            "SELECT id, spec_json, spec_json_version, values_sealed, label, identity FROM access_grant
+            "SELECT id, spec, spec_version, values_sealed, label, identity FROM access_grant
              WHERE tenant_id = $1 AND project_id = $2 AND published_by_node = $3
                AND service = $4 AND instance_id IS NOT DISTINCT FROM $5",
             &[&tenant, &project_id, &node_id, &spec.service, &instance.as_ref().map(|m| m.as_str())],
@@ -2347,8 +2356,8 @@ async fn publish_grant_in(
         // stores no app, no scopes and no expiry), so equal ones mean an
         // equal row. Stored values that no longer open are not equal to
         // anything: the publish writes the row over them.
-        let unchanged = current.spec_json_version == weft_core::AccessSpec::STORED.version()
-            && current.spec_json == serde_json::to_value(&spec)?
+        let unchanged = current.spec_version == weft_core::AccessSpec::STORED.version()
+            && current.spec == serde_json::to_value(&spec)?
             && crate::open_json(&current.values_sealed).is_ok_and(|stored| crate::values_of(&stored) == values)
             && current.label == label
             && current.identity == identity;
@@ -2413,14 +2422,15 @@ pub async fn write_pushed_values(
         return Err(AccessError::Invalid(format!("{node_id} has no baked output '{stray}', so the value its infrastructure sent for it has nowhere to go")).into());
     }
     if !values.connection.is_empty() {
-        let published: Vec<(Value, weft_core::stored::Version, String, Option<String>, String)> = tx
+        #[allow(clippy::type_complexity)]
+        let published: Vec<(JsonText<Value>, weft_core::stored::Version, String, Option<String>, String)> = tx
             .all(
-                "SELECT g.spec_json, g.spec_json_version, g.values_sealed, g.label, g.tenant_id FROM access_grant g JOIN project p ON p.tenant_id = g.tenant_id \
+                "SELECT g.spec, g.spec_version, g.values_sealed, g.label, g.tenant_id FROM access_grant g JOIN project p ON p.tenant_id = g.tenant_id \
                  WHERE p.id = $1 AND g.project_id = $1 AND g.published_by_node = $2 AND g.instance_id IS NOT DISTINCT FROM $3",
                 &[&project_id, &node_id, &instance_id],
             )
             .await?;
-        let (spec, version, sealed, label, tenant) = match published.as_slice() {
+        let (JsonText(spec), version, sealed, label, tenant) = match published.as_slice() {
             [one] => one,
             [] => return Err(AccessError::Invalid(format!("{node_id} has published no connection, so the connection values its infrastructure sent have nowhere to go")).into()),
             _ => return Err(AccessError::Invalid(format!("{node_id} published several connections, so the connection values its infrastructure sent name none of them")).into()),
@@ -2466,8 +2476,8 @@ pub async fn write_pushed_values(
 /// What a node's published connection holds now, as a publish compares it.
 struct Published {
     id: uuid::Uuid,
-    spec_json: Value,
-    spec_json_version: weft_core::stored::Version,
+    spec: Value,
+    spec_version: weft_core::stored::Version,
     values_sealed: String,
     label: Option<String>,
     identity: Option<String>,
@@ -2477,8 +2487,8 @@ impl FromRow for Published {
     fn from_row(row: Row) -> db::Result<Self> {
         Ok(Self {
             id: row.try_get("id")?,
-            spec_json: row.try_get("spec_json")?,
-            spec_json_version: row.try_get("spec_json_version")?,
+            spec: row.try_get::<_, JsonText<Value>>("spec")?.0,
+            spec_version: row.try_get("spec_version")?,
             values_sealed: row.try_get("values_sealed")?,
             label: row.try_get("label")?,
             identity: row.try_get("identity")?,

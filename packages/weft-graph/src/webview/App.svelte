@@ -12,6 +12,7 @@
   import { projectHasInfra, projectHasTriggers } from './lib/utils/node-roles';
   import type { ProjectDefinition as V1Project, NodeFiring, RunState } from './lib/types';
   import { bareRecord } from './lib/types';
+  import { runValues } from './lib/utils/run-values.svelte';
   import type { ActionBarState, CatalogWarning, ActionAvailability, LifecycleAction, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, RunCheck, WebviewMessage } from '../protocol';
   import type { EditRpcResult } from './lib/projection/types';
   import { idleActionBarState } from '../status';
@@ -75,6 +76,8 @@
   // problem surface.
   const CATALOG_HINT =
     'Stale node copies cause most catalog/metadata errors: run `weft catalog update` in the project, then save again.';
+  // The one notice a dropped live link keeps up while the host reconnects.
+  const FOLLOW_RECONNECTING_TOAST = 'follow-reconnecting';
   let layoutCode = $state('');
   // RPC for source edits: applyEdits/applyTextEdit await the host's
   // `editApplied` reply through the ONE shared request registry
@@ -256,10 +259,9 @@
   // answer instead of each checking for itself.
   const shownRunState = $derived(interactive ? runState : emptyRunState(false));
 
-  // Dedup keys for append-only inspector logs. The run follower
-  // subscribes to the live SSE stream BEFORE replaying the journal
-  // snapshot, so an event can arrive via BOTH the replay and the live
-  // buffer (the overlap window). Node firings are idempotent (keyed
+  // Dedup keys for append-only inspector logs. A host may hand the same
+  // event twice (one that reads a run's history beside its live stream,
+  // where the two overlap). Node firings are idempotent (keyed
   // by (nodeId, framesKey), mutated in place), but bus and loop logs
   // are append-only, so without dedup the same chat line / loop
   // iteration would render twice. Bus events carry a per-bus `offset`;
@@ -464,6 +466,8 @@
       }
       if (msg.kind === 'runReset' || msg.kind === 'runCleared') {
         runState = emptyRunState(msg.kind === 'runReset');
+        // The values the canvas shows are read from the run it follows.
+        runValues.follow(msg.kind === 'runReset' ? msg.runId : undefined);
         seenBusKeys = new Set();
         seenLoopKeys = new Set();
         seenCallerOffsets = new Set();
@@ -829,6 +833,19 @@
             ? 'Lost the live connection to this run. Re-open it to reconnect.'
             : 'The live run stream ended. Re-open the run to reconnect.',
         );
+        return;
+      }
+      if (msg.kind === 'followReconnecting') {
+        // The live link dropped and the host keeps opening it again: one
+        // notice, kept up and updated with each failed attempt's reason,
+        // gone once the link is back or the follow stops. The run stays
+        // live meanwhile.
+        if (msg.why === null) toast.dismiss(FOLLOW_RECONNECTING_TOAST);
+        else toast.warning('Reconnecting to the live run...', {
+          id: FOLLOW_RECONNECTING_TOAST,
+          description: msg.why,
+          duration: Number.POSITIVE_INFINITY,
+        });
         return;
       }
       if (msg.kind === 'actionBarState') {

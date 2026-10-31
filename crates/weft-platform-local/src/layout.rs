@@ -47,9 +47,14 @@ impl MachineLayout {
         self.root.join("worker-target")
     }
 
-    /// The compile cache of lane `number` (`lanes::Lane`).
-    pub fn lane_cache(&self, number: u32) -> PathBuf {
-        self.compile_caches().join(number.to_string())
+    /// The compile cache of lane `number` (`lanes::Lane`) for builds whose
+    /// nodes' `[build.env]` has the tag `cache_tag`
+    /// (`weft_core::builds::HostRecipe::cache_tag`): `<number>` for the
+    /// builds whose nodes set nothing, `<number>-<tag>` for each other set
+    /// of values and the node types that set them, all held through the
+    /// one lane's lock.
+    pub fn lane_cache(&self, number: u32, cache_tag: Option<&str>) -> PathBuf {
+        self.compile_caches().join(lane_cache_name(number, cache_tag))
     }
 
     /// The compile cache the standard worker is compiled in, which every
@@ -68,8 +73,21 @@ impl MachineLayout {
     /// There once lane `number`'s cache is warm: the seed copied whole into
     /// it, or a build finished in it. Beside the cache, for the same reason
     /// as [`Self::seed_mark`].
-    pub fn lane_mark(&self, number: u32) -> PathBuf {
-        self.compile_caches().join(format!("{number}.weft-seeded"))
+    pub fn lane_mark(&self, number: u32, cache_tag: Option<&str>) -> PathBuf {
+        self.compile_caches().join(format!("{}.weft-seeded", lane_cache_name(number, cache_tag)))
+    }
+
+    /// The lane, and the `[build.env]` tag, of a compile cache or its mark
+    /// under [`Self::compile_caches`], by its name (what
+    /// [`Self::lane_cache`] and [`Self::lane_mark`] name it): `None` for
+    /// the seed's and anything else.
+    pub fn lane_cache_of(name: &str) -> Option<(u32, Option<&str>)> {
+        let cache = name.strip_suffix(".weft-seeded").unwrap_or(name);
+        let (number, tag) = match cache.split_once('-') {
+            Some((number, tag)) => (number, Some(tag)),
+            None => (cache, None),
+        };
+        Some((number.parse().ok()?, tag))
     }
 
     /// The lock of lane `number`: held by the build compiling in it.
@@ -99,6 +117,15 @@ impl MachineLayout {
     /// the machine runs, its build sharing the machine's crates.
     pub fn host_packaging(&self) -> weft_core::builds::WorkerPackaging {
         weft_core::builds::WorkerPackaging::Host { shared_crates: self.shared_crates() }
+    }
+}
+
+/// The name of lane `number`'s cache for the tag `cache_tag`
+/// ([`MachineLayout::lane_cache`]).
+fn lane_cache_name(number: u32, cache_tag: Option<&str>) -> String {
+    match cache_tag {
+        None => number.to_string(),
+        Some(tag) => format!("{number}-{tag}"),
     }
 }
 
@@ -149,11 +176,24 @@ mod tests {
         let m = MachineLayout::new("/d");
         assert_eq!(m.workers(), Path::new("/d/workers"));
         assert_eq!(m.node_test_servers(), Path::new("/d/workers/node-tests"));
-        assert_eq!(m.lane_cache(2), Path::new("/d/worker-target/2"));
+        assert_eq!(m.lane_cache(2, None), Path::new("/d/worker-target/2"));
+        assert_eq!(m.lane_cache(2, Some("0123456789abcdef")), Path::new("/d/worker-target/2-0123456789abcdef"));
         assert_eq!(m.seed_cache(), Path::new("/d/worker-target/seed"));
         assert_eq!(m.compile_caches(), Path::new("/d/worker-target"));
         assert_eq!(m.seed_mark(), Path::new("/d/worker-target/seed.weft-seeded"), "beside the seed's cache, never in it");
-        assert_eq!(m.lane_mark(2), Path::new("/d/worker-target/2.weft-seeded"));
+        assert_eq!(m.lane_mark(2, None), Path::new("/d/worker-target/2.weft-seeded"));
+        assert_eq!(m.lane_mark(2, Some("0123456789abcdef")), Path::new("/d/worker-target/2-0123456789abcdef.weft-seeded"));
+        let tag = Some("0123456789abcdef");
+        for (name, lane) in [
+            ("2", Some((2, None))),
+            ("2-0123456789abcdef", Some((2, tag))),
+            ("2.weft-seeded", Some((2, None))),
+            ("2-0123456789abcdef.weft-seeded", Some((2, tag))),
+            ("seed", None),
+            ("seed.weft-seeded", None),
+        ] {
+            assert_eq!(MachineLayout::lane_cache_of(name), lane, "{name}");
+        }
         assert_eq!(m.host_packaging(), weft_core::builds::WorkerPackaging::Host { shared_crates: m.shared_crates() });
         assert_eq!(m.lane_lock(2), Path::new("/d/compile-lanes/2.lock"));
         assert_eq!(m.seed_lock(), Path::new("/d/compile-lanes/seed.lock"));

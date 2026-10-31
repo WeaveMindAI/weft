@@ -252,11 +252,17 @@ async fn a_run_born_before_its_writers_first_tick_is_answered_unwatched(pool: Po
     assert_eq!(answers.iter().map(|a| (a.fate, a.unwatched)).collect::<Vec<_>>(), [(Fate::Refused, false)]);
 }
 
-/// A run's row as the tests read it: state, owner, epoch, last row, cost.
+/// A run's row as the tests read it: state, owner, epoch, last row, and
+/// what its cost rows add up to, in micro-dollars.
 async fn row(pool: &Pool, run_id: weft_core::RunId) -> (String, Option<String>, i32, i32, i64) {
-    pool.one("SELECT state, owner, epoch, last_seq, cost_micro_usd FROM run WHERE run_id = $1", &[&run_id])
-        .await
-        .expect("the run's row")
+    pool.one(
+        "SELECT state, owner, epoch, last_seq, \
+                (SELECT COALESCE(round(sum(c.amount_usd) * 1000000), 0)::bigint FROM run_cost c WHERE c.run_id = run.run_id) \
+         FROM run WHERE run_id = $1",
+        &[&run_id],
+    )
+    .await
+    .expect("the run's row")
 }
 
 async fn rows_of(pool: &Pool, run_id: weft_core::RunId) -> i64 {
@@ -353,6 +359,76 @@ async fn a_batch_sent_again_changes_nothing(pool: Pool) {
     assert_eq!(row(&pool, run).await.4, 250_000, "the cost counted once");
     let counted: i64 = pool.scalar("SELECT SUM(runs)::bigint FROM version_runs", &[]).await.unwrap();
     assert_eq!(counted, 1, "the version counted the run once");
+}
+
+/// A cost row as the tests read it: its id, place, node, call path,
+/// service, model, amount, whose credential, instance, moment.
+type CostRow = (String, i32, i32, String, Vec<String>, String, Option<String>, Option<f64>, String, Option<String>, i64);
+
+async fn cost_rows(pool: &Pool, run_id: weft_core::RunId) -> Vec<CostRow> {
+    pool.all(
+        "SELECT cost_id, seq, idx, node_id, call_path, service, model, amount_usd, paid_by, paid_by_instance, at_unix \
+         FROM run_cost WHERE run_id = $1 ORDER BY seq, idx",
+        &[&run_id],
+    )
+    .await
+    .unwrap()
+}
+
+/// Each cost a batch carries is a row of its own, with what its event
+/// says and its place in the record; written again (a batch resent, or a
+/// write that lands the same cost twice) it stays one row; and a run the
+/// batch did not take keeps none of the costs it carried.
+#[weft_db_macros::test]
+async fn a_batch_writes_each_of_its_costs_once(pool: Pool) {
+    schema(&pool).await;
+    let run = weft_core::new_run_id();
+    let ada = weft_core::instance::InstanceId::new("ada").unwrap();
+    let priced = |cost_id: &str, amount_usd: Option<f64>, origin: weft_core::CredentialOwner, frames: weft_core::LoopFrames| {
+        let mut event = cost(run);
+        if let RunEvent::CostReported { cost_id: id, amount_usd: amount, origin: paid_by, frames: at, .. } = &mut event {
+            *id = cost_id.into();
+            *amount = amount_usd;
+            *paid_by = origin;
+            *at = frames;
+        }
+        event
+    };
+    let sites = vec![
+        weft_core::frames::Frame::Call { site: "one".into() },
+        weft_core::frames::Frame::Loop { index: 2 },
+        weft_core::frames::Frame::Call { site: "One.two".into() },
+    ];
+    assert_eq!(send(&pool, "w1", "w1:0", &[part(run, 1, 0, vec![vec![birth(run, Keeping::Fast)]])]).await, [Fate::Accepted]);
+    let paid = [part(
+        run,
+        1,
+        1,
+        vec![vec![
+            started(run, "a"),
+            priced("c1", Some(0.25), weft_core::CredentialOwner::Platform, sites),
+            priced("c2", None, weft_core::CredentialOwner::Instance(ada), Vec::new()),
+        ]],
+    )];
+    assert_eq!(send(&pool, "w1", "w1:0", &paid).await, [Fate::Accepted]);
+    let landed = vec![
+        (
+            "c1".to_string(), 1, 1, "llm".to_string(), vec!["one".to_string(), "One.two".to_string()], "llm".to_string(), None,
+            Some(0.25), "platform".to_string(), None, 2,
+        ),
+        ("c2".to_string(), 1, 2, "llm".to_string(), Vec::new(), "llm".to_string(), None, None, "instance".to_string(), Some("ada".to_string()), 2),
+    ];
+    assert_eq!(cost_rows(&pool, run).await, landed);
+
+    assert_eq!(send(&pool, "w1", "w1:0", &paid).await, [Fate::AlreadyApplied]);
+    let again = weft_journal::record::Written::of(&paid[0].rows[0]).costs;
+    weft_journal::costs::insert_in(&pool.get().await.unwrap(), run, 1, &again).await.unwrap();
+    assert_eq!(cost_rows(&pool, run).await, landed, "a cost written again stays one row");
+
+    // A batch under a stale epoch is refused, and nothing it carried lands.
+    let stale = [part(run, 7, 2, vec![vec![priced("c3", Some(1.0), weft_core::CredentialOwner::Author, Vec::new())]])];
+    assert_eq!(send(&pool, "w1", "w1:0", &stale).await, [Fate::Refused]);
+    assert_eq!(cost_rows(&pool, run).await.len(), 2, "a refused run's costs go nowhere");
 }
 
 /// Two workers that took one fire both bear its run: the first is the
@@ -478,7 +554,7 @@ async fn a_given_up_run_books_its_open_charge_unknown(pool: Pool) {
     drop(conn);
     assert_eq!(gave_up, weft_journal::record::GaveUp::Ended(2));
 
-    let events = weft_journal::record::read_record(&pool, run, None).await.unwrap().events(run).unwrap();
+    let events = weft_journal::record::read_page(&pool, run, None).await.unwrap().events(run).unwrap();
     let costs: Vec<&RunEvent> = events.iter().filter(|event| matches!(event, RunEvent::CostReported { .. })).collect();
     assert_eq!(costs.len(), 1, "{events:?}");
     assert!(
@@ -489,4 +565,62 @@ async fn a_given_up_run_books_its_open_charge_unknown(pool: Pool) {
     assert!(matches!(&events[events.len() - 2..], [RunEvent::CostReported { .. }, RunEvent::RunFailed { .. }]), "{events:?}");
     assert_eq!(weft_journal::ChargeBook::of_record(&events).into_open().count(), 0, "the record holds no open charge");
     assert_eq!(row(&pool, run).await.0, "ended");
+}
+
+/// A run's record reads back a page at a time: at most
+/// `weft_journal::record::PAGE_ROWS` rows, cut sooner once the rows weigh
+/// `PAGE_BYTES` (a row heavier than that alone), always one row while any
+/// is left, from past any row, empty once none is; its first row alone;
+/// any of its rows by place.
+#[weft_db_macros::test]
+async fn a_record_reads_back_a_page_at_a_time(pool: Pool) {
+    use weft_journal::record::{read_first_row, read_page, read_rows, PAGE_BYTES, PAGE_ROWS};
+    schema(&pool).await;
+    let empty = weft_core::new_run_id();
+    assert!(read_page(&pool, empty, None).await.unwrap().rows.is_empty(), "a run with no record has no page");
+    assert!(read_first_row(&pool, empty).await.unwrap().is_none());
+
+    let run = weft_core::new_run_id();
+    let light = PAGE_ROWS as usize + 10;
+    let mut rows = vec![vec![birth(run, Keeping::Fast)]];
+    rows.extend((1..light).map(|_| vec![started(run, "a")]));
+    assert_eq!(send(&pool, "w1", "w1:0", &[part(run, 1, 0, rows)]).await, [Fate::Accepted]);
+    let seqs = |page: &weft_journal::record::RawRecord| page.rows.iter().map(|row| row.seq).collect::<Vec<_>>();
+    let first = read_page(&pool, run, None).await.unwrap();
+    assert_eq!(seqs(&first), (0..PAGE_ROWS as i32).collect::<Vec<_>>(), "a full page of light rows");
+    assert!(matches!(first.events(run).unwrap()[0], RunEvent::RunStarted { .. }));
+    let next = read_page(&pool, run, Some(PAGE_ROWS as i32 - 1)).await.unwrap();
+    assert_eq!(seqs(&next), (PAGE_ROWS as i32..light as i32).collect::<Vec<_>>(), "the rest past the last row read");
+    assert!(read_page(&pool, run, Some(light as i32 - 1)).await.unwrap().rows.is_empty(), "nothing past the last row");
+    assert_eq!(seqs(&read_page(&pool, run, Some(100)).await.unwrap())[0], 101, "from past any row");
+    assert_eq!(read_first_row(&pool, run).await.unwrap().map(|row| row.seq), Some(0));
+    assert_eq!(seqs(&read_rows(&pool, run, &[3, 7, 100_000]).await.unwrap()), [3, 7], "the rows asked for that exist");
+
+    // Rows that barely compress, near half a page's weight each once
+    // stored: a page holds what fits, at least one row.
+    let heavy = weft_core::new_run_id();
+    let noise = |n: u64| -> String {
+        const SYMBOLS: &[u8; 64] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+        let mut state = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (0..PAGE_BYTES as usize / 2).map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            char::from(SYMBOLS[(state >> 58) as usize])
+        }).collect()
+    };
+    let log = |n: u64| RunEvent::LogLine {
+        run_id: heavy, node_id: "a".into(), frames: vec![], level: "info".into(), message: noise(n), at_unix: 2, at_unix_ms: None, seq: None,
+    };
+    let rows = vec![vec![birth(heavy, Keeping::Fast)], vec![log(1)], vec![log(2)], vec![log(3)], vec![log(4)]];
+    assert_eq!(send(&pool, "w1", "w1:0", &[part(heavy, 1, 0, rows)]).await, [Fate::Accepted]);
+    let mut pages = Vec::new();
+    let mut after = None;
+    loop {
+        let page = read_page(&pool, heavy, after).await.unwrap();
+        let Some(last) = page.rows.last().map(|row| row.seq) else { break };
+        pages.push(seqs(&page));
+        after = Some(last);
+    }
+    assert_eq!(pages.concat(), [0, 1, 2, 3, 4], "every row once, in order: {pages:?}");
+    assert!(pages.len() >= 2, "the weight cut the record into pages: {pages:?}");
+    assert!(pages.iter().all(|page| !page.is_empty()));
 }

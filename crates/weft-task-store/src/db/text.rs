@@ -1,5 +1,6 @@
-//! The two rules for what a statement hands the database, applied where
-//! every statement passes ([`super::Client`]) so no write can forget them.
+//! The rules for what a statement hands the database, applied where every
+//! statement passes ([`super::Client`]) or where a value is bound
+//! ([`Json`]), so no write can forget them.
 //!
 //! Postgres refuses the NUL character (U+0000) in text: a `TEXT` value
 //! holding one fails the whole statement (`invalid byte sequence for
@@ -17,6 +18,11 @@
 //!   JSON text in a `TEXT` column ([`JsonText`]), where JSON writes NUL as
 //!   the six characters `\u0000`, which `TEXT` keeps and which read back as
 //!   the character they stand for.
+//!
+//! `JSONB` is left to values that can hold no NUL: [`Json`] binds only a
+//! type that says so by implementing [`JsonbSafe`], so a value a node or a
+//! provider made cannot reach a `JSONB` column by accident.
+//! `serde_json::Value` never does: it can hold anything.
 
 use std::error::Error as StdError;
 
@@ -148,10 +154,128 @@ fn array_without_nul(written: BytesMut) -> Result<BytesMut, BoxError> {
     Ok(if changed { out } else { written })
 }
 
+/// A type whose JSON can hold no NUL character, so it may be bound into
+/// `JSONB` ([`Json`]), where one in any string refuses the whole write:
+/// every string in it is one weft wrote (a hash, an id, a name weft
+/// checked, a path in a project), never a value a node, a provider or a
+/// person handed over ([`WeftMade`] says so of a plain map or list), or it
+/// drops NUL as it writes ([`Names`]). Anything else is kept as
+/// [`JsonText`].
+///
+/// `serde_json::Value` is not one, nor is anything holding it:
+///
+/// ```compile_fail
+/// let value = serde_json::json!({ "page": "a\u{0}b" });
+/// let _: &dyn weft_task_store::db::ToSql = &weft_task_store::db::Json(value);
+/// ```
+pub trait JsonbSafe {}
+
+impl<T: JsonbSafe + ?Sized> JsonbSafe for &T {}
+impl<T: JsonbSafe> JsonbSafe for Option<T> {}
+impl<T: JsonbSafe> JsonbSafe for Vec<T> {}
+impl<T: JsonbSafe> JsonbSafe for [T] {}
+impl<T: JsonbSafe> JsonbSafe for std::collections::BTreeSet<T> {}
+impl<K: JsonbSafe, V: JsonbSafe> JsonbSafe for std::collections::BTreeMap<K, V> {}
+impl JsonbSafe for bool {}
+impl JsonbSafe for i32 {}
+impl JsonbSafe for i64 {}
+impl JsonbSafe for u32 {}
+impl JsonbSafe for u64 {}
+impl JsonbSafe for uuid::Uuid {}
+/// Hashes, and the names of the node types they are of.
+impl JsonbSafe for weft_core::project::hash::ProgramIdentity {}
+
+/// Names a person reads (scopes, the names of stored values, media types)
+/// kept as a `JSONB` list: each loses its NUL characters on the way, as
+/// every text parameter does ([`NulFree`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Names<'a, S>(pub &'a [S]);
+
+impl<S: AsRef<str>> serde::Serialize for Names<'_, S> {
+    fn serialize<Z: serde::Serializer>(&self, serializer: Z) -> Result<Z::Ok, Z::Error> {
+        serializer.collect_seq(self.0.iter().map(|name| name.as_ref().replace('\0', "")))
+    }
+}
+
+impl<S> JsonbSafe for Names<'_, S> {}
+
+/// A plain map or list of strings (and numbers, ids) every one of which
+/// weft made or checked: hashes, ids, tokens weft minted, paths in a
+/// project, names of nodes and node types. Wrapping one says so where it
+/// is bound into `JSONB`. Nothing holding a `serde_json::Value` is plain.
+#[derive(Debug, Clone, Copy)]
+pub struct WeftMade<'a, T: ?Sized>(pub &'a T);
+
+impl<T: serde::Serialize + ?Sized> serde::Serialize for WeftMade<'_, T> {
+    fn serialize<Z: serde::Serializer>(&self, serializer: Z) -> Result<Z::Ok, Z::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<T: Plain + ?Sized> JsonbSafe for WeftMade<'_, T> {}
+
+/// What [`WeftMade`] wraps: strings, numbers and ids, in maps and lists.
+pub trait Plain {}
+
+impl Plain for String {}
+impl Plain for str {}
+impl Plain for bool {}
+impl Plain for i32 {}
+impl Plain for i64 {}
+impl Plain for u32 {}
+impl Plain for u64 {}
+impl Plain for uuid::Uuid {}
+impl<T: Plain + ?Sized> Plain for &T {}
+impl<T: Plain> Plain for Option<T> {}
+impl<T: Plain> Plain for Vec<T> {}
+impl<T: Plain> Plain for [T] {}
+impl<T: Plain> Plain for std::collections::BTreeSet<T> {}
+impl<K: Plain, V: Plain> Plain for std::collections::BTreeMap<K, V> {}
+
+/// A value kept in a `JSON` or `JSONB` column: written with `serde_json`
+/// when it can hold no NUL ([`JsonbSafe`]), read back with it whatever it
+/// is (a read refuses nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Json<T>(pub T);
+
+impl<T: serde::Serialize + JsonbSafe + std::fmt::Debug> ToSql for Json<T> {
+    fn to_sql(&self, ty: &Type, out: &mut BytesMut) -> Result<IsNull, BoxError> {
+        if *ty == Type::JSONB {
+            // The version of JSONB's binary format, the one there is.
+            out.put_u8(1);
+        }
+        serde_json::to_writer(out.writer(), &self.0)?;
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::JSON | Type::JSONB)
+    }
+
+    to_sql_checked!();
+}
+
+impl<'a, T: serde::Deserialize<'a>> FromSql<'a> for Json<T> {
+    fn from_sql(ty: &Type, mut raw: &'a [u8]) -> Result<Self, BoxError> {
+        if *ty == Type::JSONB {
+            match raw.split_first() {
+                Some((1, rest)) => raw = rest,
+                _ => return Err("a JSONB value in a binary format other than version 1".into()),
+            }
+        }
+        Ok(Json(serde_json::from_slice(raw)?))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::JSON | Type::JSONB)
+    }
+}
+
 /// A value kept as its JSON text in a `TEXT` column, for a value that must
 /// read back exactly as it was written (see the module doc): written with
-/// `serde_json`, read back with it. Like `Json`, which keeps it in `JSONB`
-/// instead, where a NUL character in any of its strings refuses the write.
+/// `serde_json`, read back with it. Like [`Json`], which keeps it in
+/// `JSONB` instead, where a NUL character in any of its strings refuses the
+/// write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JsonText<T>(pub T);
 
@@ -254,5 +378,27 @@ mod tests {
         let back: JsonText<serde_json::Value> = JsonText::from_sql(&Type::TEXT, &out).unwrap();
         assert_eq!(back.0, value);
         assert!(!<JsonText<serde_json::Value> as ToSql>::accepts(&Type::JSONB), "JSONB is what it replaces");
+    }
+
+    /// A value safe in JSONB goes in JSONB's binary format (its version
+    /// byte, then the JSON) and reads back from it.
+    #[test]
+    fn json_reads_back_from_jsonb() {
+        let tokens = std::collections::BTreeMap::from([("t1".to_string(), 2u32)]);
+        let mut out = BytesMut::new();
+        Json(WeftMade(&tokens)).to_sql_checked(&Type::JSONB, &mut out).unwrap();
+        assert_eq!(out[0], 1);
+        let back: Json<std::collections::BTreeMap<String, u32>> = Json::from_sql(&Type::JSONB, &out).unwrap();
+        assert_eq!(back.0, tokens);
+        assert!(Json::<serde_json::Value>::from_sql(&Type::JSONB, b"\x02{}").is_err(), "another binary format is refused");
+    }
+
+    /// Names lose their NUL characters on the way into JSONB.
+    #[test]
+    fn names_go_without_nul() {
+        let names = ["chat:\0write".to_string(), "read".to_string()];
+        let mut out = BytesMut::new();
+        Json(Names(&names)).to_sql_checked(&Type::JSONB, &mut out).unwrap();
+        assert_eq!(&out[1..], br#"["chat:write","read"]"#);
     }
 }

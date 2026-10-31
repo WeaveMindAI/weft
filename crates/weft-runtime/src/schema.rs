@@ -33,8 +33,8 @@ pub fn groups() -> Vec<&'static SchemaGroup> {
 /// Columns not listed, and why:
 /// - Rows that do not outlive an update: task payloads and results, an
 ///   OAuth connect or picker in flight (`access_connect`,
-///   `access_picker`, `access_connect_result`, minutes), a version build
-///   in progress, worker leases, the announcement outbox.
+///   `access_picker`, `access_connect_result`, minutes), worker leases,
+///   the announcement outbox.
 /// - Columns that are no one type: `signal.kind_state` (each listener
 ///   kind keeps its own keys there), `alarm.body` (the body of whichever
 ///   route the wake calls), `infra_event.payload` (a type chosen by the
@@ -58,9 +58,9 @@ static DOCUMENTS: &[Document] = &[
     Document::of(
         &weft_core::AccessSpec::STORED,
         "access_grant",
-        "spec_json",
+        "spec",
         Encoding::Json,
-        &[],
+        weft_access_store::SPEC_FILLS,
         Some(weft_access_store::rehash_grant_recipes),
     ),
     // The events recipes a service declared, kept under their hash.
@@ -115,6 +115,9 @@ static DOCUMENTS: &[Document] = &[
     // What the project's running build was compiled with: with its name
     // and files, the request the maintenance lift builds again.
     Document::of(&weft_core::builds::BuildInputs::STORED, "project", "running_build_inputs", Encoding::Json, &[], None),
+    // What a version build waiting on its images was compiled with: it
+    // waits across an update, and registers with them once they are built.
+    Document::of(&weft_core::builds::BuildInputs::STORED, "version_build", "inputs", Encoding::Json, &[], None),
     // The program a trigger was activated on.
     Document::of(
         &weft_core::project::hash::ProgramIdentity::STORED,

@@ -28,7 +28,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use weft_task_store::db::{self, Client, FromRow, Pool};
-use weft_core::builds::{BuiltProgram, ImageBuild, VersionBuildState, VersionBuildStatus};
+use weft_core::builds::{BuildInputs, BuiltProgram, ImageBuild, VersionBuildState, VersionBuildStatus};
 
 use crate::project_store::{ProjectStoreOps, ProjectTransition, StoredProjectSummary};
 use crate::state::DispatcherState;
@@ -66,11 +66,13 @@ pub const VERSION_BUILD_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS version_buil
             manifest JSONB NOT NULL,
             -- What they were compiled with (weft_core::builds::BuildInputs),
             -- registered with them. NULL for a version an older weft
-            -- wrote down, which kept none; a row lives only while its
-            -- images build, so no document version goes with it. As its
-            -- JSON text (`db::JsonText`): its assets are keyed by
-            -- `FileRef::resolution_key`, which holds a NUL.
+            -- wrote down, which kept none. A version waits on its images
+            -- across an update, so it is carried like every stored
+            -- document. As its JSON text (`db::JsonText`), like
+            -- `program`: a text asset is inlined in it.
             inputs TEXT,
+            -- The version `inputs` was written at (`BuildInputs::STORED`).
+            inputs_version INTEGER NOT NULL,
             -- The BuiltProgram the request compiled (replacedInfraImages
             -- empty: the registration fills it), as its JSON text
             -- (`db::JsonText`), like `registered`: a text asset is
@@ -78,8 +80,10 @@ pub const VERSION_BUILD_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS version_buil
             program TEXT NOT NULL,
             -- Every image the version runs.
             images TEXT[] NOT NULL,
-            -- The ImageBuilds it waits on, by image.
-            waits_on JSONB NOT NULL,
+            -- The ImageBuilds it waits on, by image, as their JSON text
+            -- (`db::JsonText`): an image's name may be one a node's
+            -- spec wrote.
+            waits_on TEXT NOT NULL,
             -- SYNC: the states <-> weft_core::builds::VersionBuildStatus
             state TEXT NOT NULL CHECK (state IN ('waiting', 'registered', 'failed', 'cancelled', 'superseded')),
             reason TEXT,
@@ -234,8 +238,8 @@ pub async fn ask(
     };
     tx.execute(
         "INSERT INTO version_build (id, ask, project_id, tenant_id, project_name, manifest, program, images, waits_on, \
-                                    state, reason, registered, asked_at, ended_at, inputs) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, $12, $13, $15) \
+                                    state, reason, registered, asked_at, ended_at, inputs, inputs_version) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, $12, $13, $15, $16) \
          RETURNING pg_notify($14, id::TEXT)",
         &[
             &id,
@@ -243,16 +247,17 @@ pub async fn ask(
             &project,
             &tenant,
             &version.name,
-            &serde_json::to_value(&version.manifest)?,
+            &db::Json(db::WeftMade(&version.manifest)),
             &db::JsonText(&version.program),
             &version.images,
-            &serde_json::to_value(waits_on)?,
+            &db::JsonText(waits_on),
             &status_name(state),
             &superseded_by,
             &now,
             &ended_at,
             &super::follow::BUILD_CLAIMED_CHANNEL,
             &version.inputs.as_ref().map(db::JsonText),
+            &BuildInputs::STORED.version(),
         ],
     )
     .await
@@ -645,7 +650,7 @@ pub async fn advance(pool: &Pool, projects: &dyn ProjectStoreOps) -> Result<Adva
         .context("forget the long-ended version builds")?;
     let rows: Vec<WaitingRow> = pool
         .all(
-            "SELECT id, ask, project_id, tenant_id, project_name, manifest, inputs, program, images, waits_on FROM version_build \
+            "SELECT id, ask, project_id, tenant_id, project_name, manifest, inputs, inputs_version, program, images, waits_on FROM version_build \
              WHERE state = 'waiting' ORDER BY asked_at",
             &[],
         )
@@ -684,6 +689,7 @@ struct WaitingRow {
     project_name: String,
     manifest: serde_json::Value,
     inputs: Option<String>,
+    inputs_version: weft_core::stored::Version,
     program: String,
     images: Vec<String>,
     waits_on: serde_json::Value,
@@ -697,11 +703,12 @@ impl FromRow for WaitingRow {
             project_id: row.try_get("project_id")?,
             tenant_id: row.try_get("tenant_id")?,
             project_name: row.try_get("project_name")?,
-            manifest: row.try_get("manifest")?,
+            manifest: row.try_get::<_, db::Json<serde_json::Value>>("manifest")?.0,
             inputs: row.try_get("inputs")?,
+            inputs_version: row.try_get("inputs_version")?,
             program: row.try_get("program")?,
             images: row.try_get("images")?,
-            waits_on: row.try_get("waits_on")?,
+            waits_on: row.try_get::<_, db::JsonText<serde_json::Value>>("waits_on")?.0,
         })
     }
 }
@@ -733,7 +740,11 @@ async fn advance_one(pool: &Pool, projects: &dyn ProjectStoreOps, row: WaitingRo
             let version = super::Version {
                 name: row.project_name,
                 manifest: serde_json::from_value(row.manifest).context("its files do not read")?,
-                inputs: row.inputs.as_deref().map(serde_json::from_str).transpose().context("what its files were compiled with does not read")?,
+                inputs: row
+                    .inputs
+                    .as_deref()
+                    .map(|inputs| BuildInputs::STORED.decode(inputs, row.inputs_version).map_err(|e| e.at(format_args!("version build {}", row.id))))
+                    .transpose()?,
                 program: serde_json::from_str(&row.program).context("its program does not read")?,
                 images: row.images,
                 ask: row.ask,
@@ -805,11 +816,12 @@ pub async fn cancel(pool: &Pool, project: uuid::Uuid) -> Result<()> {
 /// Where `project`'s version build `id` stands, with each image build it
 /// waits on; `None` when the project has no such version build.
 pub async fn state(pool: &Pool, project: uuid::Uuid, id: uuid::Uuid) -> Result<Option<VersionBuildState>> {
-    let row: Option<(String, Option<String>, Option<String>, serde_json::Value)> = pool
+    #[allow(clippy::type_complexity)]
+    let row: Option<(String, Option<String>, Option<String>, db::JsonText<serde_json::Value>)> = pool
         .opt("SELECT state, reason, registered, waits_on FROM version_build WHERE id = $1 AND project_id = $2", &[&id, &project])
         .await
         .context("read the version build")?;
-    let Some((state, reason, registered, waits_on)) = row else { return Ok(None) };
+    let Some((state, reason, registered, db::JsonText(waits_on))) = row else { return Ok(None) };
     let waits_on: Vec<ImageBuild> = serde_json::from_value(waits_on).context("a version build's images do not read")?;
     Ok(Some(VersionBuildState {
         state: status_of(&state)?,

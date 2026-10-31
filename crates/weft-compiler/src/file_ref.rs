@@ -386,7 +386,7 @@ pub fn resolve_text_bytes(file_ref: &FileRef, bytes: &[u8]) -> Result<serde_json
 pub fn resolve_runtime_key_refs(
     refs: &[FileRef],
     listing: &[weft_core::storage::StoredFileMeta],
-    map: &mut std::collections::BTreeMap<String, serde_json::Value>,
+    map: &mut weft_core::project::AssetResolutions,
 ) -> Result<(), Vec<String>> {
     let mut mismatched = Vec::new();
     for r in refs {
@@ -705,7 +705,7 @@ pub fn resolve_file_markers(target: &mut impl MarkedValues, fs: &CompileFs) -> R
 /// appear here.
 pub fn apply_asset_resolutions(
     target: &mut impl MarkedValues,
-    map: &std::collections::BTreeMap<String, serde_json::Value>,
+    map: &weft_core::project::AssetResolutions,
 ) -> Result<(), Vec<String>> {
     let mut missing = Vec::new();
     // An `@asset` may sit on a config field (`node.config`) or on a port
@@ -713,7 +713,7 @@ pub fn apply_asset_resolutions(
     // port-driven body values); resolve both.
     fn resolve_value(
         value: &mut serde_json::Value,
-        map: &std::collections::BTreeMap<String, serde_json::Value>,
+        map: &weft_core::project::AssetResolutions,
         missing: &mut Vec<String>,
     ) {
         let Some(raw) = value.as_str() else { return };

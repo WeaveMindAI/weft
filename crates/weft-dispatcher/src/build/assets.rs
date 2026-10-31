@@ -136,7 +136,7 @@ fn asset_key(hash: &str) -> Result<String, Refused> {
 /// the resolution map by `FileRef::resolution_key`, which the caller
 /// applies (`weft_compiler::file_ref::apply_asset_resolutions`). Every ref
 /// that cannot be used is named at once.
-pub async fn resolve(reach: &Reach<'_>, target: &impl weft_compiler::file_ref::MarkedValues) -> Result<BTreeMap<String, serde_json::Value>, Refused> {
+pub async fn resolve(reach: &Reach<'_>, target: &impl weft_compiler::file_ref::MarkedValues) -> Result<weft_core::project::AssetResolutions, Refused> {
     let mut map = BTreeMap::new();
     let mut refused: Vec<String> = Vec::new();
     // Files: the version's become stored files at once; the machine's are
@@ -354,7 +354,7 @@ impl super::Prepare for Resolving<'_> {
         _storage: &dyn super::ProjectStorage,
         _tenant: &str,
         definition: &weft_core::ProjectDefinition,
-    ) -> anyhow::Result<BTreeMap<String, serde_json::Value>> {
+    ) -> anyhow::Result<weft_core::project::AssetResolutions> {
         resolve(&self.reach, definition).await.map_err(as_error)
     }
 

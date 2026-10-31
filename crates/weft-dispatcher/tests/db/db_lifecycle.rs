@@ -243,7 +243,8 @@ async fn a_fresh_capture_replaces_a_prior_bake_that_no_longer_reads(pool: Pool) 
     let complete = complete(&store, run_id).await;
     let bake = weft_dispatcher::store::TriggerBake::from_events(&[birth, complete], &setup_program()).unwrap().unwrap();
     pool.execute(
-        "INSERT INTO trigger_bake (project_id, instance_id, program_hash, bake_json, bake_json_version) VALUES ($1, NULL, $2, '{\"nonsense\": true}', $3)",
+        "INSERT INTO trigger_bake (project_id, instance_id, program_hash, bake_json, bake_json_version, source_version) \
+         VALUES ($1, NULL, $2, '{\"nonsense\": true}', $3, 'source')",
         &[&id, &bake.program.digest(), &weft_dispatcher::store::TriggerBake::STORED.version()],
     )
     .await
@@ -537,7 +538,7 @@ async fn a_take_down_keeps_the_tokens_its_wait_counts(pool: Pool) {
         .await
         .unwrap();
     let LifecycleWrite::Applied { commands, .. } = written else { panic!("applied: {written:?}") };
-    let work: serde_json::Value =
+    let weft_task_store::db::JsonText(work): weft_task_store::db::JsonText<serde_json::Value> =
         pool.scalar("SELECT spec_json FROM infra_lifecycle_command WHERE id = $1", &[&commands[0]]).await.unwrap();
     assert_eq!(work["waits_on_tokens"], json!(["upgrade-token"]), "an upgrade's stop leg counts the trigger it took down");
 }
@@ -772,7 +773,7 @@ async fn activation_cleanup_cannot_finish_or_wipe_a_newer_activation(pool: Pool)
     assert!(store.signal_get("old-entry").await.unwrap().is_none());
     assert!(queue(&store, &[trigger_setup_birth(id, first)], true).await.is_err(),
         "a cancelled activation cannot later start its setup");
-    assert!(store.events_log(first).await.unwrap().is_empty());
+    assert!(crate::events(store.events_log(first).await.unwrap()).is_empty());
 
     let second = Uuid::new_v4();
     assert!(activations.try_begin_activating(id, &[feed_key()], second, None, Claimant::Anyone).await.unwrap().is_ok());
@@ -1137,7 +1138,7 @@ async fn queueing_a_run_is_atomic_and_happens_once(pool: Pool) {
     assert!(queue(&store, &[start.clone(), kick.clone()], false).await.unwrap());
     assert_eq!((rows_of(&pool, "run", run_id).await, rows_of(&pool, "run_log", run_id).await), (1, 1),
         "the birth and its kicks are the record's first row");
-    assert_eq!(store.events_log(run_id).await.unwrap().len(), 2);
+    assert_eq!(crate::events(store.events_log(run_id).await.unwrap()).len(), 2);
     assert!(!queue(&store, &[start, kick], false).await.unwrap(), "a retried start finds its run");
     assert_eq!(rows_of(&pool, "run_log", run_id).await, 1, "and writes nothing twice");
 
@@ -1200,9 +1201,9 @@ async fn seed_worker(pool: &Pool, replica: &str, project_id: Uuid, binary_hash: 
     let until = weft_dispatcher::lease::now_unix() + if alive { 60 } else { -60 };
     pool.execute(
         "INSERT INTO worker_lease (replica, project_id, tenant_id, leased_until_unix, binary_hash, in_flight) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
+         VALUES ($1, $2, $3, $4, $5, $6::text::jsonb) \
          ON CONFLICT (replica) DO UPDATE SET leased_until_unix = EXCLUDED.leased_until_unix, in_flight = EXCLUDED.in_flight",
-        &[&replica, &project_id, &TENANT, &until, &binary_hash, &in_flight],
+        &[&replica, &project_id, &TENANT, &until, &binary_hash, &in_flight.to_string()],
     )
     .await
     .unwrap();
@@ -1298,7 +1299,7 @@ async fn a_lost_run_is_queued_again_when_durable_and_ended_when_fast_or_asked_to
     claim(&pool, fast, id, "worker-a").await;
     assert_eq!(store.let_go_of_lost(fast, past_grace, None).await.unwrap(), Lost::Ended);
     assert_eq!(run_column::<String>(&pool, "state", fast).await.as_deref(), Some("ended"));
-    assert!(matches!(store.events_log(fast).await.unwrap().last(), Some(RunEvent::RunCancelled { .. })));
+    assert!(matches!(crate::events(store.events_log(fast).await.unwrap()).last(), Some(RunEvent::RunCancelled { .. })));
     assert_eq!(store.let_go_of_lost(fast, past_grace, None).await.unwrap(), Lost::NotLost, "an ended run is not lost");
 
     // A durable run asked to stop while its worker drove it ends when that
@@ -1311,7 +1312,7 @@ async fn a_lost_run_is_queued_again_when_durable_and_ended_when_fast_or_asked_to
     assert_eq!(store.let_go_of_lost(stopped, past_grace, None).await.unwrap(), Lost::Ended);
     assert_eq!(run_column::<String>(&pool, "state", stopped).await.as_deref(), Some("ended"));
     assert!(matches!(
-        store.events_log(stopped).await.unwrap().last(),
+        crate::events(store.events_log(stopped).await.unwrap()).last(),
         Some(RunEvent::RunCancelled { cause: Some(weft_core::run::CancelCause::User), .. })
     ));
 }
@@ -1337,7 +1338,8 @@ async fn a_vouching_workers_runs_are_its_own_until_its_vouch_passes(pool: Pool) 
     let tick = |replica: &'static str, vouch: Option<i64>| {
         let pool = pool.clone();
         async move {
-            let answer: serde_json::Value = pool.scalar(
+            let in_flight = std::collections::BTreeMap::from([("t1".to_string(), 1u32)]);
+            let weft_task_store::db::Json(answer): weft_task_store::db::Json<serde_json::Value> = pool.scalar(
                 "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::boolean)",
                 &[
                     &replica,
@@ -1345,7 +1347,7 @@ async fn a_vouching_workers_runs_are_its_own_until_its_vouch_passes(pool: Pool) 
                     &TENANT,
                     &"bin-A",
                     &lease_until(now, 15, vouch),
-                    &json!({ "t1": 1 }),
+                    &weft_task_store::db::Json(weft_task_store::db::WeftMade(&in_flight)),
                     &0i64,
                     &Vec::<String>::new(),
                     &Vec::<i64>::new(),
@@ -1420,7 +1422,7 @@ async fn a_cancel_ends_a_waiting_run_and_asks_a_driven_one_to_stop(pool: Pool) {
     assert!(!written.requested);
     assert_eq!(written.node_cancellations, Some(0));
     assert_eq!(run_column::<String>(&pool, "state", waiting).await.as_deref(), Some("ended"));
-    assert!(matches!(store.events_log(waiting).await.unwrap().last(), Some(RunEvent::RunCancelled { .. })));
+    assert!(matches!(crate::events(store.events_log(waiting).await.unwrap()).last(), Some(RunEvent::RunCancelled { .. })));
 
     let driven = queued_run(&store, id).await;
     claim(&pool, driven, id, "worker-a").await;
@@ -1432,7 +1434,7 @@ async fn a_cancel_ends_a_waiting_run_and_asks_a_driven_one_to_stop(pool: Pool) {
     assert_eq!(run_column::<String>(&pool, "state", driven).await.as_deref(), Some("running"), "its worker ends it");
     let asked: Option<String> = run_column(&pool, "cancel_requested", driven).await;
     assert!(asked.is_some());
-    assert_eq!(store.events_log(driven).await.unwrap().len(), 1, "nothing written into a record its worker writes");
+    assert_eq!(crate::events(store.events_log(driven).await.unwrap()).len(), 1, "nothing written into a record its worker writes");
 }
 
 /// A cancel queues the last call of each wait that carries one, in its own
@@ -1560,7 +1562,7 @@ async fn a_cancel_books_a_parked_runs_open_charge_unknown(pool: Pool) {
 
     let written = store.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
     assert_eq!(written.node_cancellations, Some(0));
-    let events = store.events_log(run).await.unwrap();
+    let events = crate::events(store.events_log(run).await.unwrap());
     let costs: Vec<&RunEvent> = events.iter().filter(|event| matches!(event, RunEvent::CostReported { .. })).collect();
     assert_eq!(costs.len(), 1, "{events:?}");
     assert!(
@@ -1659,7 +1661,8 @@ async fn referenced_images_cover_projects_runs_workers_maps_and_unit_refs(
             &serde_json::json!({
                 "bridge-node": { "bridge": "weft-infra-bridge:live1", "blank": "" },
                 "engine-node": { "engine": "weft-infra-engine:live2" },
-            }),
+            })
+            .to_string(),
             &with_infra,
         ],
     )
@@ -1783,7 +1786,7 @@ async fn an_answer_reaches_its_run_once(pool: Pool) {
     assert_eq!(consumed.token, "tok-parked");
     assert!(store.signal_get("tok-parked").await.unwrap().is_none(), "answered once");
     assert_eq!(run_column::<String>(&pool, "state", parked_run).await.as_deref(), Some("queued"), "queued to carry on");
-    assert!(matches!(store.events_log(parked_run).await.unwrap().last(),
+    assert!(matches!(crate::events(store.events_log(parked_run).await.unwrap()).last(),
         Some(RunEvent::SuspensionResolved { token, value, .. }) if token == "tok-parked" && value == &json!("yes")));
     assert!(matches!(store.answer("tok-parked", &weft_core::primitive::WaitAnswer::Given { value: json!("again") }).await.unwrap(), Answered::Gone));
 
@@ -1802,7 +1805,7 @@ async fn an_answer_reaches_its_run_once(pool: Pool) {
         heard.woken_before(deadline, |c, p| c == weft_task_store::parked_fires::PARKED_FIRE_CHANNEL && p == named).await.unwrap(),
         "the database announces the answer handed, naming its run"
     );
-    assert_eq!(store.events_log(driven).await.unwrap().len(), 1, "nothing written into a record its worker writes");
+    assert_eq!(crate::events(store.events_log(driven).await.unwrap()).len(), 1, "nothing written into a record its worker writes");
     assert_eq!(
         weft_task_store::parked_fires::answers_for(&pool, driven).await.unwrap(),
         vec![("tok-driven".to_string(), weft_core::primitive::WaitAnswer::Given { value: json!(2) })]
@@ -1815,7 +1818,7 @@ async fn an_answer_reaches_its_run_once(pool: Pool) {
     pool.execute("UPDATE run SET state = 'parked' WHERE run_id = $1", &[&skipped_run]).await.unwrap();
     seed_wait(&store, "tok-skipped", project, skipped_run).await;
     assert!(matches!(store.answer("tok-skipped", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), Answered::Reached { .. }));
-    assert!(matches!(store.events_log(skipped_run).await.unwrap().last(),
+    assert!(matches!(crate::events(store.events_log(skipped_run).await.unwrap()).last(),
         Some(RunEvent::SuspensionSkipped { token, .. }) if token == "tok-skipped"));
     seed_wait(&store, "tok-driven-skipped", project, driven).await;
     assert!(matches!(store.answer("tok-driven-skipped", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), Answered::Reached { .. }));
@@ -2482,8 +2485,8 @@ async fn removing_a_project_takes_what_its_instances_had(pool: Pool) {
         async move {
             let grant = Uuid::new_v4();
             pool.execute(
-                "INSERT INTO access_grant (id, tenant_id, service, spec_json, values_sealed, project_id, instance_id, spec_json_version) \
-                 VALUES ($1, $2, 'svc', '{}', '', $3, $4, $5)",
+                "INSERT INTO access_grant (id, tenant_id, service, spec, values_sealed, project_id, instance_id, spec_version, exclusive) \
+                 VALUES ($1, $2, 'svc', '{}', '', $3, $4, $5, FALSE)",
                 &[&grant, &TENANT, &id, &instance, &weft_core::AccessSpec::STORED.version()],
             ).await.expect("grant");
             grant
@@ -2747,7 +2750,7 @@ async fn a_changed_connection_marks_its_signals_for_registering_again(pool: Pool
     setup(&pool).await;
     let (project, grant) = (Uuid::new_v4(), Uuid::new_v4());
     pool.execute(
-        "INSERT INTO access_grant (id, tenant_id, service, spec_json, values_sealed, spec_json_version) VALUES ($1, $2, 'svc', '{}', 'sealed', $3)",
+        "INSERT INTO access_grant (id, tenant_id, service, spec, values_sealed, spec_version, exclusive) VALUES ($1, $2, 'svc', '{}', 'sealed', $3, FALSE)",
         &[&grant, &TENANT, &weft_core::AccessSpec::STORED.version()],
     )
     .await
@@ -3192,7 +3195,7 @@ async fn the_held_rows_announce_their_changes(pool: Pool) {
     store.signal_remove_many(&["route".to_string()]).await.unwrap();
     assert!(heard_on(&mut heard, ROUTES_CHANNEL, TENANT).await, "a public entry going");
 
-    pool.execute("UPDATE project SET worker_settings_json = '{\"minInstances\": 1}'::jsonb WHERE id = $1", &[&id])
+    pool.execute("UPDATE project SET worker_settings_json = '{\"minInstances\": 1}' WHERE id = $1", &[&id])
         .await
         .unwrap();
     assert!(heard_on(&mut heard, WORKER_SETTINGS_CHANNEL, &project).await, "a project's worker levers changing name it");
@@ -3207,7 +3210,7 @@ async fn the_held_rows_announce_their_changes(pool: Pool) {
     pool.execute("UPDATE infra_node SET status = 'running' WHERE project_id = $1", &[&id]).await.unwrap();
     assert!(heard_on(&mut heard, INFRA_STATUS_CHANNEL, &project).await, "and its status changing");
     // A worker keeps where each piece answers, so a move is news too.
-    pool.execute("UPDATE infra_node SET endpoints_json = '{\"main\": \"db:5432\"}'::jsonb WHERE project_id = $1", &[&id])
+    pool.execute("UPDATE infra_node SET endpoints_json = '{\"main\": \"db:5432\"}' WHERE project_id = $1", &[&id])
         .await
         .unwrap();
     assert!(heard_on(&mut heard, INFRA_STATUS_CHANNEL, &project).await, "and where it answers changing");
@@ -4139,4 +4142,34 @@ async fn an_unfinished_activation_keeps_what_its_triggers_kept(pool: Pool) {
     let removed = activations.end_unfinished(id, empty).await.unwrap().expect("owned");
     assert_eq!(removed.iter().map(|s| s.token.as_str()).collect::<Vec<_>>(), ["kept-entry"], "no work kept: wiped");
     assert_eq!(activations.list(id).await.unwrap()[0].lifecycle.mode().as_str(), "refuse");
+}
+
+/// A trigger whose setup captured a value holding a NUL character is
+/// baked, and its bake reads back exactly: the bake is kept as its JSON
+/// text, with the source version it baked written beside it.
+#[weft_db_macros::test]
+async fn a_bake_whose_captured_values_hold_a_nul_is_kept_exactly(pool: Pool) {
+    let (store, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    pool.execute("INSERT INTO project_version (project_id, id, manifest, created_at) VALUES ($1, 'source', '{}', 0)", &[&id]).await.unwrap();
+    let run_id = Uuid::new_v4();
+    let birth = trigger_setup_birth(id, run_id);
+    queue(&store, std::slice::from_ref(&birth), false).await.unwrap();
+    let complete = complete(&store, run_id).await;
+    let mut bake = weft_dispatcher::store::TriggerBake::from_events(&[birth, complete], &setup_program()).unwrap().unwrap();
+    let ports = json!({ "page": "a\u{0}b" });
+    bake.captured.insert(
+        "entry".into(),
+        weft_dispatcher::store::TriggerCapture {
+            spec: weft_core::primitive::SignalSpec::of_kind("timer", json!({ "spec": { "kind": "after", "duration_ms": 100 } })),
+            ports: ports.clone(),
+        },
+    );
+    assert_eq!(store.finish_trigger_setup(run_id, Some(&bake)).await.unwrap(), None);
+    let saved = store.trigger_bakes(id, None).await.unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].captured["entry"].ports, ports);
+    let source: String = pool.scalar("SELECT source_version FROM trigger_bake WHERE project_id = $1", &[&id]).await.unwrap();
+    assert_eq!(source, bake.source_version);
 }

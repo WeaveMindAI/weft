@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { untrack } from "svelte";
+	import { runValues } from "../../utils/run-values.svelte";
 	import { Handle, Position, useEdges, useNodes, NodeResizer, type ResizeParams } from "@xyflow/svelte";
 	import { NODE_TYPE_CONFIG, specForService, type NodeType } from "../../nodes";
 	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeFiring, LiveDataItem, NodeFiringStatus } from "../../types";
@@ -103,7 +104,10 @@
 			/// `3 of 5 running`...), from the state the dispatcher computed;
 			/// its detail shows on hover.
 			lifecycleBadge?: import('../../lifecycle').LifecycleBadge;
-			debugData?: unknown;
+			/// The node's latest values a Debug-style preview shows, by
+			/// port, by where the run's record keeps each: read back
+			/// while the preview shows them.
+			debugData?: Record<string, import('../../../../protocol').ValueRef>;
 			firings?: NodeFiring[];
 			/// One IRC-style scrollable log per bus this node took part
 			/// in (live + replay, identical shape). Empty `[]` for
@@ -293,6 +297,7 @@
 	/// by `PayloadCards`, the same component the run inspector
 	/// uses, so a port reads the same in both places.
 	const hasDebugData = $derived(data.debugData !== undefined && data.debugData !== null);
+	const debugValues = $derived(hasDebugData ? runValues.shownPorts(data.debugData) : undefined);
 
 	// The node's declared inline file display (`features.display`):
 	// the named port's value from the latest firing, read off the side
@@ -1607,7 +1612,12 @@
      wheel inside it from moving the canvas instead. -->
 {#snippet debugDisplay()}
 	<div class="debug-data-cards nodrag nopan nowheel">
-		<PayloadCards payload={data.debugData} empty="Nothing arrived" />
+		<PayloadCards
+			payload={debugValues?.values}
+			errors={debugValues?.errors}
+			noteFor={(port) => debugValues?.gone[port]}
+			empty={debugValues?.reading ? 'Reading...' : 'Nothing arrived'}
+		/>
 	</div>
 {/snippet}
 

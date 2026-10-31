@@ -679,19 +679,8 @@ impl FsCatalog {
         })?;
         let parsed: NodeDeps = toml::from_str(&raw).map_err(|e| CatalogError::Parse {
             error: stale_copy_hint(&deps_path, e.to_string()),
-            path: deps_path.clone(),
+            path: deps_path,
         })?;
-        if let Some(key) = parsed.build.env.keys().find(|key| WEFT_OWNED_BUILD_ENV.contains(&key.as_str())) {
-            return Err(CatalogError::Parse {
-                error: format!(
-                    "[build.env] sets {key}, which weft sets for every worker build ({}, \
-                     `weft_core::builds::WORKER_RUSTFLAGS`) and would be replaced by it; a flag your package's own \
-                     code needs goes in its `build.rs` (`cargo:rustc-cfg=...`, `cargo:rustc-link-arg=...`)",
-                    weft_core::builds::WORKER_RUSTFLAGS
-                ),
-                path: deps_path,
-            });
-        }
         Ok(Some(parsed))
     }
 }
@@ -790,11 +779,6 @@ pub struct NodeDeps {
 /// the code lands under `/weft/project-nodes/src/...`). A host build
 /// expands it to the node's folder in its package crate's copy of the
 /// package.
-/// The build variables weft sets itself for every worker build: a node
-/// declaring one in `[build.env]` is refused, since one setting would
-/// replace the other.
-const WEFT_OWNED_BUILD_ENV: &[&str] = &["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"];
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildEnv {
@@ -3126,11 +3110,11 @@ mod tree_tests {
         assert!(err.contains("weft catalog update"), "{err}");
     }
 
-    /// The compiler flags of a worker build are weft's own: a node setting
-    /// them in `[build.env]` is refused, naming where its flag goes, rather
-    /// than having it silently replaced (or replacing weft's).
+    /// weft sets no compiler flags of its own for a worker build, so the
+    /// compiler flags are a node's to set in `[build.env]` like any other
+    /// variable.
     #[test]
-    fn a_node_setting_the_compiler_flags_is_refused() {
+    fn a_node_setting_the_compiler_flags_loads() {
         let dir = tempfile::tempdir().expect("tempdir");
         let node = dir.path().join("nodes/fast");
         fs::create_dir_all(&node).expect("mkdir");
@@ -3138,10 +3122,8 @@ mod tree_tests {
         fs::write(node.join("mod.rs"), "// impl\n").expect("write");
         fs::write(node.join("deps.toml"), "[build.env]\nRUSTFLAGS = \"-C target-cpu=native\"\n").expect("write");
         let catalog = FsCatalog::discover(&dir.path().join("nodes")).expect("discover");
-        let err = catalog.deps("Fast").expect_err("weft's own flags").to_string();
-        assert!(err.contains("RUSTFLAGS") && err.contains("build.rs"), "{err}");
-        fs::write(node.join("deps.toml"), "[build.env]\nFAST_CONFIG = \"{{catalog_path}}/fast.txt\"\n").expect("write");
-        assert!(catalog.deps("Fast").expect("any other variable is the node's").is_some());
+        let deps = catalog.deps("Fast").expect("RUSTFLAGS is the node's to set").expect("deps.toml");
+        assert_eq!(deps.build.env.get("RUSTFLAGS").map(String::as_str), Some("-C target-cpu=native"));
     }
 
     /// A catalog's later reads go to the tree it was discovered from:

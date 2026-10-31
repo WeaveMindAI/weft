@@ -392,11 +392,12 @@
                 (first, ended)
             })
         };
+        let program_project = std::sync::Arc::new(project);
         let drive = crate::run_driver::RunDrive {
             run_id,
             journal: run,
-            program: std::sync::Arc::new(crate::plan::ProgramTables::new(std::sync::Arc::new(project))),
-            starts_from: crate::run_driver::StartsFrom::Record(birth),
+            program: std::sync::Arc::new(crate::plan::ProgramTables::new(program_project.clone())),
+            starts_from: crate::run_driver::StartsFrom::Record(Box::new(super::engine_test_rig::claimed(&clients, run_id, &program_project, &birth).await)),
             cancellation: weft_core::cancellation::CancellationFlag::new_arc(),
             exchange: Some(crate::run_driver::Exchange { conn: conn.clone(), live: Some(conn.clone()), sink }),
             hand_back: None,

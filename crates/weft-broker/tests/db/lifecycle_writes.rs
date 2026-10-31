@@ -116,7 +116,7 @@ async fn put_units(pool: &Pool, instance: Option<&str>, units: serde_json::Value
 
 /// The shared copy's status and its units, as the readers see them.
 async fn row(pool: &Pool) -> (String, serde_json::Value) {
-    pool.one(
+    let (status, weft_task_store::db::Json(units)): (String, weft_task_store::db::Json<serde_json::Value>) = pool.one(
         &format!(
             "SELECT n.status, {} FROM infra_node n WHERE n.project_id = $1 AND n.node_id = $2 AND n.instance_id IS NULL",
             weft_broker_client::protocol::units_of_copy_sql("n")
@@ -124,7 +124,8 @@ async fn row(pool: &Pool) -> (String, serde_json::Value) {
         &[&PROJECT, &NODE],
     )
     .await
-    .expect("row")
+    .expect("row");
+    (status, units)
 }
 
 fn stamp(replica: &str, command_id: Option<i64>, unit: Option<&str>, status: Status) -> SupervisorSetStatusRequest {
@@ -529,8 +530,8 @@ async fn an_apply_that_succeeds_stamps_its_copy_with_its_build(pool: Pool) {
     for (hash, places, cut_from) in [("program", Some(serde_json::json!({ NODE: "h-2" })), None), ("cut", None, Some("program"))] {
         pool.execute(
             "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from, infra_places, project_json_version) \
-             VALUES ($1, $2, '{}', 0, $3, $4, $5)",
-            &[&PROJECT, &hash, &cut_from, &places, &weft_core::ProjectDefinition::STORED.version()],
+             VALUES ($1, $2, '{}', 0, $3, $4::text::jsonb, $5)",
+            &[&PROJECT, &hash, &cut_from, &places.map(|places| places.to_string()), &weft_core::ProjectDefinition::STORED.version()],
         )
         .await
         .unwrap();
@@ -1492,4 +1493,49 @@ async fn a_bake_holding_nul_merges_over_what_was_baked(pool: Pool) {
         .unwrap();
     assert_eq!(baked.0, serde_json::json!({ "address": "db:\u{0}1", "user": "app" }));
     assert!(!save_baked(&pool, PROJECT, "nowhere", None, &second).await.unwrap(), "no copy, nothing saved");
+}
+
+/// What a node's spec wrote reaches the database whole, a NUL character
+/// in it included: an apply's spec is handed back to the supervisor that
+/// claims it exactly, and a copy's health rules read back as written.
+#[weft_db_macros::test]
+async fn an_infra_spec_and_health_rules_holding_a_nul_read_back_exactly(pool: Pool) {
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    lease(&pool, OWNER).await;
+    let spec = serde_json::json!({ "units": [], "note": "a\u{0}b" });
+    let apply = IssuedCommand {
+        tenant_id: TENANT,
+        project_id: PROJECT,
+        node_id: Some(NODE),
+        copies: &weft_core::instance::Copies::Shared,
+        verb: InfraLifecycleVerb::Apply,
+        spec_json: Some(&spec),
+        source_hash: None,
+        issued_by_replica: "worker-1",
+    };
+    issue_command(&pool, &apply).await.unwrap().expect("issued");
+    let claimed = claim_next(&pool, OWNER, &[]).await.unwrap().expect("claimed");
+    assert_eq!(claimed.spec_json, Some(spec));
+
+    node_row(&pool, "running", serde_json::json!({})).await;
+    let rules: Vec<weft_core::infra::health::HealthRule> = serde_json::from_value(serde_json::json!([{
+        "name": "down\u{0}when flaky",
+        "when": { "kind": "unit_flaky", "unit": "postgres" },
+        "action": { "kind": "take_down_triggers" },
+        "timeoutSeconds": 600
+    }]))
+    .unwrap();
+    // Bound as the apply row's write binds them.
+    pool.execute(
+        "UPDATE infra_node SET health_rules_json = $3 WHERE project_id = $1 AND node_id = $2",
+        &[&PROJECT, &NODE, &weft_task_store::db::JsonText(&rules)],
+    )
+    .await
+    .unwrap();
+    let (weft_task_store::db::JsonText(stored), version): (weft_task_store::db::JsonText<serde_json::Value>, i32) = pool
+        .one("SELECT health_rules_json, health_rules_json_version FROM infra_node WHERE project_id = $1 AND node_id = $2", &[&PROJECT, &NODE])
+        .await
+        .unwrap();
+    assert_eq!(weft_core::infra::health::STORED_RULES.decode(stored, version).unwrap(), rules);
 }

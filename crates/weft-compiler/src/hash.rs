@@ -711,8 +711,12 @@ mod fs_hashes {
     /// linked by another). Inside the cache, cargo tells the generated
     /// package crates apart by their content-addressed directory
     /// (`codegen::write_package_crates`) and everything else by
-    /// fingerprint.
-    pub fn compute_worker_cache_key(weft_root: &Path, builder: &str) -> Result<String> {
+    /// fingerprint. And `build_env`, what tells apart the caches of
+    /// projects whose nodes set `[build.env]`
+    /// (`worker_image::NodesBuildEnv::cache_tag`): a project that sets
+    /// none (`None`) keeps the key, and the cache, every such project
+    /// shares.
+    pub fn compute_worker_cache_key(weft_root: &Path, builder: &str, build_env: Option<&str>) -> Result<String> {
         let mut hasher = Sha256::new();
         hasher.update(b"weft-worker-cache-v1\n");
         hasher.update(b"builder:");
@@ -720,6 +724,11 @@ mod fs_hashes {
         hasher.update(b"\n");
         hash_worker_build_env(&mut hasher, weft_root, true)?;
         hash_installed_stdlib_deps(&mut hasher)?;
+        if let Some(tag) = build_env {
+            hasher.update(b"build-env:");
+            hasher.update(tag.as_bytes());
+            hasher.update(b"\n");
+        }
         Ok(hex(&hasher.finalize()).chars().take(16).collect())
     }
 
@@ -1080,14 +1089,43 @@ mod fs_hashes {
         #[test]
         fn worker_cache_key_is_stable_per_builder() {
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
-            let prebuilt = compute_worker_cache_key(root, "builder-base").unwrap();
+            let prebuilt = compute_worker_cache_key(root, "builder-base", None).unwrap();
             assert_eq!(prebuilt.len(), 16);
-            assert_eq!(compute_worker_cache_key(root, "builder-base").unwrap(), prebuilt);
+            assert_eq!(compute_worker_cache_key(root, "builder-base", None).unwrap(), prebuilt);
             assert_ne!(
-                compute_worker_cache_key(root, "alpine:3.19").unwrap(),
+                compute_worker_cache_key(root, "alpine:3.19", None).unwrap(),
                 prebuilt,
                 "a from-scratch builder on another distro gets its own cache"
             );
+        }
+
+        /// A project whose nodes set no `[build.env]` keeps the key every
+        /// such project had before the variables counted, so it shares the
+        /// cache it always shared.
+        #[test]
+        fn worker_cache_key_without_build_env_is_the_shared_one() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(b"weft-worker-cache-v1\n");
+            hasher.update(b"builder:");
+            hasher.update(b"builder-base");
+            hasher.update(b"\n");
+            hash_worker_build_env(&mut hasher, root, true).unwrap();
+            hash_installed_stdlib_deps(&mut hasher).unwrap();
+            let shared: String = hex(&hasher.finalize()).chars().take(16).collect();
+            assert_eq!(compute_worker_cache_key(root, "builder-base", None).unwrap(), shared);
+        }
+
+        /// Each `[build.env]` tag gets a cache of its own.
+        #[test]
+        fn worker_cache_key_differs_per_build_env() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+            let key = |tag| compute_worker_cache_key(root, "builder-base", tag).unwrap();
+            let (none, one, other) = (key(None), key(Some("0123456789abcdef")), key(Some("fedcba9876543210")));
+            assert_eq!(key(Some("0123456789abcdef")), one);
+            for (a, b) in [(&none, &one), (&none, &other), (&one, &other)] {
+                assert_ne!(a, b);
+            }
         }
 
         #[test]

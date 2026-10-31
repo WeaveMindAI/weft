@@ -87,23 +87,53 @@ pub async fn node_state(
     run_admin::node_state(&state, &Actor::operator(caller.0), run_id(&raw)?, &node).await.map(Json)
 }
 
-/// `GET /runs/{id}/replay`.
+/// What a reader of a run's history asks of its values: `with_values=true`
+/// has them written in (`run_admin::Values`).
+#[derive(Debug, Default, Deserialize)]
+pub struct ValuesQuery {
+    pub with_values: Option<bool>,
+}
+
+/// `GET /runs/{id}/replay`: a JSON array of the run's events, written as
+/// its record is read.
 pub async fn replay(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(raw): Path<String>,
-) -> Result<Json<Vec<crate::events::LiveEvent>>, Refused> {
-    run_admin::replay(&state, &Actor::operator(caller.0), run_id(&raw)?).await.map(Json)
+    Query(query): Query<ValuesQuery>,
+) -> Result<axum::response::Response, Refused> {
+    let values = run_admin::Values::asked(query.with_values);
+    run_admin::replay(&state, &Actor::operator(caller.0), run_id(&raw)?, values).await.map(streamed_json)
 }
 
-/// `GET /runs/{id}/events` (`weft events`).
+/// `GET /runs/{id}/events` (`weft events`): the run's events, kept and
+/// spelled, written as its record is read.
 pub async fn events(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(raw): Path<String>,
     Query(request): Query<EventsRequest>,
-) -> Result<Json<weft_core::program::RunEvents>, Refused> {
-    run_admin::events(&state, &Actor::operator(caller.0), run_id(&raw)?, request).await.map(Json)
+) -> Result<axum::response::Response, Refused> {
+    run_admin::events(&state, &Actor::operator(caller.0), run_id(&raw)?, request).await.map(streamed_json)
+}
+
+/// `POST /runs/{id}/values`: the values the run's events name, read back
+/// (`run_admin::values`).
+pub async fn values(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(raw): Path<String>,
+    Json(request): Json<weft_core::program::ValuesRequest>,
+) -> Result<Json<weft_core::program::ValuesAnswer>, Refused> {
+    run_admin::values(&state, &Actor::operator(caller.0), run_id(&raw)?, request.refs).await.map(Json)
+}
+
+/// A JSON answer written as it is read (`run_admin::Streamed`), as the
+/// response that carries it.
+fn streamed_json(chunks: run_admin::Streamed) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let body = futures::stream::unfold(chunks, |mut chunks| async move { chunks.recv().await.map(|chunk| (chunk, chunks)) });
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], axum::body::Body::from_stream(body)).into_response()
 }
 
 /// `POST /runs/{id}/wake/{node}` (`weft wake`): answers how the fire was
@@ -326,55 +356,86 @@ pub fn cancel_terminal_events(
     cause: &CancelCause,
     now: u64,
 ) -> anyhow::Result<Vec<weft_journal::RunEvent>> {
-    use weft_journal::RunEvent;
-    let reason = cause.to_string();
-    let mut writes = Vec::new();
-    match program {
-        Some(program) => {
-            // The runs map says which nodes are still non-terminal.
-            // A row the fold could not apply was logged at `error!`
-            // level and is the inspector's `/replay` to show; the
-            // records that did fold are the ones to flip.
-            let snapshot = weft_journal::fold_to_snapshot(
-                run_id,
-                Arc::new(program.clone()),
-                events,
-            );
-            for e in snapshot.firings.open() {
-                writes.push(RunEvent::NodeCancelled {
-                    run_id,
-                    node_id: e.node_id.clone(),
-                    frames: e.frames.clone(),
-                    reason: reason.clone(),
-                    at_unix: now,
-                });
-            }
-        }
-        // No program: a run that never ran a node body (a node
-        // self-test) has nothing per node to flip. A run whose
-        // program is gone (its project was removed) or cannot be read
-        // still ends, on the terminal alone: the stop must land, and
-        // the run's status is read off the terminal. Its node records
-        // stay as they were (the run view paints them from a
-        // fold this run no longer has), which is what a run without a
-        // program looks like everywhere else.
-        None => {
-            if events.iter().any(|e| matches!(e, RunEvent::NodeStarted { .. })) {
-                tracing::warn!(
-                    target: "weft_dispatcher::cancel",
-                    %run_id,
-                    "cancelling without the run's program: the terminal is written, the \
-                     per-node cancels cannot be derived"
-                );
-            }
+    let mut read = CancelRead::new(run_id, program.map(|program| Arc::new(program.clone())));
+    events.iter().for_each(|event| read.apply(event));
+    Ok(read.into_events(cause, now))
+}
+
+/// What a dispatcher-side cancel reads off a run's record, fed its events
+/// in order (a page at a time: it keeps what is open, never the record):
+/// the firings still open, folded over the run's program when it has
+/// one, and the charges left open. [`Self::into_events`] is what
+/// [`cancel_terminal_events`] writes.
+pub struct CancelRead {
+    run_id: RunId,
+    /// `None` without a program: a run that never ran a node body (a
+    /// node self-test), or one whose program is gone or cannot be read,
+    /// still ends, on the terminal alone.
+    fold: Option<weft_journal::Fold>,
+    charges: weft_journal::ChargeBook,
+    started_a_node: bool,
+}
+
+impl CancelRead {
+    pub fn new(run_id: RunId, program: Option<Arc<ProjectDefinition>>) -> Self {
+        Self {
+            run_id,
+            fold: program.map(|program| weft_journal::Fold::new(run_id, program).showing()),
+            charges: weft_journal::ChargeBook::default(),
+            started_a_node: false,
         }
     }
-    // A charge its record leaves open spent money no drive is left to
-    // price: booked unknown before the ending.
-    let why = format!("the run was cancelled before the job was read back: {reason}");
-    writes.extend(weft_journal::unpriced_charges_closed(run_id, events, &why, now));
-    writes.push(RunEvent::RunCancelled { run_id, reason, cause: Some(cause.clone()), at_unix: now });
-    Ok(writes)
+
+    pub fn apply(&mut self, event: &weft_journal::RunEvent) {
+        // A row the fold could not apply was logged at `error!` level and
+        // is the inspector's `/replay` to show; the records that did fold
+        // are the ones to flip.
+        if let Some(fold) = &mut self.fold {
+            fold.apply(event);
+        }
+        self.charges.apply(event);
+        self.started_a_node |= matches!(event, weft_journal::RunEvent::NodeStarted { .. });
+    }
+
+    /// The events that end the run, cancelled for `cause` at `now`.
+    pub fn into_events(self, cause: &CancelCause, now: u64) -> Vec<weft_journal::RunEvent> {
+        use weft_journal::RunEvent;
+        let run_id = self.run_id;
+        let reason = cause.to_string();
+        let mut writes = Vec::new();
+        match &self.fold {
+            Some(fold) => {
+                for e in fold.snapshot().firings.open() {
+                    writes.push(RunEvent::NodeCancelled {
+                        run_id,
+                        node_id: e.node_id.clone(),
+                        frames: e.frames.clone(),
+                        reason: reason.clone(),
+                        at_unix: now,
+                    });
+                }
+            }
+            // Its node records stay as they were (the run view paints them
+            // from a fold this run no longer has), which is what a run
+            // without a program looks like everywhere else.
+            None => {
+                if self.started_a_node {
+                    tracing::warn!(
+                        target: "weft_dispatcher::cancel",
+                        %run_id,
+                        "cancelling without the run's program: the terminal is written, the \
+                         per-node cancels cannot be derived"
+                    );
+                }
+            }
+        }
+        // A charge its record leaves open spent money no drive is left to
+        // price: booked unknown before the ending.
+        let why = format!("the run was cancelled before the job was read back: {reason}");
+        writes.extend(weft_journal::unpriced_charges_closed(run_id, self.charges, &why, now));
+        writes.push(RunEvent::RunCancelled { run_id, reason, cause: Some(cause.clone()), at_unix: now });
+        writes
+    }
 }
 
 /// The program a cancel folds with to derive its per-node cancels, or

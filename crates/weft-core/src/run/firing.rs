@@ -100,6 +100,11 @@ pub struct NodeFiring {
     /// THIS run's `run_id` (the table is this run's); the origin is here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited_from: Option<RunId>,
+    /// When it started among the run's firings, counted from the first one
+    /// its table took ([`NodeFiringTable::insert`]): what puts two firings
+    /// in order once the ones between them are forgotten.
+    #[serde(skip)]
+    start: u64,
 }
 
 impl NodeFiring {
@@ -132,11 +137,26 @@ impl NodeFiring {
             run_id,
             frames,
             inherited_from: None,
+            start: 0,
         }
     }
 
     pub fn status(&self) -> NodeFiringStatus {
         self.status
+    }
+
+    /// When it started among the run's firings ([`NodeFiringTable::insert`]).
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    /// Where it falls among the run's failures: the run's failure is the
+    /// one first in this order, the earliest to end, then by node, then
+    /// the one that started first (two iterations failing in one second).
+    /// The one order the run names its failure by and the one a table that
+    /// forgets keeps (`crate::run::forget::Forgetting::keeping_first_failure`).
+    pub fn failure_order(&self) -> (u64, String, u64) {
+        (self.completed_at.unwrap_or(u64::MAX), self.node_id.clone(), self.start)
     }
 
     /// Whether this firing has a stream open: something went out (a bus's
@@ -168,6 +188,8 @@ pub struct NodeFiringTable {
     open: BTreeSet<FiringLocation>,
     waiting: BTreeSet<FiringLocation>,
     failed: BTreeSet<FiringLocation>,
+    /// How many records the table took: the next one's start.
+    starts: u64,
 }
 
 impl NodeFiringTable {
@@ -175,15 +197,17 @@ impl NodeFiringTable {
         Self::default()
     }
 
-    /// Add `record` after its node's others: a firing that just started,
-    /// or one a seeded run imported. A location holds at most one record,
+    /// Add `record` after its node's others, its start the next one: a
+    /// firing that just started, or one a seeded run imported. A location holds at most one record,
     /// so the caller has made sure none is there; a second one is an
     /// engine invariant broken, and panics (a drive catches it and fails
     /// the run) rather than leave the open, waiting and failed firings
     /// naming a record that was replaced.
-    pub fn insert(&mut self, record: NodeFiring) {
+    pub fn insert(&mut self, mut record: NodeFiring) {
         let at = FiringLocation::new(record.node_id.clone(), record.frames.clone());
         assert!(self.at(&at.node_id, &at.frames).is_none(), "a second record of '{}' at frames {:?}: a node fires once per frames", at.node_id, at.frames);
+        record.start = self.starts;
+        self.starts += 1;
         self.index(&at, record.status);
         self.nodes.entry(record.node_id.clone()).or_default().insert(record.frames.clone(), record);
     }
@@ -208,6 +232,22 @@ impl NodeFiringTable {
         self.failed.remove(&at);
         self.index(&at, status);
         self.at_mut(node_id, frames)
+    }
+
+    /// Take the record at `(node, frames)` out of the table: a reader that
+    /// only shows the run is done with a firing once it ended. The node's
+    /// other records keep their start order.
+    pub fn remove(&mut self, node_id: &str, frames: &LoopFrames) -> Option<NodeFiring> {
+        let records = self.nodes.get_mut(node_id)?;
+        let record = records.shift_remove(frames)?;
+        if records.is_empty() {
+            self.nodes.remove(node_id);
+        }
+        let at = FiringLocation::new(node_id, frames.clone());
+        self.open.remove(&at);
+        self.waiting.remove(&at);
+        self.failed.remove(&at);
+        Some(record)
     }
 
     /// Whether a firing has not ended yet (running, or waiting for input).
@@ -364,5 +404,14 @@ mod tests {
         table.set_status("a", &frames(1), NodeFiringStatus::Completed);
         check(&table);
         assert!(!table.any_open());
+
+        table.set_status("a", &frames(0), NodeFiringStatus::Failed);
+        assert_eq!(table.remove("a", &frames(0)).map(|record| record.status()), Some(NodeFiringStatus::Failed));
+        assert!(table.remove("a", &frames(0)).is_none(), "taken out once");
+        check(&table);
+        let order: Vec<u32> = table["a"].values().map(|record| record.frames[0].loop_index().unwrap()).collect();
+        assert_eq!(order, vec![1, 2, 3], "the others keep their order");
+        table.remove("b", &vec![]);
+        assert!(!table.contains_key("b"), "a node with no record left has no entry");
     }
 }

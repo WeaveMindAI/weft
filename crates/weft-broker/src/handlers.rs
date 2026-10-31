@@ -1147,7 +1147,7 @@ pub async fn supervisor_infra_nodes(
             name: &str,
             node_id: &str,
         ) -> Result<T, (StatusCode, String)> {
-            let v: serde_json::Value = r.try_get(name).map_err(|e| internal(anyhow::anyhow!("decode {name}: {e}")))?;
+            let db::JsonText(v) = r.try_get::<_, db::JsonText<serde_json::Value>>(name).map_err(|e| internal(anyhow::anyhow!("decode {name}: {e}")))?;
             serde_json::from_value(v)
                 .map_err(|e| internal(anyhow::anyhow!("infra_node.{name} for node='{node_id}' does not decode: {e}")))
         }
@@ -1158,9 +1158,10 @@ pub async fn supervisor_infra_nodes(
         };
         let keep_disks: Vec<String> = column(&r, "keep_disks_json", &node_id)?;
         // NULL: the node wrote no rules (it runs the built-in ones).
-        let health_rules: Option<serde_json::Value> = r
-            .try_get("health_rules_json")
-            .map_err(|e| internal(anyhow::anyhow!("decode health_rules_json: {e}")))?;
+        let health_rules = r
+            .try_get::<_, Option<db::JsonText<serde_json::Value>>>("health_rules_json")
+            .map_err(|e| internal(anyhow::anyhow!("decode health_rules_json: {e}")))?
+            .map(|rules| rules.0);
         let health_rules_version: weft_core::stored::Version = r
             .try_get("health_rules_json_version")
             .map_err(|e| internal(anyhow::anyhow!("decode health_rules_json_version: {e}")))?;
@@ -1168,7 +1169,7 @@ pub async fn supervisor_infra_nodes(
             .map(|rules| weft_core::infra::health::STORED_RULES.decode(rules, health_rules_version))
             .transpose()
             .map_err(|e| internal(e.at(format_args!("infra node '{node_id}'"))))?;
-        let units = r.try_get("units").map_err(|e| internal(anyhow::anyhow!("decode units: {e}")))?;
+        let db::Json(units) = r.try_get("units").map_err(|e| internal(anyhow::anyhow!("decode units: {e}")))?;
         let units = weft_broker_client::protocol::decode_units(units, req.project_id, &node_id).map_err(internal)?;
         nodes.push(SupervisorInfraNode {
             node_id,
@@ -1410,15 +1411,14 @@ async fn write_apply_row(
     owner: &str,
     row: ApplyRowState,
 ) -> Result<(), (StatusCode, String)> {
-    let json = |what: &str, v: Result<serde_json::Value, serde_json::Error>| {
-        v.map_err(|e| internal(anyhow::anyhow!("{what} serialize: {e}")))
-    };
-    let keep_disks_json = json("keep_disks", serde_json::to_value(keep_disks))?;
-    let health_rules_json = health_rules.map(|rules| json("health_rules", serde_json::to_value(rules))).transpose()?;
-    let endpoints_json = json("endpoints", serde_json::to_value(&row.addresses.urls))?;
-    let public_paths_json = json("public_paths", serde_json::to_value(&row.addresses.public_paths))?;
-    let doors_json = json("doors", serde_json::to_value(&row.addresses.doors))?;
-    let notes_json = json("notes", serde_json::to_value(&row.notes))?;
+    // Each as its JSON text: the names in them are the ones the node's
+    // spec wrote.
+    let keep_disks_json = db::JsonText(keep_disks);
+    let health_rules_json = health_rules.map(db::JsonText);
+    let endpoints_json = db::JsonText(&row.addresses.urls);
+    let public_paths_json = db::JsonText(&row.addresses.public_paths);
+    let doors_json = db::JsonText(&row.addresses.doors);
+    let notes_json = db::JsonText(&row.notes);
     // The INSERT pulls its values FROM the caller's still-claimed
     // apply command so the ownership check and the write share one
     // row snapshot. Every variable is a bind: no SQL built by string
@@ -1679,8 +1679,8 @@ pub async fn supervisor_project_image_tags(
     let tags: std::collections::HashMap<String, String> = match row {
         None => std::collections::HashMap::new(),
         Some(r) => {
-            let value: serde_json::Value = r
-                .try_get("infra_image_tags_json")
+            let db::JsonText(value) = r
+                .try_get::<_, db::JsonText<serde_json::Value>>("infra_image_tags_json")
                 .map_err(|e| internal(anyhow::anyhow!("decode infra_image_tags_json: {e}")))?;
             weft_broker_client::protocol::decode_infra_image_tags(
                 value,

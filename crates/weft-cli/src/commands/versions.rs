@@ -12,7 +12,11 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use weft_compiler::project::Project;
 use weft_core::versions::{VersionRun, VersionSummary, VersionTree};
-use weft_core::live_event::{DispatcherEvent, LiveEvent};
+use weft_core::live_event::{DispatcherEvent, IdentifiedEvent};
+
+/// An event of a run's history with its values written in, as the replay
+/// answers `with_values=true`.
+pub type ValuedEvent = IdentifiedEvent<DispatcherEvent<Value>>;
 use weft_core::run_spec::{Expected, ExpectedWire, RunSpec};
 
 use crate::client::DispatcherClient;
@@ -123,7 +127,8 @@ pub fn read_spec(project: &Project, name: &str) -> Result<RunSpec> {
         .with_context(|| format!("no spec at {}", spec_file_path(project, name).display()))
 }
 
-/// The rows of a run's journal, as the replay endpoint answers them.
+/// The rows of a run's journal, as the replay endpoint answers them, with
+/// their values written in.
 ///
 /// One reader, because three commands hand-rolled the same four steps
 /// (`GET .../replay`, take the array, fold it into wires, resolve the
@@ -132,9 +137,9 @@ pub fn read_spec(project: &Project, name: &str) -> Result<RunSpec> {
 pub async fn replay_rows(
     client: &crate::client::DispatcherClient,
     run_id: &str,
-) -> Result<Vec<LiveEvent>> {
+) -> Result<Vec<ValuedEvent>> {
     let rows = client
-        .get_json(&format!("/runs/{run_id}/replay"))
+        .get_json(&format!("/runs/{run_id}/replay?with_values=true"))
         .await
         .context("read the run")?;
     crate::client::read_answer(rows, "the run's events")
@@ -292,7 +297,7 @@ pub struct OutsideFacts {
     pub caller: Vec<Value>,
 }
 
-pub fn outside_facts(rows: &[LiveEvent]) -> Result<OutsideFacts> {
+pub fn outside_facts(rows: &[ValuedEvent]) -> Result<OutsideFacts> {
     let mut facts = OutsideFacts::default();
     // The program's messages the caller never received, and why: a
     // window names those a caller reading too slowly lost (possibly ones
@@ -312,7 +317,7 @@ pub fn outside_facts(rows: &[LiveEvent]) -> Result<OutsideFacts> {
     for row in rows {
         match &row.event {
             DispatcherEvent::NodeStarted { node, frames, input, .. } => {
-                inputs.insert((node.clone(), frames_key(frames)), input.clone());
+                inputs.insert((node.clone(), frames_key(frames)), serde_json::to_value(input).context("write down a firing's input")?);
             }
             // Every wait, the ones held in the worker included (those
             // never suspend or resume the node, so only this event sees
@@ -650,9 +655,9 @@ mod tests {
     fn outside_facts_record_how_each_wait_ended_with_the_question_the_node_showed() {
         // Each row as the replay answers it: the run's own fields around
         // the kind's.
-        let row = |mut fields: Value| -> LiveEvent {
+        let row = |mut fields: Value| -> ValuedEvent {
             let fields_of = fields.as_object_mut().unwrap();
-            fields_of.insert("eventId".into(), json!("journal:1:0"));
+            fields_of.insert("eventId".into(), json!("journal:1:0:0"));
             fields_of.insert("runId".into(), json!(uuid::Uuid::nil()));
             fields_of.insert("projectId".into(), json!(uuid::Uuid::nil()));
             fields_of.insert("atUnix".into(), json!(1));

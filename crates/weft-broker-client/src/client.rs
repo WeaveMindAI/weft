@@ -376,9 +376,9 @@ impl RecordClient for BrokerRecordClient {
         Err(batch_refusal(JOURNAL_RECORD_PATH, &answer))
     }
 
-    async fn record_of(&self, run_id: RunId) -> Result<weft_journal::record::RawRecord> {
+    async fn record_of(&self, run_id: RunId, after: Option<i32>) -> Result<weft_journal::record::RawRecord> {
         let path = "/v1/journal/record_of";
-        let req = RecordOfRequest { run_id };
+        let req = RecordOfRequest { run_id, after };
         let resp: RecordOfResponse = read_until_answered(path, || self.http.post(path, &req)).await?;
         Ok(resp.record)
     }
@@ -727,7 +727,7 @@ impl BrokerRunClient {
     /// again.
     pub async fn claim(&self, run_id: RunId) -> Result<Option<weft_journal::record::Claimed>> {
         let path = "/v1/run/claim";
-        let req = RunClaimRequest { run_id };
+        let req = RunClaimRequest { run_id, reads: RecordReads::ByPage };
         let resp: RunClaimResponse = self.http.post(path, &req).await?;
         Ok(resp.claimed)
     }

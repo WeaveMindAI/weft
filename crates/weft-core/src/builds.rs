@@ -124,15 +124,6 @@ pub enum BuildRecipe {
 /// The file in a host build's context that says how to build it.
 pub const HOST_RECIPE_FILE: &str = "host-recipe.json";
 
-/// The compiler flags every build of a project's worker (and of a
-/// package's node tests) runs with, on every builder: what lets its tokio
-/// runtime turn the LIFO slot off (`crate::process_runtime`). Set as
-/// `RUSTFLAGS` where the build starts, whatever the builder: the worker
-/// images (`weft_compiler::worker_image`), the builder base that seeds
-/// their compile cache, a host build, a node-test build.
-// SYNC: WORKER_RUSTFLAGS <-> deploy/docker/worker-builder-base.Dockerfile ({{worker_rustflags}}), .cargo/config.toml (weft's own builds)
-pub const WORKER_RUSTFLAGS: &str = "--cfg tokio_unstable";
-
 /// The lock beside `shared`, the folder of crates every host build on a
 /// machine shares: held shared by every build from before it stages into
 /// the folder until it is compiled, and alone by whatever removes from it,
@@ -165,6 +156,19 @@ pub struct HostRecipe {
     pub seed_lock: std::path::PathBuf,
     /// The worker binary's name under `<target>/release/`.
     pub binary_name: String,
+    /// What the nodes' `[build.env]` set (`{{catalog_path}}` expanded), in
+    /// the environment of every cargo the build runs, over the machine's
+    /// own, as an image's `ENV` lines are: there cargo reads the variables
+    /// it takes for itself (`RUSTFLAGS`) and hands every one on to build
+    /// scripts and rustc.
+    pub build_env: std::collections::BTreeMap<String, String>,
+    /// The node types that set each variable of [`Self::build_env`]:
+    /// what a build refused for its `[build.env]` names.
+    pub build_env_set_by: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// What tells this build's compile cache apart from the one builds
+    /// whose nodes set no `[build.env]` share, `None` for those
+    /// (`weft_compiler::worker_image::NodesBuildEnv::cache_tag`).
+    pub cache_tag: Option<String>,
 }
 
 /// Where a worker image (a cloud's) keeps the record of the node packages
@@ -459,23 +463,80 @@ pub struct BuildInputs {
     /// ones the program references (`referenced`).
     #[serde(rename = "nodeSet")]
     pub node_set: NodeSet,
-    /// The `@asset` resolutions the version was built with, by resolution
-    /// key (`FileRef::resolution_key`): what the install resolved when it
+    /// The `@asset` resolutions the version was built with
+    /// (`FileRef::resolution_key`): what the install resolved when it
     /// first built it, kept so a build of the same version again resolves
     /// nothing anew (a URL may answer otherwise, a file outside the project
     /// may be gone).
-    #[serde(default)]
-    pub assets: BTreeMap<String, serde_json::Value>,
+    #[serde(default, with = "crate::project::resolutions_as_list")]
+    pub assets: crate::project::AssetResolutions,
 }
 
 impl BuildInputs {
     /// What a registered build keeps of its inputs (`project.running_build_inputs`).
-    pub const STORED: crate::stored::Kind<BuildInputs> = crate::stored::Kind::new("build's inputs", &[]);
+    /// Version 2 keeps `assets` as a list of `{ path, type, value }`
+    /// ([`assets_to_list`]).
+    pub const STORED: crate::stored::Kind<BuildInputs> =
+        crate::stored::Kind::new("build's inputs", &[&[crate::stored::Op::Code { at: "assets", run: assets_to_list }]]);
+}
+
+/// Version 1 kept `assets` as an object keyed by the path and the type
+/// joined with a NUL character; version 2 keeps a list of
+/// `{ path, type, value }`. A type's spelling holds no NUL and a path may,
+/// so the key splits at its last one.
+fn assets_to_list(assets: &mut serde_json::Value) -> Result<(), String> {
+    let serde_json::Value::Object(map) = assets else {
+        return Err(format!("not an object of resolutions: {assets}"));
+    };
+    let mut list = Vec::with_capacity(map.len());
+    for (key, value) in std::mem::take(map) {
+        let Some((path, ty)) = key.rsplit_once('\u{0}') else {
+            return Err(format!("the key {key:?} has no NUL between its path and its type"));
+        };
+        list.push(serde_json::json!({ "path": path, "type": ty, "value": value }));
+    }
+    *assets = serde_json::Value::Array(list);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::ResolutionKey;
+
+    fn text_key(path: &str) -> ResolutionKey {
+        ResolutionKey { path: path.into(), ty: "String".into() }
+    }
+
+    /// Version 1's object of resolutions, keyed by path and type joined
+    /// with a NUL, becomes version 2's list, a NUL inside a path kept in
+    /// the path.
+    #[test]
+    fn version_1_assets_become_a_list() {
+        let mut doc = serde_json::json!({
+            "nodeSet": "full",
+            "assets": { "logo.png\u{0}Image": { "key": "t/asset/aa" }, "odd\u{0}name.txt\u{0}String": "hi" },
+        });
+        crate::stored::upgrade(BuildInputs::STORED.steps, 1, &mut doc).unwrap();
+        let inputs: BuildInputs = serde_json::from_value(doc).unwrap();
+        assert_eq!(inputs.assets.len(), 2);
+        assert_eq!(inputs.assets[&ResolutionKey { path: "logo.png".into(), ty: "Image".into() }], serde_json::json!({ "key": "t/asset/aa" }));
+        assert_eq!(inputs.assets[&ResolutionKey { path: "odd\u{0}name.txt".into(), ty: "String".into() }], "hi");
+
+        let mut keyless = serde_json::json!({ "nodeSet": "full", "assets": { "no separator": 1 } });
+        assert!(crate::stored::upgrade(BuildInputs::STORED.steps, 1, &mut keyless).is_err());
+    }
+
+    /// A list naming one reference twice does not read: which of the two
+    /// a build would use is not said anywhere.
+    #[test]
+    fn a_reference_resolved_twice_does_not_read() {
+        let doc = serde_json::json!({ "nodeSet": "full", "assets": [
+            { "path": "a", "type": "String", "value": 1 },
+            { "path": "a", "type": "String", "value": 2 },
+        ] });
+        assert!(serde_json::from_value::<BuildInputs>(doc).is_err());
+    }
 
     /// What a build compiles its files with sits beside them, as the
     /// project's registered build keeps them.
@@ -483,11 +544,11 @@ mod tests {
     fn a_version_source_keeps_its_inputs_beside_its_files() {
         let source = VersionSource {
             manifest: [("main.weft".to_string(), "sha256:aa".to_string())].into(),
-            inputs: BuildInputs { node_set: NodeSet::Referenced, assets: [("text:a".to_string(), serde_json::json!("x"))].into() },
+            inputs: BuildInputs { node_set: NodeSet::Referenced, assets: [(text_key("a"), serde_json::json!("x"))].into() },
         };
         let wire = serde_json::to_value(&source).unwrap();
         assert_eq!(wire["nodeSet"], "referenced");
-        assert_eq!(wire["assets"]["text:a"], "x");
+        assert_eq!(wire["assets"], serde_json::json!([{ "path": "a", "type": "String", "value": "x" }]));
         assert_eq!(serde_json::from_value::<VersionSource>(wire).unwrap(), source);
     }
 

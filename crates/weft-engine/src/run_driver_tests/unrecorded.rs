@@ -43,6 +43,48 @@
         }
     }
 
+    /// Starts waiting, then goes on without the wait: its call is dropped
+    /// once the wait is registered, and the body returns.
+    struct Abandons;
+    test_manifest!(Abandons, "Answer");
+    #[async_trait]
+    impl Node for Abandons {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let timer = weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 5_000 } };
+            let waiting = ctx.await_signal(timer);
+            tokio::pin!(waiting);
+            // Polled until it holds (registered, and waiting in its call),
+            // then dropped.
+            for _ in 0..50 {
+                if futures::poll!(waiting.as_mut()).is_ready() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            ctx.pulse_downstream(NodeOutput::new().set("value", json!("without it"))).await
+        }
+    }
+
+    /// Panics while a wait it started is open: registered, and waiting in
+    /// its call.
+    struct PanicsWaiting;
+    test_manifest!(PanicsWaiting, "Answer");
+    #[async_trait]
+    impl Node for PanicsWaiting {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let timer = weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 5_000 } };
+            let waiting = ctx.await_signal(timer);
+            tokio::pin!(waiting);
+            for _ in 0..50 {
+                if futures::poll!(waiting.as_mut()).is_ready() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("the node broke while it waited");
+        }
+    }
+
     fn project() -> ProjectDefinition {
         serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(), "edges": [],
@@ -170,11 +212,13 @@
             }
         });
         let holds = crate::run_holds::Holds::new(Box::new(|| {}));
+        let project = Arc::new(project);
+        let claimed = super::engine_test_rig::claimed(&run_clients, run_id, &project, &birth).await;
         let drive = RunDrive {
             run_id,
             journal: run,
-            program: Arc::new(crate::plan::ProgramTables::new(Arc::new(project))),
-            starts_from: StartsFrom::Record(birth),
+            program: Arc::new(crate::plan::ProgramTables::new(project)),
+            starts_from: StartsFrom::Record(Box::new(claimed)),
             cancellation: CancellationFlag::new_arc(),
             exchange: Some(super::engine_test_rig::live_exchange(conn)),
             hand_back: None,
@@ -325,6 +369,28 @@
         assert!(error.contains("gave up its wait") && error.contains("`holdSecs`") && error.contains("`recorded: false`"), "{error}");
         assert_eq!(*tasks.withdrawn.lock().unwrap(), vec![tasks.minted().expect("the wait was registered")]);
         assert!(!written.iter().any(|e| matches!(e, RunEvent::NodeSuspended { .. })), "nothing parked");
+    }
+
+    /// A firing that went on without a wait it started (its call dropped)
+    /// leaves nothing behind once it ends: the wait is withdrawn, so
+    /// nobody is asked to answer it, and the run completes.
+    #[tokio::test]
+    async fn a_wait_its_firing_went_on_without_is_withdrawn_when_the_firing_ends() {
+        let tasks = AwaitTasks::new();
+        let (outcome, _) = drive_holding(Box::new(Abandons), 60, tasks.clone(), Arc::new(Answers::default()), &crate::run_holds::Holds::new(Box::new(|| {}))).await;
+        assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
+        assert_eq!(*tasks.withdrawn.lock().unwrap(), vec![tasks.minted().expect("the wait was registered")]);
+    }
+
+    /// A firing that panics while a wait it started is open leaves nothing
+    /// behind either: the panic stops the node's code, and the drive, as
+    /// it fails the firing, withdraws the wait.
+    #[tokio::test]
+    async fn a_wait_open_when_its_firing_panics_is_withdrawn() {
+        let tasks = AwaitTasks::new();
+        let (outcome, _) = drive_holding(Box::new(PanicsWaiting), 60, tasks.clone(), Arc::new(Answers::default()), &crate::run_holds::Holds::new(Box::new(|| {}))).await;
+        assert!(matches!(&outcome, RunOutcome::Failed { error, .. } if error.contains("panicked")), "{outcome:?}");
+        assert_eq!(*tasks.withdrawn.lock().unwrap(), vec![tasks.minted().expect("the wait was registered")]);
     }
 
     /// A hold of zero gives the wait up at once, through the one path a

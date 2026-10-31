@@ -22,6 +22,7 @@ pub const VERSION_NOTE_HEADER: &str = "x-weft-version-note";
 /// (Cloud Run's `429` when every copy of the service it may start is busy,
 /// sent before weft ever saw the request, so nothing ran). The install's
 /// counterpart of `weft_platform_traits::WORKER_ANSWER_HEADER`.
+// SYNC: INSTALL_ANSWER_HEADER <-> extension-vscode/src/dispatcher.ts INSTALL_ANSWER_HEADER
 pub const INSTALL_ANSWER_HEADER: &str = "x-weft-install";
 
 /// Whether an answer the install gave itself (`from_install`: it carries
@@ -46,7 +47,7 @@ pub const INSTALL_ANSWER_HEADER: &str = "x-weft-install";
 /// passed on as it came, and a call to a trigger that is not on
 /// (`crate::arrival::NOT_NOW_FOR_CALLER`, a `503` with a `Retry-After`:
 /// nothing ran, and it goes through once the trigger is on).
-// SYNC: asks_again <-> crates/weft-dispatcher/src/api/mod.rs (database_did_not_take, unavailable_or_internal, access_store_error), crates/weft-dispatcher/src/api/storage.rs (storage_err), crates/weft-cli/src/client.rs (busy_answer)
+// SYNC: asks_again <-> crates/weft-dispatcher/src/api/mod.rs (database_did_not_take, unavailable_or_internal, access_store_error), crates/weft-dispatcher/src/api/storage.rs (storage_err), crates/weft-cli/src/client.rs (busy_answer), extension-vscode/src/dispatcher.ts (worthTryingAgain)
 pub fn asks_again(status: u16, from_install: bool) -> bool {
     status == 503 && from_install
 }

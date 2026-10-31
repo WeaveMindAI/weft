@@ -788,7 +788,7 @@ pub async fn health_state(pool: &Pool, project_id: uuid::Uuid) -> anyhow::Result
                 took_down,
                 next_retry_at_unix: r.try_get("next_retry_at_unix")?,
                 gave_up_at_unix: r.try_get("gave_up_at_unix")?,
-                gave_up_seen: r.try_get("gave_up_seen")?,
+                gave_up_seen: r.try_get::<_, Option<JsonText<serde_json::Value>>>("gave_up_seen")?.map(|seen| seen.0),
                 last_error: r.try_get("last_error")?,
             })
         })
@@ -857,7 +857,7 @@ pub async fn set_health_state(pool: &Pool, req: &SupervisorSetHealthStateRequest
                 &failures,
                 &r.next_retry_at_unix,
                 &r.gave_up_at_unix,
-                &r.gave_up_seen,
+                &r.gave_up_seen.as_ref().map(JsonText),
                 &r.last_error,
                 &r.queued.map(|q| q.command),
                 &r.queued.map(|q| q.deadline_unix),
@@ -948,7 +948,7 @@ pub async fn issue_command(pool: &Pool, cmd: &IssuedCommand<'_>) -> anyhow::Resu
             &cmd.project_id,
             &cmd.node_id,
             &cmd.verb.as_str(),
-            &cmd.spec_json,
+            &cmd.spec_json.map(JsonText),
             &cmd.issued_by_replica,
             &instance_id,
             &every_copy,
@@ -1045,8 +1045,7 @@ fn decode_command(r: &Row) -> anyhow::Result<SupervisorCommandRow> {
     let verb_str: String = r.try_get("verb")?;
     let verb = InfraLifecycleVerb::parse(&verb_str)
         .ok_or_else(|| anyhow::anyhow!("infra_lifecycle_command.id={id}: unknown verb '{verb_str}'"))?;
-    let spec_json: Option<serde_json::Value> =
-        r.try_get::<_, Option<serde_json::Value>>("spec_json")?;
+    let spec_json = r.try_get::<_, Option<JsonText<serde_json::Value>>>("spec_json")?.map(|spec| spec.0);
     let force: bool = r.try_get("force")?;
     let instance_id: Option<String> = r.try_get("instance_id")?;
     let every_copy: bool = r.try_get("every_copy")?;

@@ -24,7 +24,7 @@ mod resolve;
 mod subscriptions;
 mod transfer;
 
-use weft_task_store::db::{Client as _, Transaction};
+use weft_task_store::db::{Client as _, JsonText, Transaction};
 use weft_task_store::documents::Rederived;
 
 pub use crypt::{open_json, open_str, seal_json, seal_str};
@@ -178,10 +178,16 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             client_id TEXT,
             -- NULL for an exclusive-class shared grant.
             project_id UUID,
-            -- The AccessSpec snapshot: refresh/auth need no catalog.
-            spec_json JSONB NOT NULL,
-            -- The version `spec_json` was written at (`AccessSpec::STORED`).
-            spec_json_version INTEGER NOT NULL,
+            -- The AccessSpec snapshot: refresh/auth need no catalog. As
+            -- its JSON text (`db::JsonText`): a node publishing a
+            -- connection writes it.
+            spec TEXT NOT NULL,
+            -- The version `spec` was written at (`AccessSpec::STORED`).
+            spec_version INTEGER NOT NULL,
+            -- Whether the spec's `grants` is `exclusive` (the provider
+            -- keeps one grant per app and account), copied out of it on
+            -- every write for the `access_grant_one_exclusive` index.
+            exclusive BOOLEAN NOT NULL,
             -- The stored values (token, refresh_token, captures, pasted
             -- fields), SEALED (crypt.rs). What a resolution hands over
             -- is everything here EXCEPT the store's own keep-alive
@@ -219,7 +225,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             provider_account TEXT,
             -- The content hash (sha256 hex) of the spec snapshot's
             -- events block, NULL when it declares none. Written
-            -- beside every spec_json write. An inbound push is
+            -- beside every spec write. An inbound push is
             -- answered by the recipe the connection itself declared,
             -- so routing filters on this against the verifying
             -- recipe's hash.
@@ -277,10 +283,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         -- same moment as the first, rotates that row instead of leaving
         -- two (`flows.rs`, `insert_grant`). A pasted credential with no
         -- app and a node's published connection are not that row.
-        -- SYNC: access_grant_exclusive <-> weft_access_store::flows::insert_grant, weft_access_store::flows::exclusive_row
-        CREATE UNIQUE INDEX IF NOT EXISTS access_grant_exclusive
+        -- SYNC: access_grant_one_exclusive <-> weft_access_store::flows::insert_grant, weft_access_store::flows::exclusive_row
+        CREATE UNIQUE INDEX IF NOT EXISTS access_grant_one_exclusive
             ON access_grant (tenant_id, service, identity, client_id, instance_id, project_id) NULLS NOT DISTINCT
-            WHERE published_by_node IS NULL AND client_id IS NOT NULL AND spec_json->>'grants' = 'exclusive';
+            WHERE published_by_node IS NULL AND client_id IS NOT NULL AND exclusive;
         -- An instance's connections, for its picker and its forget.
         CREATE INDEX IF NOT EXISTS access_grant_instance
             ON access_grant (project_id, instance_id) WHERE instance_id IS NOT NULL;
@@ -338,7 +344,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- SEALED (crypt.rs).
             registration_sealed TEXT NOT NULL,
             project_id UUID,
-            spec_json JSONB NOT NULL,
+            -- As its JSON text (`db::JsonText`), like the grant's.
+            spec_json TEXT NOT NULL,
             scopes JSONB NOT NULL DEFAULT '[]',
             -- SEALED (crypt.rs): with the consent code intercepted, the
             -- verifier is what stands between a dump and the token.
@@ -460,7 +467,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             service TEXT NOT NULL,
             -- sha256 hex of the recipe's canonical JSON.
             recipe_hash TEXT NOT NULL,
-            events_json JSONB NOT NULL,
+            -- As its JSON text (`db::JsonText`): part of a spec, which a
+            -- node publishing a connection writes.
+            events_json TEXT NOT NULL,
             -- The version `events_json` was written at
             -- (`weft_core::access::events::STORED_EVENTS`).
             events_json_version INTEGER NOT NULL,
@@ -530,7 +539,31 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     data_steps: &[EXCLUSIVE_FOLD],
 };
 
-/// Before `access_grant_exclusive` is built on a database from before it,
+/// A connection's spec, which an older weft kept in `spec_json` as `JSONB`,
+/// copied into `spec` as its JSON text, at the version it was written at,
+/// with whether it is exclusive: the fill before `access_grant.spec`'s
+/// first step (`weft_runtime::schema::documents`), so the rows it copies
+/// are carried to today's shape with the rest and their recipes hashed
+/// again ([`rehash_grant_recipes`]). A data step would copy them only after
+/// the carry. The rows there came out of `JSONB`, so none holds a NUL
+/// character the cast would refuse. A database whose `spec_json` is gone
+/// (a fresh one, one this ran on) has nothing to copy.
+pub const SPEC_FILLS: &[weft_task_store::documents::Fill] = &[weft_task_store::documents::Fill {
+    from: 1,
+    sql: "DO $$
+          BEGIN
+              IF EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = current_schema() AND table_name = 'access_grant'
+                            AND column_name = 'spec_json') THEN
+                  UPDATE access_grant SET spec = spec_json::text, spec_version = spec_json_version,
+                         exclusive = COALESCE(spec_json->>'grants' = 'exclusive', FALSE)
+                   WHERE spec IS NULL;
+              END IF;
+          END
+          $$",
+}];
+
+/// Before `access_grant_one_exclusive` is built on a database from before it,
 /// the rows it would refuse are folded: two sign-ins to one exclusive
 /// account that raced under older code each left a row, and a unique
 /// index over them fails the boot, with rows nobody can mend by hand
@@ -546,19 +579,19 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 /// spec name the connection inside their text, so the id is replaced
 /// there as it is (a connection id is a uuid, found nowhere else in it).
 /// Run twice, the second run finds no duplicate and changes nothing.
-// SYNC: the exclusive key <-> access_grant_exclusive (the DDL above), crate::flows::exclusive_row
+// SYNC: the exclusive key <-> access_grant_one_exclusive (the DDL above), crate::flows::exclusive_row
 // SYNC: what names a grant <-> instance_value, install_pick, access_connect, access_picker, access_connect_result, signal_subscription (the DDL above), crates/weft-dispatcher/src/store/postgres.rs (signal.access_id)
 const EXCLUSIVE_FOLD: weft_task_store::DataStep = weft_task_store::DataStep {
     table: "access_grant",
-    until: weft_task_store::Until::Indexed("access_grant_exclusive"),
-    sql: r#"
+    until: weft_task_store::Until::Indexed("access_grant_one_exclusive"),
+    work: weft_task_store::StepWork::Sql(r#"
         UPDATE access_grant SET project_id = NULL
          WHERE instance_id IS NULL AND project_id IS NOT NULL
-           AND published_by_node IS NULL AND client_id IS NOT NULL AND spec_json->>'grants' = 'exclusive';
+           AND published_by_node IS NULL AND client_id IS NOT NULL AND exclusive;
         CREATE TEMP TABLE access_grant_fold AS
             SELECT id AS gone, first_value(id) OVER exclusive_key AS keep
               FROM access_grant
-             WHERE published_by_node IS NULL AND client_id IS NOT NULL AND spec_json->>'grants' = 'exclusive'
+             WHERE published_by_node IS NULL AND client_id IS NOT NULL AND exclusive
             WINDOW exclusive_key AS (PARTITION BY tenant_id, service, identity, client_id, instance_id, project_id
                            ORDER BY updated_at DESC, id);
         DELETE FROM access_grant_fold WHERE gone = keep;
@@ -587,20 +620,21 @@ const EXCLUSIVE_FOLD: weft_task_store::DataStep = weft_task_store::DataStep {
         $$;
         DELETE FROM access_grant WHERE id IN (SELECT gone FROM access_grant_fold);
         DROP TABLE access_grant_fold;
-    "#,
+    "#),
 };
 
 /// A connection's `events_recipe_hash` is the hash of the recipe in its
 /// own snapshot, which is what routes a push to it: hashed again from
 /// each snapshot once the snapshots are in today's shape, so a connection
 /// keeps matching the recipe [`rekey_events_recipes`] keeps it under.
-/// What `access_grant.spec_json` re-derives once its documents are carried
-/// to today's shape (`weft_runtime::schema::documents`).
+/// What `access_grant.spec` re-derives once its documents are carried to
+/// today's shape (`weft_runtime::schema::documents`).
 pub fn rehash_grant_recipes<'c>(tx: &'c Transaction<'c>) -> Rederived<'c> {
     Box::pin(async move {
-        let rows: Vec<(uuid::Uuid, serde_json::Value, weft_core::stored::Version, Option<String>)> =
-            tx.all("SELECT id, spec_json, spec_json_version, events_recipe_hash FROM access_grant", &[]).await?;
-        for (id, spec, version, stored) in rows {
+        let rows: Vec<(uuid::Uuid, JsonText<serde_json::Value>, weft_core::stored::Version, Option<String>)> = tx
+            .all("SELECT id, spec, spec_version, events_recipe_hash FROM access_grant", &[])
+            .await?;
+        for (id, JsonText(spec), version, stored) in rows {
             let hash = resolve::events_recipe_hash(&spec_of(format_args!("connection {id}"), spec, version)?.events);
             if hash != stored {
                 tx.execute("UPDATE access_grant SET events_recipe_hash = $2 WHERE id = $1", &[&id, &hash]).await?;
@@ -616,9 +650,9 @@ pub fn rehash_grant_recipes<'c>(tx: &'c Transaction<'c>) -> Rederived<'c> {
 /// re-derives once its documents are carried to today's shape.
 pub fn rekey_events_recipes<'c>(tx: &'c Transaction<'c>) -> Rederived<'c> {
     Box::pin(async move {
-        let rows: Vec<(String, String, serde_json::Value, weft_core::stored::Version)> =
+        let rows: Vec<(String, String, JsonText<serde_json::Value>, weft_core::stored::Version)> =
             tx.all("SELECT service, recipe_hash, events_json, events_json_version FROM service_events_recipe", &[]).await?;
-        for (service, stored, events, version) in rows {
+        for (service, stored, JsonText(events), version) in rows {
             let events = weft_core::access::events::STORED_EVENTS
                 .decode(events, version)
                 .map_err(|e| e.at(format_args!("a recorded events recipe of '{service}' ({stored})")))?;
@@ -644,7 +678,7 @@ pub fn rekey_events_recipes<'c>(tx: &'c Transaction<'c>) -> Rederived<'c> {
     })
 }
 
-/// A grant row's spec snapshot (`access_grant.spec_json`), written at
+/// A grant row's spec snapshot (`access_grant.spec`), written at
 /// `version`, as the typed recipe; `at` names the connection for a message.
 pub(crate) fn spec_of(
     at: impl std::fmt::Display,

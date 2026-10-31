@@ -26,13 +26,17 @@
 		}
 	}
 
-	let { label, value = undefined, closed = false, note = undefined }: {
+	let { label, value = undefined, closed = false, error = undefined, note = undefined }: {
 		/// The port name.
 		label: string;
 		value?: unknown;
 		/// A port that was closed without a value: the card is greyed
 		/// out and says so, with nothing to expand or copy.
 		closed?: boolean;
+		/// Why the port's value could not be shown (it could not be read,
+		/// or the run's record and the reference to it disagree): the card
+		/// says so as an error, with nothing to expand or copy.
+		error?: string;
 		/// Where the value came from when it did not travel a wire in
 		/// this run (a value given to the run, the seed run). Shown
 		/// in the header beside the value's type.
@@ -95,16 +99,20 @@
 
 <div
 	class="group/value rounded-md border border-zinc-200 bg-white overflow-hidden
-	       transition-colors hover:border-zinc-300 {closed ? 'opacity-60' : ''}"
+	       transition-colors hover:border-zinc-300 {closed ? 'opacity-60' : ''} {error !== undefined ? 'border-red-200' : ''}"
 >
 	<div class="flex items-center gap-2 px-2.5 py-1.5 bg-zinc-50/80 border-b border-zinc-200">
 		<span class="text-[11px] font-medium text-zinc-700 truncate">{label}</span>
-		<span class="text-[10px] text-zinc-400 shrink-0">{closed ? 'closed' : summary}</span>
+		{#if error !== undefined}
+			<span class="text-[10px] text-red-600 shrink-0">error</span>
+		{:else}
+			<span class="text-[10px] text-zinc-400 shrink-0">{closed ? 'closed' : summary}</span>
+		{/if}
 		{#if note}
 			<span class="text-[10px] text-sky-700 truncate">· {note}</span>
 		{/if}
 		<div class="flex-1"></div>
-		{#if closed}
+		{#if closed || error !== undefined}
 			<!-- Nothing to expand or copy. -->
 		{:else}
 		{#if showToggle}
@@ -127,7 +135,9 @@
 		</div>
 		{/if}
 	</div>
-	{#if closed}
+	{#if error !== undefined}
+		<div class="px-2.5 py-2 text-[11px] text-red-700 whitespace-pre-wrap break-words">{error}</div>
+	{:else if closed}
 		<div class="px-2.5 py-2 text-[11px] italic text-zinc-400">nothing arrived on this port</div>
 	{:else}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->

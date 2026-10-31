@@ -1769,7 +1769,7 @@
                 .expect("join")
                 .expect("run ok");
 
-            let events = journal.events_for_run_id(run_id).await.unwrap();
+            let events = journal.events_of(run_id);
             // The consumer must NEVER be skipped: its required `in` arrived
             // as a real value, not a closure.
             let consumer_skipped = events.iter().any(|e| {
@@ -1785,7 +1785,7 @@
             }
             let view = fold.firing_view("consumer", &vec![]).expect("consumer fired");
             assert_eq!(
-                view.input.get("in").and_then(|v| v.as_str()),
+                view.input.get("in").and_then(|v| v.value.as_deref()).and_then(|v| v.as_str()),
                 Some("payload"),
                 "iter {i}: consumer never received the producer's value on `in`"
             );

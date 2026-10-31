@@ -1,8 +1,8 @@
 //! The run event stream, as the rig reads it.
 //!
-//! `GET /runs/{run_id}/replay` returns a JSON array of
-//! `weft_core::live_event::LiveEvent` (a `{ "kind": "...", ... }` tagged
-//! union). The fetch decodes every row as that type first, so a shape the
+//! `GET /runs/{run_id}/replay?with_values=true` returns a JSON array of
+//! events with their values written in ([`ValuedEvent`], a `{ "kind":
+//! "...", ... }` tagged union). The fetch decodes every row as that type first, so a shape the
 //! dispatcher and weft-core disagree on fails there. An [`Event`] is then a
 //! thin accessor over the row's JSON: it exposes `kind()` and reads the
 //! handful of fields the assertions need by name (the node is `node`, NOT
@@ -11,6 +11,9 @@
 //! the real JSON.
 
 use serde_json::Value;
+
+/// A replay row with its values written in, as the rig asks for it.
+pub type ValuedEvent = weft_core::live_event::IdentifiedEvent<weft_core::live_event::DispatcherEvent<Value>>;
 
 /// One event from the replay stream. Wraps the raw tagged-union JSON.
 #[derive(Debug, Clone)]
@@ -100,12 +103,12 @@ impl Replay {
 
     /// True once the run has ended: some event is a run's ending,
     /// by the one rule weft-core keeps (`DispatcherEvent::is_run_terminal`).
-    /// A row that does not decode as a `LiveEvent` is an error, never "not
-    /// ended": a changed replay shape must fail by name, not time out.
+    /// A row that does not decode as a [`ValuedEvent`] is an error, never
+    /// "not ended": a changed replay shape must fail by name, not time out.
     pub fn has_terminal(&self) -> anyhow::Result<bool> {
         for e in &self.events {
-            let live: weft_core::live_event::LiveEvent = serde_json::from_value(e.0.clone())
-                .map_err(|err| anyhow::anyhow!("a replay row does not decode as a LiveEvent ({err}): {}", e.0))?;
+            let live: ValuedEvent = serde_json::from_value(e.0.clone())
+                .map_err(|err| anyhow::anyhow!("a replay row does not decode as an event ({err}): {}", e.0))?;
             if live.event.is_run_terminal() {
                 return Ok(true);
             }
