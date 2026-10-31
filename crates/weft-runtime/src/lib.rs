@@ -571,9 +571,13 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     // once.
     if placement == Some(Placement::Pool) {
         let state = holding.expect("only the holder runs in a pool");
-        let room = Some(config.holders.signals_per_copy);
-        tracing::info!(target: "weft_runtime", room = config.holders.signals_per_copy, "holding");
-        weft_listener::hold::run(state, room, server::shutdown()).await;
+        let cpu = weft_listener::load::ProcessCpu::new()?;
+        let settings = config.holders;
+        tracing::info!(
+            target: "weft_runtime", room = settings.signals_per_copy, high_cpu_percent = settings.high_cpu_percent,
+            target_cpu_percent = settings.target_cpu_percent, "holding"
+        );
+        weft_listener::hold::run(state, weft_listener::hold::Share::Copy { settings, cpu: Box::new(cpu), sample_every: weft_listener::load::sample_every() }, server::shutdown()).await;
         return Ok(());
     }
 
@@ -616,7 +620,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 // under a name every local process of the install shares:
                 // only once its ports are bound, which no second one of
                 // them can be, does it take the claims.
-                weft_dispatcher::app::spawn_supervised("hold", weft_listener::hold::run(state, None, std::future::pending()));
+                weft_dispatcher::app::spawn_supervised("hold", weft_listener::hold::run(state, weft_listener::hold::Share::Every, std::future::pending()));
             }
             tracing::info!(target: "weft_runtime", roles = ?hosted, public = %local.listen.public, internal = %local.listen.internal, "serving");
             // The internal routes are reached on the public port too, for

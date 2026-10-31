@@ -3037,17 +3037,26 @@ async fn a_registration_is_removed_only_while_the_row_is_still_it(pool: Pool) {
 }
 
 /// The holders are counted from the held rows a listener holds: a parked
-/// activation's and a signal that holds nothing do not count.
+/// activation's and a signal that holds nothing do not count. Read off
+/// the sizing at one signal to a holder, on a pool never set.
 #[weft_db_macros::test]
 async fn the_holders_count_the_held_rows_of_live_activations(pool: Pool) {
+    async fn held_count(pool: &Pool) -> anyhow::Result<u32> {
+        pool.execute("DELETE FROM holder_pool", &[]).await?;
+        let holders = weft_platform_traits::FakeHolderPool::default();
+        weft_dispatcher::holders::size(pool, &holders, &weft_platform_traits::FakeHolderNews::default(), &per_copy(1), &std::sync::atomic::AtomicBool::new(false))
+            .await?;
+        let sizes = holders.sizes.lock();
+        Ok(sizes[0])
+    }
     let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 0);
+    assert_eq!(held_count(&pool).await.unwrap(), 0);
     store.signal_insert(&held_signal("one", id, 0)).await.unwrap();
     store.signal_insert(&held_signal("two", id, 0)).await.unwrap();
     store.signal_insert(&entry_at("form", id)).await.unwrap();
-    assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 2);
+    assert_eq!(held_count(&pool).await.unwrap(), 2);
     pool.execute(
         "INSERT INTO trigger_activation (project_id, trigger, status, accepting_fires, fires_visible_to_consumers, updated_at, \
          activation_program_version) VALUES ($1, 'wiped', 'inactive', FALSE, FALSE, 0, 1)",
@@ -3056,16 +3065,16 @@ async fn the_holders_count_the_held_rows_of_live_activations(pool: Pool) {
     .await
     .unwrap();
     pool.execute("UPDATE signal SET activation_trigger = 'wiped' WHERE token = 'two'", &[]).await.unwrap();
-    assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 1, "a wiped activation's row holds nothing");
+    assert_eq!(held_count(&pool).await.unwrap(), 1, "a wiped activation's row holds nothing");
     pool.execute(
         "UPDATE trigger_activation SET accepting_fires = TRUE, fires_visible_to_consumers = TRUE WHERE trigger = 'wiped'",
         &[],
     )
     .await
     .unwrap();
-    assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 2, "a parked one's goes on holding: what it hears waits");
+    assert_eq!(held_count(&pool).await.unwrap(), 2, "a parked one's goes on holding: what it hears waits");
     pool.execute("UPDATE signal SET held_failed = 'misconfigured' WHERE token = 'one'", &[]).await.unwrap();
-    assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 1, "a row its holder gave up on needs no holder");
+    assert_eq!(held_count(&pool).await.unwrap(), 1, "a row its holder gave up on needs no holder");
 }
 
 /// The holders run as many copies as the held signals need, none for none,
@@ -3085,30 +3094,181 @@ async fn the_holders_are_sized_to_the_held_signals(pool: Pool) {
     seed_project(&projects, id, "bin-A").await;
     let (holders, here) = (weft_platform_traits::FakeHolderPool::default(), AtomicBool::new(false));
     let news = weft_platform_traits::FakeHolderNews::default();
-    assert_eq!(size(&pool, &holders, &news, 2, &here).await.unwrap(), DrainStep::Done);
+    assert_eq!(size(&pool, &holders, &news, &per_copy(2), &here).await.unwrap(), DrainStep::Done);
     assert_eq!(*holders.sizes.lock(), vec![0], "never set: the pool is set even to none");
-    size(&pool, &holders, &news, 2, &here).await.unwrap();
+    size(&pool, &holders, &news, &per_copy(2), &here).await.unwrap();
     assert_eq!(*holders.sizes.lock(), vec![0], "set to none already: not asked again");
     for t in ["a", "b", "c"] {
         store.signal_insert(&held_signal(t, id, 0)).await.unwrap();
     }
-    assert_eq!(size(&pool, &holders, &news, 2, &here).await.unwrap(), DrainStep::Done);
+    assert_eq!(size(&pool, &holders, &news, &per_copy(2), &here).await.unwrap(), DrainStep::Done);
     store.signal_insert(&held_signal("d", id, 0)).await.unwrap();
     let (sibling, there) = (weft_platform_traits::FakeHolderPool::default(), AtomicBool::new(false));
-    size(&pool, &sibling, &news, 2, &there).await.unwrap();
+    size(&pool, &sibling, &news, &per_copy(2), &there).await.unwrap();
     assert_eq!(*sibling.sizes.lock(), vec![2], "a replica just started sets the pool to the count written, as it may have drifted");
-    size(&pool, &sibling, &news, 2, &there).await.unwrap();
+    size(&pool, &sibling, &news, &per_copy(2), &there).await.unwrap();
     assert_eq!(*sibling.sizes.lock(), vec![2], "and then trusts it");
-    size(&pool, &holders, &news, 2, &here).await.unwrap();
+    size(&pool, &holders, &news, &per_copy(2), &here).await.unwrap();
     assert_eq!(*holders.sizes.lock(), vec![0, 2], "four signals still need the two holders the other replica set");
     store.signal_remove_many(&["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]).await.unwrap();
-    size(&pool, &holders, &news, 2, &here).await.unwrap();
+    size(&pool, &holders, &news, &per_copy(2), &here).await.unwrap();
     assert_eq!(*holders.sizes.lock(), vec![0, 2, 0]);
     assert_eq!(
         *news.told.lock(),
         vec![weft_platform_traits::HolderNote::HeldSetChanged; 7],
         "each sizing tells the holders, after the pool is sized for it"
     );
+}
+
+/// The holder settings with `signals_per_copy` to a holder, the rest as
+/// they default (a target of 50%).
+fn per_copy(signals_per_copy: u32) -> weft_platform_traits::config::HolderSettings {
+    weft_platform_traits::config::HolderSettings { signals_per_copy, ..Default::default() }
+}
+
+/// Claim `held` signals of project `id`, each `(token, holder)`.
+async fn claimed(store: &PostgresStore, pool: &Pool, id: Uuid, held: &[(&str, &str)]) {
+    for (t, holder) in held {
+        store.signal_insert(&held_signal(t, id, 0)).await.unwrap();
+        pool.execute("UPDATE signal SET held_by = $2 WHERE token = $1", &[t, holder]).await.unwrap();
+    }
+}
+
+/// The holders run as many copies as the load they said, summed, needs at
+/// the target each, when that is more than the held signals need; the
+/// floor wins when it is not, and counts the room a holder gave up; and
+/// never more holders than signals.
+#[weft_db_macros::test]
+async fn the_holders_are_sized_to_their_reported_load(pool: Pool) {
+    use std::sync::atomic::AtomicBool;
+    use weft_broker::held_signals::{report_load, HandTo};
+    use weft_dispatcher::holders::size;
+    let (store, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    claimed(&store, &pool, id, &[("a", "h1"), ("b", "h2"), ("c", "h3")]).await;
+    let (holders, here) = (weft_platform_traits::FakeHolderPool::default(), AtomicBool::new(false));
+    let news = weft_platform_traits::FakeHolderNews::default();
+    size(&pool, &holders, &news, &per_copy(2), &here).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![2], "three signals, two to a holder");
+
+    for (h, cpu) in [("h1", 60), ("h2", 55), ("h3", 0)] {
+        report_load(&pool, h, cpu, 2, &[], HandTo::SpareOrAny).await.unwrap();
+    }
+    size(&pool, &holders, &news, &per_copy(2), &here).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![2, 3], "115% at 50% each: the load wins");
+
+    for h in ["h1", "h2"] {
+        report_load(&pool, h, 20, 2, &[], HandTo::SpareOrAny).await.unwrap();
+    }
+    size(&pool, &holders, &news, &per_copy(2), &here).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![2, 3, 2], "40% needs one, three signals need two: the floor wins");
+
+    for h in ["h1", "h2"] {
+        report_load(&pool, h, 20, 1, &[], HandTo::SpareOrAny).await.unwrap();
+    }
+    size(&pool, &holders, &news, &per_copy(2), &here).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![2, 3, 2, 3], "two holders keeping one each leave room for one more: the room given up raises the floor");
+    report_load(&pool, "h3", 400, 2, &[], HandTo::SpareOrAny).await.unwrap();
+    size(&pool, &holders, &news, &per_copy(2), &here).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![2, 3, 2, 3], "three signals run three holders at most");
+}
+
+/// Only a holder that claims signals counts: a load said by one that
+/// claims nothing (its claims freed, or never taken) holds no work. A
+/// copy that dies keeps its claims until its check frees them, which
+/// forgets what it said; until then its load counts, as its signals still
+/// need a holder. And no copy goes while what it held moves: its signals
+/// free and nobody took them yet, or taken by a holder that has not said
+/// its load since.
+#[weft_db_macros::test]
+async fn a_load_said_by_a_holder_that_claims_nothing_is_left_out(pool: Pool) {
+    use std::sync::atomic::AtomicBool;
+    use weft_broker::held_signals::{hold, release, report_load, HandTo};
+    use weft_dispatcher::holders::size;
+    let (store, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    claimed(&store, &pool, id, &[("a", "h1"), ("b", "h1"), ("c", "h1"), ("d", "h2"), ("e", "h2"), ("f", "h2")]).await;
+    let (holders, here) = (weft_platform_traits::FakeHolderPool::default(), AtomicBool::new(false));
+    let news = weft_platform_traits::FakeHolderNews::default();
+    for h in ["h1", "h2"] {
+        report_load(&pool, h, 30, 10, &[], HandTo::SpareOrAny).await.unwrap();
+    }
+    report_load(&pool, "h3", 200, 10, &[], HandTo::SpareOrAny).await.unwrap();
+    size(&pool, &holders, &news, &per_copy(10), &here).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![2], "60% from the two that claim; h3 claims nothing and is left out");
+
+    claimed(&store, &pool, id, &[("g", "h3")]).await;
+    size(&pool, &holders, &news, &per_copy(10), &here).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![2, 6], "once it claims a signal, its 200% counts");
+
+    release(&pool, "h3").await.unwrap();
+    size(&pool, &holders, &news, &per_copy(10), &here).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![2, 6], "its check went off: g is free, and nobody took it yet");
+    hold(&pool, "h1", &[], Some(10), &[]).await.unwrap();
+    size(&pool, &holders, &news, &per_copy(10), &here).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![2, 6], "h1 took it and has not said its load since");
+    report_load(&pool, "h1", 35, 10, &[], HandTo::SpareOrAny).await.unwrap();
+    size(&pool, &holders, &news, &per_copy(10), &here).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![2, 6, 2], "measured on what it holds now: the sum decides");
+}
+
+/// A resize leaves every load said as it is, so no holder says its load
+/// again because the pool moved: each look still answers what it said.
+#[weft_db_macros::test]
+async fn a_resize_leaves_every_load_said(pool: Pool) {
+    use std::sync::atomic::AtomicBool;
+    use weft_broker::held_signals::{hold, report_load, HandTo};
+    use weft_dispatcher::holders::size;
+    let (store, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    claimed(&store, &pool, id, &[("a", "h1"), ("c", "h1"), ("b", "h2")]).await;
+    for (h, cpu) in [("h1", 60), ("h2", 55)] {
+        report_load(&pool, h, cpu, 10, &[], HandTo::SpareOrAny).await.unwrap();
+    }
+    let rows = || async {
+        let rows: Vec<(String, String, i32, bool)> =
+            pool.all("SELECT replica, xmin::text, cpu_percent, settled FROM holder_load ORDER BY replica", &[]).await.unwrap();
+        rows
+    };
+    let before = rows().await;
+    let holders = weft_platform_traits::FakeHolderPool::default();
+    size(&pool, &holders, &weft_platform_traits::FakeHolderNews::default(), &per_copy(10), &AtomicBool::new(false)).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![3]);
+    assert_eq!(rows().await, before, "not one load row written");
+    let holding: Vec<_> = ["a", "c"].map(|t| weft_broker_client::protocol::HeldNow { token: t.into(), serving: None }).into();
+    let look = hold(&pool, "h1", &holding, Some(10), &[]).await.unwrap();
+    assert_eq!(look.load, Some(60), "the holder still has what it said, so it says nothing");
+}
+
+/// A holder's load said wakes the holder sizing, a load left behind by a
+/// take does not, a load said again does, and a holder going does.
+#[weft_db_macros::test]
+async fn a_holders_load_said_wakes_the_holder_sizing(pool: Pool) {
+    use weft_broker::held_signals::{release, report_load, HandTo};
+    use weft_dispatcher::holders::HELD_SIGNALS_CHANNEL;
+    setup(&pool).await;
+    static CHANNELS: &[&str] = &[HELD_SIGNALS_CHANNEL];
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(pool.config(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
+    let mut heard = watch.subscribe();
+    async fn woken(heard: &mut weft_task_store::pg_signal::Subscription) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        heard.woken_before(deadline, |c, _| c == HELD_SIGNALS_CHANNEL).await.unwrap()
+    }
+    report_load(&pool, "h1", 30, 2, &[], HandTo::SpareOrAny).await.unwrap();
+    assert!(woken(&mut heard).await, "a first report");
+    report_load(&pool, "h1", 30, 2, &[], HandTo::SpareOrAny).await.unwrap();
+    assert!(!woken(&mut heard).await, "the same report again writes nothing");
+    pool.execute("UPDATE holder_load SET settled = false", &[]).await.unwrap();
+    assert!(!woken(&mut heard).await, "a load left behind only holds the count where it is");
+    report_load(&pool, "h1", 30, 2, &[], HandTo::SpareOrAny).await.unwrap();
+    assert!(woken(&mut heard).await, "said again after it was left behind");
+    report_load(&pool, "h1", 45, 2, &[], HandTo::SpareOrAny).await.unwrap();
+    assert!(woken(&mut heard).await, "a new load");
+    release(&pool, "h1").await.unwrap();
+    assert!(woken(&mut heard).await, "a holder going");
 }
 
 /// A held row coming or going announces itself at its commit, which is

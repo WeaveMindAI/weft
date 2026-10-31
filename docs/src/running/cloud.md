@@ -294,7 +294,7 @@ retry reaches a fresh one.
 | Piece | What it is |
 |---|---|
 | Cloud Run | weft's dispatcher, broker, listener and supervisor, a service each, and your programs' workers, one service per program. Each scales on its own load, and to zero between calls. A service at zero starts again when it is called: by the part of weft that just wrote work for it, by a Cloud Tasks wake, or by a call from outside (your CLI, a route, a provider's webhook) |
-| The holders | a Cloud Run worker pool for the triggers that keep a connection open between events (a stream, a socket, an event subscription that dials out). weft runs one holder per 200 such triggers and none when there are none |
+| The holders | a Cloud Run worker pool for the triggers that keep a connection open between events (a stream, a socket, an event subscription that dials out). weft runs at least one holder per 200 such triggers, more while the holders are busy, and none when there are none |
 | Your database | everything weft keeps, at the address you gave it |
 | Cloud Build | builds your programs' images when you deploy |
 | Pub/Sub | three topics, which let weft's parts tell each other things without going through your database: `weft-machine-events` carries Compute Engine's record of an infrastructure machine stopping or failing to the supervisor, `weft-news` is where weft announces that a run a worker drives got an answer or was cancelled, and `weft-holders` tells the holders that the triggers they should hold changed, or that one of your connections was reconnected, rotated or removed, so they drop the credentials they kept for it (a token refresh is not announced here) |
@@ -313,11 +313,30 @@ connection, go and read
 You pay for a holder while it runs, but it wakes your database only when it
 calls weft: when it starts, when an event arrives on one of its connections,
 when a connection drops or comes back (once per drop, however many reconnect
-attempts follow), and when the `weft-holders` topic tells it something
-changed. If a holder crashes, weft frees its triggers within three
+attempts follow), when its CPU has moved enough to say so (below), and when
+the `weft-holders` topic tells it something changed. If a holder crashes, weft frees its triggers within three
 minutes for another holder, or its restarted copy, to take (for how it
 notices, go and read [the listener](architecture.md#the-listener)). A holder that is
 stopped normally hands its triggers over at once.
+
+Some triggers keep a holder far busier than others: a socket that talks all
+day costs more than a subscription that hears one event an hour. So each
+holder also watches its own CPU, sampled every ten seconds and averaged over
+the last minute, and weft runs as many holders as that load needs at about
+50% each. If two holders say 60% and 55%, that is 115, and weft starts a
+third. That third holder starts with nothing, so once it has said its own
+number, the first busy holder to notice hands it a few triggers, keeping
+what brings it nearest 50%, and the spare holds work from then on. Once
+three say 20% each, that is 60, and weft stops one. It never runs
+fewer than one holder per 200 triggers, and never more holders than
+triggers, because a trigger is never split between two holders. A holder
+tells weft its number when it has a first minute measured, once more a
+minute after it took triggers or handed some over, and otherwise only once
+it has moved 10 points from the last one it said, so while the load holds
+steady it writes nothing and your database can sleep. When a holder's
+average reaches 70%, it hands part of its triggers over whether or not a
+spare is up, keeping as many as should bring it back to about 50%. A single
+trigger that keeps a holder busy on its own stays where it is.
 
 If you have VS Code pointed at the install, the editor keeps a live
 connection open to it, and the install and your database stay awake while
@@ -326,7 +345,9 @@ the editor closes that connection, and opens it again when you come back.
 Switching the editor back to your local install closes it at once.
 
 If you want to change one of the install's defaults (how many triggers a
-holder takes, a holder's CPU and memory, how many builds run at once, how
+holder takes, the CPU holders aim for and the CPU at which one hands
+triggers over, a holder's
+CPU and memory, how many builds run at once, how
 many bad tokens a minute one address may present, how many times a trigger's
 failing wake is delivered before it is given up), edit it in
 `deploy/terraform/gcp/variables.tf` in your fork and run the workflow again.

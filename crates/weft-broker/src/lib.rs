@@ -151,6 +151,7 @@ fn api(state: Arc<BrokerState>) -> Router {
         .route("/v1/signal/fire_target", post(handlers::signal_fire_target))
         .route("/v1/signal/hold", post(handlers::signal_hold))
         .route("/v1/signal/let_go", post(handlers::signal_let_go))
+        .route("/v1/signal/holder_load", post(handlers::signal_holder_load))
         .route("/v1/signal/give_up", post(handlers::signal_give_up))
         .route("/v1/signal/set_holds", post(handlers::signal_set_holds))
         .route("/v1/signal/write_kind_state", post(handlers::signal_write_kind_state))
