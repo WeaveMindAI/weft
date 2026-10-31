@@ -136,15 +136,20 @@ pub fn tick_route(t: Tick) -> Router {
     Router::new().route(TICK_PATH, post(tick)).with_state(t)
 }
 
-/// Serve `app` on `listener` until the process ends, with the peer's
-/// address on every request (the public door counts callers by it).
+/// Serve `app` on `listener` until the process is told to stop
+/// ([`shutdown`]) or its copy steps aside (`aside`, for a copy of another
+/// revision that started serving after it: `crate::superseded`), with the
+/// peer's address on every request (the public door counts callers by
+/// it). Either way it takes no new call and answers the ones in flight;
+/// what stays open for good (an event stream, a worker's line) is ended by
+/// its role as it steps aside.
 ///
 /// Every accepted connection sends at once (`TCP_NODELAY`). An answer
 /// whose headers and body leave in two writes otherwise holds the body
 /// until the caller acknowledges the headers, and a caller on a kept-alive
 /// connection delays that acknowledgement by up to 40 ms: every call after
 /// the first on a connection paid it.
-pub async fn serve(listener: tokio::net::TcpListener, app: Router) -> anyhow::Result<()> {
+pub async fn serve(listener: tokio::net::TcpListener, app: Router, aside: weft_task_store::aside::StepAside) -> anyhow::Result<()> {
     use axum::serve::ListenerExt as _;
     let listener = listener.tap_io(|connection| {
         if let Err(e) = connection.set_nodelay(true) {
@@ -152,9 +157,21 @@ pub async fn serve(listener: tokio::net::TcpListener, app: Router) -> anyhow::Re
         }
     });
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(shutdown())
+        .with_graceful_shutdown(stop_or_step_aside(aside))
         .await?;
     Ok(())
+}
+
+/// Until the process is told to stop ([`shutdown`]) or its copy steps
+/// aside.
+fn stop_or_step_aside(aside: weft_task_store::aside::StepAside) -> impl std::future::Future<Output = ()> {
+    let stop = shutdown();
+    async move {
+        tokio::select! {
+            _ = stop => {}
+            _ = aside.stepped() => tracing::info!(target: "weft_runtime", "a newer copy of this role serves; taking no new call"),
+        }
+    }
 }
 
 /// Until the process is told to stop (SIGTERM, or Ctrl+C). The SIGTERM

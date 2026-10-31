@@ -46,12 +46,14 @@
 //! When the line breaks it comes back by itself. A call that had not been
 //! written yet goes out on the next line if that opens within the call's
 //! wait to send, and fails [`LineError::NotSent`] otherwise. One that had
-//! been written is answered [`LineError::Dropped`], since it may have
-//! landed. The callers decide what is safe to make again: a batch of
-//! records is sent again on either, since the record takes a batch sent
-//! twice once (`weft_journal::record::Fate`), a read of a run's history is
-//! asked again on either (`client::read_until_answered`), and any other
-//! call fails the way a request whose connection reset does.
+//! been written may have landed, and what becomes of it is what the call
+//! says of itself where it is declared ([`BrokerCall`]): one whose second
+//! arrival changes nothing ([`Twice::Harmless`]: a read, or a write the
+//! broker recognises, like a batch of records, `weft_journal::record::Fate`)
+//! is sent again on the next line, within the wait it already had, and any
+//! other is answered [`LineError::Dropped`], which says it may or may not
+//! have landed. A broker rolling out stops its copies, and every call a
+//! stopping copy was running breaks this way.
 //!
 //! A caller that stops waiting for a call it already wrote tells the
 //! broker (`Notice::Forget`), which stops working on it, the way a request
@@ -89,8 +91,34 @@ use crate::token::TokenSource;
 // SYNC: LINE_PATH <-> crates/weft-broker/src/line.rs (routes)
 pub const LINE_PATH: &str = "/v1/line";
 
+/// One call the broker answers, as it is declared beside its request
+/// (`crate::protocol`): where it goes, and whether it may arrive twice.
+/// Both are said at once, so no call goes out without saying the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrokerCall {
+    pub path: &'static str,
+    pub twice: Twice,
+}
+
+/// Whether a call may reach the broker twice: what decides if a call whose
+/// line broke after it was written is sent again (see the module doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Twice {
+    /// Its second arrival changes nothing the first did not, and is
+    /// answered the way its caller reads the first: a read, or a write the
+    /// broker recognises or that sets what the first set. Sent again.
+    Harmless,
+    /// Anything else, and anything not shown to be harmless: a claim (the
+    /// second answers that there is nothing left to claim), something
+    /// queued or counted, a write that checks what it overwrites. Never
+    /// sent again by the line.
+    NotSafe,
+}
+
 /// How long a call waits: to be written on the line (while the line is
-/// down, or still opening), and, counted from the call, for its answer.
+/// down, or still opening), and, counted from the call, for its answer. A
+/// call sent again after its line broke waits again to be written, within
+/// the same wait for its answer.
 #[derive(Debug, Clone, Copy)]
 pub struct CallWait {
     pub to_send: Duration,
@@ -111,6 +139,11 @@ pub const DEFAULT_CALL_WAIT: CallWait = CallWait::within(Duration::from_secs(30)
 /// The first wait before opening the line again after it could not be
 /// opened; each further failure doubles it, up to [`RECONNECT_LONGEST`].
 const RECONNECT_FIRST: Duration = Duration::from_millis(100);
+
+/// How soon a line whose broker copy steps aside tries again to move to a
+/// current copy, when the last try failed. The line still answers
+/// meanwhile, turning new calls away to be sent again.
+const MOVE_AGAIN: Duration = Duration::from_secs(1);
 const RECONNECT_LONGEST: Duration = Duration::from_secs(5);
 
 /// How long one attempt to open the line may take: a broker instance that
@@ -154,8 +187,14 @@ pub enum LineError {
     /// it passes once the load does.
     #[error("the broker could not be reached for {waited:?} (line: {why})")]
     NotSent { waited: Duration, why: String, busy: bool },
-    /// The line broke after the call was written: it may have landed.
-    #[error("the line to the broker broke after the call was sent: {0}")]
+    /// The line broke after the call was written: it may or may not have
+    /// landed. Only a call that is not safe to send twice
+    /// ([`Twice::NotSafe`]) is answered so; a harmless one is sent again.
+    #[error(
+        "the line to the broker broke while the call was in flight (the broker copy that had it stopped, or the network \
+         dropped it: {0}), so it may or may not have landed, and it is not safe to send twice: what made it (a run, a \
+         command) can be run again"
+    )]
     Dropped(String),
     /// The call was written and no answer came within its wait.
     #[error("the broker did not answer within {0:?}")]
@@ -219,6 +258,11 @@ pub enum Notice {
     /// the install's news, so nothing needs looking at again; only what is
     /// kept on the line may follow again.
     Resumed,
+    /// This copy of the broker is stepping aside for a newer one
+    /// (`server::serve`): the calls running on the line are answered, and
+    /// none more is run on it. The caller replaces the line, which opens
+    /// on a current copy, and closes this one once it owes nothing.
+    SteppingAside,
 }
 
 /// Frame `head` and `body` for the line.
@@ -357,19 +401,19 @@ impl BrokerLink {
         &self.inner.http
     }
 
-    /// Call `path` with the JSON `body`, waiting as `wait` says.
-    pub async fn call(&self, path: &str, body: impl AsRef<[u8]>, wait: CallWait) -> Result<Answer, anyhow::Error> {
-        self.call_as(path, "application/json", &[], body.as_ref(), wait).await
+    /// Make `call` with the JSON `body`, waiting as `wait` says.
+    pub async fn call(&self, call: BrokerCall, body: impl AsRef<[u8]>, wait: CallWait) -> Result<Answer, anyhow::Error> {
+        self.call_as(call, "application/json", &[], body.as_ref(), wait).await
     }
 
-    /// Call `path` with `body` as raw bytes (a batch of records,
+    /// Make `call` with `body` as raw bytes (a batch of records,
     /// `weft_journal::frame`) and the extra `headers`, waiting as `wait`
     /// says.
-    pub async fn call_bytes(&self, path: &str, headers: &[(&str, &str)], body: impl AsRef<[u8]>, wait: CallWait) -> Result<Answer, anyhow::Error> {
-        self.call_as(path, "application/octet-stream", headers, body.as_ref(), wait).await
+    pub async fn call_bytes(&self, call: BrokerCall, headers: &[(&str, &str)], body: impl AsRef<[u8]>, wait: CallWait) -> Result<Answer, anyhow::Error> {
+        self.call_as(call, "application/octet-stream", headers, body.as_ref(), wait).await
     }
 
-    async fn call_as(&self, path: &str, content_type: &str, extra: &[(&str, &str)], body: &[u8], wait: CallWait) -> Result<Answer, anyhow::Error> {
+    async fn call_as(&self, call: BrokerCall, content_type: &str, extra: &[(&str, &str)], body: &[u8], wait: CallWait) -> Result<Answer, anyhow::Error> {
         let bearer = self.inner.token.read(&self.inner.base_url).await?;
         let mut headers = vec![
             ("authorization".to_string(), format!("Bearer {bearer}")),
@@ -377,7 +421,7 @@ impl BrokerLink {
         ];
         headers.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         headers.extend(self.inner.token.headers().into_iter().map(|(k, v)| (k.to_string(), v)));
-        Ok(self.line().call(path, headers, body, wait).await?)
+        Ok(self.line().call(call, headers, body, wait).await?)
     }
 
     /// What the broker pushes on this process's line (see the module doc).
@@ -525,7 +569,37 @@ impl Line {
         line
     }
 
-    async fn call(&self, path: &str, headers: Vec<(String, String)>, body: &[u8], wait: CallWait) -> Result<Answer, LineError> {
+    /// Make `call`, sending it again on the next line each time the line
+    /// breaks after writing it, when it is harmless twice and still has
+    /// time to be answered ([`after_try`]). Each try waits up to the call's
+    /// wait to be written, and none past its wait for its answer, counted
+    /// from the call.
+    async fn call(&self, call: BrokerCall, headers: Vec<(String, String)>, body: &[u8], wait: CallWait) -> Result<Answer, LineError> {
+        let answer_by = weft_core::deadline::after(tokio::time::Instant::now(), wait.to_answer);
+        loop {
+            let tried = tokio::time::Instant::now();
+            let to_send = wait.to_send.min(answer_by.saturating_duration_since(tried));
+            let sent = self.try_once(call.path, headers.clone(), body, to_send, answer_by, wait).await;
+            match after_try(call.twice, sent, tokio::time::Instant::now() < answer_by, wait) {
+                Next::Done(result) => return result,
+                Next::Again => {
+                    tracing::debug!(target: "weft_broker_client::line", path = call.path, "the line broke after a call harmless twice was written; sending it again");
+                }
+            }
+        }
+    }
+
+    /// One try of a call to `path`: written on the line within `to_send`,
+    /// and answered by `answer_by`.
+    async fn try_once(
+        &self,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body: &[u8],
+        to_send: Duration,
+        answer_by: tokio::time::Instant,
+        wait: CallWait,
+    ) -> Result<Answer, LineError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let frame = frame(&CallHead { id, path: path.to_string(), headers }, body);
         let (answer, answered) = oneshot::channel();
@@ -539,7 +613,6 @@ impl Line {
         // as long as this line: a send can only fail once neither does.
         let _ = self.outbox.send(Out::Call(id));
         let start = tokio::time::Instant::now();
-        let to_send = wait.to_send.min(wait.to_answer);
         tokio::pin!(answered);
         let landed = |result: Result<Result<Answer, LineError>, oneshot::error::RecvError>| {
             result.unwrap_or_else(|_| Err(LineError::Dropped("the line stopped".into())))
@@ -561,20 +634,20 @@ impl Line {
                 });
             }
         }
-        match tokio::time::timeout_at(weft_core::deadline::after(start, wait.to_answer), &mut answered).await {
+        match tokio::time::timeout_at(answer_by, &mut answered).await {
             Ok(result) => landed(result),
             Err(_) => Err(LineError::NoAnswer(wait.to_answer)),
         }
     }
 
-    /// The line broke: every written call may have landed and is told so;
-    /// the unwritten ones wait for the next line.
-    fn broke(&self, why: &str) {
+    /// The line broke: every written call is told what became of it
+    /// (`owed`); the unwritten ones wait for the next line.
+    fn broke(&self, why: &str, owed: Owed) {
         self.listening.store(false, Ordering::Release);
         self.cut.send_replace(None);
         let _ = self.notices.send(Heard::Lost);
         *self.down.lock().expect("line down") = Some(why.to_string());
-        self.dropped(&self.written(), why);
+        self.unanswered(&self.written(), why, owed);
     }
 
     /// The line closed for want of anything to do: nothing is heard until
@@ -638,13 +711,20 @@ impl Line {
         self.calls.lock().expect("line calls").iter().filter(|(_, w)| w.frame.is_none()).map(|(id, _)| *id).collect()
     }
 
-    /// The line being replaced broke, for `why`, with `owed` still out on
-    /// it: those may have landed.
-    fn dropped(&self, owed: &std::collections::HashSet<u64>, why: &str) {
+    /// A line broke, for `why`, with the calls `ids` still out on it:
+    /// told they may have landed, or, when its copy stepped aside and closed
+    /// it after answering every call it ran, that they never ran, which
+    /// their callers send again as a busy broker's
+    /// (`crate::client::turned_away`).
+    fn unanswered(&self, ids: &std::collections::HashSet<u64>, why: &str, owed: Owed) {
         let mut calls = self.calls.lock().expect("line calls");
-        for id in owed {
+        for id in ids {
             if let Some(waiting) = calls.remove(id) {
-                let _ = waiting.answer.send(Err(LineError::Dropped(why.to_string())));
+                let error = match owed {
+                    Owed::MayHaveLanded => LineError::Dropped(why.to_string()),
+                    Owed::NeverRan => LineError::NotSent { waited: Duration::ZERO, why: why.to_string(), busy: true },
+                };
+                let _ = waiting.answer.send(Err(error));
             }
         }
     }
@@ -688,10 +768,47 @@ impl Line {
                 }
                 None => tracing::warn!(target: "weft_broker_client::line", %channel, "the broker pushed a channel this build does not know"),
             },
+            // The line it came on is replaced (`serve`).
+            Notice::SteppingAside => {}
             Notice::Follow | Notice::Forget { .. } => {
                 tracing::warn!(target: "weft_broker_client::line", ?notice, "the broker sent what only a caller sends")
             }
         }
+    }
+}
+
+/// What the calls a line still owed when it ended became.
+#[derive(Debug, Clone, Copy)]
+enum Owed {
+    /// It broke: each may have landed.
+    MayHaveLanded,
+    /// Its copy stepped aside and closed it once nothing ran on it: each
+    /// arrived after it took no more call, so none ran.
+    NeverRan,
+}
+
+/// What becomes of one try of a call ([`after_try`]).
+#[derive(Debug)]
+enum Next {
+    /// Handed to its caller as it is.
+    Done(Result<Answer, LineError>),
+    /// Sent again on the next line.
+    Again,
+}
+
+/// What becomes of one try of a call that came back `tried`. Only a call
+/// the line broke under after writing it ([`LineError::Dropped`]) is sent
+/// again, and only when it is harmless twice and `time_left` to be
+/// answered; one out of time is answered as having had none
+/// ([`LineError::NoAnswer`]), since its last try may still be on its way.
+/// A call that is not safe twice keeps the drop, which says it may or may
+/// not have landed. Every other answer and failure is the call's, as the
+/// line gave it.
+fn after_try(twice: Twice, tried: Result<Answer, LineError>, time_left: bool, wait: CallWait) -> Next {
+    match (tried, twice) {
+        (Err(LineError::Dropped(_)), Twice::Harmless) if time_left => Next::Again,
+        (Err(LineError::Dropped(_)), Twice::Harmless) => Next::Done(Err(LineError::NoAnswer(wait.to_answer))),
+        (tried, _) => Next::Done(tried),
     }
 }
 
@@ -733,7 +850,14 @@ async fn keep_open(
                     Served::LetGo => return,
                     Served::Broke(why) => {
                         tracing::warn!(target: "weft_broker_client::line", reason = %why, "the line to the broker broke; opening it again");
-                        held.broke(&why);
+                        held.broke(&why, Owed::MayHaveLanded);
+                    }
+                    Served::SteppedAside { why, retiring } => {
+                        tracing::info!(target: "weft_broker_client::line", reason = %why, "the broker copy on the line stepped aside and closed it; opening it again");
+                        // What a line being replaced still owed went to
+                        // another copy, and may have landed there.
+                        held.unanswered(&retiring, &why, Owed::MayHaveLanded);
+                        held.broke(&why, Owed::NeverRan);
                     }
                     Served::Idle => {
                         held.idled();
@@ -799,6 +923,11 @@ fn turned_away_busy(e: &anyhow::Error) -> bool {
 enum Served {
     /// It broke, for this reason; it is opened again.
     Broke(String),
+    /// Its copy stepped aside and closed it, for `why`, after answering
+    /// every call it ran: it is opened again, and the calls written on it
+    /// and not answered never ran ([`Owed::NeverRan`]); those a line it was
+    /// replacing still owed (`retiring`) went to another copy.
+    SteppedAside { why: String, retiring: std::collections::HashSet<u64> },
     /// It had nothing to do for [`LINE_IDLE`] and closed; it opens again
     /// when something is asked of it.
     Idle,
@@ -854,6 +983,9 @@ struct Joining {
     stream: Stream,
     opened: tokio::time::Instant,
     done: oneshot::Sender<Result<(), String>>,
+    /// Its copy said it steps aside before following: once it serves,
+    /// it is replaced in turn.
+    stepping_aside: bool,
 }
 
 /// A replaced line, read until the calls written on it (`owed`) are
@@ -864,6 +996,9 @@ struct Retiring {
     stream: Stream,
     owed: std::collections::HashSet<u64>,
     closing: bool,
+    /// Its copy said it steps aside: closed by the broker, what it still
+    /// owes never ran.
+    stepping_aside: bool,
     /// Waiters were told to look again when the new line followed: that
     /// look already covers any gap the old broker could still recheck for,
     /// so a recheck it sends is not passed on.
@@ -910,6 +1045,12 @@ async fn serve(
     let mut opening: Option<Opening<'_>> = None;
     let mut joining: Option<Joining> = None;
     let mut retiring: Option<Retiring> = None;
+    // The open line's copy said it steps aside: the line is replaced by
+    // one on a current copy as soon as no replacement is under way, so no
+    // call waits out the ones still running on it, and again if that
+    // replacement fails (no sooner than [`MOVE_AGAIN`] after the last).
+    let mut stepping_aside = false;
+    let mut moved_at: Option<tokio::time::Instant> = None;
     loop {
         let pong_deadline = pong_due.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
         let written = tokio::select! {
@@ -930,9 +1071,7 @@ async fn serve(
                     Ok(())
                 }
                 Some(Out::Replace(done)) => {
-                    let connecting = tokio::time::timeout(CONNECT_WAIT, connect(opens.base_url, opens.token));
-                    let connecting = async move { connecting.await.unwrap_or_else(|_| Err(anyhow::anyhow!("opening it took more than {CONNECT_WAIT:?}"))) };
-                    opening = Some((Box::pin(connecting), tokio::time::Instant::now(), done));
+                    opening = Some((reopening(opens), tokio::time::Instant::now(), done));
                     Ok(())
                 }
                 // A call written on the replaced line is forgotten there.
@@ -949,7 +1088,7 @@ async fn serve(
                     Ok(socket) => {
                         let (mut new_sink, new_stream) = socket.split();
                         match write(&mut new_sink, follow(), "asking to follow").await {
-                            Ok(()) => joining = Some(Joining { sink: new_sink, stream: new_stream, opened: at, done }),
+                            Ok(()) => joining = Some(Joining { sink: new_sink, stream: new_stream, opened: at, done, stepping_aside: false }),
                             Err(why) => drop(done.send(Err(why))),
                         }
                     }
@@ -972,8 +1111,15 @@ async fn serve(
                             opened = new.opened;
                             pong_due = None;
                             let rechecked = line.followed_instead(listening, max_age_secs, opened);
-                            retiring = Some(Retiring { sink: old_sink, stream: old_stream, owed, closing: false, rechecked });
+                            retiring = Some(Retiring { sink: old_sink, stream: old_stream, owed, closing: false, stepping_aside, rechecked });
+                            stepping_aside = new.stepping_aside;
                             let _ = new.done.send(Ok(()));
+                            None
+                        }
+                        // A copy that stepped aside already says so before
+                        // it follows: the line it opens is replaced in turn.
+                        Ok(Notice::SteppingAside) => {
+                            new.stepping_aside = true;
                             None
                         }
                         // The broker says nothing else before it follows.
@@ -993,6 +1139,7 @@ async fn serve(
             }
             message = async { retiring.as_mut().expect("armed").stream.next().await }, if retiring.is_some() => {
                 let old = retiring.as_mut().expect("armed");
+                let closed_by_broker = matches!(message, Some(Ok(Message::Close(_)))) && !old.closing;
                 let broke = match message {
                     Some(Ok(Message::Binary(bytes))) => read_answer(line, &bytes).err(),
                     // What it pushes still counts, and so does a recheck: the
@@ -1023,8 +1170,14 @@ async fn serve(
                     None => Some("the broker closed the replaced line".into()),
                 };
                 if let Some(why) = broke {
-                    // What it still owed may have landed.
-                    line.dropped(&old.owed, &why);
+                    // A copy that stepped aside closes the line once it ran
+                    // everything it took: what it still owes never ran.
+                    // Anything else that ends it may have landed.
+                    let owed = match closed_by_broker && old.stepping_aside {
+                        true => Owed::NeverRan,
+                        false => Owed::MayHaveLanded,
+                    };
+                    line.unanswered(&old.owed, &why, owed);
                     retiring = None;
                 }
                 Ok(())
@@ -1052,12 +1205,23 @@ async fn serve(
                     Some(Err(e)) => Err(format!("reading: {e}")),
                     Some(Ok(Message::Binary(bytes))) => read_answer(line, &bytes),
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<Notice>(&text) {
+                        // Its copy steps aside: the line is replaced (below).
+                        Ok(Notice::SteppingAside) => {
+                            stepping_aside = true;
+                            Ok(())
+                        }
                         Ok(notice) => {
                             line.heard(notice, opened);
                             Ok(())
                         }
                         Err(e) => Err(format!("a notice that does not read ({text}): {e}")),
                     },
+                    // A copy that stepped aside closes the line once it ran
+                    // everything it took.
+                    Some(Ok(Message::Close(frame))) if stepping_aside => {
+                        let why = format!("the broker copy stepped aside and closed the line ({frame:?})");
+                        return Served::SteppedAside { why, retiring: retiring.map(|old| old.owed).unwrap_or_default() };
+                    }
                     Some(Ok(Message::Close(frame))) => Err(format!("the broker closed the line ({frame:?})")),
                     Some(Ok(Message::Ping(payload))) => write(&mut sink, Message::Pong(payload), "answering a ping").await,
                     Some(Ok(_)) => Ok(()),
@@ -1082,7 +1246,20 @@ async fn serve(
                 retiring = None;
             }
         }
+        // Nobody waits for this replacement's answer: it serves the line
+        // itself.
+        let replacing = opening.is_some() || joining.is_some() || retiring.is_some();
+        if stepping_aside && !replacing && moved_at.is_none_or(|at| at.elapsed() >= MOVE_AGAIN) {
+            moved_at = Some(tokio::time::Instant::now());
+            opening = Some((reopening(opens), tokio::time::Instant::now(), oneshot::channel().0));
+        }
     }
+}
+
+/// A line opening to replace the open one, within [`CONNECT_WAIT`].
+fn reopening<'o>(opens: Opens<'o>) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Socket>> + Send + 'o>> {
+    let connecting = tokio::time::timeout(CONNECT_WAIT, connect(opens.base_url, opens.token));
+    Box::pin(async move { connecting.await.unwrap_or_else(|_| Err(anyhow::anyhow!("opening it took more than {CONNECT_WAIT:?}"))) })
 }
 
 /// The `Follow` a line opens with.
@@ -1158,18 +1335,27 @@ mod tests {
     /// A fake broker: each line it accepts follows at once (listening, cut
     /// after an hour) and answers every call with the number of the line
     /// it came on, except a call to `/v1/hold`, which it holds (counted in
-    /// `holding`) until told to answer it. `closed` counts the lines the
-    /// caller closed, and `lines` reaches each line by its number.
+    /// `holding`) until told to answer it, and the first call to a path
+    /// under `/v1/drop/`, whose line it drops without answering, the way a
+    /// broker copy that stops does. `closed` counts the lines the caller
+    /// closed, `lines` reaches each line by its number, and `arrived` is
+    /// the path of every call that reached it, in order.
     struct FakeBroker {
         address: String,
         closed: Arc<AtomicUsize>,
         holding: Arc<AtomicUsize>,
         lines: Arc<Mutex<HashMap<usize, mpsc::UnboundedSender<Push>>>>,
+        arrived: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeBroker {
         fn push(&self, line: usize, push: Push) {
             self.lines.lock().unwrap()[&line].send(push).unwrap();
+        }
+
+        /// How many calls to `path` reached the broker.
+        fn arrivals(&self, path: &str) -> usize {
+            self.arrived.lock().unwrap().iter().filter(|arrived| *arrived == path).count()
         }
     }
 
@@ -1180,8 +1366,9 @@ mod tests {
             closed: Arc::default(),
             holding: Arc::default(),
             lines: Arc::default(),
+            arrived: Arc::default(),
         };
-        let (closed, holding, lines) = (broker.closed.clone(), broker.holding.clone(), broker.lines.clone());
+        let (closed, holding, lines, arrived) = (broker.closed.clone(), broker.holding.clone(), broker.lines.clone(), broker.arrived.clone());
         tokio::spawn(async move {
             loop {
                 let (tcp, _) = listener.accept().await.unwrap();
@@ -1192,7 +1379,7 @@ mod tests {
                     lines.insert(number, pushes);
                     number
                 };
-                let (closed, holding) = (closed.clone(), holding.clone());
+                let (closed, holding, arrived) = (closed.clone(), holding.clone(), arrived.clone());
                 tokio::spawn(async move {
                     let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
                     let mut held = None;
@@ -1205,6 +1392,14 @@ mod tests {
                                 }
                                 Some(Ok(Message::Binary(bytes))) => {
                                     let (head, _) = unframe::<CallHead>(&bytes).unwrap();
+                                    let first = {
+                                        let mut arrived = arrived.lock().unwrap();
+                                        arrived.push(head.path.clone());
+                                        arrived.iter().filter(|path| **path == head.path).count() == 1
+                                    };
+                                    if first && head.path.starts_with("/v1/drop/") {
+                                        return;
+                                    }
                                     if head.path == "/v1/hold" {
                                         held = Some(head.id);
                                         holding.fetch_add(1, Ordering::SeqCst);
@@ -1252,8 +1447,14 @@ mod tests {
         BrokerLink::new(broker.address.clone(), TokenSource::worker(Arc::new(weft_platform_traits::FixedToken("t".into())), "w-1"))
     }
 
+    /// A call the fake broker answers with its line's number.
+    const ANY: BrokerCall = BrokerCall { path: "/v1/x", twice: Twice::NotSafe };
+
+    /// A call the fake broker holds until told to answer it.
+    const HOLD: BrokerCall = BrokerCall { path: "/v1/hold", twice: Twice::NotSafe };
+
     async fn line_number(link: &BrokerLink) -> String {
-        String::from_utf8(link.call("/v1/x", Vec::new(), DEFAULT_CALL_WAIT).await.unwrap().body).unwrap()
+        String::from_utf8(link.call(ANY, Vec::new(), DEFAULT_CALL_WAIT).await.unwrap().body).unwrap()
     }
 
     // A replaced line: calls go out on the new one, the old one closes once
@@ -1321,7 +1522,7 @@ mod tests {
             assert!(matches!(heard.next().await.unwrap(), Heard::Recheck), "a line that opens is a recheck");
             let held = tokio::spawn({
                 let link = link.clone();
-                async move { link.call("/v1/hold", Vec::new(), DEFAULT_CALL_WAIT).await.map(|answer| answer.body) }
+                async move { link.call(HOLD, Vec::new(), DEFAULT_CALL_WAIT).await.map(|answer| answer.body) }
             });
             until("the broker holds the call", || broker.holding.load(Ordering::SeqCst) == 1).await;
 
@@ -1356,7 +1557,7 @@ mod tests {
             assert!(matches!(heard.next().await.unwrap(), Heard::Lost));
             let held = tokio::spawn({
                 let link = link.clone();
-                async move { link.call("/v1/hold", Vec::new(), DEFAULT_CALL_WAIT).await.map(|answer| answer.body) }
+                async move { link.call(HOLD, Vec::new(), DEFAULT_CALL_WAIT).await.map(|answer| answer.body) }
             });
             until("the broker holds the call", || broker.holding.load(Ordering::SeqCst) == 1).await;
 
@@ -1372,6 +1573,70 @@ mod tests {
         }
     }
 
+    fn answered() -> Result<Answer, LineError> {
+        Ok(Answer { status: reqwest::StatusCode::OK, body: b"1".to_vec() })
+    }
+
+    fn dropped() -> Result<Answer, LineError> {
+        Err(LineError::Dropped("the broker closed the line".into()))
+    }
+
+    /// A call the line broke under after writing it is sent again only
+    /// when it is harmless twice and still has time; a harmless one out of
+    /// time had no answer, and one that is not safe keeps the drop. Nothing
+    /// else is ever sent again by the line.
+    #[test]
+    fn only_a_dropped_call_harmless_twice_is_sent_again() {
+        let wait = DEFAULT_CALL_WAIT;
+        assert!(matches!(after_try(Twice::Harmless, dropped(), true, wait), Next::Again));
+        assert!(matches!(after_try(Twice::Harmless, dropped(), false, wait), Next::Done(Err(LineError::NoAnswer(_)))));
+        assert!(matches!(after_try(Twice::NotSafe, dropped(), true, wait), Next::Done(Err(LineError::Dropped(_)))));
+        for twice in [Twice::Harmless, Twice::NotSafe] {
+            let not_sent = Err(LineError::NotSent { waited: wait.to_send, why: "down".into(), busy: false });
+            assert!(matches!(after_try(twice, not_sent, true, wait), Next::Done(Err(LineError::NotSent { .. }))));
+            assert!(matches!(after_try(twice, Err(LineError::NoAnswer(wait.to_answer)), true, wait), Next::Done(Err(LineError::NoAnswer(_)))));
+            assert!(matches!(after_try(twice, answered(), true, wait), Next::Done(Ok(_))));
+        }
+    }
+
+    /// The drop a call that is not safe twice fails with says what
+    /// happened and what to do, and keeps why the line broke.
+    #[test]
+    fn a_dropped_call_says_it_may_have_landed_and_can_be_run_again() {
+        let said = LineError::Dropped("reading: peer closed connection without sending TLS close_notify".into()).to_string();
+        assert!(said.contains("may or may not have landed"), "{said}");
+        assert!(said.contains("can be run again"), "{said}");
+        assert!(said.contains("peer closed connection without sending TLS close_notify"), "{said}");
+    }
+
+    // A broker copy that stops with a call on it: a call harmless twice is
+    // answered on the next line, and one that is not safe fails saying it
+    // may have landed, having reached the broker once.
+    weft_core::stress_test! {
+        name: a_call_harmless_twice_is_sent_again_when_its_line_drops_and_another_is_not,
+        runs: 10,
+        worker_threads: 4,
+        async fn body() {
+            const READ: BrokerCall = BrokerCall { path: "/v1/drop/read", twice: Twice::Harmless };
+            const WRITE: BrokerCall = BrokerCall { path: "/v1/drop/write", twice: Twice::NotSafe };
+            let broker = fake_broker().await;
+            let link = worker_link(&broker);
+
+            let answer = link.call(READ, Vec::new(), DEFAULT_CALL_WAIT).await.expect("answered on the next line");
+            assert_eq!(answer.body, b"2", "answered on the line that replaced the dropped one");
+            assert_eq!(broker.arrivals(READ.path), 2, "sent once on each line");
+
+            let failed = link.call(WRITE, Vec::new(), DEFAULT_CALL_WAIT).await.expect_err("dropped");
+            assert!(
+                failed.chain().any(|cause| matches!(cause.downcast_ref::<LineError>(), Some(LineError::Dropped(_)))),
+                "{failed:#}"
+            );
+            assert!(format!("{failed:#}").contains("may or may not have landed"), "{failed:#}");
+            assert_eq!(line_number(&link).await, "3", "the line came back");
+            assert_eq!(broker.arrivals(WRITE.path), 1, "never sent again");
+        }
+    }
+
     #[test]
     fn a_notice_reads_back() {
         for notice in [
@@ -1382,6 +1647,7 @@ mod tests {
             Notice::Lost,
             Notice::Recheck { listening: false },
             Notice::Resumed,
+            Notice::SteppingAside,
         ] {
             let text = serde_json::to_string(&notice).unwrap();
             assert_eq!(serde_json::from_str::<Notice>(&text).unwrap(), notice);
@@ -1432,13 +1698,19 @@ pub mod server {
     /// `api` with the line beside it, pushing no notices: a fake broker's
     /// routes, reachable by the clients that speak only the line.
     pub fn with_line(api: Router) -> Router {
+        with_line_stepping_aside(api, weft_task_store::aside::StepAside::new())
+    }
+
+    /// [`with_line`] for a fake broker copy that steps aside when `aside`
+    /// says so ([`serve`]).
+    pub fn with_line_stepping_aside(api: Router, aside: weft_task_store::aside::StepAside) -> Router {
         let served = api.clone();
         Router::new()
             .route(
                 LINE_PATH,
                 get(move |ws: WebSocketUpgrade| {
-                    let api = served.clone();
-                    async move { upgrade(ws).on_upgrade(move |socket| serve(socket, api, None)) }
+                    let (api, aside) = (served.clone(), aside.clone());
+                    async move { upgrade(ws).on_upgrade(move |socket| serve(socket, api, None, aside)) }
                 }),
             )
             .merge(api)
@@ -1464,7 +1736,20 @@ pub mod server {
     /// back, and once the caller asks to follow, start `follower`. Without
     /// one the line says it follows nothing (`Following { listening: false }`),
     /// so nothing kept on it is ever trusted.
-    pub async fn serve(socket: WebSocket, api: Router, follower: Option<Follower>) {
+    ///
+    /// Once this copy of the broker steps aside (`aside`,
+    /// `weft_task_store::aside`), it says so on the line
+    /// ([`Notice::SteppingAside`]), and the caller replaces the line with
+    /// one on a current copy, moving its new calls there. This line takes
+    /// no new call: one that arrives anyway (written before the caller
+    /// heard) is answered [`crate::protocol::STEPPING_ASIDE`] with nothing
+    /// of it run, which its caller sends again (`crate::client::turned_away`).
+    /// The calls running are answered, and the caller closes the line once
+    /// it owes nothing, so no call it wrote goes unanswered. A caller that
+    /// does not close it (its replacement would not open) has it closed
+    /// once nothing runs and [`weft_task_store::aside::GRACE`] has passed
+    /// since the step aside.
+    pub async fn serve(socket: WebSocket, api: Router, follower: Option<Follower>, aside: weft_task_store::aside::StepAside) {
         let (mut sink, mut stream) = socket.split();
         let (out, mut outgoing) = mpsc::channel::<Message>(1024);
         let writer = tokio::spawn(async move {
@@ -1487,8 +1772,31 @@ pub mod server {
         let mut follower = follower;
         // The tasks pushing notices down this line, stopped when it goes.
         let mut following: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        while let Some(message) = stream.next().await {
+        // Once the copy stepped aside: when the line is closed from this
+        // end, if its caller has not closed it by then.
+        let mut stepping_aside: Option<tokio::time::Instant> = None;
+        loop {
+            // Biased: once the copy stepped aside, no call read after that
+            // is run, whichever was ready first.
+            let message = tokio::select! {
+                biased;
+                () = aside.stepped(), if stepping_aside.is_none() => {
+                    stepping_aside = Some(tokio::time::Instant::now() + weft_task_store::aside::GRACE);
+                    let said = serde_json::to_string(&Notice::SteppingAside).expect("a notice serializes");
+                    let _ = out.send(Message::Text(said.into())).await;
+                    continue;
+                }
+                Some(_) = running.join_next(), if stepping_aside.is_some() => continue,
+                () = tokio::time::sleep_until(stepping_aside.unwrap_or_else(tokio::time::Instant::now)), if stepping_aside.is_some() && running.is_empty() => break,
+                message = stream.next() => message,
+            };
+            let Some(message) = message else { break };
             match message {
+                Ok(Message::Binary(message)) if stepping_aside.is_some() => {
+                    let Ok((head, _)) = unframe::<CallHead>(&message) else { break };
+                    let answer = frame(&AnswerHead { id: head.id, status: 503 }, crate::protocol::STEPPING_ASIDE.as_bytes());
+                    let _ = out.send(Message::Binary(answer.into())).await;
+                }
                 Ok(Message::Binary(message)) => {
                     let (head, body_at) = match unframe::<CallHead>(&message) {
                         Ok((head, body)) => (head, message.len() - body.len()),
@@ -1554,6 +1862,9 @@ pub mod server {
                 Ok(Message::Close(_)) | Err(_) => break,
                 Ok(_) => {}
             }
+        }
+        if stepping_aside.is_some() {
+            let _ = out.send(Message::Close(None)).await;
         }
         for task in following {
             task.abort();

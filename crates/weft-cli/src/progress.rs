@@ -125,6 +125,10 @@ pub enum Phase {
     DrainWait,
     /// Trigger registration started (signals about to be wired up).
     TriggerRegisterStart,
+    /// The activation goes on, and what it waits on changed. Detail
+    /// carries `{ "elapsedSeconds", "waiting" }`: since it was claimed,
+    /// and what it waits on now ("its setup run <id>").
+    TriggerRegisterWait,
     TriggerRegisterDone,
     /// Waiting on a long-running infra supervisor command (stop /
     /// terminate / start), which can depend on draining in-flight
@@ -423,6 +427,18 @@ impl Progress {
         );
     }
 
+    /// The activation goes on, and waits on `progress.waiting` now.
+    /// SYNC: the trigger_register_wait detail <-> packages/weft-graph/src/webview/lib/components/project/ActionBar.svelte (trigger_register_wait)
+    pub fn trigger_register_wait(&self, progress: &weft_core::infra::wire::ChangeProgress) {
+        self.emit(
+            Phase::TriggerRegisterWait,
+            Some(serde_json::json!({
+                "elapsedSeconds": (progress.as_of_unix - progress.since_unix).max(0),
+                "waiting": progress.waiting,
+            })),
+        );
+    }
+
     pub fn trigger_register_done(&self) {
         self.emit(Phase::TriggerRegisterDone, None);
     }
@@ -617,6 +633,15 @@ fn human_line(ev: &Event<'_>, weft: &dyn Fn(&str) -> String) -> Option<String> {
             ),
         },
         Phase::TriggerRegisterStart => "registering triggers".to_string(),
+        Phase::TriggerRegisterWait => {
+            let elapsed = ev.detail.and_then(|d| d.get("elapsedSeconds")).and_then(Value::as_u64).unwrap_or(0);
+            let waiting = ev.detail.and_then(|d| d.get("waiting")).and_then(Value::as_str).unwrap_or("its next step");
+            format!(
+                "still turning on (elapsed {elapsed}s), waiting on: {waiting} (Ctrl+C stops following, the activation goes on; \
+                 `{}` stops it)",
+                weft("cancel-activate")
+            )
+        }
         Phase::InfraWait => {
             let verb = ev
                 .detail

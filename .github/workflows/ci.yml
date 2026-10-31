@@ -172,6 +172,9 @@ jobs:
         run: |
           terraform init -backend=false -input=false
           terraform validate
+      # What the install workflow's targeted applies add for every
+      # `moved` block, read from the files above.
+      - run: scripts/terraform-moved-targets.test.sh
 
   # The name the main ruleset requires: green only when every Rust check
   # above is, and the Terraform the install runs validates. It runs whatever happened above (unless the run was

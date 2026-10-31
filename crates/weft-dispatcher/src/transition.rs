@@ -9,10 +9,12 @@
 //! verb is REJECTED instantly; the only offered action is the matching
 //! cancel. This module supplies what the DRIVING process needs around that:
 //!
-//! - `TransitionHeartbeat` / `ActivationHeartbeat`: drop-guarded
-//!   background tasks bumping the row's heartbeat so the `lapses` loop
-//!   (`crate::lapses`) can tell a live transition (driver bumping) from an
-//!   orphaned one (driver process died).
+//! - `TransitionHeartbeat`: a drop-guarded background task bumping the
+//!   project row's heartbeat so the `lapses` loop (`crate::lapses`) can
+//!   tell a live build transition (driver bumping) from an orphaned one
+//!   (driver process died). An activation needs none: it is driven by a
+//!   task, whose claim is what keeps it alive
+//!   (`crate::activation_store::DRIVER_TASK_LIVE`).
 //! - `ProjectBuildGate` + `build_version_gated`: the `building`
 //!   transition around a version's build. The gate engages ONLY when
 //!   an image actually has to be built (a build whose images all exist
@@ -99,96 +101,6 @@ impl TransitionHeartbeat {
 }
 
 impl Drop for TransitionHeartbeat {
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
-}
-
-/// The same drop-guarded heartbeat for an activation in flight: bumps the
-/// heartbeat of every activation row the setup run `activation` claimed.
-///
-/// It rests while the setup run goes: from the run's first event after its
-/// birth (a worker took it) until its ending. The run may wait days on a
-/// person, and meanwhile it is judged by its own worker's lease and its
-/// ending, never by this driver (`crate::activation_store::SETUP_RUN_GOES`).
-/// When the activation is carried out by a task (a program's call), the
-/// task's claim rests on the run the same way
-/// (`weft_task_store::executor::TaskClaim`). At its ending both beat again
-/// at once, for the rest of the activation.
-pub struct ActivationHeartbeat {
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl ActivationHeartbeat {
-    pub async fn spawn(state: &DispatcherState, project_id: uuid::Uuid, activation: uuid::Uuid) -> Self {
-        let state = state.clone();
-        let claim = weft_task_store::executor::current_claim();
-        let mut events = state.events.subscribe_project(project_id).await;
-        crate::lapses::book_after_or_log(&state, heartbeat_stale_secs()).await;
-        let handle = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(heartbeat_interval());
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // The claim already stamped `now`; skip the immediate first tick.
-            tick.tick().await;
-            let mut resting = false;
-            loop {
-                let rest = tokio::select! {
-                    _ = tick.tick(), if !resting => {
-                        bump(&state, activation).await;
-                        continue;
-                    }
-                    heard = events.recv() => match heard {
-                        Ok(record) if record.event.run_id() != Some(activation) => continue,
-                        Ok(record) if record.event.is_run_terminal() => false,
-                        Ok(record) => !matches!(record.event, crate::events::DispatcherEvent::RunStarted { .. }),
-                        // A gap in what was heard: the run's row says
-                        // whether it still goes.
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            match weft_task_store::runs::ended(&state.pg_pool, activation).await {
-                                Ok(ended) => !ended && resting,
-                                Err(_) => false,
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
-                    },
-                };
-                if rest == resting {
-                    continue;
-                }
-                resting = rest;
-                if let Some(claim) = &claim {
-                    let moved = match rest {
-                        true => claim.rest_on(activation).await,
-                        false => claim.resume().await,
-                    };
-                    if let Err(e) = moved {
-                        tracing::warn!(target: "weft_dispatcher::transition", %activation, error = %format!("{e:#}"), "could not move the task's claim with its setup run");
-                    }
-                }
-                if !rest {
-                    bump(&state, activation).await;
-                    crate::lapses::book_after_or_log(&state, heartbeat_stale_secs()).await;
-                }
-            }
-        });
-        Self { handle }
-    }
-}
-
-/// Bump the heartbeat of the activation `activation`, logging a failure
-/// (the next beat tries again).
-async fn bump(state: &DispatcherState, activation: uuid::Uuid) {
-    if let Err(e) = state.activations.bump_heartbeat(activation).await {
-        tracing::warn!(
-            target: "weft_dispatcher::transition",
-            %activation,
-            error = %e,
-            "activation heartbeat bump failed; retrying next tick"
-        );
-    }
-}
-
-impl Drop for ActivationHeartbeat {
     fn drop(&mut self) {
         self.handle.abort();
     }

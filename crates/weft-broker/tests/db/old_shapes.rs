@@ -61,6 +61,7 @@ async fn broker_state(pool: Pool) -> Arc<weft_broker::BrokerState> {
             line_max_age: None,
             dispatcher_alarm: None,
             supervisor_booking: None,
+            aside: weft_task_store::aside::StepAside::new(),
         },
     )
     .expect("the broker builds")

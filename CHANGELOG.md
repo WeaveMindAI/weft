@@ -6,6 +6,18 @@ then run `weft maintenance off`.
 
 ## Unreleased
 
+**What you have to change after this update, if you use a PostgresDatabase:**
+
+- **Clients outside the program sign in as `app`, no longer as `weft`.** The
+  password, host and port stay the same; `weft infra env <node> --into .env
+  --set DATABASE_USER=User` writes the user again.
+- **A frontend's pool must expect a connection idle for a minute to close.**
+  The database now closes it. Set the pool's idle timeout under a minute, or
+  have it test a connection before using it.
+- **An extension that needs the superuser goes in the node's new `extensions`
+  setting** (`["pg_trgm", "postgres_fdw"]`). The superuser makes each one on
+  every start, and the program, signed in as `app`, uses it.
+
 **A PostgresDatabase no longer runs out of connections when the program
 scales.** Postgres serves a fixed number of connections, while its clients
 keep changing: workers scale, a change of worker settings runs old and new
@@ -28,16 +40,11 @@ upgrade`. When the database starts again it gets a new role, `app`, which
 becomes the owner of everything the superuser owned in it (except objects an
 extension made). After that:
 
-- **Every client signs in as `app`.** The host, port and password stay the
-  same. If a frontend or another client of yours signs in as `weft`, switch it
-  to `app`: `weft infra env <node> --into .env --set DATABASE_USER=User` writes
-  it again. Through the pooler a client reaches this one database only, so a
-  client that also used `postgres` or another database made beside it can no
-  longer reach those. The superuser `weft` can only sign in from inside the
-  unit. If the program needs an extension, trusted by Postgres or not, list it
-  in the node's new `extensions` setting (`["pg_trgm", "postgres_fdw"]`): the
-  superuser makes each one on every start, and `app` uses it. A name Postgres
-  does not have fails the start, and `weft infra status` names it.
+- **Through the pooler a client reaches this one database only**, so a client
+  that also used `postgres` or another database made beside it can no longer
+  reach those. The superuser `weft` can only sign in from inside the unit. An
+  extension listed in `extensions` that this Postgres does not have fails the
+  start, and `weft infra status` names it.
 - **A database whose name the pooler cannot read as written gets a second
   name for clients.** Your database keeps its name and its data. When the
   name is letters, digits, `_` and `-` only, at most 57 characters, and none
@@ -48,9 +55,7 @@ extension made). After that:
   takes it from there.
 - **The database closes a connection that sat idle for a minute.** That gives
   back a connection held by a worker that lost its CPU between requests, or by
-  an old worker a rollout left behind. If a frontend keeps a pool, set its idle
-  timeout under a minute, or have it test a connection before using it. If it
-  keeps a connection idle on purpose (one that `LISTEN`s), have it lift that
+  an old worker a rollout left behind. If a client of yours keeps a connection idle on purpose (one that `LISTEN`s), have it lift that
   limit for its own session when it connects, the way PostgresWatchQuery does:
   `SELECT set_config('idle_session_timeout', '0', false) FROM pg_settings
   WHERE name = 'idle_session_timeout'`.
@@ -93,6 +98,47 @@ status code.
 A value the service does not declare, or a required one missing, fails the
 run the way the access store refuses it on an install; before, the fake rig
 stored anything and only a real run found out.
+## 2026-10-31 (0.2.281)
+
+**An activation finishes even when the request that asked for it does not.**
+`weft activate` now hands the activation to the install, which carries it out
+on its own and goes on from where it was if the dispatcher copy doing it
+stops; the command follows it to its end, and looks again through a dropped
+connection. Before, a dispatcher copy that went away mid-activation left the
+triggers turning on, holding everything that arrived, until something noticed.
+`weft status` now says how long a trigger has been turning on and what it waits
+on. An activation an older weft had left half done when you update is ended
+the way a stuck one always was. Update your weft CLI with the install
+(`./setup.sh` does both on a machine; for a cloud install, `./setup.sh --cli`
+from the commit it runs): an older CLI's `weft activate` activates nothing and
+answers that it has to be updated.
+
+**On a cloud install, an update's old copies step aside.** A copy of the old
+weft that still had an event stream or a worker's line open used to keep
+taking work beside the new one, sometimes for most of an hour. It now
+finishes what it was answering and stops as soon as Cloud Run sends the
+requests to the new revision, and the editor and the workers reconnect to the
+new one by themselves: you may see the editor's live view reconnect during an
+update. Which revision is current is Cloud Run's answer; if it
+refuses to give it (the roles' service account cannot read its own service),
+nothing steps aside and the install's alert says so.
+
+**A cloud install of any age updates.** The install workflow could not update
+an install last updated before 2026-10-27: Terraform refused its first step
+with "Moved resource instances excluded by targeting". It now goes through
+whatever weft renamed in its Terraform since. Run the workflow as usual.
+
+**A cloud install whose database an older weft built can start fresh.** Before
+it deploys anything, the install workflow now checks the install's database.
+If an older weft built it, from before the database's history last started
+over (when executions were renamed runs), the workflow stops there, leaving
+the install as it was, and names its new `reset_database` input. Run it again
+with that input on to wipe the database and build the new weft's in its place:
+this deletes every project's run history, versions and stored connections, so
+deploy each project again with `weft activate --on prod` and make its
+connections again with `weft connect --on prod`. A role booting on such a
+database now names this way out on the cloud, where it used to name only
+`./setup.sh`.
 
 ## 2026-10-31 (0.2.280)
 

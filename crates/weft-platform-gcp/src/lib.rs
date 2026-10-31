@@ -11,7 +11,8 @@
 //!   door in front of the install's domains on a load balancer
 //!   (`domains`), the holders on a worker pool (`holders`), what happened
 //!   to a run told across copies on Pub/Sub (`news`), and what holders are
-//!   told on a Pub/Sub topic of their own (`holder_news`), and which of a
+//!   told on a Pub/Sub topic of their own (`holder_news`), which revision
+//!   of a role's service its requests go to (`revisions`), and which of a
 //!   node's needs its worker image can carry (`needs`). `api` is the one REST
 //!   client they share, `names` what they call things, `accounts` the
 //!   project's own service account, `alert_line` the log line the
@@ -48,6 +49,8 @@ pub mod needs;
 #[cfg(feature = "control")]
 pub mod news;
 #[cfg(feature = "control")]
+pub mod revisions;
+#[cfg(feature = "control")]
 pub mod runner;
 #[cfg(feature = "control")]
 pub mod storage;
@@ -56,6 +59,6 @@ pub use metadata::{identity_from_env, MetadataTokens};
 #[cfg(feature = "control")]
 pub use {
     alarm::CloudTasksAlarm, api::Google, domains::LoadBalancerDomains, frontends::CloudRunFrontends, holder_news::PubSubHolderNews, holders::WorkerPoolHolders,
-    identity::GoogleIdentity, images::CloudBuildImages, infra_host::ComputeInfraHost, needs::ImageNeeds, news::PubSubNews, runner::{CloudRunRunner, REQUEST_CAP, STOP_GRACE},
+    identity::GoogleIdentity, images::CloudBuildImages, infra_host::ComputeInfraHost, needs::ImageNeeds, news::PubSubNews, revisions::CloudRunRevisions, runner::{CloudRunRunner, REQUEST_CAP, STOP_GRACE},
     storage::GcsObjectStore,
 };

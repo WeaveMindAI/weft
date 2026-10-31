@@ -7,16 +7,20 @@
 //! today's shape by the same boot.
 
 use anyhow::Context as _;
+use weft_platform_traits::config::PlatformConfig;
 use weft_task_store::documents::Encoding;
+use weft_task_store::schema_guard::{self, BuiltBeforeTheHistory, Epoch};
 use weft_task_store::{Document, SchemaGroup};
 
 /// The parts of the list, in dependency order: each role's groups, as
-/// that role's crate orders them. The runtime-file plane names no table
-/// outside its own group (its two `REFERENCES runtime_file(key)` stay
-/// inside it), so it can sit anywhere; it goes last.
+/// that role's crate orders them, then the runtime's own. The runtime-file
+/// plane names no table outside its own group (its two `REFERENCES
+/// runtime_file(key)` stay inside it), and the copies' revisions
+/// (`crate::superseded`) none at all, so they go last.
 static PARTS: &[&[&SchemaGroup]] = &[
     weft_dispatcher::app::DISPATCHER_GROUPS,
     &[&weft_broker::runtime_store::GROUP],
+    &[&crate::superseded::GROUP],
 ];
 
 /// Every schema group the install's database holds, in dependency order.
@@ -143,9 +147,91 @@ pub async fn apply(pool: &weft_task_store::db::Pool) -> anyhow::Result<()> {
     weft_task_store::apply_schema(pool, &groups(), &documents()).await.context("apply the schema")
 }
 
+/// A boot's error, with the way out of a database from before the
+/// history ([`BuiltBeforeTheHistory`]) worded for where the install runs.
+/// The guard's own text names the local way out; a cloud install has no
+/// `./setup.sh` to run, and its way out is the install workflow, which
+/// runs [`database_history`] with `--wipe-older` before it deploys
+/// anything. Any other error is returned as it is.
+pub fn explain(e: anyhow::Error, platform: &PlatformConfig) -> anyhow::Error {
+    match platform {
+        PlatformConfig::Local(_) => e,
+        PlatformConfig::Gcp(_) => on_cloud(e),
+    }
+}
+
+/// [`explain`] on a cloud install.
+fn on_cloud(e: anyhow::Error) -> anyhow::Error {
+    if !e.chain().any(|cause| cause.is::<BuiltBeforeTheHistory>()) {
+        return e;
+    }
+    // SYNC: reset_database <-> .github/workflows/install-gcp.yml (on.workflow_dispatch.inputs)
+    anyhow::anyhow!(
+        "{} Run the install workflow again with its reset_database input on: before it deploys \
+         anything, it wipes this database and builds this weft's in its place. That deletes every \
+         project's run history, versions and stored connections; your project folders are untouched.",
+        BuiltBeforeTheHistory::WHAT
+    )
+}
+
+/// How many connections [`database_history`] opens: one for the work,
+/// one spare for the documents' pass.
+const HISTORY_POOL: u32 = 2;
+/// How long it waits for one of them.
+const HISTORY_POOL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `weft-runtime database-history`: where the database at `url` (the one
+/// the roles boot on) stands against this weft's history, and with
+/// `wipe_older` the way out of an older one.
+///
+/// Without `wipe_older` it says the [`Epoch`] and fails on the two a boot
+/// refuses, so a caller (the install workflow) learns from the exit
+/// status alone whether the roles can boot. With it, it wipes an older
+/// database and builds this weft's schema in its place
+/// (`weft_task_store::schema_guard::rebuild_from_before_the_history`, the
+/// boot's own schema work), and refuses any other: a current database is
+/// never wiped.
+pub async fn database_history(url: &str, wipe_older: bool) -> anyhow::Result<Epoch> {
+    let pool = weft_task_store::db::connect(url, HISTORY_POOL, HISTORY_POOL_WAIT, weft_task_store::db::Waits::Expected)
+        .await
+        .context("connect to the database")?;
+    let found = schema_guard::epoch(&pool).await.context("read the database's history")?;
+    if wipe_older {
+        schema_guard::rebuild_from_before_the_history(&pool, &groups(), &documents()).await?;
+        return Ok(found);
+    }
+    anyhow::ensure!(
+        found != Epoch::Older,
+        "{} Run this again with --wipe-older to wipe it and build this weft's schema in its place, \
+         which deletes every project's run history, versions and stored connections (on a cloud \
+         install, the install workflow's reset_database input does this).",
+        BuiltBeforeTheHistory::WHAT
+    );
+    match found.refusal() {
+        Some(refused) => Err(refused),
+        None => Ok(found),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On a cloud install, the boot's refusal of a database from before
+    /// the history names the install workflow's way out, however deep in
+    /// the boot's error it sits, and any other error stays as it was.
+    #[test]
+    fn a_cloud_boot_names_the_workflow_way_out() {
+        let refused = anyhow::Error::new(BuiltBeforeTheHistory).context("apply the schema");
+        assert!(refused.to_string().contains("apply the schema"));
+        let said = format!("{:#}", on_cloud(refused));
+        assert!(said.starts_with(BuiltBeforeTheHistory::WHAT), "{said}");
+        assert!(said.contains("reset_database"), "{said}");
+        assert!(!said.contains("./setup.sh"), "{said}");
+
+        let other = format!("{:#}", on_cloud(anyhow::anyhow!("the database is not reachable").context("apply the schema")));
+        assert_eq!(other, "apply the schema: the database is not reachable");
+    }
 
     /// Two groups of one name would share one stamp and one migration
     /// folder, and a table in two groups would be built twice.

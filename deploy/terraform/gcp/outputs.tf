@@ -33,3 +33,14 @@ output "database_move" {
     job             = "${var.name}-database-move"
   } : null
 }
+
+output "database_check" {
+  description = "What the install workflow's database history step needs to run the runtime image against the database this run deploys the roles on, before any role is deployed: the secret holding its address (the install's own Cloud SQL's when it has one), and where the checking job runs."
+  value = {
+    database_secret = google_secret_manager_secret.database_check.secret_id
+    service_account = google_service_account.core.email
+    network         = google_compute_network.vpc.name
+    subnet          = google_compute_subnetwork.roles.name
+    job             = "${var.name}-database-history"
+  }
+}

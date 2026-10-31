@@ -53,6 +53,11 @@ pub async fn in_flight(db: &impl crate::db::Client, run_id: weft_core::RunId) ->
     Ok(db.scalar(concat!("SELECT EXISTS (SELECT 1 FROM run r WHERE r.run_id = $1 AND ", in_flight_sql!("r"), ")"), &[&run_id]).await?)
 }
 
+/// Whether `run_id` was ever queued: its row is there, ended or not.
+pub async fn born(db: &impl crate::db::Client, run_id: weft_core::RunId) -> anyhow::Result<bool> {
+    Ok(db.scalar::<bool>("SELECT EXISTS (SELECT 1 FROM run WHERE run_id = $1)", &[&run_id]).await?)
+}
+
 /// Whether `run_id` has ended (or is gone).
 pub async fn ended(db: &impl crate::db::Client, run_id: weft_core::RunId) -> anyhow::Result<bool> {
     Ok(!db.scalar::<bool>("SELECT EXISTS (SELECT 1 FROM run WHERE run_id = $1 AND state <> 'ended')", &[&run_id]).await?)

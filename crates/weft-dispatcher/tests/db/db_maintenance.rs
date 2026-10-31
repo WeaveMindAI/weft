@@ -48,7 +48,7 @@ async fn going(pool: &Pool) -> weft_core::maintenance::Going {
 /// Switch `keys` on, as `claimant`.
 async fn turn_on(activations: &PostgresActivationStore, id: Uuid, keys: &[ActivationKey], claimant: Claimant) {
     let setup = Uuid::new_v4();
-    activations.try_begin_activating(id, keys, setup, None, claimant).await.unwrap().expect("claimed");
+    activations.try_begin_activating(id, keys, setup, None, claimant, Uuid::new_v4()).await.unwrap().expect("claimed");
     activations.end_activating(id, setup, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
 }
 
@@ -191,7 +191,7 @@ async fn the_lift_brings_back_only_what_was_marked(pool: Pool) {
 async fn while_in_maintenance_activate_is_refused(pool: Pool) {
     let (activations, id) = setup(&pool).await;
     maintenance::begin(&pool, 100).await.unwrap();
-    let refused = activations.try_begin_activating(id, &[key("feed")], Uuid::new_v4(), None, Claimant::Anyone).await.unwrap();
+    let refused = activations.try_begin_activating(id, &[key("feed")], Uuid::new_v4(), None, Claimant::Anyone, Uuid::new_v4()).await.unwrap();
     assert!(matches!(refused, Err(ClaimRefused::Maintenance)), "{refused:?}");
     assert!(activations.list(id).await.unwrap().is_empty(), "a refused claim writes nothing");
     turn_on(&activations, id, &[key("feed")], Claimant::Lift).await;
@@ -327,7 +327,7 @@ async fn a_failed_lift_activation_keeps_the_mark(pool: Pool) {
 
     // Ended the way a failure that turns the trigger off ends it.
     let lift = Uuid::new_v4();
-    activations.try_begin_activating(id, &[key("feed")], lift, None, Claimant::Lift).await.unwrap().expect("claimed");
+    activations.try_begin_activating(id, &[key("feed")], lift, None, Claimant::Lift, Uuid::new_v4()).await.unwrap().expect("claimed");
     assert!(maintenance::marked_triggers(&pool).await.unwrap().is_empty(), "while it activates, it is not left to bring back");
     activations.end_unfinished(id, lift).await.unwrap().expect("owned");
     let feed = activations.list(id).await.unwrap().remove(0);
@@ -336,7 +336,7 @@ async fn a_failed_lift_activation_keeps_the_mark(pool: Pool) {
 
     // Ended the way a failure that puts it back ends it.
     let again = Uuid::new_v4();
-    let previous = activations.try_begin_activating(id, &[key("feed")], again, None, Claimant::Lift).await.unwrap().expect("claimed");
+    let previous = activations.try_begin_activating(id, &[key("feed")], again, None, Claimant::Lift, Uuid::new_v4()).await.unwrap().expect("claimed");
     assert!(activations.restore(id, again, &previous).await.unwrap());
     assert_eq!(maintenance::marked_triggers(&pool).await.unwrap().len(), 1);
 

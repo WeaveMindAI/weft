@@ -452,8 +452,9 @@ pub type InstanceValues = std::collections::BTreeMap<String, PlaceValues>;
 /// A change to one instance's values: fields given a value, and fields
 /// cleared (which then fall back as if never given). What a store call
 /// asks for, and what the setup it re-arms runs with before the change is
-/// stored.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// stored. Carried by the task that re-arms them (weft-internal, so its
+/// fields keep Rust's spelling).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ValueChanges {
     pub set: InstanceValues,
     /// `(place, field)` pairs.

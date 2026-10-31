@@ -107,7 +107,7 @@ fn callback_base<'a>(stable: &'a str, internet: Option<&'a str>, needs: weft_cor
 /// pair for one move, whose private half stays here.
 // SYNC: migrate_key <-> crates/weft-core/src/migrate.rs TransferKey, crates/weft-broker/src/access_admin.rs migrate_key, crates/weft-cli/src/commands/migrate.rs connections
 pub async fn migrate_key(State(state): State<DispatcherState>, caller: CallerTenant) -> Result<Json<TransferKey>, ApiError> {
-    crate::broker_admin::forward_json(&state, "/v1/access/admin/migrate/key", &Tenanted { tenant: caller.0 .0, inner: serde_json::Map::new() })
+    crate::broker_admin::forward_json(&state, weft_broker_client::protocol::ADMIN_MIGRATE_KEY, &Tenanted { tenant: caller.0 .0, inner: serde_json::Map::new() })
         .await
         .map(Json)
 }
@@ -122,7 +122,7 @@ pub async fn migrate_export(
     Json(req): Json<ExportConnections>,
 ) -> Result<Json<ExportedConnections>, ApiError> {
     req.selection.validate().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    crate::broker_admin::forward_json(&state, "/v1/access/admin/migrate/export", &Tenanted { tenant: caller.0 .0, inner: req })
+    crate::broker_admin::forward_json(&state, weft_broker_client::protocol::ADMIN_MIGRATE_EXPORT, &Tenanted { tenant: caller.0 .0, inner: req })
         .await
         .map(Json)
 }
@@ -135,7 +135,7 @@ pub async fn migrate_import(
     caller: CallerTenant,
     Json(req): Json<ImportConnections>,
 ) -> Result<Json<ImportedConnections>, ApiError> {
-    crate::broker_admin::forward_json(&state, "/v1/access/admin/migrate/import", &Tenanted { tenant: caller.0 .0, inner: req })
+    crate::broker_admin::forward_json(&state, weft_broker_client::protocol::ADMIN_MIGRATE_IMPORT, &Tenanted { tenant: caller.0 .0, inner: req })
         .await
         .map(Json)
 }
@@ -160,7 +160,7 @@ pub async fn doors(
 /// `/instance/doors` an instance.
 pub(crate) async fn doors_status(state: &DispatcherState, req: &DoorsRequest) -> Result<DoorsStatus, ApiError> {
     let doors: DoorsAnswer =
-        crate::broker_admin::forward_json(state, "/v1/access/admin/doors", req).await?;
+        crate::broker_admin::forward_json(state, weft_broker_client::protocol::ADMIN_DOORS, req).await?;
     // A provider demanding https on a weft with no https address
     // blocks every CONSENT, not the panel: paste connects need no
     // callback, so the probe reports the block instead of failing.
@@ -179,7 +179,7 @@ pub async fn mint_app(
     _caller: CallerTenant,
     Json(req): Json<MintAppRequest>,
 ) -> Result<Json<MintAppResponse>, ApiError> {
-    crate::broker_admin::forward_json(&state, "/v1/access/admin/mint-app", &req)
+    crate::broker_admin::forward_json(&state, weft_broker_client::protocol::ADMIN_MINT_APP, &req)
         .await
         .map(Json)
 }
@@ -213,7 +213,7 @@ pub async fn list_grants(
     if !services.is_empty() {
         let answer: SharedCredentialsAnswer = crate::broker_admin::forward_json(
             &state,
-            "/v1/access/admin/shared-credentials",
+            weft_broker_client::protocol::ADMIN_SHARED_CREDENTIALS,
             &SharedCredentialsQuery { services },
         )
         .await?;
@@ -272,7 +272,7 @@ pub async fn connect_direct(
     req.inner.instance = None;
     crate::broker_admin::forward_json(
         &state,
-        "/v1/access/admin/connect/direct",
+        weft_broker_client::protocol::ADMIN_CONNECT_DIRECT,
         &Tenanted { tenant: caller.0 .0, inner: req },
     )
     .await
@@ -292,7 +292,7 @@ pub async fn connect_begin(
     req.inner.redirect_uri = redirect_uri(&state, &req.inner.spec).await?;
     crate::broker_admin::forward_json(
         &state,
-        "/v1/access/admin/oauth/begin",
+        weft_broker_client::protocol::ADMIN_OAUTH_BEGIN,
         &Tenanted { tenant: caller.0 .0, inner: req },
     )
     .await
@@ -350,7 +350,7 @@ pub async fn oauth_callback(
             let fwd: Result<CompletedConnect, ApiError> =
                 crate::broker_admin::forward_json(
                     &state,
-                    "/v1/access/admin/oauth/complete",
+                    weft_broker_client::protocol::ADMIN_OAUTH_COMPLETE,
                     &weft_access_store::OAuthComplete {
                         state: st.clone(),
                         code: code.clone(),
@@ -403,7 +403,7 @@ pub async fn lookup(
     req.for_instance = None;
     crate::broker_admin::forward_json(
         &state,
-        "/v1/access/admin/lookup",
+        weft_broker_client::protocol::ADMIN_LOOKUP,
         &Tenanted { tenant: caller.0 .0, inner: req },
     )
     .await
@@ -470,7 +470,7 @@ pub async fn picker_page(
     }
     let token: Token = crate::broker_admin::forward_json(
         &state,
-        "/v1/access/admin/picker-token",
+        weft_broker_client::protocol::ADMIN_PICKER_TOKEN,
         &Tenanted {
             tenant: session.tenant.clone(),
             inner: TokenQuery {
@@ -613,7 +613,7 @@ pub async fn granted(
     req.for_instance = None;
     crate::broker_admin::forward_json(
         &state,
-        "/v1/access/admin/granted",
+        weft_broker_client::protocol::ADMIN_GRANTED,
         &Tenanted { tenant: caller.0 .0, inner: req },
     )
     .await
