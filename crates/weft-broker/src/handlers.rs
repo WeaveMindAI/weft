@@ -2253,6 +2253,42 @@ pub async fn signal_let_go(
     Ok(Json(serde_json::json!({})))
 }
 
+/// A holder saying its load, letting go of what it hands over (see
+/// `SignalHolderLoadRequest`). Bound to the calling replica, so a holder
+/// only ever speaks for itself.
+pub async fn signal_holder_load(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<SignalHolderLoadRequest>,
+) -> Resp<serde_json::Value> {
+    if caller.role != Role::Listener {
+        return Err((StatusCode::FORBIDDEN, "listener only".into()));
+    }
+    require_replica_matches(&caller, &req.replica)?;
+    use crate::held_signals::{HandTo, Reported};
+    let to = if req.spare_only { HandTo::Spare } else { HandTo::SpareOrAny };
+    match crate::held_signals::report_load(&state.pool, &req.replica, req.cpu_percent, req.room, &req.let_go, to)
+        .await
+        .map_err(unavailable_or_internal)?
+    {
+        Reported::Said { handed, to } => {
+            tracing::info!(
+                target: "weft_broker::held", replica = %req.replica, cpu_percent = req.cpu_percent, room = req.room, handed,
+                spare = ?to, "a holder said its load"
+            );
+            Ok(Json(serde_json::json!({})))
+        }
+        Reported::NothingHeld => Err((
+            StatusCode::CONFLICT,
+            "this holder claims none of the signals it hands over any more; nothing was written, and it looks again before it says its load".into(),
+        )),
+        Reported::NoSpare => Err((
+            StatusCode::CONFLICT,
+            "no spare is free to take what this holder hands over (another holder handed it work first); nothing was written, and it looks again to take its signals back".into(),
+        )),
+    }
+}
+
 // ---------- helpers ----------
 
 fn require_worker(caller: &CallerIdentity) -> Result<(), (StatusCode, String)> {

@@ -1,7 +1,8 @@
 //! The holders on a Cloud Run worker pool, as many copies as weft asks
 //! for. A worker pool takes no requests and scales only when told, which
 //! is what holders want: they call out, and their count follows the held
-//! signals, not traffic. At zero copies it costs nothing.
+//! signals and the load the holders say they carry, not traffic. At zero
+//! copies it costs nothing.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};

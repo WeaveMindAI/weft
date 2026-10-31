@@ -64,7 +64,36 @@ struct Queue {
     down: std::sync::atomic::AtomicBool,
 }
 
-async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queue: Arc<Queue>) -> String {
+/// What holders in a pool said and did, as the broker keeps it: each
+/// holder's load, whether it is measured on what it holds and its room
+/// (`holder_load.cpu_percent`, `settled`, `room`; settled is left behind
+/// when one of its looks takes something), every load report written in
+/// order, every one refused, and which holder each look came from.
+#[derive(Default)]
+struct HolderBook {
+    loads: Mutex<HashMap<String, (Value, bool, u64)>>,
+    reports: Mutex<Vec<Value>>,
+    refused: Mutex<Vec<Value>>,
+    looks: Mutex<Vec<String>>,
+}
+
+/// The spares holder `replica` could hand `handing` signals to, as
+/// `held_signals::spares_sql` picks them: the other holders that said
+/// their load, have room for them all and claim no held row, the most
+/// room first, then by name.
+fn spares(loads: &HashMap<String, (Value, bool, u64)>, rows: &HashMap<String, Value>, replica: &str, handing: u64) -> Vec<(String, u64)> {
+    let mut spares: Vec<(String, u64)> = loads
+        .iter()
+        .filter(|(other, (_, _, room))| {
+            *other != replica && *room >= handing && !rows.values().any(|r| r["holds"] == json!(true) && r["held_by"] == json!(other))
+        })
+        .map(|(other, (_, _, room))| (other.clone(), *room))
+        .collect();
+    spares.sort_by(|(a, ra), (b, rb)| rb.cmp(ra).then_with(|| a.cmp(b)));
+    spares
+}
+
+async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queue: Arc<Queue>, book: Arc<HolderBook>) -> String {
     use axum::routing::post;
     use std::sync::atomic::Ordering;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -75,7 +104,10 @@ async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queu
     let list_rows = rows.clone();
     let hold_rows = rows.clone();
     let let_go_rows = rows.clone();
+    let load_rows = rows.clone();
     let target_rows = rows.clone();
+    let load_book = book.clone();
+    let let_go_book = book.clone();
     let resolving = get_held.clone();
     let app = axum::Router::new()
         // A connection resolve, refused with the status the test set.
@@ -116,11 +148,13 @@ async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queu
                 }
             }),
         )
-        // A holder giving up its claims, as `held_signals::let_go` does.
+        // A holder giving up its claims, as `held_signals::release` does:
+        // every claim, and the load it said.
         .route(
             "/v1/signal/let_go",
             post(move |axum::Json(req): axum::Json<Value>| {
                 let rows = let_go_rows.clone();
+                let book = let_go_book.clone();
                 async move {
                     let mut rows = rows.lock().unwrap();
                     for row in rows.values_mut() {
@@ -128,7 +162,54 @@ async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queu
                             row["held_by"] = Value::Null;
                         }
                     }
+                    book.loads.lock().unwrap().remove(req["replica"].as_str().unwrap());
                     axum::Json(json!({}))
+                }
+            }),
+        )
+        // A holder's load, as `held_signals::report_load` writes it: what
+        // it hands over and still claims goes to a spare (another holder
+        // that said its load and claims nothing, its load then behind) or,
+        // with none and not `spare_only`, is freed; then its load is kept,
+        // behind what it holds when it handed some over. One that hands
+        // over and moves nothing, or finds no spare when it hands over only
+        // to one, writes nothing and is refused (`refused`).
+        .route(
+            "/v1/signal/holder_load",
+            post(move |axum::Json(req): axum::Json<Value>| {
+                let rows = load_rows.clone();
+                let book = load_book.clone();
+                async move {
+                    let replica = req["replica"].as_str().unwrap().to_string();
+                    let mut rows = rows.lock().unwrap();
+                    let mut loads = book.loads.lock().unwrap();
+                    let handing_over = !req["let_go"].as_array().unwrap().is_empty();
+                    let handing = req["let_go"].as_array().unwrap().len() as u64;
+                    let spare = spares(&loads, &rows, &replica, handing).first().map(|(other, _)| other.clone());
+                    if handing_over && spare.is_none() && req["spare_only"] == json!(true) {
+                        book.refused.lock().unwrap().push(req);
+                        return Err(axum::http::StatusCode::CONFLICT);
+                    }
+                    let to = spare.clone().map_or(Value::Null, Value::String);
+                    let mut handed = 0;
+                    for token in req["let_go"].as_array().unwrap() {
+                        if let Some(row) = rows.get_mut(token.as_str().unwrap()).filter(|row| row["held_by"] == json!(replica)) {
+                            row["held_by"] = to.clone();
+                            handed += 1;
+                        }
+                    }
+                    if handing_over && handed == 0 {
+                        book.refused.lock().unwrap().push(req);
+                        return Err(axum::http::StatusCode::CONFLICT);
+                    }
+                    if let (true, Some(spare)) = (handing_over, &spare) {
+                        if let Some((_, settled, _)) = loads.get_mut(spare) {
+                            *settled = false;
+                        }
+                    }
+                    loads.insert(replica, (req["cpu_percent"].clone(), !handing_over, req["room"].as_u64().unwrap()));
+                    book.reports.lock().unwrap().push(req);
+                    Ok(axum::Json(json!({})))
                 }
             }),
         )
@@ -136,14 +217,20 @@ async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queu
         // keeps what it still claims, names what is gone as ended, and
         // takes the held rows nobody claims or that it claims and did not
         // keep (a row rewritten under it comes back in the same look),
-        // never one given up on, the wanted ones first.
+        // never one given up on: all of its own it did not keep, then free
+        // ones within its room, the wanted ones first; a look also writes
+        // its room onto its load. A take leaves the load it said behind,
+        // and the answer carries the load kept when it is measured on what
+        // it holds, and the most room a spare up has.
         .route(
             "/v1/signal/hold",
             post(move |axum::Json(req): axum::Json<Value>| {
                 let rows = hold_rows.clone();
+                let book = book.clone();
                 async move {
                     let mut rows = rows.lock().unwrap();
                     let replica = req["replica"].clone();
+                    book.looks.lock().unwrap().push(replica.as_str().unwrap().to_string());
                     let holding: Vec<&str> = req["holding"].as_array().unwrap().iter().map(|h| h["token"].as_str().unwrap()).collect();
                     let kept: Vec<&str> = holding
                         .iter()
@@ -152,26 +239,41 @@ async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queu
                         .collect();
                     let ended: Vec<&str> = holding.iter().copied().filter(|t| !rows.contains_key(*t)).collect();
                     let want: Vec<&str> = req["want"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
-                    let mut free: Vec<String> = rows
+                    let spare = spares(&book.loads.lock().unwrap(), &rows, replica.as_str().unwrap(), 1).first().map(|(_, room)| *room);
+                    let takeable = |r: &Value| r["holds"] == json!(true) && r["held_failed"].is_null();
+                    let own: Vec<String> = rows
                         .iter()
-                        .filter(|(t, r)| {
-                            r["holds"] == json!(true)
-                                && r["held_failed"].is_null()
-                                && (r["held_by"].is_null() || r["held_by"] == replica)
-                                && !kept.contains(&t.as_str())
-                        })
+                        .filter(|(t, r)| takeable(r) && r["held_by"] == replica && !kept.contains(&t.as_str()))
                         .map(|(t, _)| t.clone())
                         .collect();
-                    free.sort_by_key(|t| !want.contains(&t.as_str()));
+                    let mut free: Vec<String> =
+                        rows.iter().filter(|(_, r)| takeable(r) && r["held_by"].is_null()).map(|(t, _)| t.clone()).collect();
+                    free.sort_by_key(|t| (!want.contains(&t.as_str()), t.clone()));
+                    if let Some(room) = req["room"].as_u64() {
+                        free.truncate(usize::try_from(room).unwrap().saturating_sub(kept.len() + own.len()));
+                    }
                     let mut taken = Vec::new();
-                    for token in free {
+                    for token in own.into_iter().chain(free) {
                         let row = rows.get_mut(&token).unwrap();
                         row["held_by"] = replica.clone();
                         let mut wire = row.clone();
                         wire.as_object_mut().unwrap().remove("held_by");
                         taken.push(wire);
                     }
-                    axum::Json(json!({ "kept": kept, "ended": ended, "taken": taken }))
+                    let mut loads = book.loads.lock().unwrap();
+                    if let (Some((_, _, room)), Some(sent)) = (loads.get_mut(replica.as_str().unwrap()), req["room"].as_u64()) {
+                        *room = sent;
+                    }
+                    let said = loads.get_mut(replica.as_str().unwrap());
+                    let load = match said {
+                        Some((_, settled, _)) if !taken.is_empty() => {
+                            *settled = false;
+                            Value::Null
+                        }
+                        Some((cpu_percent, true, _)) => cpu_percent.clone(),
+                        _ => Value::Null,
+                    };
+                    axum::Json(json!({ "kept": kept, "ended": ended, "taken": taken, "load": load, "spare": spare }))
                 }
             }),
         )
@@ -271,6 +373,7 @@ struct Rig {
     rows: Rows,
     landing: Landing,
     get_held: Arc<GetHeld>,
+    book: Arc<HolderBook>,
     /// The fake broker's address.
     broker: String,
 }
@@ -286,11 +389,16 @@ fn holders() -> weft_listener::HolderPlatform {
 
 /// The listener's way to the fake broker at `broker`.
 fn link(broker: &str) -> weft_broker_client::BrokerLink {
+    link_as(broker, "test-listener")
+}
+
+/// The way to the fake broker at `broker` of the process named `replica`.
+fn link_as(broker: &str, replica: &str) -> weft_broker_client::BrokerLink {
     weft_broker_client::BrokerLink::new(
         broker.to_string(),
         weft_broker_client::TokenSource::role(
             Arc::new(weft_platform_traits::FixedToken("test-token".into())),
-            "test-listener",
+            replica.to_string(),
             weft_platform_traits::CoreRole::Listener,
         ),
     )
@@ -301,7 +409,8 @@ async fn rig(holds_here: bool) -> Rig {
     let landing: Landing = Arc::default();
     let get_held: Arc<GetHeld> = Arc::default();
     let queue = Arc::new(Queue::default());
-    let broker = spawn_broker(rows.clone(), landing.clone(), get_held.clone(), queue.clone()).await;
+    let book: Arc<HolderBook> = Arc::default();
+    let broker = spawn_broker(rows.clone(), landing.clone(), get_held.clone(), queue.clone(), book.clone()).await;
     let tasks = Arc::new(FakeTasks::default());
     let doors = Arc::new(FakeDoors::default());
     let alarm = Arc::new(FakeAlarm::new());
@@ -313,7 +422,7 @@ async fn rig(holds_here: bool) -> Rig {
         doors.clone(),
         holders(),
     );
-    Rig { state, tasks, doors, queue, alarm, rows, landing, get_held, broker }
+    Rig { state, tasks, doors, queue, alarm, rows, landing, get_held, book, broker }
 }
 
 fn identity(token: &str, spec: weft_core::primitive::SignalSpec) -> SignalIdentity {
@@ -1801,12 +1910,283 @@ async fn a_lost_claim_stops_here_and_an_ended_signal_tears_down() {
 async fn letting_go_stops_the_connections_first_and_tears_nothing_down() {
     let rig = rig(true).await;
     rig.rows.lock().unwrap().insert("rec".into(), row("rec", &recording_spec("let_go", 1), json!({}), 1));
-    weft_listener::hold::run(rig.state.clone(), None, std::future::ready(())).await;
+    weft_listener::hold::run(rig.state.clone(), weft_listener::hold::Share::Every, std::future::ready(())).await;
     assert!(rig.state.registry.get("rec").is_none());
     assert!(rig.rows.lock().unwrap()["rec"]["held_by"].is_null(), "the claim is given up");
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(recorded("let_go"), ["spawn 1"]);
 }
+
+// ---------- A holder's load ----------
+
+/// A holder's CPU as the test sets it, and how many samples were taken.
+struct FakeCpu {
+    share: Arc<Mutex<f64>>,
+    samples: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl weft_listener::load::CpuUse for FakeCpu {
+    fn busy(&mut self) -> anyhow::Result<f64> {
+        self.samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(*self.share.lock().unwrap())
+    }
+}
+
+/// How far apart a test holder samples its CPU.
+const SAMPLE_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// One holder in a pool on the rig's broker, with its CPU, its news and
+/// its stop at hand.
+struct PoolHolder {
+    state: ListenerState,
+    cpu: Arc<Mutex<f64>>,
+    samples: Arc<std::sync::atomic::AtomicUsize>,
+    news: Arc<weft_platform_traits::FakeHolderNews>,
+    stop: tokio::sync::oneshot::Sender<()>,
+    done: tokio::task::JoinHandle<()>,
+}
+
+/// Start holder `replica`, ten signals to a copy, its CPU at `cpu`.
+fn pool_holder(rig: &Rig, replica: &str, cpu: f64) -> PoolHolder {
+    let news = Arc::new(weft_platform_traits::FakeHolderNews::default());
+    let alarm: Arc<dyn weft_platform_traits::Alarm> = rig.alarm.clone();
+    let state = ListenerState::new(
+        ListenerConfig { replica: replica.into(), holds_here: true, holders: weft_listener::Holders::Pool },
+        rig.tasks.clone(),
+        link_as(&rig.broker, replica),
+        alarm.clone(),
+        rig.doors.clone(),
+        weft_listener::HolderPlatform { news: news.clone(), liveness: Arc::new(weft_platform_traits::AlarmLiveness::new(alarm)) },
+    );
+    let cpu = Arc::new(Mutex::new(cpu));
+    let samples = Arc::<std::sync::atomic::AtomicUsize>::default();
+    let settings = weft_platform_traits::config::HolderSettings { signals_per_copy: 10, high_cpu_percent: 70, target_cpu_percent: 50 };
+    let share = weft_listener::hold::Share::Copy { settings, cpu: Box::new(FakeCpu { share: cpu.clone(), samples: samples.clone() }), sample_every: SAMPLE_EVERY };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let done = tokio::spawn(weft_listener::hold::run(state.clone(), share, async move {
+        let _ = stopped.await;
+    }));
+    PoolHolder { state, cpu, samples, news, stop, done }
+}
+
+impl PoolHolder {
+    /// Tell it the held set changed, and wait until it has looked.
+    async fn look(&self, rig: &Rig) {
+        let replica = self.state.config.replica.clone();
+        let looks = || rig.book.looks.lock().unwrap().iter().filter(|r| **r == replica).count();
+        let before = looks();
+        self.news.heard.send(weft_platform_traits::HolderHeard::Note(weft_platform_traits::HolderNote::HeldSetChanged)).unwrap();
+        until(|| looks() > before, "the holder looks").await;
+    }
+
+    async fn stop(self) {
+        self.stop.send(()).unwrap();
+        self.done.await.unwrap();
+    }
+}
+
+/// The signals `replica` claims, in order.
+fn held_by(rig: &Rig, replica: &str) -> Vec<String> {
+    let mut held: Vec<String> = rig.rows.lock().unwrap().iter().filter(|(_, r)| r["held_by"] == json!(replica)).map(|(t, _)| t.clone()).collect();
+    held.sort();
+    held
+}
+
+fn reports_of(rig: &Rig, replica: &str) -> Vec<Value> {
+    rig.book.reports.lock().unwrap().iter().filter(|r| r["replica"] == json!(replica)).cloned().collect()
+}
+
+async fn until(mut done: impl FnMut() -> bool, what: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out waiting until {what}");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// The samples `holder` takes from now on, up to `windows` full windows.
+async fn windows(holder: &PoolHolder, windows: usize) {
+    let sampled = holder.samples.load(std::sync::atomic::Ordering::SeqCst);
+    until(|| holder.samples.load(std::sync::atomic::Ordering::SeqCst) >= sampled + weft_listener::load::SAMPLES * windows, "full windows sampled").await;
+}
+
+/// A holder says its load once measured, then nothing while it stays in
+/// its band. Over the high mark it hands over what it should not keep,
+/// each connection stopped here first, and keeps handing over, a window
+/// apart, until one connection is left, which it never splits; its next
+/// look leaves what it handed over for another holder, which takes them.
+/// Once it says a load under the target it takes its full room again.
+async fn overload_scenario() {
+    let rig = rig(true).await;
+    for t in ["r1", "r2", "r3", "r4"] {
+        rig.rows.lock().unwrap().insert(t.into(), row(t, &recording_spec("holder_load", 1), json!({}), 1));
+    }
+    let a = pool_holder(&rig, "holder-a", 0.5);
+    until(|| held_by(&rig, "holder-a").len() == 4, "holder-a takes every signal").await;
+    until(|| !reports_of(&rig, "holder-a").is_empty(), "holder-a says its load").await;
+    let said = &reports_of(&rig, "holder-a")[0];
+    assert_eq!((&said["cpu_percent"], &said["room"], &said["let_go"]), (&json!(50), &json!(10), &json!([])));
+    windows(&a, 3).await;
+    assert_eq!(reports_of(&rig, "holder-a").len(), 1, "within its band nothing more is said");
+
+    *a.cpu.lock().unwrap() = 0.95;
+    let handed = |rig: &Rig| -> Vec<Value> {
+        reports_of(rig, "holder-a").into_iter().filter(|r| !r["let_go"].as_array().unwrap().is_empty()).collect()
+    };
+    until(|| handed(&rig).len() == 3, "holder-a hands over until one is left").await;
+    // Each window over 0.7 keeps what would bring it to 50% of four, then
+    // three, then two connections.
+    let handed = handed(&rig);
+    let each: Vec<(&Value, &Value)> = handed.iter().map(|r| (&r["let_go"], &r["room"])).collect();
+    assert_eq!(each, [(&json!(["r4"]), &json!(3)), (&json!(["r3"]), &json!(2)), (&json!(["r2"]), &json!(1))]);
+    assert!(a.state.registry.get("r4").is_none(), "stopped here");
+    assert_eq!(held_by(&rig, "holder-a"), ["r1"]);
+    until(|| reports_of(&rig, "holder-a").last().is_some_and(|r| r["let_go"] == json!([]) && r["cpu_percent"] == json!(95)), "one left: its load said").await;
+    assert_eq!(reports_of(&rig, "holder-a").last().unwrap()["room"], json!(1), "over the target, its room stays what it kept");
+    let reported = reports_of(&rig, "holder-a").len();
+    windows(&a, 3).await;
+    assert_eq!(reports_of(&rig, "holder-a").len(), reported, "one connection is never split, and its load stays in its band");
+
+    a.look(&rig).await;
+    assert_eq!(held_by(&rig, "holder-a"), ["r1"], "its next look leaves the rest for another holder");
+
+    let b = pool_holder(&rig, "holder-b", 0.1);
+    until(|| held_by(&rig, "holder-b") == ["r2", "r3", "r4"], "holder-b takes what holder-a handed over").await;
+    until(|| b.state.registry.get("r4").is_some(), "holder-b brings it up").await;
+    until(|| !reports_of(&rig, "holder-b").is_empty(), "holder-b says its load").await;
+    let said = &reports_of(&rig, "holder-b")[0];
+    assert_eq!((&said["cpu_percent"], &said["room"], &said["let_go"]), (&json!(10), &json!(10), &json!([])));
+
+    // The window that catches the fall is said first (still over the
+    // target, so the room stays), then the new load alone.
+    *a.cpu.lock().unwrap() = 0.1;
+    until(|| reports_of(&rig, "holder-a").len() == reported + 2, "holder-a says its load fell").await;
+    let fell: Vec<(Value, Value)> = reports_of(&rig, "holder-a")[reported..].iter().map(|r| (r["cpu_percent"].clone(), r["room"].clone())).collect();
+    assert_eq!(fell, [(json!(81), json!(1)), (json!(10), json!(10))], "under the target: its full room back");
+    b.stop().await;
+    a.look(&rig).await;
+    assert_eq!(held_by(&rig, "holder-a"), ["r1", "r2", "r3", "r4"], "its full room again");
+    a.stop().await;
+}
+
+weft_core::stress_test!(
+    name: a_holder_says_its_load_once_per_band_and_hands_over_what_it_cannot_carry,
+    runs: 4,
+    worker_threads: 4,
+    async fn body() {
+        overload_scenario().await;
+    }
+);
+
+/// Two holders between the target and the high mark keep their work
+/// while there is nowhere for it to go. Once a copy added for the load is
+/// up and has said its load, the first to hand some over gives it to the
+/// spare alone; the other either learns on its look that the spare holds
+/// work, or tries, finds it taken and keeps its own. Either way the pool
+/// holds steady: no more is handed over once the spare holds work.
+async fn spare_scenario() {
+    let rig = rig(true).await;
+    for (holder, tokens) in [("holder-a", ["a1", "a2", "a3", "a4", "a5", "a6"]), ("holder-b", ["b1", "b2", "b3", "b4", "b5", "b6"])] {
+        for t in tokens {
+            let mut claimed = row(t, &recording_spec("spare", 1), json!({}), 1);
+            claimed["held_by"] = json!(holder);
+            rig.rows.lock().unwrap().insert(t.into(), claimed);
+        }
+    }
+    let a = pool_holder(&rig, "holder-a", 0.65);
+    let b = pool_holder(&rig, "holder-b", 0.65);
+    until(|| reports_of(&rig, "holder-a").len() == 1 && reports_of(&rig, "holder-b").len() == 1, "each says its load").await;
+    windows(&a, 3).await;
+    assert_eq!(
+        (reports_of(&rig, "holder-a").len(), reports_of(&rig, "holder-b").len()),
+        (1, 1),
+        "between the target and the high mark, with no spare, nothing is handed over"
+    );
+
+    let c = pool_holder(&rig, "holder-c", 0.1);
+    until(|| !reports_of(&rig, "holder-c").is_empty(), "the copy added says its load").await;
+    assert!(held_by(&rig, "holder-c").is_empty(), "nothing free to take");
+    // The sizing tells every holder once the copy's load is said.
+    a.look(&rig).await;
+    b.look(&rig).await;
+    let handed = || -> Vec<Value> {
+        rig.book.reports.lock().unwrap().iter().filter(|r| !r["let_go"].as_array().unwrap().is_empty()).cloned().collect()
+    };
+    until(|| handed().len() == 1, "one hands over to it").await;
+    let handed = handed();
+    let (giver, other) = if handed[0]["replica"] == json!("holder-a") { (&a, &b) } else { (&b, &a) };
+    let given = handed[0]["let_go"][0].as_str().unwrap().to_string();
+    assert_eq!((&handed[0]["room"], &handed[0]["spare_only"], &handed[0]["cpu_percent"]), (&json!(5), &json!(true), &json!(54)), "five of six at 65% carry 54%");
+    assert_eq!(held_by(&rig, "holder-c"), std::slice::from_ref(&given), "handed to the spare, not freed");
+    c.look(&rig).await;
+    until(|| c.state.registry.get(&given).is_some(), "the spare brings it up").await;
+    assert!(giver.state.registry.get(&given).is_none(), "stopped on the holder that handed it over");
+    windows(other, 2).await;
+    let other_name = other.state.config.replica.clone();
+    until(|| up_here(other) == 6, "the other keeps, or brings back, all of its own").await;
+    assert_eq!(held_by(&rig, &other_name).len(), 6);
+
+    // With the spare holding work, nobody hands over again.
+    a.look(&rig).await;
+    b.look(&rig).await;
+    windows(&a, 3).await;
+    windows(&b, 3).await;
+    assert_eq!(handed_count(&rig), 1, "the pool holds steady");
+    assert_eq!(held_by(&rig, "holder-c"), [given]);
+    for h in [a, b, c] {
+        h.stop().await;
+    }
+}
+
+/// A holder told a spare is up hands over to it only; when the spare
+/// holds work by the time it says so, the broker refuses and writes
+/// nothing, and the holder's next look brings back what it stopped, which
+/// is still its own.
+#[tokio::test]
+async fn a_hand_over_with_no_spare_left_takes_its_own_back() {
+    let rig = rig(true).await;
+    for t in ["a1", "a2", "a3", "a4", "a5", "a6"] {
+        let mut claimed = row(t, &recording_spec("no_spare", 1), json!({}), 1);
+        claimed["held_by"] = json!("holder-a");
+        rig.rows.lock().unwrap().insert(t.into(), claimed);
+    }
+    let a = pool_holder(&rig, "holder-a", 0.5);
+    let c = pool_holder(&rig, "holder-c", 0.1);
+    until(|| !reports_of(&rig, "holder-a").is_empty() && !reports_of(&rig, "holder-c").is_empty(), "both say their load").await;
+    a.look(&rig).await;
+    // The spare takes work of its own before holder-a says its load.
+    let mut its_own = row("c1", &recording_spec("no_spare", 1), json!({}), 1);
+    its_own["held_by"] = json!("holder-c");
+    rig.rows.lock().unwrap().insert("c1".into(), its_own);
+    *a.cpu.lock().unwrap() = 0.65;
+    until(|| !rig.book.refused.lock().unwrap().is_empty(), "holder-a tries to hand over to the spare").await;
+    let refused = rig.book.refused.lock().unwrap()[0].clone();
+    assert_eq!((&refused["let_go"], &refused["spare_only"]), (&json!(["a6"]), &json!(true)));
+    until(|| up_here(&a) == 6, "its next look brings back what it stopped").await;
+    assert_eq!(held_by(&rig, "holder-a").len(), 6, "nothing moved");
+    assert_eq!(handed_count(&rig), 0);
+    a.stop().await;
+    c.stop().await;
+}
+
+/// How many connections `holder` has up.
+fn up_here(holder: &PoolHolder) -> usize {
+    holder.state.registry.list().len()
+}
+
+/// How many load reports handed something over.
+fn handed_count(rig: &Rig) -> usize {
+    rig.book.reports.lock().unwrap().iter().filter(|r| !r["let_go"].as_array().unwrap().is_empty()).count()
+}
+
+weft_core::stress_test!(
+    name: a_copy_added_for_the_load_is_handed_work_and_the_pool_holds_steady,
+    runs: 4,
+    worker_threads: 4,
+    async fn body() {
+        spare_scenario().await;
+    }
+);
 
 /// A wake left from a row that woke, for a row registered again to be held,
 /// ends quietly instead of failing every retry of the alarm.

@@ -515,6 +515,13 @@ impl BrokerSignalClient {
         let _: Value = self.http.post(SIGNAL_LET_GO, req).await?;
         Ok(())
     }
+
+    /// Say a holder's load, letting go of what it hands over (see
+    /// [`SignalHolderLoadRequest`]).
+    pub async fn holder_load(&self, req: &SignalHolderLoadRequest) -> Result<()> {
+        let _: Value = self.http.post(SIGNAL_HOLDER_LOAD, req).await?;
+        Ok(())
+    }
 }
 
 // ---------- Provider events (listener serving surface) ----------
