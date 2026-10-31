@@ -69,7 +69,7 @@ pub async fn receive_event(
         method: "POST".to_string(),
     };
     let verdict: EventVerdict =
-        match crate::broker_admin::forward_json(&state, "/v1/events/verify", &verify).await {
+        match crate::broker_admin::forward_json(&state, weft_broker_client::protocol::EVENTS_VERIFY, &verify).await {
             Ok(v) => v,
             // The broker's status class IS the answer: a forged push
             // meets its 401 verbatim, an unknown source its 404.

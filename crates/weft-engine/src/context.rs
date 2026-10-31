@@ -4234,6 +4234,7 @@ mod replay_tests {
         let runner = crate::test_rig::LiveTestRunner::start(
             test_clients,
             test_catalog(),
+            Default::default(),
             "test-instance-1".into(),
             "tenant-1".into(),
             uuid::Uuid::from_u128(0x108),

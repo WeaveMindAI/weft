@@ -93,6 +93,28 @@ variable "signals_per_holder" {
   default     = 200
 }
 
+variable "holder_high_cpu_percent" {
+  description = "A holder whose CPU, averaged over a minute, reaches this percent hands part of its held signals over, keeping what brings it back to holder_target_cpu_percent: to a spare holder when one is up, else to any holder. A single signal is never split. Under this, a holder over the target hands signals over only to a spare."
+  type        = number
+  default     = 70
+  # SYNC: the holders' CPU rule <-> crates/weft-platform-traits/src/config.rs (InstallConfig::validate), serverless.tf (the config secret's precondition)
+  validation {
+    condition     = var.holder_high_cpu_percent == floor(var.holder_high_cpu_percent) && var.holder_high_cpu_percent >= 21 && var.holder_high_cpu_percent <= 100
+    error_message = "holder_high_cpu_percent is a whole percent from 21 to 100: a holder never uses more than 100% of its CPUs, and the target has to fit at least 20 under it."
+  }
+}
+
+variable "holder_target_cpu_percent" {
+  description = "The CPU each holder is meant to run at: weft runs as many holders as the CPU they say they use, summed, needs at this percent each (never fewer than the held signals need). It must be at least 20 under holder_high_cpu_percent: a holder says its CPU again only once it moved 10 points, so two holders merged into one can carry up to 20 more than they said, and the one left must stay under the high mark or the pool grows and shrinks for good."
+  type        = number
+  default     = 50
+  # SYNC: the holders' CPU rule <-> crates/weft-platform-traits/src/config.rs (InstallConfig::validate), serverless.tf (the config secret's precondition)
+  validation {
+    condition     = var.holder_target_cpu_percent == floor(var.holder_target_cpu_percent) && var.holder_target_cpu_percent >= 1
+    error_message = "holder_target_cpu_percent is a whole percent of 1 or more: every holder uses some CPU, so no count of them would be enough at 0."
+  }
+}
+
 variable "holder_cpu" {
   description = "The CPU of each holder."
   type        = string

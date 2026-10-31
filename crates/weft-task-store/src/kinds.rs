@@ -80,6 +80,16 @@ weft_core::wire_enum! {
         /// [`MAINTENANCE_LIFT_KEY`]. Producer = the dispatcher's own
         /// maintenance API; no caller of the broker may enqueue it.
         MaintenanceLift = "maintenance_lift",
+        /// Turn on a project's triggers (`weft activate`, weft bringing back
+        /// triggers that went down with their infra or the health check, a
+        /// change re-arming the triggers that read it), apart from whoever
+        /// asked: an activation waits on its setup run, which may wait on a
+        /// person, and the process asking may go away meanwhile. Carried by
+        /// its task, whose claim another dispatcher rescues, it goes on
+        /// from where its rows say it is. Its payload is the dispatcher's
+        /// own (`weft_dispatcher::task_kinds::activate`): the dispatcher is
+        /// its only producer, and no caller of the broker may enqueue it.
+        Activate = "activate",
     }
 }
 

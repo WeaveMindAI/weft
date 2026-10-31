@@ -161,6 +161,8 @@ mod tests {
             lifecycle: crate::activation_store::ActivationLifecycle::active(),
             program: None,
             source_version: None,
+            driver_task: None,
+            activating: None,
             cut: Some(crate::activation_store::RecordedCut {
                 fingerprint: "f".into(),
                 depends_on: depends_on.iter().map(|s| s.to_string()).collect(),

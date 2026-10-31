@@ -222,14 +222,19 @@ pub async fn workers_put(
     state.worker_defaults.with(levers).validate().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     state.projects.set_worker_overrides(project, levers).await.map_err(failed("save the worker levers"))?;
     if let Some(program) = state.projects.running_program_identity(project).await.map_err(failed("the running program"))? {
-        let target = crate::delivery::worker_target(state, actor.tenant().as_str(), project, &program.binary_hash)
+        // Read from the rows just written: this process's held copy of the
+        // levers hears the change a moment after it commits.
+        let target = crate::delivery::current_worker_target(state, actor.tenant().as_str(), project, &program.binary_hash)
             .await
             .map_err(failed("the worker target"))?;
         state.runner.prepare(&target).await.map_err(|e| {
             (StatusCode::BAD_GATEWAY, format!("the levers are saved, and the platform refused them for the running workers: {e:#}"))
         })?;
         // A project that takes calls has its front started again with the
-        // new levers (a container's or a revision's are fixed at its start).
+        // new levers (a container's or a revision's are fixed at its start),
+        // which settles the front's program on them. The running program is
+        // settled here too: it is another one when the triggers that are on
+        // still fire an older build.
         if crate::front::address(state, project).await.map_err(failed("the project's front"))?.is_some() {
             let unserved = |e: &anyhow::Error| {
                 (StatusCode::BAD_GATEWAY, format!("the levers are saved, and the project's front could not start with them: {e:#}"))
@@ -239,6 +244,7 @@ pub async fn workers_put(
                 return Err(unserved(e));
             }
         }
+        crate::front::settle(state, actor.tenant().as_str(), project, &program.binary_hash).await;
         // A queued event a failing hand-over stopped may run on the new
         // levers.
         crate::parked_drain::retry_stopped(state, project).await;

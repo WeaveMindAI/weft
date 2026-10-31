@@ -30,6 +30,20 @@ enum Command {
         #[arg(long)]
         log: Option<PathBuf>,
     },
+    /// Say where the install's database (`WEFT_DATABASE_URL`, as the roles
+    /// boot on it) stands against this weft's schema history: `empty`,
+    /// `current`, `older` (built before the history last restarted, which
+    /// no boot carries forward) or `newer`. Fails on the last two, the ones
+    /// a boot refuses. The install workflow runs it before it deploys
+    /// anything.
+    DatabaseHistory {
+        /// On an older database only: wipe weft's schema (every project's
+        /// run history, versions and stored connections) and build this
+        /// weft's in its place, then exit. Any other database is refused
+        /// and left as it is.
+        #[arg(long)]
+        wipe_older: bool,
+    },
     /// The agent beside an infra unit.
     UnitAgent {
         #[command(subcommand)]
@@ -60,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = match &args.command {
         Command::Serve { config, .. } => Some(weft_platform_traits::InstallConfig::load(config)?),
-        Command::UnitAgent { .. } => None,
+        Command::DatabaseHistory { .. } | Command::UnitAgent { .. } => None,
     };
     // Every weft crate at info, and the database libraries' own warnings
     // (`tokio_postgres`, and `deadpool`, which also covers
@@ -92,7 +106,25 @@ async fn main() -> anyhow::Result<()> {
             weft_core::time_scale::announce();
             let config = config.expect("the config of `serve` is read above");
             let role = role.as_deref().map(weft_platform_traits::CoreRole::parse).transpose().map_err(anyhow::Error::msg)?;
-            weft_runtime::serve(config, role).await
+            let platform = config.platform.clone();
+            weft_runtime::serve(config, role).await.map_err(|e| weft_runtime::schema::explain(e, &platform))
+        }
+        Command::DatabaseHistory { wipe_older } => {
+            // The same variable the roles read their database from.
+            // SYNC: WEFT_DATABASE_URL <-> crates/weft-platform-traits/src/config.rs (SECRET_ENV)
+            let url = std::env::var("WEFT_DATABASE_URL")
+                .ok()
+                .filter(|url| !url.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("WEFT_DATABASE_URL is required: the address of the database the install's roles boot on"))?;
+            let found = weft_runtime::schema::database_history(&url, wipe_older).await?;
+            if wipe_older {
+                tracing::info!(target: "weft_runtime", "the database was {found}: wiped, and this weft's schema built in its place");
+                println!("wiped");
+            } else {
+                tracing::info!(target: "weft_runtime", "the database is {found} against this weft's schema history");
+                println!("{found}");
+            }
+            Ok(())
         }
         Command::UnitAgent { command } => match command {
             AgentCommand::Serve => weft_runtime::unit_agent::serve().await,

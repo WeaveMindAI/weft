@@ -350,17 +350,54 @@ pub struct HolderSettings {
     /// copy up.
     #[serde(default = "HolderSettings::default_signals_per_copy", rename = "signalsPerCopy")]
     pub signals_per_copy: u32,
+    /// A holder whose CPU, averaged over a minute, reaches this share
+    /// (percent of the CPUs it is given) hands part of its signals over,
+    /// keeping what brings it back to [`Self::target_cpu_percent`], to a
+    /// spare when one is up and else to any holder; one connection is
+    /// never split. 70 leaves a busy holder room for a burst while another
+    /// takes them. Under it, a holder over the target hands work over only
+    /// to a spare.
+    #[serde(default = "HolderSettings::default_high_cpu_percent", rename = "highCpuPercent")]
+    pub high_cpu_percent: u8,
+    /// The CPU each holder is meant to run at (percent of the CPUs it is
+    /// given): weft runs as many holders as the load they say they carry,
+    /// summed, needs at this share each. It must stay at least two bands
+    /// ([`LOAD_BAND_PERCENT`]) under [`Self::high_cpu_percent`] (50 against
+    /// 70): a holder says its load again only once it moved a band, so two
+    /// holders merged into one when one stops can carry up to a band each
+    /// more than they said, and the one left must still be under the high
+    /// mark, or it hands work over at once, a copy comes back, and the pool
+    /// grows and shrinks for good.
+    #[serde(default = "HolderSettings::default_target_cpu_percent", rename = "targetCpuPercent")]
+    pub target_cpu_percent: u8,
 }
+
+/// How far (percent of its CPUs) a holder's load moves before it says it
+/// again: a load that stays within a band of what it last said writes
+/// nothing (`weft_listener::load`).
+pub const LOAD_BAND_PERCENT: u8 = 10;
 
 impl HolderSettings {
     fn default_signals_per_copy() -> u32 {
         200
     }
+
+    fn default_high_cpu_percent() -> u8 {
+        70
+    }
+
+    fn default_target_cpu_percent() -> u8 {
+        50
+    }
 }
 
 impl Default for HolderSettings {
     fn default() -> Self {
-        Self { signals_per_copy: Self::default_signals_per_copy() }
+        Self {
+            signals_per_copy: Self::default_signals_per_copy(),
+            high_cpu_percent: Self::default_high_cpu_percent(),
+            target_cpu_percent: Self::default_target_cpu_percent(),
+        }
     }
 }
 
@@ -523,6 +560,31 @@ impl InstallConfig {
         self.worker_settings().validate()?;
         if self.holders.signals_per_copy == 0 {
             return Err("holders.signalsPerCopy is 0: no holder could take a signal; set it to 1 or more".into());
+        }
+        let (high, target) = (self.holders.high_cpu_percent, self.holders.target_cpu_percent);
+        // SYNC: the holders' CPU rule <-> deploy/terraform/gcp/serverless.tf (the config secret's precondition), deploy/terraform/gcp/variables.tf (holder_*_cpu_percent validation)
+        if high > 100 {
+            return Err(format!("holders.highCpuPercent is {high}: a holder never uses more than 100% of its CPUs; set it to 100 or less"));
+        }
+        if target == 0 {
+            return Err("holders.targetCpuPercent is 0: every holder uses some CPU, so no count of them would be enough; set it to 1 or more".into());
+        }
+        if target >= high {
+            return Err(format!(
+                "holders.targetCpuPercent ({target}) is not under holders.highCpuPercent ({high}): a holder running at the share the pool \
+                 is counted for would hand its work over; set targetCpuPercent under highCpuPercent"
+            ));
+        }
+        if u16::from(target) + 2 * u16::from(LOAD_BAND_PERCENT) > u16::from(high) {
+            return Err(format!(
+                "holders.targetCpuPercent ({target}) is less than {} under holders.highCpuPercent ({high}): a holder says its load again \
+                 only once it moved {LOAD_BAND_PERCENT} points, so two holders merged into one because their loads fit under the target \
+                 can carry up to {} points more than they said; over the high mark the one left hands work over at once, a holder comes \
+                 back, and the pool would grow and shrink for good. Set targetCpuPercent to {} or less",
+                2 * LOAD_BAND_PERCENT,
+                2 * LOAD_BAND_PERCENT,
+                u16::from(high).saturating_sub(2 * u16::from(LOAD_BAND_PERCENT))
+            ));
         }
         for role in CoreRole::ALL {
             let placed = self.roles.of(role);
@@ -789,6 +851,33 @@ pub(crate) mod tests {
         assert_eq!(c.internet_address(), InternetAddress::QuickTunnel { metrics: "http://127.0.0.1:14120".into() });
         assert_eq!(c.own_base_url(), "http://192.168.1.20:14112");
         assert_eq!(gcp().internet_address(), InternetAddress::Fixed(gcp().public_url));
+    }
+
+    /// The holders' CPU shares default when left out, and a pair the pool
+    /// could not settle on is refused naming the setting.
+    #[test]
+    fn the_holders_cpu_shares_default_and_must_leave_two_bands() {
+        let mut unset = serde_json::to_value(gcp()).unwrap();
+        unset["holders"] = serde_json::json!({});
+        let read = serde_json::from_value::<InstallConfig>(unset).unwrap().holders;
+        assert_eq!((read.signals_per_copy, read.high_cpu_percent, read.target_cpu_percent), (200, 70, 50));
+        gcp().validate().unwrap();
+        let mut c = gcp();
+        c.holders.target_cpu_percent = 51;
+        assert!(c.validate().unwrap_err().contains("holders.targetCpuPercent (51) is less than 20 under holders.highCpuPercent (70)"));
+        assert!(c.validate().unwrap_err().contains("Set targetCpuPercent to 50 or less"));
+        c.holders.target_cpu_percent = 70;
+        assert!(c.validate().unwrap_err().contains("holders.targetCpuPercent (70) is not under holders.highCpuPercent (70)"));
+        c.holders.target_cpu_percent = 0;
+        assert!(c.validate().unwrap_err().contains("holders.targetCpuPercent is 0"));
+        let mut c = gcp();
+        c.holders.high_cpu_percent = 101;
+        assert!(c.validate().unwrap_err().contains("holders.highCpuPercent is 101"));
+        let mut c = gcp();
+        (c.holders.high_cpu_percent, c.holders.target_cpu_percent) = (100, 80);
+        c.validate().unwrap();
+        (c.holders.high_cpu_percent, c.holders.target_cpu_percent) = (20, 1);
+        assert!(c.validate().is_err(), "under two bands of room, no target fits");
     }
 
     #[test]

@@ -800,8 +800,8 @@ async fn setup(state: &DispatcherState, actor: &Actor, project_id: uuid::Uuid, r
     Ok(match crate::api::run::terminal_outcome(&state.pg_pool, run).await.map_err(failed("read how the setup ended"))? {
         None => SetupEnd::Going,
         Some(TerminalOutcome::Completed) => SetupEnd::Completed,
-        Some(TerminalOutcome::Failed) => SetupEnd::Failed,
-        Some(TerminalOutcome::Cancelled) => SetupEnd::Cancelled,
+        Some(TerminalOutcome::Failed(reason)) => SetupEnd::Failed { reason },
+        Some(TerminalOutcome::Cancelled(reason)) => SetupEnd::Cancelled { reason },
     })
 }
 

@@ -163,14 +163,22 @@ pub enum RebakeAnswer {
     NothingToSetUp,
 }
 
-crate::wire_enum! {
-    /// Where an infra setup run stands ([`InfraCall::Setup`]).
-    pub enum SetupEnd {
-        Going = "going",
-        Completed = "completed",
-        Failed = "failed",
-        Cancelled = "cancelled",
-    }
+/// Where an infra setup run stands ([`InfraCall::Setup`]): still going, or
+/// how it ended, with the reason its run recorded for a failure or a
+/// cancel (none when the run recorded none).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "end", rename_all = "snake_case")]
+pub enum SetupEnd {
+    Going,
+    Completed,
+    Failed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    Cancelled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -217,5 +225,19 @@ mod tests {
         assert_eq!(serde_json::to_value(InfraCancelAnswer { cancelled: true }).unwrap(), serde_json::json!({ "cancelled": true }));
     }
 
-    crate::wire_enum_roundtrip_tests!(SetupEnd);
+    #[test]
+    fn a_setup_end_carries_its_reason_under_its_tag() {
+        let cases = [
+            (SetupEnd::Going, serde_json::json!({ "end": "going" })),
+            (SetupEnd::Completed, serde_json::json!({ "end": "completed" })),
+            (SetupEnd::Failed { reason: Some("the extension is missing".into()) }, serde_json::json!({ "end": "failed", "reason": "the extension is missing" })),
+            (SetupEnd::Failed { reason: None }, serde_json::json!({ "end": "failed" })),
+            (SetupEnd::Cancelled { reason: Some("Cancelled by user".into()) }, serde_json::json!({ "end": "cancelled", "reason": "Cancelled by user" })),
+            (SetupEnd::Cancelled { reason: None }, serde_json::json!({ "end": "cancelled" })),
+        ];
+        for (end, wire) in cases {
+            assert_eq!(serde_json::to_value(&end).unwrap(), wire);
+            assert_eq!(serde_json::from_value::<SetupEnd>(wire).unwrap(), end);
+        }
+    }
 }

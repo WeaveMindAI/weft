@@ -377,29 +377,118 @@ fn edited_after_running<'a>(
 /// DDL of that day and the migrations before it were deleted, so no
 /// database built earlier can be carried forward. Every database built
 /// since records this id (under [`HISTORY_GROUP`]) when its first group is
-/// built, and one without it is refused with the way out.
+/// built, and one without it is refused with the way out. When the history
+/// restarts again, this id moves to [`PAST_EPOCHS`] and a new one takes its
+/// place, so the next weft knows this one's databases as older rather than
+/// newer.
+// SYNC: the history's start <-> scripts/lib/weft-cleanup.sh (weft_database_before_runs)
 const HISTORY_EPOCH: &str = "run";
+/// Every id the history started at before [`HISTORY_EPOCH`]: `serverless`,
+/// from the move off Kubernetes. A database built before that first restart
+/// records none at all.
+// SYNC: PAST_EPOCHS <-> scripts/lib/weft-cleanup.sh (weft_database_before_runs)
+const PAST_EPOCHS: &[&str] = &["serverless"];
 const HISTORY_GROUP: &str = "_history";
 
-/// Record the history's start on a new database, and refuse one that was
-/// built before it.
-async fn refuse_a_database_from_before_the_history(tx: &Transaction<'_>) -> anyhow::Result<()> {
-    let (built, current): (bool, bool) = tx
-        .one(
-            "SELECT EXISTS (SELECT 1 FROM weft_schema_stamp), \
-                    EXISTS (SELECT 1 FROM weft_migration WHERE group_name = $1 AND id = $2)",
-            &[&HISTORY_GROUP, &HISTORY_EPOCH],
-        )
-        .await?;
-    anyhow::ensure!(
-        !built || current,
-        "this database was built by an older weft (from before runs were renamed, or before \
-         it moved off Kubernetes), and its tables cannot be carried forward. Run ./setup.sh, \
-         which offers to wipe it (this deletes its projects' run history, versions and stored \
-         connections; your project folders are untouched), or wipe everything weft left on \
-         this machine with scripts/scrub-old-install.sh."
-    );
+/// Where a database stands against this weft's history ([`HISTORY_EPOCH`]),
+/// as its `_history` record says. `weft-runtime database-history` reports
+/// it, and the boot refuses the last two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Epoch {
+    /// Nothing of weft's built in it yet: the boot builds it.
+    Empty,
+    /// Built from this weft's history: the boot carries it forward.
+    Current,
+    /// Built by a weft from before this history started: nothing carries
+    /// it forward, and the one way out deletes what it holds
+    /// ([`rebuild_from_before_the_history`]).
+    Older,
+    /// Built by a weft whose history started after this one's (at
+    /// `epoch`): this weft is the old one, and must never touch it.
+    Newer { epoch: String },
+}
+
+impl std::fmt::Display for Epoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Epoch::Empty => f.write_str("empty"),
+            Epoch::Current => f.write_str("current"),
+            Epoch::Older => f.write_str("older"),
+            Epoch::Newer { .. } => f.write_str("newer"),
+        }
+    }
+}
+
+/// [`Epoch`] from what a database records: whether any group is built in
+/// it (`built`), and every id under [`HISTORY_GROUP`] (`recorded`). An id
+/// this weft does not know can only come from a later history: every
+/// earlier one is in [`PAST_EPOCHS`].
+fn epoch_from(built: bool, recorded: &[String]) -> Epoch {
     if !built {
+        return Epoch::Empty;
+    }
+    if recorded.iter().any(|id| id == HISTORY_EPOCH) {
+        return Epoch::Current;
+    }
+    match recorded.iter().find(|id| !PAST_EPOCHS.contains(&id.as_str())) {
+        Some(later) => Epoch::Newer { epoch: later.clone() },
+        None => Epoch::Older,
+    }
+}
+
+/// The [`Epoch`] of the database `db` is on. Reads only, so it is safe on a
+/// database of any age, one with no weft tables at all included.
+pub async fn epoch(db: &impl Client) -> anyhow::Result<Epoch> {
+    // Two statements: Postgres resolves every table a statement names
+    // before it runs, so whether the ledgers exist is asked first.
+    let ledgers: bool = db
+        .scalar("SELECT to_regclass('weft_schema_stamp') IS NOT NULL AND to_regclass('weft_migration') IS NOT NULL", &[])
+        .await?;
+    if !ledgers {
+        return Ok(Epoch::Empty);
+    }
+    let built: bool = db.scalar("SELECT EXISTS (SELECT 1 FROM weft_schema_stamp)", &[]).await?;
+    let recorded: Vec<String> =
+        db.scalars("SELECT id FROM weft_migration WHERE group_name = $1 ORDER BY id", &[&HISTORY_GROUP]).await?;
+    Ok(epoch_from(built, &recorded))
+}
+
+/// The boot's refusal of a database built before [`HISTORY_EPOCH`]
+/// ([`Epoch::Older`]). A type of its own so the process that knows where
+/// it runs can name the way out that works there: its text here names the
+/// local one, and `weft-runtime` names the cloud's on a cloud install
+/// (`weft_runtime::schema::explain`).
+#[derive(Debug)]
+pub struct BuiltBeforeTheHistory;
+
+impl BuiltBeforeTheHistory {
+    /// What is wrong, without the way out.
+    pub const WHAT: &'static str = "this database was built by an older weft (from before runs were renamed, \
+         or before it moved off Kubernetes), and its tables cannot be carried forward.";
+}
+
+impl std::fmt::Display for BuiltBeforeTheHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} Run ./setup.sh, which offers to wipe it (this deletes its projects' run history, versions \
+             and stored connections; your project folders are untouched), or wipe everything weft left on \
+             this machine with scripts/scrub-old-install.sh.",
+            Self::WHAT
+        )
+    }
+}
+
+impl std::error::Error for BuiltBeforeTheHistory {}
+
+/// Record the history's start on a new database, and refuse one that was
+/// built from any other history.
+async fn refuse_a_database_from_before_the_history(tx: &Transaction<'_>) -> anyhow::Result<()> {
+    let found = epoch(tx).await?;
+    if let Some(refused) = found.refusal() {
+        return Err(refused);
+    }
+    if found == Epoch::Empty {
         tx.execute(
             "INSERT INTO weft_migration (group_name, id, checksum) VALUES ($1, $2, '') ON CONFLICT DO NOTHING",
             &[&HISTORY_GROUP, &HISTORY_EPOCH],
@@ -407,6 +496,78 @@ async fn refuse_a_database_from_before_the_history(tx: &Transaction<'_>) -> anyh
         .await?;
     }
     Ok(())
+}
+
+impl Epoch {
+    /// Why the boot refuses a database at this epoch, or `None` when it
+    /// builds or carries it.
+    pub fn refusal(&self) -> Option<anyhow::Error> {
+        match self {
+            Epoch::Empty | Epoch::Current => None,
+            Epoch::Older => Some(BuiltBeforeTheHistory.into()),
+            Epoch::Newer { epoch } => Some(anyhow::anyhow!(
+                "this database was built by a newer weft (its history starts at '{epoch}', this weft's at \
+                 '{HISTORY_EPOCH}'), which this one cannot read. Run the weft that built it, or a newer one."
+            )),
+        }
+    }
+}
+
+/// Wipe a database built before this weft's history ([`Epoch::Older`])
+/// and build this weft's schema in it, as one boot on an empty database
+/// would: the cloud's way out of [`BuiltBeforeTheHistory`], which
+/// `weft-runtime database-history --wipe-older` runs.
+///
+/// What it wipes is the `public` schema, where weft keeps every table it
+/// has (the boot builds there, and the database it is given is weft's
+/// own): nothing outside it, no other schema, role or database. Every
+/// project's run history, versions and stored connections go with it.
+///
+/// It refuses unless the database really is older, read under the boot's
+/// lock in the same transaction that wipes, so it can never wipe one this
+/// weft or a later one built. And the wipe and the new schema's tables
+/// commit together: an older weft that boots on the database afterwards
+/// finds it built from a history it does not have, and refuses it, rather
+/// than finding it empty and building its own old tables in it again.
+pub async fn rebuild_from_before_the_history(
+    pool: &Pool,
+    groups: &[&SchemaGroup],
+    documents: &[&Document],
+) -> anyhow::Result<()> {
+    validate_groups(groups)?;
+    while_contended(|| wipe_and_expand_under_lock(pool, groups, MIGRATIONS)).await?;
+    apply_schema(pool, groups, documents).await
+}
+
+async fn wipe_and_expand_under_lock(pool: &Pool, groups: &[&SchemaGroup], migrations: &[Migration<'static>]) -> anyhow::Result<()> {
+    let mut conn = pool.get().await?;
+    let tx = locked_tx(&mut conn).await?;
+    let found = epoch(&tx).await?;
+    if let Some(why) = nothing_to_wipe(&found) {
+        anyhow::bail!("{why}");
+    }
+    tx.batch_execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public").await.context("wipe the public schema")?;
+    expand(&tx, groups, migrations).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Why [`rebuild_from_before_the_history`] wipes nothing on a database at
+/// `found`: every epoch but [`Epoch::Older`].
+fn nothing_to_wipe(found: &Epoch) -> Option<String> {
+    let what = match found {
+        Epoch::Older => return None,
+        Epoch::Empty => "it holds nothing of weft's yet, and the boot builds it as it is".to_string(),
+        Epoch::Current => "it was built from this weft's history, and the boot carries it forward as it is".to_string(),
+        Epoch::Newer { epoch } => format!(
+            "it was built by a newer weft (its history starts at '{epoch}', this weft's at '{HISTORY_EPOCH}'), \
+             so this weft is the old one"
+        ),
+    };
+    Some(format!(
+        "nothing was wiped: only a database built before this weft's history ('{HISTORY_EPOCH}') is ever \
+         wiped, and this one is not: {what}."
+    ))
 }
 
 /// Bring `pool`'s schema up to what `groups` describe, and its stored
@@ -775,9 +936,17 @@ pub(crate) async fn column_present(db: &impl Client, table: &str, column: &str) 
 async fn expand_under_lock(pool: &Pool, groups: &[&SchemaGroup], migrations: &[Migration<'static>]) -> anyhow::Result<()> {
     let mut conn = pool.get().await?;
     let tx = locked_tx(&mut conn).await?;
+    expand(&tx, groups, migrations).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The expand work itself, in `tx`, which holds the advisory lock; the
+/// caller commits.
+async fn expand(tx: &Transaction<'_>, groups: &[&SchemaGroup], migrations: &[Migration<'static>]) -> anyhow::Result<()> {
     tx.batch_execute(BOOKKEEPING_DDL).await?;
-    refuse_a_database_from_before_the_history(&tx).await?;
-    let states = group_states(&tx, groups, migrations).await?;
+    refuse_a_database_from_before_the_history(tx).await?;
+    let states = group_states(tx, groups, migrations).await?;
 
     // Every group that is new to this database is built from its
     // canonical DDL; its migrations (both parts) and origin are history it
@@ -794,10 +963,10 @@ async fn expand_under_lock(pool: &Pool, groups: &[&SchemaGroup], migrations: &[M
         tx.execute("INSERT INTO weft_schema_stamp (group_name, fingerprint) VALUES ($1, $2)", &[&st.group.name, &st.fp])
             .await?;
         for m in for_group(migrations, st.group.name) {
-            record_migration(&tx, st.group.name, m.id, m.sql).await?;
+            record_migration(tx, st.group.name, m.id, m.sql).await?;
         }
         if let Some(origin) = embedded_origin(st.group.name) {
-            record_migration(&tx, st.group.name, ORIGIN_ID, origin).await?;
+            record_migration(tx, st.group.name, ORIGIN_ID, origin).await?;
         }
     }
 
@@ -813,7 +982,7 @@ async fn expand_under_lock(pool: &Pool, groups: &[&SchemaGroup], migrations: &[M
     for st in &states {
         if st.stamped.as_deref() != Some(st.fp.as_str())
             || !pending(&for_group(migrations, st.group.name), &st.applied).is_empty()
-            || missing_tables(&tx, &[st.group]).await?.is_empty()
+            || missing_tables(tx, &[st.group]).await?.is_empty()
         {
             continue;
         }
@@ -825,8 +994,7 @@ async fn expand_under_lock(pool: &Pool, groups: &[&SchemaGroup], migrations: &[M
         }
     }
 
-    run_pending(&tx, &states, migrations, Part::Expand).await?;
-    tx.commit().await?;
+    run_pending(tx, &states, migrations, Part::Expand).await?;
     Ok(())
 }
 
@@ -3558,5 +3726,46 @@ mod tests {
         };
         assert_eq!(key(&disk), key(&embedded));
         assert_eq!(disk.origins, embedded.origins);
+    }
+
+    /// A database's place against this weft's history, from what it
+    /// records: nothing built is empty whatever it records, this weft's id
+    /// is current, ids from earlier histories (or none, before the first
+    /// restart) are older, and an id this weft does not know is a later
+    /// history's, never mistaken for an older one (which the wipe would
+    /// then take).
+    #[test]
+    fn a_database_is_placed_against_the_history_by_what_it_records() {
+        use super::{epoch_from, Epoch, HISTORY_EPOCH};
+        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        assert_eq!(epoch_from(false, &ids(&[])), Epoch::Empty);
+        assert_eq!(epoch_from(false, &ids(&["serverless"])), Epoch::Empty);
+        assert_eq!(epoch_from(true, &ids(&[HISTORY_EPOCH])), Epoch::Current);
+        assert_eq!(epoch_from(true, &ids(&["serverless", HISTORY_EPOCH])), Epoch::Current);
+        assert_eq!(epoch_from(true, &ids(&[])), Epoch::Older);
+        assert_eq!(epoch_from(true, &ids(&["serverless"])), Epoch::Older);
+        assert_eq!(epoch_from(true, &ids(&["later"])), Epoch::Newer { epoch: "later".into() });
+        assert_eq!(epoch_from(true, &ids(&["serverless", "later"])), Epoch::Newer { epoch: "later".into() });
+    }
+
+    /// Only an older database is ever wiped; every other one names why
+    /// nothing was.
+    #[test]
+    fn only_an_older_database_is_wiped() {
+        use super::{nothing_to_wipe, Epoch};
+        assert_eq!(nothing_to_wipe(&Epoch::Older), None);
+        for found in [Epoch::Empty, Epoch::Current, Epoch::Newer { epoch: "later".into() }] {
+            let why = nothing_to_wipe(&found).expect("refused");
+            assert!(why.starts_with("nothing was wiped"), "{why}");
+        }
+        assert!(nothing_to_wipe(&Epoch::Newer { epoch: "later".into() }).unwrap().contains("'later'"));
+    }
+
+    /// The history's current id is never also a past one: a database it
+    /// built would then read as older, and the wipe would take it.
+    #[test]
+    fn the_current_history_is_not_a_past_one() {
+        use super::{HISTORY_EPOCH, PAST_EPOCHS};
+        assert!(!PAST_EPOCHS.contains(&HISTORY_EPOCH));
     }
 }

@@ -1,7 +1,7 @@
 {
   "type": "PostgresDatabase",
   "label": "Postgres: Database",
-  "description": "Run a Postgres database inside the project, with a disk that survives restarts; wire its access output into the query and write nodes. Its generated password is handed out exactly ONCE, to whoever asks first: until then the node's card shows it masked with a copy button (how an outside client, such as a frontend with its own tables, gets in); afterwards the card's Reset password button mints and shows a new one. `weft infra env <node> --into .env --set DATABASE_USER=User --set DATABASE_PASSWORD=Password` writes both into an env file without anyone reading the password; once handed over, `weft infra press <node> reset_password` then `weft infra env` writes a fresh one (`weft infra show <node>` lists the buttons). Terminating its infra deletes the disk and all data.",
+  "description": "Run a Postgres database inside the project, with a disk that survives restarts; wire its access output into the query and write nodes. Its generated password is handed out exactly ONCE, to whoever asks first: until then the node's card shows it masked with a copy button (how an outside client, such as a frontend with its own tables, gets in); afterwards the card's Reset password button mints and shows a new one. `weft infra env <node> --into .env --set DATABASE_USER=User --set DATABASE_PASSWORD=Password` writes both into an env file without anyone reading the password; once handed over, `weft infra press <node> reset_password` then `weft infra env` writes a fresh one (`weft infra show <node>` lists the buttons). Every client (the program's workers, a frontend) signs in as `app`, which owns the database and is no superuser, through the node's pooler: Postgres serves a fixed number of connections (see `memory`), and a client past them waits its turn instead of being refused, however many workers run. A connection that sits idle for a minute is closed by the database, so an outside client's own pool must expect an idle connection to be gone (most close theirs sooner). Watching queries (PostgresWatchQuery) have their own share of the connections, a quarter of them. Through the pooler a client reaches this one database only, never Postgres's own `postgres` database or another one made beside it. An extension the program needs, trusted by Postgres or not, goes in `extensions`: the superuser `weft` makes it on every start, and `app` uses it. The superuser signs in only over the unix socket inside the database's own container. Postgres note: a function called in a `cross join lateral (select f(x) as v)` subquery and read several times through `v` can run once per read, because Postgres folds the subquery into the outer query; `offset 0` inside the subquery keeps it to one call. Terminating its infra deletes the disk and all data.",
   "tags": [
     "postgres",
     "database",
@@ -15,7 +15,8 @@
     "liveEndpoint": "credential"
   },
   "images": [
-    "images/credential"
+    "images/credential",
+    "images/pooler"
   ],
   "publishes": "postgres",
   "inputs": [
@@ -24,7 +25,7 @@
       "type": "String",
       "default": "app",
       "label": "Database name",
-      "description": "Database created on first start. Changing it later creates nothing, and the connection then names a database that does not exist."
+      "description": "Database created on first start, any name. Changing it later creates nothing, and the connection then names a database that does not exist. A client signs in by the name the card shows under Database: this one when it is only letters, digits, `_` and `-`, at most 57 characters and not `pgbouncer`, otherwise (or when it is `all`, `sameuser`, `samerole`, `samegroup` or `replication`) one the pooler makes from it (`db_my_app_1a2b3c4d`), which reaches the database under its own name."
     },
     {
       "name": "storage",
@@ -38,7 +39,14 @@
       "type": "String",
       "default": "17",
       "label": "Postgres version",
-      "description": "Postgres major version. Changing it on an existing database does not migrate: Postgres refuses a data directory from another major version."
+      "description": "Postgres major version. A new database needs 14 or later; an existing one on an older Postgres keeps running, without closing connections a client left idle, and its card and `weft infra status` say how to move it. Changing it on an existing database does not migrate: Postgres refuses a data directory from another major version."
+    },
+    {
+      "name": "extensions",
+      "type": "List[String]",
+      "default": [],
+      "label": "Extensions",
+      "description": "Extensions the program's database needs, as Postgres names them (`[\"pg_trgm\", \"postgres_fdw\"]`). On every start the superuser makes each one that is not there yet, so the program, signed in as `app`, uses them, including those Postgres does not let a non-superuser make. One this Postgres does not have fails the start, and `weft infra status` names it. Taking one off the list leaves it in the database. Changing the list restarts the database."
     },
     {
       "name": "reachable",
@@ -59,7 +67,7 @@
       "type": "String",
       "default": "1Gi",
       "label": "Memory",
-      "description": "Memory, a number followed by Gi, Mi, G or M (`1Gi`). It takes at least 886Mi, the least that holds the 20 connections one worker of the program opens. Sized with `cpu`. Postgres is set up for it: 320Mi stays with the machine and the rest is Postgres's, so at 1Gi it takes 24 connections, at 2Gi 60, at 4Gi 132 (200 at most). Each worker of the program opens up to 20, so a second worker or an outside client (a frontend) beside one wants 2Gi. If the database is killed for running out of memory, or refuses a connection with `too many clients`, raise `memory`. A local install uses the same settings and caps the container the same way."
+      "description": "Memory, a number followed by Gi, Mi, G or M (`1Gi`). It takes at least 565Mi. Sized with `cpu`. Postgres is set up for it: 352Mi stays with the machine (the pooler and the helper beside Postgres included) and the rest is Postgres's, so at 1Gi it serves 23 connections, at 2Gi 59, at 4Gi 131 (200 at most). Three of them are kept for the superuser and two spare; of the rest a quarter is for watching queries and the others for every other query. When every connection is busy, a client waits for one rather than being refused. If runs often wait for the database, or it is killed for running out of memory, raise `memory`. A local install uses the same settings and caps the container the same way."
     },
     {
       "name": "machineType",
@@ -78,6 +86,66 @@
     }
   ],
   "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "database"
+          },
+          {
+            "kind": "config_matches",
+            "field": "database",
+            "regex": "^$|\\p{Cc}"
+          }
+        ]
+      },
+      "then": {
+        "message": "PostgresDatabase '{id}' has a `database` name that is empty or holds a line break or another control character; name it without (app).",
+        "level": "structural",
+        "severity": "error",
+        "port": "database"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "version"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "version",
+              "regex": "^[1-9][0-9]{0,3}(\\.(0|[1-9][0-9]*))?$"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "PostgresDatabase '{id}' has a `version` that is not a Postgres version. Write its major version (17).",
+        "level": "structural",
+        "severity": "error",
+        "port": "version"
+      }
+    },
+    {
+      "when": {
+        "kind": "config_matches",
+        "field": "version",
+        "regex": "^([1-9]|1[0-3])(\\.(0|[1-9][0-9]*))?$"
+      },
+      "then": {
+        "message": "PostgresDatabase '{id}' runs a Postgres older than 14, which does not close connections a client left idle: an existing database keeps running without that, and a new one is refused when it starts. To move to 14 or later: Postgres cannot open an older version's data, so the data moves by dump and restore while the old database still runs. Dump it: `weft infra press {id} reset_password`, then `weft infra env {id} --into old.env --set PGUSER=User --set PGDATABASE=Database --as PGPASSWORD`, and with those exported, `pg_dump -Fc -h <host> -p <port> -f data.dump` at the address `weft infra list-doors` prints for it (turn `reachable` on first if it is off). Restore it: add a PostgresDatabase on 17 with `reachable` on, start it, write its env the same way, `pg_restore --no-owner -h <host> -p <port> -d \"$PGDATABASE\" data.dump`, and wire the new node where the old one was.",
+        "level": "structural",
+        "severity": "warning",
+        "port": "version"
+      }
+    },
     {
       "when": {
         "kind": "all",

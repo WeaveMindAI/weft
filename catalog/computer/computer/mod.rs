@@ -104,6 +104,7 @@ impl Node for ComputerNode {
             endpoints,
             keep_on_terminate: Vec::new(),
             health_rules: None,
+            notes: Vec::new(),
         })
     }
 

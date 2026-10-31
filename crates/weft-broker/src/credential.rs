@@ -86,7 +86,11 @@ pub struct DesignKeyRequest {
 /// a connection to as "nothing was done, send it again"
 /// (`handlers::unavailable_or_internal`), so a source that writes keeps
 /// each call to one statement or one transaction, or to writes that
-/// repeat harmlessly.
+/// repeat harmlessly. A resolve whose answer was lost on the way (the
+/// line broke) is sent again whole (`ACCESS_RESOLVE` is harmless twice),
+/// so a source that leases a credential per firing hands the same firing
+/// (`run_id`, `node_id`, `frames`) the lease it already holds, never a
+/// second one its caller would not know to close.
 #[async_trait::async_trait]
 pub trait CredentialSource: Send + Sync {
     async fn resolve(&self, pool: &Pool, req: &KeyRequest) -> Result<KeyResolution>;

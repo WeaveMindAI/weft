@@ -70,7 +70,9 @@ function copyBadge(copy: TriggerCopy): LifecycleBadge {
 function copyDetail(copy: TriggerCopy): string {
 	const lines: string[] = [];
 	switch (copy.state) {
-		case 'turning_on': lines.push('Its setup is running.'); break;
+		case 'turning_on':
+			lines.push(copy.progress ? `Turning on ${describeProgress(copy.progress, copy.progress.asOfUnix)}.` : 'Turning on.');
+			break;
 		case 'on': lines.push('On.'); break;
 		case 'behind': lines.push('On, firing an older version of the program. Resync brings it up to date.'); break;
 		case 'off': lines.push(copy.mode === 'registered' ? 'Off: never turned on.' : `Off: its door ${doorWords(copy.mode)}.`); break;

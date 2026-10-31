@@ -67,7 +67,11 @@ pub(crate) async fn serve(state: &DispatcherState, project: uuid::Uuid, port: Op
     .await
 }
 
-/// [`serve`]'s work, under its lock.
+/// [`serve`]'s work, under its lock. The front runs the settings the
+/// project has stored now ([`crate::delivery::current_worker_target`]),
+/// never a held copy from before a change. It settles nothing: the reaper
+/// comes through here every half minute, and the workers are settled
+/// where the settings or the build change ([`settle`]).
 async fn put_in_place(state: &DispatcherState, project: uuid::Uuid, port: Option<u16>) -> anyhow::Result<Option<ProjectAddress>> {
     if !takes_work(state, project).await? {
         return Ok(None);
@@ -76,10 +80,21 @@ async fn put_in_place(state: &DispatcherState, project: uuid::Uuid, port: Option
         return Ok(None);
     };
     let tenant = state.projects.tenant_for(project).await?.ok_or_else(|| anyhow::anyhow!("project {project} is not registered"))?;
-    let target = crate::delivery::worker_target(state, &tenant, project, &binary).await?;
+    let target = crate::delivery::current_worker_target(state, &tenant, project, &binary).await?;
+    Ok(Some(open(state, project, port, &target).await?))
+}
+
+/// Make `target` the project's front (`Runner::front`), on the project's
+/// port when the install gives projects one.
+async fn open(
+    state: &DispatcherState,
+    project: uuid::Uuid,
+    port: Option<u16>,
+    target: &weft_platform_traits::WorkerTarget,
+) -> anyhow::Result<ProjectAddress> {
     let Some(ports) = &state.project_ports else {
         anyhow::ensure!(port.is_none(), "this install gives projects no port: a project's own address is the platform's");
-        return Ok(Some(state.runner.front(&target, None).await?));
+        return state.runner.front(target, None).await;
     };
     let mut at = ports.port_of(&state.pg_pool, project, port).await?;
     // A port another program took moves the project to a free one, except
@@ -89,8 +104,8 @@ async fn put_in_place(state: &DispatcherState, project: uuid::Uuid, port: Option
     // in between makes another.
     const MOVES: usize = 3;
     for _ in 0..MOVES {
-        match state.runner.front(&target, Some(at)).await {
-            Ok(address) => return Ok(Some(address)),
+        match state.runner.front(target, Some(at)).await {
+            Ok(address) => return Ok(address),
             Err(e) => match weft_platform_traits::PortTaken::of(&e) {
                 Some(taken) if port.is_some() => {
                     anyhow::bail!("port {taken}, which `weft activate --port` asked for, was taken by another program as the project activated")
@@ -104,6 +119,30 @@ async fn put_in_place(state: &DispatcherState, project: uuid::Uuid, port: Option
         }
     }
     anyhow::bail!("every free port tried for project {project} was taken by another program before its front could open it")
+}
+
+/// Settle the project's workers at the image of `binary_hash` on the
+/// settings it has stored (`Runner::settle`): what the platform keeps
+/// running of that image under other settings is let go. Under the
+/// project's front lock, the one every change of its front takes, so a
+/// settling never reads settings older than a front a sibling process
+/// just put in place. Logged, never raised: the stored settings already
+/// serve, and what lingers takes no calls.
+pub(crate) async fn settle(state: &DispatcherState, tenant: &str, project: uuid::Uuid, binary_hash: &str) {
+    let settled = locked(state, project, || async {
+        let target = crate::delivery::current_worker_target(state, tenant, project, binary_hash).await?;
+        state.runner.settle(&target).await
+    })
+    .await;
+    if let Err(e) = settled {
+        tracing::error!(
+            target: "weft_dispatcher::front",
+            %project,
+            error = %format!("{e:#}"),
+            "could not let go of all the project's workers running under settings it no longer has; they take no \
+             calls and scale to zero once nothing calls them, and the next settings change or activation tries again"
+        );
+    }
 }
 
 /// The binary that answers `project`'s routes: the one its triggers that

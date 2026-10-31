@@ -1243,10 +1243,15 @@ async fn shutdown_signal() {
 
 /// Once the platform told the worker to stop ([`Worker::stopping`], which
 /// hands every recorded run back): wait for the runs it still drives to
-/// end and every record queued to be written. No deadline: what is waited
-/// on is the work already under way, and the platform's kill is the bound.
+/// end, let go of what they shared, and wait for every record queued to
+/// be written. No deadline: what is waited on is the work already under
+/// way, and the platform's kill is the bound.
 async fn wind_down(worker: &Worker) {
     worker.background.wait_zero().await;
+    // No run is left to use them: a pool's connections are given back to
+    // the database now, while the records go out, rather than held until
+    // the process is gone.
+    worker.clients.shared.let_go_all();
     // Every run's rows still queued go out before the process does: a
     // fast run that ended leaves its record trailing behind it.
     worker.clients.writer.written().await;
@@ -2364,6 +2369,25 @@ mod tests {
         assert!(worker.stopping.is_cancelled(), "the records went out: it stops then");
         assert!(waiting.flag.is_cancelled());
         drop((waiting, quiet, journal));
+    }
+
+    /// A stopping worker lets go of what its runs shared once the last one
+    /// ended, and not before: a pool's connections are given back to the
+    /// database then, rather than when the process goes.
+    #[tokio::test]
+    async fn winding_down_lets_go_of_what_the_runs_shared_once_they_ended() {
+        let (worker, _broker) = worker_firing(|_, _| {});
+        drop(worker.clients.shared.named::<usize, _, _>("pool", || async { Ok(1) }).await.unwrap());
+        let run = worker.background.token();
+        let winding = tokio::spawn({
+            let worker = worker.clone();
+            async move { wind_down(&worker).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(worker.clients.shared.len(), 1, "a run still going keeps it");
+        drop(run);
+        tokio::time::timeout(std::time::Duration::from_secs(5), winding).await.expect("wound down").unwrap();
+        assert!(worker.clients.shared.is_empty(), "let go once the runs ended");
     }
 
     /// A line the broker keeps for good never stops the worker.

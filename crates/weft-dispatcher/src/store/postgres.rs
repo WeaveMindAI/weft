@@ -764,7 +764,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // held set changes: a held signal comes or goes (so the holders
         // start as the first one is registered and stop with the last),
         // gives up, or loses its holder (a let-go, a rewrite, a dead
-        // holder's check), so another holder takes it.
+        // holder's check), so another holder takes it, or moves from one
+        // holder to another (a hand-over to a spare), so the spare looks
+        // and brings it up.
         // SYNC: 'weft_held_signals' <-> crate::holders::HELD_SIGNALS_CHANNEL
         r#"CREATE OR REPLACE FUNCTION signal_held_notify() RETURNS trigger AS $$
             BEGIN
@@ -794,7 +796,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE TRIGGER signal_held_on_release
             AFTER UPDATE OF held_by ON signal
             FOR EACH ROW
-            WHEN (NEW.holds AND NEW.held_by IS NULL AND OLD.held_by IS NOT NULL)
+            WHEN (NEW.holds AND OLD.held_by IS NOT NULL AND NEW.held_by IS DISTINCT FROM OLD.held_by)
             EXECUTE FUNCTION signal_held_notify()"#,
         // Tell every dispatcher a tenant's routes changed, so its copy of
         // them (`crate::held::Held::routes`) is read again: a public entry

@@ -172,6 +172,9 @@ jobs:
         run: |
           terraform init -backend=false -input=false
           terraform validate
+      # What the install workflow's targeted applies add for every
+      # `moved` block, read from the files above.
+      - run: scripts/terraform-moved-targets.test.sh
 
   # The name the main ruleset requires: green only when every Rust check
   # above is, and the Terraform the install runs validates. It runs whatever happened above (unless the run was
@@ -279,6 +282,14 @@ jobs:
       # The bridge's pure parts; `node --test` needs no install.
       - run: node --test catalog/bailey/bridge/images/bridge/src/*.test.js
 
+  postgres-credential:
+    name: Postgres credential container tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The container's pure parts, on the standard library alone.
+      - run: python3 catalog/postgres/database/images/credential/test_bootstrap.py
+
   # Kilo Code's Tangle plugin (`tangle/kilo-code/`): its tests are
   # TypeScript run straight by `node --test`, which strips the types
   # itself from Node 22.18 on, so they need no install either.
@@ -315,7 +326,7 @@ jobs:
   # The name the main ruleset requires (see the `rust` job).
   editor:
     name: graph + editor
-    needs: [graph, connect, syntax, vscode, bridge, tangle, browser]
+    needs: [graph, connect, syntax, vscode, bridge, postgres-credential, tangle, browser]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     env:

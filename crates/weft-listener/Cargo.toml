@@ -20,6 +20,9 @@ chrono-tz = { workspace = true }
 feed-rs = "3"
 dashmap = "6"
 inventory = { workspace = true }
+# A holder reads its own CPU time (`getrusage`) to say its load
+# (`load`).
+libc = "0.2"
 # The folder watch kind hears a folder through the operating system's
 # change events (inotify on Linux).
 notify = "8"

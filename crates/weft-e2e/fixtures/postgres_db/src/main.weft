@@ -13,7 +13,9 @@
 # ordering wire, any value on it means go); `read` waits on `write`
 # through the port it reads.
 
-db = PostgresDatabase
+# Named with a dash, which the pooler reads as written, so clients sign
+# in by the database's own name.
+db = PostgresDatabase { database: "notes-db" }
 
 create = PostgresExecuteQuery {
   query: "CREATE TABLE IF NOT EXISTS notes (id serial primary key, body text, tag text)"
@@ -57,3 +59,15 @@ optional.photo = maybe.photo
 
 absent = Debug
 absent.data = optional.rows
+
+# One firing is one session, whatever stands between the program and
+# Postgres: a setting made by the script's first statement is still
+# there for its last. And the program signs in as its own role, which is
+# no superuser.
+session = PostgresExecuteQuery {
+  query: "SET application_name = 'one session'; SELECT current_setting('application_name') AS name, current_user AS signed_in, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS superuser"
+}
+session.account = db.access
+
+same = Debug
+same.data = session.rows

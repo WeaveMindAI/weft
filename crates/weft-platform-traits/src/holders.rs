@@ -111,12 +111,6 @@ impl HeldCheck {
 
 #[async_trait]
 pub trait HolderLiveness: Send + Sync {
-    /// Whether a holder here is one copy of a pool the platform keeps
-    /// running: it keeps a check, since a copy that dies leaves its claims
-    /// behind, and a copy that ends is replaced by a new one, which looks
-    /// as it starts. `false` for an install's one process ([`OneProcess`]).
-    fn pooled(&self) -> bool;
-
     /// Schedule `check`. An error means it may not be scheduled.
     async fn push(&self, check: &HeldCheck) -> anyhow::Result<()>;
 
@@ -139,10 +133,6 @@ impl AlarmLiveness {
 
 #[async_trait]
 impl HolderLiveness for AlarmLiveness {
-    fn pooled(&self) -> bool {
-        true
-    }
-
     async fn push(&self, check: &HeldCheck) -> anyhow::Result<()> {
         self.alarm.set(check.wake()?).await
     }
@@ -167,10 +157,6 @@ impl HolderPool for OneProcessHolds {
 
 #[async_trait]
 impl HolderLiveness for OneProcessHolds {
-    fn pooled(&self) -> bool {
-        false
-    }
-
     async fn push(&self, _check: &HeldCheck) -> anyhow::Result<()> {
         Ok(())
     }

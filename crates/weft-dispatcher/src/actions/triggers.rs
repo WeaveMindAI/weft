@@ -8,17 +8,19 @@
 //! is one of them, so it would wait on itself ([`refuse_own_resync`]).
 
 use axum::http::StatusCode;
-use weft_core::activation::{ActivateRequest, ActivateResponse, ActivationScope, BakeRequest, CancelActivateResponse};
+use weft_core::activation::{ActivateRequest, ActivateResponse, ActivateStarted, ActivationScope, BakeRequest, CancelActivateResponse};
 use weft_core::deactivation::{DeactivateRequest, DeactivateResponse, ResyncAnswer, ResyncRequest, ResyncResponse};
 use weft_core::program::triggers::{BakeAnswer, TriggerCall};
 use weft_core::program::ProgramCallOutcome;
 use weft_core::StopSelf;
+use weft_task_store::db::Client as _;
 
 use super::{answered, failed, stop_asker, Actor, Refused};
 use crate::api::project::{
     activate_with, coherent_definition, deactivate_scope, end_unfinished_activation, instances_with_triggers_on, keys_by_owner,
     keys_to_take_down, on_another_binary, on_another_binary_refusal, prepare_trigger_setup, refuse_unrunnable, require_action,
-    require_registered_build, require_trigger_infra, resolve_scope, run_trigger_setup, ActivateAsker, Desired, StatusError, Unrunnable,
+    require_registered_build, require_trigger_infra, resolve_scope, run_trigger_setup, ActivateAsker, ActivateError, Desired, StatusError,
+    Unrunnable,
 };
 use crate::events::DispatcherEvent;
 use crate::state::DispatcherState;
@@ -71,11 +73,9 @@ fn refuse_own_resync(actor: &Actor, project: uuid::Uuid) -> Result<(), Refused> 
     }
 }
 
-/// `POST /projects/{id}/activate`, `ctx.triggers().activate(..)`: turn on
-/// the triggers the request names that are off ([`activate_with`], as a
-/// person or a program asks). A port the request names is checked before
-/// anything is activated, so a taken one refuses the activation and
-/// changes nothing.
+/// `ctx.triggers().activate(..)`: turn on the triggers the request names
+/// that are off ([`activate_checked`]), under the claim of the program's
+/// call's own task (`crate::task_kinds::program_call`).
 pub(crate) async fn activate(
     state: &DispatcherState,
     actor: &Actor,
@@ -83,16 +83,44 @@ pub(crate) async fn activate(
     request: ActivateRequest,
 ) -> Result<ActivateResponse, Refused> {
     actor.may_act_on(state, id).await?;
+    Ok(activate_checked(state, id, request).await?)
+}
+
+/// `POST /projects/{id}/activations` (`weft activate`): hand the activation to
+/// a task of its own (`crate::task_kinds::activate`) and answer that task
+/// at once, for the person to follow in short looks
+/// (`GET /projects/{id}/follow/{task}`): it waits on its setup run, which
+/// may wait on a person, and goes on whatever becomes of this request or
+/// of the dispatcher copy that took it.
+pub(crate) async fn begin_activate(
+    state: &DispatcherState,
+    actor: &Actor,
+    id: uuid::Uuid,
+    request: ActivateRequest,
+) -> Result<ActivateStarted, Refused> {
+    actor.may_act_on(state, id).await?;
+    let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("start the activation: {e:#}"));
+    let tenant = state.projects.tenant_for(id).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, "project not found".to_string()))?;
+    let payload = crate::task_kinds::activate::ActivatePayload { request, asker: crate::task_kinds::activate::TaskAsker::Outside };
+    let task = weft_task_store::tasks::enqueue(&state.pg_pool, crate::task_kinds::activate::task(&tenant, id, &payload)).await.map_err(internal)?;
+    Ok(ActivateStarted { task })
+}
+
+/// Turn on the triggers `request` names that are off, as a person or a
+/// program asks ([`activate_with`]). A port the request names is checked
+/// before anything is activated, so a taken one refuses the activation and
+/// changes nothing.
+pub(crate) async fn activate_checked(state: &DispatcherState, id: uuid::Uuid, request: ActivateRequest) -> Result<ActivateResponse, ActivateError> {
     if let Some(port) = request.port {
         let Some(ports) = &state.project_ports else {
-            return Err((StatusCode::BAD_REQUEST, "this install gives projects no port: a project's own address is the platform's".into()));
+            return Err(ActivateError::Failed(
+                StatusCode::BAD_REQUEST,
+                "this install gives projects no port: a project's own address is the platform's".into(),
+            ));
         };
-        let taken = ports
-            .check_asked(&state.pg_pool, id, port)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("check port {port}: {e:#}")))?;
+        let taken = ports.check_asked(&state.pg_pool, id, port).await.map_err(|e| ActivateError::failed(&format!("check port {port}"), e))?;
         if let Some(why) = taken {
-            return Err((
+            return Err(ActivateError::Failed(
                 StatusCode::CONFLICT,
                 format!("{why}, so nothing was activated: free it, or leave out `--port` and the project keeps a port of its own"),
             ));
@@ -174,9 +202,14 @@ pub(crate) struct Deactivated {
 /// 409 for a cancel naming triggers or an instance while a resync holds
 /// the project: the resync covers every owner's triggers, so only the
 /// unnamed cancel gives it up. 404 for a named trigger with no activation.
-/// 412 if none of them is activating and the project holds no resync: the
-/// user (or a stale UI) clicked cancel against triggers that are already
-/// up or already down.
+/// An activate whose task no dispatcher claimed yet, reaching a trigger
+/// the cancel names, is failed before it starts
+/// ([`fail_activates_not_started`]); one under way ends as every other
+/// activation here, and its task answers whoever follows it with why.
+///
+/// 412 if none of them is activating, no activate reaching them waits to
+/// start, and the project holds no resync: the user (or a stale UI)
+/// clicked cancel against triggers that are already up or already down.
 pub(crate) async fn cancel_activate(
     state: &DispatcherState,
     actor: &Actor,
@@ -228,7 +261,10 @@ pub(crate) async fn cancel_activate(
         .filter(|a| keys.contains(&a.key))
         .filter_map(|a| a.lifecycle.activating_run_id)
         .collect();
-    if activations.is_empty() && given_up.is_none() {
+    // An activate whose task no dispatcher claimed yet holds no trigger,
+    // so the rows do not show it: its task fails before it starts.
+    let not_started = fail_activates_not_started(state, id, scope).await.map_err(|e| internal("cancel the activates not started", e))?;
+    if activations.is_empty() && given_up.is_none() && not_started == 0 {
         return Err((
             StatusCode::PRECONDITION_FAILED,
             "cancel-activate: none of these triggers is activating".into(),
@@ -244,6 +280,46 @@ pub(crate) async fn cancel_activate(
         .await;
     let resync_given_up = given_up.and_then(|plan| plan.given_up).map(|given_up| given_up.left_down);
     Ok(CancelActivateResponse { resync_given_up })
+}
+
+/// Fail every `activate` task of project `id` no dispatcher claimed yet
+/// whose request reaches a trigger `scope` names ([`reaches`]), so it
+/// never starts: what `weft cancel-activate` does to an activate it beat
+/// to its first step. Answers how many.
+async fn fail_activates_not_started(state: &DispatcherState, id: uuid::Uuid, scope: &ActivationScope) -> anyhow::Result<usize> {
+    let waiting: Vec<(uuid::Uuid, weft_task_store::db::JsonText<serde_json::Value>)> = state
+        .pg_pool
+        .all(
+            "SELECT id, payload FROM task WHERE project_id = $1 AND kind = $2 AND status = 'pending'",
+            &[&id, &weft_task_store::TaskKind::Activate.as_str()],
+        )
+        .await?;
+    let mut failed = 0;
+    for (task, payload) in waiting {
+        let payload: crate::task_kinds::activate::ActivatePayload = serde_json::from_value(payload.0)?;
+        if reaches(scope, &payload.request.scope)
+            && weft_task_store::tasks::fail_pending(&state.pg_pool, task, "cancelled with `weft cancel-activate` before it started").await?
+        {
+            failed += 1;
+        }
+    }
+    Ok(failed)
+}
+
+/// Whether a cancel of `cancel` reaches an activate of `asked`: some owner
+/// both name, and some trigger of it both name (no trigger named is every
+/// one). Pure.
+fn reaches(cancel: &ActivationScope, asked: &ActivationScope) -> bool {
+    use weft_core::instance::InstanceTarget::{EveryInstance, Everything, Named, Shared};
+    let owners = match (&cancel.instances, &asked.instances) {
+        (Everything, _) | (_, Everything) => true,
+        (Shared, Shared) => true,
+        (Shared, _) | (_, Shared) => false,
+        (EveryInstance, _) | (_, EveryInstance) => true,
+        (Named(cancel), Named(asked)) => cancel.iter().any(|instance| asked.contains(instance)),
+    };
+    let triggers = cancel.triggers.is_empty() || asked.triggers.is_empty() || cancel.triggers.iter().any(|trigger| asked.triggers.contains(trigger));
+    owners && triggers
 }
 
 /// Prepare trigger settings without changing what is listening: which
@@ -513,6 +589,26 @@ pub(crate) async fn resume_resync(state: &DispatcherState, actor: &Actor, id: uu
 mod tests {
     use super::*;
     use crate::tenant::TenantId;
+
+    /// A cancel reaches an activate not started when they share an owner
+    /// and a trigger, no trigger named being every one.
+    #[test]
+    fn a_cancel_reaches_an_activate_sharing_an_owner_and_a_trigger() {
+        use weft_core::instance::{InstanceId, InstanceTarget};
+        let scope = |triggers: &[&str], instances: InstanceTarget| ActivationScope { triggers: triggers.iter().map(|t| t.to_string()).collect(), instances };
+        let ada = || InstanceTarget::Named(vec![InstanceId::new("ada").unwrap()]);
+        let bob = || InstanceTarget::Named(vec![InstanceId::new("bob").unwrap()]);
+        assert!(reaches(&ActivationScope::shared(), &ActivationScope::shared()));
+        assert!(reaches(&ActivationScope::shared(), &scope(&["door"], InstanceTarget::Shared)));
+        assert!(reaches(&scope(&["door"], InstanceTarget::Shared), &ActivationScope::shared()));
+        assert!(!reaches(&scope(&["door"], InstanceTarget::Shared), &scope(&["feed"], InstanceTarget::Shared)));
+        assert!(!reaches(&ActivationScope::shared(), &scope(&[], ada())), "the shared ones are not ada's");
+        assert!(reaches(&scope(&[], InstanceTarget::Everything), &scope(&[], ada())));
+        assert!(reaches(&scope(&[], InstanceTarget::EveryInstance), &scope(&[], ada())));
+        assert!(!reaches(&scope(&[], InstanceTarget::EveryInstance), &ActivationScope::shared()));
+        assert!(!reaches(&scope(&[], bob()), &scope(&[], ada())));
+        assert!(reaches(&scope(&["inbox"], ada()), &scope(&[], InstanceTarget::Named(vec![InstanceId::new("bob").unwrap(), InstanceId::new("ada").unwrap()]))));
+    }
 
     /// A program may resync another project of its owner, never its own
     /// (it would wait on itself); a person may resync any.

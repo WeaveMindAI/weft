@@ -2,9 +2,10 @@
 //!
 //! Most work announces itself: a task written, a run queued, a command
 //! issued. What nothing announces is a holder dying: a worker process whose
-//! lease stops being renewed under the runs it drives, a dispatcher request
-//! driving an activation, a build that stops beating, a task whose claim
-//! rested on a run that ended with nobody left to take the claim back.
+//! lease stops being renewed under the runs it drives, a task that ended
+//! with an activation it drove still activating, a build that stops
+//! beating, a task whose claim rested on a run that ended with nobody left
+//! to take the claim back.
 //! Only time tells, so this loop looks when the earliest of those could
 //! have lapsed ([`earliest_lapse`]) and repairs what did:
 //!
@@ -12,9 +13,11 @@
 //!   (`crate::worker_door::sweep_lost_runs`);
 //! - a build transition nothing holds lands at rest
 //!   (`crate::transition::settle`);
-//! - an activation whose driver died, with no setup run of its going, is
-//!   ended, keeping what its triggers kept
-//!   (`crate::api::project::end_unfinished_activation`);
+//! - an activation whose task ended without landing it is ended, keeping
+//!   what its triggers kept
+//!   (`crate::api::project::end_unfinished_activation`). One whose task's
+//!   claimant died is not this loop's: the claim is rescued by the picker,
+//!   and the task carries the activation on;
 //! - a task claim that rested on a run, long past that run's ending, goes
 //!   back to be claimed again (a resync's among them, whose task then
 //!   brings back what it took down: `crate::task_kinds::resync`).
@@ -34,9 +37,9 @@
 //! next at the earliest lapse there is; so while workers work it looks
 //! about once a lease length, a quiet worker that vouched for itself moves
 //! it to the vouch's end, and once nothing holds anything it books nothing.
-//! What starts a holder that no lease announces (an activation's driver, a
-//! build's, a run handed to a worker that has not ticked yet) books a look
-//! itself ([`book_after`]). The claims the picker, the delivery and the
+//! What starts a holder that no lease announces (an activation's claim, a
+//! build's driver, a run handed to a worker that has not ticked yet) books
+//! a look itself ([`book_after`]). The claims the picker, the delivery and the
 //! lifecycle claimer make are theirs to rescue: each looks again when its
 //! own earliest claim lapses.
 
@@ -88,7 +91,7 @@ pub fn drain_loop(state: DispatcherState) -> DrainLoop {
 async fn look(state: &DispatcherState) -> anyhow::Result<DrainStep> {
     let now = crate::lease::now_unix();
     let mut failed = crate::worker_door::sweep_lost_runs(state, now).await?;
-    failed.extend(end_stuck_activations(state, now).await?);
+    failed.extend(end_orphaned_activations(state).await?);
     crate::transition::settle(state, None).await?;
     let handed_back = hand_back_resting_claims(&state.pg_pool, now).await?;
     if handed_back > 0 {
@@ -151,12 +154,16 @@ fn next_retry(failing_for: i64) -> Option<i64> {
 /// When the earliest hold this loop watches could lapse (unix seconds),
 /// read through the very condition its repair acts on: a running run's
 /// owner holding it (`crate::worker_door::lost_run!`), a driver beating
-/// alone for an activation
-/// (`crate::activation_store::held_by_driver_alone`) or for a transition
-/// (`crate::project_store::held_by_driver_alone`), a task claim resting on
-/// a run that ended ([`resting_claim_lapses_at`]). `None` when nothing is
-/// held. Holds already past are what the look before repaired, so only
-/// those ahead count, and a look always books ahead.
+/// alone for a transition (`crate::project_store::held_by_driver_alone`),
+/// a task claim resting on a run that ended ([`resting_claim_lapses_at`]).
+/// An activation's task claimed and renewed is looked at when its claim
+/// would lapse: by then its claimant renewed it, or the task ended (and
+/// an activation it left activating is ended:
+/// `crate::activation_store::orphaned`), or its claimant died and the
+/// picker rescues the claim. One resting, or waiting to be claimed, is
+/// looked at when that changes. `None` when nothing is held. Holds already
+/// past are what the look before repaired, so only those ahead count, and
+/// a look always books ahead.
 pub async fn earliest_lapse(pool: &Pool, now: i64) -> anyhow::Result<Option<i64>> {
     let margin = crate::worker_door::lost_margin_secs();
     let stale = crate::transition::heartbeat_stale_secs();
@@ -165,13 +172,14 @@ pub async fn earliest_lapse(pool: &Pool, now: i64) -> anyhow::Result<Option<i64>
         &format!(
             "SELECT MIN(at) FROM ( \
                  SELECT MIN({held}) + $2 AS at FROM run r WHERE r.state = 'running' AND NOT ({lost}) \
-                 UNION ALL SELECT MIN(a.heartbeat_unix) + $3 FROM trigger_activation a WHERE {activation} \
+                 UNION ALL SELECT MIN(driver.claimed_until_unix) FROM trigger_activation a \
+                     JOIN task driver ON driver.id = a.driver_task \
+                     WHERE a.status = 'activating' AND driver.status = 'claimed' \
                  UNION ALL SELECT MIN(p.transition_heartbeat_unix) + $3 FROM project p WHERE {transition} \
                  UNION ALL SELECT MIN({claim}) FROM {RESTING_CLAIMS} \
              ) lapses WHERE at >= $1",
             held = weft_task_store::run_held_until_sql!("r"),
             lost = crate::worker_door::lost_run!("$1 - $2"),
-            activation = crate::activation_store::held_by_driver_alone(),
             transition = crate::project_store::held_by_driver_alone("p"),
             claim = resting_claim_lapses_at("$4"),
         ),
@@ -181,27 +189,28 @@ pub async fn earliest_lapse(pool: &Pool, now: i64) -> anyhow::Result<Option<i64>
     .context("read the earliest lapse")
 }
 
-/// End every activation whose driver died with no setup run of its going
-/// (`crate::api::project::end_unfinished_activation`); answers the ones
+/// End every activation whose task ended without landing it
+/// (`crate::activation_store::orphaned`,
+/// `crate::api::project::end_unfinished_activation`); answers the ones
 /// that could not be, each with why.
-async fn end_stuck_activations(state: &DispatcherState, now: i64) -> anyhow::Result<Vec<RepairFailed>> {
+async fn end_orphaned_activations(state: &DispatcherState) -> anyhow::Result<Vec<RepairFailed>> {
     let mut failed = Vec::new();
-    for stuck in state.activations.list_stuck(now - crate::transition::heartbeat_stale_secs()).await? {
+    for stuck in state.activations.list_orphaned().await? {
         tracing::warn!(
             target: "weft_dispatcher::lapses",
             project_id = %stuck.project_id,
             activation = %stuck.run_id,
-            "activation orphaned (driver heartbeat stale); ending it"
+            "activation orphaned (the task driving it ended without landing it); ending it"
         );
         if let Err((code, msg)) = crate::api::project::end_unfinished_activation(
             state,
             stuck.project_id,
             stuck.run_id,
-            // The activation's driver died mid-transition and this look
-            // is repairing the row; nothing superseded the run and no
-            // person stopped it.
+            // The task driving the activation ended without landing it,
+            // and this look is repairing the row; nothing superseded the
+            // run and no person stopped it.
             &weft_core::run::CancelCause::Runtime {
-                detail: "the activation's driver died mid-transition; weft ended it".into(),
+                detail: "the task turning these triggers on ended without finishing; weft ended the activation".into(),
             },
         )
         .await
@@ -215,7 +224,7 @@ async fn end_stuck_activations(state: &DispatcherState, now: i64) -> anyhow::Res
             );
             failed.push(RepairFailed {
                 project_id: stuck.project_id,
-                error: format!("an activation whose driver died could not be ended ({msg}); `weft cancel-activate` ends it"),
+                error: format!("an activation whose task ended could not be ended ({msg}); `weft cancel-activate` ends it"),
             });
             continue;
         }

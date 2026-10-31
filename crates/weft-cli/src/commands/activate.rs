@@ -2,6 +2,14 @@
 //! ensure registered, activate. With arg: treat it as a project id
 //! and activate directly (assume already registered).
 //!
+//! The activation is carried out by a task of the install's, which the
+//! request answers at once; this follows it in short looks until it ends
+//! (`super::follow::follow_task`), saying what it waits on as that
+//! changes. A look the install could not answer (its copy restarting, its
+//! gateway cutting it) is tried again, and the activation goes on
+//! meanwhile; Ctrl+C stops following, never the activation, which `weft
+//! status` still shows and `weft cancel-activate` stops.
+//!
 //! It turns on every trigger it names that is off, new ones included, and
 //! leaves the ones on alone: with nothing off it succeeds, saying so, so a
 //! script can always run it. What the triggers held while they were down
@@ -11,7 +19,7 @@
 
 use anyhow::Context;
 
-use weft_core::activation::{ActivateRequest, ActivateResponse};
+use weft_core::activation::{ActivateRequest, ActivateResponse, ActivateStarted};
 use weft_core::ReleaseHeld;
 
 use super::Ctx;
@@ -53,12 +61,31 @@ async fn run_inner(
             (handle.client, handle.id, handle.name, build)
         }
     };
-    let path = format!("/projects/{id}/activate");
+    let path = format!("/projects/{id}/activations");
     let body = ActivateRequest { build, scope, held, port };
     progress.trigger_register_start();
     progress.dispatcher_call_start(&path);
-    let answer: ActivateResponse = serde_json::from_value(client.post_json(&path, &serde_json::to_value(&body)?).await?)
-        .context("read the activate answer")?;
+    let started: ActivateStarted =
+        serde_json::from_value(client.post_json(&path, &serde_json::to_value(&body)?).await?).context("read the activate answer")?;
+    // What it waits on and for how long, on the progress channel, each
+    // time that changes and again every so often while it does not: an
+    // activation may wait on its setup run for as long as a person takes,
+    // and the time said is the time as of the look.
+    let following = std::time::Instant::now();
+    let mut said: (Option<String>, crate::progress::SayAgain) = (None, Default::default());
+    let going = async |where_it_is: Option<serde_json::Value>| {
+        let Some(where_it_is) = where_it_is else { return Ok(()) };
+        let now: weft_core::infra::wire::ChangeProgress = crate::client::read_answer(where_it_is, "where the activation is")?;
+        let (waiting, again) = &mut said;
+        if waiting.as_deref() != now.waiting.as_deref() || again.due(following.elapsed()) {
+            progress.trigger_register_wait(&now);
+            again.said(following.elapsed());
+            *waiting = now.waiting;
+        }
+        Ok(())
+    };
+    let answer: ActivateResponse =
+        crate::client::read_answer(super::follow::follow_task(&client, progress, &id, started.task, going).await?, "the activate answer")?;
     progress.dispatcher_call_done(serde_json::json!({ "projectId": id }));
     progress.trigger_register_done();
     if let Some(note) = &answer.infra_not_running {

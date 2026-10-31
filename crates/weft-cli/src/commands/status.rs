@@ -408,7 +408,10 @@ fn trigger_lines(entry: &weft_core::projects::TriggerEntry) -> Vec<String> {
                     }
                 }
             }
-            TriggerState::TurningOn => "turning on".to_string(),
+            TriggerState::TurningOn => match &copy.progress {
+                Some(progress) => format!("turning on {}", progress.describe(progress.as_of_unix)),
+                None => "turning on".to_string(),
+            },
             TriggerState::On => "on".to_string(),
             TriggerState::Behind => "on, behind the source (`weft resync` brings it up to date)".to_string(),
         };
@@ -488,7 +491,7 @@ mod tests {
     use weft_core::projects::{HeldWork, TriggerCopy, TriggerEntry, TriggerState};
 
     fn copy(instance: Option<&str>, state: TriggerState, mode: ActivationMode) -> TriggerCopy {
-        TriggerCopy { instance: instance.map(|i| InstanceId::new(i).unwrap()), state, mode, down_with: None, held_back: None, held: HeldWork::default(), waiting: None, version: None }
+        TriggerCopy { instance: instance.map(|i| InstanceId::new(i).unwrap()), state, mode, down_with: None, held_back: None, held: HeldWork::default(), waiting: None, version: None, progress: None }
     }
 
     /// A resync that stopped says so, why, and what comes next, never

@@ -4,7 +4,9 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-10-31 (0.2.282)
+
+**What breaks after this update:**
 
 **Credentials a caller sends a route moved from `headers` to `credentials`, as
 secrets.** `authorization`, `proxy-authorization`, `cookie`,
@@ -19,25 +21,11 @@ that paused and carried on got the scrubbed text back instead of the
 credential. A secret's value is kept sealed beside the run's record and comes
 back after a pause.
 
-**`MintInstanceToken`'s `token` is a `Secret[String]`.** The run's record and
-search hold its marker, never the token. A `Reply` or a `Stream` sends it to
-the browser revealed if you wired it straight into `body`. If you put it
-inside a `JsonObject`, declare the object's type with the secret in it
-(`-> (object: { token: Secret[String] })`); left as a `JsonDict`, the `Reply`
-or `Stream` fails naming where the secret is, rather than sending the browser
-its marker. So does a `Stream` whose bus message holds a secret. A program that wired `token` into a plain `String` port
-is refused when you build.
-
 **`weft run --fire` refuses a credential header on a `Route`**
 (`authorization`, `proxy-authorization`, `cookie`, `weft-instance-token`, and
 any header the route's `auth` reads a credential from, like `X-Api-Key`),
 naming it: only a real call turns those into secrets. Call the route for real
 (`weft activate` prints its URL), or leave the header out.
-
-**New: `Secret[T]`**, for a value a run's record must never show. A node makes
-one with `ctx.secret` and reads one with `ctx.reveal`, and an `ExecPython`
-output declared `Secret[String]` makes one of what its script returns. For
-what fits a secret, go and read the types page.
 
 **A secret reaches outside weft only where a type declares it.** `HttpRequest`
 sends a secret in its `body` revealed when what you wire into `body` declares
@@ -48,6 +36,22 @@ input and where the secret is: `HttpRequest` (`body`, `headers`), `Reply`,
 `Stream`, an `ExecPython` input, and any node of yours that reveals through
 `ctx.reveal_in` or the new `ctx.reveal_input`.
 
+**`MintInstanceToken`'s `token` is a `Secret[String]`.** The run's record and
+search hold its marker, never the token. A `Reply` or a `Stream` sends it to
+the browser revealed if you wired it straight into `body`. If you put it
+inside a `JsonObject`, declare the object's type with the secret in it
+(`-> (object: { token: Secret[String] })`); left as a `JsonDict`, the `Reply`
+or `Stream` fails naming where the secret is, rather than sending the browser
+its marker. A program that wired `token` into a plain `String` port is
+refused when you build.
+
+**Also in this release:**
+
+**New: `Secret[T]`**, for a value a run's record must never show. A node makes
+one with `ctx.secret` and reads one with `ctx.reveal`, and an `ExecPython`
+output declared `Secret[String]` makes one of what its script returns. For
+what fits a secret, go and read the types page.
+
 **A value the HTTP API answers may be a secret's marker**
 (`{"__weft_secret__": {"secretId": "..."}}`): `POST /runs/{id}/values`,
 `GET /runs/{id}/replay` (with or without `?with_values=true`) and the live
@@ -56,6 +60,158 @@ stream show the marker, never the value.
 If a project's runs stop being recorded after the update, its worker was
 built by the previous weft: run `weft resync` on it (the broker's log names
 the project).
+
+## 2026-10-31 (dbefc004)
+
+**What you have to change after this update, if you use a PostgresDatabase:**
+
+- **Clients outside the program sign in as `app`, no longer as `weft`.** The
+  password, host and port stay the same; `weft infra env <node> --into .env
+  --set DATABASE_USER=User` writes the user again.
+- **A frontend's pool must expect a connection idle for a minute to close.**
+  The database now closes it. Set the pool's idle timeout under a minute, or
+  have it test a connection before using it.
+- **An extension that needs the superuser goes in the node's new `extensions`
+  setting** (`["pg_trgm", "postgres_fdw"]`). The superuser makes each one on
+  every start, and the program, signed in as `app`, uses it.
+
+**A PostgresDatabase no longer runs out of connections when the program
+scales.** Postgres serves a fixed number of connections, while its clients
+keep changing: workers scale, a change of worker settings runs old and new
+workers side by side, and a frontend connects too. Each worker used to keep up
+to 20 connections open whether it used them or not, so once enough workers ran
+at once, Postgres answered `too many clients` to them and to everything else
+using that database. A PostgresDatabase now runs a pooler in front of Postgres,
+in the same unit. The pooler never opens more connections than Postgres takes,
+and a client that finds them all busy waits for one, so a run waits instead of
+failing. Watching queries (PostgresWatchQuery) get a quarter of the
+connections the pooler opens (what is left after 3 kept for the superuser and
+2 spare), at least one, so a crowd of them never leaves the other queries
+without a connection, or the other way round. If you want to see who holds the
+connections, the node's card now shows them: Postgres's own by user and state,
+each of the pooler's two shares with its clients served and waiting, and the
+clients by address.
+
+Your existing PostgresDatabase nodes get the pooler on their next `weft infra
+upgrade`. When the database starts again it gets a new role, `app`, which
+becomes the owner of everything the superuser owned in it (except objects an
+extension made). After that:
+
+- **Through the pooler a client reaches this one database only**, so a client
+  that also used `postgres` or another database made beside it can no longer
+  reach those. The superuser `weft` can only sign in from inside the unit. An
+  extension listed in `extensions` that this Postgres does not have fails the
+  start, and `weft infra status` names it.
+- **A database whose name the pooler cannot read as written gets a second
+  name for clients.** Your database keeps its name and its data. When the
+  name is letters, digits, `_` and `-` only, at most 57 characters, and none
+  of `pgbouncer`, `all`, `sameuser`, `samerole`, `samegroup` or
+  `replication`, clients use it as before; otherwise they sign in by a name the
+  pooler makes from it (`db_my_app_1a2b3c4d`), which the connection carries
+  and the card shows under Database. A client of yours outside the program
+  takes it from there.
+- **The database closes a connection that sat idle for a minute.** That gives
+  back a connection held by a worker that lost its CPU between requests, or by
+  an old worker a rollout left behind. If a client of yours keeps a connection idle on purpose (one that `LISTEN`s), have it lift that
+  limit for its own session when it connects, the way PostgresWatchQuery does:
+  `SELECT set_config('idle_session_timeout', '0', false) FROM pg_settings
+  WHERE name = 'idle_session_timeout'`.
+- **The least `memory` is 565Mi** (it was 886Mi). At 1Gi Postgres serves 23
+  connections, at 2Gi 59, at 4Gi 131.
+- **A new database needs Postgres 14 or later.** One you already have on an
+  older Postgres keeps running, but it cannot close idle connections, so its
+  card and `weft infra status` warn of it and list the commands that dump it
+  and restore it into a new node on 17.
+
+**Every Postgres node closes a pooled connection that sat idle for 5
+seconds**, and never hands out one idle for longer, whichever database it talks
+to.
+
+**A stopping worker gives back what its runs shared** (`ctx.shared`) as soon
+as its last run has ended, instead of when the process goes, so a pool's
+connections return to the database while the worker writes its last records.
+
+**On Cloud Run, a change of worker settings retires the old workers.** Once
+the new settings serve, weft moves the calls the old ones took to them and
+removes that program's revisions under any other settings, so their copies stop
+instead of running beside the new ones. Which settings are current is decided
+from what the project has stored, so a dispatcher copy that briefly still held
+the old settings and brought them back up never wins: that revision takes no
+calls and scales to zero. It goes at the next settings change or activation,
+unless it is the service's latest, which Cloud Run does not let anyone delete;
+then it goes once a later settings change or build replaces it.
+
+**When an infra node's setup fails, you are told why.** `weft infra start`,
+`weft activate` and the other commands that wait on a setup used to answer
+`infra setup failed` and nothing else; they now give the error the setup run
+failed with (a trigger's setup the same), as `weft runs` shows it.
+
+**A unit that knows why it is not ready says so in `weft infra status`.** When
+a container's health check answers an error with a reason in its body (JSON
+`{"error": "..."}`, or plain text), the status shows that reason after the
+status code.
+
+**A node's fake tests hold a published connection to its service's values.**
+A value the service does not declare, or a required one missing, fails the
+run the way the access store refuses it on an install; before, the fake rig
+stored anything and only a real run found out.
+
+## 2026-10-31 (ed587b61)
+
+**On a cloud install, how many holders run follows how busy they are**, not
+only how many triggers they hold. Each holder averages its CPU over a minute
+and tells weft the number when it has moved 10 points, and weft runs as many
+holders as those numbers added up need at 50% each, never fewer than one per
+200 triggers. A holder that reaches 70% hands part of its triggers over, and a
+holder weft starts for the load gets triggers handed to it by a busy one. A
+load that holds steady writes nothing, so your database still sleeps. The two
+shares are new settings of the install, `holders.highCpuPercent` (70) and
+`holders.targetCpuPercent` (50); on Google Cloud you set them with
+`holder_high_cpu_percent` and `holder_target_cpu_percent` in
+`deploy/terraform/gcp/variables.tf`. The target must stay at least 20 under
+the high mark, and `terraform apply` refuses a pair that is not.
+
+## 2026-10-31 (0.2.281)
+
+**An activation finishes even when the request that asked for it does not.**
+`weft activate` now hands the activation to the install, which carries it out
+on its own and goes on from where it was if the dispatcher copy doing it
+stops; the command follows it to its end, and looks again through a dropped
+connection. Before, a dispatcher copy that went away mid-activation left the
+triggers turning on, holding everything that arrived, until something noticed.
+`weft status` now says how long a trigger has been turning on and what it waits
+on. An activation an older weft had left half done when you update is ended
+the way a stuck one always was. Update your weft CLI with the install
+(`./setup.sh` does both on a machine; for a cloud install, `./setup.sh --cli`
+from the commit it runs): an older CLI's `weft activate` activates nothing and
+answers that it has to be updated.
+
+**On a cloud install, an update's old copies step aside.** A copy of the old
+weft that still had an event stream or a worker's line open used to keep
+taking work beside the new one, sometimes for most of an hour. It now
+finishes what it was answering and stops as soon as Cloud Run sends the
+requests to the new revision, and the editor and the workers reconnect to the
+new one by themselves: you may see the editor's live view reconnect during an
+update. Which revision is current is Cloud Run's answer; if it
+refuses to give it (the roles' service account cannot read its own service),
+nothing steps aside and the install's alert says so.
+
+**A cloud install of any age updates.** The install workflow could not update
+an install last updated before 2026-10-27: Terraform refused its first step
+with "Moved resource instances excluded by targeting". It now goes through
+whatever weft renamed in its Terraform since. Run the workflow as usual.
+
+**A cloud install whose database an older weft built can start fresh.** Before
+it deploys anything, the install workflow now checks the install's database.
+If an older weft built it, from before the database's history last started
+over (when executions were renamed runs), the workflow stops there, leaving
+the install as it was, and names its new `reset_database` input. Run it again
+with that input on to wipe the database and build the new weft's in its place:
+this deletes every project's run history, versions and stored connections, so
+deploy each project again with `weft activate --on prod` and make its
+connections again with `weft connect --on prod`. A role booting on such a
+database now names this way out on the cloud, where it used to name only
+`./setup.sh`.
 
 ## 2026-10-31 (0.2.280)
 

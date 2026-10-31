@@ -464,26 +464,69 @@ pub async fn program_for_cancel(
 }
 
 /// The terminal outcome recorded for a run, if any: its run row's
-/// `outcome`, stamped by the write that records its ending. `None` means the run is
-/// still in flight. Used both for cancel-dedup and as the source of
-/// truth when the in-RAM event bus drops events (broadcast `Lagged`).
+/// `outcome`, with the `error` it failed with or the `cancel_cause` it
+/// was cancelled for, all stamped by the write that records its ending.
+/// `None` means the run is still in flight. Used both for cancel-dedup
+/// and as the source of truth when the in-RAM event bus drops events
+/// (broadcast `Lagged`).
 pub(crate) async fn terminal_outcome(
     pool: &weft_task_store::db::Pool,
     run_id: RunId,
 ) -> anyhow::Result<Option<TerminalOutcome>> {
-    let outcome: Option<Option<String>> = pool.scalar_opt("SELECT outcome FROM run WHERE run_id = $1", &[&run_id]).await?;
-    Ok(outcome.flatten().map(|outcome| match outcome.as_str() {
-        "completed" => TerminalOutcome::Completed,
-        "cancelled" => TerminalOutcome::Cancelled,
-        _ => TerminalOutcome::Failed,
+    type Ending = (Option<String>, Option<String>, Option<weft_task_store::db::JsonText<CancelCause>>);
+    let row: Option<Ending> = pool
+        .opt("SELECT outcome, error, cancel_cause FROM run WHERE run_id = $1", &[&run_id])
+        .await?;
+    Ok(row.and_then(|(outcome, error, cause)| {
+        outcome.map(|outcome| TerminalOutcome::of(&outcome, error, cause.map(|cause| cause.0)))
     }))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a run ended, with the reason its row recorded for a failure or a
+/// cancel (`None` when the row holds none).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TerminalOutcome {
     Completed,
-    Failed,
-    Cancelled,
+    Failed(Option<String>),
+    Cancelled(Option<String>),
+}
+
+impl TerminalOutcome {
+    /// The outcome a run row's `outcome`, `error` and `cancel_cause`
+    /// columns say. Any outcome other than `completed` and `cancelled`
+    /// reads as a failure.
+    pub(crate) fn of(outcome: &str, error: Option<String>, cause: Option<CancelCause>) -> Self {
+        match outcome {
+            "completed" => Self::Completed,
+            "cancelled" => Self::Cancelled(cause.map(|cause| cause.to_string())),
+            _ => Self::Failed(error),
+        }
+    }
+
+    /// What a person reads when `what` (a run doing some job, like
+    /// "infra setup") did not complete: `<what> failed: <error>` or
+    /// `<what> cancelled: <cause>`, the bare `<what> failed` or
+    /// `<what> cancelled` when the row recorded no reason. `None` when it
+    /// completed.
+    pub(crate) fn not_landed(&self, what: &str) -> Option<String> {
+        let (ended, reason) = match self {
+            Self::Completed => return None,
+            Self::Failed(error) => ("failed", error),
+            Self::Cancelled(cause) => ("cancelled", cause),
+        };
+        Some(not_landed(what, ended, reason.as_deref()))
+    }
+}
+
+/// What a person reads when `what` (a run doing some job, like "infra
+/// setup") `ended` ("failed", "cancelled") for `reason`, or bare when it
+/// gave none: one wording, whether the ending was heard on the bus or read
+/// from the run's row ([`TerminalOutcome::not_landed`]).
+pub(crate) fn not_landed(what: &str, ended: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("{what} {ended}: {reason}"),
+        None => format!("{what} {ended}"),
+    }
 }
 
 /// THE reading of a runs listing as a run store query, shared by every
@@ -640,5 +683,32 @@ mod cancel_tests {
         let kinds: Vec<&str> = writes.iter().map(RunEvent::kind_str).collect();
         assert_eq!(kinds, vec!["node_cancelled", "cost_reported", "run_cancelled"]);
         assert!(matches!(&writes[1], RunEvent::CostReported { charge: Some(charge), amount_usd: None, .. } if charge == "job-1"));
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    /// A run row's ending columns read as the outcome they say, and a
+    /// run that did not complete is told with the reason its row kept,
+    /// or bare when it kept none.
+    #[test]
+    fn a_run_row_ending_reads_with_its_reason() {
+        let completed = TerminalOutcome::of("completed", None, None);
+        assert_eq!(completed, TerminalOutcome::Completed);
+        assert_eq!(completed.not_landed("infra setup"), None);
+
+        let failed = TerminalOutcome::of("failed", Some("the extension is missing".into()), None);
+        assert_eq!(failed, TerminalOutcome::Failed(Some("the extension is missing".into())));
+        assert_eq!(failed.not_landed("infra setup").as_deref(), Some("infra setup failed: the extension is missing"));
+        assert_eq!(TerminalOutcome::of("failed", None, None).not_landed("infra setup").as_deref(), Some("infra setup failed"));
+
+        let cancelled = TerminalOutcome::of("cancelled", None, Some(CancelCause::User));
+        assert_eq!(cancelled.not_landed("trigger setup").as_deref(), Some("trigger setup cancelled: Cancelled by user"));
+        assert_eq!(
+            TerminalOutcome::of("cancelled", None, None).not_landed("infra setup").as_deref(),
+            Some("infra setup cancelled")
+        );
     }
 }
