@@ -48,7 +48,8 @@ use std::time::Duration;
 
 use weft_core::run_settings::{KeepFor, Keeping, RunSettings};
 use weft_core::RunId;
-use weft_journal::frame::{BatchAnswer, BatchHead, RunHead};
+use weft_core::secret::SecretId;
+use weft_journal::frame::{BatchAnswer, BatchHead, KeptSecret, RunHead};
 use weft_journal::record::{Born, Fate, StoredProgram, Written};
 use weft_journal::unrecorded::UnrecordedNote;
 use weft_journal::{BatchError, RunEvent, JournalClient, RecordClient};
@@ -148,8 +149,10 @@ pub struct RunSpec {
     pub keep_for: KeepFor,
     pub epoch: i32,
     pub next_seq: i32,
-    /// The credentials its caller sent, cleaned from every event it writes.
-    pub redaction: weft_core::caller::Redaction,
+    /// The secrets it is born holding: the credentials its caller sent,
+    /// made secrets at the door (`crate::door`), which its first write
+    /// carries with its birth.
+    pub secrets: Vec<KeptSecret>,
     /// The cut of its project it runs, for a run born here on one
     /// (`crate::plan`): its first write carries it, unless its lane put it
     /// on record already, so the record never holds a run without the
@@ -191,13 +194,18 @@ impl WorkerJournal {
             // Picked up again from its record: its row exists, and must end.
             (false, _) => Holding::Unrecorded(UnrecordedNote::after_written()),
         };
+        let known = spec.secrets.iter().map(|secret| (secret.secret_id, secret.value.clone())).collect();
+        let unsent = match holding {
+            Holding::Recorded => spec.secrets,
+            Holding::Unrecorded(_) => Vec::new(),
+        };
         let run = Arc::new(RunLog {
             run_id: spec.run_id,
             lane,
             keeping: spec.settings.keeping(),
             keep_for: spec.keep_for,
-            redaction: spec.redaction,
             program: spec.program,
+            secrets: Mutex::new(known),
             state: Mutex::new(RunState {
                 epoch: spec.epoch,
                 next_seq: spec.next_seq,
@@ -209,6 +217,7 @@ impl WorkerJournal {
                 wrote_files: false,
                 wanted: 0,
                 queued: false,
+                secrets: unsent,
             }),
             poison: Poison::new(),
             acked: tokio::sync::watch::Sender::new(0),
@@ -487,9 +496,13 @@ struct RunLog {
     lane: usize,
     keeping: Keeping,
     keep_for: KeepFor,
-    redaction: weft_core::caller::Redaction,
     /// See [`RunSpec::program`].
     program: Option<Arc<StoredProgram>>,
+    /// Every secret this drive of the run made or revealed, by id: what it
+    /// reveals without asking the broker. The drive's own, so a fold
+    /// forgetting a finished firing never drops one, and a run picked up
+    /// again starts with none (it reveals through the broker).
+    secrets: Mutex<std::collections::HashMap<SecretId, serde_json::Value>>,
     state: Mutex<RunState>,
     poison: Poison,
     /// How many of the events handed are on record.
@@ -516,6 +529,13 @@ struct RunState {
     wanted: u64,
     /// In its lane's queue.
     queued: bool,
+    /// The secrets it made that no batch carried yet, taken with its next
+    /// events. A secret is made before any event names it, and a node
+    /// that makes one ends its firing with an event of its own, so the
+    /// batch carrying the first event that names a secret carries it too,
+    /// or an earlier one did. Always empty for an unrecorded run, whose
+    /// secrets stay in memory.
+    secrets: Vec<KeptSecret>,
 }
 
 /// Where a run's events go.
@@ -589,6 +609,7 @@ struct Taken {
     epoch: i32,
     wrote_files: bool,
     bytes: usize,
+    secrets: Vec<KeptSecret>,
 }
 
 /// A lane's task: wait for runs, gather when nobody waits, send one batch,
@@ -672,6 +693,7 @@ fn take_batch(lane: &Lane, budget: &Budget) -> Vec<Taken> {
         if run.poison.get().is_some() {
             budget.release(std::mem::take(&mut state.pending_bytes));
             state.pending.clear();
+            state.secrets.clear();
             state.queued = false;
             continue;
         }
@@ -700,13 +722,14 @@ fn take_batch(lane: &Lane, budget: &Budget) -> Vec<Taken> {
         let first_seq = state.next_seq;
         state.next_seq += 1;
         let (epoch, wrote_files) = (state.epoch, state.wrote_files);
+        let secrets = std::mem::take(&mut state.secrets);
         state.queued = !state.pending.is_empty();
         let more = state.queued;
         drop(state);
         if more {
             queue.runs.push_back(run.clone());
         }
-        taken.push(Taken { run, events, first_seq, epoch, wrote_files, bytes: run_bytes });
+        taken.push(Taken { run, events, first_seq, epoch, wrote_files, bytes: run_bytes, secrets });
     }
     taken
 }
@@ -747,6 +770,7 @@ fn frame(lane: &Lane, taken: &[Taken]) -> (Vec<u8>, usize, Vec<(usize, String)>)
             born,
             written: Written::of(&taken.events),
             wrote_files: taken.wrote_files,
+            secrets: taken.secrets.clone(),
         });
         rows.push(row);
     }
@@ -1032,8 +1056,7 @@ impl DriveJournal {
     }
 
     /// Refuse a write once the run is poisoned or ended, under a replica
-    /// other than the one its first write fixed, or of another run; clean
-    /// what is let through of the caller's credentials.
+    /// other than the one its first write fixed, or of another run.
     fn admit(&self, events: &[RunEvent], replica: Option<&str>) -> anyhow::Result<Vec<RunEvent>> {
         if let Some(e) = self.run.poisoned_error() {
             return Err(e);
@@ -1063,10 +1086,7 @@ impl DriveJournal {
                 stray.run_id()
             ));
         }
-        match events.iter().map(|event| weft_journal::redacted(event, &self.run.redaction)).collect() {
-            Ok(events) => Ok(events),
-            Err(e) => fail(format!("an event of run {} could not be cleaned of its caller's credentials: {e}", self.run.run_id)),
-        }
+        Ok(events.to_vec())
     }
 }
 
@@ -1092,6 +1112,28 @@ impl JournalClient for DriveJournal {
     async fn record_page(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<Vec<weft_journal::JournalRow>> {
         weft_journal::decoded_page(&*self.writer.record, run_id, after).await
     }
+
+    /// Held in memory for the drive, and, for a recorded run, queued to
+    /// ride its next write (see [`RunState::secrets`]).
+    fn keep_secret(&self, value: serde_json::Value) -> SecretId {
+        let secret_id = SecretId::mint();
+        self.run.secrets.lock().expect("record writer").insert(secret_id, value.clone());
+        let mut state = self.run.state.lock().expect("record writer");
+        if matches!(state.holding, Holding::Recorded) {
+            state.secrets.push(KeptSecret { secret_id, value });
+        }
+        secret_id
+    }
+
+    /// From memory, else from the broker, once, then held in memory.
+    async fn reveal_secret(&self, secret_id: SecretId) -> anyhow::Result<serde_json::Value> {
+        if let Some(value) = self.run.secrets.lock().expect("record writer").get(&secret_id) {
+            return Ok(value.clone());
+        }
+        let value = self.writer.record.secret(secret_id).await?.ok_or_else(|| weft_journal::secret_gone(secret_id))?;
+        self.run.secrets.lock().expect("record writer").insert(secret_id, value.clone());
+        Ok(value)
+    }
 }
 
 #[cfg(test)]
@@ -1116,7 +1158,7 @@ mod tests {
     }
 
     fn spec(run_id: RunId, settings: RunSettings) -> RunSpec {
-        RunSpec { run_id, settings, keep_for: KeepFor::WEFT_DEFAULT, epoch: 1, next_seq: 0, redaction: Default::default(), program: None }
+        RunSpec { run_id, settings, keep_for: KeepFor::WEFT_DEFAULT, epoch: 1, next_seq: 0, secrets: Vec::new(), program: None }
     }
 
     fn fast(writer: &Arc<WorkerJournal>) -> (RunId, Arc<DriveJournal>) {

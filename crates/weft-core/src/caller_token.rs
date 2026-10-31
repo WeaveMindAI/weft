@@ -47,6 +47,11 @@ pub struct CallerTokenClaims {
     /// The instance the run is for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<crate::instance::InstanceId>,
+    /// The headers the gate read the caller's credential from: on the
+    /// socket the ticket opens, the door makes them secrets of the run as
+    /// it does on a gated call (`crate::caller::split_credentials`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_headers: Vec<String>,
     /// Random, so two callers asking alike in the same second hold two
     /// tickets, never one.
     pub nonce: uuid::Uuid,
@@ -213,6 +218,7 @@ mod tests {
             approved: Some(RequestFingerprint::of("post", "/chat/room7", "a=1", b"{}")),
             identity: Some(serde_json::json!({ "sub": "alice" })),
             instance: None,
+            credential_headers: vec!["X-Api-Key".into()],
             nonce: Uuid::nil(),
             exp,
         }

@@ -76,6 +76,7 @@ pub mod run;
 pub mod run_flags;
 pub mod run_settings;
 pub mod run_spec;
+pub mod secret;
 #[cfg(feature = "runtime")]
 pub mod seeding;
 // The predicate submodule is wire-pure and always available (the

@@ -35,6 +35,7 @@ Generator[String]
 | `Access` | A connection to a service. Go and read [how connections work](../connections/how-they-work.md) |
 | `Generator[T]` | A stream of `T`. Go and read [streams and buses](streams-and-buses.md) |
 | `Bus` | A live channel. Same page |
+| `Secret[T]` | A `T` the run's record never holds. See [secrets](#secrets) below |
 | `Empty` | Nothing can be one. See below |
 | `T`, or `T` and a number (`T1`, `T2`) | A type variable. The node works with whatever you connect |
 
@@ -58,6 +59,10 @@ the file is, which is why a `String` holding a URL is not an `Image`.
 | `A` | `A \| B` | Yes |
 | `A \| B` | `A` | Only if **both** `A` and `B` fit `A` |
 | `Generator[A]` | `Generator[B]` | Only if they fit both ways. A stream is invariant |
+| `Secret[A]` | `Secret[B]` | If `A` fits `B` |
+| `Secret[T]` | `T`, `Json`, or a `JsonDict` | **No.** Wire it to a node whose port takes a `Secret`; that node reveals it |
+| A record or a `Dict` holding a `Secret` | `JsonDict` | **No.** A `JsonDict` would carry the secret on to a port that reads it plain |
+| `T` | `Secret[T]` | **No.** Only a node makes a secret |
 | `Empty` | anything | Yes |
 | anything | `Empty` | No |
 
@@ -178,7 +183,7 @@ conversion exists at all.
 |---|---|---|
 | `String` | `Number`, `Boolean` | Parsed |
 | `String` | `List`, `Dict`, `JsonDict`, a record, a named type | Parsed as JSON, then held to the target's shape |
-| Anything not a file or a live handle | `String` | Turned into text: a list or an object becomes its JSON |
+| Anything not a file, a live handle or a secret | `String` | Turned into text: a list or an object becomes its JSON |
 | `Json` | Anything made of JSON | Checked at run time: a `Json` holding a list casts into `List[Number]` when every item is a number |
 | `Number` | `Boolean` | 1 and 0 |
 | Any object shape | A record or a named type | Checked against the declared structure at run time |
@@ -192,6 +197,58 @@ At run time, a value that does not convert fails the node naming the field
 that was wrong: `cannot cast the value into Verdict: not a valid Verdict:
 field "score": "high" is not a number`. If you want to handle that instead of
 failing the run, wire the `Cast`'s `_error`.
+
+## Secrets
+
+`Secret[T]` is a `T` that flows through a run like any value while the run's
+record holds only a marker naming it. A caller's `Authorization` header on a
+`Route` or a `Socket` comes out this way, on `credentials`, and so does a token
+`MintInstanceToken` makes. The record, the inspector, `weft events` and search
+show the marker. The value is kept sealed beside the record, and goes when the
+record goes.
+
+A secret turns back into its value only inside a node that asks for it, and
+only where the type of what you wired in says a secret is. Some of weft's own
+do it for you: `HttpRequest` sends a secret in its headers or its body
+revealed, `Reply` and `Stream` send one to their caller revealed, and
+`ExecPython` hands its script the value of an input you declared as a secret.
+
+If a secret reaches one of them somewhere its input's type does not declare
+one (inside a `JsonDict`, or in a `Stream`'s bus message, which carries no
+type), the node fails and names the input and where the secret is, rather
+than sending the marker. Declare the type, like an object's fields, and it
+goes out revealed. If you want an `HttpRequest` body to carry a token, declare
+the object you build for it:
+
+```weft
+mint = MintInstanceToken { instance: "user-42", expiresInHours: 24 }
+handoff = JsonObject -> (object: { instance: String, token: Secret[String] }) {
+  instance: "user-42"
+  token: mint.token
+}
+notify = HttpRequest {
+  url: "https://partner.example/tokens"
+  method: "POST"
+  body: handoff.object
+}
+```
+
+Left as `JsonObject { token: mint.token }`, the same body builds, and the
+`HttpRequest` fails when it runs, naming `body` and `/token`.
+
+A body with no secret in it needs no declared type: a plain object, written
+or wired, goes out as it always did. For writing a node that makes or
+reveals one, go and read [the ctx](../nodes/ctx.md#secrets).
+
+Only a node makes a secret, so nothing written in a `.weft` file can be one.
+If you need to make one without writing a node, declare an `ExecPython`
+output as `Secret[String]`, and what the script returns there becomes a
+secret. The build refuses a value written on a `Secret` port, a secret's
+marker written anywhere (`secret-literal`: it would name a secret of another
+run), a `Cast` into or out of a secret, and an `@instance_filled` secret
+(`instance-filled-secret`). A wire cannot read a key inside one either: if
+node `s` has an output `session` typed `Secret[{ token: String }]`,
+`s.session.token` is the `deref-path` error, since what flows is the marker.
 
 ## What an unwired port starts as
 

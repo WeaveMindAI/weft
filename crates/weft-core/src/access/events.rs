@@ -434,7 +434,7 @@ fn default_true() -> bool {
 
 impl VerifyKind {
     /// The request headers this scheme reads a credential from: what a run
-    /// it admits never writes down (`crate::caller::Redaction`).
+    /// it admits holds as secrets (`crate::caller::split_credentials`).
     pub fn credential_headers(&self) -> Vec<String> {
         match self {
             VerifyKind::Hmac { signature, .. } | VerifyKind::Signature { signature, .. } => {

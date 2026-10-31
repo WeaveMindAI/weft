@@ -70,8 +70,15 @@ pub struct LiveRequest {
     pub params: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub query: BTreeMap<String, String>,
+    /// The headers that carry no credential.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<(String, String)>,
+    /// The headers that carry one ([`split_credentials`]), each made a
+    /// secret of the run at the door, so the run's record, and everything
+    /// that shows it, holds their markers and never their values. A node
+    /// reveals one to use it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<(String, crate::secret::Secret)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller: Option<Value>,
     /// The address the caller reached this install at (its request's own
@@ -95,32 +102,18 @@ impl LiveRequest {
         find_header(&self.headers, name)
     }
 
-    /// The credentials this request carries, which its run keeps in memory
-    /// and never writes down ([`Redaction`]): the values of the headers that
-    /// carry credentials on any request ([`CREDENTIAL_HEADERS`]) and of
-    /// `also`, the headers the route's own gate read.
-    pub fn credentials(&self, also: &[String]) -> Redaction {
-        let mut secrets = Vec::new();
-        for (name, value) in &self.headers {
-            let carries = CREDENTIAL_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
-                || also.iter().any(|h| name.eq_ignore_ascii_case(h));
-            if !carries || value.trim().is_empty() {
-                continue;
-            }
-            secrets.push(value.trim().to_string());
-            // `Bearer <token>`: the token alone is the credential too, and
-            // a node passing it on writes it without its scheme.
-            if let Some((_, token)) = value.trim().split_once(' ') {
-                if !token.trim().is_empty() {
-                    secrets.push(token.trim().to_string());
-                }
-            }
-        }
-        // The longest first, so a value that contains another is replaced
-        // whole.
-        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        secrets.dedup();
-        Redaction { secrets }
+    /// The first credential a request typed by hand (a fired run's)
+    /// carries, which it cannot: a header among `headers` that carries
+    /// one (any request's, or `gate`, the headers the route's gate reads),
+    /// or anything on `credentials`. A route hands a caller's credentials
+    /// to its program as secrets, which only a real call at the door makes
+    /// ([`split_credentials`]).
+    pub fn credential_typed_by_hand(&self, gate: &[String]) -> Option<&str> {
+        self.headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .find(|name| carries_credential(name, gate))
+            .or_else(|| self.credentials.first().map(|(name, _)| name.as_str()))
     }
 }
 
@@ -130,55 +123,32 @@ impl LiveRequest {
 pub const CREDENTIAL_HEADERS: &[&str] =
     &["authorization", "proxy-authorization", "cookie", crate::instance::INSTANCE_TOKEN_HEADER];
 
-/// How long a credential is before it is also replaced inside other text
-/// (see [`Redaction::scrub`]).
-pub const SCRUBBED_INSIDE: usize = 8;
-
-/// What stands in a run's record for a credential its caller sent.
-pub const REDACTED: &str = "(a credential the caller sent: not written down)";
-
-/// The credentials a run holds in memory and never writes down: wherever
-/// one appears in what the run records (its opening request, a value a node
-/// passes on), the record holds [`REDACTED`] in its place. The live run
-/// keeps the real values: only its record is cleaned.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Redaction {
-    secrets: Vec<String>,
+/// Whether the header `name` carries a credential: one of
+/// [`CREDENTIAL_HEADERS`], or one the route's gate read (`gate`).
+fn carries_credential(name: &str, gate: &[String]) -> bool {
+    CREDENTIAL_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h)) || gate.iter().any(|h| name.eq_ignore_ascii_case(h))
 }
 
-impl Redaction {
-    /// Nothing to clean: the record is written as it is.
-    pub fn is_empty(&self) -> bool {
-        self.secrets.is_empty()
-    }
+/// Why a request typed by hand (`weft run --fire`) cannot carry the
+/// credential header `header` ([`LiveRequest::credential_typed_by_hand`]).
+pub fn fired_credential(header: &str) -> String {
+    format!(
+        "a request typed by hand cannot carry the `{header}` header: a route hands its caller's credentials \
+         to the program as secrets on its `credentials` output, and only a real call makes one. Call the route \
+         for real (`weft activate` prints its URL), or leave the header out"
+    )
+}
 
-    /// `value` with every credential replaced, in every string it holds. A
-    /// credential is replaced wherever it appears inside a string; one
-    /// shorter than [`SCRUBBED_INSIDE`] only where it is the whole string,
-    /// since a few characters turn up inside unrelated text (an id, a
-    /// count) and replacing them there would corrupt the record.
-    pub fn scrub(&self, value: &mut serde_json::Value) {
-        if self.is_empty() {
-            return;
-        }
-        match value {
-            serde_json::Value::String(text) => {
-                let inside = |secret: &&String| secret.len() >= SCRUBBED_INSIDE && text.contains(secret.as_str());
-                if self.secrets.iter().any(|secret| secret == text) {
-                    *text = REDACTED.to_string();
-                } else if self.secrets.iter().any(|secret| inside(&secret)) {
-                    let mut cleaned = text.clone();
-                    for secret in self.secrets.iter().filter(|secret| secret.len() >= SCRUBBED_INSIDE) {
-                        cleaned = cleaned.replace(secret.as_str(), REDACTED);
-                    }
-                    *text = cleaned;
-                }
-            }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(|item| self.scrub(item)),
-            serde_json::Value::Object(fields) => fields.values_mut().for_each(|field| self.scrub(field)),
-            _ => {}
-        }
-    }
+/// Headers as a request carries them: name and value, in the order sent.
+pub type Headers = Vec<(String, String)>;
+
+/// `headers` as a caller sent them, split in two: the plain ones, and the
+/// ones that carry a credential (any request's, [`CREDENTIAL_HEADERS`],
+/// and `gate`, the headers the route's gate read), each in the order sent.
+/// The door makes the second ones secrets of the run before anything of it
+/// is written ([`LiveRequest::credentials`]).
+pub fn split_credentials(headers: Headers, gate: &[String]) -> (Headers, Headers) {
+    headers.into_iter().partition(|(name, _)| !carries_credential(name, gate))
 }
 
 /// The status line and headers of an HTTP response. Held by the
@@ -279,10 +249,11 @@ impl ResponseHead {
     /// `application/octet-stream`), unless it already names one.
     pub fn with_content_type_for(mut self, chunk: &OutboundChunk) -> Self {
         if !self.has_content_type() {
-            let ct = match chunk {
+            let ct = match chunk.on_the_wire() {
                 OutboundChunk::Json(_) => "application/json",
                 OutboundChunk::Text(_) => "text/plain; charset=utf-8",
                 OutboundChunk::Bytes(_) => "application/octet-stream",
+                OutboundChunk::Revealed { .. } => unreachable!("what goes on the wire is never itself revealed"),
             };
             self.headers.push(("content-type".into(), ct.into()));
         }
@@ -564,7 +535,7 @@ pub const NO_ANSWER: &str = "the run ended without answering: every path to its 
 /// One outbound message the node hands the connection layer. The layer
 /// encodes it to the wire per the declared `DataType`. A general
 /// send-value the connection adapts, rather than a per-protocol shape.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutboundChunk {
     /// A JSON value (declared `data_type = json`).
@@ -573,6 +544,36 @@ pub enum OutboundChunk {
     Text(String),
     /// Raw bytes (declared `data_type = bytes`).
     Bytes(Vec<u8>),
+    /// A message holding secrets (`crate::secret`): the caller receives
+    /// `sent`, made from the value with its secrets revealed, and the
+    /// run's record keeps `kept`, the value it was made from, with their
+    /// markers. Only a node that revealed them itself makes one, for the
+    /// places its input's type says are secrets. Never serialized, and its
+    /// `Debug` leaves `sent` out.
+    #[serde(skip)]
+    Revealed { sent: Box<OutboundChunk>, kept: Value },
+}
+
+impl OutboundChunk {
+    /// What reaches the caller: the chunk itself, or what a
+    /// [`Self::Revealed`] one sends.
+    pub fn on_the_wire(&self) -> &OutboundChunk {
+        match self {
+            OutboundChunk::Revealed { sent, .. } => sent.on_the_wire(),
+            chunk => chunk,
+        }
+    }
+}
+
+impl std::fmt::Debug for OutboundChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutboundChunk::Json(value) => f.debug_tuple("Json").field(value).finish(),
+            OutboundChunk::Text(text) => f.debug_tuple("Text").field(text).finish(),
+            OutboundChunk::Bytes(bytes) => f.debug_tuple("Bytes").field(bytes).finish(),
+            OutboundChunk::Revealed { kept, .. } => f.debug_struct("Revealed").field("sent", &"<not shown>").field("kept", kept).finish(),
+        }
+    }
 }
 
 /// One inbound message the connection layer decodes from the wire and
@@ -1508,37 +1509,39 @@ impl CallerConnection for FakeCallerConnection {
 mod tests {
     use super::*;
 
-    /// The credentials a request carries are cleaned from everything its
-    /// record holds, the token alone included, and nothing else is.
+    /// A caller's headers split into the plain ones and the ones carrying
+    /// a credential, any request's and the gate's, case aside, each in the
+    /// order sent.
     #[test]
-    fn a_requests_credentials_are_cleaned_from_its_record() {
-        let request = LiveRequest {
-            headers: vec![
-                ("Authorization".into(), "Bearer tok-12345678".into()),
-                ("X-Api-Key".into(), "key-9".into()),
-                ("Accept".into(), "application/json".into()),
-            ],
-            ..Default::default()
-        };
-        let redaction = request.credentials(&["x-api-key".to_string()]);
-        let mut record = serde_json::json!({
-            "headers": [["Authorization", "Bearer tok-12345678"], ["X-Api-Key", "key-9"], ["Accept", "application/json"]],
-            "passed_on": "token=tok-12345678",
-            "short_inside": "key-9 in a sentence",
-            "short_alone": "key-9",
-            "count": 3,
-        });
-        redaction.scrub(&mut record);
-        assert_eq!(record["headers"][0][1], REDACTED);
-        assert_eq!(record["headers"][1][1], REDACTED);
-        assert_eq!(record["headers"][2][1], "application/json");
-        assert_eq!(record["passed_on"], format!("token={REDACTED}"));
-        // A value shorter than SCRUBBED_INSIDE would match ordinary text,
-        // so only a string that is exactly it is replaced.
-        assert_eq!(record["short_inside"], "key-9 in a sentence");
-        assert_eq!(record["short_alone"], REDACTED);
-        assert_eq!(record["count"], 3);
-        assert!(LiveRequest::default().credentials(&[]).is_empty());
+    fn a_requests_credentials_are_split_from_its_headers() {
+        let headers = vec![
+            ("Authorization".to_string(), "Bearer tok-12345678".to_string()),
+            ("Accept".to_string(), "application/json".to_string()),
+            ("X-Api-Key".to_string(), "key-9".to_string()),
+            ("cookie".to_string(), "session=1".to_string()),
+        ];
+        let (plain, credentials) = split_credentials(headers, &["x-api-key".to_string()]);
+        assert_eq!(plain, vec![("Accept".to_string(), "application/json".to_string())]);
+        assert_eq!(
+            credentials.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+            ["Authorization", "X-Api-Key", "cookie"]
+        );
+    }
+
+    /// A request typed by hand names the first credential header it
+    /// carries: any request's, or one the route's gate reads.
+    #[test]
+    fn a_hand_typed_request_names_its_credential() {
+        let mut request = LiveRequest::default();
+        request.headers.push(("X-Api-Key".into(), "key".into()));
+        assert_eq!(request.credential_typed_by_hand(&[]), None, "no gate reads it");
+        assert_eq!(request.credential_typed_by_hand(&["x-api-key".to_string()]), Some("X-Api-Key"));
+        let mut request = LiveRequest::default();
+        request.headers.push(("Proxy-Authorization".into(), "x".into()));
+        assert_eq!(request.credential_typed_by_hand(&[]), Some("Proxy-Authorization"));
+        let mut marked = LiveRequest::default();
+        marked.credentials.push(("authorization".into(), crate::secret::Secret::new(crate::secret::SecretId::mint())));
+        assert_eq!(marked.credential_typed_by_hand(&[]), Some("authorization"));
     }
 
     #[test]

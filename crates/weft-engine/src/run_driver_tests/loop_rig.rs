@@ -40,6 +40,12 @@
         async fn record_page(&self, _run_id: RunId, _after: Option<i32>) -> anyhow::Result<Vec<weft_journal::JournalRow>> {
             unreachable!("the loop rig reads no other run")
         }
+        fn keep_secret(&self, _value: serde_json::Value) -> weft_core::secret::SecretId {
+            unreachable!("the loop rig makes no secrets")
+        }
+        async fn reveal_secret(&self, _id: weft_core::secret::SecretId) -> anyhow::Result<serde_json::Value> {
+            unreachable!("the loop rig makes no secrets")
+        }
     }
 
     fn primitive(p: WeftPrimitive) -> WeftType {

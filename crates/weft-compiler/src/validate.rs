@@ -180,6 +180,13 @@ fn check_instance_filled(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 push(d, &[node.part()], file, span, Severity::Error, "instance-filled-boundary", boundary_message(name, field));
                 continue;
             }
+            // An instance's value comes from outside every run, and a
+            // secret is made by a node inside one.
+            if node.inputs.iter().any(|p| p.name == field && p.port_type.holds_secret()) {
+                push(d, &[node.part()], file, span, Severity::Error, "instance-filled-secret",
+                    format!("'{name}.{field}' is `@instance_filled` and holds a Secret; {}", weft_core::secret::MADE_BY_A_NODE));
+                continue;
+            }
             if has_incoming_edge(node, project, field) {
                 push(d, &[node.part()], file, span, Severity::Error, "instance-filled-wired",
                     format!("'{name}.{field}' is `@instance_filled` and also wired: each instance provides this \
@@ -568,7 +575,7 @@ fn check_named_type_conflicts(project: &ProjectDefinition, d: &mut Vec<Diagnosti
                 out.push((name, body));
                 walk(body, out);
             }
-            WeftType::List(inner) | WeftType::Generator(inner) | WeftType::Dict(inner) => walk(inner, out),
+            WeftType::List(inner) | WeftType::Generator(inner) | WeftType::Secret(inner) | WeftType::Dict(inner) => walk(inner, out),
             WeftType::Union(members) => members.iter().for_each(|m| walk(m, out)),
             WeftType::Record { fields, .. } => fields.iter().for_each(|f| walk(&f.ty, out)),
             _ => {}
@@ -1775,6 +1782,27 @@ fn component_root(project: &ProjectDefinition) -> Option<&str> {
     alone.then_some(root)
 }
 
+/// What a type-mismatch adds when the wire carries a secret where the
+/// target takes it plain: the receiving node has to take the secret and
+/// reveal it, since nothing opens one on a wire.
+fn sealed_hint(source: &weft_core::weft_type::WeftType, target: &weft_core::weft_type::WeftType) -> Option<String> {
+    (source.holds_secret() && !target.holds_secret()).then(|| {
+        format!(
+            "; a {source} stays sealed on its way, so the receiving node must take {source} \
+             and reveal it (ctx.reveal)"
+        )
+    })
+}
+
+/// secret-literal: a value written in the program claims to be a secret
+/// (the marker, at any depth). Only a node makes one at run time, and a
+/// marker written by hand would name a secret of another run.
+fn refuse_written_secret(value: &serde_json::Value, owner: &str, port: &str) -> Option<String> {
+    weft_core::secret::Secret::claimed_in(value).then(|| {
+        format!("'{owner}.{port}' is written as a secret's marker; {}", weft_core::secret::MADE_BY_A_NODE)
+    })
+}
+
 /// Does a written value carry a `@file`/`@asset` marker anywhere (at the
 /// top, or inside a list of them)? The compiler-read fixed rule refuses
 /// those: such a port has to be readable without following a file.
@@ -2092,10 +2120,12 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             // When the pair is refused as a wire but the Cast table
             // accepts it (a JsonDict claiming a declared type, text
             // that would parse), name the door.
-            let cast_hint = if weft_core::weft_type::WeftType::cast_allowed(&src_type, tgt_port_type).is_ok() {
-                "; wire it through a Cast node to convert and validate the value"
+            let cast_hint = if let Some(sealed) = sealed_hint(&src_type, tgt_port_type) {
+                sealed
+            } else if weft_core::weft_type::WeftType::cast_allowed(&src_type, tgt_port_type).is_ok() {
+                "; wire it through a Cast node to convert and validate the value".to_string()
             } else {
-                ""
+                String::new()
             };
             push("type-mismatch",
                 format!(
@@ -2132,8 +2162,9 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             return;
         }
         if !weft_core::weft_type::WeftType::is_compatible(&from_type, &to.0) {
+            let hint = sealed_hint(&from_type, &to.0).unwrap_or_default();
             push(d, &stretch, file, span, Severity::Error, "type-mismatch",
-                format!("cannot connect '{}: {from_type}' to '{}: {}'", from.1, to.1, to.0));
+                format!("cannot connect '{}: {from_type}' to '{}: {}'{hint}", from.1, to.1, to.0));
         }
     };
     // Every wire at every place it runs, with the types each place gives
@@ -2180,6 +2211,11 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     // them.
     for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
         for (key, value) in &group.port_literals {
+            if let Some(why) = refuse_written_secret(value, &weft_core::project::plain_id(&group.id), key) {
+                let (span, file) = group_literal_anchor(group, key);
+                push(d, &[group.id.as_str()], file, span, Severity::Error, "secret-literal", why);
+                continue;
+            }
             if weft_core::run::skip::is_gate_port(key) { continue; }
             let Some(input) = group.in_ports.iter().find(|p| p.name == *key) else { continue };
             if input.port_type.is_unresolved() { continue; }
@@ -2244,6 +2280,14 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 None => value,
             };
             let span_entry = node.port_literal_spans.get(key);
+            if let Some(why) = refuse_written_secret(value, author_name(node), key) {
+                let (file, span) = match span_entry {
+                    Some(s) => (s.source_file.as_deref(), s.span),
+                    None => (node.source_file.as_deref(), node.header_span.unwrap_or_default()),
+                };
+                push(d, &[node.part()], file, span, Severity::Error, "secret-literal", why);
+                continue;
+            }
             let Some(input) = node.inputs.iter().find(|p| p.name == *key) else { continue };
             // A port whose type is still open (an unbound variable) has
             // nothing to check against yet: `unresolved-typevar` owns it, and

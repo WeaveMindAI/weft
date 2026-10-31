@@ -45,6 +45,29 @@ pub trait JournalClient: Send + Sync {
     /// ancestor's (which ended), or the run's own once what it handed is on
     /// record. A row that does not decode fails the read.
     async fn record_page(&self, run_id: weft_core::RunId, after: Option<i32>) -> anyhow::Result<Vec<JournalRow>>;
+
+    /// Keep `value` as a secret the run made (`weft_core::secret`) under a
+    /// fresh id, answered: the run reveals it from now on, and a recorded
+    /// run's record keeps it sealed, written with the run's next write and
+    /// never inside an event. A run that is not recorded keeps it in
+    /// memory alone.
+    fn keep_secret(&self, value: serde_json::Value) -> weft_core::secret::SecretId;
+
+    /// The value of the secret `secret_id`: one this run made or revealed,
+    /// else one any run of the project made, read from its record's
+    /// sealed copy. Fails with [`secret_gone`] when no run keeps it.
+    async fn reveal_secret(&self, secret_id: weft_core::secret::SecretId) -> anyhow::Result<serde_json::Value>;
+}
+
+/// Why secret `secret_id` cannot be revealed: no run of the project keeps
+/// it.
+pub fn secret_gone(secret_id: weft_core::secret::SecretId) -> anyhow::Error {
+    anyhow::anyhow!(
+        "secret {secret_id} cannot be revealed: no run of this project keeps it. A secret lives as long as \
+         the record of the run that made it, and that record is gone (its keep time ran out, or `weft clean`, \
+         `weft prune` or `weft rm` removed it); or the run that made it is not recorded, and only that run \
+         reveals its secrets"
+    )
 }
 
 /// Every event of a run's record after row `after`, read a page at a time
@@ -83,6 +106,12 @@ pub trait RecordClient: Send + Sync {
     /// its rows after `after` (from its first when `None`), empty once
     /// none is left (`crate::record::read_page`).
     async fn record_of(&self, run_id: weft_core::RunId, after: Option<i32>) -> anyhow::Result<crate::record::RawRecord>;
+
+    /// The value of the secret `secret_id`, made by a run of this worker's
+    /// project, opened from the sealed copy its record keeps
+    /// (`crate::frame::KeptSecret`). `None` when no run of the project
+    /// keeps it: that run's record is gone, or it never wrote one.
+    async fn secret(&self, secret_id: weft_core::secret::SecretId) -> anyhow::Result<Option<serde_json::Value>>;
 
     /// End `run_id`, a run this worker drives but whose record it can
     /// no longer write: the record writes its ending, failed with `why`,

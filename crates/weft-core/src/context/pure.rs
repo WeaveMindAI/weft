@@ -125,6 +125,16 @@ impl ContextHandle for PureHandle {
         self.refused("read a published connection")
     }
 
+    /// A secret is the run's own, kept with its record and read back from
+    /// it, so making and revealing one stay open.
+    fn keep_secret(&self, value: Value) -> WeftResult<crate::secret::SecretId> {
+        self.inner.keep_secret(value)
+    }
+
+    async fn reveal_secret(&self, id: crate::secret::SecretId) -> WeftResult<Value> {
+        self.inner.reveal_secret(id).await
+    }
+
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()> {
         self.inner.log(level, message).await
     }

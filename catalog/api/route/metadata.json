@@ -149,7 +149,12 @@
     {
       "name": "headers",
       "type": "Dict[String, String]",
-      "description": "Request headers, lowercase names."
+      "description": "Request headers, lowercase names, but the ones carrying a credential, which are on `credentials`."
+    },
+    {
+      "name": "credentials",
+      "type": "Dict[String, Secret[String]]",
+      "description": "The headers carrying a credential (`authorization`, `proxy-authorization`, `cookie`, `weft-instance-token`, and those the `auth` connection reads), lowercase names, each a secret: the run's record holds its marker, never its value. Wire one to a node that takes a secret (an HttpRequest's `headers`), or reveal it in your own node."
     },
     {
       "name": "caller",
@@ -175,6 +180,7 @@
     "params?": "Dict[String, String]",
     "query?": "Dict[String, String]",
     "headers?": "List[List[String]]",
+    "credentials?": "List[List[String | Secret[String]]]",
     "caller?": "JsonDict",
     "baseUrl?": "String",
     "body?": "Json"

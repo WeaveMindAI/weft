@@ -1,6 +1,7 @@
 //! MintInstanceToken: a token that acts inside one instance of this
 //! program, for a browser or extension. It always expires; the value
-//! comes out once.
+//! comes out once, as a secret, so the run's record holds its marker and
+//! a Reply or a Stream sends it to the browser revealed.
 
 use async_trait::async_trait;
 
@@ -35,9 +36,7 @@ impl Node for MintInstanceTokenNode {
         }
         let expires_in = std::time::Duration::from_secs(secs as u64);
         let minted = ctx.tokens().mint_for_instance(instance(&ctx)?, expires_in).await?;
-        ctx.pulse_downstream(
-            NodeOutput::new().set("token", minted.token).set("expiresAt", minted.expires_at_unix),
-        )
-        .await
+        let token = ctx.secret(&minted.token)?;
+        ctx.pulse_downstream(NodeOutput::new().set("token", token).set("expiresAt", minted.expires_at_unix)).await
     }
 }

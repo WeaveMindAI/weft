@@ -5515,3 +5515,82 @@ each.acc = ""
         assert!(found[0].contains(&format!("'self.{port}' is an output of")), "{source}\n{d:#?}");
     }
 }
+
+
+// ─── Secret[T] ──────────────────────────────────────────────────────────────
+
+/// A secret stays sealed on its way: wired into a port that takes its
+/// value plain, it is a type mismatch saying the receiving node must take
+/// the secret and reveal it; into a port that takes it, it is clean.
+#[test]
+fn a_secret_wired_into_a_plain_port_says_to_take_it_and_reveal_it() {
+    let refused = parse_enrich(r#"
+s = ExecPython() -> (token: Secret[String]) { code: "x" }
+t = ExecPython(n: String) -> (r: String) { code: "x" }
+t.n = s.token
+"#);
+    let d = validate(&refused, &catalog());
+    let m = d.iter().find(|x| x.code.as_deref() == Some("type-mismatch")).expect("type-mismatch");
+    assert!(m.message.contains("must take Secret[String]") && m.message.contains("reveal it"), "{}", m.message);
+
+    let clean = parse_enrich(r#"
+s = ExecPython() -> (token: Secret[String]) { code: "x" }
+t = ExecPython(n: String | Secret[String]) -> (r: String) { code: "x" }
+t.n = s.token
+"#);
+    assert!(!codes(&validate(&clean, &catalog())).contains(&"type-mismatch"));
+}
+
+/// A wire's key path never steps into a secret: what flows is its marker.
+#[test]
+fn a_path_into_a_secret_is_refused() {
+    let project = parse_enrich(r#"
+s = ExecPython() -> (out: { session: Secret[{ token: String }] }) { code: "x" }
+t = ExecPython(n: String) -> (r: String) { code: "x" }
+t.n = s.out.session.token
+"#);
+    let d = validate(&project, &catalog());
+    let m = d.iter().find(|x| x.code.as_deref() == Some("deref-path")).expect("deref-path");
+    assert!(m.message.contains("stays sealed on its way"), "{}", m.message);
+}
+
+/// Only a node makes a secret: a value written on a secret port, a
+/// secret's marker written anywhere, and a Cast into a secret are each
+/// refused naming who makes one.
+#[test]
+fn a_program_never_writes_a_secret() {
+    let plain = parse_enrich(r#"
+t = ExecPython(n: Secret[String]) -> (r: String) { code: "x", n: "hunter2" }
+"#);
+    let d = validate(&plain, &catalog());
+    assert!(d.iter().any(|x| x.message.contains("ctx.secret")), "{d:?}");
+
+    let marker = parse_enrich(r#"
+t = ExecPython(n: JsonDict) -> (r: String) { code: "x", n: { "__weft_secret__": { "secretId": "00000000-0000-0000-0000-000000000001" } } }
+"#);
+    let d = validate(&marker, &catalog());
+    let m = d.iter().find(|x| x.code.as_deref() == Some("secret-literal")).expect("secret-literal");
+    assert!(m.message.contains("ctx.secret"), "{}", m.message);
+
+    let cast = parse_enrich(r#"
+src = Text { value: "x" }
+c = Cast() -> (value: Secret[String])
+c.value = src.value
+t = ExecPython(n: Secret[String]) -> (r: String) { code: "x" }
+t.n = c.value
+"#);
+    let d = validate(&cast, &catalog());
+    let m = d.iter().find(|x| x.code.as_deref() == Some("cast-not-allowed")).expect("cast-not-allowed");
+    assert!(m.message.contains("ctx.secret"), "{}", m.message);
+}
+
+/// An instance's value comes from outside every run, so a field holding a
+/// secret cannot be `@instance_filled`.
+#[test]
+fn an_instance_filled_secret_is_refused() {
+    let project = parse_enrich(r#"
+t = ExecPython(n: Secret[String]) -> (r: String) { code: "x", n: @instance_filled }
+"#);
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"instance-filled-secret"), "{d:?}");
+}

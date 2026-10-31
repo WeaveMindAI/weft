@@ -3120,6 +3120,14 @@ impl ContextHandle for RunnerHandle {
         ))
     }
 
+    fn keep_secret(&self, value: serde_json::Value) -> WeftResult<weft_core::secret::SecretId> {
+        Ok(self.record.journal.keep_secret(value))
+    }
+
+    async fn reveal_secret(&self, id: weft_core::secret::SecretId) -> WeftResult<serde_json::Value> {
+        self.record.journal.reveal_secret(id).await.map_err(|e| WeftError::NodeFailed(format!("{e:#}")))
+    }
+
     async fn published_access(&self) -> WeftResult<Option<weft_core::access::Access>> {
         let service = self.published_spec()?.service.clone();
         let req = weft_broker_client::protocol::PublishedAccessRequest {
@@ -4874,6 +4882,8 @@ pub(crate) mod test_journal {
     pub(crate) struct CaptureJournal {
         pub(crate) events: StdMutex<Vec<RunEvent>>,
         pub(crate) fail_count: StdMutex<usize>,
+        /// The secrets kept, by id.
+        pub(crate) secrets: StdMutex<HashMap<weft_core::secret::SecretId, serde_json::Value>>,
     }
     #[async_trait]
     impl weft_journal::JournalClient for CaptureJournal {
@@ -4891,6 +4901,14 @@ pub(crate) mod test_journal {
         /// Captures are for asserting writes; nothing reads them back.
         async fn record_page(&self, _run_id: RunId, _after: Option<i32>) -> anyhow::Result<Vec<weft_journal::JournalRow>> {
             unreachable!("a capture is never read back")
+        }
+        fn keep_secret(&self, value: serde_json::Value) -> weft_core::secret::SecretId {
+            let id = weft_core::secret::SecretId::mint();
+            self.secrets.lock().unwrap().insert(id, value);
+            id
+        }
+        async fn reveal_secret(&self, id: weft_core::secret::SecretId) -> anyhow::Result<serde_json::Value> {
+            self.secrets.lock().unwrap().get(&id).cloned().ok_or_else(|| weft_journal::secret_gone(id))
         }
     }
 }

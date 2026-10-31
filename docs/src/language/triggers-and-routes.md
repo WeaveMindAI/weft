@@ -113,9 +113,35 @@ card = Route -> (id: String) {
 A call to `cards/42` puts `"42"` on `card.id`. Every other output you add to a
 `Route` has to be a capture of its path, typed `String`, or the build stops
 with `route-output-not-a-capture`. A capture can't share a name with one of
-`Route`'s own outputs (`body`, `method`, `path`, `query`, `headers`, `caller`,
-`fired`), so `cards/{body}` is the `route-capture-shadows-output` error,
+`Route`'s own outputs (`body`, `method`, `path`, `query`, `headers`,
+`credentials`, `caller`, `fired`), so `cards/{body}` is the `route-capture-shadows-output` error,
 asking you to rename the capture.
+
+**A caller's credentials come out on `credentials`, never on `headers`.** The
+headers that carry one (`authorization`, `proxy-authorization`, `cookie`,
+`weft-instance-token`, and any header the route's `auth` reads, like the
+`X-Api-Key` an `ApiKeyAuth` checks) are
+each made a secret the moment the call arrives, before anything of the run is
+written, so the run's record, the inspector, `weft events` and search hold a
+marker in their place and never the value. The value is still there for the
+run, and for the same run picked up after a pause. If you want to pass them
+on, wire them into a port that takes secrets, like an `HttpRequest`'s `headers`, which
+sends them revealed. Here a route hands its caller's credentials on to your
+own backend:
+
+```weft
+me = Route { path: "me", method: "GET" }
+profile = HttpRequest {
+  url: "https://api.internal.example/me"
+  method: "GET"
+}
+profile.headers = me.credentials
+```
+
+A plain `String` port refuses a secret: wired into a `Dict[String, String]`,
+`me.credentials` is a `type-mismatch` telling you the node has to take the
+secret and reveal it. For what a secret is, go and read
+[secrets](types.md#secrets).
 
 **Two routes that one call could reach, where neither is more specific, is an
 error.** `cards/count` beside `cards/{id}` is fine, because the first is more
@@ -260,6 +286,11 @@ and how it ended. Otherwise it leaves nothing. If you want to check that a
 trigger with `recorded` off is being called at all, `weft status` shows how
 many runs each trigger started in the last minute or two, and how many of them
 failed.
+
+If you only want a key kept out of the record, you do not need `recorded`
+off. A value that arrives as a secret (a caller's `credentials`, a node's
+`Secret` output, an `ExecPython` output you declared `Secret[String]`) is
+already kept out. For more, go and read [secrets](types.md#secrets).
 
 An unrecorded run cannot pause, so a timer or a form in it holds
 ([when a run cannot pause](#when-a-run-cannot-pause)). If a node tags it with
@@ -531,6 +562,14 @@ weft run --fire inbound='{"chatId":"123","text":"hello"}'
 
 The payload is checked against what that trigger declared it fires with, both
 ways: a missing field is refused, and so is one you invented.
+
+A route fired this way cannot carry `authorization`, `proxy-authorization`,
+`cookie`, `weft-instance-token`, or a header its `auth` reads a credential
+from (an API key's `X-Api-Key`, a signature's header), nor anything on its
+`credentials` key: a route hands its caller's credentials to the program as
+secrets, which only a real call makes, so the fire is refused, naming the
+header. If you need one, call the route for real (`weft activate`
+prints its URL), or leave the header out.
 
 A run you fire this way follows the trigger's `durable` and `keepRunsFor`, and
 it is always recorded, even when the trigger has `recorded` off, so you can

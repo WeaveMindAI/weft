@@ -5708,6 +5708,13 @@ mod pause_emissions_tests;
 #[path = "run_driver_tests/hand_back.rs"]
 mod hand_back_tests;
 
+// Layer 3: a run's secrets: only their markers on record, their values
+// riding its batches, revealed from memory, from the record, and never
+// written for a run that is not recorded.
+#[cfg(test)]
+#[path = "run_driver_tests/secrets.rs"]
+mod secrets_tests;
+
 // Layer 3: an unrecorded run keeps no history, leaves a note of itself
 // only when it fails, and holds its waits in its worker.
 #[cfg(test)]

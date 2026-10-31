@@ -3265,3 +3265,70 @@ async fn a_published_spec_holding_a_nul_is_kept_exactly(pool: Pool) {
     assert_eq!(again.connection_id, first.connection_id);
     assert_eq!(written_at().await, before, "it read back equal, so nothing was written");
 }
+
+/// The headers a route gated by a connection reads its caller's
+/// credential from come off the connection's recipe, behind the same wall
+/// as every read: another tenant's connection is not there, and one of
+/// another service is refused by name.
+#[weft_db_macros::test]
+async fn a_gates_credential_headers_come_from_its_recipe(pool: Pool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let spec: AccessSpec = serde_json::from_value(json!({
+        "service": "api_key_auth",
+        "acquisition": { "kind": "static", "fields": [{ "name": "keys" }] },
+        "verify": { "kind": "api_keys", "header": "X-Team-Key" }
+    }))
+    .expect("a valid auth recipe");
+    let done = connect_direct(
+        &pool,
+        TENANT_A,
+        ConnectDirect {
+            paste: false,
+            spec,
+            door: Door::Own,
+            registration: None,
+            values: [("keys".to_string(), "key-1".to_string())].into_iter().collect(),
+            label: None,
+            permissions: Vec::new(),
+            project_id: None,
+            instance: None,
+        },
+    )
+    .await
+    .expect("a pasted verifier connection stores without a test call");
+    let id = done.grant.id;
+
+    let headers = weft_access_store::caller_credential_headers(&pool, TENANT_A, GrantUser::Author, id, "api_key_auth").await.unwrap();
+    assert_eq!(headers, ["X-Team-Key", "authorization"]);
+    let err = weft_access_store::caller_credential_headers(&pool, TENANT_B, GrantUser::Author, id, "api_key_auth").await.unwrap_err();
+    assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NotFound)), "{err}");
+    let err = weft_access_store::caller_credential_headers(&pool, TENANT_A, GrantUser::Author, id, "slack").await.unwrap_err();
+    assert!(err.to_string().contains("wire the right service"), "{err}");
+
+    // A recipe with no `verify` block gates nothing, as a real call
+    // through it is refused.
+    let plain: AccessSpec = serde_json::from_value(json!({
+        "service": "pasted",
+        "acquisition": { "kind": "static", "fields": [{ "name": "token" }] }
+    }))
+    .expect("a valid recipe");
+    let done = connect_direct(
+        &pool,
+        TENANT_A,
+        ConnectDirect {
+            paste: false,
+            spec: plain,
+            door: Door::Own,
+            registration: None,
+            values: [("token".to_string(), "t".to_string())].into_iter().collect(),
+            label: None,
+            permissions: Vec::new(),
+            project_id: None,
+            instance: None,
+        },
+    )
+    .await
+    .expect("a pasted connection stores without a test call");
+    let err = weft_access_store::caller_credential_headers(&pool, TENANT_A, GrantUser::Author, done.grant.id, "pasted").await.unwrap_err();
+    assert!(err.to_string().contains("declares no `verify` block"), "{err}");
+}

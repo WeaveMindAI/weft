@@ -22,7 +22,53 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_stored_file_in_a_json_answer_goes_out_as_a_link", file_link),
         NodeTest::fake("a_redirect_sends_the_caller_to_the_files_link", redirect),
         NodeTest::basic("a_head_carries_status_and_string_headers", head_shape),
+        NodeTest::fake("a_secret_reaches_the_caller_revealed_and_the_record_keeps_its_marker", secret_reply),
+        NodeTest::fake("a_secret_text_body_goes_out_as_its_text", secret_text),
+        NodeTest::fake("a_secret_its_type_does_not_declare_fails_the_reply", undeclared_secret),
     ]
+}
+
+fn ty(text: &str) -> weft::WeftType {
+    weft::WeftType::try_parse(text).unwrap_or_else(|why| panic!("`{text}`: {why}"))
+}
+
+/// A secret where the body's type says one goes, and one as a header's
+/// value, reach the caller revealed; what the run's record keeps of the
+/// answer is the body with its marker.
+async fn secret_reply(rig: FakeRig) -> WeftResult<()> {
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
+    rig.attach_caller(conn.clone());
+    rig.input_type("body", ty("{ session: Secret[String], user: String }"));
+    let session = rig.secret(json!("sess-42"));
+    let cookie = rig.secret(json!("sid=42"));
+    let body = json!({ "session": session, "user": "ada" });
+    rig.run(&ReplyNode, json!({ "body": body.clone(), "headers": { "set-cookie": cookie, "x-run": "r-1" } })).await.ok()?;
+    assert_eq!(
+        conn.calls()[1],
+        CallerCall::Terminate {
+            head: Some(ResponseHead::new(200).with_header("set-cookie", "sid=42").with_header("x-run", "r-1")),
+            final_chunk: Some(OutboundChunk::Revealed {
+                sent: Box::new(OutboundChunk::Json(json!({ "session": "sess-42", "user": "ada" }))),
+                kept: body,
+            }),
+            close: None,
+        }
+    );
+    Ok(())
+}
+
+/// A text route answering a `Secret[String]` sends its text.
+async fn secret_text(rig: FakeRig) -> WeftResult<()> {
+    let conn = http_caller(DataType::Text, LiveRequest::default(), InboundMessage::Text(String::new()));
+    rig.attach_caller(conn.clone());
+    rig.input_type("body", ty("Secret[String]"));
+    let token = rig.secret(json!("tok-7"));
+    rig.run(&ReplyNode, json!({ "body": token.clone() })).await.ok()?;
+    assert_eq!(
+        conn.chunks(),
+        vec![OutboundChunk::Revealed { sent: Box::new(OutboundChunk::Text("tok-7".into())), kept: token }]
+    );
+    Ok(())
 }
 
 async fn http_reply(rig: FakeRig) -> WeftResult<()> {
@@ -205,5 +251,27 @@ async fn socket_unmade(rig: FakeRig) -> WeftResult<()> {
     rig.attach_caller(route.clone());
     let err = rig.run(&ReplyNode, json!({ "body": { "not": "text" } })).await.failure()?;
     assert!(err.contains("must be a String"), "a route's one answer is never skipped: {err}");
+    Ok(())
+}
+
+/// A secret inside a body whose type declares none (an object left as a
+/// `JsonDict`) fails the node naming its place, and nothing goes out: the
+/// caller would have received the marker. A socket that skips a message
+/// it cannot make still fails, since this is the program's mistake.
+async fn undeclared_secret(rig: FakeRig) -> WeftResult<()> {
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
+    rig.attach_caller(conn.clone());
+    rig.input_type("body", ty("JsonDict"));
+    let token = rig.secret(json!("tok-7"));
+    let err = rig.run(&ReplyNode, json!({ "body": { "auth": { "token": token } } })).await.failure()?;
+    assert!(err.contains("`body` holds a secret at /auth/token"), "{err}");
+    assert!(err.contains("{ token: Secret[String] }"), "the fix is named: {err}");
+    assert!(conn.chunks().is_empty(), "{:?}", conn.chunks());
+
+    let socket = crate::testing::caller_skipping_unmade_chunks(weft::signal::Protocol::Websocket, DataType::Json);
+    rig.attach_caller(socket.clone());
+    let err = rig.run(&ReplyNode, json!({ "body": { "token": token } })).await.failure()?;
+    assert!(err.contains("`body` holds a secret at /token"), "never skipped: {err}");
+    assert!(socket.chunks().is_empty(), "{:?}", socket.chunks());
     Ok(())
 }

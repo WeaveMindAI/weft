@@ -15,9 +15,11 @@
 //! socket, and `done` stays absent. A message that cannot be made into
 //! a chunk (a value the trigger's data type does not carry) goes through
 //! `drop_or_fail`: it fails the answer, or is skipped when the trigger's
-//! `whenChunkFails` is `drop_chunk`. The framing is the package's pure
-//! `framing.rs`; a raw payload rides per the trigger's data type through
-//! `wire::chunk_for`.
+//! `whenChunkFails` is `drop_chunk`. A secret goes out revealed where
+//! `first`'s type declares it; a marker anywhere else, a bus message
+//! included (a bus carries no type), fails the node. The framing is the
+//! package's pure `framing.rs`; a raw payload rides per the trigger's data
+//! type through `wire::chunk_for`.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -47,7 +49,7 @@ impl Node for StreamNode {
         let format: String = ctx.inputs.get("format")?;
         let format = Format::parse(&format).map_err(weft::node_error)?;
         let status: u16 = ctx.inputs.get("status")?;
-        let headers: Option<Value> = ctx.inputs.opt("headers")?;
+        let headers = wire::headers(&ctx).await?;
         let caller = ctx.live_caller().await?;
         let wire::Answer::Data(data_type) = wire::answer(&ctx)? else {
             weft::node_bail!("answerAs is redirect, and a Stream sends messages; a redirect is one answer, so send it with a Reply");
@@ -80,13 +82,14 @@ impl Node for StreamNode {
                 // A chunk that cannot be made fails the answer, or is
                 // skipped when the trigger says so (`whenChunkFails`).
                 if let Some(value) = &first {
-                    let made = framed(&ctx, format, data_type, WirePayload::Json(value.clone().into())).await;
+                    let made = wire::revealing(&ctx, "first", value.clone(), |v| framed(&ctx, format, data_type, WirePayload::Json(v.into()))).await;
                     if let Some(chunk) = http.drop_or_fail(made)? {
                         write_chunk(&http, &mut head, chunk).await?;
                     }
                 }
                 while let Some(entry) = messages.next().await {
                     let BusEntryKind::Message { payload: Some(payload), .. } = entry.kind else { continue };
+                    refuse_secret(&payload)?;
                     let Some(chunk) = http.drop_or_fail(framed(&ctx, format, data_type, payload).await)? else { continue };
                     write_chunk(&http, &mut head, chunk).await?;
                 }
@@ -103,13 +106,14 @@ impl Node for StreamNode {
             CallerHandle::Websocket(ws) => {
                 wire::refuse_head_on_socket("Stream", status, headers.as_ref())?;
                 if let Some(value) = &first {
-                    let made = framed(&ctx, Format::Raw, data_type, WirePayload::Json(value.clone().into())).await;
+                    let made = wire::revealing(&ctx, "first", value.clone(), |v| framed(&ctx, Format::Raw, data_type, WirePayload::Json(v.into()))).await;
                     if let Some(chunk) = ws.drop_or_fail(made)? {
                         ws.send(chunk).await?;
                     }
                 }
                 while let Some(entry) = messages.next().await {
                     let BusEntryKind::Message { payload: Some(payload), .. } = entry.kind else { continue };
+                    refuse_secret(&payload)?;
                     // A socket message is a frame: no HTTP framing.
                     let Some(chunk) = ws.drop_or_fail(framed(&ctx, Format::Raw, data_type, payload).await)? else { continue };
                     ws.send(chunk).await?;
@@ -129,6 +133,17 @@ fn broke_off(bus: &BusHandle) -> Option<String> {
     match bus.end() {
         Some(StreamEnd::Failed { error }) => Some(format!("the stream broke off: {error}")),
         Some(StreamEnd::Finished) | None => None,
+    }
+}
+
+/// Refuse a bus message holding a secret's marker
+/// ([`wire::refuse_secret_in_message`]): never skipped, whatever the
+/// trigger's `whenChunkFails`, since what it sends is the program's
+/// mistake rather than a chunk that could not be made.
+fn refuse_secret(payload: &WirePayload) -> WeftResult<()> {
+    match payload {
+        WirePayload::Json(value) => wire::refuse_secret_in_message("bus", value),
+        WirePayload::Bytes(_) => Ok(()),
     }
 }
 

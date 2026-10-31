@@ -292,7 +292,7 @@ mod tests {
         let (tasks, answers) = (AwaitTasks::new(), Arc::new(Answers::default()));
         let clients = EngineClients { tasks: tasks.clone(), told: answers.told.clone(), runs: answers.clone(), ..clients(Arc::new(MemJournal::default())) };
         let run_id = weft_core::new_run_id();
-        let record = RunRecord { journal: handle(&clients, run_id, &[], 0, Default::default()), costs: crate::metering::PendingCostRecords::new() };
+        let record = RunRecord { journal: handle(&clients, run_id, &[], 0, Vec::new()), costs: crate::metering::PendingCostRecords::new() };
         let waits = crate::wait_tracker::WaitTracker::new();
         let cancellation = CancellationFlag::new_arc();
         let settings = weft_core::run_settings::RunSettings::bookkeeping().holding_for(hold_secs).unwrap();

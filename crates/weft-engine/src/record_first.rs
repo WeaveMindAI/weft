@@ -275,7 +275,7 @@ mod tests {
                 keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
                 epoch: 1,
                 next_seq: 0,
-                redaction: Default::default(),
+                secrets: Vec::new(),
                 program: None,
             });
             let mut birth: weft_journal::RunEvent = serde_json::from_value(serde_json::json!({

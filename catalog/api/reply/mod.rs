@@ -39,7 +39,7 @@ impl Node for ReplyNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let body: Value = ctx.inputs.get("body")?;
         let status: u16 = ctx.inputs.get("status")?;
-        let headers: Option<Value> = ctx.inputs.opt("headers")?;
+        let headers = wire::headers(&ctx).await?;
         let caller = ctx.live_caller().await?;
         let data_type = match wire::answer(&ctx)? {
             wire::Answer::Data(data_type) => data_type,
@@ -60,7 +60,7 @@ impl Node for ReplyNode {
         // Read before the body is spent: a file sent as bytes names its
         // own type and filename on the response.
         let file = (data_type == DataType::Bytes).then(|| StoredFile::from_value(&body).ok()).flatten();
-        let made = wire::chunk_for(&ctx, data_type, body).await;
+        let made = wire::revealing(&ctx, "body", body, |body| wire::chunk_for(&ctx, data_type, body)).await;
         match caller {
             CallerHandle::Http(http) => {
                 // The whole answer: one that cannot be made is this

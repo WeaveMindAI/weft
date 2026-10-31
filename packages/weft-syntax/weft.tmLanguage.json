@@ -147,7 +147,7 @@
     },
     "builtin-type": {
       "name": "support.type.weft",
-      "match": "\\b(String|Number|Boolean|Null|Image|Video|Audio|Blob|Empty|Media|File|List|Dict|JsonDict|Json|Bus|Access|Infra|Generator)\\b"
+      "match": "\\b(String|Number|Boolean|Null|Image|Video|Audio|Blob|Empty|Media|File|List|Dict|JsonDict|Json|Bus|Access|Infra|Generator|Secret)\\b"
     },
     "type": {
       "name": "entity.name.type.weft",

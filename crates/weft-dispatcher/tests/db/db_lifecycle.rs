@@ -2459,12 +2459,13 @@ async fn a_project_being_removed_has_no_run_born(pool: Pool) {
                     born: Born::of(&events[0], weft_core::run_settings::KeepFor::WEFT_DEFAULT),
                     written: Written::of(&events),
                     wrote_files: false,
+                    secrets: Vec::new(),
                 }],
                 programs: Vec::new(),
                 events_version: weft_journal::stored::STORED_EVENTS.version(),
             };
             let batch = Batch { head, rows: vec![row.as_slice()] };
-            let answers = weft_journal::record::record_batch(&pool.get().await.unwrap(), "w1", TENANT, "w1:0", &batch).await.unwrap();
+            let answers = weft_journal::record::record_batch(&pool.get().await.unwrap(), "w1", TENANT, "w1:0", &batch, &weft_access_store::seal_json).await.unwrap();
             (answers[0].fate, run_column::<String>(&pool, "state", run_id).await)
         }
     };

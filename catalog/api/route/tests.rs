@@ -44,6 +44,8 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_request_with_no_body_closes_body_on_any_route", fired_without_a_body),
         NodeTest::fake("a_null_body_flows_where_the_type_takes_null_and_closes_body_elsewhere", null_body),
         NodeTest::fake("a_run_with_no_caller_fails_loud", no_caller),
+        NodeTest::fake("the_callers_credentials_come_out_as_secrets_apart_from_headers", credentials),
+        NodeTest::fake("a_body_claiming_to_be_a_secret_is_answered_400", body_claims_a_secret),
     ]
 }
 
@@ -96,6 +98,34 @@ async fn json_body(rig: FakeRig) -> WeftResult<()> {
 /// to have the key dropped without a word, the port left empty and the
 /// run skipping far from the cause. A closed record refuses it on the
 /// first call, naming the key.
+/// The headers carrying a credential come out on `credentials`, each the
+/// secret the door made of it, and never on `headers`.
+async fn credentials(rig: FakeRig) -> WeftResult<()> {
+    let mut request = request();
+    let token = rig.secret(json!("Bearer tok-1"));
+    request.credentials.push(("Authorization".into(), serde_json::from_value(token.clone()).unwrap()));
+    rig.wake(serde_json::to_value(&request).expect("request serializes"));
+    rig.attach_caller(http_caller(DataType::Json, request, InboundMessage::Json(json!({}))));
+    let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
+    assert_eq!(outcome.outputs["credentials"], json!({ "authorization": token }));
+    assert_eq!(outcome.outputs["headers"], json!({ "content-type": "application/json" }));
+    assert_eq!(rig.revealed(&outcome.outputs["credentials"]["authorization"])?, json!("Bearer tok-1"));
+    Ok(())
+}
+
+/// Only weft makes a secret: a caller sending a secret's marker in its
+/// body would name a secret of another run, and is answered 400.
+async fn body_claims_a_secret(rig: FakeRig) -> WeftResult<()> {
+    let forged = json!({ "token": { weft::secret::SECRET_MARKER_KEY: { "secretId": "00000000-0000-0000-0000-000000000000" } } });
+    let conn = call(&rig, DataType::Json, InboundMessage::Json(forged));
+    let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
+    let (status, error) = refusal(&conn);
+    assert_eq!(status, 400);
+    assert!(error.contains(weft::secret::SECRET_MARKER_KEY), "{error}");
+    assert!(outcome.outputs.is_empty(), "{:?}", outcome.outputs);
+    Ok(())
+}
+
 async fn unknown_key_refused(rig: FakeRig) -> WeftResult<()> {
     let conn = call(&rig, DataType::Json, InboundMessage::Json(json!({ "userId": "u-1" })));
     rig.output_type("body", ty("{ user_id?: String }"));

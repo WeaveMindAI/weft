@@ -16,7 +16,7 @@
       "name": "body",
       "type": "T",
       "required": true,
-      "description": "Any value on json, a String on text, a stored file on bytes."
+      "description": "Any value on json, a String on text, a stored file on bytes. A secret, or one inside it where its type says so, goes out revealed, and the run's record keeps its marker. A secret where its type declares none (inside a `JsonDict`) fails the node: declare the type so it says where the secret is."
     },
     {
       "name": "answerAs",
@@ -49,8 +49,8 @@
     },
     {
       "name": "headers",
-      "type": "Dict[String, String]",
-      "description": "Extra response headers (Route only); a content-type here overrides the body's."
+      "type": "Dict[String, String | Secret[String]]",
+      "description": "Extra response headers (Route only); a content-type here overrides the body's. A secret value goes out revealed."
     }
   ],
   "outputs": [

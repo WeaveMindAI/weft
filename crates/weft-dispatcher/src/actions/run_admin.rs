@@ -1473,6 +1473,24 @@ mod streamed_tests {
         assert_eq!(serde_json::to_value(&answer[4]).unwrap()["broken"].as_str().map(|_| ()), Some(()), "a broken value says why under `broken`");
     }
 
+    /// A row keeping a secret reads back as the secret's marker, alone or
+    /// inside a value: no reader of the record ever holds its value.
+    #[test]
+    fn a_secret_reads_back_as_its_marker() {
+        use weft_core::program::KeptValue;
+        let marker = weft_core::secret::Secret::new(weft_core::secret::SecretId::mint()).to_value();
+        let emitted = weft_journal::RunEvent::PortEmitted {
+            run_id: RUN, emission_id: uuid::Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(),
+            value: Arc::new(serde_json::json!({ "token": marker })), at_unix: 1,
+        };
+        let kept = [((RUN, 3, 0), emitted)].into();
+        let row = ValueRef::Row { run: RUN, seq: 3, index: 0 };
+        let refs = vec![row.clone(), row.part(vec![weft_core::record_ref::Step::Key("token".into())])];
+        let answer = resolved(&refs, &[RUN].into(), &kept, &Default::default());
+        assert_eq!(answer[0], KeptValue::Value { value: serde_json::json!({ "token": marker }) });
+        assert_eq!(answer[1], KeptValue::Value { value: marker });
+    }
+
     /// Only a run whose record is gone reads as gone, a row of it or its
     /// birth alike; the same references into a run that exists are broken.
     #[test]

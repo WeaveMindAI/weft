@@ -21,6 +21,9 @@ pub enum PathError {
     /// The type at segment `at` is not a record, so it has no keys to
     /// read. `JsonDict` and scalars land here.
     NotARecord { at: usize, ty: String },
+    /// The type at segment `at` is a `Secret[T]`: its marker is what
+    /// flows, so nothing inside it can be read off a wire.
+    IntoSecret { at: usize, ty: String },
     /// The record at segment `at` has no field `key`.
     NoSuchKey { at: usize, key: String, available: Vec<String> },
 }
@@ -31,6 +34,11 @@ impl std::fmt::Display for PathError {
             PathError::NotARecord { ty, .. } => write!(
                 f,
                 "'{ty}' has no keys to read; declare the type on the source port or Cast first"
+            ),
+            PathError::IntoSecret { ty, .. } => write!(
+                f,
+                "'{ty}' stays sealed on its way, so no key can be read off it on a wire; \
+                 the receiving node takes {ty} and reveals it"
             ),
             PathError::NoSuchKey { key, available, .. } => write!(
                 f,
@@ -48,6 +56,9 @@ impl std::fmt::Display for PathError {
 pub fn walk_path(ty: &WeftType, path: &[String]) -> Result<WeftType, PathError> {
     let mut current = ty.clone();
     for (at, key) in path.iter().enumerate() {
+        if matches!(current.structural(), WeftType::Secret(_)) {
+            return Err(PathError::IntoSecret { at, ty: current.to_string() });
+        }
         let WeftType::Record { fields, .. } = current.structural() else {
             return Err(PathError::NotARecord { at, ty: current.to_string() });
         };
@@ -166,6 +177,17 @@ mod tests {
         assert!(PathError::NotARecord { at: 0, ty: "JsonDict".into() }
             .to_string()
             .contains("declare the type on the source port or Cast first"));
+    }
+
+    /// A secret's marker is what flows, so a path stops at it, at any
+    /// level, naming the way through.
+    #[test]
+    fn a_path_never_steps_into_a_secret() {
+        let t = ty("{ session: Secret[{ token: String }] }");
+        assert_eq!(walk_path(&t, &path(&["session"])).unwrap(), ty("Secret[{ token: String }]"));
+        let refused = walk_path(&t, &path(&["session", "token"])).unwrap_err();
+        assert_eq!(refused, PathError::IntoSecret { at: 1, ty: "Secret[{token: String}]".into() });
+        assert!(refused.to_string().contains("reveals it"));
     }
 
     #[test]

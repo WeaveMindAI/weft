@@ -239,7 +239,7 @@ async fn cancel_unowned_in(
 /// one schema pass, never here.
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "run",
-    tables: &["run", "run_log", "run_cost", "signal_token", "signal", "run_tag", "trigger_setup", "trigger_bake"],
+    tables: &["run", "run_log", "run_cost", "run_secret", "signal_token", "signal", "run_tag", "trigger_setup", "trigger_bake"],
     ddl: &[
         // One row per trigger setup in flight. Several may run at once for
         // one project (each activation claims its own triggers, one instance's
@@ -522,6 +522,24 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 ORDER BY c.run, c.cost_id
                 ON CONFLICT (run_id, cost_id) DO NOTHING
             $$ LANGUAGE sql"#,
+        // run_secret: the value of each secret a run made
+        // (`weft_core::secret`), whose marker is all its record holds.
+        // Written with the batch that carries the run's rows
+        // (`weft_record_batch`), sealed by the broker before it is bound
+        // (`seal_json`'s base64, under the connection-secret key: text
+        // weft made, never the node's value itself), and read back only by
+        // a worker of the same project revealing it (`project_id` is the
+        // scope). It lives exactly as long as the record of the run that
+        // made it (`erase_run_ids`).
+        // SYNC: run_secret's columns <-> weft_journal::record::record_batch (p_secret_*), weft_broker's reveal (records.rs)
+        r#"CREATE TABLE IF NOT EXISTS run_secret (
+            secret_id UUID PRIMARY KEY,
+            project_id UUID NOT NULL,
+            run_id UUID NOT NULL,
+            sealed TEXT NOT NULL
+        )"#,
+        // What a run's erase deletes by.
+        r#"CREATE INDEX IF NOT EXISTS run_secret_by_run ON run_secret (run_id)"#,
         // signal_token: token-scoped enumeration credential. Allow
         // sets are TEXT[] arrays so parameterized binding gives no
         // SQL-injection surface and the filter SQL is a single `&&`
@@ -918,7 +936,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // takes them in. Only the runs applied now bring their rows, their
         // answers taken (`p_resolved_*`, by run ordinal), their costs
         // (`p_cost_*`, by run ordinal, through `weft_record_costs`), their
-        // version counts (on this lane's own row), their search queue entry
+        // secrets (`p_secret_*`, by run ordinal, sealed already, each kept
+        // once), their version counts (on this lane's own row), their search queue entry
         // and their storage sweep. A run born running counts as its writer's
         // until `p_delivered_until`, before the writer's lease is written.
         // Answers each run's fate, its project, whether it ended now with
@@ -938,6 +957,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 p_cost_run INTEGER[], p_cost_seq INTEGER[], p_cost_id TEXT[], p_cost_idx INTEGER[], p_cost_node TEXT[],
                 p_cost_service TEXT[], p_cost_model TEXT[], p_cost_amount DOUBLE PRECISION[], p_cost_paid_by TEXT[],
                 p_cost_paid_by_instance TEXT[], p_cost_at BIGINT[], p_cost_path_cost INTEGER[], p_cost_path_site TEXT[],
+                p_secret_run INTEGER[], p_secret_id UUID[], p_secret_sealed TEXT[],
                 p_programs JSONB, p_events_version INTEGER
             ) RETURNS TABLE (o_run_id UUID, o_fate TEXT, o_project_id UUID, o_tell_end BOOLEAN, o_keep_until BIGINT,
                              o_unwatched BOOLEAN) AS $$
@@ -1039,6 +1059,15 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                           FROM unnest(p_cost_run) WITH ORDINALITY AS c(run, n) ORDER BY c.n),
                     p_cost_seq, p_cost_id, p_cost_idx, p_cost_node, p_cost_service, p_cost_model, p_cost_amount,
                     p_cost_paid_by, p_cost_paid_by_instance, p_cost_at, p_cost_path_cost, p_cost_path_site);
+                -- A run's secrets go in only when the run did, each once:
+                -- a batch sent again finds them there.
+                INSERT INTO run_secret (secret_id, project_id, run_id, sealed)
+                    SELECT s.id, r.project_id, r.run_id, s.sealed
+                    FROM unnest(p_secret_run, p_secret_id, p_secret_sealed) AS s(run, id, sealed)
+                        JOIN run r ON r.run_id = p_ids[s.run]
+                    WHERE v_fates[s.run] IN ('insert', 'continue')
+                    ORDER BY s.id
+                    ON CONFLICT (secret_id) DO NOTHING;
                 INSERT INTO run_log (run_id, seq, events, events_version, writer, written_at)
                     SELECT p_ids[w.run], w.seq, w.events, p_events_version, p_writer, p_now
                     FROM unnest(p_row_run, p_row_seq, p_row_events) AS w(run, seq, events)
@@ -1959,7 +1988,7 @@ async fn erase_run_ids(
     // one statement that takes its queue row, so it either waits for this
     // erase and finds the row gone (writing nothing), or wrote first and
     // its entry goes here.
-    for table in ["run_search_queue", "run_search", "run_cost", "run_log", "run"] {
+    for table in ["run_search_queue", "run_search", "run_cost", "run_secret", "run_log", "run"] {
         tx.execute(&format!("DELETE FROM {table} WHERE run_id = ANY($1)"), &[&run_ids]).await?;
     }
     // A queued run its workers had failed (busy, refused, not reached)

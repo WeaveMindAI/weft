@@ -1258,19 +1258,21 @@ pub(crate) fn new_connection(
 /// Encode an outbound chunk to a websocket frame per the declared data
 /// type. JSON/text ride as Text frames; bytes as Binary.
 fn chunk_to_ws(chunk: &OutboundChunk) -> Message {
-    match chunk {
+    match chunk.on_the_wire() {
         OutboundChunk::Json(v) => Message::Text(v.to_string().into()),
         OutboundChunk::Text(s) => Message::Text(s.clone().into()),
         OutboundChunk::Bytes(b) => Message::Binary(b.clone().into()),
+        OutboundChunk::Revealed { .. } => unreachable!("what goes on the wire is never itself revealed"),
     }
 }
 
 /// Encode an outbound chunk to HTTP body bytes per the declared data type.
 fn chunk_to_bytes(chunk: &OutboundChunk) -> Vec<u8> {
-    match chunk {
+    match chunk.on_the_wire() {
         OutboundChunk::Json(v) => v.to_string().into_bytes(),
         OutboundChunk::Text(s) => s.clone().into_bytes(),
         OutboundChunk::Bytes(b) => b.clone(),
+        OutboundChunk::Revealed { .. } => unreachable!("what goes on the wire is never itself revealed"),
     }
 }
 

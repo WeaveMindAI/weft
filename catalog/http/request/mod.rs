@@ -34,8 +34,20 @@ impl Node for HttpRequestNode {
         let method = Method::from_bytes(method_str.as_bytes())
             .map_err(|_| WeftError::Input(format!("bad method '{method_str}'")))?;
 
-        let body: Option<Value> = ctx.inputs.opt("body")?;
-        let headers: Option<HashMap<String, String>> = ctx.inputs.opt("headers")?;
+        // A secret in the body or the headers (a caller's credential passed
+        // on) is revealed into the request alone, where the input's type
+        // declares it: the run's record keeps its marker. One the type does
+        // not declare fails the node rather than going out as its marker.
+        let body: Option<Value> = match ctx.inputs.opt::<Value>("body")? {
+            Some(body) => Some(ctx.reveal_input("body", body).await?),
+            None => None,
+        };
+        let headers: Option<HashMap<String, String>> = match ctx.inputs.opt::<Value>("headers")? {
+            Some(headers) => Some(serde_json::from_value(ctx.reveal_input("headers", headers).await?).map_err(|e| {
+                WeftError::Input(format!("headers must map each name to a String or a Secret[String]: {e}"))
+            })?),
+            None => None,
+        };
 
         // A connection carries a key and the header it goes in, so a
         // key never sits in plain `headers` (which travel the journal

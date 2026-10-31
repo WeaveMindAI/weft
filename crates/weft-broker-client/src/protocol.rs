@@ -174,6 +174,29 @@ pub struct RecordOfResponse {
     pub record: weft_journal::record::RawRecord,
 }
 
+/// `POST /v1/journal/secret`: the value of a secret a run of the calling
+/// worker's project made (`weft_core::secret`), opened from the sealed copy
+/// kept with that run's record. 404 when no run of the project keeps it:
+/// its run's record is gone, or that run never wrote it (a run that is not
+/// recorded keeps its secrets in memory alone).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordSecretRequest {
+    pub secret_id: weft_core::secret::SecretId,
+}
+
+/// The value, over the worker's own line, as the run that made it held it.
+/// Its `Debug` leaves the value out.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RecordSecretResponse {
+    pub value: serde_json::Value,
+}
+
+impl std::fmt::Debug for RecordSecretResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordSecretResponse").field("value", &"<not shown>").finish()
+    }
+}
+
 // ---------- Runs ----------
 
 /// `POST /v1/run/claim`: the calling worker claims a queued run of its

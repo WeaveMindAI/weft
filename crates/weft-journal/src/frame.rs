@@ -52,6 +52,28 @@ pub struct RunHead {
     /// It stored files of its own (so far), which its ending's sweep
     /// reclaims.
     pub wrote_files: bool,
+    /// The secrets it made since its last batch (`weft_core::secret`):
+    /// one is made before any row names it, so the batch that carries
+    /// the first row naming a secret carries its value too, or an earlier
+    /// one did.
+    pub secrets: Vec<KeptSecret>,
+}
+
+/// A secret one of a batch's runs made, as the batch carries it to the
+/// broker: its id and its value, plain, over the worker's own line. The
+/// broker seals the value before anything reaches the database
+/// (`crate::record::record_batch`). Its `Debug` leaves the value out, so
+/// no log of a batch ever prints one.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeptSecret {
+    pub secret_id: weft_core::secret::SecretId,
+    pub value: serde_json::Value,
+}
+
+impl std::fmt::Debug for KeptSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeptSecret").field("secret_id", &self.secret_id).field("value", &"<not shown>").finish()
+    }
 }
 
 /// A batch read off the wire: its head, and its rows in order, borrowed
@@ -120,6 +142,7 @@ mod tests {
                     born: None,
                     written: Written::default(),
                     wrote_files: false,
+                    secrets: Vec::new(),
                 })
                 .collect(),
             programs: Vec::new(),
@@ -129,6 +152,31 @@ mod tests {
 
     /// Any set of runs and rows comes back as it went: the head whole, and
     /// each row where its size puts it.
+    /// A head holding a secret reads back with it, and printing the head
+    /// never shows the value.
+    #[test]
+    fn a_secret_rides_the_head_and_never_prints() {
+        let mut head = head(&[(1, &[3])]);
+        let secret = KeptSecret { secret_id: weft_core::secret::SecretId::mint(), value: serde_json::json!("hunter2") };
+        head.runs[0].secrets.push(secret.clone());
+        let body = encode(&head, [b"abc".as_slice()]);
+        let batch = decode(&body).unwrap();
+        assert_eq!(batch.head.runs[0].secrets, vec![secret]);
+        assert!(!format!("{head:?}").contains("hunter2"));
+    }
+
+    /// A head with no `secrets` (a worker built by an older weft) is no
+    /// head of this shape: it is refused, never read as having none.
+    #[test]
+    fn a_head_without_secrets_does_not_read() {
+        let mut header = serde_json::to_value(head(&[(1, &[])])).unwrap();
+        header["runs"][0].as_object_mut().unwrap().remove("secrets");
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut body = (header.len() as u32).to_be_bytes().to_vec();
+        body.extend_from_slice(&header);
+        assert!(decode(&body).is_err());
+    }
+
     #[test]
     fn a_batch_comes_back_as_it_went() {
         let head = head(&[(1, &[3, 0]), (2, &[]), (3, &[5])]);

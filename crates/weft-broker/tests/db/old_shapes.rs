@@ -125,6 +125,43 @@ async fn an_older_workers_claim_and_record_read_are_answered_naming_the_resync(p
     }
 }
 
+/// A worker of an older weft sends batches whose runs carry no `secrets`:
+/// answered naming the resync, never read as a run that made none.
+#[weft_db_macros::test]
+async fn an_older_workers_batch_without_secrets_is_answered_naming_the_resync(pool: Pool) {
+    let router = broker(pool).await;
+    let head = weft_journal::frame::BatchHead {
+        durable: false,
+        lane: 0,
+        runs: vec![weft_journal::frame::RunHead {
+            run_id: uuid::Uuid::from_u128(9),
+            epoch: 1,
+            first_seq: 1,
+            row_sizes: Vec::new(),
+            born: None,
+            written: Default::default(),
+            wrote_files: false,
+            secrets: Vec::new(),
+        }],
+        programs: Vec::new(),
+        events_version: weft_journal::stored::STORED_EVENTS.version(),
+    };
+    let mut header = serde_json::to_value(&head).unwrap();
+    header["runs"][0].as_object_mut().unwrap().remove("secrets");
+    let header = serde_json::to_vec(&header).unwrap();
+    let mut body = (header.len() as u32).to_be_bytes().to_vec();
+    body.extend_from_slice(&header);
+    let call = Request::post(weft_broker_client::protocol::JOURNAL_RECORD_PATH)
+        .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+        .header("x-weft-replica", "worker-1")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, body) = answer(&router, call).await;
+    assert_eq!(status, weft_broker_client::protocol::UNREADABLE_SHAPE, "{body}");
+    assert!(body.contains("run `weft resync` on its project"), "{body}");
+    assert!(body.contains("missing field `secrets`"), "{body}");
+}
+
 /// A caller the broker does not know learns nothing of the shapes: its
 /// token is refused first.
 #[weft_db_macros::test]

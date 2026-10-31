@@ -24,6 +24,12 @@
             self.asked.lock().unwrap().push(after);
             Ok(crate::test_record::rows_of(run_id, &self.events.lock().unwrap(), after))
         }
+        fn keep_secret(&self, _value: serde_json::Value) -> weft_core::secret::SecretId {
+            unreachable!("the paging rig makes no secrets")
+        }
+        async fn reveal_secret(&self, _id: weft_core::secret::SecretId) -> anyhow::Result<serde_json::Value> {
+            unreachable!("the paging rig makes no secrets")
+        }
     }
 
     /// `src -> sink`, `sink` reading `in`.

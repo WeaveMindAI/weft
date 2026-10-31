@@ -66,11 +66,13 @@
     },
     {
       "name": "body",
-      "type": "JsonDict"
+      "type": "T",
+      "description": "The JSON object sent as the request's body. A secret in it (a token for the API) is revealed into the request where the type of what is wired here declares it, like `{ token: Secret[String] }`, and stays a marker on the run's record; a secret inside a body left as a `JsonDict` fails the node."
     },
     {
       "name": "headers",
-      "type": "Dict[String, String]"
+      "type": "Dict[String, String | Secret[String]]",
+      "description": "Extra request headers. A secret value (a caller's `credentials.authorization`) is revealed into the request it sends, and stays a marker on the run's record."
     },
     {
       "name": "method",
@@ -92,6 +94,9 @@
       "label": "Method"
     }
   ],
+  "typeParams": {
+    "T": "JsonDict"
+  },
   "outputs": [
     {
       "name": "status",

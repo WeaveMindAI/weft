@@ -60,6 +60,8 @@ struct Run {
 #[derive(Default)]
 struct State {
     runs: HashMap<RunId, Run>,
+    /// Every secret an accepted run's batch carried, by id.
+    secrets: HashMap<weft_core::secret::SecretId, serde_json::Value>,
     heads: Vec<BatchHead>,
     gave_up: Vec<(RunId, String)>,
     refused: HashSet<RunId>,
@@ -178,6 +180,7 @@ impl RecordClient for FakeRecord {
                 let known = state.runs.entry(id).or_default();
                 known.last_seq = run.first_seq;
                 known.events.extend(events);
+                state.secrets.extend(run.secrets.into_iter().map(|secret| (secret.secret_id, secret.value)));
             }
             fates.push(fate);
         }
@@ -191,6 +194,10 @@ impl RecordClient for FakeRecord {
 
     async fn record_of(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<RawRecord> {
         Ok(page_of(&self.events(run_id), after))
+    }
+
+    async fn secret(&self, secret_id: weft_core::secret::SecretId) -> anyhow::Result<Option<serde_json::Value>> {
+        Ok(self.state.lock().unwrap().secrets.get(&secret_id).cloned())
     }
 
     async fn give_up(&self, run_id: RunId, why: String) -> Result<(), BatchError> {

@@ -62,6 +62,7 @@ mod range_stream;
 mod reach_out;
 mod resume;
 mod route_hold;
+mod route_secret;
 mod run_follow;
 mod runtime_restart;
 mod seed_moved_file;
