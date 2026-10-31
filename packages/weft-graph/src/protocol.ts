@@ -70,7 +70,7 @@ export const ALL_PRIMITIVE_TYPES: WeftPrimitive[] = [
 /** The type names that are not primitives but still mean something to
  *  the type language: no declared type may take one. */
 // SYNC: CONTAINER_AND_SPECIAL_TYPES <-> crates/weft-core/src/weft_type.rs CONTAINER_AND_SPECIAL_TYPES
-const CONTAINER_AND_SPECIAL_TYPES = ['List', 'Dict', 'JsonDict', 'Json', 'Bus', 'Access', 'Infra', 'Generator'];
+const CONTAINER_AND_SPECIAL_TYPES = ['List', 'Dict', 'JsonDict', 'Json', 'Bus', 'Access', 'Infra', 'Generator', 'Secret'];
 
 // SYNC: NAMED_UNIONS <-> crates/weft-core/src/weft_type.rs WeftType::UNION_ALIASES
 /** Named union aliases. The ONE table both name resolution (parse) and
@@ -128,6 +128,14 @@ export type WeftType =
   // of T); exactly one producer feeds exactly one consumer. Wires only.
   // SYNC: generator <-> crates/weft-core/src/weft_type.rs WeftType::Generator
   | { kind: 'generator'; inner: WeftType }
+  // A value its run's record never holds: `Secret[T]`. What flows is a
+  // marker naming a `T` kept sealed beside the record (see
+  // `SECRET_MARKER_KEY`), so the inspector only ever sees the marker.
+  // Strict both ways: a `Secret[T]` fits only a `Secret[U]` whose `T`
+  // fits `U`, never a plain `T`, and nothing plain fits it. Wires only
+  // (a node makes one at run time, never a literal or a Cast).
+  // SYNC: WeftType 'secret' <-> crates/weft-core/src/weft_type.rs WeftType::Secret
+  | { kind: 'secret'; inner: WeftType }
   | { kind: 'union'; types: WeftType[] }
   // Dict with KNOWN field names: `{ role: String, name?: String }`.
   // `open` (written `..` as the last item, `{ role: String, .. }`) takes
@@ -238,6 +246,7 @@ function anyLeaf(t: WeftType, leaf: (kind: WeftType['kind']) => boolean): boolea
   switch (t.kind) {
     case 'list':
     case 'generator':
+    case 'secret':
       return anyLeaf(t.inner, leaf);
     case 'dict':
       return anyLeaf(t.value, leaf);
@@ -369,7 +378,7 @@ function parseSingleType(s: string): WeftType {
   if (s === 'Access') return { kind: 'access' };
   if (s === 'Infra') return { kind: 'infra' };
 
-  // Parameterized: List[T], Generator[T], Dict[String, V]
+  // Parameterized: List[T], Generator[T], Secret[T], Dict[String, V]
   const bracketPos = s.indexOf('[');
   if (bracketPos !== -1) {
     if (!s.endsWith(']')) refuse(`\`${s}\` opens a \`[\` it never closes at its end`);
@@ -378,6 +387,7 @@ function parseSingleType(s: string): WeftType {
 
     if (name === 'List') return { kind: 'list', inner: parseTypeOrThrow(inner) };
     if (name === 'Generator') return { kind: 'generator', inner: parseTypeOrThrow(inner) };
+    if (name === 'Secret') return { kind: 'secret', inner: parseTypeOrThrow(inner) };
     if (name === 'Dict') {
       const parts = splitTopLevel(inner, ',');
       if (parts.length !== 2) refuse(`\`${s}\`: a dict takes two types, \`Dict[String, V]\``);
@@ -395,7 +405,7 @@ function parseSingleType(s: string): WeftType {
       }
       return { kind: 'dict', value };
     }
-    refuse(`\`${name}[...]\` is not a type; the types that take one are List, Generator and Dict`);
+    refuse(`\`${name}[...]\` is not a type; the types that take one are List, Generator, Secret and Dict`);
   }
 
   // Primitive
@@ -512,6 +522,8 @@ export function weftTypesEqual(a: WeftType, b: WeftType): boolean {
           bf => bf.name === af.name && bf.optional === af.optional && weftTypesEqual(af.ty, bf.ty)));
     case 'generator':
       return b.kind === 'generator' && weftTypesEqual(a.inner, b.inner);
+    case 'secret':
+      return b.kind === 'secret' && weftTypesEqual(a.inner, b.inner);
     case 'named':
       return b.kind === 'named' && a.name === (b as Extract<WeftType, { kind: 'named' }>).name;
     case 'typevar':
@@ -570,6 +582,7 @@ function renderType(t: WeftType, wire: boolean): string {
     case 'access': return 'Access';
     case 'infra': return 'Infra';
     case 'generator': return `Generator[${renderType(t.inner, wire)}]`;
+    case 'secret': return `Secret[${renderType(t.inner, wire)}]`;
     case 'union': return unionAliasName(t.types) ?? t.types.map(m => renderType(m, wire)).join(' | ');
     case 'record': {
       const fields = t.fields.map(f => `${f.name}${f.optional ? '?' : ''}: ${renderType(f.ty, wire)}`);
@@ -618,7 +631,9 @@ function weftTypeReferencesFile(t: WeftType): boolean {
       return weftTypeReferencesFile(t.body);
     // A generator's port value is a live handle; its ITEMS may
     // reference files, but nothing about the port value itself is a
-    // file to cast or pick (mirrors Rust's Generator arm).
+    // file to cast or pick (mirrors Rust's Generator arm). A secret's
+    // port value is its marker, never the file it may hold, so it sits
+    // here too.
     default:
       return false;
   }
@@ -1103,6 +1118,29 @@ export { credentialOwnerKind } from '../../weft-connect/src/core/wire';
 /** The on-wire sentinel key tagging an Access value. */
 // SYNC: ACCESS_MARKER_KEY <-> crates/weft-core/src/access/value.rs ACCESS_MARKER_KEY
 export const ACCESS_MARKER_KEY = '__weft_access__';
+
+/** The on-wire sentinel key tagging a Secret's marker:
+ *  `{"__weft_secret__": {"secretId": "<uuid>"}}`. */
+// SYNC: SECRET_MARKER_KEY <-> crates/weft-core/src/secret.rs SECRET_MARKER_KEY
+export const SECRET_MARKER_KEY = '__weft_secret__';
+
+/** Whether `value` is a well-formed secret marker: an object holding
+ *  the sentinel key alone, whose payload holds a `secretId` and nothing
+ *  else. A malformed one is not a secret, just an object. */
+// SYNC: isSecretMarker <-> crates/weft-core/src/secret.rs Secret::from_value
+export function isSecretMarker(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || keys[0] !== SECRET_MARKER_KEY) return false;
+  const payload = (value as Record<string, unknown>)[SECRET_MARKER_KEY];
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return false;
+  const fields = Object.keys(payload);
+  const id = (payload as Record<string, unknown>).secretId;
+  return fields.length === 1 && fields[0] === 'secretId' && typeof id === 'string' && UUID.test(id);
+}
+
+/** A uuid in the hyphenated form the backend writes a `SecretId` in. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** The on-wire sentinel key tagging an Infra handle value. */
 // SYNC: INFRA_MARKER_KEY <-> crates/weft-core/src/infra/handle.rs INFRA_MARKER_KEY

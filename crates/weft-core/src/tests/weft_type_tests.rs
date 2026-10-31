@@ -2548,3 +2548,131 @@ fn only_a_requested_cast_turns_a_structure_into_text() {
     assert_eq!(target.cast_requested(&json!([1, 2])).unwrap(), json!(["1", "2"]), "a name over a union with text in it waits too");
     assert!(WeftType::cast_allowed(&ty("JsonDict"), &text).is_ok(), "the compile-time table grants it");
 }
+
+// ----- Secret[T] ------------------------------------------------------
+
+fn secret_marker() -> serde_json::Value {
+    crate::secret::Secret::new(crate::secret::SecretId::mint()).to_value()
+}
+
+#[test]
+fn secret_parses_prints_and_round_trips() {
+    let s = WeftType::parse("Secret[String]").expect("parses");
+    assert_eq!(s, WeftType::Secret(Box::new(WeftType::Primitive(WeftPrimitive::String))));
+    assert_eq!(s.to_string(), "Secret[String]");
+    let nested = WeftType::parse("Dict[String, String | Secret[String]]").expect("parses");
+    assert_eq!(WeftType::parse(&nested.wire_string()), Some(nested.clone()));
+    assert!(nested.holds_secret());
+    assert!(!WeftType::parse("Dict[String, String]").unwrap().holds_secret());
+}
+
+/// Strict both ways: a secret fits only a secret of what it holds, a
+/// plain value never fits a secret, and nothing launders one through an
+/// unchecked dict or `Json`.
+#[test]
+fn secret_fits_only_a_secret_of_what_it_holds() {
+    let t = |s: &str| WeftType::parse(s).unwrap();
+    let fits = |a: &str, b: &str| WeftType::is_compatible(&t(a), &t(b));
+    assert!(fits("Secret[String]", "Secret[String]"));
+    assert!(fits("Secret[String]", "String | Secret[String]"));
+    assert!(fits("Secret[String]", "Secret[String | Number]"));
+    assert!(!fits("Secret[String | Number]", "Secret[String]"));
+    assert!(!fits("Secret[String]", "String"));
+    assert!(!fits("String", "Secret[String]"));
+    assert!(!fits("Secret[String]", "Json"));
+    assert!(!fits("Dict[String, Secret[String]]", "JsonDict"));
+    assert!(!fits("{ token: Secret[String] }", "JsonDict"));
+    assert!(fits("{ token: String }", "JsonDict"));
+    assert!(fits("Secret[String]", "T"));
+}
+
+/// Only a node makes a secret: a value is never cast into one, a Cast
+/// never makes one nor opens one, and the zero value is null.
+#[test]
+fn secret_has_no_literal_no_cast_and_no_default() {
+    let s = WeftType::parse("Secret[String]").unwrap();
+    assert_eq!(s.cast_value(&serde_json::json!("abc")).unwrap_err(), crate::secret::MADE_BY_A_NODE);
+    let s_or_text = WeftType::parse("String | Secret[String]").unwrap();
+    assert_eq!(s_or_text.cast_value(&serde_json::json!("abc")).unwrap(), serde_json::json!("abc"));
+    assert!(WeftType::cast_allowed(&WeftType::parse("String").unwrap(), &s).is_err());
+    assert!(WeftType::cast_allowed(&s, &s).is_err());
+    assert!(WeftType::cast_allowed(&s, &WeftType::parse("String").unwrap()).is_err());
+    assert!(WeftType::cast_allowed(&WeftType::JsonDict, &WeftType::parse("{ a: Secret[String] }").unwrap()).is_err());
+    assert_eq!(s.zero_value(), serde_json::Value::Null);
+}
+
+/// What a secret port carries is its marker, whatever it holds: the
+/// marker passes, anything else (the plain value, a malformed marker)
+/// is refused, and a marker infers as a secret.
+#[test]
+fn secret_marker_validates_as_the_port_value() {
+    let s = WeftType::parse("Secret[{ token: String }]").unwrap();
+    let marker = secret_marker();
+    assert!(s.validate_value(&marker).is_ok());
+    assert!(s.validate_value(&serde_json::json!({ "token": "x" })).is_err());
+    assert!(s.validate_value(&serde_json::json!({ crate::secret::SECRET_MARKER_KEY: { "secretId": "nope" } })).is_err());
+    assert!(matches!(WeftType::infer(&marker), WeftType::Secret(_)));
+    let headers = WeftType::parse("Dict[String, String | Secret[String]]").unwrap();
+    assert!(headers.validate_value(&serde_json::json!({ "accept": "json", "authorization": marker })).is_ok());
+}
+
+/// The type says where a value's secrets are, at any depth, whether made
+/// already or still plain; a union reads through the member that takes
+/// the value, and a marker where the type names no secret is named as
+/// undeclared, however deep it sits.
+#[test]
+fn secret_places_follow_the_type() {
+    use crate::weft_type::SecretPlace::{Plain, Sealed, Undeclared};
+    let marker = secret_marker();
+    let headers = WeftType::parse("Dict[String, String | Secret[String]]").unwrap();
+    let value = serde_json::json!({ "accept": "json", "a/b": marker });
+    assert_eq!(headers.secret_places(&value), vec![("/a~1b".to_string(), Sealed)]);
+    let session = WeftType::parse("{ token: Secret[String], refresh?: Secret[String] | Null, tags: List[Secret[String]] }").unwrap();
+    let value = serde_json::json!({ "token": "t", "refresh": null, "tags": ["a", marker] });
+    assert_eq!(
+        session.secret_places(&value),
+        vec![("/token".to_string(), Plain), ("/tags/0".to_string(), Plain), ("/tags/1".to_string(), Sealed)]
+    );
+    let optional = WeftType::parse("Secret[String] | Null").unwrap();
+    assert_eq!(optional.secret_places(&serde_json::json!("t")), vec![(String::new(), Plain)]);
+    assert_eq!(
+        WeftType::JsonDict.secret_places(&serde_json::json!({ "x": { "y": [marker] } })),
+        vec![("/x/y/0".to_string(), Undeclared)]
+    );
+    let open = WeftType::parse("{ user: String }").unwrap();
+    assert_eq!(
+        open.secret_places(&serde_json::json!({ "user": "ada", "extra": marker })),
+        vec![("/extra".to_string(), Undeclared)]
+    );
+    // A marker reads through the union member that declares it, whichever
+    // order the members are written in, at any depth.
+    for written in ["Secret[String] | JsonDict", "JsonDict | Secret[String]"] {
+        let ty = WeftType::parse(written).unwrap();
+        assert_eq!(ty.secret_places(&marker), vec![(String::new(), Sealed)], "{written}");
+    }
+    for written in ["JsonDict | { token: Secret[String] }", "{ token: Secret[String] } | JsonDict"] {
+        let ty = WeftType::parse(written).unwrap();
+        assert_eq!(ty.secret_places(&serde_json::json!({ "token": marker })), vec![("/token".to_string(), Sealed)], "{written}");
+    }
+    // A plain value inside an optional member holding a secret is where
+    // one is to be made.
+    let optional = WeftType::parse("{ a: Secret[String] } | Null").unwrap();
+    assert_eq!(optional.secret_places(&serde_json::json!({ "a": "x" })), vec![("/a".to_string(), Plain)]);
+    let optional = WeftType::parse("List[Secret[String]] | Null").unwrap();
+    assert_eq!(optional.secret_places(&serde_json::json!(["x"])), vec![("/0".to_string(), Plain)]);
+    let both = WeftType::parse("Secret[String] | List[Secret[String]]").unwrap();
+    assert_eq!(both.secret_places(&serde_json::json!("x")), vec![(String::new(), Plain)], "the secret member first");
+    let either = WeftType::parse("String | JsonDict").unwrap();
+    assert_eq!(either.secret_places(&serde_json::json!({ "t": marker })), vec![("/t".to_string(), Undeclared)]);
+    assert!(WeftType::JsonDict.secret_places(&serde_json::json!({ "x": "plain" })).is_empty());
+}
+
+/// An output that gives some object may be declared to hold a secret
+/// (`-> (object: { token: Secret[String] })`), while wiring the same record
+/// on into an unchecked dict stays refused.
+#[test]
+fn a_record_holding_a_secret_narrows_an_object_output() {
+    let record = WeftType::parse("{ token: Secret[String], expiresAt: Number }").unwrap();
+    assert!(WeftType::fits_within(&record, &WeftType::JsonDict));
+    assert!(!WeftType::is_compatible(&record, &WeftType::JsonDict));
+}

@@ -11,6 +11,7 @@ import {
 	fitsWithin,
 	tryParseWeftType,
 	typeVarBoundRefuses,
+	collectTypeVarBindings,
 	type WeftType,
 } from '../types';
 import { portVar } from '../../../protocol';
@@ -84,6 +85,49 @@ describe('parseWeftType', () => {
 		expect(infra.kind).toBe('infra');
 		expect(isCompatible(infra, infra)).toBe(true);
 		expect(isCompatible(parseWeftType('String')!, infra)).toBe(false);
+	});
+
+	it('round-trips Secret[T], alone and inside a dict', () => {
+		for (const spelled of ['Secret[String]', 'Dict[String, String | Secret[String]]']) {
+			const t = parseWeftType(spelled)!;
+			expect(weftTypeToString(t)).toBe(spelled);
+			expect(weftTypeToWireString(t)).toBe(spelled);
+			expect(weftTypesEqual(parseWeftType(weftTypeToWireString(t))!, t)).toBe(true);
+		}
+		expect(parseWeftType('Secret[String]')).toEqual({ kind: 'secret', inner: { kind: 'primitive', value: 'String' } });
+	});
+
+	it('connects a Secret only to a Secret of what it holds', () => {
+		const ok = (s: string, t: string) => isWeftTypeCompatible(s, t);
+		expect(ok('Secret[String]', 'Secret[String]')).toBe(true);
+		expect(ok('Secret[String]', 'String | Secret[String]')).toBe(true);
+		expect(ok('Secret[String]', 'Secret[String | Number]')).toBe(true);
+		expect(ok('Secret[String]', 'String')).toBe(false);
+		expect(ok('String', 'Secret[String]')).toBe(false);
+		expect(ok('Secret[String]', 'Json')).toBe(false);
+		expect(ok('List[Secret[String]]', 'Json')).toBe(false);
+	});
+
+	it('keeps a dict or record holding a Secret out of JsonDict', () => {
+		const ok = (s: string, t: string) => isWeftTypeCompatible(s, t);
+		expect(ok('Dict[String, Secret[String]]', 'JsonDict')).toBe(false);
+		expect(ok('Dict[String, String | Secret[String]]', 'JsonDict')).toBe(false);
+		expect(ok('{ key: Secret[String] }', 'JsonDict')).toBe(false);
+		expect(ok('Dict[String, String]', 'JsonDict')).toBe(true);
+		expect(ok('{ key: String }', 'JsonDict')).toBe(true);
+	});
+
+	it('binds a type variable through a Secret, element-wise', () => {
+		const out: [string, WeftType][] = [];
+		collectTypeVarBindings(parseWeftType('Secret[T]')!, parseWeftType('Secret[String]')!, out);
+		expect(out).toEqual([['T', { kind: 'primitive', value: 'String' }]]);
+	});
+
+	it('infers a secret marker as a Secret, never as a dict', () => {
+		const marker = { __weft_secret__: { secretId: '7c9e6679-7425-40de-944b-e07fc1f90ae7' } };
+		expect(inferTypeFromValue(marker).kind).toBe('secret');
+		// A malformed marker (an extra key) is just an object.
+		expect(inferTypeFromValue({ ...marker, other: 1 }).kind).toBe('dict');
 	});
 
 	it('parses a record with optional fields', () => {

@@ -1026,7 +1026,7 @@ fn cast_literals(node: &mut weft_core::project::NodeDefinition) {
 fn holds_empty(ty: &WeftType) -> bool {
     match ty {
         WeftType::Primitive(weft_core::weft_type::WeftPrimitive::Empty) => true,
-        WeftType::List(inner) | WeftType::Dict(inner) | WeftType::Generator(inner) => holds_empty(inner),
+        WeftType::List(inner) | WeftType::Dict(inner) | WeftType::Generator(inner) | WeftType::Secret(inner) => holds_empty(inner),
         WeftType::Union(members) => members.iter().any(holds_empty),
         WeftType::Record { fields, .. } => fields.iter().any(|f| holds_empty(&f.ty)),
         WeftType::Named { body, .. } => holds_empty(body),
@@ -1321,6 +1321,7 @@ fn collect_type_var_bindings(
         (WeftType::Generator(a), WeftType::Generator(b)) => {
             collect_type_var_bindings(a, b, out)
         }
+        (WeftType::Secret(a), WeftType::Secret(b)) => collect_type_var_bindings(a, b, out),
         (WeftType::Dict(a), WeftType::Dict(b)) => collect_type_var_bindings(a, b, out),
         (WeftType::Record { fields: af, .. }, WeftType::Record { fields: bf, .. }) => {
             for fa in af {

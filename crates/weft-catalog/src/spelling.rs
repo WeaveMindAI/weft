@@ -243,7 +243,7 @@ fn check_record_fields(out: &mut Vec<String>, ty: &WeftType, declaration: bool) 
                 check_record_fields(out, body, false);
             }
         }
-        WeftType::List(inner) | WeftType::Generator(inner) | WeftType::Dict(inner) => {
+        WeftType::List(inner) | WeftType::Generator(inner) | WeftType::Secret(inner) | WeftType::Dict(inner) => {
             check_record_fields(out, inner, false)
         }
         WeftType::Union(members) => {

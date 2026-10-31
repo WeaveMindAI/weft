@@ -1517,7 +1517,11 @@ fn start_flag(project: &ProjectDefinition, spec: &RunSpec) -> impl Fn(&str) -> &
 }
 
 /// A supplied generator is an ordered list of items followed by a clean end.
+/// A supplied value never claims to be a secret: only a node makes one.
 pub fn validate_supplied_value(ty: &WeftType, value: &Value) -> Result<(), String> {
+    if crate::secret::Secret::claimed_in(value) {
+        return Err(crate::secret::MADE_BY_A_NODE.to_string());
+    }
     if let WeftType::Generator(item) = ty {
         let items = value.as_array().ok_or_else(|| "a supplied generator must be a list of items".to_string())?;
         for (index, value) in items.iter().enumerate() {

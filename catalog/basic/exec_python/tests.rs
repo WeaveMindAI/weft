@@ -134,7 +134,47 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("returning_error_fails_the_run_even_with_error_wired", returned_error_wired),
         NodeTest::fake("a_value_of_the_wrong_type_fails_the_run_even_with_error_wired", wrong_type_wired),
         NodeTest::fake("a_value_heavier_than_a_wire_comes_out_on_error_naming_the_port", heavy_value_wired),
+        NodeTest::fake("a_declared_secret_arrives_revealed_and_leaves_as_a_secret", secret_round_trip),
+        NodeTest::fake("a_secret_an_input_does_not_declare_fails_before_the_script", undeclared_secret_input),
     ]
+}
+
+/// A secret inside an input whose type declares none (a `JsonDict`) fails
+/// the node naming the input and where the secret is, before the script
+/// runs: the script would have been handed the marker.
+async fn undeclared_secret_input(rig: FakeRig) -> WeftResult<()> {
+    rig.input_type("data", WeftType::parse("JsonDict").expect("parses"));
+    rig.output_type("seen", WeftType::parse("String").expect("parses"));
+    let token = rig.secret(json!("tok-123"));
+    let err = rig
+        .run(&ExecPythonNode, json!({ "code": "return {'seen': str(data)}", "data": { "token": token } }))
+        .await
+        .failure()?;
+    assert!(err.contains("`data` holds a secret at /token"), "{err}");
+    assert!(err.contains("the type of what is wired into `data`"), "{err}");
+    Ok(())
+}
+
+/// An input declared a secret binds as its value, and a value returned on
+/// an output declared a secret leaves as one: the output is its marker,
+/// what it holds is what the script returned.
+async fn secret_round_trip(rig: FakeRig) -> WeftResult<()> {
+    rig.input_type("token", WeftType::parse("Secret[String]").expect("parses"));
+    rig.output_type("length", WeftType::parse("Number").expect("parses"));
+    rig.output_type("renewed", WeftType::parse("Secret[String]").expect("parses"));
+    let token = rig.secret(json!("tok-123"));
+    let outcome = rig
+        .run(
+            &ExecPythonNode,
+            json!({ "code": "return {'length': len(token), 'renewed': token + '-2'}", "token": token }),
+        )
+        .await
+        .ok()?;
+    assert_eq!(outcome.outputs["length"], json!(7));
+    let renewed = &outcome.outputs["renewed"];
+    assert!(weft::secret::Secret::from_value(renewed).is_some(), "{renewed}");
+    assert_eq!(rig.revealed(renewed)?, json!("tok-123-2"));
+    Ok(())
 }
 
 async fn custom_ports(rig: FakeRig) -> WeftResult<()> {

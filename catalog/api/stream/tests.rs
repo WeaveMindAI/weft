@@ -30,6 +30,8 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::basic("ndjson_is_one_json_value_per_line", ndjson_framing),
         NodeTest::fake("a_redirect_is_a_replys_answer", redirect_refused),
         NodeTest::fake("a_message_it_cannot_send_fails_the_answer_or_is_skipped", unmade_message),
+        NodeTest::fake("a_secret_in_a_bus_message_fails_the_stream", secret_on_the_bus),
+        NodeTest::fake("a_secret_firsts_type_does_not_declare_fails_the_stream", undeclared_first),
     ]
 }
 
@@ -288,5 +290,43 @@ async fn unmade_message(rig: FakeRig) -> WeftResult<()> {
             "{protocol:?}: {skipped:?}"
         );
     }
+    Ok(())
+}
+
+/// A bus carries no type, so a secret's marker in a message has nothing
+/// saying to reveal it: the node fails naming its place, after what went
+/// out before it, even behind a trigger that skips a message it cannot
+/// make.
+async fn secret_on_the_bus(rig: FakeRig) -> WeftResult<()> {
+    let conn = caller_skipping_unmade_chunks(Protocol::Http, DataType::Json);
+    rig.attach_caller(conn.clone());
+    let token = rig.secret(json!("tok-7"));
+    let bus = closed_bus(&rig, &[json!("a"), json!({ "token": token })])?;
+    let err = rig.run(&StreamNode, json!({ "bus": bus, "format": "ndjson" })).await.failure()?;
+    assert!(err.contains("a message on `bus` holds a secret at /token"), "{err}");
+    assert_eq!(conn.chunks(), vec![OutboundChunk::Text(ndjson_line(&json!("a")))]);
+    Ok(())
+}
+
+/// `first` left as a `JsonDict` holding a secret fails the node before
+/// anything goes out; declared, the same value goes out revealed.
+async fn undeclared_first(rig: FakeRig) -> WeftResult<()> {
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
+    rig.attach_caller(conn.clone());
+    let token = rig.secret(json!("tok-7"));
+    let bus = closed_bus(&rig, &[])?;
+    rig.input_type("first", weft::WeftType::try_parse("JsonDict").expect("a type"));
+    let err = rig.run(&StreamNode, json!({ "bus": bus.clone(), "first": { "token": token } })).await.failure()?;
+    assert!(err.contains("`first` holds a secret at /token"), "{err}");
+    assert!(conn.chunks().is_empty(), "{:?}", conn.chunks());
+
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
+    rig.attach_caller(conn.clone());
+    rig.input_type("first", weft::WeftType::try_parse("{ token: Secret[String] }").expect("a type"));
+    rig.run(&StreamNode, json!({ "bus": bus, "first": { "token": token } })).await.ok()?;
+    assert_eq!(
+        conn.chunks(),
+        vec![OutboundChunk::Revealed { sent: Box::new(OutboundChunk::Json(json!({ "token": "tok-7" }))), kept: json!({ "token": token }) }]
+    );
     Ok(())
 }

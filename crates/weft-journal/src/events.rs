@@ -771,20 +771,6 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
-/// `event` as its run's record holds it: every credential `redaction`
-/// names replaced (`weft_core::caller::Redaction`). An event that holds
-/// none comes back as it was.
-pub fn redacted(event: &RunEvent, redaction: &weft_core::caller::Redaction) -> Result<RunEvent, serde_json::Error> {
-    if redaction.is_empty() {
-        return Ok(event.clone());
-    }
-    let mut value = serde_json::to_value(event)?;
-    redaction.scrub(&mut value);
-    let mut clean: RunEvent = serde_json::from_value(value)?;
-    *clean.run_id_mut() = event.run_id();
-    Ok(clean)
-}
-
 /// The `run_id` of whichever event `$event` is, by reference: one
 /// match for [`RunEvent::run_id`] and [`RunEvent::run_id_mut`].
 macro_rules! run_id_of {

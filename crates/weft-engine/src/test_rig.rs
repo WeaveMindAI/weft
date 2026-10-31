@@ -158,7 +158,7 @@ impl LiveTestRunner {
             keep_for: settings.kept_for(weft_core::run_settings::KeepFor::WEFT_DEFAULT),
             epoch: 1,
             next_seq: 0,
-            redaction: Default::default(),
+            secrets: Vec::new(),
             program: None,
         });
         let birth = weft_journal::RunEvent::RunStarted {

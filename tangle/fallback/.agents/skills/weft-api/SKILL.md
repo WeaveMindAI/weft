@@ -58,7 +58,13 @@ answer = Reply { status: 201, body: hello.body.name }
 
 A [route]'s other fixed output ports carry the request as the gateway saw
 it: the method, the path as called, the query, the headers, and who the
-[gate] let in. Its metadata lists them. A path capture has no fixed port: you
+[gate] let in. Its metadata lists them. The headers carrying a credential
+(`authorization`, `proxy-authorization`, `cookie`, `weft-instance-token`, and
+the ones the [gate] reads) are never on `headers`: they come out on
+`credentials`, each a `Secret[String]`, which the run's record holds only as a
+marker. Hand them to a node that takes a secret (`HttpRequest`'s `headers`
+sends them revealed, and so does its `body` when what you wire into it declares
+where the secret is, like `{ token: Secret[String] }`); a plain `String` port refuses them at build. A path capture has no fixed port: you
 declare an output of its name (below).
 
 What you declare on `body` depends on the body shape the [route] is set to
@@ -93,7 +99,7 @@ Every output you add to a `Route` must be a capture of its path, typed
 `String`; the compiler refuses anything else with
 `route-output-not-a-capture`. A capture may not share a name with one of
 `Route`'s own outputs (`body`, `method`, `path`, `query`, `headers`,
-`caller`, `fired`): `cards/{body}` is `route-capture-shadows-output`, asking
+`credentials`, `caller`, `fired`): `cards/{body}` is `route-capture-shadows-output`, asking
 you to rename the capture.
 
 The first thing the program sends commits the status line. A `Reply` on a
@@ -708,7 +714,8 @@ appears at once at the end and tells you nothing about timing.
 To try a route BEFORE activating (no listeners armed, no URL, no waiting on
 a resync), `--fire` runs the whole thing. Give it the request envelope the
 trigger declares in its `firesWith` metadata (for a Route: `method`,
-`path`, and optionally `params`, `query`, `headers`, `caller`), plus a
+`path`, and optionally `params`, `query`, `headers` (never a credential
+header, nor `credentials`: the fire is refused naming it), `caller`), plus a
 `body` key holding what the caller would have sent. The envelope is checked
 exactly, so a key the trigger does not declare is refused by name, same as a
 missing one.

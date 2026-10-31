@@ -46,13 +46,17 @@ pub fn opening_request(ctx: &RunContext) -> WeftResult<LiveRequest> {
 /// name, which a capture called `params` is too), and `Socket` has no
 /// `method` (an upgrade is always a GET). `fired` is always true: a port
 /// a program can gate on "the trigger was called" without reading any
-/// request part. Header names are lowercased, as HTTP reads them.
+/// request part. Header names are lowercased, as HTTP reads them. The
+/// headers that carry a credential are on `credentials`, as secrets the
+/// door made of them (`LiveRequest::credentials`), never on `headers`.
 pub fn request_ports(trigger: &weft::NodeMetadata, request: &LiveRequest) -> Vec<(&'static str, Value)> {
     let headers: serde_json::Map<String, Value> = request
         .headers
         .iter()
         .map(|(k, v)| (k.to_ascii_lowercase(), Value::String(v.clone())))
         .collect();
+    let credentials: serde_json::Map<String, Value> =
+        request.credentials.iter().map(|(k, secret)| (k.to_ascii_lowercase(), secret.to_value())).collect();
     vec![
         ("fired", Value::Bool(true)),
         ("method", Value::String(request.method.clone())),
@@ -60,11 +64,52 @@ pub fn request_ports(trigger: &weft::NodeMetadata, request: &LiveRequest) -> Vec
         ("params", serde_json::to_value(&request.params).expect("a string map serializes")),
         ("query", serde_json::to_value(&request.query).expect("a string map serializes")),
         ("headers", Value::Object(headers)),
+        ("credentials", Value::Object(credentials)),
         ("caller", request.caller.clone().unwrap_or(Value::Null)),
     ]
     .into_iter()
     .filter(|(port, _)| trigger.outputs.iter().any(|o| o.name == *port))
     .collect()
+}
+
+/// What an answer node sends for `value`, the value of its input `port`:
+/// the chunk `make` builds of it, from the value revealed by the input's
+/// type (`RunContext::reveal_input`, which refuses a secret the type does
+/// not declare). Where the type holds a secret, the caller receives the
+/// value revealed and the run's record keeps it with its markers
+/// (`OutboundChunk::Revealed`).
+pub async fn revealing<F, Fut>(ctx: &RunContext, port: &str, value: Value, make: F) -> WeftResult<OutboundChunk>
+where
+    F: FnOnce(Value) -> Fut,
+    Fut: std::future::Future<Output = WeftResult<OutboundChunk>>,
+{
+    if !ctx.declared_inputs().get(port).is_some_and(WeftType::holds_secret) {
+        return make(ctx.reveal_input(port, value).await?).await;
+    }
+    let sent = ctx.reveal_input(port, value.clone()).await?;
+    Ok(OutboundChunk::Revealed { sent: Box::new(make(sent).await?), kept: value })
+}
+
+/// Refuse a bus message holding a secret's marker, naming its place: a bus
+/// carries no type, so there is no declared type to reveal it by (the
+/// typed inputs go through `RunContext::reveal_input`), and the caller
+/// would receive the marker instead of the value.
+pub fn refuse_secret_in_message(port: &str, message: &Value) -> WeftResult<()> {
+    match weft::secret::markers_in(message).first() {
+        None => Ok(()),
+        Some((at, _)) => Err(WeftError::Input(format!(
+            "a message on `{port}` holds a secret {}: a bus carries no type, so nothing says to reveal \
+             it, and the caller would receive its marker instead of its value. Send it through an input \
+             whose type declares it (`first`, or a Reply's `body`), and it goes out revealed",
+            place_name(at)
+        ))),
+    }
+}
+
+/// Where a JSON pointer sits, for a message: `at /token`, or `as the whole
+/// value` for the empty pointer.
+fn place_name(at: &str) -> String {
+    if at.is_empty() { "as the whole value".to_string() } else { format!("at {at}") }
 }
 
 /// A port value as the wire wants it for `data_type`. A JSON value's
@@ -164,8 +209,9 @@ pub async fn take_message(
 /// A caller never hands over a stored-file value itself: a marker
 /// names a key or a URL, and taking one on the caller's word would let
 /// them point the program at a file of this project or make the worker
-/// fetch an address of their choosing. Any marker anywhere in the
-/// value is refused.
+/// fetch an address of their choosing. Nor a secret: only a node makes
+/// one, and a marker taken on the caller's word would name a secret of
+/// another run. Any marker anywhere in the value is refused.
 ///
 /// `Ok(Err(why))` is the CALLER's mistake, said in words the caller can
 /// act on; `Err` is the node's own failure (storage refusing a write).
@@ -178,6 +224,12 @@ pub async fn take_inbound(
     if weft::storage::media::holds_file_marker(&value) {
         return Ok(Err(format!(
             "{name} carries a stored-file object; send a file's bytes as a data: URL or base64 instead"
+        )));
+    }
+    if weft::secret::Secret::claimed_in(&value) {
+        return Ok(Err(format!(
+            "{name} carries a `{}` object, which only weft makes; send the value itself",
+            weft::secret::SECRET_MARKER_KEY
         )));
     }
     // Four steps, so a refusal leaves nothing behind: every inline
@@ -389,9 +441,18 @@ pub fn with_file_head(mut head: ResponseHead, file: &StoredFile) -> ResponseHead
     head
 }
 
+/// The `headers` input of an answer node, every secret in it revealed
+/// (its type, `Dict[String, String | Secret[String]]`, says where): a
+/// header the caller receives carries the value, while the run's record
+/// keeps the marker. `None` when nothing was set.
+pub async fn headers(ctx: &RunContext) -> WeftResult<Option<Value>> {
+    let Some(headers) = ctx.inputs.opt::<Value>("headers")? else { return Ok(None) };
+    ctx.reveal_input("headers", headers).await.map(Some)
+}
+
 /// The response head a node's `status` and `headers` inputs describe.
-/// `headers` is a JSON object of string values (the port's declared
-/// type); anything else is refused by name.
+/// `headers` is a JSON object of string values, its secrets revealed
+/// ([`headers`]); anything else is refused by name.
 pub fn head_for(status: u16, headers: Option<&Value>) -> WeftResult<ResponseHead> {
     let mut head = ResponseHead::new(status);
     if let Some(headers) = headers {

@@ -47,6 +47,15 @@
 //!   wrapped back into its marker from its mime type, and the links stay
 //!   behind.
 //!
+//! - A secret arrives revealed where the port's DECLARED type says one
+//!   goes (`token: Secret[String]`, a secret inside a record or a list
+//!   too): the program asked for the value by declaring it, and a secret
+//!   where the type declares none fails the node. A value the
+//!   script hands back where an output's type says a secret goes is made
+//!   one (`ctx.secret_in`), so the run's record holds its marker; what it
+//!   hands back on a plain output is written down as it is, which is the
+//!   program's choice.
+//!
 //! - The return value must be a dict keyed by declared output port
 //!   name. A missing key means "no pulse on that port": the port is
 //!   left out of the node's output entirely, nothing travels down
@@ -130,11 +139,17 @@ impl Node for ExecPythonNode {
         // with nothing in the bag (a skipped upstream, an optional input
         // nobody wired) binds as `None`, so the script never meets an
         // undefined name. Stored files bind unwrapped, with their links.
+        // A secret the program declared an input to hold is revealed:
+        // the script asked for the value by declaring it. One the input's
+        // type does not declare fails the node, rather than handing the
+        // script a marker.
         let mut inputs: Vec<(String, Value)> = Vec::new();
         for name in ctx.inputs.created() {
-            let value = match ctx.inputs.raw(name) {
-                Some(value) => unwrap_files(&ctx, value, ctx.declared_inputs().get(name)).await?,
-                None => Value::Null,
+            let declared = ctx.declared_inputs().get(name);
+            let value = match (ctx.inputs.raw(name), declared) {
+                (Some(value), Some(ty)) => unwrap_files(&ctx, &ctx.reveal_input(name, value.clone()).await?, Some(ty)).await?,
+                (Some(value), None) => unwrap_files(&ctx, value, None).await?,
+                (None, _) => Value::Null,
             };
             inputs.push((name.clone(), value));
         }
@@ -146,20 +161,27 @@ impl Node for ExecPythonNode {
         // key or type refuses the firing as the program mistake it is
         // (the engine's own refusal of an emission is a failure `_error`
         // would catch).
-        ctx.pulse_downstream(answer_output(&ctx.declared_outputs(), result)?).await
+        ctx.pulse_downstream(answer_output(&ctx.declared_outputs(), result, |value, ty| ctx.secret_in(value, ty))?).await
     }
 }
 
 /// The script's answer as the firing's output. A missing key produces
 /// no pulse; `None` is a null on a port whose type takes `Null` and no
 /// pulse on any other, so `{"x": None}` skips a plain port x. A file handed back on a file-typed port
-/// goes out as the marker the wire expects. A key that is not a declared
+/// goes out as the marker the wire expects, and a value where the port's
+/// type says a secret goes is made one through `seal` (`ctx.secret_in`):
+/// the script hands back plain values, and what it hands back on a plain
+/// port is the program's to keep or not. A key that is not a declared
 /// data output, `_error` included (weft fills it with the script's
 /// failure; a script fails on purpose by raising), and a value its port
 /// does not accept are type errors naming the port. A value heavier
 /// than a wire carries is left to the runtime, which refuses the
 /// emission naming the port, its weight, and returning less.
-fn answer_output(outputs: &HashMap<String, WeftType>, result: Vec<(String, Value)>) -> WeftResult<NodeOutput> {
+fn answer_output(
+    outputs: &HashMap<String, WeftType>,
+    result: Vec<(String, Value)>,
+    seal: impl Fn(Value, &WeftType) -> WeftResult<Value>,
+) -> WeftResult<NodeOutput> {
     let mut out = NodeOutput::new();
     for (port, value) in result {
         if port == ERROR_PORT {
@@ -183,6 +205,7 @@ fn answer_output(outputs: &HashMap<String, WeftType>, result: Vec<(String, Value
             continue;
         }
         let value = if ty.references_file() { wrap_files(&value, ty)? } else { value };
+        let value = seal(value, ty)?;
         if !ty.accepts_runtime_value(&value) {
             let why = ty.validate_value(&value).err().unwrap_or_else(|| format!("expected {ty}"));
             return Err(WeftError::Type(format!(

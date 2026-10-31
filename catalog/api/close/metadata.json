@@ -43,9 +43,9 @@
     },
     {
       "name": "headers",
-      "type": "Dict[String, String]",
+      "type": "Dict[String, String | Secret[String]]",
       "label": "Headers (Route)",
-      "description": "Extra response headers, Route only (a 304's `etag`, a 429's `retry-after`); a content-type overrides the reason's. Refused after a Stream."
+      "description": "Extra response headers, Route only (a 304's `etag`, a 429's `retry-after`); a content-type overrides the reason's. A secret value goes out revealed. Refused after a Stream."
     }
   ],
   "outputs": [

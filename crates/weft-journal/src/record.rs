@@ -410,14 +410,18 @@ type RecordedRow = (RunId, String, Option<uuid::Uuid>, bool, Option<i64>, bool);
 /// of it in one statement and one transaction, synced to disk when the
 /// batch says somebody waits on it. `writer` is the worker's replica, the
 /// owner the batch's runs are fenced on; `lane` keys its version counts.
-/// Answers each run's fate, in the batch's order. Sending a batch again is
-/// always safe: what already went in answers `AlreadyApplied`.
+/// `seal` seals each secret a run made (`crate::frame::KeptSecret`), which
+/// is kept, sealed, only for a run that went in: a secret's value never
+/// reaches the database any other way. Answers each run's fate, in the
+/// batch's order. Sending a batch again is always safe: what already went
+/// in answers `AlreadyApplied`, a secret included.
 pub async fn record_batch(
     db: &impl Client,
     writer: &str,
     tenant: &str,
     lane: &str,
     batch: &crate::frame::Batch<'_>,
+    seal: &(dyn Fn(&serde_json::Value) -> anyhow::Result<String> + Sync),
 ) -> anyhow::Result<Vec<Recorded>> {
     let head = &batch.head;
     let mut ids = Vec::with_capacity(head.runs.len());
@@ -436,6 +440,9 @@ pub async fn record_batch(
     let mut row_seq = Vec::new();
     let mut resolved_run = Vec::new();
     let mut resolved_token = Vec::new();
+    let mut secret_run = Vec::new();
+    let mut secret_id = Vec::new();
+    let mut secret_sealed = Vec::new();
     for (at, run) in head.runs.iter().enumerate() {
         let ordinal = i32::try_from(at + 1)?;
         ids.push(run.run_id);
@@ -460,6 +467,11 @@ pub async fn record_batch(
         for token in &run.written.resolved {
             resolved_run.push(ordinal);
             resolved_token.push(token.as_str());
+        }
+        for secret in &run.secrets {
+            secret_run.push(ordinal);
+            secret_id.push(secret.secret_id.as_uuid());
+            secret_sealed.push(seal(&secret.value)?);
         }
     }
     let rows: Vec<&[u8]> = batch.rows.clone();
@@ -491,12 +503,13 @@ pub async fn record_batch(
         &resolved_token,
     ];
     params.extend(costs.params());
+    params.extend([&secret_run as db::Param<'_>, &secret_id, &secret_sealed]);
     params.extend([&programs as db::Param<'_>, &head.events_version]);
     let answered: Vec<RecordedRow> = db
         .all(
             "SELECT o_run_id, o_fate, o_project_id, o_tell_end, o_keep_until, o_unwatched FROM weft_record_batch(\
              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, \
-             $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37)",
+             $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)",
             &params,
         )
         .await?;

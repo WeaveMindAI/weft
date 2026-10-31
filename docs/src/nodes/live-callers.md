@@ -25,9 +25,11 @@ branch three ways: HTTP, WebSocket, or nobody.
 
 `ctx.caller_request()` does not wait for the connection, because the handshake
 is known the moment the run starts. It gives you `method`, `path`, `params` (the
-path's captures, like `room` in `/chat/{room}`), `query`, `headers`, `caller`
-(whatever identity weft established for the caller) and `base_url` (the
-address the caller reached you at). With no caller attached it fails the run,
+path's captures, like `room` in `/chat/{room}`), `query`, `headers`,
+`credentials` (the headers carrying a credential, each a `Secret` you read
+with `ctx.reveal`; they are never in `headers`), `caller` (whatever identity
+weft established for the caller) and `base_url` (the address the caller
+reached you at). With no caller attached it fails the run,
 so if your node also runs without one, check `ctx.caller()` first.
 
 ## Getting the handle
@@ -89,6 +91,19 @@ answers](../language/triggers-and-routes.md#when-a-run-ends-before-it-answers).
 
 The head can only be sent once, and sending a body after the exchange ended is
 an error rather than a silent nothing.
+
+If you want the caller to receive a secret's value while the run's record keeps
+its marker, send an `OutboundChunk::Revealed`. `sent` is what the caller gets,
+and `kept` is what the record holds:
+
+```rust
+let revealed = ctx.reveal_in(value.clone(), &ty).await?;
+caller.respond(OutboundChunk::Revealed { sent: Box::new(OutboundChunk::json(revealed)), kept: value }).await?;
+```
+
+`Reply` and `Stream` do this for you wherever their input's type says a secret
+is, and fail on a secret anywhere else, since their caller would receive the
+marker.
 
 ## Talking over a WebSocket
 

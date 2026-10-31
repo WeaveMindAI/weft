@@ -31,6 +31,15 @@ pub use program_calls::{FrontendAdd, FrontendCalls, OneFrontend, PickCalls, Pick
 /// access left behind by a crashed worker goes stale the same quarter hour.
 pub const DEFAULT_PROVIDER_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
+/// How a refusal from [`RunContext::reveal_in`] names what it revealed:
+/// the value (`what`), and what the program declares to fix it
+/// (`declare`).
+#[derive(Clone, Copy)]
+struct Revealing<'a> {
+    what: &'a str,
+    declare: &'a str,
+}
+
 /// The per-run context handed to a node body (`Node::run` /
 /// `Node::setup_trigger`). Exposes the language's primitive surface
 /// (`await_signal` for mid-run suspensions, `open`/`client` for
@@ -845,6 +854,105 @@ impl RunContext {
     /// once in the life of the thing that owns it.
     pub async fn published_access(&self) -> WeftResult<Option<crate::access::Access>> {
         self.handle.published_access().await
+    }
+
+    // ----- Secrets ---------------------------------------------------
+
+    /// Make `value` a secret of this run, and answer the
+    /// [`crate::secret::Secret`] to put on an output typed `Secret[T]`.
+    /// What flows, and what the run's record and everything that shows it
+    /// holds, is the secret's marker; the value is kept sealed beside the
+    /// record, for as long as the record is kept, and only
+    /// [`Self::reveal`] reads it back. A run that is not recorded keeps it
+    /// in memory alone, so only that run reveals it.
+    pub fn secret<T: serde::Serialize + ?Sized>(&self, value: &T) -> WeftResult<crate::secret::Secret> {
+        let value = serde_json::to_value(value)
+            .map_err(|e| WeftError::Type(format!("a secret's value is not JSON: {e}")))?;
+        Ok(crate::secret::Secret::new(self.handle.keep_secret(value)?))
+    }
+
+    /// The value `secret` holds, read as `T`: from the run's memory when
+    /// this run made or revealed it already, else from its sealed copy,
+    /// which any run of this project reveals while the record of the run
+    /// that made it is kept. Fails naming the secret once that record is
+    /// gone.
+    pub async fn reveal<T: DeserializeOwned>(&self, secret: &crate::secret::Secret) -> WeftResult<T> {
+        let value = self.handle.reveal_secret(secret.id()).await?;
+        serde_json::from_value(value).map_err(|e| {
+            WeftError::Type(format!("secret {} does not hold what this node reads it as: {e}", secret.id()))
+        })
+    }
+
+    /// `value`, of type `ty`, with every secret `ty` places in it revealed
+    /// ([`WeftType::secret_places`]): for a node handing a whole value
+    /// outside weft (to a script, in a request, to a caller) where the
+    /// program said what it holds. Refused: a place the type says is a
+    /// secret holding a plain value (the value breaking its type), and a
+    /// secret where the type declares none, which would leave weft as its
+    /// marker instead of its value. For a node's input, reveal through
+    /// [`Self::reveal_input`], whose refusal names the input.
+    pub async fn reveal_in(&self, value: Value, ty: &WeftType) -> WeftResult<Value> {
+        self.reveal_as(Revealing { what: "the value", declare: "the value's type" }, value, ty).await
+    }
+
+    /// `value`, the value of this node's input `port`, revealed as
+    /// [`Self::reveal_in`] reveals it, by the type the program declared
+    /// on the input.
+    pub async fn reveal_input(&self, port: &str, value: Value) -> WeftResult<Value> {
+        let ty = self
+            .declared_inputs()
+            .get(port)
+            .cloned()
+            .ok_or_else(|| WeftError::Config(format!("this node declares no `{port}` input")))?;
+        let (what, declare) = (format!("`{port}`"), format!("the type of what is wired into `{port}`"));
+        self.reveal_as(Revealing { what: &what, declare: &declare }, value, &ty).await
+    }
+
+    async fn reveal_as(&self, said: Revealing<'_>, mut value: Value, ty: &WeftType) -> WeftResult<Value> {
+        use crate::weft_type::SecretPlace;
+        let places = ty.secret_places(&value);
+        let where_ = |at: &str| if at.is_empty() { "as the whole value".to_string() } else { format!("at {at}") };
+        if let Some((at, _)) = places.iter().find(|(_, place)| *place == SecretPlace::Undeclared) {
+            return Err(WeftError::Input(format!(
+                "{} holds a secret {} where its type, {ty}, declares none, so it would leave weft as the \
+                 secret's marker instead of its value. Declare {} so it says where the secret is (an \
+                 object's fields, like `{{ token: Secret[String] }}`), and it goes out revealed",
+                said.what,
+                where_(at),
+                said.declare,
+            )));
+        }
+        for (at, place) in places {
+            let slot = value.pointer_mut(&at).expect("a place found in this value");
+            let secret = match place {
+                SecretPlace::Sealed => crate::secret::Secret::from_value(slot).expect("a sealed place holds a marker"),
+                SecretPlace::Plain => {
+                    return Err(WeftError::Type(format!(
+                        "{} holds a plain value {} where its type, {ty}, says a Secret; {}",
+                        said.what,
+                        where_(&at),
+                        crate::secret::MADE_BY_A_NODE,
+                    )))
+                }
+                SecretPlace::Undeclared => unreachable!("refused above"),
+            };
+            *slot = self.handle.reveal_secret(secret.id()).await?;
+        }
+        Ok(value)
+    }
+
+    /// `value`, of type `ty`, with every plain value at a place `ty` says
+    /// is a secret made one ([`Self::secret`]): for a node whose outputs
+    /// a program declares and whose own code hands back plain values (a
+    /// script).
+    pub fn secret_in(&self, mut value: Value, ty: &WeftType) -> WeftResult<Value> {
+        for (at, place) in ty.secret_places(&value) {
+            if place == crate::weft_type::SecretPlace::Plain {
+                let slot = value.pointer_mut(&at).expect("a place found in this value");
+                *slot = self.secret(slot)?.to_value();
+            }
+        }
+        Ok(value)
     }
 
     // ----- Side-effect primitives ------------------------------------
@@ -2634,6 +2742,12 @@ pub trait ContextHandle: Send + Sync {
     ) -> WeftResult<crate::access::Access>;
     /// Backs [`RunContext::published_access`].
     async fn published_access(&self) -> WeftResult<Option<crate::access::Access>>;
+    /// Backs [`RunContext::secret`]: keep `value` as a secret of this run
+    /// under a fresh id (in memory, and sealed with the run's record when
+    /// it is recorded), answering the id.
+    fn keep_secret(&self, value: Value) -> WeftResult<crate::secret::SecretId>;
+    /// Backs [`RunContext::reveal`]: the value the secret `id` holds.
+    async fn reveal_secret(&self, id: crate::secret::SecretId) -> WeftResult<Value>;
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()>;
     /// Backs [`RunContext::tag_run`]. `tags` are already
     /// validated and non-empty.
@@ -3185,6 +3299,8 @@ mod value_bag_tests {
         async fn open_connection(&self, _: &crate::access::Access, _: std::time::Duration) -> WeftResult<crate::access::OpenedConnection> { unreachable!() }
         async fn publish_access(&self, _: std::collections::BTreeMap<String, String>) -> WeftResult<crate::access::Access> { unreachable!() }
         async fn published_access(&self) -> WeftResult<Option<crate::access::Access>> { unreachable!() }
+        fn keep_secret(&self, _: Value) -> WeftResult<crate::secret::SecretId> { unreachable!() }
+        async fn reveal_secret(&self, _: crate::secret::SecretId) -> WeftResult<Value> { unreachable!() }
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
         async fn tag_run(&self, _: Vec<String>) -> WeftResult<()> { unreachable!() }
         async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }
@@ -3268,6 +3384,8 @@ mod value_bag_tests {
         async fn open_connection(&self, _: &crate::access::Access, _: std::time::Duration) -> WeftResult<crate::access::OpenedConnection> { unreachable!() }
         async fn publish_access(&self, _: std::collections::BTreeMap<String, String>) -> WeftResult<crate::access::Access> { unreachable!() }
         async fn published_access(&self) -> WeftResult<Option<crate::access::Access>> { unreachable!() }
+        fn keep_secret(&self, _: Value) -> WeftResult<crate::secret::SecretId> { unreachable!() }
+        async fn reveal_secret(&self, _: crate::secret::SecretId) -> WeftResult<Value> { unreachable!() }
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
         async fn tag_run(&self, _: Vec<String>) -> WeftResult<()> { unreachable!() }
         async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }

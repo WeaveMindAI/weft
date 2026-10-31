@@ -1435,9 +1435,9 @@ impl NodeMetadata {
                         input.name
                     ));
                 }
-                if accepts.literal && Accepts::type_is_handle(&input.input_type) {
+                if accepts.literal && Accepts::type_is_wire_only(&input.input_type) {
                     return Err(format!(
-                        "input '{}' is a {} port: a live handle no human can write, so `accepts` \
+                        "input '{}' is a {} port, a value no human can write, so `accepts` \
                          may only list \"wire\"",
                         input.name, input.input_type
                     ));
@@ -3307,16 +3307,18 @@ impl Accepts {
     }
 
     /// What a type takes when nobody says otherwise: a live handle (a
-    /// `Bus`, a `Generator`) exists only while something runs, and an
-    /// `Infra` handle only once its infra node has emitted it, so no
-    /// human can write one; everything else takes both.
+    /// `Bus`, a `Generator`) exists only while something runs, an `Infra`
+    /// handle only once its infra node has emitted it, and a `Secret` only
+    /// once a node made it, so no human can write one; everything else
+    /// takes both.
     pub fn for_type(ty: &WeftType) -> Self {
-        if Self::type_is_handle(ty) { Self::wire_only() } else { Self::both() }
+        if Self::type_is_wire_only(ty) { Self::wire_only() } else { Self::both() }
     }
 
-    /// A type whose values are live runtime handles, wire-only by nature.
-    pub fn type_is_handle(ty: &WeftType) -> bool {
-        matches!(ty.structural(), WeftType::Bus | WeftType::Infra | WeftType::Generator(_))
+    /// A type whose values only a run makes (a live handle, a secret),
+    /// wire-only by nature.
+    pub fn type_is_wire_only(ty: &WeftType) -> bool {
+        matches!(ty.structural(), WeftType::Bus | WeftType::Infra | WeftType::Generator(_) | WeftType::Secret(_))
     }
 
     /// The list as an error message reads it back: `literal, wire`.
@@ -6104,6 +6106,7 @@ pub fn materialize_auto_type_vars(t: &WeftType, key: &str) -> WeftType {
         WeftType::Generator(inner) => {
             WeftType::Generator(Box::new(materialize_auto_type_vars(inner, key)))
         }
+        WeftType::Secret(inner) => WeftType::Secret(Box::new(materialize_auto_type_vars(inner, key))),
         WeftType::Dict(v) => WeftType::Dict(Box::new(materialize_auto_type_vars(v, key))),
         WeftType::Union(members) => {
             WeftType::Union(members.iter().map(|m| materialize_auto_type_vars(m, key)).collect())

@@ -108,8 +108,10 @@ pub struct Admitted {
     /// The caller's opening request, as the trigger reads it.
     pub opening: LiveRequest,
     pub instance: Option<InstanceId>,
-    /// The credentials the caller sent, which the run never writes down.
-    pub redaction: weft_core::caller::Redaction,
+    /// The credentials the caller sent, made secrets of the run (their
+    /// markers are in `opening.credentials`): its first write carries them
+    /// with its birth.
+    pub secrets: Vec<weft_journal::frame::KeptSecret>,
     /// The run's place at the door while its own work goes.
     pub slot: Slot,
 }
@@ -287,7 +289,7 @@ impl Door {
         // socket it opened, else the gate and the instance checks.
         let (caller, credential_headers, instance, body) = match ticketed {
             Some((_, ticket)) => match self.ticket(ticket, &trigger, call.method, path, callers_query, now) {
-                Ok(claims) => (claims.identity, Vec::new(), claims.instance, body),
+                Ok(claims) => (claims.identity, claims.credential_headers, claims.instance, body),
                 Err(arrived) => return arrived,
             },
             None => {
@@ -327,7 +329,7 @@ impl Door {
                 // it at, carrying what was just approved.
                 if protocol == Protocol::Websocket && !socket {
                     let approved = (entry.auth_kind != "none").then(|| RequestFingerprint::of(call.method, path, callers_query, &bytes));
-                    return self.hand_ticket(&trigger, call, approved, caller, instance, now);
+                    return self.hand_ticket(&trigger, call, approved, caller, credential_headers, instance, now);
                 }
                 (caller, credential_headers, instance, body)
             }
@@ -347,18 +349,30 @@ impl Door {
             Ok(going) => going,
             Err(refused) => return Arrived::Answer(too_many(refused)),
         };
+        // Before anything of the run is written: from here on the run holds
+        // the caller's credentials as secrets, and its record their markers.
+        let (headers, sent) = weft_core::caller::split_credentials(headers_sent, &credential_headers);
+        let mut secrets = Vec::with_capacity(sent.len());
+        let credentials = sent
+            .into_iter()
+            .map(|(name, value)| {
+                let secret_id = weft_core::secret::SecretId::mint();
+                secrets.push(weft_journal::frame::KeptSecret { secret_id, value: serde_json::Value::String(value) });
+                (name, weft_core::secret::Secret::new(secret_id))
+            })
+            .collect();
         let opening = LiveRequest {
             method: call.method.to_string(),
             path: path.to_string(),
             params,
             query,
             base_url: weft_core::net::request_base_url(call.headers),
-            headers: headers_sent,
+            headers,
+            credentials,
             caller,
         };
-        let redaction = opening.credentials(&credential_headers);
         let slot = Slot { going, _permit: permit };
-        Arrived::Run(Box::new(Admitted { trigger, triggers_version, entry, protocol, live_config, opening, instance, redaction, slot }), body)
+        Arrived::Run(Box::new(Admitted { trigger, triggers_version, entry, protocol, live_config, opening, instance, secrets, slot }), body)
     }
 
     /// The live route serving `method` on `path` while its trigger takes
@@ -523,6 +537,7 @@ impl Door {
         call: Call<'_>,
         approved: Option<RequestFingerprint>,
         identity: Option<serde_json::Value>,
+        credential_headers: Vec<String>,
         instance: Option<InstanceId>,
         now: i64,
     ) -> Arrived {
@@ -535,6 +550,7 @@ impl Door {
             approved,
             identity,
             instance,
+            credential_headers,
             nonce: uuid::Uuid::new_v4(),
             exp: now + weft_core::time_scale::scaled_secs(TICKET_LIFE_SECS),
         };
@@ -1077,13 +1093,14 @@ mod tests {
         assert!(!admitted.opening.query.contains_key("wct"));
         // A forged ticket opens nothing.
         let forged = format!("v=1&wct={}", weft_core::caller_token::ProjectSecret::of(b"another-secret-32-bytes-bbbbbbbb", PROJECT).mint_ticket(&weft_core::caller_token::CallerTokenClaims {
-            project_id: PROJECT, route_token: "t1".into(), approved: None, identity: None, instance: None, nonce: uuid::Uuid::nil(), exp: i64::MAX,
+            project_id: PROJECT, route_token: "t1".into(), approved: None, identity: None, instance: None, credential_headers: Vec::new(), nonce: uuid::Uuid::nil(), exp: i64::MAX,
         }));
         assert_eq!(status(arrive(&door, "GET", "/feed", &forged, &opening).await).await.0, StatusCode::UNAUTHORIZED);
     }
 
     /// A gated socket's ticket holds the caller to the request the gate
-    /// checked, and carries who it said they are.
+    /// checked, and carries who it said they are and the headers it read
+    /// their credential from, which the socket's run holds as secrets.
     #[tokio::test]
     async fn a_gated_sockets_ticket_carries_the_caller_and_holds_them_to_their_request() {
         let mut gated = route("t1", "socket", "feed");
@@ -1095,9 +1112,12 @@ mod tests {
         let (_, body) = status(arrive(&door, "GET", "/feed", "room=1", &headers(&[])).await).await;
         let url = serde_json::from_str::<serde_json::Value>(&body).unwrap()["url"].as_str().unwrap().to_string();
         let ticket = url.rsplit_once("wct=").unwrap().1.to_string();
-        let opening = headers(&[("upgrade", "websocket")]);
+        let opening = headers(&[("upgrade", "websocket"), ("x-api-key", "key-9")]);
         let Arrived::Run(admitted, _) = arrive(&door, "GET", "/feed", &format!("room=1&wct={ticket}"), &opening).await else { panic!("opened") };
         assert_eq!(admitted.opening.caller, Some(serde_json::json!({ "sub": "alice" })));
+        assert!(admitted.opening.header("x-api-key").is_none(), "{:?}", admitted.opening.headers);
+        assert_eq!(admitted.opening.credentials.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["x-api-key"]);
+        assert_eq!(admitted.secrets.len(), 1);
         assert_eq!(broker.verified.lock().unwrap().len(), 1, "the socket is not gated a second time");
         assert_eq!(
             status(arrive(&door, "GET", "/feed", &format!("room=2&wct={ticket}"), &opening).await).await.0,

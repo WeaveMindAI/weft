@@ -1,7 +1,7 @@
 {
   "type": "MintInstanceToken",
   "label": "Mint instance token",
-  "description": "Mint a token a browser or extension uses to act inside one instance only: start its runs (`Weft-Instance-Token` header on a live route), answer its waits, show its displays, connect its accounts. It always expires, and its value is output once.",
+  "description": "Mint a token a browser or extension uses to act inside one instance only: start its runs (`Weft-Instance-Token` header on a live route), answer its waits, show its displays, connect its accounts. It always expires, and its value is output once, as a secret.",
   "tags": [
     "instances",
     "token",
@@ -30,8 +30,8 @@
   "outputs": [
     {
       "name": "token",
-      "type": "String",
-      "description": "The token itself."
+      "type": "Secret[String]",
+      "description": "The token, as a secret: the run's record holds its marker, never its value. A Reply or a Stream sends it to the browser revealed."
     },
     {
       "name": "expiresAt",

@@ -72,6 +72,9 @@
         /// While set, a batch reaches nothing and gets no answer: the
         /// broker is out of reach.
         pub(crate) out_of_reach: std::sync::atomic::AtomicBool,
+        /// Every secret on record, by id: the ones the batches carried
+        /// and the ones kept straight onto it.
+        pub(crate) secrets: StdMutex<std::collections::HashMap<weft_core::secret::SecretId, serde_json::Value>>,
     }
     impl MemJournal {
         /// Put `events` on record as they are: a run's record (or a seed's)
@@ -96,6 +99,14 @@
         async fn record_page(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<Vec<weft_journal::JournalRow>> {
             Ok(crate::test_record::rows_of(run_id, &self.events_of(run_id), after))
         }
+        fn keep_secret(&self, value: serde_json::Value) -> weft_core::secret::SecretId {
+            let id = weft_core::secret::SecretId::mint();
+            self.secrets.lock().unwrap().insert(id, value);
+            id
+        }
+        async fn reveal_secret(&self, id: weft_core::secret::SecretId) -> anyhow::Result<serde_json::Value> {
+            self.secrets.lock().unwrap().get(&id).cloned().ok_or_else(|| weft_journal::secret_gone(id))
+        }
     }
     #[async_trait]
     impl weft_journal::RecordClient for MemJournal {
@@ -106,11 +117,15 @@
             }
             let (_, runs) = crate::test_record::decode_batch(&batch);
             let fates = runs.iter().map(|_| weft_journal::record::Fate::Accepted).collect();
+            self.secrets.lock().unwrap().extend(runs.iter().flat_map(|(head, _)| &head.secrets).map(|secret| (secret.secret_id, secret.value.clone())));
             self.events.lock().unwrap().extend(runs.into_iter().flat_map(|(_, events)| events));
             Ok(weft_journal::frame::BatchAnswer { fates })
         }
         async fn record_of(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<weft_journal::record::RawRecord> {
             Ok(crate::test_record::page_of(&self.events_of(run_id), after))
+        }
+        async fn secret(&self, id: weft_core::secret::SecretId) -> anyhow::Result<Option<serde_json::Value>> {
+            Ok(self.secrets.lock().unwrap().get(&id).cloned())
         }
         /// The record writes the ending of a run its worker gave up on.
         async fn give_up(&self, run_id: RunId, why: String) -> Result<(), weft_journal::BatchError> {
@@ -728,7 +743,7 @@
         run_id: RunId,
         events: &[RunEvent],
         next_seq: i32,
-        redaction: weft_core::caller::Redaction,
+        secrets: Vec<weft_journal::frame::KeptSecret>,
     ) -> Arc<crate::journal_writer::DriveJournal> {
         let settings = events
             .iter()
@@ -743,7 +758,7 @@
             keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
             epoch: 1,
             next_seq,
-            redaction,
+            secrets,
             program: None,
         })
     }
@@ -751,7 +766,7 @@
     /// A run born now, the way a worker's door bears one: its handle, its
     /// birth handed to it first.
     pub(crate) async fn born(clients: &EngineClients, run_id: RunId, birth: &[RunEvent]) -> Arc<crate::journal_writer::DriveJournal> {
-        let run = handle(clients, run_id, birth, 0, Default::default());
+        let run = handle(clients, run_id, birth, 0, Vec::new());
         run.record_events(birth, Some("instance-test")).await.expect("a birth is handed");
         run
     }
@@ -867,7 +882,7 @@
         let projects = clients.project.clone();
         // What a worker's claim would hand the drive: the run's record so far.
         let first = journal.events_of(run_id);
-        let run = handle(&clients, run_id, &first, 1, Default::default());
+        let run = handle(&clients, run_id, &first, 1, Vec::new());
         let drove = run_on(project.clone(), catalog, &clients, run_id, run, first, cancellation, caller, None).await;
         // A fast run lets go of its record once its ending is handed over;
         // the checks below read the record whole, as the next reader does.

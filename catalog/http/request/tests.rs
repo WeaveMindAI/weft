@@ -27,7 +27,76 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_text_body_too_big_for_a_wire_fails_when_only_body_is_wired", oversize_text_body_unwired_file),
         NodeTest::fake("the_recipe_sets_the_named_header", connection_header),
         NodeTest::fake("a_header_set_twice_is_refused", header_set_twice),
+        NodeTest::fake("a_secret_header_is_revealed_into_the_request", secret_header),
+        NodeTest::fake("a_plain_object_body_goes_out_as_it_is", plain_body),
+        NodeTest::fake("a_secret_the_body_declares_is_revealed_into_the_request", secret_body),
+        NodeTest::fake("a_secret_the_body_does_not_declare_fails_before_sending", undeclared_secret_body),
     ]
+}
+
+/// A plain object body, left as a `JsonDict` the way every program
+/// without a secret writes it, goes out exactly as it was.
+async fn plain_body(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("POST", "/api/items", json!({ "id": 7 }));
+    rig.input_type("body", WeftType::parse("JsonDict").expect("parses"));
+    let body = json!({ "name": "widget", "tags": ["a", "b"], "nested": { "n": 1 } });
+    rig.run(&HttpRequestNode, json!({ "url": "https://api.example/api/items", "method": "POST", "body": body.clone() }))
+        .await
+        .ok()?;
+    assert_eq!(rig.requests()[0].body, Some(body));
+    Ok(())
+}
+
+/// A secret where the type of what is wired into `body` declares one goes
+/// into the request revealed.
+async fn secret_body(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("POST", "/api/login", json!({ "ok": true }));
+    rig.input_type("body", WeftType::parse("{ user: String, token: Secret[String] }").expect("parses"));
+    let token = rig.secret(json!("tok-9"));
+    rig.run(
+        &HttpRequestNode,
+        json!({ "url": "https://api.example/api/login", "method": "POST", "body": { "user": "ada", "token": token } }),
+    )
+    .await
+    .ok()?;
+    assert_eq!(rig.requests()[0].body, Some(json!({ "user": "ada", "token": "tok-9" })));
+    Ok(())
+}
+
+/// A secret inside a body left as a `JsonDict` fails the node naming the
+/// input, where the secret is and what to declare, and nothing is sent:
+/// the API would have received the marker.
+async fn undeclared_secret_body(rig: FakeRig) -> WeftResult<()> {
+    rig.input_type("body", WeftType::parse("JsonDict").expect("parses"));
+    let token = rig.secret(json!("tok-9"));
+    let err = rig
+        .run(
+            &HttpRequestNode,
+            json!({ "url": "https://api.example/api/login", "method": "POST", "body": { "auth": { "token": token } } }),
+        )
+        .await
+        .failure()?;
+    assert!(err.contains("`body` holds a secret at /auth/token"), "{err}");
+    assert!(err.contains("the type of what is wired into `body`") && err.contains("{ token: Secret[String] }"), "{err}");
+    assert!(rig.requests().is_empty(), "nothing is sent");
+    Ok(())
+}
+
+/// A header whose value is a secret (a caller's credential passed on)
+/// goes into the request revealed.
+async fn secret_header(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("GET", "/api/me", json!({ "id": 7 }));
+    let token = rig.secret(json!("Bearer tok-1"));
+    rig.run(
+        &HttpRequestNode,
+        json!({ "url": "https://api.example/api/me", "method": "GET", "headers": { "authorization": token, "x-trace": "t-9" } }),
+    )
+    .await
+    .ok()?;
+    let sent = rig.requests();
+    assert_eq!(sent[0].header("authorization"), Some("Bearer tok-1"));
+    assert_eq!(sent[0].header("x-trace"), Some("t-9"));
+    Ok(())
 }
 
 async fn bad_method_wired(rig: FakeRig) -> WeftResult<()> {

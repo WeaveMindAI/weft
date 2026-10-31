@@ -24,7 +24,7 @@
     {
       "name": "first",
       "type": "T",
-      "description": "One value sent ahead of the bus, framed like the messages (an id, a created row, a session token)."
+      "description": "One value sent ahead of the bus, framed like the messages (an id, a created row, a session token). A secret in it goes out revealed where its type declares one, and the run's record keeps its marker. A secret anywhere its type does not declare one fails the node, and so does a secret in a bus message, since a bus carries no type."
     },
     {
       "name": "format",
@@ -71,8 +71,8 @@
     },
     {
       "name": "headers",
-      "type": "Dict[String, String]",
-      "description": "Extra response headers (Route only); a content-type here overrides the format's."
+      "type": "Dict[String, String | Secret[String]]",
+      "description": "Extra response headers (Route only); a content-type here overrides the format's. A secret value goes out revealed."
     }
   ],
   "outputs": [

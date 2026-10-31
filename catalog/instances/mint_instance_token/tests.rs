@@ -1,4 +1,4 @@
-//! MintInstanceToken self-tests: the token comes out with its expiry, and
+//! MintInstanceToken self-tests: the token comes out, as a secret, with its expiry, and
 //! a token that never expires or rounds to under a second is refused,
 //! and decimal hours round to the nearest second.
 
@@ -24,7 +24,11 @@ async fn mints(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(minted.len(), 1);
     assert_eq!(minted[0].instance.as_str(), "ada");
     assert_eq!(minted[0].expires_in_secs, 7200);
-    assert!(outcome.outputs["token"].as_str().unwrap().starts_with("wft-"));
+    // Out as a secret: the output is its marker, and the value is what
+    // the mint answered.
+    let token = &outcome.outputs["token"];
+    assert!(weft::secret::Secret::from_value(token).is_some(), "{token}");
+    assert!(rig.revealed(token)?.as_str().unwrap().starts_with("wft-"));
     Ok(())
 }
 

@@ -935,6 +935,10 @@ struct FakeState {
     program_answers: Mutex<HashMap<String, VecDeque<Value>>>,
     /// Every instance token the node minted: the instance and its life.
     minted_tokens: Mutex<Vec<MintedToken>>,
+    /// The run's secrets by id: the ones the node made (`ctx.secret`) and
+    /// the ones a test handed it (`FakeRig::secret`), what `ctx.reveal`
+    /// reads.
+    secrets: Mutex<BTreeMap<crate::secret::SecretId, Value>>,
     /// The infra endpoints the node can reach, by (place, endpoint
     /// name): its own (at `NODE_UNDER_TEST_ID`, declared by
     /// `declare_endpoint`) and the ones other infra nodes shared with it
@@ -1081,6 +1085,7 @@ impl FakeState {
             program_calls: Mutex::new(Vec::new()),
             program_answers: Mutex::new(HashMap::new()),
             minted_tokens: Mutex::new(Vec::new()),
+            secrets: Mutex::new(BTreeMap::new()),
             endpoints: Mutex::new(BTreeMap::new()),
             public_urls: Mutex::new(BTreeMap::new()),
             endpoint_answers: Mutex::new(BTreeMap::new()),
@@ -1919,6 +1924,25 @@ impl FakeRig {
     pub fn minted_tokens(&self) -> Vec<MintedToken> {
         self.state.minted_tokens.lock().unwrap().clone()
     }
+
+    /// A secret of the run holding `value`, as a node upstream would have
+    /// made it: its marker, to hand the node under test as an input.
+    pub fn secret(&self, value: Value) -> Value {
+        let id = crate::secret::SecretId::mint();
+        self.state.secrets.lock().unwrap().insert(id, value);
+        crate::secret::Secret::new(id).to_value()
+    }
+
+    /// What the secret `marker` names holds: one the node made, or one a
+    /// test handed it. Fails naming the value when it is no secret of
+    /// this run.
+    pub fn revealed(&self, marker: &Value) -> WeftResult<Value> {
+        let secret = crate::secret::Secret::from_value(marker)
+            .ok_or_else(|| WeftError::Type(format!("{marker} is not a secret's marker")))?;
+        self.state.secrets.lock().unwrap().get(&secret.id()).cloned().ok_or_else(|| {
+            WeftError::Type(format!("secret {} is no secret of this run", secret.id()))
+        })
+    }
 }
 
 impl Default for FakeRig {
@@ -2630,6 +2654,18 @@ impl ContextHandle for TestHandle {
         let service = self.published_service()?;
         let identity = self.state.publish(&service, values)?;
         Ok(Access::new("fake-connection", service, identity))
+    }
+
+    fn keep_secret(&self, value: Value) -> WeftResult<crate::secret::SecretId> {
+        let id = crate::secret::SecretId::mint();
+        self.state.secrets.lock().unwrap().insert(id, value);
+        Ok(id)
+    }
+
+    async fn reveal_secret(&self, id: crate::secret::SecretId) -> WeftResult<Value> {
+        self.state.secrets.lock().unwrap().get(&id).cloned().ok_or_else(|| {
+            WeftError::Type(format!("secret {id} is no secret of this run: hand the node one made with `rig.secret(..)`"))
+        })
     }
 
     async fn published_access(&self) -> WeftResult<Option<Access>> {
@@ -3653,6 +3689,14 @@ impl ContextHandle for CapturingHandle {
 
     async fn published_access(&self) -> WeftResult<Option<Access>> {
         self.inner.published_access().await
+    }
+
+    fn keep_secret(&self, value: Value) -> WeftResult<crate::secret::SecretId> {
+        self.inner.keep_secret(value)
+    }
+
+    async fn reveal_secret(&self, id: crate::secret::SecretId) -> WeftResult<Value> {
+        self.inner.reveal_secret(id).await
     }
 
     // A delegating wrapper forwards EVERY trait method, including

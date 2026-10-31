@@ -234,7 +234,7 @@ describe('tryParseWeftType leaves only declarable unknown names to the compiler'
 		);
 		const foo = refusal('Verdict | Foo[String]');
 		expect(foo.unknownName).toBe(false);
-		expect(foo.error).toBe('`Foo[...]` is not a type; the types that take one are List, Generator and Dict');
+		expect(foo.error).toBe('`Foo[...]` is not a type; the types that take one are List, Generator, Secret and Dict');
 		const field = refusal('{a: Verdict, b}');
 		expect(field.unknownName).toBe(false);
 		expect(field.error).toBe('`{a: Verdict, b}`: the field `b` has no type (`name: Type`)');

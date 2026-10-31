@@ -67,7 +67,7 @@ macro_rules! define_primitives {
 // crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm),
 // packages/weft-graph/src/protocol.ts CONTAINER_AND_SPECIAL_TYPES
 pub const CONTAINER_AND_SPECIAL_TYPES: &[&str] =
-    &["List", "Dict", "JsonDict", "Json", "Bus", "Access", "Infra", "Generator"];
+    &["List", "Dict", "JsonDict", "Json", "Bus", "Access", "Infra", "Generator", "Secret"];
 
 define_primitives!(
     String,
@@ -708,6 +708,19 @@ pub struct FileControl {
     pub multiple: bool,
 }
 
+/// What a value holds at one place its type says is a secret
+/// ([`WeftType::secret_places`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretPlace {
+    /// The marker: the secret, made already.
+    Sealed,
+    /// A plain value, a secret yet to be made.
+    Plain,
+    /// A marker where the type declares no secret: a node sending the
+    /// value outside the run would send the marker, never the value.
+    Undeclared,
+}
+
 /// Recursive port type system.
 #[derive(Debug, Clone, Eq)]
 pub enum WeftType {
@@ -768,6 +781,14 @@ pub enum WeftType {
     /// consumer's bag value is a live runtime handle, never a literal.
     // SYNC: WeftType::Generator <-> packages/weft-graph/src/protocol.ts WeftType 'generator'
     Generator(Box<WeftType>),
+    /// A value its run's record never holds: `Secret[T]`, a marker naming
+    /// a `T` kept sealed beside the record (`crate::secret`). Strict both
+    /// ways: a `Secret[T]` fits only a `Secret[U]` whose `T` fits `U`,
+    /// never a plain `T`, and nothing plain fits it, so a node that takes
+    /// one says so and reveals it. Wired-only: a node makes it
+    /// (`ctx.secret`), never a literal or a Cast.
+    // SYNC: WeftType::Secret <-> packages/weft-graph/src/protocol.ts WeftType 'secret'
+    Secret(Box<WeftType>),
     /// Dict with KNOWN field names and per-field types:
     /// `{ role: String, name?: String }`. `?` marks an optional field.
     /// A missing required field never matches. An undeclared key is
@@ -821,6 +842,7 @@ impl PartialEq for WeftType {
             (WeftType::Access, WeftType::Access) => true,
             (WeftType::Infra, WeftType::Infra) => true,
             (WeftType::Generator(a), WeftType::Generator(b)) => a == b,
+            (WeftType::Secret(a), WeftType::Secret(b)) => a == b,
             (
                 WeftType::Record { fields: a, open: a_open },
                 WeftType::Record { fields: b, open: b_open },
@@ -1128,6 +1150,7 @@ impl WeftType {
             | WeftType::Access
             | WeftType::Infra
             | WeftType::Generator(_)
+            | WeftType::Secret(_)
             | WeftType::TypeVar(_) => false,
         }
     }
@@ -1246,6 +1269,7 @@ impl WeftType {
             | WeftType::Access
             | WeftType::Infra
             | WeftType::Generator(_)
+            | WeftType::Secret(_)
             | WeftType::TypeVar(_) => Value::Null,
         }
     }
@@ -1278,7 +1302,9 @@ impl WeftType {
             // JsonDict: compatible with any Dict[String, V] in both directions
             (WeftType::JsonDict, WeftType::JsonDict) => true,
             (WeftType::JsonDict, WeftType::Dict(_)) => true,
-            (WeftType::Dict(_), WeftType::JsonDict) => true,
+            // An unchecked dict could carry a secret on into a port that
+            // takes its value plain, so one holding a secret stays typed.
+            (WeftType::Dict(v), WeftType::JsonDict) => !v.holds_secret(),
             // Json takes every JSON-made type, at any depth; Json itself
             // flows only into Json (and a union or a variable holding it).
             (src, WeftType::Json) => src.fits_json(),
@@ -1299,6 +1325,12 @@ impl WeftType {
             (WeftType::Generator(a), WeftType::Generator(b)) => {
                 Self::is_compatible(a, b) && Self::is_compatible(b, a)
             }
+            // A secret connects only to a secret of what it holds: a
+            // plain `T` never takes a `Secret[T]` (the value would be a
+            // marker its node cannot read) and a `Secret[T]` never takes
+            // a plain `T` (only a node makes a secret).
+            // SYNC: secret compatibility <-> packages/weft-graph/src/webview/lib/types/index.ts isCompatible
+            (WeftType::Secret(a), WeftType::Secret(b)) => Self::is_compatible(a, b),
             // A NAMED type is nominal: the name is the contract, so only
             // the same name flows in. Same-named bodies are made to
             // agree by the compiler's `named-type-conflict` rule (not
@@ -1328,7 +1360,7 @@ impl WeftType {
             // never the reverse: an unchecked object claiming a declared
             // shape is exactly what the record type exists to refuse
             // (the deliberate door is the Cast node).
-            (WeftType::Record { .. }, WeftType::JsonDict) => true,
+            (WeftType::Record { .. }, WeftType::JsonDict) => !source.holds_secret(),
             // An optional field may hold null, so the dict's value type
             // must take null too.
             (WeftType::Record { fields, .. }, WeftType::Dict(v)) => fields.iter().all(|f| {
@@ -1382,7 +1414,134 @@ impl WeftType {
             WeftType::Record { fields, .. } => fields.iter().all(|f| f.ty.fits_json()),
             WeftType::Named { body, .. } => body.fits_json(),
             WeftType::JsonDict | WeftType::Json | WeftType::TypeVar(_) => true,
-            WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_) => false,
+            WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_) | WeftType::Secret(_) => false,
+        }
+    }
+
+    /// Whether a `Secret` sits anywhere in this type, at any depth (a
+    /// declared name read through its body).
+    // SYNC: holds_secret <-> packages/weft-graph/src/webview/lib/types/index.ts holdsSecret
+    pub fn holds_secret(&self) -> bool {
+        match self {
+            WeftType::Secret(_) => true,
+            WeftType::List(inner) | WeftType::Dict(inner) | WeftType::Generator(inner) => inner.holds_secret(),
+            WeftType::Union(members) => members.iter().any(Self::holds_secret),
+            WeftType::Record { fields, .. } => fields.iter().any(|f| f.ty.holds_secret()),
+            WeftType::Named { body, .. } => body.holds_secret(),
+            WeftType::Primitive(_)
+            | WeftType::JsonDict
+            | WeftType::Json
+            | WeftType::Bus
+            | WeftType::Access
+            | WeftType::Infra
+            | WeftType::TypeVar(_) => false,
+        }
+    }
+
+    /// Where a value of this type holds a secret, or is to hold one: each
+    /// place the type says is a `Secret` (a member of a union read as one
+    /// when no other member takes the value), as a JSON pointer into
+    /// `value`, with whether the value there is the marker already
+    /// ([`SecretPlace::Sealed`]) or a plain value
+    /// ([`SecretPlace::Plain`]). The type decides, never the value's
+    /// look: a marker where the type says nothing of a secret is not one
+    /// to reveal, and is named [`SecretPlace::Undeclared`]. One walk of
+    /// the value.
+    pub fn secret_places(&self, value: &serde_json::Value) -> Vec<(std::string::String, SecretPlace)> {
+        let mut places = Vec::new();
+        self.find_secret_places(value, &mut std::string::String::new(), &mut places);
+        places
+    }
+
+    fn find_secret_places(
+        &self,
+        value: &serde_json::Value,
+        at: &mut std::string::String,
+        places: &mut Vec<(std::string::String, SecretPlace)>,
+    ) {
+        use serde_json::Value;
+        let step = |at: &mut std::string::String, key: &str, ty: &WeftType, inner: &Value, places: &mut Vec<_>| {
+            let len = at.len();
+            crate::secret::push_pointer_key(at, key);
+            ty.find_secret_places(inner, at, places);
+            at.truncate(len);
+        };
+        match (self, value) {
+            (WeftType::Secret(_), value) => {
+                let place = match crate::secret::Secret::from_value(value) {
+                    Some(_) => SecretPlace::Sealed,
+                    None => SecretPlace::Plain,
+                };
+                places.push((at.clone(), place));
+            }
+            (WeftType::Named { body, .. }, value) => body.find_secret_places(value, at, places),
+            (WeftType::List(inner), Value::Array(items)) => {
+                for (i, item) in items.iter().enumerate() {
+                    step(at, &i.to_string(), inner, item, places);
+                }
+            }
+            (WeftType::Dict(inner), Value::Object(map)) => {
+                for (key, item) in map {
+                    step(at, key, inner, item, places);
+                }
+            }
+            (WeftType::Record { fields, .. }, Value::Object(map)) => {
+                for field in fields {
+                    if let Some(item) = map.get(&field.name) {
+                        step(at, &field.name, &field.ty, item, places);
+                    }
+                }
+                // What an open record holds beyond its fields.
+                for (key, item) in map.iter().filter(|(key, _)| !fields.iter().any(|field| field.name == **key)) {
+                    let len = at.len();
+                    crate::secret::push_pointer_key(at, key);
+                    undeclared(item, at, places);
+                    at.truncate(len);
+                }
+            }
+            // The member that takes the value is the one that says where
+            // its secrets are. Of the members that take it, the first that
+            // declares every marker in it wins (a `JsonDict` member takes
+            // any object, its markers included, so the order members are
+            // written in never decides whether a declared secret reads as
+            // one); with none taking it (a member holding a secret takes
+            // only its marker there), the one member that is a secret, else
+            // the one member holding a secret, is where a plain value is to
+            // become one.
+            (WeftType::Union(members), value) => {
+                let mut first_taker = None;
+                for member in members.iter().filter(|m| m.validate_value(value).is_ok()) {
+                    let mut found = Vec::new();
+                    member.find_secret_places(value, at, &mut found);
+                    if !found.iter().any(|(_, place)| *place == SecretPlace::Undeclared) {
+                        places.extend(found);
+                        return;
+                    }
+                    first_taker.get_or_insert(found);
+                }
+                match first_taker {
+                    Some(found) => places.extend(found),
+                    None => {
+                        let lone = |holds: fn(&WeftType) -> bool| {
+                            let mut found = members.iter().filter(|m| holds(m));
+                            match (found.next(), found.next()) {
+                                (Some(member), None) => Some(member),
+                                _ => None,
+                            }
+                        };
+                        match lone(|m| matches!(m.structural(), WeftType::Secret(_))).or_else(|| lone(WeftType::holds_secret)) {
+                            Some(member) => member.find_secret_places(value, at, places),
+                            None => undeclared(value, at, places),
+                        }
+                    }
+                }
+            }
+            (_, value) => undeclared(value, at, places),
+        }
+        /// Every marker in `value`, which sits at `at` where the type
+        /// declares no secret.
+        fn undeclared(value: &serde_json::Value, at: &str, places: &mut Vec<(std::string::String, SecretPlace)>) {
+            places.extend(crate::secret::markers_in(value).into_iter().map(|(inner, _)| (format!("{at}{inner}"), SecretPlace::Undeclared)));
         }
     }
 
@@ -1390,14 +1549,20 @@ impl WeftType {
     /// most `bound`: a narrowable output's call-site type, or a type
     /// parameter's binding against its bound? Every value of `declared`
     /// must be a value of `bound`, which is [`Self::is_compatible`] with
-    /// one difference: a stream narrows ITEM-wise (`Generator[Signup]`
+    /// two differences: a stream narrows ITEM-wise (`Generator[Signup]`
     /// fits `Generator[JsonDict]`), where wiring one stream into another
-    /// stays invariant. A named bound stays nominal (only its own name
+    /// stays invariant, and a record or dict holding a secret fits a
+    /// `JsonDict` bound, where wiring it into one is refused. A named bound stays nominal (only its own name
     /// fits it); a named declaration is read through its body.
     // SYNC: fits_within <-> packages/weft-graph/src/webview/lib/types/index.ts fitsWithin
     pub fn fits_within(declared: &WeftType, bound: &WeftType) -> bool {
         match (declared.structural(), bound) {
             (WeftType::Generator(a), WeftType::Generator(b)) => Self::fits_within(a, b),
+            // Every value of a record or a dict is an object, one holding a
+            // secret included: declaring one on an output that gives some
+            // object says what it holds (wiring it on into an unchecked
+            // dict is still refused, `is_compatible`).
+            (WeftType::Record { .. } | WeftType::Dict(_), WeftType::JsonDict) => true,
             _ => Self::is_compatible(declared, bound),
         }
     }
@@ -1441,6 +1606,10 @@ impl WeftType {
                 }
                 if obj.contains_key(crate::infra::INFRA_MARKER_KEY) {
                     return WeftType::Infra;
+                }
+                // A marker names a secret, never what it holds.
+                if crate::secret::Secret::from_value(value).is_some() {
+                    return WeftType::Secret(Box::new(WeftType::type_var("T")));
                 }
                 if obj.is_empty() {
                     return WeftType::dict(WeftType::Primitive(WeftPrimitive::Empty));
@@ -1604,6 +1773,9 @@ impl WeftType {
                      holding key, mimeType, sizeBytes and filename), and this value is not one"
                 ),
             });
+        }
+        if matches!(self.structural(), WeftType::Secret(_)) {
+            return Err(crate::secret::MADE_BY_A_NODE.to_string());
         }
         if self.is_unresolved()
             || matches!(self, WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_))
@@ -1804,6 +1976,17 @@ impl WeftType {
     ///
     /// Unresolved endpoints answer Ok: `unresolved-typevar` owns those.
     pub fn cast_allowed(source: &WeftType, target: &WeftType) -> Result<(), std::string::String> {
+        // Before anything else, a compatible pair included: a cast never
+        // makes a secret (only a node does) and never opens one (a node
+        // reveals it).
+        if target.holds_secret() {
+            return Err(format!("no cast into {target}: {}", crate::secret::MADE_BY_A_NODE));
+        }
+        if source.holds_secret() {
+            return Err(format!(
+                "no cast from {source}: a Secret stays sealed on its way, so a node that takes {source} reveals it"
+            ));
+        }
         if source.is_unresolved() || target.is_unresolved() {
             return Ok(());
         }
@@ -1834,7 +2017,7 @@ impl WeftType {
         }
         let text_serializable = |t: &WeftType| {
             !t.references_file()
-                && !matches!(t, WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_))
+                && !matches!(t, WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_) | WeftType::Secret(_))
         };
         let object_shaped = |t: &WeftType| {
             matches!(
@@ -2126,6 +2309,15 @@ impl WeftType {
                     mismatch(path)
                 }
             }
+            // A secret is its marker, whatever it holds: the value itself
+            // is never in hand to check.
+            WeftType::Secret(_) => {
+                if crate::secret::Secret::from_value(value).is_some() {
+                    Ok(())
+                } else {
+                    mismatch(path)
+                }
+            }
             // A generator PORT value is the live-handle marker; the
             // items themselves are validated per emission against the
             // element type, never through this whole-value gate.
@@ -2173,7 +2365,7 @@ impl WeftType {
     pub fn contains_unresolved_leaf(&self) -> bool {
         match self {
             WeftType::TypeVar(_) => true,
-            WeftType::List(inner) | WeftType::Generator(inner) | WeftType::Dict(inner) => {
+            WeftType::List(inner) | WeftType::Generator(inner) | WeftType::Secret(inner) | WeftType::Dict(inner) => {
                 inner.contains_unresolved_leaf()
             }
             WeftType::Union(members) => members.iter().any(|m| m.contains_unresolved_leaf()),
@@ -2189,7 +2381,7 @@ impl WeftType {
             WeftType::TypeVar(name) => {
                 out.insert(name.clone());
             }
-            WeftType::List(inner) | WeftType::Generator(inner) | WeftType::Dict(inner) => {
+            WeftType::List(inner) | WeftType::Generator(inner) | WeftType::Secret(inner) | WeftType::Dict(inner) => {
                 inner.collect_type_vars(out)
             }
             WeftType::Union(members) => members.iter().for_each(|m| m.collect_type_vars(out)),
@@ -2214,7 +2406,7 @@ impl WeftType {
                 *self = concrete.clone();
                 true
             }
-            WeftType::List(inner) | WeftType::Generator(inner) | WeftType::Dict(inner) => {
+            WeftType::List(inner) | WeftType::Generator(inner) | WeftType::Secret(inner) | WeftType::Dict(inner) => {
                 inner.substitute_var(var, concrete)
             }
             WeftType::Union(members) => {
@@ -2260,7 +2452,8 @@ impl WeftType {
             | WeftType::Bus
             | WeftType::Access
             | WeftType::Infra
-            | WeftType::Generator(_) => value.is_object(),
+            | WeftType::Generator(_)
+            | WeftType::Secret(_) => value.is_object(),
             WeftType::Json => true,
             WeftType::Union(members) => members.iter().any(|m| m.shallow_matches(value)),
             WeftType::Named { body, .. } => body.shallow_matches(value),
@@ -2496,7 +2689,7 @@ fn parse_single_type(s: &str) -> Result<WeftType, std::string::String> {
         _ => {}
     }
 
-    // Parameterized: List[T], Generator[T], Dict[String, V]
+    // Parameterized: List[T], Generator[T], Secret[T], Dict[String, V]
     if let Some(bracket_pos) = s.find('[') {
         if !s.ends_with(']') {
             return Err(format!("`{s}` opens a `[` it never closes at its end"));
@@ -2507,6 +2700,7 @@ fn parse_single_type(s: &str) -> Result<WeftType, std::string::String> {
         return match name {
             "List" => Ok(WeftType::List(Box::new(WeftType::try_parse(inner)?))),
             "Generator" => Ok(WeftType::Generator(Box::new(WeftType::try_parse(inner)?))),
+            "Secret" => Ok(WeftType::Secret(Box::new(WeftType::try_parse(inner)?))),
             "Dict" => {
                 let parts = split_top_level(inner, ',');
                 let [key, value] = parts.as_slice() else {
@@ -2526,7 +2720,7 @@ fn parse_single_type(s: &str) -> Result<WeftType, std::string::String> {
                 }
                 Ok(WeftType::Dict(Box::new(value)))
             }
-            _ => Err(format!("`{name}[...]` is not a type; the types that take one are List, Generator and Dict")),
+            _ => Err(format!("`{name}[...]` is not a type; the types that take one are List, Generator, Secret and Dict")),
         };
     }
 
@@ -2697,6 +2891,11 @@ impl WeftType {
             WeftType::Infra => out.push_str("Infra"),
             WeftType::Generator(inner) => {
                 out.push_str("Generator[");
+                inner.fmt_with(out, wire);
+                out.push(']');
+            }
+            WeftType::Secret(inner) => {
+                out.push_str("Secret[");
                 inner.fmt_with(out, wire);
                 out.push(']');
             }

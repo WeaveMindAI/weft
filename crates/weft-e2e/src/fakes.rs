@@ -257,6 +257,55 @@ async fn chat_completion(
     .into_response()
 }
 
+/// A fake service that keeps the headers and the JSON body of every
+/// request it gets, at any path, and answers `{"ok": true}`: what a node
+/// sent, as the service saw it.
+pub struct RequestsFake {
+    base_url: String,
+    seen: Arc<Mutex<Vec<SeenRequest>>>,
+    _server: AbortOnDrop,
+}
+
+/// One request a [`RequestsFake`] got: its headers, each name lowercase,
+/// and its body read as JSON (`Null` when it was none).
+#[derive(Debug, Clone)]
+pub struct SeenRequest {
+    pub headers: Vec<(String, String)>,
+    pub body: serde_json::Value,
+}
+
+impl RequestsFake {
+    pub async fn start() -> Result<Self> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, listener) = bind_host("requests").await?;
+        let app = Router::new().fallback(keep_request).with_state(seen.clone());
+        Ok(Self { base_url, seen, _server: serve_axum(listener, app) })
+    }
+
+    pub fn url(&self) -> String {
+        self.base_url.clone()
+    }
+
+    /// Every request received so far, in order.
+    pub async fn seen(&self) -> Vec<SeenRequest> {
+        self.seen.lock().await.clone()
+    }
+}
+
+async fn keep_request(
+    State(seen): State<Arc<Mutex<Vec<SeenRequest>>>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let kept = headers
+        .iter()
+        .map(|(name, value)| (name.as_str().to_string(), value.to_str().unwrap_or_default().to_string()))
+        .collect();
+    let body = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    seen.lock().await.push(SeenRequest { headers: kept, body });
+    axum::Json(serde_json::json!({ "ok": true }))
+}
+
 /// A fake HTTP server that serves fixed bytes at `/bytes`. Used by the storage
 /// fixture: a FetchToStorage node fetches FROM here, so the rig controls the
 /// exact content it can then download back and assert. Reachable like

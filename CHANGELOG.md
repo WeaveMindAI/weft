@@ -4,6 +4,63 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-10-31 (0.2.282)
+
+**What breaks after this update:**
+
+**Credentials a caller sends a route moved from `headers` to `credentials`, as
+secrets.** `authorization`, `proxy-authorization`, `cookie`,
+`weft-instance-token`, and any header the route's `auth` reads, now come out
+of a `Route` or a `Socket` on `credentials`, typed
+`Dict[String, Secret[String]]`, and never on `headers`. A program that still
+looks one up on `headers` finds it missing. Hand them to a node that takes a
+secret: an `HttpRequest`'s `headers` does, and sends them revealed. If you
+wire them into a plain `String` port, the build refuses it. Until now those
+values were scrubbed out of the run's record as text, which also meant a run
+that paused and carried on got the scrubbed text back instead of the
+credential. A secret's value is kept sealed beside the run's record and comes
+back after a pause.
+
+**`weft run --fire` refuses a credential header on a `Route`**
+(`authorization`, `proxy-authorization`, `cookie`, `weft-instance-token`, and
+any header the route's `auth` reads a credential from, like `X-Api-Key`),
+naming it: only a real call turns those into secrets. Call the route for real
+(`weft activate` prints its URL), or leave the header out.
+
+**A secret reaches outside weft only where a type declares it.** `HttpRequest`
+sends a secret in its `body` revealed when what you wire into `body` declares
+where it is (`-> (object: { token: Secret[String] })` on the `JsonObject` you
+build it with); a body without a secret builds and runs as before. A secret
+inside a plain `JsonDict` now fails the node that would send it, naming the
+input and where the secret is: `HttpRequest` (`body`, `headers`), `Reply`,
+`Stream`, an `ExecPython` input, and any node of yours that reveals through
+`ctx.reveal_in` or the new `ctx.reveal_input`.
+
+**`MintInstanceToken`'s `token` is a `Secret[String]`.** The run's record and
+search hold its marker, never the token. A `Reply` or a `Stream` sends it to
+the browser revealed if you wired it straight into `body`. If you put it
+inside a `JsonObject`, declare the object's type with the secret in it
+(`-> (object: { token: Secret[String] })`); left as a `JsonDict`, the `Reply`
+or `Stream` fails naming where the secret is, rather than sending the browser
+its marker. A program that wired `token` into a plain `String` port is
+refused when you build.
+
+**Also in this release:**
+
+**New: `Secret[T]`**, for a value a run's record must never show. A node makes
+one with `ctx.secret` and reads one with `ctx.reveal`, and an `ExecPython`
+output declared `Secret[String]` makes one of what its script returns. For
+what fits a secret, go and read the types page.
+
+**A value the HTTP API answers may be a secret's marker**
+(`{"__weft_secret__": {"secretId": "..."}}`): `POST /runs/{id}/values`,
+`GET /runs/{id}/replay` (with or without `?with_values=true`) and the live
+stream show the marker, never the value.
+
+If a project's runs stop being recorded after the update, its worker was
+built by the previous weft: run `weft resync` on it (the broker's log names
+the project).
+
 ## 2026-10-31 (dbefc004)
 
 **What you have to change after this update, if you use a PostgresDatabase:**

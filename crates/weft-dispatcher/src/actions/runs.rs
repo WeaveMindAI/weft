@@ -302,7 +302,15 @@ pub async fn run(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, body: &
                 .as_ref()
                 .map(|(_, payload)| payload.clone())
                 .unwrap_or(serde_json::Value::Null);
-            stand_in_caller(&capture.spec, &payload, &address).map_err(|why| refused(&weft_core::run_spec::Refusal::error(why)))?;
+            let refusal = |why: String| refused(&weft_core::run_spec::Refusal::error(why));
+            let request = stand_in_caller(&capture.spec, &payload, &address).map_err(refusal)?;
+            // Only a header typed by hand can be one the gate reads, so a
+            // request with none reads no connection.
+            let gate = match request.headers.is_empty() {
+                true => Vec::new(),
+                false => gate_headers(state, id, &capture.spec, spec.instance.as_ref(), &address).await?,
+            };
+            refuse_typed_credential(&request, &gate, &address).map_err(refusal)?;
             stand_in = Some(capture.spec.clone());
         }
     }
@@ -512,8 +520,14 @@ pub async fn run(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, body: &
     })
 }
 
-/// What a fired caller trigger serves: the request the author typed,
-/// standing in for the socket nobody opened.
+/// The request a stand-in caller serves when a run is started by hand
+/// through a trigger that answers a caller, standing in for the socket
+/// nobody opened: read out of the fire's payload, refused at the command
+/// when it is no request or the trigger is one nobody can stand in for
+/// (and when it carries a credential, [`refuse_typed_credential`]). The
+/// run's birth carries the trigger's spec
+/// (`RunStarted::stand_in`), and the worker that drives it serves this
+/// request from its firing kick.
 ///
 /// The payload is what the trigger's `firesWith` declares and the run
 /// spec already held it to, so the request is read straight out of it.
@@ -526,12 +540,6 @@ pub async fn run(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, body: &
 /// looks: NO stand-in means the trigger itself fails, asking to be
 /// triggered through a Route, which is the node the author is already
 /// looking at.
-/// The request a stand-in caller serves when a run is started by hand
-/// through a trigger that answers a caller: read out of the fire's
-/// payload, refused at the command when it is no request or the trigger
-/// is one nobody can stand in for. The run's birth carries the trigger's
-/// spec (`RunStarted::stand_in`), and the worker that drives it
-/// serves this request from its firing kick.
 fn stand_in_caller(
     spec: &weft_core::primitive::SignalSpec,
     payload: &serde_json::Value,
@@ -555,12 +563,54 @@ fn stand_in_caller(
     // here and served back through the ordinary request call would mean
     // this tier holding a caller trigger's field name to make the
     // impersonation work.
-    serde_json::from_value(payload.clone()).map_err(|e| {
+    let request: weft_core::caller::LiveRequest = serde_json::from_value(payload.clone()).map_err(|e| {
         format!(
             "--fire {address}: this trigger answers a caller, so its payload is the \
              request to serve: {e}"
         )
-    })
+    })?;
+    Ok(request)
+}
+
+/// Refuse a fired `request` (fired as `address`) carrying a credential:
+/// any request's, or one of `gate`, the headers the route's gate reads
+/// ([`gate_headers`]). A real call makes those secrets at the door, so a
+/// run started with one typed by hand would not behave as one.
+fn refuse_typed_credential(request: &weft_core::caller::LiveRequest, gate: &[String], address: &str) -> Result<(), String> {
+    match request.credential_typed_by_hand(gate) {
+        Some(header) => Err(format!("--fire {address}: {}", weft_core::caller::fired_credential(header))),
+        None => Ok(()),
+    }
+}
+
+/// The headers the gate of the caller trigger `spec` (fired as `address`,
+/// for `instance` of project `project`) reads a caller's credential from:
+/// none on an open route, else what its connection's recipe names.
+async fn gate_headers(
+    state: &DispatcherState,
+    project: uuid::Uuid,
+    spec: &weft_core::primitive::SignalSpec,
+    instance: Option<&weft_core::instance::InstanceId>,
+    address: &str,
+) -> Result<Vec<String>, Refused> {
+    let refusal = |why: String| refused(&weft_core::run_spec::Refusal::error(format!("--fire {address}: {why}")));
+    let (_, config) = weft_core::signal::live_connection(spec).map_err(refusal)?;
+    let weft_core::signal::PublicEntryAuth::Connection { access_id, service } = &config.auth else {
+        return Ok(Vec::new());
+    };
+    let access_id: uuid::Uuid =
+        access_id.parse().map_err(|_| refusal(format!("the route's gate names '{access_id}', which is no connection id")))?;
+    let tenant = crate::api::infra::tenant_of(state, project).await?;
+    let scope = instance.map(|instance| weft_core::instance::InstanceScope { project_id: project, instance: instance.clone() });
+    weft_access_store::caller_credential_headers(
+        &state.pg_pool,
+        &tenant,
+        weft_access_store::GrantUser::of(scope.as_ref()),
+        access_id,
+        service,
+    )
+    .await
+    .map_err(|e| refusal(format!("the connection gating this route cannot be read: {e:#}")))
 }
 
 
@@ -643,7 +693,7 @@ mod fire_snapshot_tests {
 
 #[cfg(test)]
 mod stand_in_caller_tests {
-    use super::stand_in_caller;
+    use super::{refuse_typed_credential, stand_in_caller};
     use serde_json::json;
 
     fn route_spec() -> weft_core::primitive::SignalSpec {
@@ -706,5 +756,29 @@ mod stand_in_caller_tests {
         let why = stand_in_caller(&route_spec(), &json!({ "method": 7 }), "list.door")
             .expect_err("a method that is not a string is not a request");
         assert!(why.contains("list.door") && why.contains("request to serve"), "{why}");
+    }
+
+    /// A credential header typed into a fired request is refused at the
+    /// command: the program reads a caller's credentials as secrets,
+    /// which only a real call makes, so the run would not behave as one.
+    #[test]
+    fn a_fired_request_carrying_a_credential_is_refused() {
+        let payload = json!({ "method": "GET", "path": "me", "headers": [["Authorization", "Bearer x"]] });
+        let request = stand_in_caller(&route_spec(), &payload, "me.door").expect("a request");
+        let why = refuse_typed_credential(&request, &[], "me.door").expect_err("a credential typed by hand");
+        assert!(why.contains("me.door") && why.contains("`Authorization`") && why.contains("credentials"), "{why}");
+    }
+
+    /// A header the route's gate reads its caller's credential from is
+    /// refused the same way, and is a plain header on a route no gate
+    /// reads it on.
+    #[test]
+    fn a_fired_request_carrying_the_gates_header_is_refused() {
+        let payload = json!({ "method": "GET", "path": "me", "headers": [["X-Api-Key", "key-9"]] });
+        let request = stand_in_caller(&route_spec(), &payload, "me.door").expect("a request");
+        let why = refuse_typed_credential(&request, &["X-Api-Key".to_string(), "authorization".to_string()], "me.door")
+            .expect_err("the gate's header typed by hand");
+        assert!(why.contains("`X-Api-Key`") && why.contains("Call the route for real"), "{why}");
+        assert_eq!(refuse_typed_credential(&request, &[], "me.door"), Ok(()), "no gate reads it");
     }
 }

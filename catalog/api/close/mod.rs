@@ -43,7 +43,7 @@ impl Node for CloseNode {
         let code: Option<u16> = ctx.inputs.opt("code")?;
         let status: Option<u16> = ctx.inputs.opt("status")?;
         let reason: Option<String> = ctx.inputs.opt("reason")?;
-        let headers: Option<Value> = ctx.inputs.opt("headers")?;
+        let headers = wire::headers(&ctx).await?;
         match ctx.live_caller().await? {
             CallerHandle::Http(http) => {
                 if let Some(code) = code {

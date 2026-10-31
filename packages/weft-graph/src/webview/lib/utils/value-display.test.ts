@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { jsonTokens, valueSummary, valueText, isPlainText } from './value-display';
+import { jsonTokens, valueSummary, valueText, isPlainText, SECRET_TEXT } from './value-display';
 
 /** The rendered text, which must always be the JSON a parser accepts back. */
 function render(value: unknown): string {
@@ -60,6 +60,24 @@ describe('jsonTokens', () => {
 	it('names a non-finite number instead of printing null', () => {
 		expect(render(Number.NaN)).toBe('NaN');
 		expect(render(Number.POSITIVE_INFINITY)).toBe('Infinity');
+	});
+});
+
+describe('secret markers', () => {
+	const marker = { __weft_secret__: { secretId: '7c9e6679-7425-40de-944b-e07fc1f90ae7' } };
+
+	it('renders a secret marker as a secret, with no value, wherever it sits', () => {
+		expect(jsonTokens(marker)).toEqual([{ text: SECRET_TEXT, kind: 'secret' }]);
+		expect(render({ token: marker, list: [marker] })).toBe(
+			`{\n  "token": ${SECRET_TEXT},\n  "list": [\n    ${SECRET_TEXT}\n  ]\n}`,
+		);
+		expect(valueSummary(marker)).toBe('secret');
+	});
+
+	it('shows a malformed marker as the object it is', () => {
+		const extra = { __weft_secret__: { secretId: 'x', more: 1 } };
+		expect(render(extra)).toBe(JSON.stringify(extra, null, 2));
+		expect(valueSummary(extra)).toBe('object · 1 key');
 	});
 });
 

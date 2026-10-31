@@ -19,10 +19,10 @@ pub mod tags;
 pub mod traits;
 pub mod unrecorded;
 
-pub use events::{redacted, RunEvent, Seed};
+pub use events::{RunEvent, Seed};
 pub use fold::{fold_to_snapshot, unpriced_charges_closed, unpriced_cost, ChargeBook, EndedWait, FiringView, Fold, FoldEffects, OpenedCharge};
 pub use seed::{seed_chain, LiveFold, SeedChain};
-pub use traits::{decoded_page, rows_after, BatchError, JournalClient, JournalRow, Position, RecordClient};
+pub use traits::{decoded_page, rows_after, secret_gone, BatchError, JournalClient, JournalRow, Position, RecordClient};
 
 /// Run `work`, which decodes, folds or encodes records, on tokio's
 /// blocking pool, and answer what it answers. A long run's record is real

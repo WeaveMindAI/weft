@@ -219,6 +219,31 @@ impl<'a> GrantUser<'a> {
     }
 }
 
+/// The wall every read of one connection row passes, pure: somebody
+/// else's connection reads the same as none at all (no existence leak),
+/// and one of another service is refused by name.
+fn walled(
+    row_tenant: &str,
+    row_service: &str,
+    row_project: Option<uuid::Uuid>,
+    row_instance: Option<&str>,
+    tenant: &str,
+    user: GrantUser<'_>,
+    service: &str,
+) -> anyhow::Result<()> {
+    if row_tenant != tenant || !user.may_use(row_project, row_instance) {
+        return Err(AccessError::NotFound.into());
+    }
+    if row_service != service {
+        return Err(AccessError::Invalid(format!(
+            "this connection is a '{row_service}' account, but the node asked for \
+             '{service}'; wire the right service's access node"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Whether a walled read renews a token that is due. A `Stored` read
 /// makes no provider call and writes nothing: what a read of a captured
 /// list or of pasted material wants, which never expires.
@@ -347,17 +372,7 @@ fn open_walled_grant(
     else {
         return Err(AccessError::NotFound.into());
     };
-    // Somebody else's reads the same as none at all: no existence leak.
-    if row_tenant != tenant || !user.may_use(row_project, instance.as_deref()) {
-        return Err(AccessError::NotFound.into());
-    }
-    if row_service != service {
-        return Err(AccessError::Invalid(format!(
-            "this connection is a '{row_service}' account, but the node asked for \
-             '{service}'; wire the right service's access node"
-        ))
-        .into());
-    }
+    walled(&row_tenant, &row_service, row_project, instance.as_deref(), tenant, user, service)?;
     let owner = crate::owner_of(&owner, instance.as_deref())?;
     let door = crate::door_of(&door)?;
     let granted = scopes_of(&granted);
@@ -731,6 +746,63 @@ pub async fn caller_verifier(
         read_walled_grant(pool, tenant, user, access_id, service, &[], Freshness::Stored).await?;
     let values = grant.spec.handoff_values(&grant.values);
     Ok(CallerVerifier { verify: grant.spec.verify.clone(), values })
+}
+
+/// The request headers a route gated by connection `access_id` reads its
+/// caller's credential from (`VerifyKind::credential_headers`): what a run
+/// it admits holds as secrets, so what a request typed by hand for it
+/// (`weft run --fire`) cannot carry. A recipe that declares no `verify`
+/// block gates no route, so it is refused, as the broker refuses every
+/// call through it. Reads the recipe through the wall, never the values.
+pub async fn caller_credential_headers(
+    pool: &Pool,
+    tenant: &str,
+    user: GrantUser<'_>,
+    access_id: uuid::Uuid,
+    service: &str,
+) -> anyhow::Result<Vec<String>> {
+    let row: Option<RecipeRow> = pool
+        .opt(
+            "SELECT tenant_id, service, spec, spec_version, instance_id, project_id FROM access_grant WHERE id = $1",
+            &[&access_id],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Err(AccessError::NotFound.into());
+    };
+    walled(&row.tenant_id, &row.service, row.project_id, row.instance_id.as_deref(), tenant, user, service)?;
+    let spec = spec_of(format_args!("connection {access_id}"), row.spec, row.spec_version)?;
+    match spec.verify {
+        Some(kind) => Ok(kind.credential_headers()),
+        None => Err(AccessError::Invalid(format!(
+            "the '{service}' service declares no `verify` block, so its connections cannot gate a route"
+        ))
+        .into()),
+    }
+}
+
+/// The `access_grant` columns the wall and a connection's recipe need:
+/// nothing sealed.
+struct RecipeRow {
+    tenant_id: String,
+    service: String,
+    spec: Value,
+    spec_version: weft_core::stored::Version,
+    instance_id: Option<String>,
+    project_id: Option<uuid::Uuid>,
+}
+
+impl FromRow for RecipeRow {
+    fn from_row(row: Row) -> db::Result<Self> {
+        Ok(Self {
+            tenant_id: row.try_get("tenant_id")?,
+            service: row.try_get("service")?,
+            spec: row.try_get::<_, JsonText<Value>>("spec")?.0,
+            spec_version: row.try_get("spec_version")?,
+            instance_id: row.try_get("instance_id")?,
+            project_id: row.try_get("project_id")?,
+        })
+    }
 }
 
 /// A stable content hash of an events-recipe map: sha256 hex of its

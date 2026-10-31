@@ -7,7 +7,14 @@
 // (an LLM reply, a prompt, a log line) would colour as garbage. Walking
 // gets it right by construction and is what the tests pin.
 
-export type JsonTokenKind = 'key' | 'string' | 'number' | 'boolean' | 'null' | 'punct';
+import { isSecretMarker } from '../../../protocol';
+
+/** `secret` is a secret's marker, wherever it sits in the value: the
+ *  run's record holds only the marker, so there is no value to show. */
+export type JsonTokenKind = 'key' | 'string' | 'number' | 'boolean' | 'null' | 'punct' | 'secret';
+
+/** What a secret's marker renders as, in the value and in its badge. */
+export const SECRET_TEXT = 'secret (not shown)';
 
 export interface JsonToken {
 	text: string;
@@ -28,6 +35,7 @@ export function isPlainText(value: unknown): value is string {
  *  without opening it. */
 export function valueSummary(value: unknown): string {
 	if (value === null) return 'null';
+	if (isSecretMarker(value)) return 'secret';
 	if (Array.isArray(value)) {
 		return `array · ${value.length} ${value.length === 1 ? 'item' : 'items'}`;
 	}
@@ -55,7 +63,8 @@ function countLabel(n: number, unit: string): string {
 
 /** Pretty-printed JSON, as tokens a renderer can colour. Indentation
  *  and newlines ride along as `punct`, so the caller only has to paint
- *  each token and keep whitespace. */
+ *  each token and keep whitespace. A secret's marker is the one thing
+ *  not printed as JSON: it renders as `SECRET_TEXT` in its place. */
 export function jsonTokens(value: unknown): JsonToken[] {
 	const out: JsonToken[] = [];
 	write(out, value, 0);
@@ -66,6 +75,7 @@ function write(out: JsonToken[], value: unknown, depth: number): void {
 	if (value === null) return push(out, 'null', 'null');
 	if (value === undefined) return push(out, 'undefined', 'null');
 	if (Array.isArray(value)) return writeArray(out, value, depth);
+	if (isSecretMarker(value)) return push(out, SECRET_TEXT, 'secret');
 	switch (typeof value) {
 		case 'string':
 			return push(out, JSON.stringify(value), 'string');

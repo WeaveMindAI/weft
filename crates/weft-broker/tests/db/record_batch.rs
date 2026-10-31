@@ -2,8 +2,9 @@
 //! (`weft_journal::record::record_batch`, the `weft_record_batch` function),
 //! against a REAL Postgres: a run born, carried on and ended by batches; a
 //! batch sent again changing nothing; a run two workers bore; a batch that
-//! does not follow on; two lanes of one worker writing side by side; and
-//! the fence between a late batch and the sweep that let go of its run.
+//! does not follow on; two lanes of one worker writing side by side; the
+//! fence between a late batch and the sweep that let go of its run; and the
+//! sealed secrets a batch carries.
 //! The fences live in the statement itself, so only a real database can
 //! prove them.
 
@@ -12,7 +13,7 @@ use std::time::Duration;
 use weft_task_store::db::{Client, JsonText, Pool};
 use weft_core::run_settings::{KeepFor, Keeping, RunSettings};
 use weft_dispatcher::store::{Lost, RunStore};
-use weft_journal::frame::{Batch, BatchHead, RunHead};
+use weft_journal::frame::{Batch, BatchHead, KeptSecret, RunHead};
 use weft_journal::record::{record_batch, Born, Fate, Written};
 use weft_journal::RunEvent;
 
@@ -86,10 +87,11 @@ struct Part {
     epoch: i32,
     first_seq: i32,
     rows: Vec<Vec<RunEvent>>,
+    secrets: Vec<KeptSecret>,
 }
 
 fn part(run_id: weft_core::RunId, epoch: i32, first_seq: i32, rows: Vec<Vec<RunEvent>>) -> Part {
-    Part { run_id, epoch, first_seq, rows }
+    Part { run_id, epoch, first_seq, rows, secrets: Vec::new() }
 }
 
 /// Write `parts` as one batch of `writer`'s lane `lane`, the way the broker
@@ -132,13 +134,14 @@ async fn answers_with(
                 born: (part.first_seq == 0).then(|| Born::of(&part.rows[0][0], KeepFor::WEFT_DEFAULT).expect("a birth")),
                 written: Written::of(&part.rows.concat()),
                 wrote_files: false,
+                secrets: part.secrets.clone(),
             })
             .collect(),
         programs,
         events_version: weft_journal::stored::STORED_EVENTS.version(),
     };
     let batch = Batch { head, rows: encoded.iter().flatten().map(Vec::as_slice).collect() };
-    record_batch(db, writer, TENANT, lane, &batch).await.unwrap()
+    record_batch(db, writer, TENANT, lane, &batch, &weft_access_store::seal_json).await.unwrap()
 }
 
 /// [`birth`] of a run of `program`, a cut of the registered `def-1`, for
@@ -429,6 +432,61 @@ async fn a_batch_writes_each_of_its_costs_once(pool: Pool) {
     let stale = [part(run, 7, 2, vec![vec![priced("c3", Some(1.0), weft_core::CredentialOwner::Author, Vec::new())]])];
     assert_eq!(send(&pool, "w1", "w1:0", &stale).await, [Fate::Refused]);
     assert_eq!(cost_rows(&pool, run).await.len(), 2, "a refused run's costs go nowhere");
+}
+
+/// What `run_secret` keeps of a run's secrets: each id and its sealed text.
+async fn secret_rows(pool: &Pool, run_id: weft_core::RunId) -> Vec<(uuid::Uuid, String)> {
+    pool.all("SELECT secret_id, sealed FROM run_secret WHERE run_id = $1 ORDER BY secret_id", &[&run_id]).await.unwrap()
+}
+
+fn secret_of(value: serde_json::Value) -> KeptSecret {
+    KeptSecret { secret_id: weft_core::secret::SecretId::mint(), value }
+}
+
+/// A secret a batch carries is kept sealed with its run, under its
+/// project: the database holds no plaintext, a worker of the project
+/// reveals it, and one of another project finds nothing. Sent again it
+/// stays one row; a run the batch did not take keeps none.
+#[weft_db_macros::test]
+async fn a_batch_keeps_its_runs_secrets_sealed_once(pool: Pool) {
+    schema(&pool).await;
+    let run = weft_core::new_run_id();
+    let token = secret_of(serde_json::json!("Bearer hunter2-\u{0}-tail"));
+    let mut first = part(run, 1, 0, vec![vec![birth(run, Keeping::Fast)]]);
+    first.secrets.push(token.clone());
+    let first = [first];
+    assert_eq!(send(&pool, "w1", "w1:0", &first).await, [Fate::Accepted]);
+    let rows = secret_rows(&pool, run).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, token.secret_id.as_uuid());
+    assert!(!rows[0].1.contains("hunter2"), "the database holds the value sealed");
+    let revealed = weft_broker::records::revealed(&pool, PROJECT, token.secret_id).await.unwrap();
+    assert_eq!(revealed, Some(token.value.clone()));
+    assert_eq!(weft_broker::records::revealed(&pool, uuid::Uuid::from_u128(9), token.secret_id).await.unwrap(), None);
+
+    assert_eq!(send(&pool, "w1", "w1:0", &first).await, [Fate::AlreadyApplied]);
+    assert_eq!(secret_rows(&pool, run).await, rows, "a batch sent again keeps its secret once");
+
+    let mut stale = part(run, 7, 1, vec![vec![started(run, "a")]]);
+    stale.secrets.push(secret_of(serde_json::json!("never kept")));
+    assert_eq!(send(&pool, "w1", "w1:0", &[stale]).await, [Fate::Refused]);
+    assert_eq!(secret_rows(&pool, run).await, rows, "a refused run keeps none of what its batch carried");
+}
+
+/// A run's secrets go with its record: once it is deleted, revealing one
+/// finds nothing, which a worker reports naming the secret.
+#[weft_db_macros::test]
+async fn a_runs_secrets_go_with_its_record(pool: Pool) {
+    schema(&pool).await;
+    let run = weft_core::new_run_id();
+    let token = secret_of(serde_json::json!("short-lived"));
+    let mut first = part(run, 1, 0, vec![vec![birth(run, Keeping::Fast), completed(run)]]);
+    first.secrets.push(token.clone());
+    assert_eq!(send(&pool, "w1", "w1:0", &[first]).await, [Fate::Accepted]);
+    let store = weft_dispatcher::store::postgres::PostgresStore::from_pool(pool.clone());
+    store.delete_run(run).await.unwrap();
+    assert!(secret_rows(&pool, run).await.is_empty());
+    assert_eq!(weft_broker::records::revealed(&pool, PROJECT, token.secret_id).await.unwrap(), None);
 }
 
 /// Two workers that took one fire both bear its run: the first is the

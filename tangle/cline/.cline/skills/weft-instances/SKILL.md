@@ -291,7 +291,16 @@ shows its displays and connects its accounts. It always expires.
 the instance is created, so a page can drive an instance started elsewhere
 (by a cron, by another route). weft keeps only a hash of it, so a replayed run
 cannot hand back the value it minted: it mints a new value for the same
-token, and the old value stops working.
+token, and the old value stops working. Its `token` comes out as a
+`Secret[String]`, so the run's record holds only its marker: wired straight
+into a `Reply`'s `body` it goes to the browser revealed, and inside an object
+it does too once that object's type says which field is the secret
+(`-> (object: { token: Secret[String], expiresAt: Number })` on a
+`JsonObject`); in a plain `JsonDict` the `Reply` fails, naming where the
+secret is, rather than sending its marker. Sending it to another service works the same
+way: wire that declared object into an `HttpRequest`'s `body` and the token
+goes into the request revealed; inside a plain `JsonDict` the request fails
+instead.
 
 `InstanceCosts` (or `ctx.costs().instance(id)`) reads what an instance's calls
 cost and whose credential paid each one, with the total; that is how a

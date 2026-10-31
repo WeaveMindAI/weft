@@ -192,7 +192,13 @@ impl StandIn {
         let payload = firing_payload
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("a run started by hand through a caller's trigger has no firing kick to serve"))?;
-        let request = serde_json::from_value(payload).context("the firing kick of a run started by hand through a caller's trigger is not a request")?;
+        let request: weft_core::caller::LiveRequest =
+            serde_json::from_value(payload).context("the firing kick of a run started by hand through a caller's trigger is not a request")?;
+        // The headers a gate reads were refused at the command, which
+        // reads the gate's connection; this floor holds the rest.
+        if let Some(header) = request.credential_typed_by_hand(&[]) {
+            anyhow::bail!("{}", weft_core::caller::fired_credential(header));
+        }
         Ok(Some(Self { spec: (**spec).clone(), request }))
     }
 
@@ -384,7 +390,7 @@ impl Worker {
             keep_for: settings.kept_for(keep_for),
             epoch: claimed.epoch,
             next_seq,
-            redaction: Default::default(),
+            secrets: Vec::new(),
             program: None,
         });
         // What fails here still books the charges the record leaves open:
@@ -850,6 +856,9 @@ fn outbound_payload(chunk: &OutboundChunk) -> weft_core::bus::WirePayload {
         OutboundChunk::Bytes(b) => {
             weft_core::bus::WirePayload::Bytes(bytes::Bytes::from(b.clone()))
         }
+        // The record keeps the value with its secrets' markers, never what
+        // the caller received.
+        OutboundChunk::Revealed { kept, .. } => weft_core::bus::WirePayload::Json(kept.clone()),
     }
 }
 
@@ -1414,9 +1423,9 @@ struct Arriving {
     /// What the trigger wakes with: a caller's opening request, or an
     /// event's payload.
     payload: serde_json::Value,
-    /// The credentials its caller sent: the run reads them in memory, and
-    /// its record holds none of them.
-    redaction: weft_core::caller::Redaction,
+    /// The secrets it is born holding: its caller's credentials
+    /// (`crate::door::Admitted::secrets`).
+    secrets: Vec<weft_journal::frame::KeptSecret>,
     /// Somebody waits to hear the run was born (a fire's firer): a durable
     /// run's birth is on record before that answer leaves.
     acknowledged: bool,
@@ -1456,7 +1465,7 @@ impl Worker {
         triggers_version: u64,
         arriving: Arriving,
     ) -> Result<RunStart, Turned> {
-        let Arriving { registered, payload, redaction, acknowledged } = arriving;
+        let Arriving { registered, payload, secrets, acknowledged } = arriving;
         let run_id = registered.run_id;
         if self.stopping.is_cancelled() {
             return Err(Turned::Stopping);
@@ -1478,7 +1487,7 @@ impl Worker {
             keep_for: plan.keep_for,
             epoch: 1,
             next_seq: 0,
-            redaction,
+            secrets,
             program: startable.runs.kept().cloned(),
         });
         let birth = startable.birth(&plan, run_id, &payload, crate::now_unix());
@@ -1528,7 +1537,7 @@ impl Worker {
         // who leaves at once finds the run to cancel. A fresh id is no
         // other run's.
         let registered = self.cancels.claim(weft_core::new_run_id()).expect("a fresh run id is no other run's");
-        let arriving = Arriving { registered, payload, redaction: admitted.redaction.clone(), acknowledged: false };
+        let arriving = Arriving { registered, payload, secrets: admitted.secrets.clone(), acknowledged: false };
         self.admit(&admitted.trigger, &admitted.entry, admitted.instance.as_ref(), admitted.triggers_version, arriving).await.map_err(|turned| match turned {
             Turned::Unread(e) => {
                 tracing::error!(target: "weft_engine::door", error = %format!("{e:#}"), "a run's facts could not be read");
@@ -1642,7 +1651,7 @@ impl Worker {
         let arriving = Arriving {
             registered,
             payload: fire.payload.clone(),
-            redaction: weft_core::caller::Redaction::default(),
+            secrets: Vec::new(),
             acknowledged: true,
         };
         let born = match self.admit(&trigger, &entry, entry.instance.as_ref(), triggers.version, arriving).await {
@@ -2306,6 +2315,9 @@ mod tests {
         async fn record_of(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<weft_journal::record::RawRecord> {
             self.record.record_of(run_id, after).await
         }
+        async fn secret(&self, id: weft_core::secret::SecretId) -> anyhow::Result<Option<serde_json::Value>> {
+            self.record.secret(id).await
+        }
         async fn give_up(&self, run_id: RunId, why: String) -> Result<(), weft_journal::BatchError> {
             self.record.give_up(run_id, why).await
         }
@@ -2338,7 +2350,7 @@ mod tests {
             keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
             epoch: 1,
             next_seq: 0,
-            redaction: Default::default(),
+            secrets: Vec::new(),
             program: None,
         });
         journal.hand(&RunEvent::RunFailed { run_id, error: "on its way".into(), at_unix: 0 }, None).unwrap();

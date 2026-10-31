@@ -387,6 +387,13 @@ impl RecordClient for BrokerRecordClient {
         Ok(resp.record)
     }
 
+    async fn secret(&self, secret_id: weft_core::secret::SecretId) -> Result<Option<Value>> {
+        let req = RecordSecretRequest { secret_id };
+        let resp: Option<RecordSecretResponse> =
+            read_until_answered(RECORD_SECRET.path, || self.http.post_or_404(RECORD_SECRET, &req)).await?;
+        Ok(resp.map(|resp| resp.value))
+    }
+
     async fn give_up(&self, run_id: RunId, why: String) -> std::result::Result<(), BatchError> {
         let answer = self
             .http

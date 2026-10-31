@@ -508,7 +508,7 @@ the `instances` package of the standard catalog has a node for each step:
 | `SetInstanceValues` | Sets or clears an instance's `@instance_filled` values, and sets up again any of its triggers that read a changed one |
 | `ActivateTriggers` | Turns on an instance's triggers |
 | `DeactivateTriggers` | Turns them off |
-| `MintInstanceToken` | Mints an instance token to hand to a browser |
+| `MintInstanceToken` | Mints an instance token to hand to a browser, as a [secret](../language/types.md#secrets): the run's record never holds it. A `Reply` sends it revealed where its type says it is a secret |
 | `WipeInstance` | Removes everything attached to an instance |
 
 If you leave `instance` unwired on `StartInfra`, `StopInfra`, `TerminateInfra`,
@@ -525,7 +525,10 @@ that order. If you want the request to answer at once rather than wait
 minutes for the copy, turn `waitUntilRunning` off on `StartInfra` and
 reply with the token after it: the start is accepted by then, so a list read
 right after shows the copy as `provisioning`. A reply placed before the start
-leaves nothing for that list to show yet. If one of the instance's triggers reads a value with no
+leaves nothing for that list to show yet. Wire the token straight into the
+`Reply`'s `body`, or into a `JsonObject` whose output you declare with the
+secret in it (`-> (object: { token: Secret[String] })`). In a plain
+`JsonDict` the browser would get the marker instead of the token. If one of the instance's triggers reads a value with no
 fallback, activating it at creation is refused, so leave
 `ActivateTriggers` for a second call your website makes once the
 settings are saved. The same route can remove an instance with `WipeInstance`:

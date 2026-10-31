@@ -1400,6 +1400,12 @@ pub(crate) mod tests {
         async fn record_page(&self, _run_id: RunId, _after: Option<i32>) -> anyhow::Result<Vec<weft_journal::JournalRow>> {
             unreachable!("metering tests only write")
         }
+        fn keep_secret(&self, _value: serde_json::Value) -> weft_core::secret::SecretId {
+            unreachable!("metering tests make no secrets")
+        }
+        async fn reveal_secret(&self, _id: weft_core::secret::SecretId) -> anyhow::Result<serde_json::Value> {
+            unreachable!("metering tests make no secrets")
+        }
     }
 
     /// A writer over a record nothing reads: the sinks write through

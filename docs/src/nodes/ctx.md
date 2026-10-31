@@ -142,6 +142,47 @@ On an opened connection: `client()`, `credential()`, `value(name)`,
 `identity()`, `owner()`. On an endpoint handle: `url()`,
 `host_and_port()`, and `call(method, path, body)`.
 
+## Secrets
+
+If your node hands out a value the run's record must never show, like a
+session key a voice app gets for a few minutes, make it a secret. What flows
+on the wire is a marker naming it. For what the record keeps and for how
+long, go and read [secrets](../language/types.md#secrets).
+
+```rust
+let session = ctx.secret(&key)?;
+ctx.pulse_downstream(NodeOutput::new().set("session", session)).await
+```
+
+Declare that output as `Secret[String]` in your `metadata.json`. A node that
+needs the value declares a `Secret[String]` input and asks for it:
+
+```rust
+let session: weft::secret::Secret = ctx.inputs.get("session")?;
+let key: String = ctx.reveal(&session).await?;
+```
+
+| Call | What you get | It fails when |
+|---|---|---|
+| `secret(&value)` | A `Secret` to put on an output typed `Secret[T]` | The value is not JSON |
+| `reveal::<T>(&secret).await` | The value, as `T` | The record of the run that made it is gone, or the value is not a `T` |
+| `reveal_input(port, value).await` | The value of your input `port` with every secret its declared type says it holds revealed, for handing a whole value outside weft (a script, a request, a caller) | As `reveal_in`, naming the input |
+| `reveal_in(value, &ty).await` | The same for a value of type `ty` that is no input of yours | A secret sits where `ty` declares none, a place `ty` says is a secret holds a plain value, or the record of the run that made one is gone |
+| `secret_in(value, &ty)` | `value` with every plain value at a place `ty` says is a secret made one, for a node whose code hands back plain values | never |
+
+A secret this run made, or revealed already, comes back from the worker's
+memory. Any other comes from its sealed copy, which any run of the same
+project can read: the same run picked up after a pause, a seeded run, a
+marker your program stored somewhere and reads back later. A run with
+`recorded` off writes nothing down, so only that run reveals its secrets.
+
+If a value holds a secret its type does not declare (a token inside a
+`JsonDict`), `reveal_in` and `reveal_input` fail rather than hand it on as
+its marker, saying where the secret is and that the program should declare
+the type, like `{ token: Secret[String] }`. If you emit a revealed value on a
+plain output, the record holds it like any other value. For which types fit a secret, go and read [what fits into
+what](../language/types.md#what-fits-into-what).
+
 ## Sharing something between runs
 
 If your node builds something on every run that is slow to build (a pool of database
