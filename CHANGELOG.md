@@ -4,19 +4,20 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-10-31 (ed587b61)
 
 **On a cloud install, how many holders run follows how busy they are**, not
 only how many triggers they hold. Each holder averages its CPU over a minute
-and tells weft when that has moved 10 points, and weft runs as many holders
-as their numbers added up need at 50% each, never fewer than one per 200
-triggers. A holder that reaches 70% hands part of its triggers over, and a
-holder weft starts for the load gets triggers handed to it by a busy one.
-A load that holds steady writes nothing, so your database still
-sleeps. If you want other numbers, `holder_target_cpu_percent` and
-`holder_high_cpu_percent` in `deploy/terraform/gcp/variables.tf` set them;
-the target must stay at least 20 under the high mark, and the workflow's
-`terraform apply` refuses a pair that is not.
+and tells weft the number when it has moved 10 points, and weft runs as many
+holders as those numbers added up need at 50% each, never fewer than one per
+200 triggers. A holder that reaches 70% hands part of its triggers over, and a
+holder weft starts for the load gets triggers handed to it by a busy one. A
+load that holds steady writes nothing, so your database still sleeps. The two
+shares are new settings of the install, `holders.highCpuPercent` (70) and
+`holders.targetCpuPercent` (50); on Google Cloud you set them with
+`holder_high_cpu_percent` and `holder_target_cpu_percent` in
+`deploy/terraform/gcp/variables.tf`. The target must stay at least 20 under
+the high mark, and `terraform apply` refuses a pair that is not.
 
 ## 2026-10-31 (0.2.281)
 
