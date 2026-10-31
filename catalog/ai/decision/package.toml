@@ -1,0 +1,20 @@
+[package]
+name = "decision"
+
+# The decision-model nodes. A decision model reads a state and answers
+# one typed question about it with probabilities, never text, so these
+# are not language-model nodes: an OpenRouter Decision Model node names
+# the model on the connection an OpenRouter Access node holds (the llm
+# package's access node: one OpenRouter connection serves both) and
+# emits a `DecisionProvider`, which no LLM node accepts, and one node
+# per question a decision model answers (DecisionChoice, DecisionYesNo,
+# DecisionScore, DecisionBox) asks it over the shared `decision.rs`.
+# The DecisionProvider and BoundingBox types are declared at this root.
+[dependencies]
+async-trait = "0.1"
+# An audio part of a decision state carries raw base64.
+base64 = "0.23"
+# The state a decision node sends keeps its fields in the order the
+# program wrote its ports.
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = "1"

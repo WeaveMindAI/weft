@@ -827,7 +827,7 @@ pub fn enrich_collecting(
         let filled: Vec<String> = weft_core::instance::instance_filled_fields(node).map(|(field, _)| field.to_string()).collect();
         node.instance_rules = (!filled.is_empty()).then(|| weft_core::project::InstanceRules {
             rules: crate::validate::node_rules(meta, node),
-            custom_outputs: crate::validate::node_custom_outputs(node, meta),
+            custom: weft_core::rules::CustomPorts::of(node, meta),
         });
         node.instance_service = match (meta.access_input(), &meta.service) {
             (Some(input), Some(spec)) if filled.contains(&input.name) => Some(spec.clone()),

@@ -18,10 +18,11 @@
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::frames::Located;
-use crate::node::{Condition, Named, NodeRole, NodeWith, RunDirection, ValidationRule};
+use crate::node::{Condition, Named, NodeMetadata, NodeRole, NodeWith, RunDirection, ValidationRule};
 use crate::project::graph::{GraphView, ProjectGraph};
 use crate::project::{NodeDefinition, ProjectDefinition};
 
@@ -80,21 +81,22 @@ impl<'a> RuleContext<'a> {
 
 /// Whether `rule` fires on `node`. Only a condition that is known to hold
 /// fires a rule; one that depends on a value nobody knows yet does not.
-/// `custom_outputs` are the output ports the source added beyond the
-/// node type's own ([`custom_outputs`]).
-pub fn fires(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, custom_outputs: &[String]) -> bool {
-    evaluate(&rule.when, node, cx, custom_outputs) == Some(true)
+/// `custom` are the ports the source added beyond the node type's own
+/// ([`CustomPorts::of`]).
+pub fn fires(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, custom: &CustomPorts) -> bool {
+    evaluate(&rule.when, node, cx, custom) == Some(true)
 }
 
-/// The message a fired rule shows: `{id}`, `{port}`, `{field}` and
-/// `{customOutputs}` replaced from the node; `{perInstanceReason}`
+/// The message a fired rule shows: `{id}`, `{port}`, `{field}`,
+/// `{customInputs}` and `{customOutputs}` replaced from the node; `{perInstanceReason}`
 /// with why it is per instance ("it reads 'blender'", "it sits inside
 /// group 'work', whose gate reads 'blender'"); `{names}` with the names
 /// its `input_names` conditions refuse, each with the full spelling it
 /// most likely meant when one exists (`'box' (did you mean
-/// 'work.box'?)`); `{with}` with the nodes its
+/// 'work.box'?)`), and the added inputs its `custom_inputs_fit`
+/// conditions refuse; `{with}` with the nodes its
 /// `downstream_of` conditions found.
-pub fn message(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, custom_outputs: &[String]) -> String {
+pub fn message(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, custom: &CustomPorts) -> String {
     let mut s = rule.then.message.replace("{id}", &node.id);
     if let Some(p) = &rule.then.port {
         s = s.replace("{port}", p);
@@ -102,15 +104,18 @@ pub fn message(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, c
     if let Some(f) = &rule.then.field {
         s = s.replace("{field}", f);
     }
+    if s.contains("{customInputs}") {
+        s = s.replace("{customInputs}", &custom.inputs.join(", "));
+    }
     if s.contains("{customOutputs}") {
-        s = s.replace("{customOutputs}", &custom_outputs.join(", "));
+        s = s.replace("{customOutputs}", &custom.outputs.join(", "));
     }
     if s.contains("{perInstanceReason}") {
         s = s.replace("{perInstanceReason}", &per_instance_reasons(node, cx).join(", and "));
     }
     if s.contains("{names}") || s.contains("{with}") {
         let (mut names, mut with_found) = (Vec::new(), Vec::new());
-        collect_from_condition(&rule.when, node, cx, &mut names, &mut with_found);
+        collect_from_condition(&rule.when, node, cx, custom, &mut names, &mut with_found);
         // Sorted, so the message reads the same whatever order the source
         // map iterates in (serde_json's key order depends on which crates
         // share the build), and so a name written twice is listed once.
@@ -127,11 +132,38 @@ fn quoted(items: &[String]) -> String {
     items.iter().map(|i| format!("'{i}'")).collect::<Vec<_>>().join(", ")
 }
 
-/// The output ports of `node` its type does not declare (`declared`): the
-/// ones the source added, written `-> (verdict: String)`.
-pub fn custom_outputs<'a>(node: &NodeDefinition, declared: impl IntoIterator<Item = &'a str>) -> Vec<String> {
-    let declared: Vec<&str> = declared.into_iter().collect();
-    node.outputs.iter().map(|p| p.name.clone()).filter(|name| !declared.contains(&name.as_str())).collect()
+/// The ports a program declared on a node beyond its type's own, in the
+/// order it wrote them: what `custom_inputs_declared`,
+/// `custom_inputs_fit`, `custom_outputs_declared` and the
+/// `{customInputs}` / `{customOutputs}` message holes read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomPorts {
+    /// Inputs written `ExecPython(photo: Image)` (`canAddInputPorts`):
+    /// every input not from the node's spec, the same ones the running
+    /// node lists as created (`ValueBag::created`). The language's gate
+    /// ports (`_should_flow`) come from the spec, so they are never on it.
+    #[serde(default, rename = "customInputs", skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
+    /// Outputs written `-> (verdict: String)` (`canAddOutputPorts`).
+    #[serde(default, rename = "customOutputs", skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<String>,
+}
+
+impl CustomPorts {
+    /// The ports of `node` its type's metadata `meta` does not declare.
+    /// Read once enrich has merged the metadata's ports into the node.
+    pub fn of(node: &NodeDefinition, meta: &NodeMetadata) -> Self {
+        Self {
+            inputs: node.inputs.iter().filter(|p| !p.from_spec).map(|p| p.name.clone()).collect(),
+            outputs: node
+                .outputs
+                .iter()
+                .map(|p| &p.name)
+                .filter(|name| !meta.outputs.iter().any(|o| o.name == **name))
+                .cloned()
+                .collect(),
+        }
+    }
 }
 
 /// What a field holds, as a rule sees it.
@@ -160,7 +192,7 @@ fn written<'a>(node: &'a NodeDefinition, field: &str) -> Written<'a> {
 /// value nobody knows yet (see the module docs). The combinators are the
 /// three-valued ones: `all` is false as soon as one part is, `any` true as
 /// soon as one part is, and otherwise unknown when a part is.
-pub fn evaluate(cond: &Condition, node: &NodeDefinition, cx: &RuleContext, custom_outputs: &[String]) -> Option<bool> {
+pub fn evaluate(cond: &Condition, node: &NodeDefinition, cx: &RuleContext, custom: &CustomPorts) -> Option<bool> {
     let (project, graph) = (cx.project(), &cx.graph);
     let about = |field: &str, test: &dyn Fn(Option<&Value>) -> bool| match written(node, field) {
         Written::Known(value) => Some(test(value)),
@@ -211,16 +243,18 @@ pub fn evaluate(cond: &Condition, node: &NodeDefinition, cx: &RuleContext, custo
             Written::Known(value) => Some(misnamed(value, project, *names).is_empty()),
             Written::Unknown => None,
         },
-        Condition::CustomOutputsDeclared {} => Some(!custom_outputs.is_empty()),
+        Condition::CustomInputsDeclared {} => Some(!custom.inputs.is_empty()),
+        Condition::CustomOutputsDeclared {} => Some(!custom.outputs.is_empty()),
         Condition::OutputTypeFits { port, within } => Some(
             node.outputs
                 .iter()
                 .find(|output| output.name == *port)
                 .is_some_and(|output| crate::weft_type::WeftType::fits_within(&output.port_type, within)),
         ),
-        Condition::All { of } => settle(of, false, |c| evaluate(c, node, cx, custom_outputs)),
-        Condition::Any { of } => settle(of, true, |c| evaluate(c, node, cx, custom_outputs)),
-        Condition::Not { of } => evaluate(of, node, cx, custom_outputs).map(|b| !b),
+        Condition::CustomInputsFit { one_of } => Some(unfit_inputs(node, custom, one_of).is_empty()),
+        Condition::All { of } => settle(of, false, |c| evaluate(c, node, cx, custom)),
+        Condition::Any { of } => settle(of, true, |c| evaluate(c, node, cx, custom)),
+        Condition::Not { of } => evaluate(of, node, cx, custom).map(|b| !b),
     }
 }
 
@@ -374,6 +408,23 @@ fn reads_along_wires<'a>(node: &NodeDefinition, cx: &'a RuleContext) -> BTreeSet
     reached.iter().filter_map(|place| cx.graph.node(&place.id)).map(|n| n.id.as_str()).collect()
 }
 
+/// The inputs the source added to `node` whose declared type fits in
+/// none of `one_of` (`custom_inputs_fit`), in the order it wrote them. A
+/// type still open (a type variable) fits; an added input the node does
+/// not carry does not.
+fn unfit_inputs<'a>(node: &NodeDefinition, custom: &'a CustomPorts, one_of: &[crate::weft_type::WeftType]) -> Vec<&'a str> {
+    custom
+        .inputs
+        .iter()
+        .filter(|name| {
+            !node.inputs.iter().find(|input| input.name == **name).is_some_and(|input| {
+                one_of.iter().any(|allowed| crate::weft_type::WeftType::fits_within(&input.port_type, allowed))
+            })
+        })
+        .map(String::as_str)
+        .collect()
+}
+
 /// The names in `value` (a String, each String of a list, or each key
 /// of an object) that are not what `named` asks for (`input_names`).
 fn misnamed(value: Option<&Value>, project: &ProjectDefinition, named: Named) -> Vec<String> {
@@ -443,23 +494,34 @@ fn refused_name(name: &str, cx: &RuleContext, named: Named) -> String {
     }
 }
 
-/// Every name the rule's `input_names` conditions refuse on `node`
+/// Every name the rule's `input_names` conditions refuse on `node` and
+/// every added input its `custom_inputs_fit` conditions refuse
 /// (`{names}`), and every node its `downstream_of` conditions found
 /// (`{with}`), walked through the combinators.
-fn collect_from_condition(cond: &Condition, node: &NodeDefinition, cx: &RuleContext, names: &mut Vec<String>, with_found: &mut Vec<String>) {
+fn collect_from_condition(
+    cond: &Condition,
+    node: &NodeDefinition,
+    cx: &RuleContext,
+    custom: &CustomPorts,
+    names: &mut Vec<String>,
+    with_found: &mut Vec<String>,
+) {
     match cond {
         Condition::InputNames { port, names: named } => {
             if let Written::Known(value) = written(node, port) {
                 names.extend(misnamed(value, cx.project(), *named).iter().map(|name| refused_name(name, cx, *named)));
             }
         }
+        Condition::CustomInputsFit { one_of } => {
+            names.extend(unfit_inputs(node, custom, one_of).into_iter().map(|name| format!("'{name}'")));
+        }
         Condition::DownstreamOf { with } => with_found.extend(upstream_with(node, cx, with)),
         Condition::All { of } | Condition::Any { of } => {
             for c in of {
-                collect_from_condition(c, node, cx, names, with_found);
+                collect_from_condition(c, node, cx, custom, names, with_found);
             }
         }
-        Condition::Not { of } => collect_from_condition(of, node, cx, names, with_found),
+        Condition::Not { of } => collect_from_condition(of, node, cx, custom, names, with_found),
         _ => {}
     }
 }

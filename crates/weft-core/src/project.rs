@@ -2065,10 +2065,11 @@ pub struct InstanceRules {
     /// language adds, like "no connection picked"), at every level: a
     /// run for an instance is a run, so runtime-level rules hold too.
     pub rules: Vec<crate::node::ValidationRule>,
-    /// The output ports the source added beyond the type's own, which
-    /// `custom_outputs_declared` and `{customOutputs}` read.
-    #[serde(default, rename = "customOutputs", skip_serializing_if = "Vec::is_empty")]
-    pub custom_outputs: Vec<String>,
+    /// The ports the source added beyond the type's own, which
+    /// `custom_inputs_declared`, `custom_inputs_fit`,
+    /// `custom_outputs_declared` and their message holes read.
+    #[serde(flatten)]
+    pub custom: crate::rules::CustomPorts,
 }
 
 /// One place of a node with a `@instance_filled` field

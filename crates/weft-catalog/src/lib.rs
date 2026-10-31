@@ -1110,17 +1110,19 @@ impl DiscoverCtx<'_> {
         }
 
         // Services, over what is left.
-        let mut by_service: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut by_service: BTreeMap<String, Vec<&CatalogEntry>> = BTreeMap::new();
         for entry in units_ok.iter().flat_map(|u| &u.entries) {
             if let Some(service) = &entry.metadata.service {
-                by_service.entry(service.service.clone()).or_default().push(entry.node_type.clone());
+                by_service.entry(service.service.clone()).or_default().push(entry);
             }
         }
         let service_clashes: BTreeMap<String, (Vec<String>, CatalogError)> = by_service
             .into_iter()
-            .filter(|(_, node_types)| node_types.len() > 1)
-            .map(|(service, node_types)| {
-                let error = CatalogError::ServiceCollision { service: service.clone(), node_types: node_types.clone() };
+            .filter(|(_, entries)| entries.len() > 1)
+            .map(|(service, entries)| {
+                let node_types: Vec<String> = entries.iter().map(|e| e.node_type.clone()).collect();
+                let dirs = entries.iter().map(|e| e.source_dir.clone()).collect();
+                let error = CatalogError::ServiceCollision { service: service.clone(), node_types: node_types.clone(), dirs };
                 (service, (node_types, error))
             })
             .collect();
@@ -1921,13 +1923,26 @@ pub enum CatalogError {
          alone, so none of them is loaded until only one declares it",
         node_types.join(", ")
     )]
-    ServiceCollision { service: String, node_types: Vec<String> },
+    /// `dirs`: each claimant's folder, in `node_types`' order.
+    ServiceCollision { service: String, node_types: Vec<String>, dirs: Vec<PathBuf> },
     #[error(
         "package name '{name}' is used by more than one folder ({}); a bare node is named by its \
          folder, a package by its package.toml. None of them is loaded until the names differ",
         list_paths(roots)
     )]
     PackageNameCollision { name: String, roots: Vec<PathBuf> },
+}
+
+impl CatalogError {
+    /// The files or folders the error is about: what places it in a
+    /// package.
+    pub fn paths(&self) -> Vec<&Path> {
+        match self {
+            Self::Io { path, .. } | Self::Parse { path, .. } => vec![path.as_path()],
+            Self::Collision { dirs, .. } | Self::ServiceCollision { dirs, .. } => dirs.iter().map(PathBuf::as_path).collect(),
+            Self::PackageNameCollision { roots, .. } => roots.iter().map(PathBuf::as_path).collect(),
+        }
+    }
 }
 
 fn list_paths(paths: &[PathBuf]) -> String {

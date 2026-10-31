@@ -1,0 +1,81 @@
+{
+  "type": "DecisionScore",
+  "label": "Decide: Score",
+  "description": "Ask a decision model where something falls on an ordered scale, and get its position with each level's probability: often cheaper than an LLM and a better fit for rating something (urgency from low to critical, a 1 to 5 rating, how relevant a result is) before an LLM or a person sees it, or after either answers. What it judges is the ports you add, one per piece, each named and typed: `urgency = DecisionScore(ticket: String) { provider: decider.provider, instructions: \"How urgent is this ticket?\", levels: [\"Can wait for the next release\", \"Should be fixed this week\", \"Blocking revenue right now\"], ticket: inbox.text }`. The values go in one object keyed by port name and each file follows it under its port's name, so the question can point at either (`ticket`, or a nested field as `ticket.messages[0]`). A value (text, a record, a dict, a list of those) is sent as it is, and a file, or a list of files, on a port of its own: a text or JSON file as its content (for anything past a wire's size), an image, audio clip or video as itself (audio and video on cloudflare/clef-omni only). A file inside a record is refused: give it its own port. Write each level as a situation that stands on its own, never \"more than the last\". To rank several items, score each one (a Loop over them) and sort by `score`.",
+  "tags": [
+    "ai",
+    "decision",
+    "score",
+    "rating",
+    "rank",
+    "triage"
+  ],
+  "icon": "Gauge",
+  "color": "#7c6f9f",
+  "inputs": [
+    {
+      "name": "provider",
+      "type": "DecisionProvider",
+      "required": true,
+      "accepts": ["wire"],
+      "description": "Which decision model and credential: wire an OpenRouter Decision Model node's `provider`."
+    },
+    {
+      "name": "instructions",
+      "type": "String",
+      "required": true,
+      "widget": { "kind": "textarea" },
+      "label": "Question",
+      "placeholder": "How urgent is this ticket?",
+      "description": "What to place on the scale, with what counts and what only looks like it."
+    },
+    {
+      "name": "levels",
+      "type": "List[String]",
+      "required": true,
+      "label": "Levels",
+      "description": "The scale's levels, lowest first, at least two, each describing a situation that stands alone."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "score",
+      "type": "Number",
+      "description": "The probability-weighted position on the scale, from 0 (the first level) to the number of levels minus 1: 1.99 on three levels is almost all on the last."
+    },
+    {
+      "name": "level",
+      "type": "String",
+      "description": "The most likely level, as written in `levels` (the lower one on a tie)."
+    },
+    {
+      "name": "probabilities",
+      "type": "List[Number]",
+      "description": "Each level's probability, in the order of `levels`."
+    },
+    {
+      "name": "confidence",
+      "type": "Number",
+      "description": "How concentrated the probabilities are on one level, 1 when all of it sits on one. It says nothing about whether the answer is right: use it to send a spread-out answer to a person or a bigger model."
+    }
+  ],
+  "features": {
+    "canAddInputPorts": true
+  },
+  "validate": [
+    {
+      "when": { "kind": "not", "of": { "kind": "custom_inputs_fit", "oneOf": ["Json", "File | Null", "List[File] | Null"] } },
+      "then": {
+        "message": "DecisionScore '{id}' takes, on each added input, exactly one of: a value made of JSON (text, a record, a dict, a list of those), a file, or a list of files, and these are none of those: {names}. Give each file a port of its own (`photo: Image`, `photos: List[Image]`) rather than a field of a record, an item of a list mixed with text, or one type with a value (`String | Image`).",
+        "level": "structural"
+      }
+    },
+    {
+      "when": { "kind": "not", "of": { "kind": "custom_inputs_declared" } },
+      "then": {
+        "message": "DecisionScore '{id}' has nothing to decide about: add one input for each piece of what the model should judge, named after it and typed, like `DecisionScore(review: String)`.",
+        "level": "structural"
+      }
+    }
+  ]
+}

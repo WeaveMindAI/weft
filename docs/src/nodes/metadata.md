@@ -274,8 +274,8 @@ read [refusals answered with a 200](../connections/declaring-a-service.md#refusa
 
 Each rule is `{ "when": <condition>, "then": <diagnostic> }`.
 
-The diagnostic takes `message` (with `{id}`, `{port}`, `{field}` and
-`{customOutputs}` filled in, plus the three the conditions below name),
+The diagnostic takes `message` (with `{id}`, `{port}` and `{field}` filled
+in, plus the ones the conditions below name),
 `level` (`structural`, the default, or `runtime`), `severity` (`error` by default, or `warning`, `info`, `hint`), and
 optionally `port` or `field` to say what the finding is about.
 
@@ -297,8 +297,10 @@ The conditions are a closed list:
 | `config_equals` | `field`, `equals` | Does it equal this exact value |
 | `config_in_set` | `field`, `values` | Is its string one of these |
 | `config_matches` | `field`, `regex` | Does its string match. False if absent, not a string, or the regex is broken |
-| `custom_outputs_declared` | | Did the source add outputs beyond the metadata's own |
+| `custom_inputs_declared` | | Did the source add inputs beyond the metadata's own. `{customInputs}` in the message names them |
+| `custom_outputs_declared` | | Did the source add outputs beyond the metadata's own. `{customOutputs}` in the message names them |
 | `output_type_fits` | `port`, `within` | Does this output, as the program declared it (or as your metadata types it, if the program declared nothing), fit in the type `within`. Use it when the types that make sense on a narrowable output depend on a setting: a route whose `dataType` is `text` takes only a `String` body. False when the node has no such output |
+| `custom_inputs_fit` | `oneOf` | Does every input the source added beyond the metadata's own fit in one of the types `oneOf` lists. Each input is held to one of them, never to their union, so your node can count on each added input being one of the shapes it handles. Use it when your node sends its added inputs somewhere that takes only some shapes: a model that reads a JSON value or a file lists `["Json", "File | Null"]` (the `Null` lets an input typed `Image | Null` through), and then a record that holds an `Image` fits neither, and neither does `String` or `Image` written as one type. An added input whose type is still open fits, and so does adding none. `{names}` in the message lists the added inputs that do not fit |
 | `run_reaches` | `direction`, `with` | Does this node's run hold a node `with` a feature. `downstream`: every run this node starts holds one. `upstream`: this node is in the run of one |
 | `downstream_of` | `with` | Is a node `with` a feature wired upstream of this one, so it runs first. `{with}` in the message names those nodes |
 | `per_instance` | | Does this node exist once per instance: marked `@per_instance`, with an `@instance_filled` field, or reading one of those (a group that receives a per-instance value on any port counts for everything reading its ports). `{perInstanceReason}` in the message says why, path included: "it reads 'blender'", or "it sits inside group 'work', which receives 'blender'" |

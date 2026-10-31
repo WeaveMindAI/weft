@@ -1,0 +1,6 @@
+{
+  "types": {
+    "DecisionProvider": "JsonDict",
+    "BoundingBox": "{ top: Number, bottom: Number, left: Number, right: Number }"
+  }
+}

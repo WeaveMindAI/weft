@@ -1,0 +1,115 @@
+{
+  "type": "DecisionYesNo",
+  "label": "Decide: Yes or No",
+  "description": "Ask a decision model whether a condition holds, and get the probability of yes: often cheaper than an LLM and a better fit wherever one would be asked yes or no (a guardrail before an LLM call, a check on what an LLM or a person produced, a moderation filter, a gate on whether the run goes on). What it judges is the ports you add, one per piece, each named and typed: `isBug = DecisionYesNo(ticket: String, screenshot?: Image) { provider: decider.provider, instructions: \"Is the customer reporting a software defect?\", ticket: inbox.text, screenshot: inbox.image }`. The values go in one object keyed by port name and each file follows it under its port's name, so a question can point at either (`ticket`, or a nested field as `ticket.messages[0]`). A value (text, a record, a dict, a list of those) is sent as it is, and a file, or a list of files, on a port of its own: a text or JSON file as its content (for anything past a wire's size), an image, audio clip or video as itself (audio and video on cloudflare/clef-omni only). A file inside a record is refused: give it its own port. Ask about the thing judged (\"Is this review promotional?\"), never about the text (\"Does it mention...\"). For labels that can apply together, use one of these per label; for exactly one of several, use Decide: Pick One. `probability` can be low for both yes and no wordings, and is no measure of intensity: to route an unsure middle band somewhere else (a person, a bigger model), send `probability` through a Switch with `between`.",
+  "tags": [
+    "ai",
+    "decision",
+    "classify",
+    "moderation",
+    "guardrail",
+    "gate",
+    "noul"
+  ],
+  "icon": "CircleQuestionMark",
+  "color": "#7c6f9f",
+  "inputs": [
+    {
+      "name": "provider",
+      "type": "DecisionProvider",
+      "required": true,
+      "accepts": ["wire"],
+      "description": "Which decision model and credential: wire an OpenRouter Decision Model node's `provider`."
+    },
+    {
+      "name": "instructions",
+      "type": "String",
+      "required": true,
+      "widget": { "kind": "textarea" },
+      "label": "Question",
+      "placeholder": "Is the customer reporting a software defect?",
+      "description": "The condition, as a question about the thing judged, with what counts and what only looks like it."
+    },
+    {
+      "name": "whenTrue",
+      "type": "String",
+      "widget": { "kind": "textarea" },
+      "label": "Counts as yes",
+      "placeholder": "The customer describes broken or unexpected product behavior.",
+      "description": "What a yes looks like. Written with `whenFalse`, or neither."
+    },
+    {
+      "name": "whenFalse",
+      "type": "String",
+      "widget": { "kind": "textarea" },
+      "label": "Counts as no",
+      "placeholder": "The customer is asking a question or requesting a feature.",
+      "description": "What a no looks like. Written with `whenTrue`, or neither."
+    },
+    {
+      "name": "threshold",
+      "type": "Number",
+      "default": 0.5,
+      "widget": { "kind": "number", "min": 0, "max": 1, "step": 0.05 },
+      "label": "Yes from",
+      "description": "The probability from which `yes` is true. 0.5 until you have run real cases, including unclear ones, and seen where this model's probabilities fall on them."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "probability",
+      "type": "Number",
+      "description": "The probability that the condition holds, from 0 to 1."
+    },
+    {
+      "name": "yes",
+      "type": "Boolean",
+      "description": "`probability` is at least the threshold. Wire it into a branch's `_should_flow`."
+    }
+  ],
+  "features": {
+    "canAddInputPorts": true
+  },
+  "validate": [
+    {
+      "when": { "kind": "not", "of": { "kind": "custom_inputs_fit", "oneOf": ["Json", "File | Null", "List[File] | Null"] } },
+      "then": {
+        "message": "DecisionYesNo '{id}' takes, on each added input, exactly one of: a value made of JSON (text, a record, a dict, a list of those), a file, or a list of files, and these are none of those: {names}. Give each file a port of its own (`photo: Image`, `photos: List[Image]`) rather than a field of a record, an item of a list mixed with text, or one type with a value (`String | Image`).",
+        "level": "structural"
+      }
+    },
+    {
+      "when": { "kind": "not", "of": { "kind": "custom_inputs_declared" } },
+      "then": {
+        "message": "DecisionYesNo '{id}' has nothing to decide about: add one input for each piece of what the model should judge, named after it and typed, like `DecisionYesNo(ticket: String, screenshot: Image)`.",
+        "level": "structural"
+      }
+    },
+    {
+      "when": {
+        "kind": "any",
+        "of": [
+          {
+            "kind": "all",
+            "of": [
+              { "kind": "input_satisfied", "port": "whenTrue" },
+              { "kind": "not", "of": { "kind": "input_satisfied", "port": "whenFalse" } }
+            ]
+          },
+          {
+            "kind": "all",
+            "of": [
+              { "kind": "input_satisfied", "port": "whenFalse" },
+              { "kind": "not", "of": { "kind": "input_satisfied", "port": "whenTrue" } }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "message": "DecisionYesNo '{id}' has one of whenTrue and whenFalse: the model reads one against the other, so write both or neither.",
+        "level": "structural",
+        "field": "whenTrue"
+      }
+    }
+  ]
+}

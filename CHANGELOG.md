@@ -4,7 +4,7 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-10-31 (0.2.280)
 
 **A project with nodes of its own compiles from a cold cache once** after this
 update: weft no longer builds with `--cfg tokio_unstable`, which changes how
@@ -83,6 +83,26 @@ kept exactly, NUL included.
 after `events`. Corruption notices (`journal_corruption`) now arrive in order
 with the rows, carrying a `journal:` event id, instead of at the end with an id
 of their own.
+
+## 2026-10-31 (ae995e3a)
+
+**Decision models, as nodes.** A new `decision` package asks OpenRouter's
+decision models a typed question and gets probabilities back, with no reply
+to parse: Decide: Yes or No, Decide: Pick One, Decide: Score and Decide: Find
+in Image, fed by an OpenRouter Decision Model node wired from the OpenRouter
+Access you already have. They are often cheaper than an LLM for routing,
+guardrails and checks around LLM or human steps. What the model judges is the
+inputs you add to the node (`DecisionYesNo(ticket: String, photo: Image)`):
+each is a value made of JSON, a file, or a list of files, and a file inside a
+record is refused when you build, so give each file its own input. Calls on
+weft's own OpenRouter key are measured like any other.
+
+**If you write nodes:** a `validate` rule can now ask about the inputs a
+program added: `custom_inputs_declared` (it added any) and `custom_inputs_fit`
+(each one fits one of the types `oneOf` lists), with `{customInputs}` and
+`{names}` in the message. And `weft test-node` now refuses to run when a node
+of the package it tests failed to load, naming it, instead of reporting the
+rest of the package green.
 
 ## 2026-10-30 (671e50f4)
 
