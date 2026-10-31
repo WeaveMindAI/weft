@@ -1254,7 +1254,8 @@ impl NodeMetadata {
     /// Every port a validation rule's condition names is one of this
     /// node's (or one a program may add, on a node that takes added
     /// ports): a misspelled port reads as never wired, and under a `not`
-    /// the rule then fires on every program.
+    /// the rule then fires on every program. For the same reason a rule
+    /// asking about added ports is on a node that takes them.
     fn check_condition_ports(&self, condition: &Condition) -> Result<(), String> {
         let input = |port: &str| {
             if self.features.can_add_input_ports || self.inputs.iter().any(|i| i.name == port) {
@@ -1280,11 +1281,19 @@ impl NodeMetadata {
                 of.iter().try_for_each(|c| self.check_condition_ports(c))
             }
             Condition::Not { of } => self.check_condition_ports(of),
+            Condition::CustomInputsDeclared {} | Condition::CustomInputsFit { .. } if !self.features.can_add_input_ports => {
+                Err("a validate rule asks for added inputs, and this node takes none (`canAddInputPorts`)".into())
+            }
+            Condition::CustomOutputsDeclared {} if !self.features.can_add_output_ports => {
+                Err("a validate rule asks for added outputs, and this node takes none (`canAddOutputPorts`)".into())
+            }
             Condition::ConfigPresent { .. }
             | Condition::ConfigNonempty { .. }
             | Condition::ConfigEquals { .. }
             | Condition::ConfigInSet { .. }
             | Condition::ConfigMatches { .. }
+            | Condition::CustomInputsDeclared {}
+            | Condition::CustomInputsFit { .. }
             | Condition::CustomOutputsDeclared {}
             | Condition::RunReaches { .. }
             | Condition::DownstreamOf { .. }
@@ -2306,6 +2315,13 @@ pub enum Condition {
     /// sibling ConfigX condition, which all treat an absent field as not-present).
     /// Wrap in `not` to assert a non-match.
     ConfigMatches { field: String, regex: String },
+    /// The source declared input ports beyond the metadata's own (a
+    /// node with `canAddInputPorts`, written `Node(ticket: String)`).
+    /// For a node whose added inputs ARE what it works on: "added
+    /// nothing" is then a program that cannot do anything, refused
+    /// with `not` around this. `{customInputs}` in the message names
+    /// them. Braced (`{}`) like `CustomOutputsDeclared`.
+    CustomInputsDeclared {},
     /// The source declared output ports beyond the metadata's own (a
     /// node with `canAddOutputPorts`, written `-> (verdict: String)`).
     /// The ingredient for "added outputs need X": a node whose added
@@ -2323,6 +2339,21 @@ pub enum Condition {
     /// rather than at the first call. False when the node has no such
     /// output.
     OutputTypeFits { port: String, within: WeftType },
+    /// Every input the source added beyond the metadata's own (a node
+    /// with `canAddInputPorts`) is declared with a type that fits in one
+    /// of the types `one_of` lists; a type still open (a type variable)
+    /// fits. Each input is held to ONE listed type, never to their
+    /// union: with `["Json", "File | Null"]`, `String | Image` fits neither, so
+    /// a node can rely on each added input being exactly one of the
+    /// shapes it handles. For a node whose added inputs are sent
+    /// somewhere that takes only some shapes, like a model that reads a
+    /// JSON value or a file but not a record holding an image. True when
+    /// nothing was added. `{names}` in the message lists the added
+    /// inputs that do not fit.
+    CustomInputsFit {
+        #[serde(rename = "oneOf")]
+        one_of: Vec<WeftType>,
+    },
     /// The run this node is part of holds a node `with` a feature, in
     /// the given direction. `downstream`: every run started from this
     /// node (a trigger's fire, or a run seeded at the node) contains
@@ -2428,6 +2459,7 @@ mod condition_tests {
             "kind": "all",
             "of": [
                 { "kind": "custom_outputs_declared" },
+                { "kind": "custom_inputs_declared" },
                 { "kind": "not", "of": { "kind": "config_equals", "field": "parseJson", "equals": true } },
                 { "kind": "any", "of": [
                     { "kind": "input_satisfied", "port": "prompt" },
@@ -2439,6 +2471,7 @@ mod condition_tests {
                     { "kind": "config_in_set", "field": "mode", "values": ["a", "b"] },
                     { "kind": "config_matches", "field": "path", "regex": "^/" },
                     { "kind": "output_type_fits", "port": "body", "within": "JsonDict | String" },
+                    { "kind": "custom_inputs_fit", "oneOf": ["Json", "List[Image]"] },
                     { "kind": "run_reaches", "direction": "downstream", "with": { "answersCaller": true } },
                     { "kind": "run_reaches", "direction": "upstream", "with": { "liveConnection": ["http"] } },
                     { "kind": "downstream_of", "with": { "answersCaller": ["stream"] } },
@@ -2454,7 +2487,9 @@ mod condition_tests {
         let again: Condition = serde_json::from_value(serde_json::to_value(&rule).unwrap()).unwrap();
         assert_eq!(serde_json::to_value(&again).unwrap(), serde_json::to_value(&rule).unwrap());
         assert!(serde_json::from_value::<Condition>(serde_json::json!({ "kind": "custom_outputs_declared", "port": "x" })).is_err(), "no fields");
+        assert!(serde_json::from_value::<Condition>(serde_json::json!({ "kind": "custom_inputs_declared", "port": "x" })).is_err(), "no fields");
         assert!(serde_json::from_value::<Condition>(serde_json::json!({ "kind": "per_instance", "port": "x" })).is_err(), "no fields");
+        assert!(serde_json::from_value::<Condition>(serde_json::json!({ "kind": "custom_inputs_fit" })).is_err(), "a list of types");
         let names = |named: serde_json::Value| {
             serde_json::from_value::<Condition>(serde_json::json!({ "kind": "input_names", "port": "x", "names": named }))
         };
@@ -4840,6 +4875,28 @@ mod input_semantics_tests {
         m.features.pairs_added_ports = false;
         m.features.custom_output_type = Some(WeftType::type_var("T"));
         assert!(m.validate_semantics().unwrap_err().contains("declare canAddOutputPorts"));
+    }
+
+    /// A rule asking for added ports is on a node that takes them: on any
+    /// other its answer never changes, and under a `not` it fires on every
+    /// program.
+    #[test]
+    fn a_rule_about_added_ports_needs_a_node_that_takes_them() {
+        for (condition, feature) in [
+            (json!({ "kind": "custom_inputs_declared" }), "canAddInputPorts"),
+            (json!({ "kind": "custom_inputs_fit", "oneOf": ["Json"] }), "canAddInputPorts"),
+            (json!({ "kind": "custom_outputs_declared" }), "canAddOutputPorts"),
+        ] {
+            let mut m = metadata_with(vec![]);
+            m.validate.push(
+                serde_json::from_value(json!({ "when": { "kind": "not", "of": condition }, "then": { "message": "m" } }))
+                    .expect("a rule"),
+            );
+            assert!(m.validate_semantics().unwrap_err().contains(feature), "{condition}");
+            m.features.can_add_input_ports = true;
+            m.features.can_add_output_ports = true;
+            m.validate_semantics().expect("a node that takes added ports");
+        }
     }
 
     /// The wire shape of a metadata port and the two features, as a

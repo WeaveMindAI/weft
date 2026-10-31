@@ -178,9 +178,10 @@ fn duplicate_service_leaves_both_out() {
         assert!(cat.entry("First").is_none() && cat.entry("Second").is_none());
         match cat.problems() {
             [problem] => match &problem.error {
-                CatalogError::ServiceCollision { service, node_types } => {
+                CatalogError::ServiceCollision { service, node_types, dirs } => {
                     assert_eq!(service, "shared");
                     assert_eq!(node_types, &["First", "Second"], "the tree's order, every time");
+                    assert!(dirs[0].ends_with("aaa"), "each claimant's folder, in the same order: {dirs:?}");
                 }
                 other => panic!("expected ServiceCollision, got {other:?}"),
             },

@@ -3921,6 +3921,41 @@ fn messages(source: &str) -> Vec<String> {
     validate(&parse_enrich(source), &catalog()).into_iter().map(|d| d.message).collect()
 }
 
+/// `custom_inputs_declared`: a decision node judges only the inputs the
+/// program adds, so one with none is refused when the program is built.
+/// The gate port the language gives every node is not an added input.
+#[test]
+fn a_node_that_needs_added_inputs_is_refused_without_one() {
+    let refused = |source: &str| messages(source).iter().any(|m| m.contains("has nothing to decide about"));
+    assert!(refused("d = DecisionYesNo { instructions: \"Bug?\" }\n"));
+    assert!(refused(
+        "t = Text { value: \"x\" }\nd = DecisionYesNo { instructions: \"Bug?\" }\nd._should_flow = t.value\n"
+    ));
+    assert!(!refused("t = Text { value: \"x\" }\nd = DecisionYesNo(ticket: String) { instructions: \"Bug?\", ticket: t.value }\n"));
+}
+
+/// `custom_inputs_fit`: a decision node takes, on each added input,
+/// exactly one of a value made of JSON, a file or a list of files, so a
+/// file inside a record, a list mixing files with text and a port that is
+/// a value or a file are refused when the program is built, naming the
+/// port.
+#[test]
+fn a_decision_input_holding_a_file_inside_a_value_is_refused() {
+    let unfit = |ports: &str| {
+        messages(&format!("d = DecisionYesNo({ports}) {{ instructions: \"Bug?\" }}\n"))
+            .into_iter()
+            .find(|m| m.contains("these are none of those"))
+    };
+    let refused = unfit("listing: { title: String, photo: Image }, ticket: String").expect("a file inside a record");
+    assert!(refused.contains("'listing'") && !refused.contains("'ticket'"), "{refused}");
+    assert!(unfit("items: List[Image | String]").is_some(), "a list mixing files with text");
+    assert!(unfit("note: String | Image").is_some(), "a value or a file, as one type");
+    assert_eq!(
+        unfit("ticket: String, listing: { title: String }, data: JsonDict, photo: Image, scan?: Image, photos: List[Image], pages: List[File]"),
+        None
+    );
+}
+
 /// `per_instance`: a route that reads an instance's value would need
 /// one public address per instance, so it is refused naming the node
 /// that made it per instance and the way that works. A shared route is

@@ -86,6 +86,7 @@ impl TierArg {
 
 /// One package to test, with an optional single-node filter (set when
 /// the target named a node type rather than a package).
+#[derive(Debug)]
 struct TargetPackage {
     name: String,
     node_filter: Option<String>,
@@ -331,9 +332,30 @@ pub(crate) fn dir_size_bytes(root: &std::path::Path) -> std::io::Result<u64> {
 /// Resolve the positional target to packages. A package name wins over
 /// a node type on the (unlikely) collision, since the package is the
 /// build unit.
+///
+/// A node that failed to load is left out of the catalog, and so out of
+/// its package's test binary: its tests would never run while the rest
+/// reads green, and a package whose every node failed is not in the
+/// catalog at all. So what did not load refuses here, for every caller
+/// (`weft test-node` and `weft node-test-hash`): under the targeted
+/// package's folder when one is named, anywhere in the project for the
+/// whole-project sweep, and listed beside "no such package" when the
+/// name matches nothing (it may be one of them).
 fn resolve_targets(catalog: &FsCatalog, target: Option<&str>) -> Result<Vec<TargetPackage>> {
+    let left_out = |within: Option<&std::path::Path>| -> Vec<String> {
+        catalog
+            .problems()
+            .iter()
+            .filter(|problem| within.is_none_or(|root| problem.error.paths().iter().any(|path| path.starts_with(root))))
+            .map(|problem| format!("  {}", problem.error))
+            .collect()
+    };
     match target {
         None => {
+            let broken = left_out(None);
+            if !broken.is_empty() {
+                bail!("some nodes of this project did not load, so their tests cannot run:\n{}", broken.join("\n"));
+            }
             // The whole-project sweep covers exactly the packages that
             // declare tests (the catalog's own predicate, shared with
             // every other consumer): building a test binary for a
@@ -351,22 +373,35 @@ fn resolve_targets(catalog: &FsCatalog, target: Option<&str>) -> Result<Vec<Targ
                 .collect())
         }
         Some(t) => {
-            if catalog.packages().any(|p| p.name == t) {
-                return Ok(vec![TargetPackage { name: t.to_string(), node_filter: None }]);
+            let found = match catalog.packages().find(|p| p.name == t) {
+                Some(package) => Some((package, None)),
+                None => catalog.package_of(t).map(|package| (package, Some(t.to_string()))),
+            };
+            let Some((package, node_filter)) = found else {
+                let mut known: Vec<&str> = catalog.packages().map(|p| p.name.as_str()).collect();
+                known.sort();
+                let broken = left_out(None);
+                let broken = if broken.is_empty() {
+                    String::new()
+                } else {
+                    format!("; these did not load, and it may be one of them:\n{}", broken.join("\n"))
+                };
+                bail!(
+                    "'{t}' is neither a package nor a node type in this project (nodes/ or src/) \
+                     (packages: {}){broken}",
+                    known.join(", ")
+                );
+            };
+            let broken = left_out(Some(&package.root));
+            if !broken.is_empty() {
+                bail!(
+                    "some nodes of package '{}' did not load, so its tests cannot run (a package is \
+                     built and tested whole):\n{}",
+                    package.name,
+                    broken.join("\n")
+                );
             }
-            if let Some(pkg) = catalog.package_of(t) {
-                return Ok(vec![TargetPackage {
-                    name: pkg.name.clone(),
-                    node_filter: Some(t.to_string()),
-                }]);
-            }
-            let mut known: Vec<&str> = catalog.packages().map(|p| p.name.as_str()).collect();
-            known.sort();
-            bail!(
-                "'{t}' is neither a package nor a node type in this project (nodes/ or src/) \
-                 (packages: {})",
-                known.join(", ")
-            );
+            Ok(vec![TargetPackage { name: package.name.clone(), node_filter }])
         }
     }
 }
@@ -1445,6 +1480,45 @@ fn drop_stale_test_servers(servers: &std::path::Path, fresh: &std::path::Path, o
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What did not load refuses the run that would have tested it: a
+    /// package with a broken node, a package whose every node broke
+    /// (named, it is in no package list, so the refusal lists what did
+    /// not load), and the whole-project sweep. A healthy package beside a
+    /// broken one still runs.
+    #[test]
+    fn what_did_not_load_refuses_the_tests_it_would_have_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let node = |dir: &std::path::Path, metadata: &str| {
+            std::fs::create_dir_all(dir).expect("mkdir");
+            std::fs::write(dir.join("metadata.json"), metadata).expect("write");
+            std::fs::write(dir.join("mod.rs"), "// node\n").expect("write");
+        };
+        for package in ["pkg", "gone", "other"] {
+            let root = tmp.path().join(package);
+            std::fs::create_dir_all(&root).expect("mkdir");
+            std::fs::write(root.join("package.toml"), format!("[package]\nname = \"{package}\"\n")).expect("write");
+        }
+        let good = |name: &str| format!(r#"{{ "type": "{name}", "label": "{name}", "description": "" }}"#);
+        let broken = |name: &str| {
+            format!(
+                r#"{{ "type": "{name}", "label": "{name}", "description": "", "validate": [{{ "when": {{ "kind": "no_such_kind" }}, "then": {{ "message": "m" }} }}] }}"#
+            )
+        };
+        node(&tmp.path().join("pkg/good"), &good("Good"));
+        node(&tmp.path().join("pkg/broken"), &broken("Broken"));
+        node(&tmp.path().join("gone/only"), &broken("Only"));
+        node(&tmp.path().join("other/fine"), &good("Fine"));
+        let catalog = FsCatalog::discover(tmp.path()).expect("discover");
+        let refusal = |target: Option<&str>| resolve_targets(&catalog, target).expect_err("refused").to_string();
+        for target in [Some("pkg"), Some("Good"), Some("gone"), None] {
+            let err = refusal(target);
+            assert!(err.contains("no_such_kind"), "{target:?}: {err}");
+        }
+        assert!(refusal(Some("gone")).contains("gone/only"), "the package that vanished is named by its folder");
+        let fine = resolve_targets(&catalog, Some("other")).expect("another package's broken node is not this one's");
+        assert_eq!(fine[0].name, "other");
+    }
 
     /// Write `bytes` bytes at `path`, creating parents.
     fn file_of(path: &std::path::Path, bytes: usize) {

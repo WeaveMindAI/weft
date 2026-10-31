@@ -1,0 +1,82 @@
+{
+  "type": "OpenRouterDecisionModel",
+  "label": "OpenRouter Decision Model",
+  "description": "Pick an OpenRouter decision model, on the connection an OpenRouter Access node holds, and wire its provider into the decision nodes (Decide: Pick One, Yes or No, Score, Find in Image), one model node for however many of them. A decision model answers a typed question about what it is given with probabilities, never text: use it for routing, classifying, moderating, gating and scoring, where an LLM would be asked a narrow question and its answer parsed. Models differ in what they read (text only, images, audio and video on cloudflare/clef-omni) and in their probabilities on the same question, so a threshold set on one model is set again on another.",
+  "tags": [
+    "ai",
+    "provider",
+    "model",
+    "decision",
+    "classify"
+  ],
+  "icon": "Cpu",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": true,
+      "accepts": ["wire"],
+      "description": "The OpenRouter connection: wire an OpenRouter Access node's `access`."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "access",
+        "freeText": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://openrouter.ai/api/v1/models?output_modalities=decisions",
+            "items": "data",
+            "label": "id",
+            "value": "id",
+            "public": true
+          }
+        ]
+      },
+      "label": "Model",
+      "placeholder": "typesafe/jev-1.14",
+      "description": "A versioned id rather than an alias (`~typesafe/jev-latest`): an alias moves to a new release, and the probabilities your thresholds were set on move with it."
+    },
+    {
+      "name": "servingProvider",
+      "type": "String",
+      "label": "Serving provider",
+      "placeholder": "(any)",
+      "description": "Serve the model from one specific OpenRouter provider. Leave empty to let OpenRouter route."
+    },
+    {
+      "name": "providerFallbacks",
+      "type": "Boolean",
+      "label": "Allow provider fallbacks",
+      "description": "Fall back to other serving providers when the preferred one is unavailable. Off makes the call fail rather than be served and billed by someone else."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "provider",
+      "type": "DecisionProvider",
+      "description": "Wire it into a decision node's provider input."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "not", "of": { "kind": "input_wired", "port": "model" } },
+          { "kind": "not", "of": { "kind": "config_nonempty", "field": "model" } }
+        ]
+      },
+      "then": {
+        "message": "OpenRouterDecisionModel '{id}' has no model; name one on the node or wire one in.",
+        "level": "runtime",
+        "field": "model"
+      }
+    }
+  ]
+}

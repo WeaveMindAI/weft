@@ -39,7 +39,7 @@ fn six_fields() -> ValidationRule {
 }
 
 fn fires_on(project: &ProjectDefinition, rule: &ValidationRule) -> bool {
-    fires(rule, &project.nodes[0], &RuleContext::new(project), &[])
+    fires(rule, &project.nodes[0], &RuleContext::new(project), &CustomPorts::default())
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn an_instance_filled_field_is_present_with_an_unknown_content() {
     assert!(!fires_on(&p, &six_fields()), "the content is not known yet");
     let missing = rule(json!({ "kind": "not", "of": { "kind": "config_nonempty", "field": "cron" } }));
     assert!(!fires_on(&p, &missing), "the instance is given it");
-    assert_eq!(evaluate(&six_fields().when, &p.nodes[0], &RuleContext::new(&p), &[]), None);
+    assert_eq!(evaluate(&six_fields().when, &p.nodes[0], &RuleContext::new(&p), &CustomPorts::default()), None);
 }
 
 /// A fallback is a known value, checked like a written one.
@@ -72,13 +72,13 @@ fn a_fallback_is_checked_like_a_written_value() {
 fn an_instances_value_is_checked_on_the_filled_node() {
     let p = program(Some(instance_filled_literal(None)));
     let bad = filled_node(&p.nodes[0], Some(&[("cron".to_string(), json!("0 3 * * *"))].into()));
-    assert!(fires(&six_fields(), &bad, &RuleContext::new(&p), &[]));
+    assert!(fires(&six_fields(), &bad, &RuleContext::new(&p), &CustomPorts::default()));
     let good = filled_node(&p.nodes[0], Some(&[("cron".to_string(), json!("0 0 3 * * *"))].into()));
-    assert!(!fires(&six_fields(), &good, &RuleContext::new(&p), &[]));
+    assert!(!fires(&six_fields(), &good, &RuleContext::new(&p), &CustomPorts::default()));
     let none = filled_node(&p.nodes[0], None);
     assert!(none.port_literals.is_empty(), "no value and no fallback leaves the field unwritten");
     let missing = rule(json!({ "kind": "not", "of": { "kind": "config_nonempty", "field": "cron" } }));
-    assert!(fires(&missing, &none, &RuleContext::new(&p), &[]));
+    assert!(fires(&missing, &none, &RuleContext::new(&p), &CustomPorts::default()));
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn unknown_parts_combine_three_ways() {
     let known_false = json!({ "kind": "config_equals", "field": "missing", "equals": 1 });
     let known_true = json!({ "kind": "not", "of": known_false });
     let unknown = json!({ "kind": "config_equals", "field": "cron", "equals": "x" });
-    let eval = |when: Value| evaluate(&rule(when).when, &p.nodes[0], &RuleContext::new(&p), &[]);
+    let eval = |when: Value| evaluate(&rule(when).when, &p.nodes[0], &RuleContext::new(&p), &CustomPorts::default());
     assert_eq!(eval(json!({ "kind": "all", "of": [known_false, unknown] })), Some(false));
     assert_eq!(eval(json!({ "kind": "all", "of": [known_true, unknown] })), None);
     assert_eq!(eval(json!({ "kind": "any", "of": [known_true, unknown] })), Some(true));
@@ -98,7 +98,7 @@ fn unknown_parts_combine_three_ways() {
 #[test]
 fn the_message_names_the_node_and_field() {
     let p = program(None);
-    assert_eq!(message(&six_fields(), &p.nodes[0], &RuleContext::new(&p), &[]), "'n' cron is bad");
+    assert_eq!(message(&six_fields(), &p.nodes[0], &RuleContext::new(&p), &CustomPorts::default()), "'n' cron is bad");
 }
 
 /// A name written on the input is held to the program's nodes; a name
@@ -114,7 +114,7 @@ fn a_name_on_an_input_is_held_to_the_programs_nodes() {
         "when": names.when, "then": { "message": "{names}" }
     }))
     .unwrap();
-    assert_eq!(message(&named, &p.nodes[0], &RuleContext::new(&p), &[]), "'ghost'");
+    assert_eq!(message(&named, &p.nodes[0], &RuleContext::new(&p), &CustomPorts::default()), "'ghost'");
     assert!(!fires_on(&program(Some(instance_filled_literal(None))), &names), "unknown yet");
     let infra = rule(json!({ "kind": "not", "of": { "kind": "input_names", "port": "cron", "names": { "node": { "role": "infra" } } } }));
     assert!(fires_on(&program(Some(json!("n"))), &infra), "`n` has no infra");
@@ -143,12 +143,12 @@ fn a_field_named_on_an_input_is_held_to_the_programs_fields() {
     assert!(!fires_on(&program(Some(json!({ "n.cron": "x" }))), &any), "object keys are names");
     let bad = program(Some(json!({ "n.cron": "x", "n.ghost": 1, "ghost.cron": 2, "n": 3 })));
     assert!(fires_on(&bad, &any));
-    assert_eq!(message(&any, &bad.nodes[0], &RuleContext::new(&bad), &[]), "'ghost.cron', 'n', 'n.ghost'");
+    assert_eq!(message(&any, &bad.nodes[0], &RuleContext::new(&bad), &CustomPorts::default()), "'ghost.cron', 'n', 'n.ghost'");
     // `cron` holds a list, not `@instance_filled`: no instance fills it.
     let filled = field(Some(true));
     let p = program(Some(json!(["n.cron"])));
     assert!(fires_on(&p, &filled), "not a field an instance fills");
-    assert_eq!(message(&filled, &p.nodes[0], &RuleContext::new(&p), &[]), "'n.cron'");
+    assert_eq!(message(&filled, &p.nodes[0], &RuleContext::new(&p), &CustomPorts::default()), "'n.cron'");
     assert!(!fires_on(&p, &field(Some(false))));
     assert!(!fires_on(&program(Some(instance_filled_literal(None))), &filled), "unknown yet");
 }
@@ -208,11 +208,11 @@ fn a_rule_pass_carves_each_seed_once() {
     let cx = RuleContext::new(&p);
     let reached = rule(json!({ "kind": "run_reaches", "direction": "upstream", "with": { "liveConnection": true } }));
     for node in p.nodes.iter().filter(|n| !n.features.is_trigger) {
-        assert_eq!(fires(&reached, node, &cx, &[]), node.id != "stray", "{}", node.id);
+        assert_eq!(fires(&reached, node, &cx, &CustomPorts::default()), node.id != "stray", "{}", node.id);
     }
     assert_eq!(cx.carved(), 3);
     for node in &p.nodes {
-        fires(&reached, node, &cx, &[]);
+        fires(&reached, node, &cx, &CustomPorts::default());
     }
     assert_eq!(cx.carved(), 3, "a second pass carves nothing new");
 }
@@ -226,7 +226,7 @@ fn all_and_any_settle_on_the_deciding_part() {
     let unknown = json!({ "kind": "config_equals", "field": "cron", "equals": "x" });
     let yes = json!({ "kind": "config_present", "field": "cron" });
     let no = json!({ "kind": "not", "of": yes.clone() });
-    let eval = |when: Value| evaluate(&rule(when).when, &p.nodes[0], &cx, &[]);
+    let eval = |when: Value| evaluate(&rule(when).when, &p.nodes[0], &cx, &CustomPorts::default());
     assert_eq!(eval(json!({ "kind": "all", "of": [no.clone(), unknown.clone()] })), Some(false));
     assert_eq!(eval(json!({ "kind": "all", "of": [unknown.clone(), yes.clone()] })), None);
     assert_eq!(eval(json!({ "kind": "all", "of": [yes.clone(), yes.clone()] })), Some(true));
@@ -251,5 +251,50 @@ fn a_short_name_is_refused_with_the_spelling_it_meant() {
     }))
     .unwrap();
     assert!(fires_on(&p, &named));
-    assert_eq!(message(&named, &p.nodes[0], &RuleContext::new(&p), &[]), "'box' (did you mean 'work.box'?)");
+    assert_eq!(message(&named, &p.nodes[0], &RuleContext::new(&p), &CustomPorts::default()), "'box' (did you mean 'work.box'?)");
+}
+
+/// `custom_inputs_fit` holds each added input to ONE of the listed types,
+/// at any depth: under `Json`, a file inside a record or a list is no
+/// JSON, a file on its own fits `File`, and a union of a value and a file
+/// fits neither. A type still open fits. `{names}` lists the added inputs
+/// that do not fit, sorted.
+#[test]
+fn added_inputs_are_held_to_the_bound_and_the_misfits_are_named() {
+    let mut p = program(None);
+    let declared = [
+        ("text", "String"),
+        ("scores", "{title: String, score: Number}"),
+        ("extra", "JsonDict"),
+        ("photo", "Image"),
+        ("maybePhoto", "Image | Null"),
+        ("photos", "List[Image]"),
+        ("open", "T"),
+        ("withPhoto", "{caption: String, photo: Image}"),
+        ("mixed", "List[Image | String]"),
+        ("valueOrFile", "String | Image"),
+    ];
+    for (name, ty) in declared {
+        let mut input: crate::project::InputDefinition =
+            serde_json::from_value(json!({ "name": name, "portType": "String", "required": false })).unwrap();
+        input.port.port_type = if ty == "T" {
+            crate::weft_type::WeftType::type_var("T")
+        } else {
+            crate::weft_type::WeftType::parse(ty).unwrap_or_else(|| panic!("{ty} parses"))
+        };
+        p.nodes[0].inputs.push(input);
+    }
+    let custom = CustomPorts { inputs: declared.iter().map(|(name, _)| name.to_string()).collect(), outputs: Vec::new() };
+    let fit: ValidationRule = serde_json::from_value(json!({
+        "when": { "kind": "not", "of": { "kind": "custom_inputs_fit",
+            "oneOf": ["Json", "File | Null", "List[File] | Null"] } },
+        "then": { "message": "{names}" }
+    }))
+    .unwrap();
+    let cx = RuleContext::new(&p);
+    assert!(fires(&fit, &p.nodes[0], &cx, &custom));
+    assert_eq!(message(&fit, &p.nodes[0], &cx, &custom), "'mixed', 'valueOrFile', 'withPhoto'");
+    let fitting = CustomPorts { inputs: custom.inputs[..7].to_vec(), outputs: Vec::new() };
+    assert!(!fires(&fit, &p.nodes[0], &cx, &fitting), "every one of the first seven fits");
+    assert!(!fires(&fit, &p.nodes[0], &cx, &CustomPorts::default()), "nothing added, nothing to refuse");
 }
