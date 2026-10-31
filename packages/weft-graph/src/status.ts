@@ -17,6 +17,7 @@ import type {
   OwnerTriggers,
   RunPhase,
   ProjectTransition,
+  TriggerCopy,
   TriggerEntry,
 } from './protocol';
 import { RUN_PHASES } from './protocol';
@@ -160,7 +161,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
     infraBusy: !!raw.infraBusy,
     infraNodes,
     instanceInfra,
-    triggers: (raw.triggers ?? []).map(parseTriggerEntry),
+    triggers: (raw.triggers ?? []).map((entry) => parseTriggerEntry(entry, localNowUnix)),
     instances: raw.instances ?? [],
   };
 }
@@ -170,14 +171,21 @@ const TRIGGER_STATES = ['off', 'turning_on', 'on', 'behind'] as const;
 
 /// One trigger entry, its every state checked: a state the editor does
 /// not know is a wire drift and throws, rather than being drawn as a
-/// state it may not be.
-function parseTriggerEntry(entry: TriggerEntry): TriggerEntry {
+/// state it may not be. The progress of a copy turning on is moved onto
+/// this machine's clock (`localNowUnix`).
+function parseTriggerEntry(entry: TriggerEntry, localNowUnix: number): TriggerEntry {
   for (const copy of [...(entry.shared ? [entry.shared] : []), ...(entry.copies ?? [])]) {
     if (!(TRIGGER_STATES as readonly string[]).includes(copy.state)) {
       throw new Error(`status names a trigger state the editor cannot read: ${JSON.stringify(entry)}`);
     }
   }
-  return entry;
+  const onLocalClock = (copy: TriggerCopy): TriggerCopy =>
+    copy.progress !== undefined ? { ...copy, progress: progressOnLocalClock(copy.progress, localNowUnix) } : copy;
+  return {
+    ...entry,
+    ...(entry.shared ? { shared: onLocalClock(entry.shared) } : {}),
+    ...(entry.copies ? { copies: entry.copies.map(onLocalClock) } : {}),
+  };
 }
 
 /// One run running right now, and what it is for.

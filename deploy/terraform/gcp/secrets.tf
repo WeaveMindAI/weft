@@ -73,7 +73,7 @@ resource "google_secret_manager_secret_version" "install" {
   lifecycle {
     precondition {
       condition     = nonsensitive(local.database_url != "")
-      error_message = "the install has no database: set the repository secret WEFT_DATABASE_URL to a Postgres, or the repository variable WEFT_DATABASE to cloud_sql for one of its own"
+      error_message = local.no_database
     }
   }
 }

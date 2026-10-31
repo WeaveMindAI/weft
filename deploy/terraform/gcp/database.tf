@@ -107,6 +107,8 @@ locals {
   # The Postgres the roles use: the install's own when it has one,
   # else the one the fork names.
   database_url = var.cloud_sql ? local.cloud_sql_url : var.database_url
+  # What every apply that writes that address down says when there is none.
+  no_database = "the install has no database: set the repository secret WEFT_DATABASE_URL to a Postgres, or the repository variable WEFT_DATABASE to cloud_sql for one of its own"
 }
 
 # The instance's address in a secret of its own, which the workflow's move
@@ -131,6 +133,36 @@ resource "google_secret_manager_secret_version" "cloud_sql_url" {
 resource "google_secret_manager_secret_iam_member" "core_reads_cloud_sql_url" {
   count     = var.cloud_sql ? 1 : 0
   secret_id = google_secret_manager_secret.cloud_sql_url[0].id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.core.email}"
+}
+
+# The address of the database this run deploys the roles on, in a secret of
+# its own that the workflow's history step writes and checks before
+# anything is deployed: the roles' own (WEFT_DATABASE_URL) still names the
+# database they boot on now until the cloud is created, and a run that
+# moves the install to another database is checked against the new one.
+resource "google_secret_manager_secret" "database_check" {
+  secret_id = "${var.name}-database-check-url"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "database_check" {
+  secret      = google_secret_manager_secret.database_check.id
+  secret_data = local.database_url
+  lifecycle {
+    precondition {
+      condition     = nonsensitive(local.database_url != "")
+      error_message = local.no_database
+    }
+  }
+}
+
+resource "google_secret_manager_secret_iam_member" "core_reads_database_check" {
+  secret_id = google_secret_manager_secret.database_check.id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.core.email}"
 }

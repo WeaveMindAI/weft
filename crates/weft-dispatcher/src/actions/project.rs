@@ -341,7 +341,7 @@ pub(crate) async fn status(
         drift,
         available_actions,
         instance_infra,
-        triggers: trigger_entries(&project, &snapshot.activations, &held, &waiting, &desired, binary_hash.as_deref()),
+        triggers: trigger_entries(&project, &snapshot.activations, &held, &waiting, &desired, binary_hash.as_deref(), crate::lease::now_unix()),
         instances,
         limited: limited_entries(state, id)
             .await
@@ -592,16 +592,19 @@ async fn deactivate_project(
 }
 
 /// `GET /projects/{id}/follow/{task}?wait_ms=<n>`: one look at a task a
-/// person (or a program) follows (a resync, a deactivate's wait for its runs): it waits
+/// person (or a program) follows (an activate, a resync, a deactivate's
+/// wait for its runs): it waits
 /// at most `look` (a route's `n` milliseconds, never past
 /// [`crate::api::HoldQuery`]'s cap; nothing for a program) for the
 /// task to end, then answers that it goes on, or what it ended with
 /// ([`weft_core::deactivation::Following`]). A resync that stopped is
 /// answered as the refusal it stopped with: the triggers it had not
 /// brought back down, the project held for it until `weft resync
-/// --resume` takes it up again or `weft cancel-activate` gives it up. The
-/// person looks again for as long as they follow; Ctrl+C stops following
-/// and never the task.
+/// --resume` takes it up again or `weft cancel-activate` gives it up. An
+/// activate answers what the activation answered, or its refusal
+/// (`crate::task_kinds::activate::followed`), and while it goes, where
+/// the activation it drives is. The person looks again for as long as
+/// they follow; Ctrl+C stops following and never the task.
 pub(crate) async fn follow(
     state: &DispatcherState,
     actor: &Actor,
@@ -615,19 +618,27 @@ pub(crate) async fn follow(
         .await
         .map_err(|e| internal("follow the task", format!("{e:#}")))?
         .ok_or((StatusCode::NOT_FOUND, format!("project {id} has no task {task} to follow")))?;
+    let kind = || async {
+        let kind: Option<String> = state
+            .pg_pool
+            .scalar_opt("SELECT kind FROM task WHERE id = $1 AND project_id = $2", &[&task, &id])
+            .await
+            .map_err(|e| internal("read the task", e.to_string()))?;
+        Ok::<_, StatusError>(kind.as_deref().and_then(weft_task_store::TaskKind::parse))
+    };
+    let activate = Some(weft_task_store::TaskKind::Activate);
     match outcome.status {
-        weft_core::task::TaskStatus::Pending | weft_core::task::TaskStatus::Claimed => Ok(Following::Going(
-            weft_task_store::tasks::progress(&state.pg_pool, task).await.map_err(|e| internal("read where the task is", format!("{e:#}")))?,
-        )),
+        weft_core::task::TaskStatus::Pending | weft_core::task::TaskStatus::Claimed => Ok(Following::Going(match kind().await? == activate {
+            true => crate::task_kinds::activate::progress(state, id, task).await.map_err(|e| internal("read where the activation is", format!("{e:#}")))?,
+            false => weft_task_store::tasks::progress(&state.pg_pool, task).await.map_err(|e| internal("read where the task is", format!("{e:#}")))?,
+        })),
+        weft_core::task::TaskStatus::Complete if kind().await? == activate => {
+            Ok(Following::Done(crate::task_kinds::activate::followed(outcome.result).map_err(|(status, why)| StatusError::Other(status, why))?))
+        }
         weft_core::task::TaskStatus::Complete => Ok(Following::Done(outcome.result.unwrap_or(serde_json::Value::Null))),
         weft_core::task::TaskStatus::Failed => {
-            let kind: Option<String> = state
-                .pg_pool
-                .scalar_opt("SELECT kind FROM task WHERE id = $1 AND project_id = $2", &[&task, &id])
-                .await
-                .map_err(|e| internal("read the task", e.to_string()))?;
             let error = outcome.error.unwrap_or_else(|| "it ended without saying why".into());
-            if kind.as_deref() != Some(weft_task_store::TaskKind::Resync.as_str()) {
+            if kind().await? != Some(weft_task_store::TaskKind::Resync) {
                 return Err(StatusError::Other(StatusCode::CONFLICT, error));
             }
             let held = state.projects.resync(id).await.map_err(|e| internal("read the resync", format!("{e:#}")))?;

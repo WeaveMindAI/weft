@@ -53,6 +53,12 @@ pub struct Activation {
     /// an infra command takes down with it. `None` until a setup of it
     /// finished.
     pub cut: Option<RecordedCut>,
+    /// The task that claimed its last activation (`driver_task`): the one
+    /// driving it while it is activating, the one that turned it on when
+    /// it is active since. `None` before any task claimed it.
+    pub driver_task: Option<uuid::Uuid>,
+    /// Where it stands while it is activating; `None` otherwise.
+    pub activating: Option<Activating>,
 }
 
 /// A trigger's cut as its setup recorded it (`weft_core::run_spec::TriggerCut`).
@@ -211,30 +217,83 @@ impl ValuesStore<'_> {
     }
 }
 
-/// The SQL condition "the setup run of the activating row `a` has not
-/// ended": queued, waiting, or driven. While it goes, the activation's
-/// driver does not beat (`crate::transition::ActivationHeartbeat`): the run
-/// may wait days on a person, and is judged by its own worker's lease
-/// (`crate::lapses`) and its ending (`crate::run_ends`).
-pub(crate) const SETUP_RUN_GOES: &str =
-    "EXISTS (SELECT 1 FROM run setup WHERE setup.run_id = a.activating_run_id AND setup.state <> 'ended')";
+/// The SQL condition "the task driving the activating row `a` is still to
+/// finish": waiting to be claimed, or claimed (renewed, or resting on the
+/// activation's setup run while it waits days on a person). While it is,
+/// the activation is alive whatever became of the process that claimed
+/// it: a claimant that died has its claim rescued by another dispatcher,
+/// whose task carries the activation on from its rows
+/// (`crate::api::project::activate_with`).
+pub(crate) const DRIVER_TASK_LIVE: &str =
+    "EXISTS (SELECT 1 FROM task driver WHERE driver.id = a.driver_task AND driver.status IN ('pending', 'claimed'))";
 
-/// THE activations their driver holds by its heartbeat alone, as a SQL
-/// condition over a `trigger_activation` row aliased `a`: activating, with
-/// no setup run of theirs going ([`SETUP_RUN_GOES`]). One whose heartbeat
-/// went stale is stuck ([`ActivationStoreOps::list_stuck`]), and the
-/// `lapses` loop looks when the earliest of them could
-/// (`crate::lapses::earliest_lapse`).
-pub(crate) fn held_by_driver_alone() -> String {
-    format!("(a.status = 'activating' AND a.activating_run_id IS NOT NULL AND NOT {SETUP_RUN_GOES})")
+/// THE activations nobody will finish, as a SQL condition over a
+/// `trigger_activation` row aliased `a`: activating, with no task driving
+/// it any more ([`DRIVER_TASK_LIVE`]): its task ended without landing it
+/// (a rollback that failed, a task run again that no longer asks for it),
+/// or the row was claimed by a weft from before activations were tasks.
+/// The `lapses` loop ends them ([`ActivationStoreOps::list_orphaned`]).
+pub(crate) fn orphaned() -> String {
+    format!("(a.status = 'activating' AND a.activating_run_id IS NOT NULL AND NOT {DRIVER_TASK_LIVE})")
 }
 
-/// An activation whose driver died mid-activation (its heartbeat went
-/// stale): the `lapses` loop rolls it back.
+/// An activation nobody will finish ([`orphaned`]): the `lapses` loop ends
+/// it.
 #[derive(Debug, Clone)]
-pub struct StuckActivation {
+pub struct OrphanedActivation {
     pub project_id: uuid::Uuid,
     pub run_id: uuid::Uuid,
+}
+
+/// The step an activation's driver is at, as its rows keep it
+/// (`trigger_activation.activating_step`): what `weft status` says a
+/// trigger turning on waits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationStep {
+    /// Checking the infra its triggers read, readying the registered
+    /// build's workers, dropping what they held when asked to.
+    Preparing,
+    /// Its setup run goes: queued for a worker, or running (which may
+    /// wait on a person).
+    SettingUp,
+    /// Arming the signals its setup captured, and landing them on.
+    Arming,
+}
+
+impl ActivationStep {
+    // SYNC: the spellings <-> trigger_activation.activating_step (GROUP)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActivationStep::Preparing => "preparing",
+            ActivationStep::SettingUp => "setting_up",
+            ActivationStep::Arming => "arming",
+        }
+    }
+
+    pub fn parse(stored: &str) -> Option<Self> {
+        [ActivationStep::Preparing, ActivationStep::SettingUp, ActivationStep::Arming].into_iter().find(|step| step.as_str() == stored)
+    }
+
+    /// What a person reads it waits on, `setup_run` being the activation's
+    /// setup run.
+    pub fn waiting(self, setup_run: weft_core::RunId) -> String {
+        match self {
+            ActivationStep::Preparing => "getting ready (the infra its triggers read, the build's workers)".into(),
+            ActivationStep::SettingUp => format!("its setup run {setup_run}"),
+            ActivationStep::Arming => "arming the signals its setup captured".into(),
+        }
+    }
+}
+
+/// Where one activating row stands: since when it is claimed, the step
+/// its driver is at, and whether the trigger listened the whole time it
+/// was down as the claim found it (what its signal carries over when it is
+/// armed: `crate::task_kinds::register_signal::listened_while_down`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Activating {
+    pub since_unix: i64,
+    pub step: ActivationStep,
+    pub listened: bool,
 }
 
 /// Backing store for activations. Implementations:
@@ -255,7 +314,10 @@ pub trait ActivationStoreOps: Send + Sync {
     /// lift's claim goes through ([`Claimant::Lift`]), decided under the
     /// project row's lock, which `weft maintenance on` waits on before it
     /// reads what is on (`crate::maintenance`), so no claim slips between.
-    /// Stamps the heartbeat. Answers the rows among
+    /// Stamps the claim with `task`, the task that drives it
+    /// ([`Activation::driver_task`]), its time and its first step, and
+    /// each row with whether its trigger listened while it was down, as
+    /// the claim found it ([`Activating::listened`]). Answers the rows among
     /// `keys` as they were just before the claim (none for a key never
     /// activated), read in the same transaction: what [`Self::restore`]
     /// puts back when the activation fails before it touched anything.
@@ -274,7 +336,12 @@ pub trait ActivationStoreOps: Send + Sync {
         run_id: uuid::Uuid,
         expect: Option<ProjectStatus>,
         claimant: Claimant,
+        task: uuid::Uuid,
     ) -> anyhow::Result<Result<Vec<Activation>, ClaimRefused>>;
+
+    /// Say the activation `run_id` names is at `step` now, on every row it
+    /// claimed. `false` when it no longer owns any.
+    async fn set_step(&self, project_id: uuid::Uuid, run_id: uuid::Uuid, step: ActivationStep) -> anyhow::Result<bool>;
 
     /// End the activation `run_id` names (every row it claimed) at `to`.
     /// With `remove_entries`, those activations' entry rows are deleted in
@@ -294,7 +361,8 @@ pub trait ActivationStoreOps: Send + Sync {
     ) -> anyhow::Result<Option<Vec<crate::store::SignalRegistration>>>;
 
     /// End the activation `run_id` names that nobody will finish (a
-    /// person cancelled it, or its driver died). When its triggers kept work
+    /// person cancelled it, or the task driving it ended without landing
+    /// it). When its triggers kept work
     /// (events held on them, runs of theirs paused:
     /// `crate::store::postgres::held_on`), they land down with their door
     /// taking and every signal kept, so that work waits for their next
@@ -358,14 +426,9 @@ pub trait ActivationStoreOps: Send + Sync {
         resync: Option<uuid::Uuid>,
     ) -> anyhow::Result<LifecycleWrite>;
 
-    /// Bump the heartbeat of the activation `run_id` names; the driving
-    /// process does this on an interval so the reaper only repairs dead ones.
-    async fn bump_heartbeat(&self, run_id: uuid::Uuid) -> anyhow::Result<()>;
-
-    /// Activations stuck in Activating: their heartbeat went stale, and no
-    /// setup run of theirs goes on ([`SETUP_RUN_GOES`]; its driver stops
-    /// beating while it does).
-    async fn list_stuck(&self, stale_before: i64) -> anyhow::Result<Vec<StuckActivation>>;
+    /// Activations nobody will finish: activating, with no task driving
+    /// them any more ([`orphaned`]).
+    async fn list_orphaned(&self) -> anyhow::Result<Vec<OrphanedActivation>>;
 }
 
 /// Whether the instances' rows a take-down writes go: a trigger that
@@ -519,7 +582,7 @@ async fn end_activating_in(
              SET status = $1::text, accepting_fires = $2, fires_visible_to_consumers = $3, fires_deadline_unix = $4, \
                  went_down_with = CASE WHEN $5::TEXT IS NOT NULL OR $1::text = 'active' THEN $5::TEXT ELSE went_down_with END, \
                  went_down_by_command = CASE WHEN $5::TEXT IS NOT NULL OR $1::text = 'active' THEN $9::bigint ELSE went_down_by_command END, \
-                 activating_run_id = NULL, \
+                 activating_run_id = NULL, activating_since_unix = NULL, activating_step = NULL, activating_listened = FALSE, \
                  activation_program = CASE WHEN $1::text = 'active' THEN activation_program ELSE NULL END, \
                  activation_version = CASE WHEN $1::text = 'active' THEN activation_version ELSE NULL END, \
                  updated_at = $6 \
@@ -594,7 +657,20 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- The trigger-setup run of the activation in flight; one run
             -- sets up every activation a verb names, so rows share it.
             activating_run_id UUID,
-            heartbeat_unix BIGINT NOT NULL DEFAULT 0,
+            -- The task that claimed its last activation: it drives the
+            -- activation while the row is activating, so its claim is
+            -- what keeps the activation alive and a task run again picks
+            -- it up where it was, and it turned the trigger on when the
+            -- row is active since. NULL before any task claimed it.
+            driver_task UUID,
+            -- While activating: when the claim was taken, the step its
+            -- driver is at ('preparing', 'setting_up', 'arming'), and
+            -- whether the trigger listened the whole time it was down,
+            -- read off the row as the claim found it (what its signal
+            -- carries over when it is armed again).
+            activating_since_unix BIGINT,
+            activating_step TEXT,
+            activating_listened BOOLEAN NOT NULL DEFAULT FALSE,
             -- What the listeners fire, recorded when setup finished.
             activation_program JSONB,
             -- The version `activation_program` was written at
@@ -714,56 +790,61 @@ impl PostgresActivationStore {
     }
 }
 
-/// One `trigger_activation` row as [`ROW_COLUMNS`] reads it.
-type LifecycleRow = (
-    String,
-    Option<String>,
-    String,
-    bool,
-    bool,
-    Option<i64>,
-    Option<String>,
-    Option<i64>,
-    Option<uuid::Uuid>,
-    Option<db::Json<serde_json::Value>>,
-    weft_core::stored::Version,
-    Option<String>,
-    Option<String>,
-    Vec<String>,
-);
+/// One `trigger_activation` row as [`ROW_COLUMNS`] reads it, by column.
+struct LifecycleRow(db::Row);
+
+impl db::FromRow for LifecycleRow {
+    fn from_row(row: db::Row) -> db::Result<Self> {
+        Ok(LifecycleRow(row))
+    }
+}
 
 /// The columns a [`LifecycleRow`] reads, of a row aliased `a`.
 const ROW_COLUMNS: &str = "a.trigger, a.instance_id, a.status, a.accepting_fires, a.fires_visible_to_consumers, \
      a.fires_deadline_unix, a.went_down_with, a.went_down_by_command, a.activating_run_id, \
-     a.activation_program, a.activation_program_version, a.activation_version, a.cut_fingerprint, a.depends_on";
+     a.activation_program, a.activation_program_version, a.activation_version, a.cut_fingerprint, a.depends_on, \
+     a.driver_task, a.activating_since_unix, a.activating_step, a.activating_listened";
 
-fn row_to_activation(row: LifecycleRow) -> anyhow::Result<Activation> {
-    let (
-        trigger,
-        instance,
-        status,
-        accepting,
-        visible,
-        deadline,
-        went_down_with,
-        went_down_by_command,
-        run_id,
-        program,
-        program_version,
-        version,
-        fingerprint,
-        depends_on,
-    ) = row;
+fn row_to_activation(LifecycleRow(row): LifecycleRow) -> anyhow::Result<Activation> {
+    let trigger: String = row.try_get("trigger")?;
+    let instance: Option<String> = row.try_get("instance_id")?;
+    let status: String = row.try_get("status")?;
+    let accepting: bool = row.try_get("accepting_fires")?;
+    let visible: bool = row.try_get("fires_visible_to_consumers")?;
+    let deadline: Option<i64> = row.try_get("fires_deadline_unix")?;
+    let went_down_with: Option<String> = row.try_get("went_down_with")?;
+    let went_down_by_command: Option<i64> = row.try_get("went_down_by_command")?;
+    let run_id: Option<uuid::Uuid> = row.try_get("activating_run_id")?;
+    let program: Option<db::Json<serde_json::Value>> = row.try_get("activation_program")?;
+    let program_version: weft_core::stored::Version = row.try_get("activation_program_version")?;
+    let version: Option<String> = row.try_get("activation_version")?;
+    let fingerprint: Option<String> = row.try_get("cut_fingerprint")?;
+    let depends_on: Vec<String> = row.try_get("depends_on")?;
+    let driver_task: Option<uuid::Uuid> = row.try_get("driver_task")?;
+    let activating_since: Option<i64> = row.try_get("activating_since_unix")?;
+    let activating_step: Option<String> = row.try_get("activating_step")?;
+    let activating_listened: bool = row.try_get("activating_listened")?;
     let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("trigger_activation.instance_id: {e}"))?;
     let program = program
         .map(|program| ProgramIdentity::STORED.decode(program.0, program_version))
         .transpose()
         .map_err(|e| e.at(format_args!("the activation of {trigger}")))?;
+    let status = ProjectStatus::parse(&status).ok_or_else(|| anyhow::anyhow!("unknown trigger_activation.status '{status}'"))?;
+    let activating = match (status, activating_since, activating_step) {
+        (ProjectStatus::Activating, Some(since_unix), Some(step)) => Some(Activating {
+            since_unix,
+            step: ActivationStep::parse(&step).ok_or_else(|| anyhow::anyhow!("unknown trigger_activation.activating_step '{step}'"))?,
+            listened: activating_listened,
+        }),
+        // Not activating; or activating under a claim of a weft from
+        // before activations said where they were, which nothing drives
+        // ([`orphaned`]) and the `lapses` loop ends when it looks.
+        _ => None,
+    };
     Ok(Activation {
         key: ActivationKey::new(trigger, Owner::from_instance(instance)),
         lifecycle: ActivationLifecycle {
-            status: ProjectStatus::parse(&status)
-                .ok_or_else(|| anyhow::anyhow!("unknown trigger_activation.status '{status}'"))?,
+            status,
             accepting_fires: accepting,
             fires_visible_to_consumers: visible,
             fires_deadline_unix: deadline,
@@ -773,11 +854,16 @@ fn row_to_activation(row: LifecycleRow) -> anyhow::Result<Activation> {
         program,
         source_version: version,
         cut: fingerprint.map(|fingerprint| RecordedCut { fingerprint, depends_on }),
+        driver_task,
+        activating,
     })
 }
 
-/// Why [`ActivationStoreOps::try_begin_activating`] refused its claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why [`ActivationStoreOps::try_begin_activating`] refused its claim. On
+/// the wire where an `activate` task answers whoever waits on it
+/// (`crate::task_kinds::activate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ClaimRefused {
     /// The project is building (or gone): no activation starts.
     Building,
@@ -810,6 +896,21 @@ fn claimable(keys:&[ActivationKey], before: &[Activation], expect: Option<Projec
         }
         _ => Ok(()),
     }
+}
+
+/// Whether each of `keys`' triggers listened the whole time it was down,
+/// in `keys`' order, as a claim finds its row among `before` (none: it was
+/// never activated) at `now_unix`
+/// (`crate::task_kinds::register_signal::listened_while_down`): read once,
+/// at the claim, and kept on the row, so the driver arming it, or the one
+/// that carries the activation on after it, arms it the same way.
+fn listened_as_found(keys: &[ActivationKey], before: &[Activation], now_unix: i64) -> Vec<bool> {
+    keys.iter()
+        .map(|key| {
+            let found = before.iter().find(|a| &a.key == key).map(|a| &a.lifecycle);
+            crate::task_kinds::register_signal::listened_while_down(found, now_unix)
+        })
+        .collect()
 }
 
 /// The keys as two parallel arrays, for an `unnest` join: the triggers,
@@ -901,6 +1002,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         run_id: uuid::Uuid,
         expect: Option<ProjectStatus>,
         claimant: Claimant,
+        task: uuid::Uuid,
     ) -> anyhow::Result<Result<Vec<Activation>, ClaimRefused>> {
         use crate::project_store::ProjectTransition;
         let now = crate::lease::now_unix();
@@ -941,6 +1043,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         }
         held.decided(&tx, project_id, keys).await?;
         let activating = ActivationLifecycle::activating(run_id);
+        let listened = listened_as_found(keys, &before, now);
         // The cut a row recorded stays until the setup records the new
         // one: an activation that fails puts the row back as it was. So
         // does what took it down (`went_down_with`): it goes only when the
@@ -951,16 +1054,21 @@ impl ActivationStoreOps for PostgresActivationStore {
             "INSERT INTO trigger_activation \
                (project_id, trigger, instance_id, status, accepting_fires, fires_visible_to_consumers, \
                 fires_deadline_unix, went_down_with, went_down_by_command, activating_run_id, \
-                heartbeat_unix, activation_program, activation_program_version, activation_version, updated_at) \
-             SELECT $1::uuid, t, NULLIF(m, ''), $4::text, $5::boolean, $6::boolean, NULL, NULL, NULL, $7::uuid, $8::bigint, NULL, $9::integer, NULL, $8::bigint \
-             FROM unnest($2::text[], $3::text[]) AS k(t, m) \
+                driver_task, activating_since_unix, activating_step, activating_listened, \
+                activation_program, activation_program_version, activation_version, updated_at) \
+             SELECT $1::uuid, t, NULLIF(m, ''), $4::text, $5::boolean, $6::boolean, NULL, NULL, NULL, $7::uuid, \
+                    $10::uuid, $8::bigint, $11::text, l, NULL, $9::integer, NULL, $8::bigint \
+             FROM unnest($2::text[], $3::text[], $12::boolean[]) AS k(t, m, l) \
              ON CONFLICT (project_id, trigger, instance_id) DO UPDATE SET \
                  status = EXCLUDED.status, \
                  accepting_fires = EXCLUDED.accepting_fires, \
                  fires_visible_to_consumers = EXCLUDED.fires_visible_to_consumers, \
                  fires_deadline_unix = NULL, \
                  activating_run_id = EXCLUDED.activating_run_id, \
-                 heartbeat_unix = EXCLUDED.heartbeat_unix, \
+                 driver_task = EXCLUDED.driver_task, \
+                 activating_since_unix = EXCLUDED.activating_since_unix, \
+                 activating_step = EXCLUDED.activating_step, \
+                 activating_listened = EXCLUDED.activating_listened, \
                  activation_program = NULL, \
                  activation_version = NULL, \
                  updated_at = EXCLUDED.updated_at",
@@ -974,6 +1082,9 @@ impl ActivationStoreOps for PostgresActivationStore {
                 &run_id,
                 &now,
                 &ProgramIdentity::STORED.version(),
+                &task,
+                &ActivationStep::Preparing.as_str(),
+                &listened,
             ],
         )
         .await?;
@@ -1041,7 +1152,8 @@ impl ActivationStoreOps for PostgresActivationStore {
                      SET status = $1, accepting_fires = $2, fires_visible_to_consumers = $3, \
                          fires_deadline_unix = $4, went_down_with = $5, went_down_by_command = $13, \
                          activating_run_id = NULL, activation_program = $6, activation_program_version = $16, \
-                         activation_version = $7, updated_at = $8, cut_fingerprint = $14, depends_on = $15 \
+                         activation_version = $7, updated_at = $8, cut_fingerprint = $14, depends_on = $15, \
+                         driver_task = $17, activating_since_unix = NULL, activating_step = NULL, activating_listened = FALSE \
                      WHERE project_id = $9 AND activating_run_id = $10 AND status = 'activating' \
                        AND trigger = $11 AND instance_id IS NOT DISTINCT FROM $12",
                     &[
@@ -1061,6 +1173,7 @@ impl ActivationStoreOps for PostgresActivationStore {
                         &activation.cut.as_ref().map(|cut| cut.fingerprint.as_str()),
                         &activation.cut.as_ref().map(|cut| cut.depends_on.clone()).unwrap_or_default(),
                         &ProgramIdentity::STORED.version(),
+                        &activation.driver_task,
                     ],
                 )
                 .await?;
@@ -1248,26 +1361,24 @@ impl ActivationStoreOps for PostgresActivationStore {
         Ok(LifecycleWrite::Applied { keys: keys.to_vec(), tokens, unlisten, held, commands })
     }
 
-    async fn bump_heartbeat(&self, run_id: uuid::Uuid) -> anyhow::Result<()> {
-        self.pool
-            .execute("UPDATE trigger_activation SET heartbeat_unix = $1 WHERE activating_run_id = $2", &[&crate::lease::now_unix(), &run_id])
-            .await?;
-        Ok(())
-    }
-
-    async fn list_stuck(&self, stale_before: i64) -> anyhow::Result<Vec<StuckActivation>> {
-        let rows: Vec<(uuid::Uuid, uuid::Uuid)> = self
+    async fn set_step(&self, project_id: uuid::Uuid, run_id: uuid::Uuid, step: ActivationStep) -> anyhow::Result<bool> {
+        let set = self
             .pool
-            .all(
-                &format!(
-                    "SELECT DISTINCT a.project_id, a.activating_run_id FROM trigger_activation a \
-                     WHERE {} AND a.heartbeat_unix < $1",
-                    held_by_driver_alone()
-                ),
-                &[&stale_before],
+            .execute(
+                "UPDATE trigger_activation SET activating_step = $3 \
+                 WHERE project_id = $1 AND activating_run_id = $2 AND status = 'activating'",
+                &[&project_id, &run_id, &step.as_str()],
             )
             .await?;
-        Ok(rows.into_iter().map(|(project_id, run_id)| StuckActivation { project_id, run_id }).collect())
+        Ok(set > 0)
+    }
+
+    async fn list_orphaned(&self) -> anyhow::Result<Vec<OrphanedActivation>> {
+        let rows: Vec<(uuid::Uuid, uuid::Uuid)> = self
+            .pool
+            .all(&format!("SELECT DISTINCT a.project_id, a.activating_run_id FROM trigger_activation a WHERE {}", orphaned()), &[])
+            .await?;
+        Ok(rows.into_iter().map(|(project_id, run_id)| OrphanedActivation { project_id, run_id }).collect())
     }
 }
 
@@ -1281,16 +1392,17 @@ fn project_keys(rows: Vec<(uuid::Uuid, String, Option<String>)>) -> anyhow::Resu
         .collect()
 }
 
-/// One fake row: the lifecycle, the heartbeat, the code and version its
-/// setup recorded, and its cut.
+/// One fake row: the lifecycle, the code and version its setup recorded,
+/// its cut, and the task that claimed it with where its activation stands.
 #[cfg(any(test, feature = "test-helpers"))]
 #[derive(Clone)]
 struct FakeRow {
     lifecycle: ActivationLifecycle,
-    heartbeat: i64,
     program: Option<ProgramIdentity>,
     version: Option<String>,
     cut: Option<RecordedCut>,
+    driver_task: Option<uuid::Uuid>,
+    activating: Option<Activating>,
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -1302,6 +1414,8 @@ impl FakeRow {
             program: self.program.clone(),
             source_version: self.version.clone(),
             cut: self.cut.clone(),
+            driver_task: self.driver_task,
+            activating: self.activating,
         }
     }
 }
@@ -1347,6 +1461,7 @@ impl ActivationStoreOps for FakeActivationStore {
         // The project's transition and the install's maintenance live in
         // tables this fake does not see: it guards the build axis alone.
         _claimant: Claimant,
+        task: uuid::Uuid,
     ) -> anyhow::Result<Result<Vec<Activation>, ClaimRefused>> {
         if self.building.read().await.contains(&project_id) {
             return Ok(Err(ClaimRefused::Building));
@@ -1357,15 +1472,28 @@ impl ActivationStoreOps for FakeActivationStore {
         if let Err(refused) = claimable(keys, &before, expect) {
             return Ok(Err(refused));
         }
-        for key in keys {
-            let before = rows.get(&(project_id, key.clone()));
-            let cut = before.and_then(|row| row.cut.clone());
-            let went_down = before.and_then(|row| row.lifecycle.went_down);
+        let now = crate::lease::now_unix();
+        for (key, listened) in keys.iter().zip(listened_as_found(keys, &before, now)) {
+            let found = rows.get(&(project_id, key.clone()));
+            let cut = found.and_then(|row| row.cut.clone());
+            let went_down = found.and_then(|row| row.lifecycle.went_down);
             let lifecycle = ActivationLifecycle { went_down, ..ActivationLifecycle::activating(run_id) };
-            let row = FakeRow { lifecycle, heartbeat: crate::lease::now_unix(), program: None, version: None, cut };
+            let activating = Some(Activating { since_unix: now, step: ActivationStep::Preparing, listened });
+            let row = FakeRow { lifecycle, program: None, version: None, cut, driver_task: Some(task), activating };
             rows.insert((project_id, key.clone()), row);
         }
         Ok(Ok(before))
+    }
+
+    async fn set_step(&self, project_id: uuid::Uuid, run_id: uuid::Uuid, step: ActivationStep) -> anyhow::Result<bool> {
+        let mut set = false;
+        for ((p, _), row) in self.rows.write().await.iter_mut() {
+            if let (true, Some(activating)) = (*p == project_id && row.lifecycle.activating_run_id == Some(run_id), row.activating.as_mut()) {
+                activating.step = step;
+                set = true;
+            }
+        }
+        Ok(set)
     }
 
     async fn end_activating(
@@ -1394,6 +1522,7 @@ impl ActivationStoreOps for FakeActivationStore {
                 (went_down, _) => went_down,
             };
             row.lifecycle = ActivationLifecycle { went_down, ..to.clone() };
+            row.activating = None;
             if to.status != ProjectStatus::Active {
                 row.program = None;
                 row.version = None;
@@ -1431,6 +1560,8 @@ impl ActivationStoreOps for FakeActivationStore {
                     row.program = before.program.clone();
                     row.version = before.source_version.clone();
                     row.cut = before.cut.clone();
+                    row.driver_task = before.driver_task;
+                    row.activating = None;
                     true
                 }
                 None => false,
@@ -1512,26 +1643,8 @@ impl ActivationStoreOps for FakeActivationStore {
         Ok(LifecycleWrite::Applied { keys, tokens: Vec::new(), unlisten: Vec::new(), held: Default::default(), commands: Vec::new() })
     }
 
-    async fn bump_heartbeat(&self, run_id: uuid::Uuid) -> anyhow::Result<()> {
-        let now = crate::lease::now_unix();
-        for row in self.rows.write().await.values_mut() {
-            if row.lifecycle.activating_run_id == Some(run_id) {
-                row.heartbeat = now;
-            }
-        }
-        Ok(())
-    }
-
-    async fn list_stuck(&self, stale_before: i64) -> anyhow::Result<Vec<StuckActivation>> {
-        let mut out: Vec<StuckActivation> = Vec::new();
-        for ((project_id, _), row) in self.rows.read().await.iter() {
-            if let (ProjectStatus::Activating, Some(run_id)) = (row.lifecycle.status, row.lifecycle.activating_run_id) {
-                if row.heartbeat < stale_before && !out.iter().any(|s| s.run_id == run_id) {
-                    out.push(StuckActivation { project_id: *project_id, run_id });
-                }
-            }
-        }
-        Ok(out)
+    async fn list_orphaned(&self) -> anyhow::Result<Vec<OrphanedActivation>> {
+        anyhow::bail!("the in-memory store keeps no tasks, so it cannot tell whose driver ended; orphans need Postgres")
     }
 }
 
@@ -1546,7 +1659,7 @@ mod tests {
 
     async fn activate(store: &FakeActivationStore, project: uuid::Uuid, key: &ActivationKey) {
         let setup = uuid::Uuid::new_v4();
-        assert!(store.try_begin_activating(project, std::slice::from_ref(key), setup, None, Claimant::Anyone).await.unwrap().is_ok());
+        assert!(store.try_begin_activating(project, std::slice::from_ref(key), setup, None, Claimant::Anyone, uuid::Uuid::new_v4()).await.unwrap().is_ok());
         store.end_activating(project, setup, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     }
 
@@ -1590,7 +1703,7 @@ mod tests {
         assert_eq!(owners(&store, project).await, vec![None, Some("bob".into()), Some("cyd".into())]);
 
         let setup = uuid::Uuid::new_v4();
-        let previous = store.try_begin_activating(project, std::slice::from_ref(&ada), setup, None, Claimant::Anyone).await.unwrap().expect("claimed");
+        let previous = store.try_begin_activating(project, std::slice::from_ref(&ada), setup, None, Claimant::Anyone, uuid::Uuid::new_v4()).await.unwrap().expect("claimed");
         assert!(previous.is_empty(), "ada activates again as never activated");
 
         // That activation cancelled (or reaped) mid-way with nothing kept
@@ -1599,7 +1712,7 @@ mod tests {
         store.end_activating(project, setup, &ActivationLifecycle::refused(), true, None).await.unwrap().expect("owned");
         assert_eq!(owners(&store, project).await, vec![None, Some("bob".into()), Some("cyd".into())]);
         let setup = uuid::Uuid::new_v4();
-        store.try_begin_activating(project, std::slice::from_ref(&shared), setup, None, Claimant::Anyone).await.unwrap().expect("claimed");
+        store.try_begin_activating(project, std::slice::from_ref(&shared), setup, None, Claimant::Anyone, uuid::Uuid::new_v4()).await.unwrap().expect("claimed");
         store.end_activating(project, setup, &ActivationLifecycle::refused(), true, None).await.unwrap().expect("owned");
         assert_eq!(owners(&store, project).await, vec![None, Some("bob".into()), Some("cyd".into())]);
     }
@@ -1612,7 +1725,7 @@ mod tests {
         let project = uuid::Uuid::new_v4();
         let feed = key(None);
         let setup = uuid::Uuid::new_v4();
-        store.try_begin_activating(project, std::slice::from_ref(&feed), setup, None, Claimant::Anyone).await.unwrap().expect("claimed");
+        store.try_begin_activating(project, std::slice::from_ref(&feed), setup, None, Claimant::Anyone, uuid::Uuid::new_v4()).await.unwrap().expect("claimed");
         let program = ProgramIdentity { definition_hash: "d".into(), binary_hash: "b".into(), implementations: Default::default() };
         let cut = RecordedCut { fingerprint: "f1".into(), depends_on: vec!["db".into()] };
         let cuts = std::collections::BTreeMap::from([("feed".to_string(), cut.clone())]);
@@ -1625,7 +1738,7 @@ mod tests {
         assert!(row.program.is_none(), "what it fires goes with it");
 
         let again = uuid::Uuid::new_v4();
-        let previous = store.try_begin_activating(project, std::slice::from_ref(&feed), again, None, Claimant::Anyone).await.unwrap().expect("claimed");
+        let previous = store.try_begin_activating(project, std::slice::from_ref(&feed), again, None, Claimant::Anyone, uuid::Uuid::new_v4()).await.unwrap().expect("claimed");
         assert!(store.restore(project, again, &previous).await.unwrap());
         assert_eq!(store.list(project).await.unwrap()[0].cut, Some(cut));
     }

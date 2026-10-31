@@ -200,10 +200,12 @@ weft_old_install_present() {
 
 # Whether the database in Postgres container `container` was built before
 # the current schema history (the rename of executions to runs): it holds
-# weft's tables but not the history's start. The runtime refuses to boot
-# on one, so setup.sh offers to wipe it first. Prints yes or no; fails
-# when the container exists but its database cannot be asked.
-# SYNC: the history's start <-> crates/weft-task-store/src/schema_guard.rs (HISTORY_EPOCH, HISTORY_GROUP)
+# weft's tables, records neither the history's start nor one this checkout
+# does not know (a later weft's, whose database is newer, never older), so
+# only past starts or none. The runtime refuses to boot on one, so setup.sh
+# offers to wipe it first. Prints yes or no; fails when the container exists
+# but its database cannot be asked.
+# SYNC: the history's start <-> crates/weft-task-store/src/schema_guard.rs (HISTORY_EPOCH, PAST_EPOCHS, HISTORY_GROUP)
 weft_database_before_runs() { # container
   if ! docker container inspect "$1" >/dev/null 2>&1; then
     echo no
@@ -220,8 +222,7 @@ weft_database_before_runs() { # container
   done
   # Two queries: Postgres resolves every table a statement names before it
   # runs, so a database with no ledgers yet (its first start failed before
-  # building them) is asked whether they exist first. The boot builds both
-  # ledgers in one transaction, so one is enough to ask about.
+  # building them) is asked whether they exist first.
   local ledgers found
   ledgers="$(docker exec "$1" psql -U weft -d weft -tAc \
     "SELECT to_regclass('public.weft_schema_stamp') IS NOT NULL AND to_regclass('public.weft_migration') IS NOT NULL")" || return 1
@@ -231,7 +232,7 @@ weft_database_before_runs() { # container
   fi
   found="$(docker exec "$1" psql -U weft -d weft -tAc \
     "SELECT EXISTS (SELECT 1 FROM weft_schema_stamp)
-        AND NOT EXISTS (SELECT 1 FROM weft_migration WHERE group_name = '_history' AND id = 'run')")" || return 1
+        AND NOT EXISTS (SELECT 1 FROM weft_migration WHERE group_name = '_history' AND id NOT IN ('serverless'))")" || return 1
   if [[ "${found}" == "t" ]]; then echo yes; else echo no; fi
 }
 

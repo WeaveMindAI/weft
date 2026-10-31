@@ -21,6 +21,8 @@
 //!   - `domains`: the door in front of the install's own domains.
 //!   - `holder_pool`: how many holders keep held connections open.
 //!   - `holders`: what holders hear, and how a dead one is noticed.
+//!   - `revisions`: which revision of a role's service the platform
+//!     sends its requests to.
 //!   - `news`: telling the install's other copies what happened to a run,
 //!     without the database.
 //!   - `clock`: time, abstracted so tests advance it deterministically.
@@ -42,6 +44,7 @@ pub mod infra_host;
 pub mod needs;
 pub mod news;
 pub mod object_store;
+pub mod revisions;
 pub mod roles;
 pub mod runner;
 pub mod unit_agent;
@@ -62,6 +65,7 @@ pub use object_store::{
     object_store_for, CopyProgress, GetLink, ObjectEntry, ObjectStore, ObjectStoreConfig, PresignAudience,
     S3ObjectStore, SharedObjectStore, Unfollowed,
 };
+pub use revisions::{Routing, RoutingRefused, ServiceRevisions};
 pub use roles::{CoreRole, Placement, RoleAddresses, RolePlacement, Vantage};
 pub use runner::{worker_auth_key, worker_auth_value, Patience, PortTaken, ProjectFolders, Runner, WorkerCall, WorkerEndpoint, WorkerStarting, WorkerTarget, WorkerWontStart, WORKER_ANSWER_HEADER, WORKER_AUTH_HEADER, WORKER_PORT_TAKEN_EXIT, WORKER_PORT_TAKEN_LINE};
 // A worker target carries its levers, so they are this crate's words too.
@@ -88,6 +92,8 @@ pub use holders::fake::FakeHolderNews;
 pub use images::FakeImageBuilder;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use news::fake::FakeNews;
+#[cfg(any(test, feature = "test-helpers"))]
+pub use revisions::fake::FakeServiceRevisions;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use object_store::fake::{FakeCall as ObjectStoreFakeCall, FakeObjectStore};
 #[cfg(any(test, feature = "test-helpers"))]

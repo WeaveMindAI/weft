@@ -146,6 +146,16 @@ describe('infra progress', () => {
     expect(progress).toEqual({ sinceUnix: 8_970, asOfUnix: 9_000 });
     expect(describeProgress(progress, Date.now() / 1000)).toBe('for 30s');
   });
+
+  it('moves a trigger turning on onto this machine\'s clock too', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(9_000_000);
+    const turningOn = { state: 'turning_on' as const, mode: 'registered' as const, progress: { sinceUnix: 100, asOfUnix: 340, waiting: 'its setup run r1' } };
+    const snap = parseStatusPayload({ triggers: [{ node: 'door', perInstance: false, shared: turningOn }] });
+    const progress = snap.triggers[0].shared!.progress!;
+    expect(progress).toEqual({ sinceUnix: 8_760, asOfUnix: 9_000, waiting: 'its setup run r1' });
+    expect(describeProgress(progress, progress.asOfUnix)).toBe('for 4m00s, waiting on: its setup run r1');
+  });
 });
 
 describe('infra restarts', () => {

@@ -17,6 +17,8 @@ use weft_task_store::tasks::{NewTask, TaskOutcome, TaskStatus};
 // enum can live beside the messages that carry it in any crate.
 use weft_core::wire_enum;
 
+use crate::line::{BrokerCall, Twice};
+
 // =================================================================
 // Typed wire enums
 // =================================================================
@@ -123,12 +125,24 @@ wire_enum! {
 // SYNC: NOT_DONE <-> crates/weft-broker/src/handlers.rs (unavailable_or_internal), crates/weft-broker-client/src/client.rs (turned_away)
 pub const NOT_DONE: &str = "the broker could not get a connection to its database, so nothing was done; send it again";
 
+/// The body of a 503 a broker copy that is stepping aside for a newer one
+/// answers a call that arrived on its line after it began to
+/// (`crate::line::server::serve`): nothing of it ran, and sent again it
+/// goes out on a line to a current copy.
+pub const STEPPING_ASIDE: &str = "this copy of the broker is stepping aside for a newer one, so nothing was done; send it again";
+
 /// The answer to a call in a shape the broker does not read, and its body
 /// (`weft_core::wire_shape`), re-exported here beside the broker's other
 /// answers.
 pub use weft_core::wire_shape::{unreadable_shape, UNREADABLE_SHAPE};
 
 // ---------- Records ----------
+
+/// A batch of records ([`JOURNAL_RECORD_PATH`]). Harmless twice: the record
+/// takes a batch sent again as one already there (`weft_journal::record::Fate::AlreadyApplied`),
+/// and so do the cost rows it carries, which go in `ON CONFLICT (run_id, cost_id) DO NOTHING`
+/// (`weft_record_costs`, `weft_dispatcher::store::postgres`).
+pub const JOURNAL_RECORD: BrokerCall = BrokerCall { path: JOURNAL_RECORD_PATH, twice: Twice::Harmless };
 
 /// `POST /v1/journal/record`: one batch of a worker's writer lane, its
 /// body the bytes `weft_journal::frame` encodes (not JSON), answered with
@@ -154,6 +168,9 @@ pub const BATCH_FATES: &str = "project_removing";
 /// such ports.
 pub const JOURNAL_RECORD_BODY_LIMIT: usize = 64 * weft_core::storage::MAX_WIRE_VALUE_BYTES;
 
+/// One page of a run's record. Harmless twice: it only reads.
+pub const RECORD_OF: BrokerCall = BrokerCall { path: "/v1/journal/record_of", twice: Twice::Harmless };
+
 /// `POST /v1/journal/record_of`: one page of the record of a run of the
 /// calling worker's project, raw (`weft_journal::record::read_page`): its
 /// rows after `after`, from its first when `null`, empty once none is
@@ -175,6 +192,12 @@ pub struct RecordOfResponse {
 }
 
 // ---------- Runs ----------
+
+/// A worker claiming a run it was handed. Harmless twice: a claim the caller
+/// holds already is given again under a new epoch, for this very case
+/// (`weft_journal::record::claim`), and nothing was written under the old
+/// one; the run's `attempts` count one more, which nothing acts on.
+pub const RUN_CLAIM: BrokerCall = BrokerCall { path: "/v1/run/claim", twice: Twice::Harmless };
 
 /// `POST /v1/run/claim`: the calling worker claims a queued run of its
 /// project, the one it was handed (`weft_journal::record::claim`). `None`
@@ -201,6 +224,10 @@ pub enum RecordReads {
 pub struct RunClaimResponse {
     pub claimed: Option<weft_journal::record::Claimed>,
 }
+
+/// The answers waiting for a run. Harmless twice: it only reads; answers
+/// go once a batch of records resolves them.
+pub const RUN_ANSWERS: BrokerCall = BrokerCall { path: "/v1/run/answers", twice: Twice::Harmless };
 
 /// `POST /v1/run/answers`: the answers waiting for the waits of a run the
 /// calling worker drives, read once (none when none waits). Only the worker
@@ -230,6 +257,9 @@ pub struct RunAnswer {
     pub answer: weft_core::primitive::WaitAnswer,
 }
 
+/// What a worker reads once its line may have missed some. Harmless twice: it only reads.
+pub const RUN_RECHECKED: BrokerCall = BrokerCall { path: "/v1/run/rechecked", twice: Twice::Harmless };
+
 /// `POST /v1/run/rechecked`: what a worker reads once its line may have
 /// missed some (it opened again after a break, or fell behind): the
 /// cancels waiting for every run it drives and the answers handed to them,
@@ -251,6 +281,10 @@ pub struct RunAnswerOf {
     pub token: String,
     pub answer: weft_core::primitive::WaitAnswer,
 }
+
+/// A worker giving a run up. Not safe twice: the first lets go of the run,
+/// so the second is refused as from a worker that no longer drives it.
+pub const RUN_GIVE_UP: BrokerCall = BrokerCall { path: "/v1/run/give_up", twice: Twice::NotSafe };
 
 /// `POST /v1/run/give_up`: end a run the calling worker drives but whose
 /// record it can no longer write (`weft_journal::record::give_up_in`).
@@ -277,6 +311,10 @@ pub struct RunCancel {
 
 // ---------- Run steering (`ctx.tag_run` / `ctx.stop_tagged`) ----------
 
+/// A worker tagging its run. Harmless twice: the tags go in
+/// `ON CONFLICT (run_id, tag) DO NOTHING` (`weft_journal::tags`), keeping the first one's place.
+pub const RUN_TAG: BrokerCall = BrokerCall { path: "/v1/run/tag", twice: Twice::Harmless };
+
 /// `POST /v1/run/tag`: the worker tags the run it is
 /// driving, its `RunTagged` already on record. Worker-only: the
 /// broker writes the `run_tag` rows synchronously, so by the time
@@ -292,6 +330,10 @@ pub struct RunTagRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunTagResponse {}
+
+/// A worker stopping the runs carrying a tag. Not safe twice: each arrival
+/// queues its own stop, and a second one may reach runs tagged in between.
+pub const RUN_STOP_TAGGED: BrokerCall = BrokerCall { path: "/v1/run/stop_tagged", twice: Twice::NotSafe };
 
 /// `POST /v1/run/stop_tagged`: the worker asks that every live
 /// run of ITS project carrying `tag` be stopped. The broker
@@ -320,6 +362,10 @@ pub struct RunStopTaggedResponse {
 
 // ---------- Tasks ----------
 
+/// Queueing a task once per key. Not safe twice: the key only holds while
+/// the first task waits or runs, so one sent again after it ended queues it again.
+pub const TASK_ENQUEUE_DEDUP: BrokerCall = BrokerCall { path: "/v1/task/enqueue_dedup", twice: Twice::NotSafe };
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskEnqueueDedupRequest {
     pub spec: NewTask,
@@ -331,6 +377,9 @@ pub struct TaskEnqueueDedupResponse {
     /// False when an identical live task already existed (a dedup hit).
     pub inserted: bool,
 }
+
+/// Waiting for a task to end. Harmless twice: it only reads.
+pub const TASK_WAIT_TERMINAL: BrokerCall = BrokerCall { path: "/v1/task/wait_terminal", twice: Twice::Harmless };
 
 /// A task's outcome, held open up to `wait_ms` until it is terminal; the
 /// answer is its state either way.
@@ -366,6 +415,16 @@ impl TaskWaitTerminalResponse {
 
 // ---------- Infra ----------
 
+/// Asking for a look at a project's infra. Harmless twice: it only rings
+/// the supervisor (`pg_notify`), and a second look finds what the first did.
+pub const INFRA_LOOK: BrokerCall = BrokerCall { path: "/v1/infra/look", twice: Twice::Harmless };
+
+/// What changed of an infra copy's values (`weft_core::infra::bake::PushedValues`).
+/// Harmless twice: a publish the same as the one there writes nothing, and the
+/// baked values are set to the same keys again; its agent sends the next only
+/// once this one is answered.
+pub const INFRA_PUSHED: BrokerCall = BrokerCall { path: "/v1/infra/pushed", twice: Twice::Harmless };
+
 /// A machine running `project_id`'s infra asking for its health to be
 /// looked at now (`BrokerInfraClient::ask_for_a_look`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,6 +434,9 @@ pub struct InfraLookRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraLookResponse {}
+
+/// Where an infra node answers. Harmless twice: it only reads.
+pub const INFRA_ENDPOINT_URL: BrokerCall = BrokerCall { path: "/v1/infra/endpoint_url", twice: Twice::Harmless };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraEndpointUrlRequest {
@@ -387,6 +449,9 @@ pub struct InfraEndpointUrlRequest {
     /// whose copy it is (absent for a shared copy).
     pub infra: weft_core::infra::InfraHandle,
 }
+
+/// What an infra node's copy saved. Harmless twice: it only reads.
+pub const INFRA_BAKED: BrokerCall = BrokerCall { path: "/v1/infra/baked", twice: Twice::Harmless };
 
 /// `POST /v1/infra/baked`: what an infra node's copy saved for its baked
 /// outputs, for the run that runs the node (`InfraReader::baked_outputs`).
@@ -404,6 +469,10 @@ pub struct InfraBakedRequest {
 pub struct InfraBakedResponse {
     pub saved: std::collections::BTreeMap<String, serde_json::Value>,
 }
+
+/// Saving what an infra setup sent out. Harmless twice: the values are merged
+/// onto the same keys again, and the run sends the next only once this one is answered.
+pub const INFRA_BAKE: BrokerCall = BrokerCall { path: "/v1/infra/bake", twice: Twice::Harmless };
 
 /// `POST /v1/infra/bake`: what an infra setup's run of an infra node sent
 /// out on its baked outputs, which its copy holds from then on, merged
@@ -428,6 +497,13 @@ pub struct InfraEndpointUrlResponse {
 }
 
 // ---------- Connections + cost recording ----------
+
+/// Resolving a connection for one firing. Harmless twice: it reads, a
+/// token due for a refresh is refreshed by whichever call claims it while it
+/// is still due (`weft_access_store::resolve`), so the second reads the fresh
+/// one, and a runtime-owned key is leased once per firing
+/// (`weft_broker::credential::CredentialSource`).
+pub const ACCESS_RESOLVE: BrokerCall = BrokerCall { path: "/v1/access/resolve", twice: Twice::Harmless };
 
 /// Worker resolves a connection reference for ONE firing: asks for the
 /// short-lived pieces it needs to authenticate calls on the stored
@@ -475,6 +551,10 @@ pub struct ResolveConnectionRequest {
     pub expected_duration_secs: u64,
 }
 
+/// A node handing out a connection to what it runs itself. Harmless twice: a
+/// publish the same as the one there answers its id and writes nothing.
+pub const ACCESS_PUBLISH: BrokerCall = BrokerCall { path: "/v1/access/publish", twice: Twice::Harmless };
+
 /// A node handing out a connection to something it runs itself, and
 /// the question that precedes it ("did I already publish one?").
 /// `values` are the service's own declared fields, exactly what a
@@ -509,6 +589,9 @@ pub struct PublishAccessResponse {
     pub connection: PublishedConnection,
 }
 
+/// A connection a node published. Harmless twice: it only reads.
+pub const ACCESS_PUBLISHED: BrokerCall = BrokerCall { path: "/v1/access/published", twice: Twice::Harmless };
+
 /// "Which connection did this node publish for this service, if any?"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishedAccessRequest {
@@ -519,6 +602,11 @@ pub struct PublishedAccessRequest {
     #[serde(default)]
     pub per_instance: bool,
 }
+
+/// Minting an instance token. Harmless twice: the token row is written over by
+/// its id (`weft_access_store::instance_tokens`), so the second mints the token
+/// the caller gets, and only the one whose answer was lost stops working.
+pub const MINT_INSTANCE_TOKEN: BrokerCall = BrokerCall { path: "/v1/program/mint_instance_token", twice: Twice::Harmless };
 
 /// Worker: mint an instance token for one instance of a project of the
 /// run's owner (`ctx.tokens().mint_for_instance`): the run's own project,
@@ -601,6 +689,9 @@ pub struct ResolveConnectionResponse {
     pub published_by: Option<String>,
 }
 
+/// Releasing a connection after a firing. Harmless twice: releasing one released already does nothing.
+pub const ACCESS_CLOSE: BrokerCall = BrokerCall { path: "/v1/access/close", twice: Twice::Harmless };
+
 /// The firing that resolved a connection finished: release the lease
 /// NOW rather than leaving a runtime-supplied credential usable to its
 /// window (which is only the crash backstop). Sent by the engine ONLY
@@ -619,6 +710,9 @@ pub struct ReleaseConnectionRequest {
 pub struct ReleaseConnectionResponse {}
 
 // ---------- Project (worker fetches its own definition) ----------
+
+/// A project's definition by hash. Harmless twice: it only reads.
+pub const PROJECT_FETCH_DEFINITION: BrokerCall = BrokerCall { path: "/v1/project/fetch_definition", twice: Twice::Harmless };
 
 /// Worker call to fetch the project's runtime `ProjectDefinition`
 /// at run claim time. Keyed by `(project_id, expected_hash)`:
@@ -662,6 +756,11 @@ pub struct ProjectFetchDefinitionResponse {
 // `weft_broker::auth::resolve_storage_caller`.
 
 // ---------- Supervisor surface (tenant-scoped) ----------
+
+/// A supervisor renewing and claiming project leases. Not safe twice: the
+/// second answers none of the projects the first took on, and counts a
+/// trouble it reports twice.
+pub const SUPERVISOR_SYNC_OWNERSHIP: BrokerCall = BrokerCall { path: "/v1/supervisor/sync_ownership", twice: Twice::NotSafe };
 
 /// Empty: a pooled supervisor lists projects across all tenants. The
 /// request body carries nothing; the trusted caller identity is the
@@ -807,6 +906,9 @@ pub struct SupervisorSyncOwnershipResponse {
     pub next_due_unix: Option<i64>,
 }
 
+/// The projects a supervisor owns. Harmless twice: it only reads.
+pub const SUPERVISOR_OWNED_PROJECTS: BrokerCall = BrokerCall { path: "/v1/supervisor/owned_projects", twice: Twice::Harmless };
+
 /// Pure read of the projects a supervisor process currently owns (no claim,
 /// no renew). The work loops (health, lifecycle) and per-command
 /// tenant lookups use this; ownership breadth is changed ONLY by
@@ -821,6 +923,9 @@ pub struct SupervisorOwnedProjectsRequest {
 pub struct SupervisorOwnedProjectsResponse {
     pub owned: Vec<SupervisorProject>,
 }
+
+/// Which copies are gone for good. Harmless twice: it only reads.
+pub const SUPERVISOR_GONE_COPIES: BrokerCall = BrokerCall { path: "/v1/supervisor/gone_copies", twice: Twice::Harmless };
 
 /// Which of `copies` (every copy the host holds anything for of
 /// `project`, as it names them) are gone for good: what the supervisor
@@ -847,6 +952,9 @@ pub struct SupervisorGoneCopiesResponse {
     /// The gone copies' ids.
     pub gone: Vec<String>,
 }
+
+/// A project's infra nodes. Harmless twice: it only reads.
+pub const SUPERVISOR_INFRA_NODES: BrokerCall = BrokerCall { path: "/v1/supervisor/infra_nodes", twice: Twice::Harmless };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorInfraNodesRequest {
@@ -894,6 +1002,9 @@ pub struct SupervisorInfraNode {
 pub struct SupervisorInfraNodesResponse {
     pub nodes: Vec<SupervisorInfraNode>,
 }
+
+/// Where a project's health rules stand. Harmless twice: it only reads.
+pub const SUPERVISOR_HEALTH_STATE: BrokerCall = BrokerCall { path: "/v1/supervisor/health_state", twice: Twice::Harmless };
 
 /// Read where each health rule of a project's copies stands, kept across
 /// the supervisor's processes.
@@ -970,6 +1081,10 @@ pub struct HealthRuleState {
     pub last_error: Option<String>,
 }
 
+/// Replacing where a project's health rules stand. Harmless twice: the whole
+/// set is deleted and written again, the same both times.
+pub const SUPERVISOR_SET_HEALTH_STATE: BrokerCall = BrokerCall { path: "/v1/supervisor/set_health_state", twice: Twice::Harmless };
+
 /// Replace a project's [`HealthRuleState`]s (a rule on a copy not listed
 /// has none left), for the supervisor holding its lease (410 otherwise).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -981,6 +1096,10 @@ pub struct SupervisorSetHealthStateRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetHealthStateResponse {}
+
+/// A supervisor claiming a command. Not safe twice: each claim counts one of
+/// the command's runs, and it is given up after a few.
+pub const SUPERVISOR_CLAIM_COMMAND: BrokerCall = BrokerCall { path: "/v1/supervisor/claim_command", twice: Twice::NotSafe };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorClaimCommandRequest {
@@ -1076,6 +1195,9 @@ impl SupervisorCommandRow {
             .map_err(|e| format!("terminate command {}: spec_json is not terminate work: {e}", self.id))
     }
 }
+
+/// Recording an infra event. Not safe twice: each arrival inserts its own event.
+pub const SUPERVISOR_EVENT_RECORD: BrokerCall = BrokerCall { path: "/v1/supervisor/event_record", twice: Twice::NotSafe };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorEventRecordRequest {
@@ -1222,6 +1344,10 @@ impl InfraEvent {
     }
 }
 
+/// Setting an infra copy's status. Harmless twice: it sets the same values
+/// again, and what the copy waits on stays, since its status did not change.
+pub const SUPERVISOR_SET_STATUS: BrokerCall = BrokerCall { path: "/v1/supervisor/set_status", twice: Twice::Harmless };
+
 /// The supervisor's claim identity on a lifecycle write: its replica
 /// id, the SAME string it claims commands with and that keys its
 /// `infra_owner` lease. The broker's ownership gate compares the lease
@@ -1281,6 +1407,9 @@ pub struct SupervisorSetStatusRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetStatusResponse {}
 
+/// Recording what a command waits on. Harmless twice: it sets the same value again.
+pub const SUPERVISOR_SET_WAITING: BrokerCall = BrokerCall { path: "/v1/supervisor/set_waiting", twice: Twice::Harmless };
+
 /// What a change of one copy (an apply, a stop, a terminate) waits on,
 /// so `weft status` can say it. Written under that change's command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1295,6 +1424,11 @@ pub struct SupervisorSetWaitingRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetWaitingResponse {}
+
+/// Recording an applied infra copy. Harmless twice: the copy's row and its
+/// units are written with the same values again (only when it was applied is
+/// stamped a moment later).
+pub const SUPERVISOR_SET_APPLIED: BrokerCall = BrokerCall { path: "/v1/supervisor/set_applied", twice: Twice::Harmless };
 
 /// Atomic post-apply state write: status, copy_id, applied spec
 /// hash, endpoints map. Supervisor calls this on successful apply.
@@ -1359,6 +1493,11 @@ pub struct AppliedEndpoints {
     pub doors: std::collections::BTreeMap<String, String>,
 }
 
+/// Recording an infra copy being provisioned. Harmless twice: the copy's row
+/// is written with the same values again (only when provisioning started is
+/// stamped a moment later).
+pub const SUPERVISOR_SET_PROVISIONING: BrokerCall = BrokerCall { path: "/v1/supervisor/set_provisioning", twice: Twice::Harmless };
+
 /// Supervisor-callable: write or update the `infra_node` row at
 /// `Provisioning` status BEFORE the apply begins. Locks in the
 /// (copy_id, keep_disks) pair so that a partial-apply failure leaves
@@ -1392,6 +1531,9 @@ pub struct SupervisorSetProvisioningRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetProvisioningResponse {}
+
+/// Queueing a lifecycle command. Not safe twice: each arrival queues its own command.
+pub const SUPERVISOR_ENQUEUE_LIFECYCLE: BrokerCall = BrokerCall { path: "/v1/supervisor/enqueue_lifecycle", twice: Twice::NotSafe };
 
 /// Supervisor-callable: enqueue a `deactivate` / `reactivate`
 /// lifecycle command for the dispatcher to claim. The supervisor
@@ -1554,6 +1696,10 @@ pub struct SupervisorEnqueueLifecycleResponse {
     pub command_id: i64,
 }
 
+/// Queueing an infra apply. Not safe twice: only an apply still waiting is
+/// matched, so one sent again after the first ended applies again.
+pub const INFRA_ENQUEUE_APPLY: BrokerCall = BrokerCall { path: "/v1/infra/enqueue_apply", twice: Twice::NotSafe };
+
 /// Worker-callable: enqueue an Apply lifecycle command for the
 /// supervisor that owns the project. The engine uses this after `node.provision_infra()`
 /// returns a fresh InfraSpec. The supervisor reads the prior
@@ -1582,6 +1728,9 @@ pub struct InfraEnqueueApplyRequest {
 pub struct InfraEnqueueApplyResponse {
     pub command_id: i64,
 }
+
+/// Waiting for an apply to end. Harmless twice: it only reads.
+pub const INFRA_WAIT_APPLY: BrokerCall = BrokerCall { path: "/v1/infra/wait_apply", twice: Twice::Harmless };
 
 /// Worker-callable: wait for a previously-issued apply command to
 /// reach terminal state. The broker holds the request until the
@@ -1625,6 +1774,9 @@ wire_enum! {
         Cancelled = "cancelled",
     }
 }
+
+/// A project's image tags. Harmless twice: it only reads.
+pub const SUPERVISOR_PROJECT_IMAGE_TAGS: BrokerCall = BrokerCall { path: "/v1/supervisor/project_image_tags", twice: Twice::Harmless };
 
 /// Supervisor reads the project's per-(node, image_name) hash map
 /// so it can resolve `Image::Local` references at apply time.
@@ -1702,6 +1854,10 @@ pub fn decode_units(
     })
 }
 
+/// Removing an infra copy. Harmless twice: the second finds nothing left to
+/// remove, and the caller reads only that the write was applied.
+pub const SUPERVISOR_REMOVE_NODE: BrokerCall = BrokerCall { path: "/v1/supervisor/remove_node", twice: Twice::Harmless };
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorRemoveNodeRequest {
     /// The supervisor's claim identity (its replica id); the broker
@@ -1722,6 +1878,10 @@ pub struct SupervisorRemoveNodeResponse {
     pub removed: bool,
 }
 
+/// Completing a command. Not safe twice: the second finds it completed and
+/// is answered that its target is gone ([`WriteOutcome`](crate::client::WriteOutcome)'s `Gone`).
+pub const SUPERVISOR_COMMAND_COMPLETE: BrokerCall = BrokerCall { path: "/v1/supervisor/command_complete", twice: Twice::NotSafe };
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorCommandCompleteRequest {
     /// The supervisor's claim identity (its replica id); the broker
@@ -1741,6 +1901,9 @@ pub struct SupervisorCommandCompleteRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorCommandCompleteResponse {}
+
+/// A project's uncompleted commands. Harmless twice: it only reads.
+pub const SUPERVISOR_INFRA_COMMAND_IN_FLIGHT: BrokerCall = BrokerCall { path: "/v1/supervisor/infra_command_in_flight", twice: Twice::Harmless };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorInfraCommandInFlightRequest {
@@ -1804,6 +1967,9 @@ pub const SIGNAL_ACTIVATION_JOIN: &str = "LEFT JOIN trigger_activation a \
 /// only hears what comes after it took it.
 pub const STILL_HELD_BY: &str = "SELECT EXISTS (SELECT 1 FROM signal WHERE token = $1 AND holds AND held_by = $2)";
 
+/// The signals a listener holds. Harmless twice: it only reads.
+pub const SIGNAL_LIST_HELD: BrokerCall = BrokerCall { path: "/v1/signal/list_held", twice: Twice::Harmless };
+
 /// Every signal the listener must hold: the rows whose governing
 /// activation listens ([`ACTIVATION_LISTENS`]), of one
 /// project when `project` names it (an activation's rehydrate), of every
@@ -1817,6 +1983,9 @@ pub struct SignalListHeldRequest {
 pub struct SignalListHeldResponse {
     pub rows: Vec<SignalRowWire>,
 }
+
+/// Where a signal's event goes. Harmless twice: it only reads.
+pub const SIGNAL_FIRE_TARGET: BrokerCall = BrokerCall { path: "/v1/signal/fire_target", twice: Twice::Harmless };
 
 /// Where an event of the signal `token` goes: what the listener asks
 /// before handing an event to the worker's door of its project.
@@ -1837,6 +2006,9 @@ pub struct SignalFireTarget {
     pub address: Option<String>,
 }
 
+/// One held signal. Harmless twice: it only reads.
+pub const SIGNAL_GET_HELD: BrokerCall = BrokerCall { path: "/v1/signal/get_held", twice: Twice::Harmless };
+
 /// One held signal by token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalGetHeldRequest {
@@ -1848,6 +2020,10 @@ pub struct SignalGetHeldResponse {
     /// `None` when no held row has that token (gone, or parked).
     pub row: Option<SignalRowWire>,
 }
+
+/// Writing a signal kind's state. Not safe twice: it writes only over the
+/// state it was read from, so the second answers that it did not land.
+pub const SIGNAL_WRITE_KIND_STATE: BrokerCall = BrokerCall { path: "/v1/signal/write_kind_state", twice: Twice::NotSafe };
 
 /// Claim a signal kind's moment: write its durable state at version
 /// `from_seq + 1`, landing only while the row is still at `from_seq`, so
@@ -2022,6 +2198,11 @@ pub enum HeldTransport {
     Unservable { reason: String },
 }
 
+/// One look of a holder. Not safe twice: with little room, a second look may
+/// take another signal in place of one the first took, which then stays
+/// claimed by a holder that does not hold it.
+pub const SIGNAL_HOLD: BrokerCall = BrokerCall { path: "/v1/signal/hold", twice: Twice::NotSafe };
+
 /// One look of a holder (`signal/hold`): say what each connection it
 /// holds is doing when that changed, learn which of them are still its
 /// own, and take more when it has room. A claim lasts until its holder
@@ -2078,6 +2259,14 @@ pub struct SignalHoldResponse {
     pub spare: Option<u32>,
 }
 
+/// A holder saying its load. Not safe twice: a second arrival of a
+/// hand-over finds what the first handed over no longer the holder's (or
+/// the spare it went to no longer a spare) and is refused, so the holder
+/// would read a hand-over that went through as one that did not, and keep
+/// its full room. One that hands nothing over is harmless twice, but the
+/// line decides per call, not per request.
+pub const SIGNAL_HOLDER_LOAD: BrokerCall = BrokerCall { path: "/v1/signal/holder_load", twice: Twice::NotSafe };
+
 /// A holder in a pool saying the CPU it uses (`signal/holder_load`), in
 /// percent of the CPUs it is given, whenever that moved a band since it
 /// last said it: never on a timer, so a pool whose load holds still
@@ -2107,6 +2296,10 @@ pub struct SignalHolderLoadRequest {
     pub spare_only: bool,
 }
 
+/// Recording whether a signal is held. Not safe twice: it clears a give-up,
+/// so a second arrival after one would undo it.
+pub const SIGNAL_SET_HOLDS: BrokerCall = BrokerCall { path: "/v1/signal/set_holds", twice: Twice::NotSafe };
+
 /// Record whether a signal keeps a connection open (`signal.holds`): what
 /// its kind decides for it now, for a row that says otherwise (one
 /// registered under a weft whose kind decided differently).
@@ -2116,6 +2309,10 @@ pub struct SignalSetHoldsRequest {
     pub holds: bool,
 }
 
+/// A holder letting go of its claims. Harmless twice: the second finds
+/// nothing claimed by it.
+pub const SIGNAL_LET_GO: BrokerCall = BrokerCall { path: "/v1/signal/let_go", twice: Twice::Harmless };
+
 /// Give up every claim `replica` holds (a holder stopping), so another
 /// holder takes them at once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2124,6 +2321,10 @@ pub struct SignalLetGoRequest {
 }
 
 // ---------- Provider-event serving (listener <-> broker) ----------
+
+/// Resolving a connection's event source. Harmless twice: it reads, and a
+/// token due for a refresh is refreshed once, as for a connection.
+pub const LISTENER_RESOLVE: BrokerCall = BrokerCall { path: "/v1/access/listener-resolve", twice: Twice::Harmless };
 
 /// The listener's event-source resolve: taken from the registered
 /// signal (the tenant traveled with it at registration). The broker
@@ -2147,6 +2348,10 @@ pub struct ListenerResolveRequest {
     #[serde(default)]
     pub required_values: Vec<String>,
 }
+
+/// Giving up on a signal. Harmless twice: only a signal not given up yet is
+/// written, and the answer is the same either way.
+pub const SIGNAL_GIVE_UP: BrokerCall = BrokerCall { path: "/v1/signal/give_up", twice: Twice::Harmless };
 
 /// Give up on a signal for good (`signal/give_up`): it could not come up
 /// after its retries, or its wake can never be handled (a spec or state
@@ -2172,6 +2377,10 @@ pub struct SignalGiveUpRequest {
 pub use weft_core::access::events::ResolvedEventSource;
 pub use weft_core::access::events::ResolvedEventSource as ListenerResolvedSource;
 
+/// Keeping a provider-side subscription alive. Harmless twice: under the
+/// signal's lock, one still fresh is answered as it is.
+pub const SUBSCRIPTION_ENSURE: BrokerCall = BrokerCall { path: "/v1/access/subscription/ensure", twice: Twice::Harmless };
+
 /// Ask the broker to make sure a live provider subscription serves
 /// this signal (subscribing or renewing as needed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2196,6 +2405,10 @@ pub struct SubscriptionEnsureResponse {
     pub expires_at_unix: Option<i64>,
 }
 
+/// Tearing a provider-side subscription down. Harmless twice: the second
+/// finds nothing left to drop.
+pub const SUBSCRIPTION_DROP: BrokerCall = BrokerCall { path: "/v1/access/subscription/drop", twice: Twice::Harmless };
+
 /// Stop (at the provider) and forget every subscription serving a
 /// signal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2203,6 +2416,9 @@ pub struct SubscriptionDropRequest {
     pub tenant: String,
     pub signal_token: String,
 }
+
+/// Checking the caller of a gated route. Harmless twice: it only reads.
+pub const CALLER_VERIFY: BrokerCall = BrokerCall { path: "/v1/caller/verify", twice: Twice::Harmless };
 
 /// One caller of a live route, as the worker's door forwards it to the
 /// broker to check against the connection the route is gated by. The
@@ -2254,6 +2470,11 @@ pub struct CallerVerified {
 
 // ---------- The worker's door (`weft_engine::door`) ----------
 
+/// Putting a fire in its trigger's queue. Not safe twice: a fire already
+/// taken off the queue is not recognised, so one sent again after that is
+/// delivered again.
+pub const DOOR_PARK_FIRE: BrokerCall = BrokerCall { path: "/v1/door/park_fire", twice: Twice::NotSafe };
+
 /// `POST /v1/door/park_fire`: put a fire in the queue of a trigger
 /// (`weft_task_store::parked_fires`): one of the asking worker's project's,
 /// or, for the listener, the trigger of an event whose worker it could not
@@ -2287,6 +2508,9 @@ pub enum DoorParked {
     /// not kept, and the holder hears so.
     NotHeld,
 }
+
+/// Every trigger of the worker's project. Harmless twice: it only reads.
+pub const DOOR_TRIGGERS: BrokerCall = BrokerCall { path: "/v1/door/triggers", twice: Twice::Harmless };
 
 /// `POST /v1/door/triggers`: every trigger of the asking worker's project
 /// (its entries: a waiting run's wait is no trigger), as it is armed and as
@@ -2368,6 +2592,9 @@ pub struct ArmedEntry {
     pub instance: Option<weft_core::instance::InstanceId>,
 }
 
+/// What a run of the worker's project needs. Harmless twice: it only reads.
+pub const DOOR_RUN_FACTS: BrokerCall = BrokerCall { path: "/v1/door/run_facts", twice: Twice::Harmless };
+
 /// `POST /v1/door/run_facts`: what a run of the asking worker's project
 /// for `instance` (or for nobody) starts with besides its caller: whether
 /// the infra it reads is up, what the instance provides, and the install's
@@ -2393,6 +2620,9 @@ pub struct DoorRunFacts {
 
 pub use weft_core::infra::run_gate::InfraCopyUp;
 
+/// Who an instance token names. Harmless twice: it only reads.
+pub const DOOR_INSTANCE_TOKEN: BrokerCall = BrokerCall { path: "/v1/door/instance_token", twice: Twice::Harmless };
+
 /// `POST /v1/door/instance_token`: who an instance token
 /// (`weft_core::instance::INSTANCE_TOKEN_HEADER`) presented at the door
 /// names. A token that names nobody, or is not an instance token, is the
@@ -2407,6 +2637,10 @@ pub struct DoorInstanceToken {
     pub project_id: Uuid,
     pub instance: weft_core::instance::InstanceId,
 }
+
+/// A worker letting go of a run. Not safe twice: a run handed back may be
+/// claimed by another worker before the second arrives, which is then refused.
+pub const DOOR_LET_GO: BrokerCall = BrokerCall { path: "/v1/door/let_go", twice: Twice::NotSafe };
 
 /// `POST /v1/door/let_go`: the asking worker no longer drives this run of
 /// its project, its whole record written, and whoever resumes it owns it
@@ -2432,6 +2666,10 @@ pub enum LetGo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoorLetGo {}
+
+/// A worker's tick. Harmless twice: its lease, what it has under way and its
+/// counts are set to what it sends, never added to (`weft_task_store::worker_door`).
+pub const DOOR_TICK: BrokerCall = BrokerCall { path: "/v1/door/tick", twice: Twice::Harmless };
 
 /// `POST /v1/door/tick`: once a second while it has work under way, a
 /// worker says it is alive (its `worker_lease`) and how many runs it
@@ -3730,3 +3968,48 @@ mod supervisor_protocol_tests {
 }
 
 
+
+// ---------- The dispatcher's admin calls (`weft_dispatcher::broker_admin`) ----------
+
+/// A person's lookup of a list source through a stored connection (a
+/// `remote_select`). Harmless twice: it reads, from the provider and the
+/// connection's row.
+pub const ADMIN_LOOKUP: BrokerCall = BrokerCall { path: "/v1/access/admin/lookup", twice: Twice::Harmless };
+/// A `granted` source read off a connection's row. Harmless twice: it
+/// reads, and makes no outbound call.
+pub const ADMIN_GRANTED: BrokerCall = BrokerCall { path: "/v1/access/admin/granted", twice: Twice::Harmless };
+/// The services the apps file holds a sign-in app for. Harmless twice: it
+/// reads the file.
+pub const ADMIN_SIGN_IN_SERVICES: BrokerCall = BrokerCall { path: "/v1/access/admin/sign-in-services", twice: Twice::Harmless };
+/// Which of the asked services the runtime holds its own credential for.
+/// Harmless twice: it reads the shared-credentials file.
+pub const ADMIN_SHARED_CREDENTIALS: BrokerCall = BrokerCall { path: "/v1/access/admin/shared-credentials", twice: Twice::Harmless };
+/// The shared-door options of a spec. Harmless twice: the spec's event
+/// recipes it records as it answers are upserted by their hash
+/// (`weft_access_store::resolve`), and the rest reads.
+pub const ADMIN_DOORS: BrokerCall = BrokerCall { path: "/v1/access/admin/doors", twice: Twice::Harmless };
+/// A key pair for one move of a tenant's connections. Not safe twice: each
+/// call makes a new key.
+pub const ADMIN_MIGRATE_KEY: BrokerCall = BrokerCall { path: "/v1/access/admin/migrate/key", twice: Twice::NotSafe };
+/// A tenant's picked connections, sealed to another install's key. Not
+/// shown harmless twice, so never sent again.
+pub const ADMIN_MIGRATE_EXPORT: BrokerCall = BrokerCall { path: "/v1/access/admin/migrate/export", twice: Twice::NotSafe };
+/// Connections sealed to this install's key, written as the tenant's. Not
+/// safe twice: it writes them.
+pub const ADMIN_MIGRATE_IMPORT: BrokerCall = BrokerCall { path: "/v1/access/admin/migrate/import", twice: Twice::NotSafe };
+/// An app of the install's own minted for a service. Not safe twice: it
+/// writes one.
+pub const ADMIN_MINT_APP: BrokerCall = BrokerCall { path: "/v1/access/admin/mint-app", twice: Twice::NotSafe };
+/// A connection made from a key given straight. Not safe twice: it writes
+/// one.
+pub const ADMIN_CONNECT_DIRECT: BrokerCall = BrokerCall { path: "/v1/access/admin/connect/direct", twice: Twice::NotSafe };
+/// The start of an OAuth connect. Not safe twice: each starts its own.
+pub const ADMIN_OAUTH_BEGIN: BrokerCall = BrokerCall { path: "/v1/access/admin/oauth/begin", twice: Twice::NotSafe };
+/// The end of an OAuth connect, spending its one-time code. Not safe twice.
+pub const ADMIN_OAUTH_COMPLETE: BrokerCall = BrokerCall { path: "/v1/access/admin/oauth/complete", twice: Twice::NotSafe };
+/// A connection's token handed to a provider's chooser. Not shown harmless
+/// twice (it may refresh the token), so never sent again.
+pub const ADMIN_PICKER_TOKEN: BrokerCall = BrokerCall { path: "/v1/access/admin/picker-token", twice: Twice::NotSafe };
+/// A provider's push proven genuine. Not shown harmless twice, so never
+/// sent again.
+pub const EVENTS_VERIFY: BrokerCall = BrokerCall { path: "/v1/events/verify", twice: Twice::NotSafe };

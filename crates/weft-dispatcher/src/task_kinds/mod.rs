@@ -7,6 +7,7 @@
 //! here reads; `crate::app::task_registry` maps every kind to its
 //! executor.
 
+pub mod activate;
 pub mod cancel_call;
 pub mod fire_signal;
 pub mod maintenance_lift;
@@ -21,6 +22,7 @@ pub mod withdraw_signal;
 
 // Only the executor unit structs are re-exported, for
 // `crate::app::task_registry` to wire into the registry.
+pub use activate::ActivateExecutor;
 pub use cancel_call::CancelCallExecutor;
 pub use fire_signal::FireSignalExecutor;
 pub use maintenance_lift::MaintenanceLiftExecutor;

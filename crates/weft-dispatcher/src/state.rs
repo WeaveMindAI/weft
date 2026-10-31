@@ -153,6 +153,11 @@ pub struct DispatcherState {
     /// look (`crate::lapses`). `None` on a machine, where every loop looks
     /// on its own.
     pub booking: Option<weft_task_store::drain::Booking>,
+    /// Whether this copy of the dispatcher was replaced
+    /// (`weft_task_store::aside`): once it is, the picker claims nothing
+    /// more and every event stream ends, so its followers open their
+    /// stream again on a current copy. Never set on a machine.
+    pub aside: weft_task_store::aside::StepAside,
 }
 
 /// The base for outside URLs of one answer

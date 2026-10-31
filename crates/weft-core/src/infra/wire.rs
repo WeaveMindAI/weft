@@ -307,11 +307,12 @@ pub struct InfraStatusEntry {
     pub progress: Option<ChangeProgress>,
 }
 
-/// How far a change of an infra copy got (a start, a stop or a
-/// terminate): since when it runs, and what it waits on right now ("its
-/// machine's agent does not answer yet: ...", "its host is taking it
-/// down"). `waiting` is absent before anything reports (the machine is
-/// still being made). `since_unix` is when the change was asked, and
+/// How far a change got (an infra copy's start, stop or terminate, a
+/// trigger turning on): since when it runs, and what it waits on right now
+/// ("its machine's agent does not answer yet: ...", "its host is taking it
+/// down", "its setup run <id>"). `waiting` is absent before anything
+/// reports (the machine is still being made). `since_unix` is when the
+/// change was asked, and
 /// `as_of_unix` the server's clock when it answered: both on one clock,
 /// so how long it has run never depends on the reader's own.
 // SYNC: ChangeProgress <-> packages/weft-graph/src/protocol.ts ChangeProgress
