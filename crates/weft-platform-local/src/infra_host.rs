@@ -1222,6 +1222,7 @@ mod tests {
             }],
             keep_on_terminate: vec!["data".into()],
             health_rules: None,
+            notes: Vec::new(),
         }
     }
 

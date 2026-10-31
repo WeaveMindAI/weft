@@ -253,17 +253,13 @@ impl InfraCalls<'_> {
         };
         loop {
             let end: SetupEnd = self.at.call(ProgramCall::Infra(InfraCall::Setup { run }), StopSelf::Keep).await?;
-            let node = &self.node;
             match end {
                 SetupEnd::Completed => return Ok(()),
                 SetupEnd::Going => {
                     self.at.ctx.await_signal(LOOK_AGAIN).await?;
                 }
-                SetupEnd::Failed | SetupEnd::Cancelled => {
-                    return Err(WeftError::NodeFailed(format!(
-                        "the rebake of infra '{node}' {end}: its setup run {run} did not complete; `weft runs` shows it"
-                    )))
-                }
+                SetupEnd::Failed { reason } => return Err(rebake_ended(&self.node, "failed", run, reason)),
+                SetupEnd::Cancelled { reason } => return Err(rebake_ended(&self.node, "cancelled", run, reason)),
             }
         }
     }
@@ -279,6 +275,16 @@ impl InfraCalls<'_> {
             ))),
         }
     }
+}
+
+/// The error a rebake whose setup run `run` ended `how` (failed,
+/// cancelled) fails with: the reason the run recorded, or, when it
+/// recorded none, a pointer to `weft runs`.
+fn rebake_ended(node: &str, how: &str, run: crate::RunId, reason: Option<String>) -> WeftError {
+    WeftError::NodeFailed(match reason {
+        Some(reason) => format!("the rebake of infra '{node}' {how}: {reason}"),
+        None => format!("the rebake of infra '{node}' {how}: its setup run {run} did not complete; `weft runs` shows it"),
+    })
 }
 
 /// What reaches every infra copy of a project at once. See
@@ -343,5 +349,19 @@ impl AllInfraCalls<'_> {
             }
             self.at.ctx.await_signal(LOOK_AGAIN).await?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rebake_that_ended_says_its_reason_or_points_at_weft_runs() {
+        let run = crate::RunId::from_u128(3);
+        let failed = rebake_ended("db", "failed", run, Some("the extension is missing".into()));
+        assert_eq!(failed.to_string(), WeftError::NodeFailed("the rebake of infra 'db' failed: the extension is missing".into()).to_string());
+        let cancelled = rebake_ended("db", "cancelled", run, None).to_string();
+        assert!(cancelled.contains("the rebake of infra 'db' cancelled: its setup run") && cancelled.contains("`weft runs`"), "{cancelled}");
     }
 }

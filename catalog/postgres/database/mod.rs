@@ -1,12 +1,22 @@
 //! PostgresDatabase: a Postgres the project runs itself, handed out as
 //! an ordinary connection.
 //!
-//! Three pieces make one unit:
+//! Four pieces make one unit:
 //!   - an init container that writes a password to the shared volume
 //!     the first time and never again, so the spec carries no
 //!     credential and stays identical on every start;
-//!   - Postgres itself, reading that password file;
-//!   - a small server beside it that hands the password over once.
+//!   - Postgres itself, reading that password file, listening only
+//!     inside the unit;
+//!   - a pooler (PgBouncer) in front of it, the one door every client
+//!     comes through. Workers scale, a rollout runs old and new copies
+//!     side by side, frontends connect too: the clients are many and
+//!     change, while Postgres serves a fixed number of connections. The
+//!     pooler holds at most that number and makes every client past it
+//!     wait its turn, so the database is never asked for more than it
+//!     serves, however many clients there are;
+//!   - a small server beside them that hands the password over once,
+//!     gives the program its own role (never the superuser), and shows
+//!     the card.
 //!
 //! `run` reads its own published connection when it has one, and asks
 //! the database for the password when it has none or when the one it
@@ -20,8 +30,8 @@
 //! and any later run that reads only that output uses the saved value
 //! without running this node, so it asks the database nothing.
 //!
-//! The graph's `Reset password` button resets it in the database, and
-//! the credential container then pushes the new password to weft
+//! The graph's `Reset password` button resets it in the database and
+//! tells the pooler, and the credential container then pushes the new password to weft
 //! (`weft_core::infra::VALUES_URL_ENV`), which writes it into the
 //! connection this node published: no run of this node is involved.
 //!
@@ -45,9 +55,14 @@ use weft::{
     WeftResult,
 };
 
-use super::postgres::{mistake, MOST_AT_ONCE};
+use super::postgres::{mistake, IDLE_CLOSE};
 
+/// The port clients connect to: the pooler's. Postgres's own default, so
+/// a connection string reads like any other Postgres one.
 const SQL_PORT: u16 = 5432;
+/// Postgres's own port, on the unit's loopback only: nothing but the
+/// pooler and the unit's own checks ever dials it.
+const POSTGRES_PORT: u16 = 5433;
 const CREDENTIAL_PORT: u16 = 8099;
 /// The one disk and its two halves, ordinary subdirectories rather
 /// than separate volumes, so a restore can never bring back one
@@ -58,8 +73,58 @@ const SECRET_PATH: &str = "/store/secret";
 /// Where the Postgres image puts its unix socket; the credential
 /// container mounts the same directory.
 const SOCKET_PATH: &str = "/var/run/postgresql";
-/// The role Postgres creates on first boot, and the only one weft uses.
+/// The role Postgres creates on first boot: the superuser. It signs in
+/// only over the unit's unix socket (the card, a reset, a person
+/// operating the database), never through the pooler, so the slots
+/// Postgres keeps for a superuser are always there for it.
 const ADMIN_USER: &str = "weft";
+/// The role the program and every other client sign in as, through the
+/// pooler. It owns the program's database and is no superuser.
+const APP_USER: &str = "app";
+/// How long a session of [`APP_USER`] may sit idle before Postgres closes
+/// it, in seconds. This is what frees a connection nobody is using
+/// whoever holds it: a worker that lost its CPU between requests, a copy
+/// left behind by a rollout, a frontend's pool. It runs inside Postgres,
+/// which always has a CPU. A client that means to sit idle (a watching
+/// query) says so for its own session.
+const IDLE_SESSION_SECS: u64 = 60;
+// A worker hands out only connections idle for less than `IDLE_CLOSE`,
+// so one the database closed for idling is never handed to a run.
+const _: () = assert!(IDLE_CLOSE.as_secs() * 4 <= IDLE_SESSION_SECS);
+/// The directory the pooler shares with the credential container: the
+/// pooler's unix socket (its admin console, for the card and for telling
+/// it a new password) and the file of who may sign in. Scratch space,
+/// written afresh on every start.
+const POOLER_PATH: &str = "/run/pooler";
+/// Where the pooler's entrypoint writes the settings this node hands it.
+/// Inside the pooler's own container, so nothing else reads them.
+const POOLER_CONFIG_FILE: &str = "/tmp/pgbouncer.ini";
+const POOLER_HBA_FILE: &str = "/tmp/pgbouncer.hba";
+/// How many clients the pooler takes at once, waiting or served: twenty
+/// for each of a hundred workers. Measured on PgBouncer 1.25, two
+/// thousand clients waiting to sign in take about 5MB.
+const MOST_CLIENTS: u64 = 2000;
+/// The pooler's memory limit, in MiB, ample for [`MOST_CLIENTS`].
+const POOLER_MIB: u64 = 32;
+/// How long the pooler keeps a connection to Postgres that no client
+/// holds, in seconds: under [`IDLE_SESSION_SECS`], so it closes its own
+/// rather than finding them closed by Postgres.
+const POOLER_SERVER_IDLE_SECS: u64 = 30;
+/// The connections Postgres keeps for the superuser
+/// (`superuser_reserved_connections`, Postgres's own default, set so it
+/// is visible): the operator's way in on a database every client is
+/// waiting for.
+const SUPERUSER_RESERVED: u64 = 3;
+/// Connections left out of the pooler's on top of those: a connection
+/// the pooler just closed still counts in Postgres for the moment its
+/// process takes to exit, and a new one opened in that moment must not
+/// find Postgres full.
+const POOLER_MARGIN: u64 = 2;
+/// The share of the pooler's connections kept for watching queries,
+/// which each hold one for as long as their run watches: a quarter, at
+/// least one. Kept apart so watchers can never take every connection
+/// from queries, nor queries from watchers.
+const WATCH_SHARE: u64 = 4;
 /// The group the shared disk belongs to, so the container that mints
 /// the password can write it and Postgres, running as its own user,
 /// can read it without the file being readable to everything. 70 is
@@ -102,18 +167,154 @@ fn secret_mount() -> Mount {
 }
 
 /// Where the credential container reads its settings from, so the
-/// paths and the port are declared once, here, and the container
-/// cannot drift from them. The database and user names are what its
-/// card shows beside the password: the three a client signs in with.
-fn credential_env(database: &str) -> Vec<EnvEntry> {
+/// paths, the ports and the names are declared once, here, and the
+/// container cannot drift from them. The pooler's name for the database
+/// and the program's user are what its card shows beside the password:
+/// the three a client signs in with. The extensions are the ones it makes
+/// on every start, as JSON, since a container's settings hold no line
+/// break.
+// SYNC: credential_env <-> catalog/postgres/database/images/credential/bootstrap.py (the container's settings)
+fn credential_env(database: &str, extensions: &[String], version: &PostgresVersion) -> Vec<EnvEntry> {
     vec![
+        EnvEntry::new("WEFT_POSTGRES_MAJOR", version.major.to_string()),
+        EnvEntry::new("WEFT_CLOSES_IDLE_SESSIONS_FROM", PostgresVersion::CLOSES_IDLE_SESSIONS.to_string()),
+        // Empty on a Postgres that closes idle sessions.
+        EnvEntry::new("WEFT_POSTGRES_NOTE", version.note().unwrap_or_default()),
+        EnvEntry::new("WEFT_DATA_DIR", DATA_PATH),
         EnvEntry::new("WEFT_DATABASE", database),
+        EnvEntry::new("WEFT_POOLER_DATABASE", pooler_database(database)),
+        EnvEntry::new("WEFT_WATCH_DATABASE", watch_database(database)),
+        EnvEntry::new("WEFT_EXTENSIONS", serde_json::to_string(extensions).expect("a list of names serializes")),
         EnvEntry::new("WEFT_SECRET_DIR", SECRET_PATH),
         EnvEntry::new("WEFT_PASSWORD_FILE", password_file()),
         EnvEntry::new("WEFT_CREDENTIAL_PORT", CREDENTIAL_PORT.to_string()),
         EnvEntry::new("WEFT_SOCKET_DIR", SOCKET_PATH),
+        EnvEntry::new("WEFT_POSTGRES_PORT", POSTGRES_PORT.to_string()),
         EnvEntry::new("WEFT_ADMIN_USER", ADMIN_USER),
+        EnvEntry::new("WEFT_APP_USER", APP_USER),
+        EnvEntry::new("WEFT_IDLE_SESSION_SECONDS", IDLE_SESSION_SECS.to_string()),
+        EnvEntry::new("WEFT_POOLER_DIR", POOLER_PATH),
+        EnvEntry::new("WEFT_POOLER_PORT", SQL_PORT.to_string()),
+        EnvEntry::new("WEFT_POOLER_USERS_FILE", pooler_users_file()),
     ]
+}
+
+/// What the pooler's entrypoint reads beside its arguments
+/// ([`pooler_args`]): where to write its settings and its sign-in rules,
+/// the file of who may sign in that it waits for, and how many open files
+/// its clients need.
+// SYNC: pooler_env, pooler_args <-> catalog/postgres/database/images/pooler/entrypoint.sh
+fn pooler_env(tuning: &Tuning) -> Vec<EnvEntry> {
+    vec![
+        EnvEntry::new("WEFT_POOLER_CONFIG_FILE", POOLER_CONFIG_FILE),
+        EnvEntry::new("WEFT_POOLER_HBA_FILE", POOLER_HBA_FILE),
+        EnvEntry::new("WEFT_POOLER_USERS_FILE", pooler_users_file()),
+        // One per client and one per connection to Postgres, and room
+        // for the pooler's own (its log, its sockets, the files above).
+        EnvEntry::new("WEFT_POOLER_OPEN_FILES", (MOST_CLIENTS + tuning.query_pool + tuning.watch_pool + 64).to_string()),
+    ]
+}
+
+/// The pooler's settings and sign-in rules, as its container's arguments,
+/// one line each: `--config` and the lines of [`pooler_config`], then
+/// `--hba` and the lines of [`pooler_hba`]. Arguments rather than
+/// environment, which cannot carry a line break.
+pub fn pooler_args(database: &str, tuning: &Tuning) -> Vec<String> {
+    std::iter::once("--config".to_string())
+        .chain(pooler_config(database, tuning))
+        .chain(std::iter::once("--hba".to_string()))
+        .chain(pooler_hba(database))
+        .collect()
+}
+
+/// The name watching queries connect to `database` by: the same
+/// database, through the pooler's second door with its own connections
+/// ([`Tuning::watch_pool`]). Published on the connection as
+/// `watchDatabase`, which the watching node reads.
+pub fn watch_database(database: &str) -> String {
+    format!("{}_watch", pooler_database(database))
+}
+
+/// PgBouncer's settings. Session pooling: a client keeps the one
+/// Postgres connection it was handed until it lets go, so `SET`, a
+/// temporary table, an advisory lock, `LISTEN` and a prepared
+/// statement all hold across one firing's statements exactly as they
+/// would on a connection of its own. The pooler's part is only that it
+/// opens at most [`Tuning::query_pool`] connections for queries and
+/// [`Tuning::watch_pool`] for watchers, and that a client past them
+/// waits, however long, for one to come free: a run waits for the
+/// database the way it waits for anything else, and stops when the run
+/// does.
+///
+/// No password is in it: who may sign in is the file the credential
+/// container writes from the database itself.
+pub fn pooler_config(database: &str, tuning: &Tuning) -> Vec<String> {
+    let (door, watch) = (pooler_database(database), watch_database(database));
+    // The database's own name, quoted the way PgBouncer reads a value
+    // (a quote doubled), so any name Postgres has reaches it.
+    let backend = format!("host=127.0.0.1 port={POSTGRES_PORT} dbname='{}'", database.replace('\'', "''"));
+    [
+        "[databases]".to_string(),
+        format!("{door} = {backend} pool_size={}", tuning.query_pool),
+        format!("{watch} = {backend} pool_size={}", tuning.watch_pool),
+        String::new(),
+        "[pgbouncer]".to_string(),
+        "listen_addr = *".to_string(),
+        format!("listen_port = {SQL_PORT}"),
+        format!("unix_socket_dir = {POOLER_PATH}"),
+        "auth_type = hba".to_string(),
+        format!("auth_hba_file = {POOLER_HBA_FILE}"),
+        format!("auth_file = {}", pooler_users_file()),
+        format!("admin_users = {ADMIN_USER}"),
+        "pool_mode = session".to_string(),
+        // What a client left on a connection goes before the next one
+        // gets it.
+        "server_reset_query = DISCARD ALL".to_string(),
+        format!("max_client_conn = {MOST_CLIENTS}"),
+        // A client waits for a connection as long as it takes.
+        "query_wait_timeout = 0".to_string(),
+        format!("server_idle_timeout = {POOLER_SERVER_IDLE_SECS}"),
+        // A client whose machine vanished without closing (a worker
+        // instance gone mid-request) is found within about a minute and
+        // its connection given back, rather than after the two hours a
+        // kernel waits by default.
+        "tcp_keepalive = 1".to_string(),
+        "tcp_keepidle = 30".to_string(),
+        "tcp_keepintvl = 10".to_string(),
+        "tcp_keepcnt = 3".to_string(),
+        // Sent by JDBC and other drivers on every connect, and harmless
+        // to leave out; anything else a client asks for at sign-in that
+        // the pooler cannot carry is refused, never dropped.
+        "ignore_startup_parameters = extra_float_digits".to_string(),
+    ]
+    .into()
+}
+
+/// Who may sign in to the pooler, and how. The program's role, with its
+/// password, to the program's database and its watching door, from
+/// anywhere the endpoint lets in; the superuser only to the pooler's
+/// admin console, only over the pooler's unix socket, which only the
+/// credential container mounts. Nobody reaches the superuser through
+/// the pooler.
+pub fn pooler_hba(database: &str) -> Vec<String> {
+    let (door, watch) = (pooler_database(database), watch_database(database));
+    [
+        format!("local pgbouncer {ADMIN_USER} trust"),
+        format!("host {door},{watch} {APP_USER} 0.0.0.0/0 scram-sha-256"),
+        format!("host {door},{watch} {APP_USER} ::/0 scram-sha-256"),
+    ]
+    .into()
+}
+
+/// The file of who may sign in to the pooler, written by the credential
+/// container from the database's own records.
+fn pooler_users_file() -> String {
+    format!("{POOLER_PATH}/users")
+}
+
+/// The pooler's shared directory ([`POOLER_PATH`]).
+fn pooler_mount() -> Mount {
+    Mount::new("pooler", POOLER_PATH)
 }
 
 /// Postgres's unix socket, shared between it and the credential
@@ -136,15 +337,15 @@ fn password_file() -> String {
 /// What the machine keeps for everything that is not Postgres, in MiB:
 /// the operating system, Docker and the agent that runs the unit (about
 /// 256 together on the smallest cloud machine), plus the credential
-/// container's 64Mi limit.
-const BESIDE_POSTGRES_MIB: u64 = 256 + 64;
+/// container's 64Mi limit and the pooler's ([`POOLER_MIB`]).
+const BESIDE_POSTGRES_MIB: u64 = 256 + 64 + POOLER_MIB;
 /// What one connection costs Postgres before it sorts or hashes
 /// anything, in MiB: the server process each connection gets, with its
 /// caches of the tables and plans it has used.
 const PER_CONNECTION_MIB: u64 = 8;
 /// The most connections Postgres takes, however big the machine. Past a
-/// few hundred, Postgres slows down from managing its connections alone,
-/// and the answer to more clients is a pooler in front of it.
+/// few hundred, Postgres slows down from managing its connections alone;
+/// more clients than that wait at the pooler instead.
 const MOST_CONNECTIONS: u64 = 200;
 /// The background cleaners (`autovacuum_max_workers`, Postgres's
 /// default), each of which may use `maintenance_work_mem` at once.
@@ -165,6 +366,11 @@ pub struct Tuning {
     pub work_mem_kib: u64,
     pub maintenance_work_mem_mib: u64,
     pub effective_cache_size_mib: u64,
+    /// The connections the pooler opens for queries, and for watching
+    /// queries: together, everything Postgres serves but the
+    /// superuser's [`SUPERUSER_RESERVED`] and the [`POOLER_MARGIN`].
+    pub query_pool: u64,
+    pub watch_pool: u64,
 }
 
 impl Tuning {
@@ -189,17 +395,21 @@ impl Tuning {
     ///   - `effective_cache_size`, only a hint to the planner of how
     ///     much the disk cache holds: three quarters of the share.
     ///
+    /// The pooler's connections are what `max_connections` leaves, split
+    /// between queries and watchers ([`WATCH_SHARE`]).
+    ///
     /// `memory` is what the node asks for, which a cloud rounds UP to
     /// the machine it picks, so the settings never assume more memory
-    /// than there is. Refused when the share holds fewer connections
-    /// than one worker opens ([`MOST_AT_ONCE`]), because that worker's
-    /// own runs would then be refused by the database.
+    /// than there is. Refused when the share leaves the pooler no
+    /// connection for queries or none for watchers.
     pub fn for_machine(memory: &str) -> WeftResult<Tuning> {
-        let Split { share, shared_buffers_mib, maintenance_work_mem_mib, connections_mib, max_connections } = split(memory_mib(memory)?);
-        if max_connections < MOST_AT_ONCE as u64 {
+        let Split { share, shared_buffers_mib, maintenance_work_mem_mib, connections_mib, max_connections, query_pool, watch_pool } =
+            split(memory_mib(memory)?);
+        if query_pool == 0 || watch_pool == 0 {
             mistake!(
-                "memory {memory} leaves Postgres room for {max_connections} connections, fewer than \
-                 the {MOST_AT_ONCE} one worker of the program opens; raise `memory` to {LEAST_MEMORY_MIB}Mi or more"
+                "memory {memory} leaves Postgres room for {max_connections} connections, too few to keep \
+                 {SUPERUSER_RESERVED} for the superuser and still give queries and watchers one each; raise \
+                 `memory` to {LEAST_MEMORY_MIB}Mi or more"
             );
         }
         let each_kib = connections_mib * 1024 / max_connections;
@@ -210,6 +420,8 @@ impl Tuning {
             work_mem_kib: (each_kib - PER_CONNECTION_MIB * 1024) / 2,
             maintenance_work_mem_mib,
             effective_cache_size_mib: share * 3 / 4,
+            query_pool,
+            watch_pool,
         })
     }
 
@@ -218,6 +430,7 @@ impl Tuning {
     pub fn args(&self) -> Vec<String> {
         [
             format!("max_connections={}", self.max_connections),
+            format!("superuser_reserved_connections={SUPERUSER_RESERVED}"),
             format!("shared_buffers={}MB", self.shared_buffers_mib),
             format!("work_mem={}kB", self.work_mem_kib),
             format!("maintenance_work_mem={}MB", self.maintenance_work_mem_mib),
@@ -238,6 +451,8 @@ struct Split {
     maintenance_work_mem_mib: u64,
     connections_mib: u64,
     max_connections: u64,
+    query_pool: u64,
+    watch_pool: u64,
 }
 
 const fn split(machine_mib: u64) -> Split {
@@ -251,20 +466,160 @@ const fn split(machine_mib: u64) -> Split {
     let connections_mib = share.saturating_sub(shared_buffers_mib + CLEANERS * maintenance_work_mem_mib);
     let fit = connections_mib / (PER_CONNECTION_MIB + 2 * 4);
     let max_connections = if fit < MOST_CONNECTIONS { fit } else { MOST_CONNECTIONS };
-    Split { share, shared_buffers_mib, maintenance_work_mem_mib, connections_mib, max_connections }
+    let pooled = max_connections.saturating_sub(SUPERUSER_RESERVED + POOLER_MARGIN);
+    let watch_pool = match pooled / WATCH_SHARE {
+        0 if pooled >= 2 => 1,
+        share => share,
+    };
+    let query_pool = pooled - watch_pool;
+    Split { share, shared_buffers_mib, maintenance_work_mem_mib, connections_mib, max_connections, query_pool, watch_pool }
 }
 
 /// The least `memory` the node takes, in MiB: the smallest machine whose
-/// share holds the [`MOST_AT_ONCE`] connections one worker opens. Read
-/// off [`split`], so it moves with the formula; the `memory` input's
-/// description states it too, and a test holds the two together.
+/// share gives the pooler a connection for queries and one for
+/// watchers. Read off [`split`], so it moves with the formula; the
+/// `memory` input's description states it too, and a test holds the two
+/// together.
 pub const LEAST_MEMORY_MIB: u64 = {
     let mut mib = BESIDE_POSTGRES_MIB;
-    while split(mib).max_connections < MOST_AT_ONCE as u64 {
+    while split(mib).query_pool == 0 || split(mib).watch_pool == 0 {
         mib += 1;
     }
     mib
 };
+
+/// The `database` input as Postgres has the database: exactly as
+/// written, whatever it holds, because a database made under a name is
+/// found only under that name again, and a node pointing at another
+/// name points at a new, empty database. Refused only when nothing
+/// could carry it: empty, or with a line break or another control
+/// character, which no container's settings can hold.
+pub fn database_name(raw: &str) -> WeftResult<String> {
+    if raw.is_empty() {
+        mistake!("the `database` input is empty; name the database (app)");
+    }
+    if raw.chars().any(char::is_control) {
+        mistake!("database {raw:?} has a line break or another control character in it; name it without (app)");
+    }
+    Ok(raw.to_string())
+}
+
+/// The longest name the pooler can let clients in by as written: its
+/// watching door ([`watch_database`]) adds `_watch`, and Postgres and
+/// the pooler both keep 63 characters of a name.
+const MOST_DOOR_CHARS: usize = 63 - "_watch".len();
+
+/// The name a client signs in to `database` by, through the pooler, and
+/// so the one the connection carries. PgBouncer's settings take a
+/// database's name unquoted, which holds letters, digits, `_` and `-`
+/// (a space, a dot or a quote stops it reading its settings at all);
+/// `pgbouncer` is its own console, and its sign-in rules read `all`,
+/// `sameuser`, `samerole`, `samegroup` and `replication` as words of their
+/// own ([`HBA_WORDS`]). So any other name like that, short enough for its
+/// watching door, is the door itself; the rest are each given one made
+/// from it, `db_`, the characters of it that fit, and 8 hex of a hash of
+/// the whole name so two names never share a door, while the pooler
+/// still hands every client to the database under its own name
+/// ([`pooler_config`]).
+pub fn pooler_database(database: &str) -> String {
+    let plain = database.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if plain && database.len() <= MOST_DOOR_CHARS && database != "pgbouncer" && !HBA_WORDS.iter().any(|word| word.eq_ignore_ascii_case(database)) {
+        return database.to_string();
+    }
+    let kept: String = database
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .take(40)
+        .collect();
+    format!("db_{kept}_{:08x}", name_hash(database) as u32)
+}
+
+/// The database names PgBouncer's sign-in rules (`auth_hba_file`, read
+/// the way Postgres reads `pg_hba.conf`) take as keywords rather than as a
+/// database: a rule naming `sameuser` matches only a database named after
+/// the user signing in. Compared ignoring case, which costs a name like
+/// `All` nothing but its own door.
+const HBA_WORDS: [&str; 5] = ["all", "sameuser", "samerole", "samegroup", "replication"];
+
+/// A hash of `name` that every build of weft computes the same (64-bit
+/// FNV-1a): the door [`pooler_database`] makes is published on the
+/// connection, so it must not move between versions.
+fn name_hash(name: &str) -> u64 {
+    name.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// The `extensions` input: each extension the program's database needs,
+/// as Postgres names it, made by the superuser on every start
+/// (`bootstrap.py`, `converge`). An empty name, or one with a control
+/// character, is refused here; one Postgres does not know fails the start
+/// naming it.
+pub fn extension_names(raw: Vec<String>) -> WeftResult<Vec<String>> {
+    for name in &raw {
+        if name.is_empty() || name.chars().any(char::is_control) {
+            mistake!("extension {name:?} in `extensions` is not a name; write each as Postgres names it (pg_trgm)");
+        }
+    }
+    Ok(raw)
+}
+
+/// How a database on a Postgres older than 14 moves to 14 or later: dump
+/// and restore, while it still runs (its card answers, and when it was set
+/// up with `reachable` on its address is a door on this machine).
+// SYNC: MOVE_TO_14 <-> catalog/postgres/database/metadata.json (the old `version` rule's message)
+const MOVE_TO_14: &str = "Postgres cannot open an older version's data, so the data moves by dump and restore while \
+     the old database still runs. Dump it: `weft infra press <node> reset_password`, then `weft infra env <node> \
+     --into old.env --set PGUSER=User --set PGDATABASE=Database --as PGPASSWORD`, and with those exported, `pg_dump \
+     -Fc -h <host> -p <port> -f data.dump` at the address `weft infra list-doors` prints for it (turn `reachable` on \
+     first if it is off). Restore it: add a PostgresDatabase on 17 with `reachable` on, start it, write its env the \
+     same way, `pg_restore --no-owner -h <host> -p <port> -d \"$PGDATABASE\" data.dump`, and wire the new node where \
+     the old one was";
+
+/// The Postgres a `version` input names: the image tag, as written, and
+/// its major version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresVersion {
+    pub tag: String,
+    pub major: u32,
+}
+
+impl PostgresVersion {
+    /// The first major that closes idle sessions (`idle_session_timeout`),
+    /// which this node sets on the program's role. A NEW database is made
+    /// on this or later only (the init container refuses an older one on an
+    /// empty disk, the one place that can tell); an existing one on an older
+    /// Postgres keeps running without the limit, said by [`Self::note`].
+    pub const CLOSES_IDLE_SESSIONS: u32 = 14;
+
+    /// What `weft infra status` and the card warn of a database on a
+    /// Postgres that does not close idle sessions, or `None` on one that does.
+    pub fn note(&self) -> Option<String> {
+        (self.major < Self::CLOSES_IDLE_SESSIONS).then(|| {
+            format!(
+                "Postgres {} does not close a connection a client left idle, so connections an idle worker or an \
+                 old revision holds stay taken until the pooler's run out; a new database needs 14 or later. To \
+                 move to 14 or later: {MOVE_TO_14}",
+                self.tag
+            )
+        })
+    }
+}
+
+/// The `version` input as a Postgres this node can run, written as an
+/// image tag names one: a major version of at most four digits and at
+/// most one minor (`17`, `16.4`), with no leading zero, kept as written
+/// for the tag.
+// SYNC: postgres_version <-> catalog/postgres/database/metadata.json (the two `version` rules)
+pub fn postgres_version(raw: &str) -> WeftResult<PostgresVersion> {
+    let number = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) && (part == "0" || !part.starts_with('0'));
+    let (major, minor) = raw.split_once('.').map_or((raw, None), |(major, minor)| (major, Some(minor)));
+    if !number(major) || major == "0" || major.len() > 4 || minor.is_some_and(|minor| !number(minor)) {
+        mistake!("version '{raw}' is not a Postgres version; write its major version (17)");
+    }
+    match major.parse::<u32>() {
+        Ok(major) => Ok(PostgresVersion { tag: raw.to_string(), major }),
+        Err(_) => mistake!("version '{raw}' is not a Postgres version; write its major version (17)"),
+    }
+}
 
 /// A memory size as the node's `memory` input writes it (`1Gi`, `512Mi`,
 /// `2G`, `1500M`), in whole MiB, rounded down so nothing is planned for
@@ -288,9 +643,9 @@ impl Node for PostgresDatabaseNode {
         _ctx: InfraProvisionContext,
         input: ValueBag,
     ) -> WeftResult<InfraSpec> {
-        let database: String = input.get("database")?;
+        let database = database_name(&input.get::<String>("database")?)?;
         let storage: String = input.get("storage")?;
-        let version: String = input.get("version")?;
+        let version = postgres_version(&input.get::<String>("version")?)?;
         // Whether anything outside this program may connect. The
         // author's decision, read here because the spec IS the answer:
         // a person reading this node sees what is reachable, and
@@ -301,6 +656,7 @@ impl Node for PostgresDatabaseNode {
         let memory: String = input.get("memory")?;
         let machine = MachineShape { cpu: input.opt("cpu")?, memory: Some(memory.clone()), kind: input.opt::<String>("machineType")?.filter(|t| !t.trim().is_empty()), gpu: None };
         let tuning = Tuning::for_machine(&memory)?;
+        let extensions = extension_names(input.opt::<Vec<String>>("extensions")?.unwrap_or_default())?;
 
         let credential = Image::Local { name: "credential".into() };
         Ok(InfraSpec {
@@ -311,13 +667,16 @@ impl Node for PostgresDatabaseNode {
                 name: "db".into(),
                 init_containers: vec![Container::new("mint", credential.clone())
                     .with_args(vec!["mint".into()])
-                    .with_env(credential_env(&database))
+                    .with_env(credential_env(&database, &extensions, &version))
                     .with_mounts(vec![store_mount()])],
                 containers: vec![
                     Container::new("postgres", Image::Upstream {
-                        reference: format!("postgres:{version}-alpine"),
+                        reference: format!("postgres:{}-alpine", version.tag),
                     })
-                    .with_args(tuning.args())
+                    // Only the unit's own loopback: every client comes
+                    // through the pooler, which is what keeps the
+                    // connections it is asked for to what it serves.
+                    .with_args(tuning.args().into_iter().chain(["-c".into(), "listen_addresses=127.0.0.1".into()]).collect())
                     // Postgres's share of the machine, so going past it
                     // is an out-of-memory kill of this container that
                     // the platform can see and name, rather than the
@@ -333,12 +692,11 @@ impl Node for PostgresDatabaseNode {
                         // mount point with lost+found in it, so it
                         // gets a subdirectory of the mount.
                         EnvEntry::new("PGDATA", DATA_PATH),
+                        // The port as the image's entrypoint reads it,
+                        // for the server and for the setup it runs on
+                        // first boot alike; the pooler takes 5432.
+                        EnvEntry::new("PGPORT", POSTGRES_PORT.to_string()),
                     ])
-                    .with_ports(vec![ContainerPort {
-                        name: "sql".into(),
-                        port: SQL_PORT,
-                        protocol: Protocol::Tcp,
-                    }])
                     .with_mounts(vec![store_mount(), socket_mount()])
                     // Postgres accepts TCP while it is still starting up
                     // and refuses every connection, so the port being
@@ -348,7 +706,7 @@ impl Node for PostgresDatabaseNode {
                         // Over TCP, not the unix socket: the entrypoint
                         // runs a temporary socket-only server while it
                         // initialises, so a socket check reports ready
-                        // while port 5432 is still closed. `-d postgres`
+                        // while the port is still closed. `-d postgres`
                         // because without one the check signs in to a
                         // database named after the user, which does not
                         // exist, and the server logs that on every check.
@@ -356,6 +714,8 @@ impl Node for PostgresDatabaseNode {
                             "pg_isready".into(),
                             "-h".into(),
                             "127.0.0.1".into(),
+                            "-p".into(),
+                            POSTGRES_PORT.to_string(),
                             "-U".into(),
                             ADMIN_USER.into(),
                             "-d".into(),
@@ -363,19 +723,40 @@ impl Node for PostgresDatabaseNode {
                         ])
                         .with_initial_delay(5),
                     ),
+                    // Before the pooler: a unit says why it is not ready by its
+                    // first container that is not, and the pooler only waits
+                    // on this one, which knows why (`/health`).
                     Container::new("credential", credential)
                         .with_args(vec!["serve".into()])
-                        .with_env(credential_env(&database))
+                        .with_env(credential_env(&database, &extensions, &version))
                         .with_ports(vec![ContainerPort {
                             name: "http".into(),
                             port: CREDENTIAL_PORT,
                             protocol: Protocol::Tcp,
                         }])
                         .with_limits(Limits { cpu: Some("0.1".into()), memory: Some("64Mi".into()) })
-                        .with_mounts(vec![secret_mount(), socket_mount()])
+                        .with_mounts(vec![secret_mount(), socket_mount(), pooler_mount()])
                         .with_readiness(
                             Probe::http(HEALTH_PATH, CREDENTIAL_PORT).with_initial_delay(2),
                         ),
+                    Container::new("pooler", Image::Local { name: "pooler".into() })
+                        .with_args(pooler_args(&database, &tuning))
+                        .with_env(pooler_env(&tuning))
+                        .with_ports(vec![ContainerPort {
+                            name: "sql".into(),
+                            port: SQL_PORT,
+                            protocol: Protocol::Tcp,
+                        }])
+                        // No CPU limit: every byte a client and the
+                        // database exchange goes through it.
+                        .with_limits(Limits { cpu: None, memory: Some(format!("{POOLER_MIB}Mi")) })
+                        .with_mounts(vec![pooler_mount()])
+                        // Its entrypoint starts PgBouncer only once the
+                        // database's sign-ins are written, so a bound
+                        // port is a pooler that can let clients in. The
+                        // credential container's own readiness waits for
+                        // the same thing to be current.
+                        .with_readiness(Probe::tcp(SQL_PORT).with_initial_delay(2)),
                 ],
                 fs_group: Some(POSTGRES_GID),
                 machine,
@@ -385,9 +766,12 @@ impl Node for PostgresDatabaseNode {
                 Volume { name: "store".into(), kind: VolumeKind::Disk { size: storage, class: None } },
                 // The socket lives and dies with the unit.
                 Volume { name: "socket".into(), kind: VolumeKind::Scratch { size_limit: None } },
+                // So does the pooler's, with who may sign in, which the
+                // credential container writes afresh on every start.
+                Volume { name: "pooler".into(), kind: VolumeKind::Scratch { size_limit: None } },
             ],
             // `sql` is the only endpoint that may ever be reachable,
-            // and only when the author asked: reaching Postgres there
+            // and only when the author asked: reaching the pooler there
             // still costs a password, so letting a client at it gives
             // nobody anything they did not already have. That is what
             // lets a frontend on the same machine use this database
@@ -402,7 +786,7 @@ impl Node for PostgresDatabaseNode {
             endpoints: vec![
                 Endpoint {
                     name: "sql".into(),
-                    target: EndpointTarget::Unit { unit: "db".into(), container: "postgres".into(), port: "sql".into() },
+                    target: EndpointTarget::Unit { unit: "db".into(), container: "pooler".into(), port: "sql".into() },
                     expose: if reachable { Expose::SameNetwork } else { Expose::Project },
                 },
                 Endpoint {
@@ -413,16 +797,18 @@ impl Node for PostgresDatabaseNode {
             ],
             keep_on_terminate: Vec::new(),
             health_rules: None,
+            notes: version.note().into_iter().collect(),
         })
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let database: String = ctx.inputs.get("database")?;
+        let database = database_name(&ctx.inputs.get::<String>("database")?)?;
         // Three asks that need nothing from each other, so they go out
         // together.
         let (sql, credential, published) =
             tokio::try_join!(ctx.endpoint("sql"), ctx.endpoint("credential"), ctx.published_access())?;
         let (host, port) = sql.host_and_port()?;
+        signs_in_as_app(&credential).await?;
         let published = match published {
             Some(access) => Some(ctx.open(&access).await?),
             None => None,
@@ -455,8 +841,11 @@ impl Node for PostgresDatabaseNode {
         // answers on a new one, and the connection must follow it.
         values.insert("host".to_string(), host);
         values.insert("port".to_string(), port.to_string());
-        values.insert("database".to_string(), database);
-        values.insert("user".to_string(), ADMIN_USER.to_string());
+        // The program signs in as its own role, through the pooler; the
+        // superuser is never on a connection.
+        values.insert("watchDatabase".to_string(), watch_database(&database));
+        values.insert("database".to_string(), pooler_database(&database));
+        values.insert("user".to_string(), APP_USER.to_string());
         // SYNC: the published `password` <-> images/credential/bootstrap.py (push_values)
         values.insert("password".to_string(), password.clone());
         // Inside the project's own network; the database serves no TLS.
@@ -480,6 +869,25 @@ impl Node for PostgresDatabaseNode {
         }
 
         ctx.pulse_downstream(NodeOutput::new().set("access", access)).await
+    }
+}
+
+/// Refuse to publish a connection for a unit from before the program had
+/// its own role: it has no `app`, and every sign-in would be refused with
+/// nothing saying why. Such a unit is one this node's infra was not
+/// upgraded for yet, and its credential server's health answer names no
+/// role.
+// SYNC: signs_in_as_app <-> catalog/postgres/database/images/credential/bootstrap.py (signsInAs)
+async fn signs_in_as_app(credential: &weft::EndpointHandle) -> WeftResult<()> {
+    let answer = credential.call(EndpointMethod::Get, HEALTH_PATH, None).await?;
+    match answer.get("signsInAs").and_then(|v| v.as_str()) {
+        Some(user) if user == APP_USER => Ok(()),
+        other => weft::node_bail!(
+            "this database's infra was set up by an older weft, which signs the program in as {}, not as \
+             `{APP_USER}`. Run `weft infra upgrade <this node>`: the database keeps its data and gives the \
+             program its own role, and the upgrade runs this node again.",
+            other.map_or("its superuser".to_string(), |u| format!("`{u}`"))
+        ),
     }
 }
 

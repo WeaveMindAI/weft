@@ -2,8 +2,9 @@
 //! (`RunContext::shared`): an open pool of database connections, a
 //! set of ready interpreter processes. Each is built the first time a run
 //! asks for it, handed to every run after that, let go once nothing used
-//! it for the project's `shared_idle_seconds` worker lever, and gone with
-//! the worker. A worker serves one project, so nothing here is ever
+//! it for the project's `shared_idle_seconds` worker lever, and let go
+//! when the worker stops ([`Shared::let_go_all`]), once its last run
+//! ended, rather than held until the process is gone. A worker serves one project, so nothing here is ever
 //! another project's, and a project that scales to zero holds nothing.
 //!
 //! A run asks by a key ([`SharedKey`]), and the KIND of key decides
@@ -251,6 +252,17 @@ impl Shared {
         });
     }
 
+    /// Let go of every thing, used or not: the worker is stopping and its
+    /// last run ended, so nothing will ask again, and what a thing holds
+    /// (a pool's connections to a database, interpreter processes) is
+    /// given back now rather than whenever the process goes. A thing a
+    /// handle still holds goes when that handle does.
+    pub fn let_go_all(&self) {
+        let all = std::mem::take(&mut *self.things.lock().expect("shared poisoned"));
+        // Dropped outside the lock: letting a thing go may take its time.
+        drop(all);
+    }
+
     /// How many things are held.
     pub fn len(&self) -> usize {
         self.things.lock().expect("shared poisoned").len()
@@ -386,6 +398,31 @@ mod tests {
         let other = shared.get_or_build::<usize, _, _>("pool", 0, Some(5), || async { Ok(1) }).await;
         assert!(matches!(other, Err(crate::error::WeftError::Config(why)) if why.contains("same limit")));
         assert!(shared.get_or_build::<usize, _, _>("pool", 0, None, || async { Ok(1) }).await.is_err(), "none is another limit too");
+    }
+
+    /// Everything goes at once, used recently or not, and a thing a
+    /// handle still holds goes when the handle does.
+    #[tokio::test]
+    async fn letting_go_of_all_drops_every_thing_and_a_held_one_with_its_handle() {
+        struct Dropped(Arc<AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let shared = Shared::new(Duration::from_secs(60));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let build = |slot: &'static str| {
+            let dropped = dropped.clone();
+            shared.get_or_build::<Dropped, _, _>(slot, 0, None, move || async move { Ok(Dropped(dropped)) })
+        };
+        drop(build("idle").await.unwrap());
+        let held = build("held").await.unwrap();
+        shared.let_go_all();
+        assert!(shared.is_empty());
+        assert_eq!(dropped.load(Ordering::SeqCst), 1, "the one nothing holds, at once");
+        drop(held);
+        assert_eq!(dropped.load(Ordering::SeqCst), 2, "the held one, with its handle");
     }
 
     #[test]

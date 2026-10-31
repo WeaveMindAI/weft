@@ -867,10 +867,12 @@ async fn setup_ended(
     run_id: weft_core::RunId,
 ) -> anyhow::Result<Option<Result<(), SyncNotLanded>>> {
     use crate::api::run::TerminalOutcome;
-    Ok(crate::api::run::terminal_outcome(&state.pg_pool, run_id).await?.map(|outcome| match outcome {
-        TerminalOutcome::Completed => Ok(()),
-        TerminalOutcome::Cancelled => Err(SyncNotLanded::Cancelled("infra setup cancelled".into())),
-        _ => Err(SyncNotLanded::Failed(StatusCode::INTERNAL_SERVER_ERROR, "infra setup failed".into())),
+    Ok(crate::api::run::terminal_outcome(&state.pg_pool, run_id).await?.map(|outcome| {
+        let Some(message) = outcome.not_landed("infra setup") else { return Ok(()) };
+        Err(match outcome {
+            TerminalOutcome::Cancelled(_) => SyncNotLanded::Cancelled(message),
+            _ => SyncNotLanded::Failed(StatusCode::INTERNAL_SERVER_ERROR, message),
+        })
     }))
 }
 
@@ -940,14 +942,14 @@ pub(crate) async fn await_infra_setup(
                         if c == run_id => {
                         return Err(SyncNotLanded::Failed(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("infra setup failed: {error}"),
+                            crate::api::run::not_landed("infra setup", "failed", Some(&error)),
                         ));
                     }
                     Ok(crate::events::DispatcherEvent::RunCancelled { run_id: c, reason, .. })
                         if c == run_id => {
                         // The user's infra-cancel (or a per-run stop)
                         // interrupted the provisioning run.
-                        return Err(SyncNotLanded::Cancelled(format!("infra setup cancelled: {reason}")));
+                        return Err(SyncNotLanded::Cancelled(crate::api::run::not_landed("infra setup", "cancelled", Some(&reason))));
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -3559,8 +3561,11 @@ async fn move_paused_runs(
 }
 
 /// Tell the platform to have the workers of the image `binary_hash`
-/// ready (`Runner::prepare`). Workers of other images are left as they
-/// are: what runs there finishes there, and they stop once idle.
+/// ready (`Runner::prepare`) with the settings the project has stored,
+/// then settle them on those (`crate::front::settle`): what the image
+/// still runs under other settings is let go. Workers of other images are
+/// left as they are: what runs there finishes there, and they stop once
+/// idle.
 async fn prepare_running_image(
     state: &DispatcherState,
     project_id: uuid::Uuid,
@@ -3568,8 +3573,10 @@ async fn prepare_running_image(
 ) -> Result<(), (StatusCode, String)> {
     let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("prepare the workers: {e:#}"));
     let tenant = state.tenant_router.tenant_for_project(project_id).await.map_err(internal)?;
-    let target = crate::delivery::worker_target(state, tenant.as_str(), project_id, binary_hash).await.map_err(internal)?;
-    state.runner.prepare(&target).await.map_err(internal)
+    let target = crate::delivery::current_worker_target(state, tenant.as_str(), project_id, binary_hash).await.map_err(internal)?;
+    state.runner.prepare(&target).await.map_err(internal)?;
+    crate::front::settle(state, tenant.as_str(), project_id, binary_hash).await;
+    Ok(())
 }
 
 
@@ -3766,7 +3773,7 @@ pub(crate) async fn run_trigger_setup(
             {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("trigger setup failed: {error}"),
+                    crate::api::run::not_landed("trigger setup", "failed", Some(&error)),
                 ));
             }
             Ok(crate::events::DispatcherEvent::RunCancelled { run_id: c, reason, .. })
@@ -3774,7 +3781,7 @@ pub(crate) async fn run_trigger_setup(
             {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("trigger setup cancelled: {reason}"),
+                    crate::api::run::not_landed("trigger setup", "cancelled", Some(&reason)),
                 ));
             }
             Ok(_) => continue,
@@ -3783,19 +3790,10 @@ pub(crate) async fn run_trigger_setup(
                 // The journal is authoritative: re-query rather than
                 // fail the trigger-setup on a transient lag.
                 match crate::api::run::terminal_outcome(&state.pg_pool, run_id).await {
-                    Ok(Some(crate::api::run::TerminalOutcome::Completed)) => break,
-                    Ok(Some(crate::api::run::TerminalOutcome::Failed)) => {
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "trigger setup failed".into(),
-                        ))
-                    }
-                    Ok(Some(crate::api::run::TerminalOutcome::Cancelled)) => {
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "trigger setup cancelled".into(),
-                        ))
-                    }
+                    Ok(Some(outcome)) => match outcome.not_landed("trigger setup") {
+                        None => break,
+                        Some(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+                    },
                     Ok(None) => continue, // still in flight; keep waiting
                     Err(e) => {
                         return Err((

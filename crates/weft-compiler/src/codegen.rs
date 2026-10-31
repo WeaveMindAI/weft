@@ -1344,6 +1344,28 @@ fn baked_type_decls(catalog: &FsCatalog) -> String {
         .collect()
 }
 
+/// The recipes of the services `node_types` publish, as the JSON of a
+/// `Vec<AccessSpec>` a node-test binary bakes in. Each is resolved the
+/// way enrich resolves it for a project build
+/// ([`weft_core::access::spec::published_recipe`], against the WHOLE
+/// catalog), so a package publishing a service another package declares
+/// tests against the same recipe production holds it to, and a node
+/// publishing a service nothing declares is refused here, at emit time.
+pub(crate) fn baked_published_services(catalog: &FsCatalog, node_types: &[String]) -> BuildResult<String> {
+    use weft_core::MetadataCatalog as _;
+    let mut services: BTreeMap<&str, &weft_core::AccessSpec> = BTreeMap::new();
+    for node_type in node_types {
+        let Some(service) = catalog.lookup(node_type).and_then(|m| m.publishes.as_deref()) else {
+            continue;
+        };
+        let spec = weft_core::access::spec::published_recipe(catalog.all(), node_type, service)
+            .map_err(BuildError::Build)?;
+        services.insert(&spec.service, spec);
+    }
+    let specs: Vec<&weft_core::AccessSpec> = services.into_values().collect();
+    serde_json::to_string(&specs).map_err(|e| BuildError::Build(format!("serialize the published services: {e}")))
+}
+
 fn write_main_rs(src_dir: &Path, catalog: &FsCatalog) -> BuildResult<()> {
     std::fs::write(src_dir.join("main.rs"), worker_main_source(&baked_type_decls(catalog))).map_err(BuildError::Io)?;
     Ok(())
@@ -1622,6 +1644,9 @@ pub fn emit_test_crate(
     };
     let mut node_types = package.node_types.clone();
     node_types.sort();
+    // Resolved before anything is written, so a node publishing a
+    // service no package declares leaves no half-emitted crate behind.
+    let published_services = baked_published_services(catalog, &node_types)?;
     let pkg = PackageEmit {
         package,
         node_types: node_types.clone(),
@@ -1717,7 +1742,8 @@ path = "src/main.rs"
     let main_rs = format!(
         r#"//! Per-package node-test binary. All runner logic lives in
 //! `weft_engine::test_runner`; this file only bakes the project's
-//! type declarations and the package's node registry.
+//! type declarations, the recipes of the services the package's nodes
+//! publish, and the package's node registry.
 
 mod registry;
 
@@ -1731,7 +1757,9 @@ fn main() -> std::process::ExitCode {{
     )
     .expect("first registry install in this process");
 
-    weft_engine::test_runner::main(&registry::PROJECT_CATALOG)
+    // The recipe each node of this package publishes against, resolved
+    // at emit time against the whole catalog, as a project build does.
+    weft_engine::test_runner::main(&registry::PROJECT_CATALOG, {published_services:?})
 }}
 "#,
     );

@@ -47,6 +47,14 @@ pub struct InfraSpec {
     /// empty list: it runs none.
     #[serde(default, rename = "healthRules", skip_serializing_if = "Option::is_none")]
     pub health_rules: Option<Vec<super::health::HealthRule>>,
+
+    /// What the node says a person should know about the copy it declares
+    /// while it runs (it runs short of something it would normally have),
+    /// one plain sentence each. `weft infra status` prints them as
+    /// warnings, beside what the host itself runs differently from what
+    /// was asked. Usually empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// What a terminate does with the disks the node lists in
@@ -640,6 +648,7 @@ mod tests {
             }],
             keep_on_terminate: Vec::new(),
             health_rules: None,
+            notes: Vec::new(),
         }
     }
 

@@ -5,7 +5,11 @@
 //! project's workers can prove which project they are and nothing else.
 //! Each program and worker settings the project runs is a revision of that
 //! service, under a tag of its own (`names::worker_tag`) whose address
-//! weft's own calls use; the project's callers reach the service's own
+//! weft's own calls use, until the dispatcher settles the project's
+//! workers on other settings for the same program and it is deleted
+//! (`Runner::settle`: which settings are current is the dispatcher's to
+//! say, from what the project has stored, never this runner's to guess
+//! from the revisions); the project's callers reach the service's own
 //! address, whose traffic goes to the project's front
 //! (`Runner::front`). Instances kept warm (`min_instances`) are the
 //! front's alone: the service holds them (Cloud Run splits a service's
@@ -315,6 +319,80 @@ fn takes_every_call(found: &Value, revision: &str) -> bool {
         }
     }
     all == 100
+}
+
+/// The revisions of the service `found` that the tag `tag` supersedes,
+/// once Cloud Run serves `tag`: every one of `revisions` (the service's,
+/// as Cloud Run v2 lists them) running the same image (`image_hash`)
+/// under another tag, that is with other settings. Each keeps instances
+/// of its own, under its own `maxInstanceCount`, for as long as it is
+/// there. Nothing goes before `tag` serves: the calls would have nowhere
+/// to go. Whether `tag`'s settings are the current ones is its caller's to
+/// know ([`Runner::settle`]): nothing on the service says so, since a
+/// dispatcher copy holding settings from before a change can deploy a
+/// revision with them after the current one. A revision of another image
+/// is left to `Runner::forget_image`.
+fn superseded(found: &Value, revisions: &[Value], tag: &str, image_hash: &str) -> Vec<String> {
+    if tagged_revision(found, tag).is_none() || tag_address(found, tag).is_none() {
+        return Vec::new();
+    }
+    revisions
+        .iter()
+        .filter(|r| r.pointer("/labels/weft-image").and_then(Value::as_str) == Some(image_hash))
+        .filter(|r| revision_tag(r).is_some_and(|other| other != tag))
+        .filter_map(revision_name)
+        .map(str::to_string)
+        .collect()
+}
+
+/// The ones of `going` that can be deleted: all but the revision the
+/// service `found`'s template names, which Cloud Run refuses to delete
+/// (it is the service's latest). Taken out of the traffic like the rest,
+/// it takes no calls, scales to zero, and goes with the next settling once
+/// a newer write named another revision in the template.
+fn deletable(found: &Value, going: Vec<String>) -> Vec<String> {
+    let template = found.pointer("/template/revision").and_then(Value::as_str);
+    going.into_iter().filter(|g| Some(g.as_str()) != template).collect()
+}
+
+/// The tags (their `weft-tag` labels) of the ones of `revisions` named
+/// in `going`: the tags whose remembered addresses retiring them ends.
+fn tags_of(revisions: &[Value], going: &[String]) -> Vec<String> {
+    revisions
+        .iter()
+        .filter(|r| revision_name(r).is_some_and(|name| going.iter().any(|g| g == name)))
+        .filter_map(revision_tag)
+        .map(str::to_string)
+        .collect()
+}
+
+/// A Cloud Run v2 revision's short name (the last part of its `name`).
+fn revision_name(revision: &Value) -> Option<&str> {
+    revision.get("name").and_then(Value::as_str).and_then(|n| n.rsplit('/').next())
+}
+
+/// The tag weft labeled a Cloud Run v2 revision with.
+fn revision_tag(revision: &Value) -> Option<&str> {
+    revision.pointer("/labels/weft-tag").and_then(Value::as_str)
+}
+
+/// The service `found`'s traffic with every entry naming one of `going`
+/// taken out and the calls they took handed to the tag `to`, or `None`
+/// when no entry names one. `going` runs the same program as `to`
+/// ([`superseded`]), so its callers are answered the same.
+fn traffic_handed_over(found: &Value, going: &[String], to: &str) -> Option<Value> {
+    let percent = |t: &Value| t.get("percent").and_then(Value::as_u64).unwrap_or(0);
+    let traffic: Vec<Value> = found.get("traffic").and_then(Value::as_array).cloned().unwrap_or_default();
+    let (leaving, mut kept): (Vec<Value>, Vec<Value>) =
+        traffic.into_iter().partition(|t| t.get("revision").and_then(Value::as_str).is_some_and(|r| going.iter().any(|g| g == r)));
+    if leaving.is_empty() {
+        return None;
+    }
+    let handed: u64 = leaving.iter().map(percent).sum();
+    if let Some(t) = kept.iter_mut().find(|t| t.get("tag").and_then(Value::as_str) == Some(to)) {
+        t["percent"] = json!(percent(t) + handed);
+    }
+    Some(Value::Array(kept.into_iter().filter(written_back).collect()))
 }
 
 /// Whether Cloud Run takes a traffic entry back as written: one that
@@ -652,6 +730,86 @@ impl CloudRunRunner {
         sent
     }
 
+    /// Retire every revision `target`'s revision supersedes on its
+    /// project's service ([`superseded`]), once `target`'s tag serves: out
+    /// of its traffic first (Cloud Run refuses to delete a revision it
+    /// routes to), its calls handed to `target`'s, then deleted, which ends
+    /// its instances and whatever they hold (database connections,
+    /// memory); a worker told to stop hands its recorded runs back. The
+    /// template's revision is taken out of the traffic and kept
+    /// ([`deletable`]). Decided from the service as Cloud Run holds it, so
+    /// whatever one attempt leaves the next retires.
+    async fn retire_superseded(&self, target: &WorkerTarget) -> anyhow::Result<()> {
+        let service = names::worker_service(target.project);
+        let tag = Self::tag_of(target);
+        let image_hash = names::image_hash(&target.image);
+        let url = self.service_url(target.project);
+        let revisions = self.revisions(&url).await?;
+        let gate = self.gate(&service);
+        let untagged = async {
+            let _one = gate.lock().await;
+            loop {
+                let Some(found) = self.google.get_opt(&url).await? else { return Ok((Vec::new(), Vec::new())) };
+                let going = superseded(&found, &revisions, &tag, &image_hash);
+                let Some(traffic) = traffic_handed_over(&found, &going, &tag) else {
+                    return Ok((going.clone(), deletable(&found, going)));
+                };
+                let template = found.get("template").cloned().ok_or_else(|| anyhow::anyhow!("{service} has no template"))?;
+                let body = self.service_body(target.project, template, traffic, warm_of(&found), found.get("etag").and_then(Value::as_str));
+                match self.write_service(&url, &body).await {
+                    // Another copy is changing the service: read it again
+                    // in a moment.
+                    Err(e) if is_status(&e, 409) || is_status(&e, 412) => tokio::time::sleep(SETTLE_POLL).await,
+                    written => return written.map(|()| (going.clone(), deletable(&found, going))),
+                }
+            }
+        }
+        .await;
+        self.ungate(&service, &gate);
+        let (untagged, deleting) = untagged?;
+        // Out of the traffic, their tags' addresses no longer answer.
+        let retired = tags_of(&revisions, &untagged);
+        self.known.lock().retain(|(s, t), _| *s != service || !retired.contains(t));
+        // Every one is tried, so the error names all that are left.
+        let mut left = Vec::new();
+        for revision in deleting {
+            let deleted = match self.google.delete(&format!("{url}/revisions/{revision}")).await {
+                Ok(Some(op)) => self.google.wait("https://run.googleapis.com/v2", op).await.map(|_| ()),
+                Ok(None) => Ok(()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = deleted {
+                left.push(format!("{revision}: {e:#}"));
+            }
+        }
+        anyhow::ensure!(
+            left.is_empty(),
+            "{} (to end them now, delete each with `gcloud run revisions delete <revision> --project {} --region {}`)",
+            left.join("; "),
+            self.gcp.project,
+            self.gcp.region,
+        );
+        Ok(())
+    }
+
+    /// Every revision of the service at `url`, as Cloud Run v2 lists them.
+    async fn revisions(&self, url: &str) -> anyhow::Result<Vec<Value>> {
+        let mut out = Vec::new();
+        let mut page: Option<String> = None;
+        loop {
+            let mut query = vec![("pageSize", "100".to_string())];
+            if let Some(token) = page.take() {
+                query.push(("pageToken", token));
+            }
+            let listed = self.google.get_query(&format!("{url}/revisions"), &query).await?;
+            out.extend(listed.get("revisions").and_then(Value::as_array).into_iter().flatten().cloned());
+            page = listed.get("nextPageToken").and_then(Value::as_str).map(str::to_string);
+            if page.is_none() {
+                return Ok(out);
+            }
+        }
+    }
+
     /// The names of the services labeled `label=value`.
     async fn labeled(&self, label: &str, value: &str) -> anyhow::Result<Vec<String>> {
         let mut out = Vec::new();
@@ -693,12 +851,10 @@ impl CloudRunRunner {
     /// never runs an image nothing references: it is left alone.
     async fn forget_revisions(&self, name: &str, image_hash: &str) -> anyhow::Result<()> {
         let url = format!("https://run.googleapis.com/v2/{name}");
-        let listed = self.google.get(&format!("{url}/revisions")).await?;
-        let going: Vec<String> = listed
-            .get("revisions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+        let going: Vec<String> = self
+            .revisions(&url)
+            .await?
+            .iter()
             .filter(|r| r.pointer("/labels/weft-image").and_then(Value::as_str) == Some(image_hash))
             .filter_map(|r| r.get("name").and_then(Value::as_str).and_then(|n| n.rsplit('/').next()).map(str::to_string))
             .collect();
@@ -779,6 +935,10 @@ impl Runner for CloudRunRunner {
         self.ensure(target, Patience::ToTheEnd).await?;
         let url = self.send_traffic_to(target).await?;
         Ok(weft_core::projects::ProjectAddress::Serving { url })
+    }
+
+    async fn settle(&self, target: &WorkerTarget) -> anyhow::Result<()> {
+        self.retire_superseded(target).await
     }
 
     // The service keeps no warm instance any more and scales to zero on
@@ -994,6 +1154,91 @@ mod tests {
         // A retried deploy of one tag replaces what the tag named.
         let retried = traffic_with(Some(&json!({ "traffic": moved })), "v2", "svc-v2-cccc", false);
         assert_eq!(retried.as_array().unwrap().iter().filter(|t| t["tag"] == "v2").count(), 1);
+    }
+
+    /// A Cloud Run v2 revision named `name`, labeled as weft labels the
+    /// revision running the image of digest `image` under `tag`.
+    fn listed(name: &str, image: &str, tag: &str) -> Value {
+        json!({
+            "name": format!("projects/acme/locations/us-central1/services/wk-x/revisions/{name}"),
+            "labels": { "weft-image": image, "weft-tag": tag },
+        })
+    }
+
+    /// Once the settled settings serve, every revision of the same program
+    /// under other settings goes, whatever traffic it held and however new
+    /// it is; another program's is left to `forget_image`, and the settled
+    /// tag's own (an earlier attempt at it included) stays.
+    #[test]
+    fn settling_supersedes_every_revision_of_the_same_program_under_other_settings() {
+        let found = json!({
+            "template": { "revision": "r-new" },
+            "traffic": [
+                { "revision": "r-old", "tag": "vaaaa0001", "percent": 100 },
+                { "revision": "r-older", "tag": "vaaaa0002" },
+                { "revision": "r-other", "tag": "vbbbb0001" },
+                { "revision": "r-new", "tag": "vaaaa0003" },
+            ],
+            "trafficStatuses": [{ "revision": "r-new", "tag": "vaaaa0003", "uri": "https://vaaaa0003---wk-x-1.a.run.app" }],
+        });
+        let revisions = [
+            listed("r-old", "aaaa", "vaaaa0001"),
+            listed("r-older", "aaaa", "vaaaa0002"),
+            // Left untagged by an attempt that did not retire it.
+            listed("r-untagged", "aaaa", "vaaaa0004"),
+            listed("r-other", "bbbb", "vbbbb0001"),
+            listed("r-new", "aaaa", "vaaaa0003"),
+            // An earlier attempt at the settled tag itself.
+            listed("r-new-try", "aaaa", "vaaaa0003"),
+        ];
+        let going = superseded(&found, &revisions, "vaaaa0003", "aaaa");
+        assert_eq!(going, ["r-old", "r-older", "r-untagged"]);
+        assert_eq!(tags_of(&revisions, &going), ["vaaaa0001", "vaaaa0002", "vaaaa0004"], "only the retired tags' addresses are forgotten");
+        let traffic = traffic_handed_over(&found, &going, "vaaaa0003").unwrap();
+        assert_eq!(
+            traffic,
+            json!([{ "revision": "r-other", "tag": "vbbbb0001" }, { "revision": "r-new", "tag": "vaaaa0003", "percent": 100 }]),
+            "the calls the other settings took go to the settled ones"
+        );
+        assert!(takes_every_call(&json!({ "traffic": traffic }), "r-new"));
+        assert_eq!(deletable(&found, going), ["r-old", "r-older", "r-untagged"]);
+        assert_eq!(traffic_handed_over(&found, &["r-untagged".to_string()], "vaaaa0003"), None, "nothing to take out of the traffic");
+    }
+
+    /// Nothing goes before the settled settings serve: the calls would
+    /// have nowhere to go.
+    #[test]
+    fn nothing_is_superseded_before_the_settled_settings_serve() {
+        let revisions = [listed("r-old", "aaaa", "vaaaa0001"), listed("r-new", "aaaa", "vaaaa0003")];
+        let tagged = json!({
+            "traffic": [{ "revision": "r-old", "tag": "vaaaa0001", "percent": 100 }, { "revision": "r-new", "tag": "vaaaa0003" }],
+        });
+        assert!(superseded(&tagged, &revisions, "vaaaa0003", "aaaa").is_empty(), "no address yet");
+        let untagged = json!({
+            "traffic": [{ "revision": "r-old", "tag": "vaaaa0001", "percent": 100 }],
+            "trafficStatuses": [{ "revision": "r-old", "tag": "vaaaa0001", "uri": "https://vaaaa0001---wk-x-1.a.run.app" }],
+        });
+        assert!(superseded(&untagged, &revisions, "vaaaa0003", "aaaa").is_empty(), "not in the traffic yet");
+    }
+
+    /// A revision deployed after the settled one with other settings (a
+    /// dispatcher copy that still held the settings from before a change)
+    /// is the service's template, which Cloud Run refuses to delete: it is
+    /// taken out of the traffic, its calls handed to the settled settings,
+    /// and kept for a later settling.
+    #[test]
+    fn the_templates_revision_leaves_the_traffic_and_is_kept() {
+        let found = json!({
+            "template": { "revision": "r-stale" },
+            "traffic": [{ "revision": "r-stale", "tag": "vaaaa0001", "percent": 100 }, { "revision": "r-new", "tag": "vaaaa0003" }],
+            "trafficStatuses": [{ "revision": "r-new", "tag": "vaaaa0003", "uri": "https://vaaaa0003---wk-x-1.a.run.app" }],
+        });
+        let revisions = [listed("r-new", "aaaa", "vaaaa0003"), listed("r-stale", "aaaa", "vaaaa0001")];
+        let going = superseded(&found, &revisions, "vaaaa0003", "aaaa");
+        assert_eq!(going, ["r-stale"]);
+        let traffic = traffic_handed_over(&found, &going, "vaaaa0003").unwrap();
+        assert!(takes_every_call(&json!({ "traffic": traffic }), "r-new"));
+        assert!(deletable(&found, going).is_empty());
     }
 
     #[test]

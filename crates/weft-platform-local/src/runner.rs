@@ -739,6 +739,16 @@ impl Runner for LocalRunner {
         Ok(weft_core::projects::ProjectAddress::Serving { url: port_url(self.cfg.project_ip, port) })
     }
 
+    // A worker with other settings already finishes what it drives and
+    // stops once idle, since calls go to one started with the current
+    // ones (`prepare`, `front`). Settling only says again which one is
+    // kept warm: a `prepare` from a caller holding settings from before a
+    // change may have made the stale one the warm one.
+    async fn settle(&self, target: &WorkerTarget) -> anyhow::Result<()> {
+        self.keep_only_current_warm(target);
+        Ok(())
+    }
+
     async fn let_front_go(&self, project: uuid::Uuid) -> anyhow::Result<()> {
         // No longer a front, it stops once idle like any worker: a project
         // that takes no calls keeps no instance warm.

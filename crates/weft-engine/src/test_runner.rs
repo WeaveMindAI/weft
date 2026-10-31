@@ -1,5 +1,5 @@
 //! The node-test binary's whole brain. Codegen emits a tiny `main.rs`
-//! per package (`weft_engine::test_runner::main(&registry::PROJECT_CATALOG)`)
+//! per package (`weft_engine::test_runner::main(&registry::PROJECT_CATALOG, ..)`)
 //! so every line of runner logic lives HERE, typechecked, instead of
 //! in generated source.
 //!
@@ -21,10 +21,11 @@
 //! failed, 2 = the runner itself could not do what was asked.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::Parser;
 
-use weft_core::node_test::{NodeTestsListing, RunAllReport, TestReport};
+use weft_core::node_test::{NodeTestsListing, PublishedServices, RunAllReport, TestReport};
 use weft_core::{NodeCatalog, TestTier};
 
 use crate::test_rig::LiveTestRunner;
@@ -91,9 +92,20 @@ impl TierArg {
 }
 
 /// Entry point the generated per-package `main.rs` calls.
-pub fn main(catalog: &'static dyn NodeCatalog) -> ExitCode {
+/// `published_services` is the JSON the emitter baked
+/// (`codegen::baked_published_services`): the recipe of every service a
+/// node of the package publishes, resolved against the whole catalog as
+/// a project build resolves it.
+pub fn main(catalog: &'static dyn NodeCatalog, published_services: &str) -> ExitCode {
     tracing_subscriber_init();
     let args = Args::parse();
+    let services = match PublishedServices::from_json(published_services) {
+        Ok(services) => Arc::new(services),
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -101,7 +113,7 @@ pub fn main(catalog: &'static dyn NodeCatalog) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    runtime.block_on(run(catalog, args))
+    runtime.block_on(run(catalog, services, args))
 }
 
 /// Stderr-only logs, so stdout stays the one clean JSON channel. This
@@ -145,7 +157,7 @@ fn refuse_misdeclared_live(catalog: &'static dyn NodeCatalog) -> Result<(), Stri
     Ok(())
 }
 
-async fn run(catalog: &'static dyn NodeCatalog, args: Args) -> ExitCode {
+async fn run(catalog: &'static dyn NodeCatalog, services: Arc<PublishedServices>, args: Args) -> ExitCode {
     if let Err(e) = refuse_misdeclared_live(catalog) {
         eprintln!("{e}");
         return ExitCode::from(2);
@@ -166,7 +178,7 @@ async fn run(catalog: &'static dyn NodeCatalog, args: Args) -> ExitCode {
 
         Args::Run { node, test } => {
             let request = TestRequest { node, test, live: None };
-            match run_one(catalog, request, None).await {
+            match run_one(catalog, &services, request, None).await {
                 Ok(report) => {
                     let passed = report.passed;
                     println!(
@@ -199,7 +211,7 @@ async fn run(catalog: &'static dyn NodeCatalog, args: Args) -> ExitCode {
                 }
             };
             let live = LiveEnv { broker_url, tenant_id, project_id, identity, run_cap: run_cap_secs.map(std::time::Duration::from_secs) };
-            match serve(catalog, live, door, port).await {
+            match serve(catalog, services, live, door, port).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("the test server stopped: {e:#}");
@@ -236,22 +248,25 @@ async fn run(catalog: &'static dyn NodeCatalog, args: Args) -> ExitCode {
             use futures::StreamExt as _;
             let mut reports: Vec<(usize, TestReport)> =
                 futures::stream::iter(selected.into_iter().enumerate())
-                    .map(|(i, (node_type, declared))| async move {
-                        let (name, tier) = (declared.name, declared.tier);
-                        let result = match tier {
-                            TestTier::Basic => {
-                                tokio::task::spawn_blocking(move || declared.run_basic())
-                                    .await
-                                    .unwrap_or_else(|e| {
-                                        Err(weft_core::error::WeftError::NodeFailed(format!(
-                                            "basic test task failed: {e}"
-                                        )))
-                                    })
-                            }
-                            TestTier::Fake => declared.run_fake().await,
-                            TestTier::Live => unreachable!("run-all never selects live"),
-                        };
-                        (i, report_of(node_type, name, tier, result, Vec::new()))
+                    .map(|(i, (node_type, declared))| {
+                        let services = services.clone();
+                        async move {
+                            let (name, tier) = (declared.name, declared.tier);
+                            let result = match tier {
+                                TestTier::Basic => {
+                                    tokio::task::spawn_blocking(move || declared.run_basic())
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            Err(weft_core::error::WeftError::NodeFailed(format!(
+                                                "basic test task failed: {e}"
+                                            )))
+                                        })
+                                }
+                                TestTier::Fake => declared.run_fake(services).await,
+                                TestTier::Live => unreachable!("run-all never selects live"),
+                            };
+                            (i, report_of(node_type, name, tier, result, Vec::new()))
+                        }
                     })
                     .buffer_unordered(limit)
                     .collect()
@@ -343,7 +358,12 @@ struct LiveEnv {
 /// Run one test. `Err` is a request that could not run at all (no such
 /// node or test, a tier mismatch); a test that ran and failed is a
 /// report with `passed: false`.
-async fn run_one(catalog: &'static dyn NodeCatalog, request: TestRequest, live_env: Option<&LiveEnv>) -> Result<TestReport, String> {
+async fn run_one(
+    catalog: &'static dyn NodeCatalog,
+    services: &Arc<PublishedServices>,
+    request: TestRequest,
+    live_env: Option<&LiveEnv>,
+) -> Result<TestReport, String> {
     let TestRequest { node, test, live } = request;
     let node_impl = catalog.lookup(&node).ok_or_else(|| format!("no node type '{node}' in this package's registry"))?;
     let tests = node_impl.tests();
@@ -355,7 +375,9 @@ async fn run_one(catalog: &'static dyn NodeCatalog, request: TestRequest, live_e
     })?;
     match (declared.tier, live) {
         (TestTier::Basic, None) => Ok(report_of(&node, declared.name, declared.tier, declared.run_basic(), Vec::new())),
-        (TestTier::Fake, None) => Ok(report_of(&node, declared.name, declared.tier, declared.run_fake().await, Vec::new())),
+        (TestTier::Fake, None) => {
+            Ok(report_of(&node, declared.name, declared.tier, declared.run_fake(services.clone()).await, Vec::new()))
+        }
         (TestTier::Basic | TestTier::Fake, Some(_)) => {
             Err(format!("test '{test}' on node '{node}' is a free-tier test and takes no connection"))
         }
@@ -377,6 +399,7 @@ async fn run_one(catalog: &'static dyn NodeCatalog, request: TestRequest, live_e
             let runner = LiveTestRunner::start(
                 clients,
                 catalog,
+                services.clone(),
                 live.replica,
                 env.tenant_id.clone(),
                 env.project_id,
@@ -412,13 +435,20 @@ async fn run_one(catalog: &'static dyn NodeCatalog, request: TestRequest, live_e
 /// `GET /_weft/tests`, until the platform stops the process. A test's
 /// answer is the report as JSON (200), or the reason the request could
 /// not run (422).
-async fn serve(catalog: &'static dyn NodeCatalog, live: LiveEnv, door: crate::worker::WeftCredential, port: u16) -> anyhow::Result<()> {
+async fn serve(
+    catalog: &'static dyn NodeCatalog,
+    services: Arc<PublishedServices>,
+    live: LiveEnv,
+    door: crate::worker::WeftCredential,
+    port: u16,
+) -> anyhow::Result<()> {
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
     #[derive(Clone)]
     struct Served {
         catalog: &'static dyn NodeCatalog,
+        services: Arc<PublishedServices>,
         live: std::sync::Arc<LiveEnv>,
         door: crate::worker::WeftCredential,
     }
@@ -426,7 +456,7 @@ async fn serve(catalog: &'static dyn NodeCatalog, live: LiveEnv, door: crate::wo
         if !s.door.admits_headers(&headers) {
             return (StatusCode::UNAUTHORIZED, "this test server answers the install only").into_response();
         }
-        match run_one(s.catalog, req, Some(&s.live)).await {
+        match run_one(s.catalog, &s.services, req, Some(&s.live)).await {
             Ok(report) => axum::Json(report).into_response(),
             Err(why) => (StatusCode::UNPROCESSABLE_ENTITY, why).into_response(),
         }
@@ -442,7 +472,7 @@ async fn serve(catalog: &'static dyn NodeCatalog, live: LiveEnv, door: crate::wo
         .route("/_weft/test", axum::routing::post(test))
         .route("/_weft/tests", axum::routing::get(tests))
         .route("/_weft/healthz", axum::routing::get(|| async { StatusCode::OK }))
-        .with_state(Served { catalog, live: std::sync::Arc::new(live), door })
+        .with_state(Served { catalog, services, live: std::sync::Arc::new(live), door })
         .layer(axum::middleware::map_response(crate::worker::mark_worker_answer));
     let listener = crate::listen::bind(port).await?;
     axum::serve(listener, app).await?;

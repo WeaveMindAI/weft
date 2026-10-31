@@ -3,7 +3,9 @@
 //! answered rows back into JSON.
 //!
 //! The connection stores `host`, `database`, `user`, `password`, and
-//! the optional `port` and `sslmode`; this module is the one place
+//! the optional `port`, `sslmode` and `watchDatabase` (the database name
+//! a watching query connects to, when the database keeps a separate door
+//! for those, as a PostgresDatabase does); this module is the one place
 //! that vocabulary is read, so every Postgres node dials the same way.
 //!
 //! Parameter typing: a JSON string binds as the TEXT form of whatever
@@ -123,11 +125,34 @@ type Connection = tokio_postgres::Connection<
     <tokio_postgres_rustls::MakeRustlsConnect as tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket>>::Stream,
 >;
 
-/// Dial the wired database: the one handshake behind `connect` and
-/// `connect_listening`, each of which drives the connection its own way.
-async fn dial(ctx: &RunContext, conn: &OpenedConnection) -> WeftResult<(tokio_postgres::Client, Connection)> {
-    dial_with(ctx, &dial_config(conn)?).await
+/// Dial the wired database for a run that watches: the one handshake
+/// behind `connect_alone` and `connect_listening`, each of which drives
+/// the connection its own way. Through the database's door for watchers
+/// when the connection names one ([`watch_config`]).
+async fn dial_watching(ctx: &RunContext, conn: &OpenedConnection) -> WeftResult<(tokio_postgres::Client, Connection)> {
+    dial_with(ctx, &watch_config(conn)?).await
 }
+
+/// [`dial_config`] for a run that watches: the same database under the
+/// name its door for watchers goes by (`watchDatabase`), when the
+/// connection has one. A PostgresDatabase keeps that door apart, with
+/// its own connections, so watchers that hold theirs for hours never
+/// take every connection from queries, nor queries from watchers.
+pub fn watch_config(conn: &OpenedConnection) -> WeftResult<Config> {
+    let mut config = dial_config(conn)?;
+    if let Some(watch) = conn.opt_value("watchDatabase").map(str::trim).filter(|w| !w.is_empty()) {
+        config.dbname(watch);
+    }
+    Ok(config)
+}
+
+/// Sent first on a watching connection: it sits idle between wakes on
+/// purpose, so it lifts, for its own session, the limit a database may
+/// put on idle sessions (`idle_session_timeout`, from Postgres 14 on; a
+/// PostgresDatabase sets one so idle clients give their connection
+/// back). Read through `pg_settings`, so a server without the setting
+/// changes nothing instead of refusing.
+const STAYS_IDLE: &str = "SELECT set_config('idle_session_timeout', '0', false) FROM pg_settings WHERE name = 'idle_session_timeout'";
 
 /// The first wait before asking a full database again, doubled on every
 /// refusal up to [`FULL_LONGEST_WAIT`].
@@ -188,7 +213,8 @@ impl FullWaits {
         let said = format!(
             "postgres: the database has no connection free (too many clients); {} run(s) wait for one now, \
              {} began waiting since the last notice. Runs slow down until one frees up. If this keeps happening, \
-             raise the database's size: on a PostgresDatabase node, raise `memory` (its connection count follows it)",
+             the database takes fewer connections than the program's workers and its other clients ask for at \
+             once: raise its connection limit, or put a pooler in front of it",
             self.waiting, self.began
         );
         self.said_at = Some(now);
@@ -268,16 +294,27 @@ fn connect_failed(e: tokio_postgres::Error) -> WeftError {
 }
 
 /// The most runs of one worker that hold a connection to one database at
-/// once. Kept low on purpose: Postgres takes 100 connections by default,
-/// and several workers of a project share them, so 20 each lets a few
-/// workers run side by side without the database refusing anyone. A
-/// PostgresDatabase takes fewer on a small machine (24 at its default
-/// 1Gi, see its `memory` input), so there a second worker can find it
-/// full and waits for a connection to free up ([`dial_with`]).
-/// A run past it waits for one to finish. A proper fix is a pooler in
-/// front of the database (TODO.md, "Several workers of a project can open
-/// more Postgres connections than the database takes").
+/// once; a run past it waits for one to finish. It keeps one worker from
+/// taking every connection from its siblings, and nothing more: how many
+/// workers run at once is not this worker's to know (they scale, and a
+/// rollout runs old and new copies side by side), so it cannot keep a
+/// database under its limit. A PostgresDatabase is kept there by its
+/// pooler, where every client past what Postgres serves waits its turn;
+/// a database reached through a PostgresAccess that has no pooler can
+/// still be found full, and a run then waits for a connection to free up
+/// ([`dial_with`]).
 pub(crate) const MOST_AT_ONCE: usize = 20;
+
+/// How long a connection may sit idle in a worker's pool before it is
+/// closed instead of handed to the next run. Long enough to serve a burst
+/// of runs with one sign-in; short, because an idle connection held here
+/// is one the database cannot give anybody else, and a pooler in session
+/// mode keeps a real Postgres connection behind every one of them. A
+/// worker that loses its CPU between requests (a Cloud Run worker does)
+/// cannot close them on time itself, so a connection idle past this is
+/// also never handed out: the database may have closed it meanwhile
+/// (a PostgresDatabase does after a minute).
+pub(crate) const IDLE_CLOSE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long a returning connection gets to clear its session before it
 /// is let go instead. Clearing is a few short statements a healthy
@@ -289,16 +326,54 @@ const CLEAR_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 /// Connections to one database, signed in once and held by the worker for
 /// its runs to share (`ctx.shared`), instead of dialed and signed in again
 /// by every run. Built from the connection's values, so a changed
-/// password builds a fresh pool.
+/// password builds a fresh pool. A connection idle for [`IDLE_CLOSE`] is
+/// closed.
 pub struct Pool {
     config: Config,
-    idle: std::sync::Mutex<Vec<tokio_postgres::Client>>,
+    /// Oldest first, each with when it went idle.
+    idle: std::sync::Mutex<Vec<(tokio_postgres::Client, std::time::Instant)>>,
 }
 
 impl Pool {
     fn new(conn: &OpenedConnection) -> WeftResult<Self> {
         Ok(Self { config: dial_config(conn)?, idle: std::sync::Mutex::new(Vec::new()) })
     }
+
+    /// The most recently returned connection that is still open and was
+    /// idle for less than [`IDLE_CLOSE`] at `now`, closing every one that
+    /// was idle longer (dropping a client closes its connection).
+    fn take(&self, now: std::time::Instant) -> Option<tokio_postgres::Client> {
+        let mut idle = self.idle.lock().expect("pool poisoned");
+        idle.retain(|(_, since)| still_fresh(*since, now));
+        while let Some((client, _)) = idle.pop() {
+            if !client.is_closed() {
+                return Some(client);
+            }
+        }
+        None
+    }
+
+    /// Put `client` back, idle from `now`, and close it once it has sat
+    /// idle for [`IDLE_CLOSE`] if no run took it. The close is a timer
+    /// here, so a worker without CPU between requests runs it late; the
+    /// next run's [`Pool::take`] closes it then, before anything uses it.
+    fn give_back(self: std::sync::Arc<Self>, client: tokio_postgres::Client, now: std::time::Instant) {
+        self.idle.lock().expect("pool poisoned").push((client, now));
+        let pool = std::sync::Arc::downgrade(&self);
+        tokio::spawn(async move {
+            tokio::time::sleep(IDLE_CLOSE).await;
+            if let Some(pool) = pool.upgrade() {
+                let now = std::time::Instant::now();
+                pool.idle.lock().expect("pool poisoned").retain(|(_, since)| still_fresh(*since, now));
+            }
+        });
+    }
+}
+
+/// Whether a connection idle since `since` may still be handed out at
+/// `now`. Pure, so the decision is testable.
+pub fn still_fresh(since: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(since) < IDLE_CLOSE
 }
 
 /// A client of the pool, for one run's use. It goes back to the pool when
@@ -360,7 +435,7 @@ impl Drop for Pooled {
         let may_hold_transaction = self.may_hold_transaction;
         tokio::spawn(async move {
             match tokio::time::timeout(CLEAR_WITHIN, clear_session(&client, may_hold_transaction)).await {
-                Ok(Ok(())) => pool.idle.lock().expect("pool poisoned").push(client),
+                Ok(Ok(())) => pool.arc().give_back(client, std::time::Instant::now()),
                 Ok(Err(e)) => tracing::warn!("postgres: a pooled connection is let go, its session could not be cleared: {e}"),
                 Err(_) => tracing::warn!(
                     "postgres: a pooled connection is let go, its database did not answer within {}s while its session was cleared",
@@ -466,16 +541,8 @@ async fn clear_session(client: &tokio_postgres::Client, may_hold_transaction: bo
 /// does.
 pub async fn connect(ctx: &RunContext, access: &weft::access::Access) -> WeftResult<Pooled> {
     let pool = ctx.shared(access, |opened| async move { Pool::new(&opened) }).with_limit(MOST_AT_ONCE).await?;
-    loop {
-        let idle = pool.idle.lock().expect("pool poisoned").pop();
-        match idle {
-            Some(client) if !client.is_closed() => {
-                return Ok(Pooled { client: Some(client), pool: Some(pool), cancel: ctx.cancellation(), may_hold_transaction: false });
-            }
-            // A connection the server or the network closed since.
-            Some(_) => continue,
-            None => break,
-        }
+    if let Some(client) = pool.take(std::time::Instant::now()) {
+        return Ok(Pooled { client: Some(client), pool: Some(pool), cancel: ctx.cancellation(), may_hold_transaction: false });
     }
     let (client, connection) = dial_with(ctx, &pool.config).await?;
     // The connection future must be driven for the client to work; it
@@ -491,10 +558,11 @@ pub async fn connect(ctx: &RunContext, access: &weft::access::Access) -> WeftRes
 
 /// A connection of its own to the wired database, for a run that holds
 /// one for as long as it watches (it would hold a pooled one away from
-/// every other run). Its task ends when the client drops or the run is
+/// every other run), dialed the way a watcher dials ([`dial_watching`],
+/// [`STAYS_IDLE`]). Its task ends when the client drops or the run is
 /// cancelled.
 pub async fn connect_alone(ctx: &RunContext, conn: &OpenedConnection) -> WeftResult<tokio_postgres::Client> {
-    let (client, connection) = dial(ctx, conn).await?;
+    let (client, connection) = dial_watching(ctx, conn).await?;
     let cancel = ctx.cancellation();
     tokio::spawn(async move {
         tokio::select! {
@@ -506,6 +574,10 @@ pub async fn connect_alone(ctx: &RunContext, conn: &OpenedConnection) -> WeftRes
             _ = cancel.cancelled() => {}
         }
     });
+    client
+        .batch_execute(STAYS_IDLE)
+        .await
+        .map_err(|e| WeftError::NodeFailed(format!("postgres: keep the watching connection open while idle: {}", pg_detail(&e))))?;
     Ok(client)
 }
 
@@ -520,7 +592,8 @@ pub enum ListenEvent {
     Failed(String),
 }
 
-/// Dial the wired database and `LISTEN` on `channel`: the client, and
+/// Dial the wired database the way a watcher dials ([`dial_watching`],
+/// [`STAYS_IDLE`]) and `LISTEN` on `channel`: the client, and
 /// the stream of notifications the server raises on that channel (a
 /// `NOTIFY channel` in a trigger, say). The connection task is driven
 /// here so its asynchronous messages can be read off it; it ends when
@@ -532,7 +605,7 @@ pub async fn connect_listening(
     channel: &str,
 ) -> WeftResult<(tokio_postgres::Client, tokio::sync::mpsc::UnboundedReceiver<ListenEvent>)> {
     use futures::StreamExt;
-    let (client, mut connection) = dial(ctx, conn).await?;
+    let (client, mut connection) = dial_watching(ctx, conn).await?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = ctx.cancellation();
     tokio::spawn(async move {
@@ -563,9 +636,9 @@ pub async fn connect_listening(
         }
     });
     client
-        .batch_execute(&format!("LISTEN {}", quote_ident(channel)?))
+        .batch_execute(&format!("{STAYS_IDLE}; LISTEN {}", quote_ident(channel)?))
         .await
-        .map_err(|e| WeftError::NodeFailed(format!("postgres: LISTEN {channel}: {}", pg_detail(&e))))?;
+        .map_err(|e| WeftError::NodeFailed(format!("postgres: keep the watching connection open while idle and LISTEN {channel}: {}", pg_detail(&e))))?;
     Ok((client, rx))
 }
 

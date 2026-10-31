@@ -41,6 +41,7 @@ naming your node when the infra is provisioned, rather than a silent nothing.
 | `endpoints` | Named ports your node and the project's other nodes reach it on, and whether anything outside the project may |
 | `keep_on_terminate` | Disks to keep even through a terminate, for the next `weft infra start` to pick up |
 | `health_rules` | What weft does to the project's triggers when a unit of this node stops being ready, and when it undoes it. For the defaults and how to write your own, go and read [when a unit stops being ready](#when-a-unit-stops-being-ready) |
+| `notes` | If the copy you declare runs short of something it normally has (an older version kept for its data, say), one plain sentence each saying what and how to fix it. `weft infra status` prints them as warnings for as long as the copy runs. Usually empty |
 
 A unit is a group of containers that run side by side, with optional init
 containers that run one after another before them. It also says what machine
@@ -157,13 +158,24 @@ address while the tunnel is open
 can reach.
 
 If an endpoint hands out a credential, keep it to the project. The Postgres
-node shows the split: the port Postgres answers on is `SameNetwork`, because
-reaching it still takes a password, but the small server that hands out that
+node shows the split: the port clients sign in on can be `SameNetwork` (its
+`reachable` input), because reaching it still takes a password, but the small server that hands out that
 password stays reachable only by the project.
 
 It works during provisioning after the apply, and in every later phase once the
 infrastructure is running. If the endpoint is not declared, or the
 infrastructure is down, the error says which and points at `weft infra status`.
+
+If your unit serves something with a fixed limit (a database that takes only
+so many connections), the waiting belongs in your unit, because it is the one
+place that sees every client, and the number of clients keeps changing
+(workers scale, and a frontend connects too). A PostgresDatabase runs a pooler
+in front of Postgres for this, in the same unit: the pooler never opens more
+connections than Postgres takes, a client that finds them all busy waits for
+one, and Postgres closes a session that sat idle for a minute, so a connection
+somebody holds without using it comes back. For what a node that talks to
+such a unit should do on its own side, go and read
+[sharing something between runs](ctx.md#sharing-something-between-runs).
 
 When a program marks your node `@per_instance`, each instance of the program
 gets its own container, and `ctx.endpoint` answers with the copy of the

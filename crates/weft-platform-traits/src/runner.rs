@@ -324,6 +324,20 @@ pub trait Runner: Send + Sync {
     /// [`PortTaken`], and nothing is started. Idempotent.
     async fn front(&self, target: &WorkerTarget, port: Option<u16>) -> anyhow::Result<weft_core::projects::ProjectAddress>;
 
+    /// `target` is what the project's workers run now: its image with the
+    /// settings the project has stored, read from them by the caller, not
+    /// from a copy that may predate a change. Let go of whatever the
+    /// platform keeps running of that image under other settings (on a
+    /// cloud, the revisions it deployed for them, their calls handed to
+    /// `target`'s). Only the caller can say which settings are current:
+    /// what the platform holds cannot, since a caller holding settings
+    /// from before a change may bring them up again after it. Does
+    /// nothing until `target` serves. An error names what is left; by
+    /// then `target` already serves, so the caller logs it rather than
+    /// failing the change that led here, and what is left takes no calls
+    /// and goes at the next settling. Idempotent.
+    async fn settle(&self, target: &WorkerTarget) -> anyhow::Result<()>;
+
     /// Stop serving the project's own address: nothing of it takes calls
     /// any more (every trigger it has was wiped). Its workers go once idle.
     async fn let_front_go(&self, project: uuid::Uuid) -> anyhow::Result<()>;
@@ -355,6 +369,7 @@ pub mod fake {
         Prepare(WorkerTarget),
         Endpoint { project: uuid::Uuid },
         Front { target: WorkerTarget, port: Option<u16> },
+        Settle(WorkerTarget),
         LetFrontGo { project: uuid::Uuid },
         KillWorkers { project: uuid::Uuid },
         Retire { project: uuid::Uuid },
@@ -414,6 +429,10 @@ pub mod fake {
         async fn front(&self, target: &WorkerTarget, port: Option<u16>) -> anyhow::Result<weft_core::projects::ProjectAddress> {
             self.calls.lock().push(RunnerCall::Front { target: target.clone(), port });
             Ok(weft_core::projects::ProjectAddress::Serving { url: self.base_url.clone() })
+        }
+        async fn settle(&self, target: &WorkerTarget) -> anyhow::Result<()> {
+            self.calls.lock().push(RunnerCall::Settle(target.clone()));
+            Ok(())
         }
         async fn let_front_go(&self, project: uuid::Uuid) -> anyhow::Result<()> {
             self.calls.lock().push(RunnerCall::LetFrontGo { project });

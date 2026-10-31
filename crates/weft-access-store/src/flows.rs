@@ -13,7 +13,7 @@ use weft_task_store::db::{self, Client, FromRow, JsonText, Pool, Row};
 
 use weft_core::access::client::{authed_client, base_client, resolve_steps, RefusalKind};
 use weft_core::access::spec::{
-    lookup_path, Acquisition, AnswerReader, CredentialField, Door, GrantCoexistence, OAuthGrant, TestCall,
+    lookup_path, storable_values, Acquisition, AnswerReader, CredentialField, Door, GrantCoexistence, OAuthGrant, TestCall,
     TokenAnswer, TokenCall, TokenExpiry, TokenLife, TokenRead, VerificationRung,
 };
 // The connect wire shapes live in the core (weft-core `access::wire`),
@@ -353,14 +353,14 @@ pub async fn connect_direct(
     let mut life: Option<TokenLife> = None;
     match &spec.acquisition {
         Acquisition::Static { fields } => {
-            values = storable_values(spec, fields, values)?;
+            values = storable_values(spec, fields, values).map_err(AccessError::Invalid)?;
         }
         Acquisition::MintJwt { fields, .. } => {
             // Held to the same rule as any other pasted set: these are
             // the fields a PERSON filled in, and a missing or blank one
             // would otherwise fail somewhere inside the mint instead of
             // naming itself here.
-            values = storable_values(spec, fields, values)?;
+            values = storable_values(spec, fields, values).map_err(AccessError::Invalid)?;
             // Mint + exchange once now, so a bad key/id fails at
             // connect instead of at first run. The minted token is
             // stored like any other value and re-minted lazily on
@@ -392,7 +392,7 @@ pub async fn connect_direct(
     if spec.verification.cost.may_auto_run() {
         run_test_call(spec.test.as_ref(), &spec.auth, &mut values).await?;
     }
-    let identity = resolve_identity(spec, &values)?;
+    let identity = spec.identity_of(&values).map_err(AccessError::Invalid)?;
     // What the row records as granted: the introspected set when the
     // service's verification produced one (the `granted_permissions`
     // capture), else the user's claimed ticks.
@@ -536,44 +536,6 @@ fn connection_name(typed: Option<String>, registration: &Option<AppRegistration>
         Some(l) if !l.trim().is_empty() => l.trim().to_string(),
         _ => registration.as_ref().map_or_else(|| spec.display_label().to_string(), |r| r.label.clone()),
     }
-}
-
-/// `values` reduced to what may actually be STORED for `spec`, or the
-/// reason they cannot be: every required field present and non-blank,
-/// no name the service does not declare, the service's all-or-nothing
-/// groups satisfied, and blanks dropped so a later read sees "missing"
-/// rather than an empty secret.
-///
-/// The gate for every set of values a PERSON or a NODE supplied: a
-/// pasted connection, a minted one, and one a node published all
-/// answer the same questions and are held to the same standard. A
-/// browser consent is the one that does not come through here, and
-/// cannot: its values are the provider's own answer to the token
-/// exchange, not fields anybody filled in.
-fn storable_values(
-    spec: &AccessSpec,
-    fields: &[CredentialField],
-    mut values: BTreeMap<String, String>,
-) -> anyhow::Result<BTreeMap<String, String>> {
-    for f in fields {
-        let empty = values.get(&f.name).is_none_or(|v| v.trim().is_empty());
-        if empty && !f.optional {
-            return Err(AccessError::Invalid(format!("field '{}' is required", f.name)).into());
-        }
-    }
-    if let Some(unknown) = values.keys().find(|k| !fields.iter().any(|f| &&f.name == k)) {
-        return Err(AccessError::Invalid(format!(
-            "the '{}' service declares no value named '{unknown}'",
-            spec.service
-        ))
-        .into());
-    }
-    weft_core::access::spec::capability_shortfall(&spec.capabilities, |name| {
-        values.get(name).is_some_and(|v| !v.trim().is_empty())
-    })
-    .map_err(AccessError::Invalid)?;
-    values.retain(|_, v| !v.trim().is_empty());
-    Ok(values)
 }
 
 pub(crate) async fn insert_grant(db: &impl Client, tenant: &str, grant: NewGrant<'_>) -> anyhow::Result<CompletedConnect> {
@@ -1589,7 +1551,7 @@ async fn finish_connect(
     if spec.verification.cost.may_auto_run() {
         run_test_call(spec.test.as_ref(), &spec.auth, &mut values).await.map_err(sign_in_spent)?;
     }
-    let identity = resolve_identity(&spec, &values)?;
+    let identity = spec.identity_of(&values).map_err(AccessError::Invalid)?;
     let label = Some(registration.label.clone());
 
     // An instance's connection always lives in its project (whatever the
@@ -1945,16 +1907,6 @@ pub(crate) async fn run_test_call(
     apply_captures(&test.captures, &body, values, AnswerOf::First)
 }
 
-pub(crate) fn resolve_identity(
-    spec: &AccessSpec,
-    values: &BTreeMap<String, String>,
-) -> anyhow::Result<Option<String>> {
-    match &spec.identity {
-        None => Ok(None),
-        Some(t) => Ok(Some(t.resolve(values).map_err(AccessError::Invalid)?)),
-    }
-}
-
 fn head_of(body: &str) -> String {
     weft_core::truncate_user_string(body, 300)
 }
@@ -2147,20 +2099,6 @@ mod tests {
     }
 
 
-    fn field(name: &str, optional: bool) -> CredentialField {
-        CredentialField {
-            name: name.into(),
-            label: None,
-            optional,
-            secret: false,
-            placeholder: None,
-        }
-    }
-
-    fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-    }
-
     /// A connection left unnamed is named after its app, else its
     /// service, so no list ever shows a nameless row a person made.
     #[test]
@@ -2180,44 +2118,6 @@ mod tests {
         assert_eq!(connection_name(Some(" acme-scraper ".into()), &app, &spec), "acme-scraper");
         assert_eq!(connection_name(Some("  ".into()), &app, &spec), "Acme app");
         assert_eq!(connection_name(None, &None, &spec), "Firecrawl");
-    }
-
-    /// The gate every set of values a person or a node supplied
-    /// passes. A blank required value is MISSING, not stored: a
-    /// downstream node would otherwise get an empty password and fail
-    /// at the provider instead of here.
-    #[test]
-    fn the_value_check_holds_a_pasted_and_a_published_connection_to_one_rule() {
-        // The spec DECLARES the two fields the check is run against,
-        // so the rule and the recipe cannot be a mismatched pair the
-        // production callers could never produce.
-        let spec: AccessSpec = serde_json::from_value(serde_json::json!({
-            "service": "pg",
-            "acquisition": { "kind": "static", "fields": [
-                { "name": "host" },
-                { "name": "port", "optional": true },
-            ]},
-        }))
-        .expect("a static spec");
-        let fields = [field("host", false), field("port", true)];
-        let check = |vals| storable_values(&spec, &fields, vals);
-
-        check(values(&[("host", "db"), ("port", "5432")])).expect("a complete set passes");
-
-        let kept = check(values(&[("host", "db"), ("port", "   ")]))
-            .expect("a blank optional passes");
-        assert!(!kept.contains_key("port"), "a blank optional stores nothing");
-
-        let e = check(values(&[("port", "5432")])).expect_err("required missing");
-        assert!(e.to_string().contains("'host' is required"), "{e}");
-
-        let e = check(values(&[("host", "  ")]))
-            .expect_err("a blank required value is missing");
-        assert!(e.to_string().contains("'host' is required"), "{e}");
-
-        let e = check(values(&[("host", "db"), ("hostname", "db")]))
-            .expect_err("undeclared name");
-        assert!(e.to_string().contains("no value named 'hostname'"), "{e}");
     }
 
     /// What lands on the row: only an authoritative rung with a
@@ -2338,11 +2238,8 @@ async fn publish_grant_in(
     req: PublishAccess,
 ) -> anyhow::Result<PublishedConnection> {
     let PublishAccess { spec, project_id, node_id, instance, values, label } = req;
-    spec.validate().map_err(AccessError::Invalid)?;
-    let fields =
-        weft_core::access::spec::publishable_fields(&spec).map_err(AccessError::Invalid)?;
-    let values = storable_values(&spec, fields, values)?;
-    let identity = resolve_identity(&spec, &values)?;
+    let weft_core::access::spec::PublishableConnection { values, identity } =
+        weft_core::access::spec::publishable_connection(&spec, values).map_err(AccessError::Invalid)?;
     let current: Option<Published> = db
         .opt(
             "SELECT id, spec, spec_version, values_sealed, label, identity FROM access_grant

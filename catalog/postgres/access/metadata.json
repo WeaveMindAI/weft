@@ -69,6 +69,13 @@
           "secret": false,
           "optional": true,
           "placeholder": "require (or verify-ca / verify-full; disable turns TLS off)"
+        },
+        {
+          "name": "watchDatabase",
+          "label": "Database for watching queries",
+          "secret": false,
+          "optional": true,
+          "placeholder": "the same as Database (a pooler's separate name for long-held connections)"
         }
       ]
     }
