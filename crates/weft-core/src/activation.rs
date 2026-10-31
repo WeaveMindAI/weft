@@ -212,7 +212,7 @@ pub fn by_owner(keys: &[ActivationKey]) -> Vec<OwnerTriggers> {
     grouped.into_iter().map(|(owner, triggers)| OwnerTriggers { owner, triggers }).collect()
 }
 
-/// `POST /projects/{id}/activate`: turn on every trigger the scope names
+/// `POST /projects/{id}/activations`: turn on every trigger the scope names
 /// that is off, and leave the ones on as they are. It never touches the
 /// runs going, and never starts infra.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -281,6 +281,17 @@ pub struct ActivateResponse {
     /// not.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub broken: Vec<crate::project::Broken>,
+}
+
+/// What `POST /projects/{id}/activations` answers: the task that carries the
+/// activation out, followed in short looks
+/// (`GET /projects/{id}/follow/{task}`) until it ends with the
+/// [`ActivateResponse`], so no request has to stay open while its setup
+/// runs, and the activation goes on whatever becomes of the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivateStarted {
+    pub task: uuid::Uuid,
 }
 
 /// What an activate did with the work its triggers held: how much there

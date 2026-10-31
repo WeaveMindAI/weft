@@ -32,6 +32,11 @@ pub struct Parts {
     /// The Google API client and its token cache, on GCP: one per process,
     /// shared by everything that calls Google (the object store too).
     pub google: Option<weft_platform_gcp::Google>,
+    /// Where the platform sends the requests of this process's own
+    /// service, among its revisions: on Cloud Run, the service Cloud Run
+    /// names in `K_SERVICE`; none where the process runs no such service
+    /// (a local install, the holders' worker pool).
+    pub revisions: Option<Arc<dyn weft_platform_traits::ServiceRevisions>>,
     /// Work the platform itself needs done for as long as the process
     /// lives (delivering local wakes, stopping idle local workers).
     pub background: Vec<(&'static str, futures::future::BoxFuture<'static, anyhow::Result<()>>)>,
@@ -115,6 +120,7 @@ pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Po
                 identity: identity.clone(),
                 tokens: identity,
                 google: None,
+                revisions: None,
                 background: vec![
                     ("local_alarm", Box::pin(async move { wakes.run(deliver).await })),
                     (
@@ -167,6 +173,12 @@ pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Po
                 frontends: Arc::new(weft_platform_gcp::CloudRunFrontends::new(google.clone(), gcp.clone())),
                 domains: Arc::new(weft_platform_gcp::LoadBalancerDomains::new(google.clone(), gcp.clone())),
                 holder_pool: Arc::new(weft_platform_gcp::WorkerPoolHolders::new(google.clone(), gcp.holder_pool.clone())),
+                revisions: std::env::var("K_SERVICE").ok().filter(|s| !s.is_empty()).map(|service| {
+                    Arc::new(weft_platform_gcp::CloudRunRevisions::new(
+                        google.clone(),
+                        format!("projects/{}/locations/{}/services/{service}", gcp.project, gcp.region),
+                    )) as Arc<dyn weft_platform_traits::ServiceRevisions>
+                }),
                 google: Some(google),
                 identity: Arc::new(weft_platform_gcp::GoogleIdentity::new(
                     gcp.project.clone(),

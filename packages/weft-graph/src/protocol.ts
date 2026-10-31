@@ -1567,6 +1567,8 @@ export interface TriggerCopy {
   waiting?: WaitingFires;
   /// The version of the source its fires run, once its setup finished.
   version?: string;
+  /// While it turns on: since when, and what its activation waits on.
+  progress?: ChangeProgress;
 }
 
 /// One trigger place of the program, with its state and each instance's
@@ -2175,6 +2177,10 @@ export type CliPhase =
   | 'infra_provision_start'
   | 'infra_provision_done'
   | 'trigger_register_start'
+  /// The activation goes on, and what it waits on changed. Detail carries
+  /// `elapsedSeconds` and `waiting` ("its setup run <id>").
+  // SYNC: the trigger_register_wait detail <-> crates/weft-cli/src/progress.rs Progress::trigger_register_wait
+  | 'trigger_register_wait'
   | 'trigger_register_done'
   /// Periodic heartbeat while an infra verb waits on the supervisor
   /// (unbounded: draining runs). Detail carries `elapsedSeconds`.

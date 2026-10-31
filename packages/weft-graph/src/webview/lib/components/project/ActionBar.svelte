@@ -106,6 +106,12 @@
 			case 'infra_provision_done': return 'Provisioning infra...';
 			case 'trigger_register_start':
 			case 'trigger_register_done': return 'Registering triggers...';
+			case 'trigger_register_wait': {
+				// SYNC: the trigger_register_wait detail <-> crates/weft-cli/src/progress.rs (Progress::trigger_register_wait)
+				const waiting = typeof detail?.waiting === 'string' ? `: ${detail.waiting}` : '...';
+				const elapsed = typeof detail?.elapsedSeconds === 'number' ? ` (${detail.elapsedSeconds}s)` : '';
+				return `Turning triggers on${elapsed}, waiting on${waiting}`;
+			}
 			// The call waits for the runs going to end before it lands:
 			// without this the bar looks hung for as long as they take.
 			case 'drain_wait': return 'Waiting for the runs still going...';

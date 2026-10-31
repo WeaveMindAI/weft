@@ -662,6 +662,8 @@ mod tests {
             lifecycle,
             program: None,
             source_version: None,
+            driver_task: None,
+            activating: None,
             cut: Some(crate::activation_store::RecordedCut {
                 fingerprint: "f".into(),
                 depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
@@ -785,6 +787,8 @@ mod tests {
             lifecycle,
             program: None,
             source_version: None,
+            driver_task: None,
+            activating: None,
             cut: Some(weft_core::run_spec::trigger_cut(project, trigger).unwrap().into()),
         }
     }

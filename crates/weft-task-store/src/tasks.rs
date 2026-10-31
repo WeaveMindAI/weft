@@ -433,7 +433,8 @@ pub async fn resume_claim(pool: &Pool, task_id: Uuid, replica: &str) -> Result<b
 }
 
 /// Surrender a claim the process can no longer hold (it cannot renew
-/// it). The work itself did not fail, so the row goes back to `pending`
+/// it, or its copy stepped aside: `crate::aside`), resting or not. The
+/// work itself did not fail, so the row goes back to `pending`
 /// with no claimant for the next claim, and a transient outage never
 /// turns into a permanent failure. Guarded on `claimed_by = $process`, so
 /// a thief that already re-claimed the row is never clobbered; answers
@@ -442,7 +443,7 @@ pub async fn resume_claim(pool: &Pool, task_id: Uuid, replica: &str) -> Result<b
 pub async fn surrender(pool: &Pool, task_id: Uuid, replica: &str) -> Result<bool> {
     let surrendered = pool
         .execute(
-            r#"UPDATE task SET status = 'pending', claimed_by = NULL, claimed_until_unix = NULL
+            r#"UPDATE task SET status = 'pending', claimed_by = NULL, claimed_until_unix = NULL, claim_rests_on = NULL
                WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'"#,
             &[&task_id, &replica],
         )

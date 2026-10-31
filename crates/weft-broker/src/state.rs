@@ -112,6 +112,8 @@ pub struct BrokerState {
     pub slot_key: weft_core::storage::slot::SlotKey,
     /// See [`BrokerSettings::supervisor_booking`].
     pub supervisor_booking: Option<weft_task_store::drain::Booking>,
+    /// See [`BrokerSettings::aside`].
+    pub aside: weft_task_store::aside::StepAside,
     /// When the log last said a sender's calls do not read
     /// (`crate::wire`).
     pub unreadable_shapes: crate::wire::UnreadableShapes,
@@ -146,6 +148,12 @@ pub struct BrokerSettings {
     /// `('supervisor', SUPERVISOR_PASS_LOOP)`) as the broker answers its
     /// ownership sync, on a supervisor that scales to zero.
     pub supervisor_booking: Option<weft_task_store::drain::Booking>,
+    /// Whether this copy of the broker was replaced
+    /// (`weft_task_store::aside`): once it is, each of its lines takes no
+    /// new call, answers the ones in flight and closes, and its caller's
+    /// next call opens a line on a current copy (`crate::line`). Never set
+    /// on a machine.
+    pub aside: weft_task_store::aside::StepAside,
 }
 
 impl BrokerState {
@@ -217,6 +225,7 @@ impl BrokerState {
             object_store_public_internet: settings.object_store_public_internet,
             slot_key: settings.slot_key,
             supervisor_booking: settings.supervisor_booking,
+            aside: settings.aside,
             unreadable_shapes: crate::wire::UnreadableShapes::default(),
         }))
     }

@@ -178,7 +178,7 @@ async fn heads_live_on_working_copies_and_activations_name_their_versions(pool: 
     let activations = PostgresActivationStore::new(pool.clone());
     let keys = [ActivationKey::new("door", Owner::Shared)];
     let setup_run_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(project, &keys, setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(project, &keys, setup_run_id, None, Claimant::Anyone, uuid::Uuid::new_v4()).await.unwrap().is_ok());
     assert!(activations.record_activation_source(project, setup_run_id, &activated, "v1", &Default::default()).await.unwrap());
     activations.end_activating(project, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     projects.register_with_hashes(rig_project(project), "db-rig", "", TENANT, Some("bin-B"), Some("def-2"), None, None, None, None, None, None).await.unwrap();

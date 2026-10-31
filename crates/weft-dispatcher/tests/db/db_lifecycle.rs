@@ -277,17 +277,17 @@ async fn a_rearm_claim_refuses_a_trigger_that_left_active(pool: Pool) {
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    assert!(matches!(activations.try_begin_activating(id, &[feed_key()], Uuid::new_v4(), Some(ProjectStatus::Active), Claimant::Anyone)
+    assert!(matches!(activations.try_begin_activating(id, &[feed_key()], Uuid::new_v4(), Some(ProjectStatus::Active), Claimant::Anyone, Uuid::new_v4())
         .await.unwrap(), Err(weft_dispatcher::activation_store::ClaimRefused::NotExpected)), "a re-arm never creates a trigger that was never activated");
     let setup_run_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[feed_key()], setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[feed_key()], setup_run_id, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     activations.end_activating(id, setup_run_id, &ActivationLifecycle::holding(), false, None).await.unwrap().expect("owned");
-    assert!(matches!(activations.try_begin_activating(id, &[feed_key()], Uuid::new_v4(), Some(ProjectStatus::Active), Claimant::Anyone)
+    assert!(matches!(activations.try_begin_activating(id, &[feed_key()], Uuid::new_v4(), Some(ProjectStatus::Active), Claimant::Anyone, Uuid::new_v4())
         .await.unwrap(), Err(weft_dispatcher::activation_store::ClaimRefused::NotExpected)), "a deactivate between the look and the claim wins: the re-arm refuses");
     let again = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[feed_key()], again, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[feed_key()], again, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     activations.end_activating(id, again, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
-    assert!(activations.try_begin_activating(id, &[feed_key()], Uuid::new_v4(), Some(ProjectStatus::Active), Claimant::Anyone)
+    assert!(activations.try_begin_activating(id, &[feed_key()], Uuid::new_v4(), Some(ProjectStatus::Active), Claimant::Anyone, Uuid::new_v4())
         .await.unwrap().is_ok(), "still Active: the re-arm claims");
 }
 
@@ -300,7 +300,7 @@ async fn an_instances_wipe_takes_its_row_and_its_signals_in_one_write(pool: Pool
     let ada = InstanceId::new("ada").unwrap();
     let ada_key = ActivationKey::new("feed", Owner::Instance(ada.clone()));
     let setup_run_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, std::slice::from_ref(&ada_key), setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, std::slice::from_ref(&ada_key), setup_run_id, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     let mut entry = governed_entry("ada-wiped-entry", id, setup_run_id);
     entry.instance = Some(ada.clone());
     store.signal_insert(&entry).await.unwrap();
@@ -327,7 +327,7 @@ async fn a_park_keeps_its_signals_listening(pool: Pool) {
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let setup_run_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[feed_key()], setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[feed_key()], setup_run_id, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     store.signal_insert(&governed_entry("parked-entry", id, setup_run_id)).await.unwrap();
     activations.end_activating(id, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
 
@@ -391,7 +391,7 @@ async fn an_infra_take_down_issues_its_commands_with_the_triggers(pool: Pool) {
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let setup_run_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[feed_key()], setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[feed_key()], setup_run_id, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     activations.end_activating(id, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     let commands = |work| TakeDownCommands { tenant_id: TENANT.into(), issued_by_replica: "disp-1".into(), work };
     let shared = weft_core::instance::Copies::Shared;
@@ -446,7 +446,7 @@ async fn an_infra_take_down_issues_its_commands_with_the_triggers(pool: Pool) {
     // One a person took down after it was listed stays theirs: never
     // marked to come back with the infra.
     let setup_run_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[feed_key()], setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[feed_key()], setup_run_id, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     activations.end_activating(id, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     activations
         .set_lifecycle_guarded(id, &[feed_key()], &ActivationLifecycle::holding(), SignalsGoing::Kept, Forget::Nothing, DownCause::Person, None)
@@ -474,7 +474,7 @@ async fn an_infra_take_down_issues_its_commands_with_the_triggers(pool: Pool) {
 /// The feed switched on with one entry signal, `token`.
 async fn activate_with_entry(activations: &PostgresActivationStore, store: &PostgresStore, id: Uuid, token: &str) {
     let setup_run_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[feed_key()], setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[feed_key()], setup_run_id, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     store.signal_insert(&governed_entry(token, id, setup_run_id)).await.unwrap();
     activations.end_activating(id, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
 }
@@ -605,7 +605,7 @@ async fn a_window_that_ends_takes_the_places_with_the_close(pool: Pool) {
     seed_project(&projects, id, "bin-A").await;
     let (over, open) = (feed_key(), ActivationKey::new("reads", Owner::Shared));
     let setup_run_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[over.clone(), open.clone()], setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[over.clone(), open.clone()], setup_run_id, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     store.signal_insert(&governed_entry("feed-entry", id, setup_run_id)).await.unwrap();
     let mut reads = entry_signal("reads-entry", id);
     reads.activation_trigger = Some("reads".into());
@@ -680,7 +680,7 @@ async fn a_door_stops_taking_work_once_its_window_ends(pool: Pool) {
     seed_project(&projects, id, "bin-A").await;
     let (over, open) = (feed_key(), ActivationKey::new("reads", Owner::Shared));
     let setup_run_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[over.clone(), open.clone()], setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[over.clone(), open.clone()], setup_run_id, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     activations.end_activating(id, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     for (key, deadline) in [(&over, 100), (&open, i64::MAX / 2)] {
         activations
@@ -723,7 +723,7 @@ async fn a_refused_let_go_still_ends_the_window_and_is_written_down(pool: Pool) 
     seed_project(&projects, id, "bin-A").await;
     let (key, later) = (feed_key(), ActivationKey::new("reads", Owner::Shared));
     let setup_run_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[key.clone(), later.clone()], setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[key.clone(), later.clone()], setup_run_id, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     store.signal_insert(&governed_entry("tok-feed", id, setup_run_id)).await.unwrap();
     activations.end_activating(id, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     let window_over = hidden_until(100);
@@ -763,8 +763,8 @@ async fn activation_cleanup_cannot_finish_or_wipe_a_newer_activation(pool: Pool)
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let first = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[feed_key()], first, None, Claimant::Anyone).await.unwrap().is_ok());
-    assert!(matches!(activations.try_begin_activating(id, &[feed_key()], Uuid::new_v4(), None, Claimant::Anyone).await.unwrap(),
+    assert!(activations.try_begin_activating(id, &[feed_key()], first, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
+    assert!(matches!(activations.try_begin_activating(id, &[feed_key()], Uuid::new_v4(), None, Claimant::Anyone, Uuid::new_v4()).await.unwrap(),
         Err(weft_dispatcher::activation_store::ClaimRefused::Claimed)), "one activation of a trigger at a time");
     store.signal_insert(&governed_entry("old-entry", id, first)).await.unwrap();
     let removed = activations.end_activating(id, first, &ActivationLifecycle::refused(), true, None).await.unwrap().unwrap();
@@ -776,7 +776,7 @@ async fn activation_cleanup_cannot_finish_or_wipe_a_newer_activation(pool: Pool)
     assert!(crate::events(store.events_log(first).await.unwrap()).is_empty());
 
     let second = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[feed_key()], second, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[feed_key()], second, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     store.signal_insert(&governed_entry("new-entry", id, second)).await.unwrap();
     let program = weft_core::project::hash::ProgramIdentity {
         definition_hash: "def-2".into(), binary_hash: "bin-A".into(), implementations: Default::default(),
@@ -812,7 +812,7 @@ async fn a_triggers_cut_is_recorded_kept_while_down_and_restored(pool: Pool) {
     let cut = RecordedCut { fingerprint: "cut-1".into(), depends_on: vec!["db".into(), "one.bridge".into()] };
     let cuts = std::collections::BTreeMap::from([("feed".to_string(), cut.clone())]);
     let first = Uuid::new_v4();
-    activations.try_begin_activating(id, &[feed_key(), ada.clone()], first, None, Claimant::Anyone).await.unwrap().expect("claimed");
+    activations.try_begin_activating(id, &[feed_key(), ada.clone()], first, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().expect("claimed");
     assert!(!activations.record_activation_source(id, Uuid::new_v4(), &program, "v1", &cuts).await.unwrap(), "only the owning setup records");
     assert!(activations.record_activation_source(id, first, &program, "v1", &cuts).await.unwrap());
     activations.end_activating(id, first, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
@@ -832,7 +832,7 @@ async fn a_triggers_cut_is_recorded_kept_while_down_and_restored(pool: Pool) {
     assert!(rows.iter().find(|a| a.key == feed_key()).unwrap().program.is_none(), "what it fired goes with it");
 
     let again = Uuid::new_v4();
-    let previous = activations.try_begin_activating(id, &[feed_key()], again, None, Claimant::Anyone).await.unwrap().expect("claimed");
+    let previous = activations.try_begin_activating(id, &[feed_key()], again, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().expect("claimed");
     let moved = std::collections::BTreeMap::from([("feed".to_string(), RecordedCut { fingerprint: "cut-2".into(), depends_on: Vec::new() })]);
     assert!(activations.record_activation_source(id, again, &program, "v2", &moved).await.unwrap());
     assert!(activations.restore(id, again, &previous).await.unwrap());
@@ -916,14 +916,14 @@ async fn an_instances_activation_is_its_own_row(pool: Pool) {
     let bob_key = ActivationKey::new("feed", Owner::Instance(bob.clone()));
 
     let shared_setup = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[feed_key()], shared_setup, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[feed_key()], shared_setup, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     let ada_setup = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, std::slice::from_ref(&ada_key), ada_setup, None, Claimant::Anyone).await.unwrap().is_ok(),
+    assert!(activations.try_begin_activating(id, std::slice::from_ref(&ada_key), ada_setup, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok(),
         "the shared activation in flight does not block an instance's");
-    assert!(matches!(activations.try_begin_activating(id, &[bob_key.clone(), ada_key.clone()], Uuid::new_v4(), None, Claimant::Anyone).await.unwrap(),
+    assert!(matches!(activations.try_begin_activating(id, &[bob_key.clone(), ada_key.clone()], Uuid::new_v4(), None, Claimant::Anyone, Uuid::new_v4()).await.unwrap(),
         Err(weft_dispatcher::activation_store::ClaimRefused::Claimed)), "a claim over a busy key claims nothing");
     let bob_setup = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, std::slice::from_ref(&bob_key), bob_setup, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, std::slice::from_ref(&bob_key), bob_setup, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
 
     let mut ada_entry = governed_entry("ada-entry", id, ada_setup);
     ada_entry.instance = Some(ada.clone());
@@ -951,7 +951,7 @@ async fn an_instances_activation_is_its_own_row(pool: Pool) {
     ], "an instance's wiped trigger leaves no row, like one never activated");
 
     let begun = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, std::slice::from_ref(&bob_key), begun, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, std::slice::from_ref(&bob_key), begun, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     let refused = activations.set_lifecycle_guarded(id, &[feed_key(), bob_key], &ActivationLifecycle::refused(), SignalsGoing::Kept, Forget::InstanceRows, DownCause::Person, None).await.unwrap();
     assert!(matches!(&refused, LifecycleWrite::Rejected { blocker } if blocker.contains("instance 'bob'")), "{refused:?}");
     let removed = activations.end_activating(id, begun, &ActivationLifecycle::refused(), true, None).await.unwrap().unwrap();
@@ -972,7 +972,7 @@ async fn a_cancelled_instances_activation_leaves_no_row(pool: Pool) {
     let ada_key = ActivationKey::new("feed", Owner::Instance(ada.clone()));
 
     let setup_run_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[feed_key(), ada_key.clone()], setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[feed_key(), ada_key.clone()], setup_run_id, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     let mut ada_entry = governed_entry("ada-entry", id, setup_run_id);
     ada_entry.instance = Some(ada.clone());
     store.signal_insert(&ada_entry).await.unwrap();
@@ -991,7 +991,7 @@ async fn a_cancelled_instances_activation_leaves_no_row(pool: Pool) {
     let rows: Vec<(Option<String>, ProjectStatus)> = activations.list(id).await.unwrap().into_iter()
         .map(|a| (a.key.instance().map(|m| m.as_str().to_string()), a.lifecycle.status)).collect();
     assert_eq!(rows, vec![(None, ProjectStatus::Inactive)], "ada's row goes; the shared one stays");
-    let again = activations.try_begin_activating(id, std::slice::from_ref(&ada_key), Uuid::new_v4(), None, Claimant::Anyone).await.unwrap();
+    let again = activations.try_begin_activating(id, std::slice::from_ref(&ada_key), Uuid::new_v4(), None, Claimant::Anyone, Uuid::new_v4()).await.unwrap();
     assert!(again.expect("claimed").is_empty(), "ada activates again as never activated");
 }
 
@@ -1016,7 +1016,7 @@ async fn a_rearm_stores_its_values_as_it_lands(pool: Pool) {
     let stored = || async { weft_access_store::instance_values(&pool, TENANT, id, &ada).await.unwrap() };
 
     let setup_run_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, std::slice::from_ref(&ada_key), setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, std::slice::from_ref(&ada_key), setup_run_id, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     assert!(activations.end_activating(id, Uuid::new_v4(), &ActivationLifecycle::active(), false, Some(&store))
         .await.unwrap().is_none());
     assert!(stored().await.is_empty(), "a landing that owns nothing stores nothing");
@@ -1038,7 +1038,7 @@ async fn a_refused_instances_row_is_forgotten(pool: Pool) {
     let (ada, bob, cyd) = (instance("ada"), instance("bob"), instance("cyd"));
     for key in [feed_key(), ada.clone(), bob.clone(), cyd.clone()] {
         let setup = Uuid::new_v4();
-        assert!(activations.try_begin_activating(id, std::slice::from_ref(&key), setup, None, Claimant::Anyone).await.unwrap().is_ok());
+        assert!(activations.try_begin_activating(id, std::slice::from_ref(&key), setup, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
         activations.end_activating(id, setup, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     }
     let rows = || async {
@@ -1061,7 +1061,7 @@ async fn a_refused_instances_row_is_forgotten(pool: Pool) {
     assert_eq!(rows().await[1], (Some("bob".into()), ProjectStatus::Inactive), "bob keeps the row");
 
     let setup = Uuid::new_v4();
-    let previous = activations.try_begin_activating(id, std::slice::from_ref(&ada), setup, None, Claimant::Anyone).await.unwrap().expect("claimed");
+    let previous = activations.try_begin_activating(id, std::slice::from_ref(&ada), setup, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().expect("claimed");
     assert!(previous.is_empty(), "ada activates again as never activated");
     activations.end_activating(id, setup, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     activations.set_lifecycle_guarded(id, std::slice::from_ref(&ada), &ActivationLifecycle::holding(), SignalsGoing::Kept, Forget::Nothing, DownCause::Person, None).await.unwrap();
@@ -1083,7 +1083,7 @@ async fn trigger_bake_ownership_publication_and_project_cleanup(pool: Pool) {
     assert_eq!(store.finish_trigger_setup(first, Some(&bake)).await.unwrap(), None, "nothing before it to replace");
 
     let second = Uuid::new_v4();
-    assert!(activations.try_begin_activating(id, &[feed_key()], second, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[feed_key()], second, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
     assert!(queue(&store, &[trigger_setup_birth(id, Uuid::new_v4())], true).await.is_err(),
         "a setup no activation is setting up is never born as one");
     queue(&store, &[trigger_setup_birth(id, second)], true).await.unwrap();
@@ -1932,7 +1932,7 @@ async fn the_sweep_selects_only_due_heads_on_active_triggers(pool: Pool) {
     ] {
         let setup_run_id = Uuid::new_v4();
         let key = ActivationKey::new(trigger, Owner::Shared);
-        assert!(activations.try_begin_activating(project, &[key], setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+        assert!(activations.try_begin_activating(project, &[key], setup_run_id, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
         activations.end_activating(project, setup_run_id, &to, false, None).await.unwrap().expect("owned");
     }
 
@@ -2231,13 +2231,13 @@ async fn a_failed_activation_puts_the_triggers_back_as_the_claim_found_them(pool
     seed_project(&projects, id, "bin-A").await;
     let fresh = ActivationKey::new("fresh", Owner::Shared);
     let first = Uuid::new_v4();
-    activations.try_begin_activating(id, &[feed_key()], first, None, Claimant::Anyone).await.unwrap().expect("claim");
+    activations.try_begin_activating(id, &[feed_key()], first, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().expect("claim");
     activations.end_activating(id, first, &ActivationLifecycle::active(), false, None).await.unwrap().expect("active");
     activations.set_lifecycle_guarded(id, &[feed_key()], &ActivationLifecycle::holding(), SignalsGoing::Kept, Forget::Nothing, DownCause::Person, None).await.unwrap();
 
     let second = Uuid::new_v4();
     let previous = activations
-        .try_begin_activating(id, &[feed_key(), fresh.clone()], second, None, Claimant::Anyone)
+        .try_begin_activating(id, &[feed_key(), fresh.clone()], second, None, Claimant::Anyone, Uuid::new_v4())
         .await
         .unwrap()
         .expect("claim");
@@ -3302,29 +3302,96 @@ async fn what_an_infra_says_changed_is_written_where_its_node_put_it(pool: Pool)
     assert!(why.contains("no longer running"), "{why}");
 }
 
-/// An activation whose driver stopped beating is stuck only once no setup
-/// run of its goes: while its setup run is parked on a person (or queued,
-/// or driven) the driver rests on purpose, and the run is judged by its own
-/// worker and its ending. A driver that died with no setup run going is.
-/// The `lapses` loop looks at the stale heartbeat only then.
+/// An activation is orphaned only once the task driving it is over: while
+/// that task waits to be claimed, is claimed, or rests on its setup run
+/// (parked on a person), the activation is alive whatever became of the
+/// process that claimed it, since a claim its claimant left is rescued and
+/// the task carries the activation on. While its task's claim is renewed,
+/// the `lapses` loop looks when that claim would lapse; resting, never.
+/// One claimed under a task that is gone is orphaned at once.
 #[weft_db_macros::test]
-async fn an_activation_whose_setup_run_goes_is_not_stuck(pool: Pool) {
+async fn an_activation_is_orphaned_only_once_its_task_is_over(pool: Pool) {
     let (store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
+    let task = weft_task_store::tasks::enqueue(
+        &pool,
+        weft_task_store::tasks::NewTask {
+            kind: weft_task_store::TaskKind::Activate,
+            project_id: Some(id),
+            dedup_key: None,
+            run_id: None,
+            tenant_id: TENANT.into(),
+            payload: json!({}),
+        },
+    )
+    .await
+    .unwrap();
     let setup_run = weft_core::new_run_id();
-    assert!(activations.try_begin_activating(id, &[feed_key()], setup_run, None, Claimant::Anyone).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(id, &[feed_key()], setup_run, None, Claimant::Anyone, task).await.unwrap().is_ok());
+    let row = activations.list(id).await.unwrap().into_iter().find(|a| a.key == feed_key()).unwrap();
+    assert_eq!(row.driver_task, Some(task), "the claim names the task driving it");
+    let activating = row.activating.expect("where it stands");
+    assert_eq!(activating.step, weft_dispatcher::activation_store::ActivationStep::Preparing);
+    assert!(!activating.listened, "never activated: it listened to nothing");
+    assert!(activations.list_orphaned().await.unwrap().is_empty(), "its task waits to be claimed");
+    let now = weft_dispatcher::lease::now_unix();
+    assert_eq!(weft_dispatcher::lapses::earliest_lapse(&pool, now).await.unwrap(), None, "nothing is looked at for a task not claimed");
+
+    let weft_task_store::tasks::Claim::Task(_) = weft_task_store::tasks::claim_next(&pool, "disp-1").await.unwrap() else { panic!("claimed") };
+    assert!(activations.list_orphaned().await.unwrap().is_empty(), "its task is claimed");
+    let claimed_until: i64 = pool.scalar("SELECT claimed_until_unix FROM task WHERE id = $1", &[&task]).await.unwrap();
+    assert_eq!(weft_dispatcher::lapses::earliest_lapse(&pool, now).await.unwrap(), Some(claimed_until), "looked at when its claim would lapse");
+
     assert!(queue(&store, &[birth(setup_run, id, weft_core::context::Phase::TriggerSetup, "bin-A")], true).await.unwrap());
     pool.execute("UPDATE run SET state = 'parked' WHERE run_id = $1", &[&setup_run]).await.unwrap();
-    pool.execute("UPDATE trigger_activation SET heartbeat_unix = 0", &[]).await.unwrap();
-    let now = weft_dispatcher::lease::now_unix();
-    assert!(activations.list_stuck(now).await.unwrap().is_empty(), "its setup run waits on a person");
+    assert!(weft_task_store::tasks::rest_claim(&pool, task, "disp-1", setup_run).await.unwrap());
+    assert!(activations.list_orphaned().await.unwrap().is_empty(), "its task rests on its setup run");
     assert_eq!(weft_dispatcher::lapses::earliest_lapse(&pool, now).await.unwrap(), None, "and nothing is looked at for it");
 
-    complete(&store, setup_run).await;
-    let stuck = activations.list_stuck(now).await.unwrap();
-    assert_eq!(stuck.iter().map(|s| s.run_id).collect::<Vec<_>>(), vec![setup_run], "no run goes and nobody drives it");
+    assert!(activations.set_step(id, setup_run, weft_dispatcher::activation_store::ActivationStep::SettingUp).await.unwrap());
+    assert!(weft_task_store::tasks::resume_claim(&pool, task, "disp-1").await.unwrap());
+    weft_task_store::tasks::fail(&pool, task, "disp-1", "the rollback failed".into()).await.unwrap();
+    let orphaned = activations.list_orphaned().await.unwrap();
+    assert_eq!(orphaned.iter().map(|s| s.run_id).collect::<Vec<_>>(), vec![setup_run], "its task ended without landing it");
+
+    let other = Uuid::new_v4();
+    seed_project(&projects, other, "bin-A").await;
+    let gone = weft_core::new_run_id();
+    assert!(activations.try_begin_activating(other, &[feed_key()], gone, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().is_ok());
+    assert!(activations.list_orphaned().await.unwrap().iter().any(|s| s.run_id == gone), "a task that is gone drives nothing");
+}
+
+/// A claim records, for each trigger, whether it listened the whole time
+/// it was down as the claim found it; a claim that fails puts back the
+/// task that turned the trigger on before, so a task trying again never
+/// reads a trigger it did not turn on as its own.
+#[weft_db_macros::test]
+async fn a_claim_keeps_what_it_found_and_a_restore_puts_back_the_driver(pool: Pool) {
+    let (_store, projects) = setup(&pool).await;
+    let activations = PostgresActivationStore::new(pool.clone());
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+    let setup_run = weft_core::new_run_id();
+    assert!(activations.try_begin_activating(id, &[feed_key()], setup_run, None, Claimant::Anyone, first).await.unwrap().is_ok());
+    activations.end_activating(id, setup_run, &weft_dispatcher::activation_store::ActivationLifecycle::active(), false, None).await.unwrap().expect("landed");
+    let on = activations.list(id).await.unwrap().into_iter().find(|a| a.key == feed_key()).unwrap();
+    assert_eq!((on.driver_task, on.activating), (Some(first), None), "on, turned on by the first task");
+
+    let again = weft_core::new_run_id();
+    let previous = activations
+        .try_begin_activating(id, &[feed_key()], again, Some(ProjectStatus::Active), Claimant::Anyone, second)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let claimed = activations.list(id).await.unwrap().into_iter().find(|a| a.key == feed_key()).unwrap();
+    assert_eq!(claimed.driver_task, Some(second));
+    assert!(claimed.activating.expect("activating").listened, "on when claimed: a re-arm listened the whole time");
+    assert!(activations.restore(id, again, &previous).await.unwrap());
+    let restored = activations.list(id).await.unwrap().into_iter().find(|a| a.key == feed_key()).unwrap();
+    assert_eq!((restored.lifecycle.status, restored.driver_task, restored.activating), (ProjectStatus::Active, Some(first), None));
 }
 
 /// A claimed task lapses when its claimant stops renewing it, which the
@@ -3746,7 +3813,7 @@ async fn a_resync_keeps_builds_and_other_activations_out_until_it_lets_go(pool: 
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let first = Uuid::new_v4();
-    activations.try_begin_activating(id, &[feed_key()], first, None, Claimant::Anyone).await.unwrap().expect("claim");
+    activations.try_begin_activating(id, &[feed_key()], first, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().expect("claim");
     activations.end_activating(id, first, &ActivationLifecycle::active(), false, None).await.unwrap().expect("active");
     let now = || weft_dispatcher::lease::now_unix();
     let stale = weft_dispatcher::transition::heartbeat_stale_secs();
@@ -3770,11 +3837,11 @@ async fn a_resync_keeps_builds_and_other_activations_out_until_it_lets_go(pool: 
     };
     let claim = |claimant: Claimant| {
         let activations = activations.clone();
-        async move { activations.try_begin_activating(id, &[feed_key()], Uuid::new_v4(), None, claimant).await.unwrap().map(|_| ()) }
+        async move { activations.try_begin_activating(id, &[feed_key()], Uuid::new_v4(), None, claimant, Uuid::new_v4()).await.unwrap().map(|_| ()) }
     };
 
     let mid_flip = Uuid::new_v4();
-    activations.try_begin_activating(id, &[feed_key()], mid_flip, None, Claimant::Anyone).await.unwrap().expect("a manual activate");
+    activations.try_begin_activating(id, &[feed_key()], mid_flip, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().expect("a manual activate");
     assert_eq!(projects.try_begin_resyncing(id, &plan, task(TENANT, id, plan.driver)).await.unwrap(), None, "no resync while a trigger is mid-flip");
     activations.end_activating(id, mid_flip, &ActivationLifecycle::active(), false, None).await.unwrap().expect("active");
     let moved = ResyncPlan { build: weft_core::builds::BuildHashes { binary_hash: Some("bin-B".into()), ..Default::default() }, ..plan.clone() };
@@ -3803,7 +3870,7 @@ async fn a_resync_keeps_builds_and_other_activations_out_until_it_lets_go(pool: 
     assert_eq!(claim(Claimant::Anyone).await, Err(ClaimRefused::Resyncing), "no other activation under it");
     assert_eq!(claim(Claimant::Resync(Uuid::new_v4())).await, Err(ClaimRefused::ResyncGone), "nor another drive's");
     let again = Uuid::new_v4();
-    activations.try_begin_activating(id, &[feed_key()], again, None, Claimant::Resync(plan.driver)).await.unwrap().expect("its own turn-on goes through");
+    activations.try_begin_activating(id, &[feed_key()], again, None, Claimant::Resync(plan.driver), Uuid::new_v4()).await.unwrap().expect("its own turn-on goes through");
     activations.end_activating(id, again, &ActivationLifecycle::active(), false, None).await.unwrap().expect("active");
 
     // Its task stopped: why is written into the plan, which still holds.
@@ -4069,7 +4136,7 @@ async fn a_failed_reactivation_keeps_what_the_park_kept(pool: Pool) {
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let first = Uuid::new_v4();
-    activations.try_begin_activating(id, &[feed_key()], first, None, Claimant::Anyone).await.unwrap().expect("claim");
+    activations.try_begin_activating(id, &[feed_key()], first, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().expect("claim");
     store.signal_insert(&governed_entry("kept-entry", id, first)).await.unwrap();
     activations.end_activating(id, first, &ActivationLifecycle::active(), false, None).await.unwrap().expect("active");
     let waiting_run = queued_run(&store, id).await;
@@ -4090,7 +4157,7 @@ async fn a_failed_reactivation_keeps_what_the_park_kept(pool: Pool) {
     };
 
     let failing = Uuid::new_v4();
-    let previous = activations.try_begin_activating(id, &[feed_key()], failing, None, Claimant::Anyone).await.unwrap().expect("claim");
+    let previous = activations.try_begin_activating(id, &[feed_key()], failing, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().expect("claim");
     assert!(activations.restore(id, failing, &previous).await.unwrap());
     let after = activations.list(id).await.unwrap();
     assert_eq!(after[0].lifecycle.mode().as_str(), "take", "the trigger is down again, its door taking");
@@ -4100,7 +4167,7 @@ async fn a_failed_reactivation_keeps_what_the_park_kept(pool: Pool) {
     }
 
     let cancelled = Uuid::new_v4();
-    activations.try_begin_activating(id, &[feed_key()], cancelled, None, Claimant::Anyone).await.unwrap().expect("claim");
+    activations.try_begin_activating(id, &[feed_key()], cancelled, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().expect("claim");
     let removed = activations
         .end_activating(id, cancelled, &ActivationLifecycle::refused(), true, None)
         .await
@@ -4121,14 +4188,14 @@ async fn an_unfinished_activation_keeps_what_its_triggers_kept(pool: Pool) {
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let first = Uuid::new_v4();
-    activations.try_begin_activating(id, &[feed_key()], first, None, Claimant::Anyone).await.unwrap().expect("claim");
+    activations.try_begin_activating(id, &[feed_key()], first, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().expect("claim");
     store.signal_insert(&governed_entry("kept-entry", id, first)).await.unwrap();
     activations.end_activating(id, first, &ActivationLifecycle::active(), false, None).await.unwrap().expect("active");
     activations.set_lifecycle_guarded(id, &[feed_key()], &ActivationLifecycle::holding(), SignalsGoing::Kept, Forget::Nothing, DownCause::Person, None).await.unwrap();
     assert_eq!(park(&pool, "kept-entry", &parked(0, 0), None).await.unwrap(), ParkAppend::Parked);
 
     let cancelled = Uuid::new_v4();
-    activations.try_begin_activating(id, &[feed_key()], cancelled, None, Claimant::Anyone).await.unwrap().expect("claim");
+    activations.try_begin_activating(id, &[feed_key()], cancelled, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().expect("claim");
     let removed = activations.end_unfinished(id, cancelled).await.unwrap().expect("owned");
     assert!(removed.is_empty(), "nothing goes");
     assert_eq!(activations.list(id).await.unwrap()[0].lifecycle.mode().as_str(), "take", "down with what it kept, its door taking");
@@ -4138,7 +4205,7 @@ async fn an_unfinished_activation_keeps_what_its_triggers_kept(pool: Pool) {
 
     pool.execute("DELETE FROM parked_fire", &[]).await.unwrap();
     let empty = Uuid::new_v4();
-    activations.try_begin_activating(id, &[feed_key()], empty, None, Claimant::Anyone).await.unwrap().expect("claim");
+    activations.try_begin_activating(id, &[feed_key()], empty, None, Claimant::Anyone, Uuid::new_v4()).await.unwrap().expect("claim");
     let removed = activations.end_unfinished(id, empty).await.unwrap().expect("owned");
     assert_eq!(removed.iter().map(|s| s.token.as_str()).collect::<Vec<_>>(), ["kept-entry"], "no work kept: wiped");
     assert_eq!(activations.list(id).await.unwrap()[0].lifecycle.mode().as_str(), "refuse");

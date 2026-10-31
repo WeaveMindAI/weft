@@ -239,6 +239,31 @@ The last builds those projects again on the new weft and brings back exactly
 what the first took down. For what each step
 does, go and read [updating weft](cli.md#updating-weft).
 
+This works from an install of any age, however long ago you last ran the
+workflow.
+
+While the workflow rolls the new weft out, a copy of the old one that still
+has something open (the editor following a project, a worker's line to the
+broker) steps aside as soon as Cloud Run sends the requests to the new one: it
+finishes what it was answering, closes what it held open, and stops. The
+editor and the workers open again on the new copies by themselves, so the two never take work side
+by side.
+
+Once in a while, weft's database starts its history over, and a database an
+older weft built cannot come across (it last happened when executions were
+renamed runs). Before it deploys anything, the workflow checks your install's
+database. If it is one of those, the workflow stops with an error that names
+the `reset_database` input, and your install stays as it was. If you want to
+go ahead, run the workflow again with `reset_database` ticked (from a terminal:
+`gh workflow run install-gcp.yml -f reset_database=true`). It wipes the
+database, builds the new weft's in its place, and deploys. That deletes every
+project's run history, versions and stored connections, and the maintenance
+with them, so there is nothing for `weft maintenance off` to bring back:
+deploy each project again with `weft activate --on prod`, and make its
+connections again with `weft connect --on prod`. Your project folders are
+untouched. If the database did not need it, the workflow stops without
+touching anything, and you run it again with the box unticked.
+
 If something in a project does not come back with `weft maintenance off --on
 prod`, everything else is back anyway, and `off` says what went wrong. If the
 message says the project's copy of the standard nodes is older than this

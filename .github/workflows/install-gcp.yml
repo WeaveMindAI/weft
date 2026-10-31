@@ -1,6 +1,9 @@
 # Install (or upgrade) weft on your own GCP project. Run it by hand from
 # the Actions tab of your fork of weft. Upgrading weft is merging
-# upstream into the fork and running it again.
+# upstream into the fork and running it again. Its one input,
+# reset_database, is for an install whose database an older weft built
+# from a schema history this one cannot carry forward (the step "the
+# database's history" says when).
 #
 # It needs, once, before the first run (the cloud chapter of the docs has
 # the commands):
@@ -36,6 +39,12 @@ name: install on GCP
 
 on:
   workflow_dispatch:
+    inputs:
+      # SYNC: reset_database <-> crates/weft-runtime/src/schema.rs (explain)
+      reset_database:
+        description: "Wipe the install's database, ONLY if an older weft built it from a schema history this one cannot carry forward, and start it fresh. This deletes every project's run history, versions and stored connections."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -134,7 +143,10 @@ jobs:
           terraform_wrapper: false
 
       # The registry first: the images this checkout names are pushed there
-      # before the services that run them exist.
+      # before the services that run them exist. Every targeted apply also
+      # targets both ends of every `moved` block, which Terraform requires
+      # while a rename still has to happen in the state, so an install last
+      # updated before any rename goes through.
       - name: create the registry
         working-directory: deploy/terraform/gcp
         env:
@@ -143,8 +155,12 @@ jobs:
           TF_VAR_database_url: unset
         run: |
           terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          targets=$("$GITHUB_WORKSPACE/scripts/terraform-moved-targets.sh" .)
+          renamed=()
+          [ -z "$targets" ] || mapfile -t renamed <<<"$targets"
           terraform apply -input=false -auto-approve \
-            -target=google_project_service.apis -target=google_artifact_registry_repository.images
+            -target=google_project_service.apis -target=google_artifact_registry_repository.images \
+            "${renamed[@]}"
 
       # The CLI weft's release built from this exact source, waited for
       # when that release is still being built; otherwise built here,
@@ -263,10 +279,14 @@ jobs:
             echo "a new install starts on its own Postgres; nothing to move"
             exit 0
           fi
+          targets=$("$GITHUB_WORKSPACE/scripts/terraform-moved-targets.sh" .)
+          renamed=()
+          [ -z "$targets" ] || mapfile -t renamed <<<"$targets"
           terraform apply -input=false -auto-approve \
             -target=google_secret_manager_secret_version.cloud_sql_url \
             -target=google_secret_manager_secret_iam_member.core_reads_cloud_sql_url \
-            -target=google_compute_subnetwork.roles
+            -target=google_compute_subnetwork.roles \
+            "${renamed[@]}"
           move=$(terraform output -json database_move)
           project="${{ vars.GCP_PROJECT_ID }}"
           region="${{ vars.GCP_REGION }}"
@@ -318,6 +338,73 @@ jobs:
             echo "::error::copying the database into the install's own failed, so the install still uses the one it had and the new one is empty; its log: gcloud logging read 'resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$job\"' --project $project --freshness 1h"
             exit 1
           fi
+
+      # Before any role is deployed: a database an older weft built from a
+      # schema history this one cannot carry forward (the history restarted
+      # since) is refused by every new role's boot, while Cloud Run keeps
+      # sending traffic to the old ones. The runtime image just pushed says
+      # where the database the roles boot on stands, from a Cloud Run job in
+      # the install's network (an install's own Cloud SQL has only a private
+      # address). Older, with reset_database on: the same job wipes it and
+      # builds this weft's schema in one go, so an old copy woken afterwards
+      # refuses the database instead of building its old tables in it again.
+      # Older with the input off: nothing is deployed. A first install has
+      # no database of its own to check yet.
+      - name: the database's history
+        working-directory: deploy/terraform/gcp
+        env:
+          RESET_DATABASE: ${{ inputs.reset_database }}
+          TF_VAR_database_url: ${{ secrets.WEFT_DATABASE_URL }}
+          TF_VAR_database_listen_url: ${{ secrets.WEFT_DATABASE_LISTEN_URL }}
+        run: |
+          if ! url=$(terraform output -raw url 2>/dev/null) || [ -z "$url" ]; then
+            if [ "$RESET_DATABASE" = true ]; then
+              echo "::error::reset_database is on, and there is no install yet whose database could be reset; run this again with it off"
+              exit 1
+            fi
+            echo "no install yet, so no database to check"
+            exit 0
+          fi
+          # Only what the job needs: the address of the database this run
+          # deploys the roles on, in a secret the roles never read (theirs
+          # names the one they boot on now until the cloud is created), and
+          # the step's output written into the state an older run left.
+          targets=$("$GITHUB_WORKSPACE/scripts/terraform-moved-targets.sh" .)
+          renamed=()
+          [ -z "$targets" ] || mapfile -t renamed <<<"$targets"
+          terraform apply -input=false -auto-approve \
+            -target=google_service_account.core -target=google_compute_subnetwork.roles \
+            -target=google_secret_manager_secret_version.database_check \
+            -target=google_secret_manager_secret_iam_member.core_reads_database_check \
+            "${renamed[@]}"
+          check=$(terraform output -json database_check)
+          project="${{ vars.GCP_PROJECT_ID }}"
+          region="${{ vars.GCP_REGION }}"
+          job=$(echo "$check" | jq -r .job)
+          # SYNC: the subcommand and its flag <-> crates/weft-runtime/src/main.rs (Command::DatabaseHistory)
+          args=database-history
+          [ "$RESET_DATABASE" = true ] && args=database-history,--wipe-older
+          gcloud run jobs deploy "$job" --project "$project" --region "$region" --quiet \
+            --image "$TF_VAR_runtime_image" \
+            --service-account "$(echo "$check" | jq -r .service_account)" \
+            --network "$(echo "$check" | jq -r .network)" --subnet "$(echo "$check" | jq -r .subnet)" \
+            --vpc-egress private-ranges-only \
+            --set-secrets "WEFT_DATABASE_URL=$(echo "$check" | jq -r .database_secret):latest" \
+            --args="$args" \
+            --max-retries 0 --task-timeout 3600s
+          checked=0
+          gcloud run jobs execute "$job" --project "$project" --region "$region" --wait || checked=$?
+          gcloud run jobs delete "$job" --project "$project" --region "$region" --quiet
+          logs="gcloud logging read 'resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$job\"' --project $project --freshness 1h"
+          if [ "$checked" -ne 0 ]; then
+            if [ "$RESET_DATABASE" = true ]; then
+              echo "::error::the database was not reset, and nothing was deployed. Either it is not from an older weft (then it needs no reset: run this again with reset_database off), or the reset failed; its log says which: $logs"
+            else
+              echo "::error::the install's database cannot be used by this weft, so nothing was deployed. If its log says an older weft built it, run this workflow again with reset_database on, which deletes every project's run history, versions and stored connections and starts the database fresh; otherwise it says what went wrong: $logs"
+            fi
+            exit 1
+          fi
+          echo "the install's database is ready for this weft's roles"
 
       - name: create the cloud
         working-directory: deploy/terraform/gcp

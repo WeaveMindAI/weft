@@ -75,27 +75,40 @@ pub static DISPATCHER_READY: &[crate::drain::WakeOn] = &[crate::drain::WakeOn::a
 /// claimant died, which nothing announces), which the claim that found
 /// nothing read too, or sleeps until a task is announced when no claim is
 /// out.
+///
+/// Once its copy steps aside (`aside`, `crate::aside`), it claims nothing
+/// more, and each task it still runs gets [`crate::aside::GRACE`] to
+/// finish before it is given back to be claimed again elsewhere; each is
+/// counted in flight until its ending is written.
 pub fn dispatcher_picker_loop<Ctx>(
     store: Arc<crate::traits::PostgresTaskStoreClient>,
     ctx: Ctx,
     registry: TaskRegistry<Ctx>,
     replica: String,
+    aside: crate::aside::StepAside,
 ) -> crate::drain::DrainLoop
 where
     Ctx: Send + Sync + Clone + 'static,
 {
     let slots = Arc::new(tokio::sync::Semaphore::new(DISPATCHER_PICKER_CONCURRENCY));
     crate::drain::DrainLoop::new("dispatcher_picker", "pick up the tasks waiting for it", DISPATCHER_READY, crate::drain::SAFETY_POLL_INTERVAL, move || {
-        let (store, ctx, registry, replica, slots) = (store.clone(), ctx.clone(), registry.clone(), replica.clone(), slots.clone());
+        let (store, ctx, registry, replica, slots, aside) = (store.clone(), ctx.clone(), registry.clone(), replica.clone(), slots.clone(), aside.clone());
         async move {
             // At capacity: wait for a running task to finish before claiming
             // another.
             let slot = slots.acquire_owned().await.expect("the picker's semaphore is never closed");
+            // Checked once the slot is ours, right before the claim: a
+            // copy that stepped aside while this pass waited claims nothing.
+            if aside.is_set() {
+                return Ok(crate::drain::DrainStep::Done);
+            }
             match store.claim_dispatcher_task(&replica).await? {
                 crate::tasks::Claim::Task(task) => {
+                    let in_flight = aside.in_flight();
                     tokio::spawn(async move {
                         let _slot = slot;
-                        run_dispatcher_task(store.pool().clone(), ctx, registry, replica, task).await;
+                        let _in_flight = in_flight;
+                        run_dispatcher_task(store.pool().clone(), ctx, registry, replica, task, aside).await;
                     });
                     Ok(crate::drain::DrainStep::More)
                 }
@@ -118,6 +131,7 @@ async fn run_dispatcher_task<Ctx>(
     registry: TaskRegistry<Ctx>,
     replica: String,
     task: Task,
+    aside: crate::aside::StepAside,
 ) where
     Ctx: Send + Sync + Clone + 'static,
 {
@@ -148,6 +162,16 @@ async fn run_dispatcher_task<Ctx>(
         lease: lease.clone(),
     };
     let heartbeat = spawn_claim_heartbeat(claim.clone());
+    // Once its copy stepped aside and the grace is over, the task is given
+    // back: the work stops here, and the next claim, a current copy's,
+    // runs it again from what it wrote down.
+    let given_back = {
+        let lease = lease.clone();
+        BesideClaim(tokio::spawn(async move {
+            aside.grace_over().await;
+            lease.lost(LeaseLoss::SteppedAside);
+        }))
+    };
     let outcome = run_with_lease_guard(
         CLAIM.scope(claim, executor.execute(&ctx, &task)),
         lease,
@@ -156,6 +180,7 @@ async fn run_dispatcher_task<Ctx>(
     )
     .await;
     drop(heartbeat);
+    drop(given_back);
     finalize_task(&pool, task_id, &replica, &kind, outcome).await;
 }
 
@@ -186,25 +211,50 @@ pub fn current_claim() -> Option<TaskClaim> {
 }
 
 impl TaskClaim {
+    /// The task this claim is of.
+    pub fn task(&self) -> uuid::Uuid {
+        self.task_id
+    }
+
     /// Rest the claim on `run` (`crate::tasks::rest_claim`): no more
-    /// renewals until [`Self::resume`].
+    /// renewals until [`Self::resume`]. A claim found no longer ours never
+    /// returns ([`Self::stand_down`]).
+    /// A rest the database did not take leaves the claim renewed.
     pub async fn rest_on(&self, run: weft_core::RunId) -> Result<()> {
+        // Set before the write, so the heartbeat stops renewing it from
+        // here; one landing after the write leaves the claim resting all
+        // the same (`crate::tasks::heartbeat`).
         self.resting.store(true, std::sync::atomic::Ordering::Release);
-        if !crate::tasks::rest_claim(&self.pool, self.task_id, &self.replica, run).await? {
-            self.lease.lost(LeaseLoss::Stolen);
+        match crate::tasks::rest_claim(&self.pool, self.task_id, &self.replica, run).await {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                self.stand_down().await;
+                Ok(())
+            }
+            Err(e) => {
+                self.resting.store(false, std::sync::atomic::Ordering::Release);
+                Err(e)
+            }
         }
-        Ok(())
     }
 
     /// Renew the claim again (`crate::tasks::resume_claim`). A claim
     /// handed back while it rested is another claimant's now: the work
-    /// stops.
+    /// stops there, never returning ([`Self::stand_down`]).
     pub async fn resume(&self) -> Result<()> {
         if !crate::tasks::resume_claim(&self.pool, self.task_id, &self.replica).await? {
-            self.lease.lost(LeaseLoss::Stolen);
+            self.stand_down().await;
         }
         self.resting.store(false, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// The claim is another claimant's: say so, and never return, so the
+    /// lease guard drops the work right here and no step after it (a
+    /// rollback of what the new claimant now carries on among them) runs.
+    async fn stand_down(&self) {
+        self.lease.lost(LeaseLoss::Stolen);
+        std::future::pending::<()>().await
     }
 }
 
@@ -222,6 +272,10 @@ enum LeaseLoss {
     /// so the task is surrendered (`tasks::surrender`): back to
     /// `pending` for any process (including us) to claim again.
     Unrenewable,
+    /// This copy of the dispatcher was replaced and the task outlived the
+    /// grace it was given (`crate::aside`): it did not fail, so it is
+    /// surrendered for a current copy to run again.
+    SteppedAside,
 }
 
 /// Cancellation token + the reason it fired. The heartbeat task sets
@@ -340,7 +394,7 @@ fn verdict(outcome: ExecOutcome, task_id: uuid::Uuid, kind: &str) -> Verdict {
             tracing::error!(target: "weft_task_store::executor", id = %task_id, kind = %kind, panic = %panic_msg, "task panicked; writing tasks::fail");
             Verdict::Fail(format!("panic: {panic_msg}"))
         }
-        ExecOutcome::LeaseLost(LeaseLoss::Unrenewable) => Verdict::Surrender,
+        ExecOutcome::LeaseLost(LeaseLoss::Unrenewable | LeaseLoss::SteppedAside) => Verdict::Surrender,
         ExecOutcome::LeaseLost(LeaseLoss::Stolen) => Verdict::StandDown,
     }
 }
@@ -440,12 +494,12 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 /// A stalled executor is NOT an exit: the heartbeat keeps renewing,
 /// the executor keeps running, no leak. A claim resting on a run
 /// ([`TaskClaim::rest_on`]) is not renewed, and touches nothing.
-fn spawn_claim_heartbeat(claim: TaskClaim) -> Heartbeat {
+fn spawn_claim_heartbeat(claim: TaskClaim) -> BesideClaim {
     let TaskClaim { pool, task_id, replica, resting, lease } = claim;
     let interval = claim_heartbeat_interval();
     let max_consecutive_errors =
         (claim_duration_secs() as f64 / interval.as_secs_f64()) as u32 + 1;
-    Heartbeat(tokio::spawn(async move {
+    BesideClaim(tokio::spawn(async move {
         let mut consecutive_errors: u32 = 0;
         loop {
             tokio::time::sleep(interval).await;
@@ -487,13 +541,14 @@ fn spawn_claim_heartbeat(claim: TaskClaim) -> Heartbeat {
     }))
 }
 
-/// A claim's heartbeat, stopped when it is dropped: the work it keeps
+/// A task working beside a claim (its heartbeat, its giving back once its
+/// copy stepped aside), stopped when it is dropped: the work it keeps
 /// claimed may be dropped mid-way (its caller went away, its task was
 /// aborted), and a heartbeat left running would hold the claim forever
 /// with nothing doing the work.
-struct Heartbeat(tokio::task::JoinHandle<()>);
+struct BesideClaim(tokio::task::JoinHandle<()>);
 
-impl Drop for Heartbeat {
+impl Drop for BesideClaim {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -514,6 +569,7 @@ mod tests {
         assert!(matches!(verdict(ExecOutcome::Finished(Ok(Err(lost))), id, "register_signal"), Verdict::Surrender));
         assert!(matches!(verdict(ExecOutcome::LeaseLost(LeaseLoss::Unrenewable), id, "register_signal"), Verdict::Surrender));
         assert!(matches!(verdict(ExecOutcome::LeaseLost(LeaseLoss::Stolen), id, "register_signal"), Verdict::StandDown));
+        assert!(matches!(verdict(ExecOutcome::LeaseLost(LeaseLoss::SteppedAside), id, "activate"), Verdict::Surrender), "a copy stepping aside gives it back");
         let failed = verdict(ExecOutcome::Finished(Ok(Err(anyhow::anyhow!("no such run")))), id, "register_signal");
         assert!(matches!(&failed, Verdict::Fail(msg) if msg == "no such run"), "{failed:?}");
     }
