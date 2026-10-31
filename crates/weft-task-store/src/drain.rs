@@ -414,11 +414,12 @@ enum Rule {
     /// Never later than what is booked: a look asked for without having
     /// read the row.
     Sooner,
-    /// The new look stands unless a sibling wrote the row since this pass
-    /// read it at this moment; then the sooner of the two does, so the
-    /// sibling's wake is never pushed back. A row written in the very
-    /// millisecond of the read counts as a sibling's: keeping the sooner
-    /// look costs one extra pass at most, overwriting it could cost a wake.
+    /// The new look stands unless a sibling booked the loop since this
+    /// pass read its row with this seq (0 when there was no row, the seq
+    /// a new row starts at); then the sooner of the two does, so the
+    /// sibling's wake is never pushed back. Every booking that sets a
+    /// wake moves the seq, so a changed seq is exactly a sibling's
+    /// booking, whatever the clocks read.
     SinceRead(i64),
 }
 
@@ -489,16 +490,16 @@ impl Booking {
             &[&role, &name],
         )
         .await?;
-        let (due, seq, set_again, failures, failure_written, written_ms, now): (Option<i64>, i64, i32, i32, bool, i64, i64) = tx
+        let (due, seq, set_again, failures, failure_written, now): (Option<i64>, i64, i32, i32, bool, i64) = tx
             .one(
                 &format!(
-                    "SELECT due_ms, seq, set_again, failures, failure_written, written_ms, {DB_NOW_MS} FROM role_loop_due \
+                    "SELECT due_ms, seq, set_again, failures, failure_written, {DB_NOW_MS} FROM role_loop_due \
                      WHERE role = $1 AND loop_name = $2 FOR UPDATE"
                 ),
                 &[&role, &name],
             )
             .await?;
-        let sibling_wrote = matches!(rule, Rule::SinceRead(read_at) if written_ms >= read_at);
+        let sibling_wrote = matches!(rule, Rule::SinceRead(read_seq) if read_seq != seq);
         // What a failed drain keeps of the booking: a look still to come
         // that is not the one whose wake ran this pass, or one a sibling
         // booked since this pass read. A look already past, or spent, was
@@ -829,7 +830,6 @@ pub async fn drain_due(
         None => None,
     };
     let share = slice / u32::try_from(running).unwrap_or(u32::MAX);
-    let rule = Rule::SinceRead(read.now);
     let mut failed: Vec<(&str, String)> = Vec::new();
     for (l, plan) in loops.iter().zip(plans) {
         if plan == Plan::Leave {
@@ -848,6 +848,7 @@ pub async fn drain_due(
                 }
             }
         };
+        let rule = Rule::SinceRead(read.booked.get(l.name).map_or(0, |b| b.seq));
         if let Err(e) = booking.rebook(l.name, Some(l.label), step, rule).await {
             failed.push((l.name, format!("{}: {e:#}", l.name)));
         }
@@ -1705,30 +1706,32 @@ mod db_tests {
         assert!(!watch.holds(), "let go once the pass ended");
     }
 
-    /// A pass that drained a loop replaces its booking when nobody wrote
-    /// the row since the pass read it, and keeps a sooner look a sibling
-    /// booked in between, so the sibling's wake is never pushed back.
+    /// A pass that drained a loop replaces its booking when nobody booked
+    /// the loop since the pass read its row, and keeps a sooner look a
+    /// sibling booked in between, so the sibling's wake is never pushed
+    /// back. Read and write land in the same millisecond here (no pause
+    /// between them): the seq decides, never the clock.
     #[weft_db_macros::test]
     async fn a_booking_keeps_a_sooner_look_a_sibling_wrote_since_the_read(pool: Pool) {
         schema(&pool).await;
         let (booking, _) = booking(&pool);
         let soon = Duration::from_secs(10);
         let later = Duration::from_secs(3600);
+        let read_seq = |read: ReadDue| read.booked.get("x").map_or(0, |b| b.seq);
 
         booking.rebook("x", None, Step::Drained(Some(soon)), Rule::Exactly).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        let read_at = read_due(&pool, ROLE.as_str()).await.unwrap().now;
-        booking.rebook("x", None, Step::Drained(Some(later)), Rule::SinceRead(read_at)).await.unwrap();
+        let read = read_due(&pool, ROLE.as_str()).await.unwrap();
+        let read_at = read.now;
+        booking.rebook("x", None, Step::Drained(Some(later)), Rule::SinceRead(read_seq(read))).await.unwrap();
         let due = row(&pool, "x").await.0.unwrap();
-        assert!(due >= read_at + 3_600_000, "nobody wrote since the read: the later look stands");
+        assert!(due >= read_at + 3_600_000, "nobody booked since the read: the later look stands");
 
-        let read_at = read_due(&pool, ROLE.as_str()).await.unwrap().now;
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        let seen = read_seq(read_due(&pool, ROLE.as_str()).await.unwrap());
         booking.rebook("x", None, Step::Drained(Some(soon)), Rule::Exactly).await.unwrap();
         let sibling_due = row(&pool, "x").await.0;
-        booking.rebook("x", None, Step::Drained(None), Rule::SinceRead(read_at)).await.unwrap();
+        booking.rebook("x", None, Step::Drained(None), Rule::SinceRead(seen)).await.unwrap();
         assert_eq!(row(&pool, "x").await.0, sibling_due, "the sibling's look outlasts an empty booking");
-        booking.rebook("x", None, Step::Drained(Some(later)), Rule::SinceRead(read_at)).await.unwrap();
+        booking.rebook("x", None, Step::Drained(Some(later)), Rule::SinceRead(seen)).await.unwrap();
         assert_eq!(row(&pool, "x").await.0, sibling_due, "the sibling's sooner look is kept");
     }
 
