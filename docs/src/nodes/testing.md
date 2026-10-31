@@ -168,7 +168,8 @@ Looking at what happened:
 | `stops(&self) -> Vec<(String, StopSelf)>` | Every `ctx.stop_tagged` asked for |
 | `program_calls(&self) -> Vec<(ProgramCall, StopSelf)>` | Every program call made |
 | `minted_tokens(&self) -> Vec<MintedToken>` | Every instance token minted: `instance`, `expires_in_secs`, `id` |
-| `published_values(&self, service: &str) -> Option<BTreeMap<String, String>>` | What the node published as that service's connection |
+| `published_values(&self, service: &str) -> Option<BTreeMap<String, String>>` | What the node published as that service's connection. A publish is held to the same rule as on an install: a value the service does not declare, a required one missing, or one the service's identity names left blank fails the run. The service's recipe is found in the whole catalog, as a project build finds it, so a node can publish a service another package declares; if no package declares it, the test build stops with an error naming it |
+| `fresh(&self) -> FakeRig` | A second, empty rig that knows the same services, for a test that needs two |
 
 
 ### The live rig

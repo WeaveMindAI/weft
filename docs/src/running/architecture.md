@@ -304,6 +304,25 @@ copies Cloud Run may start (`--max-instances`), or a copy's CPU and memory
 (`--cpu`, `--memory`), `weft workers set` changes them for one project. On
 your machine none of these four does anything: there is no Cloud Run sending
 calls or starting copies, and weft puts no CPU or memory limit on a worker.
+If a node of yours talks to something every copy draws on (a
+database's connections), plan for as many copies as `--max-instances` allows, plus the
+old ones during a change: for what that asks of the node, go and read
+[sharing something between runs](../nodes/ctx.md#sharing-something-between-runs).
+
+New worker settings start a new Cloud Run revision. Once it serves, weft hands
+it the calls the old settings took and deletes the revisions of the
+same program under other settings, so their copies stop and give back what
+they held, and each run still on them is handed back the way it is on any stop
+([what happens when something dies](#what-happens-when-something-dies)). Which
+settings are the new ones is read from what the project has stored, never
+from which revision is newest. A revision of another program stays until weft
+forgets that program's image. If deleting one fails, it takes no calls and its
+copies scale to zero once nothing calls them; the next activation or settings
+change deletes it, and weft logs an error naming the `gcloud run revisions
+delete` command that deletes it now. The one revision Cloud Run never lets
+anyone delete is the service's latest: when a dispatcher copy that still held
+the old settings brought them back up after the change, that revision takes no
+calls and goes once a later settings change or build replaces it.
 
 On a cloud install, if a run keeps working after its caller has gone (a Route
 with `outlivesCaller` that replies and carries on), the nodes it was running

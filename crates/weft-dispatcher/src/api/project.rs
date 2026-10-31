@@ -867,10 +867,12 @@ async fn setup_ended(
     run_id: weft_core::RunId,
 ) -> anyhow::Result<Option<Result<(), SyncNotLanded>>> {
     use crate::api::run::TerminalOutcome;
-    Ok(crate::api::run::terminal_outcome(&state.pg_pool, run_id).await?.map(|outcome| match outcome {
-        TerminalOutcome::Completed => Ok(()),
-        TerminalOutcome::Cancelled => Err(SyncNotLanded::Cancelled("infra setup cancelled".into())),
-        _ => Err(SyncNotLanded::Failed(StatusCode::INTERNAL_SERVER_ERROR, "infra setup failed".into())),
+    Ok(crate::api::run::terminal_outcome(&state.pg_pool, run_id).await?.map(|outcome| {
+        let Some(message) = outcome.not_landed("infra setup") else { return Ok(()) };
+        Err(match outcome {
+            TerminalOutcome::Cancelled(_) => SyncNotLanded::Cancelled(message),
+            _ => SyncNotLanded::Failed(StatusCode::INTERNAL_SERVER_ERROR, message),
+        })
     }))
 }
 
@@ -940,14 +942,14 @@ pub(crate) async fn await_infra_setup(
                         if c == run_id => {
                         return Err(SyncNotLanded::Failed(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("infra setup failed: {error}"),
+                            crate::api::run::not_landed("infra setup", "failed", Some(&error)),
                         ));
                     }
                     Ok(crate::events::DispatcherEvent::RunCancelled { run_id: c, reason, .. })
                         if c == run_id => {
                         // The user's infra-cancel (or a per-run stop)
                         // interrupted the provisioning run.
-                        return Err(SyncNotLanded::Cancelled(format!("infra setup cancelled: {reason}")));
+                        return Err(SyncNotLanded::Cancelled(crate::api::run::not_landed("infra setup", "cancelled", Some(&reason))));
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -3820,8 +3822,11 @@ async fn move_paused_runs(
 }
 
 /// Tell the platform to have the workers of the image `binary_hash`
-/// ready (`Runner::prepare`). Workers of other images are left as they
-/// are: what runs there finishes there, and they stop once idle.
+/// ready (`Runner::prepare`) with the settings the project has stored,
+/// then settle them on those (`crate::front::settle`): what the image
+/// still runs under other settings is let go. Workers of other images are
+/// left as they are: what runs there finishes there, and they stop once
+/// idle.
 async fn prepare_running_image(
     state: &DispatcherState,
     project_id: uuid::Uuid,
@@ -3829,8 +3834,10 @@ async fn prepare_running_image(
 ) -> Result<(), (StatusCode, String)> {
     let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("prepare the workers: {e:#}"));
     let tenant = state.tenant_router.tenant_for_project(project_id).await.map_err(internal)?;
-    let target = crate::delivery::worker_target(state, tenant.as_str(), project_id, binary_hash).await.map_err(internal)?;
-    state.runner.prepare(&target).await.map_err(internal)
+    let target = crate::delivery::current_worker_target(state, tenant.as_str(), project_id, binary_hash).await.map_err(internal)?;
+    state.runner.prepare(&target).await.map_err(internal)?;
+    crate::front::settle(state, tenant.as_str(), project_id, binary_hash).await;
+    Ok(())
 }
 
 
@@ -4129,14 +4136,10 @@ async fn wait_for_setup(
     run_id: uuid::Uuid,
     rest: &mut SetupRest<'_>,
 ) -> Result<(), (StatusCode, String)> {
-    let ended = |outcome: crate::api::run::TerminalOutcome, why: Option<String>| match outcome {
-        crate::api::run::TerminalOutcome::Completed => Ok(()),
-        crate::api::run::TerminalOutcome::Failed => {
-            Err((StatusCode::INTERNAL_SERVER_ERROR, why.map_or("trigger setup failed".into(), |error| format!("trigger setup failed: {error}"))))
-        }
-        crate::api::run::TerminalOutcome::Cancelled => {
-            Err((StatusCode::INTERNAL_SERVER_ERROR, why.map_or("trigger setup cancelled".into(), |reason| format!("trigger setup cancelled: {reason}"))))
-        }
+    // What the run's row recorded, or what its ending event carried.
+    let ended = |outcome: crate::api::run::TerminalOutcome| match outcome.not_landed("trigger setup") {
+        None => Ok(()),
+        Some(message) => Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
     };
     // The journal is authoritative: what the row says is read whenever
     // what was heard may have missed it (before the first event, and after
@@ -4148,7 +4151,7 @@ async fn wait_for_setup(
             let outcome = crate::api::run::terminal_outcome(&pool, run_id)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("trigger setup terminal lookup: {e}")))?;
-            let driven = match (outcome, resting) {
+            let driven = match (&outcome, resting) {
                 (None, false) => weft_task_store::runs::in_flight(&pool, run_id)
                     .await
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("trigger setup lookup: {e:#}")))?,
@@ -4159,7 +4162,7 @@ async fn wait_for_setup(
     };
     let (outcome, driven) = look(rest).await?;
     if let Some(outcome) = outcome {
-        return ended(outcome, None);
+        return ended(outcome);
     }
     if driven {
         rest.rest().await;
@@ -4168,10 +4171,10 @@ async fn wait_for_setup(
         match events.recv().await.map(|record| record.event) {
             Ok(crate::events::DispatcherEvent::RunCompleted { run_id: c, .. }) if c == run_id => return Ok(()),
             Ok(crate::events::DispatcherEvent::RunFailed { run_id: c, error, .. }) if c == run_id => {
-                return ended(crate::api::run::TerminalOutcome::Failed, Some(error));
+                return ended(crate::api::run::TerminalOutcome::Failed(Some(error)));
             }
             Ok(crate::events::DispatcherEvent::RunCancelled { run_id: c, reason, .. }) if c == run_id => {
-                return ended(crate::api::run::TerminalOutcome::Cancelled, Some(reason));
+                return ended(crate::api::run::TerminalOutcome::Cancelled(Some(reason)));
             }
             // Its first event after its birth: a worker took it.
             Ok(event) if event.run_id() == Some(run_id) && !matches!(event, crate::events::DispatcherEvent::RunStarted { .. }) => {
@@ -4182,7 +4185,7 @@ async fn wait_for_setup(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                 let (outcome, driven) = look(rest).await?;
                 if let Some(outcome) = outcome {
-                    return ended(outcome, None);
+                    return ended(outcome);
                 }
                 if driven {
                     rest.rest().await;

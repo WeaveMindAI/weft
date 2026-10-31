@@ -151,6 +151,10 @@ pub enum ResolveError {
     #[error("infra node '{node}': container '{container}' sets {name}, which weft sets itself on \
              every container (where to push the values that changed); read it instead of setting it")]
     ReservedEnv { node: String, container: String, name: &'static str },
+    #[error("infra node '{node}': container '{container}' sets {name} to a value with a line break, \
+             which a platform cannot pass in an environment variable; hand text of several lines over \
+             as the container's arguments instead (one line each)")]
+    EnvLineBreak { node: String, container: String, name: String },
     #[error("infra node '{node}': endpoint '{endpoint}' is public at path '{path}', which is not \
              a plain path. It must start with '/', and every segment between slashes must be \
              non-empty, not '.' or '..', and use only letters, digits, '-', '_', '.' and '~'")]
@@ -285,6 +289,11 @@ pub fn resolve(spec: &InfraSpec, node: &NodeRef, tags: &BTreeMap<String, String>
         unique(id, "container", u.containers.iter().chain(u.init_containers.iter()).map(|c| c.name.as_str()))?;
         if let Some(c) = u.containers.iter().chain(u.init_containers.iter()).find(|c| c.env.iter().any(|e| e.name == VALUES_URL_ENV)) {
             return Err(ResolveError::ReservedEnv { node: plain(id), container: c.name.clone(), name: VALUES_URL_ENV });
+        }
+        for c in u.containers.iter().chain(u.init_containers.iter()) {
+            if let Some(e) = c.env.iter().find(|e| e.value.contains(['\n', '\r'])) {
+                return Err(ResolveError::EnvLineBreak { node: plain(id), container: c.name.clone(), name: e.name.clone() });
+            }
         }
     }
     for v in &spec.volumes {
@@ -440,6 +449,7 @@ mod tests {
             }],
             keep_on_terminate: Vec::new(),
             health_rules: None,
+            notes: Vec::new(),
         }
     }
 
@@ -454,6 +464,17 @@ mod tests {
         assert_eq!(images[1], Image::Upstream { reference: "reg/weft-infra-credential:ab".into() });
         let e = resolve(&spec(), &node(), &BTreeMap::new()).unwrap_err();
         assert!(matches!(e, ResolveError::MissingLocalImage { .. }), "{e}");
+    }
+
+    /// No platform passes a line break in an environment variable, so a
+    /// spec that sets one is refused here, naming it, rather than when a
+    /// platform gets to start the container.
+    #[test]
+    fn an_environment_value_with_a_line_break_is_refused() {
+        let mut broken = spec();
+        broken.units[0].containers[1].env.push(EnvEntry::new("SETTINGS", "a = 1\nb = 2"));
+        let e = resolve(&broken, &node(), &tags()).unwrap_err();
+        assert!(matches!(&e, ResolveError::EnvLineBreak { container, name, .. } if container == "cred" && name == "SETTINGS"), "{e}");
     }
 
     #[test]

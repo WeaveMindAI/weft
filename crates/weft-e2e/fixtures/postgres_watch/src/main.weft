@@ -1,0 +1,24 @@
+# A query kept live through the database's pooler. A caller of the route
+# gets the count of notes as ndjson, a line each time it changes. With a
+# channel set, the watch LISTENs on its one connection and re-runs the
+# query on every NOTIFY, and between those it sits idle far longer than
+# the minute after which the database closes an idle session, so it only
+# keeps watching because it lifts that limit for its own session.
+#
+# The database's name has a dot in it, which the pooler cannot read as
+# written, so clients reach it through a door made from the name.
+
+db = PostgresDatabase { database: "watch.me", reachable: true }
+
+feed = Route { path: "__E2E_PATH__/count", method: "GET" }
+
+count = PostgresWatchQuery {
+  query: "SELECT count(*)::int AS n FROM notes"
+  channel: "notes_changed"
+  intervalSecs: 600
+}
+count.account = db.access
+count._should_flow = feed.path
+
+events = Stream { format: "ndjson" }
+events.bus = count.row

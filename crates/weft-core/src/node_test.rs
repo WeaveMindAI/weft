@@ -325,26 +325,33 @@ impl NodeTest {
         }
     }
 
-    /// Run a fake test against a fresh rig. Panics fail this one test,
-    /// and so does hanging: a test that never returns fails by NAME
-    /// after [`FAKE_TEST_DEADLINE_SECS`] instead of stalling the suite.
+    /// Run a fake test against a fresh rig that knows `services`, the
+    /// recipes of the services the package's nodes publish, so a node that
+    /// publishes is refused what the store would refuse. Panics fail
+    /// this one test, and so does hanging: a test that never returns
+    /// fails by NAME after [`FAKE_TEST_DEADLINE_SECS`] instead of
+    /// stalling the suite.
     ///
     /// The bound is here and not in each test because the shapes that
     /// hang are the rig's own (a cursor parked on a bus nothing closes,
     /// a caller nobody attaches), and without it the runner is killed
     /// from outside with no test named at all, which leaves bisecting
     /// by hand as the only way to find the culprit.
-    pub async fn run_fake(&self) -> WeftResult<()> {
-        self.run_fake_within(std::time::Duration::from_secs(FAKE_TEST_DEADLINE_SECS)).await
+    pub async fn run_fake(&self, services: Arc<PublishedServices>) -> WeftResult<()> {
+        self.run_fake_within(services, std::time::Duration::from_secs(FAKE_TEST_DEADLINE_SECS)).await
     }
 
     /// [`Self::run_fake`] with the bound named, so a test of the bound
     /// itself does not have to wait it out.
-    pub async fn run_fake_within(&self, deadline: std::time::Duration) -> WeftResult<()> {
+    pub async fn run_fake_within(
+        &self,
+        services: Arc<PublishedServices>,
+        deadline: std::time::Duration,
+    ) -> WeftResult<()> {
         match &self.run {
             TestFn::Fake(f) => {
                 let body = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                    f(FakeRig::new()),
+                    f(FakeRig::for_package(services)),
                 ));
                 match tokio::time::timeout(deadline, body).await {
                     Ok(Ok(result)) => result,
@@ -792,6 +799,38 @@ impl FakeState {
     }
 }
 
+/// The recipes of the services a node package's nodes publish, by
+/// service name, as the build resolves them: against the WHOLE catalog,
+/// the way the compiler stamps a publishing node's definition
+/// ([`crate::access::spec::published_recipe`]), baked into the node-test
+/// binary by its emitter. A publish in a test is held to the recipe
+/// found here, the way a real one is held to the recipe its definition
+/// carries, so a package publishing a service another package declares
+/// tests the same as one declaring its own.
+#[derive(Debug, Clone, Default)]
+pub struct PublishedServices(BTreeMap<String, crate::access::spec::AccessSpec>);
+
+impl PublishedServices {
+    /// These recipes, by their service. Handed two of one service, the
+    /// last wins; the emitter resolves one per service.
+    pub fn new(specs: impl IntoIterator<Item = crate::access::spec::AccessSpec>) -> Self {
+        Self(specs.into_iter().map(|spec| (spec.service.clone(), spec)).collect())
+    }
+
+    /// The recipes the emitter baked, as the JSON of a `Vec<AccessSpec>`.
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        let specs: Vec<crate::access::spec::AccessSpec> = serde_json::from_str(json)
+            .map_err(|e| format!("the published services baked into this test binary do not read: {e}"))?;
+        Ok(Self::new(specs))
+    }
+
+    /// The recipe a node publishing `service` carries, if the build
+    /// resolved one.
+    pub fn get(&self, service: &str) -> Option<&crate::access::spec::AccessSpec> {
+        self.0.get(service)
+    }
+}
+
 /// Shared state behind the fake rig and its handle. Dumb by rule:
 /// plain maps, append-only logs, zero provider logic.
 struct FakeState {
@@ -825,10 +864,14 @@ struct FakeState {
     /// Stored values the fake's opened connections answer
     /// (`conn.value(name)`), keyed by service then value name.
     connection_values: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
-    /// Services this run published a connection for, so
-    /// `published_access` answers "already published" exactly when the
-    /// node did publish, and answers None on the first run.
-    published: Mutex<std::collections::BTreeSet<String>>,
+    /// Services this run published a connection for, each with the
+    /// identity the publish resolved, so `published_access` answers
+    /// "already published" exactly when the node did publish (None on
+    /// the first run), carrying the identity a real one carries.
+    published: Mutex<BTreeMap<String, Option<String>>>,
+    /// The recipes of the services the package's nodes publish, which
+    /// a publish is held to the way the store holds a real one.
+    services: Arc<PublishedServices>,
     /// Declared granted permissions by service. A service with no
     /// declaration skips the required-permissions check entirely (a
     /// real granted set can also be unknowable); a declared set is
@@ -980,7 +1023,33 @@ impl FakeState {
             .build()
     }
 
-    fn new() -> Arc<Self> {
+    /// A publish of `service`'s connection, held to the store's own
+    /// check against the recipe the build resolved for it
+    /// ([`crate::access::spec::publishable_connection`]) and stored as
+    /// the store stores it: the values the next open answers, and the
+    /// identity a later `published_access` carries, which is returned.
+    /// The ONE place both the node's publish and a test's declared
+    /// earlier publish ([`FakeRig::published_connection`]) go through.
+    fn publish(&self, service: &str, values: BTreeMap<String, String>) -> WeftResult<Option<String>> {
+        let spec = self.services.get(service).ok_or_else(|| {
+            WeftError::Config(format!(
+                "this node publishes a '{service}' connection, but the build resolved no recipe \
+                 for that service; the fake rig knows only the services the package's nodes \
+                 publish (a rig built with `FakeRig::new` knows none: run the node on the rig \
+                 the test was handed, or on `rig.fresh()`)"
+            ))
+        })?;
+        // The store's check (`publish_grant`), and its refusal reaches
+        // the node the way a real one does.
+        let crate::access::spec::PublishableConnection { values, identity } =
+            crate::access::spec::publishable_connection(spec, values)
+                .map_err(|e| WeftError::NodeFailed(format!("publish the '{service}' connection: {e}")))?;
+        self.connection_values.lock().unwrap().insert(service.to_string(), values);
+        self.published.lock().unwrap().insert(service.to_string(), identity.clone());
+        Ok(identity)
+    }
+
+    fn new(services: Arc<PublishedServices>) -> Arc<Self> {
         Arc::new(Self {
             routes: Mutex::new(HashMap::new()),
             requests: Mutex::new(Vec::new()),
@@ -991,7 +1060,8 @@ impl FakeState {
             registered_signals: Mutex::new(Vec::new()),
             awaited_signals: Mutex::new(Vec::new()),
             connection_values: Mutex::new(BTreeMap::new()),
-            published: Mutex::new(std::collections::BTreeSet::new()),
+            published: Mutex::new(BTreeMap::new()),
+            services,
             connection_permissions: Mutex::new(BTreeMap::new()),
             output_types: Mutex::new(HashMap::new()),
             wired_outputs: Mutex::new(HashSet::new()),
@@ -1061,10 +1131,24 @@ pub struct FakeRig {
 }
 
 impl FakeRig {
-    /// A fresh, empty rig. Built by the runner ([`NodeTest::run_fake`]);
-    /// tests receive it, they don't construct it.
+    /// A fresh, empty rig that knows no service, so a node run on it
+    /// cannot publish a connection. A test that needs a second rig for
+    /// a node that publishes takes [`Self::fresh`] off the one it was
+    /// handed.
     pub fn new() -> Self {
-        Self { state: FakeState::new() }
+        Self::for_package(Arc::default())
+    }
+
+    /// A fresh, empty rig that knows `services`, the recipes of the
+    /// services the package's nodes publish. Built by the runner
+    /// ([`NodeTest::run_fake`]); tests receive it.
+    pub fn for_package(services: Arc<PublishedServices>) -> Self {
+        Self { state: FakeState::new(services) }
+    }
+
+    /// A fresh, empty rig knowing the same services as this one.
+    pub fn fresh(&self) -> Self {
+        Self::for_package(self.state.services.clone())
     }
 
     /// Declare a canned 200 response: any request the node sends on a
@@ -1316,7 +1400,7 @@ impl FakeRig {
     /// it has not published one. For a test asserting on a node that
     /// opens something it runs itself.
     pub fn published_values(&self, service: &str) -> Option<BTreeMap<String, String>> {
-        if !self.state.published.lock().unwrap().contains(service) {
+        if !self.state.published.lock().unwrap().contains_key(service) {
             return None;
         }
         Some(
@@ -1333,12 +1417,16 @@ impl FakeRig {
     /// Declare that this node published `service`'s connection on an
     /// earlier run, holding these values. The second-run state: the
     /// node finds its own connection instead of asking the thing it
-    /// runs for credentials again.
+    /// runs for credentials again. Held to the check a publish is
+    /// ([`crate::access::spec::publishable_connection`]), so a test never
+    /// starts from a connection no real run could have published; a set
+    /// it refuses is a mistake in the test, and panics.
     pub fn published_connection(&self, service: &str, values: &[(&str, &str)]) {
         let values: BTreeMap<String, String> =
             values.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        self.state.connection_values.lock().unwrap().insert(service.to_string(), values);
-        self.state.published.lock().unwrap().insert(service.to_string());
+        self.state
+            .publish(service, values)
+            .unwrap_or_else(|e| panic!("no run could have published this '{service}' connection: {e}"));
     }
 
     /// Declare that this node's own infrastructure answers on `name`
@@ -2535,27 +2623,19 @@ impl ContextHandle for TestHandle {
     /// what it published behaves as it does in production. The service
     /// comes from the node's own `publishes` declaration, exactly as it
     /// does in a real run, so a node that declares nothing fails here
-    /// the same way.
+    /// the same way. The publish passes the store's own check
+    /// ([`FakeState::publish`]), refused the way a real one is, stored as
+    /// it stores it, and answered with the identity it resolves.
     async fn publish_access(&self, values: BTreeMap<String, String>) -> WeftResult<Access> {
         let service = self.published_service()?;
-        self.state
-            .connection_values
-            .lock()
-            .unwrap()
-            .insert(service.clone(), values);
-        self.state.published.lock().unwrap().insert(service.clone());
-        Ok(Access::new("fake-connection", service, None))
+        let identity = self.state.publish(&service, values)?;
+        Ok(Access::new("fake-connection", service, identity))
     }
 
     async fn published_access(&self) -> WeftResult<Option<Access>> {
         let service = self.published_service()?;
-        Ok(self
-            .state
-            .published
-            .lock()
-            .unwrap()
-            .contains(&service)
-            .then(|| Access::new("fake-connection", service, None)))
+        let identity = self.state.published.lock().unwrap().get(&service).cloned();
+        Ok(identity.map(|identity| Access::new("fake-connection", service, identity)))
     }
 
     async fn open_connection(
@@ -4301,6 +4381,153 @@ mod tests {
         );
     }
 
+    /// A node that publishes a connection to something it runs itself,
+    /// holding the values it was built with. Its manifest publishes
+    /// `probedb`, which the access node below declares.
+    struct OwnConnectionNode {
+        values: &'static [(&'static str, &'static str)],
+    }
+    fn publisher_manifest() -> &'static NodeMetadata {
+        static MANIFEST: std::sync::OnceLock<NodeMetadata> = std::sync::OnceLock::new();
+        MANIFEST.get_or_init(|| {
+            serde_json::from_value(json!({
+                "type": "RigPublisher",
+                "label": "Rig publisher",
+                "description": "test-only node",
+                "inputs": [],
+                "outputs": [{"name": "access", "type": "Access"}],
+                "publishes": "probedb"
+            }))
+            .expect("publisher manifest")
+        })
+    }
+    fn probedb_access_manifest() -> &'static NodeMetadata {
+        static MANIFEST: std::sync::OnceLock<NodeMetadata> = std::sync::OnceLock::new();
+        MANIFEST.get_or_init(|| {
+            serde_json::from_value(json!({
+                "type": "RigProbeDbAccess",
+                "label": "Rig probe database access",
+                "description": "test-only node",
+                "inputs": [],
+                "outputs": [{"name": "access", "type": "Access"}],
+                "service": {
+                    "service": "probedb",
+                    "acquisition": { "kind": "static", "fields": [
+                        { "name": "host", "secret": false },
+                        { "name": "port", "optional": true, "secret": false },
+                    ]},
+                }
+            }))
+            .expect("access manifest")
+        })
+    }
+    impl crate::node::NodeManifest for OwnConnectionNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            publisher_manifest()
+        }
+    }
+    #[async_trait::async_trait]
+    impl Node for OwnConnectionNode {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let values =
+                self.values.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            ctx.publish_access(values).await?;
+            Ok(())
+        }
+    }
+
+    /// The services the publisher's package publishes, as the build
+    /// resolves them: the recipe the access node declares.
+    fn probedb_package() -> Arc<PublishedServices> {
+        Arc::new(PublishedServices::new([probedb_access_manifest()
+            .service
+            .clone()
+            .expect("the access node declares the service")]))
+    }
+
+    /// A fake publish is held to the service's recipe exactly as the
+    /// store holds a real one: a value the service does not declare is
+    /// refused by name, and a declared set is stored as the store stores
+    /// it, blanks dropped. Before this, the rig stored anything, so a
+    /// node test passed on a publish production refused.
+    #[tokio::test]
+    async fn a_fake_publish_is_held_to_the_values_its_service_declares() {
+        let rig = FakeRig::for_package(probedb_package());
+        let err = rig
+            .run(&OwnConnectionNode { values: &[("host", "db"), ("watchDatabase", "db_watch")] }, json!({}))
+            .await
+            .result
+            .expect_err("an undeclared value is refused")
+            .to_string();
+        assert!(err.contains("'probedb' service declares no value named 'watchDatabase'"), "{err}");
+        assert!(rig.published_values("probedb").is_none(), "a refused publish stores nothing");
+
+        let rig = rig.fresh();
+        rig.run(&OwnConnectionNode { values: &[("host", "db"), ("port", "  ")] }, json!({}))
+            .await
+            .ok()
+            .expect("a declared set publishes");
+        assert_eq!(
+            rig.published_values("probedb"),
+            Some(BTreeMap::from([("host".to_string(), "db".to_string())])),
+            "stored as the store stores it, the blank optional dropped"
+        );
+    }
+
+    /// A node that publishes and hands on what the publish answered.
+    struct EmitsItsPublish;
+    impl crate::node::NodeManifest for EmitsItsPublish {
+        fn manifest(&self) -> &'static NodeMetadata {
+            publisher_manifest()
+        }
+    }
+    #[async_trait::async_trait]
+    impl Node for EmitsItsPublish {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let access = ctx.publish_access(BTreeMap::from([("host".to_string(), "db".to_string())])).await?;
+            ctx.pulse_downstream(NodeOutput::new().set("access", access.to_value())).await
+        }
+    }
+
+    /// A fake publish answers the connection's identity the way the
+    /// store does, resolved from the values it stored, so a node that
+    /// shows or passes on its own connection sees in a test what it
+    /// sees on an install.
+    #[tokio::test]
+    async fn a_fake_publish_answers_the_identity_a_real_one_does() {
+        let spec: crate::access::spec::AccessSpec = serde_json::from_value(json!({
+            "service": "probedb",
+            "acquisition": { "kind": "static", "fields": [
+                { "name": "host", "secret": false },
+            ]},
+            "identity": "{host}",
+        }))
+        .expect("a static spec");
+        let rig = FakeRig::for_package(Arc::new(PublishedServices::new([spec])));
+        let outcome = rig.run(&EmitsItsPublish, json!({})).await.ok().expect("the publish passes");
+        let access = Access::from_value(&outcome.outputs["access"]).expect("the node emitted its access");
+        assert_eq!(access.identity(), Some("db"));
+    }
+
+    /// A node publishing a service the build resolved no recipe for has
+    /// nothing to be held to, so the rig refuses loudly instead of
+    /// storing whatever it was handed.
+    #[tokio::test]
+    async fn a_fake_publish_to_a_service_without_a_resolved_recipe_fails_loudly() {
+        let rig = FakeRig::new();
+        let err = rig
+            .run(&OwnConnectionNode { values: &[("host", "db")] }, json!({}))
+            .await
+            .result
+            .expect_err("no recipe, no publish");
+        assert!(matches!(err, WeftError::Config(_)), "{err}");
+        let err = err.to_string();
+        assert!(
+            err.contains("'probedb'") && err.contains("services the package's nodes publish"),
+            "{err}"
+        );
+    }
+
     /// A node that publishes through `ctx.run`, the exactly-once step:
     /// the provider call is the step's work, and the emitted id is
     /// whatever the step answered.
@@ -4932,7 +5159,7 @@ mod tests {
             assert_eq!(1, 2, "fake body assertion");
             Ok(())
         });
-        let err = fake.run_fake().await.expect_err("async panic too").to_string();
+        let err = fake.run_fake(Arc::default()).await.expect_err("async panic too").to_string();
         assert!(err.contains("panicked"), "{err}");
     }
 
@@ -4947,7 +5174,7 @@ mod tests {
             Ok(())
         });
         let err = hangs
-            .run_fake_within(std::time::Duration::from_millis(20))
+            .run_fake_within(Arc::default(), std::time::Duration::from_millis(20))
             .await
             .expect_err("a hang is a failure")
             .to_string();
@@ -4964,7 +5191,7 @@ mod tests {
         assert!(err.contains("fake-tier, not basic"), "{err}");
 
         let basic = NodeTest::basic("b", || Ok(()));
-        let err = basic.run_fake().await.expect_err("basic is not fake").to_string();
+        let err = basic.run_fake(Arc::default()).await.expect_err("basic is not fake").to_string();
         assert!(err.contains("basic-tier, not fake"), "{err}");
         let err = basic
             .run_live(LiveRig::new(

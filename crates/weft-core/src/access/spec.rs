@@ -1992,8 +1992,81 @@ pub fn publishable_fields(spec: &AccessSpec) -> Result<&[CredentialField], Strin
     Ok(fields)
 }
 
-/// The recipe for `service`, from whichever node's metadata declares
-/// it.
+/// `values` reduced to what may actually be STORED for `spec`, or the
+/// reason they cannot be: every required field present and non-blank,
+/// no name the service does not declare, the service's all-or-nothing
+/// groups satisfied, and blanks dropped so a later read sees "missing"
+/// rather than an empty secret.
+///
+/// The gate for every set of values a PERSON or a NODE supplied: a
+/// pasted connection, a minted one, and one a node published all
+/// answer the same questions and are held to the same standard. A
+/// browser consent is the one that does not come through here, and
+/// cannot: its values are the provider's own answer to the token
+/// exchange, not fields anybody filled in.
+///
+/// A node's publish reaches it through [`publishable_connection`],
+/// which holds the recipe and the values together.
+pub fn storable_values(
+    spec: &AccessSpec,
+    fields: &[CredentialField],
+    mut values: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    for f in fields {
+        let empty = values.get(&f.name).is_none_or(|v| v.trim().is_empty());
+        if empty && !f.optional {
+            return Err(format!("field '{}' is required", f.name));
+        }
+    }
+    if let Some(unknown) = values.keys().find(|k| !fields.iter().any(|f| &&f.name == k)) {
+        return Err(format!(
+            "the '{}' service declares no value named '{unknown}'",
+            spec.service
+        ));
+    }
+    capability_shortfall(&spec.capabilities, |name| {
+        values.get(name).is_some_and(|v| !v.trim().is_empty())
+    })?;
+    values.retain(|_, v| !v.trim().is_empty());
+    Ok(values)
+}
+
+/// What a node's publish stores: the values as the store keeps them
+/// (blanks dropped), and the connection's display identity resolved
+/// from them, which the published connection carries back to the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishableConnection {
+    pub values: BTreeMap<String, String>,
+    pub identity: Option<String>,
+}
+
+/// The whole check a node's publish passes, or the reason it cannot:
+/// the recipe valid ([`AccessSpec::validate`]) and of the shape a
+/// published connection has ([`publishable_fields`]), the values
+/// storable ([`storable_values`]), and the identity resolvable from
+/// what is stored (an identity naming an optional value left blank is
+/// refused here, not shown as a broken label).
+///
+/// ONE definition, because two places hold a publish to it and they
+/// must not be able to disagree: the access store, on every real
+/// write, and the node-test fake rig, so a test of a node that
+/// publishes refuses exactly what production refuses and answers the
+/// identity production answers.
+pub fn publishable_connection(
+    spec: &AccessSpec,
+    values: BTreeMap<String, String>,
+) -> Result<PublishableConnection, String> {
+    spec.validate()?;
+    let fields = publishable_fields(spec)?;
+    let values = storable_values(spec, fields, values)?;
+    let identity = spec.identity_of(&values)?;
+    Ok(PublishableConnection { values, identity })
+}
+
+/// The recipe a node publishing `service` carries, from whichever
+/// node's metadata declares the service, held to the shape a published
+/// connection can have ([`publishable_fields`]). `publisher` names the
+/// publishing node in the refusal.
 ///
 /// Discovery refuses a second node claiming one service, so a catalog
 /// built from a node tree has exactly one answer. That is a guarantee
@@ -2001,17 +2074,33 @@ pub fn publishable_fields(spec: &AccessSpec) -> Result<&[CredentialField], Strin
 /// another way and the first match wins, so give it the metadata a
 /// discovered catalog produced.
 ///
-/// ONE definition, because two places need it and they must not be
-/// able to disagree: the compiler resolves it against the whole
-/// catalog to stamp a publishing node's definition, and a node-test
-/// rig resolves it against the package under test.
-pub fn spec_for_service<'a>(
+/// `publisher` is what the refusal names the publishing node by: a
+/// program's node id when a program is built, its node type when a
+/// package's tests are.
+///
+/// ONE definition, because two places resolve it and they must not be
+/// able to disagree, both against the WHOLE catalog: the compiler, to
+/// stamp a publishing node's definition, and the node-test crate's
+/// emitter, to bake the recipes a package's fake tests are held to.
+/// Refused at build time because a recipe a published connection
+/// cannot have is an authoring mistake, and it belongs on the author's
+/// screen.
+pub fn published_recipe<'a>(
     metadata: impl IntoIterator<Item = &'a crate::node::NodeMetadata>,
+    publisher: &str,
     service: &str,
-) -> Option<&'a AccessSpec> {
-    metadata
+) -> Result<&'a AccessSpec, String> {
+    let spec = metadata
         .into_iter()
         .find_map(|m| m.service.as_ref().filter(|spec| spec.service == service))
+        .ok_or_else(|| {
+            format!(
+                "node '{publisher}' publishes a '{service}' connection, but no node in the \
+                 catalog declares that service"
+            )
+        })?;
+    publishable_fields(spec)?;
+    Ok(spec)
 }
 
 impl AccessSpec {
@@ -2065,6 +2154,13 @@ impl AccessSpec {
     /// fails loudly at resolution instead of at the provider.
     pub fn worker_value_names(&self) -> Result<Vec<String>, String> {
         worker_value_names_of(&self.auth)
+    }
+
+    /// The display identity of a connection holding `values`, from the
+    /// recipe's `identity` template; `None` when it declares none. A
+    /// name the values do not hold is refused, never shown blank.
+    pub fn identity_of(&self, values: &BTreeMap<String, String>) -> Result<Option<String>, String> {
+        self.identity.as_ref().map(|t| t.resolve(values)).transpose()
     }
 
     /// Serde-inexpressible rules; run wherever a spec enters the
@@ -3135,6 +3231,74 @@ mod tests {
             s3.worker_value_names().unwrap(),
             vec!["region", "accessKeyId", "secretAccessKey"]
         );
+    }
+
+    /// The gate every set of values a person or a node supplied
+    /// passes. A blank required value is MISSING, not stored: a
+    /// downstream node would otherwise get an empty password and fail
+    /// at the provider instead of here.
+    #[test]
+    fn the_value_check_holds_a_pasted_and_a_published_connection_to_one_rule() {
+        // The fields come from the spec itself, so the rule and the
+        // recipe cannot be a mismatched pair the production callers
+        // could never produce.
+        let spec: AccessSpec = serde_json::from_value(serde_json::json!({
+            "service": "pg",
+            "acquisition": { "kind": "static", "fields": [
+                { "name": "host" },
+                { "name": "port", "optional": true },
+            ]},
+        }))
+        .expect("a static spec");
+        let fields = publishable_fields(&spec).expect("a static spec publishes");
+        let values = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        let check = |vals| storable_values(&spec, fields, vals);
+
+        check(values(&[("host", "db"), ("port", "5432")])).expect("a complete set passes");
+
+        let kept = check(values(&[("host", "db"), ("port", "   ")]))
+            .expect("a blank optional passes");
+        assert!(!kept.contains_key("port"), "a blank optional stores nothing");
+
+        let e = check(values(&[("port", "5432")])).expect_err("required missing");
+        assert!(e.contains("'host' is required"), "{e}");
+
+        let e = check(values(&[("host", "  ")]))
+            .expect_err("a blank required value is missing");
+        assert!(e.contains("'host' is required"), "{e}");
+
+        let e = check(values(&[("host", "db"), ("hostname", "db")]))
+            .expect_err("undeclared name");
+        assert!(e.contains("no value named 'hostname'"), "{e}");
+    }
+
+    /// A publish answers the identity the store would record, and an
+    /// identity naming an optional value left blank is refused, since
+    /// the stored values no longer hold it.
+    #[test]
+    fn a_publish_resolves_its_identity_from_what_is_stored() {
+        let spec: AccessSpec = serde_json::from_value(serde_json::json!({
+            "service": "pg",
+            "acquisition": { "kind": "static", "fields": [
+                { "name": "host", "secret": false },
+                { "name": "database", "optional": true, "secret": false },
+            ]},
+            "identity": "{host}/{database}",
+        }))
+        .expect("a static spec");
+        let values = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+
+        let published = publishable_connection(&spec, values(&[("host", "db"), ("database", "app")]))
+            .expect("a complete set publishes");
+        assert_eq!(published.identity.as_deref(), Some("db/app"));
+        assert_eq!(published.values, values(&[("host", "db"), ("database", "app")]));
+
+        publishable_connection(&spec, values(&[("host", "db"), ("database", " ")]))
+            .expect_err("the identity names a value the blank optional left out");
     }
 
     /// The capability rule, all four ways: a complete group passes, a

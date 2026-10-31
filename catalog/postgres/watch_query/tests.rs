@@ -5,10 +5,12 @@
 //! outside, which the live rig cannot do yet; it is proven end to end
 //! by a program.
 
+use async_trait::async_trait;
 use serde_json::json;
 
-use weft::{FakeRig, NodeManifest, NodeTest, WeftResult};
+use weft::{Access, FakeRig, Node, NodeManifest, NodeMetadata, NodeTest, RunContext, WeftResult};
 
+use super::super::postgres::watch_config;
 use super::super::postgres_execute_query::PostgresExecuteQueryNode;
 use super::{cadence, changed, first_row, watched, PostgresWatchQueryNode};
 
@@ -22,6 +24,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_bad_cadence_refuses_before_dialing", bad_cadence),
         NodeTest::basic("row_carries_the_first_row_or_null", first_row_or_null),
         NodeTest::basic("the_placeholder_pattern_is_postgres_query_s", same_pattern),
+        NodeTest::fake("a_watcher_dials_the_database_s_door_for_watchers_when_it_has_one", watching_door),
     ]
 }
 
@@ -132,5 +135,40 @@ async fn bad_cadence(rig: FakeRig) -> WeftResult<()> {
         .expect_err("a cadence under the poll floor refuses")
         .to_string();
     assert!(err.contains("intervalSecs must be at least 5"), "{err}");
+    Ok(())
+}
+
+/// The database name a watching run dials on the wired connection, under
+/// this node's own manifest: what `watch_config` makes of an opened
+/// connection, with no socket behind it.
+struct DialsInto(&'static str);
+
+impl NodeManifest for DialsInto {
+    fn manifest(&self) -> &'static NodeMetadata {
+        PostgresWatchQueryNode.manifest()
+    }
+}
+
+#[async_trait]
+impl Node for DialsInto {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+        let account: Access = ctx.inputs.get("account")?;
+        let config = watch_config(&ctx.open(&account).await?)?;
+        if config.get_dbname() != Some(self.0) {
+            weft::node_bail!("a watcher dials {:?}, not {:?}", config.get_dbname(), self.0);
+        }
+        Ok(())
+    }
+}
+
+/// A PostgresDatabase keeps a door apart for watchers, named on its
+/// connection, so they never take the connections queries need; any
+/// other connection (a PostgresAccess) is dialed as it is.
+async fn watching_door(rig: FakeRig) -> WeftResult<()> {
+    let inputs = |rig: &FakeRig| json!({ "account": rig.access("postgres"), "query": "SELECT 1", "intervalSecs": 5 });
+    connection(&rig);
+    rig.run(&DialsInto("app"), inputs(&rig)).await.ok()?;
+    rig.connection_value("postgres", "watchDatabase", "app_watch");
+    rig.run(&DialsInto("app_watch"), inputs(&rig)).await.ok()?;
     Ok(())
 }

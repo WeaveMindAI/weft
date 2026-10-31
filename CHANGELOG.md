@@ -4,6 +4,101 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-10-31 (dbefc004)
+
+**What you have to change after this update, if you use a PostgresDatabase:**
+
+- **Clients outside the program sign in as `app`, no longer as `weft`.** The
+  password, host and port stay the same; `weft infra env <node> --into .env
+  --set DATABASE_USER=User` writes the user again.
+- **A frontend's pool must expect a connection idle for a minute to close.**
+  The database now closes it. Set the pool's idle timeout under a minute, or
+  have it test a connection before using it.
+- **An extension that needs the superuser goes in the node's new `extensions`
+  setting** (`["pg_trgm", "postgres_fdw"]`). The superuser makes each one on
+  every start, and the program, signed in as `app`, uses it.
+
+**A PostgresDatabase no longer runs out of connections when the program
+scales.** Postgres serves a fixed number of connections, while its clients
+keep changing: workers scale, a change of worker settings runs old and new
+workers side by side, and a frontend connects too. Each worker used to keep up
+to 20 connections open whether it used them or not, so once enough workers ran
+at once, Postgres answered `too many clients` to them and to everything else
+using that database. A PostgresDatabase now runs a pooler in front of Postgres,
+in the same unit. The pooler never opens more connections than Postgres takes,
+and a client that finds them all busy waits for one, so a run waits instead of
+failing. Watching queries (PostgresWatchQuery) get a quarter of the
+connections the pooler opens (what is left after 3 kept for the superuser and
+2 spare), at least one, so a crowd of them never leaves the other queries
+without a connection, or the other way round. If you want to see who holds the
+connections, the node's card now shows them: Postgres's own by user and state,
+each of the pooler's two shares with its clients served and waiting, and the
+clients by address.
+
+Your existing PostgresDatabase nodes get the pooler on their next `weft infra
+upgrade`. When the database starts again it gets a new role, `app`, which
+becomes the owner of everything the superuser owned in it (except objects an
+extension made). After that:
+
+- **Through the pooler a client reaches this one database only**, so a client
+  that also used `postgres` or another database made beside it can no longer
+  reach those. The superuser `weft` can only sign in from inside the unit. An
+  extension listed in `extensions` that this Postgres does not have fails the
+  start, and `weft infra status` names it.
+- **A database whose name the pooler cannot read as written gets a second
+  name for clients.** Your database keeps its name and its data. When the
+  name is letters, digits, `_` and `-` only, at most 57 characters, and none
+  of `pgbouncer`, `all`, `sameuser`, `samerole`, `samegroup` or
+  `replication`, clients use it as before; otherwise they sign in by a name the
+  pooler makes from it (`db_my_app_1a2b3c4d`), which the connection carries
+  and the card shows under Database. A client of yours outside the program
+  takes it from there.
+- **The database closes a connection that sat idle for a minute.** That gives
+  back a connection held by a worker that lost its CPU between requests, or by
+  an old worker a rollout left behind. If a client of yours keeps a connection idle on purpose (one that `LISTEN`s), have it lift that
+  limit for its own session when it connects, the way PostgresWatchQuery does:
+  `SELECT set_config('idle_session_timeout', '0', false) FROM pg_settings
+  WHERE name = 'idle_session_timeout'`.
+- **The least `memory` is 565Mi** (it was 886Mi). At 1Gi Postgres serves 23
+  connections, at 2Gi 59, at 4Gi 131.
+- **A new database needs Postgres 14 or later.** One you already have on an
+  older Postgres keeps running, but it cannot close idle connections, so its
+  card and `weft infra status` warn of it and list the commands that dump it
+  and restore it into a new node on 17.
+
+**Every Postgres node closes a pooled connection that sat idle for 5
+seconds**, and never hands out one idle for longer, whichever database it talks
+to.
+
+**A stopping worker gives back what its runs shared** (`ctx.shared`) as soon
+as its last run has ended, instead of when the process goes, so a pool's
+connections return to the database while the worker writes its last records.
+
+**On Cloud Run, a change of worker settings retires the old workers.** Once
+the new settings serve, weft moves the calls the old ones took to them and
+removes that program's revisions under any other settings, so their copies stop
+instead of running beside the new ones. Which settings are current is decided
+from what the project has stored, so a dispatcher copy that briefly still held
+the old settings and brought them back up never wins: that revision takes no
+calls and scales to zero. It goes at the next settings change or activation,
+unless it is the service's latest, which Cloud Run does not let anyone delete;
+then it goes once a later settings change or build replaces it.
+
+**When an infra node's setup fails, you are told why.** `weft infra start`,
+`weft activate` and the other commands that wait on a setup used to answer
+`infra setup failed` and nothing else; they now give the error the setup run
+failed with (a trigger's setup the same), as `weft runs` shows it.
+
+**A unit that knows why it is not ready says so in `weft infra status`.** When
+a container's health check answers an error with a reason in its body (JSON
+`{"error": "..."}`, or plain text), the status shows that reason after the
+status code.
+
+**A node's fake tests hold a published connection to its service's values.**
+A value the service does not declare, or a required one missing, fails the
+run the way the access store refuses it on an install; before, the fake rig
+stored anything and only a real run found out.
+
 ## 2026-10-31 (ed587b61)
 
 **On a cloud install, how many holders run follows how busy they are**, not

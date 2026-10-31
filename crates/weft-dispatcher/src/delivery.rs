@@ -337,7 +337,9 @@ impl std::error::Error for NotRegistered {}
 /// the install's. [`NotRegistered`] when the project is gone; a
 /// [`Refusal`] naming the lever when the settings together are a shape no
 /// platform could run (the install's changed under a project's own), a
-/// definite no that changing them answers.
+/// definite no that changing them answers. Read from this process's held
+/// copy of the levers, which a change reaches a moment after it commits:
+/// right for a call to the workers, whose next one follows the change.
 pub async fn worker_target(
     state: &DispatcherState,
     tenant: &str,
@@ -348,9 +350,45 @@ pub async fn worker_target(
     // absence is read from the rows themselves.
     let overrides = match state.held.worker_overrides.held(&project).filter(|held| held.is_some()) {
         Some(held) => held,
-        None => state.held.worker_overrides.load_fresh(project, || state.projects.worker_overrides(project)).await?,
+        None => stored_overrides(state, project).await?,
     };
-    let overrides = overrides.as_ref().as_ref().ok_or(NotRegistered(project))?;
+    target_with(state, tenant, project, binary_hash, &overrides)
+}
+
+/// [`worker_target`] with the levers as the project has them stored now,
+/// read from the rows rather than the held copy: for what decides which
+/// settings the project's workers run (its front, `Runner::prepare`,
+/// `Runner::settle`), where a copy from before a change would bring the
+/// old settings back.
+pub async fn current_worker_target(
+    state: &DispatcherState,
+    tenant: &str,
+    project: uuid::Uuid,
+    binary_hash: &str,
+) -> anyhow::Result<weft_platform_traits::WorkerTarget> {
+    let overrides = stored_overrides(state, project).await?;
+    target_with(state, tenant, project, binary_hash, &overrides)
+}
+
+/// `project`'s levers as its rows hold them now (kept in the held copy for
+/// the calls after), `None` when the project is gone.
+async fn stored_overrides(
+    state: &DispatcherState,
+    project: uuid::Uuid,
+) -> anyhow::Result<std::sync::Arc<Option<weft_platform_traits::WorkerOverrides>>> {
+    state.held.worker_overrides.load_fresh(project, || state.projects.worker_overrides(project)).await
+}
+
+/// The target of `project`'s workers at the image of `binary_hash` with
+/// `overrides` (its levers, `None` when the project is gone).
+fn target_with(
+    state: &DispatcherState,
+    tenant: &str,
+    project: uuid::Uuid,
+    binary_hash: &str,
+    overrides: &Option<weft_platform_traits::WorkerOverrides>,
+) -> anyhow::Result<weft_platform_traits::WorkerTarget> {
+    let overrides = overrides.as_ref().ok_or(NotRegistered(project))?;
     Ok(weft_platform_traits::WorkerTarget {
         tenant: tenant.to_string(),
         project,

@@ -165,7 +165,12 @@ impl<'a> ProjectCalls<'a> {
             }
         };
         serde_json::from_value(value)
-            .map_err(|e| WeftError::NodeFailed(format!("{name}: the runtime answered a shape this node cannot read: {e}")))
+            .map_err(|e| {
+                WeftError::NodeFailed(format!(
+                    "{name}: the runtime answered a shape this node cannot read ({e}), which happens when the program \
+                     was built by an older weft, or this run was started by one: run `weft resync` and start the run again"
+                ))
+            })
     }
 }
 

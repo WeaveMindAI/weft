@@ -633,25 +633,6 @@ minute on one project.
 [Update Notice Warning] If we touch `crates/weft-engine/src/door/limits.rs`
 or `/v1/door/tick`, revisit this entry.
 
-## Several workers of a project can open more Postgres connections than the database takes
-
-**Problem.** The Postgres node keeps one pool per worker and database
-(`catalog/postgres/postgres.rs`, `MOST_AT_ONCE`), held to 20 connections
-so a few workers together stay under Postgres's default limit of 100.
-That is a guess about how many workers there are. A project scaled to
-many workers can still open more connections than the database accepts,
-and the runs past it fail to connect.
-
-**Direction.** Put a connection pooler (PgBouncer, in transaction mode)
-in front of the database inside the Postgres node's own infra, so every
-worker talks to the pooler and the pooler holds the few real
-connections. The worker's own limit can then be generous again. The open
-question is a database the user brings, which has no infra of ours to
-put the pooler in.
-
-[Update Notice Warning] If we touch `catalog/postgres/postgres.rs`'s
-pool or the Postgres node's infra, revisit this entry.
-
 ## A Python process runs one script at a time
 
 **Problem.** `ExecPython` keeps as many `python3` processes as the worker

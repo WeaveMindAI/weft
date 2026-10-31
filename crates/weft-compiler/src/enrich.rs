@@ -738,25 +738,14 @@ pub fn enrich_collecting(
         // ships only the node types this project uses and so usually
         // does not include the service's own access node.
         if let Some(service) = &meta.publishes {
-            match weft_core::access::spec::spec_for_service(catalog.all(), service) {
-                // Refused HERE too, not only where the connection is
-                // finally written: a recipe shape a published
-                // connection cannot have is an authoring mistake, and
-                // it belongs on the author's screen at build time.
-                Some(spec) => match weft_core::access::spec::publishable_fields(spec) {
-                    Ok(_) => node.published_service = Some(spec.clone()),
-                    Err(message) => errors.push(EnrichError { code: "enrich", span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message }),
-                },
-                None => errors.push(EnrichError {
+            match weft_core::access::spec::published_recipe(catalog.all(), &node.id, service) {
+                Ok(spec) => node.published_service = Some(spec.clone()),
+                Err(message) => errors.push(EnrichError {
                     code: "enrich",
                     span: node_span,
                     file: node.source_file.clone(),
                     subjects: vec![node.id.clone()],
-                    message: format!(
-                        "node '{}' publishes a '{service}' connection, but no node in the \
-                         catalog declares that service",
-                        node.id
-                    ),
+                    message,
                 }),
             }
         }

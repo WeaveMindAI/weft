@@ -13,6 +13,16 @@
 //!     connection was stored the first time: by then the database
 //!     refuses to hand its password over again. The row count growing
 //!     also proves the data is really in a database;
+//!   - one firing's statements share one session through the
+//!     database's pooler, and the program signs in as its own role,
+//!     never the superuser;
+//!   - a client past the connections the pooler holds waits its turn
+//!     and is served once one frees up, instead of being refused;
+//!   - a watching query reached through the pooler keeps its one
+//!     connection past the minute after which the database closes an
+//!     idle session, and a write still fires it;
+//!   - a database named with a dash keeps its name, and one the pooler
+//!     cannot read as written is reached through a door made from it;
 //!   - terminating takes the connection away with the database.
 //!
 //! Needs an install, no external service and no credentials.
@@ -38,6 +48,59 @@ async fn postgres_grants_of_this_project(project: &Project) -> Result<Vec<serde_
 /// The one sentence this test writes, and matches on when reading
 /// back. Substituted into the fixture so the two cannot drift.
 const BODY: &str = "written by the postgres e2e";
+
+/// How many connections the database's pooler holds for queries, as its
+/// card says (`queries (<db>): ...; <open> of <pool size> connections open`).
+async fn pooler_query_connections(project: &Project) -> Result<usize> {
+    let card: serde_json::Value = serde_json::from_str(project.weft(&["infra", "show", "db", "--json"]).await?.trim())?;
+    let pooler = card["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|i| i["label"] == "Pooler"))
+        .and_then(|i| i["value"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("the card has no Pooler item: {card}"))?;
+    let queries = pooler.lines().find(|l| l.starts_with("queries")).ok_or_else(|| anyhow::anyhow!("no queries line: {pooler}"))?;
+    let size = queries
+        .rsplit_once(" connections open")
+        .and_then(|(before, _)| before.rsplit_once(" of "))
+        .map(|(_, size)| size.trim().parse::<usize>())
+        .ok_or_else(|| anyhow::anyhow!("no pool size in: {queries}"))??;
+    Ok(size)
+}
+
+/// How a client outside weft signs in to the database `node` of
+/// `project`, whose `reachable` input is on: its door from `weft infra
+/// list-doors`, and the user, the database and a fresh password from its
+/// card, written into the env file `file` by `weft infra env` (starting
+/// the database took the password it had). Checks the user is the
+/// program's role, never the superuser.
+async fn outside_client(project: &Project, node: &str, file: &str) -> Result<db::Config> {
+    let listed: weft_core::infra::wire::DoorsResponse = serde_json::from_str(project.weft(&["infra", "list-doors", "--json"]).await?.trim())?;
+    let door = listed
+        .doors
+        .iter()
+        .find(|d| d.copy.node == node && d.endpoint == "sql")
+        .ok_or_else(|| anyhow::anyhow!("the database's sql endpoint has a door: {listed:?}"))?;
+    let (host, port) = door.address.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("the door is host:port: {door:?}"))?;
+    let port: u16 = port.parse()?;
+    project.weft(&["infra", "press", node, "reset_password"]).await?;
+    let env = project.dir().join(file);
+    let into = env.to_string_lossy().to_string();
+    project
+        .weft(&["infra", "env", node, "--into", &into, "--set", "PG_PASSWORD=Password", "--set", "PG_USER=User", "--set", "PG_DB=Database"])
+        .await?;
+    let text = std::fs::read_to_string(&env)?;
+    let value = |name: &str| -> Result<String> {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}=")))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("the env file does not set {name}"))
+    };
+    anyhow::ensure!(value("PG_USER")? == "app", "an outside client signs in as the program's role, never the superuser");
+    let mut config = db::Config::new();
+    config.host(host).port(port).user(value("PG_USER")?).password(value("PG_PASSWORD")?).dbname(value("PG_DB")?);
+    Ok(config)
+}
 
 /// Run the graph once and hand back the settled run to assert on.
 async fn round_trip(project: &mut Project) -> Result<SettledRun> {
@@ -66,6 +129,7 @@ async fn a_project_runs_its_own_postgres_and_talks_to_it() -> Result<()> {
     // sent nothing, and the row is written with an empty column: one
     // node, no branch, no split insert.
     first.assert_input("absent", "data", &json!([{ "body": "no picture", "tag": null }]))?;
+    first.assert_input("same", "data", &json!([{ "name": "one session", "signed_in": "app", "superuser": false }]))?;
 
     // The second run: the database no longer hands its password out,
     // so this only works through the stored connection. Two rows now,
@@ -156,7 +220,8 @@ async fn the_password_goes_into_an_env_file_and_a_reset_gets_a_new_one() -> Resu
     }
     let mode = std::fs::metadata(&env)?.permissions().mode() & 0o777;
     anyhow::ensure!(mode == 0o600, "a new env file should be the owner's only, got {mode:o}");
-    // The program's own next run picks the new password up by itself.
+    // The press reached the program's connection too, so its next run signs
+    // in with the new password.
     round_trip(&mut project).await?;
 
     // Another reset replaces only its own line.
@@ -178,7 +243,9 @@ async fn the_password_goes_into_an_env_file_and_a_reset_gets_a_new_one() -> Resu
 /// `reachable` input on, find the door with `weft infra list-doors`, write
 /// the user, the database and a fresh password into an env file with
 /// `weft infra env`, and open Postgres from outside weft with nothing
-/// else. The program's own run keeps working beside it.
+/// else. More clients than the pooler holds connections for all get in:
+/// the one past them waits, the card says so, and it is served once
+/// another lets go. The program's own run keeps working beside it.
 #[tokio::test]
 async fn a_client_outside_weft_opens_the_database_through_its_door() -> Result<()> {
     let disp = ensure::up().await?;
@@ -187,39 +254,119 @@ async fn a_client_outside_weft_opens_the_database_through_its_door() -> Result<(
     project.set_node_config("db", "reachable", "true")?;
     infra::start_and_wait_running(&mut project, "db").await?;
 
-    let listed: weft_core::infra::wire::DoorsResponse = serde_json::from_str(project.weft(&["infra", "list-doors", "--json"]).await?.trim())?;
-    let door = listed
-        .doors
-        .iter()
-        .find(|d| d.copy.node == "db" && d.endpoint == "sql")
-        .ok_or_else(|| anyhow::anyhow!("the database's sql endpoint has a door: {listed:?}"))?;
-    let (host, port) = door.address.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("the door is host:port: {door:?}"))?;
-    let (host, port): (String, u16) = (host.to_string(), port.parse()?);
-
-    // Starting the database took its password, so a fresh one is minted
-    // for the outside client first.
-    project.weft(&["infra", "press", "db", "reset_password"]).await?;
-    let env = project.dir().join("front.env");
-    let into = env.to_string_lossy().to_string();
-    project
-        .weft(&["infra", "env", "db", "--into", &into, "--set", "PG_PASSWORD=Password", "--set", "PG_USER=User", "--set", "PG_DB=Database"])
-        .await?;
-    let text = std::fs::read_to_string(&env)?;
-    let value = |name: &str| -> Result<String> {
-        text.lines()
-            .find_map(|l| l.strip_prefix(&format!("{name}=")))
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("the env file does not set {name}"))
-    };
-    let mut config = db::Config::new();
-    config.host(&host).port(port).user(value("PG_USER")?).password(value("PG_PASSWORD")?).dbname(value("PG_DB")?);
+    let config = outside_client(&project, "db", "front.env").await?;
+    anyhow::ensure!(config.get_dbname() == Some("notes-db"), "a name with a dash is the database's own: {:?}", config.get_dbname());
     let session = db::Session::connect(&config).await?;
     let one: i32 = session.scalar("SELECT 1", &[]).await?;
     anyhow::ensure!(one == 1, "the database answered through its door");
     drop(session);
 
+    // Every connection the pooler holds for queries, taken: in session
+    // pooling a client keeps its connection for as long as it is
+    // connected.
+    let pooled = pooler_query_connections(&project).await?;
+    let mut held = Vec::new();
+    for _ in 0..pooled {
+        let session = db::Session::connect(&config).await?;
+        let _: i32 = tokio::time::timeout(std::time::Duration::from_secs(60), session.scalar("SELECT 1", &[])).await??;
+        held.push(session);
+    }
+    // One more gets in and waits for a connection rather than being
+    // refused, and the card shows it waiting.
+    let past = db::Session::connect(&config).await?;
+    let waiting = tokio::spawn(async move { past.scalar::<i32>("SELECT 2", &[]).await });
+    // The card is read when asked, so it is asked until the pooler has
+    // queued the client, for as long as a client takes to sign in at most.
+    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let card = loop {
+        let card = project.weft(&["infra", "show", "db", "--json"]).await?;
+        if card.contains("1 waiting") || tokio::time::Instant::now() >= until {
+            break card;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+    anyhow::ensure!(card.contains("1 waiting"), "the card should show the client waiting: {card}");
+    anyhow::ensure!(!waiting.is_finished(), "a client past the pooler's {pooled} connections was served at once");
+    drop(held.pop());
+    let two = tokio::time::timeout(std::time::Duration::from_secs(30), waiting).await???;
+    anyhow::ensure!(two == 2, "the waiting client was served once a connection came free");
+    drop(held);
+
     round_trip(&mut project).await?;
+    infra::terminate_and_wait_gone(&project, "db").await?;
+    project.finish().await
+}
+
+/// The next line of the ndjson answer `answer` as JSON, reading what
+/// arrives until one is whole (`pending` keeps what came after it), and
+/// failing after `within` with what was read.
+async fn next_line(answer: &mut reqwest::Response, pending: &mut String, within: std::time::Duration) -> Result<serde_json::Value> {
+    let until = tokio::time::Instant::now() + within;
+    loop {
+        if let Some((line, rest)) = pending.split_once('\n') {
+            // A blank line is the stream's keepalive, sent while the
+            // program has nothing new to say.
+            if line.trim().is_empty() {
+                *pending = rest.to_string();
+                continue;
+            }
+            let value = serde_json::from_str(line).map_err(|e| anyhow::anyhow!("a line of the feed is not JSON ({e}): {line}"))?;
+            *pending = rest.to_string();
+            return Ok(value);
+        }
+        let chunk = tokio::time::timeout_at(until, answer.chunk())
+            .await
+            .map_err(|_| anyhow::anyhow!("no whole line within {}s; read so far: {pending:?}", within.as_secs()))??
+            .ok_or_else(|| anyhow::anyhow!("the feed ended; read so far: {pending:?}"))?;
+        pending.push_str(&String::from_utf8_lossy(&chunk));
+    }
+}
+
+/// A route's caller keeps a count live through a PostgresWatchQuery
+/// reached through the pooler: the first line comes at once, a write
+/// with a NOTIFY sends the next, and after the watch sat idle longer than
+/// the minute the database gives an idle session, a write still reaches
+/// it. The database is named with a dot, so every client, the watch
+/// included, reaches it through the door the pooler made from the name.
+#[tokio::test]
+async fn a_watching_query_keeps_watching_past_the_idle_limit() -> Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("postgres_watch", disp.clone()).await?;
+    let base = project.unique_live_path()?;
+    infra::start_and_wait_running(&mut project, "db").await?;
+
+    let config = outside_client(&project, "db", "watch.env").await?;
+    let door = config.get_dbname().unwrap_or_default().to_string();
+    anyhow::ensure!(door.starts_with("db_watch_me_"), "a name the pooler cannot read is reached by a door made from it: {door}");
+    let writer = db::Session::connect(&config).await?;
+    // The writer sits idle through the wait below too, and the database
+    // would close it; it lifts the limit for its own session, as any
+    // client that keeps a connection idle on purpose does.
+    writer.batch_execute("SET idle_session_timeout = 0; CREATE TABLE notes (id serial PRIMARY KEY)").await?;
+    let database: String = writer.scalar("SELECT current_database()", &[]).await?;
+    anyhow::ensure!(database == "watch.me", "the door leads to the database under its own name, got {database}");
+    let write = || writer.batch_execute("INSERT INTO notes DEFAULT VALUES; SELECT pg_notify('notes_changed', '')");
+
+    project.activate().await?;
+    let url = format!("{}/connect/{}/count", disp.base(), base.trim_start_matches('/'));
+    let mut answer = weft_core::net::http_client().build()?.get(&url).send().await?;
+    anyhow::ensure!(answer.status().is_success(), "GET {url} answered {}", answer.status());
+    let mut pending = String::new();
+    let soon = std::time::Duration::from_secs(60);
+    anyhow::ensure!(next_line(&mut answer, &mut pending, soon).await? == json!({ "n": 0 }));
+    write().await?;
+    anyhow::ensure!(next_line(&mut answer, &mut pending, soon).await? == json!({ "n": 1 }));
+
+    // Longer than the minute after which the database closes a session
+    // that sits idle, and well short of the watch's own cadence, so only
+    // the NOTIFY can wake it.
+    tokio::time::sleep(std::time::Duration::from_secs(75)).await;
+    write().await?;
+    let after = next_line(&mut answer, &mut pending, soon).await?;
+    anyhow::ensure!(after == json!({ "n": 2 }), "the watch should still be watching after sitting idle, got {after}");
+
+    drop(answer);
+    drop(writer);
     infra::terminate_and_wait_gone(&project, "db").await?;
     project.finish().await
 }

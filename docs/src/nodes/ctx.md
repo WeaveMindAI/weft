@@ -193,7 +193,36 @@ connection changes), so pass the same limit everywhere you call it. The limit co
 past it between them, and so can the old thing and the new one for a moment
 after a connection's values change, while runs still hold handles to the old
 one. The Postgres nodes that query through the
-shared pool ask for 100, Postgres's own default connection limit.
+shared pool ask for 20.
+
+`with_limit` only caps what one worker takes, so that its runs never leave
+its sibling workers without a connection. It cannot keep a database
+under its connection limit, because it cannot see how many workers there are. If your node talks to something that only
+serves so much (a database with a fixed number of connections, an API with a
+rate limit), assume any number of workers run your node at once: Cloud Run
+starts copies up to the project's `--max-instances` (set with `weft workers
+set`), and a change of program
+or worker settings runs the old copies beside the new ones for a while. Two
+things follow:
+
+- **Hold nothing you are not using.** Close an idle connection within
+  seconds, because one a copy keeps between requests is one no other copy can
+  have. On Cloud Run a copy has no CPU between requests (unless the
+  project turned on `weft workers set --cpu-always-allocated true`), so a timer of yours that closes it may not
+  fire for minutes: check how long a connection sat idle when a run takes it,
+  too. The Postgres nodes close a pooled connection after 5 idle seconds and
+  never hand out one idle for longer.
+- **Let the other end do the counting.** It is the one place that sees every
+  copy, so that is where a client past the limit should wait its turn, or be
+  refused with a clear answer. Your node then waits, or fails with a message
+  that says why. A PostgresDatabase does this with a pooler in front of
+  Postgres, where a client that finds every connection busy waits for one,
+  and Postgres closes a session that sat idle for a minute. If your node
+  keeps a connection idle on purpose (one that `LISTEN`s), lift that limit
+  for its own session when it connects, the way PostgresWatchQuery sends
+  `SELECT set_config('idle_session_timeout', '0', false) FROM pg_settings
+  WHERE name = 'idle_session_timeout'` (the `FROM pg_settings` part makes it
+  do nothing on a Postgres that has no such setting, instead of failing).
 
 If a task you spawn needs the thing after your run returns (handing a
 connection back to its pool later), move the handle into the task: it keeps
@@ -207,7 +236,9 @@ By default, weft lets go of a shared thing about five minutes after the last
 run asked for it or dropped its handle, once no handle is left. Your
 thing's `Drop` runs once weft has let go of it and the last handle and `Arc`
 are gone, which is when a pool closes its connections. When the worker
-stops, everything goes with the process.
+stops, it lets go of every shared thing as soon as its last run has ended,
+used recently or not, so a pool's connections go back to the database while
+the worker is still writing its last records.
 
 If you want a quiet stretch not to cost a rebuild, raise the five minutes
 with `weft workers set --shared-idle-seconds <n>` (or lower it to let go

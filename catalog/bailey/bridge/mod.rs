@@ -64,6 +64,7 @@ impl Node for BaileyBridgeNode {
             }],
             keep_on_terminate: Vec::new(),
             health_rules: None,
+            notes: Vec::new(),
         })
     }
 

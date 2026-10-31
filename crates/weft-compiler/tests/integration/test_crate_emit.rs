@@ -80,7 +80,10 @@ fn emitted_test_crate_has_the_expected_shape() {
     );
 
     let main_rs = std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
-    assert!(main_rs.contains("weft_engine::test_runner::main"), "{main_rs}");
+    assert!(
+        main_rs.contains(r#"weft_engine::test_runner::main(&registry::PROJECT_CATALOG, "[]")"#),
+        "no slack node publishes, so no recipe is baked:\n{main_rs}"
+    );
     assert!(main_rs.contains("TypeRegistry::install"), "baked types installed first");
 
     let registry = std::fs::read_to_string(dir.path().join("src/registry.rs")).unwrap();
@@ -100,6 +103,38 @@ fn emitted_test_crate_has_the_expected_shape() {
     assert!(
         lib_rs.contains("/catalog/slack/send_message/mod.rs"),
         "local mode includes real absolute node paths:\n{lib_rs}"
+    );
+}
+
+/// A package whose nodes publish a connection bakes the recipe of each
+/// service they publish into the runner's main, resolved against the
+/// whole catalog the way a project build resolves it, so the fake rig
+/// holds a publish to the recipe production holds it to.
+#[test]
+fn emitted_test_crate_bakes_the_services_its_nodes_publish() {
+    let catalog = stdlib();
+    let weft_root = weft_catalog::weft_repo_root().expect("weft root");
+    let dir = tempfile::tempdir().expect("temp dir");
+    emit_test_crate(dir.path(), &catalog, "postgres", &EmitPaths::Local { weft_root })
+        .expect("emit");
+
+    let main_rs = std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
+    let baked = main_rs
+        .lines()
+        .find(|l| l.contains("weft_engine::test_runner::main(&registry::PROJECT_CATALOG, "))
+        .expect("the runner is called with the baked services");
+    let literal = baked
+        .trim()
+        .trim_start_matches("weft_engine::test_runner::main(&registry::PROJECT_CATALOG, ")
+        .trim_end_matches(')');
+    // The literal is the Debug form of the JSON string: unescape it the
+    // way the compiler will, then read the recipes back.
+    let json: String = serde_json::from_str(literal).expect("a string literal JSON reads as well");
+    let specs: Vec<weft_core::AccessSpec> = serde_json::from_str(&json).expect("the baked recipes read");
+    assert_eq!(
+        specs.iter().map(|s| s.service.as_str()).collect::<Vec<_>>(),
+        vec!["postgres"],
+        "the database node publishes the postgres service:\n{main_rs}"
     );
 }
 

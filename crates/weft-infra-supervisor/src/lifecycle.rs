@@ -946,9 +946,10 @@ async fn execute_apply(
     let resolved = infra::resolve(&spec, &copy, &image_tags).map_err(|e| anyhow!("{e}"))?;
     state.host.check(&resolved).map_err(|why| anyhow!("{why}"))?;
     // What the host runs differently from what was asked (a GPU kind it
-    // cannot choose): stamped on the row with the apply, where every
-    // status read shows it to the person who started the node.
-    let notes = state.host.notes(&resolved);
+    // cannot choose), and what the node itself says of the copy: stamped
+    // on the row with the apply, where every status read shows it to the
+    // person who started the node.
+    let notes: Vec<String> = state.host.notes(&resolved).into_iter().chain(spec.notes.iter().cloned()).collect();
     let applied_spec_hash = resolved.hash();
 
     // Per-unit apply. Reconcile only the units that are DOWN (or new);
