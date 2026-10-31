@@ -27,17 +27,21 @@ const ADMIN_WAIT: weft_broker_client::line::CallWait = weft_broker_client::line:
 /// (`weft_broker_client::client::while_busy`), so a busy database is a
 /// wait, never an error the person sees. Transport faults (the broker
 /// unreachable) are the only 500s minted here.
+/// `call` is declared with the other broker calls
+/// (`weft_broker_client::protocol`), saying whether it is sent again when
+/// its line breaks under it.
 pub async fn forward_json<Req: Serialize, Resp: DeserializeOwned>(
     state: &DispatcherState,
-    path: &str,
+    call: weft_broker_client::line::BrokerCall,
     body: &Req,
 ) -> Result<Resp, (StatusCode, String)> {
+    let path = call.path;
     let internal = |e: String| {
         tracing::error!(target: "weft_dispatcher::broker_admin", "broker admin {path}: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, "broker unreachable".to_string())
     };
     let body = serde_json::to_vec(body).map_err(|e| internal(format!("encode the call: {e}")))?;
-    let answer = while_busy(path, turned_away, || state.broker_line.call(path, &body, ADMIN_WAIT))
+    let answer = while_busy(path, turned_away, || state.broker_line.call(call, &body, ADMIN_WAIT))
         .await
         .map_err(|e| internal(format!("{e:#}")))?;
     if !answer.status.is_success() {

@@ -108,7 +108,7 @@ pub async fn list(State(state): State<DispatcherState>, caller: CallerTenant) ->
 async fn sign_in_services(state: &DispatcherState, tenant: &str) -> Result<Vec<String>, ApiError> {
     let mut services = weft_access_store::own_sign_in_services(&state.pg_pool, tenant).await.map_err(crate::api::access_store_error)?;
     let shared: weft_core::access::wire::SignInServices =
-        crate::broker_admin::forward_json(state, "/v1/access/admin/sign-in-services", &serde_json::json!({})).await?;
+        crate::broker_admin::forward_json(state, weft_broker_client::protocol::ADMIN_SIGN_IN_SERVICES, &serde_json::json!({})).await?;
     services.extend(shared.services);
     services.sort();
     services.dedup();

@@ -17,7 +17,7 @@ use weft_journal::{BatchError, RecordClient};
 use weft_task_store::tasks::{DedupOutcome, NewTask, TaskOutcome};
 use weft_task_store::{InfraReader, TaskStoreClient};
 
-use crate::line::{Answer, BrokerLink, CallWait, LineError, DEFAULT_CALL_WAIT};
+use crate::line::{Answer, BrokerCall, BrokerLink, CallWait, LineError, DEFAULT_CALL_WAIT};
 use crate::protocol::*;
 
 /// Every call of every client below, over the process's one line to the
@@ -39,11 +39,11 @@ impl HttpCore {
 
     async fn post<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
         &self,
-        path: &str,
+        call: BrokerCall,
         body: &Req,
     ) -> Result<Res> {
-        let answer = self.post_raw(path, body, DEFAULT_CALL_WAIT).await?;
-        Self::parse_success(answer, path)
+        let answer = self.post_raw(call, body, DEFAULT_CALL_WAIT).await?;
+        Self::parse_success(answer, call.path)
     }
 
     /// A call the broker holds open for up to `hold`, however long that is:
@@ -53,25 +53,27 @@ impl HttpCore {
     /// the broker's own hold ends.
     async fn post_held<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
         &self,
-        path: &str,
+        call: BrokerCall,
         body: &Req,
         hold: Duration,
     ) -> Result<Res> {
         let to_send = DEFAULT_CALL_WAIT.to_send;
         let wait = CallWait { to_send, to_answer: to_send.saturating_add(hold).saturating_add(HOLD_GRACE) };
-        let answer = self.post_raw(path, body, wait).await?;
-        Self::parse_success(answer, path)
+        let answer = self.post_raw(call, body, wait).await?;
+        Self::parse_success(answer, call.path)
     }
 
     /// Single call core: the body as JSON, sent on the line, the raw
     /// answer back, sent again for as long as the broker turns it away
-    /// busy with nothing of it run ([`while_busy`]). Status interpretation
-    /// lives in the thin wrappers (`post` = 2xx-or-error, `post_or_404` =
-    /// 404 is "no row", `post_fenced` = 410 / 409 are the two stale
-    /// `WriteOutcome`s).
-    async fn post_raw<Req: Serialize>(&self, path: &str, body: &Req, wait: CallWait) -> Result<Answer> {
+    /// busy with nothing of it run ([`while_busy`]), and, when the call is
+    /// harmless twice, after its line broke under it (the line does that,
+    /// `crate::line::BrokerCall`). Status interpretation lives in the thin
+    /// wrappers (`post` = 2xx-or-error, `post_or_404` = 404 is "no row",
+    /// `post_fenced` = 410 / 409 are the two stale `WriteOutcome`s).
+    async fn post_raw<Req: Serialize>(&self, call: BrokerCall, body: &Req, wait: CallWait) -> Result<Answer> {
+        let path = call.path;
         let body = serde_json::to_vec(body).with_context(|| format!("serialize {path}"))?;
-        while_busy(path, turned_away, || self.link.call(path, &body, wait)).await.with_context(|| format!("POST {path}"))
+        while_busy(path, turned_away, || self.link.call(call, &body, wait)).await.with_context(|| format!("POST {path}"))
     }
 
     /// Shared 2xx gate + JSON parse for the status-interpreting
@@ -91,14 +93,14 @@ impl HttpCore {
     /// under the requested key or it doesn't.
     pub async fn post_or_404<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
         &self,
-        path: &str,
+        call: BrokerCall,
         body: &Req,
     ) -> Result<Option<Res>> {
-        let answer = self.post_raw(path, body, DEFAULT_CALL_WAIT).await?;
+        let answer = self.post_raw(call, body, DEFAULT_CALL_WAIT).await?;
         if answer.status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        Ok(Some(Self::parse_success(answer, path)?))
+        Ok(Some(Self::parse_success(answer, call.path)?))
     }
 
     /// Variant of `post` for the fenced lifecycle writes: HTTP 410
@@ -110,14 +112,14 @@ impl HttpCore {
     //       (stale_write, the one place that emits them)
     pub async fn post_fenced<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
         &self,
-        path: &str,
+        call: BrokerCall,
         body: &Req,
     ) -> Result<WriteOutcome<Res>> {
-        let answer = self.post_raw(path, body, DEFAULT_CALL_WAIT).await?;
+        let answer = self.post_raw(call, body, DEFAULT_CALL_WAIT).await?;
         match answer.status {
             reqwest::StatusCode::GONE => Ok(WriteOutcome::Displaced),
             reqwest::StatusCode::CONFLICT => Ok(WriteOutcome::Gone),
-            _ => Ok(WriteOutcome::Applied(Self::parse_success(answer, path)?)),
+            _ => Ok(WriteOutcome::Applied(Self::parse_success(answer, call.path)?)),
         }
     }
 }
@@ -221,13 +223,16 @@ pub fn turned_away(sent: &Result<Answer>) -> bool {
 
 /// Whether a call was turned away busy with nothing of it run: the broker
 /// answered that it could not get a database connection for it
-/// ([`NOT_DONE`]), or the platform in front of it answered 429 because
+/// ([`NOT_DONE`]), or that its copy is stepping aside for a newer one
+/// ([`STEPPING_ASIDE`]: sent again, the call goes out on a line to a
+/// current copy), or the platform in front of it answered 429 because
 /// every copy of the broker it may run was busy and it handed the call to
 /// none (Cloud Run at its most copies). The broker never answers 429
 /// itself, so a 429 is always the platform's.
 // SYNC: NOT_DONE <-> crates/weft-broker/src/handlers.rs unavailable_or_internal
 pub fn answered_busy(status: reqwest::StatusCode, body: &[u8]) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS || (status == reqwest::StatusCode::SERVICE_UNAVAILABLE && body == NOT_DONE.as_bytes())
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || (status == reqwest::StatusCode::SERVICE_UNAVAILABLE && (body == NOT_DONE.as_bytes() || body == STEPPING_ASIDE.as_bytes()))
 }
 
 /// The first wait before asking again after the broker could not answer
@@ -366,7 +371,7 @@ impl RecordClient for BrokerRecordClient {
         let answer = self
             .http
             .link
-            .call_bytes(JOURNAL_RECORD_PATH, &[(BATCH_FATES_HEADER, BATCH_FATES)], batch, DEFAULT_CALL_WAIT)
+            .call_bytes(JOURNAL_RECORD, &[(BATCH_FATES_HEADER, BATCH_FATES)], batch, DEFAULT_CALL_WAIT)
             .await
             .map_err(BatchError::Unanswered)?;
         if answer.status.is_success() {
@@ -377,23 +382,21 @@ impl RecordClient for BrokerRecordClient {
     }
 
     async fn record_of(&self, run_id: RunId, after: Option<i32>) -> Result<weft_journal::record::RawRecord> {
-        let path = "/v1/journal/record_of";
         let req = RecordOfRequest { run_id, after };
-        let resp: RecordOfResponse = read_until_answered(path, || self.http.post(path, &req)).await?;
+        let resp: RecordOfResponse = read_until_answered(RECORD_OF.path, || self.http.post(RECORD_OF, &req)).await?;
         Ok(resp.record)
     }
 
     async fn give_up(&self, run_id: RunId, why: String) -> std::result::Result<(), BatchError> {
-        let path = "/v1/run/give_up";
         let answer = self
             .http
-            .post_raw(path, &RunGiveUpRequest { run_id, error: why }, DEFAULT_CALL_WAIT)
+            .post_raw(RUN_GIVE_UP, &RunGiveUpRequest { run_id, error: why }, DEFAULT_CALL_WAIT)
             .await
             .map_err(BatchError::Unanswered)?;
         if answer.status.is_success() {
             return Ok(());
         }
-        Err(batch_refusal(path, &answer))
+        Err(batch_refusal(RUN_GIVE_UP.path, &answer))
     }
 }
 
@@ -425,13 +428,13 @@ impl TaskStoreClient for BrokerTaskStoreClient {
     async fn enqueue_dedup(&self, spec: NewTask) -> Result<DedupOutcome> {
         let req = TaskEnqueueDedupRequest { spec };
         let resp: TaskEnqueueDedupResponse =
-            self.http.post("/v1/task/enqueue_dedup", &req).await?;
+            self.http.post(TASK_ENQUEUE_DEDUP, &req).await?;
         Ok(if resp.inserted { DedupOutcome::Inserted(resp.id) } else { DedupOutcome::AlreadyLive(resp.id) })
     }
 
     async fn wait_for_terminal(&self, task_id: Uuid, timeout: Duration) -> Result<TaskOutcome> {
         let req = TaskWaitTerminalRequest { task_id, wait_ms: wait_ms(timeout) };
-        let resp: TaskWaitTerminalResponse = self.http.post_held("/v1/task/wait_terminal", &req, timeout).await?;
+        let resp: TaskWaitTerminalResponse = self.http.post_held(TASK_WAIT_TERMINAL, &req, timeout).await?;
         Ok(resp.into_outcome())
     }
 }
@@ -451,7 +454,7 @@ impl BrokerSignalClient {
     /// names one.
     pub async fn list_held(&self, project: Option<uuid::Uuid>) -> Result<Vec<SignalRowWire>> {
         let resp: SignalListHeldResponse =
-            self.http.post("/v1/signal/list_held", &SignalListHeldRequest { project }).await?;
+            self.http.post(SIGNAL_LIST_HELD, &SignalListHeldRequest { project }).await?;
         Ok(resp.rows)
     }
 
@@ -460,19 +463,19 @@ impl BrokerSignalClient {
     /// up under.
     pub async fn park_fire(&self, token: &str, fire: &weft_task_store::parked_fires::Waiting, held_by: Option<&str>) -> Result<DoorParked> {
         self.http
-            .post("/v1/door/park_fire", &DoorParkRequest { token: token.to_string(), fire: fire.clone(), held_by: held_by.map(str::to_string) })
+            .post(DOOR_PARK_FIRE, &DoorParkRequest { token: token.to_string(), fire: fire.clone(), held_by: held_by.map(str::to_string) })
             .await
     }
 
     /// Where an event of the signal `token` goes; `None` when it is gone.
     pub async fn fire_target(&self, token: &str) -> Result<Option<SignalFireTarget>> {
-        self.http.post("/v1/signal/fire_target", &SignalFireTargetRequest { token: token.to_string() }).await
+        self.http.post(SIGNAL_FIRE_TARGET, &SignalFireTargetRequest { token: token.to_string() }).await
     }
 
     /// One held signal by token, `None` when none is held under it.
     pub async fn get_held(&self, token: &str) -> Result<Option<SignalRowWire>> {
         let resp: SignalGetHeldResponse =
-            self.http.post("/v1/signal/get_held", &SignalGetHeldRequest { token: token.to_string() }).await?;
+            self.http.post(SIGNAL_GET_HELD, &SignalGetHeldRequest { token: token.to_string() }).await?;
         Ok(resp.row)
     }
 
@@ -482,7 +485,7 @@ impl BrokerSignalClient {
         let resp: SignalWriteKindStateResponse = self
             .http
             .post(
-                "/v1/signal/write_kind_state",
+                SIGNAL_WRITE_KIND_STATE,
                 &SignalWriteKindStateRequest { token: token.to_string(), kind_state, from_seq },
             )
             .await?;
@@ -491,25 +494,25 @@ impl BrokerSignalClient {
 
     /// One look of a holder (see [`SignalHoldRequest`]).
     pub async fn hold(&self, req: &SignalHoldRequest) -> Result<SignalHoldResponse> {
-        self.http.post("/v1/signal/hold", req).await
+        self.http.post(SIGNAL_HOLD, req).await
     }
 
     /// Record what a signal's kind decides about holding it (see
     /// [`SignalSetHoldsRequest`]).
     pub async fn set_holds(&self, token: &str, holds: bool) -> Result<()> {
-        let _: Value = self.http.post("/v1/signal/set_holds", &SignalSetHoldsRequest { token: token.to_string(), holds }).await?;
+        let _: Value = self.http.post(SIGNAL_SET_HOLDS, &SignalSetHoldsRequest { token: token.to_string(), holds }).await?;
         Ok(())
     }
 
     /// Give up on a signal for good (see [`SignalGiveUpRequest`]).
     pub async fn give_up(&self, req: &SignalGiveUpRequest) -> Result<()> {
-        let _: Value = self.http.post("/v1/signal/give_up", req).await?;
+        let _: Value = self.http.post(SIGNAL_GIVE_UP, req).await?;
         Ok(())
     }
 
     /// Give up the claims on held signals (see [`SignalLetGoRequest`]).
     pub async fn let_go(&self, req: &SignalLetGoRequest) -> Result<()> {
-        let _: Value = self.http.post("/v1/signal/let_go", req).await?;
+        let _: Value = self.http.post(SIGNAL_LET_GO, req).await?;
         Ok(())
     }
 }
@@ -532,18 +535,18 @@ impl BrokerEventsClient {
         &self,
         req: &ListenerResolveRequest,
     ) -> Result<ListenerResolvedSource> {
-        self.http.post("/v1/access/listener-resolve", req).await
+        self.http.post(LISTENER_RESOLVE, req).await
     }
 
     pub async fn subscription_ensure(
         &self,
         req: &SubscriptionEnsureRequest,
     ) -> Result<SubscriptionEnsureResponse> {
-        self.http.post("/v1/access/subscription/ensure", req).await
+        self.http.post(SUBSCRIPTION_ENSURE, req).await
     }
 
     pub async fn subscription_drop(&self, req: &SubscriptionDropRequest) -> Result<()> {
-        let _: serde_json::Value = self.http.post("/v1/access/subscription/drop", req).await?;
+        let _: serde_json::Value = self.http.post(SUBSCRIPTION_DROP, req).await?;
         Ok(())
     }
 }
@@ -562,7 +565,7 @@ impl BrokerInfraClient {
     /// Ask for `project`'s infra health to be looked at now: what a machine
     /// running its infra says when how its units stand changed.
     pub async fn ask_for_a_look(&self, project: Uuid) -> Result<()> {
-        let _: InfraLookResponse = self.http.post("/v1/infra/look", &InfraLookRequest { project_id: project }).await?;
+        let _: InfraLookResponse = self.http.post(INFRA_LOOK, &InfraLookRequest { project_id: project }).await?;
         Ok(())
     }
 
@@ -570,7 +573,7 @@ impl BrokerInfraClient {
     /// agent beside it: the link's identity names the copy. A refusal comes
     /// back as `BrokerRefused`, carrying the broker's reason.
     pub async fn push_values(&self, values: &weft_core::infra::bake::PushedValues) -> Result<()> {
-        let _: serde_json::Value = self.http.post("/v1/infra/pushed", values).await?;
+        let _: serde_json::Value = self.http.post(INFRA_PUSHED, values).await?;
         Ok(())
     }
 }
@@ -585,7 +588,7 @@ impl InfraReader for BrokerInfraClient {
     ) -> Result<Option<weft_core::infra::EndpointAddress>> {
         let req = InfraEndpointUrlRequest { run_id, infra: infra.clone() };
         let resp: InfraEndpointUrlResponse =
-            self.http.post("/v1/infra/endpoint_url", &req).await?;
+            self.http.post(INFRA_ENDPOINT_URL, &req).await?;
         Ok(resp.address)
     }
 
@@ -597,16 +600,16 @@ impl InfraReader for BrokerInfraClient {
         copy: Option<&weft_core::instance::InstanceId>,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
         let req = InfraBakedRequest { run_id, place: place.to_string(), instance: copy.cloned() };
-        let resp: InfraBakedResponse = self.http.post("/v1/infra/baked", &req).await?;
+        let resp: InfraBakedResponse = self.http.post(INFRA_BAKED, &req).await?;
         Ok(resp.saved)
     }
 }
 
-// ---------- Connections + cost recording ----------
+// ---------- Connections ----------
 
 /// Worker-side client for the connection endpoints: resolve a
 /// connection for one firing, release it when the node finishes. (Cost
-/// records ride the generic task rail, not a dedicated endpoint.)
+/// rows ride the run's record batches, not an endpoint of their own.)
 pub struct BrokerAccessClient {
     http: HttpCore,
 }
@@ -620,35 +623,35 @@ impl BrokerAccessClient {
         &self,
         req: &ResolveConnectionRequest,
     ) -> Result<ResolveConnectionResponse> {
-        self.http.post("/v1/access/resolve", req).await
+        self.http.post(ACCESS_RESOLVE, req).await
     }
 
     pub async fn release_connection(
         &self,
         req: &ReleaseConnectionRequest,
     ) -> Result<ReleaseConnectionResponse> {
-        self.http.post("/v1/access/close", req).await
+        self.http.post(ACCESS_CLOSE, req).await
     }
 
     pub async fn mint_instance_token(
         &self,
         req: &ProgramMintInstanceTokenRequest,
     ) -> Result<weft_core::program::MintedInstanceToken> {
-        self.http.post("/v1/program/mint_instance_token", req).await
+        self.http.post(MINT_INSTANCE_TOKEN, req).await
     }
 
     pub async fn publish_access(
         &self,
         req: &PublishAccessRequest,
     ) -> Result<PublishAccessResponse> {
-        self.http.post("/v1/access/publish", req).await
+        self.http.post(ACCESS_PUBLISH, req).await
     }
 
     pub async fn published_access(
         &self,
         req: &PublishedAccessRequest,
     ) -> Result<PublishedAccessResponse> {
-        self.http.post("/v1/access/published", req).await
+        self.http.post(ACCESS_PUBLISHED, req).await
     }
 }
 
@@ -666,18 +669,18 @@ impl BrokerDoorClient {
     }
 
     pub async fn triggers(&self) -> Result<DoorTriggers> {
-        self.http.post("/v1/door/triggers", &DoorTriggersRequest::default()).await
+        self.http.post(DOOR_TRIGGERS, &DoorTriggersRequest::default()).await
     }
 
     pub async fn run_facts(&self, instance: Option<&weft_core::instance::InstanceId>) -> Result<DoorRunFacts> {
-        self.http.post("/v1/door/run_facts", &DoorRunFactsRequest { instance: instance.cloned() }).await
+        self.http.post(DOOR_RUN_FACTS, &DoorRunFactsRequest { instance: instance.cloned() }).await
     }
 
     /// Put `fire` in the queue of the trigger `token`; `held_by`: the
     /// holder it was picked up under.
     pub async fn park_fire(&self, token: &str, fire: &weft_task_store::parked_fires::Waiting, held_by: Option<&str>) -> Result<DoorParked> {
         self.http
-            .post("/v1/door/park_fire", &DoorParkRequest { token: token.to_string(), fire: fire.clone(), held_by: held_by.map(str::to_string) })
+            .post(DOOR_PARK_FIRE, &DoorParkRequest { token: token.to_string(), fire: fire.clone(), held_by: held_by.map(str::to_string) })
             .await
     }
 
@@ -686,26 +689,26 @@ impl BrokerDoorClient {
     pub async fn instance_token(&self, token: &str) -> Result<Option<DoorInstanceToken>> {
         let answer = self
             .http
-            .post_raw("/v1/door/instance_token", &DoorInstanceTokenRequest { token: token.to_string() }, DEFAULT_CALL_WAIT)
+            .post_raw(DOOR_INSTANCE_TOKEN, &DoorInstanceTokenRequest { token: token.to_string() }, DEFAULT_CALL_WAIT)
             .await?;
         if answer.status == reqwest::StatusCode::UNAUTHORIZED {
             return Ok(None);
         }
-        HttpCore::parse_success(answer, "/v1/door/instance_token").map(Some)
+        HttpCore::parse_success(answer, DOOR_INSTANCE_TOKEN.path).map(Some)
     }
 
     pub async fn tick(&self, request: &DoorTickRequest) -> Result<DoorTick> {
-        self.http.post("/v1/door/tick", request).await
+        self.http.post(DOOR_TICK, request).await
     }
 
     /// What a caller of a gated route proved; `Ok(None)` when the broker
     /// refused them (the reason is in its log).
     pub async fn verify_caller(&self, request: &CallerVerifyRequest) -> Result<Option<CallerVerified>> {
-        let answer = self.http.post_raw("/v1/caller/verify", request, DEFAULT_CALL_WAIT).await?;
+        let answer = self.http.post_raw(CALLER_VERIFY, request, DEFAULT_CALL_WAIT).await?;
         if answer.status == reqwest::StatusCode::UNAUTHORIZED {
             return Ok(None);
         }
-        HttpCore::parse_success::<CallerVerified>(answer, "/v1/caller/verify").map(Some)
+        HttpCore::parse_success::<CallerVerified>(answer, CALLER_VERIFY.path).map(Some)
     }
 }
 
@@ -726,25 +729,23 @@ impl BrokerRunClient {
     /// is not queued. A claim the broker could not even start is sent
     /// again.
     pub async fn claim(&self, run_id: RunId) -> Result<Option<weft_journal::record::Claimed>> {
-        let path = "/v1/run/claim";
         let req = RunClaimRequest { run_id, reads: RecordReads::ByPage };
-        let resp: RunClaimResponse = self.http.post(path, &req).await?;
+        let resp: RunClaimResponse = self.http.post(RUN_CLAIM, &req).await?;
         Ok(resp.claimed)
     }
 
     /// This worker no longer drives `run_id`, its whole record
     /// written, for `why` (`DoorLetGoRequest`).
     pub async fn let_go(&self, run_id: RunId, why: LetGo) -> Result<()> {
-        let _: DoorLetGo = self.http.post("/v1/door/let_go", &DoorLetGoRequest { run_id, why }).await?;
+        let _: DoorLetGo = self.http.post(DOOR_LET_GO, &DoorLetGoRequest { run_id, why }).await?;
         Ok(())
     }
 
     /// The answers waiting for `run_id`'s waits, but the waits in
     /// `taken`, read once (`RunAnswersRequest`).
     pub async fn answers(&self, run_id: RunId, taken: &[String]) -> Result<Vec<RunAnswer>> {
-        let path = "/v1/run/answers";
         let req = RunAnswersRequest { run_id, taken: taken.to_vec() };
-        let resp: RunAnswersResponse = read_until_answered(path, || self.http.post(path, &req)).await?;
+        let resp: RunAnswersResponse = read_until_answered(RUN_ANSWERS.path, || self.http.post(RUN_ANSWERS, &req)).await?;
         Ok(resp.answers)
     }
 
@@ -752,9 +753,8 @@ impl BrokerRunClient {
     /// drives, in one read (`RunRecheckedRequest`): what it asks once its
     /// line may have missed some.
     pub async fn rechecked(&self) -> Result<RunRecheckedResponse> {
-        let path = "/v1/run/rechecked";
         let req = RunRecheckedRequest::default();
-        read_until_answered(path, || self.http.post(path, &req)).await
+        read_until_answered(RUN_RECHECKED.path, || self.http.post(RUN_RECHECKED, &req)).await
     }
 }
 
@@ -777,7 +777,7 @@ impl BrokerSteeringClient {
     /// `stop_tagged` anchor on them.
     pub async fn tag_run(&self, run_id: RunId, tags: Vec<String>) -> Result<()> {
         let req = RunTagRequest { run_id, tags };
-        let _: RunTagResponse = self.http.post("/v1/run/tag", &req).await?;
+        let _: RunTagResponse = self.http.post(RUN_TAG, &req).await?;
         Ok(())
     }
 
@@ -786,7 +786,7 @@ impl BrokerSteeringClient {
     /// dispatcher carries it out.
     pub async fn stop_tagged(&self, run_id: RunId, tag: String, stop_self: weft_core::StopSelf) -> Result<RunStopTaggedResponse> {
         let req = RunStopTaggedRequest { run_id, tag, stop_self };
-        self.http.post("/v1/run/stop_tagged", &req).await
+        self.http.post(RUN_STOP_TAGGED, &req).await
     }
 }
 
@@ -825,7 +825,7 @@ impl BrokerProjectClient {
             expected_hash: expected_hash.to_string(),
         };
         self.http
-            .post_or_404("/v1/project/fetch_definition", &req)
+            .post_or_404(PROJECT_FETCH_DEFINITION, &req)
             .await
     }
 }
@@ -849,7 +849,7 @@ impl BrokerSupervisorClient {
     /// ones this tick took on. The supervisor acts ONLY on the owned
     /// projects.
     pub async fn sync_ownership(&self, req: &SupervisorSyncOwnershipRequest) -> Result<SupervisorSyncOwnershipResponse> {
-        self.http.post("/v1/supervisor/sync_ownership", req).await
+        self.http.post(SUPERVISOR_SYNC_OWNERSHIP, req).await
     }
 
     /// Pure read of the projects this process owns (no claim/renew). The work
@@ -860,7 +860,7 @@ impl BrokerSupervisorClient {
         };
         let resp: SupervisorOwnedProjectsResponse = self
             .http
-            .post("/v1/supervisor/owned_projects", &req)
+            .post(SUPERVISOR_OWNED_PROJECTS, &req)
             .await?;
         Ok(resp.owned)
     }
@@ -875,11 +875,10 @@ impl BrokerSupervisorClient {
         copies: &[weft_core::infra::NodeRef],
     ) -> Result<Option<Vec<String>>> {
         let req = SupervisorGoneCopiesRequest { replica: replica.to_string(), project, copies: copies.to_vec() };
-        let path = "/v1/supervisor/gone_copies";
-        match self.http.post_fenced::<_, SupervisorGoneCopiesResponse>(path, &req).await? {
+        match self.http.post_fenced::<_, SupervisorGoneCopiesResponse>(SUPERVISOR_GONE_COPIES, &req).await? {
             WriteOutcome::Applied(resp) => Ok(Some(resp.gone)),
             WriteOutcome::Displaced => Ok(None),
-            WriteOutcome::Gone => Err(anyhow::anyhow!("{path}: the broker answered 409, which a judgment never does")),
+            WriteOutcome::Gone => Err(anyhow::anyhow!("{}: the broker answered 409, which a judgment never does", SUPERVISOR_GONE_COPIES.path)),
         }
     }
 
@@ -888,14 +887,14 @@ impl BrokerSupervisorClient {
             project_id,
         };
         let resp: SupervisorInfraNodesResponse =
-            self.http.post("/v1/supervisor/infra_nodes", &req).await?;
+            self.http.post(SUPERVISOR_INFRA_NODES, &req).await?;
         Ok(resp.nodes)
     }
 
     /// Where each health rule of the project's copies stands, and how the
     /// commands they queued ended.
     pub async fn health_state(&self, project_id: Uuid) -> Result<SupervisorHealthStateResponse> {
-        self.http.post("/v1/supervisor/health_state", &SupervisorHealthStateRequest { project_id }).await
+        self.http.post(SUPERVISOR_HEALTH_STATE, &SupervisorHealthStateRequest { project_id }).await
     }
 
     /// Replace where a project's health rules stand (see
@@ -904,7 +903,7 @@ impl BrokerSupervisorClient {
         &self,
         req: &SupervisorSetHealthStateRequest,
     ) -> Result<WriteOutcome<SupervisorSetHealthStateResponse>> {
-        self.http.post_fenced("/v1/supervisor/set_health_state", req).await
+        self.http.post_fenced(SUPERVISOR_SET_HEALTH_STATE, req).await
     }
 
     /// The oldest waiting command of a project this supervisor owns that
@@ -925,7 +924,7 @@ impl BrokerSupervisorClient {
             cancelling: cancelling.to_vec(),
             wait_ms: wait_ms(wait),
         };
-        self.http.post_held("/v1/supervisor/claim_command", &req, wait).await
+        self.http.post_held(SUPERVISOR_CLAIM_COMMAND, &req, wait).await
     }
 
     pub async fn event_record(
@@ -944,12 +943,12 @@ impl BrokerSupervisorClient {
             payload,
         };
         let resp: SupervisorEventRecordResponse =
-            self.http.post("/v1/supervisor/event_record", &req).await?;
+            self.http.post(SUPERVISOR_EVENT_RECORD, &req).await?;
         Ok(resp.id)
     }
 
     pub async fn set_status(&self, req: &SupervisorSetStatusRequest) -> Result<WriteOutcome<SupervisorSetStatusResponse>> {
-        self.http.post_fenced("/v1/supervisor/set_status", req).await
+        self.http.post_fenced(SUPERVISOR_SET_STATUS, req).await
     }
 
     /// Record what the command `command_id` (an apply, a stop, a
@@ -972,7 +971,7 @@ impl BrokerSupervisorClient {
             waiting: waiting.to_string(),
         };
         self.http
-            .post_fenced::<_, SupervisorSetWaitingResponse>("/v1/supervisor/set_waiting", &req)
+            .post_fenced::<_, SupervisorSetWaitingResponse>(SUPERVISOR_SET_WAITING, &req)
             .await
     }
 
@@ -995,7 +994,7 @@ impl BrokerSupervisorClient {
             command_id,
         };
         self.http
-            .post_fenced::<_, SupervisorRemoveNodeResponse>("/v1/supervisor/remove_node", &req)
+            .post_fenced::<_, SupervisorRemoveNodeResponse>(SUPERVISOR_REMOVE_NODE, &req)
             .await
     }
 
@@ -1014,7 +1013,7 @@ impl BrokerSupervisorClient {
         };
         self.http
             .post_fenced::<_, SupervisorCommandCompleteResponse>(
-                "/v1/supervisor/command_complete",
+                SUPERVISOR_COMMAND_COMPLETE,
                 &req,
             )
             .await
@@ -1030,7 +1029,7 @@ impl BrokerSupervisorClient {
         };
         let resp: SupervisorInfraCommandInFlightResponse = self
             .http
-            .post("/v1/supervisor/infra_command_in_flight", &req)
+            .post(SUPERVISOR_INFRA_COMMAND_IN_FLIGHT, &req)
             .await?;
         Ok(resp.commands)
     }
@@ -1065,7 +1064,7 @@ impl BrokerSupervisorClient {
             health_rules,
         };
         self.http
-            .post_fenced::<_, SupervisorSetAppliedResponse>("/v1/supervisor/set_applied", &req)
+            .post_fenced::<_, SupervisorSetAppliedResponse>(SUPERVISOR_SET_APPLIED, &req)
             .await
     }
 
@@ -1098,7 +1097,7 @@ impl BrokerSupervisorClient {
         };
         self.http
             .post_fenced::<_, SupervisorSetProvisioningResponse>(
-                "/v1/supervisor/set_provisioning",
+                SUPERVISOR_SET_PROVISIONING,
                 &req,
             )
             .await
@@ -1115,7 +1114,7 @@ impl BrokerSupervisorClient {
         };
         let resp: SupervisorProjectImageTagsResponse = self
             .http
-            .post("/v1/supervisor/project_image_tags", &req)
+            .post(SUPERVISOR_PROJECT_IMAGE_TAGS, &req)
             .await?;
         Ok(resp.tags)
     }
@@ -1136,7 +1135,7 @@ impl BrokerSupervisorClient {
         };
         let resp: SupervisorEnqueueLifecycleResponse = self
             .http
-            .post("/v1/supervisor/enqueue_lifecycle", &req)
+            .post(SUPERVISOR_ENQUEUE_LIFECYCLE, &req)
             .await?;
         Ok(resp.command_id)
     }
@@ -1171,7 +1170,7 @@ impl BrokerInfraStateClient {
             run_id,
         };
         let resp: InfraEnqueueApplyResponse =
-            self.http.post("/v1/infra/enqueue_apply", &req).await?;
+            self.http.post(INFRA_ENQUEUE_APPLY, &req).await?;
         Ok(resp.command_id)
     }
 
@@ -1185,7 +1184,7 @@ impl BrokerInfraStateClient {
         values: std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<()> {
         let req = InfraBakeRequest { run_id, place: place.to_string(), instance: copy.cloned(), values };
-        let _: serde_json::Value = self.http.post("/v1/infra/bake", &req).await?;
+        let _: serde_json::Value = self.http.post(INFRA_BAKE, &req).await?;
         Ok(())
     }
 
@@ -1198,7 +1197,7 @@ impl BrokerInfraStateClient {
         wait: Duration,
     ) -> Result<InfraWaitApplyResponse> {
         let req = InfraWaitApplyRequest { project_id, command_id, wait_ms: wait_ms(wait) };
-        self.http.post_held("/v1/infra/wait_apply", &req, wait).await
+        self.http.post_held(INFRA_WAIT_APPLY, &req, wait).await
     }
 }
 

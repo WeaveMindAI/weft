@@ -198,7 +198,7 @@ pub async fn connect_direct(
     req.inner.instance = Some(caller.instance);
     crate::broker_admin::forward_json(
         &state,
-        "/v1/access/admin/connect/direct",
+        weft_broker_client::protocol::ADMIN_CONNECT_DIRECT,
         &Tenanted { tenant: caller.tenant, inner: req },
     )
     .await
@@ -218,7 +218,7 @@ pub async fn connect_begin(
     req.inner.instance = Some(caller.instance);
     crate::broker_admin::forward_json(
         &state,
-        "/v1/access/admin/oauth/begin",
+        weft_broker_client::protocol::ADMIN_OAUTH_BEGIN,
         &Tenanted { tenant: caller.tenant, inner: req },
     )
     .await
@@ -305,7 +305,7 @@ pub async fn lookup(
                 parents: req.parents,
                 cursor: req.cursor,
             };
-            crate::broker_admin::forward_json(&state, "/v1/access/admin/lookup", &Tenanted { tenant: caller.tenant, inner: request })
+            crate::broker_admin::forward_json(&state, weft_broker_client::protocol::ADMIN_LOOKUP, &Tenanted { tenant: caller.tenant, inner: request })
                 .await
                 .map(Json)
         }
@@ -314,7 +314,7 @@ pub async fn lookup(
                 own_signing(&connection, &req.node, &req.field)?;
             let request =
                 weft_access_store::GrantedQuery { for_instance: Some(caller.scope()), access_id, service, from, label, value };
-            crate::broker_admin::forward_json(&state, "/v1/access/admin/granted", &Tenanted { tenant: caller.tenant, inner: request })
+            crate::broker_admin::forward_json(&state, weft_broker_client::protocol::ADMIN_GRANTED, &Tenanted { tenant: caller.tenant, inner: request })
                 .await
                 .map(Json)
         }

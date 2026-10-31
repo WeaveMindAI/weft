@@ -347,8 +347,8 @@ pub(crate) fn triggers_reading<'a>(
 /// whoever wrote it, and a watch that may have missed one says so
 /// (`Heard::Recheck`, `Heard::Resumed`). `heard` is subscribed before the
 /// caller looked, so a change between the look and the wait wakes it.
-/// One whose driver died is ended by `crate::lapses`, which writes its
-/// status and so announces it.
+/// One whose task ended without landing it is ended by `crate::lapses`,
+/// which writes its status and so announces it.
 pub(crate) async fn wait_for_activations(heard: &mut weft_task_store::pg_signal::Subscription) -> Result<(), ApiError> {
     heard
         .woken(|channel, _| channel == crate::holders::HELD_SIGNALS_CHANNEL)

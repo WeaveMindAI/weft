@@ -241,7 +241,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             // else writes a run its worker drives.
             return Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Captured { node_id })?);
         }
-        let token = Self::arm(state, payload, None).await?.token;
+        let token = Self::arm(state, payload, false).await?.token;
         Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Registered { token })?)
     }
 }
@@ -251,16 +251,12 @@ impl RegisterSignalExecutor {
     /// The answer says what the arm did to the row, so a caller whose
     /// later step fails can take it back ([`disarm`]).
     ///
-    /// `before` is how an entry's activation stood just before the claim
-    /// that arms it (`None` for a resume, and for a trigger never
-    /// activated): whether the row it replaces was listened for the whole
-    /// time is read off it ([`listened_while_down`]).
-    pub(crate) async fn arm(
-        state: &DispatcherState,
-        mut payload: RegisterSignalPayload,
-        before: Option<&crate::activation_store::ActivationLifecycle>,
-    ) -> Result<Armed> {
-        let listened = listened_while_down(before, crate::lease::now_unix());
+    /// `listened` says whether the row an entry replaces was listened for
+    /// the whole time: read off how its activation stood as the claim that
+    /// arms it found it ([`listened_while_down`], kept on the activation's
+    /// row: `crate::activation_store::Activating::listened`); `false` for a
+    /// resume.
+    pub(crate) async fn arm(state: &DispatcherState, mut payload: RegisterSignalPayload, listened: bool) -> Result<Armed> {
         let run_id = payload.run_id;
 
         // Per-kind validation: each `Signal` impl owns its rules

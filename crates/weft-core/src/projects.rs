@@ -548,6 +548,10 @@ pub struct TriggerCopy {
     /// once it is taken down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// While it turns on: since when, and what its activation waits on
+    /// right now ("its setup run <id>").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<crate::infra::wire::ChangeProgress>,
 }
 
 /// The work held on triggers that are down: the arrivals their door held
@@ -695,6 +699,29 @@ mod tests {
     use super::*;
 
     crate::wire_enum_roundtrip_tests!(ProjectStatus, ProjectTransition);
+
+    /// A trigger turning on says since when and what it waits on, in the
+    /// editor's spelling; one that is not turning on says nothing of it.
+    #[test]
+    fn a_trigger_turning_on_carries_its_progress_on_the_wire() {
+        let copy = TriggerCopy {
+            instance: None,
+            state: TriggerState::TurningOn,
+            mode: crate::activation::ActivationMode::Registered,
+            down_with: None,
+            held_back: None,
+            held: HeldWork::default(),
+            waiting: None,
+            version: None,
+            progress: Some(crate::infra::wire::ChangeProgress { since_unix: 10, as_of_unix: 250, waiting: Some("its setup run r1".into()) }),
+        };
+        let wire = serde_json::to_value(&copy).unwrap();
+        assert_eq!(wire["progress"], serde_json::json!({ "sinceUnix": 10, "asOfUnix": 250, "waiting": "its setup run r1" }));
+        let read: TriggerCopy = serde_json::from_value(wire).unwrap();
+        assert_eq!(read.progress, copy.progress);
+        let resting = serde_json::to_value(TriggerCopy { progress: None, ..copy }).unwrap();
+        assert!(resting.get("progress").is_none());
+    }
 
     /// Names and hashes read back as written, a program's addresses
     /// included; a pair that is not `name:hash` is refused naming it.
