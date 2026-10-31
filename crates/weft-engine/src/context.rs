@@ -62,6 +62,11 @@ fn frames_dedup_key(frames: &weft_core::frames::LoopFrames) -> Result<String, se
 /// Each handle clones cheaply (every field is `Arc<dyn _>`).
 #[derive(Clone)]
 pub struct EngineClients {
+    /// The runtime the worker's standing runs on ([`io_runtime`]): its line
+    /// to the broker, its writer lanes and its door's ticks, which keep its
+    /// lease. Apart from the threads that serve calls and run node bodies,
+    /// so a body that holds a thread for long never lets the lease lapse.
+    pub io: tokio::runtime::Handle,
     /// The process's writer lanes (`crate::journal_writer`): every run's
     /// record goes through them, and the clients below that name a run
     /// write its record first through them (`crate::record_first`).
@@ -240,10 +245,9 @@ impl WorkerLine for TestLine {
 impl EngineClients {
     /// The production bundle: every client speaks on the process's one line
     /// to the broker at `broker_url`, and the clock is the real one. The
-    /// line and the writer lanes run on a runtime of their own, one thread
-    /// started here, so their wake-ups never land on the threads serving
-    /// calls. The worker binary is GENERATED, so it cannot be typechecked
-    /// with the engine; keeping the composition here means a field added or
+    /// line, the writer lanes and the door's ticks run on a runtime of their
+    /// own, one thread started here ([`Self::io`]). The worker binary is
+    /// GENERATED, so it cannot be typechecked with the engine; keeping the composition here means a field added or
     /// renamed on `EngineClients` is a compile error in this crate rather
     /// than a silent break in generated code.
     pub fn from_broker(
@@ -285,13 +289,16 @@ impl EngineClients {
             ),
             writer,
             needs_from: settings.needs_from,
+            io,
         })
     }
 }
 
-/// The process's own small runtime, one thread, for the broker lines and
-/// the writer lanes, started the first time it is asked for. It lives as
-/// long as the process: its thread drives it until the process exits.
+/// The process's own small runtime, one thread, for the broker lines, the
+/// writer lanes and the door's ticks, started the first time it is asked
+/// for. It lives as long as the process: its thread drives it until the
+/// process exits. What runs on it keeps every poll short (the lanes encode
+/// on the blocking pool): a long one delays the ticks.
 pub(crate) fn io_runtime() -> anyhow::Result<tokio::runtime::Handle> {
     static IO: Mutex<Option<tokio::runtime::Handle>> = Mutex::new(None);
     let mut io = IO.lock().expect("the io runtime");
@@ -1415,6 +1422,10 @@ pub enum TaskMsg {
         loc: FiringLocation,
         run_id: RunId,
         outcome: NodeTaskOutcome,
+        /// The firing's handle, whose waits left open the terminal
+        /// withdraws ([`RunnerHandle::withdraw_abandoned_waits`]). `None`
+        /// only for a body the drive aborted, which it never reaps.
+        runner: Option<Arc<RunnerHandle>>,
     },
 }
 
@@ -1580,6 +1591,12 @@ pub struct RunnerHandle {
     /// `&self` of the trait method; calls are serialized by the
     /// node body (single Future polling).
     awaited_sequence: Mutex<std::collections::VecDeque<weft_core::primitive::AwaitedEntry>>,
+    /// The waits this firing's calls are inside, by token: from the call's
+    /// wait until it is answered or given up. One left when the firing
+    /// ends for good was abandoned (a call dropped, a body that went on
+    /// without it, or one that panicked) and is withdrawn
+    /// ([`Self::withdraw_abandoned_waits`]).
+    open_waits: Mutex<std::collections::HashSet<String>>,
     /// 0-based ordinal of the NEXT `await_signal` or `ctx.run` call
     /// within this (node, frames) run. Increments on every call.
     /// Combined with the per-(node, frames) sequence above, it
@@ -1743,6 +1760,7 @@ impl RunnerHandle {
             tenant_id,
             cancellation,
             awaited_sequence: Mutex::new(std::collections::VecDeque::new()),
+            open_waits: Mutex::new(std::collections::HashSet::new()),
             next_call_index: Arc::new(AtomicU32::new(0)),
             next_side_effect_index: AtomicU32::new(0),
             entry_register_count: AtomicU32::new(0),
@@ -2167,6 +2185,56 @@ impl RunnerHandle {
         WeftError::WaitGaveUp(format!("node '{}' gave up its wait: {why}", self.place))
     }
 
+    /// [`Self::hold_or_suspend`], with the wait counted open while the
+    /// call is inside it: until it is answered or given up. One the call
+    /// suspends on stays open, since the firing pauses on it.
+    async fn wait_in_call(&self, token: String) -> WeftResult<Value> {
+        self.lock_open_waits().insert(token.clone());
+        let ended = self.hold_or_suspend(token.clone()).await;
+        if !matches!(ended, Err(WeftError::Suspended { .. })) {
+            self.lock_open_waits().remove(&token);
+        }
+        ended
+    }
+
+    fn lock_open_waits(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
+        self.open_waits.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Withdraw every wait this firing left open, once it ended for good
+    /// (the drive calls this as it applies the firing's terminal, a panic's
+    /// included): no call is left to take an answer, so nobody is asked
+    /// for one any more (a polling kind stops polling, a holder lets go),
+    /// and one that comes anyway is dropped. A firing that paused keeps
+    /// its waits: it carries on from them.
+    pub async fn withdraw_abandoned_waits(&self) -> WeftResult<()> {
+        let abandoned: Vec<String> = self.lock_open_waits().drain().collect();
+        for token in abandoned {
+            self.waits.held().gave_up(&token);
+            self.withdraw(token).await?;
+        }
+        Ok(())
+    }
+
+    /// Ask for the signal of wait `token` to be withdrawn.
+    async fn withdraw(&self, token: String) -> WeftResult<()> {
+        let payload = serde_json::to_value(weft_task_store::WithdrawSignalPayload { run_id: self.run_id, token: token.clone() })
+            .map_err(|e| WeftError::Suspension(format!("withdrawing wait {token} failed: {e}")))?;
+        self.clients
+            .tasks
+            .enqueue_dedup(task_store::NewTask {
+                kind: TaskKind::WithdrawSignal,
+                project_id: None,
+                dedup_key: Some(format!("withdraw/{token}")),
+                run_id: Some(self.run_id),
+                tenant_id: self.tenant_id.clone(),
+                payload,
+            })
+            .await
+            .map_err(|e| WeftError::Suspension(format!("withdrawing wait {token} failed: {e:#}")))?;
+        Ok(())
+    }
+
     /// Suspend on the wait `token`, or, while the run cannot pause, hold it
     /// in this call until the drive ends it (`crate::held_waits`): its
     /// answer goes on the run's record and is the call's value, the run
@@ -2223,19 +2291,7 @@ impl RunnerHandle {
             )
             .await
             .map_err(|e| WeftError::Suspension(format!("{error}; and recording that failed: {e:#}")))?;
-        self.clients
-            .tasks
-            .enqueue_dedup(task_store::NewTask {
-                kind: TaskKind::WithdrawSignal,
-                project_id: None,
-                dedup_key: Some(format!("withdraw/{token}")),
-                run_id: Some(self.run_id),
-                tenant_id: self.tenant_id.clone(),
-                payload: serde_json::to_value(weft_task_store::WithdrawSignalPayload { run_id: self.run_id, token })
-                    .map_err(|e| WeftError::Suspension(format!("{error}; and withdrawing it failed: {e}")))?,
-            })
-            .await
-            .map_err(|e| WeftError::Suspension(format!("{error}; and withdrawing it failed: {e:#}")))?;
+        self.withdraw(token).await.map_err(|e| WeftError::Suspension(format!("{error}; and {e}")))?;
         Err(error)
     }
 
@@ -2373,6 +2429,7 @@ pub async fn ship_node_failed(
     frames: &weft_core::frames::LoopFrames,
     error: &str,
     gave_up_wait: bool,
+    at_unix: u64,
 ) {
     record_from_replica(
         journal,
@@ -2382,7 +2439,7 @@ pub async fn ship_node_failed(
             frames: frames.clone(),
             error: error.to_string(),
             gave_up_wait,
-            at_unix: now_unix(),
+            at_unix,
         },
         replica,
     )
@@ -2519,7 +2576,7 @@ impl ContextHandle for RunnerHandle {
         let replayed = weft_core::primitive::replay_await(&mut self.lock_awaited_sequence(), call_index)?;
         match replayed {
             Some(weft_core::primitive::ReplayedAwait::Resolved(value)) => return Ok(value),
-            Some(weft_core::primitive::ReplayedAwait::Pending { token }) => return self.hold_or_suspend(token).await,
+            Some(weft_core::primitive::ReplayedAwait::Pending { token }) => return self.wait_in_call(token).await,
             None => {}
         }
 
@@ -2570,7 +2627,7 @@ impl ContextHandle for RunnerHandle {
             token = %token,
             "await_signal: registered",
         );
-        self.hold_or_suspend(token).await
+        self.wait_in_call(token).await
     }
 
     /// Replay-side of `ctx.run`. Pops the next entry in the
@@ -4832,7 +4889,7 @@ pub(crate) mod test_journal {
             Ok(())
         }
         /// Captures are for asserting writes; nothing reads them back.
-        async fn events_for_run_id(&self, _run_id: RunId) -> anyhow::Result<Vec<RunEvent>> {
+        async fn record_page(&self, _run_id: RunId, _after: Option<i32>) -> anyhow::Result<Vec<weft_journal::JournalRow>> {
             unreachable!("a capture is never read back")
         }
     }

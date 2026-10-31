@@ -17,9 +17,14 @@ use weft_core::project::loop_in_id;
 use weft_core::ProjectDefinition;
 use std::collections::BTreeMap;
 
-use weft_journal::{RunEvent, Fold, FoldEffects, SeedChain};
+use weft_core::record_ref::{Position, Shown};
+use weft_journal::{JournalRow, RunEvent, Fold, FoldEffects, SeedChain};
 
-use crate::events::DispatcherEvent;
+/// An event as the projection paints it: every value it names held with
+/// where the record keeps it (`weft_core::record_ref::Shown`), sent by
+/// reference or with the values written in.
+pub type Painted = weft_core::live_event::DispatcherEvent<Shown>;
+type DispatcherEvent = Painted;
 
 /// What a reader that folds a run's journal found when it went for
 /// the run's program.
@@ -59,29 +64,12 @@ impl ProgramLookup {
         }
     }
 
-    /// The same state, with the reason emptied.
-    ///
-    /// For a reader that has already published the reason and must not
-    /// publish it twice. It lives here because the alternative, a
-    /// `match` beside each such reader, was written twice with a `_`
-    /// arm that quietly relabels any state it does not name: a third
-    /// unpaintable state would have been reported as an undecodable row
-    /// in both places, which is the distinction these states exist to
-    /// keep.
-    pub fn without_reason(&self) -> Self {
-        match self {
-            Self::Found(p) => Self::Found(p.clone()),
-            Self::NoProgram => Self::NoProgram,
-            Self::Unreadable(_) => Self::Unreadable(String::new()),
-            Self::ProgramGone(_) => Self::ProgramGone(String::new()),
-        }
-    }
-
     /// Why this run cannot be painted whole, and where the reason
     /// belongs on screen. `None` when it can (or when it has no
-    /// program to miss). Every reader publishes this; a run that paints
-    /// empty for no stated reason is the bug that sends people hunting
-    /// through the viewer.
+    /// program to miss). A run's projection paints this with the first
+    /// row it projects ([`RunProjector`]); a run that paints empty for no
+    /// stated reason is the bug that sends people hunting through the
+    /// viewer.
     pub fn unpaintable(&self) -> Option<(weft_core::primitive::CorruptionSite, &str)> {
         use weft_core::primitive::CorruptionSite;
         match self {
@@ -93,56 +81,86 @@ impl ProgramLookup {
 }
 
 /// One run's live projection: its fold plus the project id the
-/// events are attributed to.
+/// events are attributed to. The fold SHOWS the run
+/// (`weft_journal::Fold::showing`): a firing's values are held while its
+/// events are painted and dropped once it ended, so a projection holds
+/// what is open, never the whole run.
 pub struct RunProjector {
     /// `None` for a run painted without a fold: only what needs no
     /// program is painted, and its node rows are skipped. Quietly for a
-    /// run whose program is gone or unreadable (the corruption was
-    /// published when this projection was opened); with a warning for
-    /// a run that never had one, where a node row is a writer bug.
+    /// run whose program is gone or unreadable (the projection says why,
+    /// [`Self::untold`]); with a warning for a run that never had one,
+    /// where a node row is a writer bug.
     fold: Option<Fold>,
-    /// Whether the reason this run cannot be painted whole has already
-    /// been said. Consulted only when there is no fold: a run whose
-    /// program is gone or unreadable had its reason published when the
-    /// projection was opened, so a node row here is skipped quietly,
-    /// while a run that never had a program gets a warning, because a
-    /// node row on one of those is a writer bug.
-    reason_already_published: bool,
+    /// Whether the run has a reason it cannot be painted whole, said or
+    /// not yet: a node row with no fold is then skipped quietly.
+    unpaintable: bool,
+    /// Why the run cannot be painted whole, not said yet: painted with the
+    /// first row projected, at that row's place, so every reader of the
+    /// run paints it at the same place and a follower holding that row
+    /// already hears it once.
+    untold: Option<(weft_core::primitive::CorruptionSite, String)>,
     run_id: weft_core::RunId,
     project_id: uuid::Uuid,
-    /// What a seeded run inherits, handed in by the opener (which
-    /// read the seed chain off the journal) and painted right after
-    /// the birth row, marked with the run each row came from.
-    inheritance: SeedChain,
+    /// What a seeded run inherits, imported and painted when its birth row
+    /// is projected, then [`Inherited::Nothing`].
+    inheritance: Inherited,
+}
+
+/// What a run's projection does with its inheritance at its birth row.
+/// Whatever it is, the run's own fold keeps going and its own rows paint:
+/// what its stand-ins send is on its birth (`RunStarted.given`), so it
+/// needs nothing of its ancestors to fold its own rows.
+pub enum Inherited {
+    /// Nothing to inherit: a run with no seed, or no program.
+    Nothing,
+    /// Read ([`read_inheritance`]): imported into the fold, and its
+    /// ancestors' rows painted right after the birth row, each marked with
+    /// the run it came from.
+    Read(Inheritance),
+    /// The seed chain could not be read (its seed was cleaned): nothing is
+    /// imported, and the birth row paints why, once.
+    ChainUnreadable(String),
+    /// The chain was read and the ancestors could not be reconstructed:
+    /// the birth row paints why, once.
+    Failed(String),
+}
+
+/// What a seeded run inherits, read before its own record is painted
+/// ([`read_inheritance`]): its ancestors reconstructed, each keeping what
+/// the runs after it take from it, and what the run shows of their rows,
+/// painted. Its projection imports from the first and paints the second at
+/// its birth.
+pub struct Inheritance {
+    sources: Arc<BTreeMap<weft_core::RunId, Fold>>,
+    events: Vec<DispatcherEvent>,
 }
 
 impl RunProjector {
     pub fn new(run_id: weft_core::RunId, program: ProgramLookup, project_id: uuid::Uuid) -> Self {
-        let reason_already_published = program.unpaintable().is_some();
+        let untold = program.unpaintable().map(|(site, reason)| (site, reason.to_string()));
         Self {
-            fold: program.program().map(|p| Fold::new(run_id, p)),
-            reason_already_published,
+            fold: program.program().map(|p| Fold::new(run_id, p).showing()),
+            unpaintable: untold.is_some(),
+            untold,
             run_id,
             project_id,
-            inheritance: SeedChain::default(),
+            inheritance: Inherited::Nothing,
         }
     }
 
-    /// The seed chain this run inherits from (`weft_journal::seed_chain`
-    /// over its birth row). Painted when the birth row is projected:
-    /// every inherited row lands on the screen before the run's own,
-    /// as it sits in the fold, so a seeded run reads whole instead of
-    /// as three nodes with values and twelve empty ones.
-    pub fn with_inheritance(mut self, chain: SeedChain) -> Self {
-        self.inheritance = chain;
-        self
+    /// What this run inherits ([`Inherited`]). Painted when the birth row
+    /// is projected: every inherited row lands on the screen before the
+    /// run's own, as it sits in the fold, so a seeded run reads whole
+    /// instead of as three nodes with values and twelve empty ones.
+    /// The project the run's events are attributed to.
+    pub fn project_id(&self) -> uuid::Uuid {
+        self.project_id
     }
 
-    /// Whether this projection folds at all. One that does not costs
-    /// nothing to keep, and rebuilding it would republish its
-    /// corruption, so the live view keeps it until the run's ending.
-    pub fn folds(&self) -> bool {
-        self.fold.is_some()
+    pub fn with_inheritance(mut self, inheritance: Inherited) -> Self {
+        self.inheritance = inheritance;
+        self
     }
 
     /// Apply one row and answer the events it paints. One row can
@@ -153,48 +171,56 @@ impl RunProjector {
     /// whatever the fold holds at its location is an earlier firing's,
     /// and a made-up event would contradict the corruption. The same
     /// event reaches the live screen and the replay, at the row.
-    pub fn project(&mut self, ev: &RunEvent) -> Vec<DispatcherEvent> {
-        let mut out = self.project_row(ev);
+    pub fn project(&mut self, row: &JournalRow) -> Vec<DispatcherEvent> {
+        let ev = &row.event;
+        let (run_id, project_id) = (self.run_id, self.project_id);
+        let mut out: Vec<DispatcherEvent> =
+            self.untold.take().map(|(site, reason)| DispatcherEvent::JournalCorruption { run_id, project_id, site, reason }).into_iter().collect();
+        out.extend(self.project_row(ev, row.position()));
         if let RunEvent::RunStarted { seed: Some(seed), at_unix, .. } = ev {
-            let chain = std::mem::take(&mut self.inheritance);
+            let inheritance = std::mem::replace(&mut self.inheritance, Inherited::Nothing);
             if let Some(fold) = &mut self.fold {
-                // Every ancestor is reconstructed once, here, and both
-                // consumers read from that one reconstruction.
-                let inherited = chain.materialize().and_then(|sources| {
-                    let effects = weft_journal::seed::import_origins(fold, seed, &sources, *at_unix)?;
-                    let mut events = inherited_events(&chain, &sources, seed, fold.project(), self.run_id, self.project_id)?;
-                    events.extend(effect_events(&effects, self.run_id, self.project_id, *at_unix));
-                    Ok(events)
-                });
-                match inherited {
-                    Ok(events) => {
-                        out.extend(events);
-                    }
-                    Err(error) => {
-                        self.fold = None;
-                        self.reason_already_published = true;
+                let failed = match inheritance {
+                    Inherited::Nothing => None,
+                    Inherited::ChainUnreadable(reason) => {
                         out.push(DispatcherEvent::JournalCorruption {
-                            run_id: self.run_id, project_id: self.project_id,
-                            site: weft_core::primitive::CorruptionSite::NodeLifecycle, reason: format!("cannot reconstruct seed history: {error:#}"),
+                            run_id: self.run_id, project_id: self.project_id, site: weft_core::primitive::CorruptionSite::UndecodableRow, reason,
                         });
+                        None
                     }
+                    Inherited::Failed(reason) => Some(reason),
+                    Inherited::Read(inheritance) => match weft_journal::seed::import_origins(fold, seed, &inheritance.sources, *at_unix) {
+                        Ok(effects) => {
+                            out.extend(inheritance.events);
+                            out.extend(effect_events(&effects, self.run_id, self.project_id, *at_unix));
+                            None
+                        }
+                        Err(error) => Some(format!("{error:#}")),
+                    },
+                };
+                if let Some(reason) = failed {
+                    out.push(DispatcherEvent::JournalCorruption {
+                        run_id: self.run_id, project_id: self.project_id,
+                        site: weft_core::primitive::CorruptionSite::NodeLifecycle, reason: format!("cannot reconstruct seed history: {reason}"),
+                    });
                 }
             }
         }
         out
     }
 
-    /// One of this run's own rows through its fold and onto the screen.
-    fn project_row(&mut self, ev: &RunEvent) -> Vec<DispatcherEvent> {
+    /// One of this run's own rows, at `at` in its record, through its
+    /// fold and onto the screen.
+    fn project_row(&mut self, ev: &RunEvent, at: Position) -> Vec<DispatcherEvent> {
         let inherited_from = None;
         let project_id = self.project_id;
         let run_id = self.run_id;
         let at_unix = ev.at_unix();
         let effects = match self.fold.as_mut() {
-            Some(fold) => fold.apply(ev),
+            Some(fold) => fold.apply_at(ev, Some(at)),
             None => {
                 if needs_program(ev) {
-                    if !self.reason_already_published {
+                    if !self.unpaintable {
                         tracing::warn!(
                             target: "weft_dispatcher::projection",
                             %run_id, kind = ev.kind_str(),
@@ -243,11 +269,7 @@ impl RunProjector {
                 }]
             }
             RunEvent::NodeCompleted { node_id, frames, .. } => {
-                let output = self
-                    .fold
-                    .as_ref()
-                    .and_then(|f| f.output_of(node_id, frames))
-                    .unwrap_or(serde_json::Value::Null);
+                let output = self.fold.as_ref().and_then(|f| f.output_of(node_id, frames));
                 vec![DispatcherEvent::NodeCompleted {
                     run_id, at_unix,
                     node: node_id.clone(),
@@ -311,7 +333,7 @@ impl RunProjector {
                 node: ended.at.node_id.clone(),
                 frames: ended.at.frames.clone(),
                 token: ended.token.clone(),
-                ended: ended.end.clone(),
+                ended: ended.end.clone().map(|answer| Shown::of(ended.answer_kept.as_ref(), &Arc::new(answer))),
                 inherited_from,
                 project_id,
             }).collect(),
@@ -326,11 +348,7 @@ impl RunProjector {
                 }]
             }
             RunEvent::RunCompleted { .. } => {
-                let outputs = self
-                    .fold
-                    .as_ref()
-                    .map(|f| f.final_outputs())
-                    .unwrap_or(serde_json::Value::Null);
+                let outputs = self.fold.as_ref().map(|f| f.final_outputs());
                 vec![DispatcherEvent::RunCompleted { run_id, at_unix, outputs, project_id }]
             }
             RunEvent::RunFailed { error, .. } => {
@@ -407,6 +425,9 @@ impl RunProjector {
                     at_unix,
                 }]
             }
+            // A window's messages are the window itself: its own row, which
+            // this event is the one showing of, so they travel inline and
+            // still once. The same holds for a caller's window below.
             RunEvent::BusWindow { bus_id, first_offset, last_offset, messages, totals, .. } => {
                 vec![DispatcherEvent::BusWindow {
                     run_id,
@@ -551,7 +572,7 @@ impl RunProjector {
             .as_ref()
             .and_then(|f| f.firing_view(node_id, frames))
             .unwrap_or(weft_journal::FiringView {
-                input: serde_json::Value::Object(Default::default()),
+                input: Default::default(),
                 closed_ports: Vec::new(),
                 provided_ports: Vec::new(),
                 inherited_ports: Default::default(),
@@ -575,90 +596,139 @@ fn effect_events(effects: &FoldEffects, run_id: weft_core::RunId, project_id: uu
     out
 }
 
-/// Paint selected original firings under their own program, including their
-/// suspension and resume history. These rows never enter the child's fold.
+/// Read what a seeded run inherits, its seed `seed` and its chain `chain`
+/// in hand: the ancestors reconstructed (`SeedChain::materialize`), then
+/// each origin's rows painted under its own program, including their
+/// suspension and resume history. Every record is read a page at a time
+/// through `page` (one page of a run's record after a row,
+/// `crate::store::decoded_page`). These rows never enter the child's fold.
 ///
-/// `sources` is the chain's reconstruction (`SeedChain::materialize`),
-/// which already refused any ancestor whose own seed names a run that
-/// came after it, so every ancestor's seed resolves inside it.
 /// `child_program` is the program the child runs: a scope it holds is the
 /// child's own fold's to decide and paint, so no ancestor's decision of it
 /// is painted.
-fn inherited_events(
+pub async fn read_inheritance<P, Fut>(
+    page: &P,
     chain: &SeedChain,
-    sources: &BTreeMap<weft_core::RunId, Fold>,
     seed: &weft_journal::events::Seed,
-    child_program: &ProjectDefinition,
+    child_program: Arc<ProjectDefinition>,
     child: weft_core::RunId,
     project_id: uuid::Uuid,
-) -> anyhow::Result<Vec<DispatcherEvent>> {
-    let mut out = Vec::new();
-    for ancestor in &chain.ancestors {
-        if seed.origins.values().any(|origin| *origin == ancestor.run_id) {
-            let mut source = RunProjector::new(
-                ancestor.run_id, ProgramLookup::Found(ancestor.project.clone()), project_id.to_owned(),
-            );
-            let mut ancestor_index: Option<weft_core::project::ProgramIndex> = None;
-            for row in &ancestor.rows {
-                let mut events = source.project_row(row);
-                if let RunEvent::RunStarted { seed: Some(parent), at_unix, .. } = row {
-                    let fold = source.fold.as_mut().expect("original program supplied");
-                    let effects = weft_journal::seed::import_origins(fold, parent, sources, *at_unix)?;
-                    events.extend(effect_events(&effects, ancestor.run_id, project_id, *at_unix));
+) -> anyhow::Result<Inheritance>
+where
+    P: Fn(weft_core::RunId, Option<i32>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<JournalRow>>>,
+{
+    let sources = Arc::new(chain.materialize(page).await?);
+    let seed = Arc::new(seed.clone());
+    let mut events = Vec::new();
+    for ancestor in chain.ancestors.iter().filter(|ancestor| seed.origins.values().any(|origin| *origin == ancestor.run_id)) {
+        let mut painting = AncestorPainting {
+            ancestor: ancestor.run_id,
+            project: ancestor.project.clone(),
+            source: RunProjector::new(ancestor.run_id, ProgramLookup::Found(ancestor.project.clone()), project_id),
+            index: None,
+        };
+        let mut after = None;
+        loop {
+            let rows = page(ancestor.run_id, after).await?;
+            let Some(last) = rows.last().map(|row| row.seq) else { break };
+            let (sources, seed, child_program) = (sources.clone(), seed.clone(), child_program.clone());
+            (painting, events) = weft_journal::on_blocking_pool(move || -> anyhow::Result<_> {
+                for row in &rows {
+                    painting.paint(row, &sources, &seed, &child_program, child, project_id, &mut events)?;
                 }
-                for mut event in events {
-                    match &mut event {
-                        DispatcherEvent::NodeStarted { run_id, node, frames, inherited_from, .. }
-                        | DispatcherEvent::NodeSuspended { run_id, node, frames, inherited_from, .. }
-                        | DispatcherEvent::NodeResumed { run_id, node, frames, inherited_from, .. }
-                        | DispatcherEvent::WaitEnded { run_id, node, frames, inherited_from, .. }
-                        | DispatcherEvent::NodeCompleted { run_id, node, frames, inherited_from, .. }
-                        | DispatcherEvent::NodeSkipped { run_id, node, frames, inherited_from, .. } => {
-                            if seed.origins.get(&Located::at(node.as_str(), frames)) != Some(&ancestor.run_id) { continue; }
-                            *run_id = child;
-                            *inherited_from = Some(ancestor.run_id);
-                            out.push(event);
-                        }
-                        DispatcherEvent::JournalCorruption { reason, .. } => anyhow::bail!(
-                            "original run {} cannot be projected: {reason}", ancestor.run_id,
-                        ),
-                        DispatcherEvent::LoopInstantiated { run_id, group_id, parent_frames, .. }
-                        | DispatcherEvent::LoopIterationLaunched { run_id, group_id, parent_frames, .. }
-                        | DispatcherEvent::LoopOutFired { run_id, group_id, parent_frames, .. }
-                        | DispatcherEvent::LoopTerminated { run_id, group_id, parent_frames, .. } => {
-                            if seed.origins.get(&Located::at(loop_in_id(group_id), parent_frames)) != Some(&ancestor.run_id) { continue; }
-                            *run_id = child;
-                            out.push(event);
-                        }
-                        // A copy whose every node this run reuses from the
-                        // ancestor, and that this run's program does not
-                        // hold (its cut kept nothing inside it), was decided
-                        // there: shown as it was.
-                        DispatcherEvent::ScopeDecided { run_id, scope, frames, inherited_from, .. } => {
-                            if child_program.groups.iter().any(|group| group.id == *scope) { continue; }
-                            let index = ancestor_index.get_or_insert_with(|| weft_core::project::ProgramIndex::build(&ancestor.project));
-                            let copy = weft_core::project::scopes::ScopeCopy::new(scope.clone(), frames.clone());
-                            let inside = index.scopes().inside(&copy);
-                            let mut nodes = inside.nodes.iter().map(|(at, frames)| Located::at(&ancestor.project.nodes[*at].id, frames)).peekable();
-                            if nodes.peek().is_none() || !nodes.all(|place| seed.origins.get(&place) == Some(&ancestor.run_id)) { continue; }
-                            *run_id = child;
-                            *inherited_from = Some(ancestor.run_id);
-                            out.push(event);
-                        }
-                        DispatcherEvent::CostReported { run_id, node_id, frames, inherited_from, .. }
-                        | DispatcherEvent::FileEdited { run_id, node_id, frames, inherited_from, .. } => {
-                            if seed.origins.get(&Located::at(node_id.as_str(), frames)) != Some(&ancestor.run_id) { continue; }
-                            *run_id = child;
-                            *inherited_from = Some(ancestor.run_id);
-                            out.push(event);
-                        }
-                        _ => {}
-                    }
-                }
-            }
+                Ok((painting, events))
+            })
+            .await?;
+            after = Some(last);
         }
     }
-    Ok(out)
+    Ok(Inheritance { sources, events })
+}
+
+/// One ancestor's rows being painted for a run seeded from it
+/// ([`read_inheritance`]): its projection, under its own program.
+struct AncestorPainting {
+    ancestor: weft_core::RunId,
+    project: Arc<ProjectDefinition>,
+    source: RunProjector,
+    /// Its program's index, built the first time a scope decision needs it.
+    index: Option<weft_core::project::ProgramIndex>,
+}
+
+impl AncestorPainting {
+    /// Paint `row`, the ancestor's next, onto `out`: what of it sits at a
+    /// place the child reuses from this ancestor, as the child's.
+    #[allow(clippy::too_many_arguments)]
+    fn paint(
+        &mut self,
+        row: &JournalRow,
+        sources: &BTreeMap<weft_core::RunId, Fold>,
+        seed: &weft_journal::events::Seed,
+        child_program: &ProjectDefinition,
+        child: weft_core::RunId,
+        project_id: uuid::Uuid,
+        out: &mut Vec<DispatcherEvent>,
+    ) -> anyhow::Result<()> {
+        let ancestor = self.ancestor;
+        let mut events = self.source.project_row(&row.event, row.position());
+        if let RunEvent::RunStarted { seed: Some(parent), at_unix, .. } = &row.event {
+            let fold = self.source.fold.as_mut().expect("original program supplied");
+            let effects = weft_journal::seed::import_origins(fold, parent, sources, *at_unix)?;
+            events.extend(effect_events(&effects, ancestor, project_id, *at_unix));
+        }
+        for mut event in events {
+            match &mut event {
+                DispatcherEvent::NodeStarted { run_id, node, frames, inherited_from, .. }
+                | DispatcherEvent::NodeSuspended { run_id, node, frames, inherited_from, .. }
+                | DispatcherEvent::NodeResumed { run_id, node, frames, inherited_from, .. }
+                | DispatcherEvent::WaitEnded { run_id, node, frames, inherited_from, .. }
+                | DispatcherEvent::NodeCompleted { run_id, node, frames, inherited_from, .. }
+                | DispatcherEvent::NodeSkipped { run_id, node, frames, inherited_from, .. } => {
+                    if seed.origins.get(&Located::at(node.as_str(), frames)) != Some(&ancestor) { continue; }
+                    *run_id = child;
+                    *inherited_from = Some(ancestor);
+                    out.push(event);
+                }
+                DispatcherEvent::JournalCorruption { reason, .. } => anyhow::bail!(
+                    "original run {} cannot be projected: {reason}", ancestor,
+                ),
+                DispatcherEvent::LoopInstantiated { run_id, group_id, parent_frames, .. }
+                | DispatcherEvent::LoopIterationLaunched { run_id, group_id, parent_frames, .. }
+                | DispatcherEvent::LoopOutFired { run_id, group_id, parent_frames, .. }
+                | DispatcherEvent::LoopTerminated { run_id, group_id, parent_frames, .. } => {
+                    if seed.origins.get(&Located::at(loop_in_id(group_id), parent_frames)) != Some(&ancestor) { continue; }
+                    *run_id = child;
+                    out.push(event);
+                }
+                // A copy whose every node this run reuses from the
+                // ancestor, and that this run's program does not
+                // hold (its cut kept nothing inside it), was decided
+                // there: shown as it was.
+                DispatcherEvent::ScopeDecided { run_id, scope, frames, inherited_from, .. } => {
+                    if child_program.groups.iter().any(|group| group.id == *scope) { continue; }
+                    let project = &self.project;
+                    let index = self.index.get_or_insert_with(|| weft_core::project::ProgramIndex::build(project));
+                    let copy = weft_core::project::scopes::ScopeCopy::new(scope.clone(), frames.clone());
+                    let inside = index.scopes().inside(&copy);
+                    let mut nodes = inside.nodes.iter().map(|(at, frames)| Located::at(&project.nodes[*at].id, frames)).peekable();
+                    if nodes.peek().is_none() || !nodes.all(|place| seed.origins.get(&place) == Some(&ancestor)) { continue; }
+                    *run_id = child;
+                    *inherited_from = Some(ancestor);
+                    out.push(event);
+                }
+                DispatcherEvent::CostReported { run_id, node_id, frames, inherited_from, .. }
+                | DispatcherEvent::FileEdited { run_id, node_id, frames, inherited_from, .. } => {
+                    if seed.origins.get(&Located::at(node_id.as_str(), frames)) != Some(&ancestor) { continue; }
+                    *run_id = child;
+                    *inherited_from = Some(ancestor);
+                    out.push(event);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Whether a row is about a firing the fold has to know: a row that
@@ -756,18 +826,34 @@ fn sniff_bus_participants(
 /// corruption, naming `weft clean`, and the run's own rows still paint.
 pub async fn run_inheritance(
     state: &crate::state::DispatcherState,
-    rows: &[RunEvent],
+    birth: Option<&RunEvent>,
     program: &ProgramLookup,
 ) -> Result<weft_journal::SeedChain, String> {
     if program.program().is_none() {
         return Ok(weft_journal::SeedChain::default());
     }
-    weft_journal::seed_chain(rows, |seed| state.runs.events_log(seed), |project_id, hash| async move {
+    weft_journal::seed_chain(birth, &record_page(state), |project_id, hash| async move {
         state.program(project_id, &hash).await?
             .ok_or_else(|| anyhow::anyhow!("seed definition {hash} is missing from project {project_id}"))
     })
         .await
         .map_err(|e| format!("this run inherits from a seed that cannot be read: {e:#}"))
+}
+
+/// How a reader of a seed's ancestors reads a run's record: one page after
+/// a row, decoded (`crate::store::decoded_page`).
+pub fn record_page<'a>(state: &'a crate::state::DispatcherState) -> impl Fn(weft_core::RunId, Option<i32>) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<JournalRow>>> + 'a {
+    move |run_id, after| Box::pin(crate::store::decoded_page(&*state.runs, run_id, after))
+}
+
+/// The first event of run `run_id`'s record, its birth: read alone, off
+/// the record's first page. `None` for a record with no rows. The outer
+/// error is the database; the inner one says the row no longer decodes.
+pub async fn run_birth(state: &crate::state::DispatcherState, run_id: weft_core::RunId) -> anyhow::Result<Result<Option<JournalRow>, String>> {
+    let Some(first) = state.runs.record_first_row(run_id).await? else { return Ok(Ok(None)) };
+    let record = weft_journal::record::RawRecord { rows: vec![first] };
+    let rows = weft_journal::on_blocking_pool(move || record.decode(run_id)).await;
+    Ok(rows.map(|rows| rows.into_iter().next()))
 }
 
 /// Read the selected firings' original logs together with this run's own tail.
@@ -776,33 +862,50 @@ pub async fn run_logs(
     run_id: weft_core::RunId,
     limit: u32,
 ) -> anyhow::Result<Vec<crate::store::LogEntry>> {
-    let mut logs = state.runs.logs_for(run_id, limit).await?;
+    let mut logs = crate::store::LogTail::new(limit);
+    state.runs.logs_for(run_id, limit).await?.into_iter().for_each(|line| logs.push(line));
     let inherited = async {
-        let rows = state.runs.events_log(run_id).await?;
-        let Some(RunEvent::RunStarted { seed: Some(seed), .. }) = rows.first() else { return Ok(Vec::new()); };
+        let Some(birth) = run_birth(state, run_id).await?.map_err(anyhow::Error::msg)? else { return Ok(()) };
+        let RunEvent::RunStarted { seed: Some(seed), .. } = &birth.event else { return Ok(()) };
         let program = run_program(state, run_id).await?;
         anyhow::ensure!(program.program().is_some(), "inherited logs need the run's original program");
-        let seed = seed.clone();
-        let chain = run_inheritance(state, &rows, &program).await.map_err(anyhow::Error::msg)?;
-        Ok::<_, anyhow::Error>(weft_journal::on_blocking_pool(move || inherited_logs(&chain, &seed)).await)
+        let chain = run_inheritance(state, Some(&birth.event), &program).await.map_err(anyhow::Error::msg)?;
+        inherited_logs(&record_page(state), &chain, seed, &mut logs).await
     }.await;
-    match inherited {
-        Ok(inherited) => logs.extend(inherited),
-        Err(error) => logs.push(crate::store::LogEntry::corrupt_row(0, format!("cannot read inherited log history: {error:#}"))),
+    if let Err(error) = inherited {
+        logs.push(crate::store::LogEntry::corrupt_row(0, format!("cannot read inherited log history: {error:#}")));
     }
-    Ok(crate::store::LogEntry::tail(logs, limit))
+    Ok(logs.into_entries())
 }
 
-fn inherited_logs(chain: &SeedChain, seed: &weft_journal::Seed) -> Vec<crate::store::LogEntry> {
-    chain.ancestors.iter().flat_map(|ancestor| ancestor.rows.iter().filter_map(|event| {
-        let mut line = crate::store::LogEntry::from_event(event)?;
-        if seed.origins.get(&Located::at(line.node.as_deref()?, &line.frames)) != Some(&ancestor.run_id) { return None; }
-        line.inherited_from = Some(ancestor.run_id);
-        Some(line)
-    })).collect()
+/// Feed `lines` the log lines of the firings a run seeded by `seed` reuses
+/// from each of its ancestors (`chain`), each record read a page at a time
+/// through `page`. Only the origins are read.
+async fn inherited_logs<P, Fut>(page: &P, chain: &SeedChain, seed: &weft_journal::Seed, lines: &mut crate::store::LogTail) -> anyhow::Result<()>
+where
+    P: Fn(weft_core::RunId, Option<i32>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<JournalRow>>>,
+{
+    for ancestor in chain.ancestors.iter().filter(|ancestor| seed.origins.values().any(|origin| *origin == ancestor.run_id)) {
+        let mut after = None;
+        loop {
+            let rows = page(ancestor.run_id, after).await?;
+            let Some(last) = rows.last().map(|row| row.seq) else { break };
+            rows.iter().filter_map(|row| {
+                let mut line = crate::store::LogEntry::from_event(&row.event)?;
+                if seed.origins.get(&Located::at(line.node.as_deref()?, &line.frames)) != Some(&ancestor.run_id) { return None; }
+                line.inherited_from = Some(ancestor.run_id);
+                Some(line)
+            }).for_each(|line| lines.push(line));
+            after = Some(last);
+        }
+    }
+    Ok(())
 }
 
-/// Strict reconstruction for seeding and complete output review.
+/// Strict reconstruction for seeding and complete output review: the run's
+/// fold with every output it handed out (`Fold::with_output_history`), and
+/// its ancestors', by run. Its record is read a page at a time.
 pub async fn reconstruct_run(
     state: &crate::state::DispatcherState,
     run_id: weft_core::RunId,
@@ -810,10 +913,25 @@ pub async fn reconstruct_run(
     let found = run_program(state, run_id).await?;
     let program = found.program()
         .ok_or_else(|| anyhow::anyhow!("run {run_id} has no readable original program"))?;
-    let rows = state.runs.events_log(run_id).await?;
-    let mut chain = run_inheritance(state, &rows, &found).await.map_err(anyhow::Error::msg)?;
-    chain.ancestors.push(weft_journal::seed::Ancestor { run_id, project: program, rows });
-    weft_journal::on_blocking_pool(move || chain.materialize()).await
+    let birth = run_birth(state, run_id).await?.map_err(anyhow::Error::msg)?;
+    let chain = run_inheritance(state, birth.as_ref().map(|birth| &birth.event), &found).await.map_err(anyhow::Error::msg)?;
+    let sources = Arc::new(chain.materialize(&record_page(state)).await?);
+    let live = weft_journal::LiveFold::from(weft_journal::Fold::new(run_id, program).with_output_history(), sources.clone());
+    let live = crate::store::fold_record(&*state.runs, run_id, None, live, fold_page(run_id)).await?;
+    let fold = live.into_fold()?;
+    let mut folds = Arc::try_unwrap(sources).map_err(|_| anyhow::anyhow!("run {run_id}'s fold still holds its ancestors"))?;
+    folds.insert(run_id, fold);
+    Ok(folds)
+}
+
+/// The step folding one page of run `run_id`'s record into its fold
+/// (`crate::store::fold_record`): a row that does not decode fails the
+/// read, a fold over part of a record rebuilding a run that never was.
+pub fn fold_page(run_id: weft_core::RunId) -> impl Fn(&mut weft_journal::LiveFold, weft_journal::record::RawRecord) -> anyhow::Result<()> + Clone + Send + 'static {
+    move |live, page| {
+        let rows = page.decode(run_id).map_err(anyhow::Error::msg)?;
+        live.apply(&rows)
+    }
 }
 
 /// Where run `run_id` stands, and the program it runs (its cut, for a run
@@ -827,11 +945,11 @@ pub async fn run_snapshot(
     let found = run_program(state, run_id).await?;
     let program = found.program()
         .ok_or_else(|| anyhow::anyhow!("run {run_id} has no readable original program"))?;
-    let rows = state.runs.events_log(run_id).await?;
-    let chain = run_inheritance(state, &rows, &found).await.map_err(anyhow::Error::msg)?;
-    let folded = program.clone();
-    let snapshot = weft_journal::on_blocking_pool(move || weft_journal::fold_seeded(run_id, folded, &chain, &rows)).await?;
-    Ok((program, snapshot))
+    let birth = run_birth(state, run_id).await?.map_err(anyhow::Error::msg)?;
+    let chain = run_inheritance(state, birth.as_ref().map(|birth| &birth.event), &found).await.map_err(anyhow::Error::msg)?;
+    let live = weft_journal::LiveFold::new(weft_journal::Fold::new(run_id, program.clone()), &chain, &record_page(state)).await?;
+    let live = crate::store::fold_record(&*state.runs, run_id, None, live, fold_page(run_id)).await?;
+    Ok((program, live.into_snapshot()))
 }
 
 /// The program a run runs, for the readers that fold its
@@ -931,6 +1049,24 @@ mod tests {
     use weft_journal::RunEvent;
 
     const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(0x100);
+
+    /// `event` read at row `seq` of its record.
+    fn row(seq: usize, event: &RunEvent) -> JournalRow {
+        JournalRow { seq: seq as i32, index: 0, event: event.clone() }
+    }
+
+    /// `events` as a record whose every event is a row of its own.
+    fn rows_of(events: Vec<RunEvent>) -> Vec<JournalRow> {
+        events.iter().enumerate().map(|(seq, event)| row(seq, event)).collect()
+    }
+
+    /// A painted event as a reader that asked for the values reads it.
+    fn json(event: DispatcherEvent) -> Value {
+        let written = event
+            .with_values(&mut |at| Err(weft_core::record_ref::Unresolved::Broken(format!("not at hand: {at:?}"))))
+            .expect("a projection holds every value it paints");
+        serde_json::to_value(written).expect("event json")
+    }
 
     fn run_id() -> weft_core::RunId {
         uuid::Uuid::nil()
@@ -1105,16 +1241,42 @@ mod tests {
         rows
     }
 
+    /// A run's ancestor: its run, its program, its record.
+    type Recorded = (weft_core::RunId, Arc<ProjectDefinition>, Vec<RunEvent>);
+
+    /// The records of `ancestors`, read a page of three rows at a time.
+    fn pages(ancestors: &[Recorded]) -> impl Fn(weft_core::RunId, Option<i32>) -> std::future::Ready<anyhow::Result<Vec<JournalRow>>> {
+        let records: std::collections::HashMap<weft_core::RunId, Vec<JournalRow>> =
+            ancestors.iter().map(|(run, _, events)| (*run, rows_of(events.clone()))).collect();
+        move |run, after| std::future::ready(Ok(records.get(&run).into_iter().flatten()
+            .filter(|row| after.is_none_or(|after| row.seq > after)).take(3).cloned().collect()))
+    }
+
+    /// The seed chain of a run seeded by `seed` from `ancestors`, oldest
+    /// first.
+    fn chain_of(ancestors: &[Recorded], seed: &weft_journal::events::Seed) -> SeedChain {
+        SeedChain::new(ancestors.iter().map(|(run_id, project, events)| weft_journal::seed::Ancestor {
+            run_id: *run_id, project: project.clone(), birth: row(0, &events[0]),
+        }).collect(), seed)
+    }
+
+    /// What run `child`, over `program` and seeded by `seed` from
+    /// `ancestors`, inherits ([`read_inheritance`]).
+    async fn inherits(ancestors: &[Recorded], seed: &weft_journal::events::Seed, program: Arc<ProjectDefinition>, child: weft_core::RunId) -> Inheritance {
+        read_inheritance(&pages(ancestors), &chain_of(ancestors, seed), seed, program, child, PROJECT).await.unwrap()
+    }
+
     fn project_all(rows: &[RunEvent]) -> Vec<Value> {
         let mut projector = RunProjector::new(run_id(), ProgramLookup::Found(program()), PROJECT);
         rows.iter()
-            .flat_map(|r| projector.project(r))
-            .map(|e| serde_json::to_value(e).expect("event json"))
+            .enumerate()
+            .flat_map(|(seq, r)| projector.project(&row(seq, r)))
+            .map(json)
             .collect()
     }
 
-    #[test]
-    fn inherited_firing_keeps_answers_in_order_under_its_original_program() {
+    #[tokio::test]
+    async fn inherited_firing_keeps_answers_in_order_under_its_original_program() {
         let mut rows = run_rows(true);
         for node in ["src", "sink"] {
             rows.push(RunEvent::LogLine {
@@ -1140,16 +1302,15 @@ mod tests {
                 run_id: run_id(), node_id: "src".into(), frames: vec![], token: Some("answer".into()), at_unix: 1,
             },
         ]);
-        let chain = SeedChain { ancestors: vec![weft_journal::seed::Ancestor {
-            run_id: run_id(), project: program(), rows,
-        }] };
+        let ancestors = [(run_id(), program(), rows)];
         let child = uuid::Uuid::new_v4();
         let seed = weft_journal::events::Seed {
             parent: run_id(), origins: [(Located::top("src"), run_id())].into(), answers: Default::default(),
         };
-        let events: Vec<Value> = inherited_events(&chain, &chain.materialize().unwrap(), &seed, &nothing(), child, PROJECT).unwrap()
-            .into_iter().map(|event| serde_json::to_value(event).unwrap()).collect();
-        let logs = inherited_logs(&chain, &seed);
+        let events: Vec<Value> = inherits(&ancestors, &seed, nothing(), child).await.events.into_iter().map(json).collect();
+        let mut tail = crate::store::LogTail::new(100);
+        inherited_logs(&pages(&ancestors), &chain_of(&ancestors, &seed), &seed, &mut tail).await.unwrap();
+        let logs = tail.into_entries();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].message, "original src");
         assert_eq!(logs[0].inherited_from, Some(run_id()));
@@ -1202,38 +1363,41 @@ mod tests {
     /// A copy of a scope whose every node the child reuses was decided in
     /// the run they come from, and is shown inherited from it; a copy the
     /// child runs a node of again is the child's to decide.
-    #[test]
-    fn a_scope_the_child_reuses_whole_is_shown_inherited() {
-        let chain = SeedChain { ancestors: vec![
-            weft_journal::seed::Ancestor { run_id: run_id(), project: program(), rows: run_rows(true) },
-        ] };
+    #[tokio::test]
+    async fn a_scope_the_child_reuses_whole_is_shown_inherited() {
+        let ancestors = [(run_id(), program(), run_rows(true))];
         let child = uuid::Uuid::new_v4();
-        let painted = |origins: &[&str]| -> Vec<Value> {
+        let painted = |origins: &[&str]| {
             let seed = weft_journal::events::Seed {
                 parent: run_id(),
                 origins: origins.iter().map(|node| (Located::top(*node), run_id())).collect(),
                 answers: Default::default(),
             };
-            inherited_events(&chain, &chain.materialize().unwrap(), &seed, &nothing(), child, PROJECT).unwrap()
-                .into_iter().map(|event| serde_json::to_value(event).unwrap())
-                .filter(|event| event["kind"] == "scope_decided").collect()
+            let ancestors = &ancestors;
+            async move {
+                inherits(ancestors, &seed, nothing(), child).await.events.into_iter().map(json)
+                    .filter(|event| event["kind"] == "scope_decided").collect::<Vec<Value>>()
+            }
         };
-        let whole = painted(&["src", "inner"]);
+        let whole = painted(&["src", "inner"]).await;
         assert_eq!(whole.len(), 1, "{whole:?}");
         assert_eq!(whole[0]["scope"], "g");
         assert_eq!(whole[0]["state"], "open");
         assert_eq!(whole[0]["runId"], child.to_string());
         assert_eq!(whole[0]["inheritedFrom"], run_id().to_string());
-        assert!(painted(&["src"]).is_empty(), "the child runs `inner` again, so it decides `g` itself");
+        assert!(painted(&["src"]).await.is_empty(), "the child runs `inner` again, so it decides `g` itself");
     }
 
     /// The scope decisions a seeded run paints, as `(scope, runId,
     /// inheritedFrom)`, through its projection from its birth on.
-    fn scopes_painted(child: weft_core::RunId, program: Arc<ProjectDefinition>, chain: SeedChain, rows: &[RunEvent]) -> Vec<(String, String, Value)> {
-        let mut projector = RunProjector::new(child, ProgramLookup::Found(program), PROJECT).with_inheritance(chain);
+    async fn scopes_painted(child: weft_core::RunId, program: Arc<ProjectDefinition>, ancestors: &[Recorded], rows: &[RunEvent]) -> Vec<(String, String, Value)> {
+        let RunEvent::RunStarted { seed: Some(seed), .. } = &rows[0] else { panic!("a seeded run") };
+        let inheritance = inherits(ancestors, seed, program.clone(), child).await;
+        let mut projector = RunProjector::new(child, ProgramLookup::Found(program), PROJECT).with_inheritance(Inherited::Read(inheritance));
         rows.iter()
-            .flat_map(|row| projector.project(row))
-            .map(|event| serde_json::to_value(event).unwrap())
+            .enumerate()
+            .flat_map(|(seq, event)| projector.project(&row(seq, event)))
+            .map(json)
             .inspect(|event| assert_ne!(event["kind"], "journal_corruption", "{event}"))
             .filter(|event| event["kind"] == "scope_decided")
             .map(|event| (event["scope"].as_str().unwrap().to_string(), event["runId"].as_str().unwrap().to_string(), event["inheritedFrom"].clone()))
@@ -1245,12 +1409,10 @@ mod tests {
     /// standing in), decides the copy itself from what its stand-ins send:
     /// it is painted once, as the child's own, never a second time as the
     /// ancestor's.
-    #[test]
-    fn a_seeded_run_paints_each_scope_copy_once() {
+    #[tokio::test]
+    async fn a_seeded_run_paints_each_scope_copy_once() {
         let parent = run_id();
-        let chain = SeedChain { ancestors: vec![
-            weft_journal::seed::Ancestor { run_id: parent, project: program(), rows: run_rows(true) },
-        ] };
+        let ancestors = [(parent, program(), run_rows(true))];
         let child = uuid::Uuid::from_u128(0xc1);
         let (program, given) = standing_in(&[("src", json!({ "out": 9, "flow": true }), parent), ("inner", json!({ "out": 10 }), parent)]);
         let seed = weft_journal::events::Seed {
@@ -1264,7 +1426,48 @@ mod tests {
             completed_in(child, "sink", 2),
             RunEvent::RunCompleted { run_id: child, at_unix: 3 },
         ];
-        assert_eq!(scopes_painted(child, program, chain, &rows), [("g".to_string(), child.to_string(), Value::Null)]);
+        assert_eq!(scopes_painted(child, program, &ancestors, &rows).await, [("g".to_string(), child.to_string(), Value::Null)]);
+    }
+
+    /// A seeded run whose inheritance could not be had still folds and
+    /// paints its own rows, its stand-ins read off its birth: a chain that
+    /// could not be read, an inheritance that could not be reconstructed,
+    /// or one that could not be imported, each says why once, at the birth
+    /// row.
+    #[test]
+    fn a_seeded_run_whose_inheritance_failed_still_paints_its_own_rows() {
+        let parent = run_id();
+        let child = uuid::Uuid::from_u128(0xc1);
+        let (program, given) = standing_in(&[("src", json!({ "out": 9, "flow": true }), parent), ("inner", json!({ "out": 10 }), parent)]);
+        let seed = weft_journal::events::Seed {
+            parent,
+            origins: [(Located::top("src"), parent), (Located::top("inner"), parent)].into(),
+            answers: Default::default(),
+        };
+        let rows = [
+            born(child, Some(seed), given),
+            started_in(child, "sink", 1),
+            completed_in(child, "sink", 2),
+            RunEvent::RunCompleted { run_id: child, at_unix: 3 },
+        ];
+        let unimportable = || Inheritance { sources: Arc::new(BTreeMap::new()), events: Vec::new() };
+        for (inherited, said) in [
+            (Inherited::ChainUnreadable("seed cleaned".into()), "seed cleaned"),
+            (Inherited::Failed("seed run gone".into()), "cannot reconstruct seed history: seed run gone"),
+            (Inherited::Read(unimportable()), "outside its ancestor chain"),
+        ] {
+            let mut projector = RunProjector::new(child, ProgramLookup::Found(program.clone()), PROJECT).with_inheritance(inherited);
+            let painted: Vec<(usize, Value)> = rows.iter().enumerate()
+                .flat_map(|(seq, event)| projector.project(&row(seq, event)).into_iter().map(move |event| (seq, json(event))))
+                .collect();
+            let corruptions: Vec<&(usize, Value)> = painted.iter().filter(|(_, event)| event["kind"] == "journal_corruption").collect();
+            assert_eq!(corruptions.len(), 1, "{corruptions:?}");
+            assert_eq!(corruptions[0].0, 0, "said at the birth row");
+            assert!(corruptions[0].1["reason"].as_str().unwrap().contains(said), "{corruptions:?}");
+            let sink_started = painted.iter().find(|(_, event)| event["kind"] == "node_started" && event["node"] == "sink").expect("its own row paints");
+            assert_eq!(sink_started.1["input"]["in"], 10, "fed by its stand-in, from its birth");
+            assert!(painted.iter().any(|(_, event)| event["kind"] == "node_completed" && event["node"] == "sink"), "{painted:?}");
+        }
     }
 
     /// Two hops: a middle run seeded from the first decides `g` itself
@@ -1272,8 +1475,8 @@ mod tests {
     /// reuses everything (its cut keeps no scope) shows `g` as the middle
     /// run decided it, inherited from the middle run, and the first run's
     /// own decision of it not at all.
-    #[test]
-    fn a_scope_decided_in_a_seeded_middle_run_is_inherited_from_it() {
+    #[tokio::test]
+    async fn a_scope_decided_in_a_seeded_middle_run_is_inherited_from_it() {
         let first = run_id();
         let middle = uuid::Uuid::from_u128(0xb1);
         let last = uuid::Uuid::from_u128(0xc1);
@@ -1289,12 +1492,7 @@ mod tests {
             completed_in(middle, "sink", 6),
             RunEvent::RunCompleted { run_id: middle, at_unix: 7 },
         ];
-        let chain = SeedChain { ancestors: vec![
-            weft_journal::seed::Ancestor { run_id: first, project: program(), rows: run_rows(true) },
-            weft_journal::seed::Ancestor {
-                run_id: middle, project: middle_program, rows: middle_rows,
-            },
-        ] };
+        let ancestors = [(first, program(), run_rows(true)), (middle, middle_program, middle_rows)];
         let seed = weft_journal::events::Seed {
             parent: middle,
             origins: [(Located::top("src"), first), (Located::top("inner"), middle), (Located::top("sink"), middle)].into(),
@@ -1302,7 +1500,7 @@ mod tests {
         };
         let rows = vec![born(last, Some(seed), Default::default()), RunEvent::RunCompleted { run_id: last, at_unix: 8 }];
         assert_eq!(
-            scopes_painted(last, nothing(), chain, &rows),
+            scopes_painted(last, nothing(), &ancestors, &rows).await,
             [("g".to_string(), last.to_string(), json!(middle.to_string()))],
         );
     }
@@ -1386,13 +1584,14 @@ mod tests {
         let from_start = project_all(&rows);
         let split = 6;
         let mut late = RunProjector::new(run_id(), ProgramLookup::Found(program()), PROJECT);
-        for r in &rows[..split] {
-            late.project(r);
+        for (seq, r) in rows[..split].iter().enumerate() {
+            late.project(&row(seq, r));
         }
         let tail: Vec<Value> = rows[split..]
             .iter()
-            .flat_map(|r| late.project(r))
-            .map(|e| serde_json::to_value(e).expect("event json"))
+            .enumerate()
+            .flat_map(|(seq, r)| late.project(&row(split + seq, r)))
+            .map(json)
             .collect();
         // Everything the early rows painted comes first in the full
         // projection; the tail is identical.
@@ -1407,10 +1606,10 @@ mod tests {
     #[test]
     fn a_rejected_loop_row_paints_only_its_corruption() {
         let mut projector = RunProjector::new(run_id(), ProgramLookup::Found(program()), PROJECT);
-        let row = RunEvent::LoopInstantiated { run_id: run_id(), group_id: "nope".into(), parent_frames: vec![], at_unix: 1 };
-        assert!(only_corruptions(&projector.project(&row)));
-        let row = RunEvent::LoopOutFired { run_id: run_id(), group_id: "nope".into(), parent_frames: vec![], index: 0, at_unix: 1 };
-        assert!(only_corruptions(&projector.project(&row)));
+        let instantiated = RunEvent::LoopInstantiated { run_id: run_id(), group_id: "nope".into(), parent_frames: vec![], at_unix: 1 };
+        assert!(only_corruptions(&projector.project(&row(0, &instantiated))));
+        let fired = RunEvent::LoopOutFired { run_id: run_id(), group_id: "nope".into(), parent_frames: vec![], index: 0, at_unix: 1 };
+        assert!(only_corruptions(&projector.project(&row(1, &fired))));
     }
 
     #[test]
@@ -1434,8 +1633,9 @@ mod tests {
         ];
         let events: Vec<Value> = rows
             .iter()
-            .flat_map(|r| projector.project(r))
-            .map(|e| serde_json::to_value(e).expect("event json"))
+            .enumerate()
+            .flat_map(|(seq, r)| projector.project(&row(seq, r)))
+            .map(json)
             .collect();
         let k: Vec<String> = events.iter().map(|e| e["kind"].as_str().unwrap().to_string()).collect();
         assert_eq!(k, vec!["run_started", "run_completed"]);
@@ -1452,13 +1652,13 @@ mod tests {
         let mut projector = RunProjector::new(run_id(), ProgramLookup::Found(program()), PROJECT);
         let mut rows = run_rows(true);
         rows.truncate(3);
-        for r in &rows {
-            projector.project(r);
+        for (seq, r) in rows.iter().enumerate() {
+            projector.project(&row(seq, r));
         }
-        assert!(only_corruptions(&projector.project(&started("src", 9))), "a duplicate start paints its corruption");
-        assert!(only_corruptions(&projector.project(&started("ghost", 9))), "an unknown node paints its corruption");
-        assert!(only_corruptions(&projector.project(&completed("ghost", 9))));
+        assert!(only_corruptions(&projector.project(&row(10, &started("src", 9)))), "a duplicate start paints its corruption");
+        assert!(only_corruptions(&projector.project(&row(11, &started("ghost", 9)))), "an unknown node paints its corruption");
+        assert!(only_corruptions(&projector.project(&row(12, &completed("ghost", 9)))));
         // The open firing is still painted by its own rows.
-        assert!(!projector.project(&completed("src", 10)).is_empty());
+        assert!(!projector.project(&row(13, &completed("src", 10))).is_empty());
     }
 }

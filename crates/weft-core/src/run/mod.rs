@@ -10,6 +10,8 @@ pub mod completion;
 pub mod emission;
 pub mod firing;
 #[cfg(feature = "runtime")]
+pub mod forget;
+#[cfg(feature = "runtime")]
 pub mod loop_runtime;
 pub mod postprocess;
 pub mod ready;

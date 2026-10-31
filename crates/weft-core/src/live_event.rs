@@ -6,45 +6,172 @@
 //! wait`) decodes them through these types; [`spelled`] reads them the
 //! way a person does.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::frames::LoopFrames;
+use crate::record_ref::{Position, Shown, ValueRef};
 use crate::RunId;
 
 pub mod spelled;
 
 /// An event and its delivery identity. A run's recorded events take theirs
-/// from their place in its record (the row's `seq`, the event's index in
-/// it), so replay and live delivery identify the same event without
-/// comparing timestamps or payload contents.
+/// from their place in its record ([`EventPosition`]), so replay and live
+/// delivery identify the same event without comparing timestamps or
+/// payload contents, and a follower that lost its stream asks to go on
+/// after the last place it holds.
 // SYNC: IdentifiedEvent.event_id <-> extension-vscode/src/runFollower.ts DispatcherEvent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentifiedEvent<T> {
-    pub event_id: String,
+    pub event_id: EventId,
     #[serde(flatten)]
     pub event: T,
 }
 
-impl<T> IdentifiedEvent<T> {
-    /// The event at `index` of its run's record row `seq`.
-    pub fn recorded(seq: i32, index: u32, event: T) -> Self {
-        Self { event_id: format!("journal:{seq}:{index}"), event }
-    }
+/// Who an event is: its place in its run's record, or, for one about
+/// where a run stands rather than what it did (a run parked, a row that
+/// no longer reads), a name of its own. Written as one string,
+/// `journal:{seq}:{index}:{k}` or `live:{uuid}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EventId {
+    Recorded(EventPosition),
+    Transient(uuid::Uuid),
+}
 
-    pub fn transient(event: T) -> Self {
-        Self { event_id: format!("live:{}", uuid::Uuid::new_v4()), event }
-    }
+/// An event's place in its run's record: the record event it was
+/// projected from ([`Position`]) and its index among the events that one
+/// projected to (one record event can paint several: a scope it decided,
+/// the bus a value rode). Ordered as the events were written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventPosition {
+    pub at: Position,
+    pub k: u32,
+}
 
-    pub fn project<U>(self, project: impl FnOnce(T) -> Vec<U>) -> Vec<IdentifiedEvent<U>> {
-        project(self.event).into_iter().enumerate().map(|(index, event)| IdentifiedEvent {
-            event_id: format!("{}:{index}", self.event_id), event,
-        }).collect()
+impl std::fmt::Display for EventPosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}:{}", self.at.seq, self.at.index, self.k)
     }
 }
 
+impl std::str::FromStr for EventPosition {
+    type Err = String;
+
+    /// `{seq}:{index}:{k}`, as [`Display`](std::fmt::Display) writes it.
+    fn from_str(text: &str) -> Result<Self, String> {
+        let mut parts = text.split(':');
+        let mut next = |what: &str| parts.next().ok_or_else(|| format!("'{text}' has no {what}"));
+        let seq = next("row")?.parse().map_err(|_| format!("'{text}' is no event position (seq:index:k)"))?;
+        let index = next("index")?.parse().map_err(|_| format!("'{text}' is no event position (seq:index:k)"))?;
+        let k = next("projection index")?.parse().map_err(|_| format!("'{text}' is no event position (seq:index:k)"))?;
+        if parts.next().is_some() {
+            return Err(format!("'{text}' is no event position (seq:index:k)"));
+        }
+        Ok(Self { at: Position { seq, index }, k })
+    }
+}
+
+impl std::fmt::Display for EventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Recorded(at) => write!(f, "journal:{at}"),
+            Self::Transient(id) => write!(f, "live:{id}"),
+        }
+    }
+}
+
+impl std::str::FromStr for EventId {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        if let Some(at) = text.strip_prefix("journal:") {
+            return at.parse().map(Self::Recorded);
+        }
+        if let Some(id) = text.strip_prefix("live:") {
+            return id.parse().map(Self::Transient).map_err(|_| format!("'{text}' names no transient event"));
+        }
+        Err(format!("'{text}' is no event id (journal:... or live:...)"))
+    }
+}
+
+impl Serialize for EventId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for EventId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl<T> IdentifiedEvent<T> {
+    pub fn transient(event: T) -> Self {
+        Self { event_id: EventId::Transient(uuid::Uuid::new_v4()), event }
+    }
+
+    /// The events the record event at `at` projected to, each at its own
+    /// place.
+    pub fn projected(at: Position, events: impl IntoIterator<Item = T>) -> impl Iterator<Item = Self> {
+        events.into_iter().enumerate().map(move |(k, event)| Self { event_id: EventId::Recorded(EventPosition { at, k: k as u32 }), event })
+    }
+
+    /// The event's place in its run's record; `None` for a transient one.
+    pub fn position(&self) -> Option<EventPosition> {
+        match self.event_id {
+            EventId::Recorded(at) => Some(at),
+            EventId::Transient(_) => None,
+        }
+    }
+}
+
+/// An event as the editor and the replay read it: every value named by
+/// where the record keeps it.
 pub type LiveEvent = IdentifiedEvent<DispatcherEvent>;
 
+/// An event as the reader that made it holds it (`Shown`): sent as a
+/// [`LiveEvent`], or with its values written in ([`DispatcherEvent::with_values`]).
+pub type ShownEvent = IdentifiedEvent<DispatcherEvent<Shown>>;
+
+/// What a run handed out, per place it ran (`one/@src:lib:clean.strip`),
+/// each place's ports with their values: the order the run's fold lists
+/// them in, kept on the wire.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaceOutputs<V>(pub Vec<(String, BTreeMap<String, V>)>);
+
+impl<V: Serialize> Serialize for PlaceOutputs<V> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (place, ports) in &self.0 {
+            map.serialize_entry(place, ports)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for PlaceOutputs<V> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Places<V>(std::marker::PhantomData<V>);
+        impl<'de, V: Deserialize<'de>> serde::de::Visitor<'de> for Places<V> {
+            type Value = PlaceOutputs<V>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("the outputs of a run, by place")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(entry) = map.next_entry()? {
+                    out.push(entry);
+                }
+                Ok(PlaceOutputs(out))
+            }
+        }
+        deserializer.deserialize_map(Places(std::marker::PhantomData))
+    }
+}
 
 /// An event the dispatcher publishes about some piece of runtime
 /// state changing. Tagged enum so SSE serialization matches the
@@ -52,10 +179,18 @@ pub type LiveEvent = IdentifiedEvent<DispatcherEvent>;
 // Every event projected from a journal row carries that row's `at_unix`
 // (the journal's own stamp), so a replay renders when each thing happened
 // rather than when it was read.
-// SYNC: DispatcherEvent <-> extension-vscode/src/runFollower.ts DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
+//
+// `V` is how a value the event names is held (a firing's input and
+// output, the run's outputs, a wait's answer): by reference
+// ([`ValueRef`], the default and what the editor reads), written out
+// (`serde_json::Value`, what `weft events` and a program read), or both
+// ([`Shown`], what the dispatcher holds until it sends the event one way
+// or the other).
+// SYNC: DispatcherEvent <-> extension-vscode/src/runFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts ValueRef, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
-pub enum DispatcherEvent {
+#[serde(bound(serialize = "V: Serialize", deserialize = "V: Deserialize<'de>"))]
+pub enum DispatcherEvent<V = ValueRef> {
     /// `subgraph` is every place the run's program runs (its cut of the
     /// project, `crate::project::cut`; a place that stands in for itself
     /// is not among them): the graph paints every other node as not in
@@ -79,7 +214,9 @@ pub enum DispatcherEvent {
         instance: Option<crate::instance::InstanceId>,
         at_unix: u64,
     },
-    RunCompleted { run_id: RunId, project_id: uuid::Uuid, outputs: serde_json::Value, at_unix: u64 },
+    /// `outputs` is what every place of the run last handed out, `None`
+    /// when the run's program could not be read.
+    RunCompleted { run_id: RunId, project_id: uuid::Uuid, outputs: Option<PlaceOutputs<V>>, at_unix: u64 },
     RunFailed { run_id: RunId, project_id: uuid::Uuid, error: String, at_unix: u64 },
     /// `cause` is the structured who-or-what behind the cancel (`reason`
     /// is its text). `None` only for a journal row written before the
@@ -123,7 +260,7 @@ pub enum DispatcherEvent {
         run_id: RunId,
         node: String,
         frames: LoopFrames,
-        input: serde_json::Value,
+        input: BTreeMap<String, V>,
         closed_ports: Vec<String>,
         // SYNC: input origins <-> extension-vscode/src/runFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts NodeFiringEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeFiring
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -145,9 +282,11 @@ pub enum DispatcherEvent {
     /// up. Its own event because a wait the run holds in its worker never
     /// suspends or resumes the firing, so `NodeSuspended` and `NodeResumed`
     /// see only the waits that paused the run.
-    WaitEnded { run_id: RunId, node: String, frames: LoopFrames, token: String, ended: crate::primitive::AwaitEnd, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
+    WaitEnded { run_id: RunId, node: String, frames: LoopFrames, token: String, ended: crate::primitive::AwaitEnd<V>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
     NodeCancelled { run_id: RunId, node: String, frames: LoopFrames, reason: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
-    NodeCompleted { run_id: RunId, node: String, frames: LoopFrames, output: serde_json::Value, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
+    /// `output` is what the firing handed out, port by port, `None` when
+    /// it handed out nothing.
+    NodeCompleted { run_id: RunId, node: String, frames: LoopFrames, output: Option<BTreeMap<String, V>>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
     NodeFailed { run_id: RunId, node: String, frames: LoopFrames, error: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
     /// `reason` says WHY: the author's `_should_flow` said no, or an
     /// input the node needed never arrived. A decision and a consequence
@@ -414,7 +553,149 @@ pub enum DispatcherEvent {
     },
 }
 
+impl DispatcherEvent<Shown> {
+    /// The event as the editor reads it: every value by reference.
+    pub fn by_reference(self) -> DispatcherEvent {
+        self.map_values(&mut |shown| shown.at)
+    }
+
+    /// The event with its values written in, each read off what the fold
+    /// held or, for one it did not hold, through `kept` (what a record row
+    /// or a run's birth holds, as [`ValueRef::resolve`] asks).
+    pub fn with_values(
+        self,
+        kept: &mut impl FnMut(&ValueRef) -> Result<Option<std::sync::Arc<serde_json::Value>>, crate::record_ref::Unresolved>,
+    ) -> Result<DispatcherEvent<serde_json::Value>, crate::record_ref::Unresolved> {
+        self.try_map_values(&mut |shown| match shown.value {
+            Some(value) => Ok(std::sync::Arc::unwrap_or_clone(value)),
+            None => shown.at.resolve(kept).map(std::sync::Arc::unwrap_or_clone),
+        })
+    }
+}
+
 impl DispatcherEvent {
+    /// An event read by reference, holding what it names as references
+    /// only (an announcement from another process).
+    pub fn shown(self) -> DispatcherEvent<Shown> {
+        self.map_values(&mut Shown::at)
+    }
+}
+
+impl<V> DispatcherEvent<V> {
+    /// The same event with every value it names held as `f` makes it.
+    pub fn map_values<W>(self, f: &mut impl FnMut(V) -> W) -> DispatcherEvent<W> {
+        match self.try_map_values(&mut |v| Ok::<W, std::convert::Infallible>(f(v))) {
+            Ok(event) => event,
+            Err(never) => match never {},
+        }
+    }
+
+    /// [`Self::map_values`], failing on the first value `f` fails on.
+    pub fn try_map_values<W, E>(self, f: &mut impl FnMut(V) -> Result<W, E>) -> Result<DispatcherEvent<W>, E> {
+        let mut ports = |ports: BTreeMap<String, V>| -> Result<BTreeMap<String, W>, E> {
+            ports.into_iter().map(|(port, v)| Ok((port, f(v)?))).collect()
+        };
+        Ok(match self {
+            Self::NodeStarted { run_id, node, frames, input, closed_ports, provided_ports, inherited_ports, inherited_from, project_id, at_unix } => {
+                DispatcherEvent::NodeStarted { run_id, node, frames, input: ports(input)?, closed_ports, provided_ports, inherited_ports, inherited_from, project_id, at_unix }
+            }
+            Self::NodeCompleted { run_id, node, frames, output, inherited_from, project_id, at_unix } => {
+                DispatcherEvent::NodeCompleted { run_id, node, frames, output: output.map(&mut ports).transpose()?, inherited_from, project_id, at_unix }
+            }
+            Self::RunCompleted { run_id, project_id, outputs, at_unix } => {
+                let outputs = match outputs {
+                    Some(PlaceOutputs(places)) => {
+                        let mut out = Vec::with_capacity(places.len());
+                        for (place, values) in places {
+                            out.push((place, ports(values)?));
+                        }
+                        Some(PlaceOutputs(out))
+                    }
+                    None => None,
+                };
+                DispatcherEvent::RunCompleted { run_id, project_id, outputs, at_unix }
+            }
+            Self::WaitEnded { run_id, node, frames, token, ended, inherited_from, project_id, at_unix } => {
+                let ended = match ended {
+                    crate::primitive::AwaitEnd::Answered { value } => crate::primitive::AwaitEnd::Answered { value: f(value)? },
+                    crate::primitive::AwaitEnd::GaveUp { error } => crate::primitive::AwaitEnd::GaveUp { error },
+                    crate::primitive::AwaitEnd::Skipped => crate::primitive::AwaitEnd::Skipped,
+                };
+                DispatcherEvent::WaitEnded { run_id, node, frames, token, ended, inherited_from, project_id, at_unix }
+            }
+            Self::RunStarted { run_id, entry_node, phase, subgraph, seed, project_id, instance, at_unix } => {
+                DispatcherEvent::RunStarted { run_id, entry_node, phase, subgraph, seed, project_id, instance, at_unix }
+            }
+            Self::RunFailed { run_id, project_id, error, at_unix } => DispatcherEvent::RunFailed { run_id, project_id, error, at_unix },
+            Self::RunCancelled { run_id, project_id, reason, cause, at_unix } => DispatcherEvent::RunCancelled { run_id, project_id, reason, cause, at_unix },
+            Self::RunTagged { run_id, project_id, tags, at_unix } => DispatcherEvent::RunTagged { run_id, project_id, tags, at_unix },
+            Self::RunDeleted { run_id, project_id } => DispatcherEvent::RunDeleted { run_id, project_id },
+            Self::RunParked { run_id, project_id } => DispatcherEvent::RunParked { run_id, project_id },
+            Self::NodeSuspended { run_id, node, frames, token, inherited_from, project_id, at_unix } => {
+                DispatcherEvent::NodeSuspended { run_id, node, frames, token, inherited_from, project_id, at_unix }
+            }
+            Self::NodeResumed { run_id, node, frames, token, inherited_from, project_id, at_unix } => {
+                DispatcherEvent::NodeResumed { run_id, node, frames, token, inherited_from, project_id, at_unix }
+            }
+            Self::NodeCancelled { run_id, node, frames, reason, inherited_from, project_id, at_unix } => {
+                DispatcherEvent::NodeCancelled { run_id, node, frames, reason, inherited_from, project_id, at_unix }
+            }
+            Self::NodeFailed { run_id, node, frames, error, inherited_from, project_id, at_unix } => {
+                DispatcherEvent::NodeFailed { run_id, node, frames, error, inherited_from, project_id, at_unix }
+            }
+            Self::NodeSkipped { run_id, node, frames, closed_ports, reason, inherited_from, project_id, at_unix } => {
+                DispatcherEvent::NodeSkipped { run_id, node, frames, closed_ports, reason, inherited_from, project_id, at_unix }
+            }
+            Self::ScopeDecided { run_id, project_id, scope, frames, state, inherited_from, at_unix } => {
+                DispatcherEvent::ScopeDecided { run_id, project_id, scope, frames, state, inherited_from, at_unix }
+            }
+            Self::LoopInstantiated { run_id, project_id, group_id, parent_frames, iter_cap, parallel, at_unix } => {
+                DispatcherEvent::LoopInstantiated { run_id, project_id, group_id, parent_frames, iter_cap, parallel, at_unix }
+            }
+            Self::LoopIterationLaunched { run_id, project_id, group_id, parent_frames, index, at_unix } => {
+                DispatcherEvent::LoopIterationLaunched { run_id, project_id, group_id, parent_frames, index, at_unix }
+            }
+            Self::LoopOutFired { run_id, project_id, group_id, parent_frames, index, done_vote, at_unix } => {
+                DispatcherEvent::LoopOutFired { run_id, project_id, group_id, parent_frames, index, done_vote, at_unix }
+            }
+            Self::LoopTerminated { run_id, project_id, group_id, parent_frames, reason, at_unix } => {
+                DispatcherEvent::LoopTerminated { run_id, project_id, group_id, parent_frames, reason, at_unix }
+            }
+            Self::CostReported { run_id, inherited_from, project_id, node_id, frames, cost_id, service, amount_usd, origin, at_unix } => {
+                DispatcherEvent::CostReported { run_id, inherited_from, project_id, node_id, frames, cost_id, service, amount_usd, origin, at_unix }
+            }
+            Self::FileEdited { run_id, inherited_from, project_id, node_id, frames, edit, at_unix } => {
+                DispatcherEvent::FileEdited { run_id, inherited_from, project_id, node_id, frames, edit, at_unix }
+            }
+            Self::TriggerUrlChanged { project_id, node_id, url } => DispatcherEvent::TriggerUrlChanged { project_id, node_id, url },
+            Self::ProjectRegistered { project_id, name } => DispatcherEvent::ProjectRegistered { project_id, name },
+            Self::ProjectActivated { project_id } => DispatcherEvent::ProjectActivated { project_id },
+            Self::WorkingCopyChanged { project_id, working_copy } => DispatcherEvent::WorkingCopyChanged { project_id, working_copy },
+            Self::ProjectDeactivated { project_id } => DispatcherEvent::ProjectDeactivated { project_id },
+            Self::ProjectTransitionChanged { project_id, status, transition } => DispatcherEvent::ProjectTransitionChanged { project_id, status, transition },
+            Self::InfraStatusChanged { project_id, node_id, status } => DispatcherEvent::InfraStatusChanged { project_id, node_id, status },
+            Self::InfraFlaky { project_id, node_id, reason } => DispatcherEvent::InfraFlaky { project_id, node_id, reason },
+            Self::InfraRecovered { project_id, node_id } => DispatcherEvent::InfraRecovered { project_id, node_id },
+            Self::InfraTerminated { project_id, node_id } => DispatcherEvent::InfraTerminated { project_id, node_id },
+            Self::BusJoined { run_id, project_id, bus_id, offset, name, at_unix } => DispatcherEvent::BusJoined { run_id, project_id, bus_id, offset, name, at_unix },
+            Self::BusLeft { run_id, project_id, bus_id, offset, name, at_unix } => DispatcherEvent::BusLeft { run_id, project_id, bus_id, offset, name, at_unix },
+            Self::BusWindow { run_id, project_id, bus_id, first_offset, last_offset, messages, totals, at_unix } => {
+                DispatcherEvent::BusWindow { run_id, project_id, bus_id, first_offset, last_offset, messages, totals, at_unix }
+            }
+            Self::BusClosed { run_id, project_id, bus_id, offset, end, at_unix } => DispatcherEvent::BusClosed { run_id, project_id, bus_id, offset, end, at_unix },
+            Self::CallerConnected { run_id, project_id, offset, protocol, at_unix } => DispatcherEvent::CallerConnected { run_id, project_id, offset, protocol, at_unix },
+            Self::CallerWindow { run_id, project_id, first_offset, last_offset, messages, totals, dropped, at_unix } => {
+                DispatcherEvent::CallerWindow { run_id, project_id, first_offset, last_offset, messages, totals, dropped, at_unix }
+            }
+            Self::CallerErrored { run_id, project_id, offset, message, at_unix } => DispatcherEvent::CallerErrored { run_id, project_id, offset, message, at_unix },
+            Self::CallerDisconnected { run_id, project_id, offset, reason, dropped, at_unix } => {
+                DispatcherEvent::CallerDisconnected { run_id, project_id, offset, reason, dropped, at_unix }
+            }
+            Self::BusParticipant { run_id, project_id, bus_id, node_id, ephemeral } => DispatcherEvent::BusParticipant { run_id, project_id, bus_id, node_id, ephemeral },
+            Self::JournalCorruption { run_id, project_id, site, reason } => DispatcherEvent::JournalCorruption { run_id, project_id, site, reason },
+        })
+    }
+
     pub fn project_id(&self) -> uuid::Uuid {
         match self {
             Self::RunStarted { project_id, .. }
@@ -584,7 +865,7 @@ mod identity_tests {
 
     #[test]
     fn a_started_run_names_its_fields_in_camel_case_under_a_snake_case_kind() {
-        let event = DispatcherEvent::RunStarted {
+        let event = DispatcherEvent::<ValueRef>::RunStarted {
             run_id: uuid::Uuid::nil(),
             entry_node: "hook".into(),
             phase: crate::context::Phase::Fire,
@@ -612,21 +893,67 @@ mod identity_tests {
 
     #[test]
     fn identities_survive_projection_and_wire_round_trips() {
-        let event = DispatcherEvent::RunCompleted {
+        let event = DispatcherEvent::<ValueRef>::RunCompleted {
             run_id: uuid::Uuid::nil(), project_id: uuid::Uuid::from_u128(0x100),
-            outputs: serde_json::json!({}), at_unix: 1,
+            outputs: Some(PlaceOutputs(Vec::new())), at_unix: 1,
         };
-        let record = IdentifiedEvent::recorded(42, 3, event);
-        let projected = record.clone().project(|event| vec![event.clone(), event]);
+        let at = Position { seq: 42, index: 3 };
+        let projected: Vec<LiveEvent> = IdentifiedEvent::projected(at, [event.clone(), event.clone()]).collect();
         assert_ne!(projected[0].event_id, projected[1].event_id);
-        let replay = record.project(|event| vec![event.clone(), event]);
-        assert_eq!(serde_json::to_value(&projected).unwrap(), serde_json::to_value(replay).unwrap());
         let json = serde_json::to_value(&projected[0]).unwrap();
         assert_eq!(json["eventId"], "journal:42:3:0");
         assert_eq!(json["kind"], "run_completed");
         let decoded: LiveEvent = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.event_id, projected[0].event_id);
-        let distinct = IdentifiedEvent::recorded(42, 4, decoded.event).project(|event| vec![event]);
+        assert_eq!(decoded.position(), Some(EventPosition { at, k: 0 }));
+        let distinct: Vec<LiveEvent> = IdentifiedEvent::projected(Position { seq: 42, index: 4 }, [event]).collect();
         assert_ne!(distinct[0].event_id, projected[0].event_id);
+        let transient = serde_json::to_value(IdentifiedEvent::transient(distinct[0].event.clone())).unwrap();
+        let back: LiveEvent = serde_json::from_value(transient).unwrap();
+        assert_eq!(back.position(), None);
+    }
+
+    /// Places order as the record wrote them, and a position written for
+    /// a follower reads back as itself.
+    #[test]
+    fn event_positions_order_and_read_back() {
+        let at = |seq, index, k| EventPosition { at: Position { seq, index }, k };
+        assert!(at(1, 0, 5) < at(1, 1, 0));
+        assert!(at(1, 1, 0) < at(1, 1, 1));
+        assert!(at(1, 9, 9) < at(2, 0, 0));
+        assert_eq!("12:0:3".parse::<EventPosition>().unwrap(), at(12, 0, 3));
+        assert_eq!(at(12, 0, 3).to_string().parse::<EventPosition>().unwrap(), at(12, 0, 3));
+        assert!("12:0".parse::<EventPosition>().is_err());
+        assert!("12:0:3:4".parse::<EventPosition>().is_err());
+        assert!("journal:1:2".parse::<EventId>().is_err());
+    }
+
+    /// An event the dispatcher holds goes out by reference for the editor
+    /// and with its values written in for a reader that wants them, the
+    /// two shaped alike; a value not at hand is read through the record.
+    #[test]
+    fn an_event_goes_out_by_reference_or_with_its_values() {
+        use std::sync::Arc;
+        let run = uuid::Uuid::from_u128(7);
+        let kept = ValueRef::Row { run, seq: 3, index: 1 };
+        let event = DispatcherEvent::NodeStarted {
+            run_id: run, node: "sink".into(), frames: vec![],
+            input: [
+                ("a".to_string(), Shown::of(Some(&Arc::new(kept.clone())), &Arc::new(serde_json::json!({ "big": 1 })))),
+                ("b".to_string(), Shown::at(ValueRef::Row { run, seq: 4, index: 0 })),
+            ].into(),
+            closed_ports: vec![], provided_ports: vec![], inherited_ports: Default::default(), inherited_from: None,
+            project_id: uuid::Uuid::nil(), at_unix: 1,
+        };
+        let by_reference = serde_json::to_value(event.clone().by_reference()).unwrap();
+        assert_eq!(by_reference["input"]["a"], serde_json::to_value(&kept).unwrap());
+        let mut read = Vec::new();
+        let with_values = event.with_values(&mut |at| {
+            read.push(at.clone());
+            Ok(Some(Arc::new(serde_json::json!("from the record"))))
+        }).unwrap();
+        let with_values = serde_json::to_value(with_values).unwrap();
+        assert_eq!(with_values["input"], serde_json::json!({ "a": { "big": 1 }, "b": "from the record" }));
+        assert_eq!(read, vec![ValueRef::Row { run, seq: 4, index: 0 }], "only the value not at hand is read");
     }
 }

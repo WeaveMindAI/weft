@@ -71,7 +71,7 @@ use sha2::{Digest, Sha256};
 
 use crate::db::{Client, Conn, FromRow, Pool, Row, Transaction, Waits};
 use crate::documents::Document;
-use crate::schema_group::{SchemaGroup, Until};
+use crate::schema_group::{SchemaGroup, StepWork, Until};
 
 /// One part of one change to one group's tables: the file's SQL, the group
 /// it sits under, the id it is filed by, and which [`Part`] of the change
@@ -721,7 +721,7 @@ async fn run_pending(
 /// transaction the contract parts then run in: its table is locked first,
 /// as the contract part would lock it, so nothing written to the table
 /// after the step runs is left out of it.
-async fn run_data_steps(tx: &impl Client, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
+async fn run_data_steps(tx: &Transaction<'_>, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     for group in groups {
         for step in group.data_steps {
             let has_work = match step.until {
@@ -733,13 +733,11 @@ async fn run_data_steps(tx: &impl Client, groups: &[&SchemaGroup]) -> anyhow::Re
                 continue;
             }
             tx.batch_execute(&format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", step.table)).await?;
-            tx.batch_execute(step.sql).await.map_err(|e| {
-                anyhow::Error::from(e).context(format!(
-                    "schema group '{}': the data step on {} failed",
-                    group.name,
-                    step.target()
-                ))
-            })?;
+            let done = match step.work {
+                StepWork::Sql(sql) => tx.batch_execute(sql).await.map_err(anyhow::Error::from),
+                StepWork::Code(code) => code(tx).await,
+            };
+            done.map_err(|e| e.context(format!("schema group '{}': the data step on {} failed", group.name, step.target())))?;
         }
     }
     Ok(())
@@ -2139,7 +2137,11 @@ fn changed(was: &Thing, now: &Thing, retyped: &Retyped<'_>) -> Vec<(Part, String
             let (old_ty, old_not_null, old_default) = (was.ty, was.not_null, was.default);
             let (ty, not_null, default) = (now_p.ty, now_p.not_null, now_p.default);
             let mut out = Vec::new();
-            if was.identity != now_p.identity || was.generated != now_p.generated {
+            if was.identity == now_p.identity && was.generated.is_some() && now_p.generated.is_none() {
+                // A generated column made a plain one keeps every value it
+                // holds, which its writers write from now on.
+                out.push((Part::Expand, format!("ALTER TABLE {} ALTER COLUMN {} DROP EXPRESSION;", now.table, now.name)));
+            } else if was.identity != now_p.identity || was.generated != now_p.generated {
                 out.push((Part::Expand, format!(
                     "-- {}.{} changed its identity/generated form; Postgres has no \
                      single ALTER for this.\n-- Write the ALTER TABLE ... ALTER COLUMN \
@@ -2985,6 +2987,21 @@ mod tests {
     /// the table: one kept, one changed to name an added column, one added
     /// holding it, and one removed (taken down there, never dropped again).
     /// A trigger that holds another column is left alone.
+    /// A generated column made a plain one keeps its values and drops its
+    /// expression, and a NOT NULL it gains waits for the contract part.
+    #[test]
+    fn a_generated_column_made_plain_drops_its_expression() {
+        use super::{plan_migration, Part, Thing};
+        let column = |body: &str| Thing { kind: "column".into(), table: "t".into(), name: "v".into(), body: body.into() };
+        let old = [column("text null=YES default=- generated=((doc)::jsonb ->> 'v'::text)")];
+        let new = [column("text null=NO default=-")];
+        let plan = plan_migration(&old, &new, &[], &[]).unwrap();
+        let stmts: Vec<(Part, &str)> = plan.iter().map(|p| (p.part, p.stmt.as_str())).collect();
+        assert_eq!(stmts.len(), 2, "{stmts:#?}");
+        assert_eq!(stmts[0], (Part::Expand, "ALTER TABLE t ALTER COLUMN v DROP EXPRESSION;"));
+        assert!(stmts[1].0 == Part::Contract && stmts[1].1.ends_with("ALTER TABLE t ALTER COLUMN v SET NOT NULL;"), "{stmts:#?}");
+    }
+
     #[test]
     fn a_retyped_column_takes_the_triggers_holding_it_down_and_up() {
         use super::{plan_migration, Owner, Part, Thing};
@@ -3304,7 +3321,7 @@ mod tests {
     #[tokio::test]
     async fn a_migration_refuses_a_bad_data_step_before_planning() {
         static STEP: &[crate::DataStep] =
-            &[crate::DataStep { table: "elsewhere", until: super::Until::Dropped("owner"), sql: "SELECT 1" }];
+            &[crate::DataStep { table: "elsewhere", until: super::Until::Dropped("owner"), work: crate::StepWork::Sql("SELECT 1") }];
         static BAD: super::SchemaGroup =
             super::SchemaGroup { name: "worker_replica", tables: &["worker_replica"], ddl: &[], seed: &[], data_steps: STEP };
         let err = super::write_migration(&[&BAD], &[]).await.expect_err("refused");
@@ -3385,7 +3402,7 @@ mod tests {
         static STEP: &[crate::DataStep] = &[crate::DataStep {
             table: "worker_replicas",
             until: super::Until::Dropped("owner"),
-            sql: "SELECT 1",
+            work: crate::StepWork::Sql("SELECT 1"),
         }];
         let typo = super::SchemaGroup {
             name: "worker_replica",

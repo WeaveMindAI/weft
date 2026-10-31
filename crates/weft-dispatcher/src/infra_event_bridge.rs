@@ -51,7 +51,7 @@ async fn publish(state: &DispatcherState, payload: &str) -> anyhow::Result<()> {
     }
     let Some(row) = crate::infra_event::read(&state.pg_pool, id.parse()?).await? else { return Ok(()) };
     if let Some(event) = to_dispatcher_event(&row) {
-        state.events.publish_local(crate::events::IdentifiedEvent::transient(event)).await;
+        state.events.publish_local(crate::events::IdentifiedEvent::transient(event.shown())).await;
     }
     Ok(())
 }

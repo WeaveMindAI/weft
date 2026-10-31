@@ -1700,6 +1700,40 @@ export interface Seed {
   answers?: string[];
 }
 
+/// Where a run's record keeps a value an event names, and how to read it
+/// back: a value travels once, and the graph reads it when it shows it
+/// (`readValues`). `row`: the value one record row carries (a port's
+/// emission, a wait's answer); `given`: a value the run was given at its
+/// birth; `part`: keys and list items read off another value; `list`: a
+/// list made of other values (what a loop gathered); `written`: a value
+/// kept in no row, written out (a literal, a loop's index).
+// SYNC: ValueRef <-> crates/weft-core/src/record_ref.rs ValueRef
+export type ValueRef =
+  | { from: 'row'; run: string; seq: number; index: number }
+  | { from: 'given'; run: string; place: string; port: string; side: 'input' | 'output' }
+  | { from: 'part'; of: ValueRef; path: Array<string | number> }
+  | { from: 'list'; items: ValueRef[] }
+  | { from: 'written'; value: unknown };
+
+/// One value read back (`readValues`): the value; why the run's record no
+/// longer holds it (`gone`: the run was erased); or why the record and the
+/// reference disagree (`broken`: a bug, shown as an error).
+// SYNC: KeptValue <-> crates/weft-core/src/program.rs KeptValue
+export type KeptValue = { value: unknown } | { gone: string } | { broken: string };
+
+/// `POST /runs/{id}/values`: the values some events of the run name, by
+/// where the record keeps them.
+// SYNC: ValuesRequest <-> crates/weft-core/src/program.rs ValuesRequest
+export interface ValuesRequest {
+  refs: ValueRef[];
+}
+
+/// What each reference of a `ValuesRequest` reads, in its order.
+// SYNC: ValuesAnswer <-> crates/weft-core/src/program.rs ValuesAnswer
+export interface ValuesAnswer {
+  values: KeptValue[];
+}
+
 export interface NodeFiringEvent {
   nodeId: string;
   state: NodeFiringStatus;
@@ -1719,7 +1753,8 @@ export interface NodeFiringEvent {
   /// parallel iterations don't cross-correlate.
   frames: Frame[];
   error?: string;
-  input?: unknown;
+  /// Each input port's value, by where the run's record keeps it.
+  input?: Record<string, ValueRef>;
   /// Wired input ports that arrived as CLOSURE markers for this firing
   /// (the upstream frame stack terminated without firing them). Disjoint from
   /// the keys present in `input`; the inspector renders these as
@@ -1732,7 +1767,8 @@ export interface NodeFiringEvent {
   /// tells a DECISION (`did_not_flow`) from a CONSEQUENCE (an input it
   /// needed closed) with it.
   skipReason?: SkipReason;
-  output?: unknown;
+  /// Each output port's value, by where the run's record keeps it.
+  output?: Record<string, ValueRef>;
   /// The run this firing was taken from when the run was seeded
   /// (`weft run --seed`) and reused it instead of firing the node
   /// again. The graph marks the node inherited. Absent on the run's
@@ -2580,7 +2616,16 @@ export type HostMessage =
   /// run is just no longer being followed. Distinct from runTerminal
   /// (which IS the run finishing) and from runReset (a fresh follow).
   | { kind: 'followLost'; runId: string; reason: 'closed' | 'error' }
-  | { kind: 'runReset' }
+  /// The followed run's stream dropped after it had opened, or could not
+  /// be opened again since: the host keeps opening it again past the
+  /// last event painted, for as long as the follow lasts, and says why
+  /// on every failed attempt. `why: null` when that ends (the stream
+  /// opened again, or the follow stopped). The run stays live meanwhile.
+  | { kind: 'followReconnecting'; runId: string; why: string | null }
+  /// A fresh follow of run `runId` starts: the canvas clears and its
+  /// events follow; a value they name is read from this run
+  /// (`readValues`).
+  | { kind: 'runReset'; runId: string }
   /// Pushed from the host whenever the action-bar state machine
   /// transitions. The webview is a pure renderer that reads the
   /// latest state from this message. State transitions come from
@@ -2596,6 +2641,10 @@ export type HostMessage =
   /// dispatcher route's JSON response on success; `error` is the failure
   /// reason (HTTP error body or transport fault) on failure.
   | { kind: 'storageResult'; requestId: number; result?: unknown; error?: string }
+  /// Reply to `readValues`, correlated by requestId: the dispatcher's
+  /// answer (each value, in the order asked), or why it could not be read
+  /// at all.
+  | ({ kind: 'valuesRead'; requestId: number } & (ValuesAnswer | { error: string }))
   /// Reply to `accessCall`, correlated by requestId. `result` is the
   /// dispatcher route's JSON response on success; `error` the failure
   /// reason. Summaries only: no stored value ever rides this channel.
@@ -2774,6 +2823,11 @@ export type WebviewMessage =
   /// correlated `storageResult`. This is the ONE channel for storage control
   /// calls (the inline preview's download link); bytes never ride it.
   | { kind: 'storageCall'; requestId: number; path: string; body: unknown }
+  /// Read back the values some events of run `runId` name (`refs`, as the
+  /// events carry them): the host asks the dispatcher's
+  /// `POST /runs/{runId}/values` and replies with a correlated
+  /// `valuesRead`. What the inspector and a debug preview show a value by.
+  | ({ kind: 'readValues'; requestId: number; runId: string } & ValuesRequest)
   /// Drive one access-store verb through the host: the host sends
   /// `method` to the dispatcher's `/access/<path>` route (stamping the
   /// active project into a POST body) and replies with a correlated

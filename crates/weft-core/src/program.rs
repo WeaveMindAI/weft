@@ -595,6 +595,40 @@ pub struct RunEvents {
     pub unspelled: Option<String>,
 }
 
+/// `POST /runs/{id}/values`: the values some events of the run name, by
+/// where the record keeps them (`crate::record_ref::ValueRef`, as the
+/// events carry them): what the editor reads when it shows a firing's
+/// input or output.
+// SYNC: ValuesRequest <-> packages/weft-graph/src/protocol.ts ValuesRequest
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValuesRequest {
+    pub refs: Vec<crate::record_ref::ValueRef>,
+}
+
+/// What each reference of a [`ValuesRequest`] reads, in its order.
+// SYNC: ValuesAnswer <-> packages/weft-graph/src/protocol.ts ValuesAnswer
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValuesAnswer {
+    pub values: Vec<KeptValue>,
+}
+
+/// One value read back: the value, or why it cannot be.
+// SYNC: KeptValue <-> packages/weft-graph/src/protocol.ts KeptValue
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum KeptValue {
+    Value { value: serde_json::Value },
+    /// The run's record is gone: its keep time ran out, or `weft clean`
+    /// erased it.
+    Gone { gone: String },
+    /// The run's record is there and does not hold the value where the
+    /// reference says: a row or a key it names is missing, or the row
+    /// keeps no value. Said for this value alone.
+    Broken { broken: String },
+}
+
 /// One line of a run's log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -631,14 +665,28 @@ pub enum PaidBy {
 }
 
 impl PaidBy {
-    /// Whether a call spent on `owner`'s credential is one of these.
-    pub fn covers(&self, owner: &crate::CredentialOwner) -> bool {
-        matches!(
-            (self, owner),
-            (PaidBy::Platform, crate::CredentialOwner::Platform)
-                | (PaidBy::Author, crate::CredentialOwner::Author)
-                | (PaidBy::Instance, crate::CredentialOwner::Instance(_))
-        )
+    /// Which of these a call spent on `owner`'s credential is.
+    pub fn of(owner: &crate::CredentialOwner) -> Self {
+        match owner {
+            crate::CredentialOwner::Platform => PaidBy::Platform,
+            crate::CredentialOwner::Author => PaidBy::Author,
+            crate::CredentialOwner::Instance(_) => PaidBy::Instance,
+        }
+    }
+
+    /// Its word, as the wire and a cost's row (`run_cost.paid_by`) spell it.
+    // SYNC: PaidBy::as_str <-> the serde names above, run_cost's paid_by check (crates/weft-dispatcher/src/store/postgres.rs)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PaidBy::Platform => "platform",
+            PaidBy::Author => "author",
+            PaidBy::Instance => "instance",
+        }
+    }
+
+    /// The word [`Self::as_str`] spells, read back.
+    pub fn parse(word: &str) -> Option<Self> {
+        [PaidBy::Platform, PaidBy::Author, PaidBy::Instance].into_iter().find(|paid_by| paid_by.as_str() == word)
     }
 }
 
@@ -743,15 +791,20 @@ mod tests {
     }
 
 
+    /// Each kind of credential is one of the three, and each word is the
+    /// one the wire spells and reads back.
     #[test]
-    fn paid_by_covers_its_own_kind_of_credential() {
+    fn paid_by_is_the_kind_of_credential_and_its_wire_word() {
         use crate::CredentialOwner;
         let ada = CredentialOwner::Instance(InstanceId::new("ada").unwrap());
-        assert!(PaidBy::Instance.covers(&ada));
-        assert!(!PaidBy::Instance.covers(&CredentialOwner::Author));
-        assert!(PaidBy::Author.covers(&CredentialOwner::Author));
-        assert!(PaidBy::Platform.covers(&CredentialOwner::Platform));
-        assert!(!PaidBy::Platform.covers(&ada));
+        assert_eq!(PaidBy::of(&ada), PaidBy::Instance);
+        assert_eq!(PaidBy::of(&CredentialOwner::Author), PaidBy::Author);
+        assert_eq!(PaidBy::of(&CredentialOwner::Platform), PaidBy::Platform);
+        for paid_by in [PaidBy::Platform, PaidBy::Author, PaidBy::Instance] {
+            assert_eq!(serde_json::to_value(&paid_by).unwrap(), serde_json::json!(paid_by.as_str()));
+            assert_eq!(PaidBy::parse(paid_by.as_str()), Some(paid_by));
+        }
+        assert_eq!(PaidBy::parse("ours"), None);
     }
 
     #[test]

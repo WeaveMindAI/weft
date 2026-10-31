@@ -70,7 +70,7 @@ fn definition_with(marker: &str) -> weft_core::ProjectDefinition {
 const CAT: &str = r#"@asset("assets/cat.png", Image)"#;
 
 /// The key a resolution for `marker` is sent under.
-fn key_of(marker: &str) -> String {
+fn key_of(marker: &str) -> weft_core::project::ResolutionKey {
     weft_compiler::file_ref::parse_marker(marker).unwrap().unwrap().resolution_key()
 }
 

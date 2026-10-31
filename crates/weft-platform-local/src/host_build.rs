@@ -90,12 +90,13 @@ pub(crate) fn mark_seed(machine: &MachineLayout) -> anyhow::Result<()> {
     std::fs::write(&mark, b"").map_err(|e| anyhow::anyhow!("mark the compile cache's seed whole ({}): {e}", mark.display()))
 }
 
-/// Lane `number`'s cache is warm (`MachineLayout::lane_mark`): the seed was
-/// copied whole into it, or a build finished in it. Written only once
-/// that is done, so a copy cut short leaves the lane unmarked and the next
-/// build copies the seed again over it.
-pub(crate) fn mark_lane(machine: &MachineLayout, number: u32) -> anyhow::Result<()> {
-    let mark = machine.lane_mark(number);
+/// Lane `number`'s cache for the tag `cache_tag` is warm
+/// (`MachineLayout::lane_mark`): the seed was copied whole into it, or a
+/// build finished in it. Written only once that is done, so a copy cut
+/// short leaves the lane unmarked and the next build copies the seed again
+/// over it.
+pub(crate) fn mark_lane(machine: &MachineLayout, number: u32, cache_tag: Option<&str>) -> anyhow::Result<()> {
+    let mark = machine.lane_mark(number, cache_tag);
     std::fs::write(&mark, b"").map_err(|e| anyhow::anyhow!("mark compile lane {number} warm ({}): {e}", mark.display()))
 }
 
@@ -107,10 +108,14 @@ pub enum CompileIn {
     /// nothing out.
     Seed,
     /// A free lane of `lanes`, held for the build (waiting politely for one
-    /// when every one is held): any other program. A lane whose cache is
-    /// still cold copies the seed into it first, holding the seed's lock,
-    /// so a project's first build compiles only its own packages, the way a
-    /// worker image's cache starts from the builder base's compiled tree.
+    /// when every one is held): any other program. The build compiles in
+    /// the lane's cache for its recipe's `cache_tag`, so a build whose
+    /// nodes set `[build.env]` shares a cache only with builds where the
+    /// same node types set the same values. A
+    /// cache that is still cold copies the seed into it first, holding the
+    /// seed's lock, so a project's first build compiles only its own
+    /// packages, the way a worker image's cache starts from the builder
+    /// base's compiled tree.
     Lane { lanes: u32 },
 }
 
@@ -134,6 +139,18 @@ pub async fn compile(
         &tokio::fs::read(&recipe_path).await.map_err(|e| anyhow::anyhow!("read the host recipe {}: {e}", recipe_path.display()))?,
     )
     .map_err(|e| anyhow::anyhow!("{} is not a host recipe: {e}", recipe_path.display()))?;
+    // The seed is what every lane's cache starts from, the tree a build
+    // whose nodes set nothing reuses; compiled with a node's values, it
+    // would hand every lane a tree compiled with other flags.
+    if cache == CompileIn::Seed && recipe.cache_tag.is_some() {
+        let set = recipe.build_env_set_by.iter().map(|(var, nodes)| format!("{var}, set by {}", nodes.iter().map(String::as_str).collect::<Vec<_>>().join(" and ")));
+        anyhow::bail!(
+            "the standard worker's nodes set [build.env] ({}), and they cannot: the standard worker is compiled in the compile cache \
+             every lane on this machine starts from, which must hold what a build whose nodes set nothing compiles; \
+             remove the [build.env] section from those nodes' deps.toml",
+            set.collect::<Vec<_>>().join("; ")
+        );
+    }
     let held = match cache {
         CompileIn::Seed => Held::Seed { _lock: crate::lanes::hold(&machine.seed_lock(), on_wait).await? },
         CompileIn::Lane { lanes } => Held::Lane(crate::lanes::Lane::take(machine, lanes, on_wait).await?),
@@ -154,12 +171,20 @@ pub async fn compile(
         // prebuilt has no seed: the first lane to finish a build becomes
         // it, so every other lane starts warm too. A mark that cannot be
         // written or a cache that cannot be copied costs only speed, so it
-        // is said and the build stands.
+        // is said and the build stands. Only the cache of a build whose
+        // nodes set no `[build.env]` becomes the seed: the seed is the
+        // standard worker's, whose nodes set none, and a tree compiled with
+        // other values is one its builds would not reuse.
         (Held::Lane(lane), HostBuilt::Built(_)) => {
-            if let Err(e) = mark_lane(machine, lane.number()) {
+            let tag = recipe.cache_tag.as_deref();
+            if let Err(e) = mark_lane(machine, lane.number(), tag) {
                 tracing::warn!(target: "weft_platform_local::host_build", error = %format!("{e:#}"), "could not mark this build's compile lane warm; its next build copies the seed into it again");
             }
-            if let Err(e) = warm_seed_from(toolchain, machine, &machine.lane_cache(lane.number()), log).await {
+            let warmed = match tag {
+                None => warm_seed_from(toolchain, machine, &machine.lane_cache(lane.number(), None), log).await,
+                Some(_) => Ok(()),
+            };
+            if let Err(e) = warmed {
                 tracing::warn!(target: "weft_platform_local::host_build", error = %format!("{e:#}"), "could not make this build's compile cache the machine's seed; the next cold lane compiles from nothing");
             }
         }
@@ -208,10 +233,14 @@ enum Held {
 }
 
 impl Held {
-    fn target_dir(&self, machine: &MachineLayout) -> PathBuf {
+    /// Where a build with the `[build.env]` tag `cache_tag` compiles. The
+    /// seed is the standard worker's alone, whose nodes set no
+    /// `[build.env]` ([`compile`] refuses one that does), so it carries no
+    /// tag.
+    fn target_dir(&self, machine: &MachineLayout, cache_tag: Option<&str>) -> PathBuf {
         match self {
             Held::Seed { .. } => machine.seed_cache(),
-            Held::Lane(lane) => machine.lane_cache(lane.number()),
+            Held::Lane(lane) => machine.lane_cache(lane.number(), cache_tag),
         }
     }
 }
@@ -298,6 +327,61 @@ pub fn reclaim_shared_crates(machine: &MachineLayout) -> anyhow::Result<Option<V
     Ok(Some(removed))
 }
 
+/// What [`reclaim_tagged_caches`] did: the tagged lane caches it removed,
+/// and the ones it left because a build held their lane.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TaggedCaches {
+    pub removed: Vec<PathBuf>,
+    pub held: Vec<PathBuf>,
+}
+
+/// Remove every lane cache kept for a `[build.env]` tag
+/// (`MachineLayout::lane_cache`), with its mark, from each lane no build
+/// holds right now, holding the lane meanwhile so no build starts in it
+/// mid-removal. A build's own sweep trims only the cache it compiled in,
+/// so a tag no build uses any more (an edited value, a node that stopped
+/// declaring it, a removed project) would otherwise stay for good. A tag
+/// still in use costs its next build one cold start, from the seed. The
+/// mark goes first, so a removal cut short leaves a cache the next build
+/// seeds again.
+pub fn reclaim_tagged_caches(machine: &MachineLayout) -> anyhow::Result<TaggedCaches> {
+    let caches = machine.compile_caches();
+    let entries = match std::fs::read_dir(&caches) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(TaggedCaches::default()),
+        Err(e) => anyhow::bail!("read {}: {e}", caches.display()),
+    };
+    let mut tagged: std::collections::BTreeMap<u32, BTreeSet<String>> = std::collections::BTreeMap::new();
+    for entry in entries {
+        let name = entry.map_err(|e| anyhow::anyhow!("read {}: {e}", caches.display()))?.file_name();
+        if let Some((number, Some(tag))) = name.to_str().and_then(MachineLayout::lane_cache_of) {
+            tagged.entry(number).or_default().insert(tag.to_string());
+        }
+    }
+    let mut done = TaggedCaches::default();
+    for (number, tags) in tagged {
+        let Some(_lane) = crate::lanes::Lane::try_take(machine, number)? else {
+            done.held.extend(tags.iter().map(|tag| machine.lane_cache(number, Some(tag))));
+            continue;
+        };
+        for tag in tags {
+            let (cache, mark) = (machine.lane_cache(number, Some(&tag)), machine.lane_mark(number, Some(&tag)));
+            match std::fs::remove_file(&mark) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => anyhow::bail!("remove {}: {e}", mark.display()),
+            }
+            match std::fs::remove_dir_all(&cache) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => anyhow::bail!("remove {}: {e}", cache.display()),
+            }
+            done.removed.push(cache);
+        }
+    }
+    Ok(done)
+}
+
 /// What a host build needs to know besides its recipe and its cache.
 struct HostBuild<'a> {
     recipe: &'a HostRecipe,
@@ -323,7 +407,7 @@ pub enum HostBuilt {
 /// and by a rename, so a folder holding it always holds its record too.
 async fn build(toolchain: &dyn Toolchain, machine: &MachineLayout, held: &Held, b: HostBuild<'_>) -> anyhow::Result<HostBuilt> {
     let r = b.recipe;
-    let target_dir = held.target_dir(machine);
+    let target_dir = held.target_dir(machine, r.cache_tag.as_deref());
     for crate_dir in [&r.crate_dir, &r.isolate_dir] {
         let lock = crate_dir.join("Cargo.lock");
         tokio::fs::copy(&r.seed_lock, &lock)
@@ -331,14 +415,14 @@ async fn build(toolchain: &dyn Toolchain, machine: &MachineLayout, held: &Held, 
             .map_err(|e| anyhow::anyhow!("copy the seed lock {} to {}: {e}", r.seed_lock.display(), lock.display()))?;
     }
     if let Held::Lane(lane) = held {
-        seed(toolchain, machine, lane.number(), b.log).await?;
+        seed(toolchain, machine, lane.number(), r.cache_tag.as_deref(), b.log).await?;
     }
     let messages = b.context_dir.join("cargo-messages.json");
     let target = target_dir.display().to_string();
-    let env = vec![
-        ("CARGO_TARGET_DIR".to_string(), target.clone()),
-        ("RUSTFLAGS".to_string(), weft_core::builds::WORKER_RUSTFLAGS.to_string()),
-    ];
+    // The nodes' build variables, then weft's own cache, which no node
+    // moves.
+    let env: Vec<(String, String)> =
+        r.build_env.clone().into_iter().chain([("CARGO_TARGET_DIR".to_string(), target.clone())]).collect();
     let release = target_dir.join("release");
     let step = |program: PathBuf, args: Vec<String>, stdout: Option<PathBuf>| HostCommand {
         program,
@@ -409,13 +493,17 @@ fn sweep(machine: &MachineLayout, release: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Give lane `number`'s cache the seed's compiled tree, once: when the
-/// lane is not warm yet ([`mark_lane`]) and the seed is whole
-/// ([`mark_seed`]). The copy holds the seed's lock, so it never copies a
-/// seed while it is compiled. A lane with no whole seed beside it builds
-/// from what it holds.
-async fn seed(toolchain: &dyn Toolchain, machine: &MachineLayout, number: u32, log: &Path) -> anyhow::Result<()> {
-    if machine.lane_mark(number).exists() {
+/// Give lane `number`'s cache for the tag `cache_tag` the seed's compiled
+/// tree, once: when that cache is not warm yet ([`mark_lane`]) and the seed
+/// is whole ([`mark_seed`]). The copy holds the seed's lock, so it never
+/// copies a seed while it is compiled. A lane with no whole seed beside it
+/// builds from what it holds. A tagged cache is seeded too, as a worker
+/// image's keyed cache is from the builder base: what the values leave
+/// alone (everything but the crates whose build scripts watch them, and
+/// what sits above those) is reused; under `RUSTFLAGS` or `CARGO_PROFILE_*`
+/// nothing is, and the sweep after the first build drops the copy.
+async fn seed(toolchain: &dyn Toolchain, machine: &MachineLayout, number: u32, cache_tag: Option<&str>, log: &Path) -> anyhow::Result<()> {
+    if machine.lane_mark(number, cache_tag).exists() {
         return Ok(());
     }
     let _seed_lock = crate::lanes::hold(&machine.seed_lock(), || {
@@ -425,7 +513,7 @@ async fn seed(toolchain: &dyn Toolchain, machine: &MachineLayout, number: u32, l
     if !machine.seed_mark().exists() {
         return Ok(());
     }
-    let (seed, target) = (machine.seed_cache(), machine.lane_cache(number));
+    let (seed, target) = (machine.seed_cache(), machine.lane_cache(number, cache_tag));
     tokio::fs::create_dir_all(&target).await.map_err(|e| anyhow::anyhow!("create {}: {e}", target.display()))?;
     let copy = HostCommand {
         program: "cp".into(),
@@ -436,7 +524,7 @@ async fn seed(toolchain: &dyn Toolchain, machine: &MachineLayout, number: u32, l
     };
     let code = toolchain.run(&copy, log).await?;
     anyhow::ensure!(code == 0, "copy the compile cache's seed {} into {} failed with exit code {code}", seed.display(), target.display());
-    mark_lane(machine, number)
+    mark_lane(machine, number, cache_tag)
 }
 
 /// Write `bytes` to `name` in `dir` the way [`place`] copies a file.
@@ -472,6 +560,73 @@ async fn place(dir: &Path, name: &str, from: &Path) -> anyhow::Result<()> {
         anyhow::bail!("copy {} to {}: {e}", from.display(), to.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every tagged lane cache and its mark go, from each lane no build
+    /// holds; a held lane keeps its tagged caches, and the untagged caches
+    /// and the seed always stay.
+    #[test]
+    fn reclaiming_tagged_caches_skips_held_lanes_and_untagged_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = MachineLayout::new(dir.path());
+        let (a, b) = (Some("0123456789abcdef"), Some("fedcba9876543210"));
+        for (number, tag) in [(0, None), (0, a), (0, b), (1, a)] {
+            std::fs::create_dir_all(machine.lane_cache(number, tag).join("release")).unwrap();
+            mark_lane(&machine, number, tag).unwrap();
+        }
+        std::fs::create_dir_all(machine.seed_cache()).unwrap();
+        mark_seed(&machine).unwrap();
+        let held = crate::lanes::Lane::try_take(&machine, 1).unwrap().unwrap();
+
+        let done = reclaim_tagged_caches(&machine).unwrap();
+        assert_eq!(done.removed, vec![machine.lane_cache(0, a), machine.lane_cache(0, b)]);
+        assert_eq!(done.held, vec![machine.lane_cache(1, a)]);
+        for gone in [machine.lane_cache(0, a), machine.lane_mark(0, a), machine.lane_cache(0, b), machine.lane_mark(0, b)] {
+            assert!(!gone.exists(), "{}", gone.display());
+        }
+        for kept in [machine.lane_cache(0, None), machine.lane_mark(0, None), machine.lane_cache(1, a), machine.lane_mark(1, a), machine.seed_cache(), machine.seed_mark()] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
+        assert!(crate::lanes::Lane::try_take(&machine, 0).unwrap().is_some(), "the reclaim lets go of the lane it held");
+
+        drop(held);
+        assert_eq!(reclaim_tagged_caches(&machine).unwrap().removed, vec![machine.lane_cache(1, a)]);
+    }
+
+    /// The seed is never compiled with a node's `[build.env]`: such a
+    /// build is refused, naming the variables and the node types that set
+    /// them, before it runs anything.
+    #[tokio::test]
+    async fn a_seed_build_whose_nodes_set_build_env_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = MachineLayout::new(dir.path().join("data"));
+        let ctx = dir.path().join("ctx");
+        std::fs::create_dir_all(&ctx).unwrap();
+        let recipe = HostRecipe {
+            crate_dir: ctx.join("crate"),
+            isolate_dir: ctx.join("isolate"),
+            isolate_candidates: ctx.join("crate/isolate.json"),
+            left_out_record: ctx.join("crate/left-out.json"),
+            seed_lock: ctx.join("seed.lock"),
+            binary_name: "weft-worker".into(),
+            build_env: [("RUSTFLAGS".to_string(), "-C target-cpu=native".to_string())].into(),
+            build_env_set_by: [("RUSTFLAGS".to_string(), ["Native".to_string(), "Simd".to_string()].into())].into(),
+            cache_tag: Some("0123456789abcdef".into()),
+        };
+        std::fs::write(ctx.join(weft_core::builds::HOST_RECIPE_FILE), serde_json::to_vec(&recipe).unwrap()).unwrap();
+        let toolchain = fake::FakeToolchain::default();
+        let refused = compile(&toolchain, &machine, CompileIn::Seed, &ctx, dir.path().join("out"), &dir.path().join("build.log"), || {})
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("[build.env] (RUSTFLAGS, set by Native and Simd)") && refused.contains("standard worker"), "{refused}");
+        assert!(toolchain.calls.lock().is_empty(), "nothing ran");
+        assert!(!machine.seed_cache().exists() && !machine.seed_mark().exists());
+    }
 }
 
 #[cfg(test)]

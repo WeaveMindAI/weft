@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use weft_task_store::db::{self, Client, FromRow, Pool, Row};
+use weft_task_store::db::{self, Client, FromRow, JsonText, Pool, Row};
 
 use sha2::Digest;
 
@@ -124,8 +124,8 @@ struct GrantRow {
     tenant_id: String,
     service: String,
     registration_sealed: Option<String>,
-    spec_json: Value,
-    spec_json_version: weft_core::stored::Version,
+    spec: Value,
+    spec_version: weft_core::stored::Version,
     values_sealed: String,
     granted_scopes: Value,
     permissions_verified: bool,
@@ -146,10 +146,10 @@ impl FromRow for GrantRow {
             tenant_id: row.try_get("tenant_id")?,
             service: row.try_get("service")?,
             registration_sealed: row.try_get("registration_sealed")?,
-            spec_json: row.try_get("spec_json")?,
-            spec_json_version: row.try_get("spec_json_version")?,
+            spec: row.try_get::<_, JsonText<Value>>("spec")?.0,
+            spec_version: row.try_get("spec_version")?,
             values_sealed: row.try_get("values_sealed")?,
-            granted_scopes: row.try_get("granted_scopes")?,
+            granted_scopes: row.try_get::<_, db::Json<Value>>("granted_scopes")?.0,
             permissions_verified: row.try_get("permissions_verified")?,
             owner: row.try_get("owner")?,
             door: row.try_get("door")?,
@@ -230,7 +230,7 @@ enum Freshness {
 
 /// The columns a walled read selects, in [`GrantRow`]'s order: a plain
 /// read and a renewal's claim answer the same row.
-const WALLED_COLUMNS: &str = "tenant_id, service, registration_sealed, spec_json, spec_json_version, \
+const WALLED_COLUMNS: &str = "tenant_id, service, registration_sealed, spec, spec_version, \
                               values_sealed, granted_scopes, permissions_verified, owner, door, \
                               identity, provider_account, expires_at, token_lifetime_secs, \
                               instance_id, project_id, published_by_node";
@@ -329,8 +329,8 @@ fn open_walled_grant(
         tenant_id: row_tenant,
         service: row_service,
         registration_sealed,
-        spec_json,
-        spec_json_version,
+        spec: spec_json,
+        spec_version: spec_json_version,
         values_sealed,
         granted_scopes: granted,
         permissions_verified: verified,
@@ -489,7 +489,7 @@ async fn renew(
                  SET values_sealed = $3, value_names = $4, expires_at = $5,
                      token_lifetime_secs = $6, renewal_claimed_until = NULL, updated_at = now()
                  WHERE id = $1 AND (renewal_claimed_until = $2 OR values_sealed = $3)",
-                &[&access_id, &claim, &sealed, &names, &expires_at, &lifetime],
+                &[&access_id, &claim, &sealed, &db::Json(db::Names(&names)), &expires_at, &lifetime],
             )
             .await;
         match write {
@@ -768,7 +768,7 @@ pub async fn record_events_recipes(db: &impl Client, spec: &AccessSpec) -> anyho
         "INSERT INTO service_events_recipe (service, recipe_hash, events_json, events_json_version, updated_at)
          VALUES ($1, $2, $3, $4, now())
          ON CONFLICT (service, recipe_hash) DO UPDATE SET updated_at = now()",
-        &[&spec.service, &hash, &serde_json::to_value(&spec.events)?, &weft_core::access::events::STORED_EVENTS.version()],
+        &[&spec.service, &hash, &JsonText(&spec.events), &weft_core::access::events::STORED_EVENTS.version()],
     )
     .await?;
     Ok(())
@@ -789,7 +789,7 @@ pub async fn events_recipes_of(
     pool: &Pool,
     service: &str,
 ) -> anyhow::Result<Vec<RecordedEventsRecipe>> {
-    let rows: Vec<(String, Value, weft_core::stored::Version)> = pool
+    let rows: Vec<(String, JsonText<Value>, weft_core::stored::Version)> = pool
         .all(
             "SELECT recipe_hash, events_json, events_json_version FROM service_events_recipe
              WHERE service = $1 ORDER BY updated_at DESC",
@@ -797,7 +797,7 @@ pub async fn events_recipes_of(
         )
         .await?;
     rows.into_iter()
-        .map(|(recipe_hash, v, version)| {
+        .map(|(recipe_hash, JsonText(v), version)| {
             let events = weft_core::access::events::STORED_EVENTS
                 .decode(v, version)
                 .map_err(|e| e.at(format_args!("a recorded events recipe of '{service}' ({recipe_hash})")))?;

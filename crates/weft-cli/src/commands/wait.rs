@@ -15,9 +15,8 @@
 use std::ops::ControlFlow;
 use std::time::Duration;
 
-use weft_core::live_event::DispatcherEvent;
+use weft_core::live_event::{DispatcherEvent, LiveEvent};
 
-use super::follow::Step;
 use super::Ctx;
 
 /// The longest one `weft wait` blocks. A longer wait is several calls,
@@ -47,13 +46,13 @@ impl Outcome {
     /// The run's ending, when `event` is its terminal event. A terminal
     /// kind this list does not name is refused rather than read as some
     /// other ending.
-    pub fn ended(event: &DispatcherEvent) -> anyhow::Result<Option<Self>> {
+    pub fn ended<V>(event: &DispatcherEvent<V>) -> anyhow::Result<Option<Self>> {
         Ok(match event {
             DispatcherEvent::RunCompleted { .. } => Some(Self::Completed),
             DispatcherEvent::RunFailed { .. } => Some(Self::Failed),
             DispatcherEvent::RunCancelled { .. } => Some(Self::Cancelled),
             other if other.is_run_terminal() => {
-                anyhow::bail!("the run ended in a way this CLI does not know ({other:?}); upgrade the CLI to match the install")
+                anyhow::bail!("the run ended in a way this CLI does not know; upgrade the CLI to match the install")
             }
             _ => None,
         })
@@ -90,7 +89,7 @@ impl Outcome {
 pub fn exit_codes_help() -> String {
     let mut lines = vec!["Exit codes:".to_string()];
     lines.extend(Outcome::ALL.iter().map(|outcome| format!("  {:<3} {}", outcome.code(), outcome.meaning())));
-    lines.push("  1   the wait itself failed (no such run, the install unreachable, the live updates lost)".to_string());
+    lines.push("  1   the wait itself failed (no such run, or the install unreachable)".to_string());
     lines.push("  2   the command line is wrong".to_string());
     lines.join("\n")
 }
@@ -151,8 +150,7 @@ impl Watch {
         Self { waiting_for_input }
     }
 
-    fn step(&mut self, step: Step<'_>) -> anyhow::Result<ControlFlow<Ended>> {
-        let Step::Event(event) = step else { return Ok(ControlFlow::Continue(())) };
+    fn step(&mut self, event: &LiveEvent) -> anyhow::Result<ControlFlow<Ended>> {
         if let Some(outcome) = Outcome::ended(&event.event)? {
             return Ok(ControlFlow::Break(Ended {
                 outcome,
@@ -177,7 +175,7 @@ pub async fn run(ctx: Ctx, run_id: String, timeout: Duration, waiting_for_input:
     let run_id = super::resolve_run_id(&ctx, &run_id).await?;
     let client = ctx.client()?;
     let mut watch = Watch::new(waiting_for_input);
-    let watching = super::follow::watch_run(&client, ctx.on(), &run_id, |step| watch.step(step));
+    let watching = super::follow::watch_run(&client, ctx.on(), &run_id, |event| watch.step(event));
     let ended = match tokio::time::timeout(timeout, watching).await {
         Ok(ended) => ended?,
         Err(_) => Ended::bare(Outcome::TimedOut),
@@ -213,14 +211,13 @@ pub async fn run(ctx: Ctx, run_id: String, timeout: Duration, waiting_for_input:
 mod tests {
     use super::*;
     use serde_json::json;
-    use weft_core::live_event::LiveEvent;
 
     /// One event as the dispatcher sends it: `fields` for its kind, and
     /// the ones every run event carries.
     fn event(kind: &str, fields: serde_json::Value) -> LiveEvent {
         let mut fields = fields;
         let object = fields.as_object_mut().unwrap();
-        object.insert("eventId".into(), json!(format!("{kind}:{}", object.len())));
+        object.insert("eventId".into(), json!(format!("journal:{}:0:0", object.len())));
         object.insert("kind".into(), json!(kind));
         object.insert("runId".into(), json!(uuid::Uuid::from_u128(1)));
         object.insert("projectId".into(), json!(uuid::Uuid::nil()));
@@ -237,17 +234,16 @@ mod tests {
     fn parked() -> LiveEvent {
         let mut parked = event("run_parked", json!({}));
         assert!(matches!(parked.event, DispatcherEvent::RunParked { .. }), "{parked:?}");
-        parked.event_id = "live:parked".into();
+        parked.event_id = weft_core::live_event::EventId::Transient(uuid::Uuid::nil());
         parked
     }
 
-    /// Feed `history`, then the catch-up, then `live`, the way the stream
-    /// does; answers where the watch stopped, if it did.
+    /// Feed `history`, then `live`, the way the stream does; answers
+    /// where the watch stopped, if it did.
     fn watch(waiting_for_input: bool, history: &[LiveEvent], live: &[LiveEvent]) -> Option<Ended> {
         let mut watch = Watch::new(waiting_for_input);
-        let steps = history.iter().map(Step::Event).chain([Step::CaughtUp]).chain(live.iter().map(Step::Event));
-        for step in steps {
-            if let ControlFlow::Break(ended) = watch.step(step).unwrap() {
+        for event in history.iter().chain(live) {
+            if let ControlFlow::Break(ended) = watch.step(event).unwrap() {
                 return Some(ended);
             }
         }

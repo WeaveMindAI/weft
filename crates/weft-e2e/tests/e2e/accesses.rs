@@ -35,7 +35,13 @@ use serde_json::{json, Value};
 use weft_e2e::access::{catalog_spec, connect_direct, connect_paste, set_account, SeededGrant};
 use weft_e2e::ensure::{self, env_group_or_skip, env_or_skip};
 use weft_e2e::{project::Project, run};
-use weft_task_store::db::Client as _;
+use weft_task_store::db::{self, Client as _};
+
+/// Whether a recipe's `grants` is `exclusive`, as the store writes it
+/// beside the spec.
+fn exclusive(spec: &Value) -> bool {
+    spec.get("grants") == Some(&json!("exclusive"))
+}
 
 // ---------- runtime stale-connection backstop (no credentials needed) ----------
 
@@ -59,15 +65,16 @@ async fn a_forgotten_connection_leaves_its_node_unpicked() -> Result<()> {
     let grant_id = uuid::Uuid::new_v4();
     pool.execute(
         "INSERT INTO access_grant
-           (id, tenant_id, service, registration_sealed, project_id, spec_json, values_sealed,
-            granted_scopes, permissions_verified, identity, expires_at, spec_json_version)
-         VALUES ($1, 'local', 'slack', NULL, NULL, $2, $3, $4, TRUE, 'stale-test', NULL, $5)",
+           (id, tenant_id, service, registration_sealed, project_id, spec, values_sealed,
+            granted_scopes, permissions_verified, identity, expires_at, spec_version, exclusive)
+         VALUES ($1, 'local', 'slack', NULL, NULL, $2, $3, $4, TRUE, 'stale-test', NULL, $5, $6)",
         &[
             &grant_id,
-            &catalog_spec("slack", "access")?,
+            &db::JsonText(catalog_spec("slack", "access")?),
             &weft_access_store::seal_json(&json!({ "token": "xoxb-never-used" }))?,
-            &json!(["chat:write"]),
+            &db::Json(db::Names(&["chat:write"])),
             &weft_core::AccessSpec::STORED.version(),
+            &exclusive(&catalog_spec("slack", "access")?),
         ],
     )
     .await?;
@@ -187,15 +194,16 @@ async fn scope_drift_is_refused_at_resolution() -> Result<()> {
     let grant_id = uuid::Uuid::new_v4();
     pool.execute(
         "INSERT INTO access_grant
-           (id, tenant_id, service, registration_sealed, project_id, spec_json, values_sealed,
-            granted_scopes, permissions_verified, identity, expires_at, spec_json_version)
-         VALUES ($1, 'local', 'slack', NULL, NULL, $2, $3, $4, TRUE, 'drift-test', NULL, $5)",
+           (id, tenant_id, service, registration_sealed, project_id, spec, values_sealed,
+            granted_scopes, permissions_verified, identity, expires_at, spec_version, exclusive)
+         VALUES ($1, 'local', 'slack', NULL, NULL, $2, $3, $4, TRUE, 'drift-test', NULL, $5, $6)",
         &[
             &grant_id,
-            &catalog_spec("slack", "access")?,
+            &db::JsonText(catalog_spec("slack", "access")?),
             &weft_access_store::seal_json(&json!({ "token": "xoxb-never-used" }))?,
-            &json!(["channels:read"]),
+            &db::Json(db::Names(&["channels:read"])),
             &weft_core::AccessSpec::STORED.version(),
+            &exclusive(&catalog_spec("slack", "access")?),
         ],
     )
     .await?;
@@ -242,18 +250,19 @@ async fn google_drive_refreshes_lazily_and_lists_real_files() -> Result<()> {
     let grant_id = uuid::Uuid::new_v4();
     pool.execute(
         "INSERT INTO access_grant
-           (id, tenant_id, service, registration_sealed, client_id, project_id, spec_json,
-            values_sealed, granted_scopes, identity, expires_at, spec_json_version)
+           (id, tenant_id, service, registration_sealed, client_id, project_id, spec,
+            values_sealed, granted_scopes, identity, expires_at, spec_version, exclusive)
          VALUES ($1, 'local', 'google', $2, $3, NULL, $4, $5, $6, 'gdrive-e2e',
-                 now() - interval '1 hour', $7)",
+                 now() - interval '1 hour', $7, $8)",
         &[
             &grant_id,
             &weft_access_store::seal_json(&registration)?,
             &client_id,
-            &catalog_spec("google", "access")?,
+            &db::JsonText(catalog_spec("google", "access")?),
             &weft_access_store::seal_json(&json!({ "token": "expired-token", "refresh_token": refresh_token }))?,
-            &json!(["https://www.googleapis.com/auth/drive.file"]),
+            &db::Json(db::Names(&["https://www.googleapis.com/auth/drive.file"])),
             &weft_core::AccessSpec::STORED.version(),
+            &exclusive(&catalog_spec("google", "access")?),
         ],
     )
     .await?;

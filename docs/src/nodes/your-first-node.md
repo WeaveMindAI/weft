@@ -121,7 +121,7 @@ show = Debug { data: words.count }
 machine with your own Rust, and runs it. If you have not installed Rust yet,
 go and read the [install page](../start/install.md).
 
-## Four things that would have bitten you
+## Five things that would have bitten you
 
 **Do not check your inputs.** No asserting that `text` is really a string, no
 unwrapping something you were already promised. Every wire was checked before
@@ -141,6 +141,21 @@ downstream to stop waiting.
 Bytes go in [storage](storage.md), and what travels the wire is the marker
 saying where they are. If a big answer is not a file, go and read
 [emitting](values-and-emission.md#emitting) for how to send less of it.
+
+**If your code does heavy work, hand it to `spawn_blocking`.** Your body shares
+a few threads, one per CPU, with the calls arriving at the worker and with its
+other runs, and a thread only changes hands at an `.await`. Parsing a big
+document, resizing an image or hashing a large file in one go keeps the thread
+until it is done, and everything waiting for that thread waits with it. On a
+worker with one CPU, that is everything. The worker keeps its hold on your run
+from a separate thread, so a slow body never loses the run; it only slows the
+rest down.
+
+```rust
+let rows = tokio::task::spawn_blocking(move || parse_csv(&text))
+    .await
+    .node_err("parsing the export")?;
+```
 
 ## Failing well
 

@@ -18,7 +18,7 @@ import type { LivePause } from './presence';
 import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, CatalogWarning, EditOp, ErrorVerb, FollowMode, HostMessage, InstallView, LifecycleAction, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, RunCheck, SourceLocation, StoredFileDownload, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import type { ActionErrorDetails, CatalogEntry, CatalogWarning, EditOp, ErrorVerb, FollowMode, HostMessage, InstallView, LifecycleAction, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, RunCheck, SourceLocation, StoredFileDownload, TextEdit, ValuesAnswer, ValuesRequest, WebviewMessage } from '../../packages/weft-graph/src/protocol';
 import { lifecycleCommand } from '../../packages/weft-graph/src/lifecycle-cli';
 import { addressOf, groupOfCallPath } from '../../packages/weft-graph/src/run-spec';
 import { typeReferencesFile } from '../../packages/weft-graph/src/protocol';
@@ -1344,6 +1344,9 @@ export class GraphViewController {
       case 'storageCall':
         void this.runStorageCall(msg.requestId, msg.path, msg.body);
         break;
+      case 'readValues':
+        void this.runReadValues(msg.requestId, msg.runId, { refs: msg.refs });
+        break;
       case 'accessCall':
         void this.runAccessCall(msg.requestId, msg.method, msg.path, msg.body);
         break;
@@ -1435,6 +1438,18 @@ export class GraphViewController {
             ? e.message
             : String(e);
       this.post({ kind: 'storageResult', requestId, error });
+    }
+  }
+
+  /// Read back the values some events of run `runId` name, for the
+  /// webview (`readValues`): the dispatcher reads the record rows that
+  /// keep them and answers each, or says it is gone.
+  private async runReadValues(requestId: number, runId: string, request: ValuesRequest): Promise<void> {
+    try {
+      const answer = await this.client.post<ValuesAnswer>(`/runs/${runId}/values`, request);
+      this.post({ kind: 'valuesRead', requestId, ...answer });
+    } catch (e) {
+      this.post({ kind: 'valuesRead', requestId, error: e instanceof Error ? e.message : String(e) });
     }
   }
 

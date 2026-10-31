@@ -5,11 +5,10 @@
 //! for its outcome instead of printing it.
 
 use anyhow::Context;
-use std::collections::HashSet;
 use std::ops::ControlFlow;
 use serde_json::Value;
 use futures::StreamExt;
-use weft_core::live_event::LiveEvent;
+use weft_core::live_event::{DispatcherEvent, EventPosition, IdentifiedEvent};
 
 use super::wait::Outcome;
 use super::Ctx;
@@ -20,30 +19,29 @@ enum FollowTarget<'a> {
     Run(&'a str),
 }
 
-impl FollowTarget<'_> {
-    fn path(self) -> String {
-        match self {
-            Self::Project(id) => format!("/events/project/{id}"),
-            Self::Run(run_id) => format!("/events/run/{run_id}"),
-        }
-    }
+/// How long a follower whose stream dropped waits before opening it again.
+const REOPEN_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The longest a follower waits between two attempts at opening a dropped
+/// stream again.
+const REOPEN_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long to wait before the next attempt at opening a dropped stream
+/// again, after `failed` attempts that failed since it dropped:
+/// [`REOPEN_AFTER`] doubling each time, up to [`REOPEN_CEILING`].
+fn reopen_wait(failed: u32) -> std::time::Duration {
+    REOPEN_AFTER.saturating_mul(2u32.saturating_pow(failed)).min(REOPEN_CEILING)
 }
 
-/// Where a watcher is in a stream: an event, or the moment everything
-/// that happened before it subscribed has been read, so only live events
-/// are left. A run's watcher hears its history first, then `CaughtUp`
-/// once; a project's has no history and hears `CaughtUp` at once.
-pub enum Step<'a> {
-    Event(&'a LiveEvent),
-    CaughtUp,
-}
+/// The SSE event a run's stream sends once its history is sent; what
+/// follows is live. Nothing here waits for it.
+// SYNC: CAUGHT_UP <-> crates/weft-dispatcher/src/api/events.rs CAUGHT_UP, extension-vscode/src/runFollower.ts CAUGHT_UP
+const CAUGHT_UP: &str = "caught_up";
 
 pub async fn run(ctx: Ctx, project: String) -> anyhow::Result<()> {
     let client = ctx.client()?;
-    let never: std::convert::Infallible = watch_sse(&client, ctx.on(), FollowTarget::Project(&project), |step| {
-        if let Step::Event(event) = step {
-            print_event(&serde_json::to_value(event)?);
-        }
+    let never: std::convert::Infallible = watch_sse::<Value, _>(&client, ctx.on(), FollowTarget::Project(&project), |event| {
+        print_event(&serde_json::to_value(event)?);
         Ok(ControlFlow::Continue(()))
     })
     .await?;
@@ -52,8 +50,9 @@ pub async fn run(ctx: Ctx, project: String) -> anyhow::Result<()> {
 
 /// Follow one run to its end, each event printed the way the program
 /// reads (`one.strip`, `gate`) when the project's definition is at
-/// hand; ids otherwise. `on` is the target the command was run `--on`,
-/// which the hints carry. Answers how the run ended.
+/// hand; ids otherwise, its values written in. `on` is the target the
+/// command was run `--on`, which the hints carry. Answers how the run
+/// ended.
 pub async fn follow_run_id(
     client: &crate::client::DispatcherClient,
     on: Option<&str>,
@@ -62,8 +61,7 @@ pub async fn follow_run_id(
 ) -> anyhow::Result<Outcome> {
     // Indexed once, so spelling each row is a lookup, not a scan.
     let graph = definition.map(weft_core::project::graph::ProjectGraph::new);
-    watch_run(client, on, run_id, |step| {
-        let Step::Event(event) = step else { return Ok(ControlFlow::Continue(())) };
+    watch_sse::<Value, _>(client, on, FollowTarget::Run(run_id), |event| {
         let row = serde_json::to_value(event)?;
         match &graph {
             Some(graph) => {
@@ -81,12 +79,13 @@ pub async fn follow_run_id(
 }
 
 /// Watch one run's events, its history first and then the live ones,
-/// until `watch` breaks with what it was watching for.
+/// until `watch` breaks with what it was watching for. Its values come by
+/// reference: a watcher that prints them follows with [`follow_run_id`].
 pub async fn watch_run<T>(
     client: &crate::client::DispatcherClient,
     on: Option<&str>,
     run_id: &str,
-    watch: impl FnMut(Step<'_>) -> anyhow::Result<ControlFlow<T>>,
+    watch: impl FnMut(&weft_core::live_event::LiveEvent) -> anyhow::Result<ControlFlow<T>>,
 ) -> anyhow::Result<T> {
     watch_sse(client, on, FollowTarget::Run(run_id), watch).await
 }
@@ -95,60 +94,122 @@ fn print_event(event: &Value) {
     println!("{}", format_event(event));
 }
 
-async fn watch_sse<T>(
+/// The stream of `target`: a run's from its start, or past `after` (the
+/// last event of it this follower holds); a project's from now. `V` is how
+/// its events hold their values, written in for `serde_json::Value`.
+fn stream_path<V: Values>(target: FollowTarget<'_>, after: Option<EventPosition>) -> String {
+    let mut query = Vec::new();
+    if V::WRITTEN {
+        query.push("with_values=true".to_string());
+    }
+    let path = match target {
+        FollowTarget::Project(id) => format!("/events/project/{id}"),
+        FollowTarget::Run(run_id) => {
+            if let Some(after) = after {
+                query.push(format!("after={after}"));
+            }
+            format!("/events/run/{run_id}")
+        }
+    };
+    match query.as_slice() {
+        [] => path,
+        _ => format!("{path}?{}", query.join("&")),
+    }
+}
+
+/// How an event a follower reads holds its values: by reference
+/// (`weft_core::record_ref::ValueRef`), or written in.
+pub trait Values: serde::de::DeserializeOwned + serde::Serialize {
+    const WRITTEN: bool;
+}
+
+impl Values for weft_core::record_ref::ValueRef {
+    const WRITTEN: bool = false;
+}
+
+impl Values for Value {
+    const WRITTEN: bool = true;
+}
+
+/// Follow `target` until `watch` breaks. A run's stream gives its history
+/// then its live events, each once: when it drops, it is opened again past
+/// the last event read, so nothing is missed or read twice. A project's
+/// stream has no place to go on from, so a follower that falls behind
+/// it, or loses it, says what it may have missed and listens again. Only
+/// the first open is fatal: once the stream opened, an attempt at opening
+/// it again that finds the install out of reach
+/// ([`super::ensure::look_again_after`]: its connection failing, its
+/// gateway saying it is down or starting) is said on stderr and tried
+/// again, [`reopen_wait`] apart, for as long as the follow lasts; anything
+/// else the install answers (the run is gone, the key is refused) is
+/// raised, since waiting does not lift it.
+async fn watch_sse<V: Values, T>(
     client: &crate::client::DispatcherClient,
     on: Option<&str>,
     target: FollowTarget<'_>,
-    mut watch: impl FnMut(Step<'_>) -> anyhow::Result<ControlFlow<T>>,
+    mut watch: impl FnMut(&IdentifiedEvent<DispatcherEvent<V>>) -> anyhow::Result<ControlFlow<T>>,
 ) -> anyhow::Result<T> {
     let inspect = || {
         format!(
-            "the run may still be running. Inspect it with `{}` and `{}`",
+            "inspect the run with `{}` and `{}`",
             super::weft_on(on, "runs"),
             super::weft_on(on, "events <run-id>")
         )
     };
-    // Never reopened: reconnecting without recovering history would hide
-    // lost updates, so a follower that loses the stream says it stopped
-    // watching.
-    let mut stream = std::pin::pin!(client.event_stream(&target.path()).await.context("listen for live updates")?);
-    // Only the finite initial history needs overlap detection. Do not grow
-    // a seen-event cache for the lifetime of a potentially unbounded run.
-    let mut history_ids = HashSet::new();
-    // The server is listening now. Recover everything that ran before
-    // attachment, including an already-finished run: the live stream
-    // carries only what happens from now on, never the past, and does not
-    // close for a run that already ended. New events remain buffered on
-    // the open stream meanwhile.
-    if let FollowTarget::Run(run_id) = target {
-        for event in super::versions::replay_rows(client, run_id).await? {
-            if !history_ids.insert(event_identity(&event)?.to_owned()) { continue; }
-            if let ControlFlow::Break(done) = watch(Step::Event(&event))? {
+    let mut after: Option<EventPosition> = None;
+    let mut opened_once = false;
+    // Attempts at opening the stream again that failed since it dropped.
+    let mut failed = 0u32;
+    loop {
+        let stream = match client.event_stream(&stream_path::<V>(target, after)).await {
+            Ok(stream) => stream,
+            Err(e) if !opened_once => return Err(e.context(format!("listen for live updates; {}", inspect()))),
+            Err(e) => {
+                let why = super::ensure::look_again_after(e).with_context(|| format!("listen for live updates again; {}", inspect()))?;
+                failed = failed.saturating_add(1);
+                let wait = reopen_wait(failed);
+                eprintln!("could not listen for live updates again ({why}); still trying, next attempt in {}s", wait.as_secs());
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+        };
+        opened_once = true;
+        failed = 0;
+        let mut stream = std::pin::pin!(stream);
+        let dropped = loop {
+            let Some(ev) = stream.next().await else { break None };
+            let ev = match ev {
+                Ok(ev) => ev,
+                Err(e) => break Some(e),
+            };
+            if ev.event == CAUGHT_UP {
+                continue;
+            }
+            let event: IdentifiedEvent<DispatcherEvent<V>> = serde_json::from_str(&ev.data).context("decode a live event")?;
+            if let Some(at) = event.position() {
+                after = Some(at);
+            }
+            if let ControlFlow::Break(done) = watch(&event)? {
                 return Ok(done);
             }
+        };
+        match target {
+            // A run's stream ends on its own only once its ending went
+            // out, which the watch breaks on: anything else (a gateway
+            // cutting a long answer, the connection dropping) goes on
+            // from the last event read.
+            FollowTarget::Run(_) => eprintln!(
+                "live updates dropped ({}); listening again from the last event read",
+                dropped.map_or_else(|| "the stream ended".to_string(), |e| format!("{e:#}"))
+            ),
+            FollowTarget::Project(_) => eprintln!(
+                "live updates dropped ({}); listening again, and what happened meanwhile is not shown here: {}",
+                dropped.map_or_else(|| "the stream ended".to_string(), |e| format!("{e:#}")),
+                inspect()
+            ),
         }
+        tokio::time::sleep(reopen_wait(0)).await;
     }
-    if let ControlFlow::Break(done) = watch(Step::CaughtUp)? {
-        return Ok(done);
-    }
-    while let Some(ev) = stream.next().await {
-        let ev = ev.with_context(|| format!("live updates interrupted; {}", inspect()))?;
-        let event: LiveEvent = serde_json::from_str(&ev.data).context("decode run event")?;
-        if history_ids.contains(event_identity(&event)?) { continue; }
-        if let ControlFlow::Break(done) = watch(Step::Event(&event))? {
-            return Ok(done);
-        }
-    }
-    anyhow::bail!(
-        "live updates ended before following was finished; inspect the run with `{}` and `{}`",
-        super::weft_on(on, "runs"),
-        super::weft_on(on, "events <run-id>")
-    )
-}
-
-fn event_identity(event: &LiveEvent) -> anyhow::Result<&str> {
-    Some(event.event_id.as_str()).filter(|id| !id.is_empty())
-        .context("run event has no delivery identity")
 }
 
 fn format_event(value: &Value) -> String {
@@ -267,7 +328,8 @@ mod tests {
 
     struct Server {
         client: DispatcherClient,
-        requests: Arc<Mutex<Vec<&'static str>>>,
+        /// The query of every stream opened, in order.
+        requests: Arc<Mutex<Vec<String>>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -275,26 +337,26 @@ mod tests {
         fn drop(&mut self) { self.task.abort(); }
     }
 
-    async fn server(history: Vec<Value>, live: Vec<Value>, stay_open: bool) -> Server {
+    /// A dispatcher whose stream answers its `n`th opening with
+    /// `connections[n]`, and ends it there.
+    async fn server(connections: Vec<Vec<Value>>) -> Server {
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let stream_requests = requests.clone();
-        let history_requests = requests.clone();
-        let app = Router::new()
-            .route("/events/{scope}/{id}", get(move || {
-                stream_requests.lock().unwrap().push("subscribe");
-                let live = live.clone();
+        let opened = requests.clone();
+        let app = Router::new().route(
+            "/events/{scope}/{id}",
+            get(move |uri: axum::http::Uri| {
+                let n = {
+                    let mut opened = opened.lock().unwrap();
+                    opened.push(uri.query().unwrap_or_default().to_string());
+                    opened.len() - 1
+                };
+                let events = connections.get(n).cloned().unwrap_or_default();
                 async move {
-                    let ready = stream::once(async { Ok::<_, Infallible>(Event::default().comment("ready")) });
-                    let events = stream::iter(live.into_iter().map(|v| Ok(Event::default().data(v.to_string()))));
-                    let tail = stream::pending().take(if stay_open { 1 } else { 0 });
-                    Sse::new(ready.chain(events).chain(tail))
+                    let events = stream::iter(events.into_iter().map(|v| Ok::<_, Infallible>(Event::default().data(v.to_string()))));
+                    Sse::new(events)
                 }
-            }))
-            .route("/runs/{run_id}/replay", get(move || {
-                history_requests.lock().unwrap().push("history");
-                let history = history.clone();
-                async move { Json(history) }
-            }));
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = DispatcherClient::new(format!("http://{}", listener.local_addr().unwrap()), None);
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
@@ -308,7 +370,7 @@ mod tests {
             "run_started" => json!({ "entryNode": "n", "phase": "fire" }),
             "run_completed" => json!({ "outputs": {} }),
             "run_cancelled" => json!({ "reason": "stopped" }),
-            "node_started" => json!({ "node": "n", "frames": [], "input": {}, "closedPorts": [] }),
+            "node_started" => json!({ "node": "n", "frames": [], "input": { "in": 7 }, "closedPorts": [] }),
             other => panic!("no fixture for {other}"),
         };
         let object = fields.as_object_mut().unwrap();
@@ -320,86 +382,140 @@ mod tests {
         fields
     }
 
-    /// Every event into `seen`, stopping at a run's ending the way
-    /// `follow_run_id` does; a project's watch never stops by itself.
-    async fn collect(client: &DispatcherClient, target: FollowTarget<'_>, seen: &mut Vec<LiveEvent>) -> anyhow::Result<()> {
-        watch_sse(client, None, target, |step| {
-            let Step::Event(event) = step else { return Ok(ControlFlow::Continue(())) };
-            seen.push(event.clone());
-            let ended = Outcome::ended(&event.event)?.is_some();
-            Ok(if ended && matches!(target, FollowTarget::Run(_)) { ControlFlow::Break(()) } else { ControlFlow::Continue(()) })
+    /// Every event's id into `seen`, stopping at a run's ending the way
+    /// `follow_run_id` does, or once `stop` events were seen.
+    async fn collect(client: &DispatcherClient, target: FollowTarget<'_>, stop: usize, seen: &mut Vec<String>) -> anyhow::Result<()> {
+        watch_sse::<Value, _>(client, None, target, |event| {
+            seen.push(event.event_id.to_string());
+            let ended = matches!(target, FollowTarget::Run(_)) && Outcome::ended(&event.event)?.is_some();
+            Ok(if ended || seen.len() == stop { ControlFlow::Break(()) } else { ControlFlow::Continue(()) })
         })
         .await
     }
 
-    fn ids(seen: &[LiveEvent]) -> Vec<String> {
-        seen.iter().map(|e| e.event_id.clone()).collect()
+    weft_core::stress_test!(
+        name: a_run_follower_reads_the_history_and_the_live_events_off_one_stream,
+        runs: 32,
+        worker_threads: 4,
+        async fn body() {
+            let server = server(vec![vec![event("journal:0:0:0", "run_started", 1), event("journal:1:0:0", "run_completed", 1)]]).await;
+            let mut seen = Vec::new();
+            collect(&server.client, FollowTarget::Run("a"), usize::MAX, &mut seen).await.unwrap();
+            assert_eq!(seen, vec!["journal:0:0:0", "journal:1:0:0"]);
+            assert_eq!(*server.requests.lock().unwrap(), vec!["with_values=true"], "the values come written in");
+        }
+    );
+
+    weft_core::stress_test!(
+        name: a_run_follower_whose_stream_drops_goes_on_past_the_last_event_it_read,
+        runs: 32,
+        worker_threads: 4,
+        async fn body() {
+            let server = server(vec![
+                vec![event("journal:0:0:0", "run_started", 1), event("journal:3:1:2", "node_started", 1)],
+                vec![event("journal:4:0:0", "run_completed", 1)],
+            ])
+            .await;
+            let mut seen = Vec::new();
+            collect(&server.client, FollowTarget::Run("a"), usize::MAX, &mut seen).await.unwrap();
+            assert_eq!(seen, vec!["journal:0:0:0", "journal:3:1:2", "journal:4:0:0"]);
+            assert_eq!(*server.requests.lock().unwrap(), vec!["with_values=true", "with_values=true&after=3:1:2"]);
+        }
+    );
+
+    weft_core::stress_test!(
+        name: a_project_follower_listens_again_after_its_stream_ends,
+        runs: 32,
+        worker_threads: 4,
+        async fn body() {
+            let server = server(vec![
+                vec![event("live:00000000-0000-0000-0000-000000000001", "run_completed", 1), event("journal:2:0:0", "run_cancelled", 2)],
+                vec![event("journal:5:0:0", "run_started", 3)],
+            ])
+            .await;
+            let mut seen = Vec::new();
+            collect(&server.client, FollowTarget::Project("p"), 3, &mut seen).await.unwrap();
+            assert_eq!(seen.len(), 3, "a run finishing ends nothing: {seen:?}");
+            assert_eq!(*server.requests.lock().unwrap(), vec!["with_values=true", "with_values=true"], "a project's stream has no place to go on from");
+        }
+    );
+
+    /// A dispatcher whose `n`th connection is `connections[n]`: `Some`
+    /// answers the stream with those events and ends it, `None` hangs up
+    /// before answering, the way a restarting install's connection fails.
+    async fn flaky_server(connections: Vec<Option<Vec<Value>>>) -> (DispatcherClient, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = DispatcherClient::new(format!("http://{}", listener.local_addr().unwrap()), None);
+        let task = tokio::spawn(async move {
+            for connection in connections {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).await.unwrap();
+                    head.push(byte[0]);
+                }
+                let line = String::from_utf8_lossy(&head).lines().next().unwrap_or_default().to_string();
+                seen.lock().unwrap().push(line.split(' ').nth(1).and_then(|path| path.split_once('?')).map(|(_, q)| q.to_string()).unwrap_or_default());
+                let Some(events) = connection else { continue };
+                let body: String = events.iter().map(|v| format!("data: {v}\n\n")).collect();
+                let answer = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}");
+                socket.write_all(answer.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        (client, requests, task)
     }
 
-    weft_core::stress_test!(
-        name: follow_recovers_a_run_that_finished_before_listening,
-        runs: 32,
-        worker_threads: 4,
-        async fn body() {
-            let terminal = event("done", "run_completed", 1);
-            let server = server(vec![terminal], vec![], true).await;
-            let mut seen = Vec::new();
-            collect(&server.client, FollowTarget::Run("a"), &mut seen).await.unwrap();
-            assert_eq!(ids(&seen), vec!["done"]);
-            assert_eq!(*server.requests.lock().unwrap(), vec!["subscribe", "history"]);
-        }
-    );
+    #[test]
+    fn a_dropped_stream_is_tried_again_further_apart_up_to_a_ceiling() {
+        assert_eq!(reopen_wait(0), REOPEN_AFTER);
+        assert_eq!(reopen_wait(1), REOPEN_AFTER * 2);
+        assert_eq!(reopen_wait(2), REOPEN_AFTER * 4);
+        assert_eq!(reopen_wait(10), REOPEN_CEILING);
+        assert_eq!(reopen_wait(u32::MAX), REOPEN_CEILING);
+    }
 
-    weft_core::stress_test!(
-        name: follow_applies_history_before_buffered_live_completion,
-        runs: 32,
-        worker_threads: 4,
-        async fn body() {
-            let started = event("start", "run_started", 1);
-            let terminal = event("done", "run_completed", 1);
-            let server = server(vec![started], vec![terminal], true).await;
-            let mut seen = Vec::new();
-            collect(&server.client, FollowTarget::Run("a"), &mut seen).await.unwrap();
-            assert_eq!(ids(&seen), vec!["start", "done"]);
-        }
-    );
+    /// A reopen that fails is said and tried again, from the last event
+    /// read; it never ends the follow.
+    #[tokio::test]
+    async fn a_run_follower_keeps_trying_when_opening_its_dropped_stream_again_fails() {
+        let (client, requests, task) = flaky_server(vec![
+            Some(vec![event("journal:0:0:0", "run_started", 1), event("journal:3:1:2", "node_started", 1)]),
+            None,
+            Some(vec![event("journal:4:0:0", "run_completed", 1)]),
+        ])
+        .await;
+        let mut seen = Vec::new();
+        collect(&client, FollowTarget::Run("a"), usize::MAX, &mut seen).await.unwrap();
+        task.abort();
+        assert_eq!(seen, vec!["journal:0:0:0", "journal:3:1:2", "journal:4:0:0"]);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec!["with_values=true", "with_values=true&after=3:1:2", "with_values=true&after=3:1:2"]
+        );
+    }
 
-    weft_core::stress_test!(
-        name: project_follow_keeps_watching_after_a_run_finishes,
-        runs: 32,
-        worker_threads: 4,
-        async fn body() {
-            let events = vec![event("done:a", "run_completed", 1), event("done:b", "run_cancelled", 2)];
-            let server = server(vec![], events, false).await;
-            let mut seen = Vec::new();
-            let err = collect(&server.client, FollowTarget::Project("p"), &mut seen).await.unwrap_err();
-            assert!(err.to_string().contains("live updates"), "{err}");
-            assert_eq!(ids(&seen), vec!["done:a", "done:b"]);
-            assert_eq!(*server.requests.lock().unwrap(), vec!["subscribe"]);
-        }
-    );
-
-    weft_core::stress_test!(
-        name: follow_deduplicates_replay_overlap_without_merging_distinct_events,
-        runs: 32,
-        worker_threads: 4,
-        async fn body() {
-            let first = event("row:1", "node_started", 1);
-            let second = event("row:2", "node_started", 1);
-            let terminal = event("row:3", "run_completed", 1);
-            let server = server(vec![first.clone()], vec![first, second, terminal], true).await;
-            let mut seen = Vec::new();
-            collect(&server.client, FollowTarget::Run("a"), &mut seen).await.unwrap();
-            assert_eq!(ids(&seen), vec!["row:1", "row:2", "row:3"]);
-        }
-    );
+    /// Before the stream ever opened there is nothing to go on from: the
+    /// first open failing ends the follow with why.
+    #[tokio::test]
+    async fn a_run_follower_whose_first_open_fails_ends() {
+        let (client, _requests, task) = flaky_server(vec![None]).await;
+        let mut seen = Vec::new();
+        let err = collect(&client, FollowTarget::Run("a"), usize::MAX, &mut seen).await.unwrap_err();
+        task.abort();
+        assert!(format!("{err:#}").contains("listen for live updates"), "{err:#}");
+        assert!(seen.is_empty());
+    }
 
     #[test]
-    fn events_without_identity_are_a_contract_error() {
-        let anonymous: LiveEvent = serde_json::from_value(event("", "node_started", 1)).unwrap();
-        assert!(event_identity(&anonymous).is_err());
+    fn an_event_without_its_identity_does_not_decode() {
         let unmarked = { let mut e = event("x", "node_started", 1); e.as_object_mut().unwrap().remove("eventId"); e };
-        assert!(serde_json::from_value::<LiveEvent>(unmarked).is_err(), "an event without its identity does not decode");
+        assert!(serde_json::from_value::<IdentifiedEvent<DispatcherEvent<Value>>>(unmarked).is_err(), "an event without its identity does not decode");
+        assert!(serde_json::from_value::<IdentifiedEvent<DispatcherEvent<Value>>>(event("", "node_started", 1)).is_err(), "nor one with an empty one");
     }
 
     #[test]

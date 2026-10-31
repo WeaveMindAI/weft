@@ -834,6 +834,32 @@ macro_rules! run_id_of {
 }
 
 impl RunEvent {
+    /// The value this event keeps, which a reference to its place in the
+    /// record names (`weft_core::record_ref::ValueRef::Row`): a port's
+    /// emission, a wait's answer. `None` for an event that keeps none.
+    pub fn value_kept(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        match self {
+            RunEvent::PortEmitted { value, .. } => Some(value.clone()),
+            RunEvent::SuspensionResolved { value, .. } => Some(std::sync::Arc::new(value.clone())),
+            _ => None,
+        }
+    }
+
+    /// The value this birth was given at `place`'s `port` on `side`, which
+    /// a reference to it names (`weft_core::record_ref::ValueRef::Given`).
+    /// `None` for an event that is no birth, or a port given nothing.
+    pub fn given_value(&self, place: &weft_core::frames::Located, port: &str, side: weft_core::record_ref::GivenSide) -> Option<std::sync::Arc<serde_json::Value>> {
+        let RunEvent::RunStarted { given, .. } = self else { return None };
+        match side {
+            weft_core::record_ref::GivenSide::Input => given.inputs.get(place)?.get(port).cloned(),
+            weft_core::record_ref::GivenSide::Output => match given.outputs.get(place)?.ports.get(port)? {
+                weft_core::project::GivenPort::Value { value } => Some(value.clone()),
+                weft_core::project::GivenPort::Closed { .. } => None,
+            },
+        }
+        .map(std::sync::Arc::new)
+    }
+
     /// How the wait `token` of `run_id` was answered, as its record
     /// holds it: `SuspensionResolved` with the value, or
     /// `SuspensionSkipped`. The one spelling every writer of an answer

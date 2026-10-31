@@ -147,8 +147,8 @@ async fn an_account_the_target_has_already_is_not_copied_twice(pool: Pool) {
     let app = json!({ "label": "app", "client_id": "cid", "client_secret": "s" });
     let exclusive = json!({ "grants": "exclusive" });
     pool.execute(
-        "UPDATE access_grant SET client_id = 'cid', registration_sealed = $1, spec_json = spec_json || $2::jsonb",
-        &[&weft_access_store::seal_json(&app).unwrap(), &exclusive],
+        "UPDATE access_grant SET client_id = 'cid', registration_sealed = $1, spec = (spec::jsonb || $2::text::jsonb)::text, exclusive = TRUE",
+        &[&weft_access_store::seal_json(&app).unwrap(), &exclusive.to_string()],
     )
     .await
     .unwrap();

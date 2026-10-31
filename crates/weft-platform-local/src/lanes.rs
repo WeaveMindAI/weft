@@ -2,7 +2,8 @@
 //!
 //! Cargo locks a target folder for a whole build, so one compile cache
 //! for the machine would make every build wait for the one before it. Each
-//! lane is a compile cache of its own (`MachineLayout::lane_cache`), held
+//! lane keeps a compile cache of its own (`MachineLayout::lane_cache`, one
+//! per set of `[build.env]` values and the node types that set them), held
 //! by one build at a time through a lock file (`MachineLayout::lane_lock`):
 //! every weft process on the machine (each install's runtime, every CLI)
 //! picks from the same lock files, so no two builds ever compile in one
@@ -105,7 +106,7 @@ impl Lane {
 pub async fn hold_every_cache(machine: &MachineLayout, on_wait: impl FnOnce() + Send + 'static) -> anyhow::Result<Vec<std::fs::File>> {
     let mut lanes: std::collections::BTreeSet<u32> = (0..lane_count()?).collect();
     match std::fs::read_dir(machine.compile_caches()) {
-        Ok(entries) => lanes.extend(entries.filter_map(Result::ok).filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())),
+        Ok(entries) => lanes.extend(entries.filter_map(Result::ok).filter_map(|e| Some(MachineLayout::lane_cache_of(e.file_name().to_str()?)?.0))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => anyhow::bail!("read {}: {e}", machine.compile_caches().display()),
     }
@@ -154,14 +155,15 @@ mod tests {
     }
 
     /// Holding every cache holds the seed, each counted lane and any
-    /// other lane a cache is there for.
+    /// other lane a cache is there for, tagged or not.
     #[tokio::test]
     async fn holding_every_cache_holds_each_lane_and_the_seed() {
         let dir = tempfile::tempdir().unwrap();
         let machine = MachineLayout::new(dir.path());
-        std::fs::create_dir_all(machine.lane_cache(9)).unwrap();
+        std::fs::create_dir_all(machine.lane_cache(9, None)).unwrap();
+        std::fs::create_dir_all(machine.lane_cache(7, Some("0123456789abcdef"))).unwrap();
         let held = hold_every_cache(&machine, || {}).await.unwrap();
-        for number in [0, 9] {
+        for number in [0, 7, 9] {
             assert!(Lane::try_take(&machine, number).unwrap().is_none(), "lane {number} is held");
         }
         assert!(weft_core::file_lock::try_hold(&machine.seed_lock()).unwrap().is_none(), "the seed is held");

@@ -111,7 +111,7 @@ impl InfraNodeRow {
 const UNITS_MOVE: weft_task_store::DataStep = weft_task_store::DataStep {
     table: "infra_node",
     until: weft_task_store::Until::Dropped("units_json"),
-    sql: "INSERT INTO infra_unit (project_id, node_id, instance_id, unit, status, stop_behavior, \
+    work: weft_task_store::StepWork::Sql("INSERT INTO infra_unit (project_id, node_id, instance_id, unit, status, stop_behavior, \
               flaky_after_seconds, recovery_after_seconds, not_ready_since_unix, ready_since_unix, image_refs) \
           SELECT n.project_id, n.node_id, n.instance_id, u.key, u.value->>'status', \
               u.value->'stop_behavior'->>'kind', (u.value->>'flaky_after_seconds')::bigint, \
@@ -120,7 +120,7 @@ const UNITS_MOVE: weft_task_store::DataStep = weft_task_store::DataStep {
               ARRAY(SELECT jsonb_array_elements_text(COALESCE(u.value->'image_refs', '[]'::jsonb))) \
           FROM infra_node n CROSS JOIN LATERAL jsonb_each(n.units_json) AS u \
           WHERE u.value ? 'stop_behavior' \
-          ON CONFLICT DO NOTHING",
+          ON CONFLICT DO NOTHING"),
 };
 
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
@@ -136,23 +136,27 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             failure_message     TEXT,
             applied_spec_hash   TEXT,
             applied_at_unix     BIGINT,
-            endpoints_json      JSONB NOT NULL DEFAULT '{}'::jsonb,
+            -- Endpoint name to where it answers. This column and the
+            -- other `_json` ones below are each kept as JSON text
+            -- (`db::JsonText`): the names in them are the ones the
+            -- node's spec wrote.
+            endpoints_json      TEXT NOT NULL DEFAULT '{}',
             -- Endpoint name to its front-door path, for Public
             -- endpoints only. Stamped at apply.
-            public_paths_json   JSONB NOT NULL DEFAULT '{}'::jsonb,
+            public_paths_json   TEXT NOT NULL DEFAULT '{}',
             -- Disk names to keep on terminate. JSON array; empty means
             -- "delete every disk the copy owns".
-            keep_disks_json  JSONB NOT NULL DEFAULT '[]'::jsonb,
+            keep_disks_json  TEXT NOT NULL DEFAULT '[]',
             -- Whose copy: NULL for the program's shared one, else the
             -- instance whose copy of a `@per_instance` node this is.
             instance_id         TEXT,
             -- Endpoint name to the `host:port` a SameNetwork endpoint
             -- answers at on the install's network. Stamped at apply.
-            doors_json          JSONB NOT NULL DEFAULT '{}'::jsonb,
+            doors_json          TEXT NOT NULL DEFAULT '{}',
             -- What the host runs differently from what was asked (a
             -- GPU kind it cannot choose), one sentence each. JSON
             -- array. Stamped at apply.
-            notes_json          JSONB NOT NULL DEFAULT '[]'::jsonb,
+            notes_json          TEXT NOT NULL DEFAULT '[]',
             -- While an apply is under way: what it waits on, in the
             -- host's words, and when it began. Cleared when it lands.
             waiting_on          TEXT,
@@ -171,7 +175,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- a JSON array), which the supervisor's health loop runs on
             -- the copy. NULL: the node wrote none, so it runs the
             -- built-in ones. Stamped at apply.
-            health_rules_json   JSONB,
+            health_rules_json   TEXT,
             -- The version `health_rules_json` was written at
             -- (`weft_core::infra::health::STORED_RULES`).
             health_rules_json_version INTEGER NOT NULL
@@ -698,7 +702,7 @@ fn parse_row(row: db::Row) -> anyhow::Result<InfraNodeRow> {
     let failure_message: Option<String> = row.try_get("failure_message")?;
     let applied_spec_hash: Option<String> = row.try_get("applied_spec_hash")?;
     let applied_at_unix: Option<i64> = row.try_get("applied_at_unix")?;
-    let endpoints_json: Value = row.try_get("endpoints_json")?;
+    let endpoints_json = row.try_get::<_, db::JsonText<Value>>("endpoints_json")?.0;
     let endpoints: BTreeMap<String, String> = serde_json::from_value(endpoints_json)
         .map_err(|e| {
             anyhow::anyhow!(
@@ -706,7 +710,7 @@ fn parse_row(row: db::Row) -> anyhow::Result<InfraNodeRow> {
                  is not a string-to-string map: {e}"
             )
         })?;
-    let public_paths_json: Value = row.try_get("public_paths_json")?;
+    let public_paths_json = row.try_get::<_, db::JsonText<Value>>("public_paths_json")?.0;
     let public_paths: BTreeMap<String, String> = serde_json::from_value(public_paths_json)
         .map_err(|e| {
             anyhow::anyhow!(
@@ -714,7 +718,7 @@ fn parse_row(row: db::Row) -> anyhow::Result<InfraNodeRow> {
                  is not a string-to-string map: {e}"
             )
         })?;
-    let doors_json: Value = row.try_get("doors_json")?;
+    let doors_json = row.try_get::<_, db::JsonText<Value>>("doors_json")?.0;
     let doors: BTreeMap<String, String> = serde_json::from_value(doors_json)
         .map_err(|e| {
             anyhow::anyhow!(
@@ -722,7 +726,7 @@ fn parse_row(row: db::Row) -> anyhow::Result<InfraNodeRow> {
                  is not a string-to-string map: {e}"
             )
         })?;
-    let keep_disks_json: Value = row.try_get("keep_disks_json")?;
+    let keep_disks_json = row.try_get::<_, db::JsonText<Value>>("keep_disks_json")?.0;
     let keep_disks: Vec<String> = serde_json::from_value(keep_disks_json)
         .map_err(|e| {
             anyhow::anyhow!(
@@ -730,8 +734,8 @@ fn parse_row(row: db::Row) -> anyhow::Result<InfraNodeRow> {
                  is not a Vec<String>: {e}"
             )
         })?;
-    let units = weft_broker_client::protocol::decode_units(row.try_get("units")?, project_id, &node_id)?;
-    let notes_json: Value = row.try_get("notes_json")?;
+    let units = weft_broker_client::protocol::decode_units(row.try_get::<_, db::Json<Value>>("units")?.0, project_id, &node_id)?;
+    let notes_json = row.try_get::<_, db::JsonText<Value>>("notes_json")?.0;
     let notes: Vec<String> = serde_json::from_value(notes_json).map_err(|e| {
         anyhow::anyhow!("infra_node.notes_json for project={project_id} node={node_id} is not a Vec<String>: {e}")
     })?;

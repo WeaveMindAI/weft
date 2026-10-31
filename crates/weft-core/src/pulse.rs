@@ -67,6 +67,15 @@ pub struct Pulse {
     pub provided: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited_from: Option<RunId>,
+    /// Where the run's record keeps the value, when the table was folded
+    /// from the record with its positions (`weft_journal::fold::Fold`
+    /// over a reader that shows the run): what an event names the value
+    /// by instead of carrying it. `None` on a live engine's table, which
+    /// writes the record rather than reading it. Never on the wire: a
+    /// table crossing processes is a run's state, and its reader folds
+    /// its own.
+    #[serde(skip)]
+    pub origin: Option<Arc<crate::record_ref::ValueRef>>,
 }
 
 /// A node that broke, as the closures it leaves behind carry it: the
@@ -145,6 +154,7 @@ impl Pulse {
             failure: None,
             provided: false,
             inherited_from: None,
+            origin: None,
         }
     }
 
@@ -186,6 +196,7 @@ impl Pulse {
             failure,
             provided: false,
             inherited_from: None,
+            origin: None,
         }
     }
 
@@ -199,7 +210,8 @@ impl Pulse {
 /// its bucket for the absorbed pulses, kept by id: a firing run again
 /// after a refold takes its pulses back from there ([`Self::unabsorb`]),
 /// and a pulse landing a second time (a replayed row) is known as landed
-/// ([`Self::landed`]). A stream item a consumer took is removed outright
+/// ([`Self::landed`]). A table that only shows a run keeps no taken pulse
+/// ([`Self::forget_taken`]). A stream item a consumer took is removed outright
 /// ([`Self::remove_consumed`]), which frees its payload; only that the
 /// stream supplied data is remembered.
 #[derive(Debug, Clone, Default)]
@@ -207,10 +219,29 @@ pub struct PulseTable {
     buckets: BTreeMap<String, Vec<Pulse>>,
     absorbed: HashMap<uuid::Uuid, Pulse>,
     consumed_streams: HashSet<(RunId, crate::frames::FiringLocation, String)>,
+    /// Whether a pulse taken off its wire is forgotten
+    /// ([`Self::forget_taken`]).
+    forgets_taken: bool,
 }
 
 impl PulseTable {
     pub fn new() -> Self { Self::default() }
+
+    /// From now on, a pulse taken off its wire is forgotten: for a table
+    /// folded to SHOW a run, which read each value when its firing started,
+    /// never puts a taken pulse back (only a resumed worker does,
+    /// [`Self::unabsorb`]), and folds each row of the run's record once, so
+    /// no row lands a taken pulse a second time. A long run's taken pulses
+    /// do not pile up in it.
+    pub fn forget_taken(&mut self) {
+        self.forgets_taken = true;
+        self.absorbed.clear();
+    }
+
+    /// Whether a pulse taken off its wire is forgotten ([`Self::forget_taken`]).
+    pub fn forgets_taken(&self) -> bool {
+        self.forgets_taken
+    }
 
     pub fn stream_was_consumed(&self, run_id: RunId, node: &str, port: &str, frames: &LoopFrames) -> bool {
         self.consumed_streams.contains(&(run_id, crate::frames::FiringLocation::new(node, frames.clone()), port.into()))
@@ -238,7 +269,9 @@ impl PulseTable {
         for pulse in bucket.drain(..) {
             if pulse.status.is_pending() && taken(&pulse) {
                 ids.push(pulse.id);
-                self.absorbed.insert(pulse.id, pulse);
+                if !self.forgets_taken {
+                    self.absorbed.insert(pulse.id, pulse);
+                }
             } else {
                 kept.push(pulse);
             }
@@ -255,6 +288,9 @@ impl PulseTable {
     /// table disagree about what it took, and running it on part of its
     /// inputs would be wrong.
     pub fn unabsorb(&mut self, node: &str, ids: &[uuid::Uuid]) -> Result<(), String> {
+        if self.forgets_taken {
+            return Err(format!("the firing of '{node}' cannot take its pulses again: this table forgot what was taken"));
+        }
         let on_wire = |id: &uuid::Uuid| {
             self.buckets.get(node).is_some_and(|bucket| bucket.iter().any(|pulse| pulse.id == *id && pulse.status.is_pending()))
         };
@@ -279,6 +315,26 @@ impl PulseTable {
     pub fn landed(&self, node: &str, id: uuid::Uuid) -> bool {
         self.absorbed.get(&id).is_some_and(|pulse| pulse.target_node == node)
             || self.buckets.get(node).is_some_and(|bucket| bucket.iter().any(|pulse| pulse.id == id))
+    }
+
+    /// Forget the taken pulses `ids`: what took them ended, and nothing
+    /// puts them back any more.
+    pub fn forget_absorbed(&mut self, ids: &[uuid::Uuid]) {
+        for id in ids {
+            self.absorbed.remove(id);
+        }
+    }
+
+    /// Forget every taken pulse `gone` picks.
+    pub fn forget_absorbed_where(&mut self, mut gone: impl FnMut(&Pulse) -> bool) {
+        self.absorbed.retain(|_, pulse| !gone(pulse));
+    }
+
+    /// Forget that a stream was taken from at every location `gone`
+    /// picks: a reader that only shows the run is done with a location
+    /// once nothing can fire there.
+    pub fn forget_streams(&mut self, mut gone: impl FnMut(&crate::frames::FiringLocation) -> bool) {
+        self.consumed_streams.retain(|(_, at, _)| !gone(at));
     }
 
     /// The absorbed pulse `id`, if it is one.

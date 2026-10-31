@@ -334,6 +334,12 @@ pub struct FiringInput {
     /// The ports whose value a seed's saved result sent, with the run
     /// that made it.
     pub inherited_ports: BTreeMap<String, RunId>,
+    /// Where the run's record keeps each port's value, for the ports whose
+    /// value is a pulse's that knows it (`Pulse::origin`): what a reader
+    /// showing the run names the value by. Empty on a live engine. Never
+    /// on the wire, as the pulses' own.
+    #[serde(skip)]
+    pub origins: BTreeMap<String, Arc<crate::record_ref::ValueRef>>,
 }
 
 impl FiringInput {
@@ -416,7 +422,20 @@ pub fn firing_input(
         }
     }
     let provided_ports = provided.into_iter().collect();
-    FiringInput { input: obj, closed_ports, closed_failures, type_errors, provided_ports, inherited_ports }
+    // A port's origin is its winning pulse's while the bag still holds
+    // that pulse's value: a handed value or a refused one replaced it.
+    // Looked at only when a pulse knows one, which a live engine's never
+    // does.
+    let mut origins = BTreeMap::new();
+    if group_pulses.iter().any(|p| p.origin.is_some()) {
+        for (port, value) in &obj {
+            let Some(winner) = resolve_port_value(group_pulses, port).filter(|p| !p.closed) else { continue };
+            if let Some(origin) = winner.origin.as_ref().filter(|_| Arc::ptr_eq(&winner.value, value)) {
+                origins.insert(port.clone(), origin.clone());
+            }
+        }
+    }
+    FiringInput { input: obj, closed_ports, closed_failures, type_errors, provided_ports, inherited_ports, origins }
 }
 
 /// Runtime type enforcement on input ports: the single check point

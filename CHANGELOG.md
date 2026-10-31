@@ -4,6 +4,86 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## Unreleased
+
+**A project with nodes of its own compiles from a cold cache once** after this
+update: weft no longer builds with `--cfg tokio_unstable`, which changes how
+everything compiles. After that first build it builds incrementally again. The
+stock worker, which every project that uses only weft's own nodes runs, is
+rebuilt once with the new version, as on every update, and those projects
+compile nothing. A worker built by the previous weft is refused when it claims
+a run or reads a run's record, and the broker's log names `weft resync` for its
+project.
+
+**Reading a long run back takes the same memory however long the run is.**
+Opening a run in the editor, `weft events`, `weft logs` and following a run read
+its record a page at a time, and forget a node once it has finished and a
+loop's iteration once nothing in it is still running. The one thing that still
+grows is what a loop gathers, which it hands on whole when it ends. A run
+started with `--seed` reads the runs it reuses the same way, keeping only the
+nodes it takes from each. A worker driving a run forgets the same way, so it
+holds as much on a loop's sixty-thousandth iteration as on its first (what the
+loop gathers aside). It reads a run's record a page at a time too, and when it
+answers a wait it reads only what landed since it last looked.
+
+**A fast run no longer cuts off the people following it.** `weft run`, `weft
+wait` and the editor used to stop with "live updates interrupted" or "Lost the
+live connection" when a run sent a burst of events. A run's follower now gets
+the run's history and then its live events on one stream, each event once; if
+it falls behind, weft catches it up from the record, and if the connection
+drops, it carries on from the last event it got.
+
+**A value travels once.** The editor's live events and a run's replay used to
+carry a copy of every value each time it was shown (a firing's input, the
+output it handed out). They now say where the run's record keeps it, and the
+editor reads a node's values when you open its inspector or a debug preview
+shows them. `weft events`, `weft run` and a program reading a run see the
+values as before.
+
+**weft no longer needs `--cfg tokio_unstable`.** If you build weft yourself, a
+`RUSTFLAGS` of your own works again, and a node can set `RUSTFLAGS` in its
+`deps.toml` `[build.env]` again. On a local install and in `weft test-node`,
+every `[build.env]` variable now reaches the compile: a local build used to drop
+the ones cargo reads for itself (`RUSTFLAGS`), and `weft test-node` dropped
+`[build.env]` entirely. If your custom worker Dockerfile template
+(`[build.worker] dockerfile_template`) has the line
+`ENV RUSTFLAGS="{{worker_rustflags}}"`, delete it: weft refuses a template that
+still has it, and the error names the line. A project whose nodes set `[build.env]` now compiles in a compile cache
+kept for those nodes and their values, so building it no longer makes the next
+build of every other project start from scratch. On a local install,
+`weft clean --images --all` removes those caches.
+
+**A node that does heavy work in one go no longer puts its run at risk**: the
+worker renews its lease from a thread of its own. Such work still slows the
+worker's other calls and runs, so it belongs in `tokio::task::spawn_blocking`;
+for how, go and read "Five things that would have bitten you" in Your first
+node.
+
+**Reading what an instance spent no longer reads every run's record.**
+`ctx.costs()` and the `InstanceCosts` node read a table with one row per cost,
+written together with the run's record, and answer the same records in the
+same order. A run's costs are still deleted with the run (its keep time running
+out, `weft clean`, `weft rm`), so a total only counts the runs weft still
+keeps: a cap over all time needs runs kept `forever`. The update reads every
+stored run's record once to fill the table, so it takes longer on an install
+with a lot of history.
+
+**A NUL character in a node's data no longer fails a write.** A trigger whose
+setup produced a NUL character could never be baked, and an infra spec, its
+health rules or a connection's spec holding one failed to save. These are now
+kept exactly, NUL included.
+
+**If you read weft's HTTP API yourself:** `GET /runs/{id}/replay` and `GET
+/events/run/{id}` now name each value by where the record keeps it (`{"from":
+"row", ...}`); add `?with_values=true` to get the values written in, as before.
+`POST /runs/{id}/values` reads back the values some events name.
+`/events/run/{id}` takes `after=<seq>:<index>:<k>` (the end of an event's
+`eventId`) to start past an event you hold, and sends an SSE event named
+`caught_up` once the history is sent. `GET /runs/{id}/events` writes `total`
+after `events`. Corruption notices (`journal_corruption`) now arrive in order
+with the rows, carrying a `journal:` event id, instead of at the end with an id
+of their own.
+
 ## 2026-10-30 (671e50f4)
 
 **Long runs open quickly, and weft keeps answering while they do.** Opening a

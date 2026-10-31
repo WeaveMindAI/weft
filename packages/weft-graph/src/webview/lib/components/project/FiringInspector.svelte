@@ -1,10 +1,12 @@
 <script lang="ts">
 	import { Search } from '@lucide/svelte';
 	import type { RunTerminal, NodeFiring } from '../../types';
-	import { frameText, type FileEditWire, type BusInspectorEvent, type BusMeta, type CorruptionSite, type Frame, type LoopInspectorEvent } from '../../../../protocol';
+	import { frameText, type FileEditWire, type BusInspectorEvent, type BusMeta, type CorruptionSite, type Frame, type LoopInspectorEvent, type ValueRef } from '../../../../protocol';
 	import { displayStatus, getStatusIcon, skipReasonText } from '../../utils/status';
 	import { busClosedLine, formatClockTime, formatStreamBody } from '../../utils/stream-log';
 	import PayloadCards from './PayloadCards.svelte';
+	import { runValues } from '../../utils/run-values.svelte';
+	import { refKey } from '../../utils/value-ref';
 	import CopyButton from '../ui/CopyButton.svelte';
 	import * as Dialog from '../ui/dialog';
 
@@ -168,6 +170,13 @@
 			.join('\n\n');
 	}
 
+	/// The values shown, as the copy text and the copy buttons carry
+	/// them; null when there are none (yet).
+	function shownJson(shown: { values: Record<string, unknown>; reading: boolean } | undefined): string | null {
+		if (!shown || shown.reading || Object.keys(shown.values).length === 0) return null;
+		return JSON.stringify(shown.values, null, 2);
+	}
+
 	/// How an input port got its value when no node of this run made
 	/// it: a value the run was given (handed to this input, or sent by a
 	/// node upstream standing in for itself), or a value reused from the
@@ -244,6 +253,25 @@
 		pinnedToLatest = i >= count - 1;
 	}
 	const selected = $derived(firings[selectedIndex]);
+	/// The values the open inspector shows, read back from the run's
+	/// record while it is open (a firing's events name them by where the
+	/// record keeps them), and let go of once it closes or shows another.
+	const inputShown = $derived(open && selected ? runValues.shownPorts(selected.input) : undefined);
+	const outputShown = $derived(open && selected ? runValues.shownPorts(selected.output) : undefined);
+	/// The references the inspector shows now, by `refKey`. Every event of
+	/// the firing rebuilds its row, so only what the new selection no
+	/// longer shows is let go of: a value still shown stays read.
+	const held = new Map<string, ValueRef>();
+	$effect(() => {
+		const showing = new Map<string, ValueRef>();
+		if (open && selected) {
+			for (const at of [...Object.values(selected.input ?? {}), ...Object.values(selected.output ?? {})]) showing.set(refKey(at), at);
+		}
+		runValues.release([...held].filter(([key]) => !showing.has(key)).map(([, at]) => at));
+		held.clear();
+		for (const [key, at] of showing) held.set(key, at);
+	});
+	$effect(() => () => runValues.release(held.values()));
 
 	// The stamps are the journal's, in whole seconds, so the readout
 	// claims no finer resolution than the data has.
@@ -341,14 +369,14 @@
 
 <!-- Modal -->
 {#if selected}
-{@const inputJson = (selected.input !== null && selected.input !== undefined) ? JSON.stringify(selected.input, null, 2) : null}
-{@const outputJson = (selected.output !== null && selected.output !== undefined) ? JSON.stringify(selected.output, null, 2) : null}
+{@const inputJson = shownJson(inputShown)}
+{@const outputJson = shownJson(outputShown)}
 {@const inheritedText = selected.inheritedFrom
 	? `Inherited from run ${selected.inheritedFrom}: this firing was reused, not run again`
 	: ''}
 {@const statusText = selected.error ?? (selected.status === 'completed' ? 'Completed successfully' : displayStatus(selected.status))}
 {@const detailsText = [inheritedText, statusText].filter(Boolean).join('\n')}
-{@const portOriginsText = (selected.input && typeof selected.input === 'object' ? Object.keys(selected.input as Record<string, unknown>) : [])
+{@const portOriginsText = Object.keys(selected.input ?? {})
 	.map((port) => [port, portOrigin(selected, port, false)] as const)
 	.filter(([, origin]) => origin)
 	.map(([port, origin]) => `${port}: ${origin}`)
@@ -410,10 +438,11 @@
 				</div>
 				<div class="overflow-auto flex-1 p-2.5 bg-zinc-50/40">
 					<PayloadCards
-						payload={selected.input}
+						payload={inputShown?.values}
 						closedPorts={selected.closedPorts ?? []}
-						noteFor={(port) => portOrigin(selected, port, true) ?? undefined}
-						empty="No input data"
+						errors={inputShown?.errors}
+						noteFor={(port) => inputShown?.gone[port] ?? portOrigin(selected, port, true) ?? undefined}
+						empty={inputShown?.reading ? 'Reading...' : 'No input data'}
 					/>
 				</div>
 			</div>
@@ -426,7 +455,12 @@
 					{/if}
 				</div>
 				<div class="overflow-auto flex-1 p-2.5 bg-zinc-50/40">
-					<PayloadCards payload={selected.output} empty="No output" />
+					<PayloadCards
+						payload={outputShown?.values}
+						errors={outputShown?.errors}
+						noteFor={(port) => outputShown?.gone[port]}
+						empty={outputShown?.reading ? 'Reading...' : 'No output'}
+					/>
 				</div>
 			</div>
 		</div>

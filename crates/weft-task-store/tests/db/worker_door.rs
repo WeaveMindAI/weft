@@ -8,7 +8,7 @@ use crate::support;
 use std::time::Duration;
 
 use uuid::Uuid;
-use weft_task_store::db::{Client as _, Pool, Session};
+use weft_task_store::db::{self, Client as _, Pool, Session};
 use weft_task_store::worker_door::{prune, LEASE_ALIVE_CHANNEL, LEASES_KEPT_SECS};
 
 use support::setup;
@@ -20,12 +20,14 @@ const PROJECT: Uuid = Uuid::from_u128(1);
 /// for; what the tick answers.
 async fn tick_with(pool: &Pool, replica: &str, until: i64, counts: &[(&str, i64)], shortens: bool) -> serde_json::Value {
     let (keys, hits): (Vec<String>, Vec<i64>) = counts.iter().map(|(k, h)| (k.to_string(), *h)).unzip();
-    pool.scalar(
+    let none = std::collections::BTreeMap::<String, u32>::new();
+    pool.scalar::<db::Json<serde_json::Value>>(
         "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::boolean)",
-        &[&replica, &PROJECT, &"tenant-1", &"bin-A", &until, &serde_json::json!({}), &0i64, &keys, &hits, &shortens],
+        &[&replica, &PROJECT, &"tenant-1", &"bin-A", &until, &db::Json(db::WeftMade(&none)), &0i64, &keys, &hits, &shortens],
     )
     .await
     .unwrap()
+    .0
 }
 
 /// One door tick of `replica`, its lease held until `until`.
@@ -127,7 +129,8 @@ async fn the_previous_releases_tick_still_answers_as_it_did(pool: Pool) {
     setup(&pool).await;
     let now = chrono::Utc::now().timestamp();
     tick_with(&pool, "worker-b", now + 15, &[("e:route:1", 3), ("e:other:1", 4), ("t:-:1.2.3.4", 9)], false).await;
-    let answer: serde_json::Value = pool
+    let none = std::collections::BTreeMap::<String, u32>::new();
+    let db::Json(answer): db::Json<serde_json::Value> = pool
         .scalar(
             "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text[])",
             &[
@@ -136,7 +139,7 @@ async fn the_previous_releases_tick_still_answers_as_it_did(pool: Pool) {
                 &"tenant-1",
                 &"bin-A",
                 &(now + 15),
-                &serde_json::json!({}),
+                &db::Json(db::WeftMade(&none)),
                 &0i64,
                 &Vec::<String>::new(),
                 &Vec::<i64>::new(),

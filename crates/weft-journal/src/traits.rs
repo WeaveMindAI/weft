@@ -17,15 +17,7 @@ pub struct JournalRow {
     pub event: RunEvent,
 }
 
-/// An event's place in its run's record, in the order the events were
-/// written: what a reader that names single events counts by (the
-/// editor's live feed). A read of a run's record resumes after a row,
-/// never inside one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Position {
-    pub seq: i32,
-    pub index: u32,
-}
+pub use weft_core::record_ref::Position;
 
 impl JournalRow {
     pub fn position(&self) -> Position {
@@ -48,10 +40,33 @@ pub trait JournalClient: Send + Sync {
         Ok(())
     }
 
-    /// Every event of a run on record, in order: a seed ancestor's (which
-    /// ended), or the run's own once what it handed is on record. A row that
-    /// does not decode fails the read.
-    async fn events_for_run_id(&self, run_id: weft_core::RunId) -> anyhow::Result<Vec<RunEvent>>;
+    /// One page of a run's record after row `after` (from its first when
+    /// `None`), each event with its place, empty once none is left: a seed
+    /// ancestor's (which ended), or the run's own once what it handed is on
+    /// record. A row that does not decode fails the read.
+    async fn record_page(&self, run_id: weft_core::RunId, after: Option<i32>) -> anyhow::Result<Vec<JournalRow>>;
+}
+
+/// Every event of a run's record after row `after`, read a page at a time
+/// through `page` (one page after a row, as [`JournalClient::record_page`]
+/// answers): the few that landed since a fold last looked.
+pub async fn rows_after<F, Fut>(page: F, after: Option<i32>) -> anyhow::Result<Vec<JournalRow>>
+where
+    F: FnMut(Option<i32>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<JournalRow>>>,
+{
+    crate::record::fold_pages(page, after, Vec::new(), |rows: &mut Vec<JournalRow>, page: Vec<JournalRow>| {
+        rows.extend(page);
+        Ok(())
+    })
+    .await
+}
+
+/// One page of run `run_id`'s record after `after` through `client`,
+/// decoded on the blocking pool: what a worker reads a record by.
+pub async fn decoded_page(client: &dyn RecordClient, run_id: weft_core::RunId, after: Option<i32>) -> anyhow::Result<Vec<JournalRow>> {
+    let page = client.record_of(run_id, after).await?;
+    crate::on_blocking_pool(move || page.decode(run_id)).await.map_err(anyhow::Error::msg)
 }
 
 /// Where a worker's writer lanes send their batches, and where a run's
@@ -64,8 +79,10 @@ pub trait RecordClient: Send + Sync {
     /// `AlreadyApplied` (`crate::record::Fate`).
     async fn record_batch(&self, batch: Vec<u8>) -> Result<crate::frame::BatchAnswer, BatchError>;
 
-    /// The whole record of a run of this worker's project, raw.
-    async fn record_of(&self, run_id: weft_core::RunId) -> anyhow::Result<crate::record::RawRecord>;
+    /// One page of the record of a run of this worker's project, raw:
+    /// its rows after `after` (from its first when `None`), empty once
+    /// none is left (`crate::record::read_page`).
+    async fn record_of(&self, run_id: weft_core::RunId, after: Option<i32>) -> anyhow::Result<crate::record::RawRecord>;
 
     /// End `run_id`, a run this worker drives but whose record it can
     /// no longer write: the record writes its ending, failed with `why`,

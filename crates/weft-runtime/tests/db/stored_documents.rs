@@ -7,6 +7,8 @@
 //! as the weft before versions wrote them: a Slack
 //! connection and its recorded events recipes, a signing-secret
 //! connection, a program carrying a service recipe, and a project's resync.
+//! A version build waiting on its images has its own test below, from a
+//! later weft: that older one had no `version_build.inputs` yet.
 //! (What the same boot moves out of a column it then drops is
 //! `infra_units_move`.)
 
@@ -36,7 +38,7 @@ async fn a_database_an_older_weft_filled_boots_and_every_row_reads(pool: Pool) {
     weft_task_store::schema_guard::build_as_of(&pool, &weft_runtime::schema::groups(), |m| m.id <= OLDER_WEFT_HAD)
         .await
         .unwrap();
-    let specs = samples("access_grant.spec_json", 1);
+    let specs = samples("access_grant.spec", 1);
     let (slack, hmac) = (&specs[0], &specs[1]);
     let slack_events = &slack["events"];
     let old_hash = old_recipe_hash(slack_events);
@@ -47,13 +49,16 @@ async fn a_database_an_older_weft_filled_boots_and_every_row_reads(pool: Pool) {
     {
         pool.execute(
             "INSERT INTO access_grant (id, tenant_id, service, client_id, spec_json, values_sealed, \
-             provider_account, events_recipe_hash) VALUES ($1, 'local', $2, 'cid', $3, '', 'T123', $4)",
-            &[&id, &service, spec, &hash],
+             provider_account, events_recipe_hash) VALUES ($1, 'local', $2, 'cid', $3::text::jsonb, '', 'T123', $4)",
+            &[&id, &service, &spec.to_string(), &hash],
         )
         .await
         .unwrap();
     }
-    pool.execute("INSERT INTO service_events_recipe (service, recipe_hash, events_json) VALUES ('slack', $1, $2)", &[&old_hash, slack_events])
+    pool.execute(
+        "INSERT INTO service_events_recipe (service, recipe_hash, events_json) VALUES ('slack', $1, $2::text::jsonb)",
+        &[&old_hash, &slack_events.to_string()],
+    )
         .await
         .unwrap();
     let project_id = uuid::Uuid::new_v4();
@@ -69,8 +74,8 @@ async fn a_database_an_older_weft_filled_boots_and_every_row_reads(pool: Pool) {
     let resync = &samples("project.resync", 1)[0];
     pool.execute(
         "INSERT INTO project (id, name, status, project_json, updated_at, tenant_id, transition, resync) \
-         VALUES ($1, 'p', 'registered', $2, 0, 'local', 'resyncing', $3)",
-        &[&project_id, &program.to_string(), resync],
+         VALUES ($1, 'p', 'registered', $2, 0, 'local', 'resyncing', $3::text::jsonb)",
+        &[&project_id, &program.to_string(), &resync.to_string()],
     )
     .await
     .unwrap();
@@ -79,8 +84,8 @@ async fn a_database_an_older_weft_filled_boots_and_every_row_reads(pool: Pool) {
     let read_spec = |id: uuid::Uuid| {
         let pool = pool.clone();
         async move {
-            let (spec, version): (Value, i32) =
-                pool.one("SELECT spec_json, spec_json_version FROM access_grant WHERE id = $1", &[&id]).await.unwrap();
+            let (weft_task_store::db::JsonText(spec), version): (weft_task_store::db::JsonText<Value>, i32) =
+                pool.one("SELECT spec, spec_version FROM access_grant WHERE id = $1", &[&id]).await.unwrap();
             assert_eq!(version, weft_core::AccessSpec::STORED.version(), "the row was carried");
             weft_core::AccessSpec::STORED.decode(spec, version).expect("the connection's recipe reads")
         }
@@ -122,4 +127,40 @@ async fn a_database_an_older_weft_filled_boots_and_every_row_reads(pool: Pool) {
     assert!(plan.get("driver").is_none(), "{plan}");
     let plan = weft_dispatcher::task_kinds::resync::ResyncPlan::stored(project_id, plan, plan_version, driver).expect("the plan reads");
     assert_eq!(Some(plan.driver), driver);
+}
+
+/// The last migration the weft before `version_build.inputs` carried a
+/// version had.
+const UNVERSIONED_BUILD_INPUTS_HAD: &str = "20261030T090159_task_exact_values_as_text";
+
+/// A version build still waiting on its images across an update keeps the
+/// inputs the weft before wrote (version 1, its assets an object keyed by
+/// path and type); the boot labels them version 1 and carries them, so the
+/// version registers with them once its images are built.
+#[weft_db_macros::test]
+async fn a_waiting_version_builds_inputs_are_carried(pool: Pool) {
+    weft_task_store::schema_guard::build_as_of(&pool, &weft_runtime::schema::groups(), |m| m.id <= UNVERSIONED_BUILD_INPUTS_HAD)
+        .await
+        .unwrap();
+    let older = samples("version_build.inputs", 1);
+    let ids: Vec<uuid::Uuid> = older.iter().map(|_| uuid::Uuid::new_v4()).collect();
+    for (id, inputs) in ids.iter().zip(&older) {
+        pool.execute(
+            "INSERT INTO version_build (id, ask, project_id, tenant_id, project_name, manifest, inputs, program, images, \
+             waits_on, state, asked_at) VALUES ($1, 1, $1, 'local', 'p', '{}', $2, '{}', '{}', '[]', 'waiting', 0)",
+            &[id, &inputs.to_string()],
+        )
+        .await
+        .unwrap();
+    }
+    weft_runtime::schema::apply(&pool).await.unwrap();
+
+    let today = samples("version_build.inputs", weft_core::builds::BuildInputs::STORED.version());
+    for (id, want) in ids.iter().zip(&today) {
+        let (inputs, version): (String, i32) =
+            pool.one("SELECT inputs, inputs_version FROM version_build WHERE id = $1", &[id]).await.unwrap();
+        assert_eq!(version, weft_core::builds::BuildInputs::STORED.version(), "the row was carried");
+        let read = weft_core::builds::BuildInputs::STORED.decode(inputs.as_str(), version).expect("the inputs read");
+        assert_eq!(serde_json::to_value(&read).unwrap(), *want);
+    }
 }

@@ -320,7 +320,7 @@ async fn door_tick(
     );
     // `$10` is typed: the previous release's tick, kept while an upgrade
     // rolls out, takes the same first nine arguments.
-    let answer: Value = state
+    let db::Json(answer): db::Json<Value> = state
         .pool
         .scalar(
             "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::boolean)",
@@ -330,7 +330,8 @@ async fn door_tick(
                 &tenant,
                 &req.binary_hash,
                 &leased_until,
-                &db::Json(&req.in_flight),
+                // Trigger tokens weft minted, and counts.
+                &db::Json(db::WeftMade(&req.in_flight)),
                 &req.window_start,
                 &keys,
                 &hits,

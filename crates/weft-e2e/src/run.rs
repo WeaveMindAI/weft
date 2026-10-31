@@ -241,7 +241,7 @@ pub async fn wait_for_status(disp: &Dispatcher, run_id: Uuid, status: &str) -> R
 /// waits for. Bails as soon as the run settles first, since then the
 /// nodes can no longer be caught running.
 pub async fn wait_for_nodes_started(disp: &Dispatcher, run_id: Uuid, nodes: &[&str]) -> Result<()> {
-    let path = format!("/runs/{run_id}/replay");
+    let path = format!("/runs/{run_id}/replay?with_values=true");
     poll_until(
         &format!("{nodes:?} of run {run_id} to start"),
         RUN_SETTLE_DEADLINE,
@@ -432,13 +432,13 @@ fn is_terminal_status(status: &str) -> bool {
 
 /// Fetch + parse the replay event array for `run_id`.
 async fn fetch_replay(disp: &Dispatcher, run_id: Uuid) -> Result<Replay> {
-    let path = format!("/runs/{run_id}/replay");
+    let path = format!("/runs/{run_id}/replay?with_values=true");
     let arr: Vec<Value> = disp.get_json(&path).await?;
     // Every row decodes as the real event type first, so a shape the
     // dispatcher and weft-core disagree on fails here, naming the row.
     for row in &arr {
-        serde_json::from_value::<weft_core::live_event::LiveEvent>(row.clone())
-            .map_err(|e| anyhow::anyhow!("run {run_id}: a replay row does not decode as a LiveEvent ({e}): {row}"))?;
+        serde_json::from_value::<crate::event::ValuedEvent>(row.clone())
+            .map_err(|e| anyhow::anyhow!("run {run_id}: a replay row does not decode as an event ({e}): {row}"))?;
     }
     let replay = Replay::from_array(arr);
     // Sanity: a settled run must carry exactly one terminal event. If the

@@ -197,7 +197,7 @@ async fn an_answer_handed_to_a_run_that_parks_reaches_its_record(pool: Pool) {
     assert!(let_go(&pool, worker("w1"), run_id, LetGo::Parked).await.unwrap());
     assert_eq!(standing(&pool, run_id).await, ("queued".into(), None));
     let store = weft_dispatcher::store::postgres::PostgresStore::from_pool(pool.clone());
-    let events = store.events_log(run_id).await.unwrap();
+    let events: Vec<RunEvent> = store.events_log(run_id).await.unwrap().into_iter().map(|row| row.event).collect();
     assert!(
         matches!(events.last(), Some(RunEvent::SuspensionResolved { token, .. }) if token == "form"),
         "{events:?}"

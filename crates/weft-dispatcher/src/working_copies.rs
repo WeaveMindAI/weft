@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use weft_task_store::db::{Client, Pool};
+use weft_task_store::db::{self, Client, Pool};
 use weft_core::project::hash::Manifest;
 use weft_core::working_copy::{Head, WorkingChange, WorkingCopy, WorkingCopyId, WorkingCopyKind};
 use weft_core::RunId;
@@ -213,8 +213,8 @@ type RowTuple = (
     Option<String>,
     Option<String>,
     Option<uuid::Uuid>,
-    serde_json::Value,
-    serde_json::Value,
+    db::Json<serde_json::Value>,
+    db::Json<serde_json::Value>,
     Vec<String>,
     i64,
     i64,
@@ -222,7 +222,7 @@ type RowTuple = (
 );
 
 fn row_from(row: RowTuple) -> anyhow::Result<WorkingCopyRow> {
-    let (id, project_id, kind, host, path, head_version, head_run, working, synced, conflicts, revision, created_at, updated_at) = row;
+    let (id, project_id, kind, host, path, head_version, head_run, db::Json(working), db::Json(synced), conflicts, revision, created_at, updated_at) = row;
     Ok(WorkingCopyRow {
         id,
         project_id,
@@ -272,8 +272,8 @@ impl PostgresWorkingCopyStore {
                     &place.map(|(_, path)| path),
                     &head.head_version.as_deref(),
                     &head.head_run,
-                    &serde_json::to_value(working)?,
-                    &serde_json::to_value(&synced)?,
+                    &db::Json(db::WeftMade(working)),
+                    &db::Json(db::WeftMade(&synced)),
                     &(now as i64),
                 ],
             )
@@ -360,8 +360,8 @@ impl WorkingCopyStoreOps for PostgresWorkingCopyStore {
              updated_at = CASE WHEN $6::boolean THEN $7::bigint ELSE updated_at END WHERE id = $1",
             &[
                 &id,
-                &serde_json::to_value(&working)?,
-                &serde_json::to_value(&synced)?,
+                &db::Json(db::WeftMade(&working)),
+                &db::Json(db::WeftMade(&synced)),
                 &conflicts,
                 &(revision as i64),
                 &moved,
@@ -389,7 +389,7 @@ impl WorkingCopyStoreOps for PostgresWorkingCopyStore {
             .scalar_opt(
                 "UPDATE working_copy SET working_manifest = $3, head_version = $4, head_run = $5, revision = revision + 1, updated_at = $6 \
                  WHERE id = $1 AND revision = $2 RETURNING project_id",
-                &[&id, &(revision as i64), &serde_json::to_value(working)?, &head.head_version.as_deref(), &head.head_run, &(now as i64)],
+                &[&id, &(revision as i64), &db::Json(db::WeftMade(working)), &head.head_version.as_deref(), &head.head_run, &(now as i64)],
             )
             .await?;
         let Some(project) = project else { return Ok(None) };

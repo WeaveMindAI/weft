@@ -99,7 +99,7 @@ impl EventsFilter {
     /// place and iteration filters the typed place ([`DispatcherEvent::place`]).
     /// A run-level row (a start, a completion, the run failing) names no
     /// place, so it never passes a place filter.
-    pub fn keeps(&self, event: &DispatcherEvent, row: &Value) -> bool {
+    pub fn keeps<V>(&self, event: &DispatcherEvent<V>, row: &Value) -> bool {
         let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let kind_ok = self.kind.as_deref().is_none_or(|k| kind == k || kind.contains(k));
         let Some(place) = &self.place else { return kind_ok };

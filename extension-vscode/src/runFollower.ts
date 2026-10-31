@@ -15,13 +15,21 @@
 // follows (the user picks a different past run in the
 // sidebar) closes the current event stream and opens a new one.
 //
+// The stream gives the run's history first, then its live events, each
+// once: the dispatcher reads the history off the run's record and goes on
+// with what happens live, catching up from the record by itself when it
+// falls behind. A stream that drops is opened again past the last event
+// held (`after=`), so nothing is missed or painted twice, and again after
+// every failed attempt for as long as the follow lasts; only a first open
+// that fails loses the follow.
+//
 // While the person is away from a remote install (see `presence.ts`)
 // the stream is closed, and coming back opens the same run
-// again the way a click does: history first, then live.
+// again the way a click does.
 
 import type * as vscode from 'vscode';
 
-import type { DispatcherClient } from './dispatcher';
+import { worthTryingAgain, type DispatcherClient } from './dispatcher';
 import type { LivePause } from './presence';
 import type {
   WirePayload,
@@ -30,6 +38,7 @@ import type {
   CorruptionSite,
   FileEditWire,
   RunPhase,
+  ValueRef,
   HostMessage,
   Frame,
   LoopTerminationReason,
@@ -41,14 +50,23 @@ import type {
   StreamEnd,
 } from '../../packages/weft-graph/src/protocol';
 
-// A replay may stall while live updates keep arriving. Bound the waiting
-// data by bytes, since a single node result can be much larger than a status.
-export const MAX_REPLAY_BUFFER_BYTES = 8 * 1024 * 1024;
+/** How long a follow whose stream dropped waits before opening it again,
+ *  doubling after each try that fails, up to [`REOPEN_CEILING_MS`]. */
+export const REOPEN_AFTER_MS = 1000;
+/** The longest wait between two tries at opening a dropped stream again:
+ *  an install that stays away is not asked every second. */
+export const REOPEN_CEILING_MS = 30_000;
 
-/** How a wait ended: its answer, a person skipping it, or the run giving
- *  it up (the waiting node failed with `error`). */
+/** The SSE event a run's stream sends once the run's history is sent:
+ *  what follows is live. */
+// SYNC: CAUGHT_UP <-> crates/weft-dispatcher/src/api/events.rs CAUGHT_UP, crates/weft-cli/src/commands/follow.rs CAUGHT_UP
+export const CAUGHT_UP = 'caught_up';
+
+/** How a wait ended: its answer (where the run's record keeps it), a
+ *  person skipping it, or the run giving it up (the waiting node failed
+ *  with `error`). */
 // SYNC: AwaitEnd <-> crates/weft-core/src/primitive.rs AwaitEnd
-export type AwaitEnd = { type: 'answered'; value: unknown } | { type: 'skipped' } | { type: 'gave_up'; error: string };
+export type AwaitEnd = { type: 'answered'; value: ValueRef } | { type: 'skipped' } | { type: 'gave_up'; error: string };
 
 // SYNC: DispatcherEvent <-> crates/weft-core/src/live_event.rs DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
 // SYNC: eventId <-> crates/weft-core/src/live_event.rs IdentifiedEvent
@@ -62,7 +80,10 @@ export type DispatcherEvent = { eventId: string } & (
   // `--group` start, or an output a node stood in with), `inheritedPorts`
   // the ones a seed's saved result sent.
   // SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, packages/weft-graph/src/protocol.ts NodeFiringEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeFiring
-  | { kind: 'node_started'; runId: string; node: string; frames: Frame[]; input: unknown; closedPorts: string[]; providedPorts?: string[]; inheritedPorts?: Record<string, string>; inheritedFrom?: string; projectId: string; atUnix: number }
+  // Every value an event names (a firing's input and output, the run's
+  // outputs, a wait's answer) comes as where the run's record keeps it;
+  // the graph reads a value when it shows it (`POST /runs/{id}/values`).
+  | { kind: 'node_started'; runId: string; node: string; frames: Frame[]; input: Record<string, ValueRef>; closedPorts: string[]; providedPorts?: string[]; inheritedPorts?: Record<string, string>; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_suspended'; runId: string; node: string; frames: Frame[]; token: string; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_resumed'; runId: string; node: string; frames: Frame[]; token: string | null; inheritedFrom?: string; projectId: string; atUnix: number }
   // A wait of the firing ended, the first ending on record. A wait the run
@@ -70,7 +91,7 @@ export type DispatcherEvent = { eventId: string } & (
   // the one event that sees every wait's ending.
   | { kind: 'wait_ended'; runId: string; node: string; frames: Frame[]; token: string; ended: AwaitEnd; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_cancelled'; runId: string; node: string; frames: Frame[]; reason: string; inheritedFrom?: string; projectId: string; atUnix: number }
-  | { kind: 'node_completed'; runId: string; node: string; frames: Frame[]; output: unknown; inheritedFrom?: string; projectId: string; atUnix: number }
+  | { kind: 'node_completed'; runId: string; node: string; frames: Frame[]; output: Record<string, ValueRef> | null; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_failed'; runId: string; node: string; frames: Frame[]; error: string; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_skipped'; runId: string; node: string; frames: Frame[]; closedPorts: string[]; reason: SkipReason; inheritedFrom?: string; projectId: string; atUnix: number }
   // A copy of a scope (a group, an include's call site, an included
@@ -78,7 +99,7 @@ export type DispatcherEvent = { eventId: string } & (
   // with why. A group is no node, so the graph paints it from these.
   // SYNC: DispatcherEvent scope_decided <-> crates/weft-core/src/live_event.rs DispatcherEvent::ScopeDecided, packages/weft-graph/src/protocol.ts ScopeDecidedEvent
   | ({ kind: 'scope_decided'; runId: string; projectId: string; scope: string; frames: Frame[]; inheritedFrom?: string; atUnix: number } & ScopeState)
-  | { kind: 'run_completed'; runId: string; projectId: string; outputs: unknown; atUnix: number }
+  | { kind: 'run_completed'; runId: string; projectId: string; outputs: Record<string, Record<string, ValueRef>> | null; atUnix: number }
   | { kind: 'run_failed'; runId: string; projectId: string; error: string; atUnix: number }
   | { kind: 'run_cancelled'; runId: string; projectId: string; reason: string; cause?: CancelCause; atUnix: number }
   | { kind: 'run_tagged'; runId: string; projectId: string; tags: string[]; atUnix: number }
@@ -175,6 +196,13 @@ export type DispatcherEvent = { eventId: string } & (
   // collapsed disclosure in the inspector; not a banner, not red.
   | { kind: 'journal_corruption'; runId: string; projectId: string; site: CorruptionSite; reason: string });
 
+/** The place in its run's record of the event `eventId` names
+ *  (`journal:{seq}:{index}:{k}`), as a stream takes it back in `after`;
+ *  undefined for an event about where the run stands (`live:...`). */
+export function recordedAt(eventId: string): string | undefined {
+  return eventId.startsWith('journal:') ? eventId.slice('journal:'.length) : undefined;
+}
+
 function identifiedEvent(value: unknown): DispatcherEvent {
   if (!value || typeof value !== 'object' || !('eventId' in value)
       || typeof value.eventId !== 'string' || value.eventId.length === 0) {
@@ -195,22 +223,34 @@ export interface LiveRun {
 export class RunFollower implements vscode.Disposable {
   private eventSource: { close: () => void } | undefined;
   private generation = 0;
-  private cancelStart: (() => void) | undefined;
-  private historyAbort: AbortController | undefined;
+  private reopenTimer: ReturnType<typeof setTimeout> | undefined;
   /// The run being followed, kept across a pause so coming back
   /// reopens it; cleared when the follow stops or is lost.
   private runId: string | undefined;
-  /// The followed run while it has not ended: its history is applied
-  /// and holds no terminal event, and no live one arrived since. What
-  /// `onLiveRun` listeners hear about.
+  /// The followed run while it has not ended: its history was sent
+  /// without its end, and no event since said it ended. What `onLiveRun`
+  /// listeners hear about.
   private liveRun: LiveRun | undefined;
   /// The project the followed run belongs to, from the first of its
   /// events (every run event carries it); undefined until one arrived.
   private runProject: string | undefined;
-  /// The followed run's history is applied: live events follow it.
-  private historyApplied = false;
-  /// The followed run's history or live stream carried its end.
+  /// The followed run's stream sent its history ([`CAUGHT_UP`]): what
+  /// comes now is live.
+  private caughtUp = false;
+  /// The followed run's stream carried its end.
   private ended = false;
+  /// The place in the run's record of the last event painted
+  /// (`{seq}:{index}:{k}`): a stream opened again goes on past it.
+  private after: string | undefined;
+  /// The followed run's stream opened once. Only a first open that fails
+  /// loses the follow; from then on a drop is opened again, as long as
+  /// the follow lasts.
+  private opened = false;
+  /// The stream dropped and has not opened again yet: the graph shows
+  /// that it is reconnecting until it does.
+  private reconnecting = false;
+  /// The tries at opening it again that failed since it last opened.
+  private failedReopens = 0;
   private readonly liveRunListeners: Array<(run: LiveRun | undefined) => void> = [];
 
   constructor(
@@ -219,17 +259,20 @@ export class RunFollower implements vscode.Disposable {
     private readonly pause: LivePause,
   ) {
     pause.onChange((paused) => {
-      if (paused) this.close();
-      else if (this.runId) void this.start(this.runId);
+      if (paused) {
+        // Nothing tries while paused, so nothing says it is reconnecting.
+        this.close();
+        this.endReconnecting();
+      } else if (this.runId) this.start(this.runId);
     });
   }
 
   /** Hear which followed run has not ended yet, every time that
-   *  changes: a run once its history is applied without an end in it,
-   *  and once one of its events said which project it belongs to,
-   *  then undefined when it ends, the follow is lost or stopped, or
-   *  another run is followed. The graph asks for the displays of that
-   *  run's waits while it is set. */
+   *  changes: a run once its history was sent without an end in it, and
+   *  once one of its events said which project it belongs to, then
+   *  undefined when it ends, the follow is lost or stopped, or another
+   *  run is followed. The graph asks for the displays of that run's
+   *  waits while it is set. */
   onLiveRun(listener: (run: LiveRun | undefined) => void): void {
     this.liveRunListeners.push(listener);
   }
@@ -241,164 +284,133 @@ export class RunFollower implements vscode.Disposable {
     for (const listener of this.liveRunListeners) listener(run);
   }
 
-  /** Name the followed run live once its history is applied without an
+  /** Name the followed run live once its history was sent without an
    *  end and its project is known. */
   private announceLive(): void {
-    if (this.historyApplied && !this.ended && this.runId && this.runProject) {
+    if (this.caughtUp && !this.ended && this.runId && this.runProject) {
       this.setLiveRun({ runId: this.runId, projectId: this.runProject });
     }
   }
 
-  /** Hydrate a past run by replaying every journaled event up
-   *  front, then keep following so a still-running run stays
-   *  live. Called when the user clicks a run in the sidebar. */
+  /** Paint a run from its start and keep following it, so a still-running
+   *  run stays live. Called when the user clicks a run in the sidebar. */
   async replay(runId: string): Promise<void> {
-    await this.start(runId);
-  }
-
-  /** The one follow path. Subscribe-FIRST,
-   *  buffering live events, THEN run the replay GET, THEN drain the
-   *  buffer. This closes the gap where an event that fired between
-   *  "replay GET returned" and "subscribe attached" was dropped
-   *  forever. Stable event identities remove the overlap without
-   *  comparing payloads or assuming that repeated updates are harmless. */
-  private async start(runId: string): Promise<void> {
     this.close();
+    this.endReconnecting();
     this.runId = runId;
     this.runProject = undefined;
-    this.historyApplied = false;
     this.ended = false;
+    this.caughtUp = false;
+    this.after = undefined;
+    this.opened = false;
+    this.failedReopens = 0;
     this.setLiveRun(undefined);
-    this.post({ kind: 'runReset' });
+    this.post({ kind: 'runReset', runId });
     // Coming back opens it.
     if (this.pause.paused()) return;
-    const generation = this.generation;
-    const historyAbort = new AbortController();
-    this.historyAbort = historyAbort;
-    const isCurrent = () => this.generation === generation;
+    this.start(runId);
+  }
 
-    let opened!: (ready: boolean) => void;
-    const ready = new Promise<boolean>((resolve) => { opened = resolve; });
-    this.cancelStart = () => opened(false);
+  /** Open the run's stream past what was painted (from its start when
+   *  nothing was). */
+  private start(runId: string): void {
+    this.close();
+    if (this.ended) return;
+    const generation = this.generation;
+    const isCurrent = () => this.generation === generation;
     const lost = (reason: 'closed' | 'error') => {
       if (!isCurrent()) return;
       this.stop();
       this.post({ kind: 'followLost', runId, reason });
     };
-
-    // Buffer live events until the replay has been applied,
-    // so live events never overtake their historical context.
-    let buffering = true;
-    const buffer: DispatcherEvent[] = [];
-    let bufferedBytes = 0;
-    // Track only the initial history. This cannot grow with a long-running
-    // live stream, and also covers history the bridge has not delivered yet.
-    const historyIds = new Set<string>();
-    const applyLive = (event: DispatcherEvent) => {
-      if (!historyIds.has(event.eventId)) this.apply(event);
-    };
-    const onData = (data: string) => {
+    /** The stream dropped, or could not be opened again after a drop:
+     *  open it again past the last event painted, unless the run ended
+     *  (what its record gets after its end, a meter settling a call, is
+     *  not worth a stream of its own). A first open that fails loses the
+     *  follow instead, and so does an open the install refuses for good
+     *  (the run is gone, the key refused): only an install out of reach
+     *  or busy for now is tried again ([`worthTryingAgain`]), waiting
+     *  longer after each try. */
+    const dropped = (why: string, reason: 'closed' | 'error', err?: unknown) => {
       if (!isCurrent()) return;
-      if (buffering) {
-        bufferedBytes += Buffer.byteLength(data, 'utf8');
-        if (bufferedBytes > MAX_REPLAY_BUFFER_BYTES) {
-          console.warn('[weft/runFollower] live updates exceeded the replay buffer; reopen the run to reload its history');
+      if (this.ended) {
+        this.close();
+        return;
+      }
+      if (!this.opened || (err !== undefined && !worthTryingAgain(err))) {
+        lost(reason);
+        return;
+      }
+      this.close();
+      this.reconnecting = true;
+      this.post({ kind: 'followReconnecting', runId, why });
+      const wait = Math.min(REOPEN_AFTER_MS * 2 ** this.failedReopens, REOPEN_CEILING_MS);
+      this.failedReopens++;
+      this.reopenTimer = setTimeout(() => {
+        this.reopenTimer = undefined;
+        if (this.runId === runId && !this.pause.paused()) this.start(runId);
+      }, wait);
+    };
+    const query = this.after === undefined ? '' : `?after=${encodeURIComponent(this.after)}`;
+    this.eventSource = this.client.subscribe(
+      `/events/run/${runId}${query}`,
+      (ev) => {
+        if (!isCurrent()) return;
+        if (ev.event === CAUGHT_UP) {
+          this.caughtUp = true;
+          this.announceLive();
+          return;
+        }
+        let event: DispatcherEvent;
+        try {
+          event = identifiedEvent(JSON.parse(ev.data));
+        } catch (err) {
+          console.warn('[weft/runFollower] bad SSE payload', err);
           lost('error');
           return;
         }
-      }
-      let event: DispatcherEvent;
-      try {
-        event = identifiedEvent(JSON.parse(data));
-      } catch (err) {
-        console.warn('[weft/runFollower] bad SSE payload', err);
-        lost('error');
-        return;
-      }
-      if (buffering) {
-        buffer.push(event);
-      } else applyLive(event);
-    };
-    this.eventSource = this.client.subscribe(
-      `/events/run/${runId}`,
-      (ev) => onData(ev.data),
+        const at = recordedAt(event.eventId);
+        if (at !== undefined) this.after = at;
+        this.apply(event);
+      },
       {
-        // Starting fetch is not enough: history must be read only once
-        // the server has attached the live subscription.
-        onOpen: () => opened(true),
-        // The dispatcher's per-run stream stays open (keep-alive)
-        // for the life of the project channel, so a clean close or an
-        // error both mean the live link is GONE, not "run done"
-        // (that arrives as a run_completed event on the open
-        // stream). Surface it so the UI stops presenting the run as
-        // live instead of leaving it stuck "running" forever.
-        onClosed: () => {
-          lost('closed');
+        onOpen: () => {
+          if (!isCurrent()) return;
+          this.opened = true;
+          this.failedReopens = 0;
+          this.endReconnecting();
         },
+        onClosed: () => dropped('the stream ended', 'closed'),
         onError: (err) => {
-          console.warn('[weft/runFollower] live follow lost', err);
-          lost('error');
+          console.warn('[weft/runFollower] live follow dropped', err);
+          dropped(err instanceof Error ? err.message : String(err), 'error', err);
         },
       },
     );
-
-    if (!await ready || !isCurrent()) return;
-    this.cancelStart = undefined;
-
-    {
-      try {
-        const events = await this.client.get<DispatcherEvent[]>(`/runs/${runId}/replay`, historyAbort.signal);
-        // A follow switch may have landed while the GET was in flight.
-        if (!isCurrent()) return;
-        for (const raw of events) {
-          const event = identifiedEvent(raw);
-          if (!historyIds.has(event.eventId)) {
-            historyIds.add(event.eventId);
-            this.apply(event);
-          }
-        }
-      } catch (err) {
-        if (!isCurrent()) return;
-        // The history failed to load. `followLost` tells the webview the
-        // follow is dead (Stop button hidden, "re-open to reconnect"
-        // toast), so the follow MUST actually be dead: tear down the SSE
-        // and drop the buffer before posting, instead of leaving the
-        // stream live underneath a UI that asserts it's gone. Re-opening
-        // the run retries the replay; a follow with no history is
-        // not worth keeping half-alive.
-        console.warn('[weft/runFollower] replay failed', err);
-        this.stop();
-        this.post({
-          kind: 'followLost',
-          runId,
-          reason: 'error',
-        });
-        return;
-      }
-      // Drain anything that arrived during the replay, then go live.
-      buffering = false;
-      for (const e of buffer) applyLive(e);
-      buffer.length = 0;
-      this.historyApplied = true;
-      this.announceLive();
-    }
   }
 
   /** Stop following: nothing reopens it. */
   stop(): void {
+    this.endReconnecting();
     this.runId = undefined;
     this.setLiveRun(undefined);
     this.close();
   }
 
-  /** Close the stream and abandon a replay in flight, keeping which
-   *  run it was (a pause reopens it). */
+  /** Tell the graph the followed run is no longer reconnecting, if it
+   *  was. */
+  private endReconnecting(): void {
+    if (!this.reconnecting) return;
+    this.reconnecting = false;
+    if (this.runId) this.post({ kind: 'followReconnecting', runId: this.runId, why: null });
+  }
+
+  /** Close the stream, keeping which run it was and how far it was
+   *  painted (a pause, or a dropped stream, opens it again). */
   private close(): void {
     this.generation++;
-    this.cancelStart?.();
-    this.cancelStart = undefined;
-    this.historyAbort?.abort();
-    this.historyAbort = undefined;
+    if (this.reopenTimer !== undefined) clearTimeout(this.reopenTimer);
+    this.reopenTimer = undefined;
     this.eventSource?.close();
     this.eventSource = undefined;
   }
@@ -476,7 +488,7 @@ export class RunFollower implements vscode.Disposable {
           atUnix: e.atUnix,
           state: 'completed',
           frames: e.frames,
-          output: e.output,
+          output: e.output ?? undefined,
           inheritedFrom: e.inheritedFrom,
         };
         this.post({ kind: 'firingEvent', event: firingEvent });

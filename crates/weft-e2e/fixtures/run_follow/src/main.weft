@@ -1,0 +1,27 @@
+# A fast run of a few thousand events: a loop over 400 numbers, each
+# written into a line of text, the lines gathered at the end. Nothing in
+# it waits on anything outside, so its events come in bursts far larger
+# than a project's queue of live updates.
+#
+# The rig asserts: `weft run`, following the run, prints every
+# iteration's line and ends on the run's completion; and the values the
+# run's events name read back through the dispatcher, the gathered list
+# and an iteration's item included, on this run and on a run seeded from
+# it.
+
+nums = Range { to: 400 }
+
+lines = Loop(values: Generator[Number]) -> (results: List[String | Null]) {
+  parallel: false
+  over: ["values"]
+
+  line = Format(n: Number) {
+    template: "line {{n}}"
+  }
+  line.n = self.values
+  self.results = line.text
+}
+lines.values = nums.values
+
+out = Debug
+out.data = lines.results

@@ -227,7 +227,7 @@
                 }));
                 let (drove, events) = super::engine_test_rig::drive_journal_observed(project.clone(), cat, run_id, rows, CancellationFlag::new_arc()).await;
                 let drove = drove.expect("stream run drives");
-                super::engine_test_rig::assert_fold_matches_live(&project, &events, &weft_journal::SeedChain::default(), &drove);
+                super::engine_test_rig::assert_fold_matches_live(&project, &events, Default::default(), &drove);
                 let entries = log.lock().unwrap().clone();
                 let takes: Vec<_> = entries.iter().filter(|entry| entry.starts_with("took ")).cloned().collect();
                 assert_eq!(node_failed_error(&events, "consumer"), None, "kept {kept}, count {count}, failed {failed}");

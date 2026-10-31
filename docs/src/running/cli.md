@@ -171,7 +171,7 @@ If you are scripting weft, read the exit code rather than the line:
 | `10` | failed, or was cancelled |
 | `11` | is waiting for input (only with `--waiting-for-input`, which also returns as soon as the run parks on a person or a service) |
 | `12` | is still going when the timeout runs out |
-| `1` | the wait itself failed: no such run, the install unreachable, the live updates lost |
+| `1` | the wait itself failed: no such run, or the install unreachable |
 
 `--timeout` takes a whole number and a unit (`30s`, `10m`), from one second
 to 10 minutes, and defaults to 10 minutes. A timeout only stops the waiting: the run carries on, and `weft wait` again

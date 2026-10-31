@@ -555,11 +555,14 @@ pub(crate) async fn program_in(conn: &impl Client, id: uuid::Uuid, hash: &str) -
 }
 
 /// What `project.resync`'s version 2 moved out of the JSON
-/// (`ResyncPlan::STORED`): its drive, into `resync_driver`.
+/// (`ResyncPlan::STORED`): its drive, into `resync_driver`. Every row at
+/// version 1 was written while the column was `JSONB`, so its text casts
+/// back; the cast sits in the `SET`, which reads only the rows the
+/// `WHERE` keeps (a later row's text may hold a NUL, which the cast
+/// refuses).
 pub const RESYNC_FILLS: &[weft_task_store::documents::Fill] = &[weft_task_store::documents::Fill {
     from: 1,
-    sql: "UPDATE project SET resync_driver = (resync::jsonb->>'driver')::uuid \
-          WHERE resync_version = 1 AND resync::jsonb ? 'driver'",
+    sql: "UPDATE project SET resync_driver = (resync::jsonb->>'driver')::uuid WHERE resync_version = 1",
 }];
 
 /// The `project` + `project_definition` tables. The canonical CREATEs
@@ -617,8 +620,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- request the build came from, which the maintenance lift
                 -- builds again on a newer weft (`crate::maintenance`). NULL
                 -- for a build an older weft registered, which kept none.
-                -- As its JSON text (`db::JsonText`): its assets are keyed
-                -- by `FileRef::resolution_key`, which holds a NUL.
+                -- As its JSON text (`db::JsonText`): a text asset is
+                -- inlined in it, whatever the file or the page held.
                 running_build_inputs TEXT,
                 -- The version `running_build_inputs` was written at
                 -- (`BuildInputs::STORED`).
@@ -632,12 +635,15 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- Per-(project, node) image hash maps for Image::Local
                 -- references in InfraSpecs. CLI ships these in /sync;
                 -- supervisor reads them.
-                -- Shape: { "<node_id>": { "<image_name>": "<tag>" } }
-                infra_image_tags_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                -- Shape: { "<node_id>": { "<image_name>": "<tag>" } }, as
+                -- its JSON text (`db::JsonText`): the image names are the
+                -- ones the node's spec wrote.
+                infra_image_tags_json TEXT NOT NULL DEFAULT '{}',
                 -- The project's own worker levers, each one it sets
                 -- replacing the install's (`WorkerOverrides`); empty
-                -- runs on the install's.
-                worker_settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                -- runs on the install's. As its JSON text (`db::JsonText`):
+                -- a person writes them.
+                worker_settings_json TEXT NOT NULL DEFAULT '{}',
                 -- Verb-transition marker, orthogonal to `status`:
                 -- 'none' | 'building' | 'cancelling_build' | 'resyncing'.
                 -- Written only by its own single-flight methods
@@ -779,8 +785,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             worker_log TEXT,
             -- What each node type the worker holds needs from the machine
             -- (weft_core::needs::NodeNeeds): a program using one whose
-            -- need is unmet is refused before it starts.
-            node_needs JSONB NOT NULL DEFAULT '{}',
+            -- need is unmet is refused before it starts. As its JSON text
+            -- (`db::JsonText`): each node's metadata writes its own.
+            node_needs TEXT NOT NULL DEFAULT '{}',
             PRIMARY KEY (project_id, binary_hash)
         )"#,
         r#"CREATE TABLE IF NOT EXISTS project_definition (
@@ -819,12 +826,14 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         weft_task_store::DataStep {
             table: "project",
             until: weft_task_store::Until::Dropped("head_version"),
-            sql: "INSERT INTO working_copy (id, project_id, kind, head_version, head_run, working_manifest, synced, conflicts, revision, created_at, updated_at) \
+            work: weft_task_store::StepWork::Sql(
+                "INSERT INTO working_copy (id, project_id, kind, head_version, head_run, working_manifest, synced, conflicts, revision, created_at, updated_at) \
                   SELECT gen_random_uuid(), p.id, 'program', p.head_version, p.head_run, \
                          COALESCE((SELECT v.manifest FROM project_version v WHERE v.project_id = p.id AND v.id = p.head_version), '{}'::jsonb), \
                          '{}'::jsonb, '{}', 0, EXTRACT(EPOCH FROM now())::bigint, EXTRACT(EPOCH FROM now())::bigint \
                   FROM project p WHERE p.head_version IS NOT NULL OR p.head_run IS NOT NULL \
                   ON CONFLICT DO NOTHING",
+            ),
         },
     ],
 };
@@ -857,13 +866,7 @@ async fn advance_running_hashes(
     }
     // Serialize the tag map to JSON once (NULL when not being written, so the
     // COALESCE leaves the stored column untouched).
-    let tags_json: Option<serde_json::Value> = match infra_image_tags {
-        Some(tags) => Some(
-            serde_json::to_value(tags)
-                .map_err(|e| anyhow::anyhow!("serialize infra_image_tags for running-hash advance: {e}"))?,
-        ),
-        None => None,
-    };
+    let tags_json = infra_image_tags.map(db::JsonText);
     let rows = conn
         .execute(
             "UPDATE project SET \
@@ -991,13 +994,13 @@ impl ProjectStoreOps for PostgresProjectStore {
                  VALUES ($1, $2, $3, $6, $4, $5) \
                  ON CONFLICT (project_id, definition_hash) DO UPDATE SET cut_from = NULL, \
                      infra_places = COALESCE(EXCLUDED.infra_places, project_definition.infra_places)",
-                &[&id, &hash, &project_json, &now, &infra_places.map(db::Json), &ProjectDefinition::STORED.version()],
+                &[&id, &hash, &project_json, &now, &infra_places.map(|places| db::Json(db::WeftMade(places))), &ProjectDefinition::STORED.version()],
             )
             .await?;
         }
         if let Some(code) = code {
             let binary = binary_hash.ok_or_else(|| anyhow::anyhow!("implementation fingerprints require a worker binary hash"))?;
-            let encoded = serde_json::to_value(&code.implementations)?;
+            let encoded = db::Json(db::WeftMade(&code.implementations));
             // What the worker left out is its image's (one content, one
             // build's record), so a registration of the same worker again
             // says the same; it is taken as the latest registration says.
@@ -1013,7 +1016,7 @@ impl ProjectStoreOps for PostgresProjectStore {
                         &encoded,
                         &db::JsonText(&code.left_out),
                         &code.worker_log,
-                        &serde_json::to_value(&code.node_needs)?,
+                        &db::JsonText(&code.node_needs),
                     ],
                 )
                 .await?;
@@ -1037,7 +1040,7 @@ impl ProjectStoreOps for PostgresProjectStore {
                 "UPDATE project SET running_source = $2, running_build_inputs = $3, running_build_inputs_version = $4 WHERE id = $1",
                 &[
                     &id,
-                    &source.map(|source| serde_json::to_value(source.manifest)).transpose()?,
+                    &source.map(|source| db::Json(db::WeftMade(source.manifest))),
                     &source.and_then(|source| source.inputs).map(db::JsonText),
                     &weft_core::builds::BuildInputs::STORED.version(),
                 ],
@@ -1054,11 +1057,11 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn running_build(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::builds::VersionSource>> {
-        let row: Option<(Option<serde_json::Value>, Option<String>, weft_core::stored::Version)> = self
+        let row: Option<(Option<db::Json<serde_json::Value>>, Option<String>, weft_core::stored::Version)> = self
             .pool
             .opt("SELECT running_source, running_build_inputs, running_build_inputs_version FROM project WHERE id = $1", &[&id])
             .await?;
-        let Some((Some(manifest), Some(inputs), version)) = row else { return Ok(None) };
+        let Some((Some(db::Json(manifest)), Some(inputs), version)) = row else { return Ok(None) };
         let inputs = weft_core::builds::BuildInputs::STORED
             .decode(inputs.as_str(), version)
             .map_err(|e| e.at(format_args!("project {id}'s running build")))?;
@@ -1067,19 +1070,20 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest> {
-        let row: Option<serde_json::Value> = self
+        let row: Option<db::Json<serde_json::Value>> = self
             .pool
             .scalar_opt(
                 "SELECT running_source FROM project WHERE id = $1 AND running_binary_hash = $2 AND running_definition_hash = $3 AND running_source IS NOT NULL",
                 &[&id, &program.binary_hash, &program.definition_hash],
             )
             .await?;
-        let source = row.ok_or_else(|| anyhow::anyhow!("project sources are missing or changed during preparation; register the project and retry"))?;
+        let db::Json(source) = row.ok_or_else(|| anyhow::anyhow!("project sources are missing or changed during preparation; register the project and retry"))?;
         Ok(serde_json::from_value(source)?)
     }
 
     async fn running_program(&self, id: uuid::Uuid) -> anyhow::Result<Option<RunningProgram>> {
-        let row: Option<(String, String, serde_json::Value, db::JsonText<Vec<weft_core::builds::LeftOutPackage>>, Option<String>, serde_json::Value)> = self
+        #[allow(clippy::type_complexity)]
+        let row: Option<(String, String, db::Json<serde_json::Value>, db::JsonText<Vec<weft_core::builds::LeftOutPackage>>, Option<String>, db::JsonText<weft_core::needs::NodeNeeds>)> = self
             .pool
             .opt(
                 "SELECT p.running_definition_hash, p.running_binary_hash, c.implementations, c.left_out, c.worker_log, c.node_needs \
@@ -1090,11 +1094,11 @@ impl ProjectStoreOps for PostgresProjectStore {
             .await?;
         row.map(|(definition_hash, binary_hash, implementations, left_out, worker_log, node_needs)| Ok(RunningProgram {
             identity: weft_core::project::hash::ProgramIdentity {
-                definition_hash, binary_hash, implementations: serde_json::from_value(implementations)?,
+                definition_hash, binary_hash, implementations: serde_json::from_value(implementations.0)?,
             },
             left_out: left_out.0,
             worker_log,
-            node_needs: serde_json::from_value(node_needs)?,
+            node_needs: node_needs.0,
         })).transpose()
     }
 
@@ -1104,11 +1108,11 @@ impl ProjectStoreOps for PostgresProjectStore {
         definition_hash: &str,
         binary_hash: &str,
     ) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>> {
-        let row: Option<serde_json::Value> = self
+        let row: Option<db::Json<serde_json::Value>> = self
             .pool
             .scalar_opt("SELECT implementations FROM project_code WHERE project_id = $1 AND binary_hash = $2", &[&id, &binary_hash])
             .await?;
-        row.map(|implementations| {
+        row.map(|db::Json(implementations)| {
             Ok(weft_core::project::hash::ProgramIdentity {
                 definition_hash: definition_hash.to_string(),
                 binary_hash: binary_hash.to_string(),
@@ -1238,9 +1242,9 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn running_infra_image_tags(&self, id: uuid::Uuid) -> anyhow::Result<Option<InfraImageTags>> {
-        let row: Option<serde_json::Value> =
+        let row: Option<db::JsonText<serde_json::Value>> =
             self.pool.scalar_opt("SELECT infra_image_tags_json FROM project WHERE id = $1", &[&id]).await?;
-        row.map(|value| {
+        row.map(|db::JsonText(value)| {
             let tags = weft_broker_client::protocol::decode_infra_image_tags(value, &format!("project {id}"))?;
             Ok(tags.into_iter().map(|(place, images)| (place, images.into_iter().collect())).collect())
         })
@@ -1526,9 +1530,9 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn worker_overrides(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_platform_traits::WorkerOverrides>> {
-        let row: Option<serde_json::Value> =
+        let row: Option<db::JsonText<serde_json::Value>> =
             self.pool.scalar_opt("SELECT worker_settings_json FROM project WHERE id = $1", &[&id]).await?;
-        row.map(|v| {
+        row.map(|db::JsonText(v)| {
             serde_json::from_value(v).map_err(|e| anyhow::anyhow!("project {id}'s worker settings are not valid: {e}"))
         })
         .transpose()
@@ -1553,7 +1557,7 @@ impl ProjectStoreOps for PostgresProjectStore {
                                       delivered_until = CASE WHEN waits THEN NULL ELSE delivered_until END \
                                   WHERE project_id IN (SELECT id FROM changed) AND state = 'queued') \
                  SELECT count(*) FROM changed",
-                &[&id, &serde_json::to_value(overrides)?],
+                &[&id, &db::JsonText(overrides)],
             )
             .await?;
         anyhow::ensure!(changed == 1, "no project {id}");

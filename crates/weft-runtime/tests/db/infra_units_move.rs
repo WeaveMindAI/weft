@@ -44,8 +44,8 @@ async fn an_older_copys_units_become_rows_and_their_column_goes(pool: Pool) {
         .unwrap();
     let project_id = uuid::Uuid::new_v4();
     pool.execute(
-        "INSERT INTO infra_node (project_id, node_id, copy_id, status, units_json) VALUES ($1, 'db', 'wn-db', 'running', $2)",
-        &[&project_id, &older_units()],
+        "INSERT INTO infra_node (project_id, node_id, copy_id, status, units_json) VALUES ($1, 'db', 'wn-db', 'running', $2::text::jsonb)",
+        &[&project_id, &older_units().to_string()],
     )
     .await
     .unwrap();
@@ -58,7 +58,7 @@ async fn an_older_copys_units_become_rows_and_their_column_goes(pool: Pool) {
         ("postgres".to_string(), "running".to_string(), "stop".to_string(), vec!["postgres:16".to_string()]),
     ];
     assert_eq!(unit_rows(&pool, project_id).await, moved);
-    let read: Value = pool
+    let weft_task_store::db::Json(read): weft_task_store::db::Json<Value> = pool
         .scalar(
             &format!("SELECT {} FROM infra_node n WHERE n.project_id = $1", weft_broker_client::protocol::units_of_copy_sql("n")),
             &[&project_id],

@@ -74,7 +74,7 @@ pub mod worker_door;
 #[cfg(feature = "migrate")]
 pub use documents::{apply_documents, Document};
 
-pub use schema_group::{DataStep, SchemaGroup, Until};
+pub use schema_group::{DataStep, SchemaGroup, StepCode, StepWork, Until};
 #[cfg(feature = "migrate")]
 pub use schema_guard::{apply_groups, apply_schema, Migration, Part};
 

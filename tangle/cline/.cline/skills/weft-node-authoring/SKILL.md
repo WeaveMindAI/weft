@@ -55,7 +55,7 @@ You never trust a report you can re-verify for the cost of one command. If you c
 - **empty rig**: `tests()` returns an empty vec, or `tests.rs` does not exist, and [the report] did not say so. An access node is the one exception: its body is the `access_node!` macro, there is nothing of the smith's to test, and it ships with no `tests.rs` at all.
 - **flaky-dismissed**: an intermittently failing test waved off as flaky instead of chased to its race. A race in the node is the node's bug; a test made tolerant of it (a retry, a sleep, a longer timeout) fails [the review] on both counts.
 - **an output with no bound**: a port whose value grows with what the service answers or what the node is given (a list of results, a page of text, a response body, a transcript) and nothing that keeps it under the 100 KB wire limit: no cap input or `LIMIT`, no paging, no stored file in its place. [the report] names each such port and its bound, and a `fake` test emits the largest value the bound allows; a port missing from that list is the finding. The rule is under The wire limit.
-- **body smells**: `.ok()` discarding an error, a default value standing in for a missing input, a retry loop, orchestration inside the node, a database client or a process opened fresh on every run where `ctx.shared` would hold one.
+- **body smells**: `.ok()` discarding an error, a default value standing in for a missing input, a retry loop, orchestration inside the node, a database client or a process opened fresh on every run where `ctx.shared` would hold one, heavy work (a big parse, image or audio work, compression, hashing a large file) done inline instead of in `tokio::task::spawn_blocking`.
 - **an infra output left unbaked**: an infra node's output that holds as long as the infra does (an address, a connection, a handle) with no `"baked": true`, so every run that reads it runs the node to make it again.
 - **a dead end in an image**: a state an infra container can sit in (a dead pairing, a lost credential, a revoked session) with no button on its display that leaves it, so the user's only way out is restarting or terminating the infra. Every such state gets an action, offered in every state; the rule is under Infra node.
 - **a marker in an outbound payload**: a `__weft_<kind>__` wrapper handed to a provider, a bridge, a form spec or a live item, instead of the plain URL, `data:` URL or `{ url, mimeType, filename }` that consumer reads; the rule is under A file input.
@@ -414,6 +414,25 @@ for minutes. A node that loops without it keeps running after everything
 that asked for it is gone, and the only sign is a run that never ends. If
 you catch yourself writing a loop with no cancellation arm, stop and write:
 "Wait. Nothing else can stop this." Then add the arm.
+
+**Heavy work goes through `tokio::task::spawn_blocking`.** A body runs on
+the same few threads (one per CPU) as the worker's door and its other runs,
+and a thread changes hands only at an `.await`. Parsing a big document, image
+or audio work, compressing, or hashing a large file in one go holds that
+thread until it is done, and every caller and run waiting for it waits too; on
+a one-CPU worker that is all of them. The worker renews its lease on its runs
+from a separate thread, so a slow body never loses its run; it only stalls its
+neighbours.
+Hand the work to the blocking pool and await it:
+
+```rust
+let rows = tokio::task::spawn_blocking(move || parse_csv(&text))
+    .await
+    .node_err("parsing the export")?;
+```
+
+The stdlib's `nodes/base_catalog/google/sheets_read/mod.rs` does it for a
+whole tab.
 
 Any node can stop other runs of its project from inside its own body, and
 two ctx calls are the whole of it (`TagRun` and `StopTagged` are thin

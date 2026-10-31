@@ -280,7 +280,7 @@ fn runtime_source_hash() -> Result<Sha256> {
         .map_err(|e| anyhow::anyhow!("runtime image crate closure: {e}"))?;
     let mut inputs: Vec<(String, PathBuf)> =
         closure.iter().map(|name| (format!("crates/{name}"), root.join("crates").join(name))).collect();
-    for rel in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"] {
+    for rel in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
         inputs.push((rel.to_string(), root.join(rel)));
     }
     inputs.push((RUNTIME_DOCKERFILE.to_string(), root.join("deploy/docker").join(RUNTIME_DOCKERFILE)));
@@ -674,7 +674,8 @@ async fn require_whole_worker(image: &str) -> Result<()> {
 /// One BuildKit record of a worker image's compile cache mount, as
 /// `docker buildx du --verbose` lists it: what a `weft build-images` run on
 /// this machine, or an older weft's worker image builds, left. There is
-/// one per cache key (build environment and builder), and a key retired by
+/// one per cache key (build environment, builder and the nodes'
+/// `[build.env]`), and a key retired by
 /// a toolchain bump keeps its record, and its bytes, until something
 /// prunes it.
 #[derive(Debug, Clone, PartialEq, Eq)]

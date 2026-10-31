@@ -159,7 +159,7 @@
         let drove = drive_on(Arc::new(project), nodes(), run_id, journal.clone(), clients, CancellationFlag::new_arc(), None)
             .await
             .expect("run_one ok");
-        (drove.outcome, journal.events_for_run_id(run_id).await.unwrap())
+        (drove.outcome, journal.events_of(run_id))
     }
 
     fn emitted(events: &[RunEvent], port: &str) -> Option<serde_json::Value> {

@@ -221,7 +221,7 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: Pool) {
     assert_eq!(write.node_cancellations, Some(1), "{write:?}");
     assert!(!write.requested, "no worker drives a parked run: it is ended here");
     assert!(store.signal_get("form-victim").await.unwrap().is_none());
-    let after = store.events_log(victim).await.unwrap();
+    let after = crate::events(store.events_log(victim).await.unwrap());
     let node_cancel = after
         .iter()
         .find_map(|e| match e {
@@ -248,7 +248,7 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: Pool) {
     // A second cancel finds the terminal and writes nothing new.
     let again = store.cancel_run(victim, Some(&program), &CancelCause::User).await.unwrap();
     assert!(again.removed.is_empty() && again.node_cancellations.is_none(), "{again:?}");
-    assert_eq!(store.events_log(victim).await.unwrap().len(), after.len());
+    assert_eq!(crate::events(store.events_log(victim).await.unwrap()).len(), after.len());
 
     store.delete_run(victim).await.unwrap();
     assert_eq!(tag_seq(&pool, victim, "user_7").await.unwrap(), None, "tag rows go with the journal");
@@ -266,11 +266,11 @@ async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_run_id(pool:
 
     let done = start_run(&store, project, weft_core::run::RunKind::Project).await;
     write(&store, done, &[RunEvent::RunCompleted { run_id: done, at_unix: 5 }]).await;
-    let before = store.events_log(done).await.unwrap();
+    let before = crate::events(store.events_log(done).await.unwrap());
     let program = rig_project(project);
     let write = store.cancel_run(done, Some(&program), &CancelCause::User).await.unwrap();
     assert!(write.removed.is_empty() && write.node_cancellations.is_none() && !write.requested, "{write:?}");
-    assert_eq!(store.events_log(done).await.unwrap().len(), before.len(), "a finished run keeps its terminal");
+    assert_eq!(crate::events(store.events_log(done).await.unwrap()).len(), before.len(), "a finished run keeps its terminal");
     assert_eq!(store.run_summary(done).await.unwrap().unwrap().status.as_str(), "completed");
 
     // Never started: no wait can be registered for it, and its cancel
@@ -281,7 +281,7 @@ async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_run_id(pool:
     let write = store.cancel_run(ghost, None, &CancelCause::User).await.unwrap();
     assert!(write.removed.is_empty(), "{write:?}");
     assert!(write.node_cancellations.is_none() && !write.requested, "{write:?}");
-    assert!(store.events_log(ghost).await.unwrap().is_empty());
+    assert!(crate::events(store.events_log(ghost).await.unwrap()).is_empty());
 }
 
 /// The listing's status filter: a run parked on a wait is
@@ -316,6 +316,37 @@ async fn the_status_filter_finds_a_parked_run_under_waiting_and_running(pool: Po
     assert_eq!(listed(RunStatus::Completed).await, vec![ended]);
 }
 
+/// The live view's recheck of its idle runs, one read for them all: of
+/// the runs it names, only those whose record got a row past the one named
+/// beside them come back, a run named with no row painted coming back as
+/// soon as its record has one.
+#[weft_db_macros::test]
+async fn the_idle_runs_with_rows_past_what_was_painted_are_found_in_one_read(pool: Pool) {
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let started = |n: u64, run_id| RunEvent::NodeStarted { run_id, node_id: "wait".into(), frames: vec![], at_unix: n };
+    let (caught_up, behind, unpainted) = (
+        start_run(&store, project, weft_core::run::RunKind::Project).await,
+        start_run(&store, project, weft_core::run::RunKind::Project).await,
+        start_run(&store, project, weft_core::run::RunKind::Project).await,
+    );
+    for run_id in [caught_up, behind] {
+        write(&store, run_id, &[started(2, run_id)]).await;
+    }
+    let last_row = |run_id| {
+        let pool = pool.clone();
+        async move { pool.scalar::<i32>("SELECT max(seq) FROM run_log WHERE run_id = $1", &[&run_id]).await.unwrap() }
+    };
+    let (caught_up_at, behind_at) = (last_row(caught_up).await, last_row(behind).await);
+    let mut woken = store.written_past(&[(caught_up, Some(caught_up_at)), (behind, Some(behind_at - 1)), (unpainted, None)]).await.unwrap();
+    woken.sort();
+    let mut expected = vec![behind, unpainted];
+    expected.sort();
+    assert_eq!(woken, expected);
+    assert!(store.written_past(&[]).await.unwrap().is_empty(), "naming no run finds none");
+}
+
 /// A run whose record holds a row that no longer decodes still lists
 /// with what its row says (the listing reads the run's row, never its
 /// record). Its display read keeps every row that decodes and names the
@@ -335,7 +366,7 @@ async fn a_damaged_record_lists_from_its_row_and_reads_what_decodes(pool: Pool) 
     assert_eq!(running.total, 1, "{running:?}");
     assert_eq!(running.runs[0].status, RunStatus::Running);
 
-    let (shown, bad) = store.events_log_lossy(damaged).await.unwrap();
+    let (shown, bad) = store.record_page(damaged, None).await.unwrap().decode_lossy(damaged);
     assert!(matches!(shown.iter().map(|row| &row.event).collect::<Vec<_>>()[..], [RunEvent::NodeStarted { .. }]), "{shown:?}");
     assert_eq!(bad.len(), 1);
     assert!(store.events_log(damaged).await.is_err(), "a fold never runs over part of a record");

@@ -816,10 +816,67 @@ impl FileRef {
     /// to, so one path declared `Audio` in one place and `Image` in
     /// another is two refs, checked and resolved separately (keyed by
     /// path alone, the second would ride the first's check and value).
-    pub fn resolution_key(&self) -> String {
+    pub fn resolution_key(&self) -> ResolutionKey {
         // Scoped aliases may have the same display name but different bodies.
         // The portable spelling preserves the complete declared contract.
-        format!("{}\u{0}{}", self.path, self.ty.wire_string())
+        ResolutionKey { path: self.path.clone(), ty: self.ty.wire_string() }
+    }
+}
+
+/// What a build resolves a [`FileRef`] by ([`FileRef::resolution_key`]):
+/// its path and its declared type, as two fields. A path may hold any
+/// character, so the two squeezed into one string could not be told
+/// apart again.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ResolutionKey {
+    pub path: String,
+    /// The declared type's wire spelling (`WeftType::wire_string`).
+    pub ty: String,
+}
+
+/// The `@asset` resolutions of a build: what each reference resolved to,
+/// by [`ResolutionKey`]. Kept in a document as a list of
+/// `{ "path", "type", "value" }` ([`resolutions_as_list`]), since a JSON
+/// object's keys are single strings.
+pub type AssetResolutions = std::collections::BTreeMap<ResolutionKey, Value>;
+
+/// [`AssetResolutions`] as a list of `{ "path", "type", "value" }`, for a
+/// field's `#[serde(with)]`. A list naming one key twice is refused.
+pub mod resolutions_as_list {
+    use super::{AssetResolutions, ResolutionKey};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    struct Entry<'a> {
+        path: &'a str,
+        #[serde(rename = "type")]
+        ty: &'a str,
+        value: &'a serde_json::Value,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Owned {
+        path: String,
+        #[serde(rename = "type")]
+        ty: String,
+        value: serde_json::Value,
+    }
+
+    pub fn serialize<S: Serializer>(map: &AssetResolutions, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(map.iter().map(|(key, value)| Entry { path: &key.path, ty: &key.ty, value }))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<AssetResolutions, D::Error> {
+        let mut map = AssetResolutions::new();
+        for Owned { path, ty, value } in Vec::<Owned>::deserialize(deserializer)? {
+            let key = ResolutionKey { path, ty };
+            if map.contains_key(&key) {
+                return Err(serde::de::Error::custom(format!("the asset {:?} as {} is resolved twice", key.path, key.ty)));
+            }
+            map.insert(key, value);
+        }
+        Ok(map)
     }
 }
 

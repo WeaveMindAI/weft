@@ -592,9 +592,9 @@ async fn a_waiting_version_that_no_longer_reads_ends_failed(pool: Pool) {
         projects.release_driver(project).await.unwrap();
         pool.execute(
             "INSERT INTO version_build (id, ask, project_id, tenant_id, project_name, manifest, program, images, waits_on, \
-                                        state, asked_at) \
-             VALUES ($1, 1, $1, $2, 'p', '{}', $3, '{}', $4, 'waiting', 0)",
-            &[&project, &TENANT, &program.to_string(), &waits_on],
+                                        state, asked_at, inputs_version) \
+             VALUES ($1, 1, $1, $2, 'p', '{}', $3, '{}', $4, 'waiting', 0, 1)",
+            &[&project, &TENANT, &program.to_string(), &waits_on.to_string()],
         )
         .await
         .unwrap();

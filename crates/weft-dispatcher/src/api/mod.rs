@@ -356,6 +356,9 @@ fn core_routes(state: DispatcherState) -> Router<DispatcherState> {
         // spelled against the program the run ran.
         .route("/runs/{run_id}/events", get(run::events))
         .route("/runs/{run_id}/outputs", get(run::outputs))
+        // The values a run's events name, read back as the editor shows
+        // them (the events carry where the record keeps each).
+        .route("/runs/{run_id}/values", post(run::values))
         .route(
             "/runs/{run_id}",
             get(run::get).delete(run::delete_run),

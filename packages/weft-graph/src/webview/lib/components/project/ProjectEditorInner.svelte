@@ -1759,7 +1759,7 @@
 	// `nodes` in place). `readOverlayCtx()` reads every reactive source, so
 	// calling it in an effect's tracked region registers all of them.
 	type OverlayCtx = {
-		nodeOutputs: Record<string, unknown>;
+		nodeOutputs: Record<string, Record<string, import('../../../../protocol').ValueRef>>;
 		/// The followed run's rows around this view's call path: `here` by
 		/// node id for the rows at this level, `inside` by include site for
 		/// everything that ran under one (see `rowsByCallPath`).
@@ -1955,7 +1955,7 @@
 					// the preview meaningful. Read the latest firing
 					// row's input payload when no outputs exist on
 					// the node type.
-					let debugData: unknown = undefined;
+					let debugData: Record<string, import('../../../../protocol').ValueRef> | undefined = undefined;
 					if (nodeTypeConfig?.features?.showDebugPreview) {
 						// `_error` is on every catalog node, so it says
 						// nothing about whether the node has a value to show.

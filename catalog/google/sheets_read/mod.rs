@@ -54,7 +54,12 @@ impl Node for GoogleSheetsReadNode {
             Some(_) => read_via_sheets_api(&http, &id, tab.as_deref()).await?,
             None => read_via_public_export(&http, &id, tab.as_deref()).await?,
         };
-        let rows = rows_from_cells(cells, has_header);
+        // A whole tab can hold millions of cells: its rows are built on
+        // tokio's blocking pool, off the threads the worker's calls and
+        // its other runs share.
+        let rows = tokio::task::spawn_blocking(move || rows_from_cells(cells, has_header))
+            .await
+            .node_err("google sheets: build the tab's rows")?;
         let rows = rows.as_array().map(Vec::as_slice).unwrap_or_default();
         let page = wire_page(rows, offset, max_rows)
             .map_err(|i| heavy_row(&rows[i], i + 1 + usize::from(has_header)))?;
@@ -101,7 +106,10 @@ async fn read_via_public_export(http: &ClientWithMiddleware,
     .text()
     .await
     .node_err("google sheets: read export")?;
-    parse_csv_cells(&csv)
+    // On the blocking pool, as the rows are (see `run`).
+    tokio::task::spawn_blocking(move || parse_csv_cells(&csv))
+        .await
+        .node_err("google sheets: parse the export")?
 }
 
 /// CSV text -> cell grid. Pure, so parsing is testable offline.

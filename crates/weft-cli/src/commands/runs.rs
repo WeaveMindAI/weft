@@ -752,7 +752,8 @@ async fn unused_image_sweep(data_dir: &std::path::Path, kind: SharedImageKind) -
 
 /// What the compile caches on this machine take on disk and how to drop
 /// each: the machine's worker compile caches every host build compiles in
-/// (every lane and the seed) with the crates they share, the node-test
+/// (every lane, its caches for nodes' `[build.env]` values, and the seed)
+/// with the crates they share, the node-test
 /// cache `weft test-node` builds into, and the BuildKit worker compile
 /// caches only an older weft or a `weft build-images` run leaves.
 async fn report_compile_cache_size() -> anyhow::Result<()> {
@@ -761,8 +762,10 @@ async fn report_compile_cache_size() -> anyhow::Result<()> {
     let lanes = dir_size(&machine.compile_caches())?;
     let crates = dir_size(&machine.shared_crates())?;
     println!(
-        "worker compile caches: {:.1}GB in {} (every lane and the seed), and {:.1}GB of shared crates in {}; a build keeps \
-         in both only what a program on this machine was built from, `weft clean --build-cache` drops everything now",
+        "worker compile caches: {:.1}GB in {} (every lane, its caches for nodes' [build.env] values, and the seed), and {:.1}GB \
+         of shared crates in {}; a build trims the shared crates, the cache it compiled in and the seed to what a program on \
+         this machine was built from, `weft clean --images --all` drops every cache kept for [build.env] values that no build \
+         holds, `weft clean --build-cache` drops everything now",
         gb(lanes),
         machine.compile_caches().display(),
         gb(crates),
@@ -804,8 +807,10 @@ fn dir_size(dir: &std::path::Path) -> anyhow::Result<u64> {
     super::test_node::dir_size_bytes(dir).with_context(|| format!("measure {}", dir.display()))
 }
 
-/// Layer 4 (`--all` only): the BuildKit worker image compile caches no
-/// install uses: what an older weft's worker image builds (which record
+/// Layer 4 (`--all` only): the compile caches no build needs kept. First
+/// every lane cache this machine keeps for a set of `[build.env]` values
+/// ([`tagged_lane_cache_sweep`]), then the BuildKit worker image compile
+/// caches no install uses: what an older weft's worker image builds (which record
 /// their keys in their install's record) or a `weft build-images` run
 /// (which records none) left. The key changes with the build environment
 /// or the builder, and nothing mounts an old one again unless an install
@@ -823,6 +828,7 @@ async fn unused_compile_cache_sweep(data_dir: &std::path::Path) -> anyhow::Resul
         r.compile_cache_keys.iter().map(String::as_str).collect()
     }
     let machine = weft_platform_local::MachineLayout::new(data_dir);
+    tagged_lane_cache_sweep(&machine)?;
     let mut lanes: std::collections::BTreeMap<u32, Option<weft_platform_local::lanes::Lane>> = std::collections::BTreeMap::new();
     let mut failures = Vec::new();
     for cache in crate::images::worker_compile_caches().await?.iter() {
@@ -857,6 +863,23 @@ async fn unused_compile_cache_sweep(data_dir: &std::path::Path) -> anyhow::Resul
         }
     }
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
+    Ok(())
+}
+
+/// Every lane cache kept for a set of `[build.env]` values
+/// (`weft_platform_local::host_build::reclaim_tagged_caches`) from the
+/// lanes no build holds right now. A build trims only the cache it compiled
+/// in, so this is what reclaims the cache of values no build sets any
+/// more; one still in use starts its next build from the seed.
+fn tagged_lane_cache_sweep(machine: &weft_platform_local::MachineLayout) -> anyhow::Result<()> {
+    let done = weft_platform_local::host_build::reclaim_tagged_caches(machine)?;
+    for cache in &done.held {
+        println!("keeping the compile cache {}: a build holds that lane right now", cache.display());
+    }
+    match done.removed.len() {
+        0 => println!("no compile caches kept for nodes' [build.env] values"),
+        n => println!("removed {n} compile cache(s) kept for nodes' [build.env] values"),
+    }
     Ok(())
 }
 

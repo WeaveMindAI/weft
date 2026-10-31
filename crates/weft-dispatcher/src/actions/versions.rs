@@ -924,8 +924,8 @@ pub fn blob_keys<'a>(manifests: impl Iterator<Item = (&'a str, &'a BTreeMap<Stri
 /// file is what a later build reads again).
 fn program_asset_keys(inputs: &weft_core::builds::BuildInputs) -> Vec<String> {
     let mut keys = BTreeSet::new();
-    for (resolution_key, value) in &inputs.assets {
-        let path = resolution_key.split('\u{0}').next().unwrap_or("");
+    for (key, value) in &inputs.assets {
+        let path = key.path.as_str();
         if path.starts_with("asset/") && weft_core::storage::key::is_scope_key(path) {
             keys.insert(path.to_string());
         }
@@ -1112,8 +1112,11 @@ mod tests {
         let inputs = weft_core::builds::BuildInputs {
             node_set: weft_core::builds::NodeSet::Full,
             assets: [
-                (format!("assets/pic.png\u{0}{}", image.wire_string()), weft_core::storage::typed_file_value(&file, &image)),
-                (format!("asset/{prompt}\u{0}String"), serde_json::json!("be kind")),
+                (
+                    weft_core::project::ResolutionKey { path: "assets/pic.png".into(), ty: image.wire_string() },
+                    weft_core::storage::typed_file_value(&file, &image),
+                ),
+                (weft_core::project::ResolutionKey { path: format!("asset/{prompt}"), ty: "String".into() }, serde_json::json!("be kind")),
             ]
             .into(),
         };

@@ -1,0 +1,16 @@
+[
+  {
+    "nodeSet": "full",
+    "assets": {}
+  },
+  {
+    "nodeSet": "referenced",
+    "assets": {
+      "assets/logo.png\u0000Image": {
+        "key": "tenant/assets/logo.png",
+        "hash": "sha256:00"
+      },
+      "prompts/readme.txt\u0000String": "hello"
+    }
+  }
+]

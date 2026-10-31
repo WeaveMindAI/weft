@@ -2801,8 +2801,6 @@ dependencies = [
  "chrono",
  "fallible-iterator",
  "postgres-protocol",
- "serde_core",
- "serde_json",
  "uuid",
 ]
 
@@ -5081,6 +5079,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "chrono",
+ "futures",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

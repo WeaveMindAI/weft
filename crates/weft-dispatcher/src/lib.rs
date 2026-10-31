@@ -58,6 +58,7 @@ pub mod proxy;
 pub mod instance_values;
 pub mod install_picks;
 pub mod node_state;
+pub mod painting;
 pub mod projection;
 pub mod project_store;
 pub mod front;

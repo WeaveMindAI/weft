@@ -153,6 +153,14 @@ when a read of the job says it finished. So a call still going is not in the tot
 yet. And two runs of the same instance that check at the same moment both see
 the same total, both pass, and together can go over.
 
+If your cap covers a long stretch, know that a run's costs are deleted with the
+run, so the total only counts runs weft still keeps. The example above has no
+`since`, so it really caps the last week of spending, because ended runs are
+kept for a week by default. If you want a cap over all time, keep the runs
+`forever` (the trigger's `keepRunsFor`, or `keep_for` in `weft.toml`). If your
+cap uses `since`, keep runs at least as long as that window. For how to set
+either, go and read [how long a run is kept](../running/the-journal.md#how-long-a-run-is-kept).
+
 ## A provider that states no price
 
 ElevenLabs is the example today. Its image and video generations (`flows/image`, `flows/video`) come

@@ -768,9 +768,10 @@ mod expand_and_contract {
     use super::*;
     use serde_json::{json, Value};
     use weft_core::stored::{Kind, Op};
+    use weft_task_store::db::Transaction;
     use weft_task_store::documents::{Document, Encoding, Fill};
     use weft_task_store::schema_guard::apply_schema_with;
-    use weft_task_store::{DataStep, Until};
+    use weft_task_store::{DataStep, StepWork, Until};
 
     /// The shape before the move: each holder's units inside its row,
     /// and each plan's drive inside its JSON.
@@ -801,10 +802,36 @@ mod expand_and_contract {
         data_steps: &[DataStep {
             table: "moving_holder",
             until: Until::Dropped("units"),
-            sql: "INSERT INTO moving_unit (holder, name, n) SELECT h.id, u.key, (u.value->>'n')::int \
+            work: StepWork::Sql(
+                "INSERT INTO moving_unit (holder, name, n) SELECT h.id, u.key, (u.value->>'n')::int \
                   FROM moving_holder h CROSS JOIN LATERAL jsonb_each(h.units) AS u ON CONFLICT DO NOTHING",
+            ),
         }],
     };
+
+    /// [`AFTER`], its move done by Rust: each holder's units read and
+    /// written back as rows of their own.
+    static AFTER_IN_RUST: SchemaGroup = SchemaGroup {
+        data_steps: &[DataStep { table: "moving_holder", until: Until::Dropped("units"), work: StepWork::Code(move_units) }],
+        ..AFTER
+    };
+
+    fn move_units<'c>(tx: &'c Transaction<'c>) -> futures::future::BoxFuture<'c, anyhow::Result<()>> {
+        Box::pin(async move {
+            let holders: Vec<(i32, weft_task_store::db::Json<Value>)> = tx.all("SELECT id, units FROM moving_holder ORDER BY id", &[]).await?;
+            for (holder, weft_task_store::db::Json(units)) in holders {
+                for (name, unit) in units.as_object().into_iter().flatten() {
+                    let n = unit["n"].as_i64().ok_or_else(|| anyhow::anyhow!("unit {name} has no count"))? as i32;
+                    tx.execute(
+                        "INSERT INTO moving_unit (holder, name, n) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                        &[&holder, name, &n],
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        })
+    }
 
     /// The release between them, as the generator splits it.
     static RELEASE: &[Migration] = &[
@@ -841,10 +868,10 @@ mod expand_and_contract {
     #[weft_db_macros::test]
     async fn a_moved_value_lands_before_its_column_goes(pool: Pool) {
         apply(&pool, &[&BEFORE], NONE).await.expect("the shape before the move");
-        pool.execute("INSERT INTO moving_holder (id, units) VALUES (1, $1)", &[&json!({ "db": { "n": 2 }, "cache": { "n": 1 } })])
+        pool.execute("INSERT INTO moving_holder (id, units) VALUES (1, $1::text::jsonb)", &[&json!({ "db": { "n": 2 }, "cache": { "n": 1 } }).to_string()])
             .await
             .unwrap();
-        pool.execute("INSERT INTO moving_plan (id, plan) VALUES (1, $1)", &[&json!({ "driver": DRIVER, "step": 3 })]).await.unwrap();
+        pool.execute("INSERT INTO moving_plan (id, plan) VALUES (1, $1::text::jsonb)", &[&json!({ "driver": DRIVER, "step": 3 }).to_string()]).await.unwrap();
 
         apply_schema_with(&pool, &[&AFTER], &[&PLANS], RELEASE).await.expect("the boot of today's weft");
 
@@ -859,7 +886,7 @@ mod expand_and_contract {
             .await
             .unwrap();
         assert_eq!(gone, None, "the contract part dropped the column");
-        let (plan, version, driver): (Value, i32, Option<uuid::Uuid>) =
+        let (weft_task_store::db::Json(plan), version, driver): (weft_task_store::db::Json<Value>, i32, Option<uuid::Uuid>) =
             pool.one("SELECT plan, plan_version, driver FROM moving_plan WHERE id = 1", &[]).await.unwrap();
         assert_eq!((plan, version, driver.map(|d| d.to_string())), (json!({ "step": 3 }), 2, Some(DRIVER.to_string())));
 
@@ -869,12 +896,33 @@ mod expand_and_contract {
         assert_eq!(units, 2);
     }
 
+    /// A step done in Rust runs where a step in SQL does: after the expand
+    /// part made where its rows go, before the contract part drops what it
+    /// read, and never again once the column is gone.
+    #[weft_db_macros::test]
+    async fn a_step_in_rust_moves_its_value_before_the_column_goes(pool: Pool) {
+        apply(&pool, &[&BEFORE], NONE).await.expect("the shape before the move");
+        pool.execute("INSERT INTO moving_holder (id, units) VALUES (1, $1::text::jsonb)", &[&json!({ "db": { "n": 2 }, "cache": { "n": 1 } }).to_string()])
+            .await
+            .unwrap();
+
+        apply_schema_with(&pool, &[&AFTER_IN_RUST], &[&PLANS], RELEASE).await.expect("the boot of today's weft");
+
+        let units: Vec<(i32, String, i32)> =
+            pool.all("SELECT holder, name, n FROM moving_unit ORDER BY name", &[]).await.unwrap();
+        assert_eq!(units, vec![(1, "cache".into(), 1), (1, "db".into(), 2)], "moved before the column went");
+        pool.execute("DELETE FROM moving_unit", &[]).await.unwrap();
+        apply_schema_with(&pool, &[&AFTER_IN_RUST], &[&PLANS], RELEASE).await.expect("a boot with nothing to do");
+        let units: i64 = pool.scalar("SELECT count(*) FROM moving_unit", &[]).await.unwrap();
+        assert_eq!(units, 0, "the step stopped with its column");
+    }
+
     /// A move runs on every boot until its column is dropped, so one that
     /// meets units it copied already lands each of them once.
     #[weft_db_macros::test]
     async fn a_move_over_units_it_copied_already_lands_each_once(pool: Pool) {
         apply(&pool, &[&BEFORE], NONE).await.expect("the shape before the move");
-        pool.execute("INSERT INTO moving_holder (id, units) VALUES (1, $1)", &[&json!({ "db": { "n": 2 }, "cache": { "n": 1 } })])
+        pool.execute("INSERT INTO moving_holder (id, units) VALUES (1, $1::text::jsonb)", &[&json!({ "db": { "n": 2 }, "cache": { "n": 1 } }).to_string()])
             .await
             .unwrap();
         apply_schema_with(&pool, &[&AFTER], &[&PLANS], &RELEASE[..1]).await.expect_err(
@@ -923,7 +971,7 @@ mod expand_and_contract {
 mod filled_before_not_null {
     use super::*;
     use weft_task_store::schema_guard::apply_schema_with;
-    use weft_task_store::{DataStep, Until};
+    use weft_task_store::{DataStep, StepWork, Until};
 
     static OWNERS: SchemaGroup = SchemaGroup {
         name: "fill_owner",
@@ -951,9 +999,11 @@ mod filled_before_not_null {
         data_steps: &[DataStep {
             table: "fill_probe",
             until: Until::NotNull("tenant"),
-            sql: "UPDATE fill_probe p SET tenant = o.tenant FROM fill_owner o WHERE o.id = p.id AND p.tenant IS NULL; \
+            work: StepWork::Sql(
+                "UPDATE fill_probe p SET tenant = o.tenant FROM fill_owner o WHERE o.id = p.id AND p.tenant IS NULL; \
                   DELETE FROM fill_probe WHERE tenant IS NULL; \
                   INSERT INTO fill_ran DEFAULT VALUES",
+            ),
         }],
     };
 

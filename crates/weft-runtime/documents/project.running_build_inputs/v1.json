@@ -6,11 +6,11 @@
   {
     "nodeSet": "referenced",
     "assets": {
-      "file:logo.png": {
+      "assets/logo.png\u0000Image": {
         "key": "tenant/assets/logo.png",
         "hash": "sha256:00"
       },
-      "text:readme": "hello"
+      "prompts/readme.txt\u0000String": "hello"
     }
   }
 ]

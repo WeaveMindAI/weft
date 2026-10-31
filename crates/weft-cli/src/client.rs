@@ -560,7 +560,7 @@ const BUSY_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(4);
 /// caller that knows its request is safe to send again and that the
 /// install may be starting up reads the rest itself
 /// (`crate::commands::ensure::look_again_after`).
-// SYNC: busy_answer <-> crates/weft-core/src/install.rs (asks_again)
+// SYNC: busy_answer <-> crates/weft-core/src/install.rs (asks_again), extension-vscode/src/dispatcher.ts (worthTryingAgain)
 pub(crate) fn busy_answer(status: reqwest::StatusCode, from_install: bool) -> bool {
     match status {
         reqwest::StatusCode::TOO_MANY_REQUESTS => !from_install,

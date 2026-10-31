@@ -304,7 +304,7 @@ pub async fn sync_assets(
     refs: &[FileRef],
     source: &dyn AssetSource,
     store: &dyn AssetStore,
-) -> Result<BTreeMap<String, serde_json::Value>> {
+) -> Result<weft_core::project::AssetResolutions> {
     // 1. Hash every referenced file, name its media type from its bytes
     //    (the filename only when the bytes carry no signature), and hold
     //    those bytes to the kind the ref declared. The collector deduped

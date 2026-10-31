@@ -21,6 +21,9 @@ zstd = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
+# The data step that fills the cost table hands the boot a boxed future
+# (`weft_task_store::StepCode`).
+futures = { workspace = true }
 weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [lints]

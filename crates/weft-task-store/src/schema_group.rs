@@ -10,6 +10,10 @@
 //! (`[package.metadata.weft]` in `Cargo.toml`), so writing a migration
 //! names no new worker and asks nobody to resync.
 
+use futures::future::BoxFuture;
+
+use crate::db::Transaction;
+
 /// One module's schema: the canonical DDL, the tables it creates, and the
 /// changes that carry an older database to it. Declared as a `static` next to
 /// the DDL's owning module.
@@ -61,13 +65,27 @@ pub struct DataStep {
     /// What the contract part does, which ends the step's work, and to
     /// what (a column of `table`, or an index).
     pub until: Until,
-    /// The statement that does the work. Nothing records that it ran: only
-    /// the state [`Until`] names stops it, so every boot with schema work to
-    /// do runs it again until a contract part changes that state, and it must
-    /// give the same result run twice (`ON CONFLICT DO NOTHING`, a `SET`
-    /// on the rows still `NULL`).
-    pub sql: &'static str,
+    /// What does the work. Nothing records that it ran: only the state
+    /// [`Until`] names stops it, so every boot with schema work to do runs
+    /// it again until a contract part changes that state, and it must give
+    /// the same result run twice (`ON CONFLICT DO NOTHING`, a `SET` on the
+    /// rows still `NULL`).
+    pub work: StepWork,
 }
+
+/// What does a [`DataStep`]'s work.
+pub enum StepWork {
+    /// One statement (or several, `;`-separated).
+    Sql(&'static str),
+    /// Rust, for what SQL cannot read: a run's record, say, which only
+    /// weft's code decodes (`weft_journal::stored`). Given the contract
+    /// transaction with the step's table already locked; it reads in
+    /// bounded pages, since it may walk every row the install holds.
+    Code(StepCode),
+}
+
+/// The Rust a [`StepWork::Code`] runs, given the contract transaction.
+pub type StepCode = for<'c> fn(&'c Transaction<'c>) -> BoxFuture<'c, anyhow::Result<()>>;
 
 /// What a contract part does, which leaves a [`DataStep`] nothing to do.
 /// Each variant carries the name its condition is about, so a step names

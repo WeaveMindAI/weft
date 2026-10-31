@@ -38,7 +38,8 @@
 //!
 //! The lanes run on the process's own small runtime (see
 //! [`WorkerJournal::start`]), so their wake-ups never land on the threads
-//! serving calls.
+//! serving calls, and encode each batch on the blocking pool, so that
+//! runtime's one thread stays free for the line and the door's ticks.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -260,10 +261,11 @@ impl WorkerJournal {
         self.lanes.iter().all(|lane| lane.queue.lock().expect("record writer").idle())
     }
 
-    /// End `run_id`, a run this worker drives whose record it can no
-    /// longer write (a write of it failed, see [`DriveJournal`], "Poison"):
-    /// the broker writes its ending, failed with `why`, after the last row
-    /// that landed, and the run is no longer this worker's. Asked until the
+    /// End `run_id`, a run this worker holds and cannot end itself (a
+    /// write of its record failed, see [`DriveJournal`], "Poison", or its
+    /// record cannot be read to end it): the broker writes its ending,
+    /// failed with `why`, which says what happened, after the last row that
+    /// landed, and the run is no longer this worker's. Asked until the
     /// broker answers: until then the run reads as running.
     pub async fn give_up(&self, run_id: RunId, why: &str) {
         give_up(self.record.as_ref(), run_id, why).await;
@@ -551,18 +553,18 @@ impl RunLog {
     }
 }
 
-/// End a run whose record its worker can no longer write (see
+/// End a run its worker cannot end itself (see
 /// [`WorkerJournal::give_up`]): asked until the broker answers.
 async fn give_up(record: &dyn RecordClient, run_id: RunId, why: &str) {
     let mut wait = RESEND_FIRST;
     loop {
-        match record.give_up(run_id, format!("the run's record could not be written: {why}")).await {
+        match record.give_up(run_id, why.to_string()).await {
             Ok(()) => return,
             Err(BatchError::Refused(refused)) => {
                 tracing::warn!(
                     target: "weft_engine::journal",
                     %run_id, %refused,
-                    "a run whose record could not be written is no longer this worker's to end"
+                    "a run this worker gave up is no longer this worker's to end"
                 );
                 return;
             }
@@ -570,7 +572,7 @@ async fn give_up(record: &dyn RecordClient, run_id: RunId, why: &str) {
                 tracing::warn!(
                     target: "weft_engine::journal",
                     %run_id, error = %format!("{e:#}"), retry_in_ms = wait.as_millis() as u64,
-                    "could not end a run whose record could not be written; asking again"
+                    "could not end a run this worker gave up; asking again"
                 );
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(RESEND_LONGEST);
@@ -625,7 +627,12 @@ async fn lane_loop(lane: Arc<Lane>, record: Arc<dyn RecordClient>, budget: Arc<B
         }
         let taken = take_batch(&lane, &budget);
         if !taken.is_empty() {
-            let (body, head_runs, programs) = frame(&lane, &taken);
+            // One batch can hold a huge value (see the module doc).
+            let ((body, head_runs, programs), taken) = weft_journal::on_blocking_pool({
+                let lane = lane.clone();
+                move || (frame(&lane, &taken), taken)
+            })
+            .await;
             let answer = send(record.as_ref(), body, resend_for).await;
             if let Ok(answer) = &answer {
                 let went_in = |at: usize| matches!(answer.fates.get(at), Some(Fate::Accepted | Fate::AlreadyApplied));
@@ -637,7 +644,7 @@ async fn lane_loop(lane: Arc<Lane>, record: Arc<dyn RecordClient>, budget: Arc<B
             for run in unwritten {
                 let record = record.clone();
                 let why = run.poison.get().expect("a stopped run keeps its reason");
-                tokio::spawn(async move { give_up(record.as_ref(), run.run_id, &why).await });
+                tokio::spawn(async move { give_up(record.as_ref(), run.run_id, &format!("the run's record could not be written: {why}")).await });
             }
         }
         let mut queue = lane.queue.lock().expect("record writer");
@@ -1082,9 +1089,8 @@ impl JournalClient for DriveJournal {
         self.enqueue(events, replica).await
     }
 
-    async fn events_for_run_id(&self, run_id: RunId) -> anyhow::Result<Vec<RunEvent>> {
-        let record = self.writer.record.record_of(run_id).await?;
-        record.events(run_id).map_err(anyhow::Error::msg)
+    async fn record_page(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<Vec<weft_journal::JournalRow>> {
+        weft_journal::decoded_page(&*self.writer.record, run_id, after).await
     }
 }
 

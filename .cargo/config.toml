@@ -1,8 +1,0 @@
-[build]
-# Every weft process runs on a tokio runtime with its LIFO slot off
-# (`weft_core::process_runtime`), which tokio keeps behind this flag;
-# rustdoc reads its own list, which a doc test of weft-core needs too.
-# Worker builds set the same flag their own way.
-# SYNC: rustflags <-> crates/weft-core/src/builds.rs (WORKER_RUSTFLAGS)
-rustflags = ["--cfg", "tokio_unstable"]
-rustdocflags = ["--cfg", "tokio_unstable"]

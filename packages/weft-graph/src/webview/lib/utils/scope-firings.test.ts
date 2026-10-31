@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { scopeFirings, copyFrames, type ScopeBox } from './scope-firings';
-import type { Frame, ScopeDecidedEvent } from '../../../protocol';
+import type { Frame, ScopeDecidedEvent, ValueRef } from '../../../protocol';
+import { readOnTheSpot } from './value-ref';
 import type { Edge, NodeFiring } from '../types';
 
 function row(nodeId: string, frames: Frame[], over: Partial<NodeFiring> = {}): NodeFiring {
@@ -18,6 +19,16 @@ function row(nodeId: string, frames: Frame[], over: Partial<NodeFiring> = {}): N
 		framesKey: JSON.stringify(frames),
 		...over,
 	};
+}
+
+/** Each port's value, written out in its reference. */
+function written(values: Record<string, unknown>): Record<string, ValueRef> {
+	return Object.fromEntries(Object.entries(values).map(([port, value]) => [port, { from: 'written', value }]));
+}
+
+/** Each port's value its reference holds. */
+function read(ports: Record<string, ValueRef> | undefined): Record<string, unknown> {
+	return Object.fromEntries(Object.entries(ports ?? {}).map(([port, at]) => [port, readOnTheSpot(at)?.value]));
 }
 
 function leg(source: string, sourceHandle: string, target: string, targetHandle: string, path?: string[]): Edge {
@@ -52,14 +63,14 @@ function groupBox(over: Partial<ScopeBox>, rows: Record<string, NodeFiring[]>): 
 describe('scopeFirings: a group box painted from its scope', () => {
 	it('an open copy reads its members: status, and the values at its ports', () => {
 		const rows = {
-			'g.m': [row('g.m', [], { input: { in: 'hello' }, output: { out: { text: 'HELLO', n: 1 } }, costUsd: 0.5 })],
+			'g.m': [row('g.m', [], { input: written({ in: 'hello' }), output: written({ out: { text: 'HELLO', n: 1 } }), costUsd: 0.5 })],
 		};
 		const [firing] = scopeFirings(groupBox({ decisions: [open('g', [], 3)] }, rows));
 		expect(firing.status).toBe('completed');
 		expect(firing.startedAt).toBe(3000);
-		expect(firing.input).toEqual({ x: 'hello' });
+		expect(read(firing.input)).toEqual({ x: 'hello' });
 		// The leg into `self.y` takes `text` off the member's output.
-		expect(firing.output).toEqual({ y: 'HELLO' });
+		expect(read(firing.output)).toEqual({ y: 'HELLO' });
 		expect(firing.costUsd).toBe(0.5);
 		expect(firing.skipReason).toBeUndefined();
 	});
@@ -82,8 +93,8 @@ describe('scopeFirings: a group box painted from its scope', () => {
 	it('one card per copy, each with its own rows, and only the copies of the call on screen', () => {
 		const rows = {
 			'g.m': [
-				row('g.m', [{ index: 0 }], { input: { in: 'zero' }, costUsd: 1 }),
-				row('g.m', [{ index: 1 }], { input: { in: 'one' }, costUsd: 2 }),
+				row('g.m', [{ index: 0 }], { input: written({ in: 'zero' }), costUsd: 1 }),
+				row('g.m', [{ index: 1 }], { input: written({ in: 'one' }), costUsd: 2 }),
 			],
 		};
 		const decisions = [
@@ -94,7 +105,7 @@ describe('scopeFirings: a group box painted from its scope', () => {
 		];
 		const firings = scopeFirings(groupBox({ decisions }, rows));
 		expect(firings.map((f) => f.framesKey)).toEqual([JSON.stringify([{ index: 0 }]), JSON.stringify([{ index: 1 }])]);
-		expect(firings.map((f) => f.input)).toEqual([{ x: 'zero' }, { x: 'one' }]);
+		expect(firings.map((f) => read(f.input))).toEqual([{ x: 'zero' }, { x: 'one' }]);
 		expect(firings.map((f) => f.costUsd)).toEqual([1, 2]);
 	});
 
@@ -116,7 +127,7 @@ describe('scopeFirings: a group box painted from its scope', () => {
 	it('a closed input reads closed, and a handed one keeps how it got there', () => {
 		const rows = {
 			'g.m': [row('g.m', [], { input: {}, closedPorts: ['in'] })],
-			'g.n': [row('g.n', [], { input: { in: 5 }, providedPorts: ['in'] })],
+			'g.n': [row('g.n', [], { input: written({ in: 5 }), providedPorts: ['in'] })],
 		};
 		const box = groupBox({
 			decisions: [open('g', [])],
@@ -126,15 +137,15 @@ describe('scopeFirings: a group box painted from its scope', () => {
 		}, rows);
 		const [firing] = scopeFirings(box);
 		expect(firing.closedPorts).toEqual(['x']);
-		expect(firing.input).toEqual({ z: 5 });
+		expect(read(firing.input)).toEqual({ z: 5 });
 		expect(firing.providedPorts).toEqual(['z']);
 	});
 
 	it('an include box reads its ports off the wires outside it', () => {
 		// The call site `inc` at the top: its body runs one call frame deeper.
 		const rows: Record<string, NodeFiring[]> = {
-			a: [row('a', [], { output: { out: { name: 'ada' } } })],
-			b: [row('b', [], { input: { in: 'hi ada' } })],
+			a: [row('a', [], { output: written({ out: { name: 'ada' } }) })],
+			b: [row('b', [], { input: written({ in: 'hi ada' }) })],
 		};
 		const body = row('@lib:inc.strip', [{ site: 'inc' }]);
 		const box: ScopeBox = {
@@ -151,8 +162,8 @@ describe('scopeFirings: a group box painted from its scope', () => {
 		};
 		const [firing] = scopeFirings(box);
 		expect(firing.status).toBe('completed');
-		expect(firing.input).toEqual({ who: 'ada' });
-		expect(firing.output).toEqual({ greeting: 'hi ada' });
+		expect(read(firing.input)).toEqual({ who: 'ada' });
+		expect(read(firing.output)).toEqual({ greeting: 'hi ada' });
 	});
 });
 

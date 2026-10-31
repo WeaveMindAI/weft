@@ -81,22 +81,43 @@ enum Pending {
 impl Pending {
     const BOTH: [Pending; 2] = [Pending::Queued, Pending::Older];
 
-    /// Up to [`ROUND`] of the runs waiting here, locked on `tx` with `FOR
-    /// UPDATE SKIP LOCKED`, so two searches at once never index one run
-    /// twice.
-    async fn take(self, tx: &db::Transaction<'_>) -> db::Result<Vec<RunId>> {
+    /// Up to [`ROUND`] of the runs waiting here, read without locking
+    /// them: a round reads each run's whole record, which is no time to
+    /// hold a transaction open. Two searches at once may read the same
+    /// runs; only one writes each entry ([`Pending::write`]).
+    async fn waiting(self, db: &impl Client) -> db::Result<Vec<RunId>> {
         match self {
-            Pending::Queued => {
-                tx.scalars("SELECT run_id FROM run_search_queue ORDER BY run_id LIMIT $1 FOR UPDATE SKIP LOCKED", &[&ROUND]).await
-            }
+            Pending::Queued => db.scalars("SELECT run_id FROM run_search_queue ORDER BY run_id LIMIT $1", &[&ROUND]).await,
             Pending::Older => {
-                tx.scalars(
-                    "SELECT run_id FROM run_search WHERE format < $2 ORDER BY run_id LIMIT $1 FOR UPDATE SKIP LOCKED",
-                    &[&ROUND, &FORMAT],
-                )
-                .await
+                db.scalars("SELECT run_id FROM run_search WHERE format < $2 ORDER BY run_id LIMIT $1", &[&ROUND, &FORMAT]).await
             }
         }
+    }
+
+    /// Write `entry` as run `run_id`'s if the run still waits here, in one
+    /// statement: a queued run leaves the queue in the same write that
+    /// builds its entry, so a search that stops halfway leaves every run it
+    /// did not write still waiting, and of two searches that built the same
+    /// run, the one that writes second finds it waiting no more and writes
+    /// nothing. A queued run erased meanwhile is not queued any more, so it
+    /// gets no entry.
+    async fn write(self, db: &impl Client, run_id: RunId, entry: &Entry) -> db::Result<()> {
+        match self {
+            Pending::Queued => db.execute(
+                "WITH taken AS (DELETE FROM run_search_queue WHERE run_id = $1 RETURNING run_id) \
+                 INSERT INTO run_search (run_id, words, nodes, format) \
+                 SELECT run_id, to_tsvector('simple', $2::text), $3, $4 FROM taken \
+                 ON CONFLICT (run_id) DO UPDATE SET words = EXCLUDED.words, nodes = EXCLUDED.nodes, format = EXCLUDED.format",
+                &[&run_id, &entry.words, &entry.nodes, &FORMAT],
+            )
+            .await?,
+            Pending::Older => db.execute(
+                "UPDATE run_search SET words = to_tsvector('simple', $2::text), nodes = $3, format = $4 WHERE run_id = $1 AND format < $4",
+                &[&run_id, &entry.words, &entry.nodes, &FORMAT],
+            )
+            .await?,
+        };
+        Ok(())
     }
 }
 
@@ -116,23 +137,38 @@ impl Entry {
     /// With no program to spell them by, the entry holds the run's words
     /// alone: an id is not a name a person asks with.
     pub fn of(run_id: RunId, events: &[RunEvent], g: Option<&impl GraphView>) -> Self {
-        let mut words = weft_journal::search::SearchText::default();
-        let mut nodes = std::collections::BTreeSet::new();
-        for event in events {
-            words.push(event);
-            let (RunEvent::NodeStarted { node_id, frames, .. }, Some(g)) = (event, g) else { continue };
-            let path: Vec<String> = weft_core::frames::call_path(frames).into_iter().map(str::to_string).collect();
-            match weft_core::project::placed_address(g, node_id, &path) {
-                Some(spelled) => {
-                    nodes.insert(spelled);
-                }
-                None => tracing::error!(
-                    target: "weft_dispatcher::search", %run_id, node = %node_id,
-                    "a run's record starts a node its program does not have; `--through` does not find the run by it"
-                ),
+        let mut entry = Building::default();
+        events.iter().for_each(|event| entry.push(run_id, event, g));
+        entry.finish()
+    }
+}
+
+/// An entry being built, its run's record fed in order (a page at a time:
+/// it keeps the words and nodes so far, never the record).
+#[derive(Default)]
+struct Building {
+    words: weft_journal::search::SearchText,
+    nodes: std::collections::BTreeSet<String>,
+}
+
+impl Building {
+    fn push(&mut self, run_id: RunId, event: &RunEvent, g: Option<&impl GraphView>) {
+        self.words.push(event);
+        let (RunEvent::NodeStarted { node_id, frames, .. }, Some(g)) = (event, g) else { return };
+        let path: Vec<String> = weft_core::frames::call_path(frames).into_iter().map(str::to_string).collect();
+        match weft_core::project::placed_address(g, node_id, &path) {
+            Some(spelled) => {
+                self.nodes.insert(spelled);
             }
+            None => tracing::error!(
+                target: "weft_dispatcher::search", %run_id, node = %node_id,
+                "a run's record starts a node its program does not have; `--through` does not find the run by it"
+            ),
         }
-        Self { words: words.into_text(), nodes: nodes.into_iter().collect() }
+    }
+
+    fn finish(self) -> Entry {
+        Entry { words: self.words.into_text(), nodes: self.nodes.into_iter().collect() }
     }
 }
 
@@ -159,38 +195,51 @@ pub async fn index_queued(pool: &db::Pool) -> anyhow::Result<usize> {
     Ok(indexed)
 }
 
-/// One round: up to [`ROUND`] runs waiting at `pending` indexed; answers
-/// how many.
+/// One round: up to [`ROUND`] runs waiting at `pending` indexed, each
+/// record read a page at a time outside any transaction and each entry
+/// written on its own ([`Pending::write`]); answers how many were read.
+/// Everything runs on the round's one connection.
 async fn round(pool: &db::Pool, programs: &mut Programs, pending: Pending) -> anyhow::Result<usize> {
-    let mut conn = pool.get().await?;
-    let tx = conn.transaction().await?;
-    let ids = pending.take(&tx).await?;
+    let conn = pool.get().await?;
+    let ids = pending.waiting(&conn).await?;
     for run_id in &ids {
-        let record = weft_journal::record::read_record(&tx, *run_id, None).await?;
         let id = *run_id;
-        let entry = match weft_journal::on_blocking_pool(move || record.events(id)).await {
-            Ok(events) => {
-                let program = started_on(&tx, programs, *run_id, &events).await?;
-                weft_journal::on_blocking_pool(move || Entry::of(id, &events, program.as_deref().map(ProjectGraph::new).as_ref())).await
+        let first = weft_journal::record::RawRecord { rows: weft_journal::record::read_first_row(&conn, id).await?.into_iter().collect() };
+        let birth = weft_journal::on_blocking_pool(move || first.decode(id)).await;
+        let built = match birth {
+            Ok(birth) => {
+                let program = started_on(&conn, programs, id, birth.first().map(|row| &row.event)).await?;
+                // A row that does not read leaves the run unsearchable, as
+                // a record whose birth does not.
+                weft_journal::record::fold_pages(|after| weft_journal::record::read_page(&conn, id, after), None, Ok(Building::default()), move |entry: &mut Result<Building, String>, page| {
+                    if let Ok(building) = entry {
+                        match page.decode(id) {
+                            Ok(rows) => {
+                                let g = program.as_deref().map(ProjectGraph::new);
+                                rows.iter().for_each(|row| building.push(id, &row.event, g.as_ref()));
+                            }
+                            Err(e) => *entry = Err(e),
+                        }
+                    }
+                    Ok(())
+                })
+                .await?
             }
+            Err(e) => Err(e),
+        };
+        let entry = match built {
+            Ok(entry) => entry.finish(),
             Err(e) => {
                 tracing::warn!(target: "weft_dispatcher::search", %run_id, error = %e, "a run's record does not read; it is not searchable");
                 Entry::default()
             }
         };
-        tx.execute(
-            "INSERT INTO run_search (run_id, words, nodes, format) VALUES ($1, to_tsvector('simple', $2::text), $3, $4) \
-             ON CONFLICT (run_id) DO UPDATE SET words = EXCLUDED.words, nodes = EXCLUDED.nodes, format = EXCLUDED.format",
-            &[run_id, &entry.words, &entry.nodes, &FORMAT],
-        )
-        .await?;
+        pending.write(&conn, id, &entry).await?;
     }
-    tx.execute("DELETE FROM run_search_queue WHERE run_id = ANY($1)", &[&ids]).await?;
-    tx.commit().await?;
     Ok(ids.len())
 }
 
-/// The program `events` (a run's record) was started on, read on `db`
+/// The program the run whose birth is `birth` was started on, read on `db`
 /// and kept in `programs`: the registered one its birth names (the
 /// program it was cut from, for a run of a cut, which leaves out what it
 /// reuses). `None` when there is none to spell its nodes by (gone, never
@@ -199,9 +248,9 @@ async fn started_on(
     db: &impl Client,
     programs: &mut Programs,
     run_id: RunId,
-    events: &[RunEvent],
+    birth: Option<&RunEvent>,
 ) -> anyhow::Result<Option<Arc<ProjectDefinition>>> {
-    let Some(RunEvent::RunStarted { project_id, definition_hash, cut_from, .. }) = events.first() else {
+    let Some(RunEvent::RunStarted { project_id, definition_hash, cut_from, .. }) = birth else {
         tracing::warn!(target: "weft_dispatcher::search", %run_id, "a run's record does not start with its birth; its nodes are not searchable");
         return Ok(None);
     };

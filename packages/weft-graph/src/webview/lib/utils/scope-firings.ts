@@ -1,6 +1,7 @@
-import { callPathOf, type Frame, type ScopeDecidedEvent } from '../../../protocol';
+import { callPathOf, type Frame, type ScopeDecidedEvent, type ValueRef } from '../../../protocol';
 import type { Edge, NodeFiring, NodeFiringStatus, RunTerminal } from '../types';
 import { containerStatus } from './container-status';
+import { partOf } from './value-ref';
 
 /** What one box (a group, or an include's call site) is painted from: a
  *  group is no node of a run, so the box has no firing of its own. Its
@@ -95,15 +96,15 @@ export function scopeFirings(box: ScopeBox): NodeFiring[] {
  *  keys off the value on the reading side says nothing about the value
  *  itself, so it is left out. */
 function portValues(box: ScopeBox, framesKey: string): {
-	input: Record<string, unknown>;
-	output: Record<string, unknown>;
+	input: Record<string, ValueRef>;
+	output: Record<string, ValueRef>;
 	closedPorts: string[];
 	providedPorts?: string[];
 	inheritedPorts?: Record<string, string>;
 } {
 	const rowAt = (id: string, side: 'source' | 'target') => box.rowsOf(id, side).find((r) => r.framesKey === framesKey);
-	const input: Record<string, unknown> = Object.create(null);
-	const output: Record<string, unknown> = Object.create(null);
+	const input: Record<string, ValueRef> = Object.create(null);
+	const output: Record<string, ValueRef> = Object.create(null);
 	const closedPorts: string[] = [];
 	const providedPorts: string[] = [];
 	const inheritedPorts: Record<string, string> = Object.create(null);
@@ -114,17 +115,17 @@ function portValues(box: ScopeBox, framesKey: string): {
 		const port = leg.targetHandle ?? '';
 		if (!row) return undefined;
 		if (row.closedPorts?.includes(port)) return { closed: true as const, row, port };
-		const values = row.input as Record<string, unknown> | undefined;
+		const values = row.input;
 		if (!values || !Object.prototype.hasOwnProperty.call(values, port)) return undefined;
 		return { closed: false as const, value: values[port], row, port };
 	};
 	/** What the producer at the start of `leg` sent, its keys taken. */
 	const sent = (leg: Edge) => {
 		const row = rowAt(leg.source, 'source');
-		const values = row?.output as Record<string, unknown> | undefined;
+		const values = row?.output;
 		const port = leg.sourceHandle ?? '';
 		if (!row || row.status !== 'completed' || !values || !Object.prototype.hasOwnProperty.call(values, port)) return undefined;
-		return walk(values[port], leg.path ?? []);
+		return { value: partOf(values[port], leg.path ?? []) };
 	};
 	for (const port of box.inPorts) {
 		const inner = `${port}__inner`;
@@ -161,17 +162,6 @@ function portValues(box: ScopeBox, framesKey: string): {
 		...(providedPorts.length > 0 ? { providedPorts } : {}),
 		...(Object.keys(inheritedPorts).length > 0 ? { inheritedPorts } : {}),
 	};
-}
-
-/** `value` with `path`'s keys taken off it in order, or `undefined` when a
- *  key is missing. */
-function walk(value: unknown, path: readonly string[]): { value: unknown } | undefined {
-	let at = value;
-	for (const key of path) {
-		if (typeof at !== 'object' || at === null || Array.isArray(at) || !Object.prototype.hasOwnProperty.call(at, key)) return undefined;
-		at = (at as Record<string, unknown>)[key];
-	}
-	return { value: at };
 }
 
 /** Is a row at `frames` inside the copy at `copy`: the same frame stack,

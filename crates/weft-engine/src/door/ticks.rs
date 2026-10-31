@@ -43,7 +43,7 @@
 use std::time::Duration;
 
 /// How often the loop ticks while something is under way (scaled).
-pub(super) const TICK_EVERY: Duration = Duration::from_secs(1);
+pub(crate) const TICK_EVERY: Duration = Duration::from_secs(1);
 
 /// What the worker says it has under way, besides the door's own count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,11 +175,12 @@ mod tests {
         ticking_with(move || if busy() { UnderWay::Working } else { UnderWay::Nothing }).await
     }
 
-    /// A door serving `x`, ticking, the worker saying it has `under_way`.
+    /// A door serving `x`, ticking on the test's own runtime (its clock
+    /// paused), the worker saying it has `under_way`.
     async fn ticking_with(under_way: impl Fn() -> UnderWay + Send + Sync + 'static) -> (Arc<Door>, Arc<FakeDoorBroker>) {
         let broker = FakeDoorBroker::new(vec![route("t1", "route", "x")]);
         let door = door(broker.clone());
-        door.start_ticks(Box::new(under_way));
+        door.start_ticks(&tokio::runtime::Handle::current(), Box::new(under_way));
         (door, broker)
     }
 
@@ -325,7 +326,7 @@ mod tests {
         armed(&mut trigger).spec.limits = weft_core::signal::EntryLimits { per_minute: Some(1), ..Default::default() };
         let broker = FakeDoorBroker::new(vec![trigger]);
         let door = door(broker.clone());
-        door.start_ticks(Box::new(|| UnderWay::Nothing));
+        door.start_ticks(&tokio::runtime::Handle::current(), Box::new(|| UnderWay::Nothing));
         sleep(secs(20.0)).await;
         assert!(ticks(&broker).is_empty(), "asleep since it started");
 

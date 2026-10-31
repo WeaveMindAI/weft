@@ -31,7 +31,7 @@ use weft_e2e::access::{catalog_spec, SeededGrant};
 use weft_e2e::ensure::{self, env_group_or_skip, env_or_skip};
 use weft_e2e::platform::Platform;
 use weft_e2e::{project::Project, run, SettledRun};
-use weft_task_store::db::{Client as _, Pool};
+use weft_task_store::db::{self, Client as _, Pool};
 
 /// Sign a synthetic Slack push exactly as Slack signs (the v0 scheme
 /// over `v0:{timestamp}:{body}`), with the shipped recipe's own scheme.
@@ -73,19 +73,20 @@ async fn seed_slack_grant(
     let grant_id = uuid::Uuid::new_v4();
     pool.execute(
         "INSERT INTO access_grant
-           (id, tenant_id, service, registration_sealed, client_id, project_id, spec_json,
+           (id, tenant_id, service, registration_sealed, client_id, project_id, spec,
             events_recipe_hash, values_sealed, granted_scopes, permissions_verified,
-            identity, provider_account, spec_json_version)
+            identity, provider_account, spec_version, exclusive)
          VALUES ($1, 'local', 'slack', $2, $3, NULL, $4, $5, $6, '[]', FALSE, 'events-e2e',
-                 'T0E2E', $7)",
+                 'T0E2E', $7, $8)",
         &[
             &grant_id,
             &weft_access_store::seal_json(&json!({ "label": "E2E app", "client_id": client_id }))?,
             &client_id,
-            &spec,
+            &db::JsonText(&spec),
             &recipe_hash,
             &weft_access_store::seal_json(&json!({ "token": "xoxb-never-used", "teamId": "T0E2E" }))?,
             &weft_core::AccessSpec::STORED.version(),
+            &(spec.get("grants") == Some(&json!("exclusive"))),
         ],
     )
     .await?;
@@ -94,7 +95,7 @@ async fn seed_slack_grant(
         "INSERT INTO service_events_recipe (service, recipe_hash, events_json, events_json_version)
          VALUES ('slack', $1, $2, $3)
          ON CONFLICT (service, recipe_hash) DO UPDATE SET updated_at = now()",
-        &[&recipe_hash, &serde_json::to_value(&events)?, &weft_core::access::events::STORED_EVENTS.version()],
+        &[&recipe_hash, &db::JsonText(&events), &weft_core::access::events::STORED_EVENTS.version()],
     )
     .await?;
     Ok((grant_id, seeded))

@@ -1,11 +1,13 @@
 //! A run's record: its events (`RunEvent`), how they are stored
-//! (`stored`), carried (`frame`) and written and read (`record`), and how
+//! (`stored`), carried (`frame`) and written and read (`record`, and the
+//! costs it reports: `costs`), and how
 //! folding them over the program rebuilds the run (`fold`). Shared by the
 //! dispatcher, the engine and the broker, which all need the same events
 //! and the same writes. The listener never touches it: an event it holds
 //! reaches a run through the worker's door or a `fire_signal` task.
 
 pub mod birth;
+pub mod costs;
 pub mod events;
 pub mod fold;
 pub mod frame;
@@ -19,14 +21,15 @@ pub mod unrecorded;
 
 pub use events::{redacted, RunEvent, Seed};
 pub use fold::{fold_to_snapshot, unpriced_charges_closed, unpriced_cost, ChargeBook, EndedWait, FiringView, Fold, FoldEffects, OpenedCharge};
-pub use seed::{fold_seeded, seed_chain, LiveFold, SeedChain};
-pub use traits::{BatchError, JournalClient, JournalRow, Position, RecordClient};
+pub use seed::{seed_chain, LiveFold, SeedChain};
+pub use traits::{decoded_page, rows_after, BatchError, JournalClient, JournalRow, Position, RecordClient};
 
-/// Run `work`, which decodes or folds a run's whole record, on tokio's
+/// Run `work`, which decodes, folds or encodes records, on tokio's
 /// blocking pool, and answer what it answers. A long run's record is real
 /// work, and a thread that serves calls never does it: every reader of a whole
-/// record, in the dispatcher and the broker, comes through here. A panic
-/// in `work` carries on in the caller, as if it had run there.
+/// record, in the dispatcher and the broker, comes through here, and so does
+/// every batch a worker's writer lanes encode. A panic in `work` carries on
+/// in the caller, as if it had run there.
 pub async fn on_blocking_pool<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
     match tokio::task::spawn_blocking(work).await {
         Ok(answer) => answer,

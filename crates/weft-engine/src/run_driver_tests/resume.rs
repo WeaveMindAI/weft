@@ -120,11 +120,21 @@
 
     type Applied = (PulseTable, NodeFiringTable, weft_core::primitive::KickTable, Vec<FiringLocation>);
 
+    /// `events` folded the way a worker folds the record it drives on
+    /// (`Fold::driving`).
+    fn driving_snapshot(project: &Arc<ProjectDefinition>, events: &[RunEvent]) -> weft_core::primitive::RunSnapshot {
+        let mut fold = weft_journal::Fold::new(run_id(), project.clone()).driving();
+        for event in events {
+            fold.apply(event);
+        }
+        fold.into_snapshot()
+    }
+
     /// The tables `apply_snapshot` leaves, and the firings it hands back
     /// to be failed.
     fn apply_with_crashed(events: &[RunEvent]) -> Applied {
         let project = await_project();
-        let snap = weft_journal::fold_to_snapshot(run_id(), project.clone(), events);
+        let snap = driving_snapshot(&project, events);
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
         let mut pulses = PulseTable::default();
         let mut firings = NodeFiringTable::default();
@@ -134,6 +144,7 @@
         let program = crate::plan::ProgramTables::new(project.clone());
         let crashed = apply_snapshot(
             &program, snap, &mut pulses, &mut firings, &mut kicked, &mut ScopeTable::default(), &mut awaited, &mut loops,
+            &mut weft_core::run::forget::Forgetting::new(),
         )
         .expect("the snapshot resumes");
         (pulses, firings, kicked, crashed.into_iter().map(|firing| firing.loc).collect())
@@ -204,13 +215,14 @@
     /// (location, read a stream).
     fn apply_stream(events: &[RunEvent]) -> Vec<(FiringLocation, bool)> {
         let project = stream_project();
-        let snap = weft_journal::fold_to_snapshot(run_id(), project.clone(), events);
+        let snap = driving_snapshot(&project, events);
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
         let mut pulses = PulseTable::default();
         let mut firings = NodeFiringTable::default();
         apply_snapshot(
             &crate::plan::ProgramTables::new(project.clone()), snap, &mut pulses, &mut firings,
             &mut weft_core::primitive::KickTable::new(), &mut ScopeTable::default(), &mut HashMap::new(), &mut LoopRuntime::new(),
+            &mut weft_core::run::forget::Forgetting::new(),
         )
         .expect("the snapshot resumes")
         .into_iter()

@@ -5,13 +5,14 @@
 //! `weft_journal::RUN_LOG_CHANNEL`, one project and the runs of it that got
 //! rows. When nobody here follows that project, the announcement is
 //! dropped after reading its first id. When somebody does, each of its runs
-//! is read past the last row this process painted, folded into the run's
-//! projection (`crate::projection::RunProjector`), and the events it
-//! paints are published to this process's subscribers. A run first seen
-//! here (it started before anybody watched, or this process just started
-//! watching it) is read and painted from its birth: the screen dedups by
-//! event id (`journal:{seq}:{index}`), so painting a row twice is harmless,
-//! and missing one is not.
+//! is read past the last row this process painted, a page at a time
+//! (`crate::painting`), folded into the run's projection, and the events
+//! each page paints are published to this process's subscribers as one
+//! item. A run first seen here (it started before anybody watched, or this
+//! process just started watching it) is read and painted from its birth:
+//! a follower of one run skips what it holds already by each event's place
+//! in the record (`journal:{seq}:{index}:{k}`), so painting a row twice is
+//! harmless, and missing one is not.
 //!
 //! A relay of this process's own subscribers, living while the process
 //! does: every dispatcher process reads for its own watchers, so nothing is
@@ -24,18 +25,20 @@
 //! The record is the durable shape; the events are derived by folding the
 //! rows over the program, the same way the replay does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use weft_core::live_event::ShownEvent;
 use weft_core::RunId;
-use weft_journal::RunEvent;
 use weft_task_store::pg_signal::Heard;
 
-use crate::projection::{run_program, RunProjector, ProgramLookup};
+use crate::events::EventBus;
+use crate::painting::{Painting, Sink};
+use crate::projection::RunProjector;
 use crate::state::DispatcherState;
 
 /// A projection that has painted no row for this long is dropped: a run
-/// parked on a form for days would otherwise hold its whole fold in this
+/// parked on a form for days would otherwise hold its fold in this
 /// process's RAM. Its next row rebuilds it from the record.
 const IDLE_TTL: Duration = Duration::from_secs(10 * 60);
 
@@ -44,14 +47,26 @@ struct LiveRun {
     project_id: uuid::Uuid,
     projector: RunProjector,
     /// The last record row painted.
-    painted: i32,
+    painted: Option<i32>,
     last_row_at: Instant,
 }
 
-/// Every run this process paints right now.
+/// A run whose projection went idle and was dropped: what its rebuild needs
+/// so its watchers hear nothing twice. The rows through `painted` were
+/// published, with every corruption they paint, so a rebuild folds those
+/// rows quietly and says nothing about them again (a screen counts every
+/// corruption it hears).
+struct IdleRun {
+    project_id: uuid::Uuid,
+    painted: Option<i32>,
+}
+
+/// Every run this process paints right now, and the ones it painted whose
+/// projection went idle, for as long as their project is followed here.
 #[derive(Default)]
 struct Views {
     runs: HashMap<RunId, LiveRun>,
+    idle: HashMap<RunId, IdleRun>,
 }
 
 /// Paint the runs of the projects followed on this process, for the
@@ -92,139 +107,143 @@ impl Views {
     /// `runs` of `project_id` got rows.
     async fn logged(&mut self, state: &DispatcherState, project_id: uuid::Uuid, runs: &[RunId]) -> anyhow::Result<()> {
         if !state.events.watched(project_id).await {
-            self.runs.retain(|_, live| live.project_id != project_id);
+            self.forget_project(project_id);
             return Ok(());
         }
+        let woken = self.woken(&*state.runs, runs).await?;
         for run_id in runs {
-            self.paint(state, *run_id, project_id).await?;
+            if !self.idle.contains_key(run_id) || woken.contains(run_id) {
+                self.paint(state, *run_id, project_id).await?;
+            }
         }
         Ok(())
     }
 
-    /// Read every run painted here past its last painted row.
+    /// Read every run painted here past its last painted row: the live
+    /// ones each, and the idle ones only once one read over them all
+    /// found rows past what was painted.
     async fn recheck(&mut self, state: &DispatcherState) -> anyhow::Result<()> {
-        let open: Vec<(RunId, uuid::Uuid)> = self.runs.iter().map(|(id, live)| (*id, live.project_id)).collect();
-        for (run_id, project_id) in open {
-            if state.events.watched(project_id).await {
-                self.paint(state, run_id, project_id).await?;
-            } else {
-                self.runs.remove(&run_id);
+        let projects: HashSet<uuid::Uuid> =
+            self.runs.values().map(|live| live.project_id).chain(self.idle.values().map(|idle| idle.project_id)).collect();
+        for project_id in projects {
+            if !state.events.watched(project_id).await {
+                self.forget_project(project_id);
             }
         }
+        let idle: Vec<RunId> = self.idle.keys().copied().collect();
+        let woken = self.woken(&*state.runs, &idle).await?;
+        let open: Vec<(RunId, uuid::Uuid)> = self
+            .runs
+            .iter()
+            .map(|(id, live)| (*id, live.project_id))
+            .chain(self.idle.iter().filter(|(id, _)| woken.contains(id)).map(|(id, idle)| (*id, idle.project_id)))
+            .collect();
+        for (run_id, project_id) in open {
+            self.paint(state, run_id, project_id).await?;
+        }
         Ok(())
+    }
+
+    /// Which of `runs` that are idle here got rows past what was painted,
+    /// in one read however many are idle: an idle run is rebuilt only
+    /// then.
+    async fn woken(&self, store: &dyn crate::store::RunStore, runs: &[RunId]) -> anyhow::Result<HashSet<RunId>> {
+        let past: Vec<(RunId, Option<i32>)> = runs.iter().filter_map(|id| self.idle.get(id).map(|idle| (*id, idle.painted))).collect();
+        if past.is_empty() {
+            return Ok(HashSet::new());
+        }
+        Ok(store.written_past(&past).await?.into_iter().collect())
+    }
+
+    /// Nobody here follows `project_id` any more: nothing of its runs is
+    /// kept. A watcher that comes later hears each run from its birth.
+    fn forget_project(&mut self, project_id: uuid::Uuid) {
+        self.runs.retain(|_, live| live.project_id != project_id);
+        self.idle.retain(|_, idle| idle.project_id != project_id);
     }
 
     /// Paint the rows of `run_id` past the last one painted, opening
-    /// its projection from its birth when it has none here.
+    /// its projection from its birth when it has none here, and rebuilding
+    /// it when it went idle (asked only once rows landed past what was
+    /// painted, [`Self::woken`]). A read that fails (the database, for
+    /// now) leaves the run as idle as of what was published, so the next
+    /// try says nothing twice.
     async fn paint(&mut self, state: &DispatcherState, run_id: RunId, project_id: uuid::Uuid) -> anyhow::Result<()> {
-        let after = self.runs.get(&run_id).map(|live| live.painted);
-        let record = {
-            let conn = state.pg_pool.get().await?;
-            weft_journal::record::read_record(&conn, run_id, after).await?
+        let (painting, last_row_at) = match (self.runs.remove(&run_id), self.idle.remove(&run_id)) {
+            (Some(live), _) => (Painting { painted: live.painted, ..Painting::new(live.projector) }, live.last_row_at),
+            (None, Some(idle)) => {
+                // Its rows through `painted` were published, with whatever
+                // they paint of why the run cannot be painted whole.
+                let projector = match crate::painting::open(state, run_id, project_id).await {
+                    Ok(projector) => projector,
+                    Err(e) => {
+                        self.idle.insert(run_id, idle);
+                        return Err(e);
+                    }
+                };
+                (Painting { shown_through: idle.painted, ..Painting::new(projector) }, Instant::now())
+            }
+            (None, None) => (Painting::new(crate::painting::open(state, run_id, project_id).await?), Instant::now()),
         };
-        let Some(last) = record.rows.last().map(|row| row.seq) else { return Ok(()) };
-        // Decoding and folding a run first seen here reads its whole
-        // record: off this task, which every watched run shares, and off
-        // the threads serving calls.
-        let rows = match weft_journal::on_blocking_pool(move || record.decode(run_id)).await {
-            Ok(rows) => rows,
-            Err(reason) => {
-                // The run paints only what needs no program from here on;
-                // its corruption is said once, as its projection opens.
-                publish_unreadable(
-                    state,
-                    run_id,
-                    project_id,
-                    weft_core::primitive::CorruptionSite::UndecodableRow,
-                    format!("a row of this run no longer decodes: {reason}"),
-                )
-                .await;
-                self.runs.insert(
-                    run_id,
-                    LiveRun {
-                        project_id,
-                        projector: RunProjector::new(run_id, ProgramLookup::Unreadable(String::new()), project_id),
-                        painted: last,
-                        last_row_at: Instant::now(),
-                    },
-                );
-                return Ok(());
+        let before = painting.painted;
+        let painted = crate::painting::paint(&*state.runs, run_id, painting, Published { events: state.events.clone(), project_id }).await;
+        let (painting, _) = match painted {
+            Ok(painted) => painted,
+            Err(cut) => {
+                self.idle.insert(run_id, IdleRun { project_id, painted: cut.delivered });
+                return Err(cut.into());
             }
         };
-        let mut live = match self.runs.remove(&run_id) {
-            Some(live) => live,
-            None => LiveRun { project_id, projector: open_projection(state, run_id, project_id, &rows).await?, painted: -1, last_row_at: Instant::now() },
-        };
-        let mut projector = live.projector;
-        let (projector, painted, ended) = weft_journal::on_blocking_pool(move || {
-            let mut painted = Vec::new();
-            let mut ended = false;
-            for row in &rows {
-                ended |= row.event.is_run_terminal();
-                painted.extend(crate::events::IdentifiedEvent::recorded(row.seq, row.index, ()).project(|()| projector.project(&row.event)));
-            }
-            (projector, painted, ended)
-        })
-        .await;
-        live.projector = projector;
-        for event in painted {
-            state.events.publish_local(event).await;
-        }
-        live.painted = last;
-        live.last_row_at = Instant::now();
-        // An ended run gets no more rows.
-        if !ended {
-            self.runs.insert(run_id, live);
-        }
+        // A run that ended stays like any other until it goes idle: its
+        // record can still get rows (a meter settling a call it measured),
+        // and painting them goes on from here instead of from its birth.
+        self.runs.insert(run_id, LiveRun {
+            project_id,
+            projector: painting.projector,
+            painted: painting.painted,
+            last_row_at: if painting.painted != before { Instant::now() } else { last_row_at },
+        });
         Ok(())
     }
 
-    /// Drop the projections that painted nothing for a while. One that
-    /// does not fold at all holds no RAM worth freeing, and reopening it
-    /// would republish its corruption, so it stays until its ending.
+    /// Drop the projections that painted nothing for a while, every run
+    /// alike, keeping what a rebuild needs to say nothing twice
+    /// ([`IdleRun`]).
     fn forget_idle(&mut self, now: Instant) {
-        self.runs.retain(|_, live| !live.projector.folds() || now.duration_since(live.last_row_at) < IDLE_TTL);
+        let idle: Vec<RunId> = self.runs.iter().filter(|(_, live)| now.duration_since(live.last_row_at) >= IDLE_TTL).map(|(id, _)| *id).collect();
+        for run_id in idle {
+            if let Some(live) = self.runs.remove(&run_id) {
+                self.idle.insert(run_id, IdleRun { project_id: live.project_id, painted: live.painted });
+            }
+        }
     }
 }
 
-/// Open the projection of `run_id`, whose record starts with `rows`.
-/// Only the database itself is an error. Anything permanent about the run
-/// (its program cannot be found, its seed cannot be read) degrades its
-/// projection to the program-free painting and publishes why.
-async fn open_projection(
-    state: &DispatcherState,
-    run_id: RunId,
+/// Where the live view's paints go: this process's subscribers of the
+/// run's project, one item per page painted.
+struct Published {
+    events: EventBus,
     project_id: uuid::Uuid,
-    rows: &[weft_journal::JournalRow],
-) -> anyhow::Result<RunProjector> {
-    // Whatever stops this run from painting whole, say it once, here. The
-    // projector then carries a reason-less copy of the same state, so it
-    // does not say it again on every later row.
-    let found = run_program(state, run_id).await?;
-    let program = match found.unpaintable() {
-        Some((site, reason)) => {
-            publish_unreadable(state, run_id, project_id, site, reason.to_string()).await;
-            found.without_reason()
-        }
-        None => found,
-    };
-    let birth: Vec<RunEvent> = rows.iter().take(1).map(|row| row.event.clone()).collect();
-    let inheritance = match crate::projection::run_inheritance(state, &birth, &program).await {
-        Ok(chain) => chain,
-        Err(reason) => {
-            // A cleaned seed leaves the run's own rows paintable and its
-            // inherited nodes empty on the screen.
-            publish_unreadable(state, run_id, project_id, weft_core::primitive::CorruptionSite::UndecodableRow, reason).await;
-            weft_journal::SeedChain::default()
-        }
-    };
-    Ok(RunProjector::new(run_id, program, project_id).with_inheritance(inheritance))
 }
 
-/// Something of a run that cannot be read back (its record, its seed,
-/// the bake its trigger setup landed on): logged, and published as the
-/// same corruption event the replay publishes, so the screen shows it on
-/// the run. `reason` names what did not read and what to do about it.
+#[async_trait::async_trait]
+impl Sink for Published {
+    type Page = Vec<ShownEvent>;
+
+    fn page(&mut self, events: Vec<ShownEvent>) -> anyhow::Result<Vec<ShownEvent>> {
+        Ok(events)
+    }
+
+    async fn deliver(&mut self, events: Vec<ShownEvent>) -> anyhow::Result<()> {
+        self.events.publish_batch(self.project_id, events).await;
+        Ok(())
+    }
+}
+
+/// Something about a run that no row of its record paints (the bake its
+/// trigger setup landed on): logged, and published as the same corruption
+/// event its record's rows paint, so the screen shows it on the run.
+/// `reason` names what did not read and what to do about it.
 pub(crate) async fn publish_unreadable(
     state: &DispatcherState,
     run_id: RunId,
@@ -237,11 +256,53 @@ pub(crate) async fn publish_unreadable(
         %run_id, %reason,
         "something this run's view reads cannot be read back"
     );
-    let corruption = crate::events::IdentifiedEvent::transient(crate::events::DispatcherEvent::JournalCorruption {
+    let corruption = crate::events::IdentifiedEvent::transient(weft_core::live_event::DispatcherEvent::JournalCorruption {
         run_id,
         project_id,
         site,
         reason,
     });
     state.events.publish_local(corruption).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weft_journal::RunEvent;
+
+    const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(0x100);
+
+    /// Run `n`'s record: its birth and `tags` tags, one row each.
+    async fn run_with_rows(store: &crate::store::FakeStore, n: u128, tags: u64) -> RunId {
+        let run_id = uuid::Uuid::from_u128(n);
+        let birth = RunEvent::RunStarted {
+            given: Default::default(), run_id, project_id: PROJECT, entry_node: "entry".into(),
+            phase: weft_core::context::Phase::Fire, definition_hash: None, binary_hash: None, source_version: None,
+            run_kind: weft_core::run::RunKind::Project, cut_from: None, seed: None, instance: None, stand_in: None,
+            fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0, settings: Default::default(),
+        };
+        store.record_event(&birth).await.unwrap();
+        for tag in 1..=tags {
+            store.record_event(&RunEvent::RunTagged { run_id, tags: vec![tag.to_string()], at_unix: tag }).await.unwrap();
+        }
+        run_id
+    }
+
+    /// Of the runs asked about, only the idle ones whose record got a row
+    /// past what was painted wake: a live run is not asked about, and an
+    /// idle one painted through its last row stays idle.
+    #[tokio::test]
+    async fn only_idle_runs_with_rows_past_what_was_painted_wake() {
+        let store = crate::store::FakeStore::new();
+        store.set_project_tenant(PROJECT, "t");
+        let (caught_up, behind, never_painted, live) =
+            (run_with_rows(&store, 1, 2).await, run_with_rows(&store, 2, 2).await, run_with_rows(&store, 3, 0).await, run_with_rows(&store, 4, 2).await);
+        let mut views = Views::default();
+        views.idle.insert(caught_up, IdleRun { project_id: PROJECT, painted: Some(2) });
+        views.idle.insert(behind, IdleRun { project_id: PROJECT, painted: Some(1) });
+        views.idle.insert(never_painted, IdleRun { project_id: PROJECT, painted: None });
+        let woken = views.woken(&store, &[caught_up, behind, never_painted, live]).await.unwrap();
+        assert_eq!(woken, HashSet::from([behind, never_painted]));
+        assert!(views.woken(&store, &[live]).await.unwrap().is_empty(), "a run that is not idle here is never asked about");
+    }
 }

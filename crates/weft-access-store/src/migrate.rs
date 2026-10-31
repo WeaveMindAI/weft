@@ -28,7 +28,7 @@ use weft_core::migrate::{
     Selection, TransferKey,
 };
 use weft_core::AppRegistration;
-use weft_task_store::db::{self, Client, FromRow, Pool, Row, Transaction};
+use weft_task_store::db::{self, Client, FromRow, JsonText, Pool, Row, Transaction};
 
 use crate::flows::{copy_grant, Moved, NewGrant};
 use crate::{door_of, scopes_of, values_of, AccessError};
@@ -141,8 +141,8 @@ struct GrantRow {
     service: String,
     project_id: Option<uuid::Uuid>,
     instance_id: Option<String>,
-    spec_json: Value,
-    spec_json_version: i32,
+    spec: Value,
+    spec_version: i32,
     values_sealed: String,
     registration_sealed: Option<String>,
     granted_scopes: Value,
@@ -165,11 +165,11 @@ impl FromRow for GrantRow {
             service: row.try_get("service")?,
             project_id: row.try_get("project_id")?,
             instance_id: row.try_get("instance_id")?,
-            spec_json: row.try_get("spec_json")?,
-            spec_json_version: row.try_get("spec_json_version")?,
+            spec: row.try_get::<_, JsonText<Value>>("spec")?.0,
+            spec_version: row.try_get("spec_version")?,
             values_sealed: row.try_get("values_sealed")?,
             registration_sealed: row.try_get("registration_sealed")?,
-            granted_scopes: row.try_get("granted_scopes")?,
+            granted_scopes: row.try_get::<_, db::Json<Value>>("granted_scopes")?.0,
             permissions_verified: row.try_get("permissions_verified")?,
             owner: row.try_get("owner")?,
             door: row.try_get("door")?,
@@ -183,7 +183,7 @@ impl FromRow for GrantRow {
     }
 }
 
-const GRANT_COLUMNS: &str = "id, tenant_id, service, project_id, instance_id, spec_json, spec_json_version, values_sealed, \
+const GRANT_COLUMNS: &str = "id, tenant_id, service, project_id, instance_id, spec, spec_version, values_sealed, \
     registration_sealed, granted_scopes, permissions_verified, owner, door, label, identity, expires_at, \
     token_lifetime_secs, created_at, published_by_node";
 
@@ -200,8 +200,8 @@ impl GrantRow {
             service: self.service,
             project_id: self.project_id,
             instance_id: self.instance_id,
-            spec: self.spec_json,
-            spec_version: self.spec_json_version,
+            spec: self.spec,
+            spec_version: self.spec_version,
             values: values_of(&crate::open_json(&self.values_sealed)?),
             registration,
             granted_scopes: scopes_of(&self.granted_scopes),
@@ -217,7 +217,7 @@ impl GrantRow {
     }
 
     fn summary(&self, skipped: Option<String>) -> anyhow::Result<ExportedConnection> {
-        let spec = crate::spec_of(format!("connection {}", self.id), self.spec_json.clone(), self.spec_json_version)?;
+        let spec = crate::spec_of(format!("connection {}", self.id), self.spec.clone(), self.spec_version)?;
         Ok(ExportedConnection {
             id: self.id,
             service: self.service.clone(),

@@ -1139,10 +1139,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_declared_call_never_echoes_interpolated_values() {
-        // A port just freed refuses at once; the send fails, and the error
-        // must name the call by its TEMPLATE, never the resolved URL (the
-        // query interpolates a secret here).
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        // A port held bound but never listened on refuses at once, and no
+        // other test's server can take it meanwhile (one freed by dropping
+        // a listener was, by a test running beside this one, which
+        // answered); the send fails, and the error must name the call by
+        // its TEMPLATE, never the resolved URL (the query interpolates a
+        // secret here).
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = held.local_addr().unwrap().port();
         let call: crate::access::spec::ConnectCall = serde_json::from_value(serde_json::json!({
             "url": format!("http://127.0.0.1:{port}/exchange?client_secret={{client_secret}}"),
         }))
@@ -1154,6 +1159,7 @@ mod tests {
         let err = err.to_string();
         assert!(err.contains("{client_secret}"), "names the template: {err}");
         assert!(!err.contains("s3cr3t-value"), "echoed the secret: {err}");
+        drop(held);
     }
 
     /// A declared call's refusal carries what fixes it: a credential

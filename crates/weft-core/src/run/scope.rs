@@ -48,7 +48,8 @@ use crate::project::graph::GraphView;
 use crate::project::{CrossingSide, Given, GivenOrigin, GivenPort, GroupDefinition, NodeDefinition, ProgramIndex, ProjectDefinition};
 use crate::pulse::{Failure, Pulse, PulseStatus, PulseTable};
 use crate::run::emission::{scope_emission, stand_in_emission, PulseEmission};
-use crate::run::postprocess::{close_unmentioned_downstream, emit_closure_on_edge, emit_value_on_edge};
+use crate::run::postprocess::{close_unmentioned_downstream, emit_closure_on_edge, emit_value_on_edge, part_on_wire};
+use crate::record_ref::{GivenSide, Step, ValueRef};
 use crate::run::skip::{flow_verdict, SkipReason};
 use crate::RunId;
 
@@ -104,6 +105,22 @@ impl ScopeTable {
     /// Every copy decided, in order.
     pub fn iter(&self) -> impl Iterator<Item = (&ScopeCopy, &ScopeRecord)> {
         self.copies.iter()
+    }
+
+    /// Forget the decision about every copy `gone` picks, and what was
+    /// sent at every location `sent_at` picks: a reader that only shows
+    /// the run is done with a copy once nothing can happen inside it. A
+    /// copy still waiting is never picked by such a reader.
+    pub fn forget(&mut self, mut gone: impl FnMut(&ScopeCopy) -> bool, mut sent_at: impl FnMut(&FiringLocation) -> bool) {
+        self.copies.retain(|copy, _| !gone(copy));
+        self.sent.retain(|sent| match sent {
+            Sent::StandIn(at) | Sent::Stream(at, _) => !sent_at(at),
+        });
+    }
+
+    /// The copies waiting to be decided.
+    pub fn waiting(&self) -> impl Iterator<Item = &ScopeCopy> {
+        self.waiting.iter()
     }
 
     /// Whether some copy of `scope` is decided: one look in the ordered
@@ -379,8 +396,9 @@ fn open(
     for &at in &scope.sends {
         let edge = &project.edges[at];
         match group.and_then(|group| sent_value(project, group, edge, &copy.frames)) {
+            // A literal the program holds: kept in no row.
             Some(Ok(value)) => emit_value_on_edge(
-                program_idx, &copy.scope, edge, edge.source_port(), value, emission_id, run_id, &copy.frames, pulses, emissions,
+                program_idx, &copy.scope, edge, edge.source_port(), value, None, emission_id, run_id, &copy.frames, pulses, emissions,
             ),
             Some(Err(failure)) => emit_closure_on_edge(
                 program_idx, &copy.scope, edge, edge.source_port(), emission_id, run_id, &copy.frames, Some(&failure), pulses, emissions,
@@ -626,6 +644,8 @@ fn send_given(
                 let emission_id = stand_in_emission(&place.id, &frames);
                 let start = emissions.len();
                 for (port, given) in &stand_in.ports {
+                    // Where the run's record keeps what it was given: its birth.
+                    let kept = Arc::new(ValueRef::Given { run: run_id, place: place.clone(), port: port.clone(), side: GivenSide::Output });
                     for edge in program_idx.get_outgoing(project, &place.id, &frames).into_iter().filter(|e| e.source_port() == port) {
                         // What the stand-in was given and cannot be sent as
                         // given (a stream that is no list, a port its node
@@ -643,7 +663,8 @@ fn send_given(
                                 Some(items) => {
                                     for (index, item) in items.iter().enumerate() {
                                         let item_emission = crate::run::emission::stream_emission(&place.id, &frames, index as u64);
-                                        emit_value_on_edge(program_idx, &place.id, edge, port, Arc::new(item.clone()), item_emission, run_id, &frames, pulses, emissions);
+                                        let origin = Arc::new(kept.as_ref().clone().part(vec![Step::Item(index as u64)]));
+                                        emit_value_on_edge(program_idx, &place.id, edge, port, Arc::new(item.clone()), Some(origin), item_emission, run_id, &frames, pulses, emissions);
                                     }
                                     emit_closure_on_edge(program_idx, &place.id, edge, port, emission_id, run_id, &frames, None, pulses, emissions);
                                 }
@@ -663,7 +684,9 @@ fn send_given(
                                     }
                                 };
                                 match delivered {
-                                    Ok(Some(value)) => emit_value_on_edge(program_idx, &place.id, edge, port, value, emission_id, run_id, &frames, pulses, emissions),
+                                    Ok(Some(value)) => emit_value_on_edge(
+                                        program_idx, &place.id, edge, port, value, Some(part_on_wire(&kept, edge)), emission_id, run_id, &frames, pulses, emissions,
+                                    ),
                                     Ok(None) => emit_closure_on_edge(program_idx, &place.id, edge, port, emission_id, run_id, &frames, None, pulses, emissions),
                                     Err(failure) => emit_closure_on_edge(program_idx, &place.id, edge, port, emission_id, run_id, &frames, Some(&failure), pulses, emissions),
                                 }
@@ -712,9 +735,11 @@ fn send_given(
                 let identity = serde_json::to_vec(&(&place.id, port, &frames)).expect("a stream location serializes");
                 let base = Uuid::new_v5(&run_id, &identity);
                 let bucket = pulses.entry(place.id.clone()).or_default();
+                let kept = ValueRef::Given { run: run_id, place: place.clone(), port: port.clone(), side: GivenSide::Input };
                 for (index, item) in value.as_array().into_iter().flatten().enumerate() {
                     let mut pulse = Pulse::new(Uuid::new_v5(&base, &(index as u64).to_be_bytes()), run_id, frames.clone(), &place.id, port, Arc::new(item.clone()));
                     pulse.provided = true;
+                    pulse.origin = Some(Arc::new(kept.clone().part(vec![Step::Item(index as u64)])));
                     bucket.push(pulse);
                 }
                 let mut end = Pulse::closure(Uuid::new_v5(&base, b"end"), run_id, frames.clone(), &place.id, port);

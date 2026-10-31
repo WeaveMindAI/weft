@@ -44,7 +44,7 @@ async fn resolve_asset_map(
     client: &DispatcherClient,
     files: &dyn weft_assets::AssetSource,
     target: &impl weft_compiler::file_ref::MarkedValues,
-) -> Result<BTreeMap<String, serde_json::Value>> {
+) -> Result<weft_core::project::AssetResolutions> {
     let refs = weft_compiler::file_ref::collect_asset_refs(target);
     let mut map = if refs.is_empty() {
         BTreeMap::new()
