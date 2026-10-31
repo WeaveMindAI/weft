@@ -4,7 +4,7 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## 2026-10-31 (7ab59358)
+## 2026-10-31 (dbefc004)
 
 **What you have to change after this update, if you use a PostgresDatabase:**
 
