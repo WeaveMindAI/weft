@@ -9,6 +9,13 @@
 //!   automatically (the old `usage: {include: true}` opt-in is
 //!   deprecated); `prepare` only sheds internal media-estimation
 //!   metadata from chat bodies.
+//! - `POST embeddings` and `POST rerank` are BILLABLE the same way: an id
+//!   and the inline `usage.cost` in one JSON answer, and the same
+//!   generation ledger behind it.
+//! - `POST systemone` (the Decisions API, the same request and answer as
+//!   `/api/alpha/decisions`, which lives outside this base) is BILLABLE
+//!   on its inline `usage.cost` alone: the ledger does not know its
+//!   `gen-dec-` ids (`GET generation` answers 404, checked 2026-10).
 //! - `GET generation` is FREE: it is the cost LOOKUP (`?id=gen-...`). Free
 //!   is what makes the double-charge trap structurally impossible: this
 //!   meter's own follow-up query and a node re-querying its cost by hand
@@ -28,6 +35,10 @@ use crate::{
 };
 
 pub struct OpenRouterMeter;
+
+/// The Decisions API route.
+// SYNC: openrouter::DECISIONS <-> catalog/ai/decision/decision.rs ROUTE
+const DECISIONS: &str = "systemone";
 
 /// A generation's ledger record becomes queryable ~9s after the generation
 /// ends, and a CANCELLED generation only after the upstream run finishes on
@@ -57,7 +68,8 @@ impl ProviderMeter for OpenRouterMeter {
         match (method, path) {
             ("POST", "chat/completions")
             | ("POST", "embeddings")
-            | ("POST", "rerank") => RouteClass::Billable(Pricing::Metered),
+            | ("POST", "rerank")
+            | ("POST", DECISIONS) => RouteClass::Billable(Pricing::Metered),
             ("GET", "generation") => RouteClass::Free,
             ("GET", "models") => RouteClass::Free,
             _ => RouteClass::Unknown,
@@ -69,7 +81,8 @@ impl ProviderMeter for OpenRouterMeter {
         // inline cost) in EVERY response automatically (the old
         // `usage: {include: true}` opt-in is deprecated on chat and not
         // an accepted field on embeddings/rerank at all, docs checked
-        // 2026-08), so no route needs a cost opt-in rewrite. Only chat
+        // 2026-08; the Decisions API answers it too, checked 2026-10),
+        // so no route needs a cost opt-in rewrite. Only chat
         // rewrites: it sheds the media metadata minillmlib's wire carries
         // for its own cost estimates (a clip's length, an image's size);
         // internal breadcrumbs have no business riding upstream.
@@ -78,7 +91,7 @@ impl ProviderMeter for OpenRouterMeter {
         // first.
         match path {
             "chat/completions" => {}
-            "embeddings" | "rerank" => return Ok(None),
+            "embeddings" | "rerank" | DECISIONS => return Ok(None),
             _ => anyhow::bail!("prepare called on unexpected route '{path}'"),
         }
         let mut parsed: Value = serde_json::from_slice(body)
@@ -105,16 +118,18 @@ impl ProviderMeter for OpenRouterMeter {
     fn observe(&self, _path: &str, _query: &str, _request_body: &[u8]) -> Box<dyn CallObservation> {
         // Every billable route answers the same envelope (an id + a
         // `usage` block with the inline charge), streaming or not, so
-        // one observation shape serves chat, embeddings, and rerank.
+        // one observation shape serves chat, embeddings, rerank and
+        // decisions.
         Box::new(OpenRouterObservation::new())
     }
 
     // One resolve pipeline for every billable route: the inline
     // `usage.cost` answers first, the generation ledger (which records
-    // chat, embeddings, and rerank alike) is the fallback.
+    // chat, embeddings, and rerank alike, and no decision) is the
+    // fallback.
     async fn resolve(
         &self,
-        _path: &str,
+        path: &str,
         observed: ObservedCall,
         follow_up: FollowUp<'_>,
     ) -> MeasuredCost {
@@ -131,14 +146,30 @@ impl ProviderMeter for OpenRouterMeter {
                 metadata: json!({
                     "resolution": "inline usage accounting",
                     "generationId": generation_id,
-                    "promptTokens": data["usage"]["prompt_tokens"],
-                    "completionTokens": data["usage"]["completion_tokens"],
+                    // The route's own token counts, as it names them
+                    // (`prompt_tokens` on chat, `input_tokens` on the
+                    // Decisions API).
+                    "usage": data["usage"],
                     "interrupted": observed.interrupted,
                 }),
             };
         }
 
-        // 2. A generation exists but its charge did not reach us (the stream
+        // 2. A decision whose charge did not reach us: the ledger never
+        // records one, so asking would only wait out the polls.
+        if !generation_id.is_empty() && path == DECISIONS {
+            return MeasuredCost {
+                amount_usd: None,
+                model,
+                metadata: json!({
+                    "resolution": "unknown: no inline usage, and the generation ledger holds no decision",
+                    "generationId": generation_id,
+                    "interrupted": observed.interrupted,
+                }),
+            };
+        }
+
+        // 3. A generation exists but its charge did not reach us (the stream
         // was cut before the usage chunk, or the body was too large to
         // parse): ask the ledger. The generation bills whether we hung up or
         // not, so the ledger is the truth; the polled route is free.
@@ -173,7 +204,7 @@ impl ProviderMeter for OpenRouterMeter {
             };
         }
 
-        // 3. No generation id to look up. What the status says on its own
+        // 4. No generation id to look up. What the status says on its own
         // then decides, through the one shared rule
         // (`providers::cost_from_status`): a refusal bills nothing, but a
         // 5xx is NOT a refusal. A gateway answering 502 over a generation
@@ -186,7 +217,7 @@ impl ProviderMeter for OpenRouterMeter {
             }
         }
 
-        // 4. Nothing to anchor a lookup on: unknown, said honestly.
+        // 5. Nothing to anchor a lookup on: unknown, said honestly.
         MeasuredCost {
             amount_usd: None,
             model,
@@ -419,7 +450,9 @@ mod tests {
         assert_eq!(m.classify("GET", "models"), RouteClass::Free);
         assert_eq!(m.classify("POST", "embeddings"), RouteClass::Billable(Pricing::Metered));
         assert_eq!(m.classify("POST", "rerank"), RouteClass::Billable(Pricing::Metered));
+        assert_eq!(m.classify("POST", "systemone"), RouteClass::Billable(Pricing::Metered));
         assert_eq!(m.classify("GET", "chat/completions"), RouteClass::Unknown);
+        assert_eq!(m.classify("GET", "systemone"), RouteClass::Unknown);
         assert_eq!(m.classify("GET", "embeddings"), RouteClass::Unknown);
         assert_eq!(m.classify("POST", "generation"), RouteClass::Unknown);
         assert_eq!(m.classify("POST", ""), RouteClass::Unknown);
@@ -476,15 +509,15 @@ mod tests {
         assert!(wrong_route.is_err(), "prepare on a route it was not written for refuses loud");
     }
 
-    /// Embeddings and rerank get the same accounting opt-in, and the
+    /// Embeddings, rerank and decisions get the same accounting, and the
     /// chat-shaped media shedding never touches their bodies.
     #[test]
     fn prepare_covers_every_billable_route_and_sheds_media_only_on_chat() {
-        // Embeddings and rerank bodies go out UNTOUCHED: `usage` is not
-        // an accepted request field on either (an injected unknown
+        // Embeddings, rerank and decisions bodies go out UNTOUCHED:
+        // `usage` is not an accepted request field on any of them (an injected unknown
         // field could refuse the whole call), and OpenRouter includes
         // the cost accounting in every response automatically.
-        for path in ["embeddings", "rerank"] {
+        for path in ["embeddings", "rerank", "systemone"] {
             let body = br#"{"model":"m","input":["hello"],"messages":[{"content":[{"image_url":{"url":"u","width":800}}]}]}"#;
             assert!(
                 meter().prepare(path, body).unwrap().is_none(),
@@ -618,6 +651,52 @@ mod tests {
         assert_eq!(cost.amount_usd, Some(0.0025));
         assert_eq!(cost.model.as_deref(), Some("cohere/rerank-3.5"));
         assert_eq!(cost.metadata["resolution"], "inline usage accounting");
+    }
+
+    /// A Decisions API response (recorded 2026-10: an id, the resolved
+    /// model version, and `usage` with `input_tokens` and the inline
+    /// `cost`) resolves to its inline figure, its token counts kept.
+    #[tokio::test]
+    async fn a_decisions_response_resolves_to_its_inline_cost() {
+        let body = r#"{
+            "model": "perplexity/pplx-decider-flash-v1.2-20261016",
+            "answers": {"team": {"type": "choice", "choice": "payments",
+                "probabilities": {"account": 0.0014, "payments": 0.9986}, "confidence": 0.93}},
+            "usage": {"input_tokens": 120, "output_tokens": 1, "cost": 0.0000012},
+            "id": "gen-dec-1793374013-1q8gzcAnBAh4ka78q8Ty", "provider": "Perplexity"
+        }"#;
+        let mut obs = meter().observe("systemone", "", b"");
+        obs.on_status(200);
+        obs.on_chunk(body.as_bytes());
+        let observed = obs.end(false);
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
+        let follow_up = FollowUp { http: &http, base_url: "http://unused.test", shared: &shared };
+        let cost = meter().resolve("systemone", observed, follow_up).await;
+        assert_eq!(cost.amount_usd, Some(0.0000012));
+        assert_eq!(cost.model.as_deref(), Some("perplexity/pplx-decider-flash-v1.2-20261016"));
+        assert_eq!(cost.metadata["resolution"], "inline usage accounting");
+        assert_eq!(cost.metadata["usage"]["input_tokens"], 120);
+    }
+
+    /// A decision whose inline charge is missing is unknown at once: the
+    /// ledger holds no decision, so it is never polled (the follow-up
+    /// client points nowhere, and the 25 polls would take 25 seconds).
+    #[tokio::test]
+    async fn a_decision_without_its_inline_cost_is_unknown_without_a_ledger_poll() {
+        let body = r#"{"model": "perplexity/pplx-decider-flash-v1.2", "answers": {}, "id": "gen-dec-1"}"#;
+        let mut obs = meter().observe("systemone", "", b"");
+        obs.on_status(200);
+        obs.on_chunk(body.as_bytes());
+        let observed = obs.end(false);
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
+        let follow_up = FollowUp { http: &http, base_url: "http://unused.test", shared: &shared };
+        let started = std::time::Instant::now();
+        let cost = meter().resolve("systemone", observed, follow_up).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "no ledger poll");
+        assert_eq!(cost.amount_usd, None);
+        assert_eq!(cost.metadata["generationId"], "gen-dec-1");
     }
 
     /// A recorded BYOK-routed response: OpenRouter's own charge is 0 and the

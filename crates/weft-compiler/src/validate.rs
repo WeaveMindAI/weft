@@ -1125,7 +1125,7 @@ fn check_declarative_rules(
     let rules = weft_core::rules::RuleContext::new(project);
     for node in &project.nodes {
         let Some(meta) = catalog.lookup(&node.node_type) else { continue };
-        let custom = node_custom_outputs(node, meta);
+        let custom = weft_core::rules::CustomPorts::of(node, meta);
         for rule in &node_rules(meta, node) {
             // Skip runtime-only rules in structural mode (the build and
             // the Problems panel). Runtime mode runs them: the editor's
@@ -1137,7 +1137,7 @@ fn check_declarative_rules(
                 continue;
             }
             if weft_core::rules::fires(rule, node, &rules, &custom) {
-                emit_rule_diagnostic(node, &rules, meta, rule, out);
+                emit_rule_diagnostic(node, &rules, &custom, rule, out);
             }
         }
     }
@@ -1208,15 +1208,10 @@ fn is_the_connection_rule(meta: &weft_core::node::NodeMetadata, rule: &Validatio
         )
 }
 
-/// The output ports the source added beyond the node type's own.
-pub(crate) fn node_custom_outputs(node: &NodeDefinition, meta: &weft_core::node::NodeMetadata) -> Vec<String> {
-    weft_core::rules::custom_outputs(node, meta.outputs.iter().map(|o| o.name.as_str()))
-}
-
 fn emit_rule_diagnostic(
     node: &NodeDefinition,
     rules: &weft_core::rules::RuleContext,
-    meta: &weft_core::node::NodeMetadata,
+    custom: &weft_core::rules::CustomPorts,
     rule: &ValidationRule,
     out: &mut Vec<Diagnostic>,
 ) {
@@ -1227,7 +1222,7 @@ fn emit_rule_diagnostic(
         RuleSeverity::Info => Severity::Info,
         RuleSeverity::Hint => Severity::Hint,
     };
-    let message = weft_core::rules::message(rule, node, rules, &node_custom_outputs(node, meta));
+    let message = weft_core::rules::message(rule, node, rules, custom);
     let code = match rule.then.level {
         ValidationLevel::Structural => "rule-structural",
         ValidationLevel::Runtime => "rule-runtime",
@@ -2911,11 +2906,8 @@ fn check_metadata_ports(project: &ProjectDefinition, catalog: &dyn MetadataCatal
             continue;
         }
         let Some(meta) = catalog.lookup(&node.node_type) else { continue };
-        let added_inputs: Vec<&str> = node.inputs.iter()
-            .filter(|p| !p.from_spec && !meta.inputs.iter().any(|i| i.name == p.name))
-            .map(|p| p.name.as_str())
-            .collect();
-        for input in &added_inputs {
+        let added = weft_core::rules::CustomPorts::of(node, meta);
+        for input in &added.inputs {
             if meta.outputs.iter().any(|o| o.name == *input) {
                 let (key_file, key_span) = cfg_anchor(node, input);
                 push(d, &[node.part()], key_file.or(file), key_span, Severity::Error, "unpaired-port", format!(
@@ -2925,19 +2917,21 @@ fn check_metadata_ports(project: &ProjectDefinition, catalog: &dyn MetadataCatal
                 ));
             }
         }
-        for output in node.outputs.iter().filter(|o| !meta.outputs.iter().any(|m| m.name == o.name) && o.name != weft_core::node::ERROR_PORT) {
-            if !added_inputs.contains(&output.name.as_str()) {
+        // The language's `_error` output is the metadata's own, so it is
+        // never an added output.
+        for output in &added.outputs {
+            if !added.inputs.contains(output) {
                 push(d, &[node.part()], file, span, Severity::Error, "unpaired-port", format!(
                     "node '{}': output '{}' matches no input. Each output of this node is where the input of the same \
                      name sends what it matches: add that input (`{}.{} = ...`), or remove the output",
-                    author_name(node), output.name, author_name(node), output.name,
+                    author_name(node), output, author_name(node), output,
                 ));
-            } else if !read.contains(&(node.id.as_str(), output.name.as_str())) {
-                let (key_file, key_span) = cfg_anchor(node, &output.name);
+            } else if !read.contains(&(node.id.as_str(), output.as_str())) {
+                let (key_file, key_span) = cfg_anchor(node, output);
                 push(d, &[node.part()], key_file.or(file), key_span, Severity::Error, "unpaired-port", format!(
                     "node '{}': nothing reads '{}.{}', so a value that input '{}' matches would be dropped. Wire \
                      `{}.{}` to what handles it",
-                    author_name(node), author_name(node), output.name, output.name, author_name(node), output.name,
+                    author_name(node), author_name(node), output, output, author_name(node), output,
                 ));
             }
         }

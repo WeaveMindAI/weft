@@ -592,7 +592,7 @@ pub fn rule_gaps(
         .rules
         .iter()
         .filter(|rule| rule.then.severity == crate::node::RuleSeverity::Error)
-        .filter(|rule| crate::rules::fires(rule, filled, cx, &rules.custom_outputs))
+        .filter(|rule| crate::rules::fires(rule, filled, cx, &rules.custom))
         .map(|rule| match rule.then.field.as_deref() {
             Some(field)
                 if !filled.port_literals.contains_key(field)
@@ -600,7 +600,7 @@ pub fn rule_gaps(
             {
                 format!("instance '{instance}' has not filled '{place}.{field}'")
             }
-            _ => format!("instance '{instance}' at '{place}': {}", crate::rules::message(rule, filled, cx, &rules.custom_outputs)),
+            _ => format!("instance '{instance}' at '{place}': {}", crate::rules::message(rule, filled, cx, &rules.custom)),
         })
         .collect()
 }
@@ -630,7 +630,7 @@ pub fn instance_field_needed(
             rules.rules.iter().any(|rule| {
                 rule.then.severity == crate::node::RuleSeverity::Error
                     && rule.then.field.as_deref() == Some(field)
-                    && crate::rules::fires(rule, &empty, cx, &rules.custom_outputs)
+                    && crate::rules::fires(rule, &empty, cx, &rules.custom)
             })
         })
 }

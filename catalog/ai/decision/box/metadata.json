@@ -1,0 +1,64 @@
+{
+  "type": "DecisionBox",
+  "label": "Decide: Find in Image",
+  "description": "Ask a decision model where one described thing is in an image, and get its box. Only typesafe/jev-1.14 (or ~typesafe/jev-latest) answers this question; other models refuse it. What it looks at is the ports you add, one per piece, each named and typed, at least one an Image: `product = DecisionBox(photo: Image) { provider: decider.provider, instructions: \"the product in `photo`\", photo: listing.photo }`. Describe the target and name the image it is in, rather than giving an order. A box always comes back, even when the thing is not there: ask a Decide: Yes or No beside it (\"Is there a product in `photo`?\") and use the box only when that says yes.",
+  "tags": [
+    "ai",
+    "decision",
+    "image",
+    "locate",
+    "detect",
+    "box"
+  ],
+  "icon": "ScanSearch",
+  "color": "#7c6f9f",
+  "inputs": [
+    {
+      "name": "provider",
+      "type": "DecisionProvider",
+      "required": true,
+      "accepts": ["wire"],
+      "description": "Which decision model and credential: wire an OpenRouter Decision Model node whose model is typesafe/jev-1.14."
+    },
+    {
+      "name": "instructions",
+      "type": "String",
+      "required": true,
+      "widget": { "kind": "textarea" },
+      "label": "Target",
+      "placeholder": "the product in `photo`",
+      "description": "The thing to find, described, with the image it is in."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "box",
+      "type": "BoundingBox",
+      "description": "Its edges as fractions of the image, measured from the top-left corner: `left` and `right` of the width, `top` and `bottom` of the height."
+    },
+    {
+      "name": "confidence",
+      "type": "Number",
+      "description": "How sure the model is of the box, from 0 to 1."
+    }
+  ],
+  "features": {
+    "canAddInputPorts": true
+  },
+  "validate": [
+    {
+      "when": { "kind": "not", "of": { "kind": "custom_inputs_fit", "oneOf": ["Json", "File | Null", "List[File] | Null"] } },
+      "then": {
+        "message": "DecisionBox '{id}' takes, on each added input, exactly one of: a value made of JSON (text, a record, a dict, a list of those), a file, or a list of files, and these are none of those: {names}. Give each file a port of its own (`photo: Image`, `photos: List[Image]`) rather than a field of a record, an item of a list mixed with text, or one type with a value (`String | Image`).",
+        "level": "structural"
+      }
+    },
+    {
+      "when": { "kind": "not", "of": { "kind": "custom_inputs_declared" } },
+      "then": {
+        "message": "DecisionBox '{id}' has nothing to decide about: add one input for each piece of what the model should judge, named after it and typed, like `DecisionBox(photo: Image)`.",
+        "level": "structural"
+      }
+    }
+  ]
+}

@@ -1,0 +1,76 @@
+{
+  "type": "DecisionChoice",
+  "label": "Decide: Pick One",
+  "description": "Ask a decision model which one of several options fits, and get the option with each option's probability: often cheaper than an LLM and a better fit for routing (a ticket to a team, a request to the model, agent or person that should handle it) and for picking a category or the best of several drafts. What it judges is the ports you add, one per piece, each named and typed: `team = DecisionChoice(ticket: String) { provider: decider.provider, instructions: \"Which team should own this ticket?\", options: { \"payments\": \"Checkout, billing or payment issues.\", \"frontend\": \"Rendering or layout issues.\" }, ticket: inbox.text }`. The values go in one object keyed by port name and each file follows it under its port's name, so the question can point at either (`ticket`, or a nested field as `ticket.messages[0]`). A value (text, a record, a dict, a list of those) is sent as it is, and a file, or a list of files, on a port of its own: a text or JSON file as its content (for anything past a wire's size), an image, audio clip or video as itself (audio and video on cloudflare/clef-omni only). A file inside a record is refused: give it its own port. When the options are things made in the run (drafts to pick from), add one port per option, named like the option, and name that port in the option's description. The model always picks one: when nothing may fit, ask a Decide: Yes or No beside it (\"Does any team own this?\") and read `choice` only when that says yes. Branch on `choice` with a Switch.",
+  "tags": [
+    "ai",
+    "decision",
+    "classify",
+    "route",
+    "triage",
+    "choice"
+  ],
+  "icon": "ListChecks",
+  "color": "#7c6f9f",
+  "inputs": [
+    {
+      "name": "provider",
+      "type": "DecisionProvider",
+      "required": true,
+      "accepts": ["wire"],
+      "description": "Which decision model and credential: wire an OpenRouter Decision Model node's `provider`."
+    },
+    {
+      "name": "instructions",
+      "type": "String",
+      "required": true,
+      "widget": { "kind": "textarea" },
+      "label": "Question",
+      "placeholder": "Which team should own this ticket?",
+      "description": "What to pick, with what counts and what only looks like it."
+    },
+    {
+      "name": "options",
+      "type": "Dict[String, String] | List[String]",
+      "required": true,
+      "label": "Options",
+      "description": "Every option the model may pick: a list of names, or an object of each name to what it covers, which the model reads to tell them apart. At least two. `choice` is one of the names."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "choice",
+      "type": "String",
+      "description": "The name of the option picked."
+    },
+    {
+      "name": "probabilities",
+      "type": "Dict[String, Number]",
+      "description": "Each option's probability, keyed by its name, summing to 1."
+    },
+    {
+      "name": "confidence",
+      "type": "Number",
+      "description": "How concentrated the probabilities are on one option, 1 when all of it sits on one. It says nothing about whether the pick is right: use it to send a spread-out answer to a person or a bigger model."
+    }
+  ],
+  "features": {
+    "canAddInputPorts": true
+  },
+  "validate": [
+    {
+      "when": { "kind": "not", "of": { "kind": "custom_inputs_fit", "oneOf": ["Json", "File | Null", "List[File] | Null"] } },
+      "then": {
+        "message": "DecisionChoice '{id}' takes, on each added input, exactly one of: a value made of JSON (text, a record, a dict, a list of those), a file, or a list of files, and these are none of those: {names}. Give each file a port of its own (`photo: Image`, `photos: List[Image]`) rather than a field of a record, an item of a list mixed with text, or one type with a value (`String | Image`).",
+        "level": "structural"
+      }
+    },
+    {
+      "when": { "kind": "not", "of": { "kind": "custom_inputs_declared" } },
+      "then": {
+        "message": "DecisionChoice '{id}' has nothing to decide about: add one input for each piece of what the model should judge, named after it and typed, like `DecisionChoice(email: String, attachment: Image)`.",
+        "level": "structural"
+      }
+    }
+  ]
+}
