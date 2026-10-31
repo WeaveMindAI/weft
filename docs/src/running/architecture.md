@@ -489,7 +489,24 @@ what it needs between two events, and the listener does exactly that:
   for another holder to take. A holder that cannot move its check in time
   lets go of everything and exits before the check goes off, so its
   triggers are never handed to another holder while it still holds them. A
-  holder that is shut down gives its triggers up at once.
+  holder that is shut down gives its triggers up at once. How many holders
+  run follows how busy they are too. Each holder samples its CPU every ten
+  seconds, averages the last minute, and tells weft that number when it has
+  moved 10 points from the one it said last, plus once more a minute after
+  it took triggers or handed some over, since the old number was measured
+  on what it held before. weft adds up the numbers of the holders that hold
+  triggers (a crashed one counts until its dead man's switch frees them, since that
+  work still needs a holder) and runs as many holders as the sum needs at
+  50% each, never fewer than one per 200 triggers and never more holders than
+  triggers. It stops none while triggers are on their way from one
+  holder to another, or while a holder that took some has not said its new
+  number yet. A holder whose average reaches 70% hands part of its triggers
+  over, keeping as many as should bring it back to about 50%, and takes no
+  new ones until it says less than that. A holder weft started for the load
+  holds nothing at first, so once it has said its number, the first holder
+  over 50% to notice hands it the triggers that bring it nearest 50%, at
+  least one; the broker gives them to that spare alone, so two holders never
+  pile their work onto one spare.
 - **An event subscription** needs a holder only when it dials out to the
   service. On a cloud install, when the service can push the subscribed events
   for one account, weft subscribes with the service instead and renews that

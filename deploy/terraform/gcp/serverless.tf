@@ -85,7 +85,9 @@ locals {
     # copy divides the database's connections by these to size its pools.
     maxCopies = local.max_copies
     holders = {
-      signalsPerCopy = var.signals_per_holder
+      signalsPerCopy   = var.signals_per_holder
+      highCpuPercent   = var.holder_high_cpu_percent
+      targetCpuPercent = var.holder_target_cpu_percent
     }
     edge = {
       # A caller's address, counted from the right of X-Forwarded-For
@@ -125,6 +127,13 @@ resource "google_secret_manager_secret" "config" {
 resource "google_secret_manager_secret_version" "config" {
   secret      = google_secret_manager_secret.config.id
   secret_data = jsonencode(local.install_config)
+  lifecycle {
+    # SYNC: the holders' CPU rule <-> crates/weft-platform-traits/src/config.rs (InstallConfig::validate), variables.tf (holder_*_cpu_percent validation)
+    precondition {
+      condition     = var.holder_target_cpu_percent + 20 <= var.holder_high_cpu_percent
+      error_message = "holder_target_cpu_percent must be at least 20 under holder_high_cpu_percent: a holder says its CPU again only once it moved 10 points, so two holders merged into one can carry up to 20 more than they said, and the one left must stay under the high mark, or it hands work over at once, a holder comes back, and the pool grows and shrinks for good"
+    }
+  }
 }
 
 resource "google_secret_manager_secret_iam_member" "core_reads_config" {
@@ -329,8 +338,9 @@ resource "google_cloud_run_v2_service_iam_member" "core_calls_roles" {
 # The holders: the copies of the listener that keep open the outside
 # connections some signals need between fires (a socket, a stream, a
 # subscription). A worker pool takes no requests and runs exactly as many
-# copies as it is told, which the dispatcher sets from the held signals:
-# none (and nothing billed) when there are none. Each holder claims the
+# copies as it is told, which the dispatcher sets from the held signals and
+# the CPU the holders say they use: none (and nothing billed) when there
+# are none. Each holder claims the
 # signals it holds through the broker, so they share the work and take
 # over from one that stops.
 resource "google_cloud_run_v2_worker_pool" "holder" {

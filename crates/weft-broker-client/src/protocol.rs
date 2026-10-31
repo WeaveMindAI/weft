@@ -2244,6 +2244,56 @@ pub struct SignalHoldResponse {
     pub ended: Vec<String>,
     /// What it took on this look, to bring up.
     pub taken: Vec<SignalRowWire>,
+    /// The load weft keeps for it as it last said it
+    /// ([`SignalHolderLoadRequest`]), in percent of its CPUs, once this
+    /// look is done: `None` when it said none, or what it said is behind
+    /// what it holds (this look or an earlier one took signals, or it
+    /// handed some over in saying it), so it measures afresh and says it
+    /// again.
+    pub load: Option<u16>,
+    /// The most signals a spare up could take, `None` when none is up: a
+    /// spare is another holder that said its load and claims nothing, a
+    /// copy the sizing added for the load and waiting for work. While one
+    /// is, a holder over the target hands over to it, at most this many
+    /// ([`SignalHolderLoadRequest::spare_only`]).
+    pub spare: Option<u32>,
+}
+
+/// A holder saying its load. Not safe twice: a second arrival of a
+/// hand-over finds what the first handed over no longer the holder's (or
+/// the spare it went to no longer a spare) and is refused, so the holder
+/// would read a hand-over that went through as one that did not, and keep
+/// its full room. One that hands nothing over is harmless twice, but the
+/// line decides per call, not per request.
+pub const SIGNAL_HOLDER_LOAD: BrokerCall = BrokerCall { path: "/v1/signal/holder_load", twice: Twice::NotSafe };
+
+/// A holder in a pool saying the CPU it uses (`signal/holder_load`), in
+/// percent of the CPUs it is given, whenever that moved a band since it
+/// last said it: never on a timer, so a pool whose load holds still
+/// writes nothing. A holder handing work over lets go of `let_go` in the
+/// same transaction, each connection already stopped on its side, to a
+/// spare when one is up (else freed, or nothing written when
+/// `spare_only`); a load said that way is behind what it holds, and it
+/// says its load again once measured afresh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalHolderLoadRequest {
+    /// The holder; the call must come from this replica.
+    pub replica: String,
+    /// Of what it keeps, after any hand-over: the moved work is counted by
+    /// whoever takes it, once measured there.
+    pub cpu_percent: u16,
+    /// The most signals it takes from now on: what it kept after handing
+    /// some over, until a load said under the target gives it its full
+    /// room back.
+    pub room: u32,
+    /// The signals it hands over; empty for a load said with nothing to
+    /// hand over.
+    pub let_go: Vec<String>,
+    /// Hand `let_go` only to a spare, writing nothing when none is free:
+    /// a holder only over the target, whose work is worth a reconnect only
+    /// when a spare takes it. `false` over the high mark, which sheds its
+    /// work either way.
+    pub spare_only: bool,
 }
 
 /// Recording whether a signal is held. Not safe twice: it clears a give-up,
@@ -3733,11 +3783,26 @@ mod supervisor_protocol_tests {
 
         let mut taken = make_row(SignalSurfaceKind::Internal, None, SignalAuthKind::None, None);
         taken.holds = true;
-        let resp = SignalHoldResponse { kept: vec!["a".into()], ended: vec!["c".into()], taken: vec![taken] };
+        let resp = SignalHoldResponse { kept: vec!["a".into()], ended: vec!["c".into()], taken: vec![taken], load: Some(42), spare: Some(200) };
         let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!((&v["kept"], &v["ended"], &v["taken"][0]["holds"]), (&json!(["a"]), &json!(["c"]), &json!(true)));
+        assert_eq!(
+            (&v["kept"], &v["ended"], &v["taken"][0]["holds"], &v["load"], &v["spare"]),
+            (&json!(["a"]), &json!(["c"]), &json!(true), &json!(42), &json!(200))
+        );
         let back: SignalHoldResponse = serde_json::from_value(v).unwrap();
-        assert_eq!((back.kept, back.ended, back.taken.len()), (vec!["a".to_string()], vec!["c".to_string()], 1));
+        assert_eq!(
+            (back.kept, back.ended, back.taken.len(), back.load, back.spare),
+            (vec!["a".to_string()], vec!["c".to_string()], 1, Some(42), Some(200))
+        );
+    }
+
+    #[test]
+    fn signal_holder_load_round_trip() {
+        let req = SignalHolderLoadRequest { replica: "holder-1".into(), cpu_percent: 53, room: 3, let_go: vec!["a".into()], spare_only: true };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v, json!({ "replica": "holder-1", "cpu_percent": 53, "room": 3, "let_go": ["a"], "spare_only": true }));
+        let back: SignalHolderLoadRequest = serde_json::from_value(v).unwrap();
+        assert_eq!((back.cpu_percent, back.room, back.let_go, back.spare_only), (53, 3, vec!["a".to_string()], true));
     }
 
     #[test]
