@@ -2,7 +2,10 @@
 
   - GET /health -> 200, the readiness probe target.
   - POST /fetch {"url"} -> downloads the url from inside the container and
-    answers {"size": <bytes read>}, or 502 with what the download said.
+    answers {"size": <bytes read>}, or 502 with what the download said. Only
+    a link to the machine as a container reaches it (`host.docker.internal`,
+    where a local install's container links point) is fetched; any other is
+    refused with 400, so the server never fetches an address it is handed.
 
 No dependencies (stdlib), so the image builds with no build step.
 """
@@ -10,10 +13,14 @@ No dependencies (stdlib), so the image builds with no build step.
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PORT", "8080"))
+# The machine as a container reaches it, where a local install's container
+# links point.
+MACHINE = "host.docker.internal"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -36,7 +43,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
             return
         length = int(self.headers.get("Content-Length", "0"))
-        url = json.loads(self.rfile.read(length))["url"]
+        sent = urllib.parse.urlsplit(json.loads(self.rfile.read(length))["url"])
+        if sent.scheme != "http" or sent.hostname != MACHINE or sent.port is None:
+            self._send(400, {"error": f"only a link to http://{MACHINE}:<port> is fetched here, not {sent.geturl()}"})
+            return
+        url = urllib.parse.urlunsplit(("http", f"{MACHINE}:{sent.port}", sent.path, sent.query, ""))
         try:
             with urllib.request.urlopen(url, timeout=30) as answer:
                 self._send(200, {"size": len(answer.read())})

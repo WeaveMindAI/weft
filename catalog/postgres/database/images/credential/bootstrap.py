@@ -803,8 +803,10 @@ def role_of(action: object, kind: str) -> str | None:
     if action == kind:
         return APP_USER
     if isinstance(action, str) and action.startswith(kind + ROLE_MARK):
-        role = action[len(kind + ROLE_MARK):]
-        return role if role in SIGNS_IN[1:] else None
+        # The node's own name for the role, never the caller's text: it
+        # names the role's files.
+        asked = action[len(kind + ROLE_MARK):]
+        return next((role for role in SIGNS_IN[1:] if role == asked), None)
     return None
 
 
