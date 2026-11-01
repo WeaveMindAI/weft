@@ -4,9 +4,9 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-11-01 (0.2.283)
 
-**What the compiler now refuses after this update:**
+**What breaks after this update:**
 
 **A shared trigger whose runs reach something per instance is refused.**
 A trigger every instance shares fires runs for no instance, so until now every
@@ -22,18 +22,19 @@ the site that reaches something per instance is refused: the same trigger under
 another include of the file still turns on.
 
 **A loop output nothing inside the loop writes is refused**
-(`loop-output-unwritten`), and so is any run that reaches the loop. A gathered one would be a list of nothing but nulls,
-and a carried one would never change, so it is almost certainly a port the loop
-forgot to write. Write the output inside the loop, or remove the port.
+(`loop-output-unwritten`), and so is any run that reaches the loop. A gathered
+one would be a list of nothing but nulls, and a carried one would never change,
+so it is almost certainly a port the loop forgot to write. Write the output
+inside the loop, or remove the port.
+
+**If a program of yours had its shared runs refused because a file it includes
+is also included under a per-instance part, run `weft resync` in it** once you
+are on this version, so its triggers run the new build. Until now, including a
+file inside a group with a per-instance part made that file per instance
+everywhere, so a shared route that included the same file had every run
+refused. Each include now decides for itself.
 
 **What now works:**
-
-**A file included in two places is per instance only where an instance's value
-reaches it.** Until now, including a file inside a group with a per-instance
-part made that file per instance everywhere, so a shared route that included
-the same file had every run refused. Each include now decides for itself. If a
-program of yours hit this, run `weft resync` in it once you are on this version,
-so its triggers run the new build.
 
 **The graph shows an included file's nodes per instance where they are.**
 Walked into from the entry file, a file included at several sites shows each
