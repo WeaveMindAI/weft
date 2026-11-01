@@ -18,9 +18,11 @@
 //! looks (`GET /projects/{id}/follow/{task}`, [`followed`]), each of which
 //! says where the activation is ([`progress`]). Anything else that asks
 //! outside a task's claim waits on the task's end in its own process
-//! ([`through_task`]). A program's call, a resync and the maintenance lift
-//! activate under the claim of the task they already run in, and never
-//! come here.
+//! ([`through_task`]). A program's call and a resync activate under the
+//! claim of the task they already run in, and never come here. The
+//! maintenance lift's bring-back always comes here, one task per owner,
+//! whether the lift's own task or a resync's request brings it back
+//! (`crate::maintenance`).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -57,6 +59,8 @@ pub enum TaskAsker {
     /// `ActivateAsker::Rearm`: the instance's change it re-arms with, or
     /// none when what is stored already is the answer (a pick change).
     Rearm { change: Option<InstanceChange> },
+    /// `ActivateAsker::Lift`: bringing back what a maintenance left down.
+    Lift,
 }
 
 /// An instance's change of values a re-arm sets its triggers up with and
@@ -71,9 +75,9 @@ pub struct InstanceChange {
 }
 
 impl TaskAsker {
-    /// `asker` as a task carries it. A resync's drive and the maintenance
-    /// lift only ever activate under the claim of their own task, so one
-    /// of them here is weft's own bug, said as such.
+    /// `asker` as a task carries it. A resync's drive only ever activates
+    /// under the claim of its own task, so one here is weft's own bug,
+    /// said as such.
     fn of(asker: &ActivateAsker<'_>) -> Result<Self, ActivateError> {
         Ok(match asker {
             ActivateAsker::Outside => TaskAsker::Outside,
@@ -97,10 +101,11 @@ impl TaskAsker {
                     }
                 },
             },
-            ActivateAsker::Resync(_) | ActivateAsker::Lift => {
+            ActivateAsker::Lift => TaskAsker::Lift,
+            ActivateAsker::Resync(_) => {
                 return Err(ActivateError::Failed(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "a resync or the maintenance lift activated outside the task that drives it; this is a bug in weft".into(),
+                    "a resync activated outside the task that drives it; this is a bug in weft".into(),
                 ))
             }
         })
@@ -178,6 +183,7 @@ impl TaskExecutor<DispatcherState> for ActivateExecutor {
                 let rearm = Rearm { overlay: change.as_ref().map(|change| &change.overlay), store };
                 crate::api::project::activate_with(state, id, request, ActivateAsker::Rearm(&rearm)).await.map(|answer| answer.0)
             }
+            TaskAsker::Lift => crate::api::project::activate_with(state, id, request, ActivateAsker::Lift).await.map(|answer| answer.0),
         };
         Ok(serde_json::to_value(Ended::from(ended))?)
     }

@@ -345,3 +345,25 @@ async fn a_failed_lift_activation_keeps_the_mark(pool: Pool) {
     assert!(maintenance::marked_triggers(&pool).await.unwrap().is_empty());
     assert!(maintenance::left(&pool).await.unwrap().is_empty());
 }
+
+/// A marked trigger the program no longer has is forgotten by the lift
+/// (`maintenance::forget_marks`): its mark goes, so nothing is left for a
+/// lift to bring back, while a sibling still marked, and a trigger
+/// something else took down, keep theirs.
+#[weft_db_macros::test]
+async fn a_trigger_the_program_lost_is_forgotten_and_its_siblings_stay_marked(pool: Pool) {
+    let (activations, id) = setup(&pool).await;
+    turn_on(&activations, id, &[key("old.tick"), key("feed"), key("door")], Claimant::Anyone).await;
+    take_down(&activations, id, &[key("door")], DownCause::Person).await;
+    maintenance::begin(&pool, 100).await.unwrap();
+    take_down(&activations, id, &[key("old.tick"), key("feed")], DownCause::Maintenance).await;
+    assert_eq!(maintenance::marked_triggers(&pool).await.unwrap().len(), 2);
+
+    maintenance::forget_marks(&pool, id, None, &["old.tick".into(), "door".into()]).await.unwrap();
+    let marked: Vec<ActivationKey> = maintenance::marked_triggers(&pool).await.unwrap().into_iter().map(|(_, key)| key).collect();
+    assert_eq!(marked, vec![key("feed")], "only the trigger the program lost is forgotten");
+    let left = maintenance::left(&pool).await.unwrap();
+    assert_eq!(left[0].triggers, std::collections::BTreeMap::from([(Owner::Shared, vec!["feed".into()])]));
+    let old = activations.list(id).await.unwrap().into_iter().find(|a| a.key == key("old.tick")).unwrap();
+    assert_eq!((old.lifecycle.status, old.lifecycle.went_down), (ProjectStatus::Inactive, None));
+}

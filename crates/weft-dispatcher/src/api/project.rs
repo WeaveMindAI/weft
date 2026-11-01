@@ -2803,8 +2803,8 @@ async fn held_picks(
 /// An activation is always carried out by a task, since it waits on its
 /// setup run, which may wait days on a person, and whoever asked may go
 /// away meanwhile (a request whose dispatcher copy stopped): under a
-/// task's claim (a program's call, a resync, the maintenance lift, an
-/// `activate` task) it runs here; anywhere else it is handed to an
+/// task's claim (a program's call, a resync, an `activate` task, which is
+/// how the maintenance lift's bring-back always comes) it runs here; anywhere else it is handed to an
 /// `activate` task, and this waits for that task's end
 /// (`crate::task_kinds::activate`). The rows it claims name the task
 /// (`crate::activation_store::Activation::driver_task`), so a task run
