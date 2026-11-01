@@ -661,8 +661,13 @@ async fn a_search_reads_programs_on_its_own_connection(pool: Pool) {
     let ada = ended_run_carrying(&store, project, "ada@example.com").await;
     assert_eq!(found_carrying(&store, "ada@example.com").await, vec![ada], "one connection is enough");
 
-    let first = ended_run_carrying(&store, project, "bob@example.com").await;
-    let second = ended_run_carrying(&store, project, "bob@example.com").await;
+    // Another project's program, which no search has read yet: the one
+    // `ada`'s search read stays in the dispatcher's cache of programs, and
+    // a program found there is never read from the store again.
+    let other = Uuid::new_v4();
+    seed_project(&projects, other).await;
+    let first = ended_run_carrying(&store, other, "bob@example.com").await;
+    let second = ended_run_carrying(&store, other, "bob@example.com").await;
     pool.execute("ALTER TABLE project_definition RENAME COLUMN project_json TO project_json_away", &[]).await.unwrap();
     let query = weft_dispatcher::store::RunListQuery { limit: 10, search: Some("bob@example.com".into()), ..Default::default() };
     store.list_runs(TENANT, &query).await.expect_err("the program read failed");

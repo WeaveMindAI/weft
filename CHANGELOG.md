@@ -4,7 +4,38 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-11-01 (0.2.283)
+
+**What breaks after this update:**
+
+**A database's password is handed over once to whoever takes it.** `weft infra
+env` writing it into a file, or the card's copy button, now hands it over the
+way a run storing it does: the card shows it as handed over from then on, and
+its Reset button mints a new one.
+
+**`weft infra env --as` names the secret it writes.** On a card with more than
+one secret (a database with a `login` role), `--as` used to take whichever one
+still showed its value; it now refuses and lists them, and `--set
+NAME=Label` picks one.
+
+**Tangle's specialists write `cd` and ffmpeg a little differently.** After
+`weft tangle update` in a project, a specialist changes folder only as `cd
+./<folder>`, and names each ffmpeg or ffprobe input's format right before it
+(`ffmpeg -f mp4 -i clip.mp4 ...`); any other form is refused, with a message
+showing this one. In return they may now search the project with `grep` and
+`rg`, look at media with `ffprobe` and make it with `ffmpeg` into their own
+scratch folder, read a database with a read-only `psql` transaction (`psql
+<connection> -c "BEGIN TRANSACTION READ ONLY" -c "<one SELECT, SHOW or
+EXPLAIN>"`), and stop a run they started with `weft stop`, without asking you.
+The commands they may run are now read the way your shell reads them, bash or
+zsh, so a line that only looked harmless is refused.
+
+**On Linux, weft's internal port no longer listens on every address of your
+machine.** It listens on loopback and on the one address Docker gives your
+containers for this machine, which weft asks Docker each time it starts, so
+nothing on your network reaches it any more.
+
+**The rest:**
 
 **A PostgresDatabase makes the roles your program needs.** Since the program
 signs in as `app`, which is no superuser, a database that kept tenants apart
@@ -31,7 +62,7 @@ past 512Mi a resync failed with `Service Unavailable`. It now keeps at most
 64MiB of those files there and about 90MiB of programs. The dispatcher gets
 1Gi by default, and each role's memory is a repository variable on your fork
 (`WEFT_DISPATCHER_MEMORY`, `WEFT_BROKER_MEMORY`, `WEFT_LISTENER_MEMORY`,
-`WEFT_SUPERVISOR_MEMORY`): a value set by hand in the Cloud Run console used
+`WEFT_SUPERVISOR_MEMORY`, and `WEFT_HOLDER_MEMORY` for the holders): a value set by hand in the Cloud Run console used
 to be put back to 512Mi by every install run, and now the install sets yours.
 
 **A fork's deploy no longer compiles the weft CLI.** The install workflow now
@@ -48,19 +79,7 @@ again, waiting about three minutes; it now runs on the one the install built.
 install an `internal_link` points at `127.0.0.1`, which inside a container is
 the container itself, so a download from there failed. A node's code now asks
 for `container_link(&file)`, which a project's own container opens on any
-install. On Linux, weft's internal port no longer listens on every address of
-your machine: only on loopback and on the one address Docker gives containers
-for it, which weft asks Docker each time it starts.
-
-**A database's password is handed over once to whoever takes it.** `weft infra
-env` writing it into a file, or the card's copy button, now hands it over the
-way a run storing it does: the card shows it as handed over from then on, and
-its Reset button mints a new one.
-
-**`weft infra env --as` names the secret it writes.** On a card with more than
-one secret (a database with a `login` role), `--as` used to take whichever one
-still showed its value; it now refuses and lists them, and `--set
-NAME=Label` picks one.
+install.
 
 **`weft daemon start` on a Mac says why launchd refused.** The error now
 carries everything `launchctl` printed and its exit status, where it used to
