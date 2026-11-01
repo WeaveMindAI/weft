@@ -187,7 +187,8 @@ impl UploadPlane for DispatcherPlane<'_> {
 
     async fn complete(&self, key: &str) -> Result<()> {
         let request = weft_core::storage::UploadCompleteRequest { key: key.to_string() };
-        self.0.post_json("/storage/upload/complete", &serde_json::to_value(request)?).await?;
+        // The store puts the file together from its parts, however large.
+        self.0.waiting_on_its_work().post_json("/storage/upload/complete", &serde_json::to_value(request)?).await?;
         Ok(())
     }
 

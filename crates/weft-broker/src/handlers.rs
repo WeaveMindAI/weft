@@ -402,6 +402,17 @@ pub async fn task_enqueue_dedup(
                 "a program call's asker is the run that sends it".into(),
             ));
         }
+        // The key names the call's step in the asking run, and the install
+        // names what the call makes after it
+        // (`weft_core::program::program_call_id`): a key of another run's
+        // would reach what that run's calls made.
+        // SYNC: the step's spelling <-> crates/weft-engine/src/context.rs (program_call)
+        if !req.spec.dedup_key.as_deref().is_some_and(|key| key.starts_with(&format!("program_call/{run_id}/"))) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "a program call is keyed to its step in the asking run (program_call/<run>/...)".into(),
+            ));
+        }
         if let Some(target) = payload.project {
             // The worker is pinned to its own project, so the scope check
             // every other resource goes through would refuse a sibling:

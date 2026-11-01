@@ -19,9 +19,9 @@
 use anyhow::{bail, Context};
 use weft_core::run_flags::{apply_run_flags, spec_from_flags, RunFlags};
 use weft_core::run_spec::judge::{judge, Verdict};
-use weft_core::run_spec::{Refusal, RunSpec};
+use weft_core::run_spec::RunSpec;
 use weft_core::builds::RunPreview;
-use weft_core::versions::{RunShape, RunStarted, VersionRunRequest};
+use weft_core::versions::{RunShape, RunStarted, RunStarting, StartRun, StartingRun, VersionRunRequest};
 
 use super::Ctx;
 use crate::progress::ActionVerb;
@@ -383,7 +383,7 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     };
     let path = format!("/projects/{}/versions/runs", handle.id);
     progress.dispatcher_call_start(&path);
-    let started = start_run(&handle.client, &path, &body).await?;
+    let started = start_run(&handle.client, progress, &handle.id, body).await?;
     let run_id = started.run_id;
     progress.dispatcher_call_done(serde_json::json!({ "runId": run_id, "projectId": handle.id }));
 
@@ -419,22 +419,49 @@ fn judge_run(definition: &weft_core::ProjectDefinition, spec: Option<&RunSpec>, 
     judge(definition, spec, args.seed.is_some(), &args.seed_until, &args.seed_before)
 }
 
-/// Start the run, turning the resolver's 422 into its lines: every
-/// missing input at once, each naming the three ways to satisfy it.
+/// Start the run: hand `request` to the task that starts it, under an id
+/// made here (asked again under the same id while the install is out of
+/// reach, so it is started once), and follow that task, saying what it is
+/// doing whenever that changes and every [`crate::progress::SAY_AGAIN_EVERY`]
+/// meanwhile. The resolver's 422 reads as its lines: every missing input
+/// at once, each naming the three ways to satisfy it.
+// SYNC: start_run <-> weft_core::versions::StartRun
 pub async fn start_run(
     client: &crate::client::DispatcherClient,
-    path: &str,
-    body: &VersionRunRequest,
+    progress: &crate::progress::Progress,
+    project_id: &str,
+    request: VersionRunRequest,
 ) -> anyhow::Result<RunStarted> {
-    let (status, text) = client.post_json_status(path, &serde_json::to_value(body)?).await.context("start run")?;
-    match status {
-        200..=299 => serde_json::from_str(&text).context("parse run response"),
-        422 => {
-            let refusal: Refusal = serde_json::from_str(&text).context("parse the refusal")?;
-            bail!("the run cannot start:\n{refusal}")
+    let ask = serde_json::to_value(StartRun { task: uuid::Uuid::now_v7(), request })?;
+    let path = format!("/projects/{project_id}/versions/runs");
+    let asked = std::time::Instant::now();
+    let starting: StartingRun = loop {
+        match client.post_json(&path, &ask).await {
+            Ok(answer) => break crate::client::read_answer(answer, "the task starting the run")?,
+            Err(e) => {
+                let why = super::ensure::look_again_after(e).map_err(|e| e.context("start run"))?;
+                progress.warn(&format!("could not hand the run to the install just now ({why}); asking again"));
+                tokio::time::sleep(super::follow::TASK_LOOK_AGAIN_AFTER).await;
+            }
         }
-        _ => bail!("{}", crate::client::refusal_text(&text).unwrap_or_else(|| format!("dispatcher returned {status}"))),
-    }
+    };
+    // Nothing said yet reads as no stage: the start reads what the run
+    // starts with, which takes moments.
+    let mut said = crate::progress::SaidLast::announced(None, std::time::Duration::ZERO);
+    let answer = super::follow::follow_task(client, progress, project_id, starting.task, async |stage| {
+        let stage: Option<RunStarting> = stage.map(serde_json::from_value).transpose().context("read where the run's start is")?;
+        let elapsed = asked.elapsed();
+        if let Some(Some(stage)) = said.hear(stage, elapsed) {
+            progress.run_starting(stage, elapsed);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| match crate::client::refusal(&e).map(|refused| refused.status()) {
+        Some(reqwest::StatusCode::UNPROCESSABLE_ENTITY) => anyhow::anyhow!("the run cannot start:\n{e}"),
+        _ => e.context("start run"),
+    })?;
+    crate::client::read_answer(answer, "the run it started")
 }
 
 /// The one line a run ends its start with: what was inherited and

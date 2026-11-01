@@ -258,6 +258,15 @@ impl Door {
         Ok(Slot { going, _permit: permit })
     }
 
+    /// A fire or a call of the entry `token` was dropped for `reason`
+    /// (refused before any run started): counted with its reason where
+    /// `weft status` reads it, on the door's next tick.
+    pub(crate) fn dropped(&self, token: &str, reason: &str) {
+        // The count keeps a line of it; the log keeps it whole.
+        tracing::warn!(target: "weft_engine::door", %token, "dropped before any run started: {reason}");
+        self.limits.dropped(token, reason, crate::now_unix() as i64);
+    }
+
     /// One call at the door, up to the run it starts (see the module doc).
     pub async fn arrive(&self, call: Call<'_>, body: axum::body::Body) -> Arrived {
         let now = crate::now_unix() as i64;
@@ -683,7 +692,7 @@ impl Door {
     /// about to sleep with only waiting runs, and saying when a stopping
     /// worker's lease got shorter than it vouched for last (`shortens`):
     /// whether it reported nothing in flight. Its counts are marked heard once it lands.
-    async fn tick(&self, vouch_until: Option<i64>, shortens: bool) -> anyhow::Result<bool> {
+    pub(crate) async fn tick(&self, vouch_until: Option<i64>, shortens: bool) -> anyhow::Result<bool> {
         let now = crate::now_unix() as i64;
         let (window_start, mine, mark) = self.limits.mine(now);
         let in_flight = self.limits.going();
@@ -692,7 +701,7 @@ impl Door {
             binary_hash: Some(self.binary_hash.clone()),
             in_flight,
             window_start,
-            counts: mine.into_iter().map(|(key, hits)| DoorCount { key, hits }).collect(),
+            counts: mine.into_iter().map(|count| DoorCount { key: count.key, hits: count.hits, reason: count.reason }).collect(),
             vouch_until,
             shortens,
         };

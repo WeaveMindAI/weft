@@ -85,16 +85,25 @@ pub fn connection_failed(e: &anyhow::Error) -> bool {
     e.chain().filter_map(|cause| cause.downcast_ref::<reqwest::Error>()).any(failed_on_the_way)
 }
 
-/// [`connection_failed`] for one request's error.
+/// [`connection_failed`] for one request's error. A request the install
+/// did not answer within its time limit ([`NoAnswerInTime`]) is one: its
+/// error carries the request's own.
 fn failed_on_the_way(cause: &reqwest::Error) -> bool {
     cause.status().is_none()
         && !tls_failure(cause)
         && (cause.is_connect() || cause.is_timeout() || cause.is_request() || cause.is_body() || cause.is_decode())
 }
 
-/// Whether the connection was never made: refused, or not made in time.
+/// Whether the connection was never made: refused, or not made in time
+/// ([`CONNECT_TIMEOUT`], which reqwest reports as a connect error).
 fn no_connection(cause: &reqwest::Error) -> bool {
-    !tls_failure(cause) && (cause.is_connect() || cause.is_timeout())
+    !tls_failure(cause) && cause.is_connect()
+}
+
+/// Whether the connection was made and the answer did not come whole
+/// within the request's time limit.
+fn not_answered_in_time(cause: &reqwest::Error) -> bool {
+    cause.is_timeout() && !cause.is_connect()
 }
 
 /// Whether `cause` is TLS refusing the other end, which is how rustls
@@ -165,6 +174,48 @@ impl std::error::Error for InstallUnreachable {
     }
 }
 
+/// In an error's chain when the install was reached and its answer did not
+/// come whole within the request's time limit ([`ANSWER_WITHIN`], or a
+/// long-poll's hold and [`HELD_MARGIN`]): the copy of the install serving
+/// it may have stopped while a gateway in front of it holds the connection
+/// (Cloud Run holds one up to an hour). Nothing said no, so a request that
+/// is safe to send again is looked at again
+/// (`crate::commands::ensure::look_again_after`).
+#[derive(Debug)]
+pub struct NoAnswerInTime {
+    pub limit: std::time::Duration,
+    pub cause: reqwest::Error,
+}
+
+impl std::fmt::Display for NoAnswerInTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the install did not answer within {} (the copy of it serving the request may have stopped)",
+            crate::progress::elapsed_text(self.limit.as_secs())
+        )
+    }
+}
+
+impl std::error::Error for NoAnswerInTime {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+/// How long the install may take to answer an ordinary request whole. It
+/// answers one in moments, and in well under a minute when it starts from
+/// nothing (its service and its database waking); a database too busy to
+/// take the request is answered at once with a `503` the client waits out
+/// on its own ([`busy_answer`]). A request past this is one its serving
+/// copy stopped answering.
+pub const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What a long-poll, which the install holds open up to the hold it was
+/// asked for before it answers, gets on top of that hold: its own start
+/// and its answer's way back.
+pub const HELD_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long making a connection to the install may take before the
 /// request fails as unreachable. An install answers a connection in well
 /// under a second on this machine and in a few seconds on a cloud that
@@ -186,6 +237,10 @@ pub struct DispatcherClient {
     /// that is how a command outlives one instance token.
     bearer: Option<Arc<RwLock<String>>>,
     http: reqwest::Client,
+    /// How long a request may take to be answered whole: [`ANSWER_WITHIN`]
+    /// unless set otherwise ([`Self::waiting_up_to`],
+    /// [`Self::waiting_on_its_work`]).
+    answer_within: Option<std::time::Duration>,
 }
 
 impl DispatcherClient {
@@ -193,12 +248,43 @@ impl DispatcherClient {
         // The one connection setup every request to the install uses,
         // live-update streams included.
         // A connection whose path died fails within a minute or so
-        // (`notice_dead_connections`); a request's whole length has no
-        // limit, since some verbs wait as long as the person's own work runs.
+        // (`notice_dead_connections`); a request whose answer does not
+        // come within its time limit fails too (`answer_within`), which
+        // catches a copy that stopped behind a gateway holding the
+        // connection open.
         let http = weft_core::net::notice_dead_connections(weft_core::net::http_client().connect_timeout(CONNECT_TIMEOUT))
             .build()
             .expect("an HTTP client with only timeouts set always builds");
-        Self { base: base.into(), target: None, bearer: operator_key.map(|key| Arc::new(RwLock::new(key))), http }
+        Self {
+            base: base.into(),
+            target: None,
+            bearer: operator_key.map(|key| Arc::new(RwLock::new(key))),
+            http,
+            answer_within: Some(ANSWER_WITHIN),
+        }
+    }
+
+    /// The same client, for a long-poll the install holds open up to
+    /// `hold` before it answers: each request may take that and
+    /// [`HELD_MARGIN`].
+    pub fn waiting_up_to(&self, hold: std::time::Duration) -> Self {
+        Self { answer_within: Some(hold + HELD_MARGIN), ..self.clone() }
+    }
+
+    /// The same client, for a request the install answers only once its
+    /// own work is done, however long that takes (an infra copy booting, a
+    /// frontend's service made, a call about connections that reaches an
+    /// outside service through the broker, which the install sends again
+    /// for as long as the broker's database turns it away): no time limit.
+    pub fn waiting_on_its_work(&self) -> Self {
+        Self { answer_within: None, ..self.clone() }
+    }
+
+    /// The same client, its requests held to `limit`: for a test, whose
+    /// install that never answers must not take minutes to say so.
+    #[cfg(test)]
+    pub(crate) fn answering_within(&self, limit: std::time::Duration) -> Self {
+        Self { answer_within: Some(limit), ..self.clone() }
     }
 
     /// The install's address, as requests are sent to it.
@@ -255,7 +341,9 @@ impl DispatcherClient {
     ) -> anyhow::Result<impl futures::Stream<Item = anyhow::Result<eventsource_stream::Event>> + use<>> {
         use eventsource_stream::{EventStreamError, Eventsource};
         use futures::StreamExt;
-        let resp = self.check(self.send(reqwest::Method::GET, path, None).await?).await?;
+        // A stream goes on for as long as what it follows: no time limit.
+        let streaming = self.waiting_on_its_work();
+        let resp = streaming.check(streaming.send(reqwest::Method::GET, path, None).await?).await?;
         let url = resp.url().clone();
         Ok(resp.bytes_stream().eventsource().map(move |event| {
             event.map_err(|e| match e {
@@ -310,6 +398,9 @@ impl DispatcherClient {
     ) -> anyhow::Result<reqwest::Response> {
         let url = format!("{}{}", self.base, path);
         let mut builder = self.http.request(method.clone(), &url);
+        if let Some(limit) = self.answer_within {
+            builder = builder.timeout(limit);
+        }
         if let Some(key) = self.current_bearer()? {
             builder = builder.bearer_auth(key);
         }
@@ -332,6 +423,9 @@ impl DispatcherClient {
     fn failed(&self, cause: reqwest::Error, doing: String) -> anyhow::Error {
         if no_connection(&cause) {
             return anyhow::Error::new(InstallUnreachable { url: self.base.clone(), target: self.target.clone(), cause }).context(doing);
+        }
+        if let Some(limit) = self.answer_within.filter(|_| not_answered_in_time(&cause)) {
+            return anyhow::Error::new(NoAnswerInTime { limit, cause }).context(doing);
         }
         anyhow::Error::new(cause).context(doing)
     }
@@ -483,16 +577,6 @@ impl DispatcherClient {
     pub async fn delete_json(&self, path: &str) -> anyhow::Result<serde_json::Value> {
         let resp = self.send(reqwest::Method::DELETE, path, None).await?;
         self.answer(resp).await
-    }
-
-    /// POST with a JSON body, handing back the status and the body
-    /// text whatever the status: for a caller that reads a structured
-    /// refusal (the run endpoint's 422 carries a JSON `Refusal`) and
-    /// treats every other failure as `check` would.
-    pub async fn post_json_status(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<(u16, String)> {
-        let resp = self.send(reqwest::Method::POST, path, Some(body)).await?;
-        let status = resp.status();
-        Ok((status.as_u16(), self.text(resp).await?))
     }
 
     /// POST with a JSON body, handing back the success status and the
@@ -683,6 +767,9 @@ pub(crate) mod fake {
         Answers(&'static [&'static str]),
         /// Read the request, then reset the connection without a word.
         Reset,
+        /// Read the request, then hold the connection open and never
+        /// answer: a copy that stopped behind a gateway holding it.
+        Hold,
     }
 
     /// The address of a stand-in install doing `then` to every request
@@ -692,6 +779,7 @@ pub(crate) mod fake {
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             let mut answered = 0usize;
+            let mut held = Vec::new();
             loop {
                 let Ok((mut conn, _)) = listener.accept().await else { return };
                 let mut request = vec![0u8; 64 * 1024];
@@ -703,6 +791,13 @@ pub(crate) mod fake {
                 answered += 1;
                 match then {
                     Then::Answer(raw) => {
+                        // Said closed, as it is: a client that took the
+                        // connection for kept alive would send its next
+                        // request down it as it closes, and meet a reset.
+                        let raw = match raw.split_once("\r\n") {
+                            Some((status, rest)) => format!("{status}\r\nconnection: close\r\n{rest}"),
+                            None => raw.to_string(),
+                        };
                         let _ = conn.write_all(raw.as_bytes()).await;
                         let _ = conn.shutdown().await;
                     }
@@ -710,6 +805,7 @@ pub(crate) mod fake {
                         #[allow(deprecated)]
                         conn.set_linger(Some(std::time::Duration::ZERO)).unwrap();
                     }
+                    Then::Hold => held.push(conn),
                     Then::Answers(_) => unreachable!("a script was resolved to its answer above"),
                 }
             }
@@ -854,8 +950,25 @@ mod tests {
         );
         let e = cut.get_json("/install").await.unwrap_err();
         assert!(connection_failed(&e) && !unreachable(&e), "cut halfway through the answer: {e:#}");
-        let e = cut.post_json_status("/run", &serde_json::json!({})).await.unwrap_err();
-        assert!(connection_failed(&e), "a status read never swallows its body: {e:#}");
+    }
+
+    /// A request the install took and never answered fails once its time
+    /// limit is up, as a request that failed on its way (the install was
+    /// reached, so never as unreachable), saying how long it waited; a
+    /// long-poll's limit is its hold and the margin.
+    #[tokio::test]
+    async fn a_request_never_answered_fails_on_its_way_once_its_limit_is_up() {
+        let held = DispatcherClient::new(install(Then::Hold).await, None).answering_within(std::time::Duration::from_millis(200));
+        let e = held.get_json("/install").await.unwrap_err();
+        assert!(connection_failed(&e) && !unreachable(&e), "{e:#}");
+        let no_answer = e.chain().find_map(|cause| cause.downcast_ref::<super::NoAnswerInTime>()).expect("no answer in time");
+        assert_eq!(no_answer.limit, std::time::Duration::from_millis(200));
+        assert!(format!("{e:#}").contains("the install did not answer within"), "{e:#}");
+        let client = DispatcherClient::new(closed(), None);
+        assert_eq!(client.answer_within, Some(super::ANSWER_WITHIN));
+        let polling = client.waiting_up_to(std::time::Duration::from_secs(25));
+        assert_eq!(polling.answer_within, Some(std::time::Duration::from_secs(25) + super::HELD_MARGIN));
+        assert_eq!(polling.waiting_on_its_work().answer_within, None);
     }
 
     /// A status the install answered is a refusal carrying it, never a

@@ -73,7 +73,9 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
             super::ensure::ensure_project_known(&ctx).await?;
             let hosted = body.host == FrontendHost::CloudRun;
             let asked = serde_json::to_value(&body)?;
-            let made = client.post_json(&base, &asked);
+            // A hosted one answers once its service is made, however long.
+            let making = client.waiting_on_its_work();
+            let made = making.post_json(&base, &asked);
             // A hosted frontend's service takes Cloud Run a few seconds to
             // make, and the call answers only once it is ready.
             let made = if hosted {
@@ -154,7 +156,8 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
         }
         FrontendAction::Rm { name, force } => {
             let left: Vec<String> = serde_json::from_value(
-                client.delete_json(&format!("{base}/{name}{}", if force { "?force=true" } else { "" })).await?,
+                // On a cloud install it answers once the frontend's service is gone.
+                client.waiting_on_its_work().delete_json(&format!("{base}/{name}{}", if force { "?force=true" } else { "" })).await?,
             )
             .context("read what removing the frontend left")?;
             if !ctx.json_out(&serde_json::json!({ "removed": name, "left": left }))? {

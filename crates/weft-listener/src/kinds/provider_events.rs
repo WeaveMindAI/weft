@@ -90,6 +90,19 @@ impl KindHandler for ProviderEventsHandler {
         true
     }
 
+    /// A subscription pushed to the install asks the broker whether its
+    /// first subscribe could be made here (the topic declared, and an
+    /// address the internet reaches when the provider must be told where
+    /// to send), subscribing nothing. A socket it dials needs nothing
+    /// more than settling found.
+    async fn check_coming_up(&self, spec: &SignalSpec, kind_state: &Value, ctx: &SpawnCtx) -> Result<()> {
+        if Settled::read(kind_state)?.transport != Some(SettledTransport::Webhook) {
+            return Ok(());
+        }
+        let (cfg, access) = parse_spec(spec)?;
+        ctx.events_broker.subscription_check(&subscription_request(ctx, &access, &cfg)).await
+    }
+
     /// A dial-in subscription wakes to subscribe as it comes up (at the
     /// next whole second, so every arming within one second sets one
     /// wake), then before each expiry to renew.
@@ -847,17 +860,21 @@ async fn ensure_via_broker(
     access: &AccessRef,
     cfg: &ProviderEvents,
 ) -> anyhow::Result<SubscriptionEnsureResponse> {
-    ctx.events_broker
-        .subscription_ensure(&SubscriptionEnsureRequest {
-            tenant: ctx.fire.tenant_id().to_string(),
-            service: access.service.clone(),
-            topic: cfg.topic.clone(),
-            access_id: access.id.clone(),
-            signal_token: ctx.fire.token().to_string(),
-            for_instance: ctx.fire.for_instance().cloned(),
-            params: cfg.params.clone(),
-        })
-        .await
+    ctx.events_broker.subscription_ensure(&subscription_request(ctx, access, cfg)).await
+}
+
+/// The broker's request for the subscription the signal `ctx` serves:
+/// what keeping it alive and checking it could be made both ask.
+fn subscription_request(ctx: &SpawnCtx, access: &AccessRef, cfg: &ProviderEvents) -> SubscriptionEnsureRequest {
+    SubscriptionEnsureRequest {
+        tenant: ctx.fire.tenant_id().to_string(),
+        service: access.service.clone(),
+        topic: cfg.topic.clone(),
+        access_id: access.id.clone(),
+        signal_token: ctx.fire.token().to_string(),
+        for_instance: ctx.fire.for_instance().cloned(),
+        params: cfg.params.clone(),
+    }
 }
 
 /// Keep the provider subscription alive: ensure, sleep until the

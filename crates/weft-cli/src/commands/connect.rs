@@ -163,7 +163,9 @@ async fn move_picks(ctx: &Ctx, client: &DispatcherClient, from: &str, to: &str, 
     super::ensure::ensure_project_known(ctx).await?;
     let project_id = ctx.project()?.id();
     let body = weft_core::picks::MovePicks { from: from.to_string(), to: to.to_string() };
-    let answer = client.post_json(&format!("/projects/{project_id}/picks/move"), &serde_json::to_value(&body)?).await?;
+    // It answers once the triggers that read the moved picks are set up
+    // again, however long their setup takes.
+    let answer = client.waiting_on_its_work().post_json(&format!("/projects/{project_id}/picks/move"), &serde_json::to_value(&body)?).await?;
     let moved: weft_core::picks::PicksMoved = crate::client::read_answer(answer, "the install's answer to the move")?;
     if json {
         println!("{}", serde_json::to_value(&moved)?);
@@ -1128,7 +1130,9 @@ pub(crate) async fn list_grants(
         // (`weft connect --list`) rely on, so it works from anywhere.
         None => doorway.route(Route::Grants).to_string(),
     };
-    let rows = client.get_json(&path).await?;
+    // The listing asks the broker which shared keys it holds, which the
+    // install waits on for as long as the broker's database turns it away.
+    let rows = client.waiting_on_its_work().get_json(&path).await?;
     serde_json::from_value(rows).context("parse the connection list")
 }
 
@@ -1323,7 +1327,9 @@ impl Connecting<'_> {
                 ("/instance/values".to_string(), serde_json::to_value(body)?)
             }
         };
-        let answer = self.client.put_json(&path, &body).await?;
+        // It answers once the triggers that read the change are set up
+        // again, however long their setup takes.
+        let answer = self.client.waiting_on_its_work().put_json(&path, &body).await?;
         Ok(crate::client::read_answer::<weft_core::instance_door::ValuesChanged>(answer, "the install's answer to the change")?.rearmed)
     }
 
@@ -1381,6 +1387,7 @@ impl Connecting<'_> {
         let spec = &self.target.spec;
         let doors: DoorsStatus = serde_json::from_value(
             client
+                .waiting_on_its_work()
                 .post_json(
                     self.doorway.route(Route::Doors),
                     &serde_json::to_value(DoorsRequest { spec: spec.clone() })?,
@@ -1733,6 +1740,7 @@ impl Connecting<'_> {
             };
             let answer: MintAppResponse = serde_json::from_value(
                 client
+                    .waiting_on_its_work()
                     .post_json("/access/mint-app", &serde_json::to_value(&req)?)
                     .await?,
             )
@@ -1918,7 +1926,7 @@ pub(crate) async fn connect_direct(
         shared_app,
         inner: req,
     })?;
-    let done = client.post_json(doorway.route(Route::Direct), &body).await?;
+    let done = client.waiting_on_its_work().post_json(doorway.route(Route::Direct), &body).await?;
     grant_of(done)
 }
 
@@ -1972,7 +1980,7 @@ impl Connecting<'_> {
             inner: req,
         })?;
         let started: StartedOAuth =
-            serde_json::from_value(client.post_json(self.doorway.route(Route::Begin), &body).await?)
+            serde_json::from_value(client.waiting_on_its_work().post_json(self.doorway.route(Route::Begin), &body).await?)
                 .context("parse the sign-in start")?;
         println!(
             "Finish the sign-in in your browser:\n  {}",
@@ -2005,6 +2013,7 @@ impl Connecting<'_> {
                 );
             }
             let outcome = client
+                .waiting_on_its_work()
                 .get_json(&format!(
                     "{}?state={}",
                     self.doorway.route(Route::Status),

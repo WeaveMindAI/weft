@@ -395,7 +395,8 @@ pub async fn clean(
             return Ok(());
         }
         let deleted: weft_core::program::DeletedRun =
-            serde_json::from_value(client.delete_json(&format!("/runs/{c}")).await?)
+            // A run that stored many files takes as long as removing them.
+            serde_json::from_value(client.waiting_on_its_work().delete_json(&format!("/runs/{c}")).await?)
                 .context("read what the delete removed")?;
         println!("deleted {c}");
         // The sweep of whatever version this run left bare happens on the
@@ -459,7 +460,8 @@ pub async fn clean(
         filter,
         running: if narrow.cancel_running { weft_core::program::StillGoing::Cancel } else { weft_core::program::StillGoing::Leave },
     };
-    let answer: weft_core::program::CleanOutcome = serde_json::from_value(client.post_json("/runs/clean", &serde_json::to_value(&body)?).await?)
+    // It answers once every matching run and its files are gone.
+    let answer: weft_core::program::CleanOutcome = serde_json::from_value(client.waiting_on_its_work().post_json("/runs/clean", &serde_json::to_value(&body)?).await?)
         .map_err(|e| anyhow::anyhow!("unexpected /runs/clean answer: {e}"))?;
     if ctx.json_out(&serde_json::to_value(&answer)?)? {
         return Ok(());
@@ -571,7 +573,7 @@ async fn registry_prune(ctx: &Ctx, scope: &Scope) -> anyhow::Result<()> {
         },
     };
     let body = serde_json::to_value(&request).context("encode the prune request")?;
-    let report: weft_core::images::PruneReport = serde_json::from_value(ctx.client()?.post_json("/images/prune", &body).await?)
+    let report: weft_core::images::PruneReport = serde_json::from_value(ctx.client()?.waiting_on_its_work().post_json("/images/prune", &body).await?)
         .context("read the install's prune report")?;
     for image in &report.removed {
         println!("  removed {image}");

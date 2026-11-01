@@ -3310,7 +3310,9 @@ impl ContextHandle for RunnerHandle {
     /// Carried as a durable `program_call` task for the dispatcher, keyed
     /// to the call's journal step (`call_index`, which a replay reaches
     /// at the same index) so a retried or replayed enqueue while the task
-    /// lives is one task. The answer is waited for with no
+    /// lives is one task; the install names the call after that key
+    /// (`weft_core::program::program_call_id`), so a call issued again
+    /// once that task ended finds what the first made. The answer is waited for with no
     /// deadline (an infra start can wait out a drain the person chose),
     /// saying so every [`SELF_STOP_BREADCRUMB`]. A call that stops this
     /// run too never returns: the run waits for its own cancel, which the
@@ -3325,6 +3327,8 @@ impl ContextHandle for RunnerHandle {
         let name = call.journal_name();
         let frames = frames_dedup_key(&self.node_frames)
             .map_err(|e| WeftError::NodeFailed(format!("{name}: frames: {e}")))?;
+        // SYNC: the step's spelling <-> crates/weft-broker/src/handlers.rs (the program call's key check)
+        let step = format!("program_call/{}/{}/{frames}/{call_index}", self.run_id, self.node_id);
         let payload = weft_core::program::ProgramCallPayload { by: self.run_id, stop_self, project, call };
         let id = self
             .clients
@@ -3332,7 +3336,7 @@ impl ContextHandle for RunnerHandle {
             .enqueue_dedup(task_store::NewTask {
                 kind: TaskKind::ProgramCall,
                 project_id: Some(self.project_id),
-                dedup_key: Some(format!("program_call/{}/{}/{frames}/{call_index}", self.run_id, self.node_id)),
+                dedup_key: Some(step),
                 run_id: Some(self.run_id),
                 tenant_id: self.tenant_id.clone(),
                 payload: serde_json::to_value(&payload)

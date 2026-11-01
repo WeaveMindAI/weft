@@ -223,7 +223,7 @@ async fn pruning_a_source_waits_for_setup_and_removes_its_unused_bake(pool: Pool
     let bake = weft_dispatcher::store::TriggerBake::from_events(&[birth, complete], &setup_program()).unwrap().unwrap();
     store.finish_trigger_setup(run_id, Some(&bake)).await.unwrap();
     versions.delete_versions(id, &["source".into()]).await.unwrap();
-    assert!(store.trigger_bakes(id, None).await.unwrap().is_empty());
+    assert!(store.trigger_bakes(id, None).await.unwrap().read.is_empty());
     assert!(versions.version(id, "source").await.unwrap().is_none());
 }
 
@@ -249,12 +249,28 @@ async fn a_fresh_capture_replaces_a_prior_bake_that_no_longer_reads(pool: Pool) 
     )
     .await
     .unwrap();
-    assert!(store.trigger_bakes(id, None).await.is_err(), "the prior bake does not read");
+    // Another program's bake, which reads, beside it.
+    let mut elsewhere = bake.clone();
+    elsewhere.program.binary_hash = "bin-B".into();
+    pool.execute(
+        "INSERT INTO trigger_bake (project_id, instance_id, program_hash, bake_json, bake_json_version, source_version) \
+         VALUES ($1, NULL, $2, $3, $4, 'source')",
+        &[&id, &elsewhere.program.digest(), &serde_json::to_string(&elsewhere).unwrap(), &weft_dispatcher::store::TriggerBake::STORED.version()],
+    )
+    .await
+    .unwrap();
+    let before = store.trigger_bakes(id, None).await.unwrap();
+    assert_eq!(before.read.len(), 1, "the row that reads is read past the one that does not");
+    assert_eq!(before.read[0].program, elsewhere.program);
+    let unreadable = before.unreadable_for(&bake.program).expect("read past, and named");
+    assert!(unreadable.error.contains(&weft_dispatcher::store::TriggerBake::row(id, None, &bake.program.digest())), "{}", unreadable.error);
     assert!(store.is_trigger_setup_pending(run_id).await.unwrap());
     let lost = store.finish_trigger_setup(run_id, Some(&bake)).await.unwrap().expect("the prior did not read");
     assert!(lost.error.contains(&weft_dispatcher::store::TriggerBake::row(id, None, &bake.program.digest())), "{}", lost.error);
     assert!(!store.is_trigger_setup_pending(run_id).await.unwrap(), "the setup landed");
     let saved = store.trigger_bakes(id, None).await.unwrap();
+    assert!(saved.unreadable.is_empty());
+    let saved: Vec<_> = saved.read.into_iter().filter(|saved| saved.program == bake.program).collect();
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].run_id, run_id, "the fresh capture replaced the prior");
 }
@@ -1100,12 +1116,12 @@ async fn trigger_bake_ownership_publication_and_project_cleanup(pool: Pool) {
     activations.end_activating(id, second, &ActivationLifecycle::active(), false, None).await.unwrap();
     assert!(store.signal_insert(&entry).await.is_err(), "no late registration after activation ends");
     store.finish_trigger_setup(second, None).await.unwrap();
-    assert_eq!(store.trigger_bakes(id, None).await.unwrap()[0].run_id, first);
+    assert_eq!(store.trigger_bakes(id, None).await.unwrap().read[0].run_id, first);
     store.delete_run(first).await.unwrap();
-    assert_eq!(store.trigger_bakes(id, None).await.unwrap()[0].run_id, first);
-    assert!(store.trigger_bakes(Uuid::new_v4(), None).await.unwrap().is_empty());
+    assert_eq!(store.trigger_bakes(id, None).await.unwrap().read[0].run_id, first);
+    assert!(store.trigger_bakes(Uuid::new_v4(), None).await.unwrap().read.is_empty());
     projects.remove(id).await.unwrap();
-    assert!(store.trigger_bakes(id, None).await.unwrap().is_empty());
+    assert!(store.trigger_bakes(id, None).await.unwrap().read.is_empty());
 }
 
 /// How many rows of `table` belong to run `run_id`.
@@ -1340,7 +1356,7 @@ async fn a_vouching_workers_runs_are_its_own_until_its_vouch_passes(pool: Pool) 
         async move {
             let in_flight = std::collections::BTreeMap::from([("t1".to_string(), 1u32)]);
             let weft_task_store::db::Json(answer): weft_task_store::db::Json<serde_json::Value> = pool.scalar(
-                "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::boolean)",
+                "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                 &[
                     &replica,
                     &id,
@@ -1351,6 +1367,7 @@ async fn a_vouching_workers_runs_are_its_own_until_its_vouch_passes(pool: Pool) 
                     &0i64,
                     &Vec::<String>::new(),
                     &Vec::<i64>::new(),
+                    &Vec::<Option<String>>::new(),
                     &false,
                 ],
             )
@@ -4395,7 +4412,7 @@ async fn a_bake_whose_captured_values_hold_a_nul_is_kept_exactly(pool: Pool) {
         },
     );
     assert_eq!(store.finish_trigger_setup(run_id, Some(&bake)).await.unwrap(), None);
-    let saved = store.trigger_bakes(id, None).await.unwrap();
+    let saved = store.trigger_bakes(id, None).await.unwrap().read;
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].captured["entry"].ports, ports);
     let source: String = pool.scalar("SELECT source_version FROM trigger_bake WHERE project_id = $1", &[&id]).await.unwrap();

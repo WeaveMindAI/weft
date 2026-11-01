@@ -123,6 +123,10 @@ pub enum Phase {
     /// Emitted before the call that waits, because the wait itself
     /// happens on the dispatcher: without it the command looks hung.
     DrainWait,
+    /// The run is being prepared on the install, and what its start is
+    /// doing, said once it changes and every [`SAY_AGAIN_EVERY`] while it
+    /// lasts. Detail carries `{ "elapsedSeconds", "doing" }`.
+    RunStarting,
     /// Trigger registration started (signals about to be wired up).
     TriggerRegisterStart,
     /// The activation goes on, and what it waits on changed. Detail
@@ -374,17 +378,30 @@ impl Progress {
         }
     }
 
-    /// The runs on the old version a resync waits for changed (`waits_for`,
-    /// as its task said it): said again with each one's start, and once
-    /// with none when every one named before has ended (a run a worker took
-    /// and has not put on record yet is waited for unnamed, so none named
-    /// is not none left).
+    /// Where a resync is (`waits_for`, as its task said it), `elapsed` into
+    /// following it: the owner's triggers it turns back on and what that
+    /// waits on, or the runs on the old version it waits for, each with
+    /// its start, or none once every one named before has ended (a run a
+    /// worker took and has not put on record yet is waited for unnamed, so
+    /// none named is not none left).
     // SYNC: the drain_wait detail's waitsFor <-> packages/weft-graph/src/protocol.ts CliPhase (drain_wait)
-    pub fn resync_waits_for(&self, waits_for: &weft_core::deactivation::ResyncProgress) {
+    pub fn resync_waits_for(&self, going: &weft_core::deactivation::ResyncGoing, elapsed: std::time::Duration) {
         self.emit(
             Phase::DrainWait,
-            Some(serde_json::json!({ "on": DrainOn::Resync.as_str(), "waitsFor": waits_for.waits_for })),
+            Some(serde_json::json!({
+                "on": DrainOn::Resync.as_str(),
+                "waitsFor": going.progress.waits_for,
+                "turningOn": going.turning_on,
+                "elapsedSeconds": elapsed.as_secs(),
+            })),
         );
+    }
+
+    /// The run being started is at `stage`, `elapsed` since it was asked
+    /// for.
+    // SYNC: the run_starting detail <-> packages/weft-graph/src/protocol.ts CliPhase (run_starting), packages/weft-graph/src/webview/lib/components/project/ActionBar.svelte (run_starting)
+    pub fn run_starting(&self, stage: &weft_core::versions::RunStarting, elapsed: std::time::Duration) {
+        self.emit(Phase::RunStarting, Some(serde_json::json!({ "elapsedSeconds": elapsed.as_secs(), "doing": stage.describe() })));
     }
 
     pub fn dispatcher_call_start(&self, path: &str) {
@@ -498,14 +515,15 @@ const RUNS_NAMED: usize = 5;
 
 /// What a resync waits for, at `now_unix`, as one line: the runs going on
 /// the old version (oldest first, each with how long it has been going)
-/// and the ways out, or, once none is named any more, only that: a run a
-/// worker took and has not put on record yet is waited for without being
-/// named (`weft_core::deactivation::ResyncProgress`), so an empty list
-/// never means the old version is done. `weft` spells a command for the
+/// and the ways out, or, when none is named, that the triggers come back
+/// next: a run a worker took and has not put on record yet is waited for
+/// without being named (`weft_core::deactivation::ResyncProgress`), and the
+/// task names none while it takes the triggers down or brings them back,
+/// so an empty list never says which. `weft` spells a command for the
 /// install the person acts on.
 pub(crate) fn resync_wait_line(runs: &[weft_core::deactivation::RunGoing], now_unix: i64, weft: impl Fn(&str) -> String) -> String {
     if runs.is_empty() {
-        return "the runs named on the old version have ended; the new version takes over once the resync finishes".to_string();
+        return format!("no run on the old version is named now; the triggers come back on the new version next (`{}` gives the resync up)", weft("cancel-activate"));
     }
     let mut named: Vec<String> = runs
         .iter()
@@ -606,11 +624,25 @@ fn human_line(ev: &Event<'_>, weft: &dyn Fn(&str) -> String) -> Option<String> {
             )
         }
         Phase::InfraProvisionStart => "provisioning infra".to_string(),
-        // What a resync waits for, said again each time it changes.
+        // Where a resync is, said each time it changes and again every so
+        // often while it does not.
         Phase::DrainWait if ev.detail.and_then(|d| d.get("waitsFor")).is_some() => {
             let runs: Vec<weft_core::deactivation::RunGoing> =
                 ev.detail.and_then(|d| d.get("waitsFor")).and_then(|runs| serde_json::from_value(runs.clone()).ok()).unwrap_or_default();
-            format!("  {}", resync_wait_line(&runs, now_unix() as i64, weft))
+            let elapsed = ev.detail.and_then(|d| d.get("elapsedSeconds")).and_then(Value::as_u64).unwrap_or(0);
+            let turning_on: Option<weft_core::infra::wire::ChangeProgress> =
+                ev.detail.and_then(|d| d.get("turningOn")).and_then(|on| serde_json::from_value(on.clone()).ok());
+            let doing = match turning_on {
+                Some(on) => format!("turning the triggers back on {}", on.describe(on.as_of_unix)),
+                None => resync_wait_line(&runs, now_unix() as i64, weft),
+            };
+            format!("  still resyncing (elapsed {}): {doing}", elapsed_text(elapsed))
+        }
+        Phase::RunStarting => {
+            let field = |k: &str| ev.detail.and_then(|d| d.get(k));
+            let elapsed = field("elapsedSeconds").and_then(Value::as_u64).unwrap_or(0);
+            let doing = field("doing").and_then(Value::as_str).unwrap_or("preparing it");
+            format!("  starting the run ({} so far): {doing}", elapsed_text(elapsed))
         }
         Phase::DrainWait => match ev.detail.as_ref().and_then(|d| d.get("on")).and_then(Value::as_str) {
             Some("resync") => format!(
@@ -718,6 +750,33 @@ impl SayAgain {
     }
 }
 
+/// What a wait that goes on said last (`T`, where the thing waited on says
+/// it is) and when: a line is due at once when where it is changed, and
+/// otherwise every [`SAY_AGAIN_EVERY`] ([`SayAgain`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SaidLast<T> {
+    what: T,
+    again: SayAgain,
+}
+
+impl<T: PartialEq> SaidLast<T> {
+    /// A wait whose start, at `what`, was announced `at` into it.
+    pub fn announced(what: T, at: std::time::Duration) -> Self {
+        Self { what, again: SayAgain::said_at(at) }
+    }
+
+    /// `now`, heard `elapsed` into the wait, when it is to be said (it then
+    /// is what was said last); nothing when it is not.
+    pub fn hear(&mut self, now: T, elapsed: std::time::Duration) -> Option<&T> {
+        if self.what == now && !self.again.due(elapsed) {
+            return None;
+        }
+        self.what = now;
+        self.again.said(elapsed);
+        Some(&self.what)
+    }
+}
+
 /// `work`'s answer. Every `every` until it comes, `look` runs with how long
 /// it has been, to say what is happening meanwhile: a call that takes
 /// minutes is never silent. The one shape of every such wait (a build, an
@@ -741,7 +800,7 @@ pub async fn while_waiting<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_wait_line, error_detail, SayAgain, SAY_AGAIN_EVERY};
+    use super::{build_wait_line, error_detail, SaidLast, SayAgain, SAY_AGAIN_EVERY};
 
     /// Every wait for the runs going names its commands for the install
     /// the command was given (`--on <target>`), never the local one.
@@ -764,8 +823,8 @@ mod tests {
     }
 
     /// What a resync waits for reads as the runs, oldest first with how
-    /// long each has gone, at most a few named, and the ways out; none left
-    /// says only that the named ones ended.
+    /// long each has gone, at most a few named, and the ways out; none
+    /// named says the triggers come back next.
     #[test]
     fn a_resync_says_which_runs_it_waits_for() {
         let run = |n: u128, since_unix| weft_core::deactivation::RunGoing { run_id: uuid::Uuid::from_u128(n), since_unix };
@@ -786,7 +845,8 @@ mod tests {
         assert_eq!(super::resync_wait_line(&[run(1, 1300)], 1200, weft).matches("going 0s").count(), 1, "a clock behind the install's reads 0s");
         assert_eq!(
             super::resync_wait_line(&[], 1200, weft),
-            "the runs named on the old version have ended; the new version takes over once the resync finishes",
+            "no run on the old version is named now; the triggers come back on the new version next \
+             (`weft cancel-activate --on cloud` gives the resync up)",
             "an empty list never says the old version is done: a run not on record yet is waited for unnamed"
         );
     }
@@ -806,6 +866,44 @@ mod tests {
         assert!(!announced.due(secs(6)), "a wait whose start was announced waits a beat");
         assert!(announced.due(secs(5) + SAY_AGAIN_EVERY));
         assert!(!announced.due(secs(1)), "a time before the last line is never due");
+    }
+
+    /// A resync's follower says where it is at once when that changed, and
+    /// otherwise again once a beat passed since it last spoke, with how
+    /// long it has followed: never silent for minutes while the triggers
+    /// come back.
+    #[test]
+    fn a_resync_says_where_it_is_when_it_changes_and_once_a_beat() {
+        let secs = std::time::Duration::from_secs;
+        let run = |n: u128| weft_core::deactivation::RunGoing { run_id: uuid::Uuid::from_u128(n), since_unix: 1000 };
+        let waiting = weft_core::deactivation::ResyncProgress { waits_for: vec![run(1)] };
+        let none = weft_core::deactivation::ResyncProgress::default();
+        let mut said = SaidLast::announced(none.clone(), secs(0));
+        assert_eq!(said.hear(none.clone(), secs(25)), None, "the drain-wait line just said it");
+        assert_eq!(said.hear(waiting.clone(), secs(26)), Some(&waiting), "a change is said at once");
+        assert_eq!(said.hear(waiting.clone(), secs(26) + SAY_AGAIN_EVERY - secs(1)), None);
+        assert_eq!(said.hear(none.clone(), secs(40)), Some(&none), "the runs ending is a change");
+        assert_eq!(said.hear(none.clone(), secs(40) + SAY_AGAIN_EVERY), Some(&none), "unchanged, said again after a beat");
+        assert_eq!(said.hear(none.clone(), secs(41) + SAY_AGAIN_EVERY), None, "and not again until the next beat");
+
+        let progress = super::Progress::new(super::ActionVerb::Resync, false, None);
+        let weft = |verb: &str| progress.weft(verb);
+        let detail = serde_json::json!({ "on": "resync", "waitsFor": [], "elapsedSeconds": 330 });
+        let ev = super::Event { ts_unix: 0, verb: None, phase: super::Phase::DrainWait, detail: Some(&detail) };
+        assert_eq!(
+            super::human_line(&ev, &weft).expect("where a resync is is said"),
+            "  still resyncing (elapsed 5m30s): no run on the old version is named now; the triggers come back on the new \
+             version next (`weft cancel-activate` gives the resync up)"
+        );
+        // Turning an owner's triggers back on, it says for how long and
+        // what that waits on.
+        let detail = serde_json::json!({
+            "on": "resync", "waitsFor": [], "elapsedSeconds": 90,
+            "turningOn": { "sinceUnix": 100, "asOfUnix": 160, "waiting": "its setup run r1" }
+        });
+        let ev = super::Event { ts_unix: 0, verb: None, phase: super::Phase::DrainWait, detail: Some(&detail) };
+        let line = super::human_line(&ev, &weft).expect("where a resync is is said");
+        assert!(line.starts_with("  still resyncing (elapsed 1m30s): turning the triggers back on ") && line.contains("its setup run r1"), "{line}");
     }
 
     /// The wait line names what it knows in every state, never just the time.

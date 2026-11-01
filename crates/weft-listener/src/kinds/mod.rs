@@ -195,6 +195,18 @@ pub trait KindHandler: Send + Sync {
         Ok(kind_state)
     }
 
+    /// Whether what this signal does as it first comes up (its first wake,
+    /// its held connection) could work on this install, from its spec and
+    /// the state [`Self::settle`] settled, asked before anything it would
+    /// replace is taken down and doing nothing outside (a provider
+    /// subscription that needs the provider to call in needs an address
+    /// the internet reaches). What only an outside service can answer is
+    /// not known until it is asked. Default: nothing to check beyond
+    /// settling.
+    async fn check_coming_up(&self, _spec: &SignalSpec, _kind_state: &Value, _ctx: &SpawnCtx) -> Result<()> {
+        Ok(())
+    }
+
     /// For a `Wakes` kind: whether a fresh registration handles its first
     /// wake on the spot, so what that wake does (a provider subscription's
     /// first subscribe) fails the registration loudly instead of failing
@@ -531,6 +543,27 @@ pub async fn prepare_signal(
     };
     let rendered = handler.render(&token, &signal)?;
     Ok(Prepared { routing, kind_state, rendered, holds })
+}
+
+/// Whether the signal `identity` could be registered and come up on this
+/// install, decided without registering or starting it: what registering
+/// it settles ([`prepare_signal`], which writes nothing and starts
+/// nothing), then what its kind checks of its coming up
+/// ([`KindHandler::check_coming_up`]). An error says why not. It settles
+/// from a fresh state, carrying nothing over from a row: what decides
+/// whether a signal can come up on the install (its kind, its connection,
+/// the install's address) is never what a row carries.
+pub async fn check_signal(
+    state: &crate::ListenerState,
+    identity: SignalIdentity,
+    for_instance: Option<weft_core::instance::InstanceScope>,
+    asked_at_unix_ms: i64,
+) -> Result<()> {
+    let handler = handler_or_err(&identity.spec.kind)?;
+    let (token, tenant_id, spec) = (identity.token.clone(), identity.tenant_id.clone(), identity.spec.clone());
+    let prepared = prepare_signal(state, identity, for_instance.clone(), None, asked_at_unix_ms).await?;
+    let ctx = spawn_ctx(state, &token, crate::reach::UNREGISTERED, &tenant_id, for_instance, &spec, true, Arc::default());
+    handler.check_coming_up(&spec, &prepared.kind_state, &ctx).await
 }
 
 /// The state of the replaced row `prior` a registration of `spec` carries

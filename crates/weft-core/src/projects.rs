@@ -552,6 +552,34 @@ pub struct TriggerCopy {
     /// right now ("its setup run <id>").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<crate::infra::wire::ChangeProgress>,
+    /// The fires and calls dropped in the last minute or two: refused
+    /// before any run started, which nothing tries again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<Dropped>,
+}
+
+/// The fires and calls of a trigger dropped in the last minute or two:
+/// refused before any run started (its program cannot run what they
+/// reach, it takes no work, it has no armed program), by its worker's
+/// door or by the install, counted where the door counts its runs
+/// (`weft_core::signal::limits::dropped_key`).
+// SYNC: Dropped <-> packages/weft-graph/src/protocol.ts Dropped
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Dropped {
+    pub count: u64,
+    /// Why the last one was dropped, as the door said it.
+    pub last_reason: String,
+}
+
+impl Dropped {
+    /// "3 fires or calls dropped in the last minute or two (refused before
+    /// any run started), the last because: ...".
+    // SYNC: Dropped::describe <-> packages/weft-graph/src/webview/lib/lifecycle.ts describeDropped
+    pub fn describe(&self) -> String {
+        let what = if self.count == 1 { "1 fire or call".to_string() } else { format!("{} fires or calls", self.count) };
+        format!("{what} dropped in the last minute or two (refused before any run started), the last because: {}", self.last_reason)
+    }
 }
 
 /// The work held on triggers that are down: the arrivals their door held
@@ -571,6 +599,7 @@ impl HeldWork {
     }
 
     /// "3 arrivals and 1 paused run", naming only what there is.
+    // SYNC: HeldWork::describe <-> packages/weft-graph/src/webview/lib/lifecycle.ts describeHeld
     pub fn describe(&self) -> String {
         let counted = |n: u64, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
         match (self.arrivals, self.paused) {
@@ -714,6 +743,7 @@ mod tests {
             waiting: None,
             version: None,
             progress: Some(crate::infra::wire::ChangeProgress { since_unix: 10, as_of_unix: 250, waiting: Some("its setup run r1".into()) }),
+            dropped: None,
         };
         let wire = serde_json::to_value(&copy).unwrap();
         assert_eq!(wire["progress"], serde_json::json!({ "sinceUnix": 10, "asOfUnix": 250, "waiting": "its setup run r1" }));
@@ -721,6 +751,34 @@ mod tests {
         assert_eq!(read.progress, copy.progress);
         let resting = serde_json::to_value(TriggerCopy { progress: None, ..copy }).unwrap();
         assert!(resting.get("progress").is_none());
+    }
+
+    /// A trigger that dropped fires or calls says how many and why, in the
+    /// editor's spelling; one that dropped none says nothing of it.
+    #[test]
+    fn what_a_trigger_dropped_rides_the_wire() {
+        let copy = TriggerCopy {
+            instance: None,
+            state: TriggerState::On,
+            mode: crate::activation::ActivationMode::Active,
+            down_with: None,
+            held_back: None,
+            held: HeldWork::default(),
+            waiting: None,
+            version: None,
+            progress: None,
+            dropped: Some(Dropped { count: 3, last_reason: "package 'relay' didn't compile".into() }),
+        };
+        let wire = serde_json::to_value(&copy).unwrap();
+        assert_eq!(wire["dropped"], serde_json::json!({ "count": 3, "lastReason": "package 'relay' didn't compile" }));
+        let read: TriggerCopy = serde_json::from_value(wire).unwrap();
+        assert_eq!(read.dropped, copy.dropped);
+        assert!(serde_json::to_value(TriggerCopy { dropped: None, ..copy }).unwrap().get("dropped").is_none());
+        let one = Dropped { count: 1, last_reason: "the trigger is gone".into() };
+        assert_eq!(
+            one.describe(),
+            "1 fire or call dropped in the last minute or two (refused before any run started), the last because: the trigger is gone"
+        );
     }
 
     /// Names and hashes read back as written, a program's addresses

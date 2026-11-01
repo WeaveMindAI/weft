@@ -65,6 +65,10 @@ pub struct Task {
     pub kind: String,
     pub status: TaskStatus,
     pub project_id: Option<Uuid>,
+    /// What its producer named the work (`NewTask::dedup_key`), when it
+    /// named it: the same each time the producer asks for the same work.
+    #[serde(default)]
+    pub dedup_key: Option<String>,
     /// The run that asked for the work, when one did.
     pub run_id: Option<weft_core::RunId>,
     /// The tenant the task belongs to: every task has one, and the dedup
@@ -288,6 +292,62 @@ pub async fn enqueue(pool: &Pool, spec: NewTask) -> Result<Uuid> {
     Ok(id)
 }
 
+/// What [`enqueue_as`] did with an ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Enqueued {
+    /// This call inserted the task.
+    Inserted,
+    /// The same ask was sent before: its task is there already.
+    Joined,
+    /// The id names no task of this ask, and why: another task holds it,
+    /// or the one it named ended and is no longer kept.
+    Refused(String),
+}
+
+/// Insert a new task under `id`, an id its producer's caller made: the
+/// same ask sent twice (its answer lost on the way) inserts once, and the
+/// second finds the first, whatever it has become since, for as long as
+/// the row is kept ([`TERMINAL_RETENTION_SECS`] after it ends). A row
+/// under `id` that is another task (another kind, tenant, project or
+/// payload) is refused: the id was not this ask's.
+pub async fn enqueue_as(pool: &Pool, id: Uuid, spec: NewTask) -> Result<Enqueued> {
+    let payload = JsonText(&spec.payload);
+    let inserted = pool
+        .execute(
+            r#"INSERT INTO task (id, kind, status, project_id, dedup_key, run_id, tenant_id, payload, attempts, created_at_unix)
+               VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, 0, $8)
+               ON CONFLICT (id) DO NOTHING"#,
+            &[
+                &id,
+                &spec.kind.as_str(),
+                &spec.project_id,
+                &spec.dedup_key.as_deref(),
+                &spec.run_id,
+                &spec.tenant_id.as_str(),
+                &payload,
+                &unix_now(),
+            ],
+        )
+        .await?;
+    if inserted == 1 {
+        crate::announce::committed(pool);
+        return Ok(Enqueued::Inserted);
+    }
+    let same: Option<bool> = pool
+        .scalar_opt(
+            "SELECT kind = $2 AND tenant_id = $3 AND project_id IS NOT DISTINCT FROM $4 AND payload::jsonb = $5::text::jsonb \
+             FROM task WHERE id = $1",
+            &[&id, &spec.kind.as_str(), &spec.tenant_id.as_str(), &spec.project_id, &payload],
+        )
+        .await?;
+    Ok(match same {
+        Some(true) => Enqueued::Joined,
+        Some(false) => Enqueued::Refused(format!("task {id} is another task than this ask; ask again under a new id")),
+        // Gone between the two statements: it ended and was pruned.
+        None => Enqueued::Refused(format!("task {id} ended and is no longer kept; ask again under a new id")),
+    })
+}
+
 /// Insert with dedup. If a pending or claimed task with the same
 /// `(tenant_id, kind, dedup_key)` already exists, returns its id
 /// without inserting.
@@ -366,7 +426,7 @@ pub async fn claim_next(pool: &Pool, replica: &str) -> Result<Claim> {
                                ORDER BY created_at_unix ASC
                                FOR UPDATE SKIP LOCKED
                                LIMIT 1)
-                   RETURNING id, kind, status, project_id, run_id, tenant_id, attempts, payload)
+                   RETURNING id, kind, status, project_id, dedup_key, run_id, tenant_id, attempts, payload)
                SELECT p.*,
                       CASE WHEN p.id IS NULL
                            THEN (SELECT MIN(claimed_until_unix) FROM task WHERE status = 'claimed') END AS next_lapse,
@@ -653,6 +713,7 @@ fn row_to_task(row: Row) -> Result<Task> {
         kind: row.try_get("kind")?,
         status,
         project_id: row.try_get("project_id")?,
+        dedup_key: row.try_get("dedup_key")?,
         run_id: row.try_get("run_id")?,
         tenant_id: row.try_get("tenant_id")?,
         attempts: row.try_get("attempts")?,
@@ -704,6 +765,7 @@ mod wire_tests {
             kind: crate::TaskKind::RegisterSignal.to_string(),
             status: TaskStatus::Pending,
             project_id: None,
+            dedup_key: None,
             run_id: None,
             tenant_id: "t".into(),
             attempts: 2,

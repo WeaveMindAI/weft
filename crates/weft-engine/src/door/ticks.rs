@@ -332,7 +332,7 @@ mod tests {
 
         // Meanwhile another copy ran the minute's one run.
         let minute = the_minute();
-        let ran = weft_broker_client::protocol::DoorCount { key: "e:t1".into(), hits: 1 };
+        let ran = weft_broker_client::protocol::DoorCount { key: "e:t1".into(), hits: 1, reason: None };
         *broker.heard.lock().unwrap() = (vec![ran], 2);
         *broker.tick_takes.lock().unwrap() = secs(2.0);
         let asked = Instant::now();

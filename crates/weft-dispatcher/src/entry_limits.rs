@@ -140,6 +140,48 @@ pub async fn recent_runs(pool: &Pool, project: uuid::Uuid, now: i64) -> Result<s
     Ok(runs)
 }
 
+/// The fires and calls each of the project's triggers dropped in this
+/// minute and the one before, by the activation the trigger's signal is
+/// governed by, with the reason of the newest minute's count (any
+/// counter's, when several dropped in it). A dropped fire was
+/// acknowledged, so this is the only trace it leaves outside the log.
+// SYNC: 'dropped:' <-> weft_core::signal::limits::dropped_key
+pub async fn dropped(
+    pool: &Pool,
+    project: uuid::Uuid,
+    now: i64,
+) -> Result<std::collections::BTreeMap<weft_core::activation::ActivationKey, weft_core::projects::Dropped>> {
+    let (start, _) = window(now);
+    let rows: Vec<(String, Option<String>, i64, Option<String>)> = pool
+        .all(
+            "SELECT s.activation_trigger, s.instance_id, SUM(c.hits)::BIGINT, \
+                    (array_agg(c.reason ORDER BY c.window_start DESC) FILTER (WHERE c.reason IS NOT NULL))[1] \
+             FROM door_count c JOIN signal s ON c.key = 'dropped:' || s.token \
+             WHERE c.project_id = $1 AND s.project_id = $1 AND c.window_start >= $2 \
+               AND c.key LIKE 'dropped:%' AND s.activation_trigger IS NOT NULL \
+             GROUP BY s.activation_trigger, s.instance_id",
+            &[&project, &(start - WINDOW_SECS)],
+        )
+        .await
+        .context("read what triggers dropped")?;
+    let mut dropped = std::collections::BTreeMap::new();
+    for (trigger, instance, count, reason) in rows {
+        if count <= 0 {
+            continue;
+        }
+        let instance = instance
+            .map(weft_core::instance::InstanceId::new)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("signal.instance_id for trigger {trigger}: {e}"))?;
+        // A drop is counted with its reason in one write, so a count
+        // without a reason is a row nothing of this release wrote.
+        let last_reason = reason.with_context(|| format!("trigger {trigger}'s dropped fires and calls were counted with no reason"))?;
+        let key = weft_core::activation::ActivationKey::new(trigger, weft_core::instance::Owner::from_instance(instance));
+        dropped.insert(key, weft_core::projects::Dropped { count: count as u64, last_reason });
+    }
+    Ok(dropped)
+}
+
 /// The `429` a refused call gets: which limit, and when to come back.
 pub fn too_many(refused: Refused) -> axum::response::Response {
     use axum::response::IntoResponse;

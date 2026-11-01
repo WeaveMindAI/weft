@@ -211,7 +211,7 @@ impl Limited {
     }
 }
 
-// SYNC: ran_key, failed_key <-> crates/weft-task-store/src/worker_door.rs (door_count keys)
+// SYNC: ran_key, failed_key, dropped_key <-> crates/weft-task-store/src/worker_door.rs (door_count keys), crates/weft-dispatcher/src/entry_limits.rs (dropped)
 /// The key the runs trigger `token` started in a minute are counted under,
 /// at the doors that started them (`door_count`).
 pub fn ran_key(token: &str) -> String {
@@ -222,6 +222,30 @@ pub fn ran_key(token: &str) -> String {
 /// under.
 pub fn failed_key(token: &str) -> String {
     format!("failed:{token}")
+}
+
+/// The key the fires and calls of trigger `token` dropped in a minute
+/// (refused before any run started, which nothing retries) are counted
+/// under, by its worker's door or by the install; the count's row keeps
+/// the last reason beside it (`door_count.reason`).
+pub fn dropped_key(token: &str) -> String {
+    format!("dropped:{token}")
+}
+
+/// The longest reason a drop is counted with, in characters: a line a
+/// person reads in `weft status`. A tick states it every second while it
+/// counts, so a compiler's whole output is never what travels.
+pub const DROP_REASON_CHARS: usize = 300;
+
+/// The reason a drop is counted with: the first line of why it was
+/// dropped, cut to [`DROP_REASON_CHARS`]. The whole reason is in the log
+/// of whoever dropped it.
+pub fn drop_reason(why: &str) -> String {
+    let line = why.lines().next().unwrap_or_default().trim();
+    match line.char_indices().nth(DROP_REASON_CHARS) {
+        Some((cut, _)) => format!("{}...", &line[..cut]),
+        None => line.to_string(),
+    }
 }
 
 /// A refused call: which limit, and when the caller may try again.
@@ -250,6 +274,15 @@ impl Refused {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A drop's reason is its first line, cut to a line a person reads.
+    #[test]
+    fn a_drops_reason_is_its_first_line_cut_short() {
+        assert_eq!(drop_reason("package 'relay' didn't compile: error[E0425]\n  --> src/lib.rs:3"), "package 'relay' didn't compile: error[E0425]");
+        let long = "x".repeat(DROP_REASON_CHARS + 5);
+        assert_eq!(drop_reason(&long), format!("{}...", "x".repeat(DROP_REASON_CHARS)));
+        assert_eq!(drop_reason(""), "");
+    }
 
     /// Released work gets half of the trigger's runs per minute and at
     /// once, never less than one, and a caller's own limit as it is.

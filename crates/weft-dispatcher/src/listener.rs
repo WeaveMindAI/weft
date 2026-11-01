@@ -25,7 +25,7 @@ use crate::role_client::RoleClient;
 /// on a warm listener, a few seconds on one starting from zero, and the
 /// broker's own wait for a database connection when the database is busy.
 /// The calls that reach outside services through a kind (`/prepare`,
-/// `/start`, `/rehydrate`, `/unregister`, `/cancel_call`: a provider's
+/// `/check`, `/start`, `/rehydrate`, `/unregister`, `/cancel_call`: a provider's
 /// webhook set or taken down, a connection opened, the last call of a
 /// cancelled wait) pass no limit: how long a provider takes is not weft's
 /// to bound, and a call cut short there may already have changed things
@@ -72,6 +72,20 @@ impl ListenerClient {
         req: &weft_core::signal::listener_protocol::PrepareRequest,
     ) -> Result<weft_core::signal::listener_protocol::PrepareResponse> {
         Ok(Self::ok(self.post("/prepare", None, req).await?, "/prepare").await?.json().await?)
+    }
+
+    /// Which of `signals` could not be registered and come up on this
+    /// install, each with why, registering and starting nothing: asked
+    /// before a resync takes down what they would replace. Reaches outside
+    /// services through a kind (the broker's read of a connection), so no
+    /// limit.
+    pub async fn check(
+        &self,
+        signals: Vec<weft_core::signal::listener_protocol::CheckSignal>,
+    ) -> Result<Vec<weft_core::signal::listener_protocol::CheckRefused>> {
+        let req = weft_core::signal::listener_protocol::CheckRequest { signals };
+        let answer: weft_core::signal::listener_protocol::CheckResponse = Self::ok(self.post("/check", None, &req).await?, "/check").await?.json().await?;
+        Ok(answer.refused)
     }
 
     /// What the signal's kind is showing (and, for a run's wait, the raw

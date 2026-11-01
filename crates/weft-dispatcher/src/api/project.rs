@@ -1286,13 +1286,34 @@ impl Desired {
 }
 
 
+/// What each activation's door and queue did with what arrived, by
+/// activation: the work it holds while down, the fires waiting in its
+/// queue on something no clock brings, and the fires and calls dropped.
+#[derive(Debug, Default)]
+pub(crate) struct TriggerTraffic {
+    pub held: std::collections::BTreeMap<weft_core::activation::ActivationKey, weft_core::projects::HeldWork>,
+    pub waiting: std::collections::BTreeMap<weft_core::activation::ActivationKey, weft_core::program::WaitingFires>,
+    pub dropped: std::collections::BTreeMap<weft_core::activation::ActivationKey, weft_core::projects::Dropped>,
+}
+
+impl TriggerTraffic {
+    /// The project's, as the status answer shows it.
+    pub(crate) async fn of(pool: &weft_task_store::db::Pool, project_id: uuid::Uuid, now_unix: i64) -> anyhow::Result<Self> {
+        let (held, waiting, dropped) = tokio::try_join!(
+            crate::store::postgres::held_by_activation(pool, project_id),
+            crate::api::signal::waiting_fires(pool, project_id),
+            crate::entry_limits::dropped(pool, project_id, now_unix),
+        )?;
+        Ok(Self { held, waiting, dropped })
+    }
+}
+
 /// Every trigger of the program, one entry per place (see
 /// `TriggerEntry`), then the activations of triggers it has no more.
 pub(crate) fn trigger_entries(
     project: &ProjectDefinition,
     activations: &[crate::activation_store::Activation],
-    held: &std::collections::BTreeMap<weft_core::activation::ActivationKey, weft_core::projects::HeldWork>,
-    waiting: &std::collections::BTreeMap<weft_core::activation::ActivationKey, weft_core::program::WaitingFires>,
+    traffic: &TriggerTraffic,
     desired: &Desired,
     registered_binary: Option<&str>,
     now_unix: i64,
@@ -1318,12 +1339,13 @@ pub(crate) fn trigger_entries(
             let elsewhere = on_another_binary(activations, std::slice::from_ref(&activation.key), binary);
             (!elsewhere.is_empty()).then(|| held_back_words(&elsewhere))
         }),
-        held: held.get(&activation.key).copied().unwrap_or_default(),
-        waiting: waiting.get(&activation.key).cloned(),
+        held: traffic.held.get(&activation.key).copied().unwrap_or_default(),
+        waiting: traffic.waiting.get(&activation.key).cloned(),
         version: activation.source_version.clone(),
         progress: activation.activating.zip(activation.lifecycle.activating_run_id).map(|(activating, run)| {
             weft_core::infra::wire::ChangeProgress { since_unix: activating.since_unix, as_of_unix: now_unix, waiting: Some(activating.step.waiting(run)) }
         }),
+        dropped: traffic.dropped.get(&activation.key).cloned(),
     };
     let never_on = || TriggerCopy {
         instance: None,
@@ -1335,6 +1357,7 @@ pub(crate) fn trigger_entries(
         waiting: None,
         version: None,
         progress: None,
+        dropped: None,
     };
     // Each trigger place by the way its activation is keyed, kept with the
     // place itself.
@@ -5639,7 +5662,7 @@ mod trigger_entries_tests {
             row("inbox", ada, ActivationLifecycle::active(), Some(("inbox-1", &[]))),
             row("old", Owner::Shared, ActivationLifecycle::holding(), None),
         ];
-        let entries = trigger_entries(&program(), &rows, &Default::default(), &Default::default(), &desired(&[("door", "door-1"), ("inbox", "inbox-2")]), None, 0);
+        let entries = trigger_entries(&program(), &rows, &Default::default(), &desired(&[("door", "door-1"), ("inbox", "inbox-2")]), None, 0);
         let nodes: Vec<&str> = entries.iter().map(|e| e.node.as_str()).collect();
         assert_eq!(nodes, ["door", "inbox", "old"]);
         let door = &entries[0];
@@ -5654,7 +5677,7 @@ mod trigger_entries_tests {
 
         // A shared trigger never turned on is listed off, its cut read off
         // the program.
-        let never = trigger_entries(&program(), &[], &Default::default(), &Default::default(), &desired(&[]), None, 0);
+        let never = trigger_entries(&program(), &[], &Default::default(), &desired(&[]), None, 0);
         assert_eq!(never[0].shared.as_ref().map(|c| c.state), Some(TriggerState::Off));
         assert_eq!(never[0].depends_on, vec!["db".to_string()]);
     }
@@ -5677,7 +5700,7 @@ mod trigger_entries_tests {
         inbox.program = Some(identity("old"));
         let rows = [door.clone(), inbox];
         let held_back = |rows: &[Activation], registered: &str| {
-            trigger_entries(&program(), rows, &Default::default(), &Default::default(), &desired(&[]), Some(registered), 0)[0]
+            trigger_entries(&program(), rows, &Default::default(), &desired(&[]), Some(registered), 0)[0]
                 .shared
                 .as_ref()
                 .unwrap()

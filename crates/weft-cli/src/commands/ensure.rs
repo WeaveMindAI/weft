@@ -273,8 +273,9 @@ async fn follow_version(
 
 /// A request to the install that failed: `Ok` with why, to say, when the
 /// install is only out of reach for now and the request is to be sent
-/// again: its connection failed on the way
-/// ([`crate::client::connection_failed`]), or the gateway in front of it
+/// again: its connection failed on the way, or it was taken and not
+/// answered within its time limit ([`crate::client::connection_failed`],
+/// [`crate::client::NoAnswerInTime`]), or the gateway in front of it
 /// answered that it cannot reach it right now (a 502, 503 or 504 the
 /// install did not give itself: down or starting). Every request this is
 /// read on (asking for the build, which joins the one already asked for,
@@ -539,6 +540,12 @@ mod tests {
         assert!(why.contains("did not answer"), "{why}");
         let reset = look(install(Then::Reset).await).await;
         assert!(look_again_after(reset).is_ok());
+        // A look the install took and never answered (its copy stopped
+        // behind a gateway holding the connection) is looked at again
+        // once its limit is up.
+        let held = DispatcherClient::new(install(Then::Hold).await, None).answering_within(std::time::Duration::from_millis(200));
+        let why = look_again_after(version_state(&held, "p", build).await.unwrap_err()).unwrap();
+        assert!(why.contains("did not answer within"), "{why}");
         let down = look(install(Then::Answer("HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n")).await).await;
         assert!(look_again_after(down).is_ok());
         // The gateway's 503 (the install down or starting) to the build ask

@@ -322,7 +322,7 @@ impl BakeStore for FakeStore {
         Ok(self.inner.lock().unwrap().trigger_setups.contains_key(&run_id))
     }
 
-    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&super::TriggerBake>) -> anyhow::Result<Option<super::UnreadablePriorBake>> {
+    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&super::TriggerBake>) -> anyhow::Result<Option<super::UnreadableBake>> {
         let mut g = self.inner.lock().unwrap();
         let project = g.trigger_setups.get(&run_id).copied();
         if let Some(project) = project {
@@ -341,9 +341,11 @@ impl BakeStore for FakeStore {
         Ok(None)
     }
 
-    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Vec<super::TriggerBake>> {
-        Ok(self.inner.lock().unwrap().trigger_bakes.values()
-            .filter(|bake| bake.project_id == project_id && bake.instance.as_ref() == instance).cloned().collect())
+    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<super::Bakes> {
+        let read = self.inner.lock().unwrap().trigger_bakes.values()
+            .filter(|bake| bake.project_id == project_id && bake.instance.as_ref() == instance).cloned().collect();
+        // The fake keeps bakes as values, which always read.
+        Ok(super::Bakes { read, unreadable: Vec::new() })
     }
 }
 
@@ -1144,8 +1146,8 @@ pub(crate) mod tests {
         let second = RunId::new_v4();
         store.inner.lock().unwrap().trigger_setups.insert(second, PROJECT);
         store.finish_trigger_setup(second, None).await.unwrap();
-        assert_eq!(store.trigger_bakes(PROJECT, None).await.unwrap()[0].run_id, first);
-        assert!(store.trigger_bakes(OTHER_PROJECT, None).await.unwrap().is_empty());
+        assert_eq!(store.trigger_bakes(PROJECT, None).await.unwrap().read[0].run_id, first);
+        assert!(store.trigger_bakes(OTHER_PROJECT, None).await.unwrap().read.is_empty());
         let mut refresh = bake.clone();
         refresh.run_id = second;
         refresh.targets = refresh.captured.keys().cloned().collect();
@@ -1154,7 +1156,7 @@ pub(crate) mod tests {
         store.finish_trigger_setup(second, Some(&refresh)).await.unwrap();
         store.finish_trigger_setup(first, Some(&bake)).await.unwrap();
         store.delete_run(second).await.unwrap();
-        let saved = store.trigger_bakes(PROJECT, None).await.unwrap();
+        let saved = store.trigger_bakes(PROJECT, None).await.unwrap().read;
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].run_id, second);
         assert!(saved[0].captured.is_empty(), "a skipped target cannot keep its old registration");

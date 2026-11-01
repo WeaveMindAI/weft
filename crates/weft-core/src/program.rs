@@ -92,6 +92,20 @@ impl ProgramCall {
     }
 }
 
+/// Namespace of program calls' ids: generated once and frozen.
+const PROGRAM_CALL_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x5e1f_93c2_7a0d_4b6e_9f24_c8a1_3d7b_e092);
+
+/// The id of the call a run makes at `step`, the place in the run that
+/// makes it (the run, its node, the node's loop frames and the call's
+/// index there, as the worker spells them in the call's task's dedup key,
+/// which a replay reaches the same): the same however often the call is
+/// issued again, so what the call makes (a run it starts) is made once.
+/// Derived by the install from the task's own key, never taken from what
+/// the worker says.
+pub fn program_call_id(step: &str) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&PROGRAM_CALL_NAMESPACE, step.as_bytes())
+}
+
 /// The durable task that carries a [`ProgramCall`]: who asked, what
 /// happens to the asker when the call takes it down, and the call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -850,6 +864,15 @@ mod tests {
         let other = ProgramCallPayload { project: Some(uuid::Uuid::from_u128(7)), ..own };
         let back: ProgramCallPayload = serde_json::from_value(serde_json::to_value(&other).unwrap()).unwrap();
         assert_eq!(back, other);
+    }
+
+    /// A call issued again at the same place of the same run is the same
+    /// call; any other place is another.
+    #[test]
+    fn a_call_is_named_after_the_place_that_makes_it() {
+        assert_eq!(program_call_id("program_call/r1/n/f/0"), program_call_id("program_call/r1/n/f/0"));
+        assert_ne!(program_call_id("program_call/r1/n/f/0"), program_call_id("program_call/r1/n/f/1"));
+        assert_ne!(program_call_id("program_call/r1/n/f/0"), program_call_id("program_call/r2/n/f/0"));
     }
 
     #[test]
