@@ -1345,7 +1345,7 @@ pub(crate) fn trigger_entries(
     let mut entries: Vec<TriggerEntry> = places
         .iter()
         .map(|(node, place)| {
-            let per_instance = weft_core::project::is_per_instance(project, &place.id);
+            let per_instance = weft_core::project::is_per_instance(project, place);
             let rows: Vec<&crate::activation_store::Activation> = activations.iter().filter(|a| &a.key.trigger == node).collect();
             let shared = rows.iter().copied().find(|a| a.key.instance().is_none());
             TriggerEntry {
@@ -1453,7 +1453,7 @@ pub(crate) fn infra_entries(
             takes_down: Vec::new(),
             last_restart: None,
         };
-        if node.per_instance.is_some() {
+        if node.per_instance_at(&place.path).is_some() {
             infra.push(ProjectInfraEntry {
                 instance_copy_count: Some(instance_infra.iter().filter(|c| c.node == spelled).count()),
                 takes_down: takes_down(&spelled, weft_core::instance::Copies::Every),
@@ -1595,7 +1595,7 @@ pub(crate) async fn gather_action_snapshot(
     // shared row, and are armed per instance.
     let shared_triggers: Vec<Located> = weft_core::project::trigger_places(project)
         .into_iter()
-        .filter(|place| !weft_core::project::is_per_instance(project, &place.id))
+        .filter(|place| !weft_core::project::is_per_instance(project, place))
         .collect();
     // Any trigger, shared or per instance: one that exists per instance
     // is turned on for an instance, and the verb is offered for it all
@@ -4346,6 +4346,7 @@ mod trigger_kick_tests {
         assert!(cannot_come_on(&p, &keys, &Default::default()).is_empty(), "everything loads");
         p.broken.push(weft_core::project::Broken {
             parts: vec!["auth".into()],
+            places: Vec::new(),
             why: "node 'HmacAuth' failed to load: service.verify sets signatureHeader; run `weft catalog update`".into(),
             hides: true,
         });

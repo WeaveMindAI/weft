@@ -4,6 +4,59 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## Unreleased
+
+**What the compiler now refuses after this update:**
+
+**A shared trigger whose runs reach something per instance is refused.**
+A trigger every instance shares fires runs for no instance, so until now every
+fire of one wired into a per-instance part was refused at run time ("... exists
+once per instance, so this run needs to know which instance it is for"). The
+compiler now refuses the trigger (`shared-trigger-reaches-per-instance`),
+naming what it reaches and why each is per instance: the editor shows the
+error, and the trigger cannot be turned on or fired until it is fixed, while
+the rest of the program runs. Make the trigger per instance too, or keep what
+is per instance out of what it runs. A route or a socket is not refused, since
+each call can name its instance. Under a file included at several sites, only
+the site that reaches something per instance is refused: the same trigger under
+another include of the file still turns on.
+
+**A loop output nothing inside the loop writes is refused**
+(`loop-output-unwritten`), and so is any run that reaches the loop. A gathered one would be a list of nothing but nulls,
+and a carried one would never change, so it is almost certainly a port the loop
+forgot to write. Write the output inside the loop, or remove the port.
+
+**What now works:**
+
+**A file included in two places is per instance only where an instance's value
+reaches it.** Until now, including a file inside a group with a per-instance
+part made that file per instance everywhere, so a shared route that included
+the same file had every run refused. Each include now decides for itself. If a
+program of yours hit this, run `weft resync` in it once you are on this version,
+so its triggers run the new build.
+
+**The graph shows an included file's nodes per instance where they are.**
+Walked into from the entry file, a file included at several sites shows each
+node per instance at a site where an instance's value reaches it and shared at
+one where none does, even before the install knows about it.
+
+**A loop with no outputs ends.** Until now one over an empty list, and one over
+a list with items, was declared stuck (`... never started, waiting on its scope
+to open`).
+
+**A run whose trigger has `recorded: false` can be tagged**, and a stop by that
+tag reaches it. Tagging writes down the run's start, a small row that goes when
+the run's keep period ends.
+
+**A file stored for its run only, then written somewhere that outlives the run,
+is warned about** (`run-file-kept-past-run`): `scope: run` keeps the file, but
+only its own run can read it, whatever `ttlDays` says. Store it with
+`scope: project` if a later run needs it.
+
+**A bad fire payload names every missing and unknown field at once**, and so
+does every other check of a value against a record type (a typed route body, a
+node's declared output), with the field names now in single quotes.
+
 ## 2026-11-01 (39a50c84)
 
 **Triggers come back after an update again.** Since 0.2.281, the triggers

@@ -149,6 +149,15 @@ struct ServerRequest {
     /// meant.
     #[serde(default)]
     mode: Option<ValidationMode>,
+    /// The place the editor shows `file` at: the include sites walked
+    /// into from the entry file, outermost first; empty for the entry
+    /// file itself or a file opened on its own (no place). Only for the
+    /// kinds that parse (`parse`, `edit`, `apply_edit`): a file included
+    /// at several sites can be per instance at one and shared at another,
+    /// so its nodes are told the answer at this place
+    /// ([`per_instance_at_place`]).
+    #[serde(default, rename = "callPath")]
+    call_path: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,7 +260,7 @@ fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>
 
     match req.kind {
         ServerRequestKind::Parse => {
-            match parse_source(&req.source, &project, &anchor, req.file.as_deref(), catalogs, req.reload_catalog) {
+            match parse_source(&req.source, &project, &anchor, req.file.as_deref(), &req.call_path, catalogs, req.reload_catalog) {
                 Ok(parse_resp) => envelope(id, &parse_resp),
                 Err(e) => ServerResponse { id, payload: None, error: Some(e) },
             }
@@ -341,27 +350,77 @@ fn edit_envelope(
     req: &ServerRequest,
     catalogs: &mut HashMap<PathBuf, FsCatalog>,
 ) -> ServerResponse {
-    match parse_source(&new_source, project, anchor, req.file.as_deref(), catalogs, req.reload_catalog) {
+    match parse_source(&new_source, project, anchor, req.file.as_deref(), &req.call_path, catalogs, req.reload_catalog) {
         Ok(parse) => envelope(id, &EditResponse { source: new_source, parse, inverse }),
         Err(e) => ServerResponse { id, payload: None, error: Some(e) },
     }
 }
 
-/// Lenient canvas parsing keeps includes as navigable interfaces.
+/// Lenient canvas parsing keeps includes as navigable interfaces. At a
+/// place (`call_path`, see `ServerRequest::call_path`), each node is told
+/// whether it runs per instance there.
 fn parse_source(
     source: &str,
     project: &Option<Project>,
     anchor: &Anchor,
     file: Option<&std::path::Path>,
+    call_path: &[String],
     catalogs: &mut HashMap<PathBuf, FsCatalog>,
     reload_catalog: bool,
 ) -> std::result::Result<ParseResponse, String> {
     match project {
         Some(p) => {
             let cat = warm_catalog(catalogs, &p.root, reload_catalog)?;
-            do_parse(source, p.id(), anchor, cat, file)
+            let mut parsed = do_parse(source, p.id(), anchor, cat, file)?;
+            if !call_path.is_empty() {
+                per_instance_at_place(&mut parsed, p, cat, call_path);
+            }
+            Ok(parsed)
         }
         None => do_parse(source, uuid::Uuid::nil(), anchor, &FsCatalog::empty(), file),
+    }
+}
+
+/// Tell the nodes of an included file, parsed on its own, whether each
+/// runs per instance at the place `call_path` reaches it from the entry
+/// file. The file alone cannot say: a file included at several sites is
+/// per instance where an instance's value reaches it and shared where none
+/// does, which only the whole program knows. Its nodes carry the body ids
+/// the whole program gives them, so each is matched by id and given the
+/// program's answer at this place. When the program around the file does
+/// not compile, the answer is not known, and a warning says so (the nodes
+/// keep what the file alone says).
+fn per_instance_at_place(parsed: &mut ParseResponse, project: &Project, catalog: &FsCatalog, call_path: &[String]) {
+    let entry = project.main_weft();
+    let program = std::fs::read_to_string(&entry)
+        .map_err(|e| format!("read {}: {e}", entry.display()))
+        .and_then(|source| {
+            let anchor = anchor_for(Some(&entry), Some(&project.root));
+            weft_compiler::compile_program(&source, project.id(), anchor.fs(), catalog)
+                .map_err(|diagnostics| weft_compiler::render_diagnostics(&diagnostics))
+        });
+    match program {
+        Ok(program) => stamp_per_instance(&mut parsed.project, &program, call_path),
+        Err(why) => parsed.diagnostics.push(Diagnostic::at(
+            Default::default(),
+            weft_compiler::Severity::Warning,
+            "per-instance-unknown",
+            format!(
+                "the program around this file does not compile, so whether its nodes run once per instance \
+                 here is not known; what is shown is what this file says alone: {why}"
+            ),
+        )),
+    }
+}
+
+/// [`per_instance_at_place`]'s answer, once the whole program is in hand:
+/// each node of `view` the program has is given its mark at `call_path`.
+fn stamp_per_instance(view: &mut ProjectDefinition, program: &ProjectDefinition, call_path: &[String]) {
+    for node in view.nodes.iter_mut() {
+        if let Some(whole) = program.nodes.iter().find(|n| n.id == node.id) {
+            node.per_instance = whole.per_instance_at(call_path);
+            node.per_instance_paths.clear();
+        }
     }
 }
 
@@ -556,6 +615,40 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["warnings"].as_array().map(|w| w.len()), Some(resp.warnings.len()));
         assert_eq!(json["warnings"][0]["kind"], "left_out");
+    }
+
+    /// A file included both where an instance's value reaches it and where
+    /// none does, opened in the graph at each of its two places: its node
+    /// shows per instance at the first and shared at the second, from the
+    /// whole program, whatever the file says alone.
+    #[test]
+    fn an_included_file_shows_per_instance_at_each_place_as_the_program_runs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/lib")).unwrap();
+        let carry = "Group(text: String) -> (out: String) {\n  carry = ExecPython(text: String) -> (out: String) { code: \"x\" }\n  \
+                     carry.text = self.text\n  self.out = carry.out\n}\n";
+        let main = "tick = Cron { cron: \"0 0 3 * * *\" }\nshared = @include(\"lib/carry.weft\")\nshared.text = tick.scheduledTime\n\
+                    bridge = BaileyBridge {\n  @per_instance\n}\nreceive = BaileyReceive\nreceive.bridge = bridge.bridge\n\
+                    mine = @include(\"lib/carry.weft\")\nmine.text = receive.content\n";
+        let (main_path, carry_path) = (root.join("src/main.weft"), root.join("src/lib/carry.weft"));
+        std::fs::write(&main_path, main).unwrap();
+        std::fs::write(&carry_path, carry).unwrap();
+        let catalog = weft_catalog::FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
+        let program = weft_compiler::compile_program(main, uuid::Uuid::nil(), super::anchor_for(Some(&main_path), Some(root)).fs(), &catalog)
+            .expect("the program compiles");
+        let view = |site: &str| {
+            let mut parsed = super::do_parse(carry, uuid::Uuid::nil(), &super::anchor_for(Some(&carry_path), Some(root)), &catalog, Some(&carry_path))
+                .expect("the file parses");
+            super::stamp_per_instance(&mut parsed.project, &program, &[site.to_string()]);
+            parsed.project.nodes.into_iter().find(|n| n.id.ends_with(".carry")).expect("the file's node")
+        };
+        let at_mine = view("mine");
+        assert_eq!(at_mine.per_instance, Some(weft_core::instance::PerInstance::Derived), "{:?}", at_mine.id);
+        assert!(at_mine.per_instance_paths.is_empty());
+        let at_shared = view("shared");
+        assert_eq!(at_shared.per_instance, None);
+        assert!(at_shared.per_instance_paths.is_empty());
     }
 
     #[test]

@@ -53,6 +53,7 @@
     {
       "name": "file",
       "type": "T",
+      "fileScopeFrom": "scope",
       "description": "`run`: the same reference, now kept. `project`: the NEW project copy (same name, type, size); later runs read this one. The same kind that came in: a Video stays a Video."
     },
     {

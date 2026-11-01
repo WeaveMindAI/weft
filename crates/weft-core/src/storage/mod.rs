@@ -386,6 +386,20 @@ impl StorageScope {
     pub fn instance_of(instance: crate::instance::InstanceId) -> Self {
         StorageScope::Instance { of: Some(instance) }
     }
+
+    /// The scope a node's `scope` setting names, as a program writes it:
+    /// `run`, `project`, or `instance` (the run's own). The one reading of
+    /// those words, for the nodes that offer the setting and for the
+    /// compiler judging where a file they store ends up (the words their
+    /// `metadata.json` offers); `None` for any other word.
+    pub fn named(word: &str) -> Option<Self> {
+        match word {
+            "run" => Some(StorageScope::Run),
+            "project" => Some(StorageScope::Project),
+            "instance" => Some(StorageScope::instance()),
+            _ => None,
+        }
+    }
 }
 
 /// How long a stored file lives, in any scope but the asset one. Every

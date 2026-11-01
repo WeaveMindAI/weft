@@ -631,14 +631,7 @@ pub struct TriggerCut {
 /// runs, with every bakeable infra place's baked outputs taken as saved,
 /// so it reads the source alone, never what an install has saved.
 pub fn trigger_cut(project: &ProjectDefinition, trigger: &str) -> Result<TriggerCut, String> {
-    let bakeable: crate::infra::bake::Saved = crate::project::infra_places(project)
-        .into_iter()
-        .filter_map(|place| {
-            let node = project.nodes.iter().find(|n| n.id == place.id)?;
-            (!node.baked_outputs.is_empty())
-                .then(|| (place, node.baked_outputs.iter().map(|port| (port.clone(), Value::Null)).collect()))
-        })
-        .collect();
+    let bakeable = bakeable_as_saved(project, |_| true);
     // The places read baked stand in, as a fire's do: the cut says so, and
     // they are no infra the trigger's fires run.
     let FireCut { fired, program, .. } = fire_cut(project, trigger, &bakeable)?;
@@ -668,6 +661,45 @@ pub fn trigger_cut(project: &ProjectDefinition, trigger: &str) -> Result<Trigger
     let listens_through = fed_by.into_iter().filter(|place| is_infra(place)).map(|place| crate::project::address_of(project, &place.id, &place.path));
     let depends_on: BTreeSet<String> = crate::project::infra_reached(&program).into_iter().chain(listens_through).collect();
     Ok(TriggerCut { fingerprint, depends_on: depends_on.into_iter().collect() })
+}
+
+/// Every bakeable infra place `keep` accepts, its baked outputs taken as
+/// saved: what a cut read from the source alone stands in for them.
+fn bakeable_as_saved(project: &ProjectDefinition, keep: impl Fn(&Located) -> bool) -> crate::infra::bake::Saved {
+    crate::project::infra_places(project)
+        .into_iter()
+        .filter(|place| keep(place))
+        .filter_map(|place| {
+            let node = project.nodes.iter().find(|n| n.id == place.id)?;
+            (!node.baked_outputs.is_empty())
+                .then(|| (place, node.baked_outputs.iter().map(|port| (port.clone(), Value::Null)).collect()))
+        })
+        .collect()
+}
+
+/// What a fire for no instance reads baked, from the source alone: every
+/// shared infra place's baked outputs, taken as saved. A per-instance
+/// place is never among them: a run for no instance reads no instance's
+/// copy (`crate::infra::bake::saved_for_run`). The same for every
+/// trigger of a program, so a caller asking [`instanceless_fire_reaches`]
+/// of several works it out once.
+pub fn instanceless_stand_ins(project: &ProjectDefinition) -> crate::infra::bake::Saved {
+    bakeable_as_saved(project, |place| !crate::project::is_per_instance(project, place))
+}
+
+/// The places a fire of the trigger at `trigger` (an address) for no
+/// instance runs that exist once per instance, read from the source alone
+/// with `stand_ins` ([`instanceless_stand_ins`]) standing in. For a shared
+/// trigger that cannot name an instance per fire, anything here is what
+/// [`refuse_instanceless`] would refuse every fire for, so the compiler
+/// refuses the trigger instead.
+pub fn instanceless_fire_reaches(
+    project: &ProjectDefinition,
+    trigger: &str,
+    stand_ins: &crate::infra::bake::Saved,
+) -> Result<BTreeSet<Located>, String> {
+    let FireCut { program, .. } = fire_cut(project, trigger, stand_ins)?;
+    Ok(per_instance_running(&program))
 }
 
 /// Every trigger place's [`TriggerCut`] by address, or why its cut cannot
@@ -1311,10 +1343,17 @@ pub fn refuse_unrunnable(project: &ProjectDefinition, resolved: &Resolved, spec:
 /// A place that stands in for its node never runs, so it needs no
 /// instance.
 pub fn per_instance_places(program: &ProjectDefinition) -> Vec<String> {
-    crate::project::places::running_places(program).iter()
-        .filter(|place| crate::project::is_per_instance(program, &place.id))
+    per_instance_running(program).iter()
         .map(|place| crate::project::address_of(program, &place.id, &place.path))
         .collect::<BTreeSet<_>>().into_iter().collect()
+}
+
+/// [`per_instance_places`], as places.
+fn per_instance_running(program: &ProjectDefinition) -> BTreeSet<Located> {
+    crate::project::places::running_places(program)
+        .into_iter()
+        .filter(|place| crate::project::is_per_instance(program, place))
+        .collect()
 }
 
 /// Refuse a run that reaches something per instance without saying which

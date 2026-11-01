@@ -62,6 +62,7 @@
     }
   ],
   "features": {
+    "keepsInputsPastRun": true,
     "canAddInputPorts": true,
     "addedPortsAreDataKeys": true
   }

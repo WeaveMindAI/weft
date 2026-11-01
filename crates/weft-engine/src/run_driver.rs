@@ -2265,6 +2265,9 @@ async fn drive(
                     weft_core::frames::call_path(&group.frames).into_iter().map(str::to_string).collect();
                 weft_core::project::address_of(project, &node_id, &call_path)
             };
+            // Whether the node exists once per instance HERE: a node inside
+            // a file included twice can be at one site and not the other.
+            let per_instance = node_def.per_instance_at(&weft_core::frames::call_path(&group.frames));
             //
             // A `@instance_filled` field takes what the run's instance
             // provides at this place, and a connection picked on the
@@ -2351,7 +2354,7 @@ async fn drive(
             .with_sent_before_pause(sent_before_pause)
             .with_emit_channel(task_tx.clone())
             .with_caller_connection(caller.cloned())
-            .with_per_instance(node_def.per_instance)
+            .with_per_instance(per_instance)
             .with_run_instance(instance.cloned())
             .with_declared_infra(declared_infra.clone())
             .with_baked_outputs(node_def.baked_outputs.clone())
@@ -2472,7 +2475,7 @@ async fn drive(
             let provision_tenant_id = tenant_id.to_string();
             let provision_clients = clients.clone();
             let provision_copy =
-                weft_core::instance::copy_owner(node_def.per_instance, instance).cloned();
+                weft_core::instance::copy_owner(per_instance, instance).cloned();
             let run_instance = instance.cloned();
             let baked_outputs = node_def.baked_outputs.clone();
             let failing_type = node_def.node_type.clone();

@@ -5594,3 +5594,113 @@ t = ExecPython(n: Secret[String]) -> (r: String) { code: "x", n: @instance_fille
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"instance-filled-secret"), "{d:?}");
 }
+
+/// A file stored for its run only and written into a table: no later run
+/// can open the reference the row keeps, so the build warns, on the
+/// table's input, naming where the file was stored. Kept in the project,
+/// it does not; a scope arriving on a wire is not judged.
+#[test]
+fn a_run_file_kept_past_its_run_warns() {
+    let build = |scope: &str| {
+        let mut project = compile(
+            &format!(
+                r#"
+made = TextToFile {{ text: "hi", filename: "a.txt" }}
+kept = KeepFile {{ scope: {scope}, ttlDays: 30 }}
+kept.file = made.file
+db = PostgresDatabase {{ database: "app" }}
+save = PostgresExecuteQuery(file: File) {{ query: "insert into files values ($file)" }}
+save.account = db.access
+save.file = kept.file
+"#
+            ),
+            uuid::Uuid::new_v4(),
+            CompileFs::none(),
+        )
+        .expect("compile ok");
+        enrich(&mut project, &catalog()).expect("enrich ok");
+        validate(&project, &catalog())
+    };
+    let run = build("\"run\"");
+    let warning = run
+        .iter()
+        .find(|d| d.code.as_deref() == Some("run-file-kept-past-run"))
+        .unwrap_or_else(|| panic!("warned: {run:?}"));
+    assert_eq!(warning.severity, Severity::Warning);
+    for part in ["'save'", "'file'", "'kept'", "`scope: run`", "`scope: project`"] {
+        assert!(warning.message.contains(part), "{part}: {}", warning.message);
+    }
+    assert!(!codes(&build("\"project\"")).contains(&"run-file-kept-past-run"));
+
+    // A scope left to its default is the default's: `run` for a stored file.
+    let mut defaulted = compile(
+        "made = TextToFile { text: \"hi\", filename: \"a.txt\" }\ndb = PostgresDatabase { database: \"app\" }\n\
+         save = PostgresExecuteQuery(file: File) { query: \"insert into files values ($file)\" }\n\
+         save.account = db.access\nsave.file = made.file\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+    )
+    .expect("compile ok");
+    enrich(&mut defaulted, &catalog()).expect("enrich ok");
+    assert!(codes(&validate(&defaulted, &catalog())).contains(&"run-file-kept-past-run"));
+
+    let built = |source: &str| {
+        let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile ok");
+        enrich(&mut project, &catalog()).expect("enrich ok");
+        validate(&project, &catalog())
+    };
+    // A loop's gathered files are the iterations' own: the walk goes back
+    // through the loop's end to the node that stored them.
+    let gathered = built(
+        "files = Loop(texts: List[String]) -> (made: List[File | Null]) {\n  over: [\"texts\"]\n  \
+         f = TextToFile { filename: \"a.txt\" }\n  f.text = self.texts\n  self.made = f.file\n}\n\
+         files.texts = [\"a\", \"b\"]\ndb = PostgresDatabase { database: \"app\" }\n\
+         save = PostgresExecuteQuery(made: List[File | Null]) { query: \"insert into files values ($made)\" }\n\
+         save.account = db.access\nsave.made = files.made\n",
+    );
+    let warning = gathered
+        .iter()
+        .find(|d| d.code.as_deref() == Some("run-file-kept-past-run"))
+        .unwrap_or_else(|| panic!("warned through the loop: {gathered:?}"));
+    assert!(warning.message.contains("'files.f'"), "{}", warning.message);
+
+    // A scope that arrives on a wire is not known when the program builds.
+    let wired = built(
+        "made = TextToFile { text: \"hi\", filename: \"a.txt\" }\nwhere = Text { value: \"run\" }\n\
+         kept = KeepFile { ttlDays: 30 }\nkept.file = made.file\nkept.scope = where.value\n\
+         db = PostgresDatabase { database: \"app\" }\n\
+         save = PostgresExecuteQuery(file: File) { query: \"insert into files values ($file)\" }\n\
+         save.account = db.access\nsave.file = kept.file\n",
+    );
+    // Built cleanly, so the silence is the rule's answer and not a program
+    // refused before it.
+    assert!(errors(&wired).is_empty(), "{wired:?}");
+    assert!(!codes(&wired).contains(&"run-file-kept-past-run"), "{wired:?}");
+}
+
+/// A loop output nothing inside writes could only gather nulls: refused,
+/// naming the port. Written, it builds.
+#[test]
+fn a_loop_output_nothing_inside_writes_is_refused() {
+    let build = |inside: &str| {
+        let mut project = compile(
+            &format!(
+                "t = ExecPython() -> (items: List[String]) {{ code: \"x\" }}\n\
+                 l = Loop(items: List[String]) -> (res: List[String | Null]) {{\n  over: [\"items\"]\n  {inside}\n}}\n\
+                 l.items = t.items\nout = Debug\nout.data = l.res\n"
+            ),
+            uuid::Uuid::new_v4(),
+            CompileFs::none(),
+        )
+        .expect("compile ok");
+        enrich(&mut project, &catalog()).expect("enrich ok");
+        validate(&project, &catalog())
+    };
+    let unwritten = build("d = Debug\n  d.data = self.items");
+    let refusal = unwritten
+        .iter()
+        .find(|d| d.code.as_deref() == Some("loop-output-unwritten"))
+        .unwrap_or_else(|| panic!("refused: {unwritten:?}"));
+    assert!(refusal.message.contains("`self.res`"), "{}", refusal.message);
+    assert!(!codes(&build("self.res = self.items")).contains(&"loop-output-unwritten"));
+}

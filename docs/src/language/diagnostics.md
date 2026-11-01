@@ -45,6 +45,7 @@ a slug per cause.
 | `graph-cycle` | The wires form a cycle | Iterate with a Loop, or exchange feedback over a bus. If what goes back is a value you can write in the program, like a tool's description, make it a [metadata port](groups.md#metadata-ports) |
 | `required-port-unmet` | A required input has no wire, no written value and no default. On a group, loop or included file: a port nothing outside connects, whose value a node inside cannot run without (a required input, or the last possible member of a `@require_one_of` set) | Give it one of the three; for a group port, connect or write it from outside |
 | `optional-pass-through-port` | A `?` on a port of a group or an included file, or on a loop port the loop neither iterates nor carries. Such a port passes what reaches it to the nodes inside, so it is never optional itself ([a group input passes through](groups.md#a-group-input-passes-through)) | Remove the `?`; to let a node inside run without the value, write the `?` on that node's input |
+| `run-file-kept-past-run` (warning) | A file a node stored for its run only, because its `scope` setting says `run` (written, or that default, as on the storage nodes such as `KeepFile`), whatever `ttlDays` says, is wired into a node that keeps what it is given after the run ends, like a table write or an instance's values. No later run can read that file, so the row ends up holding a dead reference | Store it with `scope: project`. For which files outlive a run, go and read [files at run time](../running/files.md#keeping-something) |
 
 ## Values you wrote
 
@@ -113,6 +114,7 @@ For what a metadata port is, go and read [metadata ports](groups.md#metadata-por
 | `loop-unknown-config-field` | A key that is not `parallel`, `over`, `carry`, `maxIters` or `trimOnMismatch` | Fix the name |
 | `loop-parallel-not-boolean` | `parallel` is not `true` or `false` | Write one of them |
 | `loop-max-iters-not-integer` | `maxIters` is not a whole number of zero or more | Write one |
+| `loop-output-unwritten` | A loop declares an output nothing inside it writes: a gathered one would be a list of nothing but nulls, a carried one would never change | Write `self.<output>` inside the loop, or remove the port |
 | `loop-trim-not-boolean` | `trimOnMismatch` is not a boolean | Write `true` or `false` |
 | `loop-over-unknown-port` | `over` names an input that does not exist | Fix the name |
 | `over-not-a-list` | An `over` port is neither `List[T]` nor `Generator[T]` | Declare it as one |
@@ -171,6 +173,7 @@ For why neither a trigger nor an infra node can sit inside a loop, go and read
 | `instance-filled-place-types` | An `@instance_filled` field of a node in an included file takes a different type at each place the file is included, and one instance's value cannot be both | Declare the field's type on the node |
 | `instance-filled-boundary` | `@instance_filled` on a group's or included file's own port | Write it on the input of the node inside that reads the value |
 | `instance-filled-not-an-input` | `@instance_filled` on a key that is not one of the node's inputs | Put it on an input |
+| `shared-trigger-reaches-per-instance` | A trigger every instance shares (so its runs are for no instance) starts runs that reach something per instance, so every fire would be refused. A route or a socket is not checked: each call can name its instance | Make the trigger per instance too (wire it from what is per instance, or write one of its fields `@instance_filled`), or keep what is per instance out of what it runs |
 
 For what `@per_instance` and `@instance_filled` do, go and read [Programs with instances](../running/instances.md).
 

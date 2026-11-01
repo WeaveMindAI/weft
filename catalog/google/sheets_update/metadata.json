@@ -130,6 +130,7 @@
     }
   ],
   "features": {
+    "keepsInputsPastRun": true,
     "oneOfRequired": [
       [
         "rowNumber",

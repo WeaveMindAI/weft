@@ -58,6 +58,7 @@
     {
       "name": "file",
       "type": "File",
+      "fileScopeFrom": "scope",
       "narrowable": true,
       "description": "The stored file."
     },

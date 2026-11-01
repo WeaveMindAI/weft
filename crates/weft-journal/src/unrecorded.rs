@@ -11,7 +11,7 @@
 //!   failed and why: nothing of what ran before;
 //! - before it does something that names it to the install (asks for a
 //!   stored file, a connection or an infrastructure address its worker
-//!   does not already hold, a task, a stop by tag:
+//!   does not already hold, a task, a tag or a stop by tag:
 //!   `weft_engine::record_first`), and when it reports a cost, its birth, so the thing naming it finds a row. From then on its costs are
 //!   written as they come, and its ending however it ends, because a row
 //!   that exists has to be closed.

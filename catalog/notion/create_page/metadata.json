@@ -8,6 +8,9 @@
   ],
   "icon": "FilePlus",
   "color": "#37352f",
+  "features": {
+    "keepsInputsPastRun": true
+  },
   "inputs": [
     {
       "name": "account",

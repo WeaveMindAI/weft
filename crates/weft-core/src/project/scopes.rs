@@ -98,6 +98,11 @@ pub struct Scope {
     /// The nodes directly inside (a nested loop's `LoopIn` and `LoopOut`
     /// among them), by position in `project.nodes`.
     pub members: Vec<usize>,
+    /// The nodes that fire directly in a copy of it, by position: its
+    /// members less a nested loop's `LoopOut` (which fires in that loop's
+    /// iterations), and, for a loop, its own `LoopOut`. The other side of
+    /// [`ScopeIndex::node_copy`].
+    pub firing: Vec<usize>,
     /// The scopes directly inside, loops included.
     pub children: Vec<String>,
     /// The wires that land on its gate.
@@ -120,8 +125,9 @@ pub struct ScopeIndex {
     /// top's groups and sites (a body is never at the top: it runs under
     /// a site; nor a loop: its iterations open as it launches them).
     top: Vec<String>,
-    /// The nodes outside every scope.
-    top_members: Vec<usize>,
+    /// The nodes that fire outside every scope (a top loop's `LoopOut`
+    /// is not one: it fires in that loop's iterations).
+    top_firing: Vec<usize>,
 }
 
 impl ScopeIndex {
@@ -138,6 +144,7 @@ impl ScopeIndex {
                 kind,
                 parent: group.parent_group_id.clone(),
                 members: Vec::new(),
+                firing: Vec::new(),
                 children: Vec::new(),
                 gates: Vec::new(),
                 sends: Vec::new(),
@@ -158,15 +165,18 @@ impl ScopeIndex {
                 None => {}
             }
         }
-        let mut top_members = Vec::new();
+        let mut top_firing = Vec::new();
         for (at, node) in project.nodes.iter().enumerate() {
-            match node.scope.last() {
+            if let Some(scope) = node.scope.last().and_then(|scope| scopes.get_mut(scope)) {
+                scope.members.push(at);
+            }
+            match firing_scope(node) {
                 Some(scope) => {
                     if let Some(scope) = scopes.get_mut(scope) {
-                        scope.members.push(at);
+                        scope.firing.push(at);
                     }
                 }
-                None => top_members.push(at),
+                None => top_firing.push(at),
             }
         }
         let is_site = |id: &str| project.groups.iter().any(|g| g.id == id && matches!(g.kind, GroupKind::Call { .. }));
@@ -206,7 +216,7 @@ impl ScopeIndex {
                 }
             }
         }
-        let mut index = Self { scopes, top, top_members };
+        let mut index = Self { scopes, top, top_firing };
         index.mark_fed_back(project);
         index
     }
@@ -248,22 +258,20 @@ impl ScopeIndex {
         self.scopes.get(id)
     }
 
-    /// The nodes outside every scope, by position.
-    pub fn top_members(&self) -> &[usize] {
-        &self.top_members
+    /// The nodes that fire directly in a copy of `scope` (outside every
+    /// scope for `None`), by position: [`Scope::firing`]. Empty for a
+    /// scope the program does not have.
+    pub fn firing_in(&self, scope: Option<&str>) -> &[usize] {
+        match scope {
+            Some(scope) => self.scopes.get(scope).map_or(&[], |scope| &scope.firing),
+            None => &self.top_firing,
+        }
     }
 
     /// The copy of the scope a node at `frames` fires DIRECTLY in, or
-    /// `None` for a node outside every scope. A loop's `LoopOut` fires
-    /// once per iteration, inside the iteration's copy; every other node
-    /// (a loop's `LoopIn` among them) in the innermost scope of its own.
+    /// `None` for a node outside every scope ([`firing_scope`]).
     pub fn node_copy(&self, node: &super::NodeDefinition, frames: &LoopFrames) -> Option<ScopeCopy> {
-        if node.node_type == super::boundary_types::LOOP_OUT {
-            if let Some(boundary) = &node.group_boundary {
-                return Some(ScopeCopy::new(boundary.group_id.clone(), frames.clone()));
-            }
-        }
-        node.scope.last().map(|scope| ScopeCopy::new(scope.clone(), frames.clone()))
+        firing_scope(node).map(|scope| ScopeCopy::new(scope, frames.clone()))
     }
 
     /// The copy `copy` runs inside: `Ok(None)` at the top. A loop's
@@ -349,6 +357,24 @@ impl ScopeIndex {
         inside.nodes.sort();
         inside
     }
+}
+
+/// The scope a node fires directly in, `None` outside every scope. A
+/// loop's `LoopOut` fires once per iteration, inside the iteration's copy
+/// (though it sits beside the loop, in the scope around it); every other
+/// node (a loop's `LoopIn` among them) in the innermost scope of its own.
+fn firing_scope(node: &super::NodeDefinition) -> Option<&str> {
+    fires_per_iteration_of(node).or_else(|| node.scope.last().map(String::as_str))
+}
+
+/// The loop whose iterations a node fires in although it sits beside that
+/// loop: a loop's `LoopOut`. `None` for every other node. The one reading
+/// of that rule, for [`firing_scope`] and for whoever asks what an
+/// iteration holds (`crate::seeding`, `crate::run::forget`).
+pub fn fires_per_iteration_of(node: &super::NodeDefinition) -> Option<&str> {
+    (node.node_type == super::boundary_types::LOOP_OUT)
+        .then(|| node.group_boundary.as_ref().map(|boundary| boundary.group_id.as_str()))
+        .flatten()
 }
 
 /// The places that run only after `seeds` did (the seeds included):

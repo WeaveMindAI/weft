@@ -29,3 +29,26 @@ async fn sequential_map_doubles_each_element() -> anyhow::Result<()> {
 
     project.finish().await
 }
+
+/// A loop with no output port ends, over items and over an empty list:
+/// nothing writes into its end, which used to start once at the loop's
+/// own level, wait on an iteration that never opens there, and leave the
+/// run stuck (`... never started, waiting on its scope to open`).
+#[tokio::test]
+async fn a_loop_with_no_output_ends_over_items_and_over_nothing() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("loop_map", disp).await?;
+    for (items, iterations) in [("[1, 2]", 2), ("[]", 0)] {
+        project.set_main(&format!(
+            "src = ExecPython() -> (items: List[Number]) {{\n  code: \"return {{'items': {items}}}\"\n}}\n\
+             each = Loop(values: List[Number]) -> () {{\n  over: [\"values\"]\n  log = Debug\n  log.data = self.values\n}}\n\
+             each.values = src.items\n"
+        ))?;
+        let settled = run::run_and_settle(&mut project).await?;
+        settled.completed()?;
+        settled.assert_loop_iterations("each", iterations)?;
+        let logged = settled.events_of("each.log").filter(|e| e.kind() == "node_completed").count();
+        anyhow::ensure!(logged == iterations, "the body ran once per item: {logged} for {items}");
+    }
+    project.finish().await
+}

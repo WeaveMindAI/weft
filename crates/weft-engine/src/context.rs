@@ -1522,8 +1522,8 @@ pub struct RunnerHandle {
     /// The run runs no program (a node test's): no worker could pick it
     /// back up, so it never pauses and every wait holds in its call.
     without_program: bool,
-    /// Whether this node exists once per instance: its infra is then the
-    /// run instance's own copy, never the shared one.
+    /// Whether this node exists once per instance at the place it fires:
+    /// its infra is then the run instance's own copy, never the shared one.
     per_instance: Option<weft_core::instance::PerInstance>,
     /// The instance the run is for, as its journal says. The broker never
     /// takes it from here (it reads the run's own row); the worker keys
@@ -1901,7 +1901,8 @@ impl RunnerHandle {
         self
     }
 
-    /// Whether this node exists once per instance (from its definition).
+    /// Whether this node exists once per instance at the place it fires
+    /// (from its definition, `NodeDefinition::per_instance_at`).
     pub fn with_per_instance(mut self, per_instance: Option<weft_core::instance::PerInstance>) -> Self {
         self.per_instance = per_instance;
         self
@@ -3263,20 +3264,13 @@ impl ContextHandle for RunnerHandle {
     /// (run, tag) row, so a body replayed after a durable wait
     /// re-tags onto the same state. Not journaled through `ctx.run` for that reason.
     async fn tag_run(&self, tags: Vec<String>) -> WeftResult<()> {
-        // A tag is a row in the journal about this run, and an
-        // unrecorded run writes none: it is not listed, and a stop by
-        // tag selects only recorded runs.
-        if !self.settings.recorded() {
-            return Err(WeftError::Config(format!(
-                "node '{}' tags this run, and the run is not recorded (its trigger has `recorded` \
-                 off), so there is no run to find by that tag. Turn `recorded` back on to tag it",
-                self.place
-            )));
-        }
         // The act goes on the run's record first: the broker's call below
         // names the run, so the record so far (this row with it) is
         // written before the call goes out (`crate::record_first`), and the
         // tag rows it writes never exist without the act they select by.
+        // An unrecorded run drops the row and writes its birth instead
+        // (`weft_journal::unrecorded`): its run row is what a stop by tag
+        // selects it through, and its tag rows go when that row goes.
         self.record
             .journal
             .record_event(
@@ -3863,7 +3857,7 @@ mod type_check_tests {
     fn a_declared_record_names_the_missing_field_and_an_open_one_drops_extras() {
         let verdict = WeftType::parse("{ label: String, score: Number }").expect("type");
         let why = verdict.conform_value(serde_json::json!({ "label": "ok" })).unwrap_err();
-        assert!(why.contains("missing required field \"score\""), "{why}");
+        assert!(why.contains("missing required field 'score'"), "{why}");
         let open = WeftType::parse("{ label: String, .. }").expect("type");
         assert_eq!(
             open.conform_value(serde_json::json!({ "label": "ok", "extra": 1 })),

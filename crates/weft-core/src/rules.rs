@@ -37,11 +37,20 @@ pub struct RuleContext<'a> {
     /// The nodes of the run seeded at each place asked about; `None`
     /// when that seed cannot be carved.
     runs: RefCell<HashMap<Located, Option<BTreeSet<Located>>>>,
+    /// What each per-instance origin asked about reaches
+    /// (`places::per_instance_reach`), walked once however many places
+    /// ask why they are per instance.
+    reaches: RefCell<HashMap<Located, std::rc::Rc<BTreeSet<Located>>>>,
 }
 
 impl<'a> RuleContext<'a> {
     pub fn new(project: &'a ProjectDefinition) -> Self {
-        Self { graph: ProjectGraph::new(project), places: OnceCell::new(), runs: RefCell::new(HashMap::new()) }
+        Self {
+            graph: ProjectGraph::new(project),
+            places: OnceCell::new(),
+            runs: RefCell::new(HashMap::new()),
+            reaches: RefCell::new(HashMap::new()),
+        }
     }
 
     pub fn project(&self) -> &ProjectDefinition {
@@ -50,6 +59,16 @@ impl<'a> RuleContext<'a> {
 
     fn places(&self) -> &BTreeSet<Located> {
         self.places.get_or_init(|| crate::project::places::every_place_in(&self.graph))
+    }
+
+    /// The places an instance value at `origin` reaches.
+    fn reach_of(&self, origin: &Located) -> std::rc::Rc<BTreeSet<Located>> {
+        if let Some(reach) = self.reaches.borrow().get(origin) {
+            return reach.clone();
+        }
+        let reach = std::rc::Rc::new(crate::project::places::per_instance_reach(&self.graph, vec![origin.clone()]));
+        self.reaches.borrow_mut().insert(origin.clone(), reach.clone());
+        reach
     }
 
     /// Whether the run seeded at `seed` (a fire when it is a trigger, a
@@ -238,7 +257,7 @@ pub fn evaluate(cond: &Condition, node: &NodeDefinition, cx: &RuleContext, custo
         }),
         Condition::RunReaches { direction, with } => Some(run_reaches(node, cx, *direction, with)),
         Condition::DownstreamOf { with } => Some(!upstream_with(node, cx, with).is_empty()),
-        Condition::PerInstance {} => Some(node.per_instance.is_some()),
+        Condition::PerInstance {} => Some(node.per_instance_somewhere()),
         Condition::InputNames { port, names } => match written(node, port) {
             Written::Known(value) => Some(misnamed(value, project, *names).is_empty()),
             Written::Unknown => None,
@@ -317,95 +336,124 @@ fn upstream_with(node: &NodeDefinition, cx: &RuleContext, with: &NodeWith) -> Ve
     upstream_of(node, cx).into_iter().filter(|n| with.matches(&n.features)).map(|n| n.id.clone()).collect()
 }
 
-/// Why `node` exists once per instance, one clause per node that made it
-/// so (the ones marked `@per_instance` or holding an `@instance_filled`
-/// field, among itself and everything upstream of it), each telling the
+/// Why `node` exists once per instance, for a rule asked of the node as
+/// a whole: the reasons at each place where it is per instance
+/// ([`per_instance_reasons_at`]), each led by the place when the node runs
+/// at more than one (a node inside a file included twice may be per
+/// instance under one site only, and the reasons differ per site).
+pub fn per_instance_reasons(node: &NodeDefinition, cx: &RuleContext) -> Vec<String> {
+    let here: Vec<&Located> = cx.places().iter().filter(|place| place.id == node.id).collect();
+    let mut out: Vec<String> = Vec::new();
+    // Its own mark holds at every place, so it is said once, unled.
+    let own = own_mark_reason(node);
+    out.extend(own.clone());
+    for place in here.iter().filter(|place| node.per_instance_at(&place.path).is_some()) {
+        let lead = (here.len() > 1).then(|| format!("at '{}', ", crate::project::address_of(&cx.graph, &place.id, &place.path)));
+        for reason in per_instance_reasons_at(place, cx).into_iter().filter(|reason| own.as_ref() != Some(reason)) {
+            let reason = format!("{}{reason}", lead.as_deref().unwrap_or(""));
+            if !out.contains(&reason) {
+                out.push(reason);
+            }
+        }
+    }
+    out
+}
+
+/// The reason a node's own mark gives, when it carries one: it holds at
+/// every place the node runs.
+fn own_mark_reason(node: &NodeDefinition) -> Option<String> {
+    match node.per_instance {
+        Some(crate::instance::PerInstance::Marked) => Some("it is marked `@per_instance`".to_string()),
+        Some(crate::instance::PerInstance::Filled) => Some("one of its own fields is `@instance_filled`".to_string()),
+        _ => None,
+    }
+}
+
+/// Why the node at `place` exists once per instance there, one clause per
+/// node that made it so (the ones marked `@per_instance` or holding an
+/// `@instance_filled` field, among itself and every place whose instance
+/// value reaches this one, `places::per_instance_reach`), each telling the
 /// path the way it runs:
-/// - "it reads 'blender'" when the value flows into `node` along wires;
+/// - "it reads 'blender'" when the value flows into `place` along wires;
 /// - "it sits inside group 'work', whose gate reads 'blender'" when the
-///   value decides whether a group around `node` runs: the group runs
+///   value decides whether a group around `place` runs: the group runs
 ///   once per instance, and so does everything inside it;
 /// - "it sits inside loop 'each', which runs on what 'blender' gives it"
-///   when the value reaches what starts a loop around `node`.
-fn per_instance_reasons(node: &NodeDefinition, cx: &RuleContext) -> Vec<String> {
+///   when the value reaches what starts a loop around `place`.
+///
+/// Every walk is from `place` alone, so a site that feeds the same
+/// included file an instance's value never gives a reason for another
+/// site.
+pub fn per_instance_reasons_at(place: &Located, cx: &RuleContext) -> Vec<String> {
     use crate::instance::PerInstance;
-    let mut out: Vec<String> = Vec::new();
-    match node.per_instance {
-        Some(PerInstance::Marked) => out.push("it is marked `@per_instance`".to_string()),
-        Some(PerInstance::Filled) => out.push("one of its own fields is `@instance_filled`".to_string()),
-        _ => {}
-    }
-    let starts = |n: &NodeDefinition| matches!(n.per_instance, Some(PerInstance::Marked | PerInstance::Filled));
-    let upstream = upstream_of(node, cx);
-    let along_wires = reads_along_wires(node, cx);
-    for origin in upstream.iter().filter(|n| starts(n) && n.id != node.id) {
-        if along_wires.contains(origin.id.as_str()) {
-            out.push(format!("it reads '{}'", crate::project::plain_id(&origin.id)));
+    use crate::project::places;
+    let g = &cx.graph;
+    let Some(node) = g.node(&place.id) else { return Vec::new() };
+    let mut out: Vec<String> = own_mark_reason(node).into_iter().collect();
+    let spelled = |at: &Located| crate::project::address_of(g, &at.id, &at.path);
+    let along_wires = places::upstream_by_wires(g, std::slice::from_ref(place));
+    let origins = cx.places().iter().filter(|at| {
+        *at != place && g.node(&at.id).is_some_and(|n| matches!(n.per_instance, Some(PerInstance::Marked | PerInstance::Filled)))
+    });
+    for origin in origins {
+        let reach = cx.reach_of(origin);
+        if !reach.contains(place) {
             continue;
         }
-        // Not along the wires: the value reaches a gate of a group around
-        // `node`, or what starts a loop around it (its `LoopIn` reads the
-        // list and the gate alike), outermost first.
-        let gated = enclosing_groups(node, cx).into_iter().find_map(|group| {
-            let is_loop = cx.graph.group(&group).is_some_and(|g| matches!(g.kind, crate::project::GroupKind::Loop { .. }));
-            let decides: Vec<String> = if is_loop {
-                cx.graph.edges_into(&crate::project::loop_in_id(&group)).map(|edge| edge.source.clone()).collect()
-            } else {
-                cx.graph.edges_into(&group)
-                    .filter(|edge| crate::run::skip::is_gate_port(edge.target_port()) && !edge.to_group_port())
-                    .map(|edge| edge.source.clone()).collect()
-            };
-            crate::project::upstream_closure(&cx.graph, &decides).contains(&origin.id).then_some((group, is_loop))
-        });
-        out.push(match gated {
-            Some((group, false)) => format!("it sits inside group '{}', whose gate reads '{}'", crate::project::plain_id(&group), crate::project::plain_id(&origin.id)),
-            Some((group, true)) => format!("it sits inside loop '{}', which runs on what '{}' gives it", crate::project::plain_id(&group), crate::project::plain_id(&origin.id)),
-            None => format!("it reads '{}'", crate::project::plain_id(&origin.id)),
-        });
-    }
-    out
-}
-
-/// Every group whose gate decides whether `node` runs, outermost first:
-/// the groups around it, and for a member of an included body, each call
-/// site of that body with the groups around it.
-fn enclosing_groups(node: &NodeDefinition, cx: &RuleContext) -> Vec<String> {
-    fn add(chain: Vec<String>, cx: &RuleContext, out: &mut Vec<String>) {
-        for group in chain {
-            if out.contains(&group) { continue; }
-            let sites: Vec<String> = cx.project().groups.iter()
-                .filter(|site| matches!(&site.kind, crate::project::GroupKind::Call { body, .. } if *body == group))
-                .map(|site| site.id.clone())
-                .collect();
-            for site in sites {
-                add(chain_to(&site, cx), cx, out);
+        let reason = if along_wires.contains(origin) {
+            format!("it reads '{}'", spelled(origin))
+        } else {
+            // Not along the wires: the value reaches a gate of a group
+            // around `place`, or what starts a loop around it (its
+            // `LoopIn` reads the list and the gate alike), outermost
+            // first. Reached the way the mark is (a gate it opened on the
+            // way counts), so a gate fed by something per instance only
+            // through another gate still names the group.
+            let gated = places::scopes_around(g, place).into_iter().find_map(|scope| {
+                let is_loop = g.is_loop(&scope.id);
+                let decides: Vec<Located> = if is_loop {
+                    let loop_in = Located::new(crate::project::loop_in_id(&scope.id), scope.path.clone());
+                    places::incoming(g, &loop_in).map(|(_, source)| source).collect()
+                } else {
+                    places::incoming(g, &scope)
+                        .filter(|(edge, _)| crate::run::skip::is_gate_port(edge.target_port()))
+                        .map(|(_, source)| source)
+                        .collect()
+                };
+                decides.iter().any(|source| source == origin || reach.contains(source)).then_some((scope, is_loop))
+            });
+            match gated {
+                Some((group, false)) => format!(
+                    "it sits inside group '{}', whose gate reads '{}'",
+                    crate::project::group_address(g, &group.id, &group.path),
+                    spelled(origin)
+                ),
+                Some((group, true)) => format!(
+                    "it sits inside loop '{}', which runs on what '{}' gives it",
+                    crate::project::group_address(g, &group.id, &group.path),
+                    spelled(origin)
+                ),
+                // Reached neither along the wires nor through a gate
+                // around it: it reads something that runs per instance
+                // because of `origin` (a node inside a group the value
+                // gates), and the one it reads is what it is told. The
+                // walk reaches a place only along a wire from a place it
+                // reached, or by opening a scope around it, so such a
+                // wire is always there.
+                None => {
+                    let source = places::incoming(g, place)
+                        .map(|(_, source)| source)
+                        .find(|source| reach.contains(source))
+                        .expect("a place reached past every gate around it is reached along one of its own wires");
+                    format!("it reads '{}'", spelled(&source))
+                }
             }
-            out.push(group);
+        };
+        if !out.contains(&reason) {
+            out.push(reason);
         }
     }
-    // A group and the groups around it, outermost first.
-    fn chain_to(group: &str, cx: &RuleContext) -> Vec<String> {
-        let mut chain = vec![group.to_string()];
-        while let Some(parent) = cx.graph.group(chain.last().unwrap()).and_then(|g| g.parent_group_id.clone()) {
-            chain.push(parent);
-        }
-        chain.reverse();
-        chain
-    }
-    let mut out = Vec::new();
-    add(node.scope.clone(), cx, &mut out);
     out
-}
-
-/// The nodes whose value flows into `node` along wires, port to port,
-/// from any place `node` runs at: the plain data walk
-/// ([`crate::project::places::upstream_by_wires`]), where an ordinary
-/// node passes any input to every output and a loop's boundary passes
-/// each port straight through, so only the input of the same name.
-fn reads_along_wires<'a>(node: &NodeDefinition, cx: &'a RuleContext) -> BTreeSet<&'a str> {
-    let here: Vec<Located> = cx.places().iter().filter(|place| place.id == node.id).cloned().collect();
-    let reached = crate::project::places::upstream_by_wires(&cx.graph, &here);
-    reached.iter().filter_map(|place| cx.graph.node(&place.id)).map(|n| n.id.as_str()).collect()
 }
 
 /// The inputs the source added to `node` whose declared type fits in
@@ -435,24 +483,24 @@ fn misnamed(value: Option<&Value>, project: &ProjectDefinition, named: Named) ->
         _ => Vec::new(),
     };
     let node_at = |spelled: &str| match crate::project::places::named(project, spelled) {
-        Ok(crate::project::places::Named::Node(place)) => project.nodes.iter().find(|n| n.id == place.id),
+        Ok(crate::project::places::Named::Node(place)) => project.nodes.iter().find(|n| n.id == place.id).map(|n| (n, place)),
         _ => None,
     };
     let fits = |spelled: &str| match named {
         Named::Node { role, per_instance } => {
-            let Some(found) = node_at(spelled) else { return false };
+            let Some((found, place)) = node_at(spelled) else { return false };
             let role_fits = match role {
                 None => true,
                 Some(NodeRole::Infra) => crate::project::infra_place_spellings(project).contains_key(spelled),
                 Some(NodeRole::Trigger) => found.features.is_trigger,
             };
-            role_fits && per_instance.is_none_or(|wanted| found.per_instance.is_some() == wanted)
+            role_fits && per_instance.is_none_or(|wanted| found.per_instance_at(&place.path).is_some() == wanted)
         }
         // `node.field` split at its last dot, the way the runtime reads it:
         // the node may be spelled through its call sites (`one.send.model`).
         Named::Field { instance_filled } => {
             let Some((at, field)) = spelled.rsplit_once('.') else { return false };
-            let Some(found) = node_at(at).filter(|_| !field.is_empty()) else { return false };
+            let Some((found, _)) = node_at(at).filter(|_| !field.is_empty()) else { return false };
             let has_field = found.inputs.iter().any(|i| i.name == field) || found.written_value(field).is_some();
             let filled = crate::instance::instance_filled_fields(found).any(|(f, _)| f == field);
             has_field && instance_filled.is_none_or(|wanted| filled == wanted)

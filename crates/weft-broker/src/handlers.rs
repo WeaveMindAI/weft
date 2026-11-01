@@ -67,8 +67,9 @@ pub(crate) async fn require_worker_drives(
 /// `ctx.tag_run`: write the `run_tag` rows, synchronously, so
 /// they exist by the time the node's call returns (a following
 /// `stop_tagged` anchors on them). The run's own `RunTagged` is on
-/// record already: its worker writes it before any call that names the
-/// run. Only the worker driving the run tags it.
+/// record already (for an unrecorded run, its birth): its worker writes
+/// it before any call that names the run. Only the worker driving the
+/// run tags it.
 pub async fn run_tag(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
