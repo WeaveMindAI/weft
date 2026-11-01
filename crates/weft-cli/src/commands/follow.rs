@@ -262,7 +262,7 @@ fn short(v: Option<&serde_json::Value>) -> String {
 
 /// How long to wait before looking again at a task when the install could
 /// not be reached, or answered that it cannot serve right now.
-const TASK_LOOK_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+pub(crate) const TASK_LOOK_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Follow task `task` of project `project_id` (a resync, a deactivate's
 /// wait for its runs) until it ends, and answer what it ended with
@@ -300,6 +300,7 @@ pub async fn follow_at(
     mut going: impl AsyncFnMut(Option<Value>) -> anyhow::Result<()>,
 ) -> anyhow::Result<Value> {
     let path = format!("{follow}?wait_ms={}", look.as_millis());
+    let client = client.waiting_up_to(look);
     loop {
         match client.get_json(&path).await {
             Ok(answer) => match crate::client::read_answer(answer, "the task's state")? {

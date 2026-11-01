@@ -1147,7 +1147,7 @@ impl BakeStore for PostgresStore {
         Ok(self.pool.scalar("SELECT EXISTS (SELECT 1 FROM trigger_setup WHERE run_id = $1)", &[&run_id]).await?)
     }
 
-    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&super::TriggerBake>) -> anyhow::Result<Option<super::UnreadablePriorBake>> {
+    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&super::TriggerBake>) -> anyhow::Result<Option<super::UnreadableBake>> {
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
         let mut lost = None;
@@ -1175,7 +1175,7 @@ impl BakeStore for PostgresStore {
                     Ok(prior) => prior.refreshed_by(bake),
                     Err(e) => {
                         let e = e.at(super::TriggerBake::row(project_id, instance, &digest));
-                        lost = Some(super::UnreadablePriorBake { error: e.to_string() });
+                        lost = Some(super::UnreadableBake { program_hash: digest.clone(), error: e.to_string() });
                         bake.clone()
                     }
                 },
@@ -1194,7 +1194,7 @@ impl BakeStore for PostgresStore {
         Ok(lost)
     }
 
-    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Vec<super::TriggerBake>> {
+    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<super::Bakes> {
         let instance = instance.map(|m| m.as_str());
         let rows: Vec<(String, weft_core::stored::Version, String)> = self
             .pool
@@ -1203,13 +1203,17 @@ impl BakeStore for PostgresStore {
                 &[&project_id, &instance],
             )
             .await?;
-        rows.into_iter()
-            .map(|(value, version, program)| {
-                Ok(super::TriggerBake::STORED
-                    .decode(value.as_str(), version)
-                    .map_err(|e| e.at(super::TriggerBake::row(project_id, instance, &program)))?)
-            })
-            .collect()
+        let mut bakes = super::Bakes::default();
+        for (value, version, program) in rows {
+            match super::TriggerBake::STORED.decode(value.as_str(), version) {
+                Ok(bake) => bakes.read.push(bake),
+                Err(e) => {
+                    let error = e.at(super::TriggerBake::row(project_id, instance, &program)).to_string();
+                    bakes.unreadable.push(super::UnreadableBake { program_hash: program, error });
+                }
+            }
+        }
+        Ok(bakes)
     }
 }
 

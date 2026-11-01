@@ -86,6 +86,51 @@ async fn the_runs_a_trigger_started_are_reported_for_two_minutes(pool: Pool) {
     assert_eq!(runs["tick"], (7, 1));
 }
 
+/// The fires a trigger's doors dropped are reported for two minutes per
+/// activation, summed over the copies, with the newest minute's reason,
+/// for the project alone; a token no activation governs counts for nothing.
+#[weft_db_macros::test]
+async fn the_fires_a_trigger_dropped_are_reported_with_the_last_reason(pool: Pool) {
+    use weft_core::activation::ActivationKey;
+    use weft_core::instance::{InstanceId, Owner};
+    use weft_core::signal::limits::dropped_key;
+    setup(&pool).await;
+    let (project, other) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+    for (token, trigger, instance) in [("tick", Some("tick"), None), ("ada-inbox", Some("inbox"), Some("ada")), ("loose", None, None)] {
+        pool.execute(
+            "INSERT INTO signal (token, tenant_id, project_id, node_id, is_resume, spec_json, created_at, \
+             spec_json_version, program_json_version, activation_trigger, instance_id) \
+             VALUES ($1, 'tenant-1', $2, $1, FALSE, '{}', 1, $3, 1, $4, $5)",
+            &[&token, &project, &weft_core::primitive::SignalSpec::STORED.version(), &trigger, &instance],
+        )
+        .await
+        .unwrap();
+    }
+    let rows = [
+        (dropped_key("tick"), 60, "w1", project, 2, "the trigger is gone"),
+        (dropped_key("tick"), 120, "w2", project, 1, "package 'relay' didn't compile"),
+        (dropped_key("tick"), 120, "x", other, 9, "another project's"),
+        (dropped_key("ada-inbox"), 120, "w1", project, 4, "its trigger takes no work (inactive)"),
+        (dropped_key("loose"), 120, "w1", project, 5, "no activation"),
+        (dropped_key("tick"), 0, "w1", project, 7, "too old"),
+    ];
+    for (key, window, replica, owner, hits, reason) in rows {
+        pool.execute(
+            "INSERT INTO door_count (key, window_start, replica, project_id, hits, reason) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[&key, &(window as i64), &replica, &owner, &(hits as i64), &reason],
+        )
+        .await
+        .unwrap();
+    }
+    let dropped = entry_limits::dropped(&pool, project, 130).await.unwrap();
+    let shared = ActivationKey::new("tick", Owner::Shared);
+    let ada = ActivationKey::new("inbox", Owner::Instance(InstanceId::new("ada").unwrap()));
+    assert_eq!(dropped.len(), 2, "{dropped:?}");
+    assert_eq!((dropped[&shared].count, dropped[&shared].last_reason.as_str()), (3, "package 'relay' didn't compile"));
+    assert_eq!((dropped[&ada].count, dropped[&ada].last_reason.as_str()), (4, "its trigger takes no work (inactive)"));
+    assert!(entry_limits::dropped(&pool, project, 300).await.unwrap().is_empty());
+}
+
 /// The minutes that no longer count go with the next refused token, so the
 /// counts are kept small by the writes that fill them and no timer looks.
 #[weft_db_macros::test]

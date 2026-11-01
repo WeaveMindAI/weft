@@ -46,6 +46,26 @@ async fn partial_result_round_trips_on_the_task_row(pool: Pool) {
     assert_eq!(tasks::stored_result(&pool, Uuid::new_v4()).await.expect("read"), None);
 }
 
+/// A task asked under its caller's id is inserted once: the same ask sent
+/// again joins it, even once it ended, and an ask that is not the one the
+/// id was made for is refused.
+#[weft_db_macros::test]
+async fn a_task_asked_under_its_callers_id_is_inserted_once(pool: Pool) {
+    setup(&pool).await;
+    let id = Uuid::now_v7();
+    let ask = || tasks::NewTask { dedup_key: None, payload: json!({ "version": "v1", "seed": true }), ..dispatcher_task("unused") };
+    assert_eq!(tasks::enqueue_as(&pool, id, ask()).await.unwrap(), tasks::Enqueued::Inserted);
+    assert_eq!(tasks::enqueue_as(&pool, id, ask()).await.unwrap(), tasks::Enqueued::Joined);
+    pool.execute("UPDATE task SET status = 'complete', completed_at_unix = 1 WHERE id = $1", &[&id]).await.unwrap();
+    assert_eq!(tasks::enqueue_as(&pool, id, ask()).await.unwrap(), tasks::Enqueued::Joined, "ended, and still the same ask");
+    let other = tasks::NewTask { payload: json!({ "version": "v2" }), ..ask() };
+    assert!(matches!(tasks::enqueue_as(&pool, id, other).await.unwrap(), tasks::Enqueued::Refused(why) if why.contains("another task")));
+    let tenant = tasks::NewTask { tenant_id: "tenant-2".into(), ..ask() };
+    assert!(matches!(tasks::enqueue_as(&pool, id, tenant).await.unwrap(), tasks::Enqueued::Refused(_)), "another tenant's ask");
+    let count: i64 = pool.scalar("SELECT count(*) FROM task", &[]).await.unwrap();
+    assert_eq!(count, 1);
+}
+
 /// What a running task says about where it is replaces what it said
 /// before, and is read back by whoever follows it; a task that never said
 /// anything, or no task at all, reads as nothing.

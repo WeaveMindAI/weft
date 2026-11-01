@@ -18,8 +18,8 @@
 //! began with ([`resume`]): it builds nothing and never starts a new one.
 
 use super::Ctx;
-use crate::progress::ActionVerb;
-use weft_core::deactivation::{ResyncAnswer, ResyncProgress, ResyncResponse};
+use crate::progress::{ActionVerb, SaidLast};
+use weft_core::deactivation::{ResyncAnswer, ResyncGoing, ResyncResponse};
 use weft_core::TakeDownChoice;
 
 pub async fn run(ctx: Ctx, scope: weft_core::activation::ActivationScope, choice: TakeDownChoice) -> anyhow::Result<()> {
@@ -60,19 +60,32 @@ async fn answer_of(
     match crate::client::read_answer(answer, "the resync's answer")? {
         ResyncAnswer::Done(done) => Ok(done),
         ResyncAnswer::UnderWay { task, brought_back } => {
-            // What it waits for, said each time it changes: on the progress
+            // Where it is, with how long it has been followed, said each
+            // time it changes and again every so often while it does not
+            // (the triggers coming back can take minutes): on the progress
             // channel, so a CI log shows it line by line and `--json` gets
-            // it as events. It starts as naming none, so a first look that
-            // names none says nothing: the drain-wait line already said what
-            // the resync waits for, and an empty list never means nothing is
-            // left (a run not on record yet is waited for unnamed).
-            let mut said = ResyncProgress::default();
+            // it as events. It starts as naming none, said at the start, so
+            // a first look that names none waits a beat: the drain-wait line
+            // already said what the resync waits for, and an empty list
+            // never means nothing is left (a run not on record yet is
+            // waited for unnamed).
+            let following = std::time::Instant::now();
+            // A change is what it waits for: the runs, or the activation
+            // it drives and its step (never the clock that answer was read
+            // at, which moves on every look).
+            let changed = |going: &ResyncGoing| {
+                (going.progress.waits_for.clone(), going.turning_on.as_ref().map(|on| (on.since_unix, on.waiting.clone())))
+            };
+            let mut said = SaidLast::announced(changed(&ResyncGoing::default()), std::time::Duration::ZERO);
             let going = async |where_it_is: Option<serde_json::Value>| {
-                let Some(where_it_is) = where_it_is else { return Ok(()) };
-                let now: ResyncProgress = crate::client::read_answer(where_it_is, "where the resync is")?;
-                if said != now {
-                    progress.resync_waits_for(&now);
-                    said = now;
+                let now: ResyncGoing = match where_it_is {
+                    Some(where_it_is) => crate::client::read_answer(where_it_is, "where the resync is")?,
+                    // A task that has said nothing yet names no run.
+                    None => ResyncGoing::default(),
+                };
+                let elapsed = following.elapsed();
+                if said.hear(changed(&now), elapsed).is_some() {
+                    progress.resync_waits_for(&now, elapsed);
                 }
                 Ok(())
             };
@@ -98,7 +111,10 @@ async fn run_inner(
     progress.drain_wait(take_down.running, crate::progress::DrainOn::Resync);
     progress.trigger_register_start();
     progress.dispatcher_call_start(&path);
-    let answer = answer_of(&handle.client, progress, &handle.id, handle.client.post_json(&path, &serde_json::to_value(&body)?).await?).await?;
+    // It answers at once, but first brings back what a maintenance left
+    // down of the project, when it left something, however long that is.
+    let asked = handle.client.waiting_on_its_work().post_json(&path, &serde_json::to_value(&body)?).await?;
+    let answer = answer_of(&handle.client, progress, &handle.id, asked).await?;
     progress.dispatcher_call_done(serde_json::to_value(&answer)?);
     progress.trigger_register_done();
     handle.warn_broken(progress);

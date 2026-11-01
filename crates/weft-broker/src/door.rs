@@ -312,18 +312,18 @@ async fn door_tick(
 ) -> Resp<DoorTick> {
     let (tenant, project, replica) = worker(&caller)?;
     let now = chrono::Utc::now().timestamp();
-    let (keys, hits): (Vec<String>, Vec<i64>) = req.counts.iter().map(|c| (c.key.clone(), c.hits)).unzip();
+    let keys: Vec<&str> = req.counts.iter().map(|c| c.key.as_str()).collect();
+    let hits: Vec<i64> = req.counts.iter().map(|c| c.hits).collect();
+    let reasons: Vec<Option<&str>> = req.counts.iter().map(|c| c.reason.as_deref()).collect();
     let leased_until = weft_task_store::worker_door::lease_until(
         now,
         weft_core::time_scale::scaled_secs(weft_task_store::worker_door::WORKER_LEASE_SECS),
         req.vouch_until,
     );
-    // `$10` is typed: the previous release's tick, kept while an upgrade
-    // rolls out, takes the same first nine arguments.
     let db::Json(answer): db::Json<Value> = state
         .pool
         .scalar(
-            "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::boolean)",
+            "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &[
                 &replica,
                 &project,
@@ -335,6 +335,7 @@ async fn door_tick(
                 &req.window_start,
                 &keys,
                 &hits,
+                &reasons,
                 &req.shortens,
             ],
         )

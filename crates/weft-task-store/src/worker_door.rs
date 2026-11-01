@@ -92,6 +92,25 @@ pub async fn prune(pool: &crate::db::Pool, now: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Count one fire or call of trigger `token` of `project` the install
+/// dropped itself, before any worker's door saw it (its trigger has no
+/// armed program), with `reason`: under `counter` (the dispatcher copy
+/// that dropped it), beside what the workers' doors count, so `weft
+/// status` reads both the same way. One statement; a drop is the path
+/// that pays for it.
+pub async fn count_drop(pool: &crate::db::Pool, project: uuid::Uuid, token: &str, counter: &str, reason: &str, now: i64) -> anyhow::Result<()> {
+    use crate::db::Client as _;
+    let (window_start, _) = weft_core::signal::limits::window(now);
+    pool.execute(
+        "INSERT INTO door_count (key, window_start, replica, project_id, hits, reason) VALUES ($1, $2, $3, $4, 1, $5) \
+         ON CONFLICT (key, window_start, replica) DO UPDATE SET hits = door_count.hits + 1, reason = EXCLUDED.reason \
+         WHERE door_count.project_id = EXCLUDED.project_id",
+        &[&weft_core::signal::limits::dropped_key(token), &window_start, &counter, &project, &weft_core::signal::limits::drop_reason(reason)],
+    )
+    .await?;
+    Ok(())
+}
+
 pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
     name: "worker_door",
     tables: &["worker_lease", "door_count"],
@@ -140,10 +159,10 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             FOR EACH ROW
             WHEN (OLD.leased_until_unix < EXTRACT(EPOCH FROM NOW())::BIGINT)
             EXECUTE FUNCTION worker_lease_alive_notify()"#,
-        // SYNC: door_count keys <-> crates/weft-core/src/signal/limits.rs (ran_key, failed_key)
+        // SYNC: door_count keys <-> crates/weft-core/src/signal/limits.rs (ran_key, failed_key, dropped_key)
         // What one worker counted at its door in one minute, per key
         // (`c:<token>:<caller>`, `e:<token>`, `refused:<token>:<limit>`,
-        // `ran:<token>`, `failed:<token>`):
+        // `ran:<token>`, `failed:<token>`, `dropped:<token>`):
         // its own total so far, replaced by each tick, under its project
         // (a copy hears only its own project's counts). UNLOGGED: a crash
         // loses a minute's counts, which only ever lets a few extra calls
@@ -154,11 +173,15 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             replica TEXT NOT NULL,
             project_id UUID NOT NULL,
             hits BIGINT NOT NULL,
+            -- The last reason the worker gave for the count, for a key
+            -- that keeps one (a dropped fire's); NULL for every other.
+            reason TEXT,
             PRIMARY KEY (key, window_start, replica)
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_door_count_window ON door_count(window_start)"#,
         // One tick of a worker: its lease renewed with what it drives
-        // now, its counts of the minute stored, and what the project's
+        // now, its counts of the minute stored (each with its reason, for
+        // a key that keeps one), and what the project's
         // other copies counted (keys are `<what>:<token>:...`; every key
         // but the refused-token ones, `t:-:<address>`, which each copy
         // bounds alone), with how many copies are alive; and, on a tick
@@ -168,7 +191,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         // SYNC: the answer's shape <-> weft_broker_client::protocol::DoorTick
 concat!(        r#"CREATE OR REPLACE FUNCTION weft_door_tick(
                 p_replica TEXT, p_project UUID, p_tenant TEXT, p_binary_hash TEXT, p_leased_until BIGINT,
-                p_in_flight JSONB, p_window BIGINT, p_keys TEXT[], p_hits BIGINT[], p_shortens BOOLEAN
+                p_in_flight JSONB, p_window BIGINT, p_keys TEXT[], p_hits BIGINT[], p_reasons TEXT[], p_shortens BOOLEAN
             ) RETURNS JSONB AS $$
             BEGIN
                 INSERT INTO worker_lease (replica, project_id, tenant_id, binary_hash, leased_until_unix, in_flight, alive_since)
@@ -179,9 +202,9 @@ concat!(        r#"CREATE OR REPLACE FUNCTION weft_door_tick(
                             alive_since = CASE WHEN "#, worker_alive!("worker_lease"), r#"
                                                THEN worker_lease.alive_since ELSE EXCLUDED.alive_since END
                     WHERE worker_lease.project_id = EXCLUDED.project_id;
-                INSERT INTO door_count (key, window_start, replica, project_id, hits)
-                    SELECT k, p_window, p_replica, p_project, h FROM unnest(p_keys, p_hits) AS t(k, h)
-                    ON CONFLICT (key, window_start, replica) DO UPDATE SET hits = EXCLUDED.hits
+                INSERT INTO door_count (key, window_start, replica, project_id, hits, reason)
+                    SELECT k, p_window, p_replica, p_project, h, r FROM unnest(p_keys, p_hits, p_reasons) AS t(k, h, r)
+                    ON CONFLICT (key, window_start, replica) DO UPDATE SET hits = EXCLUDED.hits, reason = EXCLUDED.reason
                     WHERE door_count.project_id = EXCLUDED.project_id;
                 -- This tick's lease ends before the one the worker vouched
                 -- for last: the look at lapsed leases, booked for the
@@ -204,28 +227,6 @@ concat!(        r#"CREATE OR REPLACE FUNCTION weft_door_tick(
                                  AND "#, worker_alive!("l"), r#"));
             END;
             $$ LANGUAGE plpgsql"#),
-        // The tick as the previous release's brokers call it, which they
-        // do while an upgrade rolls out: the lease and the counts written
-        // as the tick above writes them, no lease shortened, and the other
-        // copies' counts of exactly the tokens they name (`p_tokens`,
-        // refused ones included), as that release answered. The release
-        // after this one drops it.
-        r#"CREATE OR REPLACE FUNCTION weft_door_tick(
-                p_replica TEXT, p_project UUID, p_tenant TEXT, p_binary_hash TEXT, p_leased_until BIGINT,
-                p_in_flight JSONB, p_window BIGINT, p_keys TEXT[], p_hits BIGINT[], p_tokens TEXT[]
-            ) RETURNS JSONB AS $$
-                SELECT jsonb_build_object(
-                    'others', COALESCE((
-                        SELECT jsonb_agg(jsonb_build_object('key', o.key, 'hits', o.hits))
-                        FROM (SELECT key, SUM(hits)::bigint AS hits FROM door_count
-                              WHERE window_start = p_window AND replica <> p_replica
-                                AND project_id = p_project
-                                AND split_part(key, ':', 2) = ANY(p_tokens)
-                              GROUP BY key) o), '[]'::jsonb),
-                    'copies', t.tick->'copies')
-                FROM (SELECT weft_door_tick(p_replica, p_project, p_tenant, p_binary_hash, p_leased_until,
-                                            p_in_flight, p_window, p_keys, p_hits, FALSE) AS tick) t
-            $$ LANGUAGE sql"#,
     ],
     seed: &[],
     data_steps: &[],

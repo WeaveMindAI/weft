@@ -279,7 +279,7 @@ async fn infra_sync(
         progress.dispatcher_call_start(&path);
         let body = serde_json::to_value(&sync)?;
         let answer = crate::progress::while_waiting(
-            handle.client.post_json(&path, &body),
+            handle.client.waiting_on_its_work().post_json(&path, &body),
             std::time::Duration::from_secs(10),
             async |elapsed| progress.infra_wait("start", elapsed.as_secs(), &changing_now(&handle.client, &handle.id).await),
         )
@@ -344,8 +344,10 @@ async fn infra_destroy(
 /// wait that may legitimately last hours; a hard deadline would turn a
 /// correct slow operation into a spurious failure (same rule as
 /// `wait_for_drain`). The wait stays legible via an `InfraWait`
-/// breadcrumb; Ctrl+C is the recovery. Status-endpoint errors still
-/// bubble loudly.
+/// breadcrumb; Ctrl+C is the recovery. A look the install did not answer
+/// (out of reach, or never answering within the hold) is said and looked
+/// at again (`look_again_after`); every other status-endpoint error still
+/// bubbles loudly.
 async fn wait_for_command(
     progress: &Progress,
     on: Option<&str>,
@@ -361,13 +363,19 @@ async fn wait_for_command(
         // Held by the dispatcher until the command completes or the hold
         // runs out (at most `COMMAND_HOLD`), so the loop asks again at
         // once either way.
-        let resp = client
-            .get_json(&format!(
-                "/projects/{project_id}/infra/commands/{command_id}?wait_ms={}",
-                COMMAND_HOLD.as_millis()
-            ))
-            .await
-            .with_context(|| format!("waiting on infra {verb} command {command_id}"))?;
+        let looked = client
+            .waiting_up_to(COMMAND_HOLD)
+            .get_json(&format!("/projects/{project_id}/infra/commands/{command_id}?wait_ms={}", COMMAND_HOLD.as_millis()))
+            .await;
+        let resp = match looked {
+            Ok(resp) => resp,
+            Err(e) => {
+                let why = super::ensure::look_again_after(e).map_err(|e| e.context(format!("waiting on infra {verb} command {command_id}")))?;
+                progress.warn(&format!("could not look at infra {verb} command {command_id} just now ({why}); looking again"));
+                tokio::time::sleep(super::follow::TASK_LOOK_AGAIN_AFTER).await;
+                continue;
+            }
+        };
         // A status that does not read fails loud: a missing `done` read
         // as "not done" would loop forever (the wait is unbounded).
         let status: CommandStatus = crate::client::read_answer(resp, &format!("the status of the infra {verb} command"))?;

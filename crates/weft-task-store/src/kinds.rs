@@ -90,6 +90,14 @@ weft_core::wire_enum! {
         /// own (`weft_dispatcher::task_kinds::activate`): the dispatcher is
         /// its only producer, and no caller of the broker may enqueue it.
         Activate = "activate",
+        /// Start a run a person asked for (`weft run`, the editor through
+        /// it), apart from the request: preparing it can take minutes (a
+        /// seed's results read, its files checked), and the process asking
+        /// may go away meanwhile. Its id is the caller's, and the run's, so
+        /// an ask sent again joins it. Its payload is the dispatcher's own
+        /// (`weft_core::versions::StartRun`): the dispatcher is its only
+        /// producer, and no caller of the broker may enqueue it.
+        StartRun = "start_run",
     }
 }
 

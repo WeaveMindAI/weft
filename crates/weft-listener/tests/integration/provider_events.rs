@@ -496,3 +496,94 @@ impl weft_listener::fire_sink::WorkerDoors for FakeDoors {
         Ok(weft_core::door_fire::Fired::Started { run_id: weft_core::door_fire::run_of_fire(fire.fire_id) })
     }
 }
+
+/// A fake broker for a subscription pushed to the install: the
+/// listener-resolve route answering a webhook-only topic, and the
+/// subscription check answering what `check` says, recording each check.
+async fn spawn_webhook_broker(check: Result<(), &'static str>) -> (String, Arc<Mutex<Vec<Value>>>) {
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    let checked: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = checked.clone();
+    let app = axum::Router::new()
+        .route(
+            "/v1/access/listener-resolve",
+            post(|| async {
+                axum::Json(json!({
+                    "values": { "token": "tok-api" },
+                    "auth": [],
+                    "recipe_values": {},
+                    "events": {
+                        "messages": {
+                            "fields": { "text": "text" },
+                            "account": { "value": "team", "path": "team_id" },
+                            "webhook": {
+                                "verify": { "kind": "token_echo" },
+                                "routeBy": "subscription",
+                                "idPath": "header:X-Chan-Id",
+                                "tokenPath": "header:X-Chan-Token",
+                                "subscribe": {
+                                    "subscribe": {
+                                        "url": "https://provider.test/watch",
+                                        "method": "POST",
+                                        "body": { "address": "{receiverUrl}" },
+                                        "auth": []
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/v1/access/subscription/check",
+            post(move |axum::Json(req): axum::Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(req);
+                    match check {
+                        Ok(()) => (axum::http::StatusCode::OK, axum::Json(Value::Null)).into_response(),
+                        Err(why) => (axum::http::StatusCode::BAD_REQUEST, why.to_string()).into_response(),
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, weft_broker_client::line::server::with_line(app)).await.unwrap() });
+    (base, checked)
+}
+
+/// Whether a subscription pushed to the install could come up is asked
+/// of the broker, subscribing nothing: its refusal (no address the
+/// internet reaches) is what the check answers, naming the fix; a broker
+/// that says it could lets it through.
+#[tokio::test]
+async fn a_pushed_subscription_is_checked_with_the_broker_before_it_comes_up() {
+    for (check, refused) in [(Err("this trigger needs 'fakechat' to deliver events TO your weft"), true), (Ok(()), false)] {
+        let (base, checked) = spawn_webhook_broker(check).await;
+        let rig = rig(&uuid::Uuid::new_v4().simple().to_string(), base);
+        let access = Access::new(uuid::Uuid::new_v4().to_string(), "fakechat", None);
+        let spec = to_spec(ProviderEvents::new(&access, "messages", Vec::new()));
+        let identity = weft_listener::kinds::SignalIdentity {
+            token: "sig-1".into(),
+            tenant_id: "tenant-a".into(),
+            node_id: "inbox".into(),
+            is_resume: false,
+            run_id: None,
+            spec,
+        };
+        let answer = weft_listener::kinds::check_signal(&rig.state, identity, None, 1_000).await;
+        match refused {
+            true => {
+                let why = format!("{:#}", answer.expect_err("refused"));
+                assert!(why.contains("to deliver events TO your weft"), "{why}");
+            }
+            false => answer.expect("it could come up"),
+        }
+        let checked = checked.lock().unwrap();
+        assert_eq!(checked.len(), 1, "one check, and no subscribe");
+        assert_eq!((checked[0]["topic"].as_str(), checked[0]["signal_token"].as_str()), (Some("messages"), Some("sig-1")));
+    }
+}

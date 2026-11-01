@@ -440,7 +440,16 @@ pub(crate) async fn fire_entry(state: &DispatcherState, routing: &FireGateInfo, 
     use weft_core::door_fire::Fired;
     let project_id = routing.project_id;
     let Some(binary_hash) = &routing.binary_hash else {
-        tracing::warn!(target: "weft_dispatcher::signal", token = %fire.token, "fire dropped: its trigger has no armed program; activate it again");
+        let reason = "its trigger has no armed program; activate it again";
+        tracing::warn!(target: "weft_dispatcher::signal", token = %fire.token, %project_id, "fire dropped: {reason}");
+        // Counted where `weft status` reads the drops of the workers'
+        // doors. The fire is dropped whatever becomes of the count: a
+        // count that failed is said, never a reason to hand it over again.
+        if let Err(e) =
+            weft_task_store::worker_door::count_drop(&state.pg_pool, project_id, &fire.token, &state.replica, reason, crate::lease::now_unix()).await
+        {
+            tracing::error!(target: "weft_dispatcher::signal", token = %fire.token, %project_id, error = %format!("{e:#}"), "a dropped fire could not be counted");
+        }
         return Ok(Landed::Done);
     };
     let reason = match crate::worker_fire::fire(state, &routing.tenant_id, project_id, binary_hash, &fire).await {
@@ -448,8 +457,9 @@ pub(crate) async fn fire_entry(state: &DispatcherState, routing: &FireGateInfo, 
         // The install hands over no fire under a holder's name, so a worker
         // has nobody to refuse as no longer holding.
         Ok(Fired::NotHeld) => anyhow::bail!("the worker answered that a fire's holder no longer holds the signal, for a fire handed over in no holder's name"),
+        // The worker's door counted it with its reason (`weft status`).
         Ok(Fired::Dropped { reason }) => {
-            tracing::info!(target: "weft_dispatcher::signal", token = %fire.token, %project_id, "fire dropped: {reason}");
+            tracing::warn!(target: "weft_dispatcher::signal", token = %fire.token, %project_id, "fire dropped: {reason}");
             return Ok(Landed::Done);
         }
         Ok(Fired::Refused { reason, retry_after_secs }) => return Ok(Landed::Refused { reason, retry_after_secs }),

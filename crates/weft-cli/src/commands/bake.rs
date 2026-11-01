@@ -24,7 +24,8 @@ pub async fn run(
         let path = format!("/projects/{id}/bake");
         let body = weft_core::activation::BakeRequest { scope };
         progress.dispatcher_call_start(&path);
-        let result: serde_json::Value = client.post_json(&path, &serde_json::to_value(&body)?).await?;
+        // It answers once each trigger's setup run ended, however long.
+        let result: serde_json::Value = client.waiting_on_its_work().post_json(&path, &serde_json::to_value(&body)?).await?;
         progress.dispatcher_call_done(serde_json::json!({"projectId": id}));
         // The install's own reading of the version it baked, whichever way
         // it was named.

@@ -103,8 +103,9 @@ pub struct RunningSource {
     pub manifest: Manifest,
 }
 
-/// What a started run answers (`POST /projects/{id}/versions/run`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What a started run answers: the end of the task a person's ask hands
+/// it to ([`StartRun`]), and a program's call to start one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunStarted {
     pub run_id: RunId,
@@ -169,6 +170,65 @@ pub struct VersionRunRequest {
     pub seed_before: Vec<String>,
     #[serde(flatten)]
     pub shape: RunShape,
+}
+
+/// `POST /projects/{id}/versions/runs` as a person asks it (`weft run`,
+/// the editor through it): [`VersionRunRequest`], carried out by a task
+/// the caller follows (`GET /projects/{id}/follow/{task}`), which says
+/// what it is doing on the way ([`RunStarting`]) and ends with
+/// [`RunStarted`] or the refusal. Preparing a run can take minutes (a
+/// seed's results read, its files checked), and a task goes on whatever
+/// becomes of the request that asked.
+// SYNC: StartRun <-> crates/weft-cli/src/commands/run.rs (start_run)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartRun {
+    /// The id of the task that starts the run, made by the caller, a
+    /// fresh one for every run it asks for: an ask sent again after its
+    /// answer was lost joins that task instead of starting a second run.
+    /// The run is named after it.
+    pub task: uuid::Uuid,
+    #[serde(flatten)]
+    pub request: VersionRunRequest,
+}
+
+/// What `POST /projects/{id}/versions/runs` answers: the task starting
+/// the run, to follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartingRun {
+    pub task: uuid::Uuid,
+}
+
+/// Where a run being started is, while its task prepares it, as the task
+/// says it when it begins a part that can take a while. Nothing said: it
+/// reads what the run starts with, which takes moments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum RunStarting {
+    /// Reading the results the seed run holds, to reuse them: the longer
+    /// that run's record, the longer it takes.
+    ReadingSeed { seed: RunId },
+    /// Checking that the stored files the reused results name have not
+    /// changed since: `files` of them.
+    CheckingFiles { files: usize },
+    /// Waiting for the project's lock, which a write to its version tree
+    /// or the start of an infra sync holds for a few writes.
+    WaitingForLock,
+}
+
+impl RunStarting {
+    /// What it is doing, in a person's words.
+    pub fn describe(&self) -> String {
+        match self {
+            RunStarting::ReadingSeed { seed } => format!("reading the results of seed run {}", &seed.to_string()[..8]),
+            RunStarting::CheckingFiles { files: 1 } => "checking the stored file a reused result names has not changed".into(),
+            RunStarting::CheckingFiles { files } => format!("checking the {files} stored files reused results name have not changed"),
+            RunStarting::WaitingForLock => {
+                "waiting for the project's lock, which a write to its version tree or the start of an infra sync holds".into()
+            }
+        }
+    }
 }
 
 /// What a run starts with: a saved example of the version it runs, edited
@@ -249,6 +309,26 @@ mod tests {
         assert_eq!(diff.added, vec!["d"]);
         assert_eq!(diff.removed, vec!["c"]);
         assert_eq!(diff.changed, vec!["b"]);
+    }
+
+    /// A person's ask to start a run carries its task beside the request,
+    /// flat, and reads back as written; where a start is reads in the
+    /// wire's casing.
+    #[test]
+    fn an_ask_to_start_a_run_and_where_it_is_ride_the_wire() {
+        let ask = StartRun {
+            task: uuid::Uuid::from_u128(7),
+            request: VersionRunRequest { version: "v1".into(), definition_hash: "d".into(), binary_hash: "b".into(), seed: true, ..Default::default() },
+        };
+        let wire = serde_json::to_value(&ask).unwrap();
+        assert_eq!(wire["task"], serde_json::json!(uuid::Uuid::from_u128(7)));
+        assert_eq!((wire["version"].as_str(), wire["seed"].as_bool()), (Some("v1"), Some(true)));
+        assert_eq!(serde_json::from_value::<StartRun>(wire).unwrap(), ask);
+        let seed = RunId::from_u128(9);
+        assert_eq!(serde_json::to_value(RunStarting::ReadingSeed { seed }).unwrap(), serde_json::json!({ "stage": "reading_seed", "seed": seed }));
+        assert_eq!(serde_json::to_value(RunStarting::CheckingFiles { files: 2 }).unwrap(), serde_json::json!({ "stage": "checking_files", "files": 2 }));
+        assert_eq!(serde_json::to_value(RunStarting::WaitingForLock).unwrap(), serde_json::json!({ "stage": "waiting_for_lock" }));
+        assert!(RunStarting::ReadingSeed { seed }.describe().starts_with("reading the results of seed run 00000000"));
     }
 
     #[test]

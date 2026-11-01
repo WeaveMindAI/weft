@@ -68,6 +68,43 @@ pub struct PrepareRequest {
     pub for_instance: Option<crate::instance::InstanceScope>,
 }
 
+/// `POST /check`: whether each of these entry signals could be registered
+/// and come up on this install, asked before what they would replace is
+/// taken down (a resync's bring-back), registering and starting nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckRequest {
+    pub signals: Vec<CheckSignal>,
+}
+
+/// One entry signal a [`CheckRequest`] asks about, as it would be
+/// registered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckSignal {
+    pub token: String,
+    pub tenant_id: String,
+    /// Its place, spelled the way the program writes it.
+    pub node_id: String,
+    pub spec: SignalSpec,
+    #[serde(default)]
+    pub for_instance: Option<crate::instance::InstanceScope>,
+}
+
+/// What `POST /check` answers: the signals that could not come up, each
+/// with why. Empty: every one could, as far as anything short of asking
+/// an outside service can tell.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CheckResponse {
+    #[serde(default)]
+    pub refused: Vec<CheckRefused>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckRefused {
+    pub token: String,
+    pub node_id: String,
+    pub why: String,
+}
+
 /// Where a registration's kind_state starts from: fresh, or from the row
 /// it replaces. The listener decides which, the same way for every kind
 /// (`weft_listener::kinds::prepare_signal`).

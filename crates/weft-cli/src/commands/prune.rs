@@ -44,7 +44,8 @@ pub async fn run(ctx: Ctx, reference: String, yes: bool) -> anyhow::Result<()> {
             return Ok(());
         }
     }
-    let done = client.delete_json(&base).await.context("prune")?;
+    // It answers once the pruned runs' files are gone, however many.
+    let done = client.waiting_on_its_work().delete_json(&base).await.context("prune")?;
     // What was actually removed, not what the plan predicted: the two
     // are separate round trips and the subtree can move in between.
     let removed: PruneResponse = serde_json::from_value(done.clone()).context("read the prune answer")?;

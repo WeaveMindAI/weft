@@ -19,11 +19,19 @@ const PROJECT: Uuid = Uuid::from_u128(1);
 /// `counts` this minute, saying whether it `shortens` a lease it vouched
 /// for; what the tick answers.
 async fn tick_with(pool: &Pool, replica: &str, until: i64, counts: &[(&str, i64)], shortens: bool) -> serde_json::Value {
-    let (keys, hits): (Vec<String>, Vec<i64>) = counts.iter().map(|(k, h)| (k.to_string(), *h)).unzip();
+    let counts: Vec<(&str, i64, Option<&str>)> = counts.iter().map(|(k, h)| (*k, *h, None)).collect();
+    tick_counting(pool, replica, until, &counts, shortens).await
+}
+
+/// [`tick_with`], each count with the reason it keeps, if any.
+async fn tick_counting(pool: &Pool, replica: &str, until: i64, counts: &[(&str, i64, Option<&str>)], shortens: bool) -> serde_json::Value {
+    let keys: Vec<&str> = counts.iter().map(|(k, _, _)| *k).collect();
+    let hits: Vec<i64> = counts.iter().map(|(_, h, _)| *h).collect();
+    let reasons: Vec<Option<&str>> = counts.iter().map(|(_, _, r)| *r).collect();
     let none = std::collections::BTreeMap::<String, u32>::new();
     pool.scalar::<db::Json<serde_json::Value>>(
-        "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::boolean)",
-        &[&replica, &PROJECT, &"tenant-1", &"bin-A", &until, &db::Json(db::WeftMade(&none)), &0i64, &keys, &hits, &shortens],
+        "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        &[&replica, &PROJECT, &"tenant-1", &"bin-A", &until, &db::Json(db::WeftMade(&none)), &0i64, &keys, &hits, &reasons, &shortens],
     )
     .await
     .unwrap()
@@ -120,40 +128,38 @@ async fn a_tick_hears_the_other_copies_counts_but_their_refused_tokens(pool: Poo
     assert_eq!(answer["others"], serde_json::json!([{ "key": "e:route:1", "hits": 3 }]));
 }
 
-/// The tick as the previous release's brokers call it (the tokens it
-/// serves named, no lease shortened) still renews the lease and answers
-/// the counts of exactly the tokens it names, a refused one included, as
-/// that release did.
+/// A tick keeps the reason a count carries, replaced by the next tick's
+/// along with its hits, and none for a count that carries none.
 #[weft_db_macros::test]
-async fn the_previous_releases_tick_still_answers_as_it_did(pool: Pool) {
+async fn a_tick_keeps_the_reason_a_count_carries(pool: Pool) {
     setup(&pool).await;
     let now = chrono::Utc::now().timestamp();
-    tick_with(&pool, "worker-b", now + 15, &[("e:route:1", 3), ("e:other:1", 4), ("t:-:1.2.3.4", 9)], false).await;
-    let none = std::collections::BTreeMap::<String, u32>::new();
-    let db::Json(answer): db::Json<serde_json::Value> = pool
-        .scalar(
-            "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text[])",
-            &[
-                &"worker-a",
-                &PROJECT,
-                &"tenant-1",
-                &"bin-A",
-                &(now + 15),
-                &db::Json(db::WeftMade(&none)),
-                &0i64,
-                &Vec::<String>::new(),
-                &Vec::<i64>::new(),
-                &vec!["route".to_string(), "-".to_string()],
-            ],
-        )
-        .await
-        .unwrap();
-    let mut others: Vec<(String, i64)> = serde_json::from_value::<Vec<serde_json::Value>>(answer["others"].clone())
-        .unwrap()
-        .into_iter()
-        .map(|count| (count["key"].as_str().unwrap().to_string(), count["hits"].as_i64().unwrap()))
-        .collect();
-    others.sort();
-    assert_eq!(others, [("e:route:1".to_string(), 3), ("t:-:1.2.3.4".to_string(), 9)], "only the tokens it names");
-    assert_eq!(answer["copies"], serde_json::json!(2));
+    tick_counting(&pool, "worker-a", now + 15, &[("dropped:t1", 1, Some("the trigger is gone")), ("ran:t1", 2, None)], false).await;
+    tick_counting(&pool, "worker-a", now + 15, &[("dropped:t1", 3, Some("package 'relay' didn't compile")), ("ran:t1", 2, None)], false).await;
+    let rows: Vec<(String, i64, Option<String>)> =
+        pool.all("SELECT key, hits, reason FROM door_count ORDER BY key", &[]).await.unwrap();
+    assert_eq!(
+        rows,
+        [("dropped:t1".to_string(), 3, Some("package 'relay' didn't compile".to_string())), ("ran:t1".to_string(), 2, None)]
+    );
+}
+
+/// A drop the install counts itself adds to its own row of the minute,
+/// keeping the last reason, beside a worker's count of the same key.
+#[weft_db_macros::test]
+async fn a_drop_the_install_counts_adds_up_beside_the_workers(pool: Pool) {
+    setup(&pool).await;
+    let now = chrono::Utc::now().timestamp();
+    tick_counting(&pool, "worker-a", now + 15, &[("dropped:t1", 2, Some("the trigger is gone"))], false).await;
+    weft_task_store::worker_door::count_drop(&pool, PROJECT, "t1", "dispatcher-1", "no armed program", 0).await.unwrap();
+    weft_task_store::worker_door::count_drop(&pool, PROJECT, "t1", "dispatcher-1", "still no armed program", 30).await.unwrap();
+    let rows: Vec<(String, i64, Option<String>)> =
+        pool.all("SELECT replica, hits, reason FROM door_count WHERE key = 'dropped:t1' ORDER BY replica", &[]).await.unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("dispatcher-1".to_string(), 2, Some("still no armed program".to_string())),
+            ("worker-a".to_string(), 2, Some("the trigger is gone".to_string())),
+        ]
+    );
 }

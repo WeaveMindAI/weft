@@ -419,7 +419,8 @@ fn trigger_lines(entry: &weft_core::projects::TriggerEntry) -> Vec<String> {
         let held = if copy.held.is_empty() { String::new() } else { format!(", holding {}", copy.held.describe()) };
         let version = copy.version.as_deref().map(|v| format!(", version {}", super::versions::short(v))).unwrap_or_default();
         let waiting = copy.waiting.as_ref().map(waiting_words).unwrap_or_default();
-        format!("{state}{held_back}{held}{version}{waiting}")
+        let dropped = copy.dropped.as_ref().map(|dropped| format!("; {}", dropped.describe())).unwrap_or_default();
+        format!("{state}{held_back}{held}{version}{waiting}{dropped}")
     };
     let mut lines = Vec::new();
     match &entry.shared {
@@ -491,7 +492,7 @@ mod tests {
     use weft_core::projects::{HeldWork, TriggerCopy, TriggerEntry, TriggerState};
 
     fn copy(instance: Option<&str>, state: TriggerState, mode: ActivationMode) -> TriggerCopy {
-        TriggerCopy { instance: instance.map(|i| InstanceId::new(i).unwrap()), state, mode, down_with: None, held_back: None, held: HeldWork::default(), waiting: None, version: None, progress: None }
+        TriggerCopy { instance: instance.map(|i| InstanceId::new(i).unwrap()), state, mode, down_with: None, held_back: None, held: HeldWork::default(), waiting: None, version: None, progress: None, dropped: None }
     }
 
     /// A resync that stopped says so, why, and what comes next, never
@@ -542,6 +543,27 @@ mod tests {
         assert_eq!(lines[0], "inbox: once per instance, 1 of 2 on");
         assert!(lines[1].starts_with("  instance ada: on, behind the source"), "{lines:?}");
         assert_eq!(lines[2], "  instance bob: off");
+    }
+
+    /// A trigger whose door dropped fires says how many, and why the last
+    /// one was dropped.
+    #[test]
+    fn a_trigger_that_dropped_fires_or_calls_says_how_many_and_why() {
+        let door = TriggerEntry {
+            node: "door".into(),
+            per_instance: false,
+            gone: false,
+            shared: Some(TriggerCopy {
+                dropped: Some(weft_core::projects::Dropped { count: 3, last_reason: "package 'relay' didn't compile".into() }),
+                ..copy(None, TriggerState::On, ActivationMode::Active)
+            }),
+            copies: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        assert_eq!(
+            super::trigger_lines(&door),
+            ["door: on; 3 fires or calls dropped in the last minute or two (refused before any run started), the last because: package 'relay' didn't compile"]
+        );
     }
 
     /// A trigger the health check took down says so, and what brings it

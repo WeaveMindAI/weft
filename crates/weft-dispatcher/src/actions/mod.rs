@@ -38,9 +38,11 @@ pub enum Actor {
     /// A person, through the CLI or the editor, with their tenant's key.
     Operator { tenant: TenantId },
     /// A program's run, through `ctx`: the run, the project it is a run
-    /// of, and that project's owner. It may act on any project of the
-    /// same owner.
-    Program { tenant: TenantId, project: uuid::Uuid, run: RunId },
+    /// of, that project's owner, and the call it makes
+    /// (`weft_core::program::program_call_id`, the same each time the run
+    /// issues it again). It may act on any project of the same
+    /// owner.
+    Program { tenant: TenantId, project: uuid::Uuid, run: RunId, call: uuid::Uuid },
 }
 
 impl Actor {
@@ -216,7 +218,7 @@ mod tests {
         let own = uuid::Uuid::now_v7();
         let other = uuid::Uuid::now_v7();
         let run = uuid::Uuid::now_v7();
-        let program = Actor::Program { tenant: TenantId::local(), project: own, run };
+        let program = Actor::Program { tenant: TenantId::local(), project: own, run, call: uuid::Uuid::now_v7() };
         assert_eq!(program.take_down_asker(own), crate::take_down::TakeDownAsker::Run(run));
         assert_eq!(program.take_down_asker(other), crate::take_down::TakeDownAsker::Outside);
         assert!(program.is_own_project(own) && !program.is_own_project(other));
