@@ -1918,10 +1918,10 @@ fn validate_value_names_the_offending_path() {
     let err = history
         .validate_value(&json!([{ "role": "user", "content": "a", "extra": 1 }]))
         .unwrap_err();
-    assert!(err.contains("unknown field \"extra\""), "{err}");
+    assert!(err.contains("unknown field 'extra'"), "{err}");
 
     let err = history.validate_value(&json!([{ "role": "user" }])).unwrap_err();
-    assert!(err.contains("missing required field \"content\""), "{err}");
+    assert!(err.contains("missing required field 'content'"), "{err}");
 
     // A raw URL string is NOT a stored image: the marker is the contract.
     let err = history
@@ -2191,12 +2191,136 @@ fn validate_value_refuses_an_unknown_key_only_on_a_closed_record() {
     use serde_json::json;
     let value = json!({ "email": "a@b", "utm": "x" });
     let e = ty("{ email: String }").validate_value(&value).unwrap_err();
-    assert!(e.contains("unknown field \"utm\""), "{e}");
+    assert!(e.contains("unknown field 'utm'"), "{e}");
     ty("{ email: String, .. }").validate_value(&value).expect("an open record takes it");
     for t in ["{ email: String }", "{ email: String, .. }"] {
         let e = ty(t).validate_value(&json!({})).unwrap_err();
-        assert!(e.contains("missing required field \"email\""), "{t}: {e}");
+        assert!(e.contains("missing required field 'email'"), "{t}: {e}");
     }
+}
+
+/// A record names every problem it has in one error, its own keys and
+/// its fields' values at any depth, each at its path; a list stops at
+/// its first bad item.
+#[test]
+fn a_record_names_every_problem_at_once() {
+    use serde_json::json;
+    let user = ty("{ email: String, name: String }");
+    let t = ty("{ id: String, n: Number, user: { email: String, name: String } }");
+    let e = t
+        .validate_value(&json!({ "n": "x", "extra": 1, "more": 2, "user": { "nick": "a" } }))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        format!(
+            "value: unknown fields 'extra' and 'more' (not declared on {t}, and a type that should \
+             ignore keys it does not declare ends with `..`); value: missing required field 'id'; \
+             .n: expected Number, got String; .user: unknown field 'nick' (not declared on {user}, and \
+             a type that should ignore keys it does not declare ends with `..`); .user: missing \
+             required fields 'email' and 'name'"
+        )
+    );
+    let e = ty("List[{ a: String }]").validate_value(&json!([{}, {}])).unwrap_err();
+    assert_eq!(e, "[0]: missing required field 'a'");
+
+    let e = ty("{ a: Number, b: Number, c: Number }")
+        .cast_requested(&json!({ "a": "1", "x": 1 }))
+        .unwrap_err();
+    assert!(e.contains("unknown field 'x'") && e.contains("missing required fields 'b' and 'c'"), "{e}");
+}
+
+/// A cast names each problem of a nested record under the field it sits
+/// in, and a named type under its name, so none reads as the outer
+/// record's own.
+#[test]
+fn a_cast_names_each_nested_problem_under_its_field() {
+    use serde_json::json;
+    let inner = ty("{ x: Number, y: Number }");
+    let e = ty("{ a: { x: Number, y: Number }, b: Number }")
+        .cast_value(&json!({ "a": { "z": 1 }, "b": "no" }))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        format!(
+            "field 'a': unknown field 'z' (not declared on {inner}, and a type that should ignore \
+             keys it does not declare ends with `..`); field 'a': missing required fields 'x' and \
+             'y'; field 'b': \"no\" is not a number"
+        )
+    );
+    let e = reg_parse("{ m: ChatMessage }")
+        .cast_value(&json!({ "m": { "role": [1], "zz": 1 } }))
+        .unwrap_err();
+    let problems: Vec<&str> = e.split("; ").collect();
+    assert_eq!(problems.len(), 3, "{e}");
+    assert!(problems[0].starts_with("field 'm': not a valid ChatMessage: unknown field 'zz'"), "{e}");
+    assert_eq!(problems[1], "field 'm': not a valid ChatMessage: missing required field 'content'");
+    assert!(problems[2].starts_with("field 'm': not a valid ChatMessage: field 'role': "), "{e}");
+
+    // A list names the item, a dict the (escaped) key, each problem under it.
+    let item = ty("{ x: Number }");
+    let e = ty("List[{ x: Number }]").cast_value(&json!([{ "x": 1 }, { "x": "no", "z": 1 }])).unwrap_err();
+    assert_eq!(
+        e,
+        format!(
+            "item 1: unknown field 'z' (not declared on {item}, and a type that should ignore keys \
+             it does not declare ends with `..`); item 1: field 'x': \"no\" is not a number"
+        )
+    );
+    let e = ty("Dict[String, Number]").cast_value(&json!({ "a\"b": "no" })).unwrap_err();
+    assert_eq!(e, r#"key 'a\"b': "no" is not a number"#);
+}
+
+/// A union of records takes a value only its second member fits, and a
+/// value only one member could have meant is refused with all of that
+/// member's problems.
+#[test]
+fn a_union_of_records_takes_the_member_that_fits_and_names_the_one_candidate() {
+    use serde_json::json;
+    let records = ty("{ a: String } | { b: Number }");
+    records.validate_value(&json!({ "b": 1 })).expect("the second member takes it");
+    assert!(records.accepts_runtime_value(&json!({ "b": 1 })));
+    assert!(!records.accepts_runtime_value(&json!({ "b": "x" })));
+
+    let member = ty("{ a: String, b: Number }");
+    let union = ty("String | { a: String, b: Number }");
+    union.validate_value(&json!({ "a": "x", "b": 1 })).expect("the record member takes it");
+    let e = union.validate_value(&json!({ "b": "x", "c": 1 })).unwrap_err();
+    assert_eq!(
+        e,
+        format!(
+            "value: unknown field 'c' (not declared on {member}, and a type that should ignore keys \
+             it does not declare ends with `..`); value: missing required field 'a'; .b: expected \
+             Number, got String"
+        )
+    );
+}
+
+/// A record names at most 20 undeclared keys and counts the rest, and
+/// spells each key escaped, since the sender wrote it.
+#[test]
+fn unknown_keys_are_capped_and_escaped() {
+    use serde_json::json;
+    let t = ty("{ a?: String }");
+    let mut value = serde_json::Map::new();
+    for i in 0..25 {
+        value.insert(format!("k{i:02}"), json!(1));
+    }
+    let e = t.validate_value(&serde_json::Value::Object(value)).unwrap_err();
+    let named: Vec<String> = (0..20).map(|i| format!("'k{i:02}'")).collect();
+    assert_eq!(
+        e,
+        format!(
+            "value: unknown fields {} and 5 more (not declared on {t}, and a type that should ignore \
+             keys it does not declare ends with `..`)",
+            named.join(", ")
+        )
+    );
+
+    let e = t.validate_value(&json!({ "it's\nhere": 1 })).unwrap_err();
+    assert!(e.contains(r"unknown field 'it\'s\nhere'"), "{e}");
+    assert!(!e.contains('\n'), "{e}");
+    let e = t.cast_value(&json!({ "it's\nhere": 1 })).unwrap_err();
+    assert!(e.contains(r"unknown field 'it\'s\nhere'"), "{e}");
 }
 
 #[test]
@@ -2215,7 +2339,7 @@ fn conform_value_drops_what_an_open_record_does_not_declare_at_any_depth() {
     let e = nested
         .conform_value(json!({ "id": 1, "extra": true, "user": { "email": "a" } }))
         .unwrap_err();
-    assert!(e.contains("unknown field \"extra\""), "the closed parent still refuses: {e}");
+    assert!(e.contains("unknown field 'extra'"), "the closed parent still refuses: {e}");
 
     let closed = ty("{ a: String, b?: Number }");
     let value = json!({ "a": "x", "b": null });
@@ -2396,7 +2520,7 @@ fn an_unresolved_leaf_takes_any_value_inside_a_checked_shape() {
     assert!(ty("{ x: T }").conform_value(json!({ "x": 1, "y": 2 })).is_err());
 
     let e = ty("{ score: Number }").conform_value(json!({})).unwrap_err();
-    assert!(e.contains("missing required field \"score\""), "{e}");
+    assert!(e.contains("missing required field 'score'"), "{e}");
 }
 
 // ── Json ─────────────────────────────────────────────────────────────
@@ -2521,7 +2645,7 @@ fn a_cast_narrows_json_and_checks_the_value() {
     let e = record.cast_requested(&json!([1, 2])).unwrap_err();
     assert!(e.contains("no cast from List"), "{e}");
     let e = record.cast_requested(&json!({ "n": 1 })).unwrap_err();
-    assert!(e.contains("missing required field \"id\""), "{e}");
+    assert!(e.contains("missing required field 'id'"), "{e}");
     assert_eq!(ty("List[List[Number]]").cast_requested(&json!([[1], [2, 3]])).unwrap(), json!([[1], [2, 3]]));
     assert!(ty("JsonDict").cast_requested(&json!([1])).is_err(), "a list is no object");
     // Into Json itself, any JSON value passes; a stored file does not.

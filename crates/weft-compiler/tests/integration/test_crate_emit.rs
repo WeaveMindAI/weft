@@ -320,7 +320,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         features: weft_core::NodeFeatures::default(),
         scope: Vec::new(),
         group_boundary: None,
-        requires_infra: false, per_instance: None,
+        requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
         images: Vec::new(),
         fires_with: Default::default(), baked_outputs: Default::default(),
         published_service: None,

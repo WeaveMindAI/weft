@@ -151,7 +151,7 @@ async fn a_typed_body_that_does_not_fit_is_answered_400() -> anyhow::Result<()> 
         live::http_json(&disp, Method::POST, &format!("{base}/signup"), &[], &json!({ "age": 3 })).await?;
     assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
     let v: Value = serde_json::from_slice(&body)?;
-    assert!(v["error"].as_str().is_some_and(|e| e.contains("missing required field \"email\"")), "{v}");
+    assert!(v["error"].as_str().is_some_and(|e| e.contains("missing required field 'email'")), "{v}");
 
     let (status, _, body) = live::http_json(
         &disp,
@@ -163,7 +163,7 @@ async fn a_typed_body_that_does_not_fit_is_answered_400() -> anyhow::Result<()> 
     .await?;
     assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
     let v: Value = serde_json::from_slice(&body)?;
-    assert!(v["error"].as_str().is_some_and(|e| e.contains("unknown field \"userId\"")), "{v}");
+    assert!(v["error"].as_str().is_some_and(|e| e.contains("unknown field 'userId'")), "{v}");
 
     let (status, _, body) = live::http_json(
         &disp,

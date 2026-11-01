@@ -61,6 +61,18 @@ fast = OpenRouterModel {
 digest = Cron { cron: @instance_filled("0 0 8 * * *") }
 ```
 
+A trigger that is not per instance is shared by every instance and starts
+runs for no instance. If what it runs reaches something per instance, every
+fire would be refused, so the compiler refuses the trigger
+(`shared-trigger-reaches-per-instance`, naming what the trigger reaches and
+why each is per instance): it cannot be turned on or fired until it is fixed,
+and the rest of the program still runs. Make the trigger per instance too
+(wire it from what is per instance, or write one of its fields
+`@instance_filled`), or keep what is per instance out of what it runs. A
+route or a socket is not refused: each call can name its instance (see
+"Routes stay shared" below), and a call naming none is refused when it
+arrives.
+
 On a connection field, what you write decides whose key pays for an
 instance's calls, so ask the user which they want before writing it:
 
@@ -135,6 +147,13 @@ and an `@include` takes no braces, so its input goes on its own line.
 It is compiled once, so the two includes share one body, and each answers
 its own route. Each route still picks its instance one of the two ways
 above.
+
+If a shared path and the per-instance part need the same helper, include one
+file in both places: each include decides on its own whether the file's nodes
+run per instance. Say `carry.weft` is included inside a group that receives a
+per-instance value and again for a shared route: its nodes run per instance
+under the group's include, where the instance's values reach them, and stay
+shared under the route's, so the route's runs need no instance.
 
 When one per-instance node serves several routes, the shape that compiles
 is the node and its routes side by side at the same level, in a group that

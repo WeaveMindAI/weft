@@ -456,20 +456,18 @@ fn kick_unfed_members(
     kick_scope(kicked, &roots, frames, None);
 }
 
-/// The members directly in `scope` (the top of the program for `None`) at
-/// `frames` that start with it: those no wire feeds there. A trigger is
-/// never among them (its fire kicks it, or a run kicks it payload-less at
-/// its start), nor a place the program does not run there, nor one that
-/// stands in for its node (it sends on its own, [`send_given`]).
+/// The nodes that fire directly in the copy of `scope` (the top of the
+/// program for `None`) at `frames` and start with it: those no wire feeds
+/// there. A loop's `LoopOut` starts with each iteration of its own loop
+/// (one nothing writes into fires as the iteration opens, so the
+/// iteration reaches the loop's edge at once), never with
+/// the scope it sits in, whose copy at those frames holds no iteration. A
+/// trigger is never among them (its fire kicks it, or a run kicks it
+/// payload-less at its start), nor a place the program does not run
+/// there, nor one that stands in for its node (it sends on its own,
+/// [`send_given`]).
 pub fn starting_members(project: &ProjectDefinition, program_idx: &ProgramIndex, scope: Option<&str>, frames: &LoopFrames) -> Vec<String> {
-    let members: &[usize] = match scope {
-        Some(scope) => match program_idx.scopes().get(scope) {
-            Some(scope) => &scope.members,
-            None => return Vec::new(),
-        },
-        None => program_idx.scopes().top_members(),
-    };
-    members.iter()
+    program_idx.scopes().firing_in(scope).iter()
         .map(|&at| &project.nodes[at])
         .filter(|node| !node.features.is_trigger)
         .filter(|node| program_idx.admits(&node.id, frames) && !program_idx.stands_in(&node.id, frames))
@@ -539,8 +537,9 @@ fn tell_inside(
 }
 
 /// Open iteration `body_frames` of the loop `loop_id`: the one opening
-/// every scope gets, for the copy a launch starts. Its members no wire
-/// feeds start with it, and the groups inside it become decidable.
+/// every scope gets, for the copy a launch starts. What fires in it that
+/// no wire feeds starts with it (the loop's own `LoopOut` too, when
+/// nothing writes into it), and the groups inside it become decidable.
 pub fn open_iteration(
     project: &ProjectDefinition,
     program_idx: &ProgramIndex,
@@ -1255,5 +1254,104 @@ mod tests {
         setup.arrive("trig", "in", vec![], Some(json!("v")));
         assert!(setup.settle(Phase::TriggerSetup).dropped.is_empty());
         assert!(setup.pulses["trig"][0].status.is_pending());
+    }
+
+    /// `project` with each `(node, loop, role)` made that loop's boundary
+    /// (`role` `In` or `Out`), the way the compiler mints them.
+    fn with_boundaries(mut project: ProjectDefinition, boundaries: &[(&str, &str, &str)]) -> ProjectDefinition {
+        for (id, group, role) in boundaries {
+            let node = project.nodes.iter_mut().find(|node| node.id == *id).expect("a boundary in the program");
+            node.node_type = match *role {
+                "In" => crate::project::boundary_types::LOOP_IN,
+                _ => crate::project::boundary_types::LOOP_OUT,
+            }.to_string();
+            node.group_boundary = Some(serde_json::from_value(json!({ "groupId": group, "role": role })).expect("a boundary"));
+        }
+        project
+    }
+
+    /// A loop with no output: nothing writes into its `LoopOut` (`done`
+    /// is its only input). `L` sits in the group `g` when `in_group`.
+    fn outputless_loop(in_group: bool) -> ProjectDefinition {
+        /// A group of the fixture: its id, its kind, the group around it.
+        type Group<'a> = (&'a str, &'a str, Option<&'a str>);
+        let (around, inside, groups): (&[&str], &[&str], Vec<Group>) = if in_group {
+            (&["g"], &["g", "L"], vec![("g", "group", None), ("L", "loop", Some("g"))])
+        } else {
+            (&[], &["L"], vec![("L", "loop", None)])
+        };
+        with_boundaries(program(
+            &[
+                ("src", &[], &[], &["items"], false),
+                ("L__in", around, &["items"], &["items"], false),
+                ("L.b", inside, &["in"], &[], false),
+                ("L.u", inside, &[], &[], false),
+                ("L__out", around, &["done"], &[], false),
+            ],
+            &groups,
+            &[("src", "items", &[], "L__in", "items"), ("L__in", "items", &[], "L.b", "in")],
+        ), &[("L__in", "L", "In"), ("L__out", "L", "Out")])
+    }
+
+    /// A loop's `LoopOut` never starts with the scope it sits in, which
+    /// has no iteration at its frames to end: only with an iteration of
+    /// its own loop, and there only when nothing writes into it. Before,
+    /// an outputless loop's `LoopOut` was kicked at the run's start, at
+    /// frames no iteration ever opens, and the run ended stuck on it.
+    #[test]
+    fn a_loop_out_starts_only_with_an_iteration_and_only_when_nothing_feeds_it() {
+        let iteration = vec![Frame::Loop { index: 0 }];
+        for in_group in [false, true] {
+            let project = outputless_loop(in_group);
+            let index = ProgramIndex::build(&project);
+            let around = in_group.then_some("g");
+            assert_eq!(starting_members(&project, &index, around, &vec![]), if in_group { Vec::<String>::new() } else { vec!["src".to_string()] },
+                "the scope around the loop never starts its LoopOut (in a group: {in_group})");
+            assert_eq!(starting_members(&project, &index, Some("L"), &iteration), vec!["L.u".to_string(), "L__out".to_string()],
+                "an iteration starts its unfed LoopOut (in a group: {in_group})");
+        }
+
+        // With an output a body node writes, the LoopOut waits on that
+        // write in every iteration and nowhere starts on its own.
+        let mut project = outputless_loop(false);
+        project.edges.push(serde_json::from_value(json!({
+            "id": "L.u->L__out", "source": "L.u", "sourceHandle": "out", "target": "L__out", "targetHandle": "done",
+        })).expect("a wire"));
+        let index = ProgramIndex::build(&project);
+        assert_eq!(starting_members(&project, &index, None, &vec![]), vec!["src".to_string()]);
+        assert_eq!(starting_members(&project, &index, Some("L"), &iteration), vec!["L.u".to_string()]);
+
+        // A loop inside a loop: an outer iteration starts neither the
+        // inner LoopOut nor anything of the inner body.
+        let nested = with_boundaries(program(
+            &[
+                ("O.u", &["O"], &[], &["out"], false),
+                ("O.I__in", &["O"], &["items"], &["items"], false),
+                ("O.I.u", &["O", "O.I"], &[], &[], false),
+                ("O.I__out", &["O"], &["done"], &[], false),
+            ],
+            &[("O", "loop", None), ("O.I", "loop", Some("O"))],
+            &[("O.u", "out", &[], "O.I__in", "items")],
+        ), &[("O.I__in", "O.I", "In"), ("O.I__out", "O.I", "Out")]);
+        let index = ProgramIndex::build(&nested);
+        assert_eq!(starting_members(&nested, &index, Some("O"), &iteration), vec!["O.u".to_string()],
+            "an outer iteration starts its own unfed members, and not the inner LoopOut");
+        let inner = vec![Frame::Loop { index: 0 }, Frame::Loop { index: 2 }];
+        assert_eq!(starting_members(&nested, &index, Some("O.I"), &inner), vec!["O.I.u".to_string(), "O.I__out".to_string()]);
+    }
+
+    /// Launching an iteration of an outputless loop kicks its `LoopOut`
+    /// there, the kick its scope permits at once: the iteration fires its
+    /// `LoopOut` straight away.
+    #[test]
+    fn an_outputless_loops_iteration_kicks_its_loop_out_inside_it() {
+        let mut run = Run::of(outputless_loop(false));
+        run.settle(Phase::Fire);
+        assert!(run.kick("L__out", vec![]).is_none(), "nothing at the loop's own frames");
+        let iteration = vec![Frame::Loop { index: 0 }];
+        open_iteration(&run.project, &run.index, "L", &iteration, 1, &mut run.scopes, &mut run.kicked);
+        assert_eq!(run.kick("L__out", iteration.clone()).map(|kick| kick.scope_skipped.is_none()), Some(true));
+        let node = run.project.nodes.iter().find(|node| node.id == "L__out").expect("the LoopOut");
+        assert_eq!(scope_permission(&run.index, node, &iteration, &run.scopes), ScopePermission::Allowed);
     }
 }

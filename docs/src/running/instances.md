@@ -121,6 +121,22 @@ You do not mark the other nodes: a node that reads an instance's value or copy,
 directly or through nodes before it, runs per instance too. Above, `read` needs
 Google through the instance's connection, so it runs in that instance's runs.
 
+If you include a file in two places, each place decides this for itself. Say a
+group with a per-instance bridge includes `carry.weft`, and your shared inbound
+route includes `carry.weft` too: the file's nodes run per instance under the
+group's include, where the bridge's values reach them, and stay shared under
+the route's, so the route's runs need no instance.
+
+A trigger every instance shares fires runs for no instance. If those runs would
+reach something per instance, every fire would be refused, so the compiler
+refuses the trigger (`shared-trigger-reaches-per-instance`), and the message
+names what the trigger reaches and why each is per instance. The editor shows
+the error, the trigger cannot be turned on or fired until it is fixed, and the
+rest of the program still runs. If the trigger sits in a file you include at
+several sites, only the site that reaches something per instance is refused. A route or a socket is not refused, since each
+call can name its instance (an instance token, or the `Weft-Instance` header on
+a gated route); a call that names none is refused when it arrives.
+
 weft checks an instance's value against the node's own rules at three moments:
 
 - **when the program compiles**: a rule that only needs the field to have a
@@ -539,6 +555,7 @@ weft cannot tell when an instance is no longer needed, so your backend says so.
 | What you see | What it means |
 |---|---|
 | `'bridge' exists once per instance, so this run needs to know which instance it is for` | The run reaches something per instance and nobody named one. Add `--instance`, or start the run through an instance's trigger, with an instance token, or with the `Weft-Instance` header on a gated route |
+| `Trigger 'tick' is shared by every instance, so its runs are for no instance, but they reach 'send'` | The compiler refuses the trigger: the trigger's runs would reach something per instance, and nothing could pick the instance. Make the trigger per instance too (wire it from what is per instance, or write one of its fields `@instance_filled`), or keep what is per instance out of what it runs |
 | `instance 'user-42' has not filled 'read.spreadsheet'` | The run needs a value that instance never got. Fill it in on its settings page, or your program sets it with `SetInstanceValues` or `ctx.values()` |
 | `instance 'user-42' at 'digest': ...` | That instance's value breaks the node's own rule, which the rest of the message states. Change it on its settings page, or your program does with `SetInstanceValues` |
 | `connect your account at 'google' first: this list is read through it` | A list on the instance's settings page is read through its connection at that node, and none is connected yet. Connect it first, at that node |

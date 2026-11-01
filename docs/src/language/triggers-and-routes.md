@@ -281,7 +281,7 @@ lists it with the node that failed and why, and nothing of what ran before. If
 it reports a cost, or asks weft for something on its behalf that its worker
 does not already hold (a stored file, a new connection or infrastructure
 address, a task such as starting or stopping its infra, a stop through
-`ctx.stop_tagged`, a wait on a timer or a form), it is listed with its costs
+`ctx.stop_tagged`, a tag through `ctx.tag_run`, a wait on a timer or a form), it is listed with its costs
 and how it ended. Otherwise it leaves nothing. If you want to check that a
 trigger with `recorded` off is being called at all, `weft status` shows how
 many runs each trigger started in the last minute or two, and how many of them
@@ -293,9 +293,9 @@ off. A value that arrives as a secret (a caller's `credentials`, a node's
 already kept out. For more, go and read [secrets](types.md#secrets).
 
 An unrecorded run cannot pause, so a timer or a form in it holds
-([when a run cannot pause](#when-a-run-cannot-pause)). If a node tags it with
-`ctx.tag_run` (a label you later find or stop runs by), the node fails:
-an unrecorded run has no record a tag could point at. The compiler also
+([when a run cannot pause](#when-a-run-cannot-pause)). A tag works on it (a
+label you later find or stop runs by, `ctx.tag_run`): the run is listed, as
+above, and a stop by that tag reaches it while it runs. The compiler also
 refuses `durable: true` with `recorded: false`.
 
 **On a cloud install, one stretch of a run lasts an hour at most.** Cloud Run

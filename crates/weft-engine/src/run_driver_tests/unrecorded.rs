@@ -402,3 +402,69 @@
         assert!(matches!(&outcome, RunOutcome::Failed { error, held_too_long: true } if error.contains("is 0")), "{outcome:?}");
         assert_eq!(*tasks.withdrawn.lock().unwrap(), vec![tasks.minted().expect("the wait was registered")]);
     }
+
+    /// Tags its run, then answers.
+    struct Tags;
+    test_manifest!(Tags, "Answer");
+    #[async_trait]
+    impl Node for Tags {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            ctx.tag_run(["user_7"]).await?;
+            ctx.pulse_downstream(NodeOutput::new().set("value", json!("tagged"))).await
+        }
+    }
+
+    /// The broker's side of a tag: the tags asked for, each with what the
+    /// record held of the run when the call came.
+    struct SeeingSteering {
+        journal: Arc<MemJournal>,
+        seen: std::sync::Mutex<Vec<(Vec<String>, Vec<RunEvent>)>>,
+    }
+
+    #[async_trait]
+    impl crate::context::RunSteeringClient for SeeingSteering {
+        async fn tag_run(&self, run_id: weft_core::RunId, tags: Vec<String>) -> anyhow::Result<()> {
+            self.seen.lock().unwrap().push((tags, self.journal.events_of(run_id)));
+            Ok(())
+        }
+        async fn stop_tagged(&self, _: weft_core::RunId, _: String, _: weft_core::StopSelf) -> anyhow::Result<bool> {
+            unreachable!("the run stops nothing")
+        }
+    }
+
+    /// An unrecorded run tags itself: its birth is written before the
+    /// tag call reaches the broker (the row a stop by tag finds it
+    /// through), and its ending once it ends, since a row that exists is
+    /// closed. Nothing else of it is written.
+    #[tokio::test]
+    async fn a_run_tags_itself_and_leaves_its_birth_and_its_ending() {
+        let run_id = weft_core::new_run_id();
+        let project = project();
+        let birth = birth(run_id, &project, weft_core::run_settings::DEFAULT_HOLD_SECS);
+        let journal = Arc::new(MemJournal::default());
+        let base = clients(journal.clone());
+        let seeing = Arc::new(SeeingSteering { journal: journal.clone(), seen: Default::default() });
+        let steering = crate::record_first::RecordFirst::new(seeing.clone() as Arc<dyn crate::context::RunSteeringClient>, base.writer.clone());
+        let run_clients = EngineClients { steering, ..base };
+        let run = born(&run_clients, run_id, &birth).await;
+        let holds = crate::run_holds::Holds::new(Box::new(|| {}));
+        let drove = run_on_holding(Arc::new(project), catalog(vec![("Answer", Box::new(Tags) as Box<dyn Node>)]), &run_clients, run_id, run, birth, CancellationFlag::new_arc(), None, None, &holds)
+            .await
+            .expect("the drive ends");
+        run_clients.writer.written().await;
+        assert!(matches!(drove.outcome, RunOutcome::Completed), "{:?}", drove.outcome);
+
+        let seen = seeing.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].0, vec![weft_core::tag::normalize_tag("user_7").unwrap()]);
+        assert!(
+            matches!(seen[0].1.as_slice(), [RunEvent::RunStarted { settings, .. }] if !settings.recorded()),
+            "its birth alone was on record when the tag went out: {:?}",
+            seen[0].1
+        );
+        let written = journal.events_of(run_id);
+        assert!(
+            matches!(written.as_slice(), [RunEvent::RunStarted { .. }, RunEvent::RunCompleted { .. }]),
+            "its birth and its ending: {written:?}"
+        );
+    }

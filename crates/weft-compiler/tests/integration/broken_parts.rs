@@ -236,3 +236,37 @@ fn the_gate_places_findings_through_the_reader_that_compiled() {
     assert!(left.is_empty(), "{left:?}");
     assert!(!weft_compiler::unsettled(&program, &catalog, CompileFs::disk(root)).is_empty());
 }
+
+/// A finding about one place of a file included twice breaks that place
+/// alone: a shared trigger reaching what is per instance under one include
+/// is refused there, and the same trigger under the other include, which
+/// reaches nothing per instance, turns on.
+#[test]
+fn a_part_broken_at_one_include_runs_at_the_other() {
+    const TICKER: &str = r#"
+Group(text: String) -> () {
+  tick = Cron { cron: "0 0 3 * * *" }
+  log = Debug
+  log.data = self.text
+  log._should_flow = tick.scheduledTime
+}
+"#;
+    const SITES: &str = r#"
+bridge = BaileyBridge {
+  @per_instance
+}
+receive = BaileyReceive
+receive.bridge = bridge.bridge
+mine = @include("ticker.weft")
+mine.text = receive.content
+plain = @include("ticker.weft")
+plain.text = "hello"
+"#;
+    let program = compile_in(&[("ticker.weft", TICKER)], SITES).expect("the program compiles around the broken place");
+    let broken: Vec<&weft_core::project::Broken> = program.broken.iter().filter(|part| part.why.contains("is shared by every instance")).collect();
+    assert_eq!(broken.len(), 1, "{:?}", program.broken);
+    assert_eq!(broken[0].places.iter().map(ToString::to_string).collect::<Vec<_>>(), vec![format!("mine/{}", broken[0].parts[0])]);
+    let refused = weft_core::run_spec::trigger_cut(&program, "mine.tick").expect_err("refused at the include that reaches the bridge");
+    assert!(refused.contains("is shared by every instance"), "{refused}");
+    weft_core::run_spec::trigger_cut(&program, "plain.tick").expect("the same trigger under the other include turns on");
+}

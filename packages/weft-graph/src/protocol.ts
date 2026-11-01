@@ -701,9 +701,15 @@ export interface NodeDefinition {
   // SYNC: typeParams <-> crates/weft-core/src/project.rs NodeDefinition.type_params
   typeParams?: TypeParamWire[];
   requiresInfra?: boolean;
-  /// Set on a node that exists once per instance of the program.
+  /// Set on a node that exists once per instance of the program at every
+  /// place it runs.
   // SYNC: perInstance <-> crates/weft-core/src/project.rs NodeDefinition.per_instance
   perInstance?: PerInstance;
+  /// The call paths (outermost site first) where a node inside an
+  /// included file reads an instance's value, when its places disagree;
+  /// absent when `perInstance` holds at every place.
+  // SYNC: perInstancePaths <-> crates/weft-core/src/project.rs NodeDefinition.per_instance_paths
+  perInstancePaths?: string[][];
   span?: Span;
   headerSpan?: Span;
   configSpans?: Record<string, ConfigFieldSpan>;
@@ -932,6 +938,10 @@ export interface Broken {
   /// The node and group ids the problem is about; a cut keeping all of
   /// them needs it.
   parts: string[];
+  /// The places (`locatedKey`) it holds at, when only some; absent: every
+  /// place its parts run.
+  // SYNC: Broken.places <-> crates/weft-core/src/project.rs Broken.places
+  places?: string[];
   why: string;
   /// The part may stand for nodes the program cannot see (an included
   /// file that does not compile, a node whose type did not load).
@@ -969,6 +979,10 @@ export interface Diagnostic {
   // group, the two ends for a wire); absent when it is about the program
   // as a whole.
   subjects?: string[];
+  // The places (`locatedKey`) the finding holds at, when only some of
+  // its subjects' places are wrong; absent: every place.
+  // SYNC: Diagnostic.places <-> crates/weft-core/src/node.rs Diagnostic.places
+  places?: string[];
 }
 
 /// Derived from the Widget union (never a second hand-kept list).

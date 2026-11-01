@@ -169,6 +169,11 @@ file includes. If `img` and `vid` are your two includes of `blur.weft`, and it
 includes a file as `inner`, `img.inner` and `vid.inner` each get their own
 types. The nodes and their code stay one copy each.
 
+Whether a node runs once per instance is decided per include too. A file
+included under a per-instance part and also somewhere shared is per instance
+only under the first; for what that means, go and read
+[programs with instances](../running/instances.md#what-an-instance-fills-instance_filled).
+
 ### Naming a node inside one
 
 An included file has no name you write. Its nodes are named through the site:

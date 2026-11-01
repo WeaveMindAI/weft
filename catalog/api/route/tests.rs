@@ -132,7 +132,7 @@ async fn unknown_key_refused(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
     let (status, error) = refusal(&conn);
     assert_eq!(status, 400);
-    assert!(error.contains("unknown field \"userId\""), "{error}");
+    assert!(error.contains("unknown field 'userId'"), "{error}");
     assert!(outcome.outputs.is_empty(), "nothing downstream runs: {:?}", outcome.outputs);
     Ok(())
 }
@@ -143,7 +143,7 @@ async fn missing_field_refused(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
     let (status, error) = refusal(&conn);
     assert_eq!(status, 400);
-    assert!(error.contains("missing required field \"name\""), "{error}");
+    assert!(error.contains("missing required field 'name'"), "{error}");
     assert!(outcome.outputs.is_empty(), "{:?}", outcome.outputs);
     Ok(())
 }

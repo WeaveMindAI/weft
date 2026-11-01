@@ -251,7 +251,7 @@ pub(crate) fn resolve_infra_nodes(
     instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<std::collections::BTreeMap<String, Located>, (StatusCode, String)> {
     let declared = weft_core::project::infra_place_spellings(project);
-    let per_instance_of = |place: &Located| weft_core::project::is_per_instance(project, &place.id);
+    let per_instance_of = |place: &Located| weft_core::project::is_per_instance(project, place);
     if nodes.is_empty() {
         return Ok(declared.into_iter().filter(|(_, place)| per_instance_of(place) == instance.is_some()).collect());
     }

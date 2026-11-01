@@ -54,6 +54,7 @@
     }
   ],
   "features": {
+    "keepsInputsPastRun": true,
     "oneOfRequired": [
       [
         "content",

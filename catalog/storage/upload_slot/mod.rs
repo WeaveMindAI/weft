@@ -23,12 +23,8 @@ mod tests;
 /// The scope a `scope` setting names: `project`, `instance` (the run's
 /// own) or `run`.
 fn slot_scope(name: &str) -> WeftResult<StorageScope> {
-    match name {
-        "project" => Ok(StorageScope::Project),
-        "instance" => Ok(StorageScope::instance()),
-        "run" => Ok(StorageScope::Run),
-        other => Err(WeftError::Input(format!("`scope` is '{other}'; it is `project`, `instance` or `run`"))),
-    }
+    StorageScope::named(name)
+        .ok_or_else(|| WeftError::Input(format!("`scope` is '{name}'; it is `project`, `instance` or `run`")))
 }
 
 #[async_trait]

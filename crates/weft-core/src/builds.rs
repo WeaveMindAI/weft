@@ -237,6 +237,7 @@ impl LeftOut {
             let Some(package) = packages.iter().find(|p| p.node_types.contains(&node.node_type)) else { continue };
             parts.push(crate::project::Broken {
                 parts: vec![node.part().to_string()],
+                places: Vec::new(),
                 why: format!("{}: {}", crate::project::plain_id(&node.id), package.reason(log)),
                 hides: false,
             });

@@ -276,3 +276,256 @@ read.account = google.access
     assert_eq!(found.whose, FieldConnection::Shared);
     assert!(lookup_connection(&project, &Located::top("g.read"), "hasHeader", &InstanceValues::new(), &InstanceValues::new()).is_err());
 }
+
+/// One file included at two sites: what one site feeds it is that site's
+/// alone, so the per-instance slice is too.
+const CARRY: &str = r#"
+Group(text: String) -> (out: String) {
+  carry = ExecPython(text: String) -> (out: String, parts: List[String]) { code: "x" }
+  carry.text = self.text
+  each = Loop(items: List[String]) -> (marks: List[String | Null]) {
+    over: ["items"]
+    mark = ExecPython(c: String) -> (out: String) { code: "x" }
+    mark.c = self.items
+    self.marks = mark.out
+  }
+  each.items = carry.parts
+  self.out = carry.out
+}
+"#;
+
+fn build_with(main: &str, files: &[(&str, &str)]) -> weft_core::ProjectDefinition {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (path, text) in files {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("a folder")).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let mut project = compile(main, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile ok");
+    enrich(&mut project, &catalog()).expect("enrich ok");
+    project
+}
+
+/// The node of an included body whose id ends in `.{local}`.
+fn body_node<'a>(project: &'a weft_core::ProjectDefinition, local: &str) -> &'a weft_core::project::NodeDefinition {
+    let suffix = format!(".{local}");
+    project.nodes.iter().find(|n| n.id.ends_with(&suffix)).unwrap_or_else(|| panic!("no body node {local}"))
+}
+
+/// The outage this guards: a per-instance part (a bridge per customer)
+/// added to a group that includes a file the program's shared path
+/// includes too. The file's nodes are per instance under the group's site
+/// and shared under the shared one, so the shared trigger's runs reach
+/// nothing per instance and are never refused, and the program builds.
+#[test]
+fn an_included_file_is_per_instance_only_where_an_instance_reaches_it() {
+    let project = build_with(
+        r#"
+tick = Cron { cron: "0 0 3 * * *" }
+shared = @include("lib/carry.weft")
+shared.text = tick.scheduledTime
+space = Group() -> () {
+  bridge = BaileyBridge {
+    @per_instance
+  }
+  receive = BaileyReceive
+  receive.bridge = bridge.bridge
+  mine = @include("lib/carry.weft")
+  mine.text = receive.content
+}
+"#,
+        &[("lib/carry.weft", CARRY)],
+    );
+    for local in ["carry", "mark"] {
+        let node = body_node(&project, local);
+        assert_eq!(node.per_instance, None, "{local} is not per instance everywhere");
+        assert_eq!(node.per_instance_at(&["shared"]), None, "{local} under the shared site");
+        assert_eq!(node.per_instance_at(&["space.mine"]), Some(PerInstance::Derived), "{local} under the group's site");
+        assert!(node.per_instance_somewhere());
+    }
+    assert!(!codes(&project).iter().any(|c| c == "shared-trigger-reaches-per-instance"), "{:?}", codes(&project));
+    assert!(weft_core::run_spec::instanceless_fire_reaches(&project, "tick", &weft_core::run_spec::instanceless_stand_ins(&project)).expect("cut").is_empty());
+    let fire = weft_core::run_spec::compute_trigger_fire(&project, "tick", &serde_json::json!({}), None, &Default::default())
+        .expect("the fire's cut");
+    assert!(weft_core::run_spec::refuse_instanceless(&fire.program, None).is_ok());
+}
+
+/// Nested: a file that includes another, itself included at a shared
+/// site and a per-instance one. The inner file's nodes follow the outer
+/// site they run under.
+#[test]
+fn a_nested_include_follows_the_outer_site() {
+    let outer = r#"
+Group(text: String) -> (out: String) {
+  inner = @include("carry.weft")
+  inner.text = self.text
+  self.out = inner.out
+}
+"#;
+    let project = build_with(
+        r#"
+tick = Cron { cron: "0 0 3 * * *" }
+shared = @include("lib/outer.weft")
+shared.text = tick.scheduledTime
+bridge = BaileyBridge {
+  @per_instance
+}
+receive = BaileyReceive
+receive.bridge = bridge.bridge
+mine = @include("lib/outer.weft")
+mine.text = receive.content
+"#,
+        &[("lib/outer.weft", outer), ("lib/carry.weft", CARRY)],
+    );
+    let inner_site = project
+        .groups
+        .iter()
+        .find(|g| matches!(g.kind, weft_core::project::GroupKind::Call { .. }) && g.id.ends_with(".inner"))
+        .map(|g| g.id.clone())
+        .expect("the inner site");
+    let carry = body_node(&project, "carry");
+    assert_eq!(carry.per_instance_at(&["shared".to_string(), inner_site.clone()]), None);
+    assert_eq!(carry.per_instance_at(&["mine".to_string(), inner_site]), Some(PerInstance::Derived));
+    assert!(!codes(&project).iter().any(|c| c == "shared-trigger-reaches-per-instance"), "{:?}", codes(&project));
+}
+
+/// A file every site of which reads an instance's value is per instance
+/// everywhere: the one mark, no list of places.
+#[test]
+fn a_file_per_instance_at_every_site_is_marked_once() {
+    let project = build_with(
+        r#"
+bridge = BaileyBridge {
+  @per_instance
+}
+receive = BaileyReceive
+receive.bridge = bridge.bridge
+one = @include("lib/carry.weft")
+one.text = receive.content
+two = @include("lib/carry.weft")
+two.text = receive.pushName
+"#,
+        &[("lib/carry.weft", CARRY)],
+    );
+    let carry = body_node(&project, "carry");
+    assert_eq!(carry.per_instance, Some(PerInstance::Derived));
+    assert!(carry.per_instance_paths.is_empty(), "{:?}", carry.per_instance_paths);
+}
+
+/// A shared trigger wired straight into what is per instance has no
+/// instance to run for: the build refuses it, naming the trigger, what it
+/// reaches and why that is per instance.
+#[test]
+fn a_shared_trigger_reaching_per_instance_places_fails_the_build() {
+    let project = build(
+        r#"
+bridge = BaileyBridge {
+  @per_instance
+}
+receive = BaileyReceive
+receive.bridge = bridge.bridge
+tick = Cron { cron: "0 0 3 * * *" }
+send = BaileySend { message: "hi", to: "x" }
+send.bridge = bridge.bridge
+send._should_flow = tick.scheduledTime
+"#,
+    );
+    let found = validate(&project, &catalog());
+    let refusal = found
+        .iter()
+        .find(|d| d.code.as_deref() == Some("shared-trigger-reaches-per-instance"))
+        .unwrap_or_else(|| panic!("refused: {found:?}"));
+    for part in ["Trigger 'tick'", "'send'", "'bridge'", "it reads 'bridge'", "marked `@per_instance`"] {
+        assert!(refusal.message.contains(part), "{part}: {}", refusal.message);
+    }
+    // The per-instance trigger beside it fires for its own instance.
+    assert_eq!(found.iter().filter(|d| d.code.as_deref() == Some("shared-trigger-reaches-per-instance")).count(), 1);
+}
+
+/// A route names its instance per call (an instance token, or the
+/// `Weft-Instance` header on a gated route), so a shared route reaching
+/// what is per instance builds: a call naming no instance is refused at
+/// run time instead.
+#[test]
+fn a_shared_route_reaching_per_instance_places_builds() {
+    let project = build(
+        r#"
+bridge = BaileyBridge {
+  @per_instance
+}
+door = Route { path: "send", method: "POST" }
+send = BaileySend { message: "hi", to: "x" }
+send.bridge = bridge.bridge
+send._should_flow = door.fired
+reply = Reply
+reply.body = send.messageId
+"#,
+    );
+    assert!(!codes(&project).iter().any(|c| c == "shared-trigger-reaches-per-instance"), "{:?}", codes(&project));
+    assert!(!weft_core::run_spec::instanceless_fire_reaches(&project, "door", &weft_core::run_spec::instanceless_stand_ins(&project)).expect("cut").is_empty());
+}
+
+/// Why a place is per instance is told from that place alone: a file
+/// included twice, each include fed by its own per-instance bridge, names
+/// its own include's bridge and never the other's.
+#[test]
+fn each_place_tells_its_own_reason() {
+    let project = build_with(
+        r#"
+first = BaileyBridge {
+  @per_instance
+}
+hearFirst = BaileyReceive
+hearFirst.bridge = first.bridge
+one = @include("lib/carry.weft")
+one.text = hearFirst.content
+second = BaileyBridge {
+  @per_instance
+}
+hearSecond = BaileyReceive
+hearSecond.bridge = second.bridge
+two = @include("lib/carry.weft")
+two.text = hearSecond.content
+"#,
+        &[("lib/carry.weft", CARRY)],
+    );
+    let carry = body_node(&project, "carry");
+    let rules = weft_core::rules::RuleContext::new(&project);
+    let at = |site: &str| {
+        weft_core::rules::per_instance_reasons_at(&weft_core::frames::Located::new(carry.id.clone(), vec![site.to_string()]), &rules)
+    };
+    assert_eq!(at("one"), vec!["it reads 'first'".to_string()]);
+    assert_eq!(at("two"), vec!["it reads 'second'".to_string()]);
+    // Asked of the node as a whole, each reason names its include, once.
+    assert_eq!(
+        weft_core::rules::per_instance_reasons(carry, &rules),
+        vec!["at 'one.carry', it reads 'first'".to_string(), "at 'two.carry', it reads 'second'".to_string()],
+    );
+}
+
+/// A value deciding a group's gate makes what is inside per instance,
+/// and what reads it from outside: each told the way it runs.
+#[test]
+fn a_gate_is_told_as_a_gate_and_what_reads_past_it_as_a_read() {
+    let project = build(
+        r#"
+bridge = BaileyBridge {
+  @per_instance
+}
+receive = BaileyReceive
+receive.bridge = bridge.bridge
+g = Group() -> (out: String) {
+  m = Text { value: "x" }
+  self.out = m.value
+}
+g._should_flow = receive.isGroup
+d = Debug
+d.data = g.out
+"#,
+    );
+    let rules = weft_core::rules::RuleContext::new(&project);
+    let at = |id: &str| weft_core::rules::per_instance_reasons_at(&weft_core::frames::Located::top(id), &rules);
+    assert_eq!(at("g.m"), vec!["it sits inside group 'g', whose gate reads 'bridge'".to_string()]);
+    assert_eq!(at("d"), vec!["it reads 'g.m'".to_string()]);
+    assert_eq!(at("bridge"), vec!["it is marked `@per_instance`".to_string()]);
+}

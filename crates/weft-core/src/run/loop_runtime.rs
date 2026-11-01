@@ -491,7 +491,8 @@ pub enum LoopNews {
     Launched(LoopInstanceKey, u32),
     /// Iteration `index`'s `LoopOut` fired.
     OutFired(LoopInstanceKey, u32),
-    /// The loop at `key` ended, every iteration with it.
+    /// The loop at `key` ended: it launches nothing more. Its iterations
+    /// are forgotten once nothing inside them is alive.
     Ended(LoopInstanceKey),
 }
 
@@ -866,7 +867,7 @@ impl LoopRuntime {
             below_cap
         } else {
             // Sequential: ready exactly when every launched iteration
-            // has fired its LoopOut (nothing in flight). Derived, not
+            // has fired its LoopOut (no iteration owes its LoopOut). Derived, not
             // stored, so a rehydrated instance is correct by
             // construction.
             inst.out_fired.len() == inst.launched.len() && below_cap

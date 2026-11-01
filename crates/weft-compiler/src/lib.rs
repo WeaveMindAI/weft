@@ -472,6 +472,7 @@ fn broken_part(
     };
     Ok(weft_core::project::Broken {
         parts: d.subjects.clone(),
+        places: d.places.clone(),
         why: format!("{file}:{}:{} {}", d.line, d.column, d.message),
         hides: d.subjects.iter().any(|part| hiding.contains(part)),
     })

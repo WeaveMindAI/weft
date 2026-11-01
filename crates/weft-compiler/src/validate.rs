@@ -84,6 +84,8 @@ fn validate_scoped(
     check_named_type_conflicts(project, &mut d);
     check_route_claims(project, catalog, &mut d);
     check_per_instance(project, catalog, &mut d);
+    check_shared_trigger_runs(project, &mut d);
+    check_run_files_kept(project, catalog, &mut d);
     check_instance_filled(project, &mut d);
     check_run_settings(project, &mut d);
     d
@@ -136,6 +138,130 @@ fn check_per_instance(project: &ProjectDefinition, catalog: &dyn MetadataCatalog
                  container each); a {} runs nothing of its own to copy. {instead}",
                 node.node_type,
             ));
+    }
+}
+
+/// shared-trigger-reaches-per-instance: a trigger every instance shares
+/// fires runs for no instance, so a run of it that reaches something per
+/// instance would be refused at every fire, with no instance anybody could
+/// pick (`run_spec::refuse_instanceless`). Refused here instead, naming
+/// what it reaches and why each is per instance. A trigger that holds its
+/// caller's connection (a route, a socket) is left alone: each call can
+/// name its instance (an instance token, or the `Weft-Instance` header on
+/// a gated route), and a call that names none hears the run-time refusal.
+fn check_shared_trigger_runs(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    let shared: Vec<(&NodeDefinition, weft_core::frames::Located)> = weft_core::project::trigger_places(project)
+        .into_iter()
+        .filter_map(|place| {
+            let node = project.nodes.iter().find(|n| n.id == place.id)?;
+            (node.features.live_connection.is_none() && !weft_core::project::is_per_instance(project, &place))
+                .then_some((node, place))
+        })
+        .collect();
+    if shared.is_empty() {
+        return;
+    }
+    let stand_ins = weft_core::run_spec::instanceless_stand_ins(project);
+    // Built only once a trigger is refused: the reasons are all it serves.
+    let rules = std::cell::OnceCell::new();
+    for (node, place) in shared {
+        let trigger = weft_core::project::address_of(project, &place.id, &place.path);
+        // A fire that cannot be cut is reported by what makes it so.
+        let Ok(reached) = weft_core::run_spec::instanceless_fire_reaches(project, &trigger, &stand_ins) else { continue };
+        if reached.is_empty() {
+            continue;
+        }
+        let rules = rules.get_or_init(|| weft_core::rules::RuleContext::new(project));
+        let spelled: Vec<String> =
+            reached.iter().map(|at| weft_core::project::address_of(project, &at.id, &at.path)).collect();
+        let why: Vec<String> = reached
+            .iter()
+            .zip(&spelled)
+            .filter_map(|(at, spelled)| {
+                let reasons = weft_core::rules::per_instance_reasons_at(at, rules);
+                (!reasons.is_empty()).then(|| format!("'{spelled}': {}", reasons.join(", and ")))
+            })
+            .collect();
+        let because = if why.is_empty() { String::new() } else { format!(" ({})", why.join("; ")) };
+        // This place's alone: the same trigger under another include of
+        // its file may be per instance there, or reach nothing per
+        // instance, and turns on.
+        push_at(d, &[node.part()], std::slice::from_ref(&place), node.source_file.as_deref(), node.header_span_or_default(), Severity::Error,
+            "shared-trigger-reaches-per-instance",
+            format!(
+                "Trigger '{trigger}' is shared by every instance, so its runs are for no instance, but they reach \
+                 {}, which {} once per instance{because}. Every fire would be refused, since no instance could be \
+                 picked. Make the trigger per instance too (wire it from what is per instance, or write one of its \
+                 fields `@instance_filled`), so each instance fires its own copy, or keep what is per instance out \
+                 of what it runs",
+                weft_core::comma_list::spell_list(&spelled),
+                if spelled.len() == 1 { "exists" } else { "exist" },
+            ));
+    }
+}
+
+/// run-file-kept-past-run: a file stored for its run only is readable by
+/// that run alone (keeping it for days with `scope: run` keeps it for that
+/// run still), so wiring one into a node that keeps what it is given past
+/// the run (`keepsInputsPastRun`: a table, a record, an instance's values)
+/// leaves a reference no later run can open. A run that reads it back
+/// works only while it is the same run, which is why it slips through a
+/// first try. Warned on the wire's end, naming where the file was stored.
+/// Only a file whose scope the program wrote is judged: the output names
+/// the input that picks it (`fileScopeFrom`), and that input says `run`
+/// (written, or by its default); one arriving on a wire, and an output
+/// that says nothing of its scope, are not known here. A loop's
+/// boundaries pass a value on unchanged, so the walk goes back through
+/// them to where the file was made.
+fn check_run_files_kept(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, d: &mut Vec<Diagnostic>) {
+    use weft_core::frames::Located;
+    use weft_core::project::graph::{GraphView, ProjectGraph};
+    use weft_core::project::places;
+    let g = ProjectGraph::new(project);
+    // Where the file at `port` of the node at `at` was stored for its run
+    // only: that node's place and the input that said so.
+    fn run_scoped_origin(
+        g: &ProjectGraph,
+        catalog: &dyn MetadataCatalog,
+        at: &Located,
+        port: &str,
+        seen: &mut std::collections::BTreeSet<(Located, String)>,
+    ) -> Option<(Located, String)> {
+        if !seen.insert((at.clone(), port.to_string())) {
+            return None;
+        }
+        let node = g.node(&at.id)?;
+        if node.group_boundary.is_some() {
+            let feeders: Vec<(Located, String)> = places::incoming(g, at)
+                .filter(|(edge, _)| edge.target_port() == port)
+                .map(|(edge, source)| (source, edge.source_port().to_string()))
+                .collect();
+            return feeders.into_iter().find_map(|(source, out)| run_scoped_origin(g, catalog, &source, &out, seen));
+        }
+        let from = catalog.lookup(&node.node_type)?.outputs.iter().find(|o| o.name == port)?.file_scope_from.clone()?;
+        if places::incoming(g, at).any(|(edge, _)| edge.target_port() == from) {
+            return None;
+        }
+        let scope = node.written_value(&from).or_else(|| node.inputs.iter().find(|i| i.name == from)?.default.as_ref())?;
+        (scope.as_str().and_then(weft_core::storage::StorageScope::named) == Some(weft_core::storage::StorageScope::Run))
+            .then(|| (at.clone(), from))
+    }
+    for (edge, source, target) in places::located_wires(project) {
+        let Some(keeper) = g.node(&target.id).filter(|n| n.features.keeps_inputs_past_run) else { continue };
+        let Some(made) = g.node(&source.id) else { continue };
+        if !made.types_at(&source.path).output(edge.source_port()).is_some_and(|ty| ty.references_file()) {
+            continue;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let Some((origin, scope_input)) = run_scoped_origin(&g, catalog, &source, edge.source_port(), &mut seen) else { continue };
+        let keeper_name = weft_core::project::address_of(project, &target.id, &target.path);
+        let origin_name = weft_core::project::address_of(project, &origin.id, &origin.path);
+        cfg_push(d, keeper, edge.target_port(), Severity::Warning, "run-file-kept-past-run", format!(
+            "'{keeper_name}' keeps what '{}' is given after the run ends, but the file it gets was stored by \
+             '{origin_name}' for its run only (`{scope_input}: run`), and no later run can read it. Store it with \
+             `{scope_input}: project` so every later run of the project can",
+            edge.target_port(),
+        ));
     }
 }
 
@@ -1265,6 +1391,23 @@ fn push(
         }
     }
     d.push(Diagnostic::at(span, severity, code, message).in_file(file).about(subjects));
+}
+
+/// [`push`] for a finding that holds at some `places` of its parts only
+/// (`Diagnostic::places`): a cut keeping none of them still runs.
+#[allow(clippy::too_many_arguments)]
+fn push_at(
+    d: &mut Vec<Diagnostic>,
+    about: &[&str],
+    places: &[weft_core::frames::Located],
+    file: Option<&str>,
+    span: Span,
+    severity: Severity,
+    code: &str,
+    message: impl Into<String>,
+) {
+    push(d, about, file, span, severity, code, message);
+    d.last_mut().expect("just pushed").places = places.to_vec();
 }
 
 /// `NodeDefinition::part` for an id a wire names: a node's part, or the id
@@ -3585,6 +3728,29 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                     format!(
                         "loop '{gid}': gather output '{}' must be declared as List[T | Null] (was {}); per-iteration body failures produce null slots",
                         port.name, port.port_type,
+                    ));
+            }
+        }
+
+        // loop-output-unwritten: an output (a gather or a carry) is what
+        // each iteration writes at the loop's `LoopOut`. One nothing inside
+        // writes, by a wire or a written value, would gather a list of
+        // nothing but nulls, or carry its first value unchanged through
+        // every iteration: almost certainly a port the body forgot to
+        // write. `done` is the language's own vote, never required.
+        for port in out_node.inputs.iter().filter(|p| p.name != "done" && !weft_core::run::skip::is_gate_port(&p.name)) {
+            let wired = project.edges.iter().any(|e| e.target == loop_out_id && e.target_handle.as_deref() == Some(port.name.as_str()));
+            if !wired && out_node.written_value(&port.name).is_none() {
+                let would = if carry_set.contains(&port.name) {
+                    "it would carry its first value unchanged through every iteration"
+                } else {
+                    "it would gather a list of nothing but nulls"
+                };
+                push(d, &[*gid], file, span, Severity::Error, "loop-output-unwritten",
+                    format!(
+                        "loop '{gid}' declares output '{}', but nothing inside it writes `self.{}`: {would}. \
+                         Write it inside the loop, or remove the port",
+                        port.name, port.name,
                     ));
             }
         }

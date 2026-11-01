@@ -1022,7 +1022,7 @@ mod tests {
             features: NodeFeatures::default(),
             scope: Vec::new(),
             group_boundary: None,
-            requires_infra: false, per_instance: None,
+            requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
             images: Vec::new(),
             fires_with: Default::default(), baked_outputs: Default::default(),
             published_service: None,

@@ -190,6 +190,82 @@ async fn live_tagged_read_respects_the_project_wall_and_terminals(pool: Pool) {
     assert_eq!(via_trait, live);
 }
 
+/// Write the birth of an unrecorded run of `project` the way its
+/// worker writes one before a call names it (`weft_journal::unrecorded`),
+/// `then` after it in the same batch: its row, running under worker `w1`,
+/// or ended when `then` ends it.
+async fn worker_writes_unrecorded(pool: &Pool, project: Uuid, then: impl FnOnce(weft_core::RunId) -> Vec<RunEvent>) -> weft_core::RunId {
+    use weft_journal::frame::{Batch, BatchHead, RunHead};
+    use weft_journal::record::{Born, Fate, Written};
+    let run_id = weft_core::new_run_id();
+    let mut events = vec![RunEvent::RunStarted { given: Default::default(),
+        run_id,
+        project_id: project,
+        entry_node: "start".into(),
+        phase: weft_core::context::Phase::Fire,
+        definition_hash: Some("def-1".into()),
+        binary_hash: Some("bin-A".into()),
+        run_kind: weft_core::run::RunKind::Project,
+        source_version: None,
+        cut_from: None,
+        seed: None,
+        instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
+        settings: weft_core::run_settings::RunSettings::new(weft_core::run_settings::Keeping::Fast, false).unwrap(),
+    }];
+    events.extend(then(run_id));
+    let rows: Vec<Vec<u8>> = events.iter().map(|event| weft_journal::stored::encode(std::slice::from_ref(event))).collect();
+    let head = BatchHead {
+        durable: true,
+        lane: 0,
+        runs: vec![RunHead {
+            run_id,
+            epoch: 1,
+            first_seq: 0,
+            row_sizes: rows.iter().map(|row| row.len() as u32).collect(),
+            born: Born::of(&events[0], weft_core::run_settings::KeepFor::WEFT_DEFAULT),
+            written: Written::of(&events),
+            wrote_files: false,
+            secrets: Vec::new(),
+        }],
+        programs: Vec::new(),
+        events_version: weft_journal::stored::STORED_EVENTS.version(),
+    };
+    let batch = Batch { head, rows: rows.iter().map(Vec::as_slice).collect() };
+    let answers = weft_journal::record::record_batch(&pool.get().await.unwrap(), "w1", TENANT, "w1:0", &batch, &weft_access_store::seal_json)
+        .await
+        .unwrap();
+    assert_eq!(answers[0].fate, Fate::Accepted);
+    run_id
+}
+
+/// An unrecorded run that tags itself is found by a stop like any run:
+/// the birth its worker writes before the tag call is the row the live
+/// read joins on, the stop asks its worker to end it, and once it ended
+/// its tag rows go with its row when its keep runs out.
+#[weft_db_macros::test]
+async fn an_unrecorded_run_is_tagged_stopped_and_erased_with_its_tags(pool: Pool) {
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let recorded = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let live = worker_writes_unrecorded(&pool, project, |_| Vec::new()).await;
+    let ended = worker_writes_unrecorded(&pool, project, |run_id| vec![RunEvent::RunCompleted { run_id, at_unix: 2 }]).await;
+    tag(&pool, recorded, &["user_7"], 1).await;
+    tag(&pool, live, &["user_7"], 2).await;
+    tag(&pool, ended, &["user_7"], 3).await;
+
+    let selected: Vec<_> = live_tagged_runs(&pool, project, "user_7").await.unwrap().iter().map(|t| t.run_id).collect();
+    assert_eq!(selected, vec![recorded, live], "the live unrecorded run is selected, the ended one is not");
+
+    let cause = CancelCause::Run { by: recorded, tag: Some("user_7".into()) };
+    let write = store.cancel_run(live, Some(&rig_project(project)), &cause).await.unwrap();
+    assert!(write.requested, "its worker drives it, so its worker is asked to end it: {write:?}");
+
+    assert_eq!(store.erase_expired(i64::MAX, 100).await.unwrap().0, 1, "the ended unrecorded run's keep ran out");
+    assert_eq!(tag_seq(&pool, ended, "user_7").await.unwrap(), None, "its tag rows went with its row");
+    assert!(tag_seq(&pool, live, "user_7").await.unwrap().is_some(), "a run not ended keeps its tags");
+}
+
 /// A tag stop's terminal names who asked and which tag matched, on the
 /// run row and on every per-node cancel it writes; and `weft
 /// clean` takes the tag rows with the store.

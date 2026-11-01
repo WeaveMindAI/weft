@@ -2,7 +2,10 @@
 //!
 //! A tag is recorded as an `RunTagged` event (the record of the act,
 //! written by the run's own worker) AND kept in `run_tag`, one row per
-//! (run, tag), which the broker writes once the event is on record.
+//! (run, tag), which the broker writes once the event is on record. An
+//! unrecorded run writes its birth instead of the event
+//! (`crate::unrecorded`), so it is tagged and stopped through its run row
+//! like any run, and its tag rows go with that row.
 //! The table exists because `ctx.stop_tagged` has to answer "which live
 //! runs of this project carry tag T" on every inbound message, and
 //! folding every open run's record to find out would be O(all history).
@@ -74,7 +77,8 @@ pub async fn max_tag_seq(db: &impl Client) -> db::Result<i64> {
 }
 
 /// Every LIVE run of `project_id` carrying `tag`, with its tag
-/// row's `seq`: a project run that has not ended (never a node test). The
+/// row's `seq`: a project run that has not ended (never a node test),
+/// recorded or not (an unrecorded run that tagged itself has its row). The
 /// ordering and self rules are applied afterwards by
 /// [`select_stop_targets`], which is pure, so the SQL stays a plain read
 /// and the rule has a layer-1 test.

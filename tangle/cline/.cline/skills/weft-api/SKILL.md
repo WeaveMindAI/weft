@@ -228,9 +228,11 @@ on the `Route` so each call does not leave a run behind. weft keeps no history
 of such a run: one that fails is listed in `weft runs` with the node that
 failed and why, one that reported a cost, or asked weft for something its
 worker does not already hold (a stored file, a new connection or infrastructure
-address, starting its infra, a stop by tag, a wait on a timer or a form), is
+address, starting its infra, a tag or a stop by tag, a wait on a timer or a form), is
 listed with its costs and how it ended, and any other leaves nothing. An
-unrecorded run keeps no record to pause on, and it cannot be tagged.
+unrecorded run keeps no record to pause on. If you tag one, weft writes down that
+it started (a small row that goes when its trigger's `keepRunsFor`
+ends), so a stop by that tag still reaches it while it runs.
 
 A run that cannot pause (an unrecorded one, or one whose caller is still on
 the line with `outlivesCaller` off) still waits on a timer or a form: the wait

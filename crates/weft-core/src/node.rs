@@ -135,6 +135,13 @@ pub struct Diagnostic {
     /// about the program as a whole and stops every command.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subjects: Vec<String>,
+    /// The places the finding holds at, when only some of its subjects'
+    /// places are wrong (one site of a file included twice): what it
+    /// breaks there and nowhere else ([`crate::project::Broken::places`]).
+    /// Empty: every place.
+    // SYNC: Diagnostic.places <-> packages/weft-graph/src/protocol.ts Diagnostic.places
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub places: Vec<crate::frames::Located>,
 }
 
 impl Diagnostic {
@@ -152,6 +159,7 @@ impl Diagnostic {
             code: Some(code.into()),
             file: None,
             subjects: Vec::new(),
+            places: Vec::new(),
         }
     }
 
@@ -676,6 +684,23 @@ mod fire_payload_tests {
         assert!(err.contains("new"), "{err}");
     }
 
+    /// Every missing and every undeclared field is named in the one
+    /// refusal, so whoever typed the payload fixes it in one go instead
+    /// of meeting the next problem on each rerun.
+    #[test]
+    fn every_missing_and_unknown_field_is_named_at_once() {
+        let fires: std::collections::BTreeMap<String, String> =
+            [("scheduledTime", "String"), ("cron", "String"), ("caller?", "JsonDict")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let err = check_fire_payload(&fires, Some(&json!({ "when": "now" })))
+            .expect_err("two missing fields and one undeclared");
+        assert!(err.contains("unknown field 'when'"), "{err}");
+        assert!(err.contains("missing required fields 'cron' and 'scheduledTime'"), "{err}");
+        assert!(err.contains(". It wants {"), "the wanted shape still closes it: {err}");
+    }
+
     /// A node that declares nothing is held to nothing: the shape is
     /// unknown, so refusing would be inventing a contract.
     #[test]
@@ -1133,6 +1158,12 @@ impl NodeMetadata {
         }
         if features.live_connection.is_some() && features.journal_settings {
             return Err("features.liveConnection already gives the trigger the journal settings; remove features.journalSettings".into());
+        }
+        for output in &self.outputs {
+            let Some(from) = &output.file_scope_from else { continue };
+            if !self.inputs.iter().any(|input| input.name == *from) {
+                return Err(format!("output '{}': fileScopeFrom names '{from}', which is not an input of the node", output.name));
+            }
         }
         let mut added: Vec<InputSpec> = Vec::new();
         if features.is_trigger {
@@ -2372,9 +2403,10 @@ pub enum Condition {
     /// a node the other one merely needs (wired INTO it) is not
     /// upstream here. `{with}` in the message names the nodes found.
     DownstreamOf { with: NodeWith },
-    /// This node exists once per instance: marked `@per_instance`, has
-    /// an `@instance_filled` field, or reads one of those downstream
-    /// (the compiler's per-instance slice). For a node that cannot be
+    /// This node exists once per instance, at any place it runs: marked
+    /// `@per_instance`, has an `@instance_filled` field, or reads one of
+    /// those downstream (the compiler's per-instance slice; a node inside
+    /// a file included twice may read one at a single site). For a node that cannot be
     /// copied per instance, like a trigger serving one public address.
     /// `{perInstanceReason}` in the message says why, path included
     /// ("it reads 'blender'", "it sits inside group 'work', whose gate
@@ -2595,6 +2627,7 @@ fn error_output() -> OutputSpec {
         ),
         baked: false,
         narrowable: None,
+        file_scope_from: None,
     }
 }
 
@@ -2705,6 +2738,14 @@ pub struct NodeFeatures {
     /// caller and does not either. Backend-only, like `liveConnection`.
     #[serde(default, rename = "calledFromOutside", skip_serializing_if = "std::ops::Not::not")]
     pub called_from_outside: bool,
+    /// The node keeps what its inputs are given after the run ends: it
+    /// writes them into a table, a record, an instance's values, where a
+    /// later run reads them back. A file stored for its run only is
+    /// readable by that run alone, so the compiler warns when one is
+    /// wired in ([`OutputSpec::file_scope_from`] says which files are).
+    /// Backend-only, like `liveConnection`.
+    #[serde(default, rename = "keepsInputsPastRun", skip_serializing_if = "std::ops::Not::not")]
+    pub keeps_inputs_past_run: bool,
     /// The node opens a bus whose recording its users may tune, so the
     /// language gives it the journal settings (`journalEphemeral`,
     /// `journalWindowMs`, [`crate::stream_journal::JournalPolicy::node_inputs`])
@@ -3506,6 +3547,15 @@ pub struct OutputSpec {
     // SYNC: OutputSpec.narrowable <-> packages/weft-graph/src/protocol.ts OutputSpec.narrowable
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub narrowable: Option<Narrowable>,
+    /// For an output carrying a file the node stores where the program
+    /// chooses: the input whose value names the storage scope (`run`,
+    /// `project`). The compiler reads it to warn when a file stored for
+    /// its run only, which no other run can read, is kept past the run
+    /// ([`NodeFeatures::keeps_inputs_past_run`]); an output without it
+    /// says nothing of its file's scope (a route's upload lands where its
+    /// slot said), and is never warned about. Backend-only.
+    #[serde(default, rename = "fileScopeFrom", skip_serializing_if = "Option::is_none")]
+    pub file_scope_from: Option<String>,
 }
 
 /// How far an output may be narrowed ([`OutputSpec::narrowable`]),
@@ -4857,7 +4907,7 @@ mod input_semantics_tests {
         assert!(m.validate_semantics().unwrap_err().contains("remove them"));
         for taken in ["value", "_should_flow", ERROR_PORT] {
             let mut m = metadata_with(vec![]);
-            m.outputs.push(OutputSpec { name: "value".into(), port_type: WeftType::Primitive(WeftPrimitive::String), description: None, baked: false, narrowable: None });
+            m.outputs.push(OutputSpec { name: "value".into(), port_type: WeftType::Primitive(WeftPrimitive::String), description: None, baked: false, narrowable: None, file_scope_from: None });
             m.metadata_ports.push(port(taken, "String", Some(json!("x"))));
             assert!(m.validate_semantics().unwrap_err().contains("share one set of names"), "{taken}");
         }
@@ -4930,7 +4980,7 @@ mod input_semantics_tests {
     #[test]
     fn only_an_infra_nodes_output_may_be_baked() {
         let mut m = metadata_with(vec![]);
-        m.outputs.push(OutputSpec { name: "access".into(), port_type: WeftType::Access, description: None, baked: true, narrowable: None });
+        m.outputs.push(OutputSpec { name: "access".into(), port_type: WeftType::Access, description: None, baked: true, narrowable: None, file_scope_from: None });
         assert!(m.validate_semantics().unwrap_err().contains("only an infra node's outputs are"));
         m.requires_infra = true;
         m.validate_semantics().expect("an infra node bakes");
@@ -5058,6 +5108,7 @@ mod input_semantics_tests {
             description: None,
             baked: false,
             narrowable: None,
+            file_scope_from: None,
         };
         let mut plain = metadata_with(vec![]);
         plain.add_language_ports().unwrap();
@@ -5299,6 +5350,7 @@ mod input_semantics_tests {
             description: None,
             baked: false,
             narrowable: None,
+            file_scope_from: None,
         };
 
         publishing("postgres", vec![access_out()])
@@ -5676,6 +5728,7 @@ mod input_semantics_tests {
                 description: None,
                 baked: false,
                 narrowable: None,
+                file_scope_from: None,
             });
             m.display = Some(d);
             m

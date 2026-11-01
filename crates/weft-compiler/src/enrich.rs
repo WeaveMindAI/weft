@@ -899,84 +899,61 @@ pub fn enrich_collecting(
 /// Everything that reads a per-instance value becomes per-instance too.
 ///
 /// The author writes only the starting points (`@per_instance` on an infra
-/// node, `@instance_filled` on a field); whatever sits downstream of one along the
-/// wires reads that instance's value, so it exists per instance as well: a
-/// trigger reading an instance's bridge address is armed once per instance,
-/// and a node reading an instance's connection runs in that instance's runs.
-/// A wire runs straight from a node to the node that reads it, through any
-/// group's port, so the walk follows wires and nothing else, with one more
-/// step: a wire landing on a group's gate decides whether the group runs,
-/// so everything inside a group whose gate reads a per-instance value runs
-/// per instance too. A loop's boundaries are ordinary nodes the wires
-/// cross, and its `LoopIn` (where its gate lands) launches every
-/// iteration, so reaching it reaches the loop's inside. A node an include's body
-/// shares between call sites is one node, so one per-instance site makes
-/// it per-instance for every site: the conservative answer, and the one
-/// that never lets an instance's value reach a shared run unnoticed.
+/// node, `@instance_filled` on a field); whatever sits downstream of one
+/// (`places::per_instance_reach`, the walk and its rules) reads that
+/// instance's value, so it exists per instance as well: a trigger reading
+/// an instance's bridge address is armed once per instance, and a node
+/// reading an instance's connection runs in that instance's runs. The
+/// walk is over places, so a file included where an instance's value
+/// reaches it and where none does is per instance at the first site and
+/// shared at the second. A node per instance at every place it runs is
+/// marked `Derived`; one per instance at some of its places keeps those
+/// places (`per_instance_paths`).
 ///
 /// Derived and filled marks are recomputed from scratch each time, so a
 /// stale one can never outlive what it came from.
 pub fn mark_per_instance_slice(project: &mut ProjectDefinition) {
+    use weft_core::frames::Located;
     use weft_core::instance::PerInstance;
+    use weft_core::project::graph::{GraphView, ProjectGraph};
+    use weft_core::project::places;
     for node in project.nodes.iter_mut() {
         if matches!(node.per_instance, Some(PerInstance::Derived | PerInstance::Filled)) {
             node.per_instance = None;
         }
+        node.per_instance_paths.clear();
         // The second starting point: a node with a field each instance fills.
         if node.per_instance.is_none() && weft_core::instance::instance_filled_fields(node).next().is_some() {
             node.per_instance = Some(PerInstance::Filled);
         }
     }
-    let mut downstream: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    for edge in project.edges.iter().filter(|edge| !edge.to_group_port()) {
-        downstream.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
+    // Each node's places, and the ones the walk reached.
+    let (every, reached) = {
+        let g = ProjectGraph::new(project);
+        let every = places::every_place_in(&g);
+        let starts: Vec<Located> = every
+            .iter()
+            .filter(|place| g.node(&place.id).is_some_and(|n| matches!(n.per_instance, Some(PerInstance::Marked | PerInstance::Filled))))
+            .cloned()
+            .collect();
+        let reached = places::per_instance_reach(&g, starts);
+        (every, reached)
+    };
+    let mut places_of: std::collections::HashMap<&str, Vec<&Located>> = std::collections::HashMap::new();
+    for place in &every {
+        places_of.entry(place.id.as_str()).or_default().push(place);
     }
-    // A group reached through its gate reaches everything inside it, and
-    // a call site the body it calls.
-    let mut inside: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    for node in &project.nodes {
-        for group in &node.scope {
-            inside.entry(group.as_str()).or_default().push(node.id.as_str());
+    for node in project.nodes.iter_mut().filter(|n| n.per_instance.is_none()) {
+        let here = places_of.get(node.id.as_str()).map(Vec::as_slice).unwrap_or_default();
+        let derived: std::collections::BTreeSet<Vec<String>> =
+            here.iter().filter(|place| reached.contains(**place)).map(|place| place.path.clone()).collect();
+        if derived.is_empty() {
+            continue;
         }
-    }
-    for group in &project.groups {
-        if let weft_core::project::GroupKind::Call { body, .. } = &group.kind {
-            inside.entry(group.id.as_str()).or_default().push(body.as_str());
-        }
-    }
-    let mut reached: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut frontier: Vec<&str> = project
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.per_instance, Some(PerInstance::Marked | PerInstance::Filled)))
-        .map(|n| n.id.as_str())
-        .collect();
-    let groups: std::collections::HashSet<&str> = project.groups.iter().map(|g| g.id.as_str()).collect();
-    // A loop's gate lands on its `LoopIn`, which launches every iteration:
-    // reaching it reaches the loop's inside, the members no wire feeds
-    // among them.
-    let loop_of: std::collections::HashMap<&str, &str> = project.nodes.iter()
-        .filter_map(|n| n.group_boundary.as_ref()
-            .filter(|b| b.role == weft_core::project::GroupBoundaryRole::In)
-            .map(|b| (n.id.as_str(), b.group_id.as_str())))
-        .collect();
-    while let Some(id) = frontier.pop() {
-        let opens = if groups.contains(id) { Some(id) } else { loop_of.get(id).copied() };
-        let next = downstream.get(id).map(Vec::as_slice).unwrap_or_default().iter()
-            // A gate reached: the group's inside. A group's own port (a
-            // wire from it) is reached only through its gate, never on
-            // its own: a literal is no instance's value.
-            .chain(opens.and_then(|group| inside.get(group)).into_iter().flatten());
-        for &next in next {
-            if reached.insert(next.to_string()) {
-                frontier.push(next);
-            }
-        }
-    }
-    let reached: std::collections::BTreeSet<String> = reached;
-    for node in project.nodes.iter_mut() {
-        if node.per_instance.is_none() && reached.contains(&node.id) {
+        if derived.len() == here.len() {
             node.per_instance = Some(PerInstance::Derived);
+        } else {
+            node.per_instance_paths = derived;
         }
     }
 }
