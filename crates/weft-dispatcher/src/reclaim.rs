@@ -8,11 +8,13 @@ use async_trait::async_trait;
 /// hook. Run as the project is removed (BEFORE the project row is dropped, so a
 /// row-cascade can't strand bytes a content tree references).
 ///
-/// The DEFAULT impl (`WipeProjectFiles`) frees the project's `project/`-scoped
-/// runtime files from the object store (present whenever a bucket backs
+/// The DEFAULT impl (`WipeProjectFiles`) frees the project's `project/`- and
+/// `instance/`-scoped runtime files from the object store (present whenever a bucket backs
 /// `ctx.storage`). One hook, one role: "free this deleted project's stored
-/// data." (Runtime files NOT under the `project/` scope, i.e. `shared/`, are the
-/// owner's and deliberately outlive the project; this never touches them.)
+/// data." (Its runs' files go with the runs' records, erased with the
+/// project; its instances' files live inside it and go with it; `shared/`
+/// files belong to a space, not the project, and outlive it: only a person
+/// or their deadline deletes them, so this never touches them.)
 ///
 /// Must be idempotent: a `weft rm` retry replays it, and an error aborts the
 /// delete so the operator retries rather than leaving stranded data.
@@ -28,12 +30,12 @@ pub trait ProjectReclaimer: Send + Sync {
 
 /// The default reclaimer: free the project's per-project storage from the
 /// object store: its `project/`-scoped runtime files (persistent state a
-/// running node wrote) and every instance's files, which go away with the
-/// project. Its references to the tenant's assets are dropped, so an asset no
-/// other project of the tenant references starts its countdown; one another
-/// project still references stays. `shared/`-scoped files are the owner's,
-/// not the project's, and are deliberately left untouched (they outlive the
-/// project). This runtime-files plane always exists, so it is the default.
+/// running node wrote) and every instance's files, which live inside the
+/// project and go away with it. Its references to the tenant's assets are
+/// dropped, so an asset no other project of the tenant references starts its
+/// countdown; one another project still references stays. `shared/`-scoped
+/// files are a space's, not the project's, and are left untouched. This
+/// runtime-files plane always exists, so it is the default.
 pub struct WipeProjectFiles;
 
 #[async_trait]
@@ -48,26 +50,23 @@ impl ProjectReclaimer for WipeProjectFiles {
         // format string would skip the segment grammar that keeps a wipe
         // inside its owner boundary.
         let project = project_id.to_string();
-        let project_files =
-            weft_core::storage::key::ParsedKey::project_prefix(tenant, &project)
-                .map_err(|e| anyhow::anyhow!("project wipe prefix: {e}"))?;
-        // Every instance's files: an instance id is only a name inside its
-        // project, so they go with the project.
-        let instances = weft_core::storage::key::ParsedKey::instances_prefix(tenant, &project)
-            .map_err(|e| anyhow::anyhow!("instance wipe prefix: {e}"))?;
-        crate::storage::wipe_prefix(state, &project_files).await?;
+        let removed = weft_core::storage::key::ParsedKey::removed_with_project(tenant, &project)
+            .map_err(|e| anyhow::anyhow!("project wipe prefix: {e}"))?;
+        for prefix in &removed {
+            crate::storage::wipe_prefix(state, prefix).await?;
+        }
         crate::storage::set_asset_references(
             state,
             tenant,
             weft_core::storage::AssetReferencesRequest { project, keys: Vec::new(), kept: Vec::new() },
         )
         .await?;
-        crate::storage::wipe_prefix(state, &instances).await?;
         Ok(())
     }
 }
 
-/// The default project reclaimer: wipe the project's runtime files.
+/// The default project reclaimer: wipe the project's and its instances'
+/// runtime files, and drop its asset references.
 pub fn default_reclaimer() -> Arc<dyn ProjectReclaimer> {
     Arc::new(WipeProjectFiles)
 }

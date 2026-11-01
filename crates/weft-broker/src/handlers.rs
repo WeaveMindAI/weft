@@ -18,6 +18,7 @@ use axum::{
 use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL, ISSUED_WAKE};
 use weft_broker_client::protocol::*;
 use weft_task_store::db::{self, Client as _, Row};
+use weft_task_store::stopping::Deadline;
 use weft_task_store::tasks::DedupOutcome;
 use weft_task_store::TaskKind;
 
@@ -183,9 +184,12 @@ pub(crate) fn unix_now_secs() -> u64 {
 
 /// When a held call's wait of `wait_ms` ends: as long as the caller asks
 /// (it is held on a line, which has no idle timeout), and forever for a
-/// wait past what the clock holds.
-pub(crate) fn held_until(wait_ms: u64) -> tokio::time::Instant {
-    weft_core::deadline::after(tokio::time::Instant::now(), Duration::from_millis(wait_ms))
+/// wait past what the clock holds; or as soon as this copy is stopping,
+/// answering what the wait running out answers, so the caller asks again
+/// on a copy that runs. Every held call waits through this.
+pub(crate) fn held_until(state: &BrokerState, wait_ms: u64) -> Deadline {
+    Deadline::at(weft_core::deadline::after(tokio::time::Instant::now(), Duration::from_millis(wait_ms)))
+        .or_stop(&state.stopping)
 }
 
 // ---------- Tasks ----------
@@ -462,11 +466,10 @@ pub async fn task_wait_terminal(
     Json(req): Json<TaskWaitTerminalRequest>,
 ) -> Resp<TaskWaitTerminalResponse> {
     require_task_owned_by(&state, &caller, req.task_id).await?;
-    let outcome = state
-        .tasks
-        .wait_for_terminal(req.task_id, Duration::from_millis(req.wait_ms))
-        .await
-        .map_err(|e| unavailable_or_internal(e.context("wait for the task to end")))?;
+    let outcome =
+        weft_task_store::terminal::wait_for_terminal_before(&state.pool, &state.signals, req.task_id, held_until(&state, req.wait_ms))
+            .await
+            .map_err(|e| unavailable_or_internal(e.context("wait for the task to end")))?;
     Ok(Json(TaskWaitTerminalResponse::from_outcome(outcome)))
 }
 
@@ -1233,7 +1236,7 @@ pub async fn supervisor_claim_command(
     // own ticks): the answer then says so, and the process takes ownership
     // at once instead of on its next tick. Only after a wake, so a
     // supervisor woken by a command it cannot take yet does not spin.
-    let deadline = held_until(req.wait_ms);
+    let deadline = held_until(&state, req.wait_ms);
     let mut heard = state.signals.subscribe();
     let mut woken_once = false;
     let cancel_heard = |channel: &str, payload: &str| {
@@ -1270,7 +1273,7 @@ pub async fn supervisor_claim_command(
             return Ok(Json(SupervisorClaim::UnownedWork));
         }
         let woken = heard
-            .woken_before(deadline, |channel, payload| ISSUED_WAKE.hears(channel, payload) || cancel_heard(channel, payload))
+            .woken_before(deadline.clone(), |channel, payload| ISSUED_WAKE.hears(channel, payload) || cancel_heard(channel, payload))
             .await
             .map_err(internal)?;
         if !woken {
@@ -1793,7 +1796,7 @@ pub async fn infra_wait_apply(
     }
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let deadline = held_until(req.wait_ms);
+    let deadline = held_until(&state, req.wait_ms);
     let mut heard = state.signals.subscribe();
     loop {
         let answer = apply_command_state(&state, &req).await?;
@@ -1801,7 +1804,7 @@ pub async fn infra_wait_apply(
             return Ok(Json(answer));
         }
         let woken = heard
-            .woken_before(deadline, |channel, payload| {
+            .woken_before(deadline.clone(), |channel, payload| {
                 channel == INFRA_COMMAND_CHANNEL
                     && InfraCommandSignal::parse(payload) == Some(InfraCommandSignal::Done { id: req.command_id })
             })

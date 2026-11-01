@@ -155,8 +155,9 @@ like `FirstInOrder`. Its inputs are optional and it needs no gate.
 one or more of its events. It is what the graph shows you, and what a worker
 reads to pick up a durable run or one that was waiting.
 
-**Keep.** Marking a file to survive the sweep that clears a run's storage.
-Additive, and there is no un-keep.
+**Keep.** Giving a stored file a deadline: it is deleted once nobody has
+touched it for that long, or with its run or project if that comes first. The
+`KeepFile` node also copies a file into its project, so it outlives its run.
 
 **Left out.** A node folder weft could not load (bad metadata, a name two
 folders claim), which `weft describe-nodes` lists with why, or a node package

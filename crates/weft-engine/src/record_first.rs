@@ -145,9 +145,8 @@ impl RunSteeringClient for RecordFirst<dyn RunSteeringClient> {
     }
 }
 
-/// A store also says the run stored files of its own, before the bytes
-/// move, so its ending's sweep reclaims them
-/// ([`WorkerJournal::stored_files`]).
+/// A file the run stores, reads or links: a record that cannot be written
+/// first fails the call as the node's storage error.
 #[async_trait]
 impl WorkerStorageOps for RecordFirst<dyn WorkerStorageOps> {
     async fn put(
@@ -161,7 +160,6 @@ impl WorkerStorageOps for RecordFirst<dyn WorkerStorageOps> {
         declared_size: Option<u64>,
         data: ByteStream,
     ) -> WeftResult<Value> {
-        self.writer.stored_files(run_id);
         self.first_for_storage(run_id).await?;
         self.inner.put(run_id, scope, identity, mime_type, filename, keep, declared_size, data).await
     }
@@ -173,7 +171,6 @@ impl WorkerStorageOps for RecordFirst<dyn WorkerStorageOps> {
         declared_size: Option<u64>,
         data: ByteStream,
     ) -> WeftResult<weft_core::storage::ReplaceOutcome> {
-        self.writer.stored_files(run_id);
         self.first_for_storage(run_id).await?;
         self.inner.replace(run_id, key, expected_version, declared_size, data).await
     }
@@ -215,7 +212,6 @@ impl WorkerStorageOps for RecordFirst<dyn WorkerStorageOps> {
         identity: Option<&str>,
         keep: Option<KeepTtl>,
     ) -> WeftResult<Value> {
-        self.writer.stored_files(run_id);
         self.first_for_storage(run_id).await?;
         self.inner.copy(run_id, key, scope, identity, keep).await
     }
@@ -224,7 +220,6 @@ impl WorkerStorageOps for RecordFirst<dyn WorkerStorageOps> {
         self.inner.upload_slot(run_id, request).await
     }
     async fn claim_uploads(&self, run_id: RunId, claims: &[(&str, &weft_core::weft_type::WeftType)]) -> WeftResult<Vec<Value>> {
-        self.writer.stored_files(run_id);
         self.first_for_storage(run_id).await?;
         self.inner.claim_uploads(run_id, claims).await
     }

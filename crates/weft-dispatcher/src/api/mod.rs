@@ -201,8 +201,12 @@ fn version_note(source: Option<&weft_core::install::WeftSource>, cli_commit: &st
 }
 
 impl HoldQuery {
-    pub fn hold(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.wait_ms).min(MAX_HOLD)
+    /// When the held read answers as it stands: once its hold is up, or
+    /// as soon as this copy starts stopping, so the client asks again on
+    /// a running copy instead of being cut off at the exit.
+    pub fn hold(&self, stopping: &weft_task_store::stopping::Stopping) -> weft_task_store::stopping::Deadline {
+        let hold = std::time::Duration::from_millis(self.wait_ms).min(MAX_HOLD);
+        weft_task_store::stopping::Deadline::at(tokio::time::Instant::now() + hold).or_stop(stopping)
     }
 }
 

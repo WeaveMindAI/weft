@@ -1159,12 +1159,6 @@ impl NodeMetadata {
         if features.live_connection.is_some() && features.journal_settings {
             return Err("features.liveConnection already gives the trigger the journal settings; remove features.journalSettings".into());
         }
-        for output in &self.outputs {
-            let Some(from) = &output.file_scope_from else { continue };
-            if !self.inputs.iter().any(|input| input.name == *from) {
-                return Err(format!("output '{}': fileScopeFrom names '{from}', which is not an input of the node", output.name));
-            }
-        }
         let mut added: Vec<InputSpec> = Vec::new();
         if features.is_trigger {
             added.extend(crate::signal::EntryLimits::node_inputs(features.has_outside_caller()));
@@ -2627,7 +2621,6 @@ fn error_output() -> OutputSpec {
         ),
         baked: false,
         narrowable: None,
-        file_scope_from: None,
     }
 }
 
@@ -2738,14 +2731,6 @@ pub struct NodeFeatures {
     /// caller and does not either. Backend-only, like `liveConnection`.
     #[serde(default, rename = "calledFromOutside", skip_serializing_if = "std::ops::Not::not")]
     pub called_from_outside: bool,
-    /// The node keeps what its inputs are given after the run ends: it
-    /// writes them into a table, a record, an instance's values, where a
-    /// later run reads them back. A file stored for its run only is
-    /// readable by that run alone, so the compiler warns when one is
-    /// wired in ([`OutputSpec::file_scope_from`] says which files are).
-    /// Backend-only, like `liveConnection`.
-    #[serde(default, rename = "keepsInputsPastRun", skip_serializing_if = "std::ops::Not::not")]
-    pub keeps_inputs_past_run: bool,
     /// The node opens a bus whose recording its users may tune, so the
     /// language gives it the journal settings (`journalEphemeral`,
     /// `journalWindowMs`, [`crate::stream_journal::JournalPolicy::node_inputs`])
@@ -3547,15 +3532,6 @@ pub struct OutputSpec {
     // SYNC: OutputSpec.narrowable <-> packages/weft-graph/src/protocol.ts OutputSpec.narrowable
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub narrowable: Option<Narrowable>,
-    /// For an output carrying a file the node stores where the program
-    /// chooses: the input whose value names the storage scope (`run`,
-    /// `project`). The compiler reads it to warn when a file stored for
-    /// its run only, which no other run can read, is kept past the run
-    /// ([`NodeFeatures::keeps_inputs_past_run`]); an output without it
-    /// says nothing of its file's scope (a route's upload lands where its
-    /// slot said), and is never warned about. Backend-only.
-    #[serde(default, rename = "fileScopeFrom", skip_serializing_if = "Option::is_none")]
-    pub file_scope_from: Option<String>,
 }
 
 /// How far an output may be narrowed ([`OutputSpec::narrowable`]),
@@ -4907,7 +4883,7 @@ mod input_semantics_tests {
         assert!(m.validate_semantics().unwrap_err().contains("remove them"));
         for taken in ["value", "_should_flow", ERROR_PORT] {
             let mut m = metadata_with(vec![]);
-            m.outputs.push(OutputSpec { name: "value".into(), port_type: WeftType::Primitive(WeftPrimitive::String), description: None, baked: false, narrowable: None, file_scope_from: None });
+            m.outputs.push(OutputSpec { name: "value".into(), port_type: WeftType::Primitive(WeftPrimitive::String), description: None, baked: false, narrowable: None });
             m.metadata_ports.push(port(taken, "String", Some(json!("x"))));
             assert!(m.validate_semantics().unwrap_err().contains("share one set of names"), "{taken}");
         }
@@ -4980,7 +4956,7 @@ mod input_semantics_tests {
     #[test]
     fn only_an_infra_nodes_output_may_be_baked() {
         let mut m = metadata_with(vec![]);
-        m.outputs.push(OutputSpec { name: "access".into(), port_type: WeftType::Access, description: None, baked: true, narrowable: None, file_scope_from: None });
+        m.outputs.push(OutputSpec { name: "access".into(), port_type: WeftType::Access, description: None, baked: true, narrowable: None });
         assert!(m.validate_semantics().unwrap_err().contains("only an infra node's outputs are"));
         m.requires_infra = true;
         m.validate_semantics().expect("an infra node bakes");
@@ -5108,7 +5084,6 @@ mod input_semantics_tests {
             description: None,
             baked: false,
             narrowable: None,
-            file_scope_from: None,
         };
         let mut plain = metadata_with(vec![]);
         plain.add_language_ports().unwrap();
@@ -5350,7 +5325,6 @@ mod input_semantics_tests {
             description: None,
             baked: false,
             narrowable: None,
-            file_scope_from: None,
         };
 
         publishing("postgres", vec![access_out()])
@@ -5728,7 +5702,6 @@ mod input_semantics_tests {
                 description: None,
                 baked: false,
                 narrowable: None,
-                file_scope_from: None,
             });
             m.display = Some(d);
             m

@@ -11,8 +11,8 @@ Always through the runner:
 
 ```bash
 scripts/run-e2e.sh                          # every test
-scripts/run-e2e.sh live_chat plain          # every test in these files
-scripts/run-e2e.sh accesses::some_test      # one test
+scripts/run-e2e.sh live_chat loops          # every test in these files
+scripts/run-e2e.sh live_chat::websocket_echoes_with_turn_counter   # one test
 scripts/run-e2e.sh --failed                 # the tests that did not pass last time
 scripts/run-e2e.sh -j 8                     # 8 tests at once instead of 4
 scripts/run-e2e.sh --keep-going             # keep going after a failure, to see them all
@@ -23,7 +23,10 @@ The runner tests the install of the checkout you run it from: the default
 install on `main`, the branch's own install anywhere else (what `weft daemon
 which` names). It brings that install to current code once (`setup.sh --cli
 --daemon`), builds the one test binary once, then runs every TEST on its own,
-side by side, longest first (by how long each took last time). Everything a
+side by side, longest first (by how long each took last time). The build is
+the one `cargo nextest run --workspace` makes, with this crate's `e2e` feature
+on, so if you ran the unit tests first it compiles this crate and nothing
+else. Everything a
 run keeps lives in the install's own folder, under `e2e/` (for the default
 install, `~/.local/share/weft/e2e/`): each test's output lands in
 `e2e/run/<file>::<test>.log`, and the summary prints one line per test with
@@ -100,7 +103,7 @@ They are named `WEFT_E2E_<SERVICE>_<FIELD>`:
 | Telegram | `WEFT_E2E_TELEGRAM_TOKEN`, `_CHAT_ID` |
 | Email | `WEFT_E2E_EMAIL_USER`, `_PASSWORD`, `_IMAP_HOST`, `_IMAP_PORT`, `_SMTP_HOST`, `_SMTP_PORT` |
 | ElevenLabs | `WEFT_E2E_ELEVENLABS_API_KEY` |
-| OpenRouter, your own key (`openrouter`'s own-key test, `openrouter_custom`, `llm_stream_tool`; spends money) | `OPENROUTER_API_KEY` |
+| OpenRouter, your own key (`llm_stream_tool`; spends money) | `OPENROUTER_API_KEY` |
 | A GCP install (`gcp_install`, spends money on your cloud) | `WEFT_E2E_GCP_URL`, `_OPERATOR_KEY`, `_PROJECT`, `_REGION`; and, on this machine, a project whose `weft.toml` has a target at that address, with `weft login <that target>` done, because the CLI the test drives finds its key there |
 
 A test whose variables are absent **skips** rather than fails, through
@@ -136,6 +139,15 @@ If a test needs a capability the toolkit lacks, see "Add a test". Never patch
 a test to tolerate the wrong state.
 
 ## Add a test
+
+If you are about to add one, first ask whether a lower layer can prove it: a
+node's own logic, a compiler message, a wire shape, a cut, an engine decision
+a rig can drive all have tests of their own, and those are where the test
+goes. An e2e is the last resort, for a mechanism end to end (a bus across
+nodes, files through storage, a resync, a trigger's life on a real
+listener), and it has to prove something no other e2e proves: if one already
+goes through that path, extend it instead. A node being new is never a reason
+for an e2e by itself.
 
 Add `tests/e2e/<area>.rs` and a `mod <area>;` line in `tests/e2e/main.rs`
 (every e2e test is one binary, each file a module of it; the runner asks the
@@ -199,7 +211,7 @@ test may only touch and count what it made itself. In practice:
 - End a passing test with `project.finish()` (and `cell.finish()` if it made a
   cell). A failing test skips that on purpose.
 - Fakes bind a port the system picks. Never pick a fixed port.
-- Make connections through `access::connect_direct` / `connect_paste` (and wrap
+- Make connections through `access::connect_direct` (and wrap
   a grant you seed by hand in `access::SeededGrant`): a connection carries no
   name that says it is a test's, so those record it in a ledger, and the next
   run removes what a failed test left in it.
@@ -208,7 +220,8 @@ test may only touch and count what it made itself. In practice:
 
 A few things belong to the whole install, and a test that changes one of
 them needs an install to itself. Today that means restarting the runtime
-(`runtime_restart`), or running the runtime's own clock faster (`api_ticket`).
+(`runtime_restart`), or putting the whole install in maintenance
+(`maintenance`).
 
 If your test needs that, start a cell: a whole install of its own (its own
 runtime process, Postgres and ports) on the same machine. It starts from the
@@ -218,33 +231,14 @@ dispatcher there:
 ```rust
 use weft_e2e::{platform::Platform, project::Project, Cell};
 
-let cell = Cell::start(1.0).await?;                     // an install of this test's own
+let cell = Cell::start().await?;                         // an install of this test's own
 let disp = cell.dispatcher();
-let platform = Platform::connect(&disp).await?;          // this cell's Postgres, worker processes and infra containers
+let platform = Platform::connect(&disp).await?;          // this cell's worker processes and infra containers
 let mut project = Project::prepare("reach_out_feed", disp.clone()).await?;
 // ... drive, assert ...
 project.finish().await?;
 cell.finish().await                                      // removes the cell (pass only)
 ```
-
-The number you hand `Cell::start` is how fast the cell's own timers run: `1.0`
-is real time, and `0.1` runs them ten times faster. That is
-every lease, reaper tick, ticket and silence window the runtime keeps for
-itself, all together, so the protocol behaves the same, only sooner: a lease
-that runs out after 60 seconds at real time runs out after 6. What a person
-configured (a wait's timeout, a trigger's poll interval) and budgets for real
-work (a worker's start) keep their real length. If
-your test waits on one of the runtime's own timers, `cell.scaled(...)` turns a
-real-time duration into the cell's.
-
-Use real time when a faster clock would end the thing you are observing before
-you observe it.
-
-Pick something between the two when one of those timers also has to cover real
-work, which no clock compresses. A late live caller may have to wait for a
-worker to start, and at a tenth of the ticket's two minutes a busy machine
-starting that worker used up most of what was left, so `api_ticket` runs at
-`0.25`.
 
 A cell costs its own startup, so a test that does not watch anything
 install-wide stays on the install under test.
@@ -254,20 +248,20 @@ install-wide stays on the install under test.
 | Module | What it does |
 | --- | --- |
 | `ensure` | Reach the install under test (the runner brought it up); wait for health; read a credential or skip. |
-| `cell::Cell` | A whole install of a test's own, with its own pace; see above. |
+| `cell::Cell` | A whole install of a test's own; see above. |
 | `project::Project` | Fixture -> isolated project: `prepare`, `build`, `activate`, `weft(args)`, `substitute_in_main`, `finish`. |
 | `run` | `run_and_settle`, `start`, `wait_for_triggered_run`, `SettledRun::observe`. |
 | `assert` (`SettledRun`) | `completed`, `failed_with`, `assert_input/output/skipped`, `assert_loop_iterations`. |
 | `signal` | Discover + fire signals: `SignalScope`, `fire_token`. |
-| `live` | Live caller: `open_ws`, `http_post`, `http_request`, `browser_post_json`. |
+| `live` | Live caller: `open_ws`, `http_request`, `http_json`, `browser_post_json`. |
 | `human` | Human-in-the-loop: `wait_for_form_by_node`, `answer_form`. |
-| `fakes` | Servers the system dials OUT to: `SseFake`, `PollFake`, `BytesFake`, `HangingBytesFake`, `QueueFake`. |
-| `infra` | Infra lifecycle: `start_and_wait_running`, `call_endpoint`, `terminate_and_wait_gone`. |
+| `fakes` | Servers the system dials OUT to: `SseFake`, `PollFake`, `BytesFake`, `QueueFake`, `ChatFake`. |
+| `infra` | Infra lifecycle: `start_and_wait_running`, `terminate_and_wait_gone`. |
 | `storage` | `list`, `download`, `assert_file_contents`. |
 | `platform::Platform` | Reaches BEHIND the API on purpose (below). |
 
 Driving each trigger kind: **plain** `run::run_and_settle`; **HTTP**
-`activate` + `live::http_post`; **WebSocket** `activate` + `live::open_ws`;
+`activate` + `live::http_json`; **WebSocket** `activate` + `live::open_ws`;
 **human form** `human::wait_for_form_by_node` + `answer_form`; **dial-out
 (SSE/poll)** a `fakes::*` + `substitute_in_main` +
 `wait_for_triggered_run`; **infra** `infra::start_and_wait_running` +
@@ -276,11 +270,13 @@ Driving each trigger kind: **plain** `run::run_and_settle`; **HTTP**
 ## Platform layer
 
 The toolkit above tests the PROGRAM (what a `.weft` does, via the public API).
-`platform` tests the SYSTEM underneath (which worker served a run, crash
-recovery) by reaching behind the API the way an operator would: it reads the
-install's Postgres, signals the worker processes the runtime started, found in
-the install's worker registry (`kill_workers`, `stop_workers`), lists infra
-containers with Docker, and reads the runtime's log (`wait_for_runtime_log`).
+`platform` tests the SYSTEM underneath (crash recovery, what the install
+keeps on the machine) by reaching behind the API the way an operator would:
+it signals the worker processes the runtime started, found in the install's
+worker registry (`kill_workers`, `stop_workers`), lists the worker programs
+the install holds (`worker_programs`), and lists infra containers with
+Docker. A test that seeds rows opens a database directly through
+`platform::database`.
 **None of it ships**: `platform` compiles only under `e2e`, and this crate is
 never built into anything shipped. Scope is LOCAL reliability only (crash and
 restart on one machine). The API-driving client

@@ -1392,27 +1392,26 @@ with `photo["public"]` False when the open internet cannot open that link,
 so the script sends that service the bytes instead), and its description
 says how.
 
-A file a storage node keeps lives as long as its `ttlDays` says, and its
-scope says who can open it: a `run` file only the run that made it, a `project` file every later
-run of the project. The storage nodes `TextToFile`,
-`FetchToStorage` and `KeepFile` all take `scope` (`run` or `project`)
-and `ttlDays`, and emit `file`, `filename`, `mimeType` and `sizeBytes` like
-every node that makes a file. `ttlDays` works in both scopes: the file
-expires that many days after anybody last touched it, since every read,
-download or link resets the clock, and `0` keeps it for ever. If a later run
-needs the file, store it with `scope: project`, whatever its `ttlDays`: `run`
-is the default, and a later run reading a `run` file's reference back (from a
-table row, an instance's values) is refused with `run-scoped file belongs to
-a different run`. A run that stores the file and reads it back itself works,
-so one test run does not catch it. The compiler warns
-`run-file-kept-past-run` when a storage node set to `scope: run` feeds a node
-that keeps its inputs past the run (a table write, a record, an instance's
-values). Any node besides the storage
-nodes that makes a file (an S3, Slack or Drive download, a generated picture)
-stores it for its run only: if you want it longer, or in a later run, wire
-it through `KeepFile`. Every write makes a new file, except where a node
-keeps a growing value: it edits the file it was handed, in place, and its
-description says so.
+Any run in your account can read any stored file for as long as the file
+exists; its scope says only how long that is. A `run` file is deleted with its
+run, when the run's record goes (its keep time runs out, `weft clean`,
+`weft rm`), and a `project` file with the project (`weft rm`). The storage
+nodes `TextToFile`, `FetchToStorage` and `KeepFile` all take `scope` (`run` or
+`project`) and `ttlDays`, and emit `file`, `filename`, `mimeType` and
+`sizeBytes` like every node that makes a file. `ttlDays` is a deadline in
+either scope: the file is deleted once nobody has touched it for that many
+days (every read, download or link resets the clock), or with its run or
+project if that comes first, and empty or `0` means no deadline. Any other
+node that makes a file (an S3, Slack or Drive download, a generated picture)
+stores it with its run, with no deadline, unless its description says it keeps the file in the
+project's files. If a later run needs the file (its
+reference kept in a table row or an instance's values), wire it through
+`KeepFile`: `scope: project`, the default, copies it into the project's files
+and emits the new reference, while `scope: run` only sets its deadline, so the
+file still goes with its run. When a read finds a file gone, the error says
+what can have deleted it and how to make one last. Every write makes a new
+file, except where a node keeps a growing value: it edits the file it was
+handed, in place, and its description says so.
 
 A link made to a stored file lives 15 minutes. If people need it longer (a
 video somebody watches for an hour), pass the file through `LinkOptions {

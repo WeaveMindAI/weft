@@ -7,10 +7,10 @@
 //! `crate::files_door`, passes requests on to the store unchanged). It is here
 //! only to (1) front the CLI verbs (the CLI authenticates to the dispatcher, which
 //! resolves the acting tenant and forwards to the broker as the control plane),
-//! and (2) durably drive the terminate sweep: a worker can stall-then-die before
-//! its eager sweep runs, so the write that ends a run that stored files of
-//! its own enqueues a row, and this reaper drains it by asking the broker to
-//! sweep the run's un-kept run files.
+//! and (2) durably delete the files of the runs whose record went: a run's
+//! files are deleted with its record, so the erase of every run enqueues a
+//! row in the same transaction, and this reaper drains
+//! it by asking the broker to delete the run's files.
 
 use anyhow::{Context, Result};
 use weft_task_store::db::Client as _;
@@ -19,7 +19,7 @@ use weft_task_store::drain::DrainStep;
 use weft_core::storage::{
     AdminLinkRequest, AssetUploadBeginRequest, AssetsHeldRequest, AssetsHeldResponse, LinkReader, ListFilesResponse,
     PartDoneRequest, PresignResult,
-    StoredFileMeta, SweepRunRequest, SweepRunResponse, Tenanted, TenantScopeRequest, TenantUsage,
+    RunFilesRequest, RunFilesResponse, StoredFileMeta, Tenanted, TenantScopeRequest, TenantUsage,
     UploadAbortRequest, UploadBeginResponse, UploadCompleteRequest, UploadPartsRequest,
     UploadPartsResponse, UploadResumeRequest, UploadResumeResponse, WipePrefixRequest,
     WipePrefixResponse,
@@ -428,16 +428,15 @@ pub async fn wipe_prefix(state: &DispatcherState, prefix: &str) -> Result<u64> {
     Ok(out.wiped)
 }
 
-/// Terminate-sweep a run's un-kept run files: the broker reaps crashed
-/// uploads now and stamps completed files with the post-run linger expiry.
-async fn sweep_run(state: &DispatcherState, tenant: &str, run_id: &str) -> Result<SweepRunResponse> {
+/// Delete every file of the runs of `tenant` whose records went.
+async fn delete_run_files(state: &DispatcherState, tenant: &str, run_ids: &[weft_core::RunId]) -> Result<RunFilesResponse> {
     post_admin(
         state,
-        "/v1/storage/admin/sweep-run",
-        "sweep-run",
-        // Every file the run stored is swept: no limit.
+        "/v1/storage/admin/delete-run-files",
+        "delete-run-files",
+        // Every file the runs stored is deleted: no limit.
         None,
-        &SweepRunRequest { tenant: tenant.to_string(), run_id: run_id.to_string() },
+        &RunFilesRequest { tenant: tenant.to_string(), run_ids: run_ids.iter().map(ToString::to_string).collect() },
     )
     .await
 }
@@ -640,27 +639,28 @@ impl weft_assets::upload::UploadPlane for InstallUploads<'_> {
     }
 }
 
-// ---------- durable terminate-sweep queue ----------
+// ---------- durable queue of the runs whose files go ----------
 
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "storage_sweep",
     tables: &["storage_sweep"],
     ddl: &[r#"
-        -- Durable terminate-sweep queue: a row per ended run that stored
-        -- files of its own, whose un-kept run files still need sweeping.
-        -- Inserted by the write that ends the run (`weft_record_batch`,
-        -- `weft_journal::record::append_locked_in`), deleted by the sweep
-        -- reaper once the broker confirmed the sweep.
+        -- Durable queue of the runs whose files go: a row per run whose
+        -- record was deleted, whether it stored files or not. Inserted
+        -- by the erase of the run's record (the dispatcher's
+        -- `erase_run_ids`), deleted by the reaper once the broker
+        -- confirmed the run's files are gone.
         CREATE TABLE IF NOT EXISTS storage_sweep (
             run_id UUID PRIMARY KEY,
             tenant_id TEXT NOT NULL,
             enqueued_at_unix BIGINT NOT NULL
         );
         "#,
-        // Wake the sweep reaper when a run is queued, through the
+        // Wake the sweep reaper when runs are queued, through the
         // announcement outbox like every other wake (`weft_task_store::announce`):
-        // sent once the write commits, one wake for every row a flush
-        // takes, since the reaper reads the whole queue.
+        // sent once the write commits. One wake per statement, not per
+        // row: an erase queues every run it erases at once, and the
+        // reaper reads the queue a page at a time whatever woke it.
         // SYNC: 'weft_storage_sweep' <-> crate::reaper::STORAGE_SWEEP_CHANNEL
         r#"CREATE OR REPLACE FUNCTION storage_sweep_notify() RETURNS trigger AS $$
             BEGIN
@@ -671,86 +671,83 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"DROP TRIGGER IF EXISTS storage_sweep_notify_on_insert ON storage_sweep"#,
         r#"CREATE TRIGGER storage_sweep_notify_on_insert
             AFTER INSERT ON storage_sweep
-            FOR EACH ROW
+            FOR EACH STATEMENT
             EXECUTE FUNCTION storage_sweep_notify()"#,
     ],
     seed: &[],
     data_steps: &[],
 };
 
-/// Sweep-queue reaper: ask the broker to sweep each pending run's un-kept
-/// run files. A row is removed only after the broker confirmed; a TRANSIENT
-/// broker error (unreachable, 5xx) leaves the row and fails the pass once
-/// every row was tried, so the loop tries again shortly a few times and then
-/// writes the failure down for `weft status` (`weft_task_store::drain`); the
-/// next run ending queued for a sweep wakes it, and every row is tried again
-/// (the sweep is idempotent). A TERMINAL refusal (a 4xx: the broker understood and
-/// rejected the request) is loud + dead-lettered: retrying the identical
-/// request every tick forever would be a silent infinite loop over a row the
-/// user can neither see nor clear, so the row is dropped with an error log
-/// naming the run (the files, if any, remain reclaimable via `weft files`).
+/// How many queued runs one pass of [`process_sweep_queue`] takes: every
+/// erased run is queued, most of them with no file, so a pass reads a page
+/// and asks the broker once per tenant in it.
+const SWEEP_PAGE: i64 = 500;
+
+/// The reaper of [`GROUP`]'s queue: ask the broker to delete the files of
+/// the queued runs, a page at a time, one call per tenant in the page. A
+/// row is removed only after the broker confirmed; a fault that passes (the
+/// broker unreachable, a 5xx, an upload still completing) leaves the rows
+/// and fails the pass once every tenant was tried, so the loop tries again
+/// shortly a few times and then writes the failure down for `weft status`
+/// (`weft_task_store::drain`); the next run erased wakes it, and every row
+/// is tried again (a deletion is idempotent). A refusal (a 4xx: the broker
+/// understood and rejected the request, or a file the bucket refused to
+/// remove, which stays marked in `weft status`) drops the rows with an
+/// error log naming the runs: retrying the identical request every tick
+/// forever would be a silent infinite loop over rows the user can neither
+/// see nor clear (the files left stay deletable via `weft files rm`).
 pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
-    let rows: Vec<(weft_core::RunId, String)> =
-        state.pg_pool.all("SELECT run_id, tenant_id FROM storage_sweep ORDER BY enqueued_at_unix", &[]).await?;
-    let mut deferred = Vec::new();
+    let rows: Vec<(weft_core::RunId, String)> = state
+        .pg_pool
+        .all("SELECT run_id, tenant_id FROM storage_sweep ORDER BY enqueued_at_unix LIMIT $1", &[&SWEEP_PAGE])
+        .await?;
+    let full_page = rows.len() as i64 == SWEEP_PAGE;
+    let mut by_tenant: std::collections::BTreeMap<String, Vec<weft_core::RunId>> = std::collections::BTreeMap::new();
     for (run_id, tenant) in rows {
-        match sweep_run(&state, &tenant, &run_id.to_string()).await {
+        by_tenant.entry(tenant).or_default().push(run_id);
+    }
+    let pool = &state.pg_pool;
+    let done = |run_ids: Vec<weft_core::RunId>| async move {
+        pool.execute("DELETE FROM storage_sweep WHERE run_id = ANY($1)", &[&run_ids]).await
+    };
+    let mut deferred = Vec::new();
+    for (tenant, run_ids) in by_tenant {
+        match delete_run_files(&state, &tenant, &run_ids).await {
             Ok(out) => {
-                if out.swept > 0 || out.lingering > 0 {
-                    tracing::info!(
-                        target: "weft_dispatcher::storage",
-                        %run_id, tenant = %tenant, swept = out.swept, lingering = out.lingering,
-                        "terminate sweep: reaped crashed uploads, stamped completed \
-                         un-kept run files with the post-run linger expiry"
-                    );
+                if out.deleted > 0 {
+                    tracing::info!(target: "weft_dispatcher::storage", tenant = %tenant, runs = run_ids.len(), deleted = out.deleted, "deleted the files of runs whose records went");
                 }
-                state.pg_pool.execute("DELETE FROM storage_sweep WHERE run_id = $1", &[&run_id]).await?;
+                done(run_ids).await?;
             }
+            // Nothing left under the runs: done.
             Err(e) if e.downcast_ref::<StorageNotFound>().is_some() => {
-                // 404 from the broker means there was nothing to sweep for this
-                // run (its files are already gone). That is terminal SUCCESS, not
-                // a rejection: drop the row quietly (debug, not error).
-                tracing::debug!(
-                    target: "weft_dispatcher::storage",
-                    %run_id, tenant = %tenant,
-                    "terminate sweep found nothing to remove; clearing the queue row"
-                );
-                state.pg_pool.execute("DELETE FROM storage_sweep WHERE run_id = $1", &[&run_id]).await?;
+                done(run_ids).await?;
             }
-            Err(e) if e.downcast_ref::<BrokerRejected>().is_some() => {
-                // The broker understood and permanently refuses this request (bad
-                // shape / denied / over quota). Retrying it every tick forever would
-                // be a silent infinite loop over a row nobody can clear, so drop it
-                // with a loud error naming the run (any files stay reclaimable via
-                // `weft files`).
+            Err(e) if e.downcast_ref::<BrokerRejected>().is_some_and(|rejected| !rejected.completing) => {
                 tracing::error!(
                     target: "weft_dispatcher::storage",
-                    %run_id, tenant = %tenant, error = format!("{e:#}"),
-                    "terminate sweep REJECTED by the broker; dropping the queue row \
-                     (any remaining files for this run stay listable/deletable via \
-                     the storage API)"
+                    tenant = %tenant, runs = ?run_ids, error = format!("{e:#}"),
+                    "deleting runs' files was REFUSED by the broker; dropping their queue rows \
+                     (any files left stay listable and deletable via `weft files`)"
                 );
-                state.pg_pool.execute("DELETE FROM storage_sweep WHERE run_id = $1", &[&run_id]).await?;
+                done(run_ids).await?;
             }
             Err(e) => {
-                // Transient (broker unreachable, apiserver blip surfaced as 401,
-                // 5xx): keep the row, and fail the pass once the others went.
                 tracing::warn!(
                     target: "weft_dispatcher::storage",
-                    %run_id, tenant = %tenant, error = %e,
-                    "terminate sweep deferred (transient broker/control-plane fault)"
+                    tenant = %tenant, runs = run_ids.len(), error = %e,
+                    "deleting runs' files deferred (a fault that passes)"
                 );
-                deferred.push(format!("{run_id}: {e:#}"));
+                deferred.push(format!("{} runs of tenant {tenant}: {e:#}", run_ids.len()));
             }
         }
     }
     anyhow::ensure!(
         deferred.is_empty(),
-        "the broker could not sweep the files of {} ended runs: {}",
-        deferred.len(),
+        "the broker could not delete the files of erased runs: {}",
         deferred.join("; ")
     );
-    Ok(DrainStep::Done)
+    Ok(if full_page { DrainStep::More } else { DrainStep::Done })
 }
 
 #[cfg(test)]

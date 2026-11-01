@@ -9,45 +9,38 @@ with them. For putting one there from a node, go and read
 
 ## Where they live
 
+Any run of any project in your account can read any stored file, for as long as
+the file exists. The space a file is in decides only how long that is.
+
 | Space | Holds | Gone when |
 |---|---|---|
-| Run | What one run made | Five minutes after the run ends, so its output is still downloadable, unless something kept it |
-| Project | Things that outlive a run | `weft clean` or `weft rm` |
+| Run | What one run made | Its run is deleted: the run's keep time runs out, `weft clean`, or `weft rm`. The run ending leaves it |
+| Project | What the project keeps using | `weft rm` |
 | Shared | Things several projects meet in, by name | You remove them |
 | Assets | Your `@asset` copies | They follow your source |
-| Instance | One instance's files in this project | Your program deletes them, you wipe the instance (the `WipeInstance` node), or `weft rm` |
+| Instance | One instance's files in this project | Your program deletes them, you remove them, you wipe the instance (the `WipeInstance` node), or `weft rm` |
 
-The five minute window matters. A run that makes a picture and ends has not
-thrown it away yet, and a link you handed somebody still works for a little
-while.
+A file can also have a deadline, and then it goes when nobody has touched it
+for that long, or with its run or project if that comes first. Every read,
+download or link pushes the deadline back, so a file still in use stays.
 
 ## Keeping something
 
-A node stores a file with a keep policy, and that is what saves it from the
-sweep: thirty days by default, a span you choose, or forever.
+In a graph, the storage nodes `TextToFile` and `FetchToStorage` take two
+settings: `scope` (`run` or `project`) and `ttlDays` (the deadline in idle
+days, empty or `0` for none). Every other node that makes a file, a download
+from S3, Slack or Drive or a generated image included, stores it in the run's
+space with no deadline, so it lives as long as its run is kept, unless its
+description says it keeps the file in the project's files (a chat bridge's
+media, kept under the message it came with, is one).
 
-Reading a file postpones its expiry, so one that is still in use stays.
-
-In a graph, the storage nodes `TextToFile`, `FetchToStorage` and `KeepFile`
-take the same two settings: `scope` (`run`, this run only, or
-`project`, every later run of the project can read it) and `ttlDays` (how
-long it lives once nobody touches it, `0` for never expiring). Every other
-node that makes a file, a download from S3, Slack or Drive included, stores
-it for its run only. If you want such a file longer, or in a later run, wire
-it through `KeepFile`.
-
-If a later run needs the file, `scope: run` is the wrong keep however many
-days you give it: the file lives on, but only the run that made it can read
-it, so a later run that reads its reference back (from a table row, from an
-instance's values) is refused with `run-scoped file belongs to a different
-run`. A test inside one run passes, which is what makes this easy to miss. Use
-`scope: project` instead. If a storage node keeps a file with `scope: run` (or
-that default) and the file is wired straight into a node that keeps what it is
-given past the run, the compiler warns (`run-file-kept-past-run`). It does not
-see a file another node made, or one packed into a larger value on the way.
-
-There is no un-keep. A file marked to survive survives until somebody removes
-it.
+If you want a file to outlive the run that made it (an upload one request
+receives and the next one serves, a file a table row points at), wire it
+through `KeepFile`. With `scope: project`, its default, it copies the file into
+the project's files and hands on the new reference, which lasts until `weft rm`.
+With `scope: run` it leaves the file where it is and only sets its deadline.
+If you would rather keep the whole run longer, set the trigger's `keepRunsFor`
+or run it with `weft run --keep-for`.
 
 ## Looking at them
 
@@ -60,8 +53,8 @@ weft files usage
 
 `ls` groups by space (`run/<run-id>/`, `project/<project-id>/`,
 `instance/<project-id>/<instance>/`, `shared/<name>/`, and `asset/`, where each
-asset is named by its content hash) and, for each file, shows its id, the size, the filename, and whether it is kept and when it
-expires. A file's key is its space followed by its id, such as
+asset is named by its content hash) and, for each file, shows its id, the size, the filename, and when it is deleted if it has a
+deadline. A file's key is its space followed by its id, such as
 `run/9b81d0a2-4e17-4a33-bc90-51d8e2f4a7c1/3f6c0e1a-77d2-4b8e-9a41-2c5d8e0b9f13`,
 and that key is what `inspect`, `download` and `rm` take. Give `ls` the start
 of a key (`project/`, or one run's `run/<run-id>/`) and it lists only the files
@@ -89,11 +82,11 @@ weft files rm <key>
 weft files rm project/<project-id>/
 ```
 
-The second form removes a whole space, **including files somebody deliberately
-kept**. It tells you how many of those there are before it does anything:
+The second form removes a whole space. It tells you how many files that is
+before it does anything:
 
 ```text
-About to remove the whole space 'project/<project-id>/': 48 file(s), 12 of them KEPT (persisted on purpose).
+About to remove the whole space 'project/<project-id>/': 48 file(s).
 Type 'yes' to confirm:
 ```
 
@@ -113,8 +106,10 @@ file link gets](../build/public-address.md#which-address-a-file-link-gets).
 
 ## When a file goes missing
 
-If a download or a node says a key is not there, it was almost certainly swept:
-a run-scoped file that nothing kept, past its window.
+If a download or a node says a file is no longer available, the message says,
+for that file's space, what can have deleted it: its run, its project, its
+deadline, or somebody by hand. It also says how to make one last: `KeepFile`
+with `scope: project`, keeping runs longer (`keepRunsFor`, `weft run
+--keep-for`), or `ttlDays: 0` to take a deadline away.
 
-`weft files ls` tells you what is actually there. If a program's output needs
-to outlive its run, the node that made it has to say so when it stores it.
+`weft files ls` tells you what is actually there.

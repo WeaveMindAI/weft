@@ -1,24 +1,15 @@
 # Runs steering each other by tag, built from the two catalog nodes
-# and no Rust. Three programs share one fake SSE feed, one event name
-# each, so the rig picks the program by the event it pushes.
+# and no Rust, on one fake SSE feed.
 #
-# "go" is the debounce shape. Every event starts a run. `claim` tags the
-# run with the sender and with `everyone`, `stop` asks that every EARLIER
-# run carrying that sender be stopped (keeping this one), and the run
-# then parks on a HumanQuery, the way a real assistant would wait before
-# answering. Three events in a row for one sender leave exactly one run
-# alive, the last, and the two it stopped are journaled as cancelled BY
-# that run, with the tag named. A stopped run's form is gone: answering
-# it does nothing, because its wake was erased, not merely ignored.
-#
-# "purge" is the operator shape: the event names a tag, and the run stops
-# every run carrying it. It never tags itself, so with `includeSelf` on
-# it still survives (it does not carry the tag) and reaches every run
-# tagged so far, having no position of its own in the tag order.
-#
-# "abort" is the take-the-batch-down shape: the run tags itself with the
-# target, then stops every run carrying it, itself included. It ends
-# cancelled by its own hand.
+# This is the debounce shape. Every "go" event starts a run. `claim`
+# tags the run with the sender and with `everyone`, `stop` asks that
+# every EARLIER run carrying that sender be stopped (keeping this one),
+# and the run then parks on a HumanQuery, the way a real assistant would
+# wait before answering. Three events in a row for one sender leave
+# exactly one run alive, the last, and the two it stopped are journaled
+# as cancelled BY that run, with the tag named. A stopped run's form is
+# gone: answering it does nothing, because its wake was erased, not
+# merely ignored.
 #
 # `_should_flow` is the ordering wire: stop only after the tag is on
 # the run (the tag's position is what orders concurrent stops), and ask
@@ -56,51 +47,3 @@ review.sender = start.value
 
 out = Debug
 out.data = review.decisionApproved
-
-purge = TestSseTrigger -> (value: String) {
-  url: "__E2E_FAKE_URL__"
-  event_name: "purge"
-}
-
-purge_all = StopTagged(target: String) {
-  includeSelf: true
-}
-purge_all.target = purge.value
-
-purge_confirm = HumanQuery {
-  _should_flow: purge_all.done
-  title: "Purged"
-  fields: [{
-    "kind": "approve_reject",
-    "key": "ack"
-  }]
-}
-
-purge_out = Debug
-purge_out.data = purge_confirm.ackApproved
-
-abort = TestSseTrigger -> (value: String) {
-  url: "__E2E_FAKE_URL__"
-  event_name: "abort"
-}
-
-abort_claim = TagRun(target: String)
-abort_claim.target = abort.value
-
-abort_all = StopTagged(target: String) {
-  includeSelf: true
-  _should_flow: abort_claim.done
-}
-abort_all.target = abort.value
-
-abort_confirm = HumanQuery {
-  _should_flow: abort_all.done
-  title: "Never shown: this run stopped itself"
-  fields: [{
-    "kind": "approve_reject",
-    "key": "ack"
-  }]
-}
-
-abort_out = Debug
-abort_out.data = abort_confirm.ackApproved

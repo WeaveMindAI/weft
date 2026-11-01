@@ -267,7 +267,9 @@ enum Cmd {
         /// Start the cut at this node, optionally handing it inputs as
         /// node='{"port": value}': a handed port takes that value, and no
         /// wire into it runs. Repeatable; with --seed an unchanged start is
-        /// reused like any other node.
+        /// reused like any other node. Inside a loop's body too: started
+        /// and ended there, the part runs once, inside iteration 0, and
+        /// you hand it what the loop would have.
         #[arg(long, value_name = "node[=json]")]
         from: Vec<String>,
         /// Run only this node and what it needs (repeatable: several
@@ -505,7 +507,8 @@ enum Cmd {
     ///
     /// The run is named by its id or the start of it; the node the way
     /// `weft run --from` takes it (`render`, `one.render`). A node inside
-    /// a loop runs once per iteration and is refused: name the loop.
+    /// a loop runs once per iteration and is refused: name the loop. In a
+    /// run of part of that loop's body it ran once, and is read.
     NodeState { run_id: String, node: String },
     /// Prepare and save trigger settings without listening for events.
     Bake {

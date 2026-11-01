@@ -1,19 +1,11 @@
 {
   "type": "QueueJob",
   "label": "Queue job",
-  "description": "Submit a job to a queue-style paid provider and, optionally, read its answer back. Used by the e2e rig to prove what the cost trail records when a submitted job is never read: money out with no figure, never a zero and never nothing.",
+  "description": "Submit a job to a queue-style paid provider and read its answer back. Used by the e2e rig to prove the cost trail records what the provider stated on the later read.",
   "tags": ["e2e", "metering", "queue"],
   "icon": "ListOrdered",
   "color": "#7c6f9f",
   "inputs": [
-    {
-      "name": "readBack",
-      "type": "Boolean",
-      "widget": { "kind": "checkbox" },
-      "default": false,
-      "label": "Read the answer back",
-      "description": "Off: submit and walk away, so nothing ever states what the job cost."
-    },
     {
       "name": "connection",
       "type": "Access",

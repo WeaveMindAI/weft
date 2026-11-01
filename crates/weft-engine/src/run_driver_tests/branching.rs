@@ -452,7 +452,9 @@
 
     /// An ENTRY node (no incoming edges, dispatched through the kick
     /// path) still answers to `_should_flow: false` written in its
-    /// braces: the run skips it instead of running it anyway.
+    /// braces: the run skips it instead of running it anyway, as its
+    /// author's decision, and the node reading it is skipped as the
+    /// consequence (its input can never come), so the two read apart.
     #[tokio::test]
     async fn a_false_guard_literal_turns_off_an_entry_node() {
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
@@ -469,21 +471,194 @@
                 "features": {}, "scope": [], "groupBoundary": null,
                 "requiresInfra": false, "images": [],
                 "portLiterals": { SHOULD_FLOW_PORT: false }
+            }, {
+                "id": "after", "nodeType": "Behind", "label": null,
+                "config": null, "position": { "x": 0.0, "y": 0.0 },
+                "inputs": [{ "name": "value", "portType": "String", "required": true }],
+                "outputs": [{ "name": "value", "portType": "String", "required": false }],
+                "features": {}, "scope": [], "groupBoundary": null,
+                "requiresInfra": false, "images": []
             }],
-            "edges": [],
+            "edges": [{ "id": "e1", "source": "solo", "target": "after", "sourceHandle": "value", "targetHandle": "value" }],
             "groups": []
         }))
         .expect("solo project");
-        let cat = catalog(vec![("Solo", Box::new(Echo { id: "solo", ran: ran.clone() }))]);
+        let cat = catalog(vec![
+            ("Solo", Box::new(Echo { id: "solo", ran: ran.clone() })),
+            ("Behind", Box::new(Echo { id: "after", ran: ran.clone() })),
+        ]);
         let (outcome, events) = drive(project, cat, &["solo"]).await;
 
         assert!(
             ran.lock().unwrap().is_empty(),
-            "the turned-off entry node must not run: {:?}",
+            "neither the turned-off entry node nor its reader may run: {:?}",
             ran.lock().unwrap()
         );
         assert_eq!(skip_reason(&events, "solo"), Some(SkipReason::DidNotFlow));
+        assert_eq!(
+            skip_reason(&events, "after"),
+            Some(SkipReason::RequiredInputClosed { port: "value".into(), failure: None }),
+            "the reader is a consequence, not a decision"
+        );
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
+    }
+
+    /// The birth of `run_id` running all of `project`, kicked at `kick`.
+    fn birth_of(project: &ProjectDefinition, run_id: RunId, kick: &str) -> Vec<RunEvent> {
+        vec![
+            RunEvent::RunStarted { given: Default::default(),
+                run_id, project_id: project.id, entry_node: kick.into(),
+                phase: weft_core::context::Phase::Fire,
+                definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),
+                cut_from: None, binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
+                seed: None, instance: None, fired_trigger: None, stand_in: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                settings: Default::default(),
+            },
+            RunEvent::NodeKicked { run_id, node_id: kick.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
+        ]
+    }
+
+    /// Emits `value`, then waits for a person; once answered it sends
+    /// the answer on.
+    struct Asks;
+    test_manifest!(Asks, "Asks");
+    #[async_trait]
+    impl Node for Asks {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let answer = ctx
+                .await_signal(weft_core::signal::Form {
+                    form_type: "human_query".into(),
+                    schema: weft_core::signal::FormSchema { fields: Vec::new() },
+                    title: None,
+                    description: None,
+                    consumer_kind: None,
+                })
+                .await?;
+            ctx.pulse_downstream(NodeOutput::new().set("value", json!(answer.to_string()))).await
+        }
+    }
+
+    /// A question a person skips skips the node that asked it, with that
+    /// reason, and the node reading its answer is skipped in turn; the
+    /// run completes. The run parks on the question, the skip lands on
+    /// its record, and the next drive of the run carries it on from there.
+    #[tokio::test]
+    async fn a_skipped_question_skips_its_node_and_the_run_completes() {
+        use super::engine_test_rig::{clients, drive_on, AwaitTasks, MemJournal};
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let mut project = guarded_project();
+        project.nodes.iter_mut().find(|node| node.id == "guarded").expect("guarded").node_type = "Asks".into();
+        project.edges.retain(|edge| edge.target_handle.as_deref() != Some(SHOULD_FLOW_PORT));
+        let project = Arc::new(project);
+        let nodes = catalog(vec![
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
+            ("Asks", Box::new(Asks)),
+            ("Behind", Box::new(Echo { id: "behind", ran: ran.clone() })),
+        ]);
+        let run_id = weft_core::new_run_id();
+        let journal = Arc::new(MemJournal::default());
+        journal.seed(&birth_of(&project, run_id, "source"));
+        let tasks = AwaitTasks::new();
+        let with_tasks = || EngineClients { tasks: tasks.clone(), ..clients(journal.clone()) };
+
+        let parked = drive_on(project.clone(), nodes.clone(), run_id, journal.clone(), with_tasks(), CancellationFlag::new_arc(), None)
+            .await
+            .expect("the first drive runs")
+            .outcome;
+        assert!(matches!(parked, RunOutcome::Stalled), "the run parks on its question: {parked:?}");
+
+        let token = tasks.minted().expect("the question was registered");
+        journal.seed(&[RunEvent::wait_answered(run_id, token, weft_core::primitive::WaitAnswer::Skipped, 1)]);
+        let ended = drive_on(project, nodes, run_id, journal.clone(), with_tasks(), CancellationFlag::new_arc(), None)
+            .await
+            .expect("the second drive runs")
+            .outcome;
+        assert!(matches!(ended, RunOutcome::Completed), "a skipped question is not a failure: {ended:?}");
+
+        let events = journal.events_of(run_id);
+        assert_eq!(skip_reason(&events, "guarded"), Some(SkipReason::WaitSkipped), "{events:?}");
+        assert_eq!(
+            skip_reason(&events, "behind"),
+            Some(SkipReason::RequiredInputClosed { port: "value".into(), failure: None }),
+            "the reader of the answer never gets one"
+        );
+        assert!(ran.lock().unwrap().is_empty(), "nothing behind the question ran: {:?}", ran.lock().unwrap());
+    }
+
+    /// Stops every run tagged `everyone`, its own run included, then
+    /// sends on.
+    struct StopsEveryone;
+    test_manifest!(StopsEveryone, "StopsEveryone");
+    #[async_trait]
+    impl Node for StopsEveryone {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            ctx.stop_tagged("everyone", weft_core::StopSelf::Include).await?;
+            ctx.pulse_downstream(NodeOutput::new().set("value", json!("went on"))).await
+        }
+    }
+
+    /// The broker's side of a stop by tag that takes the asker too: it
+    /// answers that the asker is among the runs stopped, and the stop
+    /// reaches the asker's run the way the line brings it, as a cancel of
+    /// its flag naming who asked and with which tag.
+    struct StopsTheAsker {
+        flag: Arc<CancellationFlag>,
+        asked: StdMutex<Vec<(RunId, String)>>,
+    }
+    #[async_trait]
+    impl crate::context::RunSteeringClient for StopsTheAsker {
+        async fn tag_run(&self, _: RunId, _: Vec<String>) -> anyhow::Result<()> {
+            unreachable!("the run tags nothing")
+        }
+        async fn stop_tagged(&self, run_id: RunId, tag: String, stop_self: weft_core::StopSelf) -> anyhow::Result<bool> {
+            assert_eq!(stop_self, weft_core::StopSelf::Include);
+            self.asked.lock().unwrap().push((run_id, tag.clone()));
+            self.flag.cancel_because(weft_core::run::CancelCause::Run { by: run_id, tag: Some(tag) });
+            Ok(true)
+        }
+    }
+
+    /// A run that stops every run carrying a tag, itself included, stops
+    /// where it asked: it ends cancelled by its own stop, the node that
+    /// asked sends nothing on, and nothing after it starts.
+    #[tokio::test]
+    async fn a_run_that_stops_itself_by_tag_starts_nothing_after_the_stop() {
+        use super::engine_test_rig::{clients, drive_on, MemJournal};
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let mut project = guarded_project();
+        project.nodes.iter_mut().find(|node| node.id == "guarded").expect("guarded").node_type = "StopsEveryone".into();
+        project.edges.retain(|edge| edge.target_handle.as_deref() != Some(SHOULD_FLOW_PORT));
+        let nodes = catalog(vec![
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
+            ("StopsEveryone", Box::new(StopsEveryone)),
+            ("Behind", Box::new(Echo { id: "behind", ran: ran.clone() })),
+        ]);
+        let run_id = weft_core::new_run_id();
+        let journal = Arc::new(MemJournal::default());
+        journal.seed(&birth_of(&project, run_id, "source"));
+        let flag = CancellationFlag::new_arc();
+        let steering = Arc::new(StopsTheAsker { flag: flag.clone(), asked: Default::default() });
+        let with_steering = EngineClients { steering: steering.clone(), ..clients(journal.clone()) };
+
+        let outcome = drive_on(Arc::new(project), nodes, run_id, journal.clone(), with_steering, flag, None)
+            .await
+            .expect("the drive runs")
+            .outcome;
+        assert!(
+            matches!(&outcome, RunOutcome::Cancelled { cause: weft_core::run::CancelCause::Run { by, tag: Some(tag) } } if *by == run_id && tag == "everyone"),
+            "the run is stopped by its own stop: {outcome:?}"
+        );
+        assert_eq!(*steering.asked.lock().unwrap(), vec![(run_id, "everyone".to_string())]);
+        let events = journal.events_of(run_id);
+        assert!(ran.lock().unwrap().is_empty(), "nothing after the stop ran: {:?}", ran.lock().unwrap());
+        assert!(
+            !events.iter().any(|event| matches!(event, RunEvent::NodeCompleted { node_id, .. } | RunEvent::NodeStarted { node_id, .. } if node_id == "behind")),
+            "nothing after the stop starts: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(event, RunEvent::PortEmitted { node_id, .. } if node_id == "guarded")),
+            "the asker sends nothing on: {events:?}"
+        );
     }
 
     /// A run of a cut (a trigger fire's program) stays inside it: a node
@@ -612,6 +787,25 @@
         assert!(!touched(&events, "theirs"), "another program's node must leave no trace: {events:?}");
         // Outside the program the driver was handed: nothing either.
         assert!(!touched(&events, "leaf"), "{events:?}");
+
+        // The fired program's own leaf (it feeds nothing) runs once the
+        // fire's cut holds it, and the other program still leaves no trace.
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let (outcome, events) = drive_fire(
+            two_programs_project(),
+            branch_catalog(Some(json!(true)), &ran),
+            "my_trigger",
+            &["my_trigger", "shared"],
+            Some(&["my_trigger", "shared", "mine", "leaf"]),
+        )
+        .await;
+        assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
+        assert_eq!(ran.lock().unwrap().as_slice(), &["guarded", "behind"], "`mine`, then its leaf");
+        assert!(
+            events.iter().any(|e| matches!(e, RunEvent::NodeCompleted { node_id, .. } if node_id == "leaf")),
+            "the fired program's leaf completes: {events:?}"
+        );
+        assert!(!touched(&events, "theirs"), "{events:?}");
 
         // The same fire run whole: the shared pulse parks on
         // `theirs`, whose other input never comes, and the run is Stuck.

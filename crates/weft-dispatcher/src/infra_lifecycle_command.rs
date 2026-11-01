@@ -674,19 +674,19 @@ pub async fn read_command_outcome(
     }
 }
 
-/// [`read_command_outcome`], held for up to `hold` while the command is
+/// [`read_command_outcome`], held until `deadline` while the command is
 /// still pending: the read ends when the command completes (announced by
-/// its row's own trigger) or the hold runs out. For a client that waits
-/// on one command and asks again after each hold.
+/// its row's own trigger) or the deadline comes (its hold ran out, or the
+/// copy started stopping). For a client that waits on one command and
+/// asks again after each hold.
 pub async fn held_command_outcome(
     pool: &Pool,
     signals: &weft_task_store::pg_signal::PgSignalWatch,
     project_id: uuid::Uuid,
     command_id: i64,
-    hold: std::time::Duration,
+    deadline: weft_task_store::stopping::Deadline,
 ) -> Result<Option<WaitOutcome>> {
     use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL};
-    let deadline = tokio::time::Instant::now() + hold;
     let mut heard = signals.subscribe();
     loop {
         let outcome = read_command_outcome(pool, project_id, command_id).await?;
@@ -694,7 +694,7 @@ pub async fn held_command_outcome(
             return Ok(outcome);
         }
         let woken = heard
-            .woken_before(deadline, |channel, payload| {
+            .woken_before(deadline.clone(), |channel, payload| {
                 channel == INFRA_COMMAND_CHANNEL
                     && InfraCommandSignal::parse(payload) == Some(InfraCommandSignal::Done { id: command_id })
             })

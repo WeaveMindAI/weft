@@ -1,5 +1,0 @@
-# An infra node that asks for a GPU, and reports the one it was given.
-
-gpu = GpuProbe
-out = Debug
-out.data = gpu.gpus

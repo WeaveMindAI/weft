@@ -23,7 +23,7 @@ use weft_task_store::locks::Leased;
 
 use crate::state::DispatcherState;
 
-/// The channel a queued terminate sweep announces on (no payload: the
+/// The channel a run queued for its files' deletion announces on (no payload: the
 /// reaper reads the whole queue), from the `storage_sweep_notify_on_insert`
 /// trigger in `storage::GROUP`.
 pub const STORAGE_SWEEP_CHANNEL: &str = "weft_storage_sweep";
@@ -62,13 +62,12 @@ pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
         woken(state, ON_PARKED_FIRE, crate::parked_drain::PARKED_FIRES, "hand queued trigger events to their runs", |s| async move {
             crate::parked_drain::drain_due(&s).await
         }),
-        // Storage plane: the durable terminate sweep (un-kept run files of
-        // a terminated run). The queue deletes a run's row only after
-        // the broker confirms the sweep; a broker that keeps failing fails
-        // the pass, and the next run ending queued for a sweep tries every
-        // row again. The kept-file expiry sweep is the broker's own loop
-        // (it owns the bucket + metadata).
-        woken(state, ON_STORAGE_SWEEP, "storage_sweep", "clear the files of ended runs", crate::storage::process_sweep_queue),
+        // Storage plane: the files of the runs whose record went. The
+        // queue deletes a run's row only after the broker confirms the
+        // files are gone; a broker that keeps failing fails the pass, and
+        // the next run erased tries every row again. The deadline sweep is
+        // the broker's own loop (it owns the bucket + metadata).
+        woken(state, ON_STORAGE_SWEEP, "storage_sweep", "delete the files of erased runs", crate::storage::process_sweep_queue),
         // A door's window ending: its triggers stop listening and taking
         // work. Sleeps until the next one ends.
         woken(state, ON_DOOR_WINDOW, DOOR_WINDOWS, DOOR_WINDOWS_LABEL, close_door_windows),

@@ -109,9 +109,67 @@ fn a_cut_from_one_call_to_the_next_holds_the_path_between_them() {
         assert!(grouped.runs.contains(&place), "{place} in {:?}", grouped.runs);
     }
     assert!(!grouped.runs.iter().any(|p| p.id == "src" || p.id == "out" || p.path == ["two"]));
-    // The site inside the loop is cut with the loop.
+    // Up to a node of the call inside the loop: it reads what the loop
+    // hands its body, so the run reaches the loop's start and not its end.
     let err = walk(&project, SelectionBounds { target: vec!["outer.call.strip".into()], ..Default::default() }).unwrap_err();
-    assert!(err.contains("inside loop 'outer'"), "{err}");
+    assert!(err.contains("loop 'outer''s start but not its end"), "{err}");
+    // Started inside that call, the run sits in the loop's iteration 0,
+    // one call deeper.
+    let inside = walk(&project, SelectionBounds { from: vec!["outer.call.strip".into()], target: vec!["outer.call.loud".into()], ..Default::default() }).unwrap();
+    let program = cut::cut(&project, &inside, &mut Default::default()).expect("a cut");
+    let index = ProgramIndex::build(&program);
+    assert_eq!(index.frames_at(&program, &at("@lib:clean.strip", &["outer.call"])), vec![Frame::Loop { index: 0 }, Frame::Call { site: "outer.call".into() }]);
     let whole = weft_core::project::places::every_place(&project);
     assert!(whole.contains(&at("@lib:clean.each.mark", &["outer.call"])) && whole.contains(&at("@lib:clean.each.mark", &["one"])));
+}
+
+/// The loop `each` in the included file is one loop under both sites.
+/// Part of its body under one site runs inside its iteration 0; a run that
+/// also holds all of it under the other site is refused, naming both.
+#[test]
+fn an_included_loop_runs_whole_or_in_part_in_one_run_not_both() {
+    let project = compiled();
+    let part = walk(&project, SelectionBounds { from: vec!["two.each.mark".into()], target: vec!["two.each.mark".into()], ..Default::default() }).unwrap();
+    let program = cut::cut(&project, &part, &mut Default::default()).expect("a cut");
+    let index = ProgramIndex::build(&program);
+    assert_eq!(index.frames_at(&program, &at("@lib:clean.each.mark", &["two"])), vec![Frame::Call { site: "two".into() }, Frame::Loop { index: 0 }]);
+    let err = walk(&project, SelectionBounds {
+        from: vec!["one.letters".into(), "two.each.mark".into()],
+        target: vec!["one.tally".into(), "two.each.mark".into()],
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(err.contains("all of loop 'one.each'") && err.contains("part of the body of loop 'two.each'"), "{err}");
+}
+
+/// A cut started inside an included file, frozen as an example, keeps its
+/// start spelled through the site (`one.strip`, not the file's own id) and
+/// its review focus the same way, reads back from the file it was written
+/// to, and runs the same cut again with the frozen value handed to that one
+/// call's node: nothing before the start, nothing past the target.
+#[test]
+fn a_frozen_cut_inside_a_call_reads_back_and_runs_that_call_again() {
+    use weft_core::run_spec::{resolve_spec, Expected, FrozenFrom, RunSpec};
+    let project = compiled();
+    let frozen = RunSpec {
+        from: [("one.strip".to_string(), [("text".to_string(), serde_json::json!(" frozen "))].into())].into(),
+        target: vec!["two.strip".into()],
+        frozen_from: Some(FrozenFrom { version: "v".into(), run_id: uuid::Uuid::nil(), definition_hash: "h".into() }),
+        expected: Some(Expected { focus: vec!["two.strip".into()], ..Default::default() }),
+        ..RunSpec::whole("inner")
+    };
+    let text = frozen.file_text().unwrap();
+    let file: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(file["from"]["one.strip"]["text"], serde_json::json!(" frozen "), "{text}");
+    assert_eq!(file["expected"]["focus"], serde_json::json!(["two.strip"]), "{text}");
+
+    let replayed = RunSpec::parse_file(&text).unwrap();
+    let resolved = resolve_spec(&replayed, &project, &Default::default()).expect("the frozen spec runs again");
+    let expected: BTreeSet<Located> = [
+        at("@lib:clean.strip", &["one"]), at("@lib:clean.loud", &["one"]), at("@lib:clean.strip", &["two"]),
+    ].into();
+    assert_eq!(resolved.runs, expected, "{:?}", resolved.runs);
+    let handed = resolved.given.inputs.get(&at("@lib:clean.strip", &["one"])).expect("the start is handed its value");
+    assert_eq!(handed.get("text"), Some(&serde_json::json!(" frozen ")));
+    assert!(!resolved.runs.iter().any(|place| place.id == "src" || place.id == "out"), "{:?}", resolved.runs);
 }

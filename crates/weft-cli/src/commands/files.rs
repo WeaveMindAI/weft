@@ -69,10 +69,10 @@ fn space_of(wire_key: &str) -> (String, String) {
     };
     let space = scoped.strip_suffix(&format!("/{}", parsed.id)).unwrap_or(scoped).to_string();
     let label = match parsed.scope {
-        KeyScope::Run { .. } => "one run's files, removed soon after it ends unless kept".to_string(),
-        KeyScope::Project { .. } => "the project's files".to_string(),
-        KeyScope::Instance { instance, .. } => format!("instance {instance}'s files in the project"),
-        KeyScope::Shared { name } => format!("the shared space '{name}'"),
+        KeyScope::Run { .. } => "one run's files, deleted with the run".to_string(),
+        KeyScope::Project { .. } => "the project's files, deleted with the project".to_string(),
+        KeyScope::Instance { instance, .. } => format!("instance {instance}'s files in the project, deleted by hand or with the project"),
+        KeyScope::Shared { name } => format!("the shared space '{name}', deleted by hand"),
         KeyScope::Asset => "assets: the files your projects' @asset references hold, one per content".to_string(),
     };
     (space, label)
@@ -100,9 +100,7 @@ pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
     for ((space, label), entries) in groups {
         println!("{space}/  ({label})");
         for f in entries {
-            let keep = if f.keep { " keep" } else { "" };
-            // Remaining lifetime, not a raw timestamp: a kept file's TTL, or an
-            // ended run's un-kept output in its post-run linger window.
+            // Remaining lifetime, not a raw timestamp: the file's deadline.
             let expiry = match f.expires_at_unix {
                 Some(t) => {
                     let now = std::time::SystemTime::now()
@@ -114,7 +112,7 @@ pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
                 None => String::new(),
             };
             println!(
-                "  {:<40} {:>10}  {}{keep}{expiry}",
+                "  {:<40} {:>10}  {}{expiry}",
                 f.key.rsplit('/').next().unwrap_or(&f.key),
                 fmt_size(f.size_bytes),
                 f.filename,
@@ -476,12 +474,7 @@ pub async fn rm(ctx: Ctx, target: String, yes: bool) -> anyhow::Result<()> {
                 println!("nothing under '{target}' to remove");
                 return Ok(());
             }
-            let kept = victims.iter().filter(|f| f.keep).count();
-            println!(
-                "About to remove the whole space '{target}': {} file(s){}.",
-                victims.len(),
-                if kept > 0 { format!(", {kept} of them KEPT (persisted on purpose)") } else { String::new() }
-            );
+            println!("About to remove the whole space '{target}': {} file(s).", victims.len());
         } else {
             println!("About to remove '{target}'.");
         }
@@ -635,10 +628,16 @@ mod tests {
         let label = |key: &str| space_of(key).1;
         assert_eq!(space("t/run/r1/f0"), "run/r1");
         assert!(label("t/run/r1/f0").starts_with("one run's files"));
-        assert_eq!((space("t/project/p1/f0"), label("t/project/p1/f0")), ("project/p1".into(), "the project's files".into()));
+        assert_eq!(
+            (space("t/project/p1/f0"), label("t/project/p1/f0")),
+            ("project/p1".into(), "the project's files, deleted with the project".into())
+        );
         assert_eq!(space("t/instance/p1/alice/f0"), "instance/p1/alice");
-        assert_eq!(label("t/instance/p1/alice/f0"), "instance alice's files in the project");
-        assert_eq!((space("t/shared/team/f0"), label("t/shared/team/f0")), ("shared/team".into(), "the shared space 'team'".into()));
+        assert_eq!(label("t/instance/p1/alice/f0"), "instance alice's files in the project, deleted by hand or with the project");
+        assert_eq!(
+            (space("t/shared/team/f0"), label("t/shared/team/f0")),
+            ("shared/team".into(), "the shared space 'team', deleted by hand".into())
+        );
         assert_eq!(space(&format!("t/asset/{hash}")), "asset");
         assert!(label(&format!("t/asset/{hash}")).starts_with("assets"));
         assert_eq!(label("t/bogus/x/f0"), "not a key weft makes", "never filed as a shared space");

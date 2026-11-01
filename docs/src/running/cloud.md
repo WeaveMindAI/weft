@@ -256,12 +256,28 @@ does, go and read [updating weft](cli.md#updating-weft).
 This works from an install of any age, however long ago you last ran the
 workflow.
 
-While the workflow rolls the new weft out, a copy of the old one that still
-has something open (the editor following a project, a worker's line to the
-broker) steps aside as soon as Cloud Run sends the requests to the new one: it
-finishes what it was answering, closes what it held open, and stops. The
-editor and the workers open again on the new copies by themselves, so the two never take work side
-by side.
+Once the new weft is rolled out, the workflow deletes the older revisions of
+each of weft's own services (the dispatcher, the broker, the listener and the
+supervisor), and that stops every copy of the old weft still running, even one
+the editor or a worker was holding a connection to. Each finishes what it was
+answering, closes what it held open and gives back the work it was in the
+middle of, all within the 10 seconds Cloud Run gives it, and the editor and the
+workers open again on the new copies by themselves. So the old weft and the new
+one never take work side by side. If a service's new revision is not ready, or
+does not get all of its requests (traffic you pinned or split by hand), that
+step stops with an error naming the service and deletes nothing. The holders
+are not on that list: they run in a worker pool, which moves every one of its
+copies onto its newest revision as soon as that revision is rolled out, so the
+old holders stop by themselves. That holds while the pool sends its copies to
+its latest revision, which is how the install sets it up. If you split its
+copies between revisions by hand, that split stays through every later
+update and the old holders keep running; send every copy to the latest
+revision again with `gcloud run worker-pools update-instance-split weft-holder
+--to-latest --region <your region>`.
+
+If you roll a revision out by hand, outside the workflow, the copies of the
+older revisions keep running until the next run of the workflow deletes them,
+or until you delete them yourself with `gcloud run revisions delete`.
 
 Once in a while, weft's database starts its history over, and a database an
 older weft built cannot come across (it last happened when executions were

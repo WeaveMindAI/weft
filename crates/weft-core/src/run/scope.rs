@@ -25,7 +25,9 @@
 //! A loop is a scope plus iterations: each iteration it launches is a
 //! copy, opened by the launch through the same opening ([`open_iteration`])
 //! and taken down through the same teardown when its `LoopIn` does not
-//! run ([`tear_down_loop`]).
+//! run ([`tear_down_loop`]). A loop a cut holds only part of the body of
+//! is never launched: its iteration 0 is decided like a group's copy, and
+//! opens at once with the copy around it.
 //!
 //! Nothing here is a fact the engine learned from outside: a decision is
 //! a function of the program and of the pulses, so the journal never
@@ -307,6 +309,12 @@ pub fn waiting_copies(program_idx: &ProgramIndex, scopes: &ScopeTable) -> Vec<Sc
 fn verdict(project: &ProjectDefinition, program_idx: &ProgramIndex, given: &Given, copy: &ScopeCopy, run_id: RunId, pulses: &PulseTable) -> Option<ScopeState> {
     let scope = program_idx.scopes().get(&copy.scope)?;
     let group = project.group(&copy.scope)?;
+    // An entered loop's iteration 0 is where the run's part of its body
+    // runs: nothing of the loop's own (its gate, its `LoopIn`) is in the
+    // program to decide it, so it opens with the copy around it.
+    if scope.entered {
+        return Some(ScopeState::Open);
+    }
     // A gate handed a value at a group start is the gate's, as a literal
     // written on it would be (the cut keeps no wire onto it).
     let handed_gate: BTreeMap<String, Value> = given.inputs.get(&Located::at(&copy.scope, &copy.frames)).into_iter().flatten()
@@ -628,7 +636,7 @@ fn send_given(
 ) -> bool {
     let mut sent = false;
     for (place, stand_in) in &given.outputs {
-        let frames = place.frames();
+        let frames = program_idx.frames_at(project, place);
         let location = FiringLocation::new(place.id.clone(), frames.clone());
         if scopes.sent.contains(&Sent::StandIn(location.clone())) { continue; }
         let Some(node) = program_idx.node(project, &place.id) else { continue };

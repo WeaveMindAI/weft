@@ -15,6 +15,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_structure_becomes_its_json_text", structure_to_text),
         NodeTest::fake("an_impossible_value_fails_loud", impossible_value),
         NodeTest::fake("a_stored_file_marker_casts_into_its_kind_and_no_other", file_marker),
+        NodeTest::fake("an_object_casts_into_a_named_type_through_its_body", named_type),
     ]
 }
 
@@ -36,6 +37,24 @@ async fn file_marker(rig: FakeRig) -> WeftResult<()> {
     assert!(err.contains("a stored Blob, not Image"), "{err}");
     let err = rig.run(&CastNode, json!({ "value": { "photo": "cat.png" } })).await.result.expect_err("no marker").to_string();
     assert!(err.contains("__weft_image__") && err.contains("is not one"), "{err}");
+    Ok(())
+}
+
+/// A type a project declares (`Profile`, from a node's `types`) is a
+/// name over a record: an object cast into it is held to that record,
+/// its optional field left absent and its text parsed where the record
+/// wants a number, and one that does not fit is refused naming the type
+/// and the field.
+async fn named_type(rig: FakeRig) -> WeftResult<()> {
+    let profile = WeftType::Named {
+        name: "Profile".into(),
+        body: Box::new(WeftType::parse("{ name: String, age: Number, nickname?: String }").expect("the record parses")),
+    };
+    rig.output_type("value", profile);
+    let outcome = rig.run(&CastNode, json!({ "value": { "name": "Ada", "age": "36" } })).await.ok()?;
+    assert_eq!(outcome.outputs["value"], json!({ "name": "Ada", "age": 36.0 }));
+    let err = rig.run(&CastNode, json!({ "value": { "age": 36 } })).await.failure()?;
+    assert!(err.contains("not a valid Profile") && err.contains("'name'"), "{err}");
     Ok(())
 }
 

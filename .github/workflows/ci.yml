@@ -175,6 +175,9 @@ jobs:
       # What the install workflow's targeted applies add for every
       # `moved` block, read from the files above.
       - run: scripts/terraform-moved-targets.test.sh
+      # Which revisions of the roles the install workflow deletes after
+      # its apply, with a fake gcloud.
+      - run: scripts/delete-old-role-revisions.test.sh
       # Where a deploy finds its CLI: the install, then weft's release,
       # then a build, with a fake web standing in for both.
       - run: scripts/release-cli.test.sh
@@ -297,6 +300,14 @@ jobs:
       # The container's pure parts, on the standard library alone.
       - run: python3 catalog/postgres/database/images/credential/test_bootstrap.py
 
+  computer-container:
+    name: Computer container tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The container's tools, its screen ones faked, on the standard library alone.
+      - run: python3 catalog/computer/computer/images/computer/test_computer.py
+
   # The Tangle plugins and hooks that decide what a specialist may run:
   # Kilo Code's and OpenCode's tests are TypeScript run straight by
   # `node`, which strips the types itself from Node 22.18 on, and Claude
@@ -338,7 +349,7 @@ jobs:
   # The name the main ruleset requires (see the `rust` job).
   editor:
     name: graph + editor
-    needs: [graph, connect, syntax, vscode, bridge, postgres-credential, tangle, browser]
+    needs: [graph, connect, syntax, vscode, bridge, postgres-credential, computer-container, tangle, browser]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     env:

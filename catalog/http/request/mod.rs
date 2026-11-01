@@ -9,7 +9,7 @@ use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use reqwest::Method;
 use serde_json::Value;
 
-use weft::storage::{self, diff::is_text_mime, KeepTtl, StorageScope};
+use weft::storage::{self, diff::is_text_mime, StorageScope};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, StorageHandle, WeftError, WeftResult, WeftType};
 use weft::node::NodeOutput;
 
@@ -95,7 +95,7 @@ impl Node for HttpRequestNode {
             Some(ct) if !is_text_mime(&ct) => {
                 let mime = storage::normalize_content_type(Some(&ct));
                 let file = files
-                    .put_stream(storage::response_stream(resp), &mime, &filename, Some(KeepTtl::Default))
+                    .put_stream(storage::response_stream(resp), &mime, &filename, None)
                     .await?;
                 out.set("file", file)
             }
@@ -112,7 +112,7 @@ impl Node for HttpRequestNode {
                     Ok(text) => text_out(&ctx, &files, out, text.to_string(), "text/plain", &filename).await?,
                     Err(_) => {
                         let mime = storage::sniff_mime(&bytes).unwrap_or("application/octet-stream");
-                        out.set("file", files.put(bytes, mime, &filename, Some(KeepTtl::Default)).await?)
+                        out.set("file", files.put(bytes, mime, &filename, None).await?)
                     }
                 }
             }
@@ -158,7 +158,7 @@ async fn text_out(
         }
         return Ok(out);
     }
-    let file = files.put(raw.into_bytes(), mime, filename, Some(KeepTtl::Default)).await?;
+    let file = files.put(raw.into_bytes(), mime, filename, None).await?;
     Ok(out.set("file", file))
 }
 

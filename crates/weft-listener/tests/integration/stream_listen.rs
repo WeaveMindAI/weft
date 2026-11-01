@@ -53,6 +53,13 @@ struct FakePeer {
 }
 
 async fn spawn_peer() -> FakePeer {
+    spawn_peer_gated(tokio::sync::watch::channel(true).1).await
+}
+
+/// [`spawn_peer`], answering the sign-in only once `signed_in` turns
+/// true: until then a dialogue that waits on each answer has nothing
+/// more to send.
+async fn spawn_peer_gated(signed_in: tokio::sync::watch::Receiver<bool>) -> FakePeer {
     let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(16);
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
@@ -67,14 +74,25 @@ async fn spawn_peer() -> FakePeer {
             let mut lines = BufReader::new(read_half).lines();
             let rx = rx.clone();
             let received = received_srv.clone();
+            let mut signed_in = signed_in.clone();
             tokio::spawn(async move {
                 // The peer speaks first, like a real IMAP server.
                 if write.write_all(b"* OK ready\r\n").await.is_err() {
                     return;
                 }
+                // A sign-in read but not yet answered: the peer keeps
+                // reading (and recording) while it holds the answer back.
+                let mut sign_in_held = false;
                 loop {
                     let mut guard = rx.lock().await;
                     tokio::select! {
+                        open = async { signed_in.wait_for(|open| *open).await.is_ok() }, if sign_in_held => {
+                            drop(guard);
+                            sign_in_held = false;
+                            if !open || write.write_all(b"a1 OK signed in\r\n").await.is_err() {
+                                break;
+                            }
+                        }
                         line = guard.recv() => {
                             drop(guard);
                             let Some(line) = line else { break };
@@ -89,8 +107,11 @@ async fn spawn_peer() -> FakePeer {
                                     // Answer the dialogue like the
                                     // protocol would.
                                     let answer = if line.starts_with("a1 LOGIN") {
-                                        Some("a1 OK signed in")
-                                    } else if line == "a2 IDLE" {
+                                        sign_in_held = true;
+                                        None
+                                    } else if line == "a2 SELECT INBOX" {
+                                        Some("a2 OK [READ-WRITE] SELECT completed")
+                                    } else if line.ends_with(" IDLE") {
                                         Some("+ idling")
                                     } else {
                                         None
@@ -121,19 +142,27 @@ async fn spawn_peer() -> FakePeer {
 /// connection's values, and the infra-address route, which knows no
 /// infra and hands every address back unchanged.
 async fn spawn_broker() -> String {
+    spawn_broker_with(json!({ "user": "q@acme.com", "password": "s3cret" })).await
+}
+
+/// [`spawn_broker`], answering `values` as what the connection stores.
+async fn spawn_broker_with(values: Value) -> String {
     use axum::routing::post;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = axum::Router::new().route(
         "/v1/access/listener-resolve",
-        post(|axum::Json(req): axum::Json<Value>| async move {
-            assert_eq!(req["service"], "email");
-            axum::Json(json!({
-                "values": { "user": "q@acme.com", "password": "s3cret" },
-                "auth": [],
-                "events": {},
-                "recipe_values": {}
-            }))
+        post(move |axum::Json(req): axum::Json<Value>| {
+            let values = values.clone();
+            async move {
+                assert_eq!(req["service"], "email");
+                axum::Json(json!({
+                    "values": values,
+                    "auth": [],
+                    "events": {},
+                    "recipe_values": {}
+                }))
+            }
         }),
     )
     // An entry's event goes straight to its project's worker
@@ -274,6 +303,75 @@ async fn run_scenario() {
         2,
         "the non-matching line must not have fired"
     );
+}
+
+/// The mail trigger's own dialogue, as `ReceiveEmail` declares it
+/// (`catalog/email/receive_email/mod.rs`), against an in-process IMAP
+/// server: the address comes from the connection's `imapHost` and
+/// `imapPort`, the sign-in sends the user and password as IMAP quoted
+/// strings, each line waits for the server's answer to the one before
+/// (nothing after the LOGIN goes out until the server says OK), the inbox
+/// is opened and held in IDLE, and only the server's arrival
+/// announcement fires.
+#[tokio::test]
+async fn the_mail_triggers_imap_dialogue_signs_in_opens_the_inbox_and_fires_on_arrival() {
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let (sign_in, signed_in) = tokio::sync::watch::channel(false);
+    let peer = spawn_peer_gated(signed_in).await;
+    let (host, port) = peer.address.rsplit_once(':').unwrap();
+    let broker_base = spawn_broker_with(json!({
+        "user": "q@acme.com", "password": r#"pa"ss w\rd"#, "imapHost": host, "imapPort": port,
+    }))
+    .await;
+    let doors = Arc::new(FakeDoors::default());
+    let state = listener_state(&run_id, broker_base, doors.clone());
+
+    let access = Access::new(uuid::Uuid::new_v4().to_string(), "email", None);
+    let mut kind = StreamListen::new(
+        "{imapHost}:{imapPort}",
+        Framing::Delimiter { bytes: "\r\n".into() },
+        r"^\* \d+ (EXISTS|RECENT)",
+    )
+    .with_access(&access)
+    .step(
+        SocketFrame::Text { body: "a1 LOGIN {user|quoted} {password|quoted}\r\n".into() },
+        "^a1 OK",
+    )
+    .step(SocketFrame::Text { body: "a2 SELECT INBOX\r\n".into() }, "^a2 OK")
+    .step(SocketFrame::Text { body: "a3 IDLE\r\n".into() }, r"^\+")
+    .with_heartbeat(SocketFrame::Text { body: "DONE\r\na9 IDLE\r\n".into() }, 25 * 60);
+    // The in-process server has no certificate.
+    kind.tls = false;
+    let token = format!("sig-{run_id}");
+    let row = json!({
+        "token": token, "tenant_id": "tenant-a", "for_instance": null, "node_id": "recv",
+        "spec_json": serde_json::to_string(&to_spec(kind)).unwrap(), "is_resume": false, "run_id": null,
+        "surface_kind": "internal", "mount_path": null, "mount_methods": [], "auth_kind": "none",
+        "auth_config": null, "kind_state": {}, "kind_state_seq": 1, "holds": true, "serving": null
+    });
+    bring_up(&state, serde_json::from_value(row).unwrap(), weft_core::signal::listener_protocol::StartMode::Restore)
+        .await
+        .expect("registration succeeds");
+
+    wait_until(|| !peer.received.lock().unwrap().is_empty(), "the sign-in").await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        *peer.received.lock().unwrap(),
+        vec![r#"a1 LOGIN "q@acme.com" "pa\"ss w\\rd""#.to_string()],
+        "nothing goes out before the server accepts the sign-in"
+    );
+    sign_in.send(true).unwrap();
+    wait_until(|| peer.received.lock().unwrap().len() >= 3, "the rest of the dialogue").await;
+    assert_eq!(peer.received.lock().unwrap()[1..], ["a2 SELECT INBOX".to_string(), "a3 IDLE".to_string()]);
+    assert!(doors.fired.lock().unwrap().is_empty(), "the dialogue's answers fire nothing");
+
+    peer.downlink.send("* 1 FETCH (FLAGS (\\Seen))".into()).await.unwrap();
+    peer.downlink.send("* 7 EXISTS".into()).await.unwrap();
+    wait_until(|| !doors.fired.lock().unwrap().is_empty(), "the arrival").await;
+    let fires = doors.fired.lock().unwrap();
+    assert_eq!(fires.len(), 1, "only the arrival fired");
+    assert_eq!(fires[0].payload, Value::String("* 7 EXISTS".into()));
+    assert_eq!(fires[0].token, Value::String(token.clone()));
 }
 
 /// A broker whose answer about the connection is that only a reconnect

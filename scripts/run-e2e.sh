@@ -12,7 +12,7 @@
 #
 # What a run does, once: brings this checkout's install to current code
 # (setup.sh, which on a branch is the branch's own install, never main's),
-# removes whatever earlier failed runs kept, builds the test binary, then
+# builds the test binary, removes whatever earlier failed runs kept, then
 # runs the tests one by one, as many at once as -j says, longest first (by
 # how long each took last time) so a slow one never starts last and holds
 # the run open. Each test's output goes to
@@ -176,13 +176,57 @@ logged() { # log cmd...
   "$@" >"$log" 2>&1
 }
 
+# ---------- Build the test binary once ----------
+# Every e2e test is in one binary (tests/e2e/main.rs, one module per file).
+# Then each test runs the binary directly: dozens of `cargo test`s at once
+# would only queue on cargo's build lock. The build is the one
+# `cargo nextest run --workspace` makes (nextest builds through `cargo test
+# --no-run`), so after the unit tests it compiles weft-e2e alone, the one
+# crate the `e2e` feature changes. Anything narrower compiles most of the
+# workspace a second time: `cargo build` uses the dev profile where `cargo
+# test` uses the test one, which changes every build script's dependencies,
+# and selecting only `--test e2e` leaves the other crates' dev-dependencies
+# out, which turns on different features of the crates under them. The
+# same build makes the clean binary below (a package's binaries are built
+# for its integration tests), beside the test binary's `deps/` folder.
+# `--clean` runs no test, so it builds the clean binary alone: the cleanup
+# needs no test of any crate to compile.
+BUILD_OUT="$E2E_DIR/build.log"
+if [ "$CLEAN" -eq 1 ]; then
+  echo "building the clean binary"
+  if ! with_build_slot logged "$BUILD_OUT" cargo build --workspace --features weft-e2e/e2e --bin weft-e2e-clean --message-format json-render-diagnostics; then
+    echo "building the clean binary failed:" >&2
+    tail -60 "$BUILD_OUT" >&2
+    exit 1
+  fi
+  CLEAN_BINARY="$(sed -n 's|.*"executable":"\([^"]*/weft-e2e-clean\)".*|\1|p' "$BUILD_OUT" | tail -1)"
+else
+  echo "building the e2e test binary"
+  if ! with_build_slot logged "$BUILD_OUT" cargo test --workspace --features weft-e2e/e2e --no-run; then
+    echo "building the e2e tests failed:" >&2
+    tail -60 "$BUILD_OUT" >&2
+    exit 1
+  fi
+  # cargo names the binary relative to the workspace root.
+  BINARY="$(sed -n 's|^ *Executable tests/e2e/main\.rs (\(.*\))$|\1|p' "$BUILD_OUT")"
+  case "$BINARY" in
+    "") echo "the e2e build named no test binary; its output is in $BUILD_OUT" >&2; exit 1 ;;
+    /*) ;;
+    *) BINARY="$REPO_ROOT/$BINARY" ;;
+  esac
+  CLEAN_BINARY="$(dirname "$(dirname "$BINARY")")/weft-e2e-clean"
+fi
+if [ ! -x "$CLEAN_BINARY" ]; then
+  echo "the build made no clean binary (looked for '$CLEAN_BINARY'); its output is in $BUILD_OUT" >&2
+  exit 1
+fi
+
 # ---------- What earlier failed runs kept ----------
 # Kept so a failure could be looked at; starting a new run means that is
 # done. Removed before anything new is made, so it never mixes with this
 # run's state.
 echo "removing what earlier failed runs kept"
-if ! with_build_slot logged "$E2E_DIR/clean.log" cargo build -q --workspace --features weft-e2e/e2e --bin weft-e2e-clean \
-  || ! without_machine_locks "$REPO_ROOT/target/debug/weft-e2e-clean" >>"$E2E_DIR/clean.log" 2>&1; then
+if ! without_machine_locks "$CLEAN_BINARY" >"$E2E_DIR/clean.log" 2>&1; then
   echo "removing what earlier runs kept failed; its output is in $E2E_DIR/clean.log" >&2
   exit 1
 fi
@@ -286,29 +330,6 @@ if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ]; then
   export WEFT_E2E_S3_ACCESS_KEY_ID WEFT_E2E_S3_SECRET_ACCESS_KEY
   export WEFT_E2E_S3_BUCKET="$BUCKET"
 fi
-
-# ---------- Build the test binary once ----------
-# Every e2e test is in one binary (tests/e2e/main.rs, one module per file).
-# Then each test runs the binary directly: dozens of `cargo test`s at once
-# would only queue on cargo's build lock. Built with the whole workspace
-# selected (both here and for the clean binary above): a build of
-# weft-e2e alone turns on different features of the crates under it, so
-# cargo would compile a second copy of the workspace instead of reusing
-# the one the unit tests built.
-echo "building the e2e test binary"
-BUILD_OUT="$E2E_DIR/build.log"
-if ! with_build_slot logged "$BUILD_OUT" cargo test --workspace --features weft-e2e/e2e --test e2e --no-run; then
-  echo "building the e2e tests failed:" >&2
-  tail -60 "$BUILD_OUT" >&2
-  exit 1
-fi
-# cargo names the binary relative to the workspace root.
-BINARY="$(sed -n 's|^ *Executable tests/e2e/main\.rs (\(.*\))$|\1|p' "$BUILD_OUT")"
-case "$BINARY" in
-  "") echo "the e2e build named no test binary; its output is in $BUILD_OUT" >&2; exit 1 ;;
-  /*) ;;
-  *) BINARY="$REPO_ROOT/$BINARY" ;;
-esac
 
 # ---------- Which tests ----------
 # Every test, asked of the binary itself, so a new test (or a new

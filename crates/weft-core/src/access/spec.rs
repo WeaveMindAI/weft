@@ -3334,7 +3334,7 @@ mod tests {
 
         // No group at all names every choice.
         let err = capability_shortfall(&caps, filled(&[])).unwrap_err();
-        assert!(err.contains("receive mail") && err.contains("send mail"), "{err}");
+        assert!(err.contains("able to do nothing") && err.contains("receive mail") && err.contains("send mail"), "{err}");
 
         // A service with no groups declared never refuses.
         capability_shortfall(&[], filled(&[])).expect("no rule, no refusal");

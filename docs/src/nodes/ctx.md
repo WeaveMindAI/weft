@@ -26,9 +26,10 @@ on a node with a `Generator` input, because a stream cannot be replayed.
 reading logs. If your body can call it a different number of times on a replay,
 wrap the thing that varies.
 
-**`put` with no keep policy is run-scoped**, and the file is swept shortly
-after the run ends. Right for scratch, wrong for anything a person will open
-later.
+**A file in `StorageScope::Run` goes with its run**, when the run's record is
+deleted (its keep time runs out, `weft clean`, `weft rm`).
+Right for what one run makes, wrong for something a project keeps using: store
+that in `StorageScope::Project`.
 
 **`ctx.stop_tagged` returns when the stop is queued, not when the other runs
 are gone.** Do not write a node whose next step assumes they stopped.
@@ -290,10 +291,11 @@ are running and stop.
 
 ## Storage
 
-`ctx.storage(scope)` gives you a handle. The scope decides where new files go
-and what `list` sees; `get`, `delete`, `keep` and the links act on whatever
-scope the key itself belongs to, so a later node can read a file without
-knowing where it came from.
+`ctx.storage(scope)` gives you a handle. The scope decides where new files go,
+how long they live, and what `list` sees; `get`, `delete`, `keep` and the links
+act on whatever scope the key itself belongs to. Any run of any project in your
+account can read any stored file it holds a reference to, for as long as the
+file exists.
 
 For every scope, go and read [Storage](storage.md).
 
@@ -313,7 +315,7 @@ For every scope, go and read [Storage](storage.md).
 | `get_bytes(&file)` | The whole file in memory. Only for small ones |
 | `delete(&file)` | Deletes it. Stored files only, not URL-backed ones |
 | `list()` | Everything under this scope |
-| `keep(&file, ttl)` | Sets how long the file lives from now on, and saves a run-scoped one from the sweep (that part cannot be undone) |
+| `keep(&file, ttl)` | Sets the file's deadline from now on (`Never` takes it away). It does not move the file, so a run file still goes with its run |
 | `internal_link(&file)` | A `FileLink { url, public }` for code inside the install (a script your node runs), straight to storage |
 | `external_link(&file)` | A `FileLink { url, public }` for anything outside the install. `public: false` means only this machine (or its network) opens it, so an internet service needs the bytes instead |
 | `external_file(&file)` | The external link when it is public, else a `data:` URL of the bytes, with the file's mime type and filename |
@@ -323,7 +325,7 @@ For every scope, go and read [Storage](storage.md).
 | `internalize(&value, &ty, keep)` | The reverse: pulls URLs and inline data into stored files |
 
 `keep` takes `KeepTtl::Default` (30 days, pushed back each time the file is
-read), `Secs { secs }`, or `Never`, in every scope but `Asset`. For what it
+read), `Secs { secs }`, or `Never` (no deadline), in every scope but `Asset`. For what it
 means in each scope, go and read [how long a file lives](storage.md#how-long-a-file-lives).
 
 What comes out of `externalize` is no longer a value of that type, because the
@@ -487,7 +489,7 @@ this run's own project, go through `ctx.own_project()` (for example
 | `wake(node)` / `wake_in(node, &[3])` | `weft wake`: resolves a time wait now, and refuses one that expects a value |
 | `logs(lines)`, `events()...read()` | `weft logs` and `weft events` |
 | `outputs(&[..])`, `detail()` | Everything the run produced, as `weft freeze` reads it, and the run with the waits it is parked on |
-| `node_state(node)` | Where one node of the run stands: `pending`, `running`, `waiting` (with the last answer its wait got), `completed`, `failed` (with the error), `skipped` or `cancelled`. Name the node the way `weft run --from` takes it: `render`, `work.render` inside a group, `one.render` inside the file the site `one` includes. A node inside a loop is refused (name the loop) |
+| `node_state(node)` | Where one node of the run stands: `pending`, `running`, `waiting` (with the last answer its wait got), `completed`, `failed` (with the error), `skipped` or `cancelled`. Name the node the way `weft run --from` takes it: `render`, `work.render` inside a group, `one.render` inside the file the site `one` includes. A node inside a loop is refused (name the loop), except in a run of part of that loop's body, where it ran once |
 | `delete()` | `weft clean <run>`. A run still going is refused, and so is this one |
 
 `ctx.resolve_run("3f2a")` finds the one run whose id starts that way, the way

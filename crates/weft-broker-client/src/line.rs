@@ -140,8 +140,8 @@ pub const DEFAULT_CALL_WAIT: CallWait = CallWait::within(Duration::from_secs(30)
 /// opened; each further failure doubles it, up to [`RECONNECT_LONGEST`].
 const RECONNECT_FIRST: Duration = Duration::from_millis(100);
 
-/// How soon a line whose broker copy steps aside tries again to move to a
-/// current copy, when the last try failed. The line still answers
+/// How soon a line whose broker copy is stopping tries again to move to a
+/// running copy, when the last try failed. The line still answers
 /// meanwhile, turning new calls away to be sent again.
 const MOVE_AGAIN: Duration = Duration::from_secs(1);
 const RECONNECT_LONGEST: Duration = Duration::from_secs(5);
@@ -258,11 +258,11 @@ pub enum Notice {
     /// the install's news, so nothing needs looking at again; only what is
     /// kept on the line may follow again.
     Resumed,
-    /// This copy of the broker is stepping aside for a newer one
-    /// (`server::serve`): the calls running on the line are answered, and
-    /// none more is run on it. The caller replaces the line, which opens
-    /// on a current copy, and closes this one once it owes nothing.
-    SteppingAside,
+    /// This copy of the broker is stopping (`server::serve`): the calls
+    /// running on the line are answered, and none more is run on it. The
+    /// caller replaces the line, which opens on a running copy, and closes
+    /// this one once it owes nothing.
+    Stopping,
 }
 
 /// Frame `head` and `body` for the line.
@@ -712,7 +712,7 @@ impl Line {
     }
 
     /// A line broke, for `why`, with the calls `ids` still out on it:
-    /// told they may have landed, or, when its copy stepped aside and closed
+    /// told they may have landed, or, when its copy was stopping and closed
     /// it after answering every call it ran, that they never ran, which
     /// their callers send again as a busy broker's
     /// (`crate::client::turned_away`).
@@ -769,7 +769,7 @@ impl Line {
                 None => tracing::warn!(target: "weft_broker_client::line", %channel, "the broker pushed a channel this build does not know"),
             },
             // The line it came on is replaced (`serve`).
-            Notice::SteppingAside => {}
+            Notice::Stopping => {}
             Notice::Follow | Notice::Forget { .. } => {
                 tracing::warn!(target: "weft_broker_client::line", ?notice, "the broker sent what only a caller sends")
             }
@@ -782,7 +782,7 @@ impl Line {
 enum Owed {
     /// It broke: each may have landed.
     MayHaveLanded,
-    /// Its copy stepped aside and closed it once nothing ran on it: each
+    /// Its copy was stopping and closed it once nothing ran on it: each
     /// arrived after it took no more call, so none ran.
     NeverRan,
 }
@@ -852,8 +852,8 @@ async fn keep_open(
                         tracing::warn!(target: "weft_broker_client::line", reason = %why, "the line to the broker broke; opening it again");
                         held.broke(&why, Owed::MayHaveLanded);
                     }
-                    Served::SteppedAside { why, retiring } => {
-                        tracing::info!(target: "weft_broker_client::line", reason = %why, "the broker copy on the line stepped aside and closed it; opening it again");
+                    Served::Stopped { why, retiring } => {
+                        tracing::info!(target: "weft_broker_client::line", reason = %why, "the broker copy on the line is stopping and closed it; opening it again");
                         // What a line being replaced still owed went to
                         // another copy, and may have landed there.
                         held.unanswered(&retiring, &why, Owed::MayHaveLanded);
@@ -923,11 +923,11 @@ fn turned_away_busy(e: &anyhow::Error) -> bool {
 enum Served {
     /// It broke, for this reason; it is opened again.
     Broke(String),
-    /// Its copy stepped aside and closed it, for `why`, after answering
+    /// Its copy was stopping and closed it, for `why`, after answering
     /// every call it ran: it is opened again, and the calls written on it
     /// and not answered never ran ([`Owed::NeverRan`]); those a line it was
     /// replacing still owed (`retiring`) went to another copy.
-    SteppedAside { why: String, retiring: std::collections::HashSet<u64> },
+    Stopped { why: String, retiring: std::collections::HashSet<u64> },
     /// It had nothing to do for [`LINE_IDLE`] and closed; it opens again
     /// when something is asked of it.
     Idle,
@@ -983,9 +983,9 @@ struct Joining {
     stream: Stream,
     opened: tokio::time::Instant,
     done: oneshot::Sender<Result<(), String>>,
-    /// Its copy said it steps aside before following: once it serves,
+    /// Its copy said it is stopping before following: once it serves,
     /// it is replaced in turn.
-    stepping_aside: bool,
+    stopping: bool,
 }
 
 /// A replaced line, read until the calls written on it (`owed`) are
@@ -996,9 +996,9 @@ struct Retiring {
     stream: Stream,
     owed: std::collections::HashSet<u64>,
     closing: bool,
-    /// Its copy said it steps aside: closed by the broker, what it still
+    /// Its copy said it is stopping: closed by the broker, what it still
     /// owes never ran.
-    stepping_aside: bool,
+    stopping: bool,
     /// Waiters were told to look again when the new line followed: that
     /// look already covers any gap the old broker could still recheck for,
     /// so a recheck it sends is not passed on.
@@ -1045,11 +1045,11 @@ async fn serve(
     let mut opening: Option<Opening<'_>> = None;
     let mut joining: Option<Joining> = None;
     let mut retiring: Option<Retiring> = None;
-    // The open line's copy said it steps aside: the line is replaced by
-    // one on a current copy as soon as no replacement is under way, so no
+    // The open line's copy said it is stopping: the line is replaced by
+    // one on a running copy as soon as no replacement is under way, so no
     // call waits out the ones still running on it, and again if that
     // replacement fails (no sooner than [`MOVE_AGAIN`] after the last).
-    let mut stepping_aside = false;
+    let mut stopping = false;
     let mut moved_at: Option<tokio::time::Instant> = None;
     loop {
         let pong_deadline = pong_due.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
@@ -1088,7 +1088,7 @@ async fn serve(
                     Ok(socket) => {
                         let (mut new_sink, new_stream) = socket.split();
                         match write(&mut new_sink, follow(), "asking to follow").await {
-                            Ok(()) => joining = Some(Joining { sink: new_sink, stream: new_stream, opened: at, done, stepping_aside: false }),
+                            Ok(()) => joining = Some(Joining { sink: new_sink, stream: new_stream, opened: at, done, stopping: false }),
                             Err(why) => drop(done.send(Err(why))),
                         }
                     }
@@ -1111,15 +1111,15 @@ async fn serve(
                             opened = new.opened;
                             pong_due = None;
                             let rechecked = line.followed_instead(listening, max_age_secs, opened);
-                            retiring = Some(Retiring { sink: old_sink, stream: old_stream, owed, closing: false, stepping_aside, rechecked });
-                            stepping_aside = new.stepping_aside;
+                            retiring = Some(Retiring { sink: old_sink, stream: old_stream, owed, closing: false, stopping, rechecked });
+                            stopping = new.stopping;
                             let _ = new.done.send(Ok(()));
                             None
                         }
-                        // A copy that stepped aside already says so before
-                        // it follows: the line it opens is replaced in turn.
-                        Ok(Notice::SteppingAside) => {
-                            new.stepping_aside = true;
+                        // A copy already stopping says so before it
+                        // follows: the line it opens is replaced in turn.
+                        Ok(Notice::Stopping) => {
+                            new.stopping = true;
                             None
                         }
                         // The broker says nothing else before it follows.
@@ -1170,10 +1170,10 @@ async fn serve(
                     None => Some("the broker closed the replaced line".into()),
                 };
                 if let Some(why) = broke {
-                    // A copy that stepped aside closes the line once it ran
+                    // A stopping copy closes the line once it ran
                     // everything it took: what it still owes never ran.
                     // Anything else that ends it may have landed.
-                    let owed = match closed_by_broker && old.stepping_aside {
+                    let owed = match closed_by_broker && old.stopping {
                         true => Owed::NeverRan,
                         false => Owed::MayHaveLanded,
                     };
@@ -1205,9 +1205,9 @@ async fn serve(
                     Some(Err(e)) => Err(format!("reading: {e}")),
                     Some(Ok(Message::Binary(bytes))) => read_answer(line, &bytes),
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<Notice>(&text) {
-                        // Its copy steps aside: the line is replaced (below).
-                        Ok(Notice::SteppingAside) => {
-                            stepping_aside = true;
+                        // Its copy is stopping: the line is replaced (below).
+                        Ok(Notice::Stopping) => {
+                            stopping = true;
                             Ok(())
                         }
                         Ok(notice) => {
@@ -1216,11 +1216,11 @@ async fn serve(
                         }
                         Err(e) => Err(format!("a notice that does not read ({text}): {e}")),
                     },
-                    // A copy that stepped aside closes the line once it ran
+                    // A stopping copy closes the line once it ran
                     // everything it took.
-                    Some(Ok(Message::Close(frame))) if stepping_aside => {
-                        let why = format!("the broker copy stepped aside and closed the line ({frame:?})");
-                        return Served::SteppedAside { why, retiring: retiring.map(|old| old.owed).unwrap_or_default() };
+                    Some(Ok(Message::Close(frame))) if stopping => {
+                        let why = format!("the broker copy is stopping and closed the line ({frame:?})");
+                        return Served::Stopped { why, retiring: retiring.map(|old| old.owed).unwrap_or_default() };
                     }
                     Some(Ok(Message::Close(frame))) => Err(format!("the broker closed the line ({frame:?})")),
                     Some(Ok(Message::Ping(payload))) => write(&mut sink, Message::Pong(payload), "answering a ping").await,
@@ -1249,7 +1249,7 @@ async fn serve(
         // Nobody waits for this replacement's answer: it serves the line
         // itself.
         let replacing = opening.is_some() || joining.is_some() || retiring.is_some();
-        if stepping_aside && !replacing && moved_at.is_none_or(|at| at.elapsed() >= MOVE_AGAIN) {
+        if stopping && !replacing && moved_at.is_none_or(|at| at.elapsed() >= MOVE_AGAIN) {
             moved_at = Some(tokio::time::Instant::now());
             opening = Some((reopening(opens), tokio::time::Instant::now(), oneshot::channel().0));
         }
@@ -1647,7 +1647,7 @@ mod tests {
             Notice::Lost,
             Notice::Recheck { listening: false },
             Notice::Resumed,
-            Notice::SteppingAside,
+            Notice::Stopping,
         ] {
             let text = serde_json::to_string(&notice).unwrap();
             assert_eq!(serde_json::from_str::<Notice>(&text).unwrap(), notice);
@@ -1698,19 +1698,19 @@ pub mod server {
     /// `api` with the line beside it, pushing no notices: a fake broker's
     /// routes, reachable by the clients that speak only the line.
     pub fn with_line(api: Router) -> Router {
-        with_line_stepping_aside(api, weft_task_store::aside::StepAside::new())
+        with_line_stopping(api, weft_task_store::stopping::Stopping::new())
     }
 
-    /// [`with_line`] for a fake broker copy that steps aside when `aside`
+    /// [`with_line`] for a fake broker copy that stops when `stopping`
     /// says so ([`serve`]).
-    pub fn with_line_stepping_aside(api: Router, aside: weft_task_store::aside::StepAside) -> Router {
+    pub fn with_line_stopping(api: Router, stopping: weft_task_store::stopping::Stopping) -> Router {
         let served = api.clone();
         Router::new()
             .route(
                 LINE_PATH,
                 get(move |ws: WebSocketUpgrade| {
-                    let (api, aside) = (served.clone(), aside.clone());
-                    async move { upgrade(ws).on_upgrade(move |socket| serve(socket, api, None, aside)) }
+                    let (api, stopping) = (served.clone(), stopping.clone());
+                    async move { upgrade(ws).on_upgrade(move |socket| serve(socket, api, None, stopping)) }
                 }),
             )
             .merge(api)
@@ -1737,23 +1737,27 @@ pub mod server {
     /// one the line says it follows nothing (`Following { listening: false }`),
     /// so nothing kept on it is ever trusted.
     ///
-    /// Once this copy of the broker steps aside (`aside`,
-    /// `weft_task_store::aside`), it says so on the line
-    /// ([`Notice::SteppingAside`]), and the caller replaces the line with
-    /// one on a current copy, moving its new calls there. This line takes
-    /// no new call: one that arrives anyway (written before the caller
-    /// heard) is answered [`crate::protocol::STEPPING_ASIDE`] with nothing
+    /// Once this copy of the broker is stopping (`stopping`,
+    /// `weft_task_store::stopping`), it says so on the line
+    /// ([`Notice::Stopping`]), and the caller replaces the line with one
+    /// on a running copy, moving its new calls there. This line takes no
+    /// new call: one that arrives anyway (written before the caller heard)
+    /// is answered [`crate::protocol::STOPPING`] with nothing
     /// of it run, which its caller sends again (`crate::client::turned_away`).
-    /// The calls running are answered, and the caller closes the line once
-    /// it owes nothing, so no call it wrote goes unanswered. A caller that
-    /// does not close it (its replacement would not open) has it closed
-    /// once nothing runs and [`weft_task_store::aside::GRACE`] has passed
-    /// since the step aside.
-    pub async fn serve(socket: WebSocket, api: Router, follower: Option<Follower>, aside: weft_task_store::aside::StepAside) {
+    /// The calls running are answered (each counts as work in flight, which
+    /// the stopping process waits for before it exits), and the caller
+    /// closes the line once it owes nothing. A caller that does not close it
+    /// (its replacement would not open) has it closed once nothing runs and
+    /// [`weft_task_store::stopping::GRACE`] has passed since the stop began,
+    /// or sooner when the process exits because nothing runs anywhere.
+    pub async fn serve(socket: WebSocket, api: Router, follower: Option<Follower>, stopping: weft_task_store::stopping::Stopping) {
         let (mut sink, mut stream) = socket.split();
-        let (out, mut outgoing) = mpsc::channel::<Message>(1024);
+        // Each message carries the work in flight it answers, if any, let
+        // go once the message is on the socket: a stopping process waits for
+        // an answer to be sent, not only made.
+        let (out, mut outgoing) = mpsc::channel::<(Message, Option<weft_task_store::stopping::InFlight>)>(1024);
         let writer = tokio::spawn(async move {
-            while let Some(message) = outgoing.recv().await {
+            while let Some((message, _answering)) = outgoing.recv().await {
                 if sink.send(message).await.is_err() {
                     return;
                 }
@@ -1772,30 +1776,31 @@ pub mod server {
         let mut follower = follower;
         // The tasks pushing notices down this line, stopped when it goes.
         let mut following: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        // Once the copy stepped aside: when the line is closed from this
-        // end, if its caller has not closed it by then.
-        let mut stepping_aside: Option<tokio::time::Instant> = None;
+        // Whether the line said its copy is stopping: it is closed from
+        // this end once the grace is over, if its caller has not closed it
+        // by then.
+        let mut said_stopping = false;
         loop {
-            // Biased: once the copy stepped aside, no call read after that
+            // Biased: once the copy is stopping, no call read after that
             // is run, whichever was ready first.
             let message = tokio::select! {
                 biased;
-                () = aside.stepped(), if stepping_aside.is_none() => {
-                    stepping_aside = Some(tokio::time::Instant::now() + weft_task_store::aside::GRACE);
-                    let said = serde_json::to_string(&Notice::SteppingAside).expect("a notice serializes");
-                    let _ = out.send(Message::Text(said.into())).await;
+                () = stopping.begun(), if !said_stopping => {
+                    said_stopping = true;
+                    let said = serde_json::to_string(&Notice::Stopping).expect("a notice serializes");
+                    let _ = out.send((Message::Text(said.into()), None)).await;
                     continue;
                 }
-                Some(_) = running.join_next(), if stepping_aside.is_some() => continue,
-                () = tokio::time::sleep_until(stepping_aside.unwrap_or_else(tokio::time::Instant::now)), if stepping_aside.is_some() && running.is_empty() => break,
+                Some(_) = running.join_next(), if said_stopping => continue,
+                () = stopping.grace_over(), if said_stopping && running.is_empty() => break,
                 message = stream.next() => message,
             };
             let Some(message) = message else { break };
             match message {
-                Ok(Message::Binary(message)) if stepping_aside.is_some() => {
+                Ok(Message::Binary(message)) if said_stopping => {
                     let Ok((head, _)) = unframe::<CallHead>(&message) else { break };
-                    let answer = frame(&AnswerHead { id: head.id, status: 503 }, crate::protocol::STEPPING_ASIDE.as_bytes());
-                    let _ = out.send(Message::Binary(answer.into())).await;
+                    let answer = frame(&AnswerHead { id: head.id, status: 503 }, crate::protocol::STOPPING.as_bytes());
+                    let _ = out.send((Message::Binary(answer.into()), Some(stopping.in_flight()))).await;
                 }
                 Ok(Message::Binary(message)) => {
                     let (head, body_at) = match unframe::<CallHead>(&message) {
@@ -1813,6 +1818,12 @@ pub mod server {
                     let Ok(call) = calls.clone().acquire_owned().await else { break };
                     let Ok(held) = bytes.clone().acquire_many_owned(size).await else { break };
                     let (api, out, ended) = (api.clone(), out.clone(), by_id.clone());
+                    // A running call is work in flight: a stopping copy exits
+                    // once its answer is sent (or the winding down ran out).
+                    // The server's own graceful shutdown does not wait for
+                    // it, an upgraded connection being no longer the
+                    // server's; an idle line holds nothing up.
+                    let counted = stopping.in_flight();
                     while running.try_join_next().is_some() {}
                     let id = head.id;
                     // Spawned under the lock its end takes, so a call that
@@ -1821,7 +1832,7 @@ pub mod server {
                     let handle = running.spawn(async move {
                         let (status, answer) = run(api, &head, message.slice(body_at..)).await;
                         ended.lock().expect("line calls by id").remove(&head.id);
-                        let _ = out.send(Message::Binary(frame(&AnswerHead { id: head.id, status }, &answer).into())).await;
+                        let _ = out.send((Message::Binary(frame(&AnswerHead { id: head.id, status }, &answer).into()), Some(counted))).await;
                         drop((call, held));
                     });
                     ids.insert(id, handle);
@@ -1833,7 +1844,7 @@ pub mod server {
                         following.push(tokio::spawn(async move {
                             while let Some(notice) = heard.recv().await {
                                 let text = serde_json::to_string(&notice).expect("a notice serializes");
-                                if pushed.send(Message::Text(text.into())).await.is_err() {
+                                if pushed.send((Message::Text(text.into()), None)).await.is_err() {
                                     return;
                                 }
                             }
@@ -1857,14 +1868,14 @@ pub mod server {
                     }
                 },
                 Ok(Message::Ping(payload)) => {
-                    let _ = out.send(Message::Pong(payload)).await;
+                    let _ = out.send((Message::Pong(payload), None)).await;
                 }
                 Ok(Message::Close(_)) | Err(_) => break,
                 Ok(_) => {}
             }
         }
-        if stepping_aside.is_some() {
-            let _ = out.send(Message::Close(None)).await;
+        if said_stopping {
+            let _ = out.send((Message::Close(None), None)).await;
         }
         for task in following {
             task.abort();

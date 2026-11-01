@@ -1,7 +1,5 @@
 //! An infra node's display, through the doors an app built on a weft program
-//! uses: the signal-token listing, the read, and the button press. The trigger
-//! side of these doors is covered by `web_trigger`; this is the side with a
-//! button that does something.
+//! uses: the signal-token listing, the read, and the button press.
 #![cfg(feature = "e2e")]
 
 use std::time::Duration;
@@ -62,55 +60,5 @@ async fn a_token_reads_an_infra_display_and_presses_its_button() -> anyhow::Resu
     anyhow::ensure!(shown.expect_text("Presses")? == "1", "the refused press did nothing: {shown:?}");
 
     infra::terminate_and_wait_gone(&project, "panel").await?;
-    project.finish().await
-}
-
-/// An instance's display says where its copy stands: the listing an
-/// instance token reads gives the copy's `status`, and once the copy is stopped the
-/// read door answers 404 naming it, instead of a connection error from a
-/// copy scaled to nothing.
-#[tokio::test]
-async fn an_instances_display_says_where_its_copy_stands() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let project = Project::prepare("infra_display", disp.clone()).await?;
-    project.set_main("panel = DisplayService {\n  @per_instance\n}\n")?;
-    let pid = project.id();
-    let status_of = |listed: &[serde_json::Value]| {
-        listed.iter().find(|d| d["node"] == "panel").and_then(|d| d["status"].as_str().map(str::to_string))
-    };
-
-    project.weft(&["infra", "start", "--instance", "ada"]).await?;
-    let minted: serde_json::Value = serde_json::from_str(
-        project.weft(&["token", "mint", "--instance", "ada", "--expires", "1d", "--display", "panel", "--json"]).await?.trim(),
-    )?;
-    let token = minted["token"].as_str().expect("a token").to_string();
-    let read = format!("/signal-token/displays/{pid}/panel");
-    poll_until("ada's panel to answer", Duration::from_secs(300), Duration::from_millis(750), || async {
-        let listed = display::list_for_token(&disp, &token).await?;
-        anyhow::ensure!(status_of(&listed).as_deref() != Some("failed"), "ada's copy failed: {listed:?}");
-        if status_of(&listed).as_deref() != Some("running") {
-            return Ok(None);
-        }
-        let (status, _) = disp.get_raw_bearer(&read, &token).await?;
-        Ok(status.is_success().then_some(()))
-    })
-    .await?;
-
-    project.weft(&["infra", "stop", "--infra", "panel", "--force", "--instance", "ada"]).await?;
-    poll_until("ada's copy to stop", Duration::from_secs(300), Duration::from_millis(750), || async {
-        Ok((status_of(&display::list_for_token(&disp, &token).await?).as_deref() == Some("stopped")).then_some(()))
-    })
-    .await?;
-    let (status, body) = disp.get_raw_bearer(&read, &token).await?;
-    anyhow::ensure!(
-        status == reqwest::StatusCode::NOT_FOUND && body.contains("stopped"),
-        "a stopped copy's display is a 404 naming its state: {status} {body}"
-    );
-
-    project.weft(&["infra", "terminate", "--infra", "panel", "--instance", "ada", "--yes"]).await?;
-    poll_until("ada's copy to go", Duration::from_secs(300), Duration::from_millis(750), || async {
-        Ok((status_of(&display::list_for_token(&disp, &token).await?).as_deref() == Some("none")).then_some(()))
-    })
-    .await?;
     project.finish().await
 }

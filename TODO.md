@@ -705,3 +705,36 @@ Facts from Google's docs (2026-10): Cloud Run GPUs are GA (L4 24 GB,
 RTX PRO 6000 96 GB, one per copy, a few regions), scale to zero, start in
 about 5 seconds plus model load, stay warm up to 10 minutes idle, and are
 billed per second of a copy's life with a 1 minute minimum.
+
+## Sockets that several devices join by tag
+
+**Problem.** A user's personal-assistant program keeps several devices (a
+Mac, a phone) connected at once, each on its own websocket, and one
+device's message often has to reach another device's open socket. Today
+that is impossible: each connection is its own run, on the worker copy
+that accepted it, and the socket lives only in that worker's memory
+(`crates/weft-engine/src/caller_conn.rs`, `handle_connect`). Two devices
+whose connections land on different worker copies cannot reach each
+other at all.
+
+**Direction that was planned.** A `Socket` takes a session tag; a
+connection carrying a tag that a live run already carries joins that run
+instead of starting one (one atomic claim per connection, keyed by
+project, armed entry, instance and tag). Each `inbound` item says which
+member sent it (`{ from, message }`), and `Reply`/`Stream` take an
+optional `to`. Members on other worker copies reach the session's run
+through the holders, used as a fixed meeting point that worker copies
+dial into and that hands a session over when a holder is overloaded.
+The full plan, re-checked against `main` after wave 2.5, is kept outside
+the repo (`~/.claude/plans/feedback-lane6-socket-sessions.md` on
+Quentin's machine).
+
+**Why deferred.** Quentin is not convinced by the design: it changes the
+shape of every socket program's `inbound`, puts per-session traffic on
+the holders, and adds a link between worker copies and holders with its
+own security. It needs a rethink of the shape before anything is built,
+not a smaller version of this one.
+
+[Update Notice Warning] If we touch `catalog/api/socket/`,
+`crates/weft-engine/src/caller_conn.rs` or the holders
+(`crates/weft-listener/src/hold.rs`), revisit this entry.

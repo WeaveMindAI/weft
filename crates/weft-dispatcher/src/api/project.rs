@@ -1600,19 +1600,7 @@ pub(crate) async fn gather_action_snapshot(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra copies: {e:#}")))?;
     let infra_rows = &observed.rows;
 
-    // Every SHARED infra place the source declares, spelled the way its
-    // row is keyed (a file included twice declares two placements): the
-    // project's infra. An instance's copies are their program's to run;
-    // they count here only when they are orphans, so live infra never
-    // vanishes from view.
-    // SYNC: shared roles <-> packages/weft-graph/src/webview/lib/utils/node-roles.ts projectHasInfra, projectHasTriggers
-    // SYNC: shared roles <-> crates/weft-compiler/src/weft_compiler.rs collect_included_contents
-    let declared = weft_core::project::DeclaredInfra::of(project);
-    let source_infra: std::collections::BTreeSet<String> = weft_core::project::infra_place_spellings(project)
-        .into_keys()
-        .filter(|n| declared.declares(n, false))
-        .collect();
-    let has_infra = !source_infra.is_empty();
+    let InfraStanding { source_infra, has_infra, orphaned_infra, infra_rollup } = infra_standing(project, &observed);
     // The program's own triggers, and the shared infra their setup reads:
     // an instance's triggers read that instance's copies, which have no
     // shared row, and are armed per instance.
@@ -1632,6 +1620,59 @@ pub(crate) async fn gather_action_snapshot(
             .filter(|spelled| source_infra.contains(spelled))
             .collect();
     let trigger_infra_ready = trigger_infra_ready(&shared_trigger_infra, infra_rows);
+    // Infra-op-in-flight fact the rollup can't always see (a claimed
+    // stop still draining; a provisioning run before any row flips).
+    let infra_busy = crate::infra_lifecycle_command::any_in_flight(&state.pg_pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("commands in flight: {e}")))?
+        || infra_setup_in_flight(state, id, Some(None))
+            .await
+            .map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup_in_flight: {e}"))
+            })?;
+    Ok(ActionSnapshot {
+        lifecycle,
+        activations,
+        any_on,
+        any_behind,
+        transition,
+        resync,
+        has_triggers,
+        has_infra,
+        trigger_infra_ready,
+        orphaned_infra,
+        infra_rollup,
+        infra_busy,
+        infra: observed,
+    })
+}
+
+/// Where a project's infra stands, read off its source and its copies.
+struct InfraStanding {
+    /// Every shared infra place the source declares, spelled.
+    source_infra: std::collections::BTreeSet<String>,
+    has_infra: bool,
+    /// A live copy the source does not declare.
+    orphaned_infra: bool,
+    infra_rollup: String,
+}
+
+/// Where the infra of `project` stands, its copies being `observed`.
+fn infra_standing(project: &ProjectDefinition, observed: &crate::infra_node::ObservedCopies) -> InfraStanding {
+    let infra_rows = &observed.rows;
+    // Every SHARED infra place the source declares, spelled the way its
+    // row is keyed (a file included twice declares two placements): the
+    // project's infra. An instance's copies are their program's to run;
+    // they count here only when they are orphans, so live infra never
+    // vanishes from view.
+    // SYNC: shared roles <-> packages/weft-graph/src/webview/lib/utils/node-roles.ts projectHasInfra, projectHasTriggers
+    // SYNC: shared roles <-> crates/weft-compiler/src/weft_compiler.rs collect_included_contents
+    let declared = weft_core::project::DeclaredInfra::of(project);
+    let source_infra: std::collections::BTreeSet<String> = weft_core::project::infra_place_spellings(project)
+        .into_keys()
+        .filter(|n| declared.declares(n, false))
+        .collect();
+    let has_infra = !source_infra.is_empty();
     // Live rows the source does not declare: the user deleted the node
     // from source, or it sits behind a part that does not compile
     // (`DeclaredInfra::gone` tells the two apart, for what takes copies
@@ -1713,32 +1754,7 @@ pub(crate) async fn gather_action_snapshot(
             "partial".to_string()
         }
     };
-
-    // Infra-op-in-flight fact the rollup can't always see (a claimed
-    // stop still draining; a provisioning run before any row flips).
-    let infra_busy = crate::infra_lifecycle_command::any_in_flight(&state.pg_pool, id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("commands in flight: {e}")))?
-        || infra_setup_in_flight(state, id, Some(None))
-            .await
-            .map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup_in_flight: {e}"))
-            })?;
-    Ok(ActionSnapshot {
-        lifecycle,
-        activations,
-        any_on,
-        any_behind,
-        transition,
-        resync,
-        has_triggers,
-        has_infra,
-        trigger_infra_ready,
-        orphaned_infra,
-        infra_rollup,
-        infra_busy,
-        infra: observed,
-    })
+    InfraStanding { source_infra, has_infra, orphaned_infra, infra_rollup }
 }
 
 /// Enforce a verb against the SAME reconciliation the status handler
@@ -3542,8 +3558,13 @@ pub(crate) async fn instances_with_triggers_on(
         .list(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("activations: {e}")))?;
+    Ok(instances_on(&rows))
+}
+
+/// The instances with a trigger on among the activation `rows`.
+fn instances_on(rows: &[crate::activation_store::Activation]) -> Vec<weft_core::instance::InstanceId> {
     let live = rows.iter().filter(|a| a.lifecycle.status == crate::activation_store::ProjectStatus::Active).map(|a| &a.key);
-    Ok(weft_core::activation::owners_of(live).into_iter().filter_map(|owner| owner.instance().cloned()).collect())
+    weft_core::activation::owners_of(live).into_iter().filter_map(|owner| owner.instance().cloned()).collect()
 }
 
 /// Take `keys` down as `take_down` says, as `asker` asked, marked by
@@ -3635,7 +3656,7 @@ pub async fn follow(
     Path((id, task)): Path<(uuid::Uuid, uuid::Uuid)>,
     axum::extract::Query(hold): axum::extract::Query<super::HoldQuery>,
 ) -> Result<Json<weft_core::deactivation::Following>, StatusError> {
-    Ok(Json(project_actions::follow(&state, &operator(caller), id, task, hold.hold()).await?))
+    Ok(Json(project_actions::follow(&state, &operator(caller), id, task, hold.hold(&state.stopping)).await?))
 }
 
 
@@ -4563,10 +4584,31 @@ mod trigger_kick_tests {
         assert_eq!(setup_entry(&p, &program, &kicks), "g.db");
         let (program, _) = setup(&p, trigger_places(&p)).unwrap();
         assert_eq!(sorted(&program), vec!["g.trig"]);
-        p.groups[0].kind = weft_core::project::GroupKind::Loop { loop_config: serde_json::json!({}) };
-        assert!(setup(&p, infra_places(&p)).unwrap_err().contains("inside loop"));
-        assert!(setup(&p, trigger_places(&p)).unwrap_err().contains("inside loop"));
-        assert!(compute_trigger_fire(&p, "g.trig", &Value::Null, None, &Default::default()).unwrap_err().contains("inside loop"));
+    }
+
+    /// A node inside a group feeding both a trigger and the trigger's own
+    /// consumer: the trigger's setup runs the node and the trigger and
+    /// stops there (the consumer reads a fire, and there is none yet),
+    /// while a fire runs the node again beside the trigger, so the
+    /// consumer gets its other input. What is wired to neither stays out
+    /// of both.
+    #[test]
+    fn a_producer_shared_by_a_trigger_and_its_consumer_runs_again_on_fire() {
+        //  g.sched ──► g.tick ──► g.after
+        //     └────────────────────┘
+        //  g.unrelated
+        let p = project_with(
+            &[("g.sched", false, &["g"]), ("g.tick", true, &["g"]), ("g.after", false, &["g"]), ("g.unrelated", false, &["g"])],
+            vec![wire("g.sched", "g.tick", &[]), wire("g.sched", "g.after", &[]), wire("g.tick", "g.after", &[])],
+            vec![group_g(&["g.sched", "g.tick", "g.after", "g.unrelated"])],
+        );
+        let (program, _) = setup(&p, trigger_places(&p)).unwrap();
+        assert_eq!(sorted(&program), vec!["g.sched", "g.tick"], "the setup leaves the consumer out");
+        let TriggerFire { kicks, program, .. } = fire(&p, "g.tick", serde_json::json!({ "scheduledTime": "t" }));
+        assert_eq!(sorted(&program), vec!["g.after", "g.sched", "g.tick"], "the shared producer runs again");
+        // The group starts the producer as it opens (it reads nothing);
+        // the trigger is the one kick, carrying the fire.
+        assert_eq!(ids(&kicks), vec!["g.tick".to_string()]);
     }
 
     #[test]
@@ -4848,6 +4890,22 @@ mod resolve_scope_tests {
         assert_eq!(resolve_against(&p, &all(), &[alice(), bob()]).expect("every instance's trigger").len(), 2);
         let (_, msg) = resolve_against(&p, &all(), &[]).expect_err("no instance known");
         assert!(msg.contains("no instance weft holds anything for yet"), "{msg}");
+    }
+
+    /// A plain resync reaches no instance's trigger: its scope is the
+    /// program's own, which names nothing of a trigger that exists once
+    /// per instance. `--all-instances` reaches the trigger of every
+    /// instance that has one on, and only those.
+    #[test]
+    fn a_resync_reaches_an_instances_trigger_only_with_all_instances() {
+        let p = per_instance_only();
+        let mut bob_down = row("t", Some("bob"));
+        bob_down.lifecycle = crate::activation_store::ActivationLifecycle::refused();
+        let rows = [row("t", Some("alice")), bob_down];
+        assert!(shared().resolve(&p, &instances_on(&rows)).unwrap().is_empty(), "a plain resync names no instance's trigger");
+        let on = instances_on(&rows);
+        assert_eq!(on, vec![alice()], "bob's trigger is down, so bob has nothing to refresh");
+        assert_eq!(all().resolve(&p, &on).unwrap(), vec![weft_core::activation::ActivationKey::new("t", weft_core::instance::Owner::Instance(alice()))]);
     }
 }
 
@@ -5592,6 +5650,26 @@ mod infra_entries_tests {
         let (infra, instances) = infra_entries(&project, &ObservedCopies::default(), &[], &no_hashes());
         assert!(infra.is_empty() && instances.is_empty());
     }
+
+    /// A live copy of an infra node the source no longer declares is an
+    /// orphan: the program has no infra of its own, yet the project says
+    /// it has orphaned infra and counts the copy in its rollup, so the
+    /// infra controls stay for it. Once it is gone, the project has none.
+    #[test]
+    fn a_copy_the_source_no_longer_declares_is_orphaned_infra() {
+        let project = super::infra_kick_and_dep_tests::project(&[("plain", false, false)], &[]);
+        let copies = ObservedCopies { rows: vec![row("svc", None, InfraNodeStatus::Running)], ..ObservedCopies::default() };
+        let standing = super::infra_standing(&project, &copies);
+        assert_eq!((standing.has_infra, standing.orphaned_infra, standing.infra_rollup.as_str()), (false, true, "running"));
+        let stopped = ObservedCopies { rows: vec![row("svc", None, InfraNodeStatus::Stopped)], ..ObservedCopies::default() };
+        assert_eq!(super::infra_standing(&project, &stopped).infra_rollup, "stopped");
+        let standing = super::infra_standing(&project, &ObservedCopies::default());
+        assert_eq!((standing.has_infra, standing.orphaned_infra, standing.infra_rollup.as_str()), (false, false, "none"));
+
+        let declared = super::infra_kick_and_dep_tests::project(&[("svc", false, true)], &[]);
+        let standing = super::infra_standing(&declared, &copies);
+        assert_eq!((standing.has_infra, standing.orphaned_infra, standing.infra_rollup.as_str()), (true, false, "running"), "declared, it is the project's own");
+    }
 }
 
 #[cfg(test)]
@@ -5917,6 +5995,41 @@ mod plan_activation_tests {
         assert!(!prepared(ActivationStep::Preparing));
         assert!(prepared(ActivationStep::SettingUp));
         assert!(prepared(ActivationStep::Arming));
+    }
+}
+
+#[cfg(test)]
+mod project_id_spelling_tests {
+    use axum::extract::{Json, Path, State};
+    use axum::routing::post;
+    use tower::ServiceExt as _;
+
+    /// A project id in the deactivate path reaches the handler as the
+    /// parsed id, never as the text the caller typed, so an id spelled in
+    /// capitals takes down the same project's triggers. The handler's
+    /// `Path<Uuid>` is pinned here (changing it to a string fails to
+    /// compile), and the router's parse of an uppercase spelling is the
+    /// canonical id. A deactivate once matched its runs by the caller's
+    /// text, found none for an uppercase id, and answered that it had
+    /// cancelled a run it never touched.
+    #[tokio::test]
+    async fn an_uppercase_project_id_reaches_deactivate_as_the_same_id() {
+        let _takes_a_parsed_id: fn(
+            State<crate::state::DispatcherState>,
+            crate::authenticator::CallerTenant,
+            Path<uuid::Uuid>,
+            Json<weft_core::deactivation::DeactivateRequest>,
+        ) -> _ = super::deactivate;
+        let echo = |Path(id): Path<uuid::Uuid>| async move { id.to_string() };
+        let app = axum::Router::new().route("/projects/{id}/deactivate", post(echo));
+        let id = uuid::Uuid::new_v4();
+        let request = axum::http::Request::post(format!("/projects/{}/deactivate", id.to_string().to_uppercase()))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let answer = app.oneshot(request).await.unwrap();
+        assert_eq!(answer.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(answer.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), id.to_string());
     }
 }
 

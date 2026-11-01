@@ -1615,8 +1615,8 @@ export class GraphViewController {
   }
 
   /// The STORED runtime files the picker offers: the same listing door
-  /// `weft files` uses (the dispatcher's tenant file list), narrowed to the
-  /// files this project's runs can read (see `storedFilePickerRows`), keys
+  /// `weft files` uses (the dispatcher's tenant file list), less the
+  /// tenant's assets (see `storedFilePickerRows`), keys
   /// handed back TENANT-LESS (the short address a picked ref writes into
   /// source).
   private async runListRuntimeFiles(requestId: number): Promise<void> {
@@ -1632,7 +1632,7 @@ export class GraphViewController {
     }
     try {
       const resp = await this.client.get<{ files: StoredFileRow[] }>('/storage/files');
-      const files = storedFilePickerRows(resp.files ?? [], pid);
+      const files = storedFilePickerRows(resp.files ?? []);
       this.post({ kind: 'runtimeFiles', requestId, files });
     } catch (e) {
       // A failed listing must never render as "this project has no stored

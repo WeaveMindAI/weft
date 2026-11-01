@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -42,11 +42,15 @@ async fn bind_host(what: &str) -> Result<(String, TcpListener)> {
 }
 
 /// Spawn an axum app on a bound listener, returning an abort-on-drop handle.
-/// Shared by the three HTTP-shaped fakes (poll / bytes / sse); the WS fake runs
-/// a custom accept loop and builds its own [`AbortOnDrop`].
+/// Every fake here serves through it.
 fn serve_axum(listener: TcpListener, app: Router) -> AbortOnDrop {
     AbortOnDrop(tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        // A spawned task has no caller to return to: say it in the test's
+        // log, where a fake that went quiet would otherwise look like the
+        // system under test never calling.
+        if let Err(e) = axum::serve(listener, app).await {
+            eprintln!("weft-e2e: a fake server stopped serving: {e}");
+        }
     }))
 }
 
@@ -88,83 +92,6 @@ impl PollFake {
 async fn poll_handler(State(body): State<Arc<Mutex<String>>>) -> impl IntoResponse {
     let b = body.lock().await.clone();
     ([(axum::http::header::CONTENT_TYPE, "application/json")], b)
-}
-
-/// A fake outside job's status address, the shape of a queue provider's
-/// "is it done yet" endpoint: the first `pending` reads answer
-/// `{"status": "IN_PROGRESS"}`, every read after them answers
-/// `{"status": "COMPLETED", "result": <result>}`. Counts the reads, so a
-/// test can see the job was polled until done and not after, and the
-/// calls to its cancel address (`PUT /cancel`), so a test can see a
-/// cancelled run's last call reached it, and how many times.
-pub struct JobFake {
-    base_url: String,
-    reads: Arc<std::sync::atomic::AtomicUsize>,
-    cancels: Arc<std::sync::atomic::AtomicUsize>,
-    _server: AbortOnDrop,
-}
-
-#[derive(Clone)]
-struct JobState {
-    reads: Arc<std::sync::atomic::AtomicUsize>,
-    cancels: Arc<std::sync::atomic::AtomicUsize>,
-    pending: usize,
-    result: Arc<String>,
-}
-
-impl JobFake {
-    /// Bind the fake: `pending` reads say "still running", then the job
-    /// is done with `result`.
-    pub async fn start(pending: usize, result: &str) -> Result<Self> {
-        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let cancels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (base_url, listener) = bind_host("job").await?;
-        let state = JobState { reads: reads.clone(), cancels: cancels.clone(), pending, result: Arc::new(result.to_string()) };
-        let app = Router::new()
-            .route("/status", get(job_status))
-            .route("/cancel", axum::routing::put(job_cancel))
-            .with_state(state);
-        Ok(Self {
-            base_url,
-            reads,
-            cancels,
-            _server: serve_axum(listener, app),
-        })
-    }
-
-    /// The reachable URL of the job's cancel address (`<base>/cancel`).
-    pub fn cancel_url(&self) -> String {
-        format!("{}/cancel", self.base_url)
-    }
-
-    /// How many times the job was asked to cancel so far.
-    pub fn cancels(&self) -> usize {
-        self.cancels.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// The reachable URL of the status address (`<base>/status`).
-    pub fn url(&self) -> String {
-        format!("{}/status", self.base_url)
-    }
-
-    /// How many times the status was read so far.
-    pub fn reads(&self) -> usize {
-        self.reads.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-async fn job_cancel(State(state): State<JobState>) -> impl IntoResponse {
-    state.cancels.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    axum::Json(serde_json::json!({ "status": "CANCELLED" }))
-}
-
-async fn job_status(State(state): State<JobState>) -> impl IntoResponse {
-    let seen = state.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    if seen < state.pending {
-        axum::Json(serde_json::json!({ "status": "IN_PROGRESS" }))
-    } else {
-        axum::Json(serde_json::json!({ "status": "COMPLETED", "result": *state.result }))
-    }
 }
 
 /// A scripted model behind an OpenAI-compatible chat endpoint
@@ -257,84 +184,24 @@ async fn chat_completion(
     .into_response()
 }
 
-/// A fake service that keeps the headers and the JSON body of every
-/// request it gets, at any path, and answers `{"ok": true}`: what a node
-/// sent, as the service saw it.
-pub struct RequestsFake {
-    base_url: String,
-    seen: Arc<Mutex<Vec<SeenRequest>>>,
-    _server: AbortOnDrop,
-}
-
-/// One request a [`RequestsFake`] got: its headers, each name lowercase,
-/// and its body read as JSON (`Null` when it was none).
-#[derive(Debug, Clone)]
-pub struct SeenRequest {
-    pub headers: Vec<(String, String)>,
-    pub body: serde_json::Value,
-}
-
-impl RequestsFake {
-    pub async fn start() -> Result<Self> {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let (base_url, listener) = bind_host("requests").await?;
-        let app = Router::new().fallback(keep_request).with_state(seen.clone());
-        Ok(Self { base_url, seen, _server: serve_axum(listener, app) })
-    }
-
-    pub fn url(&self) -> String {
-        self.base_url.clone()
-    }
-
-    /// Every request received so far, in order.
-    pub async fn seen(&self) -> Vec<SeenRequest> {
-        self.seen.lock().await.clone()
-    }
-}
-
-async fn keep_request(
-    State(seen): State<Arc<Mutex<Vec<SeenRequest>>>>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    let kept = headers
-        .iter()
-        .map(|(name, value)| (name.as_str().to_string(), value.to_str().unwrap_or_default().to_string()))
-        .collect();
-    let body = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-    seen.lock().await.push(SeenRequest { headers: kept, body });
-    axum::Json(serde_json::json!({ "ok": true }))
-}
-
 /// A fake HTTP server that serves fixed bytes at `/bytes`. Used by the storage
 /// fixture: a FetchToStorage node fetches FROM here, so the rig controls the
-/// exact content it can then download back and assert. Reachable like
-/// the other fakes (bound on the host, advertised at the host's address on the network).
+/// exact content it can then download back and assert. Bound on
+/// `127.0.0.1` like the other fakes (see the module docs).
 pub struct BytesFake {
     base_url: String,
-    served: Arc<std::sync::atomic::AtomicUsize>,
     _server: AbortOnDrop,
-}
-
-/// What the bytes handler holds: the body, and a count of the times it
-/// was fetched (a test's proof of WHO fetched, and when).
-#[derive(Clone)]
-struct BytesState {
-    body: Arc<Vec<u8>>,
-    served: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl BytesFake {
     /// Serve `content` (as `application/octet-stream`) at `<url>()`.
     pub async fn start(content: Vec<u8>) -> Result<Self> {
-        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (base_url, listener) = bind_host("bytes").await?;
         let app = Router::new()
             .route("/bytes", get(bytes_handler))
-            .with_state(BytesState { body: Arc::new(content), served: served.clone() });
+            .with_state(Arc::new(content));
         Ok(Self {
             base_url,
-            served,
             _server: serve_axum(listener, app),
         })
     }
@@ -343,21 +210,14 @@ impl BytesFake {
     pub fn url(&self) -> String {
         format!("{}/bytes", self.base_url)
     }
-
-    /// How many times the bytes were fetched so far.
-    pub fn served(&self) -> usize {
-        self.served.load(std::sync::atomic::Ordering::SeqCst)
-    }
 }
 
 /// A fake provider with a QUEUE shape: money is committed when a job is
 /// submitted, and the amount is only stated on a later read.
 ///
 /// The shape every "submit now, pay later" provider has, and the one the
-/// worker's open-charge machinery exists for. The rig owns both ends, so
-/// a test can submit a job and then decide whether its answer is ever
-/// read back: that is the difference between a spend with a figure on it
-/// and a spend the trail has to record as unknown.
+/// worker's open-charge machinery exists for: every read answers the job
+/// finished, with its billed count in [`QUEUE_UNITS_HEADER`].
 pub struct QueueFake {
     base_url: String,
     state: QueueState,
@@ -367,24 +227,16 @@ pub struct QueueFake {
 #[derive(Clone)]
 struct QueueState {
     next_id: Arc<std::sync::atomic::AtomicUsize>,
-    submits: Arc<std::sync::atomic::AtomicUsize>,
     reads: Arc<std::sync::atomic::AtomicUsize>,
-    /// What every read of this fake answers: `Some(units)` states a
-    /// billed count, `None` says "still running", which is how a test
-    /// produces a spend nobody can put a figure on. Set once at
-    /// `start` and never changed, so it needs no lock: it used to be
-    /// behind one for a `finish_with` that no test called.
-    units: Option<u32>,
+    /// The billed count every read of this fake states.
+    units: u32,
 }
 
 impl QueueFake {
-    /// Bind the fake. `units` is what a read reports once the job has
-    /// finished; `None` leaves every read saying "still running", which
-    /// is how a test produces a spend nobody can put a figure on.
-    pub async fn start(units: Option<u32>) -> Result<Self> {
+    /// Bind the fake. `units` is the billed count every read reports.
+    pub async fn start(units: u32) -> Result<Self> {
         let state = QueueState {
             next_id: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-            submits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             units,
         };
@@ -405,16 +257,10 @@ impl QueueFake {
         self.base_url.clone()
     }
 
-    /// How many jobs were submitted (money committed).
-    pub fn submits(&self) -> usize {
-        self.state.submits.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
     /// How many times an answer was read back.
     pub fn reads(&self) -> usize {
         self.state.reads.load(std::sync::atomic::Ordering::SeqCst)
     }
-
 }
 
 /// The header a read states the billed count in, the way a real queue
@@ -426,100 +272,23 @@ impl QueueFake {
 pub const QUEUE_UNITS_HEADER: &str = "x-queue-units";
 
 async fn queue_submit(State(state): State<QueueState>) -> impl IntoResponse {
-    state.submits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let id = state.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     axum::Json(serde_json::json!({ "request_id": format!("job-{id}") }))
 }
 
 async fn queue_result(State(state): State<QueueState>) -> impl IntoResponse {
     state.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    match state.units {
-        Some(units) => (
-            [(QUEUE_UNITS_HEADER, units.to_string())],
-            axum::Json(serde_json::json!({ "status": "COMPLETED" })),
-        )
-            .into_response(),
-        None => axum::Json(serde_json::json!({ "status": "IN_PROGRESS" })).into_response(),
-    }
-}
-
-async fn bytes_handler(State(state): State<BytesState>) -> impl IntoResponse {
-    state.served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     (
-        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-        (*state.body).clone(),
+        [(QUEUE_UNITS_HEADER, state.units.to_string())],
+        axum::Json(serde_json::json!({ "status": "COMPLETED" })),
     )
 }
 
-/// A fake that PROMISES more bytes than it delivers, then breaks the
-/// connection mid-body: it advertises `Content-Length: <declared>` but streams
-/// only `<sent>` bytes before erroring the response body. A client streaming
-/// the body (the worker's fetch-into-storage) sees an incomplete-body transport
-/// error partway through, so a large fetch that has already uploaded one or more
-/// parts is interrupted with work in flight. Used to prove the upload path
-/// cleans up (aborts the in-flight upload, frees the quota reservation) and
-/// leaves NO leftover when a source dies mid-transfer.
-pub struct HangingBytesFake {
-    base_url: String,
-    _server: AbortOnDrop,
-}
-
-/// State for the hanging handler: how many real bytes to emit before erroring,
-/// and the full length to advertise (must exceed `sent`).
-#[derive(Clone)]
-struct HangingState {
-    sent: usize,
-    declared: usize,
-}
-
-impl HangingBytesFake {
-    /// Advertise `declared` bytes but deliver only `sent` before breaking the
-    /// body. `sent` must be < `declared` (otherwise the transfer completes).
-    pub async fn start(sent: usize, declared: usize) -> Result<Self> {
-        if sent >= declared {
-            bail!("HangingBytesFake needs sent ({sent}) < declared ({declared}) to interrupt");
-        }
-        let (base_url, listener) = bind_host("hanging-bytes").await?;
-        let app = Router::new()
-            .route("/bytes", get(hanging_handler))
-            .with_state(HangingState { sent, declared });
-        Ok(Self {
-            base_url,
-            _server: serve_axum(listener, app),
-        })
-    }
-
-    /// The reachable URL of the served (truncated) bytes.
-    pub fn url(&self) -> String {
-        format!("{}/bytes", self.base_url)
-    }
-}
-
-async fn hanging_handler(State(state): State<HangingState>) -> impl IntoResponse {
-    use futures::stream::StreamExt;
-
-    // Emit `sent` bytes in modest chunks, then ONE error item. axum aborts the
-    // body on the error; combined with the oversized Content-Length below, the
-    // client sees an incomplete-body transport error, exactly what a source
-    // that dies mid-transfer looks like.
-    const CHUNK: usize = 64 * 1024;
-    let chunks = state.sent.div_ceil(CHUNK);
-    let data = futures::stream::iter((0..chunks).map(move |i| {
-        let start = i * CHUNK;
-        let end = (start + CHUNK).min(state.sent);
-        Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![(i % 251) as u8; end - start]))
-    }));
-    let broken = futures::stream::once(async {
-        Err::<axum::body::Bytes, std::io::Error>(std::io::Error::other("fake source dropped mid-body"))
-    });
-    let body = axum::body::Body::from_stream(data.chain(broken));
-    axum::response::Response::builder()
-        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
-        // Advertise MORE than we will send, so the early close is an
-        // incomplete-body error on the client, not a clean EOF.
-        .header(axum::http::header::CONTENT_LENGTH, state.declared.to_string())
-        .body(body)
-        .expect("build hanging response")
+async fn bytes_handler(State(body): State<Arc<Vec<u8>>>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        (*body).clone(),
+    )
 }
 
 /// Shared state for the SSE fake: the broadcast sender plus a count of
@@ -645,10 +414,13 @@ impl SseFake {
     ///
     /// Poll `subscriber_count() >= n` (n = the connections the test depends
     /// on) before calling this so the event reaches every reading connection.
-    pub fn push_event(&self, event: &str, data: &str) {
-        // Ignore the "no subscribers yet" error: the test sequences push after
-        // the subscription is live, but a stray early push is harmless to drop.
-        let _ = self.state.tx.send((event.to_string(), data.to_string()));
+    /// Errors when no connection is reading at all: the event would be lost.
+    pub fn push_event(&self, event: &str, data: &str) -> Result<()> {
+        self.state
+            .tx
+            .send((event.to_string(), data.to_string()))
+            .map_err(|_| anyhow::anyhow!("pushed SSE event '{event}' with no connection reading the feed; it was lost"))?;
+        Ok(())
     }
 }
 

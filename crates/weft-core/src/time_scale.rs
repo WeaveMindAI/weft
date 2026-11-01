@@ -12,9 +12,8 @@
 //! install: `weft daemon start` puts it in the runtime's environment (every
 //! role reads it there), and the local worker runner passes it on to each
 //! worker container, because a worker's heartbeat and the dispatcher's
-//! stale check must agree on it. Unset means `1`, real time.
-//! A test cell sets something like `0.05` so a sixty-second scale-down
-//! tick comes round in three seconds.
+//! stale check must agree on it. Unset means `1`, real time; `0.05`
+//! brings a sixty-second scale-down tick round in three seconds.
 //!
 //! Two kinds of duration are never scaled. Durations a PERSON chose (a
 //! project's grace period, a wait node's timeout, a poll interval in a

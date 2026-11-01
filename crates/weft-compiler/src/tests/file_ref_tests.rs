@@ -239,7 +239,6 @@ fn resolve_runtime_key_refs_matches_listing_by_tenant_less_key() {
         mime_type: "image/png".into(),
         size_bytes: 9,
         filename: filename.into(),
-        keep: false,
         expires_at_unix: None,
         keep_ttl_secs: None,
         created_at_unix: 0,

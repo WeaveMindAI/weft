@@ -1,12 +1,10 @@
-//! KeepFile: make a stored run file outlive its run, one of two
-//! ways. `scope: run` flags the file to survive the end-of-run
-//! sweep (additive, no un-keep) and passes the reference through, so
-//! a "create many, keep the good one" pipeline ends by routing the
-//! keeper through this node. `scope: project` copies the file into
-//! the project scope and emits the NEW reference: a run file
-//! is walled to the run that made it, so the copy is the only form a
-//! later run can read. Either way `ttlDays` is how long the kept file
-//! lives once nobody touches it.
+//! KeepFile: make a stored file last longer, one of two ways.
+//! `scope: project` copies the file into the project's files and emits
+//! the NEW reference: a run's file goes when its run's record is deleted,
+//! a project's when the project is. `scope: run` leaves the file where it
+//! is and sets its deadline instead. Either way `ttlDays` is the deadline
+//! (the file is deleted once nobody touched it that long, or with its
+//! owner if that comes first); empty or `0`, it has none.
 
 use async_trait::async_trait;
 
@@ -31,19 +29,15 @@ impl Node for KeepFileNode {
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let file: FileHandle = ctx.inputs.get("file")?;
-        // `ttlDays` has no metadata default on purpose: absent means
-        // the scope's own answer (the storage default for a kept run
-        // file, no expiry for a project copy).
         let ttl_days: Option<u64> = ctx.inputs.opt("ttlDays")?;
+        // No deadline unless `ttlDays` names one: the file then lives as
+        // long as its scope says.
+        let ttl = ttl_days.map_or(KeepTtl::Never, lifetime::ttl_of_days);
         let scope_name: String = ctx.inputs.get("scope")?;
         let output = match lifetime::scope_named(&scope_name)? {
             StorageScope::Run => {
-                // Absent = the storage default (30 days, owned there);
-                // 0 days = never expire; otherwise a fixed-day window
-                // that any access renews. The key carries its own
-                // scope, so the handle's scope here is just the verb's
-                // home.
-                let ttl = ttl_days.map_or(KeepTtl::Default, lifetime::ttl_of_days);
+                // The key carries its own scope, so the handle's scope here
+                // is just the verb's home.
                 ctx.storage(StorageScope::Run).keep(&file, ttl).await?;
                 // Pass the MARKER through untouched: downstream gets
                 // exactly the reference that arrived, not a
@@ -51,9 +45,8 @@ impl Node for KeepFileNode {
                 ctx.inputs.raw("file").cloned().expect("file was just read")
             }
             // The copy is a NEW file under the project prefix; the
-            // run-scoped original is still swept with its run. With no
-            // `ttlDays` it lives until deleted.
-            scope => ctx.storage(scope).copy(&file, ttl_days.map(lifetime::ttl_of_days)).await?,
+            // original is left as it was, deleted with its own owner.
+            scope => ctx.storage(scope).copy(&file, Some(ttl)).await?,
         };
         ctx.pulse_downstream(NodeOutput::stored_file(StoredFile::from_value(&output)?)).await
     }

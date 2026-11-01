@@ -1,7 +1,7 @@
 {
   "type": "GoogleDriveDownload",
   "label": "Google Drive: Download",
-  "description": "Downloads a Drive file into storage; Google-native files are exported (Docs/Slides as PDF, Sheets as CSV, or the mime you set). The file is swept when the run ends; wire it through KeepFile to keep it.",
+  "description": "Downloads a Drive file into storage; Google-native files are exported (Docs/Slides as PDF, Sheets as CSV, or the mime you set). The file is stored with the run and deleted with it (once the run's record goes); wire it through KeepFile to keep it past that.",
   "tags": [
     "google",
     "drive",

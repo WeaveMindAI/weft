@@ -119,7 +119,10 @@ fn refusal(context: &str, status: reqwest::StatusCode, body: String) -> WeftErro
         return WeftError::NodeFailed(weft_broker_client::WorkerOutdated { path: context.to_string(), said: body }.to_string());
     }
     match status.as_u16() {
-        404 => WeftError::NodeFailed(format!("storage file not found: {body}")),
+        // The broker says in its own words what is missing (a file and
+        // what deleted it, or an upload that is not in flight).
+        404 if !body.is_empty() => WeftError::NodeFailed(format!("storage: {body}")),
+        404 => WeftError::NodeFailed(format!("storage: {context}: not found")),
         401 | 403 => WeftError::NodeFailed(format!("storage denied: {body}")),
         413 => WeftError::NodeFailed(format!("storage quota exceeded: {body}")),
         _ => WeftError::NodeFailed(format!("storage: {context}: {status}: {body}")),
@@ -786,8 +789,9 @@ impl WorkerStorageOps for WorkerStorage {
 // ---------- fake (tests) ----------
 
 /// In-memory `WorkerStorageOps` for layer-3 tests: a map keyed by the
-/// canonical storage key, with the same scope wall the broker enforces. Dumb:
-/// state in a map, no business logic beyond the wall + keep flag.
+/// canonical storage key, behind the same tenant wall the broker enforces
+/// (`check_key_access`). Dumb: state in a map, no business logic beyond the
+/// wall and a file's deadline.
 #[cfg(any(test, feature = "test-helpers"))]
 pub use fake::FakeWorkerStorage;
 
@@ -880,7 +884,6 @@ mod fake {
                 mime_type: mime_type.to_string(),
                 size_bytes: bytes.len() as u64,
                 filename: filename.to_string(),
-                keep: keep.is_some() && matches!(scope, StorageScope::Run),
                 expires_at_unix: None,
                 keep_ttl_secs: keep.and_then(KeepTtl::secs),
                 created_at_unix: 0,
@@ -989,7 +992,6 @@ mod fake {
             let (meta, _) = files
                 .get_mut(key)
                 .ok_or_else(|| WeftError::NodeFailed(format!("storage file not found: {key}")))?;
-            meta.keep = meta.keep || matches!(key::parse_key(key), Ok(p) if matches!(p.scope, key::KeyScope::Run { .. }));
             meta.keep_ttl_secs = ttl.secs();
             Ok(())
         }
@@ -1072,9 +1074,16 @@ mod claim_tests {
     /// refused naming its slot (409), a slot named `short` gets an answer
     /// missing a file, a slot named `locked` is the worker's own
     /// credentials refused (401), and anything else is answered with one
-    /// file per claim, keyed by its slot.
-    async fn broker() -> Arc<WorkerStorage> {
-        async fn claim(axum::Json(req): axum::Json<ClaimUploadRequest>) -> axum::response::Response {
+    /// file per claim, keyed by its slot. Also answers how many requests
+    /// it took.
+    async fn broker() -> (Arc<WorkerStorage>, Arc<std::sync::atomic::AtomicUsize>) {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = asked.clone();
+        let claim = move |axum::Json(req): axum::Json<ClaimUploadRequest>| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(answer(req))
+        };
+        fn answer(req: ClaimUploadRequest) -> axum::response::Response {
             use axum::response::IntoResponse;
             if let Some(refused) = req.claims.iter().find(|c| c.fits == "Audio") {
                 return (StatusCode::CONFLICT, format!("the file uploaded through '{}' does not fit here", refused.slot)).into_response();
@@ -1090,16 +1099,17 @@ mod claim_tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let token = weft_broker_client::TokenSource::worker(Arc::new(weft_platform_traits::identity::FixedToken("t".into())), "r1");
-        WorkerStorage::new(format!("http://{addr}"), token)
+        (WorkerStorage::new(format!("http://{addr}"), token), asked)
     }
 
     /// Every slot of one claim goes to the broker in ONE request and the
     /// files come back in the claims' order; a refusal of any slot is the
     /// caller's input error in the broker's words, and an answer missing a
     /// file or the worker's credentials refused is the node's failure.
+    /// (That a refused claim takes none of the slots is the broker's.)
     #[tokio::test]
-    async fn uploads_are_claimed_in_one_request_all_or_none() {
-        let storage = broker().await;
+    async fn uploads_are_claimed_in_one_request() {
+        let (storage, asked) = broker().await;
         let ty = |t: &str| WeftType::parse(t).unwrap();
         let (image, video, audio) = (ty("Image"), ty("Video | Null"), ty("Audio"));
         let files = storage.claim_uploads(RunId::nil(), &[("weft-upload:a", &image), ("weft-upload:b", &video)]).await.unwrap();
@@ -1107,6 +1117,7 @@ mod claim_tests {
             files,
             [serde_json::json!({"key": "weft-upload:a", "fits": "Image"}), serde_json::json!({"key": "weft-upload:b", "fits": "Video | Null"})]
         );
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1, "two slots, one request");
 
         let refused = storage.claim_uploads(RunId::nil(), &[("weft-upload:a", &image), ("weft-upload:b", &audio)]).await.unwrap_err();
         assert!(matches!(&refused, WeftError::Input(why) if why.contains("'weft-upload:b' does not fit")), "{refused:?}");
@@ -1201,5 +1212,101 @@ mod busy_tests {
 
         assert_eq!(storage.complete_until_landed(run, "k").await.unwrap(), serde_json::json!({"key": "k"}));
         assert_eq!(calls[2].load(Ordering::SeqCst), 4);
+    }
+}
+
+#[cfg(test)]
+mod abort_tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// What the fake broker and bucket saw of one upload.
+    #[derive(Default)]
+    struct Seen {
+        parts_done: AtomicU32,
+        completes: AtomicU32,
+        aborted: std::sync::Mutex<Vec<String>>,
+    }
+
+    /// A broker that opens every upload under `run/r/f` in parts of four
+    /// bytes, signs each part to its own bucket address beside it, and
+    /// writes down every part reported landed, every completion and every
+    /// abort; the bucket takes any part.
+    async fn broker(seen: Arc<Seen>) -> Arc<WorkerStorage> {
+        use axum::response::IntoResponse;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done, completes, aborts) = (seen.clone(), seen.clone(), seen);
+        let app = axum::Router::new()
+            .route(
+                "/v1/storage/upload/begin",
+                axum::routing::post(|| async { axum::Json(serde_json::json!({ "key": "run/r/f", "partSize": 4 })) }),
+            )
+            .route(
+                "/v1/storage/upload/parts",
+                axum::routing::post(move |axum::Json(asked): axum::Json<weft_core::storage::UploadPartsRequest>| async move {
+                    let parts = asked
+                        .parts
+                        .iter()
+                        .map(|part| serde_json::json!({
+                            "partNumber": part.part_number,
+                            "sizeBytes": part.size_bytes,
+                            "offsetBytes": 0,
+                            "url": format!("http://{addr}/bucket/{}", part.part_number),
+                        }))
+                        .collect::<Vec<_>>();
+                    axum::Json(serde_json::json!({ "parts": parts }))
+                }),
+            )
+            .route("/bucket/{part}", axum::routing::put(|| async { ([("etag", "\"e\"")], "").into_response() }))
+            .route(
+                "/v1/storage/upload/part-done",
+                axum::routing::post(move || async move {
+                    done.parts_done.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NO_CONTENT
+                }),
+            )
+            .route(
+                "/v1/storage/upload/complete",
+                axum::routing::post(move || async move {
+                    completes.completes.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({ "key": "run/r/f" }))
+                }),
+            )
+            .route(
+                "/v1/storage/upload/abort",
+                axum::routing::post(move |axum::Json(abort): axum::Json<weft_core::storage::UploadAbortRequest>| async move {
+                    aborts.aborted.lock().unwrap().push(abort.key);
+                    StatusCode::NO_CONTENT
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let token = weft_broker_client::TokenSource::worker(Arc::new(weft_platform_traits::identity::FixedToken("t".into())), "r1");
+        WorkerStorage::new(format!("http://{addr}"), token)
+    }
+
+    /// A source that breaks off part way through a file fails the node's
+    /// put, and the upload it began is aborted, once and by its key, so
+    /// the broker frees what it reserved for it; it is never completed,
+    /// so no cut-short file is kept as if it were whole. Here one whole
+    /// part had landed when the source broke.
+    #[tokio::test]
+    async fn an_upload_whose_source_breaks_off_is_aborted_and_never_completed() {
+        let seen = Arc::new(Seen::default());
+        let storage = broker(seen.clone()).await;
+        let breaking: ByteStream = Box::pin(futures::stream::iter(vec![
+            Ok(bytes::Bytes::from_static(b"abcd")),
+            Ok(bytes::Bytes::from_static(b"ef")),
+            Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "the source hung up")),
+        ]));
+        let failed = storage
+            .put(RunId::nil(), &StorageScope::Run, None, "application/octet-stream", "f.bin", None, Some(12), breaking)
+            .await
+            .unwrap_err();
+        assert!(matches!(&failed, WeftError::NodeFailed(why) if why.contains("the source hung up")), "{failed:?}");
+        assert_eq!(seen.parts_done.load(Ordering::SeqCst), 1, "the whole part that came first landed");
+        assert_eq!(*seen.aborted.lock().unwrap(), vec!["run/r/f".to_string()]);
+        assert_eq!(seen.completes.load(Ordering::SeqCst), 0, "a broken upload is never completed");
     }
 }

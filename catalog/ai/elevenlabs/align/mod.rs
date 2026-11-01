@@ -71,7 +71,7 @@ impl Node for ElevenLabsAlignNode {
 
         // Each timed character weighs about 40 bytes as JSON, so a few
         // minutes of speech outgrow the 100 KB a wire carries: the
-        // alignment always travels as a file, kept past the run.
+        // alignment always travels as a file.
         let file = store_json(&ctx, &alignment, "alignment.json").await?;
         ctx.pulse_downstream(out.set("alignment", file)).await
     }

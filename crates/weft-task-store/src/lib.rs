@@ -20,8 +20,8 @@
 //!     waiter built on it).
 //!   - `announce`: how a write announces itself without every commit
 //!     waiting on every other (an outbox, flushed in batches).
-//!   - `aside`: a copy of a role stepping aside for the copy that
-//!     replaced it.
+//!   - `stopping`: a copy of a role winding down once it is told to
+//!     stop.
 //!   - `unanswered`: weft's own calls that keep failing, kept for
 //!     whoever waits on the work behind them to see why.
 //!   - `held_copy`: a process's copy of rows read on every request,
@@ -48,7 +48,6 @@ extern crate self as weft_task_store;
 
 pub mod alarm;
 pub mod announce;
-pub mod aside;
 pub mod budget;
 pub mod db;
 #[cfg(feature = "migrate")]
@@ -67,6 +66,7 @@ pub mod runs;
 pub mod schema_group;
 #[cfg(feature = "migrate")]
 pub mod schema_guard;
+pub mod stopping;
 pub mod tasks;
 pub mod terminal;
 pub mod throttle;

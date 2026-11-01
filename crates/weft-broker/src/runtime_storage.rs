@@ -27,8 +27,8 @@
 //!   POST   /v1/storage/admin/tenant-usage   one tenant's (count, bytes)
 //!   DELETE /v1/storage/admin/files/{*key}   delete one file
 //!   POST   /v1/storage/admin/link           a download link, for a person, weft or the outside
-//!   POST   /v1/storage/admin/wipe-prefix    weft rm / weft clean
-//!   POST   /v1/storage/admin/sweep-run     terminate sweep for one run
+//!   POST   /v1/storage/admin/wipe-prefix    a removed project's files, `weft files rm --prefix`
+//!   POST   /v1/storage/admin/delete-run-files  every file of a run whose record went
 //!   GET    /v1/storage/admin/install-cli/{tree}  the weft CLI the install stored for a source tree
 //!
 //! A page's upload through a slot (bearer = the dispatcher, which passes
@@ -58,7 +58,7 @@ use weft_core::storage::slot::{
 use weft_core::storage::{
     AdminLinkRequest, AssetUploadBeginRequest, AssetsHeldRequest, AssetsHeldResponse, CopyRequest,
     DownloadUrlResponse, FileLink, LinkAnswer, LinkReach, LinkReader, LinkRequest, ListFilesResponse, PartDoneRequest,
-    PresignResult, StorageScope, StoredFile, StoredFileMeta, SweepRunRequest, SweepRunResponse, Tenanted,
+    PresignResult, RunFilesRequest, RunFilesResponse, StorageScope, StoredFile, StoredFileMeta, Tenanted,
     TenantScopeRequest, TenantUsage, UploadAbortRequest, UploadBeginRequest, UploadBeginResponse,
     PartSender, UploadCompleteRequest, UploadPartsRequest, UploadPartsResponse, UploadResumeRequest,
     UploadResumeResponse, WipePrefixRequest, WipePrefixResponse,
@@ -158,7 +158,7 @@ pub fn router() -> Router<Arc<BrokerState>> {
         .route("/v1/storage/admin/install-cli/{tree}", get(admin_install_cli))
         .route("/v1/storage/admin/link", post(admin_link))
         .route("/v1/storage/admin/wipe-prefix", post(admin_wipe_prefix))
-        .route("/v1/storage/admin/sweep-run", post(admin_sweep_run))
+        .route("/v1/storage/admin/delete-run-files", post(admin_delete_run_files))
 }
 
 // ---------- error mapping ----------
@@ -215,30 +215,42 @@ fn opaque(answer: (StatusCode, String)) -> (StatusCode, String) {
 }
 
 fn unavailable_file_message(key: &str) -> String {
-    let is_asset =
-        key::parse_key(key).is_ok_and(|p| matches!(p.scope, key::KeyScope::Asset));
-    // Expiry and explicit deletion both remove the row. Do not invent which
-    // happened once that evidence is gone; explain both and name the recovery.
-    // The recovery differs by scope: an asset is uploaded by the build from
-    // the project's own source, so rebuilding puts it back and clears its
-    // countdown. Keep File is for a file a NODE made, and the store refuses
-    // it on an asset, so naming it here would send the reader after a knob
-    // this file does not have.
-    if is_asset {
-        return format!(
+    let scope = key::parse_key(key).map(|p| p.scope);
+    // The row is gone with the file, so what removed it is not on record:
+    // say what can remove a file of this scope, and how to make one last.
+    // An asset is uploaded by the build from the project's own source, so
+    // rebuilding puts it back and clears its countdown; KeepFile is for a
+    // file a NODE made, and the store refuses it on an asset.
+    let days = crate::runtime_store::DEFAULT_KEEP_TTL_SECS / 86400;
+    match scope {
+        Ok(key::KeyScope::Asset) => format!(
             "File '{key}' is no longer available: it may have expired or been deleted. \
-             A file the project uploads expires after {} days once nothing in the \
+             A file the project uploads expires after {days} days once nothing in the \
              workflow references it any more, even if an older run is still waiting. \
-             Build and deploy the project again to upload it back, then start a new run.",
-            crate::runtime_store::DEFAULT_KEEP_TTL_SECS / 86400
-        );
+             Build and deploy the project again to upload it back, then start a new run."
+        ),
+        Ok(key::KeyScope::Run { .. }) => format!(
+            "File '{key}' is no longer available: it was deleted with its run (a run's files go \
+             when its record does: its keep time ran out, `weft clean`, `weft rm`), at its \
+             deadline, or by hand. To make a file last, keep it in the project (a Keep File node \
+             with `scope: project`, or a storage node with `scope: project`), or keep its runs \
+             longer (`keepRunsFor`, `weft run --keep-for`)."
+        ),
+        Ok(key::KeyScope::Project { .. } | key::KeyScope::Instance { .. }) => format!(
+            "File '{key}' is no longer available: it was deleted with its project (`weft rm`), \
+             at its deadline, or by hand. A file with no deadline lives as long as its project \
+             (a Keep File node with `ttlDays: 0` takes its deadline away)."
+        ),
+        Ok(key::KeyScope::Shared { .. }) => format!(
+            "File '{key}' is no longer available: it was deleted by hand or at its deadline. \
+             A file with no deadline lives until somebody deletes it (a Keep File node with \
+             `ttlDays: 0` takes its deadline away)."
+        ),
+        // Every `NotFound` carries the key of the file it looked for
+        // (an upload no longer in flight is `NoUpload`), so a key that does
+        // not read is a store bug: said plainly, with no made-up cause.
+        Err(_) => format!("File '{key}' is no longer available."),
     }
-    format!(
-        "File '{key}' is no longer available: it may have expired or been deleted. \
-         Files can expire according to their keep duration, even while a run is \
-         waiting. Create the file again and start a new run; to keep a file longer \
-         next time, put a Keep File node after the one that made it, or raise its days."
-    )
 }
 
 // ---------- caller resolution ----------
@@ -1358,22 +1370,12 @@ async fn admin_link(
 }
 
 /// The project an outside link is for, once the file at `parsed` is
-/// checked to be one its callers reach: the project's tenant, and its
-/// own files (a run's only when the run is the project's), with the same
-/// wall a worker of the project meets.
+/// checked to be one its callers reach: a file of the project's tenant,
+/// the one wall a worker of the project meets.
 async fn outside_reader(state: &BrokerState, project: &str, parsed: &key::ParsedKey) -> Result<uuid::Uuid, ApiError> {
     let project = project_uuid(project)?;
     let tenant = crate::scope::lookup_project_tenant(&state.scope_cache, &state.pool, project).await?;
-    let run_id = match &parsed.scope {
-        key::KeyScope::Run { run_id } => {
-            let run: weft_core::RunId =
-                run_id.parse().map_err(|_| ApiError::from((StatusCode::BAD_REQUEST, format!("'{run_id}' is not a run id"))))?;
-            let scope = crate::scope::lookup_run_id_scope(&state.scope_cache, &state.pool, run).await?;
-            (scope.project == project).then(|| run_id.clone())
-        }
-        _ => None,
-    };
-    let reader = CallerAuth::Worker { tenant, project_id: project.to_string(), run_id, instance: None };
+    let reader = CallerAuth::Worker { tenant, project_id: project.to_string(), run_id: None, instance: None };
     key::check_key_access(&reader, parsed).map_err(|e| (StatusCode::FORBIDDEN, e))?;
     Ok(project)
 }
@@ -1392,23 +1394,14 @@ async fn admin_wipe_prefix(
     Ok(Json(WipePrefixResponse { wiped }))
 }
 
-async fn admin_sweep_run(
+async fn admin_delete_run_files(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
-    Json(req): Json<SweepRunRequest>,
-) -> Result<Json<SweepRunResponse>, ApiError> {
+    Json(req): Json<RunFilesRequest>,
+) -> Result<Json<RunFilesResponse>, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = &state.runtime_store;
-    let swept = store.sweep_run(&req.tenant, &req.run_id).await.map_err(map_err)?;
-    // A row the bucket refused is marked and shown in `weft status` (the one
-    // record of it); the run's end is done with either way.
-    if !swept.refused.is_empty() {
-        tracing::warn!(
-            target: "weft_broker::runtime_storage", tenant = %req.tenant, run_id = %req.run_id,
-            refused = %swept.refused.join("; "), "the end-of-run sweep left rows the bucket refused to remove"
-        );
-    }
-    Ok(Json(SweepRunResponse { swept: swept.reaped, lingering: swept.lingering }))
+    let deleted = state.runtime_store.delete_run_files(&req.tenant, &req.run_ids).await.map_err(map_err)?;
+    Ok(Json(RunFilesResponse { deleted }))
 }
 
 #[cfg(test)]
@@ -1442,6 +1435,27 @@ mod link_route_tests {
         assert!(!message.contains("Keep File"), "{message}");
     }
 
+    /// A file that is gone says what can have deleted a file of its scope
+    /// (its run, its project, its deadline, a person) and how to make one
+    /// last.
+    #[test]
+    fn a_gone_file_says_what_deletes_its_scope_and_how_to_make_it_last() {
+        let id = uuid::Uuid::nil();
+        let gone = |key: &str| map_err(RuntimeStoreError::NotFound(key.into())).message;
+        let run = gone(&format!("t/run/{id}/f"));
+        for text in ["deleted with its run", "its keep time ran out", "at its", "deadline", "by hand", "`scope: project`", "--keep-for"] {
+            assert!(run.contains(text), "missing {text:?}: {run}");
+        }
+        let project = gone(&format!("t/project/{id}/f"));
+        for text in ["deleted with its project", "`weft rm`", "deadline", "by hand", "`ttlDays: 0`"] {
+            assert!(project.contains(text), "missing {text:?}: {project}");
+        }
+        let instance = gone(&format!("t/instance/{id}/ada/f"));
+        assert!(instance.contains("deleted with its project"), "{instance}");
+        let shared = gone("t/shared/team/f");
+        assert!(shared.contains("by hand or at its deadline") && !shared.contains("with its"), "{shared}");
+    }
+
     /// Every verb that meets a claimed upload (parts, part-done, resume,
     /// complete, delete) answers the same marked 409.
     #[test]
@@ -1465,9 +1479,8 @@ mod link_route_tests {
     }
 
     #[test]
-    fn unavailable_generated_file_does_not_claim_a_fixed_thirty_day_lifetime() {
+    fn a_gone_run_file_does_not_claim_a_fixed_thirty_day_lifetime() {
         let message = map_err(RuntimeStoreError::NotFound("tenant/run/run_id/file".into())).message;
-        assert!(message.contains("keep duration"), "{message}");
         assert!(!message.contains("30 days"), "{message}");
     }
 

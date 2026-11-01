@@ -18,7 +18,7 @@ use serde_json::{json, Map, Value};
 use weft::access::client::{json_call, Multipart};
 use weft::context::LogLevel;
 use weft::node::NodeOutput;
-use weft::storage::{FileHandle, KeepTtl, StorageScope};
+use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 use super::elevenlabs::{detected_entity, store_json, text_input, API};
@@ -655,8 +655,6 @@ async fn emit(ctx: &RunContext, answer: Answer) -> WeftResult<()> {
     for (position, chunk) in answer.transcripts.chunks().iter().enumerate() {
         empty_exports += chunk.empty_exports;
         for export in &chunk.exports {
-            // The files are the run's product: kept past the run (the
-            // default 30-day TTL, renewed on access).
             let (filename, channel) = if per_channel {
                 let channel = chunk.channel.unwrap_or(position as u64);
                 (format!("transcript_channel_{channel}.{}", export.extension), chunk.channel)
@@ -664,7 +662,7 @@ async fn emit(ctx: &RunContext, answer: Answer) -> WeftResult<()> {
                 (format!("transcript.{}", export.extension), None)
             };
             let file = storage
-                .put(export.bytes.clone(), &export.content_type, &filename, Some(KeepTtl::Default))
+                .put(export.bytes.clone(), &export.content_type, &filename, None)
                 .await?;
             let mut entry = json!({ "format": export.format, "file": file });
             if let Some(channel) = channel {
@@ -685,7 +683,7 @@ async fn emit(ctx: &RunContext, answer: Answer) -> WeftResult<()> {
     }
 
     // Hours of speech are more than a wire carries, so the transcript
-    // always travels as a file, kept past the run like the exports.
+    // always travels as a file, like the exports.
     let file = store_json(ctx, &transcript_document(&answer.transcripts), "transcript.json").await?;
     out = out.set("transcript", file);
 

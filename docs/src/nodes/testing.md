@@ -155,7 +155,7 @@ Looking at what happened:
 | `requests(&self) -> Vec<SentRequest>` | Every web request the node sent, in order, answered or not |
 | `assert_sent(&self, method: &str, path: &str)` | Panics, listing what was sent, unless one request matched |
 | `stored_bytes(&self, key: &str) -> WeftResult<Bytes>` | The content stored under a key |
-| `stored_meta(&self, key: &str) -> WeftResult<StoredFileMeta>` | What storage records for it: `keep`, `keep_ttl_secs`, the size |
+| `stored_meta(&self, key: &str) -> WeftResult<StoredFileMeta>` | What storage records for it: its deadline (`expires_at_unix`, `keep_ttl_secs`), the size |
 | `stored_files(&self, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>>` | Every file stored in a scope |
 | `file_edits(&self) -> Vec<FileEdit>` | Every change made to a stored file in place, in order: the file, the versions, the diff |
 | `bus(&self, marker: &Value) -> WeftResult<BusHandle>` | The bus behind a marker the node emitted |

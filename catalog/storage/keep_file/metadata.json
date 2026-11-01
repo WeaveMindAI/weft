@@ -1,7 +1,7 @@
 {
   "type": "KeepFile",
   "label": "Keep File",
-  "description": "Make a file this run stored outlive the run. Run files are swept when the run ends and unreadable by other runs. `scope: run` (default) only extends THIS run's file, still unreadable elsewhere; `scope: project` copies it into project storage and emits the NEW reference every later run can read (how an upload in one request is served by the next). For a file not yet in storage (a URL), use FetchToStorage.",
+  "description": "Make a stored file last longer. A run's file is deleted when its run is (once the run's record goes), a project's when the project is, and any file at its deadline if it has one. `scope: project` (default) copies the file into the project's files and emits the NEW reference, so it outlives the run that made it (how an upload in one request is served by the next). `scope: run` leaves the file where it is and only sets its deadline. Any run can read any file either way. For a file not yet in storage (a URL), use FetchToStorage.",
   "tags": [
     "storage",
     "keep",
@@ -18,21 +18,21 @@
       "name": "file",
       "type": "T",
       "required": true,
-      "description": "Stored run file, of any kind (`File`). Kept in place with `run`; copied (original untouched) with `project`."
+      "description": "A stored file, of any kind (`File`). Copied (original untouched) with `project`; left where it is with `run`."
     },
     {
       "name": "scope",
       "type": "String",
-      "default": "run",
+      "default": "project",
       "widget": {
         "kind": "select",
         "options": [
-          "run",
-          "project"
+          "project",
+          "run"
         ]
       },
       "label": "Keep as",
-      "description": "`run`: survive the end-of-run sweep for `ttlDays`, readable only by this run. `project`: copy into project scope, readable by every later run."
+      "description": "`project`: copy it into the project's files, deleted with the project. `run`: leave it where it is, deleted with its own owner, and only set its deadline."
     },
     {
       "name": "ttlDays",
@@ -42,8 +42,8 @@
         "min": 0,
         "step": 1
       },
-      "label": "Keep for (days, 0 = forever)",
-      "description": "Lifetime since last access (any read, download or link resets it); 0 never expires. Empty: 30 days for a run file, no expiry for a project copy."
+      "label": "Deadline (idle days, empty or 0 = none)",
+      "description": "The file is deleted once nobody has touched it for this many days (any read, download or link resets the count), or with its owner if that comes first. Empty or 0: no deadline, it lives as long as its scope says."
     }
   ],
   "typeParams": {
@@ -53,8 +53,7 @@
     {
       "name": "file",
       "type": "T",
-      "fileScopeFrom": "scope",
-      "description": "`run`: the same reference, now kept. `project`: the NEW project copy (same name, type, size); later runs read this one. The same kind that came in: a Video stays a Video."
+      "description": "`project`: the NEW project copy (same name, type, size). `run`: the same reference, with its new deadline. The same kind that came in: a Video stays a Video."
     },
     {
       "name": "filename",

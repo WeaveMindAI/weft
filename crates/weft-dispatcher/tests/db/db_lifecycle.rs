@@ -1124,6 +1124,40 @@ async fn trigger_bake_ownership_publication_and_project_cleanup(pool: Pool) {
     assert!(store.trigger_bakes(id, None).await.unwrap().read.is_empty());
 }
 
+/// A run's files go with its record, never with its end: ending a run
+/// queues nothing, and each way its record is deleted (a clean of the
+/// run, its keep running out, its project removed) queues its files for
+/// the broker to delete.
+#[weft_db_macros::test]
+async fn a_runs_files_are_queued_when_its_record_goes_not_when_it_ends(pool: Pool) {
+    let (store, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let queued = |run: weft_core::RunId| {
+        let pool = pool.clone();
+        async move { pool.scalar::<i64>("SELECT COUNT(*) FROM storage_sweep WHERE run_id = $1", &[&run]).await.unwrap() }
+    };
+    let [cleaned, expired, removed] = [(); 3].map(|_| weft_core::new_run_id());
+    for run in [cleaned, expired, removed] {
+        assert!(queue(&store, &[birth(run, id, weft_core::context::Phase::Fire, "bin-A")], false).await.unwrap());
+    }
+    for run in [cleaned, expired, removed] {
+        complete(&store, run).await;
+    }
+    for run in [cleaned, expired, removed] {
+        assert_eq!(queued(run).await, 0, "ending a run leaves its files");
+    }
+    store.delete_run(cleaned).await.unwrap();
+    assert_eq!(queued(cleaned).await, 1, "a clean of the run");
+    pool.execute("UPDATE run SET keep_until = 0 WHERE run_id = $1", &[&expired]).await.unwrap();
+    assert_eq!(store.erase_expired(1, 100).await.unwrap().0, 1);
+    assert_eq!(queued(expired).await, 1, "its keep ran out");
+    projects.remove(id).await.unwrap();
+    assert_eq!(queued(removed).await, 1, "its project removed");
+    let tenant: String = pool.scalar("SELECT tenant_id FROM storage_sweep WHERE run_id = $1", &[&cleaned]).await.unwrap();
+    assert_eq!(tenant, TENANT, "queued under the tenant its files were written under");
+}
+
 /// How many rows of `table` belong to run `run_id`.
 async fn rows_of(pool: &Pool, table: &str, run_id: weft_core::RunId) -> i64 {
     pool.scalar(&format!("SELECT COUNT(*) FROM {table} WHERE run_id = $1"), &[&run_id])
@@ -1879,6 +1913,75 @@ async fn the_consumer_listing_reads_the_whole_signal_row(pool: Pool) {
     assert!(signals_visible_to(&pool, "someone-else", &[], &[], None).await.unwrap().is_empty());
 }
 
+/// The signal-token listing shows an entry form as a trigger
+/// (`isResume: false`, its rendered kind kept) and goes on showing it
+/// after a fire was queued on it, since an entry starts runs for as long
+/// as it is registered; a run's question is listed as a resume until it
+/// is answered, and gone from the listing once it is.
+#[weft_db_macros::test]
+async fn an_entry_form_lists_as_a_trigger_before_and_after_a_fire(pool: Pool) {
+    use weft_dispatcher::api::signal::consumer_listing;
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    let rendered = |node: &str| json!({ "kind": "form", "node": node });
+    let mut entry = entry_signal("tok-start", project);
+    entry.node_id = "start".into();
+    entry.consumer_payload = Some(rendered("start"));
+    store.signal_insert(&entry).await.unwrap();
+    let run_id = queued_run(&store, project).await;
+    for token in ["tok-ask", "tok-answered"] {
+        let mut wait = entry_signal(token, project);
+        wait.node_id = format!("wait-{token}");
+        wait.is_resume = true;
+        wait.run_id = Some(run_id);
+        wait.consumer_payload = Some(rendered(&wait.node_id));
+        store.signal_insert(&wait).await.unwrap();
+    }
+    assert_eq!(park(&pool, "tok-start", &parked(0, 0), None).await.unwrap(), ParkAppend::Parked, "a fire queued on the entry");
+    assert_eq!(park(&pool, "tok-answered", &parked(0, 0), None).await.unwrap(), ParkAppend::Parked, "an answer queued on the question");
+
+    let listed = consumer_listing(signals_visible_to(&pool, TENANT, &[], &[], None).await.unwrap());
+    let shown: Vec<(&str, &str, bool)> = listed
+        .iter()
+        .map(|payload| (payload["node"].as_str().unwrap(), payload["kind"].as_str().unwrap(), payload["isResume"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(shown, vec![("start", "form", false), ("wait-tok-ask", "form", true)]);
+}
+
+/// A run whose build's worker cannot start ends every run queued on that
+/// build, and only those: a parked run of the build waits on in its
+/// record, and a run queued on another build of the project is not
+/// touched. A new build of the project moves no paused run: it resumes on
+/// the build it was born on until a resync moves it.
+#[weft_db_macros::test]
+async fn a_worker_that_cannot_start_ends_the_runs_queued_on_its_build_alone(pool: Pool) {
+    use weft_core::context::Phase;
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    let on = |binary: &'static str| {
+        let store = &store;
+        async move {
+            let run_id = weft_core::new_run_id();
+            assert!(queue(store, &[birth(run_id, project, Phase::Fire, binary)], false).await.unwrap());
+            run_id
+        }
+    };
+    let (first, second, paused, other) = (on("bin-A").await, on("bin-A").await, on("bin-A").await, on("bin-B").await);
+    pool.execute("UPDATE run SET state = 'parked' WHERE run_id = $1", &[&paused]).await.unwrap();
+
+    let mut ending = weft_dispatcher::delivery::queued_on_build(&pool, project, Some("bin-A")).await.unwrap();
+    ending.sort();
+    let mut expected = vec![first, second];
+    expected.sort();
+    assert_eq!(ending, expected, "the queued runs of that build, never the parked one nor another build's");
+
+    seed_project(&projects, project, "bin-C").await;
+    assert_eq!(run_column::<String>(&pool, "binary_hash", paused).await.as_deref(), Some("bin-A"), "a build moves no paused run");
+    assert_eq!(run_column::<String>(&pool, "binary_hash", other).await.as_deref(), Some("bin-B"));
+}
+
 /// The park names its refusal instead of returning "0 rows": a re-run
 /// that finds its own event queued (nothing lost), a wait already
 /// answered, an entry queue at its cap (a refused NEW event, a loss the
@@ -2475,7 +2578,6 @@ async fn a_project_being_removed_has_no_run_born(pool: Pool) {
                     row_sizes: vec![row.len() as u32],
                     born: Born::of(&events[0], weft_core::run_settings::KeepFor::WEFT_DEFAULT),
                     written: Written::of(&events),
-                    wrote_files: false,
                     secrets: Vec::new(),
                 }],
                 programs: Vec::new(),

@@ -1886,11 +1886,15 @@
 	}
 
 	/// Whether the box `id` stands for something the followed run runs at
-	/// this call path. A node is a place; a loop is its LoopIn; a group is
-	/// in the run when one of its members is, and an include when a place
-	/// under its call is.
+	/// this call path. A node is a place; a loop is its LoopIn, or, in a
+	/// run of part of its body (which holds neither of its ends), one of
+	/// its members; a group is in the run when one of its members is, and
+	/// an include when a place under its call is.
 	function boxInRun(id: string, nodeType: string, runScope: ReadonlySet<string>, ctx: OverlayCtx): boolean {
-		if (isLoopNodeType(nodeType)) return runScope.has(locatedKey(loopInId(id), ctx.callPath));
+		if (isLoopNodeType(nodeType)) {
+			return runScope.has(locatedKey(loopInId(id), ctx.callPath))
+				|| ctx.projectNodes.some((p) => p.parentId === id && boxInRun(p.id, p.nodeType, runScope, ctx));
+		}
 		if (isIncludeNodeType(nodeType)) {
 			const under = `${locatedKey(id, ctx.callPath)}/`;
 			for (const place of runScope) if (place.startsWith(under)) return true;

@@ -17,8 +17,6 @@
 //! - `guard`: the identity check on every internal route.
 //! - `role_waker`: waking the roles that scale to zero when work is
 //!   written for them.
-//! - `superseded`: telling a copy of a role that a newer copy replaced
-//!   it, so it steps aside.
 //! - `schema`: every table group the install's database holds.
 //! - `log_file`: a local install's bounded log file.
 //! - `unit_agent`: the agent beside every infra unit.
@@ -29,7 +27,6 @@ pub mod platform;
 pub mod role_waker;
 pub mod schema;
 pub mod server;
-pub mod superseded;
 pub mod unit_agent;
 
 use std::sync::Arc;
@@ -77,9 +74,12 @@ const LOCK_POOL_WAIT: Duration = Duration::from_secs(120);
 /// flight, so the wait is how the database slows the workers down).
 const RECORD_POOL_WAIT: Duration = Duration::from_secs(60);
 
-/// How long a copy that stepped aside waits, past the grace its tasks got,
-/// for them to be given back: the write that gives one back.
-const STEPPED_ASIDE_SETTLING: Duration = Duration::from_secs(10);
+// A stopping copy winds down (its tasks' grace, then their giving back)
+// inside the time Cloud Run leaves it between SIGTERM and killing it, with
+// room for its last words below (`serve`'s end).
+const _: () = assert!(
+    weft_task_store::stopping::GRACE.as_secs() + weft_task_store::stopping::GIVING_BACK.as_secs() < weft_platform_gcp::STOP_GRACE.as_secs()
+);
 
 /// A required secret from the environment (`SECRET_ENV`).
 fn secret(name: &str) -> anyhow::Result<String> {
@@ -140,14 +140,11 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     };
     let runs = |r: CoreRole| hosted.contains(&r);
     let replica = weft_platform_traits::identity::mint_replica_id("runtime");
-    // Whether this copy was replaced by a copy of another revision of its
-    // role (`superseded`): never, in a process with no revision (a local
-    // install), or one of a role that opens no database.
-    let aside = weft_task_store::aside::StepAside::new();
-    let revision = match only {
-        Some(role) if DATABASE_ROLES.contains(&role) => superseded::revision().map(|revision| (role, Arc::<str>::from(revision))),
-        _ => None,
-    };
+    // Whether this copy is stopping: begun once the process is told to
+    // stop (SIGTERM, Ctrl+C), whatever it is doing then, and every role it
+    // hosts winds down from it (`weft_task_store::stopping`).
+    let stopping = weft_task_store::stopping::Stopping::new();
+    tokio::spawn(server::stop_on(server::shutdown(), stopping.clone()));
     let addresses = config.role_addresses(here);
     // The processes that write: every write is the dispatcher's or the
     // broker's (every other role writes through the broker).
@@ -222,9 +219,6 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             }
             if runs(CoreRole::Broker) {
                 channels.extend(weft_broker::state::BROKER_CHANNELS);
-            }
-            if revision.is_some() {
-                channels.push(superseded::ROLE_REVISION_CHANNEL);
             }
             channels.sort_unstable();
             channels.dedup();
@@ -318,7 +312,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 // to zero.
                 supervisor_booking: (config.roles.of(CoreRole::Supervisor) == Placement::Serverless)
                     .then(|| weft_task_store::drain::Booking::new(pool.clone(), CoreRole::Supervisor, parts.alarm.clone())),
-                aside: aside.clone(),
+                stopping: stopping.clone(),
             },
         )?;
         let heard = news.as_ref().expect("the broker's process hears news").listen();
@@ -360,7 +354,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 // Scaled to zero, the dispatcher's loops book each other's
                 // looks; on a machine each looks on its own.
                 booking: serverless.then(|| weft_task_store::drain::Booking::new(pool.clone(), CoreRole::Dispatcher, parts.alarm.clone())),
-                aside: aside.clone(),
+                stopping: stopping.clone(),
             },
             weft_dispatcher::app::Defaults::for_install(&secret(weft_core::signal_token::INSTALL_KEY_SECRET)?)?,
         )
@@ -521,11 +515,11 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                         for l in loops.iter().cloned() {
                             let subscription = signals.subscribe();
                             let looks = weft_task_store::drain::Looks::WhileWorking(signals.clone());
-                            // A copy that stepped aside runs no loop of its
-                            // role's any more: a current copy does.
-                            let aside = aside.clone();
+                            // A stopping copy runs no loop of its role's any
+                            // more: a running copy does.
+                            let stopping = stopping.clone();
                             weft_dispatcher::app::spawn_supervised(l.name, async move {
-                                aside.while_current(l.run_forever(subscription, looks)).await
+                                stopping.while_running(l.run_forever(subscription, looks)).await
                             });
                         }
                     }
@@ -533,9 +527,9 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                     // Each pass holds the process's watch while its loops
                     // drain: they write what other roles wait on, and a
                     // write made while the watch is quiet would be
-                    // announced to nobody. A copy that stepped aside takes
-                    // no new tick (its server stops taking calls), and the
-                    // one in flight is answered.
+                    // announced to nobody. A stopping copy takes no new
+                    // tick (its server stops taking calls), and the one in
+                    // flight is answered.
                     let listen = signals.clone();
                     Arc::new(move |call, pass| {
                         let (loops, booking, listen) = (loops.clone(), booking.clone(), listen.clone());
@@ -565,8 +559,9 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                     let signals = signals.clone().expect("a process with drain loops listens");
                     for l in loops {
                         let subscription = signals.subscribe();
+                        let stopping = stopping.clone();
                         weft_dispatcher::app::spawn_supervised(l.name, async move {
-                            l.run_forever(subscription, weft_task_store::drain::Looks::AtSafety).await
+                            stopping.while_running(l.run_forever(subscription, weft_task_store::drain::Looks::AtSafety)).await
                         });
                     }
                 }
@@ -610,7 +605,9 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             target: "weft_runtime", room = settings.signals_per_copy, high_cpu_percent = settings.high_cpu_percent,
             target_cpu_percent = settings.target_cpu_percent, "holding"
         );
-        weft_listener::hold::run(state, weft_listener::hold::Share::Copy { settings, cpu: Box::new(cpu), sample_every: weft_listener::load::sample_every() }, server::shutdown()).await;
+        let stopped = async move { stopping.begun().await };
+        weft_listener::hold::run(state, weft_listener::hold::Share::Copy { settings, cpu: Box::new(cpu), sample_every: weft_listener::load::sample_every() }, stopped).await;
+        let_go_at_exit(waker_at_exit, news, holder_news).await;
         return Ok(());
     }
 
@@ -639,20 +636,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             }
             let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind {addr}"))?;
             tracing::info!(target: "weft_runtime", role = ?only, %addr, "serving");
-            // Serving: this copy asks the platform whether its revision
-            // is the one it routes to, steps aside if not, and otherwise
-            // announces it, so copies of another revision ask in turn.
-            // Heard from before it announces, so a copy that announces
-            // just after it is never missed.
-            if let (Some((role, revision)), Some((_, pool)), Some(signals)) = (&revision, &pool, &signals) {
-                let revisions = parts.revisions.clone().context("a copy with a revision runs a service its platform routes requests to")?;
-                let heard = signals.subscribe();
-                weft_dispatcher::app::spawn_supervised(
-                    "superseded",
-                    superseded::run(pool.clone(), heard, superseded::Copy::new(*role, revision.clone(), revisions, aside.clone())),
-                );
-            }
-            tokio::spawn(server::serve(listener, app, aside.clone()))
+            tokio::spawn(server::serve(listener, app, stopping.clone()))
         }
         PlatformConfig::Local(local) => {
             let internal_listener = tokio::net::TcpListener::bind(local.listen.internal)
@@ -692,21 +676,21 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             let front = public.nest(weft_platform_traits::roles::INTERNAL_DOOR, internal.clone());
             let mut servers = Vec::new();
             if let Some(listener) = containers_listener {
-                servers.push(tokio::spawn(server::serve(listener, internal.clone(), aside.clone())));
+                servers.push(tokio::spawn(server::serve(listener, internal.clone(), stopping.clone())));
             }
             servers.extend([
-                tokio::spawn(server::serve(internal_listener, internal, aside.clone())),
-                tokio::spawn(server::serve(public_listener, front, aside.clone())),
+                tokio::spawn(server::serve(internal_listener, internal, stopping.clone())),
+                tokio::spawn(server::serve(public_listener, front, stopping.clone())),
             ]);
             if let (Some(addr), Some(app)) = (local.listen.outside, outside) {
                 let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind the outside port {addr}"))?;
-                servers.push(tokio::spawn(server::serve(listener, app, aside.clone())));
+                servers.push(tokio::spawn(server::serve(listener, app, stopping.clone())));
             }
             if let (Some(addr), Some(app)) = (local.listen.network, network) {
                 let listener = tokio::net::TcpListener::bind(addr)
                     .await
                     .with_context(|| format!("bind the outside doors on the network address {addr} (WEFT_NETWORK_ADDRESS: is it an address of this machine?)"))?;
-                servers.push(tokio::spawn(server::serve(listener, app, aside.clone())));
+                servers.push(tokio::spawn(server::serve(listener, app, stopping.clone())));
             }
             tokio::spawn(async move {
                 for s in futures::future::join_all(servers).await {
@@ -721,20 +705,31 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
         work.await?;
     }
     let served = serving.await;
-    // A copy that stepped aside lets the tasks it still ran end or be
-    // given back (`weft_task_store::aside::GRACE`) before it exits, so a
-    // current copy takes them at once rather than once their claims lapse.
-    if aside.is_set() {
-        let given_back = weft_task_store::aside::GRACE + STEPPED_ASIDE_SETTLING;
-        if tokio::time::timeout(given_back, aside.settled()).await.is_err() {
-            tracing::warn!(target: "weft_runtime", "stepping aside, some tasks were not given back in time; their claims lapse and a current copy takes them then");
+    // A stopping copy lets the tasks it still ran end or be given back
+    // (`weft_task_store::stopping`) before it exits, so a running copy
+    // takes them at once rather than once their claims lapse.
+    if stopping.has_begun() {
+        if !stopping.wound_down().await {
+            tracing::warn!(target: "weft_runtime", "stopping, some work did not end in time: a task not given back has its claim lapse and a running copy takes it then, and a call still running on a broker line goes unanswered (its caller hears the line close)");
         }
-        tracing::info!(target: "weft_runtime", "stepped aside for a newer copy of this role; exiting");
+        tracing::info!(target: "weft_runtime", "stopped; exiting");
     }
-    // The servers stop once the process is told to (`server::shutdown`),
-    // or the task serving them ended; a ring still out would otherwise go
-    // with the process either way.
-    if let Some(waker) = waker_at_exit {
+    // The servers stop once the process is told to (`server::stop_on`),
+    // or the task serving them ended.
+    let_go_at_exit(waker_at_exit, news, holder_news).await;
+    served?
+}
+
+/// What a process lets go of as it exits, however it ran (serving its
+/// roles, or holding in a pool): the rings still out are answered, which
+/// would otherwise go with the process, and the news it heard is given
+/// back rather than left for the platform to drop later.
+async fn let_go_at_exit(
+    waker: Option<Arc<role_waker::RoleWaker>>,
+    news: Option<Arc<dyn weft_platform_traits::News>>,
+    holder_news: Option<Arc<dyn weft_platform_traits::HolderNews>>,
+) {
+    if let Some(waker) = waker {
         waker.settle().await;
     }
     if let Some(news) = news {
@@ -747,5 +742,4 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             tracing::warn!(target: "weft_runtime", error = %format!("{e:#}"), "could not let go of the holders' news; the platform drops it on its own later");
         }
     }
-    served?
 }

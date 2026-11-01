@@ -111,7 +111,7 @@ Flags on `weft run`:
 | `--before <node>` | Run what it needs, and not it. Repeatable |
 | `--from <node>=<json>` | Start here, handing these ports their values. A port you hand a value keeps it: nothing a wire brings replaces it |
 | `--emit <node>=<json>` | Stand in for a node: say what it would have emitted, and do not run it |
-| `--group <group>=<json>` | Run one group, or one included file, on its own, with the values you hand it. A port a node inside needs that you do not hand is refused before the run starts |
+| `--group <group>=<json>` | Run one group, or one included file, on its own, with the values you hand it, a group inside a loop's body too. A port a node inside needs that you do not hand is refused before the run starts |
 | `--feed <start>` | Also run what feeds this start: for each input you did not hand a value, the node that feeds it (through any groups and included files on the way) and nothing above it. Names a `--from` or `--group` start. Repeatable |
 | `--fire <trigger>=<json>` | Fire exactly one trigger with this event, using its bake. One per run |
 | `--seed[=<run>]` | Reuse, from head's run or the run you name, everything whose slice of the program did not change (any finished run of the project, one a trigger started or one that failed included). A node that runs again and waited for an answer there gets that answer replayed, if its code did not change |
@@ -125,6 +125,14 @@ Flags on `weft run`:
 | `--keep-for <duration>` | If you want this run kept longer or shorter after it ends than its trigger or project says: `30m`, `12h`, `7d`, or `forever`. For the project and trigger settings, go and read [how long a run is kept](the-journal.md#how-long-a-run-is-kept) |
 | `--hold-secs <seconds>` | If a wait in this run should hold longer or shorter than its trigger's `holdSecs` while the run cannot pause (a bus between its nodes is open): `0` fails such a wait at once, at most 30 days. For when a run cannot pause, go and read [triggers and routes](../language/triggers-and-routes.md#when-a-run-cannot-pause) |
 | `--instance <id>` | Run for this instance of the program. Needed when the run reaches a node that exists once per instance (see [programs with instances](instances.md)) |
+
+The cut flags (`--target`, `--before`, `--from`, `--emit`, `--group`,
+`--feed`) take a node or a group anywhere in the program, inside a loop's
+body too. If you start and end inside a body, only that part runs, once,
+inside the loop's first iteration, and you hand it what the loop would have.
+A run that holds one end of a loop without the other is refused. For the
+details, go and read [running part of a loop's
+body](../language/loops.md#running-part-of-its-body).
 
 A run that fires a trigger (`--fire`) follows the trigger's `durable`,
 `keepRunsFor` and `holdSecs`, and `--durable`, `--fast`, `--keep-for` and
@@ -468,7 +476,7 @@ Other flags: `--test <name>` for one test, `--key <service>` and
 | `weft clean --instance <id>`, `--tag <tag>`, `--status <how>`, `--node <node>` | Deletes only the runs these name, across the projects you name (or every one). Naming an instance or a tag takes all their runs; add `--keep-days` to spare recent ones. A run still going is left to finish unless you pass `--cancel-running` |
 | `weft clean --images` | Reclaims the workers and infra images nothing references (on your machine a worker is a program under `~/.local/share/weft/workers/`, on a cloud install an image), then prints how much the worker compile caches (`~/.local/share/weft/worker-target/`) and the crates your machine compiles workers from (`worker-crates/`) take. `--all` spans every project, and also removes what installs no longer on this machine left behind (below) |
 | `weft clean --build-cache` | Drops the node-test cache, waits for the builds compiling right now to end, then drops the worker compile caches and the crates your machine compiles workers from (`~/.local/share/weft/worker-target/` and `worker-crates/`), then Docker's build cache. The next build of a project with its own nodes then compiles the whole standard library again |
-| `weft rm` | Unregisters a project: its triggers taken down (the door refusing, what they held dropped, the runs going cancelled), infra terminated, runs erased, stored data reclaimed. Before it erases anything, it waits until the last calls its cancelled runs queued (an outside job told it was cancelled, say) have gone out, following that in short looks: Ctrl+C stops following, and running `weft rm` again picks it back up |
+| `weft rm` | Unregisters a project: its triggers taken down (the door refusing, what they held dropped, the runs going cancelled), infra terminated, runs erased, run and project files deleted. Before it erases anything, it waits until the last calls its cancelled runs queued (an outside job told it was cancelled, say) have gone out, following that in short looks: Ctrl+C stops following, and running `weft rm` again picks it back up |
 | `weft rm --journal` | Waits for every run of the project to end, then erases its runs one by one before unregistering it; `weft rm` erases them on its own too |
 | `weft rm --local` | Also wipes its build artifacts here |
 | `weft rm --all` | Both of those |
@@ -511,7 +519,7 @@ default.
 
 | Command | What goes |
 |---|---|
-| `weft rm` | The project's registration, its signals, its runs, its infra **including disks**, its stored data |
+| `weft rm` | The project's registration, its signals, its runs, its infra **including disks**, its run and project files (its instances' files stay) |
 | `weft rm --journal` | The same runs, erased before the registration goes |
 | `weft rm --local` | Also `.weft/target/` and its slice of the node-test cache |
 | `weft prune <version>` | That version, every version under it, and every run beneath them |

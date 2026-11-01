@@ -133,10 +133,20 @@ saved example keeps the marker, so it reads the file afresh on every run.
 
 A [cut] inside an ordinary group stays at the requested node, and the
 group's `_should_flow` gate still applies: false stops the branch; true
-dispatches only the selected work. Loops are indivisible: you use the
-public loop name for a [start], `--group`, `--target`, or `--before`; a
-node inside the loop cannot be an endpoint. Trigger setup and infra
-preparation obey the same group cuts and loop restriction.
+dispatches only the selected work. A [cut] works inside a loop's body
+too, as long as it does not cut the loop in half: it holds both of the
+loop's ends (its start, where its inputs go in, and its end, where its
+outputs come out) and the loop runs whole, or neither, and only the part
+of the body you picked runs, once, inside iteration `0` of each loop
+around it (its nodes show at `#0`). So to prove one stage of a body, start
+and end inside it (`--from` and `--target` on nodes of the body, or
+`--group` on a group in it) and hand the start what the loop would have
+(the item, `index`, a carried value); a value nobody hands is refused
+before the run starts, naming it. A run that reaches one end of a loop
+without the other is refused, naming the loop and the end it lacks. A loop in a file
+included at several places is one loop at all of them: a run that holds
+all of it at one place and part of its body at another is refused, naming
+both.
 
 ## Choose how a trigger participates
 

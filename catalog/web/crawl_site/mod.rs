@@ -22,7 +22,7 @@ use weft::access::client::get_json;
 use weft::node::NodeOutput;
 use weft::signal::{CancelCall, PollEndpoint, Predicate};
 use weft::reqwest_middleware::ClientWithMiddleware;
-use weft::storage::{ByteStream, KeepTtl, StorageScope};
+use weft::storage::{ByteStream, StorageScope};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 #[cfg(feature = "node-tests")]
@@ -102,11 +102,9 @@ impl Node for CrawlSiteNode {
         let count = Arc::new(AtomicUsize::new(0));
         let failure: Arc<Mutex<Option<WeftError>>> = Arc::new(Mutex::new(None));
         let lines = answer_lines(http.clone(), status_url, count.clone(), failure.clone());
-        // Kept past the run, like any result a workflow goes on to read:
-        // the default access-bumped lifetime.
         let stored = ctx
             .storage(StorageScope::Run)
-            .put_stream(lines, "application/jsonl", &format!("crawl-{job}.jsonl"), Some(KeepTtl::Default))
+            .put_stream(lines, "application/jsonl", &format!("crawl-{job}.jsonl"), None)
             .await;
         let pages = match stored {
             Ok(pages) => pages,

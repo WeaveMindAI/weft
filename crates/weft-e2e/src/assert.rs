@@ -63,15 +63,6 @@ impl SettledRun {
         Ok(self)
     }
 
-    /// The run-level outputs (`run_completed.outputs`), or null if
-    /// the run did not complete.
-    pub fn completed_outputs(&self) -> Value {
-        self.replay
-            .first_kind("run_completed")
-            .and_then(|e| e.field("outputs").cloned())
-            .unwrap_or(Value::Null)
-    }
-
     /// The `error` text of `run_failed`, if the run failed.
     pub fn failure_message(&self) -> Option<String> {
         self.replay
@@ -90,21 +81,11 @@ impl SettledRun {
 
     /// The output value a node produced on its FIRST firing
     /// (`node_completed.output` for the root frame). Returns `None` if the node
-    /// never completed (it was skipped, failed, or did not run). For a node that
-    /// fires multiple times (a loop body), use [`SettledRun::node_outputs`].
+    /// never completed (it was skipped, failed, or did not run).
     pub fn output_of(&self, node: &str) -> Option<Value> {
         self.events_of(node)
             .find(|e| e.kind() == "node_completed")
             .and_then(|e| e.field("output").cloned())
-    }
-
-    /// Every output value a node produced across all its firings, in event
-    /// order (one per `node_completed`). For loop bodies and repeated fires.
-    pub fn node_outputs(&self, node: &str) -> Vec<Value> {
-        self.events_of(node)
-            .filter(|e| e.kind() == "node_completed")
-            .filter_map(|e| e.field("output").cloned())
-            .collect()
     }
 
     /// Does an integer spelling name the same value as a float: the float
@@ -177,86 +158,6 @@ impl SettledRun {
         }
     }
 
-/// The VALUE inside a journalled caller payload.
-///
-/// Both directions of an exchange are recorded in the same tagged wire
-/// vocabulary the bus uses (`{"kind": "json", "data": ...}`), so a test
-/// reading a body straight off the event would be asserting about the
-/// envelope. Bytes ride it as base64 text under the same `data`, which
-/// is the honest thing to hand back for a `bytes` route.
-fn wire_value(payload: &Value) -> Value {
-        payload.get("data").cloned().unwrap_or_else(|| payload.clone())
-    }
-
-    /// Every message of the conversation that went `direction`, in
-    /// order, paired with whether it was the last thing the program
-    /// said.
-    ///
-    /// The journal does not write one row per message: it folds a
-    /// window of the conversation into a single `caller_window` row
-    /// carrying the messages it covered, so a socket at fifty messages
-    /// a second is one write rather than fifty. The rows arrive in
-    /// window order and each row's `messages` are in order within it,
-    /// so walking them in sequence rebuilds the conversation.
-    ///
-    /// A message the journal did not keep (an ephemeral exchange, raw
-    /// bytes) still has a row, carrying only its size. It has no
-    /// payload, so it is not returned here; a test that wants to see
-    /// those reads the rows itself. Nor is a message of the program's
-    /// that a window (the caller read too slowly) or the row saying the
-    /// caller left (it was still waiting to go out) names in `dropped`:
-    /// the caller never received it.
-    fn caller_messages(&self, direction: &str) -> Vec<(Value, bool)> {
-        let dropped: std::collections::HashSet<u64> = self
-            .replay
-            .by_kind("caller_window")
-            .chain(self.replay.by_kind("caller_disconnected"))
-            .filter_map(|e| e.field("dropped").and_then(Value::as_array))
-            .flatten()
-            .filter_map(Value::as_u64)
-            .collect();
-        self.replay
-            .by_kind("caller_window")
-            .filter_map(|e| e.field("messages").and_then(Value::as_array))
-            .flatten()
-            .filter(|m| m.get("direction").and_then(Value::as_str) == Some(direction))
-            .filter(|m| m.get("offset").and_then(Value::as_u64).is_none_or(|offset| !dropped.contains(&offset)))
-            .filter_map(|m| {
-                let payload = m.get("payload").map(Self::wire_value)?;
-                let terminal = m.get("terminal").and_then(Value::as_bool).unwrap_or(false);
-                Some((payload, terminal))
-            })
-            .collect()
-    }
-
-    /// What the program ANSWERED its caller, as the journal recorded
-    /// it: every outbound chunk in order, with the terminal one last.
-    ///
-    /// A route's answer never lands on a node's ports (it goes to the
-    /// person on the other end), so no node assertion can see it. This
-    /// is how a test checks what a caller actually received, and it
-    /// reads the same rows whether the caller was a real socket or the
-    /// stand-in a fired run serves.
-    pub fn caller_answers(&self) -> Vec<Value> {
-        self.caller_messages("outbound").into_iter().map(|(payload, _)| payload).collect()
-    }
-
-    /// The exchange ended, and this is what went out last. `None` when
-    /// the program never answered at all, which is itself the thing a
-    /// route test usually wants to catch.
-    pub fn caller_final_answer(&self) -> Option<Value> {
-        self.caller_messages("outbound")
-            .into_iter()
-            .filter(|(_, terminal)| *terminal)
-            .map(|(payload, _)| payload)
-            .next_back()
-    }
-
-    /// What the caller SENT, as the journal recorded it.
-    pub fn caller_requests(&self) -> Vec<Value> {
-        self.caller_messages("inbound").into_iter().map(|(payload, _)| payload).collect()
-    }
-
     /// The assembled INPUT a node received on its first firing
     /// (`node_started.input`). For sink nodes like Debug (which consume an input
     /// and emit nothing), this is how the rig asserts "the node received value
@@ -299,11 +200,6 @@ fn wire_value(payload: &Value) -> Value {
         self.events_of(node).any(|e| e.kind() == "node_completed")
     }
 
-    /// True if the node was started at least once.
-    pub fn node_started(&self, node: &str) -> bool {
-        self.events_of(node).any(|e| e.kind() == "node_started")
-    }
-
     /// Assert a node was SKIPPED via null-propagation: a `node_skipped` event
     /// fired and the node did NOT complete (it produced no output). The engine
     /// still ships a `node_started` (with the closed port listed) as part of its
@@ -317,38 +213,6 @@ fn wire_value(payload: &Value) -> Value {
                  Its events: {:?}",
                 self.events_of(node).map(|e| e.kind()).collect::<Vec<_>>()
             );
-        }
-        if self.node_completed(node) {
-            bail!("node '{node}' was skipped AND completed; expected a skip with no output");
-        }
-        Ok(self)
-    }
-
-    /// Assert a node was skipped EXACTLY ONCE, with the given reason
-    /// (`did_not_flow`, `required_input_closed`, `scope_skipped`,
-    /// ...). The count matters as much as the reason: a firing location
-    /// terminates once, and a duplicated lifecycle pair is a bug this
-    /// assertion must surface, never read past.
-    pub fn assert_skip_reason(&self, node: &str, reason_kind: &str) -> Result<&Self> {
-        let reasons: Vec<String> = self
-            .events_of(node)
-            .filter(|e| e.kind() == "node_skipped")
-            .map(|e| {
-                e.field("reason")
-                    .and_then(|r| r.get("kind"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("<no reason>")
-                    .to_string()
-            })
-            .collect();
-        if reasons.len() != 1 {
-            bail!(
-                "expected exactly one node_skipped for '{node}', got {} (reasons: {reasons:?})",
-                reasons.len()
-            );
-        }
-        if reasons[0] != reason_kind {
-            bail!("node '{node}' skipped with reason '{}', expected '{reason_kind}'", reasons[0]);
         }
         if self.node_completed(node) {
             bail!("node '{node}' was skipped AND completed; expected a skip with no output");
@@ -414,11 +278,7 @@ fn wire_value(payload: &Value) -> Value {
         Ok(self)
     }
 
-    /// Every cost the run recorded, as `(service, amount_usd)` in order.
-    /// Each is a provider meter's measurement of a real call; the run's
-    /// money trail. A record whose amount is `null` (the meter could not
-    /// resolve the figure, an honest unknown) is skipped here.
-    /// Every resolved cost record: `(service, origin, amount_usd)`. Origin is
+    /// Every resolved cost record, in order: `(service, origin, amount_usd)`. Origin is
     /// the wire string of whose key the call spent (`"author"` or
     /// `"platform"`). Records with a null amount (an honest unknown) are
     /// not in this list.
@@ -433,52 +293,6 @@ fn wire_value(payload: &Value) -> Value {
                 ))
             })
             .collect()
-    }
-
-    /// Assert the run recorded `count` spends for `service` that
-    /// carry NO figure.
-    ///
-    /// The counterpart of [`Self::assert_measured`]: money went out and
-    /// nothing ever stated what it came to. That is an honest answer and
-    /// it has to reach the trail, because the alternative is a zero
-    /// (which claims the call was free) or no row at all (which claims
-    /// the call never happened). A job submitted and never read back is
-    /// the shape that produces it.
-    ///
-    /// Like a resolved record, an unresolved one lands after the
-    /// terminal event, so this waits for it rather than judging the
-    /// at-terminal snapshot.
-    pub async fn assert_spend_without_figure(
-        &mut self,
-        service: &str,
-        count: usize,
-    ) -> Result<&Self> {
-        const COST_TRAIL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
-        let unpriced = |replay: &Replay| {
-            replay
-                .by_kind("cost_reported")
-                .filter(|e| e.str_field("service") == Some(service))
-                .filter(|e| e.0.get("amountUsd").is_none_or(Value::is_null))
-                .count()
-        };
-        self.refresh_replay_until(
-            &format!("{count} unpriced '{service}' spend(s) to land on the journal"),
-            COST_TRAIL_DEADLINE,
-            move |replay| unpriced(replay) >= count,
-        )
-        .await?;
-        let got = unpriced(&self.replay);
-        if got != count {
-            bail!(
-                "expected {count} '{service}' spend(s) with no figure, got {got}; \
-                 every cost record: {:?}",
-                self.replay
-                    .by_kind("cost_reported")
-                    .map(|e| (e.str_field("service").unwrap_or("?").to_string(), e.0.get("amountUsd").cloned()))
-                    .collect::<Vec<_>>()
-            );
-        }
-        Ok(self)
     }
 
     /// Assert the run recorded exactly one cost for `service`, resolved

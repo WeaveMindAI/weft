@@ -316,10 +316,7 @@ pub async fn run(ctx: Ctx, args: EnvArgs) -> Result<()> {
         };
         let value = item_text(item);
         taken.extend(item.taken_press());
-        written.push(match item.kind {
-            LiveItemKind::Secret => (name.clone(), None),
-            _ => (name.clone(), Some(value.clone())),
-        });
+        written.push((name.clone(), told_value(item)));
         pairs.push((name.clone(), value));
     }
     write_env(&path, &pairs)?;
@@ -335,9 +332,28 @@ pub async fn run(ctx: Ctx, args: EnvArgs) -> Result<()> {
         })?;
     }
     let shown = args.into.display().to_string();
+    let (report, line) = told(&shown, &card.place, &written);
+    if !ctx.json_out(&report)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// What the command says of an item it wrote: its value, or nothing for
+/// a secret, whose value is never printed.
+fn told_value(item: &LiveItem) -> Option<String> {
+    match item.kind {
+        LiveItemKind::Secret => None,
+        _ => Some(item_text(item)),
+    }
+}
+
+/// What the command says once `written` (each name with [`told_value`])
+/// is in `file`: the `--json` answer, and the line a person reads.
+fn told(file: &str, node: &str, written: &[(String, Option<String>)]) -> (serde_json::Value, String) {
     let report = serde_json::json!({
-        "file": shown,
-        "node": card.place,
+        "file": file,
+        "node": node,
         "env": written
             .iter()
             .map(|(name, value)| match value {
@@ -346,18 +362,15 @@ pub async fn run(ctx: Ctx, args: EnvArgs) -> Result<()> {
             })
             .collect::<Vec<_>>(),
     });
-    if !ctx.json_out(&report)? {
-        let names = written
-            .iter()
-            .map(|(name, value)| match value {
-                Some(value) => format!("{name}={value}"),
-                None => format!("{name} (secret, not shown)"),
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("wrote {names} to {shown}");
-    }
-    Ok(())
+    let names = written
+        .iter()
+        .map(|(name, value)| match value {
+            Some(value) => format!("{name}={value}"),
+            None => format!("{name} (secret, not shown)"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    (report, format!("wrote {names} to {file}"))
 }
 
 /// The refusal for a secret the node handed over already: what its card
@@ -398,6 +411,20 @@ mod tests {
 
     fn label(l: &str) -> Want {
         Want::Label(l.to_string())
+    }
+
+    /// Writing a secret never prints it, as a line or under `--json`: a
+    /// plain line written beside it is said with its value.
+    #[test]
+    fn what_was_written_is_said_without_the_secret() {
+        let feed = fresh();
+        let written: Vec<(String, Option<String>)> =
+            vec![("PG_USER".into(), told_value(&feed.items[0])), ("PG_PASSWORD".into(), told_value(&feed.items[1]))];
+        let (report, line) = told(".env", "db", &written);
+        assert_eq!(line, "wrote PG_USER=weft, PG_PASSWORD (secret, not shown) to .env");
+        assert!(!report.to_string().contains("s3cret"), "{report}");
+        assert_eq!(report["env"][1], serde_json::json!({ "name": "PG_PASSWORD", "secret": true }));
+        assert_eq!(report["env"][0]["value"], "weft");
     }
 
     #[test]

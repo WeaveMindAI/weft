@@ -1918,6 +1918,31 @@ pub(crate) mod tests {
         weft_catalog::FsCatalog::discover(&dir.join("nodes")).unwrap()
     }
 
+    /// A type a project's own node declares in its `metadata.json`
+    /// (`"types": {"Profile": ...}`) is baked into the worker's `main.rs`,
+    /// and the row it bakes builds, at the worker's start, the same named
+    /// type the build resolved: what lets the node's `Profile` input and a
+    /// `Cast` into `Profile` mean one thing at run time.
+    #[test]
+    fn a_type_a_projects_node_declares_is_baked_into_the_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().join("nodes/profile_greet");
+        std::fs::create_dir_all(&at).unwrap();
+        std::fs::write(at.join("metadata.json"), r#"{"type": "ProfileGreet", "label": "Profile Greet", "description": "d",
+            "types": {"Profile": "{ name: String, age: Number, nickname?: String }"},
+            "inputs": [{"name": "profile", "type": "Profile", "required": true}], "outputs": [{"name": "greeting", "type": "String"}]}"#).unwrap();
+        std::fs::write(at.join("mod.rs"), "// impl\n").unwrap();
+        let catalog = weft_catalog::FsCatalog::discover(&dir.path().join("nodes")).unwrap();
+        let resolved = catalog.type_registry().lookup("Profile").expect("the catalog resolves the declared type");
+
+        let rows = super::baked_type_decls(&catalog);
+        let (_, body) = catalog.type_registry().nominal_entries().into_iter().find(|(name, _)| name == "Profile").expect("a nominal entry");
+        assert!(rows.contains(&format!("({:?}.to_string(), {body:?}.to_string(), \"baked\".to_string())", "Profile")), "{rows}");
+        assert!(super::worker_main_source(&rows).contains(&rows), "the worker's main installs the rows");
+        let at_start = weft_core::weft_type::TypeRegistry::build(&[("Profile".into(), body, "baked".into())]).expect("the baked row builds");
+        assert_eq!(at_start.lookup("Profile"), Some(resolved));
+    }
+
     /// The needs of a program are those of the node types it uses, each
     /// with the program's nodes of that type; a catalog node it does not
     /// use is never asked about, nor a type weft gives its own nodes.

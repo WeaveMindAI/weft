@@ -167,7 +167,9 @@ mod tests {
         assert_eq!(tag.len(), "49151_s_whatsapp_net-".len() + FINGERPRINT_LEN);
         assert!(validate_tag(&tag).is_ok());
         assert_eq!(normalize_tag("49151@s.whatsapp.net").unwrap(), tag, "deterministic");
-        assert_ne!(normalize_tag("+33 6 12").unwrap(), normalize_tag("+33.6.12").unwrap());
+        let phone = normalize_tag("+33 6 12").unwrap();
+        assert!(phone.starts_with("_33_6_12-") && phone.len() == "_33_6_12-".len() + FINGERPRINT_LEN, "{phone}");
+        assert_ne!(phone, normalize_tag("+33.6.12").unwrap(), "a lookalike sender is another tag");
         let long = "y".repeat(MAX_LEN + 1);
         let cut = normalize_tag(&long).unwrap();
         assert_eq!(cut.len(), MAX_LEN);

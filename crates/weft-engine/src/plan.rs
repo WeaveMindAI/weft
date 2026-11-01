@@ -278,7 +278,7 @@ impl Startable {
             settings: plan.entry.spec.settings,
             at_unix,
         });
-        let baked = weft_journal::birth::baked_rows(run_id, &self.baked, at_unix);
+        let baked = weft_journal::birth::baked_rows(run_id, &program.project, &program.index, &self.baked, at_unix);
         std::iter::once(start).chain(kicks).chain(baked).collect()
     }
 

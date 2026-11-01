@@ -100,28 +100,10 @@ pub async fn connect_direct(
     door: &str,
     values: Value,
 ) -> Result<Connection> {
-    connect_direct_inner(disp, spec, door, values, false).await
-}
-
-/// Connect through a consent service's `ownPage.paste` section (a
-/// ready credential, no app): the store snapshots the spec's static
-/// paste variant.
-pub async fn connect_paste(disp: &Dispatcher, spec: Value, values: Value) -> Result<Connection> {
-    connect_direct_inner(disp, spec, "own", values, true).await
-}
-
-async fn connect_direct_inner(
-    disp: &Dispatcher,
-    spec: Value,
-    door: &str,
-    values: Value,
-    paste: bool,
-) -> Result<Connection> {
     let done: Value = disp
         .post_json(
             "/access/connect/direct",
-            &json!({ "spec": spec, "door": door, "values": values, "paste": paste,
-                     "projectId": null }),
+            &json!({ "spec": spec, "door": door, "values": values, "projectId": null }),
         )
         .await
         .context("connect_direct through the dispatcher")?;

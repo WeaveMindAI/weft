@@ -271,8 +271,8 @@ fn not_copied(meta: &StoredFileMeta, source: &str) -> Option<String> {
     match weft_core::storage::key::parse_key(&meta.key) {
         Err(e) => Some(format!("its key is not one weft makes ({e})")),
         Ok(parsed) => match parsed.scope {
-            weft_core::storage::key::KeyScope::Run { .. } if !meta.keep => {
-                Some(format!("a run's file goes with its run, which stays on {source} (a kept one would be copied)"))
+            weft_core::storage::key::KeyScope::Run { .. } => {
+                Some(format!("a run's file goes with its run, which stays on {source}"))
             }
             _ => None,
         },
@@ -379,13 +379,12 @@ mod tests {
         assert!(parse_moment("yesterday").unwrap_err().contains("neither a date"));
     }
 
-    fn meta(key: &str, keep: bool) -> StoredFileMeta {
+    fn meta(key: &str) -> StoredFileMeta {
         StoredFileMeta {
             key: key.into(),
             mime_type: "text/plain".into(),
             size_bytes: 1,
             filename: "f".into(),
-            keep,
             expires_at_unix: None,
             keep_ttl_secs: None,
             created_at_unix: 0,
@@ -394,11 +393,10 @@ mod tests {
     }
 
     #[test]
-    fn a_runs_file_stays_unless_kept() {
+    fn a_runs_file_stays_with_its_run() {
         let run = format!("t/run/{}/f", uuid::Uuid::nil());
-        assert!(not_copied(&meta(&run, false), "local").unwrap().contains("stays on local"));
-        assert_eq!(not_copied(&meta(&run, true), "local"), None);
-        assert_eq!(not_copied(&meta(&format!("t/project/{}/f", uuid::Uuid::nil()), false), "local"), None);
+        assert!(not_copied(&meta(&run), "local").unwrap().contains("stays on local"));
+        assert_eq!(not_copied(&meta(&format!("t/project/{}/f", uuid::Uuid::nil())), "local"), None);
     }
 
     #[test]

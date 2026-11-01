@@ -2768,8 +2768,8 @@ impl ContextHandle for RunnerHandle {
     ) -> WeftResult<(weft_core::storage::StoredFileMeta, weft_core::storage::ByteStream)> {
         // Fetch the external URL directly, from the worker. A byte range
         // is passed through as a Range header so a piecewise read never buffers
-        // the whole resource; a server that ignores Range simply returns the
-        // full body (the caller's range logic still slices correctly).
+        // the whole resource; a server that ignores Range answers 200 with the
+        // full body, and that body is sliced here (`slice_to_range`).
         let mut req = http_client().get(url);
         if let Some(r) = range {
             let header = match r.end {
@@ -2779,13 +2779,14 @@ impl ContextHandle for RunnerHandle {
                         r.start
                     )));
                 }
+                // Nothing to read, so nothing is asked: the size is the
+                // declared one, the only one known without a request.
                 Some(e) if e == r.start => {
                     let meta = weft_core::storage::StoredFileMeta {
                         key: String::new(),
                         mime_type: declared_mime.to_string(),
                         size_bytes: declared_size,
                         filename: declared_filename.to_string(),
-                        keep: false,
                         expires_at_unix: None,
                         keep_ttl_secs: None,
                         created_at_unix: 0,
@@ -2815,19 +2816,48 @@ impl ContextHandle for RunnerHandle {
         // The response's own Content-Type is authoritative for the bytes; fall
         // back to the marker's declared mime when the server omits one (rather
         // than the generic octet-stream `normalize_content_type` would give).
-        // Same for the size (Content-Length when present, else the declared).
         let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok());
         let mime = match ct {
             Some(ct) => weft_core::storage::normalize_content_type(Some(ct)),
             None => declared_mime.to_string(),
         };
-        let size = resp.content_length().unwrap_or(declared_size);
+        // The size is the whole file's, as a stored file's range read
+        // answers, read off the answer (a URL's declared size is often 0):
+        // a whole body's Content-Length, or a part's Content-Range total;
+        // the declared one only when the server says neither. A part is
+        // read from where it starts: a server may answer more than was
+        // asked (rounded to its blocks), never a later start.
+        let (size, body_starts_at) = match resp.status() {
+            reqwest::StatusCode::PARTIAL_CONTENT => {
+                let Some((starts_at, total)) =
+                    resp.headers().get("content-range").and_then(|v| v.to_str().ok()).and_then(content_range)
+                else {
+                    return Err(WeftError::NodeFailed(format!(
+                        "fetch {url}: a partial answer with no readable Content-Range"
+                    )));
+                };
+                (total.unwrap_or(declared_size), starts_at)
+            }
+            _ => (resp.content_length().unwrap_or(declared_size), 0),
+        };
+        let range = match range {
+            Some(r) if body_starts_at > r.start => {
+                return Err(WeftError::NodeFailed(format!(
+                    "fetch {url}: asked for bytes from {}, the server answered from {body_starts_at}",
+                    r.start
+                )));
+            }
+            Some(r) => Some(weft_core::storage::ByteRange {
+                start: r.start - body_starts_at,
+                end: r.end.map(|e| e - body_starts_at),
+            }),
+            None => None,
+        };
         let meta = weft_core::storage::StoredFileMeta {
             key: String::new(),
             mime_type: mime,
             size_bytes: size,
             filename: declared_filename.to_string(),
-            keep: false,
             expires_at_unix: None,
             keep_ttl_secs: None,
             created_at_unix: 0,
@@ -2837,7 +2867,10 @@ impl ContextHandle for RunnerHandle {
             resp.bytes_stream()
                 .map_err(|e| std::io::Error::other(format!("fetch stream: {e}"))),
         );
-        Ok((meta, stream))
+        match range {
+            Some(range) => Ok((meta, slice_to_range(stream, range))),
+            None => Ok((meta, stream)),
+        }
     }
 
     async fn storage_delete(&self, key: &str) -> WeftResult<()> {
@@ -3637,20 +3670,26 @@ async fn enqueue_register_signal_task(
         })
         .await?
         .id();
-    let outcome = tasks
-        .wait_for_terminal(id, TASK_WAIT_TIMEOUT)
-        .await?;
-    match outcome.status {
-        task_store::TaskStatus::Complete => {
-            let result = outcome
-                .result
-                .ok_or_else(|| anyhow::anyhow!("register_signal returned no result"))?;
-            Ok(serde_json::from_value(result)?)
+    // A held wait can answer before its time is up (a broker copy that
+    // starts stopping answers "not done yet" at once): asked again, on a
+    // running copy, for what is left of the one budget.
+    let until = tokio::time::Instant::now() + TASK_WAIT_TIMEOUT;
+    loop {
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        let outcome = tasks.wait_for_terminal(id, left).await?;
+        match outcome.status {
+            task_store::TaskStatus::Complete => {
+                let result = outcome
+                    .result
+                    .ok_or_else(|| anyhow::anyhow!("register_signal returned no result"))?;
+                return Ok(serde_json::from_value(result)?);
+            }
+            task_store::TaskStatus::Failed => {
+                anyhow::bail!("{}", outcome.error.unwrap_or_else(|| "register_signal failed".into()))
+            }
+            other if tokio::time::Instant::now() >= until => anyhow::bail!("register_signal status: {other:?}"),
+            _ => {}
         }
-        task_store::TaskStatus::Failed => {
-            anyhow::bail!("{}", outcome.error.unwrap_or_else(|| "register_signal failed".into()))
-        }
-        other => anyhow::bail!("register_signal status: {other:?}"),
     }
 }
 
@@ -3787,7 +3826,55 @@ where
 /// call rebuilds the pool).
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        weft_core::net::http_client()
+            .build()
+            .expect("an HTTP client with no custom settings always builds")
+    })
+}
+
+/// Where a partial answer's body starts in the whole resource, and the
+/// whole resource's size when the server knows it, read off its
+/// `Content-Range` (`bytes 6-11/40`, `bytes 6-11/*`).
+fn content_range(header: &str) -> Option<(u64, Option<u64>)> {
+    let (unit, rest) = header.trim().split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (span, total) = rest.split_once('/')?;
+    let (start, _) = span.split_once('-')?;
+    let total = match total.trim() {
+        "*" => None,
+        total => Some(total.parse().ok()?),
+    };
+    Some((start.trim().parse().ok()?, total))
+}
+
+/// Only `range` out of a stream of the resource from its first byte, for a
+/// server that ignored the Range header or answered more than was asked
+/// (the range is then counted from where the answer starts). Chunks before
+/// the range are dropped, the edge chunks trimmed, and the stream ends at
+/// the range's end without downloading the rest.
+fn slice_to_range(
+    stream: weft_core::storage::ByteStream,
+    range: weft_core::storage::ByteRange,
+) -> weft_core::storage::ByteStream {
+    let end = range.end.unwrap_or(u64::MAX);
+    let sliced = futures::StreamExt::scan(stream, 0u64, move |at, chunk| {
+        std::future::ready(match chunk {
+            Err(e) => Some(Err(e)),
+            Ok(_) if *at >= end => None,
+            Ok(chunk) => {
+                let chunk_start = *at;
+                *at += chunk.len() as u64;
+                let len = chunk.len() as u64;
+                let from = range.start.saturating_sub(chunk_start).min(len);
+                let to = end.saturating_sub(chunk_start).min(len).max(from);
+                Some(Ok(chunk.slice(from as usize..to as usize)))
+            }
+        })
+    });
+    Box::pin(sliced.try_filter(|chunk| std::future::ready(!chunk.is_empty())))
 }
 
 #[cfg(test)]
@@ -4297,18 +4384,22 @@ mod replay_tests {
         let bytes = weft_core::storage::collect_stream(stream).await.unwrap();
         assert_eq!(&bytes[..], b"payload");
 
-        // The wall: another run's run key (under the same tenant) is denied.
-        let err = match handle.storage_get("t1/run/OTHER/f0", None).await {
+        // The wall is the tenant's alone: another run's key is no refusal
+        // (only missing here), another tenant's is denied.
+        let other_run = match handle.storage_get("t1/run/OTHER/f0", None).await {
             Err(e) => e,
-            Ok(_) => panic!("cross-run get must be denied"),
+            Ok(_) => panic!("the fake holds no file of another run"),
         };
-        assert!(err.to_string().contains("denied"), "{err}");
+        assert!(!other_run.to_string().contains("denied"), "{other_run}");
+        let other_tenant = match handle.storage_get("t2/run/c1/f0", None).await {
+            Err(e) => e,
+            Ok(_) => panic!("another tenant's get must be denied"),
+        };
+        assert!(other_tenant.to_string().contains("denied"), "{other_tenant}");
 
-        // Keep marks the file to survive the broker's terminate sweep (the
-        // sweep itself is broker-side, covered by the broker's db tests;
-        // the worker has no sweep verb).
+        // Keep sets the file's deadline.
         handle.storage_keep(&stored.key, KeepTtl::Default).await.expect("keep");
-        assert!(handle.storage_get(&stored.key, None).await.is_ok(), "kept file still readable");
+        assert!(handle.storage_get(&stored.key, None).await.is_ok(), "a file with a deadline still reads");
 
         // A link to an owned file, for node code and for the outside.
         let inside = handle.storage_link(&stored.key, Some(60), weft_core::storage::LinkReach::Internal).await.expect("link");
@@ -4401,9 +4492,8 @@ mod replay_tests {
         assert_eq!(copied.filename, "upload.png");
         assert_eq!(copied.size_bytes, 4);
 
-        let (meta, bytes) = project.get_bytes(&FileHandle::key(copied.key.clone())).await.expect("read the copy");
+        let (_, bytes) = project.get_bytes(&FileHandle::key(copied.key.clone())).await.expect("read the copy");
         assert_eq!(&bytes[..], b"PNG!");
-        assert!(!meta.keep, "a project file carries no keep flag");
         let (_, still_there) = project.get_bytes(&source).await.expect("the source is untouched");
         assert_eq!(&still_there[..], b"PNG!");
     }
@@ -4693,6 +4783,176 @@ mod replay_tests {
         let mine = weft_core::infra::InfraHandle::new("node-x", "api", Some(alice));
         let err = handle.endpoint_address(&mine).await.expect_err("no row behind the fake").to_string();
         assert!(err.contains("is not available"), "a declared copy reaches the lookup: {err}");
+    }
+
+    const URL_FILE_BODY: &[u8] = b"bytes behind the link";
+
+    /// Every request a [`url_file_server`] got: (path, Range header).
+    type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    /// A local server standing in for wherever a url-backed file lives:
+    /// `/a.bin` serves `URL_FILE_BODY` (honoring a `Range` header with a
+    /// 206, like a real CDN), `/blocks.bin` answers a range from the start
+    /// of its 8-byte block to the end, `/whole.bin` ignores `Range` (a 200
+    /// with everything), `/gone` answers 404. Every request lands in the
+    /// returned log.
+    async fn url_file_server() -> (String, Seen) {
+        let seen: Seen = Arc::default();
+        let log = seen.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let log = log.clone();
+            async move {
+                let path = req.uri().path().to_string();
+                let range = req
+                    .headers()
+                    .get("range")
+                    .map(|v| v.to_str().unwrap().to_string());
+                log.lock().unwrap().push((path.clone(), range.clone()));
+                if path == "/gone" {
+                    return axum::response::Response::builder()
+                        .status(404)
+                        .body(axum::body::Body::from("no such file"))
+                        .unwrap();
+                }
+                // `/a.bin` answers what was asked; `/blocks.bin` answers
+                // from the start of the 8-byte block the range starts in, to
+                // the end; `/whole.bin` ignores the range.
+                let honored = range.as_deref().filter(|_| path != "/whole.bin");
+                let answer = axum::response::Response::builder().header("content-type", "text/plain");
+                match honored.and_then(|r| r.strip_prefix("bytes=")) {
+                    Some(spec) => {
+                        let (start, end) = spec.split_once('-').unwrap();
+                        let mut start: usize = start.parse().unwrap();
+                        let mut end = if end.is_empty() { URL_FILE_BODY.len() } else { end.parse::<usize>().unwrap() + 1 };
+                        if path == "/blocks.bin" {
+                            (start, end) = (start / 8 * 8, URL_FILE_BODY.len());
+                        }
+                        let total = URL_FILE_BODY.len();
+                        answer
+                            .status(206)
+                            .header("content-range", format!("bytes {start}-{}/{total}", end - 1))
+                            .body(axum::body::Body::from(&URL_FILE_BODY[start..end]))
+                            .unwrap()
+                    }
+                    None => answer.status(200).body(axum::body::Body::from(URL_FILE_BODY)).unwrap(),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base, seen)
+    }
+
+    /// A file at `url` as an `@asset("https://...")` names one: its size
+    /// is not known until it is read (`url_file_value` writes 0).
+    fn url_file(url: String) -> weft_core::storage::FileHandle {
+        weft_core::storage::FileHandle::Url {
+            url,
+            mime_type: "application/octet-stream".into(),
+            filename: "a.bin".into(),
+            size_bytes: 0,
+        }
+    }
+
+    /// A url-backed file is read by the worker itself: one GET to the
+    /// url per read, the bytes are the server's, and the server's
+    /// Content-Type wins over the declared mime.
+    #[tokio::test]
+    async fn a_url_file_is_fetched_from_its_url_once_per_read() {
+        let (base, seen) = url_file_server().await;
+        let ctx = ctx_over(handle_with_sequence(Vec::new()));
+        let storage = ctx.storage(weft_core::storage::StorageScope::Project);
+        let file = url_file(format!("{base}/a.bin"));
+
+        let (meta, bytes) = storage.get_bytes(&file).await.unwrap();
+        assert_eq!(&bytes[..], URL_FILE_BODY);
+        assert_eq!(meta.mime_type, "text/plain");
+        assert_eq!(meta.filename, "a.bin");
+        assert_eq!(meta.size_bytes, URL_FILE_BODY.len() as u64);
+        assert_eq!(*seen.lock().unwrap(), [("/a.bin".to_string(), None)]);
+
+        storage.get_bytes(&file).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 2, "a second read is a second fetch, nothing cached");
+    }
+
+    /// A range read asks the server for only that range (the end is
+    /// exclusive in weft, inclusive in HTTP) and still reports the whole
+    /// file's size, read off the answer; an empty range answers without
+    /// touching the network. A server that ignores the Range, or answers
+    /// more than was asked from an earlier start, still yields only the
+    /// range.
+    #[tokio::test]
+    async fn a_url_file_range_read_asks_the_server_for_only_that_range() {
+        let (base, seen) = url_file_server().await;
+        let ctx = ctx_over(handle_with_sequence(Vec::new()));
+        let storage = ctx.storage(weft_core::storage::StorageScope::Project);
+        let read = |path: &'static str, start, end| {
+            let storage = &storage;
+            let file = url_file(format!("{base}{path}"));
+            async move {
+                let range = weft_core::storage::ByteRange { start, end };
+                let (meta, stream) = storage.get_range(&file, range).await.unwrap();
+                if end != Some(start) {
+                    assert_eq!(meta.size_bytes, URL_FILE_BODY.len() as u64, "the whole file's size, read off the answer");
+                }
+                weft_core::storage::collect_stream(stream).await.unwrap()
+            }
+        };
+
+        assert_eq!(&read("/a.bin", 6, Some(12)).await[..], b"behind");
+        assert_eq!(&read("/a.bin", 17, None).await[..], b"link");
+        assert!(read("/a.bin", 4, Some(4)).await.is_empty());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                ("/a.bin".to_string(), Some("bytes=6-11".to_string())),
+                ("/a.bin".to_string(), Some("bytes=17-".to_string())),
+            ],
+            "the empty range made no request",
+        );
+        assert_eq!(&read("/whole.bin", 6, Some(12)).await[..], b"behind");
+        assert_eq!(&read("/whole.bin", 17, None).await[..], b"link");
+        // A server answering more than was asked, from an earlier start:
+        // only the range reaches the node.
+        assert_eq!(&read("/blocks.bin", 10, Some(12)).await[..], b"nd");
+        assert_eq!(&read("/blocks.bin", 6, Some(12)).await[..], b"behind");
+    }
+
+    /// The slice of a whole body holds across chunk edges: a range that
+    /// starts in one chunk and ends in another, and one inside a single
+    /// chunk; the stream stops at the range's end.
+    #[tokio::test]
+    async fn a_whole_body_is_sliced_to_the_range_across_chunks() {
+        let slice = |start, end| async move {
+            let chunks = ["bytes ", "behind ", "the link"]
+                .map(|c| Ok::<_, std::io::Error>(bytes::Bytes::from_static(c.as_bytes())));
+            let whole: weft_core::storage::ByteStream = Box::pin(futures::stream::iter(chunks));
+            let range = weft_core::storage::ByteRange { start, end };
+            weft_core::storage::collect_stream(slice_to_range(whole, range)).await.unwrap()
+        };
+        assert_eq!(&slice(3, Some(9)).await[..], b"es beh");
+        assert_eq!(&slice(7, Some(10)).await[..], b"ehi");
+        assert_eq!(&slice(13, None).await[..], b"the link");
+        assert_eq!(&slice(0, Some(21)).await[..], URL_FILE_BODY);
+    }
+
+    /// A url that answers anything but 2xx fails the read, naming the
+    /// url, the status and what the server said, instead of handing the
+    /// node an error page as if it were the file.
+    #[tokio::test]
+    async fn a_url_file_answered_with_an_error_status_fails_naming_it() {
+        let (base, seen) = url_file_server().await;
+        let ctx = ctx_over(handle_with_sequence(Vec::new()));
+        let storage = ctx.storage(weft_core::storage::StorageScope::Project);
+        let url = format!("{base}/gone");
+
+        let err = storage.get_bytes(&url_file(url.clone())).await.expect_err("a 404 is not the file").to_string();
+        assert!(err.contains(&format!("fetch {url} returned 404")), "{err}");
+        assert!(err.contains("no such file"), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }
 

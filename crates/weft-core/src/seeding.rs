@@ -448,7 +448,7 @@ pub fn inheritable_nodes(project: &ProjectDefinition, snapshot: &RunSnapshot) ->
         for at in places.iter().filter(|place| place.id == entry_id) {
             if enclosing_loops(&g, at).iter().any(|around| around.id != group.id) { continue; }
             let members = members_in(&g, &group.id, &at.path);
-            let complete = complete_loop(project, &index, snapshot, &group.id, &at.frames())
+            let complete = complete_loop(project, &index, snapshot, &group.id, &index.frames_at(project, at))
                 && members.iter().all(|member| snapshot.firings.get(&member.id).is_none_or(|records|
                     records.values().filter(|record| Located::at(&member.id, &record.frames) == *member)
                         .all(|record| matches!(record.status(), NodeFiringStatus::Completed | NodeFiringStatus::Skipped))));

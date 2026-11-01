@@ -1,9 +1,0 @@
-# A run that fails: `explode` raises and nothing is wired on its `error`,
-# so its failure fails the run. The rig asserts the exit code `weft wait`
-# and `weft run` end with for a failed run.
-
-explode = ExecPython -> (done: Boolean) {
-  code: "raise RuntimeError('this run fails on purpose')"
-}
-out = Debug
-out.data = explode.done

@@ -31,9 +31,9 @@ use weft_core::access::wire::{
 };
 use weft_core::storage::Tenanted;
 use weft_core::migrate::{ExportConnections, ExportedConnections, ImportConnections, ImportedConnections, TransferKey};
-use weft_core::AccessSpec;
+use weft_core::{AccessSpec, AppRegistration};
 
-use crate::app_provider::resolve_shared_app;
+use crate::app_provider::{resolve_shared_app, AppProvider};
 use crate::auth::control_plane;
 use crate::state::BrokerState;
 use weft_core::wire_shape::Json;
@@ -147,26 +147,28 @@ fn shared_app_err(e: anyhow::Error) -> ApiError {
 }
 
 /// The SHARED-door app grant for one oauth connect: resolve the
-/// registered app the user picked by label, and answer the app itself
-/// (client id + secret for the exchange) plus its fixed `covers` as
-/// the connect's permissions. Nothing the client sent survives on
-/// either: the client names a choice, never an app or a permission
-/// set.
+/// registered app the user picked by label, and write the app itself
+/// (client id + secret for the exchange) into the connect's
+/// `registration` and its fixed `covers` into its `permissions`.
+/// Nothing the client sent survives on either: the client names a
+/// choice, never an app or a permission set.
 async fn shared_app_grant(
-    state: &BrokerState,
+    provider: &Arc<dyn AppProvider>,
     spec: &AccessSpec,
     shared_app: Option<&str>,
-) -> Result<(weft_core::AppRegistration, Vec<String>), ApiError> {
+    registration: &mut Option<AppRegistration>,
+    permissions: &mut Vec<String>,
+) -> Result<(), ApiError> {
     let label = shared_app.ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             format!("a shared-door '{}' connect names which registered app to use", spec.service),
         )
     })?;
-    let picked = resolve_shared_app(&state.app_provider, spec, label)
-        .await
-        .map_err(shared_app_err)?;
-    Ok((picked.app, picked.covers))
+    let picked = resolve_shared_app(provider, spec, label).await.map_err(shared_app_err)?;
+    *registration = Some(picked.app);
+    *permissions = picked.covers;
+    Ok(())
 }
 
 /// The spec a connect's DOOR is decided on: the paste variant when
@@ -217,9 +219,14 @@ async fn connect_direct(
         let decided = door_decision_spec(&inner.spec, inner.paste)
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
         if decided.is_oauth() {
-            let (app, covers) = shared_app_grant(&state, &decided, shared_app.as_deref()).await?;
-            inner.registration = Some(app);
-            inner.permissions = covers;
+            shared_app_grant(
+                &state.app_provider,
+                &decided,
+                shared_app.as_deref(),
+                &mut inner.registration,
+                &mut inner.permissions,
+            )
+            .await?;
         } else {
             let available = state
                 .credentials
@@ -247,9 +254,14 @@ async fn oauth_begin(
     control_plane(&state, &headers).await?;
     let SharedDoorPick { shared_app, mut inner } = req.inner;
     if inner.door == Door::Shared {
-        let (app, covers) = shared_app_grant(&state, &inner.spec, shared_app.as_deref()).await?;
-        inner.registration = Some(app);
-        inner.permissions = covers;
+        shared_app_grant(
+            &state.app_provider,
+            &inner.spec,
+            shared_app.as_deref(),
+            &mut inner.registration,
+            &mut inner.permissions,
+        )
+        .await?;
     }
     weft_access_store::begin_oauth(&state.pool, &req.tenant, inner)
         .await
@@ -626,6 +638,73 @@ mod tests {
         .unwrap();
         let decided = door_decision_spec(&spec, true).unwrap();
         assert!(!decided.is_oauth(), "the paste variant is static, judged as such");
+    }
+
+    /// A shared-door connect's app and permissions are the picked
+    /// app's, whatever the client sent: its registration replaces the
+    /// client's, its `covers` replace the client's ticks. A connect
+    /// that names no app is refused and leaves both untouched.
+    #[tokio::test]
+    async fn a_shared_grant_makes_the_picked_app_the_registration_and_its_covers_the_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("apps.json");
+        std::fs::write(
+            &path,
+            r#"{ "google": [
+                   { "kind": "oauth_app", "label": "Broad", "covers": ["a", "b"],
+                     "authUrl": "https://a/x", "tokenUrl": "https://a/t",
+                     "client_id": "cid-broad", "client_secret": "sec" },
+                   { "kind": "oauth_app", "label": "Narrow", "covers": ["a"],
+                     "authUrl": "https://a/x", "tokenUrl": "https://a/t",
+                     "client_id": "cid-narrow", "client_secret": "sec" }
+                 ] }"#,
+        )
+        .unwrap();
+        let provider: Arc<dyn AppProvider> =
+            Arc::new(crate::app_provider::FileAppProvider::at(&path));
+        let spec: AccessSpec = serde_json::from_value(serde_json::json!({
+            "service": "google",
+            "acquisition": { "kind": "oauth2",
+                "grant": { "kind": "authorization_code", "authUrl": "https://a/x" },
+                "tokenUrl": "https://a/t" },
+            "permissions": [
+                { "id": "a", "label": "a", "description": "d." },
+                { "id": "b", "label": "b", "description": "d." }
+            ]
+        }))
+        .unwrap();
+        let sent = || {
+            (
+                Some(AppRegistration {
+                    label: "client".into(),
+                    client_id: "cid-client".into(),
+                    client_secret: Some("client-secret".into()),
+                    extra: Default::default(),
+                }),
+                vec!["a".to_string(), "b".to_string()],
+            )
+        };
+
+        let (mut registration, mut permissions) = sent();
+        shared_app_grant(&provider, &spec, Some("Narrow"), &mut registration, &mut permissions)
+            .await
+            .unwrap();
+        let registration = registration.expect("the picked app is the registration");
+        assert_eq!(
+            (registration.label.as_str(), registration.client_id.as_str()),
+            ("Narrow", "cid-narrow")
+        );
+        assert_eq!(permissions, ["a"]);
+
+        let (mut registration, mut permissions) = sent();
+        let (status, err) =
+            shared_app_grant(&provider, &spec, None, &mut registration, &mut permissions)
+                .await
+                .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err.contains("names which registered app"), "{err}");
+        assert_eq!(registration.unwrap().client_id, "cid-client");
+        assert_eq!(permissions, ["a", "b"]);
     }
 
     /// `{permissions}` substitutes ANYWHERE in the mint payload, as a

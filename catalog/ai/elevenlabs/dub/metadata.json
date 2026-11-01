@@ -96,7 +96,7 @@
     {
       "name": "file",
       "type": "Audio",
-      "description": "The dubbed audio (FLAC), kept for 30 days after it was last read."
+      "description": "The dubbed audio (FLAC), stored with the run and deleted with it (once the run's record goes); wire it through KeepFile to keep it past that."
     },
     {
       "name": "projectId",

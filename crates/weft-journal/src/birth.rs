@@ -95,6 +95,8 @@ pub fn birth_events(birth: Birth<'_>) -> (RunEvent, Vec<RunEvent>) {
 /// (`weft_core::project::Given`).
 pub fn baked_rows(
     run_id: weft_core::RunId,
+    program: &weft_core::project::ProjectDefinition,
+    index: &weft_core::project::ProgramIndex,
     baked: &weft_core::infra::bake::Saved,
     at_unix: u64,
 ) -> Vec<RunEvent> {
@@ -103,7 +105,7 @@ pub fn baked_rows(
         .map(|(place, values)| RunEvent::LogLine {
             run_id,
             node_id: place.id.clone(),
-            frames: place.frames(),
+            frames: index.frames_at(program, place),
             level: "info".to_string(),
             message: format!(
                 "did not run: everything this run reads from it is baked, so its saved {} went out instead",

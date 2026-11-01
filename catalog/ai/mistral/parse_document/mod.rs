@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
 use weft::access::client::{get_json, json_call, post_json, Multipart};
-use weft::storage::{FileHandle, KeepTtl, StorageScope};
+use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
@@ -121,16 +121,14 @@ impl Node for MistralParseDocumentNode {
             .collect::<Vec<_>>()
             .join("\n\n");
         let count = pages.len() as f64;
-        // Kept past the run, like any document a workflow goes on to
-        // read: the default access-bumped lifetime.
         let storage = ctx.storage(StorageScope::Run);
         let stem = file_stem(&meta.filename);
         let markdown = storage
-            .put(markdown.into_bytes(), "text/markdown", &format!("{stem}.md"), Some(KeepTtl::Default))
+            .put(markdown.into_bytes(), "text/markdown", &format!("{stem}.md"), None)
             .await?;
         let pages_json = serde_json::to_vec(&pages).node_err("mistral: write the pages as JSON")?;
         let pages = storage
-            .put(pages_json, "application/json", &format!("{stem}.pages.json"), Some(KeepTtl::Default))
+            .put(pages_json, "application/json", &format!("{stem}.pages.json"), None)
             .await?;
         ctx.pulse_downstream(
             NodeOutput::new()

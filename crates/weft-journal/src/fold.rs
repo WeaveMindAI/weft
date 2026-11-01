@@ -1160,7 +1160,7 @@ impl Fold {
         let given = self.snap.given.clone();
         for (place, stand_in) in &given.outputs {
             if matches!(stand_in.origin, GivenOrigin::Inherited { .. }) { continue; }
-            let frames = place.frames();
+            let frames = self.program_idx.frames_at(&project, place);
             let generator = |port: &str| project.nodes.iter().find(|node| node.id == place.id)
                 .and_then(|node| node.outputs.iter().find(|output| output.name == port)).is_some_and(|output| output.is_generator());
             for (port, given) in &stand_in.ports {

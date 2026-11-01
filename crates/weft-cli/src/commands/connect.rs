@@ -2471,6 +2471,58 @@ mod tests {
         assert_eq!(spellings_of(&p, "db").unwrap(), vec!["db".to_string()]);
     }
 
+    /// `weft connect --node` over a real project whose access node lives
+    /// in a file included at two sites: each site's name picks it and is
+    /// the name it answers in, the compiler's own key and the bare name
+    /// are refused with both names that work, and a pick written for one
+    /// site (keyed the way `write_pick` keys it) reads back as connected
+    /// at that site only.
+    #[test]
+    fn an_included_access_node_is_named_by_its_site_and_its_pick_reads_back_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = weft_compiler::project::Project::init(dir.path(), "sites").unwrap();
+        let catalog = weft_compiler::build::build_project_catalog(&project.root).unwrap();
+        std::fs::create_dir_all(project.src_dir().join("lib")).unwrap();
+        std::fs::write(
+            project.src_dir().join("lib/part.weft"),
+            "Group(text: String) -> (access: Access) {\n  key = ApiKeyAuth\n  self.access = key.access\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.main_weft(),
+            "src = Text { value: \"hello\" }\none = @include(\"lib/part.weft\")\none.text = src.value\n\
+             two = @include(\"lib/part.weft\")\ntwo.text = src.value\n",
+        )
+        .unwrap();
+        let choose = |name: &str| {
+            let mut others = Vec::new();
+            let (targets, program) = discover(&project, &catalog, &mut others).unwrap();
+            choose_target(&project, &program, targets, &others, Some(name), true)
+        };
+        for place in ["one.key", "two.key"] {
+            let target = choose(place).unwrap();
+            assert_eq!(target.spelling(), place, "it answers in the name it was asked by");
+            assert!(target.spellings().iter().all(|s| !s.contains('@')), "{:?}", target.spellings());
+        }
+        for nobodys in ["key", "@src:lib:part.key"] {
+            let why = format!("{:#}", choose(nobodys).err().expect("refused"));
+            assert!(why.contains("one.key") && why.contains("two.key"), "{nobodys}: {why}");
+        }
+
+        let id = Uuid::from_u128(9);
+        let mut one = choose("one.key").unwrap();
+        let mut two = choose("two.key").unwrap();
+        let stored: weft_core::picks::Picks =
+            serde_json::from_value(serde_json::json!({ "one.key": { one.input(): { "id": id.to_string() } } })).unwrap();
+        with_install_picks(std::slice::from_mut(&mut one), &stored).unwrap();
+        with_install_picks(std::slice::from_mut(&mut two), &stored).unwrap();
+        let place = Place { on: None, instance: None };
+        let listed = grants_listing(&one, &one.picked, place, "Key", &[]);
+        assert!(listed.contains(&format!("'one.key' is connected as {id}")), "{listed}");
+        let listed = grants_listing(&two, &two.picked, place, "Key", &[]);
+        assert!(listed.contains("'two.key' has no connection picked"), "{listed}");
+    }
+
     /// A node at no place in the program is refused, never given a
     /// name no other command would take.
     #[test]

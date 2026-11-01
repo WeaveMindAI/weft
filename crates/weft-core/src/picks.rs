@@ -77,14 +77,7 @@ pub fn fill_picks(node: &NodeDefinition, literals: &mut serde_json::Map<String, 
 
 /// Every place of a node with a field picked on the install, spelled.
 pub fn picked_places(project: &ProjectDefinition) -> Vec<(String, &NodeDefinition)> {
-    crate::project::places::every_place(project)
-        .into_iter()
-        .filter_map(|place| {
-            let node = project.nodes.iter().find(|n| n.id == place.id)?;
-            picked_fields(node).next()?;
-            Some((crate::project::address_of(project, &place.id, &place.path), node))
-        })
-        .collect()
+    places_of(project).into_iter().filter(|(_, node)| picked_fields(node).next().is_some()).collect()
 }
 
 /// The service a picked field connects to, off its widget (the compiler
@@ -110,17 +103,16 @@ fn optional(node: &NodeDefinition, field: &str) -> bool {
 /// or the refusal naming every required connection nobody picked on this
 /// install, with the command that picks it.
 pub fn run_picks(program: &ProjectDefinition, stored: &Picks) -> Result<Picks, Refusal> {
-    let project = program;
     let mut picks = Picks::new();
     let mut refusal = Refusal { errors: Vec::new() };
     let mut seen = BTreeSet::new();
     // Only what runs opens a connection: a stand-in never does.
     for place in &crate::project::places::running_places(program) {
-        let Some(node) = project.nodes.iter().find(|n| n.id == place.id) else { continue };
+        let Some(node) = program.nodes.iter().find(|n| n.id == place.id) else { continue };
         if picked_fields(node).next().is_none() {
             continue;
         }
-        let spelled = crate::project::address_of(project, &place.id, &place.path);
+        let spelled = crate::project::address_of(program, &place.id, &place.path);
         if !seen.insert(spelled.clone()) {
             continue;
         }
@@ -188,15 +180,7 @@ pub struct CheckedPick {
 /// check, where the connection is. All or nothing: the refusal names
 /// every pick refused.
 pub fn check_picks(project: Option<&ProjectDefinition>, inputs: &[PickInput]) -> Result<Vec<CheckedPick>, Refusal> {
-    let known: BTreeMap<String, &NodeDefinition> = project
-        .into_iter()
-        .flat_map(|project| {
-            crate::project::places::every_place(project).into_iter().filter_map(move |place| {
-                let node = project.nodes.iter().find(|n| n.id == place.id)?;
-                Some((crate::project::address_of(project, &place.id, &place.path), node))
-            })
-        })
-        .collect();
+    let known = project.map(places_of).unwrap_or_default();
     let mut refusal = Refusal { errors: Vec::new() };
     let mut checked = Vec::new();
     for input in inputs {
@@ -332,7 +316,7 @@ pub fn stranded(project: &ProjectDefinition, stored: &[StoredField]) -> Vec<Stra
 /// /projects/{id}/picks/kept`, read by `weft target export` to run the
 /// same check on the program it is about to deploy, wherever that program
 /// is (it never travels: a large one would not fit in a request).
-// SYNC: Kept <-> crates/weft-dispatcher/src/api/picks.rs kept, crates/weft-cli/src/commands/target.rs unpicked_connections
+// SYNC: Kept <-> crates/weft-dispatcher/src/api/picks.rs kept, crates/weft-cli/src/commands/target.rs check_picks
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Kept {
@@ -452,7 +436,8 @@ mod tests {
         assert_eq!(run_picks(&p, &stored).unwrap()["slack"]["access"], handle);
         let refused = run_picks(&p, &Picks::new()).unwrap_err();
         assert_eq!(refused.errors.len(), 1, "the optional one is not required: {refused:?}");
-        assert!(refused.errors[0].contains("weft connect --node slack"), "{refused:?}");
+        assert!(refused.errors[0].contains("no slack connection picked on this install")
+            && refused.errors[0].contains("weft connect --node slack"), "{refused:?}");
     }
 
     #[test]

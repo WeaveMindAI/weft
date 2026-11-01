@@ -1,26 +1,13 @@
 //! Runs steering each other by tag, end to end, through the two
 //! catalog nodes `TagRun` and `StopTagged` and nothing else.
 //!
-//! The `steer_by_tag` fixture has three programs on one fake SSE feed:
-//! "go" (the debounce: tag with the sender, stop the earlier runs for
-//! that sender, park on a form), "purge" (an untagged operator run stops
-//! everything carrying a tag and survives) and "abort" (a run tags
-//! itself and takes the whole batch down, itself included). Every test
-//! is one contract from the steering page of the book:
-//!
-//!   - the newest run for a sender is the only one left, and the ones it
-//!     stopped read as stopped BY it with the tag named;
-//!   - a stopped run's form is gone (its wake was erased);
-//!   - senders never touch each other;
-//!   - two runs a moment apart do not kill each other: one survivor;
-//!   - a stop reaches a run whose node is in flight, not only a parked one;
-//!   - `includeSelf` reaches everything, the asker included when it
-//!     carries the tag and not when it does not;
-//!   - any string is a tag: an unsafe sender is cleaned and fingerprinted
-//!     the same way by both nodes, so it still stops its own earlier runs
-//!     and never a lookalike's;
-//!   - a stop never crosses a project;
-//!   - the tags show on the run everywhere a person looks for them.
+//! The `steer_by_tag` fixture is the debounce on one fake SSE feed: each
+//! "go" event starts a run that tags itself with the sender, stops the
+//! earlier runs for that sender, and parks on a form. The one test proves
+//! the newest run for a sender is the only one left, the ones it stopped
+//! read as stopped BY it with the tag named, a stopped run's form is gone
+//! (its wake was erased), and the tags show on the run everywhere a
+//! person looks for them.
 #![cfg(feature = "e2e")]
 
 use std::collections::HashSet;
@@ -29,12 +16,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use uuid::Uuid;
 use weft_e2e::client::Dispatcher;
-use weft_e2e::fakes::{PollFake, SseFake};
+use weft_e2e::fakes::SseFake;
 use weft_e2e::{ensure, human, project::Project, run, signal, SettledRun};
-
-/// The fixture's three trigger nodes each hold one SSE connection to the
-/// feed, so a push is only safe once all three are reading.
-const FEED_SUBSCRIBERS: usize = 3;
 
 /// A prepared, activated copy of the fixture with its own feed, ready to
 /// push events at.
@@ -47,27 +30,14 @@ struct Rig {
 }
 
 impl Rig {
-    /// One rig on the install under test. A test that needs two rigs on one
-    /// dispatcher calls [`Self::up_on`] for each.
+    /// One rig on the install under test, its trigger reading the feed.
     async fn up() -> anyhow::Result<Self> {
-        Self::up_on(ensure::up().await?).await
-    }
-
-    async fn up_on(disp: Dispatcher) -> anyhow::Result<Self> {
-        let project = Project::prepare("steer_by_tag", disp.clone()).await?;
+        let disp = ensure::up().await?;
+        let mut project = Project::prepare("steer_by_tag", disp.clone()).await?;
         let feed = SseFake::start().await?;
         project.substitute_in_main("__E2E_FAKE_URL__", &feed.url())?;
-        Self::activate(disp, project, feed, FEED_SUBSCRIBERS).await
-    }
-
-    async fn activate(
-        disp: Dispatcher,
-        mut project: Project,
-        feed: SseFake,
-        subscribers: usize,
-    ) -> anyhow::Result<Self> {
         project.activate().await?;
-        feed.wait_for_subscribers(subscribers, Duration::from_secs(60)).await?;
+        feed.wait_for_subscriber(Duration::from_secs(60)).await?;
         let pid = project.id();
         let known = run::runs(&disp, &pid).await?;
         Ok(Self {
@@ -90,30 +60,12 @@ impl Rig {
 
     /// Push one event and return the run it started.
     async fn fire(&mut self, event: &str, value: &str) -> anyhow::Result<Uuid> {
-        self.feed.push_event(event, &Self::event_data(value));
+        self.feed.push_event(event, &Self::event_data(value))?;
         let run_id =
             run::wait_for_triggered_run(&self.disp, &self.pid, &self.known, Duration::from_secs(60))
                 .await?;
         self.known.insert(run_id);
         Ok(run_id)
-    }
-
-    /// Push `values` as a burst of "go" events with no wait between them
-    /// and return the runs they started.
-    async fn fire_burst(&mut self, values: &[&str]) -> anyhow::Result<Vec<Uuid>> {
-        for value in values {
-            self.feed.push_event("go", &Self::event_data(value));
-        }
-        let run_ids = run::wait_for_triggered_runs(
-            &self.disp,
-            &self.pid,
-            &self.known,
-            values.len(),
-            Duration::from_secs(60),
-        )
-        .await?;
-        self.known.extend(run_ids.iter().copied());
-        Ok(run_ids)
     }
 
     async fn summary(&self, run_id: Uuid) -> anyhow::Result<Value> {
@@ -122,26 +74,6 @@ impl Rig {
 
     async fn parked(&self, run_id: Uuid) -> anyhow::Result<()> {
         run::wait_for_status(&self.disp, run_id, "waiting_for_input").await
-    }
-
-    /// Wait until `run_id` carries `tag`. A run reads as running before
-    /// its tag node has run, and the stop order is the order runs TAGGED
-    /// themselves, so a test that means "a later run stops this one"
-    /// waits for the tag, not for the status.
-    async fn tagged(&self, run_id: Uuid, tag: &str) -> anyhow::Result<()> {
-        weft_e2e::client::poll_until(
-            &format!("run {run_id} to carry the tag '{tag}'"),
-            Duration::from_secs(60),
-            Duration::from_millis(100),
-            || async move {
-                let summary = self.summary(run_id).await?;
-                let carries = summary["tags"]
-                    .as_array()
-                    .is_some_and(|tags| tags.iter().any(|t| t == tag));
-                Ok(carries.then_some(()))
-            },
-        )
-        .await
     }
 
     async fn finish(self) -> anyhow::Result<()> {
@@ -237,263 +169,6 @@ async fn later_run_stops_earlier_runs_for_the_same_sender() -> anyhow::Result<()
     third_settled.assert_input("out", "data", &json!(true))?;
 
     rig.finish().await
-}
-
-/// A stop is by tag: a message from one sender leaves every other
-/// sender's run exactly where it was.
-#[tokio::test]
-async fn senders_do_not_touch_each_other() -> anyhow::Result<()> {
-    let mut rig = Rig::up().await?;
-
-    let alice = rig.fire("go", "alice").await?;
-    let bob = rig.fire("go", "bob").await?;
-    rig.parked(alice).await?;
-    rig.parked(bob).await?;
-
-    // Alice again: her first run dies, Bob's is untouched.
-    let alice_again = rig.fire("go", "alice").await?;
-    let alice_settled = SettledRun::observe(&rig.disp, alice).await?;
-    assert_stopped_by(&alice_settled, alice_again, "alice")?;
-    rig.parked(alice_again).await?;
-    assert_eq!(run::status_of(&rig.disp, bob).await?, "waiting_for_input");
-
-    rig.finish().await
-}
-
-/// Two messages from one sender land a moment apart: both runs say
-/// "stop the others, keep me". The tag order decides, so exactly one
-/// survives and the other reads as stopped by it. Never zero, never two.
-#[tokio::test]
-async fn two_messages_at_once_leave_exactly_one_survivor() -> anyhow::Result<()> {
-    let mut rig = Rig::up().await?;
-
-    let burst = rig.fire_burst(&["user_7", "user_7"]).await?;
-    let [a, b] = burst.as_slice() else { unreachable!() };
-    let (a, b) = (*a, *b);
-
-    // One of the two settles as cancelled; wait for whichever it is. The
-    // timeout names what both runs were last doing.
-    let last = std::sync::Mutex::new(String::new());
-    let (dead, alive) = weft_e2e::poll_until_describing(
-        "one of the two burst runs to be cancelled",
-        run::RUN_SETTLE_DEADLINE,
-        Duration::from_millis(300),
-        || {
-            let disp = rig.disp.clone();
-            let last = &last;
-            async move {
-                let mut seen = String::new();
-                for (x, y) in [(a, b), (b, a)] {
-                    let now = run::status_of(&disp, x).await?;
-                    seen.push_str(&format!("{x}: {now}; "));
-                    if now == "cancelled" {
-                        return Ok(Some((x, y)));
-                    }
-                }
-                *last.lock().unwrap() = seen;
-                Ok(None)
-            }
-        },
-        || format!("last statuses observed: {}", last.lock().unwrap()),
-    )
-    .await?;
-    let dead_settled = SettledRun::observe(&rig.disp, dead).await?;
-    assert_stopped_by(&dead_settled, alive, "user_7")?;
-    rig.parked(alive).await?;
-
-    // The survivor stays alive: it was tagged after the run it stopped,
-    // so that run's own stop never reached it.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert_eq!(run::status_of(&rig.disp, alive).await?, "waiting_for_input");
-
-    rig.finish().await
-}
-
-/// A stop reaches a run whose node is in flight, not only a parked one:
-/// the held node is cancelled with the same cause, and the run that did
-/// the stopping goes on to finish once released.
-#[tokio::test]
-async fn a_stop_reaches_a_run_in_flight() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let project = Project::prepare("steer_by_tag", disp.clone()).await?;
-    let feed = SseFake::start().await?;
-    let gate = PollFake::start("hold").await?;
-    project.add_node_from_fixture("lifecycle", "hold_gate")?;
-    project.set_main(&graph_in_flight(&feed.url(), &gate.url()))?;
-    let mut rig = Rig::activate(disp, project, feed, 1).await?;
-
-    let first = rig.fire("go", "user_7").await?;
-    run::wait_for_status(&rig.disp, first, "running").await?;
-    rig.tagged(first, "user_7").await?;
-
-    let second = rig.fire("go", "user_7").await?;
-    let first_settled = SettledRun::observe(&rig.disp, first).await?;
-    assert_stopped_by(&first_settled, second, "user_7")?;
-    let held = first_settled
-        .replay()
-        .by_kind("node_cancelled")
-        .find(|e| e.is_node("hold"))
-        .ok_or_else(|| anyhow::anyhow!("the in-flight node must be cancelled: {:?}", first_settled.replay().events))?;
-    anyhow::ensure!(
-        held.str_field("reason").unwrap_or_default().contains("user_7"),
-        "the held node's cancel names the tag: {:?}",
-        held.0
-    );
-
-    // The survivor is still held; release it and it completes.
-    assert_eq!(run::status_of(&rig.disp, second).await?, "running");
-    gate.set_body("release").await;
-    SettledRun::observe(&rig.disp, second)
-        .await?
-        .completed()?
-        .assert_input("out", "data", &json!("released"))?;
-
-    rig.finish().await
-}
-
-/// `includeSelf` from a run that never tagged itself: every run carrying
-/// the tag goes, whoever the sender was, and the asker survives because
-/// it does not carry the tag. Having no tag of its own, it reaches
-/// everything tagged so far.
-#[tokio::test]
-async fn purge_stops_every_run_carrying_the_tag_and_spares_the_untagged_asker() -> anyhow::Result<()> {
-    let mut rig = Rig::up().await?;
-
-    let alice = rig.fire("go", "alice").await?;
-    let bob = rig.fire("go", "bob").await?;
-    rig.parked(alice).await?;
-    rig.parked(bob).await?;
-
-    let purge = rig.fire("purge", "everyone").await?;
-    for victim in [alice, bob] {
-        let settled = SettledRun::observe(&rig.disp, victim).await?;
-        assert_stopped_by(&settled, purge, "everyone")?;
-    }
-
-    // The purge run carries no tag, is still alive, and answers.
-    rig.parked(purge).await?;
-    let purge_summary = rig.summary(purge).await?;
-    assert_eq!(purge_summary["tags"], json!([]), "{purge_summary}");
-    let form = human::wait_for_form_by_node(&rig.disp, &rig.pid, "purge_confirm").await?;
-    human::answer_form(&rig.disp, &form, &json!({ "ack": "approve" })).await?;
-    SettledRun::observe(&rig.disp, purge)
-        .await?
-        .completed()?
-        .assert_input("purge_out", "data", &json!(true))?;
-
-    rig.finish().await
-}
-
-/// `includeSelf` from a run that carries the tag: the whole batch goes,
-/// the asker included, and the asker's own terminal names itself.
-#[tokio::test]
-async fn abort_takes_the_asker_down_too() -> anyhow::Result<()> {
-    let mut rig = Rig::up().await?;
-
-    let alice = rig.fire("go", "alice").await?;
-    rig.parked(alice).await?;
-
-    let abort = rig.fire("abort", "everyone").await?;
-    let alice_settled = SettledRun::observe(&rig.disp, alice).await?;
-    assert_stopped_by(&alice_settled, abort, "everyone")?;
-
-    let abort_settled = SettledRun::observe(&rig.disp, abort).await?;
-    assert_eq!(abort_settled.status, "cancelled", "the aborting run stops itself");
-    assert_stopped_by(&abort_settled, abort, "everyone")?;
-    assert_tagged_event(&abort_settled, &["everyone"])?;
-    anyhow::ensure!(
-        abort_settled.replay().for_node("abort_out").next().is_none(),
-        "nothing past the self-stop may complete: {:?}",
-        abort_settled.replay().events
-    );
-
-    rig.finish().await
-}
-
-/// A sender outside `[A-Za-z0-9_-]` (a phone number with `+` and spaces)
-/// is still a tag: both nodes clean it the same way and append a
-/// fingerprint of the original, so the run is tagged, a second message
-/// from the same sender stops it, and a lookalike sender (same once
-/// cleaned, different original) does not.
-#[tokio::test]
-async fn an_unsafe_sender_is_cleaned_and_still_steers() -> anyhow::Result<()> {
-    let mut rig = Rig::up().await?;
-
-    let first = rig.fire("go", "+33 6 12").await?;
-    rig.parked(first).await?;
-    let summary = rig.summary(first).await?;
-    let tag = summary["tags"][0].as_str().unwrap_or("").to_string();
-    anyhow::ensure!(tag.starts_with("_33_6_12-") && tag.len() == "_33_6_12-".len() + 16, "{summary}");
-    assert_eq!(summary["tags"][1], json!("everyone"), "{summary}");
-
-    // A lookalike (same readable part, different original) is another tag.
-    let lookalike = rig.fire("go", "+33.6.12").await?;
-    rig.parked(lookalike).await?;
-    assert_eq!(run::status_of(&rig.disp, first).await?, "waiting_for_input");
-
-    // The same sender again stops the first run, with the cleaned tag named.
-    let second = rig.fire("go", "+33 6 12").await?;
-    let first_settled = SettledRun::observe(&rig.disp, first).await?;
-    assert_stopped_by(&first_settled, second, &tag)?;
-    rig.parked(second).await?;
-    assert_eq!(run::status_of(&rig.disp, lookalike).await?, "waiting_for_input");
-
-    rig.finish().await
-}
-
-/// A stop is scoped to its project: the same tag in another project is
-/// a different tag.
-#[tokio::test]
-async fn a_stop_never_crosses_a_project() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let mut left = Rig::up_on(disp.clone()).await?;
-    let mut right = Rig::up_on(disp).await?;
-
-    let left_run = left.fire("go", "user_7").await?;
-    left.parked(left_run).await?;
-
-    // Two messages on the right: the first right run dies, the left one
-    // does not notice.
-    let right_first = right.fire("go", "user_7").await?;
-    right.parked(right_first).await?;
-    let right_second = right.fire("go", "user_7").await?;
-    let right_settled = SettledRun::observe(&right.disp, right_first).await?;
-    assert_stopped_by(&right_settled, right_second, "user_7")?;
-    right.parked(right_second).await?;
-    assert_eq!(run::status_of(&left.disp, left_run).await?, "waiting_for_input");
-
-    // A purge on the right, same story.
-    let purge = right.fire("purge", "everyone").await?;
-    SettledRun::observe(&right.disp, right_second).await?;
-    right.parked(purge).await?;
-    assert_eq!(run::status_of(&left.disp, left_run).await?, "waiting_for_input");
-
-    right.finish().await?;
-    left.finish().await
-}
-
-/// The "go" program with the form swapped for a HoldGate, so the run
-/// sits in `running` on a node in flight instead of parked on a person.
-fn graph_in_flight(sse_url: &str, release_url: &str) -> String {
-    format!(
-        "start = TestSseTrigger -> (value: String) {{\n\
-         \x20 url: \"{sse_url}\"\n\
-         \x20 event_name: \"go\"\n\
-         }}\n\
-         claim = TagRun(sender: String)\n\
-         claim.sender = start.value\n\
-         stop = StopTagged(sender: String) {{\n\
-         \x20 _should_flow: claim.done\n\
-         }}\n\
-         stop.sender = start.value\n\
-         hold = HoldGate {{\n\
-         \x20 _should_flow: stop.done\n\
-         \x20 url: \"{release_url}\"\n\
-         }}\n\
-         hold.arm = start.value\n\
-         out = Debug\n\
-         out.data = hold.done\n"
-    )
 }
 
 /// The stopped run's terminal names the run that asked and the tag

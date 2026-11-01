@@ -261,7 +261,7 @@ async fn inline_picture(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(file.mime_type, "image/png");
     assert_eq!(file.size_bytes, png_bytes().len() as u64);
     assert_eq!(file.filename, "body");
-    assert!(!rig.stored_meta(&file.key)?.keep, "run-scoped: the program keeps what it wants");
+    assert!(file.key.contains("/run/"), "run-scoped: the program keeps what it wants: {}", file.key);
     assert_eq!(outcome.outputs["body"]["caption"], json!("a cat"), "the other fields come as sent");
 
     // A stored-file object is never taken on a caller's word: it would

@@ -542,13 +542,7 @@ async fn hand_back(state: &DispatcherState, delivery: &Delivery, e: &anyhow::Err
         GiveBack::WontStart => {
             // Every run queued on that build ends with it: each would bring
             // up the same worker and meet the same answer.
-            let queued: Vec<RunId> = state
-                .pg_pool
-                .scalars(
-                    "SELECT run_id FROM run WHERE project_id = $1 AND binary_hash IS NOT DISTINCT FROM $2 AND state = 'queued'",
-                    &[&delivery.project_id, &delivery.binary_hash.as_deref()],
-                )
-                .await?;
+            let queued = queued_on_build(&state.pg_pool, delivery.project_id, delivery.binary_hash.as_deref()).await?;
             tracing::warn!(
                 target: "weft_dispatcher::delivery",
                 %run_id,
@@ -581,6 +575,19 @@ async fn hand_back(state: &DispatcherState, delivery: &Delivery, e: &anyhow::Err
             Ok(())
         }
     }
+}
+
+/// The runs of `project` queued on the build `binary_hash`: what ends with
+/// a run whose worker of that build cannot start, since each would bring
+/// up the same worker and meet the same answer. A run parked or driven is
+/// not queued, and a run of another build is not on this one.
+pub async fn queued_on_build(pool: &Pool, project: uuid::Uuid, binary_hash: Option<&str>) -> anyhow::Result<Vec<RunId>> {
+    Ok(pool
+        .scalars(
+            "SELECT run_id FROM run WHERE project_id = $1 AND binary_hash IS NOT DISTINCT FROM $2 AND state = 'queued'",
+            &[&project, &binary_hash],
+        )
+        .await?)
 }
 
 /// Why a delivery goes back to the queue: the platform still bringing the

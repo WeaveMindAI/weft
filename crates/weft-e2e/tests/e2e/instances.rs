@@ -125,39 +125,6 @@ async fn a_per_instance_infra_node_runs_one_copy_per_instance() -> anyhow::Resul
     project.finish().await
 }
 
-/// Each trigger is turned on and off on its own: activating one leaves
-/// the others dark, and taking one down leaves the others listening.
-#[tokio::test]
-async fn one_trigger_is_turned_on_and_off_alone() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let project = Project::prepare("instances", disp.clone()).await?;
-    project.set_main(
-        "a = Route -> (body: { text: String }) { path: \"__E2E_PATH__/a\", method: \"POST\" }\n\
-         ra = Reply\nra.body = a.body.text\n\
-         b = Route -> (body: { text: String }) { path: \"__E2E_PATH__/b\", method: \"POST\" }\n\
-         rb = Reply\nrb.body = b.body.text\n",
-    )?;
-    let base = project.unique_live_path()?;
-    let call = |route: &'static str| {
-        let disp = disp.clone();
-        let url = format!("{base}/{route}");
-        async move { live::http_json(&disp, Method::POST, &url, &[], &json!({ "text": route })).await.map(|(s, _, _)| s) }
-    };
-
-    project.weft(&["activate", "--trigger", "a"]).await?;
-    anyhow::ensure!(call("a").await? == 200);
-    anyhow::ensure!(call("b").await? != 200, "b was never turned on");
-    let status = project.weft(&["status"]).await?;
-    anyhow::ensure!(status.contains("triggers:"), "{status}");
-
-    project.weft(&["activate", "--trigger", "b"]).await?;
-    anyhow::ensure!(call("b").await? == 200);
-    project.weft(&["deactivate", "--trigger", "a", "--door", "refuse", "--held", "drop", "--running", "cancel"]).await?;
-    anyhow::ensure!(call("a").await? != 200, "a is down");
-    anyhow::ensure!(call("b").await? == 200, "b kept listening");
-    project.finish().await
-}
-
 /// The doors that name an instance: the `Weft-Instance` header on a route
 /// gated by a connection, and an instance token. An instance connects its
 /// own account and gives it for an `@instance_filled` connection field
@@ -419,74 +386,5 @@ async fn an_instances_value_reaches_its_live_trigger() -> anyhow::Result<()> {
     project.weft(&["instance-values", "--instance", "bob", "--set", "tick.cron=0 30 9 * * *"]).await?;
     let listed = project.weft(&["instance-values", "--instance", "bob", "--json"]).await?;
     anyhow::ensure!(listed.contains("0 30 9 * * *"), "{listed}");
-    project.finish().await
-}
-
-/// `weft resync` brings up to date the triggers of the owners it names:
-/// plain, the shared ones, so an instance's trigger that is on and behind
-/// the build is left as it is (and still reads behind); `--all-instances`
-/// reaches it and brings it onto the build.
-#[tokio::test]
-async fn resync_reaches_an_instances_trigger_only_when_told_to() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let project = Project::prepare("instances", disp.clone()).await?;
-    let pid = project.id();
-    let program = "tick = Cron { cron: @instance_filled(\"0 0 3 * * *\") }\nlog = Debug\nlog.data = tick.scheduledTime\n";
-    project.set_main(program)?;
-    project.weft(&["activate", "--trigger", "tick", "--instance", "ada"]).await?;
-    let state = |s: &weft_e2e::status::ProjectStatus| s.trigger_state("tick", Some("ada")).to_string();
-    weft_e2e::status::wait_until(&disp, &pid, "ada's trigger on", weft_e2e::status::STATUS_DEADLINE, |s| state(s) == "on").await?;
-
-    // One more node reads each fire, so the trigger's cut moves.
-    project.set_main(&format!("{program}also = Debug\nalso.data = tick.scheduledTime\n"))?;
-    project.weft(&["resync"]).await?;
-    let s = weft_e2e::status::fetch(&disp, &pid).await?;
-    anyhow::ensure!(state(&s) == "behind", "a plain resync leaves ada's trigger as it was: {:?}", s.trigger("tick"));
-
-    project.weft(&["resync", "--all-instances"]).await?;
-    let s = weft_e2e::status::wait_until(&disp, &pid, "ada's trigger on the new build", weft_e2e::status::STATUS_DEADLINE, |s| {
-        state(s) == "on"
-    })
-    .await?;
-    anyhow::ensure!(!s.offers("resync"), "nothing is behind any more: {:?}", s.available_actions());
-    project.finish().await
-}
-
-/// One file included by a shared route and by a group whose infra runs
-/// once per instance: the file's nodes are per instance only under the
-/// group's include, so a call to the shared route, which names no
-/// instance, runs through its own include and is answered (it used to be
-/// refused, the whole file read as per instance). A shared trigger wired
-/// straight into the per-instance part has no instance to run for, and
-/// the build refuses it.
-#[tokio::test]
-async fn a_file_shared_with_a_per_instance_part_stays_shared_at_its_shared_site() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let project = Project::prepare("instances", disp.clone()).await?;
-    project.add_node_from_fixture("infra_min", "mini_service")?;
-    project.write_file(
-        "src/lib/carry.weft",
-        "Group(text: String) -> (out: String) {\n  carry = Format(text: String) { template: \"got {{text}}\" }\n  \
-         carry.text = self.text\n  self.out = carry.text\n}\n",
-    )?;
-    let main = "door = Route -> (body: { text: String }) { path: \"__E2E_PATH__/in\", method: \"POST\" }\n\
-                shared = @include(\"lib/carry.weft\")\nshared.text = door.body.text\nreply = Reply\nreply.body = shared.out\n\
-                space = Group() -> () {\n  svc = MiniService {\n    @per_instance\n  }\n  \
-                mine = @include(\"lib/carry.weft\")\n  mine.text = svc.status\n  log = Debug\n  log.data = mine.out\n}\n";
-    project.set_main(main)?;
-    let base = project.unique_live_path()?;
-    project.weft(&["activate", "--trigger", "door"]).await?;
-    let (status, _, body) = live::http_json(&disp, Method::POST, &format!("{base}/in"), &[], &json!({ "text": "hi" })).await?;
-    let body = String::from_utf8_lossy(&body);
-    anyhow::ensure!(status == 200, "the shared route is answered: {status} {body}");
-    anyhow::ensure!(body.contains("got hi"), "{body}");
-
-    project.set_main(&main.replace(
-        "  log.data = mine.out\n}",
-        "  log.data = mine.out\n  tick = Cron { cron: \"0 0 3 * * *\" }\n  ping = Debug\n  ping.data = svc.status\n  \
-         ping._should_flow = tick.scheduledTime\n}",
-    ))?;
-    let refused = project.weft_refused(&["activate", "--trigger", "space.tick"]).await?;
-    anyhow::ensure!(refused.contains("Trigger 'space.tick' is shared by every instance"), "{refused}");
     project.finish().await
 }

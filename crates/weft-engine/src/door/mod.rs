@@ -565,7 +565,7 @@ impl Door {
         };
         let ticket = self.secret.mint_ticket(&claims);
         let url = weft_core::caller_token::socket_url(&base, call.raw_path, call.raw_query, &ticket);
-        // SYNC: the ticket answer's shape <-> crates/weft-e2e/src/live.rs (ticket), packages/weft-connect/src/core/socket.ts (socketAddress)
+        // SYNC: the ticket answer's shape <-> packages/weft-connect/src/core/socket.ts (socketAddress)
         let body = serde_json::json!({ "url": url, "protocol": "websocket" });
         Arrived::Answer(
             Response::builder()
@@ -1083,7 +1083,13 @@ mod tests {
         let _first = arrive(&door, "GET", "/x", "", &headers(&[])).await;
         let Arrived::Answer(answer) = arrive(&door, "GET", "/x", "", &headers(&[])).await else { panic!("refused") };
         assert_eq!(answer.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert!(answer.headers().contains_key(axum::http::header::RETRY_AFTER));
+        let retry_after: u64 = answer
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+            .expect("a refusal says when to come back, in seconds");
+        assert!((1..=60).contains(&retry_after), "within the minute the count is for: {retry_after}");
     }
 
     /// A browser's plain request for its socket is handed a URL on the
@@ -1105,6 +1111,28 @@ mod tests {
             project_id: PROJECT, route_token: "t1".into(), approved: None, identity: None, instance: None, credential_headers: Vec::new(), nonce: uuid::Uuid::nil(), exp: i64::MAX,
         }));
         assert_eq!(status(arrive(&door, "GET", "/feed", &forged, &opening).await).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A ticket past its life opens nothing, and its caller is told why
+    /// and what to do: ask for a new one.
+    #[tokio::test]
+    async fn an_expired_ticket_is_refused_telling_the_caller_to_ask_again() {
+        let door = door(FakeDoorBroker::new(vec![route("t1", "socket", "feed")]));
+        let spent = weft_core::caller_token::ProjectSecret::of(SECRET, PROJECT).mint_ticket(&weft_core::caller_token::CallerTokenClaims {
+            project_id: PROJECT,
+            route_token: "t1".into(),
+            approved: None,
+            identity: None,
+            instance: None,
+            credential_headers: Vec::new(),
+            nonce: uuid::Uuid::new_v4(),
+            exp: crate::now_unix() as i64 - 1,
+        });
+        let opening = headers(&[("upgrade", "websocket")]);
+        let (code, said) = status(arrive(&door, "GET", "/feed", &format!("wct={spent}"), &opening).await).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert_eq!(said, weft_core::caller_token::refusal("socket ticket expired"));
+        assert!(said.contains("expired") && said.contains("Ask for a new one"), "{said}");
     }
 
     /// A gated socket's ticket holds the caller to the request the gate

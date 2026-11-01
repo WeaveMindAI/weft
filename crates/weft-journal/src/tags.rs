@@ -172,6 +172,19 @@ mod tests {
         );
     }
 
+    /// `Include` asked by a run that carries no tag (a purge from a run
+    /// nobody tagged): every run carrying the tag goes, and the asker is
+    /// not among them, so it lives on and finishes.
+    #[test]
+    fn include_stop_by_an_untagged_asker_reaches_every_row_and_spares_it() {
+        let a = tagged(1);
+        let b = tagged(2);
+        let asker = RunId::new_v4();
+        let stopped = select_stop_targets(&[a.clone(), b.clone()], asker, None, StopSelf::Include);
+        assert_eq!(stopped, vec![a.run_id, b.run_id]);
+        assert!(!stopped.contains(&asker));
+    }
+
     /// `Keep` never returns the asker even when the seq filter would.
     #[test]
     fn keep_never_returns_the_asker() {

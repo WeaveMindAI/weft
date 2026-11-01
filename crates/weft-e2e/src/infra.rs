@@ -1,4 +1,4 @@
-//! Infra node lifecycle: provision, wait-to-running, read outputs, terminate.
+//! Infra node lifecycle: provision, wait-to-running, terminate.
 //!
 //! Infra nodes are long-running backing services the platform provisions
 //! (Docker containers on a local install). The rig drives them through the real CLI (`weft infra start|terminate`,
@@ -80,22 +80,6 @@ pub async fn wait_running(project: &Project, node: &str) -> Result<String> {
     .await
 }
 
-/// Call an HTTP route on an infra endpoint URL (e.g. `/outputs`, `/health`, a
-/// node's `/action`). Returns the raw bytes. The endpoint URL is the
-/// address the install shows for it: on a local install, the unit's port
-/// published on this machine's loopback, which the rig reaches directly.
-pub async fn call_endpoint(disp: &Dispatcher, endpoint_url: &str, path: &str) -> Result<Vec<u8>> {
-    let url = format!("{}/{}", endpoint_url.trim_end_matches('/'), path.trim_start_matches('/'));
-    let (status, bytes) = disp.get_abs_raw(&url).await?;
-    if !status.is_success() {
-        bail!(
-            "infra endpoint GET {url} -> HTTP {status}: {}",
-            String::from_utf8_lossy(&bytes)
-        );
-    }
-    Ok(bytes)
-}
-
 /// Terminate the project's infra (`weft infra terminate`) and wait until the
 /// instance at `node` is gone from `/infra/status` (the row is removed on
 /// successful terminate). Asserts cleanup actually happened rather than
@@ -106,7 +90,7 @@ pub async fn terminate_and_wait_gone(project: &Project, node: &str) -> Result<()
 }
 
 /// Wait until the placement at `node` has no row any more.
-pub async fn wait_gone(project: &Project, node: &str) -> Result<()> {
+async fn wait_gone(project: &Project, node: &str) -> Result<()> {
     let disp = project.dispatcher().clone();
     let pid = project.id();
     let nid = node.to_string();

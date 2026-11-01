@@ -1933,3 +1933,145 @@
             }
         }
     }
+
+    /// `lister.items -> l (Loop over items)`: in the body, `a` reads the
+    /// item and `l` gathers it; `spread` passes the list it is handed into
+    /// the inner loop `l.m`, whose body `l.m.c` reads each item, and `after`
+    /// reads what `l.m` gathers. Two loops deep for a cut inside `l.m`'s
+    /// body.
+    fn nested_loop_project() -> ProjectDefinition {
+        let node = |id: &str, node_type: &str, scope: &[&str], inputs: serde_json::Value, outputs: serde_json::Value| serde_json::json!({
+            "id": id, "nodeType": node_type, "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
+            "inputs": inputs, "outputs": outputs, "features": {}, "scope": scope, "groupBoundary": null, "requiresInfra": false, "images": []
+        });
+        let boundary = |group: &str, role: &str, scope: &[&str], inputs: serde_json::Value, outputs: serde_json::Value| {
+            let (suffix, node_type, config) = if role == "In" {
+                ("__in", "LoopIn", serde_json::json!({ "parentId": group, "parallel": false, "over": ["items"], "carry": [] }))
+            } else {
+                ("__out", "LoopOut", serde_json::json!({ "parentId": group }))
+            };
+            serde_json::json!({
+                "id": format!("{group}{suffix}"), "nodeType": node_type, "label": null, "config": config,
+                "position": { "x": 0.0, "y": 0.0 }, "inputs": inputs, "outputs": outputs, "features": {}, "scope": scope,
+                "requiresInfra": false, "images": [], "groupBoundary": { "groupId": group, "role": role }
+            })
+        };
+        let port = |name: &str, ty: &str| serde_json::json!({ "name": name, "portType": ty, "required": true });
+        let gather = |name: &str, ty: &str| serde_json::json!({ "name": name, "portType": ty, "required": false, "optional": true });
+        let done = gather("done", "Boolean");
+        let loop_in = |group: &str, scope: &[&str]| boundary(group, "In", scope,
+            serde_json::json!([port("items", "List[Number]")]),
+            serde_json::json!([{ "name": "items", "portType": "Number", "required": false }, { "name": "index", "portType": "Number", "required": false }]));
+        let loop_out = |group: &str, scope: &[&str]| boundary(group, "Out", scope,
+            serde_json::json!([gather("results", "Number"), done.clone()]),
+            serde_json::json!([port("results", "List[Number | Null]")]));
+        let wire = |id: &str, source: &str, source_port: &str, target: &str, target_port: &str| serde_json::json!({
+            "id": id, "source": source, "sourceHandle": source_port, "target": target, "targetHandle": target_port
+        });
+        let lists = serde_json::json!([{ "name": "items", "portType": "List[Number]", "required": false }]);
+        let tally = |ty: &str| (serde_json::json!([port("value", ty)]), serde_json::json!([{ "name": "value", "portType": ty, "required": false }]));
+        let (number_in, number_out) = tally("Number");
+        let (list_in, list_out) = tally("List[Number | Null]");
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                node("lister", "Lister", &[], serde_json::json!([]), lists),
+                loop_in("l", &[]),
+                node("l.a", "Tally", &["l"], number_in.clone(), number_out.clone()),
+                node("l.spread", "Tally", &["l"], serde_json::json!([port("value", "List[Number]")]), serde_json::json!([{ "name": "value", "portType": "List[Number]", "required": false }])),
+                loop_in("l.m", &["l"]),
+                node("l.m.c", "Tally", &["l", "l.m"], number_in, number_out),
+                loop_out("l.m", &["l"]),
+                node("l.after", "Tally", &["l"], list_in.clone(), list_out.clone()),
+                loop_out("l", &[]),
+                node("sink", "Tally", &[], list_in, list_out),
+            ],
+            "edges": [
+                wire("e1", "lister", "items", "l__in", "items"),
+                wire("e2", "l__in", "items", "l.a", "value"),
+                wire("e3", "l.a", "value", "l__out", "results"),
+                wire("e4", "l__out", "results", "sink", "value"),
+                wire("e5", "l.spread", "value", "l.m__in", "items"),
+                wire("e6", "l.m__in", "items", "l.m.c", "value"),
+                wire("e7", "l.m.c", "value", "l.m__out", "results"),
+                wire("e8", "l.m__out", "results", "l.after", "value"),
+            ],
+            "groups": [
+                { "id": "l", "kind": "loop", "nodeIds": ["l.a", "l.spread", "l.after"], "loopConfig": { "parallel": false, "over": ["items"], "carry": [] } },
+                { "id": "l.m", "kind": "loop", "nodeIds": ["l.m.c"], "parentGroupId": "l", "loopConfig": { "parallel": false, "over": ["items"], "carry": [] } },
+            ],
+            "createdAt": parse_dt(),
+            "updatedAt": parse_dt(),
+        }))
+        .expect("nested loop project")
+    }
+
+    /// The run of the cut `bounds` of `whole`, handed `given` at its
+    /// starts: its birth (the cut it runs, what it is given, its kicks)
+    /// driven through, the fold checked against the worker's tables.
+    async fn run_cut(whole: &ProjectDefinition, bounds: weft_core::project::cut::SelectionBounds, handed: Vec<(&str, serde_json::Value)>) -> (Drove, Vec<RunEvent>, Vec<serde_json::Value>) {
+        let walked = weft_core::project::cut::walk(&weft_core::project::graph::ProjectGraph::new(whole), &bounds).expect("the cut walks");
+        let mut given = weft_core::project::Given {
+            inputs: handed.into_iter().map(|(at, value)| (weft_core::frames::Located::top(at), [("value".to_string(), value)].into())).collect(),
+            outputs: Default::default(),
+        };
+        let project = weft_core::project::cut::cut(whole, &walked, &mut given).expect("a cut");
+        let run_id = uuid::Uuid::new_v4();
+        let mut rows = vec![RunEvent::RunStarted { given: Box::new(given),
+            run_id, project_id: project.id, entry_node: "l".into(),
+            phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()), cut_from: Some("whole-hash".into()), binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
+            seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            settings: Default::default(),
+        }];
+        rows.extend(weft_core::run_spec::KickPlan::for_program(&project, None, None).into_iter().map(|kick| RunEvent::NodeKicked {
+            run_id, node_id: kick.node, frames: kick.frames, firing: false, payload: None, port_snapshot: None, at_unix: 0,
+        }));
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let cat = super::engine_test_rig::catalog(vec![
+            ("Lister", Box::new(Lister { items: serde_json::json!([1, 2]) })),
+            ("Tally", Box::new(Tally { seen: seen.clone() })),
+        ]);
+        let (drove, events) = super::engine_test_rig::drive_journal_observed(project.clone(), cat, run_id, rows, CancellationFlag::new_arc()).await;
+        let drove = drove.expect("the cut's run drives");
+        super::engine_test_rig::assert_fold_matches_live(&project, &events, Default::default(), &drove);
+        let seen = seen.lock().unwrap().clone();
+        (drove, events, seen)
+    }
+
+    weft_core::stress_test! {
+        name: a_cut_inside_a_loop_body_runs_in_its_iteration_zero,
+        runs: 8,
+        worker_threads: 4,
+        async fn body() {
+            use weft_core::project::cut::SelectionBounds;
+            let whole = nested_loop_project();
+            let spelled = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+
+            // A start handed its list, and a stretch holding the inner loop
+            // whole: everything in it runs once, inside `l`'s iteration 0,
+            // the inner loop launching its own iterations there; nothing of
+            // `l` itself runs, nor the rest of its body.
+            let bounds = SelectionBounds { from: spelled(&["l.spread"]), target: spelled(&["l.after"]), ..Default::default() };
+            let (drove, events, mut seen) = run_cut(&whole, bounds, vec![("l.spread", serde_json::json!([1, 2]))]).await;
+            assert!(matches!(drove.outcome, RunOutcome::Completed), "{:?}", drove.outcome);
+            assert_eq!(completed_at(&events, "l.spread"), vec![vec![0]]);
+            assert_eq!(completed_at(&events, "l.m.c"), vec![vec![0, 0], vec![0, 1]], "the inner loop ran its iterations inside iteration 0");
+            assert_eq!(completed_at(&events, "l.m__out"), vec![vec![0, 0], vec![0, 1]]);
+            assert_eq!(completed_at(&events, "l.after"), vec![vec![0]]);
+            for outside in ["lister", "l__in", "l.a", "l__out", "sink"] {
+                assert!(!events.iter().any(|row| matches!(row, RunEvent::NodeStarted { node_id, .. } | RunEvent::NodeKicked { node_id, .. } if node_id == outside)), "{outside} never runs");
+            }
+            assert!(!events.iter().any(|row| matches!(row, RunEvent::LoopInstantiated { group_id, .. } if group_id == "l")), "the loop around the cut is never launched");
+            seen.sort_by_key(|value| value.to_string());
+            assert_eq!(seen, vec![serde_json::json!(1), serde_json::json!(2), serde_json::json!([1, 2]), serde_json::json!([1, 2])]);
+
+            // Wholly inside the inner loop's body: one firing, inside
+            // iteration 0 of both loops.
+            let bounds = SelectionBounds { from: spelled(&["l.m.c"]), target: spelled(&["l.m.c"]), ..Default::default() };
+            let (drove, events, seen) = run_cut(&whole, bounds, vec![("l.m.c", serde_json::json!(5))]).await;
+            assert!(matches!(drove.outcome, RunOutcome::Completed), "{:?}", drove.outcome);
+            assert_eq!(completed_at(&events, "l.m.c"), vec![vec![0, 0]]);
+            assert_eq!(seen, vec![serde_json::json!(5)]);
+            assert!(!events.iter().any(|row| matches!(row, RunEvent::LoopInstantiated { .. })), "no loop is launched");
+        }
+    }

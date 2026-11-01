@@ -371,6 +371,7 @@ mod tests {
             "run_started" => json!({ "entryNode": "n", "phase": "fire" }),
             "run_completed" => json!({ "outputs": {} }),
             "run_cancelled" => json!({ "reason": "stopped" }),
+            "run_failed" => json!({ "error": "this run fails on purpose" }),
             "node_started" => json!({ "node": "n", "frames": [], "input": { "in": 7 }, "closedPorts": [] }),
             other => panic!("no fixture for {other}"),
         };
@@ -406,6 +407,20 @@ mod tests {
             assert_eq!(*server.requests.lock().unwrap(), vec!["with_values=true"], "the values come written in");
         }
     );
+
+    /// `weft run` follows its run to the end and exits the way `weft
+    /// wait` does: a run that failed ends the follow in the failed
+    /// outcome, whose exit code is not zero, and one that completed in
+    /// the completed one.
+    #[tokio::test]
+    async fn a_followed_run_ends_in_how_the_run_ended() {
+        let failed = server(vec![vec![event("journal:0:0:0", "run_started", 1), event("journal:1:0:0", "run_failed", 1)]]).await;
+        let outcome = follow_run_id(&failed.client, None, "a", None).await.unwrap();
+        assert_eq!(outcome, Outcome::Failed);
+        assert_ne!(outcome.code(), 0);
+        let completed = server(vec![vec![event("journal:0:0:0", "run_started", 1), event("journal:1:0:0", "run_completed", 1)]]).await;
+        assert_eq!(follow_run_id(&completed.client, None, "a", None).await.unwrap(), Outcome::Completed);
+    }
 
     weft_core::stress_test!(
         name: a_run_follower_whose_stream_drops_goes_on_past_the_last_event_it_read,

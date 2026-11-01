@@ -9,9 +9,6 @@
   ],
   "icon": "TableRowsSplit",
   "color": "#1FA463",
-  "features": {
-    "keepsInputsPastRun": true
-  },
   "inputs": [
     {
       "name": "account",

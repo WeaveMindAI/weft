@@ -773,7 +773,6 @@ impl FakeState {
             mime_type: mime_type.to_string(),
             size_bytes: bytes.len() as u64,
             filename: filename.to_string(),
-            keep: false,
             expires_at_unix: None,
             keep_ttl_secs: None,
             created_at_unix: 0,
@@ -1749,8 +1748,8 @@ impl FakeRig {
 
     /// The metadata the run stored under `key` (from an emitted
     /// stored-file value's `key` field), for asserting storage-side
-    /// facts the wire value does not carry (the keep flag, the lifetime
-    /// in `keep_ttl_secs`). Loud when nothing was stored under that key.
+    /// facts the wire value does not carry (the lifetime in
+    /// `keep_ttl_secs`, the deadline in `expires_at_unix`). Loud when nothing was stored under that key.
     pub fn stored_meta(&self, key: &str) -> WeftResult<crate::storage::StoredFileMeta> {
         self.state
             .storage
@@ -2892,15 +2891,12 @@ impl ContextHandle for TestHandle {
         }
         let identity_key = identity.map(|i| (scope.clone(), i.to_string()));
         let key = self.state.mint_storage_key(&scope, filename);
-        // As the store records it: the keep flag is the end-of-run
-        // exemption only a run file has; the lifetime applies in
-        // every scope.
+        // As the store records it: the deadline applies in every scope.
         let meta = crate::storage::StoredFileMeta {
             key: key.clone(),
             mime_type: mime_type.to_string(),
             size_bytes: bytes.len() as u64,
             filename: filename.to_string(),
-            keep: keep.is_some() && scope == crate::storage::StorageScope::Run,
             expires_at_unix: None,
             keep_ttl_secs: keep.and_then(crate::storage::KeepTtl::secs),
             created_at_unix: 0,
@@ -3061,14 +3057,10 @@ impl ContextHandle for TestHandle {
     async fn storage_keep(&self, key: &str, ttl: crate::storage::KeepTtl) -> WeftResult<()> {
         match self.state.storage.lock().unwrap().get_mut(key) {
             Some(entry) => {
-                match entry.scope {
-                    crate::storage::StorageScope::Asset => {
-                        return Err(WeftError::NodeFailed(
-                            "an asset's lifetime follows the source that references it; it takes no keep".into(),
-                        ))
-                    }
-                    crate::storage::StorageScope::Run => entry.meta.keep = true,
-                    _ => {}
+                if entry.scope == crate::storage::StorageScope::Asset {
+                    return Err(WeftError::NodeFailed(
+                        "an asset's lifetime follows the source that references it; it takes no keep".into(),
+                    ));
                 }
                 entry.meta.keep_ttl_secs = ttl.secs();
                 Ok(())
@@ -4351,7 +4343,7 @@ mod tests {
         assert_eq!((put.size_bytes, replaced.size_bytes), (2, 11));
         assert_eq!(rig.stored_bytes(&put.key).unwrap().as_ref(), b"version two");
         let meta = rig.stored_meta(&put.key).unwrap();
-        assert_eq!((meta.keep, meta.keep_ttl_secs), (false, Some(60)), "a project file expires, unflagged");
+        assert_eq!(meta.keep_ttl_secs, Some(60), "a project file has its deadline");
         assert_eq!(rig.stored_files(&crate::storage::StorageScope::Project).unwrap().len(), 1);
         assert_eq!(
             reply["link"],

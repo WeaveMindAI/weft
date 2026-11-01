@@ -11,26 +11,31 @@ ctx.pulse_downstream(NodeOutput::stored_file(StoredFile::from_value(&stored)?)).
 
 ## The five scopes
 
-The scope decides where new files go, and how long they live.
+Any run of any project in your account can read any stored file, whatever its
+scope, for as long as the file exists. The scope decides only where a new file
+goes and how long it lives.
 
-| Scope | Lives | Gone when |
+| Scope | Holds | Gone when |
 |---|---|---|
-| `Run` (the default) | This run | Five minutes after the run ends, so its output is still downloadable, unless you kept it |
-| `Project` | Across runs of this project | `weft clean` or `weft rm`, or once its lifetime runs out if you gave it one |
-| `Shared { name }` | Across projects that name the same space | Explicit removal, or once its lifetime runs out if you gave it one |
-| `Asset` | The project's `@asset` copies | Readable by your node, and the worker refuses writes to it |
-| `Instance { of }` | One instance's space in this project (`StorageScope::instance()` for the run's own instance, `instance_of(id)` for any) | Until removed. For what removes them and who reaches them, go and read [an instance's files](../running/instances.md#an-instances-files) |
+| `Run` (the default) | What this run made | Its run is deleted, that is when the run's record goes (its keep time runs out, `weft clean`, `weft rm`). The run ending does not delete it |
+| `Project` | Files of this project | The project is deleted (`weft rm`) |
+| `Shared { name }` | Files several projects meet in by naming the same space | Somebody deletes them (`weft files rm`) |
+| `Asset` | The project's `@asset` copies | No version of the project names it any more, after a countdown. Your node reads it, and the worker refuses writes to it |
+| `Instance { of }` | One instance's files in this project (`StorageScope::instance()` for the run's own instance, `instance_of(id)` for any) | Somebody deletes them (`weft files rm`, or wiping the instance with `WipeInstance`), or the project is removed. For more, go and read [an instance's files](../running/instances.md#an-instances-files) |
 
 The scope governs **writes and lists**. Reading, deleting, keeping and linking
-act on whatever scope the key itself belongs to, so a later node can `get` a
-file without knowing where it came from. `copy` is the one that does both,
-reading from the key's scope and writing into yours, which is how a file
-crosses.
+act on whatever scope the key itself belongs to, so a later node, or a later
+run that kept the reference, can `get` a file without knowing where it came
+from. `copy` is the one that does both, reading from the key's scope and
+writing into yours, which is how a file moves to a scope that lives longer.
 
 ## How long a file lives
 
-A run-scoped file is swept shortly after the run ends. If you want it to
-outlive the run (anything a person will open later), give it a lifetime:
+A file can also have a deadline. It is deleted when the deadline arrives,
+whatever its scope, or with its owner (its run, its project) if that comes
+first. Every read, link or replace pushes the deadline back, so a file
+something still uses does not vanish underneath it. A file with no deadline
+lives as long as its scope says.
 
 ```rust
 storage.put(bytes, "image/png", "chart.png", Some(KeepTtl::Default)).await?;
@@ -38,16 +43,12 @@ storage.put(bytes, "image/png", "chart.png", Some(KeepTtl::Default)).await?;
 
 | `KeepTtl` | Meaning |
 |---|---|
-| `Default` | 30 days |
-| `Secs { secs }` | That long |
-| `Never` | No expiry. Only `weft files rm` or `weft clean` removes it |
+| `Default` | 30 days since it was last touched |
+| `Secs { secs }` | That long since it was last touched |
+| `Never` | No deadline: it lives as long as its scope says |
 
-The lifetime counts from the last time something touched the file: every read,
-link or replace pushes the expiry back, so a file something still uses does not
-vanish underneath it.
-
-Project, shared and instance files take a lifetime too. There, `None` means the
-file lives until somebody deletes it. A cache of fetched pages, say:
+`None` gives no deadline either. A cache of fetched pages that should go once
+nobody has read it for a week, say:
 
 ```rust
 ctx.storage(StorageScope::Project)
@@ -55,12 +56,12 @@ ctx.storage(StorageScope::Project)
     .await?;
 ```
 
-For a file that already exists, `keep(&file, ttl)` sets its lifetime from now
-on. On a run file it also marks the file to outlive its run, and that
-mark cannot be taken back. On the other scopes `keep(&file, KeepTtl::Never)`
-takes a lifetime away again. An asset lives as long as a version of the project
-still names it (once none does, it expires on its own), so you cannot give one
-a lifetime.
+For a file that already exists, `keep(&file, ttl)` sets its deadline from now
+on, and `keep(&file, KeepTtl::Never)` takes it away. Neither moves the file, so
+a run file still goes with its run. If you want a file to outlive the run that
+made it, `copy` it into the project (the `KeepFile` node with `scope: project`
+does that). An asset lives as long as a version of the project still names it
+(once none does, it expires on its own), so you cannot give one a deadline.
 
 ## Storing
 
@@ -102,7 +103,7 @@ function must use only the bytes it is given: no counter it bumps, no call
 out, no other read. Returning the bytes unchanged writes nothing.
 
 The file keeps its key, so every reference already handed out now reads the
-new content. It also keeps its scope, name, type and lifetime. A reader sees
+new content. It also keeps its scope, name, type and deadline. A reader sees
 either the old bytes or the new ones, never a mix. What comes back is the file's value
 with its new `sizeBytes` and `version`.
 

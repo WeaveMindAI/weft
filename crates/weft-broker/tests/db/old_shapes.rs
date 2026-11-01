@@ -68,7 +68,7 @@ pub(crate) async fn broker_state_on(pool: Pool, object_store: Arc<dyn weft_platf
             line_max_age: None,
             dispatcher_alarm: None,
             supervisor_booking: None,
-            aside: weft_task_store::aside::StepAside::new(),
+            stopping: weft_task_store::stopping::Stopping::new(),
         },
     )
     .expect("the broker builds")
@@ -148,7 +148,6 @@ async fn an_older_workers_batch_without_secrets_is_answered_naming_the_resync(po
             row_sizes: Vec::new(),
             born: None,
             written: Default::default(),
-            wrote_files: false,
             secrets: Vec::new(),
         }],
         programs: Vec::new(),

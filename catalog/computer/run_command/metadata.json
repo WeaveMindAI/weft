@@ -34,7 +34,7 @@
     {
       "name": "output",
       "type": "File",
-      "description": "The command's whole output, standard output and standard error together, as a text file stored for this run (wire it through KeepFile to keep it longer)."
+      "description": "The command's whole output, standard output and standard error together, as a text file stored with this run and deleted with it (wire it through KeepFile to keep it past that)."
     },
     {
       "name": "exitCode",

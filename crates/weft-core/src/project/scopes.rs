@@ -14,6 +14,10 @@
 //! members fire at. A group inside a loop has one copy per iteration, a
 //! body one per call (the frames end with the call frame of the site that
 //! called it), a loop one per iteration (the iteration's frames).
+//!
+//! A loop the program holds without its boundaries (a cut of part of its
+//! body, `super::cut`) is never launched: the run sits inside its
+//! iteration 0, which opens with the copy around it ([`Scope::entered`]).
 
 use std::collections::HashMap;
 
@@ -114,6 +118,38 @@ pub struct Scope {
     pub entering: Vec<Leg>,
     /// The wires that take a value from inside it out.
     pub leaving: Vec<Leg>,
+    /// A loop whose `LoopIn` the program does not hold: a cut of part of
+    /// its body, which runs inside the loop's iteration 0. Nothing launches
+    /// that iteration: it is a copy like a group's, opening with the copy
+    /// around it (or at the run's start), and nothing of the loop's own
+    /// runs (its gate, its other iterations, its outputs).
+    pub entered: bool,
+}
+
+impl Scope {
+    /// Whether a copy of it opens as a candidate when the copy around it
+    /// opens (at the run's start for one at the top): a group, a site and
+    /// an entered loop. A body opens under the site calling it, and a loop
+    /// the program launches opens each iteration as it launches it.
+    fn opens_with_its_parent(&self) -> bool {
+        match self.kind {
+            ScopeKind::Group | ScopeKind::Call { .. } => true,
+            ScopeKind::Loop => self.entered,
+            ScopeKind::Body => false,
+        }
+    }
+
+    /// The frames of its copy inside the copy at `frames` around it: one
+    /// iteration deeper for an entered loop (its iteration 0), the same
+    /// frames for any other scope (a launched loop's are where its body is
+    /// listed when it never iterated, [`ScopeIndex::inside`]).
+    fn copy_frames(&self, frames: &LoopFrames) -> LoopFrames {
+        let mut inner = frames.clone();
+        if self.entered {
+            inner.push(Frame::Loop { index: 0 });
+        }
+        inner
+    }
 }
 
 /// Every scope of a program, by id, and the scopes at the top. Built once
@@ -122,8 +158,9 @@ pub struct Scope {
 pub struct ScopeIndex {
     scopes: HashMap<String, Scope>,
     /// The scopes outside every other, in the program's group order: the
-    /// top's groups and sites (a body is never at the top: it runs under
-    /// a site; nor a loop: its iterations open as it launches them).
+    /// top's groups, sites and entered loops (a body is never at the top:
+    /// it runs under a site; nor a loop the program launches: its
+    /// iterations open as it launches them).
     top: Vec<String>,
     /// The nodes that fire outside every scope (a top loop's `LoopOut`
     /// is not one: it fires in that loop's iterations).
@@ -139,9 +176,12 @@ impl ScopeIndex {
                 GroupKind::Call { body, .. } => ScopeKind::Call { body: body.clone() },
                 GroupKind::Body => ScopeKind::Body,
             };
+            let entered = kind == ScopeKind::Loop
+                && !project.nodes.iter().any(|node| node.id == super::loop_in_id(&group.id));
             let scope = Scope {
                 id: group.id.clone(),
                 kind,
+                entered,
                 parent: group.parent_group_id.clone(),
                 members: Vec::new(),
                 firing: Vec::new(),
@@ -161,7 +201,7 @@ impl ScopeIndex {
                         parent.children.push(group.id.clone());
                     }
                 }
-                None if !matches!(group.kind, GroupKind::Body | GroupKind::Loop { .. }) => top.push(group.id.clone()),
+                None if scopes[&group.id].opens_with_its_parent() => top.push(group.id.clone()),
                 None => {}
             }
         }
@@ -307,13 +347,15 @@ impl ScopeIndex {
     }
 
     /// The copies `copy` opens as candidates when it opens: its groups and
-    /// sites at its frames, and a site's body one call frame deeper. A
-    /// loop is not among them: its iterations open as it launches them.
+    /// sites at its frames, an entered loop's iteration 0 one iteration
+    /// deeper, and a site's body one call frame deeper. A loop the program
+    /// launches is not among them: its iterations open as it launches them.
     pub fn children_of(&self, copy: &ScopeCopy) -> Vec<ScopeCopy> {
         let Some(scope) = self.scopes.get(&copy.scope) else { return Vec::new() };
         let mut out: Vec<ScopeCopy> = scope.children.iter()
-            .filter(|child| self.scopes.get(*child).is_some_and(|c| c.kind != ScopeKind::Loop))
-            .map(|child| ScopeCopy::new(child.clone(), copy.frames.clone()))
+            .filter_map(|child| self.scopes.get(child))
+            .filter(|child| child.opens_with_its_parent())
+            .map(|child| ScopeCopy::new(child.id.clone(), child.copy_frames(&copy.frames)))
             .collect();
         if let ScopeKind::Call { body } = &scope.kind {
             let mut frames = copy.frames.clone();
@@ -323,9 +365,42 @@ impl ScopeIndex {
         out
     }
 
-    /// The copies at the top of a run, open the moment it starts.
+    /// The frames of the copy of `scope` (the top of a file for `None`)
+    /// reached through the call path `path` that a run opens without
+    /// launching anything: one call frame per site on the path, and
+    /// iteration 0 of each entered loop around it (itself included),
+    /// outermost first. What a node sitting directly in `scope` fires at
+    /// when the run kicks it, hands it a value or has it stand in. A node
+    /// inside a loop the program launches fires at the iterations it
+    /// launches instead.
+    pub fn frames_at(&self, scope: Option<&str>, path: &[String]) -> LoopFrames {
+        let mut frames = LoopFrames::new();
+        for site in path {
+            let above = self.scopes.get(site).and_then(|site| site.parent.as_deref());
+            self.push_entered(above, &mut frames);
+            frames.push(Frame::Call { site: site.clone() });
+        }
+        self.push_entered(scope, &mut frames);
+        frames
+    }
+
+    /// Push iteration 0 of every entered loop from the top of the file
+    /// down to `scope`, itself included.
+    fn push_entered(&self, scope: Option<&str>, frames: &mut LoopFrames) {
+        let mut chain = Vec::new();
+        let mut at = scope.and_then(|id| self.scopes.get(id));
+        while let Some(here) = at {
+            chain.push(here);
+            at = here.parent.as_deref().and_then(|parent| self.scopes.get(parent));
+        }
+        frames.extend(chain.into_iter().rev().filter(|scope| scope.entered).map(|_| Frame::Loop { index: 0 }));
+    }
+
+    /// The copies at the top of a run, candidates the moment it starts.
     pub fn top_copies(&self) -> Vec<ScopeCopy> {
-        self.top.iter().map(|id| ScopeCopy::new(id.clone(), Vec::new())).collect()
+        self.top.iter().filter_map(|id| self.scopes.get(id))
+            .map(|scope| ScopeCopy::new(scope.id.clone(), scope.copy_frames(&Vec::new())))
+            .collect()
     }
 
     /// Everything inside `copy`, however deep, at the frames each would
@@ -334,19 +409,22 @@ impl ScopeIndex {
     /// deeper, and so on down. A loop inside never iterated, so what is
     /// in its body is listed at the loop's own frames: that is how it
     /// reads as taken down by the scope around the loop, never by an
-    /// iteration. The loop itself is no copy (its iterations are).
+    /// iteration. The loop itself is no copy (its iterations are). An
+    /// entered loop's iteration 0 is a copy like a group's, one iteration
+    /// deeper.
     pub fn inside(&self, copy: &ScopeCopy) -> Inside {
         let mut inside = Inside::default();
         let mut pending = vec![copy.clone()];
         let mut first = true;
         while let Some(next) = pending.pop() {
             let Some(scope) = self.scopes.get(&next.scope) else { continue };
-            if !first && scope.kind != ScopeKind::Loop {
+            if !first && (scope.kind != ScopeKind::Loop || scope.entered) {
                 inside.copies.push(next.clone());
             }
             first = false;
             inside.nodes.extend(scope.members.iter().map(|&at| (at, next.frames.clone())));
-            pending.extend(scope.children.iter().map(|child| ScopeCopy::new(child.clone(), next.frames.clone())));
+            pending.extend(scope.children.iter().filter_map(|child| self.scopes.get(child))
+                .map(|child| ScopeCopy::new(child.id.clone(), child.copy_frames(&next.frames))));
             if let ScopeKind::Call { body } = &scope.kind {
                 let mut frames = next.frames.clone();
                 frames.push(Frame::Call { site: next.scope.clone() });
@@ -379,9 +457,9 @@ pub fn fires_per_iteration_of(node: &super::NodeDefinition) -> Option<&str> {
 
 /// The places that run only after `seeds` did (the seeds included):
 /// along wires, and at a scope's gate everything inside that scope. Not a
-/// run's walk (`super::cut::downstream`), which takes a loop whole: a node
-/// of the loop a seed sits in can run before the seed in each iteration,
-/// so it does not wait on it.
+/// run's walk (`super::cut::downstream`), which takes a loop whole once it
+/// reaches the loop's start: a node of the loop a seed sits in can run
+/// before the seed in each iteration, so it does not wait on it.
 fn runs_after(g: &super::graph::ProjectGraph, seeds: &[crate::frames::Located]) -> std::collections::BTreeSet<crate::frames::Located> {
     use super::graph::GraphView;
     let mut reached = std::collections::BTreeSet::new();

@@ -1,8 +1,9 @@
 //! A project whose nodes are all base catalog nodes runs on the standard
 //! worker the install made ready when it started, so its first run
-//! compiles nothing.
+//! compiles nothing, and its value arrives where it is wired.
 #![cfg(feature = "e2e")]
 
+use serde_json::json;
 use weft_e2e::{ensure, project::Project, run};
 
 #[tokio::test]
@@ -20,5 +21,7 @@ async fn a_stock_project_runs_on_the_ready_standard_worker() -> anyhow::Result<(
     anyhow::ensure!(out.contains(&format!("on worker {}", &hash[..16])), "a stock project builds to the standard worker: {out}");
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
+    // Debug is a sink (no output); the value arrived on its `data` input.
+    settled.assert_input("out", "data", &json!("hello weft"))?;
     project.finish().await
 }

@@ -45,7 +45,6 @@ a slug per cause.
 | `graph-cycle` | The wires form a cycle | Iterate with a Loop, or exchange feedback over a bus. If what goes back is a value you can write in the program, like a tool's description, make it a [metadata port](groups.md#metadata-ports) |
 | `required-port-unmet` | A required input has no wire, no written value and no default. On a group, loop or included file: a port nothing outside connects, whose value a node inside cannot run without (a required input, or the last possible member of a `@require_one_of` set) | Give it one of the three; for a group port, connect or write it from outside |
 | `optional-pass-through-port` | A `?` on a port of a group or an included file, or on a loop port the loop neither iterates nor carries. Such a port passes what reaches it to the nodes inside, so it is never optional itself ([a group input passes through](groups.md#a-group-input-passes-through)) | Remove the `?`; to let a node inside run without the value, write the `?` on that node's input |
-| `run-file-kept-past-run` (warning) | A file a node stored for its run only, because its `scope` setting says `run` (written, or that default, as on the storage nodes such as `KeepFile`), whatever `ttlDays` says, is wired into a node that keeps what it is given after the run ends, like a table write or an instance's values. No later run can read that file, so the row ends up holding a dead reference | Store it with `scope: project`. For which files outlive a run, go and read [files at run time](../running/files.md#keeping-something) |
 
 ## Values you wrote
 

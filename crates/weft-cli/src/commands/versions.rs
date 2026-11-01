@@ -567,6 +567,28 @@ mod tests {
         assert_eq!(read_spec(&project, "old").unwrap(), spec);
     }
 
+    /// An example file that is there but does not parse is an error naming
+    /// the file, never an absence: `weft freeze` and `weft run --save`
+    /// write over an absent example, and would destroy one whose only
+    /// problem was a typo. Reading leaves the file as the person left it.
+    #[test]
+    fn an_example_that_does_not_parse_is_an_error_and_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("weft.toml"), "[package]\nname = 'test'\nid = '00000000-0000-0000-0000-000000000001'\n").unwrap();
+        let project = Project::load(dir.path()).unwrap();
+        std::fs::create_dir_all(examples_dir(&project)).unwrap();
+        let path = spec_path(&project, "chain");
+        let typo = "{ \"name\": \"chain\", \"target\": [\"out\"],, }";
+        std::fs::write(&path, typo).unwrap();
+        let why = format!("{:#}", read_spec_if_present(&project, "chain").unwrap_err());
+        assert!(why.contains("parse") && why.contains("chain.json"), "{why}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), typo);
+
+        std::fs::write(&path, "{ \"name\": \"chain\" }").unwrap();
+        assert_eq!(read_spec_if_present(&project, "chain").unwrap().map(|spec| spec.name).as_deref(), Some("chain"));
+        assert!(read_spec_if_present(&project, "absent").unwrap().is_none(), "only a missing file is an absence");
+    }
+
     fn version(id: &str, label: Option<&str>) -> VersionSummary {
         VersionSummary {
             id: format!("{id}00000000"),

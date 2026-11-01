@@ -70,7 +70,6 @@ async fn ttl_keeps_a_run_file(rig: FakeRig) -> WeftResult<()> {
         .ok()?;
     let key = weft::storage::StoredFile::from_value(&outcome.outputs["file"])?.key;
     let meta = rig.stored_meta(&key)?;
-    assert!(meta.keep, "kept past the run: {meta:?}");
     assert_eq!(meta.keep_ttl_secs, Some(2 * 24 * 3600));
     assert_eq!(outcome.outputs["filename"], json!("logo.png"), "the four ports a stored file travels as");
     Ok(())

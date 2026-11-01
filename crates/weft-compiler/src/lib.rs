@@ -508,6 +508,7 @@ pub fn render_diagnostic(d: &Diagnostic) -> String {
 /// Turn an `Error`-severity diagnostic set into a single loud
 /// [`error::BuildError::Validate`]; `Ok(())` when only warnings (or
 /// nothing) remain. The build's gate (`build::build_project`) aborts on it.
+#[cfg(feature = "build")]
 pub(crate) fn bail_on_errors(diagnostics: Vec<Diagnostic>) -> error::BuildResult<()> {
     if diagnostics.iter().any(|d| matches!(d.severity, Severity::Error)) {
         Err(error::BuildError::Validate(render_diagnostics(&diagnostics)))

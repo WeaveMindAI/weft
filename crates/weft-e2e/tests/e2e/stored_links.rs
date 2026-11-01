@@ -127,7 +127,10 @@ async fn upload(http: &reqwest::Client, base: &str, slot: &str, filename: &str, 
         let offset = part["offsetBytes"].as_u64().context("an offset")? as usize;
         let size = part["sizeBytes"].as_u64().context("a size")? as usize;
         let put = http.put(part["url"].as_str().context("a link")?).body(bytes[offset..offset + size].to_vec()).send().await?;
-        anyhow::ensure!(put.status().is_success(), "a part PUT answered {}: {}", put.status(), put.text().await.unwrap_or_default());
+        if !put.status().is_success() {
+            let status = put.status();
+            anyhow::bail!("a part PUT answered {status}: {}", put.text().await.context("read the refused part PUT's answer")?);
+        }
         let etag = put.headers().get("etag").and_then(|v| v.to_str().ok()).context("a part answers its etag")?.to_string();
         call("part-done", json!({ "slot": slot, "key": key, "partNumber": part["partNumber"], "etag": etag })).await?;
     }

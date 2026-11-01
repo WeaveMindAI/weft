@@ -16,6 +16,11 @@ output "url" {
   value       = local.role_urls["dispatcher"]
 }
 
+output "role_services" {
+  description = "The Cloud Run service of each of weft's roles, whose older revisions the install workflow deletes once the new one serves."
+  value       = [for role in local.serverless_roles : google_cloud_run_v2_service.role[role].name]
+}
+
 # SYNC: install_key_secret <-> crates/weft-core/src/signal_token.rs (INSTALL_KEY_SECRET),
 #       .github/workflows/install-gcp.yml (every step that reads the key)
 output "install_key_secret" {

@@ -214,7 +214,6 @@ impl WorkerJournal {
                 handed: 0,
                 holding,
                 replica: None,
-                wrote_files: false,
                 wanted: 0,
                 queued: false,
                 secrets: unsent,
@@ -235,15 +234,6 @@ impl WorkerJournal {
         match self.live_run(run_id) {
             Some(run) => self.note(&run).await,
             None => Ok(()),
-        }
-    }
-
-    /// A run of this process stores files of its own, which its ending's
-    /// sweep reclaims: said before the bytes move, since a store that fails
-    /// part way may still leave a part to reclaim.
-    pub fn stored_files(&self, run_id: RunId) {
-        if let Some(run) = self.live_run(run_id) {
-            run.state.lock().expect("record writer").wrote_files = true;
         }
     }
 
@@ -522,7 +512,6 @@ struct RunState {
     holding: Holding,
     /// The replica the run writes under, fixed by its first write.
     replica: Option<Option<String>>,
-    wrote_files: bool,
     /// The most events a flush waits to see on record; the lane sends at
     /// once while fewer are ([`RunLog::waited_on`]). A flush already
     /// answered counts no more, so the run's later events gather as usual.
@@ -607,7 +596,6 @@ struct Taken {
     events: Vec<RunEvent>,
     first_seq: i32,
     epoch: i32,
-    wrote_files: bool,
     bytes: usize,
     secrets: Vec<KeptSecret>,
 }
@@ -721,7 +709,7 @@ fn take_batch(lane: &Lane, budget: &Budget) -> Vec<Taken> {
         bytes += run_bytes;
         let first_seq = state.next_seq;
         state.next_seq += 1;
-        let (epoch, wrote_files) = (state.epoch, state.wrote_files);
+        let epoch = state.epoch;
         let secrets = std::mem::take(&mut state.secrets);
         state.queued = !state.pending.is_empty();
         let more = state.queued;
@@ -729,7 +717,7 @@ fn take_batch(lane: &Lane, budget: &Budget) -> Vec<Taken> {
         if more {
             queue.runs.push_back(run.clone());
         }
-        taken.push(Taken { run, events, first_seq, epoch, wrote_files, bytes: run_bytes, secrets });
+        taken.push(Taken { run, events, first_seq, epoch, bytes: run_bytes, secrets });
     }
     taken
 }
@@ -769,7 +757,6 @@ fn frame(lane: &Lane, taken: &[Taken]) -> (Vec<u8>, usize, Vec<(usize, String)>)
             row_sizes: vec![u32::try_from(row.len()).expect("a row is under 4 GiB")],
             born,
             written: Written::of(&taken.events),
-            wrote_files: taken.wrote_files,
             secrets: taken.secrets.clone(),
         });
         rows.push(row);
@@ -1610,20 +1597,5 @@ mod tests {
         drive.leave(Leaving::Ended).await.unwrap();
         writer.written().await;
         assert!(record.heads().is_empty());
-    }
-
-    /// A run that stored files says so on its rows from then on.
-    #[tokio::test]
-    async fn a_run_that_stored_files_says_so() {
-        let record = Arc::new(FakeRecord::default());
-        let writer = writer(&record, WriterSettings::default());
-        let (run, drive) = fast(&writer);
-        drive.record_event(&started(run, "a"), Some("w")).await.unwrap();
-        drive.flush().await.unwrap();
-        writer.stored_files(run);
-        drive.record_event(&completed(run), Some("w")).await.unwrap();
-        drive.flush().await.unwrap();
-        let wrote: Vec<bool> = record.heads().iter().map(|head| head.runs[0].wrote_files).collect();
-        assert_eq!(wrote, [false, true]);
     }
 }

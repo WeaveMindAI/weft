@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
-use weft::storage::{KeepTtl, StorageScope};
+use weft::storage::{StorageScope};
 use weft::{EndpointHandle, NodeErrExt, RunContext, WeftResult};
 
 // SYNC: computer actions and routes <-> catalog/computer/computer/images/computer/computer.py
@@ -54,14 +54,13 @@ pub async fn act_and_say(ctx: &RunContext, action: &str, payload: Value, result:
     ctx.pulse_downstream(NodeOutput::new().set("result", result)).await
 }
 
-/// The image in the computer's answer (`png`, base64), stored and kept
-/// past the run like any image a node makes: a conversation that shows
-/// it to a model holds a reference to it, and a later run may read that
-/// conversation again.
+/// The image in the computer's answer (`png`, base64), stored for the run
+/// like any image a node makes: a conversation that shows it to a model
+/// holds a reference to it, which reads for as long as the run is kept.
 pub async fn store_png(ctx: &RunContext, answer: &Value, filename: &str) -> WeftResult<Value> {
     let encoded = answer["png"].as_str().node_err(format!("the computer answered no image: {answer}"))?;
     let png = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .node_err("the computer's image is not base64")?;
-    ctx.storage(StorageScope::Run).put(png, "image/png", filename, Some(KeepTtl::Default)).await
+    ctx.storage(StorageScope::Run).put(png, "image/png", filename, None).await
 }

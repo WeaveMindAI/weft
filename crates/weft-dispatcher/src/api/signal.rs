@@ -117,13 +117,23 @@ pub async fn skip_signal(
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
-    if routing.surface_kind == "internal" {
-        return (StatusCode::NOT_FOUND, "internal signal kind has no public surface").into_response();
-    }
-    if !routing.is_resume {
-        return (StatusCode::CONFLICT, "only a question a waiting run asked can be skipped; this signal starts runs").into_response();
+    if let Err(refused) = skippable(&routing) {
+        return refused.into_response();
     }
     answer_run(&state, &token, &routing, weft_core::primitive::WaitAnswer::Skipped).await.into_response()
+}
+
+/// Whether the signal `routing` reads may be skipped at the public door:
+/// only a question a waiting run asked, never an entry (it has nothing to
+/// decline) nor a signal with no public surface.
+fn skippable(routing: &FireGateInfo) -> Result<(), (StatusCode, &'static str)> {
+    if routing.surface_kind == "internal" {
+        return Err((StatusCode::NOT_FOUND, "internal signal kind has no public surface"));
+    }
+    if !routing.is_resume {
+        return Err((StatusCode::CONFLICT, "only a question a waiting run asked can be skipped; this signal starts runs"));
+    }
+    Ok(())
 }
 
 async fn fire_signal_inner(
@@ -594,9 +604,13 @@ pub async fn cancel_signal(
 /// signal must be one that token sees (same tenant, allowed projects and
 /// tags, project visibility), the field is one the signal's kind names a
 /// file for (`Signal::stored_file`, asked through the kind inventory so
-/// this door knows no kind), and the file must belong to the signal (its
-/// project, its run, or the tenant's shared space). Anything else
-/// is 404, so a token learns nothing about signals or files it cannot see.
+/// this door knows no kind). The file itself is the tenant's, which the
+/// broker checks as it makes the link (any file of the tenant is the form's
+/// to show: a file's scope says how long it lives, never who reads it).
+/// A signal or field the token cannot see is 404, so a token learns
+/// nothing about signals it cannot see; a key the store refuses (the
+/// program put a file of another tenant on its form) is the install's
+/// fault, a 500 saying so, which tells nothing about any file either.
 pub async fn signal_file_for_token(
     State(state): State<DispatcherState>,
     headers: HeaderMap,
@@ -623,10 +637,6 @@ pub async fn signal_file_for_token(
     let file = weft_core::signal::stored_file(&spec, &field)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(not_found)?;
-    let parsed = weft_core::storage::key::parse_key(&file.key).map_err(|_| not_found())?;
-    if !file_belongs_to_signal(&parsed, &sig) {
-        return Err(not_found());
-    }
     // The store's own message names the storage key, and this door
     // exists so a consumer never sees one. Say what happened in the
     // consumer's terms and keep the store's text for the operator log.
@@ -656,6 +666,10 @@ pub async fn signal_file_for_token(
                          deleted. Run the workflow again to make it afresh."
                     ),
                 )
+            } else if e.downcast_ref::<crate::storage::BrokerRejected>().is_some() {
+                // The store refused the key itself (not one it reads, or
+                // not this tenant's): asking again cannot help.
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("the file behind '{field}' cannot be linked: the signal names a file the store refuses"))
             } else {
                 (
                     StatusCode::BAD_GATEWAY,
@@ -697,32 +711,6 @@ pub struct SignalFileLink {
 /// leaked link is soon worthless. A consumer asks again when it renders.
 const SIGNAL_FILE_LINK_TTL_SECS: u64 = 3600;
 
-/// May a signal's consumer be handed this file: the file sits in the
-/// signal's own tenant, and in the signal's project (a project file),
-/// its run (a file the run made), the tenant's shared space, or the
-/// tenant's assets. A file of another project or run is not the form's to show.
-fn file_belongs_to_signal(
-    parsed: &weft_core::storage::key::ParsedKey,
-    sig: &crate::store::SignalRegistration,
-) -> bool {
-    use weft_core::storage::key::KeyScope;
-    if parsed.tenant != sig.tenant_id {
-        return false;
-    }
-    match &parsed.scope {
-        KeyScope::Project { project_id } => *project_id == sig.project_id.to_string(),
-        // The tenant's own content (the tenant wall above): an asset is named
-        // by its sha256, so naming one already takes holding its bytes.
-        KeyScope::Asset => true,
-        // An instance's file shows on a form of that instance's run alone.
-        KeyScope::Instance { project_id, instance } => {
-            *project_id == sig.project_id.to_string() && sig.instance.as_ref().is_some_and(|m| m.as_str() == instance)
-        }
-        KeyScope::Run { run_id } => sig.run_id.is_some_and(|c| c.to_string() == *run_id),
-        KeyScope::Shared { .. } => true,
-    }
-}
-
 /// Scoped enumeration. Filters by
 /// the signal token's allowed_projects, allowed_tags AND
 /// by project visibility (`fires_visible_to_consumers = TRUE`):
@@ -747,6 +735,13 @@ pub async fn list_signals_for_token(
         .visible_signals(&state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
+    Ok(Json(Value::Array(consumer_listing(visible))))
+}
+
+/// What the signal-token listing hands a consumer for the signals it may
+/// see, `visible`: each one's rendered payload, stamped with whether it
+/// answers a waiting run. A signal with nothing rendered is left out.
+pub fn consumer_listing(visible: Vec<crate::store::SignalRegistration>) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(visible.len());
     for sig in visible {
         if let Some(mut payload) = sig.consumer_payload {
@@ -765,7 +760,7 @@ pub async fn list_signals_for_token(
             out.push(payload);
         }
     }
-    Ok(Json(Value::Array(out)))
+    out
 }
 
 /// `GET /signal-token/health` (Bearer-authenticated). Liveness + auth probe.
@@ -1780,65 +1775,6 @@ mod can_cancel_tests {
 }
 
 #[cfg(test)]
-mod signal_file_scope_tests {
-    use super::file_belongs_to_signal;
-    use crate::store::SignalRegistration;
-    use weft_core::storage::key::parse_key;
-
-    fn signal(run_id: Option<&str>) -> SignalRegistration {
-        SignalRegistration {
-            instance: None,
-            activation_trigger: None,
-            source_version: None,
-            setup_run_id: None,
-            program: None,
-            token: "tok-1".into(),
-            tenant_id: "t".into(),
-            project_id: uuid::Uuid::from_u128(0x100),
-            run_id: run_id.map(|c| c.parse().expect("a uuid")),
-            node_id: "n".into(),
-            is_resume: run_id.is_some(),
-            spec_json: "{}".into(),
-            access_id: None,
-            consumer_kind: None,
-            tags: vec![],
-            port_snapshot: None,
-            consumer_payload: None,
-            surface_kind: "task_callback".into(),
-            mount_path: None,
-            mount_methods: Vec::new(),
-            auth_kind: "none".into(),
-            auth_config: None,
-            kind_state: serde_json::Value::Object(Default::default()),
-            kind_state_seq: 0,
-            holds: false,
-            generation: 0,
-        }
-    }
-
-    /// A form may show its own project's files, its own run's files,
-    /// and the tenant's shared files; nothing of another tenant,
-    /// project or run.
-    #[test]
-    fn a_file_is_the_forms_to_show_only_inside_its_own_walls() {
-        let run_id = "11111111-1111-1111-1111-111111111111";
-        let sig = signal(Some(run_id));
-        let p = sig.project_id;
-        let ok = |key: &str| file_belongs_to_signal(&parse_key(key).expect(key), &sig);
-        assert!(ok(&format!("t/project/{p}/cat")));
-        assert!(ok("t/asset/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
-        assert!(!ok("other/asset/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"), "another tenant's asset");
-        assert!(ok(&format!("t/run/{run_id}/cat")));
-        assert!(ok("t/shared/pool/cat"));
-        assert!(!ok(&format!("other/project/{p}/cat")), "another tenant");
-        assert!(!ok("t/project/q/cat"), "another project");
-        assert!(!ok("t/run/22222222-2222-2222-2222-222222222222/cat"), "another run");
-        let entry = signal(None);
-        assert!(!file_belongs_to_signal(&parse_key(&format!("t/run/{run_id}/cat")).unwrap(), &entry), "an entry signal has no run");
-    }
-}
-
-#[cfg(test)]
 mod gated_entry_tests {
     use super::*;
 
@@ -1848,5 +1784,142 @@ mod gated_entry_tests {
         let (status, message) = refuse_gated_entry("connection", "/connect/local/x").unwrap_err();
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(message.contains("call it at /connect/local/x"), "{message}");
+    }
+
+    /// Only a question a waiting run asked can be skipped at
+    /// `POST /signal/{token}/skip`: an entry is refused with a 409 (it
+    /// starts runs, there is nothing to decline) and a signal with no
+    /// public surface with a 404.
+    #[test]
+    fn only_a_waiting_runs_question_can_be_skipped() {
+        let routing = |surface_kind: &str, is_resume: bool| FireGateInfo {
+            project_id: uuid::Uuid::nil(),
+            tenant_id: "t".into(),
+            status: crate::activation_store::ProjectStatus::Active,
+            accepting_fires: true,
+            fires_deadline_unix: None,
+            surface_kind: surface_kind.into(),
+            auth_kind: "none".into(),
+            is_resume,
+            binary_hash: None,
+        };
+        assert_eq!(skippable(&routing("task_callback", true)), Ok(()));
+        let (status, why) = skippable(&routing("public_entry", false)).unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(why.contains("this signal starts runs"), "{why}");
+        assert_eq!(skippable(&routing("internal", true)).unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+}
+
+// These tests need a real Postgres. A module named `db_tests` is how
+// `.config/nextest.toml` finds database tests inside a library: the
+// default profile leaves them out, the `db` profile runs them.
+#[cfg(test)]
+mod db_tests {
+    use weft_core::activation::ActivationKey;
+    use weft_core::instance::Owner;
+    use weft_core::take_down::TakeDown;
+    use weft_task_store::db::Pool;
+
+    use super::{match_relayed, read_tenant_routes, Relayed, StatusCode};
+    use crate::activation_store::{ActivationLifecycle, ActivationStoreOps, Claimant, DownCause, Forget, PostgresActivationStore};
+    use crate::store::postgres::PostgresStore;
+    use crate::store::{SignalRegistration, SignalStore};
+    use crate::take_down::{signals_going, TakeDownTarget};
+
+    const TENANT: &str = "tenant-1";
+
+    /// Trigger `door` of a fresh project, activated, its live route at
+    /// `users/{id}` on program `bin-A`.
+    async fn an_active_route(pool: &Pool) -> (uuid::Uuid, PostgresActivationStore) {
+        weft_task_store::apply_groups(pool, crate::app::DISPATCHER_GROUPS).await.unwrap();
+        let store = PostgresStore::from_pool(pool.clone());
+        let projects = crate::PostgresProjectStore::new(pool.clone());
+        let id = uuid::Uuid::new_v4();
+        let definition = serde_json::from_value(serde_json::json!({ "id": id, "nodes": [], "edges": [] })).unwrap();
+        crate::project_store::ProjectStoreOps::register_with_hashes(
+            &projects, definition, "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        let activations = PostgresActivationStore::new(pool.clone());
+        let setup = uuid::Uuid::new_v4();
+        let key = ActivationKey::new("door", Owner::Shared);
+        assert!(activations.try_begin_activating(id, std::slice::from_ref(&key), setup, None, Claimant::Anyone, uuid::Uuid::new_v4()).await.unwrap().is_ok());
+        store
+            .signal_insert(&SignalRegistration {
+                instance: None,
+                activation_trigger: Some("door".into()),
+                source_version: None,
+                setup_run_id: Some(setup),
+                program: Some(weft_core::project::hash::ProgramIdentity {
+                    definition_hash: "def-1".into(),
+                    binary_hash: "bin-A".into(),
+                    implementations: Default::default(),
+                }),
+                token: "door-token".into(),
+                tenant_id: TENANT.into(),
+                project_id: id,
+                run_id: None,
+                node_id: "door".into(),
+                is_resume: false,
+                spec_json: "{}".into(),
+                consumer_kind: None,
+                tags: Vec::new(),
+                consumer_payload: None,
+                surface_kind: "public_entry".into(),
+                mount_path: Some(weft_core::route::SharedMount::new(TENANT, id).mount_path("users/{id}")),
+                mount_methods: Vec::new(),
+                auth_kind: "none".into(),
+                auth_config: None,
+                kind_state: serde_json::json!({}),
+                kind_state_seq: 0,
+                access_id: None,
+                port_snapshot: None,
+                holds: false,
+                generation: 0,
+            })
+            .await
+            .unwrap();
+        activations.end_activating(id, setup, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
+        (id, activations)
+    }
+
+    /// Take trigger `door` of project `id` down as `take_down` says, the
+    /// way a person's `weft deactivate` writes it.
+    async fn take_down(activations: &PostgresActivationStore, id: uuid::Uuid, take_down: &TakeDown) {
+        let keys = vec![ActivationKey::new("door", Owner::Shared)];
+        let target = TakeDownTarget::Activations(keys.clone());
+        let signals = signals_going(&target, take_down, None, &[]);
+        let lifecycle = ActivationLifecycle::down(take_down, crate::lease::now_unix());
+        activations
+            .set_lifecycle_guarded(id, &keys, &lifecycle, signals, Forget::of(take_down, &DownCause::Person), DownCause::Person, None)
+            .await
+            .unwrap();
+    }
+
+    /// Where a live call to `users/42` of project `id` goes, read from the
+    /// rows as a dispatcher that never heard of the route reads them.
+    async fn called(pool: &Pool, id: uuid::Uuid) -> Result<Relayed, StatusCode> {
+        let routes = read_tenant_routes(pool, TENANT).await.unwrap();
+        let mount = weft_core::route::SharedMount::new(TENANT, id);
+        match_relayed(&routes, mount, "GET", "users/42").map(|route| route.relayed(crate::lease::now_unix())).map_err(|e| e.0)
+    }
+
+    /// A route whose trigger is taken down with its door refusing and what
+    /// it held dropped (`weft deactivate --door refuse --held drop`) is
+    /// gone: its path answers 404, as if it never existed. A plain
+    /// deactivate keeps the route and only turns its callers away with the
+    /// 503 that says to come back.
+    #[weft_db_macros::test]
+    async fn a_route_taken_down_refusing_with_nothing_kept_is_404_where_a_plain_one_is_503(pool: Pool) {
+        let (id, activations) = an_active_route(&pool).await;
+        assert_eq!(called(&pool, id).await, Ok(Relayed::To("bin-A".into())), "on, the call goes to the program");
+
+        take_down(&activations, id, &TakeDown::DEFAULT).await;
+        assert_eq!(called(&pool, id).await, Ok(Relayed::NotNow), "a plain deactivate keeps the route, turned away with a 503");
+
+        take_down(&activations, id, &TakeDown { door: weft_core::take_down::Door::Refuse, held: weft_core::take_down::Held::Drop, ..TakeDown::DEFAULT }).await;
+        assert_eq!(called(&pool, id).await, Err(StatusCode::NOT_FOUND), "refused with nothing kept, the route is gone");
     }
 }

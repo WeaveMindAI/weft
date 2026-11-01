@@ -54,6 +54,7 @@ use anyhow::Result;
 use tokio::sync::broadcast;
 
 use crate::db::{Client as _, Session};
+use crate::stopping::Deadline;
 
 /// What a waiter hears: one notification, or "every waiter should look
 /// at its row again" because notifications may have been lost.
@@ -450,20 +451,27 @@ impl Subscription {
 
     /// Wait for a reason to read the row again: a signal that `concerns`
     /// (given its channel and payload) says is ours, or a recheck.
-    /// `false` when `deadline` passed first.
+    /// `false` when `deadline` passed first (an instant, or a held wait's
+    /// [`Deadline`], which also passes once its copy is stopping).
     pub async fn woken_before(
         &mut self,
-        deadline: tokio::time::Instant,
+        deadline: impl Into<Deadline>,
         concerns: impl Fn(&str, &str) -> bool,
     ) -> Result<bool> {
+        let deadline = deadline.into();
+        let passed = deadline.passed();
+        tokio::pin!(passed);
         loop {
-            match tokio::time::timeout_at(deadline, self.next()).await {
-                Err(_) => return Ok(false),
-                Ok(heard) => {
+            // What was heard first, as a timeout would: a wake already
+            // there when the deadline comes still wakes.
+            tokio::select! {
+                biased;
+                heard = self.next() => {
                     if wakes(&heard?, &concerns) {
                         return Ok(true);
                     }
                 }
+                () = &mut passed => return Ok(false),
             }
         }
     }
@@ -670,5 +678,35 @@ mod tests {
         assert_eq!(subscription.next().await.unwrap(), signal("a", "y"));
         drop(tx);
         assert!(subscription.clear().is_err(), "a stopped watch is loud");
+    }
+
+    /// A held wait ends the moment its copy starts stopping, long before
+    /// its deadline, answering as the deadline would; a wait on a copy
+    /// that runs waits its whole deadline, and one whose copy was already
+    /// stopping ends at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_wait_ends_as_its_copy_starts_stopping() {
+        let (tx, rx) = broadcast::channel(8);
+        let stopping = crate::stopping::Stopping::new();
+        let held = Deadline::at(Instant::now() + Duration::from_secs(60)).or_stop(&stopping);
+        let mut subscription = Subscription::from(rx);
+        let started = Instant::now();
+        let waiting = tokio::spawn(async move { subscription.woken_before(held, |_: &str, _: &str| false).await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!waiting.is_finished(), "a copy that runs keeps holding");
+        stopping.begin();
+        assert!(!waiting.await.unwrap().unwrap(), "ended as its deadline would");
+        assert_eq!(started.elapsed(), Duration::from_secs(1), "at the stop, not the deadline");
+
+        let mut subscription = Subscription::from(tx.subscribe());
+        let started = Instant::now();
+        let held = Deadline::at(Instant::now() + Duration::from_secs(60)).or_stop(&stopping);
+        assert!(!subscription.woken_before(held, |_: &str, _: &str| false).await.unwrap());
+        assert_eq!(started.elapsed(), Duration::ZERO, "already stopping");
+
+        let started = Instant::now();
+        let unheld = Deadline::at(Instant::now() + Duration::from_secs(60));
+        assert!(!subscription.woken_before(unheld, |_: &str, _: &str| false).await.unwrap());
+        assert_eq!(started.elapsed(), Duration::from_secs(60), "a wait not held for a caller ignores the stop");
     }
 }

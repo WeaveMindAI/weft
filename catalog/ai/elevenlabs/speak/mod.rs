@@ -43,7 +43,7 @@ use weft::bus::{BusEntryKind, BusOptions, BusPayloadKind, WirePayload};
 use weft::stream_journal::JournalPolicy;
 use weft::context::PendingBus;
 use weft::node::NodeOutput;
-use weft::storage::{KeepTtl, StorageScope};
+use weft::storage::{StorageScope};
 use weft::{
     node_error, Access, RunContext, Node, NodeErrExt, NodeManifest, ValueBag, WeftError, WeftResult,
 };
@@ -549,9 +549,7 @@ impl Node for ElevenLabsSpeakNode {
 
         let stored = ctx
             .storage(StorageScope::Run)
-            // The generated speech is the run's product: keep it past
-            // the run (default 30-day access-bumped TTL).
-            .put(full, mime, &format!("speech.{ext}"), Some(KeepTtl::Default))
+            .put(full, mime, &format!("speech.{ext}"), None)
             .await?;
         let stored = weft::storage::StoredFile::from_value(&stored)?;
         ctx.pulse_downstream(NodeOutput::stored_file(stored)).await

@@ -396,8 +396,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             cancel_cause TEXT,
             -- Node firings it skipped.
             skipped INTEGER NOT NULL DEFAULT 0,
-            -- It stored files of its own, which its ending's sweep reclaims.
-            wrote_files BOOLEAN NOT NULL DEFAULT FALSE,
             -- How long it is kept once it ended, in seconds (NULL: for
             -- ever), and the moment that runs out, set when it ends.
             keep_for BIGINT,
@@ -950,8 +948,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // answers taken (`p_resolved_*`, by run ordinal), their costs
         // (`p_cost_*`, by run ordinal, through `weft_record_costs`), their
         // secrets (`p_secret_*`, by run ordinal, sealed already, each kept
-        // once), their version counts (on this lane's own row), their search queue entry
-        // and their storage sweep. A run born running counts as its writer's
+        // once), their version counts (on this lane's own row) and their
+        // search queue entry. A run born running counts as its writer's
         // until `p_delivered_until`, before the writer's lease is written.
         // Answers each run's fate, its project, whether it ended now with
         // somebody to tell (`watch_end`, `holds_signals`), for one that
@@ -963,7 +961,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         concat!(r#"CREATE OR REPLACE FUNCTION weft_record_batch(
                 p_writer TEXT, p_tenant TEXT, p_lane TEXT, p_now BIGINT, p_delivered_until BIGINT, p_durable BOOLEAN,
                 p_ids UUID[], p_epochs INTEGER[], p_first INTEGER[], p_last INTEGER[],
-                p_skipped INTEGER[], p_wrote BOOLEAN[], p_born JSONB,
+                p_skipped INTEGER[], p_born JSONB,
                 p_ended_at BIGINT[], p_outcomes TEXT[], p_errors TEXT[], p_cancel_causes TEXT[],
                 p_row_run INTEGER[], p_row_seq INTEGER[], p_row_events BYTEA[],
                 p_resolved_run INTEGER[], p_resolved_token TEXT[],
@@ -996,7 +994,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                     INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, entry_node,
                                      instance_id, fired_by, source_version, definition_hash, cut_from, binary_hash,
                                      seed_of, state, owner, epoch, last_seq, started_at, ended_at, outcome, error,
-                                     cancel_cause, skipped, wrote_files, keep_for, keep_until,
+                                     cancel_cause, skipped, keep_for, keep_until,
                                      delivered_until, spec_version)
                     SELECT v.id, (x.b->>'project_id')::uuid, p_tenant, x.b->>'phase', x.b->>'kind', x.b->>'keeping',
                            (x.b->>'recorded')::boolean, x.b->>'entry_node', x.b->>'instance_id', x.b->>'fired_by',
@@ -1005,12 +1003,12 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                            CASE WHEN v.ended_at IS NULL THEN 'running' ELSE 'ended' END,
                            CASE WHEN v.ended_at IS NULL THEN p_writer END,
                            v.epoch, v.last_seq, (x.b->>'started_at')::bigint, v.ended_at, v.outcome,
-                           v.error, v.cancel_cause, v.skipped, v.wrote, (x.b->>'keep_for')::bigint,
+                           v.error, v.cancel_cause, v.skipped, (x.b->>'keep_for')::bigint,
                            v.ended_at + (x.b->>'keep_for')::bigint,
                            CASE WHEN v.ended_at IS NULL THEN p_delivered_until END, (x.b->>'spec_version')::integer
-                    FROM unnest(p_ids, p_epochs, p_last, p_skipped, p_wrote, v_fates,
+                    FROM unnest(p_ids, p_epochs, p_last, p_skipped, v_fates,
                                 p_ended_at, p_outcomes, p_errors, p_cancel_causes)
-                            WITH ORDINALITY AS v(id, epoch, last_seq, skipped, wrote, fate,
+                            WITH ORDINALITY AS v(id, epoch, last_seq, skipped, fate,
                                                  ended_at, outcome, error, cancel_cause, n)
                         CROSS JOIN LATERAL (SELECT p_born->(v.n::integer - 1) AS b) x
                     WHERE v.fate = 'insert'
@@ -1050,7 +1048,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 UPDATE run r SET
                         last_seq = v.last_seq,
                         skipped = r.skipped + v.skipped,
-                        wrote_files = r.wrote_files OR v.wrote,
                         state = CASE WHEN v.ended_at IS NULL THEN r.state ELSE 'ended' END,
                         owner = CASE WHEN v.ended_at IS NULL THEN r.owner END,
                         ended_at = v.ended_at,
@@ -1059,9 +1056,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                         cancel_cause = v.cancel_cause,
                         keep_until = v.ended_at + r.keep_for,
                         holds_signals = v.ended_at IS NOT NULL AND EXISTS (SELECT 1 FROM signal s WHERE s.run_id = r.run_id)
-                    FROM unnest(p_ids, p_last, p_skipped, p_wrote, v_fates,
+                    FROM unnest(p_ids, p_last, p_skipped, v_fates,
                                 p_ended_at, p_outcomes, p_errors, p_cancel_causes)
-                            WITH ORDINALITY AS v(id, last_seq, skipped, wrote, fate,
+                            WITH ORDINALITY AS v(id, last_seq, skipped, fate,
                                                  ended_at, outcome, error, cancel_cause, n)
                     WHERE v.fate = 'continue' AND r.run_id = v.id;
                 -- Each cost is named by its run's ordinal, which names the
@@ -1114,13 +1111,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                         JOIN run r ON r.run_id = v.id
                     WHERE v.fate IN ('insert', 'continue') AND p_ended_at[v.n::integer] IS NOT NULL
                       AND r.recorded
-                    ON CONFLICT (run_id) DO NOTHING;
-                INSERT INTO storage_sweep (run_id, tenant_id, enqueued_at_unix)
-                    SELECT r.run_id, r.tenant_id, p_now
-                    FROM unnest(p_ids, v_fates) WITH ORDINALITY AS v(id, fate, n)
-                        JOIN run r ON r.run_id = v.id
-                    WHERE v.fate IN ('insert', 'continue') AND p_ended_at[v.n::integer] IS NOT NULL
-                      AND r.wrote_files
                     ON CONFLICT (run_id) DO NOTHING;
                 IF 'insert' = ANY(v_fates) THEN
                     v_writer_alive := EXISTS (SELECT 1 FROM worker_lease l
@@ -1599,6 +1589,9 @@ impl RunStore for PostgresStore {
         let tx = conn.transaction().await?;
         let removed = erase_run_ids(&tx, &[run_id]).await?;
         tx.commit().await?;
+        // Its files were queued through the announcement outbox
+        // (`erase_run_ids`), which goes out once poked.
+        weft_task_store::announce::committed(&self.pool);
         Ok(removed)
     }
 
@@ -1616,6 +1609,9 @@ impl RunStore for PostgresStore {
             .await?;
         let removed = erase_run_ids(&tx, &run_ids).await?;
         tx.commit().await?;
+        // Their files were queued through the announcement outbox
+        // (`erase_run_ids`), which goes out once poked.
+        weft_task_store::announce::committed(&self.pool);
         Ok((run_ids.len(), removed))
     }
 
@@ -2001,6 +1997,16 @@ async fn erase_run_ids(
         .context("erase runs: read a resume signal row")?;
     let removed = rows.into_iter().map(row_to_signal).collect::<anyhow::Result<Vec<_>>>()?;
     tx.execute("DELETE FROM parked_fire WHERE run_id = ANY($1)", &[&run_ids]).await?;
+    // A run's files go with its record: queued here, in the erase's own
+    // transaction, for the broker to delete (`crate::storage::process_sweep_queue`),
+    // so no path that erases a run can leave its files behind.
+    tx.execute(
+        "INSERT INTO storage_sweep (run_id, tenant_id, enqueued_at_unix) \
+         SELECT run_id, tenant_id, $2::bigint FROM run WHERE run_id = ANY($1) \
+         ON CONFLICT (run_id) DO NOTHING",
+        &[&run_ids, &crate::lease::now_unix()],
+    )
+    .await?;
     // The queue before the entries: a search writes a run's entry in the
     // one statement that takes its queue row, so it either waits for this
     // erase and finds the row gone (writing nothing), or wrote first and

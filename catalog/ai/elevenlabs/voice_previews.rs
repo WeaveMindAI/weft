@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use weft::access::client::post_json;
 use weft::node::NodeOutput;
-use weft::storage::{KeepTtl, StorageScope};
+use weft::storage::{StorageScope};
 use weft::{Access, RunContext, NodeErrExt, WeftResult};
 
 use super::elevenlabs::{audio_file_type, API};
@@ -84,10 +84,8 @@ pub async fn emit_previews(
             .node_err("ElevenLabs answered a preview whose audio is not base64")?;
         // Stored as the format that was asked for, never a type read
         // off the answer: everything downstream reads the stored type
-        // as the truth about the bytes. The previews are the run's
-        // product, so they outlive it (default 30-day access-bumped
-        // TTL).
-        let audio = storage.put(bytes, mime, &format!("preview-{}.{extension}", n + 1), Some(KeepTtl::Default)).await?;
+        // as the truth about the bytes.
+        let audio = storage.put(bytes, mime, &format!("preview-{}.{extension}", n + 1), None).await?;
         previews.push(json!({
             "voiceId": voice_id,
             "audio": audio,

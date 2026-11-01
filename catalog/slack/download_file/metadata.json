@@ -1,7 +1,7 @@
 {
   "type": "SlackDownloadFile",
   "label": "Slack: Download File",
-  "description": "Downloads a Slack-hosted file (an F... id, e.g. from the file-shared trigger) into storage. The file is swept when the run ends; wire it through KeepFile to keep it.",
+  "description": "Downloads a Slack-hosted file (an F... id, e.g. from the file-shared trigger) into storage. The file is stored with the run and deleted with it (once the run's record goes); wire it through KeepFile to keep it past that.",
   "tags": [
     "slack",
     "file"

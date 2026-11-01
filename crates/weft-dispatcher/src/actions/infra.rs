@@ -102,7 +102,7 @@ pub(crate) async fn program_call(
         // Read at once: a held read would hold the asking run's worker
         // open; `ctx.all_infra().follow_command(..)` looks again on a
         // parked timer instead.
-        InfraCall::Command { id } => answered(&command(state, actor, project_id, *id, std::time::Duration::ZERO).await?),
+        InfraCall::Command { id } => answered(&command(state, actor, project_id, *id, weft_task_store::stopping::Deadline::at(tokio::time::Instant::now())).await?),
         InfraCall::Show { node, instance } => answered(&show(state, actor, project_id, node, instance.as_ref()).await?),
         InfraCall::Press { node, instance, press: pressed } => answered(&press(state, actor, project_id, node, instance.as_ref(), pressed).await?),
         InfraCall::Rebake { node, instance } => {
@@ -684,7 +684,7 @@ pub(crate) async fn command(
     actor: &Actor,
     project_id: uuid::Uuid,
     command_id: i64,
-    hold: std::time::Duration,
+    hold: weft_task_store::stopping::Deadline,
 ) -> Result<CommandStatus, Refused> {
     actor.may_act_on(state, project_id).await?;
     use infra_lifecycle_command::WaitOutcome;

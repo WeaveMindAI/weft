@@ -61,8 +61,8 @@ async fn open(state: Arc<BrokerState>, headers: HeaderMap, ws: WebSocketUpgrade,
         Err((status, message)) => return (status, message).into_response(),
     };
     let follower = follower(state.lines.clone(), principal);
-    let aside = state.aside.clone();
-    server::upgrade(ws).on_upgrade(move |socket| server::serve(socket, api, Some(follower), aside)).into_response()
+    let stopping = state.stopping.clone();
+    server::upgrade(ws).on_upgrade(move |socket| server::serve(socket, api, Some(follower), stopping)).into_response()
 }
 
 /// How many notices a line may fall behind by before the fan-out lets go of
@@ -324,23 +324,24 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() })
     }
 
-    // A broker copy stepping aside says so on the line, and its caller
-    // moves to a line on a current copy at once: a new call is answered
-    // there, never held behind the one still running on the old line,
-    // which is answered where it runs. A call written on the old line
-    // before the caller heard is turned away with nothing of it run.
+    // A stopping broker copy says so on the line, and its caller moves to
+    // a line on a running copy at once: a new call is answered there,
+    // never held behind the one still running on the old line, which is
+    // answered where it runs, and the old line is closed then. A call
+    // written on the old line before the caller heard is turned away as
+    // not done, with nothing of it run.
     weft_core::stress_test! {
-        name: a_copy_stepping_aside_answers_what_runs_and_its_caller_moves_to_a_current_copy,
+        name: a_stopping_copy_answers_what_runs_and_its_caller_moves_to_a_running_copy,
         runs: 10,
         worker_threads: 4,
         async fn body() {
             let release = StdArc::new(tokio::sync::Notify::new());
             let holding = StdArc::new(tokio::sync::Notify::new());
-            let aside = weft_task_store::aside::StepAside::new();
+            let stopping = weft_task_store::stopping::Stopping::new();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
-            // `/v1/held` says when it is running, so the copy steps aside
-            // with it on the line.
+            // `/v1/held` says when it is running, so the copy stops with it
+            // on the line.
             let held_api = Router::new().route(
                 "/v1/held",
                 post({
@@ -356,19 +357,27 @@ mod tests {
                 }),
             );
             let app = api(StdArc::new(tokio::sync::Notify::new())).merge(held_api);
-            // The first line lands on the copy that steps aside, every
-            // later one on a current copy.
+            // The first line lands on the copy that stops, every later one
+            // on a running copy.
             let lines = StdArc::new(AtomicU64::new(0));
-            let (served, stepping) = (app.clone(), aside.clone());
+            let first_closed = StdArc::new(AtomicBool::new(false));
+            let (served, stops, closed) = (app.clone(), stopping.clone(), first_closed.clone());
             let copies = Router::new().route(
                 LINE_PATH,
                 get(move |ws: WebSocketUpgrade| {
-                    let api = served.clone();
-                    let aside = match lines.fetch_add(1, Ordering::SeqCst) {
-                        0 => stepping.clone(),
-                        _ => weft_task_store::aside::StepAside::new(),
+                    let (api, closed) = (served.clone(), closed.clone());
+                    let (first, stopping) = match lines.fetch_add(1, Ordering::SeqCst) {
+                        0 => (true, stops.clone()),
+                        _ => (false, weft_task_store::stopping::Stopping::new()),
                     };
-                    async move { server::upgrade(ws).on_upgrade(move |socket| server::serve(socket, api, None, aside)) }
+                    async move {
+                        server::upgrade(ws).on_upgrade(move |socket| async move {
+                            server::serve(socket, api, None, stopping).await;
+                            if first {
+                                closed.store(true, Ordering::SeqCst);
+                            }
+                        })
+                    }
                 }),
             );
             let _server = serve(listener, copies).await;
@@ -378,15 +387,15 @@ mod tests {
                 async move { link.call(call("/v1/held"), b"{}".to_vec(), CallWait::within(Duration::from_secs(10))).await }
             });
             tokio::time::timeout(Duration::from_secs(10), holding.notified()).await.expect("the held call runs");
-            aside.step_aside();
+            stopping.begin();
             // Sent again while it is turned away, as every caller does
             // (`weft_broker_client::client::while_busy`): it is answered on
-            // the current copy long before the held call ends.
+            // the running copy long before the held call ends.
             let moved = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     let answer = link.call(call("/v1/echo"), b"late".to_vec(), CallWait::within(Duration::from_secs(10))).await.unwrap();
                     if weft_broker_client::client::answered_busy(answer.status, &answer.body) {
-                        assert_eq!(String::from_utf8(answer.body).unwrap(), weft_broker_client::protocol::STEPPING_ASIDE);
+                        assert_eq!(String::from_utf8(answer.body).unwrap(), weft_broker_client::protocol::STOPPING);
                         tokio::time::sleep(Duration::from_millis(20)).await;
                         continue;
                     }
@@ -394,12 +403,19 @@ mod tests {
                 }
             })
             .await
-            .expect("a new call is answered on a current copy while the held one still runs");
+            .expect("a new call is answered on a running copy while the held one still runs");
             assert_eq!(moved.status, 200);
             assert!(!held.is_finished(), "the held call is still running on the old line");
             release.notify_one();
             let held = held.await.unwrap().unwrap();
             assert_eq!(String::from_utf8(held.body).unwrap(), "released", "the call it was running is answered");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !first_closed.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the stopping copy's line closes once it owes nothing");
         }
     }
 
