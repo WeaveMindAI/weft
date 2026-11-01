@@ -276,6 +276,10 @@ jobs:
           borrow-packages: packages/weft-graph packages/weft-syntax packages/weft-connect
       - run: pnpm -C extension-vscode test
       - run: pnpm -C extension-vscode run compile
+      # The production webview bundle, as the release packages it: a PR that
+      # only type-checks the webview let a bundle that cannot build reach
+      # main and stop a release (0.2.285).
+      - run: pnpm -C extension-vscode run bundle:webview
 
   bridge:
     name: WhatsApp bridge tests

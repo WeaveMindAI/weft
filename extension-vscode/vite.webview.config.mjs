@@ -99,6 +99,12 @@ export default defineConfig({
         chunkFileNames: 'bundle-[name].js',
         assetFileNames: 'bundle.[ext]',
         inlineDynamicImports: true,
+        // The webview loads the bundle as a classic script (`<script src>`,
+        // `graphView.ts`), which is what an IIFE is. Built as an ES module,
+        // vite lexes the whole minified bundle for its imports, and its
+        // bundled lexer (es-module-lexer 1.7.0) refuses this one ("bundle.js
+        // (1:0): Parse error"), which stopped the 0.2.285 release.
+        format: 'iife',
       },
     },
   },
