@@ -4,6 +4,12 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-11-01 (0.2.286)
+
+**The editor extension ships again.** 0.2.285 never reached the stores: its
+webview bundle failed to build. This release carries everything 0.2.285 lists
+below. Nothing to do beyond updating as usual.
+
 ## 2026-11-01 (0.2.285)
 
 **What breaks after this update:**
