@@ -4,7 +4,7 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-11-01 (39a50c84)
 
 **Triggers come back after an update again.** Since 0.2.281, the triggers
 `weft maintenance on` took down could stay down: `weft resync` warned "a
