@@ -97,7 +97,9 @@ pub struct LocalPlatform {
     pub data_dir: std::path::PathBuf,
     /// The machine's internal port as a container reaches it
     /// (`http://host.docker.internal:14113`): the base an infra
-    /// container's agent calls the broker under.
+    /// container's agent calls the broker under, and the one a link to a
+    /// stored file for a project's containers goes through
+    /// (`InstallConfig::container_files_base`).
     #[serde(rename = "containerInternalUrl")]
     pub container_internal_url: String,
     /// The image `weft-runtime` runs from (the agent beside every infra
@@ -309,7 +311,12 @@ pub struct GcpPlatform {
 pub struct Listen {
     /// The public port: the management API, the public door, the relay.
     pub public: SocketAddr,
-    /// The internal port: every role's internal endpoints.
+    /// The internal port, on loopback: every role's internal endpoints,
+    /// for the processes on this machine (its workers). The runtime also
+    /// opens it on the address the project's containers reach this
+    /// machine at, when that is not loopback, which it asks Docker on
+    /// every start (`weft_platform_local::docker::containers_call_in_at`),
+    /// never on every interface.
     pub internal: SocketAddr,
     /// A port carrying only the doors outside callers use, for a tunnel
     /// that brings the open internet to an install whose management API
@@ -657,6 +664,16 @@ impl InstallConfig {
         Some(base.trim_end_matches('/').to_string())
     }
 
+    /// Where a project's own containers reach the install's files door
+    /// (`object_store::FILES_DOOR`), when they cannot reach the store at
+    /// the address the workers do: a local install's internal port as a
+    /// container reaches it, since a container's `127.0.0.1` is itself.
+    /// `None` on a platform without a machine, whose containers reach the
+    /// store where the workers do.
+    pub fn container_files_base(&self) -> Option<String> {
+        self.machine_base(Vantage::Private)
+    }
+
     /// One role's internal address as a caller at `from` reaches it;
     /// `None` for the dispatcher on the machine and for the holder, which
     /// have none.
@@ -797,6 +814,15 @@ pub(crate) mod tests {
         c.max_copies = BTreeMap::from([(CoreRole::Dispatcher, 2), (CoreRole::Broker, 4)]);
         c.validate().unwrap();
         c
+    }
+
+    /// A local install's containers reach its files door at the internal
+    /// port as a container reaches it; a cloud install's reach the store
+    /// where its workers do, so it names none.
+    #[test]
+    fn a_local_install_names_where_its_containers_reach_the_files_door() {
+        assert_eq!(local().container_files_base().as_deref(), Some("http://host.docker.internal:14113"));
+        assert_eq!(gcp().container_files_base(), None);
     }
 
     /// Every serverless role that opens the database has a ceiling on its

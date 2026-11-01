@@ -13,7 +13,7 @@ use weft_platform_traits::identity::{IdentityRefused, Principal};
 use weft_task_store::db::Pool;
 
 const WORKER_TOKEN: &str = "worker-token";
-const CORE_TOKEN: &str = "core-token";
+pub(crate) const CORE_TOKEN: &str = "core-token";
 
 /// One project's worker, for its one token, and weft's own account.
 struct OneWorker;
@@ -34,6 +34,12 @@ async fn broker(pool: Pool) -> axum::Router {
 }
 
 async fn broker_state(pool: Pool) -> Arc<weft_broker::BrokerState> {
+    broker_state_on(pool, Arc::new(weft_platform_traits::object_store::fake::FakeObjectStore::new())).await
+}
+
+/// The broker's state on `object_store`, for a test that puts objects in
+/// the bucket first.
+pub(crate) async fn broker_state_on(pool: Pool, object_store: Arc<dyn weft_platform_traits::ObjectStore>) -> Arc<weft_broker::BrokerState> {
     let signals = weft_task_store::pg_signal::PgSignalWatch::start(
         pool.config(),
         weft_broker::state::BROKER_CHANNELS,
@@ -49,13 +55,14 @@ async fn broker_state(pool: Pool) -> Arc<weft_broker::BrokerState> {
         weft_broker::state::BrokerSettings {
             auth: weft_broker::AuthConfig { audiences: vec!["http://broker".into()] },
             identity: Arc::new(OneWorker),
-            object_store: Arc::new(weft_platform_traits::object_store::fake::FakeObjectStore::new()),
+            object_store,
             entitlements: Arc::new(weft_broker::entitlement::LocalEntitlementSource::from_env()),
             credentials: Arc::new(weft_broker::credential::FileCredentialSource::from_env()),
             app_provider: Arc::new(weft_broker::app_provider::FileAppProvider::from_env()),
             service_url: "http://broker".into(),
             internet: weft_platform_traits::config::InternetAddress::None,
             own_base_url: "http://broker".into(),
+            container_files_base: None,
             object_store_public_internet: false,
             slot_key: weft_core::storage::slot::SlotKey::of(b"a test secret"),
             line_max_age: None,
@@ -87,7 +94,7 @@ fn old_caller_verify(bearer: &str) -> Request<Body> {
         .unwrap()
 }
 
-async fn answer(router: &axum::Router, request: Request<Body>) -> (StatusCode, String) {
+pub(crate) async fn answer(router: &axum::Router, request: Request<Body>) -> (StatusCode, String) {
     let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();

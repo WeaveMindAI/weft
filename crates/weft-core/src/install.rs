@@ -347,9 +347,53 @@ crate::wire_enum! {
     }
 }
 
+/// The weft CLI the install workflow stored for one source tree, as the
+/// install answers it (`GET /install/cli/{tree}`): where to download it,
+/// a link the store signs, and the sha256 of its bytes, in hex, which the
+/// caller checks what it downloaded against.
+// SYNC: InstallCli <-> scripts/release-cli.sh (from_install), crates/weft-dispatcher/src/api/install_cli.rs (the route)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallCli {
+    pub url: String,
+    pub sha256: String,
+}
+
+/// Whether `tree` is a git tree id: 40 hex digits (SHA-1) or 64 (SHA-256),
+/// lowercase, as git prints one. What names a stored CLI, so nothing else
+/// reaches the store's keys through it.
+pub fn is_tree_id(tree: &str) -> bool {
+    matches!(tree.len(), 40 | 64) && tree.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Where in the install's file store the CLI built from `tree` lives, and
+/// the file beside it holding its sha256, which is written last, so its
+/// being there is what says the CLI is whole.
+// SYNC: install_cli_keys <-> .github/workflows/install-gcp.yml (store the weft CLI in the install)
+pub fn install_cli_keys(tree: &str) -> (String, String) {
+    (format!("install/cli/{tree}/weft"), format!("install/cli/{tree}/sha256"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tree_id_is_40_or_64_lowercase_hex_digits() {
+        assert!(is_tree_id(&"a".repeat(40)));
+        assert!(is_tree_id(&"0123456789abcdef".repeat(4)));
+        assert!(!is_tree_id(&"A".repeat(40)), "uppercase");
+        assert!(!is_tree_id(&"a".repeat(41)));
+        assert!(!is_tree_id(&format!("{}/", "a".repeat(39))), "a path");
+        assert!(!is_tree_id(""));
+    }
+
+    /// The answer the deploy's lookup reads (`.url`, `.sha256`).
+    #[test]
+    fn a_stored_cli_answers_the_fields_the_lookup_reads() {
+        let answer = serde_json::to_value(InstallCli { url: "https://u".into(), sha256: "s".into() }).unwrap();
+        assert_eq!(answer, serde_json::json!({ "url": "https://u", "sha256": "s" }));
+        assert_eq!(serde_json::from_value::<InstallCli>(answer).unwrap(), InstallCli { url: "https://u".into(), sha256: "s".into() });
+    }
 
     crate::wire_enum_roundtrip_tests!(DatabaseHolder);
 

@@ -281,8 +281,9 @@ impl ContextHandle for PureHandle {
     /// The link its caller fetches, which a pure node answering its
     /// caller (Reply) needs. Making it twice is harmless: within a window
     /// it is the same link, and the file's life it extends only ever
-    /// grows to cover a link handed out. One for node code would be
-    /// fetched by something beside the body, outside the run.
+    /// grows to cover a link handed out. One for node code or its
+    /// containers would be fetched by something beside the body, outside
+    /// the run.
     async fn storage_link(
         &self,
         key: &str,
@@ -291,7 +292,7 @@ impl ContextHandle for PureHandle {
     ) -> WeftResult<crate::storage::LinkAnswer> {
         match reach {
             crate::storage::LinkReach::External => self.inner.storage_link(key, ttl_secs, reach).await,
-            crate::storage::LinkReach::Internal => self.refused("link a stored file for node code"),
+            crate::storage::LinkReach::Internal | crate::storage::LinkReach::Container => self.refused("link a stored file for node code"),
         }
     }
 

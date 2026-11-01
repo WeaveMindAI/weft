@@ -58,6 +58,15 @@ project's folder and names the target with `--on <target>`.
   ceilings gives each copy a bigger share instead. Then run the install
   workflow again. The weft-cloud-install skill has the steps, and the
   restart they cost.
+- **A copy of weft runs out of memory.** A request answers `Service
+  Unavailable`, often while `weft resync` or `weft maintenance off` brings
+  many triggers back, and the role's `cloud_run_revision` log says `Memory
+  limit of ... exceeded`. Raise that role's memory with the fork's
+  repository variable (`WEFT_DISPATCHER_MEMORY`, 1Gi when unset, or
+  `WEFT_BROKER_MEMORY`, `WEFT_LISTENER_MEMORY`, `WEFT_SUPERVISOR_MEMORY`,
+  512Mi each), then run the install workflow again. A value set by hand in
+  the Cloud Run console does not last: the next install run puts the
+  variable's back.
 
 Then tell the user plainly what happened, what you did, and what is back:
 "The database ran out of memory at about 3pm and stopped answering, so I

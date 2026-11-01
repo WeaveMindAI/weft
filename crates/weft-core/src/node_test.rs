@@ -3080,7 +3080,8 @@ impl ContextHandle for TestHandle {
     }
 
     /// A link to a file the fake stores: one straight to the fake
-    /// store for node code, one under [`FAKE_LINK_BASE`] for the outside,
+    /// store for node code, one under [`FAKE_CONTAINER_BASE`] for the
+    /// project's containers, one under [`FAKE_LINK_BASE`] for the outside,
     /// public only once the test said so (`FakeRig::public_links`). A
     /// lifetime past seven days is refused, as the real store refuses it.
     async fn storage_link(
@@ -3101,6 +3102,9 @@ impl ContextHandle for TestHandle {
             .map_err(WeftError::NodeFailed)?;
         let link = match reach {
             crate::storage::LinkReach::Internal => crate::storage::FileLink { url: format!("{FAKE_STORE_BASE}/{key}?ttl={ttl}"), public: false },
+            crate::storage::LinkReach::Container => {
+                crate::storage::FileLink { url: format!("{FAKE_CONTAINER_BASE}/files/{key}?ttl={ttl}"), public: false }
+            }
             crate::storage::LinkReach::External => crate::storage::FileLink {
                 url: format!("{FAKE_LINK_BASE}/files/{key}?ttl={ttl}"),
                 public: self.state.public_links.load(Ordering::SeqCst),
@@ -3359,6 +3363,10 @@ pub const FAKE_LINK_BASE: &str = "https://fake-weft.test";
 /// Where the fake rig's internal links point
 /// (`StorageHandle::internal_link`).
 pub const FAKE_STORE_BASE: &str = "http://fake-store.test";
+
+/// The base the fake rig's links for the project's containers go under
+/// (`StorageHandle::container_link`).
+pub const FAKE_CONTAINER_BASE: &str = "http://fake-containers.test";
 
 /// The firing id every [`HandleRole::Harness`] handle runs as, keeping
 /// the test code's own waits out of the watchdog's picture.

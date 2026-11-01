@@ -39,9 +39,10 @@ impl Card {
         serde_json::from_value::<LiveFeed>(answer).context("read the node's display")
     }
 
-    /// Press `action` and hand back what the node answered.
-    pub async fn press(&self, action: &LiveAction) -> Result<Value> {
-        self.client.post_json(&format!("{}/action{}", self.base, self.query), &serde_json::to_value(action.press())?).await
+    /// Send `press` (a button's, or a reader's `taken`) and hand back what
+    /// the node answered.
+    pub async fn press(&self, press: &weft_core::live::LivePress) -> Result<Value> {
+        self.client.post_json(&format!("{}/action{}", self.base, self.query), &serde_json::to_value(press)?).await
     }
 }
 
@@ -172,7 +173,7 @@ pub async fn run_press(ctx: Ctx, args: PressArgs) -> Result<()> {
     // Naming the button's action on the command line is the choice the
     // editor's confirm box asks for, so the press never asks again; the
     // button's warning is printed with the result instead.
-    let answer = card.press(action).await?;
+    let answer = card.press(&action.press()).await?;
     // A node that answers a press with the value its card shows as a
     // secret does not get it printed. The mask comes from the card as it
     // was read before the press: once the press is done, nothing here may

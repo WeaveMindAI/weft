@@ -1040,16 +1040,6 @@ fn container_internal_url(ports: Ports) -> String {
     format!("http://host.docker.internal:{}", ports.internal)
 }
 
-/// Where the internal port listens. An infra unit's agent reaches it from
-/// its container through the Docker bridge, which on Linux is not loopback,
-/// so it listens on every interface there (every internal route checks
-/// its caller's identity). Docker Desktop brings a container's calls to
-/// the machine's loopback, so it stays on loopback there.
-fn internal_listen(ports: Ports) -> std::net::SocketAddr {
-    let host = if cfg!(target_os = "linux") { [0, 0, 0, 0] } else { [127, 0, 0, 1] };
-    (host, ports.internal).into()
-}
-
 /// The edge settings: an environment variable when one is set, what the
 /// install already had otherwise, the defaults on a new install.
 fn edge_config(kept: Option<KeptEdge>) -> Result<EdgeConfig> {
@@ -1253,7 +1243,10 @@ fn install_config(
             worker_idle_stop_seconds: idle_stop,
             listen: Listen {
                 public: ([127, 0, 0, 1], ports.public).into(),
-                internal: internal_listen(ports),
+                // Also where the project's containers reach this machine,
+                // which the runtime asks Docker on every start
+                // (`weft_platform_local::docker::containers_call_in_at`).
+                internal: ([127, 0, 0, 1], ports.internal).into(),
                 // Served whether or not a tunnel carries it: it answers a
                 // subset of what the public port does, and a tunnel opened
                 // later finds it already there.
@@ -1567,6 +1560,23 @@ fn launchd_plist_path(install: &Install) -> PathBuf {
     home.join("Library/LaunchAgents").join(format!("{}.plist", launchd_label(install)))
 }
 
+/// The launchd job that runs `line` under `label`. What the shell prints
+/// before the runtime's own redirect takes over (a secrets file it cannot
+/// read, a binary gone) goes to `log` through `StandardErrorPath`.
+fn launchd_plist(label: &str, line: &str, log: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>{line}</string></array>\n<key>StandardErrorPath</key><string>{log}</string>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n</dict></plist>\n",
+        label = xml_text(label),
+        line = xml_text(line),
+        log = xml_text(log),
+    )
+}
+
+/// `text` as a plist's `<string>` holds it.
+fn xml_text(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 fn pid_path(install: &Install) -> PathBuf {
     install.dir.join("runtime.pid")
 }
@@ -1576,7 +1586,8 @@ fn pid_path(install: &Install) -> PathBuf {
 /// runtime's builds, needs checks and workers use the person's own tools:
 /// cargo, python3, Homebrew's), the secrets into the environment, then the
 /// runtime, which keeps its log bounded itself (`--log`); what escapes it
-/// (a panic's last words) is appended to the same file.
+/// (a panic's last words) is appended to the same file, which the runtime
+/// keeps its stderr on across each roll (`weft_runtime::log_file`).
 fn runtime_command(install: &Install, bin: &Path) -> String {
     let path = std::env::var("PATH").unwrap_or_default().replace('\'', "'\\''");
     format!(
@@ -1591,8 +1602,24 @@ fn runtime_command(install: &Install, bin: &Path) -> String {
 
 async fn run_checked(cmd: &mut Command, what: &str) -> Result<()> {
     let out = cmd.output().await.with_context(|| format!("run {what}"))?;
-    anyhow::ensure!(out.status.success(), "{what} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    anyhow::ensure!(out.status.success(), "{}", failed(what, &out));
     Ok(())
+}
+
+/// A service manager's failure, whole: its exit status and everything it
+/// printed. `launchctl` says why on stdout as often as on stderr, and an
+/// error that kept only stderr once read `launchctl bootstrap failed: `
+/// and nothing more.
+fn failed(what: &str, out: &std::process::Output) -> String {
+    let said: Vec<String> = [&out.stdout, &out.stderr]
+        .into_iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect();
+    match said.is_empty() {
+        true => format!("{what} failed ({}) and printed nothing", out.status),
+        false => format!("{what} failed ({}): {}", out.status, said.join("\n")),
+    }
 }
 
 async fn start_runtime(install: &Install) -> Result<()> {
@@ -1623,15 +1650,10 @@ async fn start_runtime(install: &Install) -> Result<()> {
             let plist = launchd_plist_path(install);
             std::fs::create_dir_all(plist.parent().expect("a plist path has a directory"))?;
             let label = launchd_label(install);
-            let escaped = line.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-            std::fs::write(
-                &plist,
-                format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>{escaped}</string></array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n</dict></plist>\n"
-                ),
-            )?;
+            std::fs::write(&plist, launchd_plist(&label, &line, &install.log_path().display().to_string()))?;
+            // Booted out already: the start stops the runtime before it
+            // gets here (`stop_runtime`), and says so when it could not.
             let domain = format!("gui/{}", current_uid().await?);
-            let _ = Command::new("launchctl").args(["bootout", &format!("{domain}/{label}")]).output().await;
             run_checked(Command::new("launchctl").args(["bootstrap", &domain, &plist.display().to_string()]), "launchctl bootstrap").await
         }
         Manager::Detached => {
@@ -1708,15 +1730,17 @@ async fn stop_runtime(install: &Install) -> Result<()> {
             // still active after a failed stop is not.
             if !out.status.success() {
                 let active = Command::new("systemctl").args(["--user", "is-active", "--quiet", &name]).status().await?.success();
-                anyhow::ensure!(!active, "systemctl --user stop {name} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+                anyhow::ensure!(!active, "{}", failed(&format!("systemctl --user stop {name}"), &out));
             }
         }
         Manager::Launchd => {
             let target = format!("gui/{}/{}", current_uid().await?, launchd_label(install));
             let out = Command::new("launchctl").args(["bootout", &target]).output().await.context("run launchctl")?;
+            // A service that was not loaded is already stopped; one still
+            // loaded after a failed bootout is not.
             if !out.status.success() {
                 let loaded = Command::new("launchctl").args(["print", &target]).output().await?.status.success();
-                anyhow::ensure!(!loaded, "launchctl bootout {target} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+                anyhow::ensure!(!loaded, "{}", failed(&format!("launchctl bootout {target}"), &out));
             }
         }
         Manager::Detached => stop_detached(install).await?,
@@ -2069,6 +2093,32 @@ fn which(ctx: &Ctx, wanted: &Wanted) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The job's command line and log path reach launchd as written, with
+    /// every character XML gives a meaning escaped.
+    #[test]
+    fn the_launchd_job_carries_its_command_and_log_escaped() {
+        let plist = launchd_plist("ai.weavemind.weft", "a && b < c > d", "/Users/x/R&D <1>/runtime.log");
+        assert!(plist.contains("<string>a &amp;&amp; b &lt; c &gt; d</string>"), "{plist}");
+        assert!(plist.contains("<key>StandardErrorPath</key><string>/Users/x/R&amp;D &lt;1&gt;/runtime.log</string>"), "{plist}");
+        assert!(!plist.contains("R&D"), "{plist}");
+    }
+
+    /// A service manager's failure keeps its status and what it printed on
+    /// either stream, and says so when it printed nothing.
+    #[test]
+    fn a_failed_service_manager_is_quoted_whole() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |stdout: &str, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(5 << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let both = failed("launchctl bootstrap", &out("Bootstrap failed: 5: Input/output error\n", "  try again\n"));
+        assert!(both.contains("exit status: 5"), "{both}");
+        assert!(both.ends_with("Bootstrap failed: 5: Input/output error\ntry again"), "{both}");
+        assert!(failed("launchctl bootstrap", &out("", "")).ends_with("and printed nothing"));
+    }
 
     /// Docker's refusal for a container whose network was made again is
     /// told apart from every other start failure.

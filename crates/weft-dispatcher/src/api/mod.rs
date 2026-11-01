@@ -208,6 +208,7 @@ impl HoldQuery {
 
 pub mod project;
 pub mod domains;
+pub mod install_cli;
 // `pub` (not `pub(crate)`) like `project` above: `cancel_terminal_events`
 // is exercised by the db-test rig in `tests/db/db_tags.rs` against a real
 // Postgres.
@@ -247,6 +248,9 @@ mod public_page;
 fn core_routes(state: DispatcherState) -> Router<DispatcherState> {
     Router::new()
         .route("/install", get(project::install))
+        // The weft CLI the install stores for one source tree, which a
+        // project's deploy workflow downloads instead of compiling.
+        .route("/install/cli/{tree}", get(install_cli::for_tree))
         // Whether the database held the install back lately (`weft status`).
         .route("/install/database", get(project::install_database))
         .route("/install/domains", get(domains::list).post(domains::add))
@@ -509,13 +513,7 @@ fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
             "/files/upload/{verb}",
             post(crate::files_door::upload).layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),
         )
-        // The files door: a link to a stored file that goes through the
-        // install, passed on to the store unchanged; the link's signature
-        // is the credential (`files_door::forward`). The bytes stream
-        // through, so the body limit is the door's own: a PUT says its
-        // length, at most what a store takes in one piece.
-        // SYNC: the files door <-> crates/weft-platform-traits/src/object_store.rs FILES_DOOR
-        .route("/files/{*path}", any(crate::files_door::forward).layer(DefaultBodyLimit::disable()))
+        .route(FILES_DOOR_PATH, files_door())
         // The root page, so a person checking the address sees
         // something deliberate.
         .route("/", get(public_page::index))
@@ -595,6 +593,29 @@ fn permissive_cors() -> CorsLayer {
         .allow_headers(tower_http::cors::Any)
         .expose_headers(tower_http::cors::Any)
         .max_age(std::time::Duration::from_secs(24 * 3600))
+}
+
+/// Where the files door answers.
+// SYNC: the files door <-> crates/weft-platform-traits/src/object_store.rs FILES_DOOR
+const FILES_DOOR_PATH: &str = "/files/{*path}";
+
+/// The files door: a link to a stored file that goes through the install,
+/// passed on to the store unchanged; the link's signature is the
+/// credential (`files_door::forward`). The bytes stream through, so the
+/// body limit is the door's own: a PUT says its length, at most what a
+/// store takes in one piece.
+fn files_door() -> axum::routing::MethodRouter<DispatcherState> {
+    any(crate::files_door::forward).layer(DefaultBodyLimit::disable())
+}
+
+/// The files door alone, for the port a local install's containers reach
+/// the machine on (its internal port): a project's own container opens a
+/// file through the link made for it (`LinkReach::Container`) there,
+/// since inside a container `127.0.0.1` is the container itself. Beside
+/// the roles' routes and outside their guard: the link's signature is the
+/// credential, as on every other address the door answers.
+pub fn container_files_router(state: DispatcherState) -> Router {
+    Router::new().route(FILES_DOOR_PATH, files_door()).with_state(state)
 }
 
 /// Build the dispatcher router, bound to `state`: the management surface

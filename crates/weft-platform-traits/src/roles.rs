@@ -94,6 +94,17 @@ impl Placement {
             Self::Serverless | Self::Pool => Vantage::Private,
         }
     }
+
+    /// Whether what a process placed here writes to its own files takes
+    /// its memory: a serverless or pooled copy (Cloud Run) has no disk,
+    /// and its file system is held in the memory the copy is given, so a
+    /// file it keeps counts against that limit like anything it allocates.
+    pub fn files_take_memory(self) -> bool {
+        match self {
+            Self::Machine => false,
+            Self::Serverless | Self::Pool => true,
+        }
+    }
 }
 
 /// Where a caller stands, which decides the address it reaches a role at:

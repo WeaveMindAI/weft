@@ -413,6 +413,20 @@
 	/// closing/reopening the inspector resets to hidden, which is
 	/// the desired security default.
 	let revealedSecrets = $state<Record<string, boolean>>({});
+
+	/// Tell the node a secret it hands out once was copied out (`taken`),
+	/// with the exact value copied as the proof it asks for, through the
+	/// same press a button sends. No confirm: the copy already happened.
+	// SYNC: takenFrom <-> crates/weft-core/src/live.rs LiveItem::taken_press,
+	//       catalog/postgres/database/images/credential/bootstrap.py (TAKEN_ACTION, taken)
+	function takenFrom(item: LiveDataItem, copied: string) {
+		if (!item.taken) return;
+		window.dispatchEvent(
+			new CustomEvent('weft-display-action', {
+				detail: { nodeId: id, actionKind: item.taken, payload: { value: copied } },
+			}),
+		);
+	}
 	// The node's root element (`bind:this`). `$state` because an `$effect` below
 	// reads it (the deselect-blur effect): when `bind:this` assigns it after
 	// mount, the effect must re-run, which a plain `let` would not trigger.
@@ -1586,6 +1600,8 @@
      preview) rendered the SAME way in the full body and the simplified card,
      so the two never drift. `actionBtn` is its helper. Defined at the top
      level so both render branches can call it. -->
+<!-- A secret the node hands out once is retired as soon as it is copied:
+     the press carries the value taken, the way `weft infra env` sends it. -->
 {#snippet actionBtn(item: LiveDataItem)}
 	{#if item.action}
 		<button
@@ -1674,7 +1690,11 @@
 								>
 									{#if revealed}<EyeOff class="w-3 h-3" />{:else}<Eye class="w-3 h-3" />{/if}
 								</button>
-								<CopyButton text={String(item.data)} class="absolute top-1 right-1" />
+								<CopyButton
+									text={String(item.data)}
+									class="absolute top-1 right-1"
+									oncopied={item.taken ? (copied) => takenFrom(item, copied) : undefined}
+								/>
 							</div>
 							{@render actionBtn(item)}
 						</div>

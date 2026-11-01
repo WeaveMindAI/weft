@@ -2077,6 +2077,16 @@ export interface LiveDataItem {
     payload?: unknown;
     confirm?: string;
   };
+  /// On a secret the node hands out once: the action kind pressed as soon
+  /// as the value is copied out, with `{ value }` as its payload, so the
+  /// node retires the value its reader now holds.
+  // SYNC: taken <-> crates/weft-core/src/live.rs LiveItem::taken, LiveItem::taken_press
+  taken?: string;
+  /// The line standing where such a secret was once it was handed over;
+  /// its button makes a new one.
+  // SYNC: handedOver <-> crates/weft-core/src/live.rs LiveItem::handed_over,
+  //       catalog/postgres/database/images/credential/bootstrap.py (password_item)
+  handedOver?: boolean;
 }
 
 /// State of one node's display. The dispatcher pushes one of these

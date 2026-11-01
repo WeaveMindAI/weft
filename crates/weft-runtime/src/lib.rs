@@ -308,6 +308,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 service_url: config.public_url.clone(),
                 internet: config.internet_address(),
                 own_base_url: config.own_base_url().to_string(),
+                container_files_base: config.container_files_base(),
                 object_store_public_internet: config.object_store.public_internet(),
                 slot_key: weft_core::storage::slot::SlotKey::of(&install_secret()?),
                 line_max_age: platform::line_max_age(&config, serverless),
@@ -374,6 +375,11 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             if local.listen.network.is_some() {
                 network = Some(weft_dispatcher::api::network_router(state.clone()));
             }
+            // The port containers reach the machine on answers the files
+            // door too, for a link made for a project's own container
+            // (`LinkReach::Container`). A cloud's containers reach the
+            // store itself, so only here.
+            internal = internal.merge(weft_dispatcher::api::container_files_router(state.clone()));
         }
         let api = weft_dispatcher::api::router(state.clone());
         let door = weft_dispatcher::door::router(state.clone(), api);
@@ -652,6 +658,20 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             let internal_listener = tokio::net::TcpListener::bind(local.listen.internal)
                 .await
                 .with_context(|| format!("bind the internal port {}", local.listen.internal))?;
+            // The same internal port where the project's containers call
+            // the machine, and nowhere else: asked of Docker on this start,
+            // so a change to Docker's network is picked up by the next one.
+            let containers = weft_platform_local::docker::containers_call_in_at(&weft_platform_local::DockerCli, &local.runtime_image)
+                .await?
+                .map(|address| std::net::SocketAddr::new(address, local.listen.internal.port()));
+            let containers_listener = match containers {
+                Some(addr) => Some(
+                    tokio::net::TcpListener::bind(addr)
+                        .await
+                        .with_context(|| format!("bind the internal port where the project's containers reach this machine, {addr}"))?,
+                ),
+                None => None,
+            };
             let public_listener = tokio::net::TcpListener::bind(local.listen.public)
                 .await
                 .with_context(|| format!("bind the public port {}", local.listen.public))?;
@@ -662,17 +682,22 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 // them can be, does it take the claims.
                 weft_dispatcher::app::spawn_supervised("hold", weft_listener::hold::run(state, weft_listener::hold::Share::Every, std::future::pending()));
             }
-            tracing::info!(target: "weft_runtime", roles = ?hosted, public = %local.listen.public, internal = %local.listen.internal, "serving");
+            tracing::info!(target: "weft_runtime", roles = ?hosted, public = %local.listen.public, internal = %local.listen.internal, containers = ?containers, "serving");
             // The internal routes are reached on the public port too, for
             // a caller outside the machine (`Vantage::Public`). A local
             // install trusts every caller of its public API, and its
             // internal port is one containers reach, so that port stays
-            // roles only.
+            // roles only, and the files door, whose links carry their own
+            // signature.
             let front = public.nest(weft_platform_traits::roles::INTERNAL_DOOR, internal.clone());
-            let mut servers = vec![
+            let mut servers = Vec::new();
+            if let Some(listener) = containers_listener {
+                servers.push(tokio::spawn(server::serve(listener, internal.clone(), aside.clone())));
+            }
+            servers.extend([
                 tokio::spawn(server::serve(internal_listener, internal, aside.clone())),
                 tokio::spawn(server::serve(public_listener, front, aside.clone())),
-            ];
+            ]);
             if let (Some(addr), Some(app)) = (local.listen.outside, outside) {
                 let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind the outside port {addr}"))?;
                 servers.push(tokio::spawn(server::serve(listener, app, aside.clone())));

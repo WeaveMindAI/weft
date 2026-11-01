@@ -217,6 +217,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
     }
     info!("dispatcher replica: {replica}");
     let store = Arc::new(PostgresStore::from_pool(pool.clone()));
+    let programs = store.programs().clone();
     let projects: crate::ProjectStore = Arc::new(crate::PostgresProjectStore::new(pool.clone()));
     let activations: crate::activation_store::ActivationStore =
         Arc::new(crate::activation_store::PostgresActivationStore::new(pool.clone()));
@@ -233,7 +234,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         images,
         pool: pool.clone(),
         prunes: Default::default(),
-        blobs: crate::build::blob_cache::BlobCache::in_temp_dir(),
+        blobs: crate::build::blob_cache::BlobCache::in_temp_dir(config.roles.of(CoreRole::Dispatcher).files_take_memory()),
     });
     // Every peer this client talks to (the broker and listener roles, an
     // infra unit's `/live` and `/action`, a worker) answers in place; a
@@ -301,7 +302,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
             weft_broker_client::TokenSource::role(tokens, replica.clone(), CoreRole::Dispatcher),
         ),
         http,
-        programs: Arc::new(weft_core::content_cache::ContentCache::new(64)),
+        programs,
         held,
         project_ports: match &config.platform {
             weft_platform_traits::config::PlatformConfig::Local(local) => {

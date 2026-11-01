@@ -28,11 +28,15 @@ specialist, keyed by its agent name, in the same shape as claude-code's
 `specialist_commands.json`: an entry is the words a command starts with, or
 an object that refuses some words after them (`weft test-node` without
 `--tier live`), takes only process ids (`kill`), or runs a check
-(`opencode-trial`, below). `decide.ts` beside it makes the decision, a port
+(`opencode-trial`, below, and the read-only tools' own: `grep` and `rg` inside
+the project, `ffprobe` and `ffmpeg` reading an input only as `-f <format>
+-i <file>`, `ffmpeg` writing only under the specialist's
+`.scratch/` folder, `psql` running one SELECT, SHOW or EXPLAIN inside a read-only transaction and calling no function that acts outside it). `decide.ts` beside it makes the decision, a port
 of claude-code's `specialist_commands.py` with the same shell-aware split
 (Python's `shlex` read token by token) and the same refusals for every
-specialist: a command built at run time or written over several lines, an
-output redirection, a `cd` or an input file outside the project, and `--on`
+specialist: shell syntax it does not read (a `$` or a backtick, braces, `<(...)`, a `#` outside quotes) or a command written over several lines, an
+output redirection, a `cd` outside the project or not written as
+`cd ./<folder> && ...`, an input file outside the project, and `--on`
 or `--dispatcher` on a weft command for all but the deployer.
 `.opencode/plugins/specialist-commands.ts` runs it in OpenCode's
 `tool.execute.before` hook, which fires before the `bash` tool and its

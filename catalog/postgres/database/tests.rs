@@ -7,8 +7,8 @@ use serde_json::json;
 use weft::{EndpointMethod, FakeRig, NodeTest, WeftResult};
 
 use super::{
-    database_name, extension_names, memory_mib, PostgresVersion, pooler_config, pooler_database, pooler_hba, postgres_version, watch_database,
-    PostgresDatabaseNode, Tuning,
+    database_name, extension_names, memory_mib, PostgresVersion, pooler_config, pooler_database, pooler_hba, postgres_version, role_list,
+    watch_database, PostgresDatabaseNode, Role, Tuning,
     CREDENTIAL_PATH, CREDENTIAL_STORED_PATH, HEALTH_PATH, LEAST_MEMORY_MIB,
 };
 
@@ -26,7 +26,9 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("waits_for_postgres_to_answer_for_itself", ready),
         NodeTest::fake("every_client_comes_in_through_the_pooler", one_door),
         NodeTest::basic("the_pooler_keeps_sessions_and_its_connections_to_what_postgres_serves", pooler_settings),
-        NodeTest::basic("only_the_program_s_role_signs_in_through_the_pooler", pooler_sign_ins),
+        NodeTest::basic("only_the_program_s_role_and_the_login_roles_sign_in_through_the_pooler", pooler_sign_ins),
+        NodeTest::basic("a_role_name_a_program_cannot_write_or_one_kept_for_postgres_is_refused", role_names),
+        NodeTest::fake("each_listed_role_is_handed_to_the_credential_server_and_the_pooler", roles),
         NodeTest::basic("any_database_name_is_kept_as_postgres_has_it", database_names),
         NodeTest::basic("a_name_the_pooler_cannot_read_gets_a_door_of_its_own", doors),
         NodeTest::fake("a_database_named_with_a_dash_is_reached_by_that_name", dashed),
@@ -502,10 +504,12 @@ fn pooler_settings() -> WeftResult<()> {
     let config = lines.join("\n");
     let line = |key: &str| lines.iter().find(|l| l.starts_with(&format!("{key} = "))).cloned().unwrap_or_else(|| panic!("{key} in {config}"));
     assert_eq!(line("pool_mode"), "pool_mode = session");
-    assert_eq!(line("shop"), format!("shop = host=127.0.0.1 port=5433 dbname='shop' pool_size={}", tuning.query_pool));
+    // Every role's pool of a door together is held to the door's share.
+    let (query, watch) = (tuning.query_pool, tuning.watch_pool);
+    assert_eq!(line("shop"), format!("shop = host=127.0.0.1 port=5433 dbname='shop' pool_size={query} max_db_connections={query}"));
     assert_eq!(
         line(&watch_database("shop")),
-        format!("shop_watch = host=127.0.0.1 port=5433 dbname='shop' pool_size={}", tuning.watch_pool)
+        format!("shop_watch = host=127.0.0.1 port=5433 dbname='shop' pool_size={watch} max_db_connections={watch}")
     );
     assert_eq!(line("listen_port"), "listen_port = 5432");
     assert_eq!(line("query_wait_timeout"), "query_wait_timeout = 0", "a client waits its turn, never refused for waiting");
@@ -517,23 +521,93 @@ fn pooler_settings() -> WeftResult<()> {
     assert!(!config.to_lowercase().contains("password"), "{config}");
     // Handed over as the container's arguments, a line each, since no
     // platform carries a line break in an environment variable.
-    let args = super::pooler_args("shop", &tuning);
+    let args = super::pooler_args("shop", &tuning, &[]);
     assert_eq!(args[0], "--config");
     assert_eq!(args[1..=lines.len()], lines[..]);
     assert_eq!(args[lines.len() + 1], "--hba");
-    assert_eq!(args[lines.len() + 2..], pooler_hba("shop")[..]);
+    assert_eq!(args[lines.len() + 2..], pooler_hba("shop", &[])[..]);
     assert!(args.iter().all(|a| !a.contains('\n')));
     Ok(())
 }
 
-/// The program's role, by password, to the program's database and its
-/// watching door only; the superuser only to the pooler's console, over
-/// its unix socket.
+/// A role of the `roles` input, as the input writes it.
+fn role(name: &str, login: bool, bypass_row_level_security: bool) -> Role {
+    Role { name: name.into(), login, bypass_row_level_security }
+}
+
+/// The program's role and each login role, each by its own password, to
+/// the program's database and its watching door only; a role that does
+/// not sign in has no line; the superuser only to the pooler's console,
+/// over its unix socket. No password is ever in the rules.
 fn pooler_sign_ins() -> WeftResult<()> {
     assert_eq!(
-        pooler_hba("shop"),
+        pooler_hba("shop", &[]),
         ["local pgbouncer weft trust", "host shop,shop_watch app 0.0.0.0/0 scram-sha-256", "host shop,shop_watch app ::/0 scram-sha-256"]
     );
+    let roles = [role("tenant_app", false, false), role("tenant_site", true, false), role("tenant_admin", false, true)];
+    assert_eq!(
+        pooler_hba("shop", &roles),
+        [
+            "local pgbouncer weft trust",
+            "host shop,shop_watch app 0.0.0.0/0 scram-sha-256",
+            "host shop,shop_watch app ::/0 scram-sha-256",
+            "host shop,shop_watch tenant_site 0.0.0.0/0 scram-sha-256",
+            "host shop,shop_watch tenant_site ::/0 scram-sha-256",
+        ]
+    );
+    Ok(())
+}
+
+/// A role name is one a program writes unquoted, so `set role tenant_app`
+/// reaches it; the names this node and Postgres keep, and a name listed
+/// twice, are refused naming the role.
+fn role_names() -> WeftResult<()> {
+    // Words Postgres reserves no further than as type or column names take
+    // `set role` as they are.
+    let listed = vec![
+        role("tenant_app", false, false),
+        role("_site2", true, true),
+        role(&"a".repeat(63), false, false),
+        role("admin", false, false),
+        role("left", false, false),
+    ];
+    assert_eq!(role_list(listed.clone())?, listed);
+    for refused in [
+        "", "Tenant", "2tenant", "tenant-app", "tenant app", "tenant\napp", &"a".repeat(64), "app", "weft", "public", "none", "all",
+        "current_user", "current_role", "session_user", "pg_monitor", "pg_tenant", "user", "select", "table", "order", "grant",
+    ] {
+        match role_list(vec![role(refused, false, false)]) {
+            Err(weft::WeftError::Input(message)) => assert!(message.contains(&format!("{refused:?}")), "{message}"),
+            other => panic!("{refused:?} was not refused: {other:?}"),
+        }
+    }
+    let twice = role_list(vec![role("tenant_app", false, false), role("tenant_app", true, false)]);
+    assert!(matches!(&twice, Err(weft::WeftError::Input(m)) if m.contains("twice")), "{twice:?}");
+    Ok(())
+}
+
+/// The roles the node lists reach the credential server whole, which makes
+/// them on every start, and each login role reaches the pooler's rules; a
+/// key the input does not have is refused rather than dropped; none listed
+/// is an empty list.
+async fn roles(rig: FakeRig) -> WeftResult<()> {
+    let mut settings = config();
+    settings["roles"] = json!([{ "name": "tenant_app" }, { "name": "tenant_site", "login": true, "bypassRowLevelSecurity": true }]);
+    let listed = rig.run_provision_infra(&PostgresDatabaseNode, settings).await.ok()?;
+    let spec = listed.infra_spec()?;
+    assert_eq!(
+        credential_setting(spec, "WEFT_ROLES"),
+        r#"[{"name":"tenant_app","login":false,"bypassRowLevelSecurity":false},{"name":"tenant_site","login":true,"bypassRowLevelSecurity":true}]"#
+    );
+    let pooler = spec.units[0].containers.iter().find(|c| c.name == "pooler").expect("declared");
+    assert!(pooler.args.contains(&"host app,app_watch tenant_site 0.0.0.0/0 scram-sha-256".to_string()), "{:?}", pooler.args);
+    assert!(!pooler.args.iter().any(|a| a.contains("tenant_app")), "{:?}", pooler.args);
+    let none = rig.run_provision_infra(&PostgresDatabaseNode, config()).await.ok()?;
+    assert_eq!(credential_setting(none.infra_spec()?, "WEFT_ROLES"), "[]");
+    let mut misspelled = config();
+    misspelled["roles"] = json!([{ "name": "tenant_admin", "bypassRls": true }]);
+    let failure = rig.run_provision_infra(&PostgresDatabaseNode, misspelled).await.failure()?;
+    assert!(failure.contains("bypassRls"), "{failure}");
     Ok(())
 }
 
@@ -571,11 +645,12 @@ fn doors() -> WeftResult<()> {
     let tuning = Tuning::for_machine("1Gi")?;
     let lines = pooler_config("it's odd", &tuning);
     let door = pooler_database("it's odd");
+    let pool = tuning.query_pool;
     assert!(
-        lines.contains(&format!("{door} = host=127.0.0.1 port=5433 dbname='it''s odd' pool_size={}", tuning.query_pool)),
+        lines.contains(&format!("{door} = host=127.0.0.1 port=5433 dbname='it''s odd' pool_size={pool} max_db_connections={pool}")),
         "{lines:?}"
     );
-    assert_eq!(pooler_hba("it's odd")[1], format!("host {door},{door}_watch app 0.0.0.0/0 scram-sha-256"));
+    assert_eq!(pooler_hba("it's odd", &[])[1], format!("host {door},{door}_watch app 0.0.0.0/0 scram-sha-256"));
     Ok(())
 }
 

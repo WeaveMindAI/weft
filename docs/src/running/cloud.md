@@ -187,6 +187,16 @@ share of at least 6 and a dispatcher copy 5, and one whose share is smaller
 refuses to start, with a log line that names the numbers and these
 variables.
 
+If you want a role to have more memory, set `WEFT_DISPATCHER_MEMORY` (1Gi
+when unset), `WEFT_BROKER_MEMORY`, `WEFT_LISTENER_MEMORY` or
+`WEFT_SUPERVISOR_MEMORY` (512Mi each when unset), a whole number of `Mi` or
+`Gi` from 512Mi to 4Gi, or `WEFT_HOLDER_MEMORY` for each copy that holds a
+trigger's open connection (512Mi when unset, at least 512Mi). The install sets each one on every run, so a value you
+change by hand in the Cloud Run console is put back the next time the workflow
+runs. The dispatcher gets more because every version is compiled there, and on
+Cloud Run the files a build writes are held in memory, beside the programs the
+dispatcher keeps read (about 90 MiB at most).
+
 These are repository variables on your fork, like the ones above, so
 merging a new weft into the fork keeps them. After you change one, run the
 install workflow again.
@@ -212,7 +222,11 @@ run it right after weft's main moved and your fork caught up, the release
 for that source may still be building: the workflow waits for it rather
 than compiling the same thing, and says so in its log. When it does have to
 build, it keeps the compiled dependencies for the next run, so after an
-upgrade only what changed in weft compiles again.
+upgrade only what changed in weft compiles again. Among the images is the
+standard worker, which every project made only of the standard nodes runs on,
+so the first of them to run after an upgrade starts at once instead of
+waiting a few minutes for that build. It also keeps the CLI it used in your
+install, so your projects' deploys download it instead of compiling it.
 
 When it finishes, its last step (in the run's summary, and in its log for
 `gh run view <id> --log`) gives you the install's address, a Cloud Run
@@ -683,9 +697,12 @@ frontend's token, with the install's address, to a file only you can read.
 Put those in the frontend's environment.
 
 `weft ci add` writes `.github/workflows/deploy.yml`, a workflow you run by
-hand from the Actions tab. It takes the weft CLI the release built from the
-source your install runs (waiting for it while that release is still
-building, or building it when the release has none), deploys
+hand from the Actions tab. It takes the weft CLI built from the source your
+install runs: first the one the install workflow stored in your install
+(signed in with `WEFT_OPERATOR_KEY`, its sha256 checked), which is how a fork
+gets its own CLI without compiling it, then the one weft's release built
+(waiting for it while that release is still building), and it compiles the
+CLI only when neither has one. Then it deploys
 the program with `weft infra upgrade --all` then `weft resync --all`, then
 builds `front/` with Docker and deploys it to the repository's service. If
 you run `weft ci add` again, it replaces the file only if you have not edited

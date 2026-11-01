@@ -28,6 +28,23 @@ locals {
     dispatcher = var.dispatcher_max_copies
     broker     = var.broker_max_copies
   }
+  # The memory of one copy of each role, in Mi, read from the setting
+  # (`<n>Mi` or `<n>Gi`); 0 when it is neither, which the role's
+  # precondition refuses.
+  role_memory = {
+    dispatcher = var.dispatcher_memory
+    broker     = var.broker_memory
+    listener   = var.listener_memory
+    supervisor = var.supervisor_memory
+  }
+  # SYNC: reading `<n>Mi` / `<n>Gi` <-> variables.tf (holder_memory's validation)
+  role_memory_mi = {
+    for role, memory in local.role_memory : role => try(
+      tonumber(regex("^([0-9]+)Mi$", memory)[0]),
+      tonumber(regex("^([0-9]+)Gi$", memory)[0]) * 1024,
+      0,
+    )
+  }
   # How many requests one copy of a role takes at once, where it is not
   # Cloud Run's default of 80. Every worker, listener and holder process
   # keeps one line open to the broker (a websocket, which Cloud Run counts
@@ -252,6 +269,9 @@ resource "google_cloud_run_v2_service" "role" {
         # that wrote has answered, which needs its CPU then. Billed while
         # an instance is up, and none is up while nothing calls it.
         cpu_idle = !contains(local.writers, each.value)
+        limits = {
+          memory = local.role_memory[each.value]
+        }
       }
 
       env {
@@ -289,6 +309,16 @@ resource "google_cloud_run_v2_service" "role" {
           mount_path = "/etc/weft-apps"
         }
       }
+    }
+  }
+
+  lifecycle {
+    # A role runs on Cloud Run's default of one CPU, which takes up to
+    # 4Gi; it is never given less than Cloud Run's default of 512Mi.
+    # SYNC: the memory rule <-> variables.tf (dispatcher_memory, broker_memory, listener_memory, supervisor_memory)
+    precondition {
+      condition     = local.role_memory_mi[each.value] >= 512 && local.role_memory_mi[each.value] <= 4096
+      error_message = "${each.value}_memory is \"${local.role_memory[each.value]}\": it is a whole number of Mi or Gi from 512Mi to 4Gi (\"512Mi\", \"1Gi\", \"1536Mi\"). 512Mi is Cloud Run's default and what a role is never given less than, and above 4Gi Cloud Run needs more than the one CPU a role runs on."
     }
   }
 

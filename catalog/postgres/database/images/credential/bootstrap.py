@@ -12,7 +12,9 @@ Two jobs, one script, chosen by argv:
          up for the program (`converge`): the program's own role, which
          owns the program's database and everything in it and is no
          superuser, signing in with the password on the shared volume;
-         then it tells the pooler who may sign in. Every start does it
+         the roles the node lists, each granted to the program's role, a
+         login one with a password of its own beside the program's; then
+         it tells the pooler who may sign in. Every start does it
          again, so a database made before any of this existed is brought
          to the same shape. Until it is done, `/health` says not ready.
 
@@ -29,14 +31,18 @@ Two jobs, one script, chosen by argv:
          It also serves the graph: `/live` shows the database and user
          to sign in as, whether the password is still readable, and who
          is connected (to Postgres and to the pooler, read when the card
-         asks, never on a timer); its one button, `/action` with
+         asks, never on a timer); its Reset button, `/action` with
          `reset_password`, mints a new password, sets it on the program's
          role over the unix socket (which needs no password), tells the
          pooler, and makes it readable again. Then it tells weft the new
          password (`WEFT_VALUES_URL`, the agent beside this unit), which
          writes it into the connection the node published, so the
          program's next run signs in with it; the card shows it until the
-         node's next run retires it.
+         node's next run, or a reader that copied it out (`password_taken`,
+         with the password as proof), retires it. Each login role's
+         password works the same way, under its own name
+         (`reset_password:<role>`, `password_taken:<role>`), up to telling
+         the pooler: weft keeps no connection for it.
 
 Where the files live, which ports and names to use, all come from the
 node that declares this container, so the two sides cannot drift.
@@ -73,6 +79,10 @@ POOLER_DATABASE = os.environ.get("WEFT_POOLER_DATABASE")
 WATCH_DATABASE = os.environ.get("WEFT_WATCH_DATABASE")
 # The extensions the program's database needs, as a JSON list of names.
 EXTENSIONS_JSON = os.environ.get("WEFT_EXTENSIONS")
+# The roles it needs beside the program's own, as a JSON list of
+# `{"name", "login", "bypassRowLevelSecurity"}`, checked by the node.
+# SYNC: WEFT_ROLES <-> catalog/postgres/database/mod.rs (Role)
+ROLES_JSON = os.environ.get("WEFT_ROLES")
 # The Postgres this unit runs, the first major that closes idle sessions,
 # and what to warn of when it is older (empty when it is not).
 POSTGRES_MAJOR = os.environ.get("WEFT_POSTGRES_MAJOR")
@@ -91,7 +101,8 @@ _FROM_THE_NODE = {
     "WEFT_SECRET_DIR": SECRET_DIR, "WEFT_PASSWORD_FILE": PASSWORD_FILE, "WEFT_CREDENTIAL_PORT": PORT,
     "WEFT_SOCKET_DIR": SOCKET_DIR, "WEFT_POSTGRES_PORT": POSTGRES_PORT, "WEFT_ADMIN_USER": ADMIN_USER,
     "WEFT_APP_USER": APP_USER, "WEFT_DATABASE": DATABASE, "WEFT_POOLER_DATABASE": POOLER_DATABASE,
-    "WEFT_WATCH_DATABASE": WATCH_DATABASE, "WEFT_EXTENSIONS": EXTENSIONS_JSON, "WEFT_POSTGRES_MAJOR": POSTGRES_MAJOR,
+    "WEFT_WATCH_DATABASE": WATCH_DATABASE, "WEFT_EXTENSIONS": EXTENSIONS_JSON, "WEFT_ROLES": ROLES_JSON,
+    "WEFT_POSTGRES_MAJOR": POSTGRES_MAJOR,
     "WEFT_CLOSES_IDLE_SESSIONS_FROM": CLOSES_IDLE_SESSIONS_FROM, "WEFT_DATA_DIR": DATA_DIR,
     "WEFT_IDLE_SESSION_SECONDS": IDLE_SESSION_SECONDS, "WEFT_POOLER_DIR": POOLER_DIR,
     "WEFT_POOLER_PORT": POOLER_PORT, "WEFT_POOLER_USERS_FILE": POOLER_USERS_FILE,
@@ -108,7 +119,25 @@ CLOSES_IDLE_SESSIONS = int(POSTGRES_MAJOR) >= int(CLOSES_IDLE_SESSIONS_FROM)
 EXTENSIONS = json.loads(EXTENSIONS_JSON)
 if not isinstance(EXTENSIONS, list) or not all(isinstance(name, str) and name for name in EXTENSIONS):
     sys.exit(f"WEFT_EXTENSIONS must be a JSON list of names, got {EXTENSIONS_JSON}")
-SEALED_FILE = os.path.join(SECRET_DIR, "sealed")
+
+
+def read_roles(raw: str) -> list[dict]:
+    """The node's roles, each with all three keys, or exit naming what is wrong."""
+    roles = json.loads(raw)
+    keys = {"name", "login", "bypassRowLevelSecurity"}
+    if not isinstance(roles, list) or not all(
+        isinstance(role, dict) and set(role) == keys and isinstance(role["name"], str) and role["name"]
+        and isinstance(role["login"], bool) and isinstance(role["bypassRowLevelSecurity"], bool)
+        for role in roles
+    ):
+        sys.exit(f"WEFT_ROLES must be a JSON list of {sorted(keys)}, got {raw}")
+    return roles
+
+
+ROLES = read_roles(ROLES_JSON)
+# The roles that sign in by themselves, through the pooler, each with a
+# password of its own: the program's, then the node's login roles.
+SIGNS_IN = [APP_USER] + [role["name"] for role in ROLES if role["login"]]
 
 # SYNC: credential routes <-> catalog/postgres/database/mod.rs
 #       CREDENTIAL_PATH / CREDENTIAL_STORED_PATH / HEALTH_PATH
@@ -119,6 +148,15 @@ HEALTH_PATH = "/health"
 LIVE_PATH = "/live"
 ACTION_PATH = "/action"
 RESET_ACTION = "reset_password"
+# What a reader presses once it copied a password out of the card (`weft
+# infra env`, the editor's copy button), with the password as proof.
+# SYNC: TAKEN_ACTION <-> crates/weft-core/src/live.rs (LiveItem::taken, taken_press),
+#       packages/weft-graph/src/webview/lib/components/project/ProjectNode.svelte (takenFrom)
+TAKEN_ACTION = "password_taken"
+# A login role's own button and its own taken press carry its name after a
+# `:` (`reset_password:<role>`), so each is pressed by its own name; the
+# program's carry none.
+ROLE_MARK = ":"
 
 # Set once `converge` finished: the program's role is in place and the
 # pooler knows who may sign in. `/health` answers ready from then on.
@@ -129,8 +167,12 @@ CONVERGED = threading.Event()
 NOT_READY = {"why": "the database is still being set up for the program"}
 # How long `converge` waits before trying again after the database refused.
 CONVERGE_RETRY_SECONDS = 30
-# One change of the password at a time: two presses at once would leave
-# the pooler told one password and the database holding the other.
+# One change of a password at a time: two presses at once would leave the
+# pooler told one password and the database holding the other. Sealing one
+# takes it too, comparing and sealing in one step, so a password a reset
+# just minted is never sealed by a taker holding the one it replaced; a run
+# confirming its password while a reset tells weft (up to 30s) waits for
+# it, and then confirms against the new one.
 CHANGING = threading.Lock()
 
 
@@ -147,7 +189,7 @@ def mint() -> None:
     os.makedirs(SECRET_DIR, mode=0o750, exist_ok=True)
     if os.path.exists(PASSWORD_FILE):
         return
-    write_password(new_password())
+    write_password(APP_USER, new_password())
 
 
 def too_old_for_a_new_database(closes_idle_sessions: bool, has_data: bool) -> str | None:
@@ -192,12 +234,31 @@ def write_file(path: str, text: str) -> None:
         os.close(dir_fd)
 
 
-def write_password(password: str) -> None:
-    write_file(PASSWORD_FILE, password)
+def password_file(role: str) -> str:
+    """Where `role`'s password lives: the program's is the one Postgres was
+    made with, each login role's sits beside it. A role name is lowercase
+    letters, digits and `_` (the node checks), so it is a file name as it is."""
+    return PASSWORD_FILE if role == APP_USER else os.path.join(SECRET_DIR, f"role.{role}")
 
 
-def sealed() -> bool:
-    return os.path.exists(SEALED_FILE)
+def write_password(role: str, password: str) -> None:
+    write_file(password_file(role), password)
+
+
+def sealed_file(role: str) -> str:
+    """The file whose being there says `role`'s password was handed over:
+    beside its password, for the program's role and each login role alike."""
+    return os.path.join(SECRET_DIR, "sealed") if role == APP_USER else password_file(role) + ".sealed"
+
+
+def sealed(role: str) -> bool:
+    return os.path.exists(sealed_file(role))
+
+
+def seal(role: str) -> None:
+    """Mark `role`'s password handed over. Idempotent. Raises `OSError`."""
+    with open(sealed_file(role), "w", encoding="utf-8") as f:
+        f.write("stored")
 
 
 class Refused(Exception):
@@ -322,11 +383,45 @@ ALTER ROLE :"app" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION N
 ALTER DATABASE :"database" OWNER TO :"app";
 """ + OWNED_BY_ADMIN
 
-# Postgres closes the role's sessions once they sit idle, which is how a
+# Postgres closes a role's sessions once they sit idle, which is how a
 # connection a client holds and does not use goes back to the pooler
-# whoever the client is. Set on a Postgres that has the setting only: an
-# older one keeps its idle sessions open, which its card warns of.
-CLOSE_IDLE_SESSIONS = """ALTER ROLE :"app" SET idle_session_timeout = :'idle';\n"""
+# whoever the client is. Set on each role that signs in, on a Postgres that
+# has the setting only: an older one keeps its idle sessions open, which its
+# card warns of.
+CLOSE_IDLE_SESSIONS = """ALTER ROLE :"role" SET idle_session_timeout = :'idle';\n"""
+
+
+def role_script(role: dict) -> str:
+    """One of the node's roles, made when missing and held to what its entry
+    says on every start, never a superuser and never one that makes roles,
+    and granted to the program's role so the program can `set role` to it.
+    The two attributes the entry sets are picked from fixed words, never
+    written from its values."""
+    login = "LOGIN" if role["login"] else "NOLOGIN"
+    bypass = "BYPASSRLS" if role["bypassRowLevelSecurity"] else "NOBYPASSRLS"
+    return (
+        "SELECT format('CREATE ROLE %I', :'role') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'role')\n"
+        "\\gexec\n"
+        f'ALTER ROLE :"role" WITH NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION {login} {bypass};\n'
+        'GRANT :"role" TO :"app";\n'
+    )
+
+
+# The roles the node listed once and lists no more: every role `app` was
+# granted by the superuser (only `converge` grants that way) that the list no
+# longer names, never one of Postgres's own. Each stays in the database with
+# what it owns, and loses what the list gave it: `app`'s membership (so the
+# program can no longer `set role` to it), signing in, and passing the
+# row-level security policies.
+STRIP_UNLISTED = r"""
+SELECT format('REVOKE %I FROM %I', r.rolname, :'app'), format('ALTER ROLE %I WITH NOLOGIN NOBYPASSRLS', r.rolname)
+  FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid
+ WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = :'app')
+   AND m.grantor = (SELECT oid FROM pg_roles WHERE rolname = :'admin')
+   AND r.rolname !~ '^pg_'
+   AND r.rolname <> ALL (SELECT json_array_elements_text(:'listed'::json))
+\gexec
+"""
 
 
 def scram_accepts(verifier: str | None, password: str) -> bool:
@@ -348,35 +443,39 @@ def scram_accepts(verifier: str | None, password: str) -> bool:
         return False
 
 
-def pooler_users(verifier: str) -> str:
-    """The pooler's file of who may sign in: the program's role with its
-    verifier (the pooler checks a client's password against it, and signs
-    in to Postgres with what the client proved), and the superuser with no
+def pooler_users(verifiers: dict[str, str]) -> str:
+    """The pooler's file of who may sign in: each role that signs in with its
+    verifier (the pooler checks a client's password against it, and signs in
+    to Postgres with what the client proved), and the superuser with no
     password at all, which the pooler's own rules let in only to its admin
     console over its unix socket."""
     quoted = lambda value: '"' + value.replace('"', '""') + '"'
-    return f"{quoted(APP_USER)} {quoted(verifier)}\n{quoted(ADMIN_USER)} \"\"\n"
+    lines = [f"{quoted(role)} {quoted(verifier)}\n" for role, verifier in verifiers.items()]
+    return "".join(lines) + f"{quoted(ADMIN_USER)} \"\"\n"
 
 
-def app_verifier() -> str | None:
-    """The program's role's stored password verifier, or None when it has none."""
-    found = rows(psql("SELECT rolpassword FROM pg_authid WHERE rolname = :'app';\n", {"app": APP_USER}))
+def verifier(role: str) -> str | None:
+    """`role`'s stored password verifier, or None when it has none."""
+    found = rows(psql("SELECT rolpassword FROM pg_authid WHERE rolname = :'role';\n", {"role": role}))
     if not found:
         return None
     return found[0]["rolpassword"] or None
 
 
-def set_app_password(password: str) -> None:
-    psql("ALTER ROLE :\"app\" PASSWORD :'password';\n", {"app": APP_USER, "password": password})
+def set_password(role: str, password: str) -> None:
+    psql("ALTER ROLE :\"role\" PASSWORD :'password';\n", {"role": role, "password": password})
 
 
 def tell_the_pooler() -> None:
     """Write who may sign in from the database's own records, then have
     the pooler read it again. Raises `Refused` when the pooler would not."""
-    verifier = app_verifier()
-    if verifier is None:
-        raise Refused(f"the role {APP_USER} has no password in the database")
-    write_file(POOLER_USERS_FILE, pooler_users(verifier))
+    verifiers = {}
+    for role in SIGNS_IN:
+        held = verifier(role)
+        if held is None:
+            raise Refused(f"the role {role} has no password in the database")
+        verifiers[role] = held
+    write_file(POOLER_USERS_FILE, pooler_users(verifiers))
     psql("RELOAD;\n", {}, pooler=True)
 
 
@@ -431,25 +530,51 @@ def converge() -> None:
     sys.stderr.write(f"credential: the program signs in as {APP_USER}, through the pooler\n")
 
 
+def signs_in_with_its_password(role: str, password: str) -> None:
+    """Give `role` `password` when it does not already have it, and close its
+    idle sessions. Raises `Refused`."""
+    if CLOSES_IDLE_SESSIONS:
+        psql(CLOSE_IDLE_SESSIONS, {"role": role, "idle": f"{IDLE_SESSION_SECONDS}s"})
+    if not scram_accepts(verifier(role), password):
+        set_password(role, password)
+
+
 def converge_once() -> str | None:
     """One pass of `converge`: what the database refused, or None once done.
 
-    The password file is the one source of the program's password: the
-    role is given it when it does not already have it, so a reset that
-    stopped halfway is settled by the next start. Each extension the
-    node lists is made by the superuser when it is not there yet."""
+    Each password file is the one source of its role's password: the role
+    is given it when it does not already have it, so a reset that stopped
+    halfway is settled by the next start. The program's is minted by the
+    init container, before Postgres starts; a login role's is minted here
+    the first time it is listed, and kept from then on. Each role and each
+    extension the node lists is made by the superuser when it is not there
+    yet, and each role it listed once and no longer does loses what the list
+    gave it (`STRIP_UNLISTED`)."""
     wait_until("Postgres to accept connections", postgres_not_serving)
-    password = stored_password()
+    password = stored_password(APP_USER)
     if password is None:
         sys.exit("credential: no password on the shared volume; the init container writes it before this one starts")
     try:
         psql(CONVERGE, {"app": APP_USER, "admin": ADMIN_USER, "database": DATABASE})
-        if CLOSES_IDLE_SESSIONS:
-            psql(CLOSE_IDLE_SESSIONS, {"app": APP_USER, "idle": f"{IDLE_SESSION_SECONDS}s"})
-        if not scram_accepts(app_verifier(), password):
-            set_app_password(password)
+        signs_in_with_its_password(APP_USER, password)
     except Refused as e:
         return f"the database refused to be set up for the program: {e}"
+    for role in ROLES:
+        name = role["name"]
+        try:
+            psql(role_script(role), {"role": name, "app": APP_USER})
+            if role["login"]:
+                if stored_password(name) is None:
+                    write_password(name, new_password())
+                signs_in_with_its_password(name, stored_password(name))
+        except Refused as e:
+            return f"the database could not set up the role '{name}' the node lists in `roles`: {e}"
+        except OSError as e:
+            return f"the password of the role '{name}' the node lists in `roles` could not be written to the database's disk: {e}"
+    try:
+        psql(STRIP_UNLISTED, {"app": APP_USER, "admin": ADMIN_USER, "listed": json.dumps([role["name"] for role in ROLES])})
+    except Refused as e:
+        return f"the database could not take back from a role the node no longer lists in `roles` what the list gave it: {e}"
     for name in EXTENSIONS:
         try:
             psql('CREATE EXTENSION IF NOT EXISTS :"name";\n', {"name": name})
@@ -459,9 +584,10 @@ def converge_once() -> str | None:
     return None
 
 
-def reset_password() -> str | None:
-    """Mint a new password, set it on the program's role, tell the pooler,
-    make it readable again, and tell weft: what went wrong, or None.
+def reset_password(role: str) -> str | None:
+    """Mint a new password for `role` (the program's, or a login role's), set
+    it on the role, tell the pooler, and for the program's make it readable
+    again and tell weft: what went wrong, or None.
 
     The database is told first, over its unix socket, which trusts a
     local connection without a password: a file that named a password
@@ -474,56 +600,61 @@ def reset_password() -> str | None:
         # back as it is (Postgres keeps a SCRAM verifier it is handed), not
         # the old password hashed again under a new salt, which the pooler,
         # holding this one, could no longer sign in with.
-        held = app_verifier()
+        held = verifier(role)
         if held is None:
-            return f"the role {APP_USER} has no password in the database, so the reset has nothing to replace; restart the database's infra"
+            return f"the role {role} has no password in the database, so the reset has nothing to replace; restart the database's infra"
         try:
-            set_app_password(password)
+            set_password(role, password)
         except Refused as e:
-            sys.stderr.write(f"credential: reset refused by the database: {e}\n")
+            sys.stderr.write(f"credential: reset of {role} refused by the database: {e}\n")
             return f"the database refused the new password: {e}"
         try:
-            write_password(password)
+            write_password(role, password)
         except OSError as e:
             # A write that failed after the file was swapped in (its
             # directory not synced) still left the new password there.
             try:
-                written = stored_password() == password
+                written = stored_password(role) == password
             except OSError:
                 written = False
             if not written:
-                sys.stderr.write(f"credential: reset, but the password could not be written: {e}\n")
+                sys.stderr.write(f"credential: reset of {role}, but the password could not be written: {e}\n")
                 try:
-                    set_app_password(held)
+                    set_password(role, held)
                 except Refused as undo:
                     return (
-                        f"the database took a new password that could not be written to its disk ({e}), and would not "
-                        f"take the old one back ({undo}), so no client can sign in. Free some room on the database's "
-                        "disk (or whatever the error says) and press Reset password again, or restart the database's infra."
+                        f"the database took a new password for {role} that could not be written to its disk ({e}), and "
+                        f"would not take the old one back ({undo}), so no client can sign in as {role}. Free some room "
+                        "on the database's disk (or whatever the error says) and press Reset password again, or "
+                        "restart the database's infra."
                     )
                 return (
                     f"the new password could not be written to the database's disk ({e}), so the reset was undone and "
                     "the old password still signs in. Free some room on that disk (or whatever the error says) and press Reset password again."
                 )
-            sys.stderr.write(f"credential: the new password is written, but its directory could not be synced: {e}\n")
+            sys.stderr.write(f"credential: the new password of {role} is written, but its directory could not be synced: {e}\n")
         try:
             tell_the_pooler()
         except (Refused, OSError) as e:
-            sys.stderr.write(f"credential: reset, but the pooler was not told: {e}\n")
+            sys.stderr.write(f"credential: reset of {role}, but the pooler was not told: {e}\n")
             return (
-                f"the database has the new password, but its pooler could not be told ({e}), so no client can "
-                "sign in until it is. Press Reset password again."
+                f"the database has the new password for {role}, but its pooler could not be told ({e}), so no client "
+                f"can sign in as {role} until it is. Press Reset password again."
             )
         try:
-            os.remove(SEALED_FILE)
+            os.remove(sealed_file(role))
         except FileNotFoundError:
             pass
         except OSError as e:
-            sys.stderr.write(f"credential: reset, but the password stays sealed: {e}\n")
+            sys.stderr.write(f"credential: reset of {role}, but the password stays sealed: {e}\n")
             return (
-                f"the database and its pooler have a new password, but it could not be made readable ({e}), so "
-                "neither the card nor a run can take it. Press Reset password again."
+                f"the database and its pooler have a new password for {role}, but it could not be made readable ({e}), "
+                "so nothing can take it. Press Reset password again."
             )
+        if role != APP_USER:
+            # No connection weft keeps signs in as a login role.
+            sys.stderr.write(f"credential: password of {role} reset; readable again until it is taken\n")
+            return None
         # The connection the node published still holds the old password
         # until weft is told the new one.
         unheard = push_password(password)
@@ -552,9 +683,9 @@ def push_password(password: str) -> str | None:
         return str(e)
 
 
-def stored_password() -> str | None:
+def stored_password(role: str) -> str | None:
     try:
-        with open(PASSWORD_FILE, encoding="utf-8") as f:
+        with open(password_file(role), encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
         return None
@@ -591,7 +722,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path != CREDENTIAL_PATH:
             self._send(404, {"error": "no such path"})
             return
-        password = stored_password()
+        password = stored_password(APP_USER)
         if password is None:
             self._send(503, {"error": "no password on the shared volume yet"})
             return
@@ -599,7 +730,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # that asks needs to act on it (find its own connection, or
         # tell the user how to recover), and an HTTP error would reach
         # it as an opaque transport failure instead.
-        self._send(200, {"sealed": True} if sealed() else {"password": password})
+        self._send(200, {"sealed": True} if sealed(APP_USER) else {"password": password})
 
     def _body(self) -> dict:
         try:
@@ -621,31 +752,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path != CREDENTIAL_STORED_PATH:
             self._send(404, {"error": "no such path"})
             return
-        password = stored_password()
-        if password is None:
-            self._send(503, {"error": "no password on the shared volume yet"})
-            return
-        sent = self._body().get("password", "")
-        # Only a caller that actually holds the password may retire it.
-        # Compared as BYTES: comparing str refuses non-ASCII outright,
-        # which would escape as a crash rather than a refusal.
-        #
         # A mismatch is an ANSWER, not a failure. It is how the caller
         # learns that the password it holds is not this database's,
         # which happens when the disk was replaced under it: a fresh
         # disk means a fresh password, and the caller has to notice
         # rather than go on handing out one nothing accepts.
-        if not secrets.compare_digest(str(sent).encode("utf-8"), password.encode("utf-8")):
-            self._send(200, {"stored": False})
-            return
-        # Idempotent: confirming twice is the same as confirming once.
         try:
-            with open(SEALED_FILE, "w", encoding="utf-8") as f:
-                f.write("stored")
+            held = seal_if_held(APP_USER, str(self._body().get("password", "")))
         except OSError as e:
             self._send(503, {"error": f"the password could not be retired, its disk refused the write: {e}"})
             return
-        self._send(200, {"stored": True})
+        if held is None:
+            self._send(503, {"error": "no password on the shared volume yet"})
+            return
+        self._send(200, {"stored": held})
 
     def _action(self, body: dict) -> None:
         # The graph's button, in the dispatcher's envelope: a refusal
@@ -653,13 +773,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # SYNC: the /action envelope <-> crates/weft-core/src/infra/action.rs, catalog/bailey/bridge/images/bridge/src/actions.js,
         #       catalog/computer/computer/images/computer/computer.py
         action = body.get("action")
-        if action != RESET_ACTION:
+        if (role := role_of(action, TAKEN_ACTION)) is not None:
+            payload = body.get("payload")
+            refused = taken(role, payload.get("value") if isinstance(payload, dict) else None)
+            self._send(200, {"result": {"error": refused} if refused is not None else {"taken": True}})
+            return
+        role = role_of(action, RESET_ACTION)
+        if role is None:
             self._send(200, {"result": {"error": f"no such action: {action!r}"}})
             return
         if not CONVERGED.is_set():
             self._send(200, {"result": {"error": "the database is still being set up for the program; press it again in a moment"}})
             return
-        refused = reset_password()
+        refused = reset_password(role)
         if refused is not None:
             self._send(200, {"result": {"error": refused}})
             return
@@ -670,42 +796,99 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sys.stderr.write("credential: %s\n" % (fmt % args))
 
 
-def live_items() -> list:
-    """What the node's card shows: the names to sign in with, the password
-    itself while it is still readable or the state it has moved on to, with
-    the one button that makes it readable again, then who is connected.
+def role_of(action: object, kind: str) -> str | None:
+    """The role an `action` of `kind` (a reset, a taken) is for: `kind` alone
+    names the program's role, `kind:<role>` a login role. None when no
+    button or press of this card is called that."""
+    if action == kind:
+        return APP_USER
+    if isinstance(action, str) and action.startswith(kind + ROLE_MARK):
+        role = action[len(kind + ROLE_MARK):]
+        return role if role in SIGNS_IN[1:] else None
+    return None
 
-    The card is a legitimate first taker. The password is readable
-    exactly once, by whoever asks first, and then sealed; a person
-    looking at the graph is asking the same way a run does, so while it
-    is unsealed the card SHOWS it, masked, with a way to copy it. That
-    is how somebody outside the program (a frontend that needs its own
-    tables in this database, a `psql` session) gets in without anybody
-    digging in a container for it.
 
-    Once a run has taken it the value is gone from here for good, and
-    the way back is the button below: reset, and the fresh password is
-    readable, and shown, again."""
-    password = stored_password()
+def taken(role: str, value: object) -> str | None:
+    """A reader copied `role`'s password out of the card: seal it, so the card
+    shows it handed over until a reset. Only a reader that holds the password
+    may, as for a run that stored it. What went wrong, or None."""
+    try:
+        held = seal_if_held(role, value)
+    except OSError as e:
+        return f"the password of {role} could not be marked handed over, its disk refused the write: {e}"
+    if held is None:
+        return f"the role {role} has no password yet, so there is nothing to have taken"
+    if not held:
+        return f"what was sent is not the password of {role} any more; read the card again"
+    return None
+
+
+def seal_if_held(role: str, value: object) -> bool | None:
+    """Seal `role`'s password when `value` is it: True once sealed, False when
+    it is not (an answer: the sender holds another password), None when the
+    role has none yet. Only a sender that holds the password may retire it,
+    so nothing able to reach this port retires a password nobody holds.
+    Compared as BYTES: comparing str refuses non-ASCII outright, which would
+    escape as a crash rather than a refusal. Idempotent. Raises `OSError`."""
+    with CHANGING:
+        password = stored_password(role)
+        if password is None:
+            return None
+        if not isinstance(value, str) or not secrets.compare_digest(value.encode("utf-8"), password.encode("utf-8")):
+            return False
+        seal(role)
+        return True
+
+
+def password_item(role: str) -> dict:
+    """`role`'s password on the card, one model for every password the node
+    holds: readable (masked, with reveal and copy) until it is handed over,
+    to a run that stored it or a reader that copied it out (`taken`); after
+    that a line saying so; and the button that mints a new one, readable
+    again, in either state."""
+    mark = "" if role == APP_USER else ROLE_MARK + role
+    label = "Password" if role == APP_USER else f"{role} password"
+    password = stored_password(role)
     if password is None:
-        item = {
-            "type": "text",
-            "label": "Password",
-            "data": "not minted yet",
-        }
-    elif sealed():
-        item = {
-            "type": "text",
-            "label": "Password",
-            "data": "handed over to a connection; reset to get a new one",
-        }
+        item = {"type": "text", "label": label, "data": "not minted yet"}
+    elif sealed(role):
+        # SYNC: handedOver <-> crates/weft-core/src/live.rs (LiveItem::handed_over), packages/weft-graph/src/protocol.ts (LiveDataItem.handedOver)
+        item = {"type": "text", "label": label, "data": "handed over; reset to get a new one", "handedOver": True}
     else:
-        # Rendered masked, with reveal and copy beside it.
-        item = {
-            "type": "secret",
-            "label": "Password",
-            "data": password,
-        }
+        item = {"type": "secret", "label": label, "data": password, "taken": TAKEN_ACTION + mark}
+    item["action"] = {
+        "label": "Reset password",
+        "actionKind": RESET_ACTION + mark,
+        "confirm": (
+            "Give the database a new password? A client already connected stays "
+            "connected; every new sign-in with the old one is refused. The program's "
+            "own next run picks the new one up by itself; anything outside it (a "
+            "frontend, a psql session) takes it from this card."
+        )
+        if role == APP_USER
+        else (
+            f"Give the role {role} a new password? A client already connected as {role} stays connected; every "
+            "new sign-in with the old one is refused, so whatever signs in as it takes the new one from this card."
+        ),
+    }
+    return item
+
+
+def live_items() -> list:
+    """What the node's card shows: the names to sign in with, then each
+    password the node holds (the program's, then each login role's), then
+    who is connected.
+
+    The card is a legitimate first taker. A password is readable exactly
+    once, by whoever takes it first, and then sealed; a person looking at
+    the graph is asking the same way a run does, so while it is unsealed
+    the card SHOWS it, masked, with a way to copy it. That is how somebody
+    outside the program (a frontend that needs its own tables in this
+    database, a site signing in as a login role, a `psql` session) gets in
+    without anybody digging in a container for it.
+
+    Once taken the value is gone from here for good, and the way back is
+    its Reset button: the fresh password is readable, and shown, again."""
     # The database and user a client signs in with, beside the
     # password. The pooler lets clients into this database only, under
     # this name.
@@ -713,18 +896,8 @@ def live_items() -> list:
         {"type": "text", "label": "Database", "data": POOLER_DATABASE},
         {"type": "text", "label": "User", "data": APP_USER},
     ]
-    item["action"] = {
-        "label": "Reset password",
-        "actionKind": RESET_ACTION,
-        "confirm": (
-            "Give the database a new password? A client already connected stays "
-            "connected; every new sign-in with the old one is refused. The program's "
-            "own next run picks the new one up by itself; anything outside it (a "
-            "frontend, a psql session) takes it from this card."
-        ),
-    }
     warning = [{"type": "text", "label": "Warning", "data": POSTGRES_NOTE}] if POSTGRES_NOTE else []
-    return warning + names + [item] + connection_items()
+    return warning + names + [password_item(role) for role in SIGNS_IN] + connection_items()
 
 
 def connection_items() -> list:
@@ -771,15 +944,18 @@ def postgres_connections(limits: dict, activity: list[dict]) -> str:
 
 
 def pooler_lanes(databases: list[dict], pools: list[dict]) -> str:
-    """The pooler's two doors: clients served and waiting, connections open of its share."""
+    """The pooler's two doors: clients served and waiting, connections open of
+    its share. A door has a pool per role signing in through it, all held to
+    the door's share together, so its clients are counted across them."""
     lines = []
     for name, lane in ((POOLER_DATABASE, "queries"), (WATCH_DATABASE, "watchers")):
         db = next((row for row in databases if row.get("name") == name), {})
-        pool = next((row for row in pools if row.get("database") == name and row.get("user") == APP_USER), {})
-        served, waiting = int(pool.get("cl_active", 0)), int(pool.get("cl_waiting", 0))
+        door = [row for row in pools if row.get("database") == name]
+        served = sum(int(row.get("cl_active", 0)) for row in door)
+        waiting = sum(int(row.get("cl_waiting", 0)) for row in door)
         line = f"{lane} ({name}): {served} client(s) served, {waiting} waiting"
         if waiting:
-            line += f" (the longest for {pool.get('maxwait', '0')}s)"
+            line += f" (the longest for {max(int(row.get('maxwait', 0)) for row in door)}s)"
         line += f"; {db.get('current_connections', 0)} of {db.get('pool_size', '?')} connections open"
         lines.append(line)
     return "\n".join(lines)

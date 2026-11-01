@@ -24,7 +24,7 @@
 //! address, and several words find the runs carrying all of them (a
 //! quoted phrase, the runs carrying it as written).
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use weft_core::project::graph::{GraphView, ProjectGraph};
@@ -172,16 +172,20 @@ impl Building {
     }
 }
 
-/// The programs runs were started on, by project and hash, as a search
-/// read them (`None`: there is none to spell its nodes by): kept for the
-/// whole search, so each is read once.
-type Programs = HashMap<(uuid::Uuid, String), Option<Arc<ProjectDefinition>>>;
+/// The programs runs were started on, as a search reads them: through the
+/// process's one cache of programs (`crate::state::Programs`), and the
+/// ones there is none to spell their nodes by, kept for the whole search
+/// so each is looked for once.
+struct Programs<'a> {
+    read: &'a crate::state::Programs,
+    none: HashSet<(uuid::Uuid, String)>,
+}
 
 /// Build the entry of every run queued, then build again every entry at
 /// an older [`FORMAT`], a round of [`ROUND`] at a time, and answer how
 /// many.
-pub async fn index_queued(pool: &db::Pool) -> anyhow::Result<usize> {
-    let mut programs = Programs::new();
+pub async fn index_queued(pool: &db::Pool, programs: &crate::state::Programs) -> anyhow::Result<usize> {
+    let mut programs = Programs { read: programs, none: HashSet::new() };
     let mut indexed = 0;
     for pending in Pending::BOTH {
         loop {
@@ -199,7 +203,7 @@ pub async fn index_queued(pool: &db::Pool) -> anyhow::Result<usize> {
 /// record read a page at a time outside any transaction and each entry
 /// written on its own ([`Pending::write`]); answers how many were read.
 /// Everything runs on the round's one connection.
-async fn round(pool: &db::Pool, programs: &mut Programs, pending: Pending) -> anyhow::Result<usize> {
+async fn round(pool: &db::Pool, programs: &mut Programs<'_>, pending: Pending) -> anyhow::Result<usize> {
     let conn = pool.get().await?;
     let ids = pending.waiting(&conn).await?;
     for run_id in &ids {
@@ -246,7 +250,7 @@ async fn round(pool: &db::Pool, programs: &mut Programs, pending: Pending) -> an
 /// named, or no longer reading), said in the log.
 async fn started_on(
     db: &impl Client,
-    programs: &mut Programs,
+    programs: &mut Programs<'_>,
     run_id: RunId,
     birth: Option<&RunEvent>,
 ) -> anyhow::Result<Option<Arc<ProjectDefinition>>> {
@@ -256,8 +260,11 @@ async fn started_on(
     };
     let Some(hash) = cut_from.as_ref().or(definition_hash.as_ref()) else { return Ok(None) };
     let key = (*project_id, hash.clone());
-    if let Some(program) = programs.get(&key) {
-        return Ok(program.clone());
+    if programs.none.contains(&key) {
+        return Ok(None);
+    }
+    if let Some(program) = programs.read.get(&key) {
+        return Ok(Some(program));
     }
     let program = match crate::project_store::program_in(db, *project_id, hash).await {
         Ok(Some(program)) => Some(Arc::new(program)),
@@ -271,7 +278,12 @@ async fn started_on(
         }
         Err(e) => return Err(e),
     };
-    programs.insert(key, program.clone());
+    match &program {
+        Some(program) => programs.read.put(key, program.clone()),
+        None => {
+            programs.none.insert(key);
+        }
+    }
     Ok(program)
 }
 

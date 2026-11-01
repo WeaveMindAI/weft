@@ -36,7 +36,7 @@ a time, each with a timeout of at most 60 seconds:
 ```bash
 pnpm dlx sv@0.17.0 create front --template minimal --types ts --no-add-ons --no-install
 pnpm dlx sv@0.17.0 add tailwindcss="plugins:none" --no-install --cwd front --no-git-check --no-download-check
-cd front && pnpm add clsx tailwind-merge && pnpm add -D tw-animate-css shadcn-svelte@1.6.1 && pnpm install
+cd ./front && pnpm add clsx tailwind-merge && pnpm add -D tw-animate-css shadcn-svelte@1.6.1 && pnpm install
 ```
 
 The Tailwind add-on writes `src/routes/layout.css`. `shadcn-svelte init`

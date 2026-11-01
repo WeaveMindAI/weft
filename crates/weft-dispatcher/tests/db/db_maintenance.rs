@@ -285,7 +285,7 @@ async fn the_lift_rebuilds_from_the_version_the_running_build_came_from(pool: Po
         images: fake.clone(),
         pool: pool.clone(),
         prunes: Default::default(),
-        blobs: weft_dispatcher::build::blob_cache::BlobCache::in_temp_dir(),
+        blobs: weft_dispatcher::build::blob_cache::BlobCache::in_temp_dir(false),
     };
     let underway = match builder
         .start_images(version, &images, &Staging::new(()), id, TENANT, Arc::new(NoGate), ImageHold::new(&pool, id))

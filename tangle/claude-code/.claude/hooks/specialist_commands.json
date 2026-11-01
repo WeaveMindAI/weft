@@ -21,7 +21,11 @@
       "weft files inspect",
       "weft tree",
       "weft diff",
-      "weft examples"
+      "weft examples",
+      {"prefix": "grep", "check": "grep"},
+      {"prefix": "rg", "check": "rg"},
+      {"prefix": "ffprobe", "check": "ffprobe"},
+      {"prefix": "psql", "check": "psql"}
     ]
   },
   "red-teamer": {
@@ -30,7 +34,9 @@
       "weft validate",
       "weft parse",
       "weft status",
-      "weft daemon logs"
+      "weft daemon logs",
+      {"prefix": "grep", "check": "grep"},
+      {"prefix": "rg", "check": "rg"}
     ]
   },
   "group-builder": {
@@ -46,7 +52,13 @@
       "weft logs",
       "weft runs",
       "weft status",
-      "weft daemon logs"
+      "weft daemon logs",
+      "weft stop",
+      {"prefix": "grep", "check": "grep"},
+      {"prefix": "rg", "check": "rg"},
+      {"prefix": "ffprobe", "check": "ffprobe"},
+      {"prefix": "ffmpeg", "check": "ffmpeg", "writes_under": ".scratch/group-builder"},
+      {"prefix": "psql", "check": "psql"}
     ]
   },
   "node-smith": {
@@ -73,7 +85,13 @@
       "weft infra show",
       "weft infra press",
       "weft infra terminate",
-      "cd"
+      "cd",
+      "weft stop",
+      {"prefix": "grep", "check": "grep"},
+      {"prefix": "rg", "check": "rg"},
+      {"prefix": "ffprobe", "check": "ffprobe"},
+      {"prefix": "ffmpeg", "check": "ffmpeg", "writes_under": ".scratch/node-smith"},
+      {"prefix": "psql", "check": "psql"}
     ]
   },
   "prompt-engineer": {
@@ -85,7 +103,10 @@
       "weft bake",
       "weft events",
       "weft status",
-      "weft daemon logs"
+      "weft daemon logs",
+      "weft stop",
+      {"prefix": "grep", "check": "grep"},
+      {"prefix": "rg", "check": "rg"}
     ]
   },
   "frontend-builder": {
@@ -110,7 +131,13 @@
       "weft wait",
       "weft status",
       "weft daemon logs",
-      "cd"
+      "cd",
+      "weft stop",
+      {"prefix": "grep", "check": "grep"},
+      {"prefix": "rg", "check": "rg"},
+      {"prefix": "ffprobe", "check": "ffprobe"},
+      {"prefix": "ffmpeg", "check": "ffmpeg", "writes_under": ".scratch/frontend-builder"},
+      {"prefix": "psql", "check": "psql"}
     ]
   },
   "designer": {
@@ -123,7 +150,11 @@
       "pnpm exec playwright",
       "pnpm exec node",
       {"prefix": "kill", "args": "pids"},
-      "cd"
+      "cd",
+      {"prefix": "grep", "check": "grep"},
+      {"prefix": "rg", "check": "rg"},
+      {"prefix": "ffprobe", "check": "ffprobe"},
+      {"prefix": "ffmpeg", "check": "ffmpeg", "writes_under": ".scratch/designer"}
     ]
   },
   "deployer": {
@@ -159,7 +190,10 @@
       "weft frontend add",
       "weft frontend token",
       "weft target list",
-      {"prefix": "weft workers", "refuse": [["set"]]}
+      {"prefix": "weft workers", "refuse": [["set"]]},
+      "weft daemon logs",
+      {"prefix": "grep", "check": "grep"},
+      {"prefix": "rg", "check": "rg"}
     ]
   }
 }

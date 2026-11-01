@@ -29,6 +29,7 @@
 //!   POST   /v1/storage/admin/link           a download link, for a person, weft or the outside
 //!   POST   /v1/storage/admin/wipe-prefix    weft rm / weft clean
 //!   POST   /v1/storage/admin/sweep-run     terminate sweep for one run
+//!   GET    /v1/storage/admin/install-cli/{tree}  the weft CLI the install stored for a source tree
 //!
 //! A page's upload through a slot (bearer = the dispatcher, which passes
 //! the page's verbs on from its `/files/upload/...` door; the slot in each
@@ -154,6 +155,7 @@ pub fn router() -> Router<Arc<BrokerState>> {
         .route("/v1/storage/admin/tenant-usage", post(admin_tenant_usage))
         .route("/v1/storage/admin/files/{*key}", delete(admin_delete_file))
         .route("/v1/storage/admin/meta/{*key}", get(admin_meta))
+        .route("/v1/storage/admin/install-cli/{tree}", get(admin_install_cli))
         .route("/v1/storage/admin/link", post(admin_link))
         .route("/v1/storage/admin/wipe-prefix", post(admin_wipe_prefix))
         .route("/v1/storage/admin/sweep-run", post(admin_sweep_run))
@@ -590,9 +592,10 @@ async fn keep_file(
 }
 
 /// `POST /v1/storage/link`: a link to one of the caller's files for node
-/// code (`internal`, straight to the bucket at the workers' address) or
-/// for the outside (`external`, [`link_route`]), whether the open
-/// internet opens it, and the file it opens. An outside link reads the
+/// code (`internal`, straight to the bucket at the workers' address), for
+/// the project's containers (`container`) or for the outside
+/// (`external`), as [`link_route`] routes it, whether the open internet
+/// opens it, and the file it opens. An outside link reads the
 /// project's visitor address in the same statement that reads the file.
 async fn link(
     State(state): State<Arc<BrokerState>>,
@@ -603,7 +606,7 @@ async fn link(
     let parsed = wall(&caller, &req.key)?;
     let visitors_of = match req.reach {
         LinkReach::External => Some(caller_project(&caller)?),
-        LinkReach::Internal => None,
+        LinkReach::Internal | LinkReach::Container => None,
     };
     let granted = state.runtime_store.grant_link(&parsed, req.ttl_secs, true, visitors_of).await.map_err(map_err)?;
     let (audience, public) = link_route(&state, req.reach, granted.visitor_address.clone()).await?;
@@ -623,10 +626,18 @@ fn project_uuid(project: &str) -> Result<uuid::Uuid, ApiError> {
     project.parse().map_err(|_| ApiError::from((StatusCode::BAD_REQUEST, format!("'{project}' is not a project id"))))
 }
 
-/// [`route_link`] with this install's store, own address and internet
-/// address.
+/// [`route_link`] with this install's store, its containers' address,
+/// own address and internet address.
 async fn link_route(state: &BrokerState, reach: LinkReach, visitor: Option<String>) -> Result<(PresignAudience, bool), ApiError> {
-    route_link(reach, state.object_store_public_internet, visitor, &state.own_base_url, || state.internet_base()).await
+    route_link(
+        reach,
+        state.object_store_public_internet,
+        state.container_files_base.as_deref(),
+        visitor,
+        &state.own_base_url,
+        || state.internet_base(),
+    )
+    .await
 }
 
 /// The audience of a page's upload parts through a slot of `project`:
@@ -654,8 +665,12 @@ async fn visitor_address(state: &BrokerState, project: uuid::Uuid) -> Result<Opt
 /// Where a link goes, and whether the open internet opens it. Node code
 /// (`internal`) reaches the store at the workers' address, which the
 /// internet opens only on a store it reaches (`store_public`, Cloud
-/// Storage). For the outside (`external`): the store's own link when the
-/// internet reaches it; else through the install's forwarder at the
+/// Storage). The project's containers (`container`) reach it through the
+/// files door at the install's address they reach (`containers`, a
+/// local install's internal port as a container reaches it), which only
+/// the machine's containers open; with none, they reach the store where
+/// the workers do, and the link is the internal one. For the outside
+/// (`external`): the store's own link when the internet reaches it; else through the install's forwarder at the
 /// project's `visitor` address, else at the install's internet address
 /// (`internet`, asked only when no visitor address applies: a quick
 /// tunnel's is a call to cloudflared), both public; else at the install's
@@ -665,6 +680,7 @@ async fn visitor_address(state: &BrokerState, project: uuid::Uuid) -> Result<Opt
 async fn route_link<F, Fut>(
     reach: LinkReach,
     store_public: bool,
+    containers: Option<&str>,
     visitor: Option<String>,
     own: &str,
     internet: F,
@@ -673,8 +689,10 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<Option<String>>>,
 {
-    if reach == LinkReach::Internal {
-        return Ok((PresignAudience::Install, store_public));
+    match (reach, containers) {
+        (LinkReach::Container, Some(base)) => return Ok((PresignAudience::Forwarded { base: base.to_string() }, false)),
+        (LinkReach::Internal | LinkReach::Container, _) => return Ok((PresignAudience::Install, store_public)),
+        (LinkReach::External, _) => {}
     }
     if store_public {
         return Ok((PresignAudience::External, true));
@@ -1278,6 +1296,42 @@ async fn admin_delete_file(
 /// install as a project's callers do. An outside link's file is checked
 /// to be one that project's callers reach ([`outside_reader`]), so a
 /// dispatcher bug can still never hand out another tenant's file.
+/// How long a link to the install's stored CLI works: long enough for a
+/// deploy to download it on a slow runner.
+const INSTALL_CLI_LINK_SECS: u64 = 3600;
+
+/// `GET /v1/storage/admin/install-cli/{tree}`: a link to the weft CLI the
+/// install workflow stored for the source tree `tree`, with its sha256;
+/// 404 when it stored none. The install's own file, beside every tenant's
+/// and no tenant's, which the workflow writes and replaces, so nothing of
+/// it is recorded here.
+async fn admin_install_cli(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Path(tree): Path<String>,
+) -> Result<Json<weft_core::install::InstallCli>, ApiError> {
+    control_plane(&state, &headers).await?;
+    if !weft_core::install::is_tree_id(&tree) {
+        return Err(ApiError::from((StatusCode::BAD_REQUEST, format!("'{tree}' is not a git tree id (40 or 64 lowercase hex digits)"))));
+    }
+    // A read and a signature: nothing is written, so a failure is one
+    // asking again may clear.
+    let failed = |e: anyhow::Error| map_err(RuntimeStoreError::BeforeWrites(e.context("read the stored weft CLI")));
+    let (cli, sha256) = weft_core::install::install_cli_keys(&tree);
+    let Some(sha256) = state.object_store.get(&sha256).await.map_err(failed)? else {
+        return Err(ApiError::from((StatusCode::NOT_FOUND, format!("no weft CLI is stored for the source tree {tree}"))));
+    };
+    let link = weft_platform_traits::GetLink {
+        audience: PresignAudience::External,
+        signed_at: std::time::SystemTime::now(),
+        ttl_secs: INSTALL_CLI_LINK_SECS,
+        content_type: Some("application/octet-stream".into()),
+        disposition: None,
+    };
+    let url = state.object_store.presign_get(&cli, &link).await.map_err(failed)?;
+    Ok(Json(weft_core::install::InstallCli { url, sha256: String::from_utf8_lossy(&sha256).trim().to_string() }))
+}
+
 async fn admin_link(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
@@ -1360,6 +1414,7 @@ async fn admin_sweep_run(
 #[cfg(test)]
 mod link_route_tests {
     use super::{map_err, route_link, LinkReach, PresignAudience, RuntimeStoreError, StatusCode};
+    use weft_platform_traits::object_store::{fake::FakeObjectStore, GetLink, ObjectStore};
     use weft_task_store::db;
 
     /// What a statement that got no connection fails with.
@@ -1442,10 +1497,47 @@ mod link_route_tests {
     async fn an_internal_link_is_public_only_on_a_public_store() {
         for store_public in [false, true] {
             let (read, ask) = internet(tunnel());
-            let route = route_link(LinkReach::Internal, store_public, Some("https://shop.example".into()), OWN, ask).await.unwrap();
+            let route = route_link(LinkReach::Internal, store_public, None, Some("https://shop.example".into()), OWN, ask).await.unwrap();
             assert_eq!(route, (PresignAudience::Install, store_public));
             assert!(!read.load(std::sync::atomic::Ordering::SeqCst));
         }
+    }
+
+    /// A local install's internal port as its containers reach it.
+    const CONTAINERS: &str = "http://host.docker.internal:14113";
+
+    /// A link for the project's containers on a local install goes
+    /// through the files door on the internal port as a container reaches
+    /// it, signed for that address (a container's `127.0.0.1` is itself),
+    /// and the internet does not open it. On an install whose containers
+    /// reach the store where the workers do (a cloud one), it is the
+    /// internal link, whatever the store. Neither asks the tunnel.
+    #[tokio::test]
+    async fn a_container_link_goes_through_the_containers_address_else_it_is_the_internal_one() {
+        let (read, ask) = internet(tunnel());
+        let local = route_link(LinkReach::Container, false, Some(CONTAINERS), None, OWN, ask).await.unwrap();
+        assert_eq!(local, (forwarded(CONTAINERS), false));
+        let signed = FakeObjectStore::new()
+            .presign_get(
+                "runtime/t/k",
+                &GetLink {
+                    audience: local.0,
+                    signed_at: std::time::UNIX_EPOCH,
+                    ttl_secs: 900,
+                    content_type: None,
+                    disposition: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(signed.starts_with("http://host.docker.internal:14113/files/"), "{signed}");
+        for store_public in [false, true] {
+            let (_, ask) = internet(tunnel());
+            let internal = route_link(LinkReach::Internal, store_public, None, None, OWN, ask).await.unwrap();
+            let (_, ask) = internet(tunnel());
+            assert_eq!(route_link(LinkReach::Container, store_public, None, None, OWN, ask).await.unwrap(), internal);
+        }
+        assert!(!read.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// A store the internet reaches signs its own link, whatever else the
@@ -1453,7 +1545,7 @@ mod link_route_tests {
     #[tokio::test]
     async fn an_outside_link_on_a_public_store_is_the_stores() {
         let (read, ask) = internet(tunnel());
-        let route = route_link(LinkReach::External, true, Some("https://shop.example".into()), OWN, ask).await.unwrap();
+        let route = route_link(LinkReach::External, true, None, Some("https://shop.example".into()), OWN, ask).await.unwrap();
         assert_eq!(route, (PresignAudience::External, true));
         assert!(!read.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -1462,7 +1554,7 @@ mod link_route_tests {
     #[tokio::test]
     async fn an_outside_link_goes_through_the_visitor_address_without_asking_the_tunnel() {
         let (read, ask) = internet(Err(anyhow::anyhow!("never asked")));
-        let route = route_link(LinkReach::External, false, Some("https://shop.example/weft".into()), OWN, ask).await.unwrap();
+        let route = route_link(LinkReach::External, false, None, Some("https://shop.example/weft".into()), OWN, ask).await.unwrap();
         assert_eq!(route, (forwarded("https://shop.example/weft"), true));
         assert!(!read.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -1472,10 +1564,10 @@ mod link_route_tests {
     #[tokio::test]
     async fn an_outside_link_without_a_site_goes_through_the_internet_else_the_own_address() {
         let (read, ask) = internet(tunnel());
-        assert_eq!(route_link(LinkReach::External, false, None, OWN, ask).await.unwrap(), (forwarded("https://t.example"), true));
+        assert_eq!(route_link(LinkReach::External, false, None, None, OWN, ask).await.unwrap(), (forwarded("https://t.example"), true));
         assert!(read.load(std::sync::atomic::Ordering::SeqCst));
         let (_, ask) = internet(Ok(None));
-        assert_eq!(route_link(LinkReach::External, false, None, OWN, ask).await.unwrap(), (forwarded(OWN), false));
+        assert_eq!(route_link(LinkReach::External, false, None, None, OWN, ask).await.unwrap(), (forwarded(OWN), false));
     }
 
     /// A tunnel that cannot say its address refuses the link: one through
@@ -1483,7 +1575,7 @@ mod link_route_tests {
     #[tokio::test]
     async fn an_unreadable_tunnel_refuses_the_outside_link() {
         let (_, ask) = internet(Err(anyhow::anyhow!("cloudflared is down")));
-        let refused = route_link(LinkReach::External, false, None, OWN, ask).await.unwrap_err();
+        let refused = route_link(LinkReach::External, false, None, None, OWN, ask).await.unwrap_err();
         assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 

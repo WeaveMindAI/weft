@@ -1,4 +1,4 @@
-# SYNC: the variables the install workflow sets (project_id, region, zone, database_url, database_listen_url, cloud_sql, cloud_sql_tier, cloud_sql_max_connections, dispatcher_max_copies, broker_max_copies, runtime_image, builder_base_image, weft_repository, weft_commit, access_apps_json, alert_email) <-> .github/workflows/install-gcp.yml (the TF_VAR_* names)
+# SYNC: the variables the install workflow sets (project_id, region, zone, database_url, database_listen_url, cloud_sql, cloud_sql_tier, cloud_sql_max_connections, dispatcher_max_copies, broker_max_copies, dispatcher_memory, broker_memory, listener_memory, supervisor_memory, holder_memory, runtime_image, builder_base_image, weft_repository, weft_commit, access_apps_json, alert_email) <-> .github/workflows/install-gcp.yml (the TF_VAR_* names)
 
 variable "project_id" {
   description = "The GCP project the install lives in."
@@ -80,6 +80,34 @@ variable "broker_max_copies" {
   }
 }
 
+# The memory of one copy of each role. Cloud Run's own default is 512Mi,
+# and a role left at it is given 512Mi again by every apply, so each one
+# is set here, where a value somebody chose survives the next install run.
+# SYNC: the memory rule <-> serverless.tf (google_cloud_run_v2_service.role's precondition)
+variable "dispatcher_memory" {
+  description = "The memory of each copy of the dispatcher, in Mi or Gi (\"1Gi\", \"1536Mi\"), from 512Mi to 4Gi. More than the other roles by default: every version is compiled there, and on Cloud Run the files a build writes are held in memory, beside the programs the dispatcher keeps read."
+  type        = string
+  default     = "1Gi"
+}
+
+variable "broker_memory" {
+  description = "The memory of each copy of the broker, in Mi or Gi, from 512Mi to 4Gi."
+  type        = string
+  default     = "512Mi"
+}
+
+variable "listener_memory" {
+  description = "The memory of each copy of the listener, in Mi or Gi, from 512Mi to 4Gi."
+  type        = string
+  default     = "512Mi"
+}
+
+variable "supervisor_memory" {
+  description = "The memory of each copy of the supervisor, in Mi or Gi, from 512Mi to 4Gi."
+  type        = string
+  default     = "512Mi"
+}
+
 variable "database_listen_url" {
   description = "A direct (session) address of the same database, when database_url goes through a pooler that hands out a connection per transaction: a LISTEN needs a session of its own (the runtime refuses to start, naming this, when it cannot listen). Empty when database_url is already one."
   type        = string
@@ -122,9 +150,20 @@ variable "holder_cpu" {
 }
 
 variable "holder_memory" {
-  description = "The memory of each holder."
+  description = "The memory of each holder, in Mi or Gi (\"512Mi\", \"1Gi\"), at least 512Mi; Cloud Run refuses more than its CPU (`holder_cpu`) takes."
   type        = string
   default     = "512Mi"
+  # The roles' 512Mi floor, without their 4Gi ceiling: a holder's CPU is
+  # its own setting, and Cloud Run refuses more memory than that CPU takes.
+  # SYNC: reading `<n>Mi` / `<n>Gi` <-> serverless.tf (local.role_memory_mi)
+  validation {
+    condition = try(
+      tonumber(regex("^([0-9]+)Mi$", var.holder_memory)[0]),
+      tonumber(regex("^([0-9]+)Gi$", var.holder_memory)[0]) * 1024,
+      0,
+    ) >= 512
+    error_message = "holder_memory is a whole number of Mi or Gi of at least 512Mi (\"512Mi\", \"1Gi\"), Cloud Run's default and what a holder is never given less than."
+  }
 }
 
 variable "runtime_image" {

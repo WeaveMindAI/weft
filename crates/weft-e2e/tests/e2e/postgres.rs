@@ -21,6 +21,9 @@
 //!   - a watching query reached through the pooler keeps its one
 //!     connection past the minute after which the database closes an
 //!     idle session, and a write still fires it;
+//!   - the roles the node lists keep tenants apart under a `FORCE`
+//!     policy, one marked to bypass it writes past it, and a login role
+//!     signs in through the pooler with its own password;
 //!   - a database named with a dash keeps its name, and one the pooler
 //!     cannot read as written is reached through a door made from it;
 //!   - terminating takes the connection away with the database.
@@ -208,6 +211,9 @@ async fn the_password_goes_into_an_env_file_and_a_reset_gets_a_new_one() -> Resu
         ["infra", "env", "db", "--into", &into, "--set", "PG_PASSWORD=Password", "--set", "PG_USER=User"];
     let written = project.weft(&secret).await?;
     anyhow::ensure!(written.contains("PG_USER="), "env should print the plain values it wrote, its lines: {:?}", names(&written));
+    // Written into the file is taken: the card shows it handed over now.
+    let taken = project.weft_refused(&only_secret).await?;
+    anyhow::ensure!(taken.contains("weft infra press"), "the password env wrote should be handed over: {taken}");
     let user_line = std::fs::read_to_string(&env)?;
     anyhow::ensure!(
         user_line.lines().any(|l| l.starts_with("PG_USER=") && l.len() > "PG_USER=".len()),
@@ -293,6 +299,128 @@ async fn a_client_outside_weft_opens_the_database_through_its_door() -> Result<(
     drop(held);
 
     round_trip(&mut project).await?;
+    infra::terminate_and_wait_gone(&project, "db").await?;
+    project.finish().await
+}
+
+/// The roles the next test lists: one per kind of tenant, one that signs
+/// in by itself, one that writes past every policy.
+const ROLES: &str = r#"[{"name": "tenant_app"}, {"name": "tenant_site", "login": true}, {"name": "tenant_admin", "bypassRowLevelSecurity": true}]"#;
+
+/// Whether `outcome` is the refusal of a row-level security policy.
+fn refused_by_a_policy<T: std::fmt::Debug>(outcome: Result<T, impl std::fmt::Display>) -> bool {
+    matches!(outcome, Err(e) if e.to_string().contains("row-level security"))
+}
+
+/// How a program keeps tenants apart with roles the node lists: `app`
+/// (the tables' owner, bound by a `FORCE` policy like everyone) `set
+/// role`s to a tenant's role and writes only that tenant's rows, a role
+/// marked `bypassRowLevelSecurity` writes past the policy, and a `login`
+/// role signs in through the pooler with its own password from the card
+/// (`app`'s does not open it), handed out once and minted again by its own
+/// Reset button. Taking roles off the list restarts the database, which
+/// sets up the one still listed again without failing, and takes back what
+/// the list gave the others (`set role`, signing in, passing policies)
+/// while keeping them and their rows.
+#[tokio::test]
+async fn roles_keep_tenants_apart_and_a_login_role_signs_in_by_itself() -> Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("postgres_db", disp).await?;
+    project.substitute_in_main("__E2E_BODY__", BODY)?;
+    project.set_node_config("db", "reachable", "true")?;
+    project.set_node_config("db", "roles", ROLES)?;
+    infra::start_and_wait_running(&mut project, "db").await?;
+
+    let app = outside_client(&project, "db", "front.env").await?;
+    let owner = db::Session::connect(&app).await?;
+    owner
+        .batch_execute(
+            "CREATE TABLE tenants (tenant text NOT NULL); \
+             ALTER TABLE tenants ENABLE ROW LEVEL SECURITY; ALTER TABLE tenants FORCE ROW LEVEL SECURITY; \
+             CREATE POLICY own ON tenants USING (tenant = current_user) WITH CHECK (tenant = current_user); \
+             GRANT SELECT, INSERT ON tenants TO tenant_app, tenant_site, tenant_admin",
+        )
+        .await?;
+    anyhow::ensure!(
+        refused_by_a_policy(owner.execute("INSERT INTO tenants VALUES ('tenant_app')", &[]).await),
+        "a FORCE policy binds the tables' owner too"
+    );
+    owner.batch_execute("SET ROLE tenant_app; INSERT INTO tenants VALUES ('tenant_app')").await?;
+    anyhow::ensure!(
+        refused_by_a_policy(owner.execute("INSERT INTO tenants VALUES ('tenant_site')", &[]).await),
+        "a tenant's role writes only its own rows"
+    );
+    owner.batch_execute("SET ROLE tenant_admin; INSERT INTO tenants VALUES ('tenant_site'); RESET ROLE").await?;
+
+    // The login role, with its own password from the card.
+    let env = project.dir().join("site.env");
+    let into = env.to_string_lossy().to_string();
+    project.weft(&["infra", "env", "db", "--into", &into, "--set", "SITE_PASSWORD=tenant_site password"]).await?;
+    let text = std::fs::read_to_string(&env)?;
+    let password = text
+        .lines()
+        .find_map(|l| l.strip_prefix("SITE_PASSWORD="))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("the env file does not set SITE_PASSWORD"))?;
+    let mut site = app.clone();
+    site.user("tenant_site").password(password.as_str());
+    let signed_in = db::Session::connect(&site).await?;
+    let seen: Vec<String> = signed_in.scalars("SELECT tenant FROM tenants", &[]).await?;
+    anyhow::ensure!(seen == ["tenant_site"], "the login role sees its own rows only, got {seen:?}");
+    drop(signed_in);
+    let mut wrong = site.clone();
+    wrong.password(app.get_password().unwrap_or_default());
+    anyhow::ensure!(db::Session::connect(&wrong).await.is_err(), "app's password does not sign the login role in");
+
+    // Handed out once, like app's: taken by the env file, then a reset
+    // mints a new one, which the old one no longer signs in after.
+    let again: [&str; 7] = ["infra", "env", "db", "--into", &into, "--set", "SITE_PASSWORD=tenant_site password"];
+    let refused = project.weft_refused(&again).await?;
+    anyhow::ensure!(refused.contains("weft infra press db reset_password:tenant_site"), "{refused}");
+    project.weft(&["infra", "press", "db", "reset_password:tenant_site"]).await?;
+    project.weft(&again).await?;
+    let fresh = std::fs::read_to_string(&env)?
+        .lines()
+        .find_map(|l| l.strip_prefix("SITE_PASSWORD="))
+        .map(|v| v.trim().to_string())
+        .ok_or_else(|| anyhow::anyhow!("the env file does not set SITE_PASSWORD after the reset"))?;
+    anyhow::ensure!(fresh != password, "the reset minted a new password");
+    anyhow::ensure!(db::Session::connect(&site).await.is_err(), "the old password signs in no more");
+    let password = fresh;
+    site.password(password.as_str());
+    db::Session::connect(&site).await?;
+    drop(owner);
+
+    // Off the list: the restart sets up the one still listed again, and the
+    // two taken off stay in the database with their rows, but lose what the
+    // list gave them: `app`'s `set role`, signing in, writing past policies.
+    project.set_node_config("db", "roles", r#"[{"name": "tenant_app"}]"#)?;
+    project.weft(&["infra", "upgrade"]).await?;
+    infra::wait_running(&project, "db").await?;
+    let app = outside_client(&project, "db", "front.env").await?;
+    let owner = db::Session::connect(&app).await?;
+    let gone = "FROM pg_roles WHERE rolname IN ('tenant_site', 'tenant_admin')";
+    let kept: i64 = owner.scalar(&format!("SELECT count(*) {gone}"), &[]).await?;
+    let login: bool = owner.scalar(&format!("SELECT bool_or(rolcanlogin) {gone}"), &[]).await?;
+    let bypass: bool = owner.scalar(&format!("SELECT bool_or(rolbypassrls) {gone}"), &[]).await?;
+    anyhow::ensure!(kept == 2, "roles taken off the list stay in the database");
+    anyhow::ensure!(!login && !bypass, "they sign in no more and pass the policies no more (login {login}, bypass {bypass})");
+    for gone in ["tenant_site", "tenant_admin"] {
+        let refused = owner.batch_execute(&format!("SET ROLE {gone}")).await;
+        anyhow::ensure!(refused.is_err(), "the program can no longer `set role {gone}`");
+    }
+    owner.batch_execute("SET ROLE tenant_app").await?;
+    owner.batch_execute("RESET ROLE; ALTER TABLE tenants NO FORCE ROW LEVEL SECURITY").await?;
+    let rows: i64 = owner.scalar("SELECT count(*) FROM tenants", &[]).await?;
+    anyhow::ensure!(rows == 2, "the rows stay, got {rows}");
+    let mut site = app.clone();
+    site.user("tenant_site").password(password.as_str());
+    anyhow::ensure!(db::Session::connect(&site).await.is_err(), "the pooler lets a role taken off the list in no more");
+    let card = project.weft(&["infra", "show", "db"]).await?;
+    anyhow::ensure!(!card.contains("tenant_site password"), "its card line goes: {card}");
+    drop(owner);
+
     infra::terminate_and_wait_gone(&project, "db").await?;
     project.finish().await
 }

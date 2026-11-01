@@ -472,8 +472,8 @@ fn first_file_version() -> u64 {
 /// concrete `__weft_<kind>__` marker (see `to_value`). The ONLY thing
 /// that flows on edges / into the journal for a stored file. Carries
 /// NO url: byte access always goes through an authenticated fetch (or
-/// an expiring link a node deliberately asks for, `internal_link` /
-/// `external_link`). The
+/// an expiring link a node deliberately asks for, `internal_link`,
+/// `container_link` or `external_link`). The
 /// concrete kind (Image/Video/Audio/Blob) is derived from `mime_type`.
 // SYNC: StoredFile <-> packages/weft-graph/src/protocol.ts FileValueWire
 //       (per-kind markers __weft_image__/video/audio/blob, parseFileValue)
@@ -776,8 +776,8 @@ pub struct IdentityLookupResponse {
 
 /// A link to a stored file: where to fetch it, and whether the open
 /// internet can (a provider handed a link it cannot open gets the bytes
-/// in its request instead). What `StorageHandle::internal_link` and
-/// `external_link` answer.
+/// in its request instead). What `StorageHandle::internal_link`,
+/// `container_link` and `external_link` answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileLink {
     pub url: String,
@@ -799,6 +799,13 @@ pub enum LinkReach {
     /// Node code inside the install: straight to storage, at the address
     /// a worker reaches it by, never through a tunnel.
     Internal,
+    /// A project's own container (an infra unit's): at the address the
+    /// install's containers reach it by, never through a tunnel. On a
+    /// local install that is the install's internal port as a container
+    /// reaches it, through the files door there (a container's own
+    /// `127.0.0.1` is itself); on an install whose store every container
+    /// reaches at the workers' address (a cloud one), the `Internal` link.
+    Container,
     /// Anything outside the install's containers (a browser, an app, an
     /// outside service): the project's visitor address, else weft's
     /// tunnel, else the install's own address (`public: false`); on a
@@ -2320,6 +2327,10 @@ mod tests {
         // No lifetime named: the value's own default is asked for.
         let bare: LinkRequest = serde_json::from_value(json!({"key": "k", "reach": "internal"})).unwrap();
         assert_eq!((bare.ttl_secs, bare.reach), (None, LinkReach::Internal));
+        let container = LinkRequest { key: "k".into(), ttl_secs: None, reach: LinkReach::Container };
+        let v = serde_json::to_value(&container).unwrap();
+        assert_eq!(v, json!({"key": "k", "reach": "container"}));
+        assert_eq!(serde_json::from_value::<LinkRequest>(v).unwrap().reach, LinkReach::Container);
         assert_eq!(
             serde_json::to_value(FileLink { url: "https://x/f".into(), public: false }).unwrap(),
             json!({"url": "https://x/f", "public": false})

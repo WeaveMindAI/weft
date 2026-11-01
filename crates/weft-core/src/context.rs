@@ -2411,6 +2411,19 @@ impl StorageHandle {
         self.link(file, crate::storage::LinkReach::Internal).await
     }
 
+    /// A link the project's own containers fetch this file from (an
+    /// infra unit's container the body hands it to): at the address the
+    /// install's containers reach it by, never out through a tunnel and
+    /// back. On a local install a container's `127.0.0.1` is the
+    /// container itself, so an [`Self::internal_link`] opens nothing
+    /// there and this one goes through the install's internal port as
+    /// containers reach it; on a cloud install it is the internal link.
+    /// Lifetime as for [`Self::internal_link`]. A url-backed file value
+    /// is already a link and answers itself.
+    pub async fn container_link(&self, file: &crate::storage::FileHandle) -> WeftResult<crate::storage::FileLink> {
+        self.link(file, crate::storage::LinkReach::Container).await
+    }
+
     /// A link anything outside the install fetches this file from (a
     /// browser, an app, an outside service), and whether the open
     /// internet can open it (`public`). On a cloud install it is the
@@ -2964,8 +2977,9 @@ pub trait ContextHandle: Send + Sync {
     /// run file this also makes it survive the terminate sweep.
     async fn storage_keep(&self, key: &str, ttl: crate::storage::KeepTtl) -> WeftResult<()>;
 
-    /// A link to `key` for `reach` (see `StorageHandle::internal_link`
-    /// and `external_link`), living `ttl_secs` (`None`: the default).
+    /// A link to `key` for `reach` (see `StorageHandle::internal_link`,
+    /// `container_link` and `external_link`), living `ttl_secs` (`None`:
+    /// the default).
     async fn storage_link(
         &self,
         key: &str,
@@ -3437,6 +3451,7 @@ mod value_bag_tests {
             self.note(format!("link {key} {ttl_secs:?} {reach:?}"));
             let link = match reach {
                 crate::storage::LinkReach::Internal => crate::storage::FileLink { url: format!("http://store/{key}"), public: false },
+                crate::storage::LinkReach::Container => crate::storage::FileLink { url: format!("http://containers/{key}"), public: false },
                 crate::storage::LinkReach::External => crate::storage::FileLink { url: format!("https://out/{key}"), public: self.public },
             };
             Ok(crate::storage::LinkAnswer { link, file: probe_meta(key) })
@@ -3494,6 +3509,7 @@ mod value_bag_tests {
         let linked = pure.storage_link("k", None, crate::storage::LinkReach::External).await.unwrap();
         assert_eq!(linked.link.url, "https://out/k");
         assert!(pure.storage_link("k", None, crate::storage::LinkReach::Internal).await.is_err());
+        assert!(pure.storage_link("k", None, crate::storage::LinkReach::Container).await.is_err());
         pure.storage_claim_uploads(&[("weft-upload:s", &crate::weft_type::WeftType::parse("File").unwrap())]).await.expect("its caller's upload");
         let slot = crate::storage::slot::UploadSlotRequest {
             max_bytes: 1,
@@ -3543,10 +3559,16 @@ mod value_bag_tests {
         let storage = ctx.storage(crate::storage::StorageScope::Run);
         let file = crate::storage::FileHandle::from_value(&stored).unwrap();
         assert_eq!(storage.internal_link(&file).await.unwrap().url, "http://store/run/c1/put1");
+        assert_eq!(storage.container_link(&file).await.unwrap().url, "http://containers/run/c1/put1");
         storage.external_link(&crate::storage::FileHandle::key("run/c1/other")).await.unwrap();
         assert_eq!(
             probe.calls(),
-            ["put Run a.txt", "link run/c1/put1 Some(7200) Internal", "link run/c1/other None External"]
+            [
+                "put Run a.txt",
+                "link run/c1/put1 Some(7200) Internal",
+                "link run/c1/put1 Some(7200) Container",
+                "link run/c1/other None External"
+            ]
         );
     }
 

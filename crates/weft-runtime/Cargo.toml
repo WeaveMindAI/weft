@@ -49,6 +49,9 @@ parking_lot = { workspace = true }
 # The process's allocator, the one every worker runs on
 # (`weft_engine::Jemalloc`): it hands freed memory back to the system.
 tikv-jemallocator = { workspace = true }
+# `dup2`: the log moves the process's stderr onto each fresh file it rolls
+# to (`log_file`).
+libc = "0.2"
 weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]

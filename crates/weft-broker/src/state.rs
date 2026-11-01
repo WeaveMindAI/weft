@@ -102,6 +102,8 @@ pub struct BrokerState {
     /// neither a site nor the internet carries it (the network address
     /// when one is set): such a link says `public: false`.
     pub own_base_url: String,
+    /// See [`BrokerSettings::container_files_base`].
+    pub container_files_base: Option<String>,
     /// True iff the object store's own presigned links are reachable from
     /// the open internet (Cloud Storage): a link to a stored file for the
     /// outside is then the store's, straight, and never goes through the
@@ -135,6 +137,10 @@ pub struct BrokerSettings {
     /// is the address, read live.
     pub internet: weft_platform_traits::config::InternetAddress,
     pub own_base_url: String,
+    /// Where the project's own containers reach the install's files door
+    /// (`InstallConfig::container_files_base`), when they do not reach the
+    /// store at the workers' address: a link for them goes through it.
+    pub container_files_base: Option<String>,
     pub object_store_public_internet: bool,
     pub slot_key: weft_core::storage::slot::SlotKey,
     /// How long this process's platform lets one line live before cutting
@@ -222,6 +228,7 @@ impl BrokerState {
             app_provider: settings.app_provider,
             address,
             own_base_url: settings.own_base_url.trim_end_matches('/').to_string(),
+            container_files_base: settings.container_files_base.map(|base| base.trim_end_matches('/').to_string()),
             object_store_public_internet: settings.object_store_public_internet,
             slot_key: settings.slot_key,
             supervisor_booking: settings.supervisor_booking,
