@@ -20,6 +20,12 @@
 #                         WEFT_BROKER_MAX_COPIES (the same for the broker;
 #                         4 when unset). Each copy of those two takes an
 #                         equal share of the database's connections.
+#                         WEFT_DISPATCHER_MEMORY, WEFT_BROKER_MEMORY,
+#                         WEFT_LISTENER_MEMORY, WEFT_SUPERVISOR_MEMORY (the
+#                         memory of each copy of that role, from 512Mi to
+#                         4Gi; 1Gi for the dispatcher and 512Mi for the
+#                         others when unset), WEFT_HOLDER_MEMORY (each
+#                         holder's, at least 512Mi, 512Mi when unset).
 #   repository secrets    WEFT_DATABASE_URL (the Postgres the install keeps
 #                         everything in; not needed with the variable
 #                         WEFT_DATABASE set to cloud_sql, which gives the
@@ -95,13 +101,19 @@ jobs:
 
       # The optional sizes, handed to Terraform only when set: an unset
       # repository variable reads as an empty string, which Terraform
-      # refuses for a number, so an unset one leaves Terraform's default.
+      # refuses for a number or a memory size, so an unset one leaves
+      # Terraform's default.
       # SYNC: these TF_VAR_* names <-> deploy/terraform/gcp/variables.tf
       - name: the optional sizes
         env:
           CLOUD_SQL_MAX_CONNECTIONS: ${{ vars.WEFT_CLOUD_SQL_MAX_CONNECTIONS }}
           DISPATCHER_MAX_COPIES: ${{ vars.WEFT_DISPATCHER_MAX_COPIES }}
           BROKER_MAX_COPIES: ${{ vars.WEFT_BROKER_MAX_COPIES }}
+          DISPATCHER_MEMORY: ${{ vars.WEFT_DISPATCHER_MEMORY }}
+          BROKER_MEMORY: ${{ vars.WEFT_BROKER_MEMORY }}
+          LISTENER_MEMORY: ${{ vars.WEFT_LISTENER_MEMORY }}
+          SUPERVISOR_MEMORY: ${{ vars.WEFT_SUPERVISOR_MEMORY }}
+          HOLDER_MEMORY: ${{ vars.WEFT_HOLDER_MEMORY }}
         run: |
           set_if_given() {
             if [ -n "$2" ]; then
@@ -111,6 +123,11 @@ jobs:
           set_if_given TF_VAR_cloud_sql_max_connections "$CLOUD_SQL_MAX_CONNECTIONS"
           set_if_given TF_VAR_dispatcher_max_copies "$DISPATCHER_MAX_COPIES"
           set_if_given TF_VAR_broker_max_copies "$BROKER_MAX_COPIES"
+          set_if_given TF_VAR_dispatcher_memory "$DISPATCHER_MEMORY"
+          set_if_given TF_VAR_broker_memory "$BROKER_MEMORY"
+          set_if_given TF_VAR_listener_memory "$LISTENER_MEMORY"
+          set_if_given TF_VAR_supervisor_memory "$SUPERVISOR_MEMORY"
+          set_if_given TF_VAR_holder_memory "$HOLDER_MEMORY"
 
       - uses: actions/checkout@v7
 
@@ -210,12 +227,16 @@ jobs:
             exit 1
           fi
 
-      # The runtime image and the worker builder base this checkout names,
-      # pushed to the install's registry. Each is taken from the install's
-      # registry if there, else copied from the release's (the same tag is
-      # the same contents), else built. A fork carrying its own changes
-      # hashes to new tags and gets exactly its own runtime, made from the
-      # `weft-runtime` built above instead of compiled again in Docker.
+      # The runtime image, the worker builder base and the standard worker
+      # this checkout names, pushed to the install's registry. Each is taken
+      # from the install's registry if there, else copied from the
+      # release's (the same tag is the same contents), else built. A fork
+      # carrying its own changes hashes to new tags and gets exactly its
+      # own runtime, made from the `weft-runtime` built above instead of
+      # compiled again in Docker. The standard worker is the one every
+      # project whose nodes are all the standard library's runs, so the
+      # first of them after this update finds it ready and builds nothing
+      # (crates/weft-dispatcher/src/build/mod.rs, `built_whole`).
       - name: build the runtime's images
         env:
           BUILT_HERE: ${{ steps.release.outputs.found != 'yes' }}
@@ -425,6 +446,29 @@ jobs:
           key_secret=$(terraform output -raw install_key_secret)
           gcloud secrets versions access latest --secret "$key_secret" --project "${{ vars.GCP_PROJECT_ID }}" \
             | "$GITHUB_WORKSPACE/target/release/weft" catalog preload --dispatcher "$url" --key-stdin
+
+      # The CLI this run used (the release's for this exact source, or the
+      # one built above), stored in the install under that source's tree, so
+      # a project's deploy downloads it (`GET /install/cli/<tree>`, through
+      # scripts/release-cli.sh) instead of compiling it: a fork's CLI exists
+      # nowhere else. The deploy runs on the same runner as this job
+      # (ubuntu-24.04, x86_64), so this binary runs there. The sha256 goes
+      # last, since it is what says the CLI is whole, and only this source's
+      # CLI is kept: once the install runs it, no deploy asks for another.
+      # This workflow's account writes the bucket as the project's Owner.
+      # SYNC: install/cli/<tree>/{weft,sha256} <-> crates/weft-core/src/install.rs (install_cli_keys)
+      # SYNC: runs-on <-> crates/weft-cli/templates/ci/gcp.yml (runs-on)
+      - name: store the weft CLI in the install
+        working-directory: deploy/terraform/gcp
+        run: |
+          bucket=$(terraform output -raw files_bucket)
+          tree=$(git -C "$GITHUB_WORKSPACE" rev-parse 'HEAD^{tree}')
+          cli="$GITHUB_WORKSPACE/target/release/weft"
+          sha256sum "$cli" | cut -d' ' -f1 > "$RUNNER_TEMP/cli.sha256"
+          gcloud storage cp "$cli" "gs://$bucket/install/cli/$tree/weft"
+          gcloud storage cp "$RUNNER_TEMP/cli.sha256" "gs://$bucket/install/cli/$tree/sha256"
+          gcloud storage ls "gs://$bucket/install/cli/" | { grep -v "/install/cli/$tree/\$" || true; } \
+            | xargs -r gcloud storage rm --recursive
 
       # Written to the run's log as well as its summary: `gh run view`
       # shows the log, never the summary, and whoever installs from a

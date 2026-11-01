@@ -1,0 +1,30 @@
+{
+  "type": "ContainerFetch",
+  "label": "Container Fetch",
+  "description": "An e2e infra node: a container that downloads the file it is handed a link to and answers how many bytes it read. Used by the e2e rig to prove a project's own container opens a file's container link.",
+  "tags": [
+    "infra",
+    "e2e"
+  ],
+  "icon": "Server",
+  "color": "#22c55e",
+  "inputs": [
+    {
+      "name": "file",
+      "type": "Blob",
+      "label": "File",
+      "description": "The file the container downloads."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "size",
+      "type": "Number"
+    }
+  ],
+  "requiresInfra": true,
+  "images": [
+    "images/container_fetch"
+  ],
+  "features": {}
+}

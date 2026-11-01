@@ -175,6 +175,9 @@ jobs:
       # What the install workflow's targeted applies add for every
       # `moved` block, read from the files above.
       - run: scripts/terraform-moved-targets.test.sh
+      # Where a deploy finds its CLI: the install, then weft's release,
+      # then a build, with a fake web standing in for both.
+      - run: scripts/release-cli.test.sh
 
   # The name the main ruleset requires: green only when every Rust check
   # above is, and the Terraform the install runs validates. It runs whatever happened above (unless the run was
@@ -290,9 +293,11 @@ jobs:
       # The container's pure parts, on the standard library alone.
       - run: python3 catalog/postgres/database/images/credential/test_bootstrap.py
 
-  # Kilo Code's Tangle plugin (`tangle/kilo-code/`): its tests are
-  # TypeScript run straight by `node --test`, which strips the types
-  # itself from Node 22.18 on, so they need no install either.
+  # The Tangle plugins and hooks that decide what a specialist may run:
+  # Kilo Code's and OpenCode's tests are TypeScript run straight by
+  # `node`, which strips the types itself from Node 22.18 on, and Claude
+  # Code's and Codex's are Python on the standard library, so none of
+  # them needs an install.
   tangle:
     name: Tangle plugin tests
     runs-on: ubuntu-latest
@@ -302,6 +307,9 @@ jobs:
         with:
           node-version: 24
       - run: node --test tangle/kilo-code/tests/*.test.ts
+      - run: node tangle/opencode/tests/specialist-commands.test.ts
+      - run: python3 tangle/claude-code/tests/test_specialist_commands.py
+      - run: python3 tangle/codex/tests/test_specialist_commands.py
 
   # The browser extension ships to three stores gated only on a version
   # bump, so its checks belong in the same gate as everything else JS.

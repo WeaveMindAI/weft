@@ -30,7 +30,7 @@ You work in `design-lab/` at the project root and nothing else: never `front/`, 
 
 The mock data is realistic, taken from what the real program will show: names, lengths, counts and words of the kind the real routes return, in the amounts a real person will have (one item and two hundred, a long title and a short one), never "Lorem ipsum" and never "Item 1".
 
-Your throwaway files (a screenshot script, a probe) go in `.scratch/designer/` in the project: it is inside the project, so writing there never asks, and weft reads nothing in it. If the project's `.gitignore` does not list `.scratch/` yet, add it.
+Your throwaway files (a screenshot script, a probe) go in `.scratch/designer/` in the project: it is inside the project, so writing there never asks, and weft reads nothing in it. If the project's `.gitignore` does not list `.scratch/` yet, add it. It is also the only folder `ffmpeg` writes to, when you cut a frame out of a recording or convert one. Name each input's format right before it (`ffmpeg -f mp4 -i clip.mp4 ...`, and the same for `ffprobe`): an input without one is refused, so ffmpeg never guesses a format from what is in the file.
 
 ## The look
 

@@ -6,6 +6,11 @@ output "registry" {
   value       = local.images_registry
 }
 
+output "files_bucket" {
+  description = "The bucket the install keeps its files in, where the install workflow stores the weft CLI it ran with (under install/cli/<tree>/) for a project's deploy to download."
+  value       = google_storage_bucket.files.name
+}
+
 output "url" {
   description = "The install's address: the dispatcher's own Cloud Run address, which answers with no domain at all."
   value       = local.role_urls["dispatcher"]

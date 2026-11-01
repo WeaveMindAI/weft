@@ -85,8 +85,9 @@ pub enum PresignAudience {
     /// runtime does its own I/O on, which the workers reach it at too.
     Install,
     /// Somebody who reaches the store through the install's forwarder
-    /// ([`FILES_DOOR`]) at `base` (`https://<tunnel>`, or a site that passes
-    /// `/weft/...` on: `https://shop.example/weft`): sign for `base`'s host,
+    /// ([`FILES_DOOR`]) at `base` (`https://<tunnel>`, a site that passes
+    /// `/weft/...` on: `https://shop.example/weft`, or a local install's
+    /// internal port as its containers reach it): sign for `base`'s host,
     /// which the forwarder hands the store as `X-Forwarded-Host`, and answer
     /// the link under `base` ([`forwarded_link`]).
     Forwarded { base: String },
@@ -97,7 +98,7 @@ pub enum PresignAudience {
 /// `<store>/<bucket>/<object key>?<query>`), so a link signed for the
 /// install's public address reaches the bytes with every header (`Range`,
 /// `If-None-Match`) intact.
-// SYNC: FILES_DOOR <-> crates/weft-dispatcher/src/api/mod.rs (outside_caller_routes), packages/weft-connect/src/server/passthrough.ts PASSED_DOORS
+// SYNC: FILES_DOOR <-> crates/weft-dispatcher/src/api/mod.rs (FILES_DOOR_PATH), packages/weft-connect/src/server/passthrough.ts PASSED_DOORS
 pub const FILES_DOOR: &str = "files";
 
 /// The part of the bucket the forwarder passes on: the runtime files, and
@@ -1379,6 +1380,11 @@ mod tests {
         assert!(url(PresignAudience::Forwarded { base: "https://shop.example/weft".into() })
             .await
             .starts_with("https://shop.example/weft/files/a/b?"));
+        // A local install's containers, at its internal port as they
+        // reach it.
+        assert!(url(PresignAudience::Forwarded { base: "http://host.docker.internal:14113".into() })
+            .await
+            .starts_with("http://host.docker.internal:14113/files/a/b?"));
     }
 
     fn link(audience: PresignAudience) -> GetLink {

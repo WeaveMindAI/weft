@@ -172,10 +172,11 @@ who will open it:
 | Call | Use it when |
 |---|---|
 | `internal_link(&file)` | Code inside the install opens it: a script or a process your node runs on the worker. The link goes straight to storage, never out through a tunnel and back |
+| `container_link(&file)` | One of your project's own containers opens it: an infra unit your node hands the file to. Inside a container `127.0.0.1` is the container itself, so on a local install this link reaches your machine at `host.docker.internal`, through weft's internal port. On a cloud install it is the same link as `internal_link` |
 | `external_link(&file)` | Anything outside the install opens it: a browser, an app, a provider's API. This is the link a `Reply` puts in its answer in place of a file |
 | `external_file(&file)` | You are sending the file to an outside service: its external link when the open internet can open it, else a `data:` URL carrying the bytes, with the file's mime type and filename beside it |
 
-Both links come back as a `FileLink { url, public }`, where `public` says
+Every link comes back as a `FileLink { url, public }`, where `public` says
 whether the open internet can open `url`. An external link goes the first of
 these ways that exists:
 

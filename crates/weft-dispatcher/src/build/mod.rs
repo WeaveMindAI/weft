@@ -361,14 +361,9 @@ impl VersionBuilder {
             if !seen.insert(image.image_ref.clone()) {
                 continue;
             }
-            // A worker is only there once a build of it succeeded on the
-            // ledger, with the record of what it left out when its build
-            // reports one: one a failed read left in the registry, or one
-            // nothing here built, is built again, never run with its gaps
-            // unknown (registration reads that record, `ledger::left_out`).
             let recorded = image.kind == weft_compiler::build_plan::ImageKind::Worker;
             let there = self.images.image_exists(&image.image_ref).await?
-                && (!recorded || ledger::succeeded(&self.pool, &image.image_ref).await?);
+                && (!recorded || self.built_whole(&image.image_ref).await?);
             if !there {
                 stale.push(image.clone());
             }
@@ -393,6 +388,30 @@ impl VersionBuilder {
             }
         });
         answered.await.map_err(|_| anyhow!("the start of the project's images ended without an answer"))?
+    }
+
+    /// Whether the worker image `image_ref`, which the store holds, may run
+    /// as it is. A worker is only there once a build of it succeeded on the
+    /// ledger, with the record of what it left out when its build reports
+    /// one: one a failed read left in the store, or one nothing here built,
+    /// is built again, never run with its gaps unknown (registration reads
+    /// that record, `ledger::left_out`). The one exception is the standard
+    /// worker, which the install made ready as it was set up (`weft
+    /// build-images` on a cloud, `weft daemon start` on a machine), each of
+    /// which refuses one that left a package out: found with no build on
+    /// the ledger, it is recorded as built (`ledger::note_shared`), so the
+    /// first stock project after an update runs on it instead of building
+    /// it again. A build of it the ledger has on record (one that failed,
+    /// or one still running) is left as it stands.
+    async fn built_whole(&self, image_ref: &str) -> Result<bool> {
+        if ledger::succeeded(&self.pool, image_ref).await? {
+            return Ok(true);
+        }
+        if image_ref != prune::standard_worker_ref(self.images.as_ref())? {
+            return Ok(false);
+        }
+        ledger::note_shared(&self.pool, image_ref, crate::lease::now_unix()).await?;
+        ledger::succeeded(&self.pool, image_ref).await
     }
 
     /// [`Self::start_images`]' starts and the version written down as

@@ -35,7 +35,7 @@ fn builder_on(pool: &Pool, images: Arc<dyn ImageBuilder>) -> VersionBuilder {
         images,
         pool: pool.clone(),
         prunes: Default::default(),
-        blobs: weft_dispatcher::build::blob_cache::BlobCache::in_temp_dir(),
+        blobs: weft_dispatcher::build::blob_cache::BlobCache::in_temp_dir(false),
     }
 }
 
@@ -202,6 +202,30 @@ async fn present_images_are_skipped_without_the_gate(pool: Pool) {
     assert!(matches!(asked, VersionBuild::Ready { .. }), "nothing to wait on");
     assert!(fake.starts().is_empty());
     assert_eq!(gate.begun.load(Ordering::SeqCst), 0);
+}
+
+/// The standard worker the install made ready as it was set up is in the
+/// store with no build of it on the ledger: the first stock project runs
+/// on it, recorded as built, instead of building it again. Any other
+/// worker found that way is built again.
+#[weft_db_macros::test]
+async fn the_ready_standard_worker_is_used_without_a_build(pool: Pool) {
+    setup(&pool).await;
+    let fake = Arc::new(FakeImageBuilder::new());
+    let standard = weft_dispatcher::build::prune::standard_worker_ref(fake.as_ref()).unwrap();
+    let other = "fake.registry/weft-worker:unrecorded";
+    fake.set_image_exists(&standard);
+    fake.set_image_exists(other);
+    let builder = builder(&pool, fake.clone());
+    let gate = gate();
+    let asked = ask(&builder, &pool, uuid::Uuid::new_v4(), "standard", &[image(ImageKind::Worker, &standard)], gate.clone()).await.unwrap();
+    assert!(matches!(asked, VersionBuild::Ready { .. }), "the standard worker is there");
+    assert!(fake.starts().is_empty());
+    assert_eq!(gate.begun.load(Ordering::SeqCst), 0);
+    assert_eq!(status_of(&pool, &standard).await, "succeeded", "recorded as built");
+
+    waiting_on(ask(&builder, &pool, uuid::Uuid::new_v4(), "unrecorded", &[image(ImageKind::Worker, other)], gate).await.unwrap());
+    assert_eq!(fake.starts().len(), 1, "a worker nothing here built is built again");
 }
 
 /// A stale image is started once, and the request answers with

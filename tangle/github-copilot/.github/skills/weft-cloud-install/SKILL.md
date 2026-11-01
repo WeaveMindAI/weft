@@ -209,6 +209,16 @@ their provider. For how the share is worked out and the least each copy
 needs, go and read the cloud guide's section "How many connections the
 install takes".
 
+Four more set how much memory each copy of a role has:
+`WEFT_DISPATCHER_MEMORY` (1Gi when unset), `WEFT_BROKER_MEMORY`,
+`WEFT_LISTENER_MEMORY` and `WEFT_SUPERVISOR_MEMORY` (512Mi each when
+unset), a whole number of `Mi` or `Gi` from 512Mi to 4Gi, and
+`WEFT_HOLDER_MEMORY` for the copies that hold triggers' open connections
+(512Mi when unset, at least 512Mi). The install sets
+them on every run, so a value changed by hand in the Cloud Run console comes
+back to these on the next run: if the user wants a role to keep more memory,
+set the variable.
+
 Changing the tier, or setting or changing
 `WEFT_CLOUD_SQL_MAX_CONNECTIONS`, restarts weft's database once, and the
 workflow replaces nothing while anything on the install is on, so ask the

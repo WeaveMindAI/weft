@@ -33,7 +33,9 @@ concurrency:
 jobs:
   deploy:
     # A named release: `ubuntu-latest` moves to a new one on GitHub's
-    # schedule, under a workflow that worked the day before.
+    # schedule, under a workflow that worked the day before. The same as
+    # the install workflow's, whose CLI this job downloads and runs.
+    # SYNC: runs-on <-> .github/workflows/install-gcp.yml (runs-on, store the weft CLI in the install)
     runs-on: ubuntu-24.04
     env:
       # What happens to the runs going when the deploy replaces what they
@@ -54,10 +56,11 @@ jobs:
       # so an install upgraded since `weft target export` is followed here
       # with no setting to change. The CLI below is that weft's own (it
       # reads the project's nodes from this source), so what it sends is
-      # what the install expects. weft's release of that CLI is downloaded
-      # (waited for while it is still being built), otherwise it is built
-      # here from a cache that keeps the dependencies between runs, so a
-      # newer weft compiles only what changed in it.
+      # what the install expects. It is downloaded from the install itself,
+      # which stores the CLI its install workflow used, else from weft's
+      # release of that source (waited for while it is still being built),
+      # otherwise it is built here from a cache that keeps the dependencies
+      # between runs, so a newer weft compiles only what changed in it.
       - name: ask the install which weft it runs
         id: source
         run: |
@@ -82,7 +85,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if .weft/scripts/release-cli.sh .weft "$RUNNER_TEMP/weft"; then
+          if .weft/scripts/release-cli.sh .weft "$RUNNER_TEMP/weft" "${{ vars.WEFT_PUBLIC_URL }}"; then
             echo "$RUNNER_TEMP/weft" >> "$GITHUB_PATH"
             echo "found=yes" >> "$GITHUB_OUTPUT"
           else

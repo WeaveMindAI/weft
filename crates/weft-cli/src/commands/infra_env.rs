@@ -8,9 +8,11 @@
 //! Generic over nodes: the card is whatever the node's display (`/live`)
 //! serves. `--set NAME=Label` takes the item under that label, whatever
 //! its kind; `--as NAME` takes the card's only `secret` item. A node that
-//! hands its secret out once replaces that item with a line carrying a
-//! button (the Postgres database's "Reset password"); this refuses then
-//! and points at `weft infra press`, which presses it.
+//! hands its secret out once names what its reader presses once it holds
+//! it (`LiveItem::taken`), which this presses as soon as the file is
+//! written; from then on the node shows a line it marks handed over
+//! (`LiveItem::handed_over`), carrying a button, in its place (the Postgres database's "Reset password"), and this refuses and
+//! points at `weft infra press`, which presses it.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -92,11 +94,10 @@ enum Pick<'a> {
 
 /// Find an item in a card.
 ///
-/// A secret handed over already shows as another kind of item under the
-/// same label, carrying the button that makes it readable again, so a
-/// non-secret line with a button is that state, never a value to write.
-/// With no label, that item is recognized as the only one with a button,
-/// so a node with one secret works with `--as` whichever state it is in.
+/// A secret the node handed over already shows as a line the node marks
+/// so (`LiveItem::handed_over`), under the same label, carrying the button
+/// that makes a new one: that state is never a value to write. Any other
+/// line is its value, a plain line with a button included.
 fn pick<'a>(feed: &'a LiveFeed, want: &Want) -> Result<Pick<'a>> {
     let labels = |items: &[&LiveItem]| {
         items.iter().map(|i| format!("'{}'", i.label)).collect::<Vec<_>>().join(", ")
@@ -104,33 +105,40 @@ fn pick<'a>(feed: &'a LiveFeed, want: &Want) -> Result<Pick<'a>> {
     let all: Vec<&LiveItem> = feed.items.iter().collect();
     match want {
         Want::Label(label) => match feed.items.iter().find(|i| &i.label == label) {
-            Some(item) => match (&item.kind, &item.action) {
-                (LiveItemKind::Secret, _) | (_, None) => Ok(Pick::Value(item)),
-                (_, Some(action)) => Ok(Pick::HandedOver(item, action)),
-            },
+            Some(item) => as_picked(item),
             None if all.is_empty() => bail!("the node shows nothing, so there is no '{label}' to write"),
             None => bail!("the node shows no '{label}'; it shows {}", labels(&all)),
         },
+        // Every secret the card holds counts, whether it shows its value
+        // or has been handed over: with two, the one showing now is not
+        // necessarily the one asked for, so `--as` names neither and the
+        // line is named instead.
         Want::OnlySecret => {
-            let secrets: Vec<&LiveItem> = feed.items.iter().filter(|i| i.kind == LiveItemKind::Secret).collect();
+            let secrets: Vec<&LiveItem> =
+                feed.items.iter().filter(|i| i.kind == LiveItemKind::Secret || i.handed_over).collect();
             match secrets.as_slice() {
-                [only] => Ok(Pick::Value(only)),
-                [] => {
-                    let buttons: Vec<(&LiveItem, &LiveAction)> =
-                        feed.items.iter().filter_map(|i| Some((i, i.action.as_ref()?))).collect();
-                    match buttons.as_slice() {
-                        [(item, action)] => Ok(Pick::HandedOver(item, action)),
-                        _ if all.is_empty() => bail!("the node shows nothing, so there is no secret to write"),
-                        _ => bail!(
-                            "the node shows no secret right now; name the line with --set NAME=Label (it shows {})",
-                            labels(&all)
-                        ),
-                    }
-                }
+                [only] => as_picked(only),
+                [] if all.is_empty() => bail!("the node shows nothing, so there is no secret to write"),
+                [] => bail!("the node shows no secret right now; name the line with --set NAME=Label (it shows {})", labels(&all)),
                 many => bail!("the node shows several secrets; name each with --set NAME=Label ({})", labels(many)),
             }
         }
         Want::Door(_) => unreachable!("a door's address is read off the doors, not the card"),
+    }
+}
+
+/// `item` as what it gives: its value, or, for a secret the node handed
+/// over, the button that makes a new one. One marked handed over with no
+/// button leaves nothing to press, which is the node's mistake to name.
+fn as_picked(item: &LiveItem) -> Result<Pick<'_>> {
+    match (item.handed_over, &item.action) {
+        (false, _) => Ok(Pick::Value(item)),
+        (true, Some(action)) => Ok(Pick::HandedOver(item, action)),
+        (true, None) => bail!(
+            "the node shows '{}' as a secret it handed over, with no button to get a new one; its card says \"{}\"",
+            item.label,
+            item_text(item)
+        ),
     }
 }
 
@@ -292,6 +300,9 @@ pub async fn run(ctx: Ctx, args: EnvArgs) -> Result<()> {
     };
     let mut pairs = Vec::new();
     let mut written = Vec::new();
+    // The secrets their node hands out once, retired once the file holds
+    // them.
+    let mut taken = Vec::new();
     for (name, want) in &wanted {
         if let (Want::Door(endpoint), Some(doors)) = (want, &doors) {
             let address = door_address(doors, &card.place, args.instance.as_ref(), endpoint)?;
@@ -304,6 +315,7 @@ pub async fn run(ctx: Ctx, args: EnvArgs) -> Result<()> {
             Pick::HandedOver(item, action) => bail!("{}", handed_over(&card.place, item, action, ctx.on())),
         };
         let value = item_text(item);
+        taken.extend(item.taken_press());
         written.push(match item.kind {
             LiveItemKind::Secret => (name.clone(), None),
             _ => (name.clone(), Some(value.clone())),
@@ -311,6 +323,17 @@ pub async fn run(ctx: Ctx, args: EnvArgs) -> Result<()> {
         pairs.push((name.clone(), value));
     }
     write_env(&path, &pairs)?;
+    for press in &taken {
+        card.press(press).await.with_context(|| {
+            format!(
+                "{} is written, but {} refused to mark the secret it holds as taken (the cause is below: when the node \
+                 made a new one meanwhile, the file holds the old one); run this again, which writes what the card \
+                 shows now and retires it",
+                args.into.display(),
+                card.place
+            )
+        })?;
+    }
     let shown = args.into.display().to_string();
     let report = serde_json::json!({
         "file": shown,
@@ -369,7 +392,7 @@ mod tests {
     fn handed_over() -> LiveFeed {
         LiveFeed::new(vec![
             LiveItem::text("User", "weft"),
-            LiveItem::text("Password", "handed over").with_action(reset_button()),
+            LiveItem::text("Password", "handed over").as_handed_over().with_action(reset_button()),
         ])
     }
 
@@ -458,6 +481,34 @@ mod tests {
         let err = pick(&feed, &Want::OnlySecret).unwrap_err().to_string();
         assert!(err.contains("'A', 'B'"), "{err}");
         assert_eq!(pick(&feed, &label("B")).unwrap(), Pick::Value(&feed.items[1]));
+    }
+
+    /// A plain line with a button is its value, never a secret handed
+    /// over (a node's restart button on its status line, say), and it is
+    /// no secret for `--as` either.
+    #[test]
+    fn a_plain_line_with_a_button_is_its_value() {
+        let feed = LiveFeed::new(vec![
+            LiveItem::text("Shell", "running").with_action(LiveAction::new("Restart the shell", "restart_shell")),
+            LiveItem::secret("Key", "k"),
+        ]);
+        assert_eq!(pick(&feed, &label("Shell")).unwrap(), Pick::Value(&feed.items[0]));
+        assert_eq!(pick(&feed, &Want::OnlySecret).unwrap(), Pick::Value(&feed.items[1]));
+        let lost = LiveFeed::new(vec![LiveItem::text("Password", "gone").as_handed_over()]);
+        assert!(pick(&lost, &label("Password")).unwrap_err().to_string().contains("no button"));
+    }
+
+    /// A secret handed over still counts: `--as` never writes the other
+    /// one just because it is the only one showing its value.
+    #[test]
+    fn a_handed_over_secret_beside_another_one_needs_a_label() {
+        let feed = LiveFeed::new(vec![
+            LiveItem::text("Password", "handed over").as_handed_over().with_action(reset_button()),
+            LiveItem::secret("site password", "2").with_action(LiveAction::new("Reset password", "reset_password:site")),
+        ]);
+        let err = pick(&feed, &Want::OnlySecret).unwrap_err().to_string();
+        assert!(err.contains("'Password', 'site password'"), "{err}");
+        assert_eq!(pick(&feed, &label("site password")).unwrap(), Pick::Value(&feed.items[1]));
     }
 
     #[test]

@@ -140,8 +140,14 @@ pub struct DispatcherState {
     /// Programs already read and parsed, by project and definition hash
     /// (see [`DispatcherState::program`]): a definition never changes
     /// under its hash, so a busy route stops reading and parsing its
-    /// program on every call.
-    pub programs: Arc<weft_core::content_cache::ContentCache<(uuid::Uuid, String), weft_core::ProjectDefinition>>,
+    /// program on every call. Bounded by what they weigh
+    /// ([`PROGRAMS_JSON_BYTES`]), never by how many: an entry is anything
+    /// from a trigger's cut of a few kilobytes to a whole program of
+    /// megabytes (every build registers the program under a new hash, and
+    /// every run reads its own cut), so a count bounds nothing. The store's
+    /// own (`PostgresStore::programs`), which a search's pass reads through
+    /// too, so the bound is the whole process's.
+    pub programs: Programs,
     /// The rows every live call reads, held in memory and read again when
     /// they change (`crate::held`).
     pub held: Arc<crate::held::Held>,
@@ -158,6 +164,42 @@ pub struct DispatcherState {
     /// more and every event stream ends, so its followers open their
     /// stream again on a current copy. Never set on a machine.
     pub aside: weft_task_store::aside::StepAside,
+}
+
+/// Parsed programs by project and definition hash, bounded by what they
+/// weigh ([`programs_cache`]).
+pub type Programs = Arc<weft_core::content_cache::ContentCache<(uuid::Uuid, String), weft_core::ProjectDefinition>>;
+
+/// An empty [`Programs`], weighed by [`program_json_bytes`] and bounded by
+/// [`PROGRAMS_JSON_BYTES`].
+pub fn programs_cache() -> Programs {
+    Arc::new(weft_core::content_cache::ContentCache::weighed(PROGRAMS_JSON_BYTES, program_json_bytes))
+}
+
+/// How many bytes of JSON the programs a dispatcher keeps parsed
+/// ([`DispatcherState::programs`]) may weigh together
+/// ([`program_json_bytes`]). A parsed program holds about three times its
+/// JSON (`tests/resync_memory.rs` measures it), so they hold about 90 MiB
+/// at most, inside the 512Mi a dispatcher is never given less than.
+pub const PROGRAMS_JSON_BYTES: usize = 32 * 1024 * 1024;
+
+/// What `program` weighs in [`DispatcherState::programs`]: the length of
+/// its JSON, counted as it is written out, nothing kept. Run once per
+/// program read from the store, never on a cache hit.
+pub fn program_json_bytes(program: &weft_core::ProjectDefinition) -> usize {
+    struct Counted(usize);
+    impl std::io::Write for Counted {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counted = Counted(0);
+    serde_json::to_writer(&mut counted, program).expect("a program read from its JSON writes back as JSON");
+    counted.0
 }
 
 /// The base for outside URLs of one answer

@@ -25,6 +25,12 @@ use weft_core::program::{RunPage, RunSummary, RunStatus};
 /// signals, an answer writes its run), so one value implements all four.
 pub struct PostgresStore {
     pool: Pool,
+    /// The programs read from the database, parsed, by project and hash:
+    /// the process's one copy of each, which the dispatcher reads through
+    /// (`DispatcherState::programs`) and a search's pass too
+    /// (`crate::search_index::index_queued`), so their bound
+    /// (`crate::state::PROGRAMS_JSON_BYTES`) is the process's.
+    programs: crate::state::Programs,
 }
 
 /// The `run.phase` column as a phase. The column is NOT NULL and only
@@ -131,7 +137,12 @@ impl PostgresStore {
     /// included) is applied once, before construction, by the boot's one
     /// schema pass.
     pub fn from_pool(pool: Pool) -> Self {
-        Self { pool }
+        Self { pool, programs: crate::state::programs_cache() }
+    }
+
+    /// The process's one cache of parsed programs ([`Self::programs`]).
+    pub fn programs(&self) -> &crate::state::Programs {
+        &self.programs
     }
 
     /// Expose the inner pool for sibling modules (lease manager,
@@ -1454,7 +1465,7 @@ impl RunStore for PostgresStore {
         // once it ended, here, by the first listing that reads one
         // (`crate::search_index`).
         if query.node.is_some() || query.search.is_some() {
-            crate::search_index::index_queued(&self.pool).await?;
+            crate::search_index::index_queued(&self.pool, &self.programs).await?;
         }
         // SYNC: list_runs (status clause) <-> crates/weft-core/src/program.rs RunStatus
         let where_clause = "r.tenant_id = $1 \

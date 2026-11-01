@@ -268,6 +268,12 @@ fn standard_worker_hash(images: &dyn weft_platform_traits::ImageBuilder) -> Resu
     weft_compiler::build::stock_binary_hash(&images.worker_packaging()).map_err(|e| anyhow::anyhow!("the standard worker's hash: {e}"))
 }
 
+/// Where this weft's standard worker is in `images`' store: the image
+/// every project whose nodes are all the standard library's builds to.
+pub fn standard_worker_ref(images: &dyn weft_platform_traits::ImageBuilder) -> Result<String> {
+    Ok(images.image_ref(&weft_compiler::build::worker_image_tag(&standard_worker_hash(images)?)))
+}
+
 /// How many of a project's earlier builds stay beside the current one,
 /// so going back one edit does not recompile.
 pub const PREVIOUS_BUILDS_KEPT: usize = 1;
@@ -410,7 +416,7 @@ async fn reclaim(state: &crate::state::DispatcherState, projects: &BTreeSet<uuid
     let keep = keep_set(&state.pg_pool.get().await.context("a connection to read the keep-set")?, ImageScope::All, images).await?;
     // The standard worker a newer weft replaced goes too: the current one
     // is recorded (and kept by the keep-set), earlier ones are not kept.
-    let standard = images.image_ref(&weft_compiler::build::worker_image_tag(&standard_worker_hash(images)?));
+    let standard = standard_worker_ref(images)?;
     if state.builder.images.image_exists(&standard).await? {
         super::ledger::note_shared(&state.pg_pool, &standard, crate::lease::now_unix()).await?;
     }

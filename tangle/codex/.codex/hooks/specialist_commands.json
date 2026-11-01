@@ -21,7 +21,19 @@
       "weft files inspect",
       "weft tree",
       "weft diff",
-      "weft examples"
+      "weft examples",
+      {
+        "prefix": "grep",
+        "check": "grep"
+      },
+      {
+        "prefix": "rg",
+        "check": "rg"
+      },
+      {
+        "prefix": "ffprobe",
+        "check": "ffprobe"
+      }
     ]
   },
   "red-teamer": {
@@ -30,7 +42,15 @@
       "weft validate",
       "weft parse",
       "weft status",
-      "weft daemon logs"
+      "weft daemon logs",
+      {
+        "prefix": "grep",
+        "check": "grep"
+      },
+      {
+        "prefix": "rg",
+        "check": "rg"
+      }
     ]
   },
   "group-builder": {
@@ -46,7 +66,25 @@
       "weft logs",
       "weft runs",
       "weft status",
-      "weft daemon logs"
+      "weft daemon logs",
+      "weft stop",
+      {
+        "prefix": "grep",
+        "check": "grep"
+      },
+      {
+        "prefix": "rg",
+        "check": "rg"
+      },
+      {
+        "prefix": "ffprobe",
+        "check": "ffprobe"
+      },
+      {
+        "prefix": "ffmpeg",
+        "check": "ffmpeg",
+        "writes_under": ".scratch/group-builder"
+      }
     ]
   },
   "node-smith": {
@@ -86,7 +124,25 @@
       "weft infra logs",
       "weft infra show",
       "weft infra press",
-      "weft infra terminate"
+      "weft infra terminate",
+      "weft stop",
+      {
+        "prefix": "grep",
+        "check": "grep"
+      },
+      {
+        "prefix": "rg",
+        "check": "rg"
+      },
+      {
+        "prefix": "ffprobe",
+        "check": "ffprobe"
+      },
+      {
+        "prefix": "ffmpeg",
+        "check": "ffmpeg",
+        "writes_under": ".scratch/node-smith"
+      }
     ]
   },
   "prompt-engineer": {
@@ -98,7 +154,16 @@
       "weft wait",
       "weft events",
       "weft status",
-      "weft daemon logs"
+      "weft daemon logs",
+      "weft stop",
+      {
+        "prefix": "grep",
+        "check": "grep"
+      },
+      {
+        "prefix": "rg",
+        "check": "rg"
+      }
     ]
   },
   "frontend-builder": {
@@ -122,7 +187,25 @@
       "weft run",
       "weft wait",
       "weft status",
-      "weft daemon logs"
+      "weft daemon logs",
+      "weft stop",
+      {
+        "prefix": "grep",
+        "check": "grep"
+      },
+      {
+        "prefix": "rg",
+        "check": "rg"
+      },
+      {
+        "prefix": "ffprobe",
+        "check": "ffprobe"
+      },
+      {
+        "prefix": "ffmpeg",
+        "check": "ffmpeg",
+        "writes_under": ".scratch/frontend-builder"
+      }
     ]
   },
   "designer": {
@@ -134,7 +217,24 @@
       "pnpm dlx shadcn-svelte@",
       "pnpm --dir design-lab exec playwright",
       "pnpm --dir design-lab exec node",
-      "python3 .codex/scripts/stop_server.py"
+      "python3 .codex/scripts/stop_server.py",
+      {
+        "prefix": "grep",
+        "check": "grep"
+      },
+      {
+        "prefix": "rg",
+        "check": "rg"
+      },
+      {
+        "prefix": "ffprobe",
+        "check": "ffprobe"
+      },
+      {
+        "prefix": "ffmpeg",
+        "check": "ffmpeg",
+        "writes_under": ".scratch/designer"
+      }
     ]
   },
   "deployer": {
@@ -177,6 +277,15 @@
             "set"
           ]
         ]
+      },
+      "weft daemon logs",
+      {
+        "prefix": "grep",
+        "check": "grep"
+      },
+      {
+        "prefix": "rg",
+        "check": "rg"
       }
     ]
   }

@@ -1008,6 +1008,7 @@ mod fake {
             // not open.
             let link = match reach {
                 LinkReach::Internal => FileLink { url: format!("http://fake-bucket/runtime/{key}?ttl={ttl}"), public: false },
+                LinkReach::Container => FileLink { url: format!("http://fake-containers/files/runtime/{key}?ttl={ttl}"), public: false },
                 LinkReach::External => FileLink { url: format!("http://fake-install/files/runtime/{key}?ttl={ttl}"), public: false },
             };
             Ok(LinkAnswer { link, file })

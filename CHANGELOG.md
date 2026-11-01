@@ -4,6 +4,90 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-11-01 (0.2.285)
+
+**What breaks after this update:**
+
+**A database's password is handed over once to whoever takes it.** `weft infra
+env` writing it into a file, or the card's copy button, now hands it over the
+way a run storing it does: the card shows it as handed over from then on, and
+its Reset button mints a new one.
+
+**`weft infra env --as` names the secret it writes.** On a card with more than
+one secret (a database with a `login` role), `--as` used to take whichever one
+still showed its value; it now refuses and lists them, and `--set
+NAME=Label` picks one.
+
+**Tangle's specialists write `cd` and ffmpeg a little differently.** After
+`weft tangle update` in a project, a specialist changes folder only as `cd
+./<folder>`, and names each ffmpeg or ffprobe input's format right before it
+(`ffmpeg -f mp4 -i clip.mp4 ...`); any other form is refused, with a message
+showing this one. In return they may now search the project with `grep` and
+`rg`, look at media with `ffprobe` and make it with `ffmpeg` into their own
+scratch folder, read a database with a read-only `psql` transaction (`psql
+<connection> -c "BEGIN TRANSACTION READ ONLY" -c "<one SELECT, SHOW or
+EXPLAIN>"`), and stop a run they started with `weft stop`, without asking you.
+The commands they may run are now read the way your shell reads them, bash or
+zsh, so a line that only looked harmless is refused.
+
+**On Linux, weft's internal port no longer listens on every address of your
+machine.** It listens on loopback and on the one address Docker gives your
+containers for this machine, which weft asks Docker each time it starts, so
+nothing on your network reaches it any more.
+
+**The rest:**
+
+**A PostgresDatabase makes the roles your program needs.** Since the program
+signs in as `app`, which is no superuser, a database that kept tenants apart
+with roles of its own could no longer make them, `set role` to them, or let a
+site sign in as one, and a setup step writing past a `FORCE` row-level
+security policy was refused. List them in the node's new `roles` input: on
+every start the database makes each one, grants it to `app` (so `set role`
+works), lets one marked `login` sign in through the pooler with a password of
+its own, handed out once like the program's (`weft infra env <node> --into
+.env --set SITE_PASSWORD="<role> password"` takes it, and its Reset button on
+the card mints a new one), and lets one marked
+`bypassRowLevelSecurity` write past every policy. Roles you made by hand keep
+what they own; list them under the same names and the database takes them
+over, except that a `login` role gets a password of its own, so whatever signs
+in as it needs the new one from the card. Taking a role off the list takes back
+what it gave: `app` can no longer `set role` to it, and it signs in and passes
+row-level security no more; the role and what it owns stay. Changing the list
+restarts the database.
+
+**A cloud dispatcher fits in its memory, and keeps the memory you give it.**
+On Cloud Run a role's files are held in its memory, and the dispatcher kept
+up to 1GiB of a build's files there, and 64 programs whatever their size;
+past 512Mi a resync failed with `Service Unavailable`. It now keeps at most
+64MiB of those files there and about 90MiB of programs. The dispatcher gets
+1Gi by default, and each role's memory is a repository variable on your fork
+(`WEFT_DISPATCHER_MEMORY`, `WEFT_BROKER_MEMORY`, `WEFT_LISTENER_MEMORY`,
+`WEFT_SUPERVISOR_MEMORY`, and `WEFT_HOLDER_MEMORY` for the holders): a value set by hand in the Cloud Run console used
+to be put back to 512Mi by every install run, and now the install sets yours.
+
+**A fork's deploy no longer compiles the weft CLI.** The install workflow now
+keeps the CLI it used in your install, and the deploy workflow downloads it
+from there first, checking its sha256, before weft's release and before
+compiling it. Run `weft ci add` again in each project to get the new deploy
+workflow, and the install workflow once, to store the CLI.
+
+**The first project of standard nodes after a cloud update starts at once.**
+The install already built the standard worker, and that project built it
+again, waiting about three minutes; it now runs on the one the install built.
+
+**A node can hand a stored file to its project's own container.** On a local
+install an `internal_link` points at `127.0.0.1`, which inside a container is
+the container itself, so a download from there failed. A node's code now asks
+for `container_link(&file)`, which a project's own container opens on any
+install.
+
+**`weft daemon start` on a Mac says why launchd refused.** The error now
+carries everything `launchctl` printed and its exit status, where it used to
+end at `launchctl bootstrap failed:`. What fails before the runtime even
+starts (a secrets file it cannot read, a binary gone) now lands in the
+install's log, and so does a runtime's panic after its log has rolled over,
+which used to go to a file nobody reads.
+
 ## 2026-11-01 (0.2.284)
 
 **What breaks after this update:**

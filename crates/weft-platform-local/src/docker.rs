@@ -426,6 +426,61 @@ pub fn host_gateway_args() -> [String; 2] {
     ["--add-host".into(), "host.docker.internal:host-gateway".into()]
 }
 
+/// The address the project's containers reach this machine at, when they
+/// reach it somewhere other than loopback: what the engine resolves
+/// `host-gateway` to, asked of the engine itself in a throwaway container
+/// of `image` (the runtime's own image, which the install already has, so
+/// nothing is pulled), since a daemon setting (`host-gateway-ip`) can move
+/// it off the default bridge. Asked on every start of the runtime, so a
+/// change to Docker's network is picked up by the next start.
+///
+/// Where it is an address of this machine, the engine runs on this
+/// machine's own kernel (Linux) and a container's call comes in on that
+/// bridge: weft's internal port listens there too, and only there beside
+/// loopback, so the machine's network never reaches it. Where it is not,
+/// the engine runs in a machine of its own (Docker Desktop and the like),
+/// which brings a container's call to this machine's loopback: `None`.
+/// Refused, naming the probe, when the engine names no address at all.
+pub async fn containers_call_in_at(docker: &dyn Docker, image: &str) -> anyhow::Result<Option<std::net::IpAddr>> {
+    let [flag, host] = host_gateway_args();
+    let args: Vec<String> =
+        ["run", "--rm", &flag, &host, "--entrypoint", "getent", image, "hosts", "host.docker.internal"].map(String::from).into();
+    let answer = docker
+        .exec(&args)
+        .await?
+        .ok(&args)
+        .map_err(|e| e.context("ask Docker which address the project's containers reach this machine at"))?;
+    containers_address(&answer, image, |address| std::net::TcpListener::bind((address, 0)).map(drop))
+}
+
+/// [`containers_call_in_at`]'s decision on what the probe printed
+/// (`getent hosts`: `172.17.0.1  host.docker.internal`), with `bind`
+/// trying the address (a bind succeeds only on an address this machine
+/// has, and an address it does not have is the one refusal that means the
+/// engine runs elsewhere; any other refusal is said).
+fn containers_address(
+    answer: &str,
+    image: &str,
+    bind: impl Fn(std::net::IpAddr) -> std::io::Result<()>,
+) -> anyhow::Result<Option<std::net::IpAddr>> {
+    let Some(address) = answer.split_whitespace().next().and_then(|word| word.parse().ok()) else {
+        anyhow::bail!(
+            "Docker named no address for this machine as its containers reach it (`host-gateway` gave {:?}), so they \
+             could not reach weft's internal port; check that `docker run --rm --add-host \
+             host.docker.internal:host-gateway --entrypoint getent {image} hosts host.docker.internal` prints an address",
+            answer.trim()
+        );
+    };
+    match bind(address) {
+        Ok(()) => Ok(Some(address)),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => Ok(None),
+        Err(e) => anyhow::bail!(
+            "Docker says its containers reach this machine at {address}, which is this machine's, but weft cannot listen \
+             there ({e}), so they could not reach weft's internal port"
+        ),
+    }
+}
+
 /// The network every container weft starts joins, so an infra container
 /// reaches another by name.
 pub const NETWORK: &str = "weft";
@@ -516,6 +571,25 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The containers' address is used when this machine has it, left out
+    /// when the engine runs elsewhere (the address is not this machine's),
+    /// and refused when Docker names none or the address cannot be listened
+    /// on for another reason.
+    #[test]
+    fn the_containers_address_is_this_machine_s_or_none() {
+        let gateway: std::net::IpAddr = [172, 17, 0, 1].into();
+        let answer = "172.17.0.1      host.docker.internal\n";
+        assert_eq!(containers_address(answer, "img", |_| Ok(())).unwrap(), Some(gateway));
+        let elsewhere = containers_address(answer, "img", |_| Err(std::io::ErrorKind::AddrNotAvailable.into())).unwrap();
+        assert_eq!(elsewhere, None);
+        let denied = containers_address(answer, "img", |_| Err(std::io::ErrorKind::PermissionDenied.into())).unwrap_err();
+        assert!(denied.to_string().contains("cannot listen there"), "{denied}");
+        for none in ["", "host.docker.internal"] {
+            let refused = containers_address(none, "img", |_| Ok(())).unwrap_err();
+            assert!(refused.to_string().contains("--entrypoint getent img hosts"), "{refused}");
+        }
+    }
 
     #[tokio::test]
     async fn a_container_already_going_counts_as_removed() {

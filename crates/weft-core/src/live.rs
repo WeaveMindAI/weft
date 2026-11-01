@@ -152,6 +152,25 @@ pub struct LiveItem {
     pub data: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<LiveAction>,
+    /// On a secret a node hands out once: the action kind a reader presses
+    /// as soon as it has copied the value out (`weft infra env` writing it
+    /// into a file, the editor's copy button), sending the value it took as
+    /// the press's payload ([`LiveItem::taken_press`]), so the node retires
+    /// only a value its taker really holds. The node then shows the secret
+    /// as handed over until it makes a new one.
+    // SYNC: taken <-> packages/weft-graph/src/protocol.ts LiveDataItem.taken,
+    //       packages/weft-graph/src/webview/lib/components/project/ProjectNode.svelte (takenFrom),
+    //       catalog/postgres/database/images/credential/bootstrap.py (TAKEN_ACTION, taken)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taken: Option<String>,
+    /// The line standing where such a secret was once it was handed over:
+    /// its value is gone from the display, and its button (`action`) is
+    /// the one that makes a new one. Said by the node, never read off the
+    /// line's shape: a plain line with a button is just that.
+    // SYNC: handedOver <-> packages/weft-graph/src/protocol.ts LiveDataItem.handedOver,
+    //       catalog/postgres/database/images/credential/bootstrap.py (password_item)
+    #[serde(default, rename = "handedOver", skip_serializing_if = "std::ops::Not::not")]
+    pub handed_over: bool,
 }
 
 impl LiveItem {
@@ -183,7 +202,7 @@ impl LiveItem {
     }
 
     fn of(kind: LiveItemKind, label: impl Into<String>, data: Value) -> Self {
-        Self { kind, label: label.into(), data, action: None }
+        Self { kind, label: label.into(), data, action: None, taken: None, handed_over: false }
     }
 
     /// Is this item's `data` the shape its kind draws?
@@ -231,6 +250,33 @@ impl LiveItem {
     pub fn with_action(mut self, action: LiveAction) -> Self {
         self.action = Some(action);
         self
+    }
+
+    /// Mark this secret as one its reader retires by pressing `kind` once
+    /// it holds the value ([`Self::taken`]).
+    pub fn taken_by(mut self, kind: impl Into<String>) -> Self {
+        self.taken = Some(kind.into());
+        self
+    }
+
+    /// Mark this line as the one standing where a secret was handed over
+    /// ([`Self::handed_over`]).
+    pub fn as_handed_over(mut self) -> Self {
+        self.handed_over = true;
+        self
+    }
+
+    /// What a reader that copied this item's value out presses to say so,
+    /// with the value as its proof, or `None` for an item nobody retires
+    /// (only a secret is ever retired this way).
+    // SYNC: taken_press <-> packages/weft-graph/src/webview/lib/components/project/ProjectNode.svelte (the secret's copy button),
+    //       catalog/postgres/database/images/credential/bootstrap.py (TAKEN_ACTION)
+    pub fn taken_press(&self) -> Option<LivePress> {
+        if self.kind != LiveItemKind::Secret {
+            return None;
+        }
+        let kind = self.taken.clone()?;
+        Some(LivePress { kind, payload: serde_json::json!({ "value": self.data }) })
     }
 }
 
@@ -368,6 +414,30 @@ mod live_wire_tests {
             feed.items[0].action,
             Some(LiveAction::new("Cancel restore", "cancel"))
         );
+    }
+
+    /// A secret handed out once names what its reader presses, and the
+    /// press carries the value taken; an item with none is never pressed.
+    #[test]
+    fn a_secret_handed_out_once_is_retired_with_the_value_taken() {
+        let sent = serde_json::json!({
+            "items": [{ "type": "secret", "label": "Password", "data": "pw", "taken": "password_taken" }]
+        });
+        let feed = LiveFeed::from_answer(&sent).expect("the envelope is right");
+        assert_eq!(feed.items[0], LiveItem::secret("Password", "pw").taken_by("password_taken"));
+        assert_eq!(serde_json::to_value(&feed).unwrap(), sent);
+        assert_eq!(
+            feed.items[0].taken_press(),
+            Some(LivePress { kind: "password_taken".into(), payload: serde_json::json!({ "value": "pw" }) })
+        );
+        assert_eq!(LiveItem::secret("API key", "k").taken_press(), None);
+        let mut text = LiveItem::text("Password", "pw");
+        text.taken = Some("password_taken".into());
+        assert_eq!(text.taken_press(), None, "only a secret is retired by its reader");
+        let gone = LiveItem::text("Password", "handed over").as_handed_over();
+        assert_eq!(serde_json::to_value(&gone).unwrap()["handedOver"], true);
+        assert_eq!(serde_json::from_value::<LiveItem>(serde_json::to_value(&gone).unwrap()).unwrap(), gone);
+        assert!(serde_json::to_value(LiveItem::text("Phone", "paired")).unwrap().get("handedOver").is_none());
     }
 
     #[test]

@@ -1,0 +1,12 @@
+# A project's own container downloads a stored file. ContainerFetch (a
+# project-local infra node under nodes/container_fetch/) runs a tiny HTTP
+# server in a container; its run asks for the file's container link and
+# hands it to that server, which downloads it and answers how many bytes it
+# got. The node starts with NO `file` set: the test writes one
+# `@asset("assets/data.bin", Blob)` line, and asserts the count the
+# container read equals the payload it wrote.
+
+fetch = ContainerFetch
+
+out = Debug
+out.data = fetch.size
