@@ -4,6 +4,24 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-11-01 (39a50c84)
+
+**Triggers come back after an update again.** Since 0.2.281, the triggers
+`weft maintenance on` took down could stay down: `weft resync` warned "a
+resync or the maintenance lift activated outside the task that drives it;
+this is a bug in weft" for each of them, and running it again changed
+nothing. Both `weft maintenance off` and the `weft resync` that brings back
+what a lift left now bring them back. If you updated to 0.2.281 or 0.2.282
+and your triggers are still down, run `weft resync` in the project once you
+are on this version. A trigger renamed or removed since it was last on is no
+longer brought back with the others: the lift says it is no trigger of the
+program any more and forgets it, where it used to fail the whole group with
+it.
+
+**A resync no longer waits forever on a run that already ended.** A run that
+ended in the moment a resync (or a deactivate) started waiting on it was never
+heard ending, so the wait never finished and the new version never took over.
+
 ## 2026-10-31 (0.2.282)
 
 **What breaks after this update:**
