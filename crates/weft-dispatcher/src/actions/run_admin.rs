@@ -186,16 +186,23 @@ pub async fn wake(state: &DispatcherState, actor: &Actor, run_id: RunId, node: &
     // answers with nothing, and the refusal below names the kind without
     // this tier ever knowing one.
     let payload = state.listener.wake_by_hand(&wait.token).await.map_err(failed("ask what it wakes with"))?;
-    let Some(payload) = payload else {
-        return Err((
+    let payload = woken_with(&wait, payload)?;
+    crate::api::signal::fire_registered_signal(state, &wait.token, payload).await
+}
+
+/// What `wait` is woken with: the payload its kind's listener answered
+/// (`wake_by_hand`), or, when the kind answered nothing because it expects
+/// a value, the refusal that says to answer it instead.
+fn woken_with(wait: &ParkedWait, payload: Option<serde_json::Value>) -> Result<serde_json::Value, Refused> {
+    payload.ok_or_else(|| {
+        (
             StatusCode::CONFLICT,
             format!(
                 "'{}' is waiting on a {} signal, which expects a value; answer it (its form, in the browser extension or through its signal URL) instead of waking it",
                 wait.node, wait.kind
             ),
-        ));
-    };
-    crate::api::signal::fire_registered_signal(state, &wait.token, payload).await
+        )
+    })
 }
 
 /// The one of `waits` (the waits of `run_id` at the place `spelled`, a
@@ -755,27 +762,10 @@ fn within_value_limits(refs: &[weft_core::record_ref::ValueRef]) -> Result<(), R
 /// (a seeded run's inherited value is kept in the run it came from), of
 /// the same project only. Only the rows the references name are read.
 pub async fn values(state: &DispatcherState, actor: &Actor, run_id: RunId, refs: Vec<weft_core::record_ref::ValueRef>) -> Result<weft_core::program::ValuesAnswer, Refused> {
-    use std::collections::{BTreeMap, BTreeSet};
-    use weft_core::record_ref::ValueRef;
+    use std::collections::BTreeSet;
     within_value_limits(&refs)?;
     let owner = authorize(state, actor, run_id).await?;
-    // Every row each run is read at, and whether its birth is.
-    let mut rows: BTreeMap<RunId, BTreeSet<i32>> = BTreeMap::new();
-    let mut births: BTreeSet<RunId> = BTreeSet::new();
-    fn bases(at: &ValueRef, rows: &mut BTreeMap<RunId, BTreeSet<i32>>, births: &mut BTreeSet<RunId>) {
-        match at {
-            ValueRef::Row { run, seq, .. } => {
-                rows.entry(*run).or_default().insert(*seq);
-            }
-            ValueRef::Given { run, .. } => {
-                births.insert(*run);
-            }
-            ValueRef::Part { of, .. } => bases(of, rows, births),
-            ValueRef::List { items } => items.iter().for_each(|item| bases(item, rows, births)),
-            ValueRef::Written { .. } => {}
-        }
-    }
-    refs.iter().for_each(|at| bases(at, &mut rows, &mut births));
+    let (rows, births) = bases(&refs);
     let runs: BTreeSet<RunId> = rows.keys().copied().chain(births.iter().copied()).collect();
     // The runs whose record exists: a row missing from one of them is a
     // reference the record disagrees with, a run erased is gone.
@@ -793,13 +783,7 @@ pub async fn values(state: &DispatcherState, actor: &Actor, run_id: RunId, refs:
         }
     }
     // What each row kept, by its place, and what each birth was given.
-    let mut kept: std::collections::HashMap<(RunId, i32, u32), weft_journal::RunEvent> = std::collections::HashMap::new();
-    for (run, seqs) in rows {
-        let seqs: Vec<i32> = seqs.into_iter().collect();
-        let record = state.runs.record_rows(run, &seqs).await.map_err(failed("values: read the record"))?;
-        let decoded = weft_journal::on_blocking_pool(move || record.decode(run)).await.map_err(|why| (StatusCode::INTERNAL_SERVER_ERROR, why))?;
-        kept.extend(decoded.into_iter().map(|row| ((run, row.seq, row.index), row.event)));
-    }
+    let kept = kept_rows(state.runs.as_ref(), rows).await?;
     let mut born: std::collections::HashMap<RunId, weft_journal::RunEvent> = std::collections::HashMap::new();
     for run in births {
         let birth = crate::projection::run_birth(state, run).await.map_err(failed("values: read a run's birth"))?.map_err(|why| (StatusCode::INTERNAL_SERVER_ERROR, why))?;
@@ -808,6 +792,44 @@ pub async fn values(state: &DispatcherState, actor: &Actor, run_id: RunId, refs:
         }
     }
     Ok(weft_core::program::ValuesAnswer { values: resolved(&refs, &existing, &kept, &born) })
+}
+
+/// The record rows `refs` read, by run, and the runs whose birth they
+/// read a given value of.
+fn bases(refs: &[weft_core::record_ref::ValueRef]) -> (std::collections::BTreeMap<RunId, std::collections::BTreeSet<i32>>, std::collections::BTreeSet<RunId>) {
+    use weft_core::record_ref::ValueRef;
+    fn walk(at: &ValueRef, rows: &mut std::collections::BTreeMap<RunId, std::collections::BTreeSet<i32>>, births: &mut std::collections::BTreeSet<RunId>) {
+        match at {
+            ValueRef::Row { run, seq, .. } => {
+                rows.entry(*run).or_default().insert(*seq);
+            }
+            ValueRef::Given { run, .. } => {
+                births.insert(*run);
+            }
+            ValueRef::Part { of, .. } => walk(of, rows, births),
+            ValueRef::List { items } => items.iter().for_each(|item| walk(item, rows, births)),
+            ValueRef::Written { .. } => {}
+        }
+    }
+    let (mut rows, mut births) = Default::default();
+    refs.iter().for_each(|at| walk(at, &mut rows, &mut births));
+    (rows, births)
+}
+
+/// What each of `rows` (record rows, by run) kept, by run and place, read
+/// off `runs`.
+async fn kept_rows(
+    runs: &dyn crate::store::RunStore,
+    rows: std::collections::BTreeMap<RunId, std::collections::BTreeSet<i32>>,
+) -> Result<std::collections::HashMap<(RunId, i32, u32), weft_journal::RunEvent>, Refused> {
+    let mut kept = std::collections::HashMap::new();
+    for (run, seqs) in rows {
+        let seqs: Vec<i32> = seqs.into_iter().collect();
+        let record = runs.record_rows(run, &seqs).await.map_err(failed("values: read the record"))?;
+        let decoded = weft_journal::on_blocking_pool(move || record.decode(run)).await.map_err(|why| (StatusCode::INTERNAL_SERVER_ERROR, why))?;
+        kept.extend(decoded.into_iter().map(|row| ((run, row.seq, row.index), row.event)));
+    }
+    Ok(kept)
 }
 
 /// What each of `refs` reads, given the runs whose record exists
@@ -1190,11 +1212,30 @@ mod waits_tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(why.contains("in iterations 0.0, 1.2; say which with `--iteration`"), "{why}");
         assert_eq!(pick_wait(&waits[..1], None, None, 2, "lp.ask", mine).unwrap().token, "t0", "one wait needs no record");
-        assert_eq!(pick(&[], None).unwrap_err().0, StatusCode::NOT_FOUND);
         // A wait the record does not hold yet is listed by its token, and
         // no iteration picks it.
         let (_, why) = pick_wait(&waits, Some(&HashMap::new()), None, 2, "lp.ask", mine).unwrap_err();
         assert!(why.contains("wait t0 (not on the run's record yet)"), "{why}");
+    }
+
+    /// A wake at a node that holds no wait in the run is refused with a
+    /// 404 saying so and pointing at what the node did; a wait whose kind
+    /// answers nothing to a wake by hand (a form, which expects a value)
+    /// is refused with a 409 saying to answer it instead, while a kind that
+    /// answers (a timer) is woken with what it answered.
+    #[test]
+    fn a_wake_refuses_a_node_not_waiting_and_a_wait_that_expects_a_value() {
+        let mine = RunId::new_v4();
+        let (status, why) = pick_wait(&[], None, None, 0, "src", mine).unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(why, format!("'src' is not waiting on anything in {mine}; `weft events {mine} --node src` shows what it did"));
+
+        let form = ParkedWait { node: "review".into(), token: "f".into(), kind: "form".into() };
+        let (status, why) = woken_with(&form, None).unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(why.starts_with("'review' is waiting on a form signal, which expects a value; answer it"), "{why}");
+        let timer = ParkedWait { node: "hold".into(), token: "t".into(), kind: "timer".into() };
+        assert_eq!(woken_with(&timer, Some(serde_json::json!({ "fired": true }))).unwrap(), serde_json::json!({ "fired": true }));
     }
 
     /// `--iteration` is checked against the place before any wait is
@@ -1525,5 +1566,88 @@ mod streamed_tests {
         let (status, why) = within_value_limits(&[row.clone(), nested(MAX_VALUE_REF_DEPTH + 1)]).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(why.contains("reference 1") && why.contains(&MAX_VALUE_REF_DEPTH.to_string()), "{why}");
+    }
+}
+
+// These tests need a real Postgres. A module named `db_tests` is how
+// `.config/nextest.toml` finds database tests inside a library: the
+// default profile leaves them out, the `db` profile runs them.
+#[cfg(test)]
+mod db_tests {
+    use std::sync::Arc;
+
+    use weft_core::program::KeptValue;
+    use weft_core::record_ref::{Step, ValueRef};
+    use weft_journal::record::{Appended, Queued, Then};
+    use weft_journal::RunEvent;
+    use weft_task_store::db::Pool;
+
+    use super::{bases, kept_rows, resolved, RunId};
+    use crate::store::postgres::PostgresStore;
+    use crate::store::RunStore;
+
+    const TENANT: &str = "tenant-1";
+
+    /// Queue run `run_id` of `project`, seeded from `seed`, and write
+    /// `value` as what its node `n` sent on `out`: the record row that
+    /// keeps it.
+    async fn a_run_that_sent(store: &PostgresStore, project: uuid::Uuid, run_id: RunId, seed: Option<RunId>, value: serde_json::Value) -> i32 {
+        let birth = RunEvent::RunStarted {
+            given: Default::default(),
+            run_id, project_id: project, entry_node: "n".into(), phase: weft_core::context::Phase::Fire,
+            definition_hash: Some("def-1".into()), binary_hash: Some("bin-A".into()), source_version: None,
+            run_kind: weft_core::run::RunKind::Project, cut_from: None,
+            seed: seed.map(|parent| weft_core::run_spec::Seed { parent, origins: Default::default(), answers: Default::default() }),
+            instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(),
+            at_unix: 1, settings: Default::default(),
+        };
+        let queued = Queued {
+            events: std::slice::from_ref(&birth), tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
+            watch_end: false, stale: &[], spec: None, example: None, program: None,
+        };
+        assert!(store.queue_run(queued, false).await.unwrap());
+        let sent = RunEvent::PortEmitted {
+            run_id, emission_id: uuid::Uuid::new_v4(), node_id: "n".into(), frames: vec![], port: "out".into(), value: Arc::new(value), at_unix: 2,
+        };
+        match store.append(run_id, &[sent], Then::Stays).await.unwrap() {
+            Appended::At(seq) => seq,
+            other => panic!("written: {other:?}"),
+        }
+    }
+
+    /// The values a run names read back off the record rows that keep
+    /// them, read from the database: its own rows, a part of one, a list
+    /// gathered from several, and, for a seeded run, the row of the run it
+    /// inherited the value from.
+    #[weft_db_macros::test]
+    async fn the_values_a_run_and_its_seeded_run_name_read_back_off_the_record(pool: Pool) {
+        weft_task_store::apply_groups(&pool, crate::app::DISPATCHER_GROUPS).await.unwrap();
+        let store = PostgresStore::from_pool(pool.clone());
+        let project = uuid::Uuid::new_v4();
+        let definition = serde_json::from_value(serde_json::json!({ "id": project, "nodes": [], "edges": [] })).unwrap();
+        crate::project_store::ProjectStoreOps::register_with_hashes(
+            &crate::PostgresProjectStore::new(pool.clone()), definition, "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        let (first, seeded) = (weft_core::new_run_id(), weft_core::new_run_id());
+        let first_row = a_run_that_sent(&store, project, first, None, serde_json::json!({ "items": ["a", "b"] })).await;
+        let seeded_row = a_run_that_sent(&store, project, seeded, Some(first), serde_json::json!("own")).await;
+
+        let inherited = ValueRef::Row { run: first, seq: first_row, index: 0 };
+        let own = ValueRef::Row { run: seeded, seq: seeded_row, index: 0 };
+        let refs = vec![
+            own.clone(),
+            inherited.clone().part(vec![Step::Key("items".into()), Step::Item(1)]),
+            ValueRef::List { items: vec![own, inherited.part(vec![Step::Key("items".into()), Step::Item(0)])] },
+            ValueRef::Row { run: seeded, seq: seeded_row + 1, index: 0 },
+        ];
+        let (rows, _) = bases(&refs);
+        let kept = kept_rows(&store, rows).await.unwrap();
+        let answer = resolved(&refs, &[first, seeded].into(), &kept, &Default::default());
+        assert_eq!(answer[0], KeptValue::Value { value: serde_json::json!("own") });
+        assert_eq!(answer[1], KeptValue::Value { value: serde_json::json!("b") }, "a seeded run's inherited value, off the first run's record");
+        assert_eq!(answer[2], KeptValue::Value { value: serde_json::json!(["own", "a"]) });
+        assert!(matches!(&answer[3], KeptValue::Broken { .. }), "a row the record does not hold: {:?}", answer[3]);
     }
 }

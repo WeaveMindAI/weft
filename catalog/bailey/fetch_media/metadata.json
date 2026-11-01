@@ -30,7 +30,7 @@
       "name": "file",
       "type": "File",
       "narrowable": true,
-      "description": "The message's media, stored."
+      "description": "The message's media, kept in the project's files under the message it came with (deleted with the project, or by hand)."
     },
     {
       "name": "filename",

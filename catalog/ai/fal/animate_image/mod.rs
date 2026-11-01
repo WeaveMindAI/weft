@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
-use weft::storage::{FileHandle, KeepTtl, StorageScope};
+use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::fal::{merge_params, run_queued, video_url};
@@ -51,9 +51,7 @@ impl Node for FalAnimateImageNode {
         let ty = ctx.output_type("video")?;
         let stored = ctx
             .storage(StorageScope::Run)
-            // The generated video is the run's product: keep it past the
-            // run (default 30-day access-bumped TTL).
-            .internalize(&Value::String(url.to_string()), &ty, Some(KeepTtl::Default))
+            .internalize(&Value::String(url.to_string()), &ty, None)
             .await?;
         ctx.pulse_downstream(NodeOutput::new().set("video", stored)).await
     }

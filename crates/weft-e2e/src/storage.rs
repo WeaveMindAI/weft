@@ -6,8 +6,8 @@
 //!   - download: `POST /storage/files/download { key }` -> `{ url }`,
 //!               then GET the bytes from that link, straight from the store.
 //!
-//! File keys are scoped: `run/<run_id>/<id>` (run scratch, swept on
-//! terminate unless kept), `project/<project_id>/<id>`, `shared/<name>/<id>`.
+//! File keys are scoped: `run/<run_id>/<id>` (deleted with its run's record,
+//! or at its deadline), `project/<project_id>/<id>`, `shared/<name>/<id>`.
 
 use std::time::Duration;
 
@@ -28,7 +28,7 @@ pub async fn list(disp: &Dispatcher) -> Result<Vec<StoredFileMeta>> {
 /// but tests think in the scope portion, so match the key with its leading
 /// `<tenant>/` segment stripped. Tenant-agnostic, so it works for any
 /// tenant, `local` included.
-pub async fn list_prefix(disp: &Dispatcher, prefix: &str) -> Result<Vec<StoredFileMeta>> {
+async fn list_prefix(disp: &Dispatcher, prefix: &str) -> Result<Vec<StoredFileMeta>> {
     Ok(list(disp)
         .await?
         .into_iter()
@@ -44,11 +44,11 @@ pub async fn list_prefix(disp: &Dispatcher, prefix: &str) -> Result<Vec<StoredFi
 /// Download a stored file's bytes by key: handshake for a presigned bucket URL,
 /// then stream the bytes directly from the storage bucket.
 ///
-/// The bucket (SeaweedFS) is a docker container on the host in the local
-/// emulation, published on the loopback. A container still settling can
-/// transiently answer `502`/`503`/`504` or refuse the connection. That is a
-/// not-ready state, not a download failure, so we poll through those codes +
-/// transport errors until the bucket is serving (bounded). Any OTHER non-success
+/// The bucket (SeaweedFS) is a docker container on the host, published on
+/// the loopback. A container still settling can transiently answer
+/// `502`/`503`/`504` or refuse the connection. That is a not-ready state,
+/// not a download failure, so we poll through those codes + transport
+/// errors until the bucket is serving (bounded). Any OTHER non-success
 /// (403 denied/expired signature, 404 gone) fails fast.
 pub async fn download(disp: &Dispatcher, key: &str) -> Result<Vec<u8>> {
     // Gateway "upstream not ready yet" codes: retry these, fail fast on the rest.
@@ -66,19 +66,17 @@ pub async fn download(disp: &Dispatcher, key: &str) -> Result<Vec<u8>> {
         disp.post_json("/storage/files/download", &serde_json::to_value(&body)?).await?;
     let url = handshake.url;
 
-    // Poll the (single) URL through the box's cold-wake window; a timeout
-    // names the LAST observation, turning a genuinely-down box from a vague
-    // "timed out" into an actionable error.
+    // Poll the (single) URL until the store serves it; a timeout names the
+    // LAST observation, turning a genuinely-down store from a vague "timed
+    // out" into an actionable error.
     //
-    // Two flavors of "not ready yet" both retry: (a) an HTTP 502/503/504 (nginx
-    // is up but has no healthy box upstream registered), and (b) a TRANSPORT
-    // error (connection refused / reset: nginx itself isn't accepting yet,
-    // earlier in the cold wake). Both are transient wake states, not download
-    // failures, so the poll rides them out. Only a definitive HTTP response
-    // (403 denied, 404 gone) fails fast.
+    // Two flavors of "not ready yet" both retry: (a) an HTTP 502/503/504, and
+    // (b) a TRANSPORT error (connection refused / reset: the container is not
+    // accepting yet). Only a definitive HTTP response (403 denied, 404 gone)
+    // fails fast.
     let last = std::sync::Mutex::new(String::new());
     poll_until_describing(
-        &format!("the storage box to serve the download for {key}"),
+        &format!("the object store to serve the download for {key}"),
         deadline,
         interval,
         || {
@@ -98,7 +96,7 @@ pub async fn download(disp: &Dispatcher, key: &str) -> Result<Vec<u8>> {
                         }
                         format!("HTTP {status}")
                     }
-                    // Transport error: nginx not accepting connections yet. Retry.
+                    // Transport error: the store not accepting connections yet. Retry.
                     Err(e) => format!("transport error: {e}"),
                 };
                 *last.lock().unwrap() = observed;
@@ -107,8 +105,8 @@ pub async fn download(disp: &Dispatcher, key: &str) -> Result<Vec<u8>> {
         },
         || {
             format!(
-                "last observation was [{}] from {url}; the box never became routable: is it \
-                 stuck waking, or genuinely down?",
+                "last observation was [{}] from {url}; the object store never served it: is \
+                 its container down?",
                 last.lock().unwrap()
             )
         },

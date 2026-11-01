@@ -133,7 +133,6 @@ async fn answers_with(
                 row_sizes: rows.iter().map(|row| row.len() as u32).collect(),
                 born: (part.first_seq == 0).then(|| Born::of(&part.rows[0][0], KeepFor::WEFT_DEFAULT).expect("a birth")),
                 written: Written::of(&part.rows.concat()),
-                wrote_files: false,
                 secrets: part.secrets.clone(),
             })
             .collect(),
@@ -142,6 +141,18 @@ async fn answers_with(
     };
     let batch = Batch { head, rows: encoded.iter().flatten().map(Vec::as_slice).collect() };
     record_batch(db, writer, TENANT, lane, &batch, &weft_access_store::seal_json).await.unwrap()
+}
+
+/// A run that ended keeps its files: nothing is queued to delete them
+/// until its record goes.
+#[weft_db_macros::test]
+async fn a_run_keeps_its_files_past_its_end(pool: Pool) {
+    schema(&pool).await;
+    let run = weft_core::new_run_id();
+    let ended = part(run, 1, 0, vec![vec![birth(run, Keeping::Fast), completed(run)]]);
+    assert_eq!(send(&pool, "w1", "w1:0", &[ended]).await, [Fate::Accepted]);
+    let queued: i64 = pool.scalar("SELECT COUNT(*) FROM storage_sweep WHERE run_id = $1", &[&run]).await.unwrap();
+    assert_eq!(queued, 0, "ending a run deletes none of its files");
 }
 
 /// [`birth`] of a run of `program`, a cut of the registered `def-1`, for

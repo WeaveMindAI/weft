@@ -1,8 +1,0 @@
-# Shapes the answer of `back`.
-Group(text: String) -> (body: JsonDict) {
-  shape = ExecPython(text: String) -> (body: JsonDict) {
-    code: "return {'body': {'heard': text.upper()}}"
-  }
-  shape.text = self.text
-  self.body = shape.body
-}

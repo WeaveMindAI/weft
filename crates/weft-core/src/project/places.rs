@@ -278,8 +278,8 @@ pub enum StatePlace {
 
 /// The place `spelled` names (written the way `--from` takes it, read by
 /// [`named`]) whose state a run can tell, or why it has none. A node
-/// inside a loop fires once per iteration, so it is refused like a cut
-/// inside a loop, and the outermost loop around it is named instead; a
+/// inside a loop fires once per iteration, so it is refused, and the
+/// outermost loop around it is named instead; a
 /// plain group or an include's site has no state of its own (it is a
 /// scope: whether it ran is the state of the nodes inside it).
 pub fn state_place(project: &ProjectDefinition, spelled: &str) -> Result<StatePlace, String> {
@@ -315,7 +315,10 @@ pub fn running_places(project: &ProjectDefinition) -> BTreeSet<Located> {
     let index = super::ProgramIndex::build(project);
     every_place(project)
         .into_iter()
-        .filter(|place| index.admits(&place.id, &place.frames()) && !index.stands_in(&place.id, &place.frames()))
+        .filter(|place| {
+            let frames = index.frames_at(project, place);
+            index.admits(&place.id, &frames) && !index.stands_in(&place.id, &frames)
+        })
         .collect()
 }
 
@@ -483,10 +486,10 @@ pub fn named(g: &impl GraphView, spelled: &str) -> Result<Named, String> {
 
 /// The outermost loop `named` runs inside, at the place the loop runs, if
 /// any: a loop around the node or group itself, or around any site on its
-/// call path (a call inside a loop runs whole with the loop). A loop's own
-/// boundaries are inside it; a loop is not inside itself. A loop runs once
-/// per iteration as a whole, so a place inside one is no end of a run and
-/// has no one state: the loop is what is named instead.
+/// call path (a call inside a loop runs once per iteration with the loop).
+/// A loop's own boundaries are inside it; a loop is not inside itself. A
+/// place inside a loop fires once per iteration, so it has no one state:
+/// the loop is what is named instead.
 pub fn loop_around(g: &impl GraphView, named: &Named) -> Option<Located> {
     match named {
         Named::Node(place) => enclosing_loops(g, place).into_iter().next(),

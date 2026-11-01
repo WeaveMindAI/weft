@@ -155,7 +155,7 @@ read [when the worker dies mid-run](../nodes/durable-execution.md#when-the-worke
 ## How long a run is kept
 
 An ended run is kept for a week, and then deleted with its record, its logs,
-its costs, its search entry and its tags. A run that has not ended (running, parked,
+its costs, its search entry, its tags and the files it stored in run scope. A run that has not ended (running, parked,
 waiting for a worker) is never deleted, however old. If you want another
 length:
 

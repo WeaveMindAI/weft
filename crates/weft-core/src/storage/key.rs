@@ -1,21 +1,24 @@
-//! Storage keys + the identity wall, as pure functions (Layer 1).
+//! Storage keys + the tenant wall, as pure functions (Layer 1).
 //!
 //! A key IS the fully-qualified path of a file. The FIRST segment is
-//! the owning tenant; the rest encodes the scope:
-//!   `<tenant>/run/<run_id>/<id>`        run scratch (swept unless kept)
-//!   `<tenant>/project/<project_id>/<id>`   per-project persistent
-//!   `<tenant>/shared/<name>/<id>`       tenant-shared by agreed name
-//!   `<tenant>/instance/<project_id>/<instance>/<id>`  one instance's, in one project
+//! the owning tenant; the rest encodes the scope, which says how long the
+//! file lives:
+//!   `<tenant>/run/<run_id>/<id>`        deleted with its run's record
+//!   `<tenant>/project/<project_id>/<id>`   deleted with its project
+//!   `<tenant>/shared/<name>/<id>`       a space's, deleted by hand
+//!   `<tenant>/instance/<project_id>/<instance>/<id>`  deleted by hand or with its project
 //!   `<tenant>/asset/<sha256>`           the tenant's content-addressed files
+//! A deadline (a keep with a time) deletes a file in any scope when it
+//! arrives, whichever comes first.
 //!
-//! The wall: a verified caller identity + a key resolve to
-//! allowed/denied with NO policy configuration. The runtime-storage
-//! bucket is SHARED across every tenant (one bucket, keys namespaced by
-//! the tenant prefix), so the tenant segment is the outer wall: a caller
-//! can only ever reach keys under ITS OWN broker-verified tenant, and
-//! within that, only prefixes it is proven to own (its own run, its
-//! own project) or has opted into by naming (shared). The broker is the
-//! only thing that signs bucket requests, so these functions ARE the wall.
+//! The wall: the runtime-storage bucket is SHARED across every tenant
+//! (one bucket, keys namespaced by the tenant prefix), so a caller can
+//! only ever reach keys under ITS OWN broker-verified tenant. Inside it,
+//! any run of any project reads any file. A caller WRITES and LISTS under
+//! the spaces it owns (its own run, its own project, an instance of it,
+//! a shared space it names), which is where its files are put, not who
+//! reads them. The broker is the only thing that signs bucket requests,
+//! so these functions ARE the wall.
 
 use super::StorageScope;
 
@@ -32,7 +35,7 @@ pub enum CallerAuth {
     /// vouches for the tenant, the broker re-checks the key against it).
     /// `run_id` is the run being driven (verified: the run's owning
     /// process is the caller); None when no run claim was presented (then
-    /// run-scoped keys are unreachable).
+    /// it can put no run-scoped file, having no run to put it under).
     Worker {
         tenant: String,
         project_id: String,
@@ -77,9 +80,9 @@ pub enum KeyScope {
     /// surface; any worker of the tenant may READ it, none may write it.
     Asset,
     /// `instance/<project_id>/<instance>/<id>`: one instance's files in one
-    /// project. The only scope whose owner is two segments: the project is
-    /// the wall (an instance id is only a name inside one project), the instance
-    /// is whose.
+    /// project. The only scope whose owner is two segments: the project
+    /// bounds where a worker puts and lists (an instance id is only a name
+    /// inside one project), and the files go with it; the instance is whose.
     Instance { project_id: String, instance: String },
 }
 
@@ -256,11 +259,13 @@ impl ParsedKey {
         Self::owned_prefix(tenant, "project", project)
     }
 
-    /// The `<tenant>/instance/<project_id>/` prefix covering every instance's
-    /// files in one project: what the project reclaimer wipes with the
-    /// project, and what `forget` of an instance narrows to one instance.
-    pub fn instances_prefix(tenant: &str, project: &str) -> Result<String, String> {
-        Self::owned_prefix(tenant, "instance", project)
+    /// The prefixes holding every file that goes with a project when it is
+    /// removed: its own files (`<tenant>/project/<project_id>/`) and every
+    /// instance's (`<tenant>/instance/<project_id>/`), since an instance id
+    /// is only a name inside its project. Its runs' files go with their
+    /// records, and shared files are a space's, so neither is here.
+    pub fn removed_with_project(tenant: &str, project: &str) -> Result<[String; 2], String> {
+        Ok([Self::project_prefix(tenant, project)?, Self::owned_prefix(tenant, "instance", project)?])
     }
 
     /// A validated `<tenant>/<tag>/<owner>/` prefix: both segments pass the
@@ -346,7 +351,8 @@ pub fn parse_key(key: &str) -> Result<ParsedKey, String> {
 /// Validate that `prefix` is one of the two scope-anchored boundaries
 /// `wipe_prefix` may delete, each ending in `/`:
 ///   - `<tenant>/<scope>/<owner>/` (any tag in [`SCOPE_TAGS`]) : one owner's space
-///     (the dispatcher's `weft rm` / `weft clean <run_id>` / project-delete).
+///     (a run's files once its record went, a removed project's and its
+///     instances' files, `weft files rm --prefix`).
 ///   - `<tenant>/` : the WHOLE tenant (a tenant-delete wiping every
 ///     object under the tenant's prefix).
 /// Both are real prefix boundaries. A raw `starts_with` on an unanchored
@@ -524,13 +530,14 @@ pub fn run_prefix(tenant: &str, run_id: &str) -> Result<String, String> {
 }
 
 /// Can `caller` touch the file at `key` (get/delete/keep/presign)?
-/// The TENANT segment is the outer wall (the shared bucket holds many
-/// tenants' keys under one prefix space), then the key's own scope
-/// decides. Deny reasons are specific.
+/// The TENANT segment is the one wall (the shared bucket holds many
+/// tenants' keys under one prefix space): inside its tenant, any run of
+/// any project reads any file, whatever its scope. A scope says how long
+/// a file lives, never who may read it. Deny reasons are specific.
 // SYNC: check_key_access <-> extension-vscode/src/storedFilePicker.ts storedFilePickerRows
 pub fn check_key_access(caller: &CallerAuth, parsed: &ParsedKey) -> Result<(), String> {
-    let (tenant, project_id, run_id) = match caller {
-        CallerAuth::Worker { tenant, project_id, run_id, .. } => (tenant, project_id, run_id),
+    let tenant = match caller {
+        CallerAuth::Worker { tenant, .. } => tenant,
         // Acting for a tenant reaches that tenant's assets, nothing else.
         CallerAuth::Tenant { tenant } => {
             if &parsed.tenant != tenant {
@@ -556,56 +563,16 @@ pub fn check_key_access(caller: &CallerAuth, parsed: &ParsedKey) -> Result<(), S
             return Err("control-plane callers use the admin surface, not the data path".into());
         }
     };
-    // Tenant wall FIRST: the bucket is shared, so a worker must never
-    // reach a key under a different tenant's prefix. The caller tenant is
-    // the broker verdict; the key tenant is the first path segment. This
-    // is the load-bearing isolation check on the shared bucket.
+    // The bucket is shared, so a worker must never reach a key under a
+    // different tenant's prefix. The caller tenant is the broker verdict;
+    // the key tenant is the first path segment.
     if &parsed.tenant != tenant {
         return Err(format!(
             "denied: file belongs to tenant '{}', not the caller's tenant '{tenant}'",
             parsed.tenant
         ));
     }
-    match &parsed.scope {
-        KeyScope::Run { run_id: key_run_id } => match run_id {
-            Some(c) if c == key_run_id => Ok(()),
-            Some(_) => Err(
-                "denied: run-scoped file belongs to a different run (runs are \
-                 walled per run; use Project scope for files that outlive a run)"
-                    .into(),
-            ),
-            None => Err("denied: caller presented no verified run".into()),
-        },
-        KeyScope::Project { project_id: key_project } => {
-            if key_project == project_id {
-                Ok(())
-            } else {
-                Err("denied: project-scoped file belongs to a different project".into())
-            }
-        }
-        // The tenant's assets: any worker of the tenant may read one (the
-        // compiled config references them by key). The tenant wall above is
-        // the whole wall: an asset is named by its content's sha256, so
-        // naming one already takes holding its bytes. Writes never reach
-        // here from workers (the data-path upload verbs refuse the scope).
-        KeyScope::Asset => Ok(()),
-        // Naming a shared key IS the opt-in (the grant table records it
-        // for audit/listing; it never denies a worker of the tenant).
-        // Safe because the tenant wall above already confirmed the caller
-        // owns this key's tenant, so a shared space is only ever reachable
-        // by workers of the SAME tenant.
-        KeyScope::Shared { .. } => Ok(()),
-        // Any instance of the caller's own project: inside its project the
-        // program may reach every instance's files; another project's never,
-        // even under the same instance id.
-        KeyScope::Instance { project_id: key_project, .. } => {
-            if key_project == project_id {
-                Ok(())
-            } else {
-                Err("denied: instance-scoped file belongs to a different project".into())
-            }
-        }
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -628,13 +595,10 @@ mod tests {
     }
 
     #[test]
-    fn a_instance_key_is_walled_by_its_project() {
+    fn an_instance_key_names_its_project_and_instance() {
         let key = parse_key("t1/instance/p1/ada/f").expect("five segments");
         assert_eq!(key.scope, KeyScope::Instance { project_id: "p1".into(), instance: "ada".into() });
         assert_eq!(key.to_key(), "t1/instance/p1/ada/f");
-        assert!(check_key_access(&worker(None), &key).is_ok(), "any instance of the caller's project");
-        let other_project = parse_key("t1/instance/p2/ada/f").unwrap();
-        assert!(check_key_access(&worker(None), &other_project).is_err(), "same instance id, other project");
         assert!(parse_key("t1/instance/p1/../f").is_err());
         assert!(parse_key("t1/instance/p1/f").is_err(), "an instance key names its instance");
     }
@@ -837,21 +801,27 @@ mod tests {
         );
     }
 
+    /// Inside its tenant, a worker reads any file whatever its scope: its
+    /// own run's or another run's, its project's or another project's,
+    /// any instance's of any project, a shared space's, with or without a
+    /// run of its own. A scope says how long a file lives, never who reads
+    /// it. The control plane is still kept off the data path.
     #[test]
-    fn access_walls_per_tenant_then_scope() {
-        let w = worker(Some("c1")); // tenant t1
-                                    // Own run under own tenant: allowed.
-        assert!(check_key_access(&w, &pk("t1", KeyScope::Run { run_id: "c1".into() })).is_ok());
-        // Another run: denied.
-        assert!(check_key_access(&w, &pk("t1", KeyScope::Run { run_id: "c2".into() })).is_err());
-        // Own project: allowed. Another project: denied.
-        assert!(check_key_access(&w, &pk("t1", KeyScope::Project { project_id: "p1".into() })).is_ok());
-        assert!(check_key_access(&w, &pk("t1", KeyScope::Project { project_id: "p2".into() })).is_err());
-        // Shared under own tenant: naming is the opt-in.
-        assert!(check_key_access(&w, &pk("t1", KeyScope::Shared { name: "x".into() })).is_ok());
-        // No run claim cannot reach ANY run key.
-        assert!(check_key_access(&worker(None), &pk("t1", KeyScope::Run { run_id: "c1".into() })).is_err());
-        // Control plane is rejected on the data path.
+    fn a_worker_reads_every_file_of_its_tenant() {
+        for caller in [worker(Some("c1")), worker(None)] {
+            for scope in [
+                KeyScope::Run { run_id: "c1".into() },
+                KeyScope::Run { run_id: "c2".into() },
+                KeyScope::Project { project_id: "p1".into() },
+                KeyScope::Project { project_id: "p2".into() },
+                KeyScope::Instance { project_id: "p1".into(), instance: "ada".into() },
+                KeyScope::Instance { project_id: "p2".into(), instance: "bob".into() },
+                KeyScope::Shared { name: "x".into() },
+                KeyScope::Asset,
+            ] {
+                assert!(check_key_access(&caller, &pk("t1", scope.clone())).is_ok(), "{caller:?} reads {scope:?}");
+            }
+        }
         assert!(check_key_access(
             &CallerAuth::ControlPlane,
             &pk("t1", KeyScope::Project { project_id: "p1".into() })
@@ -879,6 +849,21 @@ mod tests {
     }
 
     #[test]
+    fn a_removed_project_takes_its_own_and_its_instances_files_and_nothing_else() {
+        let prefixes = ParsedKey::removed_with_project("t1", "p1").unwrap();
+        let goes = |key: &str| prefixes.iter().any(|p| key.starts_with(p.as_str()));
+        assert!(goes("t1/project/p1/f0"));
+        assert!(goes("t1/instance/p1/ada/f0"));
+        assert!(!goes("t1/project/p10/f0"), "another project");
+        assert!(!goes("t1/instance/p2/ada/f0"), "another project's instance");
+        assert!(!goes("t1/shared/team/f0"), "a shared space");
+        assert!(!goes("t2/project/p1/f0"), "another tenant");
+        for prefix in &prefixes {
+            assert!(validate_wipe_prefix(prefix).is_ok(), "{prefix}");
+        }
+    }
+
+    #[test]
     fn validate_wipe_prefix_accepts_tenant_and_owner_boundaries() {
         // Whole tenant.
         assert!(validate_wipe_prefix("t1/").is_ok());
@@ -903,9 +888,8 @@ mod tests {
 
     /// A worker with a MALFORMED owner segment (a run/project that contains a
     /// slash or `..`) must be rejected by BOTH construction paths, not just
-    /// key_for_put. Before the shared `owned_scope_segments`, prefix_for_list
-    /// skipped the run/project check, so a malformed owner produced a list
-    /// prefix that escaped the owner boundary.
+    /// key_for_put: both go through `owned_scope`, so a malformed owner
+    /// can never produce a list prefix that escapes the owner boundary.
     #[test]
     fn prefix_for_list_rejects_malformed_owner_like_key_for_put() {
         // Malformed run.

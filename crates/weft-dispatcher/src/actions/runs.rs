@@ -454,7 +454,9 @@ pub(crate) async fn run(
     let stale = resolved.runs.clone();
     let kicks = resolved.kicks.clone();
     let now = crate::lease::now_unix() as u64;
-    let birth_rows = weft_journal::birth::baked_rows(run_id, &resolved.baked, now);
+    let birth_rows = weft_journal::birth::baked_rows(
+        run_id, &resolved.program, &weft_core::project::ProgramIndex::build(&resolved.program), &resolved.baked, now,
+    );
     // An empty `entry_node` is the journal's marker for a row that no
     // longer decodes, and `weft runs` prints `?` for it. A run with
     // nothing kicked (a seeded run of a node fed by what it reuses, a run

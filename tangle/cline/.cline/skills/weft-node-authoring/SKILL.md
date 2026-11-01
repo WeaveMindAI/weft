@@ -119,7 +119,7 @@ Unknown keys are a loud parse error. Top level:
 | `outputs` | output ports |
 | `metadataPorts` | ports whose value you write here by hand and no run computes, each `{ "name", "type", "description", "value" }` (`description` optional). A wire leaving one is a metadata wire: the compiler writes the value into the input it points at, as if typed there, and the wire never runs. Their names share one namespace with `inputs` and `outputs` |
 | `types` | named type declarations, e.g. `"ChatHistory": "List[ChatMessage]"` |
-| `features` | flags: `pure` (the body does nothing outside its run beyond answering its caller and the run's own files: no network, connection, `ctx.run`, wait, tag, or storage beyond this run; a durable run starts it without waiting for the database and runs it again after a crash if it had sent nothing on and reads no stream. `Text`, `Switch` and `Reply` are pure, `HttpRequest` is not; an outside ctx call on a pure node fails, naming the flag), `isTrigger`, `canAddInputPorts` (an open-ended set of values arrives as ports the author declares inline; the body reads `ctx.inputs.custom()`), `canAddOutputPorts`, `join` (the node meets several branches and goes on with whichever arrived, like `FirstInOrder`: its added inputs are optional, it runs once each has arrived or closed, closes its output itself when none arrived, and needs no `_should_flow`), `customInputType`, `customOutputType` (the type every added output takes, as `customInputType` is for added inputs; a variable one of the node's inputs uses, `T`, types each added output as that input), `pairsAddedPorts` (each input a program adds comes with an output of the same name, which the compiler makes and the program never writes; an added output nothing reads fails the build; declared beside `canAddOutputPorts`, as `Dispatch` does), `oneOfRequired`, `showDebugPreview`, `liveEndpoint` (the endpoint serving this infra node's display, see [The display](#the-display)), `castPorts`, `hidden`, `answersCaller` (`"whole"`, `"stream"` or `"end"`: this node answers a live caller the way `Reply`, `Stream` or `Close` does; any custom node that answers the caller declares it, so the compiler counts it), `liveConnection` (`"http"` or `"websocket"`: this trigger holds a caller, as `Route` and `Socket` do), `keepsInputsPastRun` (the node keeps what its inputs are given after the run ends, writing them into a table, a record or an instance's values; the compiler then warns when a file stored for its run only is wired into it, `run-file-kept-past-run`), `addedPortsAreDataKeys` (under Spelling) |
+| `features` | flags: `pure` (the body does nothing outside its run beyond answering its caller and the run's own files: no network, connection, `ctx.run`, wait, tag, or storage beyond this run; a durable run starts it without waiting for the database and runs it again after a crash if it had sent nothing on and reads no stream. `Text`, `Switch` and `Reply` are pure, `HttpRequest` is not; an outside ctx call on a pure node fails, naming the flag), `isTrigger`, `canAddInputPorts` (an open-ended set of values arrives as ports the author declares inline; the body reads `ctx.inputs.custom()`), `canAddOutputPorts`, `join` (the node meets several branches and goes on with whichever arrived, like `FirstInOrder`: its added inputs are optional, it runs once each has arrived or closed, closes its output itself when none arrived, and needs no `_should_flow`), `customInputType`, `customOutputType` (the type every added output takes, as `customInputType` is for added inputs; a variable one of the node's inputs uses, `T`, types each added output as that input), `pairsAddedPorts` (each input a program adds comes with an output of the same name, which the compiler makes and the program never writes; an added output nothing reads fails the build; declared beside `canAddOutputPorts`, as `Dispatch` does), `oneOfRequired`, `showDebugPreview`, `liveEndpoint` (the endpoint serving this infra node's display, see [The display](#the-display)), `castPorts`, `hidden`, `answersCaller` (`"whole"`, `"stream"` or `"end"`: this node answers a live caller the way `Reply`, `Stream` or `Close` does; any custom node that answers the caller declares it, so the compiler counts it), `liveConnection` (`"http"` or `"websocket"`: this trigger holds a caller, as `Route` and `Socket` do), `addedPortsAreDataKeys` (under Spelling) |
 | `portsFromConfig` | ports derived from a config list: `{ "field", "matchInput", "specs": [{kind, keyField, catchAll?, addsInputs, addsOutputs}] }` |
 | `firesWith` | trigger only: EVERY field a firing can carry, name to weft type, `?` on the name for sometimes-present (`{"scheduledTime": "String", "caller?": "JsonDict"}`). Checked exactly: a firing missing a required field is refused, and so is one carrying a field you did not name. On a node without `features.isTrigger`, or with a type weft cannot parse, the node fails to load |
 | `display` | inline render: `{ "kind": "media" \| "link", "output" \| "input": "<port>" }` |
@@ -206,7 +206,7 @@ any other word fails to load. `json` also fits a `JsonDict` input
 (edited as JSON text); the others edit a `String`. A `number` widget with a whole `step`
 (`"step": 1`) takes whole numbers only: the compiler checks a written value
 and the runtime a wired one, so your body can cast it to an integer.
-Output entry: `name`, `type`, `description` (an output has no `required`), `narrowable`, `fileScopeFrom` (on an output carrying a file the node stores where the program chooses: the name of the input whose value names the scope, `run` or `project`; it must name an input of the node, or the node does not load), and on an infra node `baked` (see Infra node). If only the program knows an output's shape (a model's JSON answer, a request's body, a query's rows), type it broadly and set `"narrowable": true` (any type that fits inside `type`), or a type string (anything that fits inside that type, which may be wider than `type`): the program then declares what it holds (`-> (response: Verdict)`), and each value is checked against that at run time. Without it, a program can only restate the output's own type.
+Output entry: `name`, `type`, `description` (an output has no `required`), `narrowable`, and on an infra node `baked` (see Infra node). If only the program knows an output's shape (a model's JSON answer, a request's body, a query's rows), type it broadly and set `"narrowable": true` (any type that fits inside `type`), or a type string (anything that fits inside that type, which may be wider than `type`): the program then declares what it holds (`-> (response: Verdict)`), and each value is checked against that at run time. Without it, a program can only restate the output's own type.
 
 A `validate` rule's `when` is a closed set of conditions, combined with
 `all`, `any` and `not`: the input and config checks (`input_satisfied`,
@@ -851,26 +851,30 @@ by giving up on a job whose status nobody has asked for in a few intervals
 terminating the infra stops it with everything else. To test the node, queue
 the answer with `rig.signal(json!({ "status": "done", "result": ... }))`.
 
-**Keeping a file past the run**: a file stored in `StorageScope::Run`
-with no keep is swept shortly after the run ends. If the file is what the
-node produced, pass a keep when you store it, the way a speech node does:
+**How long a file lives**: a file in `StorageScope::Run` is deleted with its
+run, when the run's record goes, and one in `StorageScope::Project` with the
+project. Any run in your account can read either for as long as it exists. A
+node that makes a file (a download, generated speech) stores it in the run
+scope with no deadline (`None`), so it lives as long as its run is kept, the
+way a speech node does:
 
 ```rust
-use weft::storage::{KeepTtl, StorageScope};
+use weft::storage::StorageScope;
 
 let file = ctx.storage(StorageScope::Run)
-    .put(bytes, "audio/mpeg", "speech.mp3", Some(KeepTtl::Default))
+    .put(bytes, "audio/mpeg", "speech.mp3", None)
     .await?;
 ```
 
-or keep one you already hold with
-`ctx.storage(StorageScope::Run).keep(&file, KeepTtl::Default).await?`
-(a keep cannot be taken back). `KeepTtl::Default` is 30 days,
-`KeepTtl::Secs { secs }` is a number of seconds, and both start again at every
-access; `KeepTtl::Never` lasts until `weft files rm` or `weft clean`. Files in
-the project, shared or instance scopes outlive runs anyway: there, `None` or
-`Never` means until deleted. A file the container itself needs to keep goes on
-a `Disk` volume instead.
+The last argument is a deadline: `Some(KeepTtl::Default)` deletes the file
+once nobody has touched it for 30 days, `KeepTtl::Secs { secs }` after that
+many idle seconds, either one or with its owner if that comes first; `None` or
+`KeepTtl::Never` gives none. `ctx.storage(..).keep(&file, ttl)` sets the
+deadline of a file you already hold (`KeepTtl::Never` takes it away). A
+deadline never moves a file: if a program needs one to outlive its run, it
+wires it through `KeepFile` (or your node `copy`s it into
+`StorageScope::Project`). A file the container itself needs to keep goes on a
+`Disk` volume instead.
 
 **The rig for an infra node** (`fake` tier):
 

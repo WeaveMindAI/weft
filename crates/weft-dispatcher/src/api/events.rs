@@ -44,7 +44,7 @@ pub async fn project_stream(
         .await
         .map_err(|(s, _)| s)?;
     let rx = state.events.subscribe_project(project_id).await;
-    let stream = live_events(rx, Values::asked(query.with_values)).take_until(stepping_aside(&state));
+    let stream = live_events(rx, Values::asked(query.with_values)).take_until(stopping(&state));
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
@@ -96,7 +96,7 @@ pub async fn display_stream(
         let waits = crate::display_feeds::run_waits(reader, run).map(|display| Ok(display_event(&display)));
         streams.push(Box::pin(waits));
     }
-    let stream = futures::stream::select_all(streams).take_until(stepping_aside(&state));
+    let stream = futures::stream::select_all(streams).take_until(stopping(&state));
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
@@ -166,7 +166,7 @@ pub async fn run_stream(
     // falls between the two.
     let live = state.events.subscribe_batches(project_id).await;
     let (tx, rx) = mpsc::channel(FOLLOWER_AHEAD);
-    let aside = stepping_aside(&state);
+    let stopping = stopping(&state);
     let history = RecordHistory { state, run_id: target_run_id, project_id, painting: None };
     let left = tx.clone();
     let follow = RunFollow::new(history, target_run_id, Values::asked(query.with_values), after, tx);
@@ -179,18 +179,18 @@ pub async fn run_stream(
             }
         }
     });
-    let stream = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|event| (Ok(event), rx)) }).take_until(aside);
+    let stream = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|event| (Ok(event), rx)) }).take_until(stopping);
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
-/// Once this copy of the dispatcher steps aside (`DispatcherState::aside`):
-/// where every event stream ends, after the event it is sending. Its
-/// follower opens it again, on a current copy: a run's stream from the
+/// Once this copy of the dispatcher is stopping
+/// (`DispatcherState::stopping`): where every event stream ends, after the
+/// event it is sending. Its follower opens it again, on a running copy: a run's stream from the
 /// last event it holds (`after`), a project's stream after looking at the
 /// project's state again, a display stream from the displays as they are.
-fn stepping_aside(state: &DispatcherState) -> impl std::future::Future<Output = ()> + Send + 'static {
-    let aside = state.aside.clone();
-    async move { aside.stepped().await }
+fn stopping(state: &DispatcherState) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let stopping = state.stopping.clone();
+    async move { stopping.begun().await }
 }
 
 /// How many events wait for a slow follower of a run before its read of

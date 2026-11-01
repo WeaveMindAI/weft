@@ -4,6 +4,63 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-11-01 (0.2.287)
+
+**What breaks after this update:**
+
+**A file's scope now says only how long it lives, never who may read it.**
+Every run of every project in your account can read every stored file, for as
+long as it exists. A run's file is deleted when its own time runs out or when
+its run is deleted (its keep time running out, `weft clean`, `weft rm`),
+whichever comes first; it is no longer deleted when its run ends. A project's
+file is deleted when its own time runs out or when its project is deleted,
+whichever comes first, and so is an instance's file, which lives inside its
+project. A shared space's file is deleted only by hand or when its own time
+runs out. Run files stay on disk as long as their runs are kept, so an
+install that keeps many runs keeps more files. The files nodes make (downloads,
+generated pictures and audio, transcripts) no longer carry a 30-day time of
+their own: they last as long as their run.
+
+**Keep File means something else.** `scope: project`, now the default, copies
+the file into the project's files, so it outlives the run that made it.
+`scope: run` leaves the file where it is and only sets its time: `ttlDays` is
+how many idle days it lives, and empty or `0` gives it none. A program that
+relied on the old default (`run`, keeping a run file past its run's end) now
+copies into the project; set `scope: run` to keep the old place.
+
+**The `run-file-kept-past-run` warning is gone,** with the `fileScopeFrom`
+and `keepsInputsPastRun` keys of a node's `metadata.json`. A node that sets
+either no longer loads: remove the key.
+
+**The rest:**
+
+**On a cloud install, an update stops the old weft's copies.** They used to
+decide for themselves that they had been replaced. The install workflow now
+deletes the older revisions of weft's own services once the new ones serve,
+which stops those copies: each finishes what it was answering, closes what it
+held open and gives back the work it was in the middle of, and the editor and
+the workers reconnect to the new copies by themselves (you may see the
+editor's live view reconnect during an update). If you roll a revision out by
+hand outside the workflow, the older copies keep running until the next
+workflow run or until you delete their revisions yourself.
+
+**Part of a loop's body runs on its own.** `--from`, `--target`, `--emit`,
+`--before`, `--group` and `--feed` now take a node or a group inside a loop's
+body. A run that starts and ends inside the body runs that part once, inside
+the loop's first iteration (`#0`), and you hand it what the loop would have
+(the item, the index). A run that holds one end of a loop without the other is
+refused, naming the loop. `weft run` checks where a run starts and ends before
+it builds anything, so a cut it cannot make costs no build.
+
+**A command following something during an update carries on.** A `weft`
+command following a task, an infra command, a maintenance lift or a node's
+tests while a copy of weft stops (an update, or a cloud copy scaled away) is
+answered at once and asks again on a running copy, instead of losing its
+connection. A worker waiting on something weft is doing for it does the same.
+
+**The editor's stored-file picker lists every file of your account,** not only
+the current project's, since any run can read any of them.
+
 ## 2026-11-01 (0.2.286)
 
 **The editor extension ships again.** 0.2.285 never reached the stores: its

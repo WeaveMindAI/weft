@@ -187,8 +187,8 @@ pub struct DispatcherSettings<'a> {
     pub tokens: Arc<dyn weft_platform_traits::IdentityTokens>,
     /// See `DispatcherState::booking`.
     pub booking: Option<weft_task_store::drain::Booking>,
-    /// See `DispatcherState::aside`.
-    pub aside: weft_task_store::aside::StepAside,
+    /// See `DispatcherState::stopping`.
+    pub stopping: weft_task_store::stopping::Stopping,
 }
 
 /// Build the dispatcher state.
@@ -210,7 +210,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         holder_news,
         tokens,
         booking,
-        aside,
+        stopping,
     } = settings;
     for channel in DISPATCHER_CHANNELS {
         signals.require(channel)?;
@@ -311,7 +311,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
             weft_platform_traits::config::PlatformConfig::Gcp(_) => None,
         },
         booking,
-        aside,
+        stopping,
     })
 }
 
@@ -382,7 +382,7 @@ pub fn drain_loops(state: &DispatcherState, registry: crate::task_executor::Task
     // again when its earliest claim lapses. Every other hold that lapses
     // unannounced is the `lapses` loop's.
     let mut loops = vec![
-        weft_task_store::dispatcher_picker_loop(picker_store, state.clone(), registry, state.replica.clone(), state.aside.clone()),
+        weft_task_store::dispatcher_picker_loop(picker_store, state.clone(), registry, state.replica.clone(), state.stopping.clone()),
         crate::delivery::drain_loop(state.clone()),
         crate::lifecycle_claimer::drain_loop(state.clone()),
         crate::lapses::drain_loop(state.clone()),

@@ -47,8 +47,6 @@ use weft_core::ports;
 const POSTGRES_IMAGE: &str = "postgres:18-alpine";
 
 /// The local database account.
-// SYNC: local-dev PG credentials <-> crates/weft-e2e/src/platform.rs
-//       (PG_USER/PG_PASSWORD/PG_DBNAME)
 const PG_USER: &str = "weft";
 const PG_PASSWORD: &str = "weft-local-dev";
 const PG_DB: &str = "weft";

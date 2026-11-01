@@ -3,25 +3,17 @@
 //!
 //! Most tests share the install under test and stay out of each other's way,
 //! because each only touches the projects it made. A few cannot: the ones
-//! that restart the runtime, or wait on its own timers at a faster pace.
-//! Those tests start a cell.
+//! that restart the runtime, or put the whole install in maintenance. Those
+//! tests start a cell.
 //!
 //! A cell is a named install (`weft_core::infra::Install`) on the same
 //! machine: its own runtime, Postgres and ports, sharing only the object
 //! store and the images. The install under test's `weft` starts it, from
 //! the images that install already has, so nothing is built.
 //!
-//! A cell also chooses how fast its own timers run
-//! (`weft_core::time_scale`): at `0.1`, a lease that runs a minute
-//! of real time runs out in six seconds, and so does every silence window
-//! it depends on, together. Budgets for real work (a boot) keep their real
-//! length.
-//!
 //! Like a project, a cell is removed when the test passes
 //! ([`Cell::finish`]) and kept when it fails, so what the test saw is still
 //! there to look at.
-
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -32,15 +24,12 @@ pub struct Cell {
     install: weft_core::infra::Install,
     /// `None` only while [`Self::start`] is still bringing it up.
     dispatcher: Option<Dispatcher>,
-    time_scale: f64,
     finished: bool,
 }
 
 impl Cell {
-    /// Start a cell whose own timers run at `time_scale` times real time
-    /// (`1.0` for real time, less for a test that waits on them), and
-    /// wait until its dispatcher answers.
-    pub async fn start(time_scale: f64) -> Result<Self> {
+    /// Start a cell and wait until its dispatcher answers.
+    pub async fn start() -> Result<Self> {
         // Fits `weft_core::infra::MAX_INSTALL_NAME`: the prefix (which no
         // branch's install starts with) and nine characters of a fresh id.
         let name = format!(
@@ -59,7 +48,7 @@ impl Cell {
         crate::kept::cell_made(&name)?;
         // From here on the cell exists, whole or in part: the guard keeps
         // it for inspection if anything below fails.
-        let mut cell = Self { install: install.clone(), dispatcher: None, time_scale, finished: false };
+        let mut cell = Self { install: install.clone(), dispatcher: None, finished: false };
         cell.daemon("start").await?;
         let port = public_port(&install)?;
         let dispatcher = Dispatcher::for_install(&format!("http://127.0.0.1:{port}"), install)?;
@@ -77,26 +66,15 @@ impl Cell {
         crate::ensure::wait_healthy(&self.dispatcher()).await
     }
 
-    /// Run `weft daemon <verb>` for this cell, at its pace.
+    /// Run `weft daemon <verb>` for this cell.
     async fn daemon(&self, verb: &str) -> Result<()> {
-        daemon(&self.install, verb, self.time_scale).await
+        daemon(&self.install, verb).await
     }
 
     /// The cell's dispatcher: hand it to [`crate::project::Project::prepare`]
     /// and every project, CLI call and platform probe follows it here.
     pub fn dispatcher(&self) -> Dispatcher {
         self.dispatcher.clone().expect("a started cell has a dispatcher")
-    }
-
-    /// How fast the cell's own timers run.
-    pub fn time_scale(&self) -> f64 {
-        self.time_scale
-    }
-
-    /// `real` at the cell's pace: what a test waits for one of the
-    /// runtime's own timers to come round.
-    pub fn scaled(&self, real: Duration) -> Duration {
-        weft_core::time_scale::scaled_by(real, self.time_scale)
     }
 
     /// Remove the cell: call as the last line of a PASSING test, after every
@@ -158,13 +136,13 @@ fn public_port(install: &weft_core::infra::Install) -> Result<u16> {
     }
 }
 
-/// Run `weft daemon <verb>` for the cell `install`, its timers at
-/// `time_scale`, with the install under test's `weft`
+/// Run `weft daemon <verb>` for the cell `install`, with the install under
+/// test's `weft`
 /// ([`crate::client::weft_command`]) in the repo root. One implementation
 /// for a cell's whole life: its test starts, restarts and removes it here,
 /// and so does the sweep of a cell a failed test kept
 /// ([`crate::cleanup::clean_kept`]).
-pub(crate) async fn daemon(install: &weft_core::infra::Install, verb: &str, time_scale: f64) -> Result<()> {
+pub(crate) async fn daemon(install: &weft_core::infra::Install, verb: &str) -> Result<()> {
     let name = install.name().expect("a cell is a named install");
     let root = crate::ensure::repo_root()?;
     let started = std::time::Instant::now();
@@ -172,7 +150,6 @@ pub(crate) async fn daemon(install: &weft_core::infra::Install, verb: &str, time
         .args(["daemon", verb])
         .current_dir(&root)
         .env("WEFT_REPO_ROOT", &root)
-        .env(weft_core::time_scale::TIME_SCALE_ENV, time_scale.to_string())
         .stdin(std::process::Stdio::null())
         .output()
         .await

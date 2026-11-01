@@ -450,6 +450,24 @@ mod tests {
         std::time::Duration::from_secs(n)
     }
 
+    /// Each part of a build that does not compile is one warning saying
+    /// so, with the compiler's own words (which name the file) kept
+    /// whole, their later lines indented under it.
+    #[test]
+    fn a_part_that_does_not_compile_is_one_warning_naming_it() {
+        let broken = vec![weft_core::project::Broken {
+            parts: vec!["back".into()],
+            places: Vec::new(),
+            why: "src/lib/stage.weft:2:3 unclosed group\nshape = ExecPython(".into(),
+            hides: true,
+        }];
+        assert_eq!(
+            broken_warnings(&broken),
+            vec!["does not compile, so nothing that needs it runs: src/lib/stage.weft:2:3 unclosed group\n  shape = ExecPython("]
+        );
+        assert!(broken_warnings(&[]).is_empty());
+    }
+
     /// A build is said once the builder names it, again once its log's
     /// address comes, and built at its end, with how long it took.
     #[test]

@@ -115,8 +115,8 @@ async fn appends_user(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// With no file in, the message starts a conversation of its own, kept
-/// past the run like any output the run made.
+/// With no file in, the message starts a conversation of its own, a file
+/// of the run like any output the run made.
 async fn starts_a_file(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig
         .run(&ChatHistoryAppendNode, json!({ "role": "user", "text": "hi" }))
@@ -124,7 +124,8 @@ async fn starts_a_file(rig: FakeRig) -> WeftResult<()> {
         .ok()?;
     let file = StoredFile::from_value(outcome.output("historyFile")?)?;
     let meta = rig.stored_meta(&file.key)?;
-    assert!(meta.keep, "a started conversation outlives the run: {meta:?}");
+    assert_eq!(meta.keep_ttl_secs, None, "a started conversation has no deadline, it goes with its run: {meta:?}");
+    assert!(file.key.contains("/run/"), "run-scoped: a started conversation is the run's: {}", file.key);
     assert_eq!(conversation(&rig, outcome.output("historyFile")?)?.len(), 1);
     Ok(())
 }

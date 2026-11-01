@@ -37,7 +37,7 @@ pub async fn change(
 
 /// `GET /projects/{id}/picks/kept`: what this install keeps for the
 /// project's connections, which an activation checks the program against.
-// SYNC: kept <-> crates/weft-core/src/picks.rs Kept, crates/weft-cli/src/commands/target.rs unpicked_connections
+// SYNC: kept <-> crates/weft-core/src/picks.rs Kept, crates/weft-cli/src/commands/target.rs check_picks
 pub async fn kept(
     State(state): State<DispatcherState>,
     caller: CallerTenant,

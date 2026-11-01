@@ -2196,6 +2196,103 @@
         assert_eq!(b_count, 2, "reader B saw both messages (broadcast, not stolen): {got:?}");
     }
 
+    /// Streams the text of each message its socket's caller sends, until
+    /// the caller is gone.
+    struct SocketTexts;
+    test_manifest!(SocketTexts, "SocketTexts");
+    #[async_trait]
+    impl Node for SocketTexts {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
+                return Err(weft_core::error::WeftError::NodeFailed("no ws caller".into()));
+            };
+            while let Some(message) = ws.recv_next().await? {
+                let InboundMessage::Json(message) = message else { continue };
+                ctx.pulse_downstream(NodeOutput::new().set("texts", message["text"].clone())).await?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Answers its socket's caller with the text it read and its length.
+    struct ReplyEcho;
+    test_manifest!(ReplyEcho, "ReplyEcho");
+    #[async_trait]
+    impl Node for ReplyEcho {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let text: String = ctx.inputs.get("text")?;
+            let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
+                return Err(weft_core::error::WeftError::NodeFailed("no ws caller".into()));
+            };
+            ws.send(OutboundChunk::Json(json!({ "echo": text, "len": text.len() }))).await?;
+            ctx.pulse_downstream(NodeOutput::new().set("sent", json!(true))).await
+        }
+    }
+
+    /// A sequential Loop over what a socket's caller sends runs one
+    /// iteration per message, and a reply in each answers the caller in
+    /// the order the messages came: `socket.texts (stream) -> lp`, whose
+    /// body is the reply.
+    #[tokio::test]
+    async fn a_loop_over_a_sockets_messages_answers_each_in_order() {
+        let catalog = super::engine_test_rig::catalog(vec![
+            ("SocketTexts", Box::new(SocketTexts) as Box<dyn Node>),
+            ("ReplyEcho", Box::new(ReplyEcho)),
+        ]);
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                { "id": "socket", "nodeType": "SocketTexts", "position": { "x": 0, "y": 0 }, "inputs": [],
+                  "outputs": [{ "name": "texts", "portType": "Generator[String]", "required": false }] },
+                { "id": "lp__in", "nodeType": "LoopIn", "position": { "x": 0, "y": 0 },
+                  "config": { "parentId": "lp", "parallel": false, "over": ["texts"], "carry": [] },
+                  "inputs": [{ "name": "texts", "portType": "Generator[String]", "required": true }],
+                  "outputs": [{ "name": "texts", "portType": "String", "required": false }, { "name": "index", "portType": "Number", "required": false }],
+                  "groupBoundary": { "groupId": "lp", "role": "In" } },
+                { "id": "lp.reply", "nodeType": "ReplyEcho", "position": { "x": 0, "y": 0 }, "scope": ["lp"],
+                  "inputs": [{ "name": "text", "portType": "String", "required": true }],
+                  "outputs": [{ "name": "sent", "portType": "Boolean", "required": false }] },
+                { "id": "lp__out", "nodeType": "LoopOut", "position": { "x": 0, "y": 0 }, "config": { "parentId": "lp" },
+                  "inputs": [{ "name": "sent", "portType": "Boolean", "required": false, "optional": true },
+                             { "name": "done", "portType": "Boolean", "required": false, "optional": true }],
+                  "outputs": [{ "name": "sent", "portType": "List[Boolean | Null]", "required": false }],
+                  "groupBoundary": { "groupId": "lp", "role": "Out" } }
+            ],
+            "edges": [
+                { "id": "e1", "source": "socket", "sourceHandle": "texts", "target": "lp__in", "targetHandle": "texts" },
+                { "id": "e2", "source": "lp__in", "sourceHandle": "texts", "target": "lp.reply", "targetHandle": "text" },
+                { "id": "e3", "source": "lp.reply", "sourceHandle": "sent", "target": "lp__out", "targetHandle": "sent" }
+            ],
+            "groups": [{ "id": "lp", "kind": "loop", "loopConfig": {}, "nodeIds": ["lp.reply"] }]
+        }))
+        .expect("socket loop project");
+        let run_id = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        seed(&journal, run_id, &project, "socket").await;
+        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
+        for text in ["hello", "again", "bye"] {
+            fake.push_inbound(InboundMessage::Json(json!({ "text": text })));
+        }
+
+        let outcome = run_with_caller(project, catalog, journal.clone(), run_id, Some(fake.clone() as Arc<dyn CallerConnection>)).await;
+        assert!(matches!(outcome, RunOutcome::Completed), "got {outcome:?}");
+        let replies: Vec<serde_json::Value> = fake
+            .chunks()
+            .into_iter()
+            .filter_map(|chunk| match chunk {
+                OutboundChunk::Json(value) => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            ["hello", "again", "bye"].map(|text| json!({ "echo": text, "len": text.len() })).to_vec(),
+            "one reply per message, in the order they came"
+        );
+        let launched = journal.events_of(run_id).iter().filter(|e| matches!(e, RunEvent::LoopIterationLaunched { .. })).count();
+        assert_eq!(launched, 3, "one iteration per message");
+    }
+
     /// HTTP respond + downstream pulse in one firing: the node talks to the
     /// caller AND emits `done`, both happen, run completes.
     #[tokio::test]

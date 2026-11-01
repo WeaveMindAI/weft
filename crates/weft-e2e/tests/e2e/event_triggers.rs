@@ -14,12 +14,8 @@
 //!   WEFT_E2E_DATABASE_URL          the store's Postgres, for seeding
 //!                                  the connection + the recipe
 //!
-//! The APP (dial-out socket) pattern lives below in this same file:
-//! its live proof (a real Slack app + app-level token), the gate that
-//! keeps a bot-pattern connection off the app-wide firehose, and the
-//! shared door's fixed-permissions contract. The socket machinery
-//! itself is also proven in the listener's contract tests against an
-//! in-process gateway.
+//! Two tests: a signed message push fires a run, and a signed
+//! interactivity push resumes a run parked on it.
 #![cfg(feature = "e2e")]
 
 use std::time::Duration;
@@ -28,8 +24,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use weft_e2e::access::{catalog_spec, SeededGrant};
-use weft_e2e::ensure::{self, env_group_or_skip, env_or_skip};
-use weft_e2e::platform::Platform;
+use weft_e2e::ensure::{self, env_group_or_skip};
 use weft_e2e::{project::Project, run, SettledRun};
 use weft_task_store::db::{self, Client as _, Pool};
 
@@ -144,7 +139,7 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
     let [signing_secret, client_id, db_url] =
         <[String; 3]>::try_from(env).expect("three vars requested");
     let disp = ensure::up().await?;
-    let pool = weft_e2e::platform::database(&db_url, 2).await.context("connect WEFT_E2E_DATABASE_URL")?;
+    let pool = weft_e2e::platform::database(&db_url).await.context("connect WEFT_E2E_DATABASE_URL")?;
 
     let (grant_id, seeded) = seed_slack_grant(&pool, &client_id).await?;
 
@@ -257,7 +252,7 @@ async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
     let [signing_secret, client_id, db_url] =
         <[String; 3]>::try_from(env).expect("three vars requested");
     let disp = ensure::up().await?;
-    let pool = weft_e2e::platform::database(&db_url, 2).await.context("connect WEFT_E2E_DATABASE_URL")?;
+    let pool = weft_e2e::platform::database(&db_url).await.context("connect WEFT_E2E_DATABASE_URL")?;
     let (grant_id, seeded) = seed_slack_grant(&pool, &client_id).await?;
 
     let mut project = Project::prepare("slack_await", disp.clone()).await?;
@@ -321,12 +316,9 @@ async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
         .send()
         .await
         .context("POST the signed interactivity payload")?;
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "the signed interactivity push was refused: {} {}",
-        resp.status(),
-        resp.text().await.unwrap_or_default()
-    );
+    let status = resp.status();
+    let refusal = resp.text().await.context("read the interactivity push's answer")?;
+    anyhow::ensure!(status.is_success(), "the signed interactivity push was refused: {status} {refusal}");
 
     // The SAME run resumes (no new run) and completes with the
     // clicked action mapped through the topic's fields.
@@ -336,221 +328,4 @@ async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
 
     seeded.finish().await?;
     project.finish().await
-}
-
-// ---------- The APP (dial-out socket) pattern ----------
-//
-// Env for the live socket proof (a hand-made Slack app of your own):
-//
-//   WEFT_E2E_SLACK_BOT_TOKEN   the app's bot token (xoxb-), invited to
-//                              the channel below
-//   WEFT_E2E_SLACK_APP_TOKEN   the SAME app's app-level token (xapp-,
-//                              Basic Information > App-Level Tokens,
-//                              scope connections:write), with Socket
-//                              Mode enabled and the bot subscribed to
-//                              message.channels
-//   WEFT_E2E_SLACK_CHANNEL_ID  a channel the bot is in
-//
-// The negative gate needs only WEFT_E2E_SLACK_BOT_TOKEN.
-
-/// The APP pattern live: a connection through one's own app with the
-/// app-level token pasted arms the firehose over Socket Mode (weft
-/// dials out and holds the line; no public address involved), and a
-/// real message posted in the workspace fires the trigger.
-#[tokio::test]
-async fn slack_app_socket_receives_a_real_workspace_message() -> Result<()> {
-    let Some(env) = env_group_or_skip(
-        "slack app socket",
-        &[
-            "WEFT_E2E_SLACK_BOT_TOKEN",
-            "WEFT_E2E_SLACK_APP_TOKEN",
-            "WEFT_E2E_SLACK_CHANNEL_ID",
-        ],
-    ) else {
-        return Ok(());
-    };
-    let [bot_token, app_token, channel] =
-        <[String; 3]>::try_from(env).expect("three vars requested");
-    let disp = weft_e2e::ensure::up().await?;
-    let conn = weft_e2e::access::connect_paste(
-        &disp,
-        catalog_spec("slack", "access")?,
-        json!({ "token": bot_token, "appToken": app_token }),
-    )
-    .await?;
-
-    let mut project = Project::prepare("slack_app_messages", disp.clone()).await?;
-    let pid = project.id();
-    weft_e2e::access::set_account(&project, "ws", conn.handle()).await?;
-    // The proof posts AS THE BOT below, and bot messages are ignored
-    // by default (a workflow must not trigger itself unasked).
-    project.set_node_config("recv", "includeBots", "true")?;
-    project.activate().await?;
-    let before = run::runs(&disp, &pid).await?;
-
-    // Wait until the listener has actually dialed the socket (its own
-    // log line), then post a real message AS THE BOT (its own posts
-    // ride the firehose too). Generous window: the
-    // whole suite may be running at once.
-    Platform::connect(&disp)
-        .await?
-        .wait_for_runtime_log(
-            "the listener to dial the app socket ('socket connected' in its log)",
-            "socket connected",
-            Duration::from_secs(240),
-        )
-        .await?;
-    let marker = format!("weft-e2e-app-{}", uuid::Uuid::new_v4());
-    let resp: Value = weft_core::net::http_client()
-        .build()?
-        .post("https://slack.com/api/chat.postMessage")
-        .bearer_auth(&bot_token)
-        .json(&json!({ "channel": channel, "text": marker }))
-        .send()
-        .await?
-        .json()
-        .await?;
-    anyhow::ensure!(
-        resp.get("ok").and_then(Value::as_bool) == Some(true),
-        "chat.postMessage refused: {resp}"
-    );
-
-    let run_id =
-        run::wait_for_triggered_run(&disp, &pid, &before, Duration::from_secs(90)).await?;
-    let settled = SettledRun::observe(&disp, run_id).await?;
-    settled.completed()?;
-    let text = settled
-        .input_of("out")
-        .and_then(|i| i.get("data").and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_default();
-    anyhow::ensure!(text.contains(&marker), "the fired text was: {text:?}");
-
-    project.finish().await?;
-    conn.finish().await
-}
-
-/// The gate between the two patterns: a BOT-pattern connection (a
-/// pasted bot token, no app-level token) cannot open the app-wide
-/// firehose. The trigger declares it needs the connection's
-/// `appToken`, and the register-time resolve refuses to arm it, so
-/// ACTIVATION fails loudly naming the missing value instead of
-/// minting a dead trigger. The values live on the store's grant
-/// row, so nothing a client sends can fake the token's presence.
-#[tokio::test]
-async fn a_bot_pattern_connection_cannot_open_the_app_firehose() -> Result<()> {
-    let Some(bot_token) = env_or_skip("WEFT_E2E_SLACK_BOT_TOKEN") else {
-        return Ok(());
-    };
-    let disp = weft_e2e::ensure::up().await?;
-    let conn = weft_e2e::access::connect_paste(
-        &disp,
-        catalog_spec("slack", "access")?,
-        json!({ "token": bot_token }),
-    )
-    .await?;
-
-    let mut project = Project::prepare("slack_app_messages", disp.clone()).await?;
-    weft_e2e::access::set_account(&project, "ws", conn.handle()).await?;
-    let output = project.activate_refused().await?;
-    anyhow::ensure!(
-        output.contains("needs the connection's 'appToken'"),
-        "the refusal must name the missing app_token; activate said:\n{output}"
-    );
-
-    project.finish().await?;
-    conn.finish().await
-}
-
-// ---------- The shared door's fixed permissions ----------
-
-/// The doors probe lists each registered app as its own option with
-/// its FIXED `covers`, and a shared consent pins exactly the chosen
-/// app: its client_id and its covers ride the consent URL, and an
-/// unknown label is refused. On a weft with no https address the
-/// probe instead reports every consent blocked (Slack only accepts
-/// https callbacks), which is the other half of the same contract.
-#[tokio::test]
-async fn the_shared_door_offers_each_registered_app_with_fixed_permissions() -> Result<()> {
-    let Some(client_id) = env_or_skip("WEFT_E2E_SLACK_CLIENT_ID") else {
-        return Ok(());
-    };
-    let disp = weft_e2e::ensure::up().await?;
-    let spec = catalog_spec("slack", "access")?;
-    let doors: Value = disp.post_json("/access/doors", &json!({ "spec": spec })).await?;
-
-    if let Some(blocked) = doors.get("consentBlocked").and_then(Value::as_str) {
-        anyhow::ensure!(
-            blocked.contains("https"),
-            "the consent block must teach the https fix: {blocked}"
-        );
-        eprintln!("SKIPPED consent-url half: no https address on this weft ({blocked})");
-        return Ok(());
-    }
-
-    let apps = doors
-        .get("sharedApps")
-        .and_then(Value::as_array)
-        .cloned()
-        .context("doors answered no shared_apps")?;
-    anyhow::ensure!(!apps.is_empty(), "the apps file offers no slack app to this probe");
-    for app in &apps {
-        anyhow::ensure!(
-            app.get("covers").and_then(Value::as_array).is_some_and(|c| !c.is_empty()),
-            "a registered app must show its fixed permissions: {app}"
-        );
-    }
-    let first = &apps[0];
-    let label = first.get("label").and_then(Value::as_str).context("app without label")?;
-    let covers: Vec<String> = first
-        .get("covers")
-        .and_then(Value::as_array)
-        .unwrap()
-        .iter()
-        .filter_map(|c| c.as_str().map(str::to_string))
-        .collect();
-
-    let started: Value = disp
-        .post_json(
-            "/access/connect/begin",
-            &json!({ "spec": spec, "door": "shared", "sharedApp": label,
-                     "permissions": [], "projectId": null,
-                     "upgradeGrantId": null, "registration": null }),
-        )
-        .await?;
-    let consent = started
-        .get("consentUrl")
-        .and_then(Value::as_str)
-        .context("begin answered no consent_url")?;
-    anyhow::ensure!(consent.contains(&client_id), "the consent must pin the app: {consent}");
-    // Read the scope parameter off the parsed URL (query_pairs decodes
-    // the percent-encoding) and assert set membership on the split
-    // scope list, so a permission that merely appears as a substring
-    // of another never fakes a pass.
-    let parsed = url::Url::parse(consent).context("parse the consent url")?;
-    let scope = parsed
-        .query_pairs()
-        .find(|(k, _)| k == "scope")
-        .map(|(_, v)| v.into_owned())
-        .context("the consent url carries no scope parameter")?;
-    let scopes: std::collections::HashSet<&str> =
-        scope.split([' ', ',']).filter(|s| !s.is_empty()).collect();
-    for cover in &covers {
-        anyhow::ensure!(
-            scopes.contains(cover.as_str()),
-            "the consent must carry the app's fixed permission '{cover}'; its scopes: {scope}"
-        );
-    }
-
-    let err = disp
-        .post_json::<Value>(
-            "/access/connect/begin",
-            &json!({ "spec": spec, "door": "shared", "sharedApp": "no-such-app",
-                     "permissions": [], "projectId": null,
-                     "upgradeGrantId": null, "registration": null }),
-        )
-        .await
-        .err()
-        .context("an unknown app label must be refused")?;
-    anyhow::ensure!(format!("{err:#}").contains("labelled"), "unexpected refusal: {err:#}");
-    Ok(())
 }

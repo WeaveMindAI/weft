@@ -430,7 +430,6 @@ pub async fn record_batch(
     let mut last = Vec::with_capacity(head.runs.len());
     let mut costs = CostColumns::default();
     let mut skipped = Vec::with_capacity(head.runs.len());
-    let mut wrote = Vec::with_capacity(head.runs.len());
     let mut born = Vec::with_capacity(head.runs.len());
     let mut ended_at = Vec::with_capacity(head.runs.len());
     let mut outcomes = Vec::with_capacity(head.runs.len());
@@ -453,7 +452,6 @@ pub async fn record_batch(
             costs.push(ordinal, run.first_seq, cost);
         }
         skipped.push(run.written.skipped);
-        wrote.push(run.wrote_files);
         born.push(&run.born);
         let ended = run.written.ended.as_ref();
         ended_at.push(ended.map(|ending| ending.at));
@@ -490,7 +488,6 @@ pub async fn record_batch(
         &first,
         &last,
         &skipped,
-        &wrote,
         &born,
         &ended_at,
         &outcomes,
@@ -509,7 +506,7 @@ pub async fn record_batch(
         .all(
             "SELECT o_run_id, o_fate, o_project_id, o_tell_end, o_keep_until, o_unwatched FROM weft_record_batch(\
              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, \
-             $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)",
+             $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)",
             &params,
         )
         .await?;
@@ -879,13 +876,6 @@ pub async fn append_locked_in(
             "INSERT INTO run_search_queue (run_id) SELECT run_id FROM run WHERE run_id = $1 AND recorded \
              ON CONFLICT (run_id) DO NOTHING",
             &[&run_id],
-        )
-        .await?;
-        db.execute(
-            "INSERT INTO storage_sweep (run_id, tenant_id, enqueued_at_unix) \
-             SELECT run_id, tenant_id, $2::bigint FROM run WHERE run_id = $1 AND wrote_files \
-             ON CONFLICT (run_id) DO NOTHING",
-            &[&run_id, &now],
         )
         .await?;
     }

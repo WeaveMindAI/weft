@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -43,14 +43,8 @@ impl ProjectStatus {
         self.0.get("infraRollup").and_then(Value::as_str).unwrap_or("")
     }
 
-    /// Whether the REGISTERED definition declares infra (the source fact the
-    /// dispatcher enforces with; refreshed on every register).
-    pub fn has_infra(&self) -> bool {
-        self.0.get("hasInfra").and_then(Value::as_bool).unwrap_or(false)
-    }
-
     /// Live infra rows whose node is no longer in the registered source.
-    pub fn orphaned_infra(&self) -> bool {
+    fn orphaned_infra(&self) -> bool {
         self.0.get("orphanedInfra").and_then(Value::as_bool).unwrap_or(false)
     }
 
@@ -74,30 +68,21 @@ impl ProjectStatus {
             .find(|t| t.get("node").and_then(Value::as_str) == Some(node))
     }
 
-    /// One owner's activation of `node`: the shared one when `instance`
-    /// is `None`, that instance's otherwise.
-    pub fn trigger_copy(&self, node: &str, instance: Option<&str>) -> Option<&Value> {
-        let entry = self.trigger(node)?;
-        match instance {
-            None => entry.get("shared"),
-            Some(instance) => entry
-                .get("copies")
-                .and_then(Value::as_array)?
-                .iter()
-                .find(|c| c.get("instance").and_then(Value::as_str) == Some(instance)),
-        }
+    /// The shared activation of `node` (`triggers[].shared`).
+    pub fn trigger_copy(&self, node: &str) -> Option<&Value> {
+        self.trigger(node)?.get("shared")
     }
 
     /// Where that activation stands (`off` / `turning_on` / `on` /
     /// `behind`), `""` when it has none.
-    pub fn trigger_state(&self, node: &str, instance: Option<&str>) -> &str {
-        self.trigger_copy(node, instance).and_then(|c| c.get("state")).and_then(Value::as_str).unwrap_or("")
+    pub fn trigger_state(&self, node: &str) -> &str {
+        self.trigger_copy(node).and_then(|c| c.get("state")).and_then(Value::as_str).unwrap_or("")
     }
 
     /// What that activation holds while it is down: the arrivals its door
     /// held, and the runs it fired that are paused.
-    pub fn trigger_held(&self, node: &str, instance: Option<&str>) -> (u64, u64) {
-        let held = self.trigger_copy(node, instance).and_then(|c| c.get("held"));
+    pub fn trigger_held(&self, node: &str) -> (u64, u64) {
+        let held = self.trigger_copy(node).and_then(|c| c.get("held"));
         let count = |key: &str| held.and_then(|h| h.get(key)).and_then(Value::as_u64).unwrap_or(0);
         (count("arrivals"), count("paused"))
     }
@@ -130,26 +115,12 @@ impl ProjectStatus {
     }
 
     /// The entry of the infra place the program spells `node` (`infra[]`).
-    pub fn infra_place(&self, node: &str) -> Option<&Value> {
+    fn infra_place(&self, node: &str) -> Option<&Value> {
         self.0
             .get("infra")
             .and_then(Value::as_array)?
             .iter()
             .find(|p| p.get("node").and_then(Value::as_str) == Some(node))
-    }
-
-    /// Where the shared copy of the infra place `node` stands (`running`,
-    /// `stopped`, `not_started`, ...), `""` when the program has no such
-    /// place.
-    pub fn infra_state(&self, node: &str) -> &str {
-        self.infra_place(node).and_then(|p| p.get("status")).and_then(Value::as_str).unwrap_or("")
-    }
-
-    /// Whether the shared copy of `node` was applied from other infra than
-    /// the registered build holds (`behind`): what `weft infra upgrade`
-    /// replaces once it runs.
-    pub fn infra_behind(&self, node: &str) -> bool {
-        self.infra_place(node).and_then(|p| p.get("behind")).and_then(Value::as_bool).unwrap_or(false)
     }
 
     /// The reconciliation table's answer: the verbs the dispatcher will
@@ -212,24 +183,6 @@ where
         Ok(if pred(&s) { Some(s) } else { None })
     })
     .await
-}
-
-/// Wait until `verb` appears in `available_actions`.
-pub async fn wait_until_action(
-    disp: &Dispatcher,
-    id: &Uuid,
-    verb: &str,
-    deadline: Duration,
-) -> Result<ProjectStatus> {
-    wait_until(
-        disp,
-        id,
-        &format!("project to offer '{verb}'"),
-        deadline,
-        |s| s.offers(verb),
-    )
-    .await
-    .with_context(|| format!("project never offered '{verb}'"))
 }
 
 /// Wait until the stored lifecycle status equals `status`.

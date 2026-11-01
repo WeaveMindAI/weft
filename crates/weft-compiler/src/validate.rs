@@ -85,7 +85,6 @@ fn validate_scoped(
     check_route_claims(project, catalog, &mut d);
     check_per_instance(project, catalog, &mut d);
     check_shared_trigger_runs(project, &mut d);
-    check_run_files_kept(project, catalog, &mut d);
     check_instance_filled(project, &mut d);
     check_run_settings(project, &mut d);
     d
@@ -197,71 +196,6 @@ fn check_shared_trigger_runs(project: &ProjectDefinition, d: &mut Vec<Diagnostic
                 weft_core::comma_list::spell_list(&spelled),
                 if spelled.len() == 1 { "exists" } else { "exist" },
             ));
-    }
-}
-
-/// run-file-kept-past-run: a file stored for its run only is readable by
-/// that run alone (keeping it for days with `scope: run` keeps it for that
-/// run still), so wiring one into a node that keeps what it is given past
-/// the run (`keepsInputsPastRun`: a table, a record, an instance's values)
-/// leaves a reference no later run can open. A run that reads it back
-/// works only while it is the same run, which is why it slips through a
-/// first try. Warned on the wire's end, naming where the file was stored.
-/// Only a file whose scope the program wrote is judged: the output names
-/// the input that picks it (`fileScopeFrom`), and that input says `run`
-/// (written, or by its default); one arriving on a wire, and an output
-/// that says nothing of its scope, are not known here. A loop's
-/// boundaries pass a value on unchanged, so the walk goes back through
-/// them to where the file was made.
-fn check_run_files_kept(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, d: &mut Vec<Diagnostic>) {
-    use weft_core::frames::Located;
-    use weft_core::project::graph::{GraphView, ProjectGraph};
-    use weft_core::project::places;
-    let g = ProjectGraph::new(project);
-    // Where the file at `port` of the node at `at` was stored for its run
-    // only: that node's place and the input that said so.
-    fn run_scoped_origin(
-        g: &ProjectGraph,
-        catalog: &dyn MetadataCatalog,
-        at: &Located,
-        port: &str,
-        seen: &mut std::collections::BTreeSet<(Located, String)>,
-    ) -> Option<(Located, String)> {
-        if !seen.insert((at.clone(), port.to_string())) {
-            return None;
-        }
-        let node = g.node(&at.id)?;
-        if node.group_boundary.is_some() {
-            let feeders: Vec<(Located, String)> = places::incoming(g, at)
-                .filter(|(edge, _)| edge.target_port() == port)
-                .map(|(edge, source)| (source, edge.source_port().to_string()))
-                .collect();
-            return feeders.into_iter().find_map(|(source, out)| run_scoped_origin(g, catalog, &source, &out, seen));
-        }
-        let from = catalog.lookup(&node.node_type)?.outputs.iter().find(|o| o.name == port)?.file_scope_from.clone()?;
-        if places::incoming(g, at).any(|(edge, _)| edge.target_port() == from) {
-            return None;
-        }
-        let scope = node.written_value(&from).or_else(|| node.inputs.iter().find(|i| i.name == from)?.default.as_ref())?;
-        (scope.as_str().and_then(weft_core::storage::StorageScope::named) == Some(weft_core::storage::StorageScope::Run))
-            .then(|| (at.clone(), from))
-    }
-    for (edge, source, target) in places::located_wires(project) {
-        let Some(keeper) = g.node(&target.id).filter(|n| n.features.keeps_inputs_past_run) else { continue };
-        let Some(made) = g.node(&source.id) else { continue };
-        if !made.types_at(&source.path).output(edge.source_port()).is_some_and(|ty| ty.references_file()) {
-            continue;
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        let Some((origin, scope_input)) = run_scoped_origin(&g, catalog, &source, edge.source_port(), &mut seen) else { continue };
-        let keeper_name = weft_core::project::address_of(project, &target.id, &target.path);
-        let origin_name = weft_core::project::address_of(project, &origin.id, &origin.path);
-        cfg_push(d, keeper, edge.target_port(), Severity::Warning, "run-file-kept-past-run", format!(
-            "'{keeper_name}' keeps what '{}' is given after the run ends, but the file it gets was stored by \
-             '{origin_name}' for its run only (`{scope_input}: run`), and no later run can read it. Store it with \
-             `{scope_input}: project` so every later run of the project can",
-            edge.target_port(),
-        ));
     }
 }
 

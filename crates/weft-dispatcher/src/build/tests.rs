@@ -45,7 +45,6 @@ fn meta(key: &str, mime: &str) -> weft_core::storage::StoredFileMeta {
         mime_type: mime.into(),
         size_bytes: 42,
         filename: "cat.png".into(),
-        keep: false,
         expires_at_unix: None,
         keep_ttl_secs: None,
         created_at_unix: 0,

@@ -1191,6 +1191,7 @@ async fn a_shared_key_connect_stores_a_runtime_owned_row(pool: Pool) {
 /// A CLAIMED (unverified) permission set never blocks resolution: a
 /// pasted credential on a service that reports nothing must resolve
 /// whatever a consumer requires (nobody actually knows what it holds).
+/// A VERIFIED set short of what the consumer requires is refused.
 #[weft_db_macros::test]
 async fn a_claimed_shortfall_is_let_through_at_resolution(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
@@ -1224,6 +1225,31 @@ async fn a_claimed_shortfall_is_let_through_at_resolution(pool: Pool) {
     )
     .await
     .expect("an unknown granted set never blocks");
+
+    // Once the provider has reported what the connection holds, a
+    // permission it lacks is refused at resolution, naming the permission
+    // and the reconnect that adds it.
+    pool.execute(
+        "UPDATE access_grant SET permissions_verified = TRUE, granted_scopes = '[\"base.read\"]'::jsonb WHERE id = $1",
+        &[&done.grant.id],
+    )
+    .await
+    .unwrap();
+    let err = resolve_for_worker(
+        &pool,
+        TENANT_A, GrantUser::Author,
+        done.grant.id,
+        "fakestatic",
+        &["chat:write".to_string()],
+        &[],
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("'chat:write'") && err.to_string().contains("reconnect"), "{err}");
+    assert!(
+        matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NeedsReconnect { .. })),
+        "{err}"
+    );
 }
 
 
@@ -1915,7 +1941,24 @@ async fn optional_field_groups_gate_what_a_connection_can_do(pool: Pool) {
     )
     .await
     .unwrap_err();
-    assert!(err.to_string().contains("out_host"), "{err}");
+    assert!(err.to_string().contains("needs the connection's 'out_host'"), "{err}");
+    assert!(
+        matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NeedsReconnect { .. })),
+        "{err}"
+    );
+    // A trigger arming on the same connection (the listener's resolve) is
+    // refused the same way, which is what an activation reports.
+    let err = weft_access_store::resolve_event_source(
+        &pool,
+        TENANT_A,
+        GrantUser::Author,
+        done.grant.id,
+        "fakemail",
+        &["out_host".to_string()],
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("needs the connection's 'out_host'"), "{err}");
     assert!(
         matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NeedsReconnect { .. })),
         "{err}"
@@ -2525,6 +2568,9 @@ async fn the_install_keeps_the_authors_picks(pool: Pool) {
         service: service.into(),
     };
     let conn = pool.get().await.unwrap();
+    let unknown = uuid::Uuid::new_v4();
+    let err = change_install_picks(&conn, TENANT_A, PROJECT_1, &[pick("post", unknown, "fakestatic")], &[]).await.unwrap_err();
+    assert!(err.to_string().contains(&unknown.to_string()), "a connection that is not there is named: {err}");
     let err = change_install_picks(&conn, TENANT_A, PROJECT_1, &[pick("post", mine.id, "fakestatic"), pick("read", adas.id, "fakestatic")], &[])
         .await
         .unwrap_err();
@@ -2760,6 +2806,8 @@ async fn a_provider_naming_the_client_differently_gets_that_name_everywhere(pool
     assert_eq!(query.get("client_key").map(String::as_str), Some("cid"), "{consent}");
     assert!(!query.contains_key("client_id"), "{consent}");
     assert_eq!(query.get("app").map(String::as_str), Some("cid"), "{consent}");
+    let scopes: Vec<&str> = query.get("scope").map(|s| s.split([' ', ',']).collect()).unwrap_or_default();
+    assert!(scopes.contains(&"read"), "the consent asks for every permission the connect carries: {consent}");
     let grant = complete_oauth(&pool, &started.state, "the-code").await.unwrap().grant;
     expire_now(&pool, grant.id).await;
 

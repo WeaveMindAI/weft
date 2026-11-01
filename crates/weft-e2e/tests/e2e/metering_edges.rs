@@ -1,22 +1,10 @@
-//! Layer-4: what the cost trail says when a paid job's figure never
-//! arrives, and what a worker has left after node code panics.
+//! Layer-4: what the cost trail says about a paid job whose figure is
+//! stated only on a later read (a queue-shaped provider).
 //!
-//! Both need a fixture, because neither is reachable from outside: a
-//! provider that commits money and then stays silent, and a node that
-//! panics inside its own `run`. The rig owns both ends, so a test can
-//! decide whether an answer is ever read back, and can make a real
-//! panic unwind through the worker's own machinery.
-//!
-//! What is being proved:
-//!   - a job submitted and never read back lands on the trail as a
-//!     spend with NO figure, when the run ends, rather than as a
-//!     zero (which would claim the call was free), as nothing at all
-//!     (which would claim it never happened), or only when the worker
-//!     eventually dies (which used to keep the worker from retiring);
-//!   - a job whose answer IS read back lands with what the provider
-//!     actually stated;
-//!   - a panicking node fails its own run and leaves the worker
-//!     able to run the next one.
+//! The `metering_queue` fixture ships both the node and its meter, and
+//! the rig serves the provider ([`QueueFake`]), so the test owns both
+//! ends: the node submits a job, reads its answer back, and the trail
+//! carries what the provider stated.
 #![cfg(feature = "e2e")]
 
 use weft_e2e::access::{connect_direct, service_spec_of, set_account};
@@ -42,43 +30,14 @@ async fn connect_queue(
     Ok(conn)
 }
 
-/// Money out, and nothing will ever say how much.
-///
-/// The node submits a job and walks away, which is an ordinary thing to
-/// do: a branch stops caring, a person cancels. The spend is real, and
-/// the only honest record is one with no figure on it. It has to land
-/// when the RUN ends: tying it to the worker's own shutdown meant
-/// the record arrived whenever that worker eventually died, and the worker
-/// refused to retire while any such charge was open.
-#[tokio::test]
-async fn a_job_submitted_and_never_read_back_records_spend_with_no_figure() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let mut project = Project::prepare("metering_queue", disp.clone()).await?;
-    // No units ever: every read would say "still running", and the node
-    // does not read anyway.
-    let fake = QueueFake::start(None).await?;
-    let conn = connect_queue(&project, &disp, &fake).await?;
-
-    let mut settled = run::run_and_settle(&mut project).await?;
-    settled.completed()?;
-
-    anyhow::ensure!(fake.submits() == 1, "the job was submitted once: {}", fake.submits());
-    anyhow::ensure!(fake.reads() == 0, "and its answer was never read: {}", fake.reads());
-    settled.assert_spend_without_figure("queue_fake", 1).await?;
-
-    conn.finish().await?;
-    project.finish().await
-}
-
-/// The same call, read back. The provider states the count and the
+/// A submitted job, read back. The provider states the count and the
 /// trail carries what it actually came to.
 #[tokio::test]
 async fn a_job_read_back_records_what_the_provider_stated() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("metering_queue", disp.clone()).await?;
-    let fake = QueueFake::start(Some(3)).await?;
+    let fake = QueueFake::start(3).await?;
     let conn = connect_queue(&project, &disp, &fake).await?;
-    project.set_node_config("job", "readBack", "true")?;
 
     let mut settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
@@ -99,57 +58,5 @@ async fn a_job_read_back_records_what_the_provider_stated() -> anyhow::Result<()
     );
 
     conn.finish().await?;
-    project.finish().await
-}
-
-/// Node code panics. The run has to end failed rather than hang,
-/// and the worker has to be fit to run the next one: a panic unwinds
-/// past the ordinary cleanup, so everything that run registered on
-/// the worker is released by a guard or not at all.
-#[tokio::test]
-async fn a_panicking_node_fails_its_run_and_leaves_the_worker_healthy() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let mut project = Project::prepare("worker_panic", disp.clone()).await?;
-
-    let settled = run::run_and_settle(&mut project).await?;
-    anyhow::ensure!(
-        settled.status == "failed",
-        "a panicking node fails its run rather than hanging it; got {}",
-        settled.status
-    );
-    // Whatever the worker does with the node behind a panic (skip it on
-    // the closed input, or never reach it at all), the one thing it must
-    // NOT do is run it: a panicking node produced no value for it.
-    let after: Vec<&str> = settled.replay.for_node("after").map(|e| e.kind()).collect();
-    anyhow::ensure!(
-        !after.contains(&"node_completed"),
-        "the node behind a panicking one must not run; its events: {after:?}"
-    );
-
-    // THE SAME WORKER takes another run, which is the part that matters: a
-    // fresh worker would pass this whatever the panic left behind. So the
-    // worker serving the first run is read, the second run goes through,
-    // and the worker is asserted to be that same one, still running. If
-    // the panic had left the run's state behind, this is where it
-    // shows: a cancel flag and a live config for a dead run, and a
-    // worker that refuses to retire.
-    let platform = weft_e2e::platform::Platform::connect(&disp).await?;
-    let pid = project.id();
-    let before = platform.run_writer(&settled.run_id).await?
-        .ok_or_else(|| anyhow::anyhow!("the panicking run's record names no worker"))?;
-
-    project.set_node_config("boom", "explode", "false")?;
-    let ok = run::run_and_settle(&mut project).await?;
-    ok.completed()?;
-    ok.assert_completed("after")?;
-    let owner = platform.run_writer(&ok.run_id).await?;
-    anyhow::ensure!(owner.as_deref() == Some(before.as_str()), "the second run used {owner:?}, but the panicking run used {before}");
-
-    let running = platform.workers_for_project(&pid).await?;
-    anyhow::ensure!(
-        running.len() == 1,
-        "the worker that survived the panic must be the only one serving the project: {running:?}"
-    );
-
     project.finish().await
 }

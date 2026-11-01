@@ -300,7 +300,9 @@ The same cron can also clean up what weft itself can see: containers in
 `WipeInstance` removes the instance's triggers, the containers you name (with
 every disk, the ones kept through a terminate too), its values, connections,
 tokens, files and runs. `weft rm` of the project takes every instance's
-values, connections, tokens and files with it.
+values, connections, tokens and files with it. Short of that, an
+instance's files go only when somebody deletes them or a deadline they were
+given arrives.
 
 ## Tokens and costs
 

@@ -5754,6 +5754,12 @@ mod paging_tests;
 #[path = "run_driver_tests/seeded.rs"]
 mod seeded_tests;
 
+// Layer 3: a file included at several sites runs once per call, each
+// call under its own frame, with its own picks and its own waits.
+#[cfg(test)]
+#[path = "run_driver_tests/include_calls.rs"]
+mod include_calls_tests;
+
 // Layer 3: Generator streams + delivery-waiting emissions through the
 // real loop. See the module doc for the contracts pinned there.
 #[cfg(test)]

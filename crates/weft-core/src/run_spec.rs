@@ -541,12 +541,15 @@ impl KickPlan {
         let mut roots: BTreeSet<Located> = crate::run::scope::starting_members(program, &index, None, &Vec::new())
             .into_iter().map(Located::top).collect();
         roots.extend(crate::project::trigger_places(program).into_iter()
-            .filter(|place| index.admits(&place.id, &place.frames()) && !index.stands_in(&place.id, &place.frames()))
-            .filter(|place| index.get_incoming(program, &place.id, &place.frames()).is_empty()));
+            .filter(|place| {
+                let frames = index.frames_at(program, place);
+                index.admits(&place.id, &frames) && !index.stands_in(&place.id, &frames)
+                    && index.get_incoming(program, &place.id, &frames).is_empty()
+            }));
         roots.into_iter().map(|place| {
             let event = fire.filter(|(at, _)| *at == &place);
             Self {
-                frames: place.frames(),
+                frames: index.frames_at(program, &place),
                 node: place.id,
                 firing: event.is_some(), payload: event.map(|(_, value)| value.clone()),
                 port_snapshot: event.and(port_snapshot).cloned(),
@@ -943,7 +946,8 @@ pub fn resolve_seeded(spec: &RunSpec, project: &ProjectDefinition, saved: &crate
         .map(|spelled| crate::project::places::named(&g, spelled).map(crate::project::places::Named::into_place))
         .collect::<Result<_, String>>().map_err(Refusal::error)?;
     let fired = bounds.fired.clone();
-    let (mut walked, baked) = walk_reading_baked(&g, bounds, saved, &named);
+    let (mut walked, baked) = walk_reading_baked(&g, bounds.clone(), saved, &named);
+    cut::validate_loops(&g, &bounds, &walked).map_err(Refusal::error)?;
     // The bounds name nothing to run. A seed reusing all of what they name
     // leaves nothing to run either, which is a run that reuses everything.
     let walked_nothing = walked.runs.is_empty() && walked.stand_ins.is_empty();
@@ -2447,5 +2451,119 @@ mod tests {
         assert!(refused.contains("'a' is no node with a field each instance fills"), "{refused}");
         let unknown_field = InstanceValueInput { node: "b".into(), field: "other".into(), value: json!(1) };
         assert!(check_instance_values(&project, &ada, &Default::default(), &[unknown_field]).is_err());
+    }
+
+    /// A trigger whose own input is wired (`sched -> wired -> beat`, the
+    /// shape a bridge feeds a trigger) fires by hand on what it registered
+    /// at activation: the fire runs without `sched`, nothing calls the
+    /// wired port missing, and the one kick that fires is the trigger,
+    /// carrying its event, the kick its registered snapshot goes on. A
+    /// live fire hands the snapshot in here; a hand fire has it set on the
+    /// same firing kick by the dispatcher (`actions::runs`).
+    #[test]
+    fn a_registered_port_lets_the_fire_resolve() {
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [
+                node("sched", &[], &[], &["value"], false),
+                node("wired", &[], &[("cron", true)], &["scheduledTime"], true),
+                node("beat", &[], &[("data", true)], &[], false),
+            ],
+            "edges": [wire("sched", "value", "wired", "cron"), wire("wired", "scheduledTime", "beat", "data")],
+        })).unwrap();
+        let event = json!({"scheduledTime": "2026-03-03T00:00:00Z"});
+        let spec = RunSpec { fire: Some(("wired".into(), event.clone())), ..RunSpec::whole("x") };
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
+        assert_eq!(resolved.runs, BTreeSet::from([Located::top("wired"), Located::top("beat")]), "sched is not in the fire");
+        refuse_unrunnable(&project, &resolved, &spec).expect("the wired port comes from the registration, not from sched");
+        let firing: Vec<&KickPlan> = resolved.kicks.iter().filter(|kick| kick.firing).collect();
+        assert_eq!(firing.len(), 1, "{:?}", resolved.kicks);
+        assert_eq!((firing[0].node.as_str(), firing[0].payload.as_ref()), ("wired", Some(&event)));
+
+        let snapshot = json!({"cron": "0 0 * * * *"});
+        let fire = compute_trigger_fire(&project, "wired", &event, Some(&snapshot), &Default::default()).unwrap();
+        let wired = fire.kicks.iter().find(|kick| kick.node == "wired").expect("the trigger is kicked");
+        assert_eq!((wired.firing, wired.port_snapshot.as_ref()), (true, Some(&snapshot)));
+        assert!(fire.kicks.iter().filter(|kick| kick.node != "wired").all(|kick| kick.port_snapshot.is_none()), "{:?}", fire.kicks);
+        assert!(fire.program.nodes.iter().all(|node| node.id != "sched"), "a fire never runs what feeds its trigger");
+    }
+
+    /// An aimed run is its target and what the target needs, nothing
+    /// else: two chains and a leaf (`left_src -> left -> out_left`, `left
+    /// -> side`, `right_src -> right -> out_right`), aimed at the end of
+    /// one chain or at a node in its middle, runs that node and its
+    /// upstream, kicks only that chain's root, and leaves the leaf and the
+    /// other chain out of the program entirely. A name that is no node is
+    /// refused before anything runs.
+    #[test]
+    fn an_aimed_run_is_its_target_and_what_the_target_needs() {
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [
+                node("left_src", &[], &[], &["value"], false),
+                node("left", &[], &[("value", true)], &["value"], false),
+                node("out_left", &[], &[("data", true)], &[], false),
+                node("side", &[], &[("value", true)], &["value"], false),
+                node("right_src", &[], &[], &["value"], false),
+                node("right", &[], &[("value", true)], &["value"], false),
+                node("out_right", &[], &[("data", true)], &[], false),
+            ],
+            "edges": [
+                wire("left_src", "value", "left", "value"), wire("left", "value", "out_left", "data"),
+                wire("left", "value", "side", "value"),
+                wire("right_src", "value", "right", "value"), wire("right", "value", "out_right", "data"),
+            ],
+        })).unwrap();
+        let aimed = |target: &str| resolve_spec(&RunSpec { target: vec![target.into()], ..RunSpec::whole("x") }, &project, &Default::default());
+        for (target, runs) in [("out_left", &["left_src", "left", "out_left"][..]), ("left", &["left_src", "left"][..])] {
+            let resolved = aimed(target).unwrap();
+            assert_eq!(resolved.runs, runs.iter().map(|id| Located::top(*id)).collect::<BTreeSet<_>>(), "aimed at {target}");
+            let mut in_program: Vec<&str> = resolved.program.nodes.iter().map(|node| node.id.as_str()).collect();
+            in_program.sort();
+            let mut expected = runs.to_vec();
+            expected.sort();
+            assert_eq!(in_program, expected, "aimed at {target}, the program holds nothing else");
+            let kicked: Vec<&str> = resolved.kicks.iter().map(|kick| kick.node.as_str()).collect();
+            assert_eq!(kicked, ["left_src"], "aimed at {target}, only the chain's root is kicked");
+        }
+        let refused = aimed("nope").unwrap_err().to_string();
+        assert!(refused.contains("unknown node 'nope'"), "{refused}");
+    }
+
+    /// A per-instance infra node (`svc = MiniService { @per_instance }`
+    /// read by `out`) makes a run name its instance: with none, the run is
+    /// refused saying it needs to know which instance it is for; with one,
+    /// it reads only that instance's copy, so a run for `ada` before
+    /// `ada`'s copy is up, or a run for `bob` while only `ada`'s runs, is
+    /// refused naming `svc (instance '<id>')` and the `--instance` start
+    /// that brings it up.
+    #[test]
+    fn a_run_reaching_a_per_instance_copy_names_its_instance_and_reads_only_that_copy() {
+        let mut svc = node("svc", &[], &[], &["status"], false);
+        svc["requiresInfra"] = json!(true);
+        svc["perInstance"] = json!("marked");
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [svc, node("out", &[], &[("data", true)], &[], false)],
+            "edges": [wire("svc", "status", "out", "data")],
+        })).unwrap();
+        let spec = RunSpec::whole("x");
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
+        let refused = refuse_unrunnable(&project, &resolved, &spec).unwrap_err().to_string();
+        assert!(refused.contains("'svc' exists once per instance, so this run needs to know which instance it is for"), "{refused}");
+
+        let (ada, bob) = (crate::instance::InstanceId::new("ada").unwrap(), crate::instance::InstanceId::new("bob").unwrap());
+        let for_ada = RunSpec { instance: Some(ada.clone()), ..spec.clone() };
+        refuse_unrunnable(&project, &resolved, &for_ada).expect("an instance named is enough to start");
+        use crate::infra::run_gate::{copies_read, infra_not_running, missing_copies, InfraCopyUp};
+        let down = |instance: &crate::instance::InstanceId, copies: &[InfraCopyUp]| {
+            infra_not_running(&missing_copies(&copies_read(&resolved.program, None, Some(instance)), copies))
+        };
+        let refused = down(&ada, &[]);
+        assert!(refused.contains("svc (instance 'ada')") && refused.contains("--instance ada"), "{refused}");
+        let adas = [InfraCopyUp { node_id: "svc".into(), instance: Some(ada.clone()), running: true, baked: Default::default() }];
+        assert!(missing_copies(&copies_read(&resolved.program, None, Some(&ada)), &adas).is_empty(), "ada's run reads ada's copy");
+        let refused = down(&bob, &adas);
+        assert!(refused.contains("svc (instance 'bob')"), "bob's copy is not ada's: {refused}");
     }
 }

@@ -21,19 +21,25 @@
 //!
 //! - [`client`] : HTTP client over the dispatcher API + `weft` CLI shell-out.
 //! - [`ensure`] : reach the install under test (the runner brought it up).
-//! - [`cell`]   : a whole install of a test's own, with its own pace.
+//! - [`cell`]   : a whole install of a test's own.
 //! - [`event`]  : the run replay event stream, typed-accessor over JSON.
 //! - [`project`]: fixture -> isolated project lifecycle (prepare/build/run/rm).
+//! - [`teardown`]: the guard that removes a project on a pass and keeps it on a fail.
+//! - [`kept`]   : the ledger of what tests made, so the next run removes what a failed one kept.
+//! - `cleanup`  : removing what failed runs kept (`scripts/run-e2e.sh --clean`).
 //! - [`run`]    : start a run, wait for it to settle, fetch its replay.
 //! - [`assert`] : intent assertions over a settled run (output / skip / loop).
 //! - [`signal`] : discover + fire triggers the outside world calls IN.
-//! - [`live`]   : the live-caller handshake + HTTP/WS exchange.
+//! - [`live`]   : a live caller's HTTP/WS exchange.
 //! - [`human`]  : human-in-the-loop forms (discover, answer, assert resume).
 //! - [`fakes`]  : throwaway servers for triggers the system dials OUT to.
-//! - [`infra`]  : infra node lifecycle (start, poll, drive, terminate).
+//! - [`infra`]  : infra node lifecycle (start, poll, terminate).
+//! - [`display`]: read what a node is showing, through an outside client's door.
+//! - [`access`] : connect a service through the dispatcher's store, as the editor does.
 //! - [`status`] : project status + available-actions observation.
 //! - [`storage`]: stored-file list / download / assert + sweep.
 //! - [`bus`]    : bus conversation assertions over the event log.
+//! - `platform` : worker processes, containers and the database, behind the API.
 //!
 //! ## Tests (the `tests/` directory)
 //!
@@ -51,7 +57,7 @@
 //! it its key ([`client::Dispatcher::with_key`]; everything API + token, no
 //! CLI). What stays specific to this harness and
 //! is NOT reused: [`ensure`] and [`cell`] (installs on this machine),
-//! `platform` (Postgres direct), and [`project::Project`] (shells out to the
+//! `platform` (worker processes and containers on this machine), and [`project::Project`] (shells out to the
 //! `weft` CLI).
 
 pub mod access;
@@ -71,10 +77,10 @@ pub mod human;
 pub mod infra;
 pub mod kept;
 pub mod live;
-// The platform layer reaches behind the public API (direct Postgres + Docker)
-// to observe and drive what the SYSTEM does underneath a program. It needs the
-// install's Postgres, so it compiles ONLY under `e2e`. None of it ships; see
-// the module docs.
+// The platform layer reaches behind the public API (worker processes, Docker,
+// a direct database) to observe and drive what the SYSTEM does underneath a
+// program, so it compiles ONLY under `e2e`. None of it ships; see the module
+// docs.
 #[cfg(feature = "e2e")]
 pub mod platform;
 pub mod project;
@@ -82,12 +88,9 @@ pub mod run;
 pub mod signal;
 pub mod status;
 pub mod storage;
-// The teardown guard (clean-on-pass / keep-and-warn-on-fail) is backing-agnostic,
-// so both the local CLI fixture (`project::Project`) and an HTTP fixture in
-// another harness share ONE definition of the policy via this guard.
 pub mod teardown;
 
-pub use client::{cli, cli_ok, poll_until, poll_until_describing, tail, time_left, Dispatcher, TEST_LIMIT};
+pub use client::{cli, cli_ok, poll_until, poll_until_describing, time_left, Dispatcher, TEST_LIMIT};
 #[cfg(feature = "e2e")]
 pub use platform::Platform;
 pub use cell::Cell;

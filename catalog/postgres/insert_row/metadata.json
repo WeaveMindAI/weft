@@ -9,9 +9,6 @@
   ],
   "icon": "DatabaseBackup",
   "color": "#336791",
-  "features": {
-    "keepsInputsPastRun": true
-  },
   "inputs": [
     {
       "name": "account",

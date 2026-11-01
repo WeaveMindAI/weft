@@ -18,7 +18,7 @@ use weft_e2e::{project::Project, run, Cell, SettledRun};
 /// lift fires a run.
 #[tokio::test]
 async fn a_trigger_comes_back_after_the_maintenance() -> anyhow::Result<()> {
-    let cell = Cell::start(1.0).await?;
+    let cell = Cell::start().await?;
     let disp = cell.dispatcher();
     let mut project = Project::prepare("reach_out_feed", disp.clone()).await?;
     let feed = SseFake::start().await?;
@@ -43,7 +43,7 @@ async fn a_trigger_comes_back_after_the_maintenance() -> anyhow::Result<()> {
     weft_e2e::status::wait_until_status(&disp, &pid, "active", Duration::from_secs(60)).await?;
     feed.wait_for_subscriber(Duration::from_secs(60)).await?;
     let before = run::runs(&disp, &pid).await?;
-    feed.push_event("tick", &json!({ "value": 7 }).to_string());
+    feed.push_event("tick", &json!({ "value": 7 }).to_string())?;
     let run_id = run::wait_for_triggered_run(&disp, &pid, &before, Duration::from_secs(60)).await?;
     SettledRun::observe(&disp, run_id).await?.completed()?;
     let status = project.weft(&["maintenance"]).await?;

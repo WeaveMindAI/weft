@@ -81,7 +81,7 @@
     {
       "name": "historyFile",
       "type": "File",
-      "description": "The `historyFile` that came in with this call's user message and reply added (same file, next version), or, when none came in, a new file holding this turn, kept past the run. Unwired with no file in, the call keeps nothing."
+      "description": "The `historyFile` that came in with this call's user message and reply added (same file, next version), or, when none came in, a new file holding this turn, stored with the run (KeepFile keeps it past that). Unwired with no file in, the call keeps nothing."
     },
     {
       "name": "toolCalls",

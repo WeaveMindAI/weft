@@ -23,7 +23,7 @@ async fn plain_text(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(file.mime_type, "text/plain");
     assert_eq!(rig.stored_bytes(&file.key)?.as_ref(), "héllo".as_bytes(), "saved as UTF-8");
     let meta = rig.stored_meta(&file.key)?;
-    assert_eq!((meta.keep, meta.keep_ttl_secs), (false, None), "a run file goes with its run");
+    assert_eq!(meta.keep_ttl_secs, None, "a run file goes with its run");
     Ok(())
 }
 

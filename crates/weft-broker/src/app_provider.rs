@@ -784,6 +784,37 @@ mod tests {
         }
     }
 
+    /// A shared-door connect takes the app the person picked by its label,
+    /// whole: its own client id and its fixed `covers` (what the consent
+    /// then asks for), never another app's. A label the file no longer
+    /// holds is refused, saying nothing is labelled that way.
+    #[tokio::test]
+    async fn a_shared_connect_takes_the_labelled_apps_client_and_covers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "apps.json",
+            r#"{ "google": [
+                   { "kind": "oauth_app", "label": "Broad", "covers": ["a", "b"],
+                     "authUrl": "https://a/x", "tokenUrl": "https://a/t",
+                     "client_id": "cid-broad", "client_secret": "sec" },
+                   { "kind": "oauth_app", "label": "Narrow", "covers": ["a"],
+                     "authUrl": "https://a/x", "tokenUrl": "https://a/t",
+                     "client_id": "cid-narrow", "client_secret": "sec" }
+                 ] }"#,
+        );
+        let provider: Arc<dyn AppProvider> = Arc::new(FileAppProvider::at(&path));
+        let spec = spec_with_permissions(&["a", "b"]);
+
+        let picked = resolve_shared_app(&provider, &spec, "Narrow").await.unwrap();
+        assert_eq!((picked.app.client_id.as_str(), picked.covers.as_slice()), ("cid-narrow", ["a".to_string()].as_slice()));
+        let picked = resolve_shared_app(&provider, &spec, "Broad").await.unwrap();
+        assert_eq!((picked.app.client_id.as_str(), picked.covers.len()), ("cid-broad", 2));
+
+        let err = resolve_shared_app(&provider, &spec, "no-such-app").await.unwrap_err();
+        assert!(format!("{err:#}").contains("labelled 'no-such-app'"), "{err:#}");
+    }
+
     #[tokio::test]
     async fn the_file_supplies_app_lists_by_service_name() {
         let dir = tempfile::tempdir().unwrap();

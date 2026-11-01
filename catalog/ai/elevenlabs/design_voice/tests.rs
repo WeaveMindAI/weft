@@ -65,11 +65,11 @@ fn answers(rig: &FakeRig, query: &str, clips: &[(&str, &[u8])], text: Option<&st
 }
 
 /// The stored file behind a preview's audio: its bytes, name and type,
-/// and whether it was kept past the run.
-fn stored(rig: &FakeRig, preview: &Value) -> WeftResult<(Vec<u8>, String, String, bool)> {
+/// and its deadline.
+fn stored(rig: &FakeRig, preview: &Value) -> WeftResult<(Vec<u8>, String, String, Option<u64>)> {
     let file = StoredFile::from_value(&preview["audio"])?;
     let meta = rig.stored_meta(&file.key)?;
-    Ok((rig.stored_bytes(&file.key)?.to_vec(), meta.filename, meta.mime_type, meta.keep))
+    Ok((rig.stored_bytes(&file.key)?.to_vec(), meta.filename, meta.mime_type, meta.keep_ttl_secs))
 }
 
 /// Every format the metadata offers stores under a real extension and
@@ -99,11 +99,13 @@ async fn designs(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(previews[0]["voiceId"], json!("gen-1"));
     assert_eq!(previews[0]["durationSecs"], json!(3.5));
     assert_eq!(previews[0]["language"], json!("en"));
-    let (bytes, filename, mime, kept) = stored(&rig, &previews[0])?;
+    let (bytes, filename, mime, deadline) = stored(&rig, &previews[0])?;
     assert_eq!(bytes, b"preview-audio".to_vec(), "the decoded clip is what is stored");
     assert_eq!(filename, "preview-1.mp3");
     assert_eq!(mime, "audio/mpeg");
-    assert!(kept, "the previews are the run's product and outlive it");
+    assert_eq!(deadline, None, "the previews are the run's, with no deadline: they go with the run");
+    let key = StoredFile::from_value(&previews[0]["audio"])?.key;
+    assert!(key.contains("/run/"), "run-scoped: the previews are the run's: {key}");
     assert_eq!(outcome.outputs["text"], json!(LINE), "the line ElevenLabs wrote");
 
     let sent = &rig.requests()[0];

@@ -76,39 +76,40 @@ pub static DISPATCHER_READY: &[crate::drain::WakeOn] = &[crate::drain::WakeOn::a
 /// nothing read too, or sleeps until a task is announced when no claim is
 /// out.
 ///
-/// Once its copy steps aside (`aside`, `crate::aside`), it claims nothing
-/// more, and each task it still runs gets [`crate::aside::GRACE`] to
-/// finish before it is given back to be claimed again elsewhere; each is
-/// counted in flight until its ending is written.
+/// Once its copy is stopping (`stopping`, `crate::stopping`), it claims
+/// nothing more, and each task it still runs gets
+/// [`crate::stopping::GRACE`] to finish before it is given back to be
+/// claimed again elsewhere; each is counted in flight until its ending is
+/// written.
 pub fn dispatcher_picker_loop<Ctx>(
     store: Arc<crate::traits::PostgresTaskStoreClient>,
     ctx: Ctx,
     registry: TaskRegistry<Ctx>,
     replica: String,
-    aside: crate::aside::StepAside,
+    stopping: crate::stopping::Stopping,
 ) -> crate::drain::DrainLoop
 where
     Ctx: Send + Sync + Clone + 'static,
 {
     let slots = Arc::new(tokio::sync::Semaphore::new(DISPATCHER_PICKER_CONCURRENCY));
     crate::drain::DrainLoop::new("dispatcher_picker", "pick up the tasks waiting for it", DISPATCHER_READY, crate::drain::SAFETY_POLL_INTERVAL, move || {
-        let (store, ctx, registry, replica, slots, aside) = (store.clone(), ctx.clone(), registry.clone(), replica.clone(), slots.clone(), aside.clone());
+        let (store, ctx, registry, replica, slots, stopping) = (store.clone(), ctx.clone(), registry.clone(), replica.clone(), slots.clone(), stopping.clone());
         async move {
             // At capacity: wait for a running task to finish before claiming
             // another.
             let slot = slots.acquire_owned().await.expect("the picker's semaphore is never closed");
             // Checked once the slot is ours, right before the claim: a
-            // copy that stepped aside while this pass waited claims nothing.
-            if aside.is_set() {
+            // copy that began stopping while this pass waited claims nothing.
+            if stopping.has_begun() {
                 return Ok(crate::drain::DrainStep::Done);
             }
             match store.claim_dispatcher_task(&replica).await? {
                 crate::tasks::Claim::Task(task) => {
-                    let in_flight = aside.in_flight();
+                    let in_flight = stopping.in_flight();
                     tokio::spawn(async move {
                         let _slot = slot;
                         let _in_flight = in_flight;
-                        run_dispatcher_task(store.pool().clone(), ctx, registry, replica, task, aside).await;
+                        run_dispatcher_task(store.pool().clone(), ctx, registry, replica, task, stopping).await;
                     });
                     Ok(crate::drain::DrainStep::More)
                 }
@@ -131,7 +132,7 @@ async fn run_dispatcher_task<Ctx>(
     registry: TaskRegistry<Ctx>,
     replica: String,
     task: Task,
-    aside: crate::aside::StepAside,
+    stopping: crate::stopping::Stopping,
 ) where
     Ctx: Send + Sync + Clone + 'static,
 {
@@ -162,14 +163,14 @@ async fn run_dispatcher_task<Ctx>(
         lease: lease.clone(),
     };
     let heartbeat = spawn_claim_heartbeat(claim.clone());
-    // Once its copy stepped aside and the grace is over, the task is given
-    // back: the work stops here, and the next claim, a current copy's,
+    // Once its copy is stopping and the grace is over, the task is given
+    // back: the work stops here, and the next claim, a running copy's,
     // runs it again from what it wrote down.
     let given_back = {
         let lease = lease.clone();
         BesideClaim(tokio::spawn(async move {
-            aside.grace_over().await;
-            lease.lost(LeaseLoss::SteppedAside);
+            stopping.grace_over().await;
+            lease.lost(LeaseLoss::Stopping);
         }))
     };
     let outcome = run_with_lease_guard(
@@ -272,10 +273,10 @@ enum LeaseLoss {
     /// so the task is surrendered (`tasks::surrender`): back to
     /// `pending` for any process (including us) to claim again.
     Unrenewable,
-    /// This copy of the dispatcher was replaced and the task outlived the
-    /// grace it was given (`crate::aside`): it did not fail, so it is
-    /// surrendered for a current copy to run again.
-    SteppedAside,
+    /// This copy of the dispatcher is stopping and the task outlived the
+    /// grace it was given (`crate::stopping`): it did not fail, so it is
+    /// surrendered for a running copy to run again.
+    Stopping,
 }
 
 /// Cancellation token + the reason it fired. The heartbeat task sets
@@ -394,7 +395,7 @@ fn verdict(outcome: ExecOutcome, task_id: uuid::Uuid, kind: &str) -> Verdict {
             tracing::error!(target: "weft_task_store::executor", id = %task_id, kind = %kind, panic = %panic_msg, "task panicked; writing tasks::fail");
             Verdict::Fail(format!("panic: {panic_msg}"))
         }
-        ExecOutcome::LeaseLost(LeaseLoss::Unrenewable | LeaseLoss::SteppedAside) => Verdict::Surrender,
+        ExecOutcome::LeaseLost(LeaseLoss::Unrenewable | LeaseLoss::Stopping) => Verdict::Surrender,
         ExecOutcome::LeaseLost(LeaseLoss::Stolen) => Verdict::StandDown,
     }
 }
@@ -542,7 +543,7 @@ fn spawn_claim_heartbeat(claim: TaskClaim) -> BesideClaim {
 }
 
 /// A task working beside a claim (its heartbeat, its giving back once its
-/// copy stepped aside), stopped when it is dropped: the work it keeps
+/// copy is stopping), stopped when it is dropped: the work it keeps
 /// claimed may be dropped mid-way (its caller went away, its task was
 /// aborted), and a heartbeat left running would hold the claim forever
 /// with nothing doing the work.
@@ -569,7 +570,7 @@ mod tests {
         assert!(matches!(verdict(ExecOutcome::Finished(Ok(Err(lost))), id, "register_signal"), Verdict::Surrender));
         assert!(matches!(verdict(ExecOutcome::LeaseLost(LeaseLoss::Unrenewable), id, "register_signal"), Verdict::Surrender));
         assert!(matches!(verdict(ExecOutcome::LeaseLost(LeaseLoss::Stolen), id, "register_signal"), Verdict::StandDown));
-        assert!(matches!(verdict(ExecOutcome::LeaseLost(LeaseLoss::SteppedAside), id, "activate"), Verdict::Surrender), "a copy stepping aside gives it back");
+        assert!(matches!(verdict(ExecOutcome::LeaseLost(LeaseLoss::Stopping), id, "activate"), Verdict::Surrender), "a stopping copy gives it back");
         let failed = verdict(ExecOutcome::Finished(Ok(Err(anyhow::anyhow!("no such run")))), id, "register_signal");
         assert!(matches!(&failed, Verdict::Fail(msg) if msg == "no such run"), "{failed:?}");
     }

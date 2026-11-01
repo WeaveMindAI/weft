@@ -240,8 +240,10 @@ weft takes those nodes and everything feeding into them, stopping the walk when
 it reaches a trigger. A node that several branches share does not drag those
 other branches in. A target inside a group brings only the work needed through
 it, and the group's `_should_flow` comes along too, unless it is wired straight
-from a trigger the run does not fire. A loop is the exception: it comes along
-whole, and cutting inside one is refused.
+from a trigger the run does not fire. A loop the walk reaches from outside
+comes along whole: a target after a loop runs every iteration of it. If you
+want to run part of a loop's body, start and end the run inside the body
+(see [running part of a loop's body](loops.md#running-part-of-its-body)).
 
 What runs is a **cut**: a smaller program holding only what the walk kept,
 with every node under its own name, so the journal and the inspector line up
@@ -328,6 +330,12 @@ past a node without running it (a trigger you have not activated, an infra
 node, a call you do not want to pay for twice), stand in for it with
 `--emit`: `--emit fetch='{"body": "..."}'` says what `fetch` would have sent,
 and the run starts from there, the way it starts at a `--from`.
+
+Any of these flags can name a node or a group inside a loop's body, as long as
+the run does not cut a loop in half: it holds both ends of a loop (the loop
+runs whole, every iteration) or neither (only the part of its body you
+picked runs, once). For what that part gets and what is refused, go and read
+[running part of a loop's body](loops.md#running-part-of-its-body).
 
 On a `--seed` run the check waits for the seed, since a saved result can
 supply the input. It only can when the run it reads completed that node and

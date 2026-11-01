@@ -185,26 +185,32 @@ pub async fn run(ctx: Ctx, run_id: String, timeout: Duration, waiting_for_input:
     if ctx.json_out(&answer)? {
         return Ok(ended.outcome);
     }
-    let short = super::versions::short(&run_id);
-    let line = match ended.outcome {
+    println!("{}", ended_line(&ended, &run_id, timeout, waiting_for_input, ctx.on()));
+    Ok(ended.outcome)
+}
+
+/// The line a person reads when the wait on `run_id` stops: how the run
+/// ended, or what to call to keep waiting (aimed at the install `on`
+/// names).
+fn ended_line(ended: &Ended, run_id: &str, timeout: Duration, waiting_for_input: bool, on: Option<&str>) -> String {
+    let short = super::versions::short(run_id);
+    match ended.outcome {
         Outcome::Completed => format!("run {short} completed"),
         Outcome::Failed => format!("run {short} failed: {}", ended.error.as_deref().unwrap_or_default()),
         Outcome::Cancelled => format!("run {short} was cancelled: {}", ended.reason.as_deref().unwrap_or_default()),
         Outcome::WaitingForInput => format!(
             "run {short} is waiting for input; see what it waits on with `{}`",
-            super::weft_on(ctx.on(), &format!("events {run_id} --kind node_suspended"))
+            super::weft_on(on, &format!("events {run_id} --kind node_suspended"))
         ),
         Outcome::TimedOut => {
             let again = if waiting_for_input { format!("wait {run_id} --waiting-for-input") } else { format!("wait {run_id}") };
             format!(
                 "run {short} is still going after {}; to keep waiting, call `{}` again",
                 spell_duration(timeout),
-                super::weft_on(ctx.on(), &again)
+                super::weft_on(on, &again)
             )
         }
-    };
-    println!("{line}");
-    Ok(ended.outcome)
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +281,24 @@ mod tests {
         assert!(parse_timeout("1h").is_err());
         assert!(parse_timeout("0s").unwrap_err().contains("at least 1s"));
         assert!(parse_timeout("10").is_err(), "a duration needs its unit");
+    }
+
+    /// A wait that timed out names the whole call that keeps waiting on
+    /// the same run, with the flag it was given and the install it was
+    /// aimed at; a run that ended says how, with the error or the reason.
+    #[test]
+    fn a_timed_out_wait_names_the_call_that_keeps_waiting() {
+        let run = "c2000000-0000-0000-0000-000000000000";
+        let ten = Duration::from_secs(600);
+        let line = ended_line(&Ended::bare(Outcome::TimedOut), run, ten, false, None);
+        assert_eq!(line, format!("run c2000000 is still going after 10m; to keep waiting, call `weft wait {run}` again"));
+        let line = ended_line(&Ended::bare(Outcome::TimedOut), run, Duration::from_secs(90), true, Some("prod"));
+        assert!(line.contains(&format!("`weft wait {run} --waiting-for-input --on prod`")) && line.contains("after 90s"), "{line}");
+        let cancelled = Ended { reason: Some("stopped by a person".into()), ..Ended::bare(Outcome::Cancelled) };
+        assert_eq!(ended_line(&cancelled, run, ten, false, None), "run c2000000 was cancelled: stopped by a person");
+        let failed = Ended { error: Some("this run fails on purpose".into()), ..Ended::bare(Outcome::Failed) };
+        assert_eq!(ended_line(&failed, run, ten, false, None), "run c2000000 failed: this run fails on purpose");
+        assert_eq!(ended_line(&Ended::bare(Outcome::Completed), run, ten, false, None), "run c2000000 completed");
     }
 
     #[test]

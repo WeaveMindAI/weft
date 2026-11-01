@@ -163,7 +163,7 @@
     {
       "name": "image",
       "type": "Image",
-      "description": "The generated image, kept for 30 days after it was last read."
+      "description": "The generated image, stored with the run and deleted with it (once the run's record goes); wire it through KeepFile to keep it past that."
     }
   ],
   "validate": [

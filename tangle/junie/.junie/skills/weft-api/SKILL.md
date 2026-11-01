@@ -265,18 +265,19 @@ nothing past the route runs.
 Multipart bodies are not read: the caller sends JSON with a data URL. A file
 too big for a JSON body (a video, a long recording) goes through an upload
 slot. The program mints one with `UploadSlot` and hands its `slot` string
-(`weft-upload:...`) to the page; the page uploads the file with it, then
-calls the route with that string in a field the route declares as a file
-(`{ "video": "weft-upload:..." }`), and the route receives the stored file.
-A slot takes one file, and an upload no route received within its `minutes`
-is deleted. For the page's side, go and read the `weft-frontend` skill. A
-file sent in the body lands at run scope, walled to that run and swept when it ends: a
-later request cannot read it even if it was kept. If you want to serve a picture from a
-later request, wire it through `KeepFile { scope: "project" }`, which copies
-it into the project's storage, then write the whole [stored-file value] it
-emits into a jsonb column, exactly as it arrived. If it should not live for
-ever, give `KeepFile` a `ttlDays` too: the copy then expires that many days
-after anybody last read it.
+(`weft-upload:...`) to the page; the page uploads the file with it, then calls
+the route with that string in a field the route declares as a file
+(`{ "video": "weft-upload:..." }`), and the route receives the stored file. A
+slot takes one file, and an upload no route received within its `minutes` is
+deleted. For the page's side, go and read the `weft-frontend` skill. A file
+sent in the body lands in the run's files and is deleted with that run, once
+its record goes (a week after the run ends, by default). If you want to serve
+a picture from a later request, wire it through
+`KeepFile { scope: "project" }`, which copies it into the project's files,
+then write the whole [stored-file value] it emits into a jsonb column, exactly
+as it arrived. If it should not live as long as the project, give `KeepFile` a
+`ttlDays` too: the copy is then deleted that many days after anybody last read
+it.
 
 Two columns, and only one of them is right:
 
@@ -303,9 +304,8 @@ as a typed value on a wire, to hand it to a node that takes a picture.
 If you want to serve a picture that is redrawn often (a live preview), the
 shape is one place that always names the latest copy, which every render
 overwrites and the serving route reads and answers as bytes. A render's own
-file is at run scope and swept when its run ends, so a link to it dies
-with that run: each render is kept in the project scope first. One way to
-build it, with a table: each render goes through
+file is deleted with its run, so each render is copied into the project
+scope first. One way to build it, with a table: each render goes through
 `KeepFile { scope: "project", ttlDays: 1 }`, and its whole value goes over
 one row per preview (`INSERT INTO preview (view, picture) VALUES ($view, $picture)
 ON CONFLICT (view) DO UPDATE SET picture = EXCLUDED.picture`). No storage node

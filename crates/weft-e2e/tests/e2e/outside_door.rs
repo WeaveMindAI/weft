@@ -1,7 +1,10 @@
 //! The outside port (the one the public tunnel carries) answers only the
 //! doors outside callers use, however a path is spelled: the management
 //! API, which trusts every caller of the loopback public port, is never
-//! reachable through it.
+//! reachable through it. On the loopback public port, the management API
+//! asks every caller for the install's key and answers no web page, while
+//! the doors outside callers use stay open to every origin, each checking
+//! its own token.
 //!
 //! The requests are raw HTTP/1.1, because an HTTP client would tidy
 //! `/signal/../projects` into `/projects` before sending it, and the whole
@@ -59,5 +62,39 @@ async fn the_outside_port_answers_only_the_outside_doors() -> Result<()> {
     // signal door, not missing.
     let code = status(port, "GET", "/signal-token/health").await?;
     anyhow::ensure!(code != 404, "the signal-token door answers through the outside port, got {code}");
+
+    // On the public port, without the key the management API refuses;
+    // with it, it answers but never tells a browser that a page of another
+    // origin may read the answer. A trigger door still answers a page's
+    // preflight.
+    let http = weft_core::net::http_client().build()?;
+    let base = disp.base();
+    let key = disp.install().secret(weft_core::signal_token::INSTALL_KEY_SECRET).map_err(anyhow::Error::msg)?;
+    let unkeyed = http.get(format!("{base}/projects")).header("origin", "https://evil.example").send().await?;
+    anyhow::ensure!(unkeyed.status() == reqwest::StatusCode::UNAUTHORIZED, "an unkeyed call is refused, got {}", unkeyed.status());
+    let keyed = http.get(format!("{base}/projects")).bearer_auth(&key).header("origin", "https://evil.example").send().await?;
+    anyhow::ensure!(keyed.status().is_success(), "the key is accepted, got {}", keyed.status());
+    anyhow::ensure!(
+        keyed.headers().get("access-control-allow-origin").is_none(),
+        "no web origin may read the management API: {:?}",
+        keyed.headers().get("access-control-allow-origin")
+    );
+    let preflight = http
+        .request(reqwest::Method::OPTIONS, format!("{base}/projects"))
+        .header("origin", "https://evil.example")
+        .header("access-control-request-method", "DELETE")
+        .send()
+        .await?;
+    anyhow::ensure!(preflight.headers().get("access-control-allow-origin").is_none(), "no preflight lets a page through");
+    let door = http
+        .request(reqwest::Method::OPTIONS, format!("{base}/signal/not-a-token"))
+        .header("origin", "https://site.example")
+        .header("access-control-request-method", "POST")
+        .send()
+        .await?;
+    anyhow::ensure!(
+        door.headers().get("access-control-allow-origin").is_some(),
+        "a trigger door answers every origin, its token being its check"
+    );
     Ok(())
 }

@@ -13,13 +13,7 @@
 //!     `weft run` then runs that code with nothing left to send;
 //!   - `weft branch <older version>` keeps the folder's unrecorded work
 //!     as a version and prints the command that comes back, and that
-//!     command brings the files back exactly;
-//!   - a file changed both in the folder and in its working copy keeps
-//!     the folder's and writes the other beside it, and `weft resolve`
-//!     settles it either way;
-//!   - a folder that is gone keeps its head's versions from a prune
-//!     until `weft branch --copy` moves it or `weft forget-copy` removes
-//!     it, keeping its files as a version.
+//!     command brings the files back exactly.
 #![cfg(feature = "e2e")]
 
 use std::time::Duration;
@@ -182,118 +176,6 @@ async fn a_branch_keeps_the_work_as_a_version_and_its_come_back_line_restores_it
     let tree = tree_of(&project).await?;
     anyhow::ensure!(version_ids(&tree).len() == 2, "the base and the work, nothing else: {tree}");
     anyhow::ensure!(my_copy(&tree)?["workingVersion"] == json!(saved), "the folder is the work again: {tree}");
-
-    project.finish().await
-}
-
-#[tokio::test]
-async fn a_gone_folder_is_moved_or_forgotten_so_a_prune_goes() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let project = Project::prepare("version_tree", disp.clone()).await?;
-    let base: Value = serde_json::from_str(project.weft(&["checkpoint", "base", "--json"]).await?.trim())?;
-    let v1 = base["version"].as_str().unwrap_or_default().to_string();
-    project.write_file("prompts/greeting.txt", "louder")?;
-    project.weft(&["checkpoint", "loud", "--json"]).await?;
-    let mine = folder_copy_id(&project).await?;
-
-    // A second folder of the project registers on the newest head, then
-    // goes away with the head still on `loud`.
-    let second = project.second_checkout()?;
-    let out = weft_e2e::client::cli(&disp, &second, &["tree"]).await?;
-    anyhow::ensure!(out.success, "the second folder registers: {}", out.stderr);
-    let copies = working_copies(&disp, &project.id()).await?;
-    let other = copies.iter().find(|c| c.id != mine).ok_or_else(|| anyhow::anyhow!("no second working copy: {copies:?}"))?.clone();
-    let path = other.path.clone().unwrap_or_default();
-    std::fs::remove_dir_all(&second)?;
-    project.weft(&["branch", "base"]).await?;
-
-    // The prune is refused naming that folder and both ways out.
-    let refused = project.weft_refused(&["prune", "loud", "--yes"]).await?;
-    anyhow::ensure!(
-        refused.contains(&format!("--copy {path}")) && refused.contains(&format!("weft forget-copy {path}")),
-        "{refused}"
-    );
-
-    // Moving it away from here lets the prune go.
-    let moved: Value = serde_json::from_str(project.weft(&["branch", "base", "--copy", &path, "--json"]).await?.trim())?;
-    anyhow::ensure!(moved["copy"]["id"] == json!(other.id) && moved["copy"]["headVersion"] == json!(v1), "{moved}");
-    anyhow::ensure!(project.read_file("prompts/greeting.txt")? == "hello", "this folder stayed where it was");
-    let pruned: Value = serde_json::from_str(project.weft(&["prune", "loud", "--yes", "--json"]).await?.trim())?;
-    anyhow::ensure!(pruned["deleted"] == json!(true), "{pruned}");
-
-    // Forgetting it keeps its files as a version and removes it.
-    let forgot: Value = serde_json::from_str(project.weft(&["forget-copy", &path, "--json"]).await?.trim())?;
-    anyhow::ensure!(forgot["saved"] == json!(v1), "its files were the base: {forgot}");
-    let left = working_copies(&disp, &project.id()).await?;
-    anyhow::ensure!(left.iter().all(|c| c.id != other.id), "the copy is gone: {left:?}");
-    let here = left.iter().find(|c| c.id == mine).and_then(|c| c.path.clone()).unwrap_or_default();
-    let refused = project.weft_refused(&["forget-copy", &here]).await?;
-    anyhow::ensure!(refused.contains("this folder's working copy"), "{refused}");
-
-    project.finish().await
-}
-
-/// The working copy `id` with its files, as the install holds it now.
-async fn state_of(project: &Project, id: Uuid) -> anyhow::Result<weft_core::working_copy::WorkingState> {
-    project.dispatcher().get_json(&format!("/projects/{}/working-copies/state?workingCopy={id}", project.id())).await
-}
-
-/// Change `path` in the working copy `id` to the stored `hash`, as a
-/// program's write would, while the folder holds something else of its
-/// own: the next sync finds both sides moved.
-async fn change_in_the_install(project: &Project, id: Uuid, path: &str, hash: &str, read: &str) -> anyhow::Result<()> {
-    let body = json!({ "workingCopy": id, "changes": [{ "path": path, "hash": hash, "expected": { "expect": "hash", "hash": read } }] });
-    let applied: Value = project.dispatcher().post_json(&format!("/projects/{}/working-copies/changes", project.id()), &body).await?;
-    // The runtime's sync waits for the folder to go quiet, so the save is
-    // not up yet and the change still finds what it read.
-    anyhow::ensure!(applied["outcome"] == json!("applied"), "the install took the change before the save went up: {applied}");
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_conflict_keeps_both_files_and_resolve_settles_it_either_way() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let project = Project::prepare("version_tree", disp).await?;
-    const FILE: &str = "prompts/greeting.txt";
-    project.weft(&["checkpoint", "base", "--json"]).await?;
-    let folder = folder_copy_id(&project).await?;
-    let hello = state_of(&project, folder).await?.working[FILE].clone();
-    project.write_file(FILE, "louder")?;
-    project.weft(&["checkpoint", "loud", "--json"]).await?;
-    let louder = state_of(&project, folder).await?.working[FILE].clone();
-
-    // Both sides move: a save here, and the install's copy back to "hello".
-    project.write_file(FILE, "mine")?;
-    change_in_the_install(&project, folder, FILE, &hello, &louder).await?;
-    let conflicted = weft_e2e::poll_until("the sync to find the conflict", SYNC_DEADLINE, Duration::from_millis(250), || async {
-        let copy = copy_of(&project, folder).await?;
-        Ok((!copy.conflicts.is_empty()).then_some(copy))
-    })
-    .await?;
-    let beside = conflicted.conflicts[0].clone();
-    anyhow::ensure!(project.read_file(FILE)? == "mine", "the folder's file is kept");
-    anyhow::ensure!(project.read_file(&beside)? == "hello", "the install's is beside it as {beside}");
-
-    // Taking the install's side puts it in place and the copy goes.
-    let resolved: Value = serde_json::from_str(project.weft(&["resolve", FILE, "--keep", "incoming", "--json"]).await?.trim())?;
-    anyhow::ensure!(resolved["resolved"] == json!([FILE]), "{resolved}");
-    anyhow::ensure!(project.read_file(FILE)? == "hello" && !project.has_file(&beside), "the install's file is in place");
-    let state = state_of(&project, folder).await?;
-    anyhow::ensure!(state.working[FILE] == hello && state.copy.conflicts.is_empty(), "the working copy agrees: {state:?}");
-
-    // And keeping the folder's drops the copy and sends the folder's up.
-    project.write_file(FILE, "mine again")?;
-    change_in_the_install(&project, folder, FILE, &louder, &hello).await?;
-    let conflicted = weft_e2e::poll_until("the second conflict", SYNC_DEADLINE, Duration::from_millis(250), || async {
-        let copy = copy_of(&project, folder).await?;
-        Ok((!copy.conflicts.is_empty()).then_some(copy))
-    })
-    .await?;
-    let beside = conflicted.conflicts[0].clone();
-    project.weft(&["resolve", "--keep", "folder"]).await?;
-    anyhow::ensure!(project.read_file(FILE)? == "mine again" && !project.has_file(&beside), "the folder's file stays, alone");
-    let state = state_of(&project, folder).await?;
-    anyhow::ensure!(state.working[FILE] != louder && state.copy.conflicts.is_empty(), "the folder's file went up: {state:?}");
 
     project.finish().await
 }

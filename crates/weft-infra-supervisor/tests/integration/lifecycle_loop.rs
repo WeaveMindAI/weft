@@ -222,6 +222,30 @@ async fn an_end_that_could_not_be_written_runs_the_command_again() {
     assert_eq!(ending, Some(true), "the pass keeps no lease");
 }
 
+/// A file included twice holds one infra node at two places (`one.svc`,
+/// `two.svc`), each its own copy. A stop naming one place stops that
+/// copy's unit and writes only its row: the other call's copy keeps
+/// running, untouched.
+#[tokio::test]
+async fn a_stop_of_one_place_leaves_the_same_node_at_another_place_running() {
+    let rig = rig();
+    rig.broker.add_infra_node_units(PROJECT, "one.svc", "copy-one", &[("main", Status::Running)]);
+    rig.broker.add_infra_node_units(PROJECT, "two.svc", "copy-two", &[("main", Status::Running)]);
+    rig.broker.enqueue_command(cmd(1, Verb::Stop, Some("one.svc")));
+
+    rig.tick_lifecycle().await.unwrap();
+
+    assert_eq!(stops(&rig), vec!["copy-one/main".to_string()]);
+    assert_eq!(rig.broker.infra_node(PROJECT, "one.svc").unwrap().status, Status::Stopped);
+    assert_eq!(rig.broker.infra_node(PROJECT, "two.svc").unwrap().status, Status::Running);
+    assert!(
+        rig.broker.status_writes().iter().all(|(_, n, _, _)| n == "one.svc"),
+        "nothing is written for the other place: {:?}",
+        rig.broker.status_writes()
+    );
+    assert_eq!(rig.broker.completed_commands(), vec![(1, None, false)]);
+}
+
 #[tokio::test]
 async fn stop_leaves_keep_running_units_and_stops_the_rest() {
     let rig = rig();

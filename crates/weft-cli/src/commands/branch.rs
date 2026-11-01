@@ -17,7 +17,7 @@
 
 use anyhow::{bail, Context};
 use weft_core::versions::VersionTree;
-use weft_core::working_copy::{Forgotten, SwitchRequest, SwitchTo, Switched, WorkingCopy, WorkingCopyKind, WorkingCopyRef};
+use weft_core::working_copy::{Forgotten, SwitchRequest, SwitchTo, Switched, WorkingCopy, WorkingCopyId, WorkingCopyKind, WorkingCopyRef};
 
 use super::versions::{fetch_tree, resolve_run, resolve_version, short};
 use super::Ctx;
@@ -83,10 +83,7 @@ pub async fn run(ctx: Ctx, reference: String, copy: Option<String>) -> anyhow::R
 pub async fn forget(ctx: Ctx, named: String) -> anyhow::Result<()> {
     let here = super::copy::this_copy(&ctx, None).await?;
     let tree = fetch_tree(&here.client, &here.project_id).await?;
-    let copy = resolve_copy(&tree, &named)?;
-    if copy.id == here.copy.id {
-        bail!("{named} is this folder's working copy, which every command run here registers again at once; run this from another folder");
-    }
+    let copy = copy_to_forget(&tree, &named, here.copy.id)?;
     let answer = here
         .client
         .delete_json(&format!("/projects/{}/working-copies/{}", here.project_id, copy.id))
@@ -106,6 +103,17 @@ pub async fn forget(ctx: Ctx, named: String) -> anyhow::Result<()> {
         None => println!("forgot {}, which held no files", copy_name(copy)),
     }
     Ok(())
+}
+
+/// The working copy `named` names, for `weft forget-copy` run from the
+/// folder whose own copy is `here`: never that one, which every command
+/// run in the folder registers again at once.
+fn copy_to_forget<'a>(tree: &'a VersionTree, named: &str, here: WorkingCopyId) -> anyhow::Result<&'a WorkingCopy> {
+    let copy = resolve_copy(tree, named)?;
+    if copy.id == here {
+        bail!("{named} is this folder's working copy, which every command run here registers again at once; run this from another folder");
+    }
+    Ok(copy)
 }
 
 /// The working copy `named` names: `program` (the program copy), a
@@ -193,5 +201,28 @@ mod tests {
         assert_eq!(lines[1], "conflict copies to look at: main.weft-conflict-1");
         let empty = Switched { saved: None, ..switched(None, &[]) };
         assert_eq!(moved_lines(&empty, &weft), vec!["this folder is now at version 11112222"], "nothing was kept, so there is nothing to come back to");
+    }
+
+    /// `weft forget-copy` refuses this folder's own working copy, by
+    /// whatever name it is given, and forgets any other.
+    #[test]
+    fn forgetting_this_folders_own_copy_is_refused() {
+        let folder = |id: u128, path: &str| WorkingCopy {
+            id: uuid::Uuid::from_u128(id),
+            path: Some(path.into()),
+            ..switched(None, &[]).copy
+        };
+        let tree = VersionTree {
+            working_copies: vec![folder(1, "/srv/here"), folder(2, "/srv/gone")],
+            activated_versions: Vec::new(),
+            versions: Vec::new(),
+            runs: Vec::new(),
+        };
+        let here = uuid::Uuid::from_u128(1);
+        for named in ["/srv/here", "/srv/here/", "00000000-0000-0000-0000-000000000001"] {
+            let why = copy_to_forget(&tree, named, here).unwrap_err().to_string();
+            assert!(why.contains("this folder's working copy") && why.contains("from another folder"), "{named}: {why}");
+        }
+        assert_eq!(copy_to_forget(&tree, "/srv/gone", here).unwrap().id, uuid::Uuid::from_u128(2));
     }
 }

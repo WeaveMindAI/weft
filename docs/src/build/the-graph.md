@@ -141,9 +141,12 @@ trigger feeds is skipped. If you want that box to run, fire the trigger with a
 made-up event from the CLI (`weft run --fire`). A box that two branches share
 does not drag the other branch in. If the box sits inside a group, only the
 boxes of that group it needs run, plus whatever feeds the switch that decides
-whether the group runs at all (its `_should_flow` or `_should_not_flow`). If weft reaches a loop on the way, the whole loop comes along, and a
-box inside a loop cannot be picked on its own: Run stays grey and tells you to
-select the whole loop.
+whether the group runs at all (its `_should_flow` or `_should_not_flow`). If weft reaches a loop on the way, the whole loop comes along. A
+box inside a loop needs what the loop hands its body, so picked on its own it
+reaches the loop's start without its end, and Run stays grey saying so. If
+you want to run part of a loop's body, start the run inside it from the
+command line (`weft run --from ... --target ...`, see [running part of a
+loop's body](../language/loops.md#running-part-of-its-body)).
 
 Triggers and infra have no Run button: select one and the bar offers its own
 buttons instead (**Turn on**, **Turn off**, **Resync** for a trigger; **Start**,

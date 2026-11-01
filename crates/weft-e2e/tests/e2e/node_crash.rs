@@ -1,23 +1,24 @@
-//! Platform: the worker dies while two nodes are running, and neither runs
-//! again. In a durable run, a node that was mid-body may have partly
-//! happened (an email sent, a row written), so the worker that picks the
-//! run back up fails it with a message saying so instead of starting it
-//! over, and a node with its `_error` wired hands this one there like any
-//! other. A fast run's record trails it, so it is not
-//! picked back up at all: it ends cancelled.
+//! Platform: the worker goes away while two nodes are running, and neither
+//! runs again. A node that was mid-body may have partly happened (an email
+//! sent, a row written), so the worker that picks the run back up fails it
+//! with a message saying so instead of starting it over, and a node with
+//! its `_error` wired hands this one there like any other.
 //!
 //! Shape: the `node_crash` fixture runs two `ExecPython` nodes that sleep
-//! for ten minutes. Once both have started, every worker of the project is
-//! removed (a fake crash). The claim on the run lapses and a fresh worker
-//! takes it. Durable, the run ends failed: `plain` failed with the crash
-//! message, `caught` completed with that message on `_error`, `handler`
-//! received it. Fast, the run ends cancelled, saying its worker went away.
-//! Either way each node started exactly once.
+//! for ten minutes. Once both have started, the project's workers go away,
+//! two ways:
 //!
-//! A worker told to stop (`SIGTERM`) is the other case: it gives its runs
-//! a few seconds, then stops the nodes still running and hands every
-//! recorded run back, fast ones included. The next worker carries the run
-//! on from its record and fails those nodes the way it fails a crashed one.
+//!   - killed (a fake crash), in a durable run: the claim on the run
+//!     lapses and a fresh worker takes it. The run ends failed: `plain`
+//!     failed with the crash message, `caught` completed with that message
+//!     on `_error`, `handler` received it.
+//!   - told to stop (`SIGTERM`), in a fast run: the worker gives its runs
+//!     a few seconds, then stops the nodes still running and hands every
+//!     recorded run back. The next worker carries the run on from its
+//!     record, fails those nodes the way it fails a crashed one, and the
+//!     run ends failed.
+//!
+//! Either way each node started exactly once.
 #![cfg(feature = "e2e")]
 
 use std::time::Duration;
@@ -63,32 +64,6 @@ async fn a_node_the_worker_died_in_is_failed_never_run_again() -> anyhow::Result
         .and_then(|input| input.get("data").and_then(|v| v.as_str()).map(str::to_string))
         .ok_or_else(|| anyhow::anyhow!("'handler' never received the caught failure"))?;
     anyhow::ensure!(caught.contains(WENT_AWAY), "{caught}");
-
-    project.finish().await
-}
-
-#[tokio::test]
-async fn a_fast_run_whose_worker_died_ends_cancelled_never_run_again() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let platform = Platform::connect(&disp).await?;
-    let mut project = Project::prepare("node_crash", disp.clone()).await?;
-    let pid = project.id();
-
-    let run_id = run::start(&mut project).await?;
-    run::wait_for_nodes_started(&disp, run_id, &["plain", "caught"]).await?;
-    let killed = platform.kill_workers(&pid).await?;
-    anyhow::ensure!(!killed.is_empty(), "no worker was running the nodes when the test removed them");
-
-    // The dead worker's claim lapses, a fresh worker takes the run's task
-    // and ends it instead of driving it.
-    let settled = SettledRun::observe_within(&disp, run_id, Duration::from_secs(240)).await?;
-    anyhow::ensure!(settled.status == "cancelled", "expected the fast run to be cancelled, it is {}", settled.status);
-    let reason = settled.cancel_reason().unwrap_or_default();
-    anyhow::ensure!(reason.contains("a fast run lives in its worker's memory"), "{reason}");
-    for node in ["plain", "caught"] {
-        let starts = settled.events_of(node).filter(|e| e.kind() == "node_started").count();
-        anyhow::ensure!(starts == 1, "'{node}' started {starts} times; a fast run is never run again");
-    }
 
     project.finish().await
 }

@@ -1676,6 +1676,16 @@ impl ProgramIndex {
         &self.scopes
     }
 
+    /// The frames the node at `place` fires at when the run itself puts it
+    /// there (a kick, a value handed to it, its standing in): one call
+    /// frame per site on its path, and iteration 0 of each loop the program
+    /// holds only part of the body of ([`scopes::Scope::entered`]),
+    /// outermost first ([`scopes::ScopeIndex::frames_at`]).
+    pub fn frames_at(&self, project: &ProjectDefinition, place: &Located) -> LoopFrames {
+        let scope = self.node(project, &place.id).and_then(|node| node.scope.last());
+        self.scopes.frames_at(scope.map(String::as_str), &place.path)
+    }
+
     /// Whether the node `node_id` exists at `frames`: every node does,
     /// except under a site a cut runs only part of the body of
     /// ([`GroupKind::Call`]'s `runs`), where only the places it lists do.
@@ -2502,6 +2512,27 @@ mod trigger_dependency_tests {
         let p = program_with_two_sites();
         assert_eq!(deps(&p, "one.door"), vec!["one.svc".to_string(), "top_db".to_string()]);
         assert_eq!(deps(&p, "two.door"), vec!["two.svc".to_string()]);
+    }
+
+    /// An infra node inside a file included twice is two placements, one
+    /// per call: each is its own place, spelled through its site (`one.svc`,
+    /// `two.svc`, never the file's own id), running under that call's frame,
+    /// and a bare `svc` names neither and is refused with the spelling
+    /// that works.
+    #[test]
+    fn a_file_included_twice_has_one_infra_placement_per_call() {
+        let p = program_with_two_sites();
+        let at = |site: &str| Located::new("Bridge.svc", vec![site.to_string()]);
+        assert_eq!(infra_places(&p), vec![at("one"), at("two"), Located::top("top_db")]);
+        assert_eq!(infra_reached(&p), ["one.svc", "two.svc", "top_db"].map(String::from).into());
+        let index = ProgramIndex::build(&p);
+        for site in ["one", "two"] {
+            assert_eq!(index.frames_at(&p, &at(site)), vec![crate::frames::Frame::Call { site: site.into() }]);
+            let named = places::named(&graph::ProjectGraph::new(&p), &format!("{site}.svc")).expect("a placement is named through its site");
+            assert_eq!(named.into_place(), at(site));
+        }
+        let refused = places::named(&graph::ProjectGraph::new(&p), "svc").map(|_| ()).unwrap_err();
+        assert!(refused.contains("site.svc"), "{refused}");
     }
 }
 

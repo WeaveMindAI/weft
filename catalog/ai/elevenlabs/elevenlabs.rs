@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use weft::bus::StreamEnd;
 use weft::context::LogLevel;
 use weft::node::NodeOutput;
-use weft::storage::{KeepTtl, StorageScope, StoredFile};
+use weft::storage::{StorageScope, StoredFile};
 use weft::{node_error, RunContext, NodeErrExt, WeftError, WeftResult};
 
 pub const API: &str = "https://api.elevenlabs.io/v1";
@@ -49,13 +49,12 @@ pub fn link_filename(link: &str, fallback: &str) -> String {
         .to_string()
 }
 
-/// Store `value` as a JSON file kept past the run (default 30-day
-/// access-bumped TTL), and give back the file marker a port carries:
+/// Store `value` as a JSON file of the run, and give back the file marker a port carries:
 /// how a result that grows with the input (a transcript, timings, a
 /// conversation) leaves a node, since a wire carries at most 100 KB.
 pub async fn store_json(ctx: &RunContext, value: &Value, filename: &str) -> WeftResult<Value> {
     let bytes = serde_json::to_vec(value).node_err(format!("serialize {filename}"))?;
-    ctx.storage(StorageScope::Run).put(bytes, "application/json", filename, Some(KeepTtl::Default)).await
+    ctx.storage(StorageScope::Run).put(bytes, "application/json", filename, None).await
 }
 
 /// An optional text input, with a blank value read as absent.
@@ -204,8 +203,6 @@ pub async fn store_audio(
     mime: &str,
 ) -> WeftResult<StoredFile> {
     ctx.storage(StorageScope::Run)
-        // The generated audio is the run's product: keep it past the
-        // run (default 30-day access-bumped TTL).
-        .put_response(resp, what, Some(mime), filename, Some(KeepTtl::Default))
+        .put_response(resp, what, Some(mime), filename, None)
         .await
 }

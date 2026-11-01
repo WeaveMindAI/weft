@@ -49,6 +49,18 @@ fn every_fixture_catalog_parses() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The fixtures that are INCOMPLETE on disk on purpose: their test
+/// writes the missing value in before running (a chat id read from the
+/// environment, a file the rig uploads first), so the graph only stands
+/// up once the rig has been through it.
+///
+/// Named one by one rather than matched by the diagnostic, so adding a
+/// fixture that genuinely does not compile fails here instead of
+/// quietly joining a category.
+const FILLED_IN_BY_THE_RIG: [&str; 1] = [
+    "email_send",
+];
+
 /// Every fixture's GRAPH compiles: it parses against its own catalog
 /// plus the stdlib, enriches, and validate finds nothing STRUCTURALLY
 /// wrong with it.
@@ -61,32 +73,12 @@ fn every_fixture_catalog_parses() -> anyhow::Result<()> {
 /// rather than a typo in its fixture.
 ///
 /// STRUCTURAL, not runtime: a fixture is deliberately incomplete until
-/// the rig fills it in (`substitute_in_main` writes the live path, a
-/// chat id, a bucket), so "this required input has no driver" is the
-/// fixture working as intended, not a mistake. The structural tier is
-/// exactly the one that does not depend on the rig having run, which is
-/// what makes this test honest without an install.
-/// The fixtures that are INCOMPLETE on disk on purpose: their test
-/// writes the missing value in before running (a chat id read from the
-/// environment, a file the rig uploads first), so the graph only stands
-/// up once the rig has been through it.
-///
-/// Named one by one rather than matched by the diagnostic, so adding a
-/// fixture that genuinely does not compile fails here instead of
-/// quietly joining a category.
-const FILLED_IN_BY_THE_RIG: [&str; 7] = [
-    "access_s3",
-    "access_telegram",
-    "audio_transcribe",
-    "config_media",
-    "email_send",
-    "fetch_once",
-    // `MiniService` is copied in from `infra_min` by the test
-    // (`add_node_from_fixture`), so the committed source names a node
-    // this parse cannot see.
-    "include_twice_infra",
-];
-
+/// the rig fills it in (`unique_live_path` writes the live path,
+/// `substitute_in_main` a fake's URL, a test a recipient), so "this
+/// required input has no driver" is the fixture working as intended, not
+/// a mistake. The structural tier is exactly the one that does not
+/// depend on the rig having run, which is what makes this test honest
+/// without an install.
 #[test]
 fn every_fixture_graph_compiles() -> anyhow::Result<()> {
     let stdlib = weft_catalog::stdlib_root().map_err(|e| anyhow::anyhow!("stdlib root: {e}"))?;

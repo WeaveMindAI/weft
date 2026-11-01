@@ -155,7 +155,7 @@
     {
       "name": "video",
       "type": "Video",
-      "description": "The generated video, kept for 30 days after it was last read."
+      "description": "The generated video, stored with the run and deleted with it (once the run's record goes); wire it through KeepFile to keep it past that."
     }
   ],
   "features": {

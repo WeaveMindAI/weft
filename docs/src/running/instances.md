@@ -414,10 +414,13 @@ ctx.storage(StorageScope::instance())
 ctx.storage(StorageScope::instance_of(InstanceId::new("user-42")?))
 ```
 
-The files stay until your program deletes them, you wipe the instance (see
-[cleaning up after instances](#cleaning-up-after-instances)), or you `weft rm`
-the project. Using `instance()` in a run for no instance is an error. Another
-program never reaches these files, even for the same instance id.
+The files belong to the instance, not to a run or to the project, so they stay
+until your program or somebody deletes them (`weft files rm`), you wipe the
+instance (see [cleaning up after instances](#cleaning-up-after-instances)), or
+a deadline you gave one arrives. Removing the project deletes them too. Using
+`instance()` in a run for no instance is an error. `instance_of(id)` in another
+program names that program's own instance, but any run in your account can read
+one of these files from its reference.
 
 ## Who paid for a call
 

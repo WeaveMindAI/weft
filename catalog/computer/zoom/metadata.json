@@ -32,7 +32,7 @@
     {
       "name": "image",
       "type": "Image",
-      "description": "The enlarged region, a PNG kept past the run."
+      "description": "The enlarged region, a PNG stored with the run."
     }
   ],
   "metadataPorts": [

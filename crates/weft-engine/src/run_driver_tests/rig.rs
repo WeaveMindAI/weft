@@ -467,11 +467,11 @@
         /// One pulse as compared: node, id, status (`absorbed` for a pulse
         /// taken off its wire), closed, close error, frames, port, value
         /// (as its JSON text, so the row orders totally).
-        type PulseRow = (String, uuid::Uuid, String, bool, Option<weft_core::pulse::Failure>, Vec<u32>, String, String, bool, Option<uuid::Uuid>);
+        type PulseRow = (String, uuid::Uuid, String, bool, Option<weft_core::pulse::Failure>, Vec<String>, String, String, bool, Option<uuid::Uuid>);
         /// One record as compared: node, frames, status, error,
         /// suspension token, absorbed pulses.
         type RecordRow =
-            (String, Vec<u32>, NodeFiringStatus, Option<String>, Option<String>, Vec<uuid::Uuid>, String, Option<uuid::Uuid>, String, Vec<String>);
+            (String, Vec<String>, NodeFiringStatus, Option<String>, Option<String>, Vec<uuid::Uuid>, String, Option<uuid::Uuid>, String, Vec<String>);
         /// One gather port as compared: per iteration index, the write
         /// (a value as JSON text, or the closed slot).
         type GatherRow = (String, Vec<(u32, String)>);
@@ -480,7 +480,7 @@
         /// terminated, carries, gathers, outer input (as JSON text).
         type LoopRow = (
             String,
-            Vec<u32>,
+            Vec<String>,
             String,
             String,
             Option<u32>,
@@ -494,7 +494,9 @@
         );
         /// One kick as compared: node, frames, dispatched, firing,
         /// payload, port snapshot, the scope that skipped it.
-        type KickRow = (String, Vec<u32>, bool, bool, Option<String>, Option<String>, Option<String>);
+        type KickRow = (String, Vec<String>, bool, bool, Option<String>, Option<String>, Option<String>);
+        // Frames as compared: each loop index and call site, in order.
+        let frames_of = |frames: &[weft_core::frames::Frame]| frames.iter().map(|frame| format!("{frame:?}")).collect::<Vec<_>>();
         let birth = events.first().expect("journal has rows");
         let run_id = birth.run_id();
         let snap = {
@@ -526,7 +528,7 @@
                         status,
                         p.closed,
                         p.failure.clone(),
-                        p.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect::<Vec<_>>(),
+                        frames_of(&p.frames),
                         p.target_port.clone(),
                         p.value.to_string(),
                         p.provided,
@@ -560,7 +562,7 @@
                         closed_outputs.sort();
                         (
                             node.clone(),
-                            r.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect::<Vec<_>>(),
+                            frames_of(&r.frames),
                             r.status(),
                             r.error.clone(),
                             r.callback_id.clone(),
@@ -591,7 +593,7 @@
                     let out_fired: Vec<u32> = inst.out_fired.iter().collect();
                     (
                         key.group_id.clone(),
-                        key.parent_frames.iter().map(|f| f.loop_index().expect("loop frame")).collect(),
+                        frames_of(&key.parent_frames),
                         format!("{:?}", inst.config),
                         format!("{:?}", inst.source),
                         inst.iter_cap,
@@ -615,7 +617,7 @@
                 .map(|(loc, k)| {
                     (
                         loc.node_id.clone(),
-                        loc.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect(),
+                        frames_of(&loc.frames),
                         k.dispatched(),
                         k.firing,
                         k.payload.as_ref().map(|v| v.to_string()),
@@ -654,16 +656,6 @@
 
     /// `drive_journal`, keeping the worker's tables.
     pub(super) async fn drive_journal_observed(
-        project: ProjectDefinition,
-        catalog: Arc<dyn NodeCatalog>,
-        run_id: RunId,
-        rows: Vec<RunEvent>,
-        cancellation: Arc<CancellationFlag>,
-    ) -> (anyhow::Result<Drove>, Vec<RunEvent>) {
-        drive_rows(project, catalog, run_id, rows, cancellation).await
-    }
-
-    async fn drive_rows(
         project: ProjectDefinition,
         catalog: Arc<dyn NodeCatalog>,
         run_id: RunId,

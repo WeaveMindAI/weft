@@ -125,11 +125,11 @@ wire_enum! {
 // SYNC: NOT_DONE <-> crates/weft-broker/src/handlers.rs (unavailable_or_internal), crates/weft-broker-client/src/client.rs (turned_away)
 pub const NOT_DONE: &str = "the broker could not get a connection to its database, so nothing was done; send it again";
 
-/// The body of a 503 a broker copy that is stepping aside for a newer one
-/// answers a call that arrived on its line after it began to
-/// (`crate::line::server::serve`): nothing of it ran, and sent again it
-/// goes out on a line to a current copy.
-pub const STEPPING_ASIDE: &str = "this copy of the broker is stepping aside for a newer one, so nothing was done; send it again";
+/// The body of a 503 a stopping broker copy answers a call that arrived
+/// on its line after the stop began (`crate::line::server::serve`):
+/// nothing of it ran, and sent again it goes out on a line to a running
+/// copy.
+pub const STOPPING: &str = "this copy of the broker is stopping, so nothing was done; send it again";
 
 /// The answer to a call in a shape the broker does not read, and its body
 /// (`weft_core::wire_shape`), re-exported here beside the broker's other

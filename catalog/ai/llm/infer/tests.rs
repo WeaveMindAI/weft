@@ -35,6 +35,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_reply_that_looks_like_json_stays_text", json_looking_reply_stays_text),
         NodeTest::fake("a_stream_without_finish_reason_is_truncated", truncated),
         NodeTest::fake("media_rides_the_user_message_as_image_parts", media_parts),
+        NodeTest::fake("an_image_earlier_in_a_conversation_file_is_sent_again_and_kept_stored", earlier_media),
         NodeTest::fake("tools_and_tool_choice_ride_and_calls_surface", tool_round),
         NodeTest::fake("params_shape_the_request_and_seed_the_system_prompt", params_shape),
         NodeTest::fake("a_conversation_keeps_its_own_system_prompt", history_system_wins),
@@ -441,6 +442,41 @@ async fn media_parts(rig: FakeRig) -> WeftResult<()> {
         stored_slot.get("__weft_image__").is_some(),
         "history must hold the stored value, got {stored_slot}"
     );
+    Ok(())
+}
+
+/// A conversation file whose earlier turn attached a picture: the next
+/// turn sends that picture again (the provider reads the whole
+/// conversation each call), while the file keeps the stored-file value in
+/// its slot, never the bytes or a link, so a growing conversation holds
+/// references only.
+async fn earlier_media(rig: FakeRig) -> WeftResult<()> {
+    rig.respond_raw("POST", "/api/v1/chat/completions", 200, "text/event-stream", sse(&["Red."], Some("stop")));
+    let image = rig.store_file("square.png", "image/png", b"PNGDATA".to_vec());
+    let file = conversation_file(
+        &rig,
+        json!([
+            { "role": "user", "content": [
+                { "type": "text", "text": "what colour is it?" },
+                { "type": "image_url", "image_url": { "url": image.clone() } },
+            ] },
+            { "role": "assistant", "content": "Red." },
+        ]),
+    );
+    let outcome = rig
+        .run(&LlmInferenceNode, json!({ "provider": provider(&rig), "prompt": "and again?", "historyFile": file }))
+        .await
+        .ok()?;
+
+    let sent = rig.requests()[0].body.clone().expect("call body");
+    let url = sent["messages"][0]["content"][1]["image_url"]["url"].as_str().expect("the earlier picture is sent");
+    assert!(url.starts_with("data:image/png;base64,"), "not inlined: {url}");
+
+    let kept = conversation(&rig, outcome.output("historyFile")?)?;
+    assert_eq!(kept.len(), 4, "{kept:?}");
+    assert_eq!(kept[0]["content"][1]["image_url"]["url"], image, "the slot keeps the stored-file value");
+    let text = serde_json::to_string(&kept).expect("json");
+    assert!(!text.contains("data:image") && !text.contains("base64,"), "the file holds no bytes: {text}");
     Ok(())
 }
 

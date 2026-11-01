@@ -35,16 +35,6 @@ impl DiscoveredSignal {
     pub fn node_id(&self) -> Option<&str> {
         self.0.get("nodeId").and_then(Value::as_str)
     }
-    /// The signal kind tag (`form`, `route`, `socket`, ...).
-    pub fn kind(&self) -> Option<&str> {
-        self.0.get("kind").and_then(Value::as_str)
-    }
-    /// True for a RESUME signal (a one-shot reply to a paused run), false
-    /// for an ENTRY trigger (fireable repeatedly to start a run). The consumer
-    /// splits its list on this: "Triggers" vs "Tasks".
-    pub fn is_resume(&self) -> Option<bool> {
-        self.0.get("isResume").and_then(Value::as_bool)
-    }
 }
 
 /// Mint an api token scoped to a single project, so enumeration through it
@@ -55,7 +45,7 @@ impl DiscoveredSignal {
 /// the same gate instead of best-effort filtering the (often project_id-less)
 /// consumer payload after the fact. Localhost-gated mint, so this only works
 /// against the local dev dispatcher (the rig's target).
-pub async fn mint_project_token(
+async fn mint_project_token(
     disp: &Dispatcher,
     project_id: &uuid::Uuid,
     name: &str,
@@ -67,7 +57,7 @@ pub async fn mint_project_token(
 
 /// Enumerate every signal a signal token can see. The token authenticates via
 /// the `Authorization: Bearer` header (never a URL path).
-pub async fn list_signals(disp: &Dispatcher, signal_token: &str) -> Result<Vec<DiscoveredSignal>> {
+async fn list_signals(disp: &Dispatcher, signal_token: &str) -> Result<Vec<DiscoveredSignal>> {
     let arr: Vec<Value> = disp
         .get_json_bearer("/signal-token/signals", signal_token)
         .await?;
@@ -87,8 +77,9 @@ pub struct SignalScope {
 }
 
 impl SignalScope {
-    /// Mint the project-scoped token for `project_id`. Call once, then `find`
-    /// against the returned scope as many times as a poll loop needs.
+    /// Mint the project-scoped token for `project_id`. Call once, then
+    /// [`Self::signal_for_node`] against the returned scope as many times as
+    /// a poll loop needs.
     pub async fn open(disp: &Dispatcher, project_id: &uuid::Uuid) -> Result<Self> {
         let token = mint_project_token(disp, project_id, "weft-e2e-discover").await?;
         Ok(Self {
@@ -98,38 +89,24 @@ impl SignalScope {
         })
     }
 
-    /// Enumerate this scope's signals and pick the single one matching `pred`.
-    /// Separates the two outcomes a poll loop treats differently: `Ok(None)`
-    /// means "zero matches yet" (not registered, keep polling) and `Err` means
-    /// "more than one matched" (ambiguous fixture, loud immediately). A real
-    /// enumeration failure (HTTP / decode) propagates as `Err` from the `?`
-    /// before the count check, so it too surfaces at once, never as a timeout.
-    /// `what` names the thing being matched, for the ambiguity error.
-    async fn find(
-        &self,
-        what: &str,
-        pred: impl Fn(&DiscoveredSignal) -> bool,
-    ) -> Result<Option<DiscoveredSignal>> {
+    /// The single signal whose trigger node is `node_id`. Separates the two
+    /// outcomes a poll loop treats differently: `Ok(None)` means "none yet"
+    /// (not registered, keep polling) and `Err` means "more than one matched"
+    /// (ambiguous fixture, loud immediately). A real enumeration failure
+    /// (HTTP / decode) propagates as `Err` before the count check, so it too
+    /// surfaces at once, never as a timeout.
+    pub async fn signal_for_node(&self, node_id: &str) -> Result<Option<DiscoveredSignal>> {
         let all = list_signals(&self.disp, &self.token).await?;
-        let mut matches = all.into_iter().filter(|s| pred(s));
-        let first = matches.next();
-        match (first, matches.next()) {
+        let mut matches = all.into_iter().filter(|s| s.node_id() == Some(node_id));
+        match (matches.next(), matches.next()) {
             (None, _) => Ok(None),
             (Some(sig), None) => Ok(Some(sig)),
             (Some(_), Some(_)) => bail!(
-                "expected exactly one {what} for project {}, found more than one \
-                 (ambiguous fixture)",
+                "expected exactly one signal for node '{node_id}' in project {}, found more \
+                 than one (ambiguous fixture)",
                 self.project_id
             ),
         }
-    }
-
-    /// The single signal whose trigger node is `node_id` (`Ok(None)` = none yet).
-    pub async fn signal_for_node(&self, node_id: &str) -> Result<Option<DiscoveredSignal>> {
-        self.find(&format!("signal for node '{node_id}'"), |s| {
-            s.node_id() == Some(node_id)
-        })
-        .await
     }
 }
 
@@ -137,10 +114,4 @@ impl SignalScope {
 /// submissions and any task-callback fire.
 pub async fn fire_token(disp: &Dispatcher, token: &str, body: &Value) -> Result<()> {
     disp.post_empty(&format!("/signal/{token}"), body).await
-}
-
-/// Skip the waiting node behind `token` (its `/skip` door), as a person
-/// declining the question does.
-pub async fn skip_token(disp: &Dispatcher, token: &str) -> Result<()> {
-    disp.post_empty(&format!("/signal/{token}/skip"), &Value::Null).await
 }

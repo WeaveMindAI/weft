@@ -11,9 +11,8 @@
 //! fresh UUID (so concurrent / repeated runs never collide on the dispatcher),
 //! refreshes the catalog, and is then ready to build/run/activate.
 //!
-//! Teardown is EXPLICIT and lives in the shared [`crate::teardown::Teardown`]
-//! guard (so the local CLI suite and an API-driven HTTP suite cannot drift on the
-//! policy): a passing test ends with `project.finish().await?`, which
+//! Teardown is EXPLICIT and its policy lives in the [`crate::teardown::Teardown`]
+//! guard: a passing test ends with `project.finish().await?`, which
 //! deactivates + removes the project from the dispatcher, deletes the temp copy,
 //! and marks the guard done, all awaited so a teardown failure surfaces loudly.
 //! A test that panics / returns early never reaches `finish`, so the guard's
@@ -45,18 +44,9 @@ pub struct Project {
     dir: PathBuf,
     /// Dispatcher client, shared from the suite's ensured-up system.
     disp: Dispatcher,
-    /// The shared clean-on-pass / keep-and-warn-on-fail guard. Owns the id's
-    /// finished bookkeeping + the Drop warning, so this CLI fixture
-    /// and an API-driven HTTP fixture share ONE teardown policy.
+    /// The clean-on-pass / keep-and-warn-on-fail guard. Owns the id's
+    /// finished bookkeeping + the Drop warning.
     teardown: Teardown,
-    /// Extra working directories this project handed out
-    /// ([`Self::second_checkout`]), removed with `dir` at teardown.
-    /// They sit beside `dir` rather than inside it, because a copy of a
-    /// tree cannot live in that tree, so nothing else would ever remove
-    /// them: every test that asked for one used to leave its whole
-    /// source tree (and, with the catalog, the generated catalog too)
-    /// behind in the system temp dir for good.
-    extra_dirs: std::sync::Mutex<Vec<PathBuf>>,
 }
 
 impl Project {
@@ -97,7 +87,6 @@ impl Project {
             dir,
             disp,
             teardown: Teardown::new(id, fixture, recovery_hint),
-            extra_dirs: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -139,54 +128,6 @@ impl Project {
         cli_ok(&self.disp, &self.dir, args).await
     }
 
-    /// A SECOND checkout of this same project: a copy of the working
-    /// directory, carrying the same `weft.toml` and so the same project
-    /// id.
-    ///
-    /// This is what makes a two-session race expressible. One working
-    /// directory cannot hold two different edits at once, so running two
-    /// commands from one directory tests two sessions doing the SAME
-    /// thing; the interesting race is two people who edited differently
-    /// and both saved. Run commands in the returned directory with
-    /// `weft_e2e::client::cli`.
-    pub fn second_checkout(&self) -> Result<PathBuf> {
-        // A fresh path per call. Deriving it from the project's directory
-        // name alone gave two calls in one test the SAME directory, and
-        // the second copy then merged into the first instead of being an
-        // independent checkout.
-        let other = self.dir.parent().unwrap_or(&self.dir).join(format!(
-            "{}-second-{}",
-            self.dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-            Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&other)?;
-        self.extra_dirs.lock().expect("extra dirs").push(other.clone());
-        // The same copy the rig uses to stage a fixture, so the second
-        // checkout is source only: no `.weft`, no build output.
-        copy_tree(&self.dir, &other)
-            .with_context(|| format!("copy {} to {}", self.dir.display(), other.display()))?;
-        Ok(other)
-    }
-
-    /// A second checkout WITH the built-in node catalog, for a test whose
-    /// commands compile.
-    ///
-    /// `second_checkout` copies source only, and the catalog is generated
-    /// rather than committed, so a plain copy has no `Text`, `Cast` or
-    /// `Debug`: anything that compiles in it fails with unknown node
-    /// types. A test that only checkpoints never noticed, because a
-    /// checkpoint of an already-registered project compiles nothing, and
-    /// it also silently recorded a DIFFERENT installed-weft identity in
-    /// its manifest (the catalog hash of an empty folder), which is a
-    /// manifest difference no edit of the test's caused.
-    pub async fn second_checkout_with_catalog(&self) -> Result<PathBuf> {
-        let other = self.second_checkout()?;
-        cli_ok(&self.disp, &other, &["catalog", "update"])
-            .await
-            .with_context(|| format!("catalog update for the second checkout at {}", other.display()))?;
-        Ok(other)
-    }
-
     /// Run `weft <args>` EXPECTING a refusal: errors if it succeeds,
     /// otherwise returns stdout and stderr together so the test asserts
     /// on the refusal's message.
@@ -226,37 +167,8 @@ impl Project {
     /// real URL. Errors if the placeholder is absent (a fixture/test mismatch we
     /// want loud, never a silent no-op that ships a placeholder to the compiler).
     pub fn substitute_in_main(&self, placeholder: &str, value: &str) -> Result<()> {
-        let path = self.dir.join("src").join("main.weft");
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
-        if !raw.contains(placeholder) {
-            bail!(
-                "placeholder '{placeholder}' not found in {}; fixture and test disagree",
-                path.display()
-            );
-        }
-        let out = raw.replace(placeholder, value);
-        std::fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;
-        Ok(())
-    }
-
-    /// Replace `placeholder` in every `.weft` file under `src/`, included
-    /// files too. Errors if no file carries it (the fixture and the test
-    /// disagree).
-    pub fn substitute_in_sources(&self, placeholder: &str, value: &str) -> Result<()> {
-        let mut touched = 0usize;
-        for path in weft_sources(&self.dir.join("src"))? {
-            let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-            if !raw.contains(placeholder) {
-                continue;
-            }
-            std::fs::write(&path, raw.replace(placeholder, value)).with_context(|| format!("write {}", path.display()))?;
-            touched += 1;
-        }
-        if touched == 0 {
-            bail!("placeholder '{placeholder}' not found under {}; fixture and test disagree", self.dir.join("src").display());
-        }
-        Ok(())
+        let main = self.dir.join("src").join("main.weft");
+        substitute_in(&main, std::slice::from_ref(&main), placeholder, value)
     }
 
     /// Replace the project's `main.weft` wholesale. Transition tests evolve
@@ -334,33 +246,15 @@ impl Project {
     /// or `POST /<tenant>/<project>/<path>` (public fire). e2e runs as tenant
     /// `local`, so the callable path is `local/<project>/<path>`. The unique suffix is
     /// derived from the project's fresh id (stable within a run, distinct across
-    /// runs). Call BEFORE activate.
+    /// runs). The placeholder is replaced in every `.weft` file under
+    /// `src/`, included files too. Call BEFORE activate.
     pub fn unique_live_path(&self) -> Result<String> {
-        self.mount_at(&self.bare_live_path())
-    }
-
-    /// The bare path [`Self::unique_live_path`] would claim, without
-    /// claiming it. For a test that hands one project's path to a
-    /// SECOND project, which is the only way to build a collision the
-    /// compiler cannot see: two files, each fine on its own.
-    pub fn bare_live_path(&self) -> String {
         // First 12 hex of the id (sans hyphens): short, unique, path-safe.
-        let suffix: String = self
-            .id
-            .simple()
-            .to_string()
-            .chars()
-            .take(12)
-            .collect();
-        format!("e2e-{suffix}")
-    }
-
-    /// Mount this project's live triggers at `path`, whoever chose it,
-    /// and answer the callable path.
-    pub fn mount_at(&self, path: &str) -> Result<String> {
+        let path = format!("e2e-{}", &self.id.simple().to_string()[..12]);
         // The node config carries the BARE path; the dispatcher prefixes the
         // owning tenant and project when it stores + serves the mount path.
-        self.substitute_in_sources("__E2E_PATH__", path)?;
+        let src = self.dir.join("src");
+        substitute_in(&src, &weft_sources(&src)?, "__E2E_PATH__", &path)?;
         // The test connects under the tenant (e2e tenant = local) and project.
         Ok(format!("local/{}/{path}", self.id))
     }
@@ -379,29 +273,6 @@ impl Project {
     pub async fn activate(&mut self) -> Result<()> {
         self.weft(&["activate"]).await?;
         Ok(())
-    }
-
-    /// Run `weft activate` EXPECTING a refusal: errors if activation
-    /// succeeds, otherwise returns the CLI's combined output so the
-    /// test asserts on the refusal's message.
-    pub async fn activate_refused(&mut self) -> Result<String> {
-        let out = crate::client::cli(&self.disp, &self.dir, &["activate"]).await?;
-        anyhow::ensure!(
-            !out.success,
-            "`weft activate` unexpectedly succeeded; this scenario expects a refusal"
-        );
-        Ok(format!("{}\n{}", out.stdout, out.stderr))
-    }
-
-    /// Remove the project the way a user does, as the thing under
-    /// test rather than as teardown: `weft rm <id> --yes`. Teardown
-    /// then finds it gone and only has the temp directory left to clear.
-    pub async fn remove(&mut self) -> Result<String> {
-        let id = self.id.to_string();
-        let out = cli_ok(&self.disp, &self.dir, &["rm", &id, "--yes"])
-            .await
-            .with_context(|| format!("weft rm {id}"))?;
-        Ok(out)
     }
 
     /// End-of-test teardown for a PASSING test: remove the project from the
@@ -424,15 +295,6 @@ impl Project {
             cli_ok(&self.disp, &self.dir, &["rm", &id, "--yes"])
                 .await
                 .with_context(|| format!("teardown: weft rm {id}"))?;
-        }
-        let extras: Vec<PathBuf> = std::mem::take(&mut *self.extra_dirs.lock().expect("extra dirs"));
-        for extra in extras {
-            // A test may delete a second checkout itself (a folder that is
-            // gone is what it tests); what is already gone needs no removing.
-            match std::fs::remove_dir_all(&extra) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                done => done.with_context(|| format!("teardown: remove temp dir {}", extra.display()))?,
-            }
         }
         std::fs::remove_dir_all(&self.dir)
             .with_context(|| format!("teardown: remove temp dir {}", self.dir.display()))?;
@@ -504,6 +366,25 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
             std::fs::copy(&from, &to)
                 .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
         }
+    }
+    Ok(())
+}
+
+/// Replace `placeholder` with `value` in each of `files`. Errors if none
+/// carries it (the fixture and the test disagree, and a placeholder must
+/// never reach the compiler); `scope` names where it was looked for.
+fn substitute_in(scope: &Path, files: &[PathBuf], placeholder: &str, value: &str) -> Result<()> {
+    let mut touched = 0usize;
+    for path in files {
+        let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        if !raw.contains(placeholder) {
+            continue;
+        }
+        std::fs::write(path, raw.replace(placeholder, value)).with_context(|| format!("write {}", path.display()))?;
+        touched += 1;
+    }
+    if touched == 0 {
+        bail!("placeholder '{placeholder}' not found in {}; fixture and test disagree", scope.display());
     }
     Ok(())
 }

@@ -493,7 +493,7 @@ pub async fn resume_claim(pool: &Pool, task_id: Uuid, replica: &str) -> Result<b
 }
 
 /// Surrender a claim the process can no longer hold (it cannot renew
-/// it, or its copy stepped aside: `crate::aside`), resting or not. The
+/// it, or its copy is stopping: `crate::stopping`), resting or not. The
 /// work itself did not fail, so the row goes back to `pending`
 /// with no claimant for the next claim, and a transient outage never
 /// turns into a permanent failure. Guarded on `claimed_by = $process`, so

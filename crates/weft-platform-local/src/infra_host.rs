@@ -1367,6 +1367,17 @@ mod tests {
         let cos = LocalInfraHost::new(Arc::new(FakeDocker::new()), cfg(GpuAccess::CosDriver));
         assert!(cos.notes(&node).is_empty(), "a machine made with the kind asked runs it as asked");
         assert!(host(Arc::new(FakeDocker::new()), true).notes(&resolve(&spec(), &node_ref(), &BTreeMap::new()).unwrap()).is_empty());
+
+        // The container that asked for one is handed every GPU; one that
+        // asked for none gets none.
+        let unit = node.unit("main").unwrap();
+        let docker_gpus = cfg(GpuAccess::DockerGpus);
+        let args = container_args(&node, unit, &unit.unit.containers[0], std::path::Path::new("/e"), ContainerRun::App, &docker_gpus).unwrap();
+        assert!(args.windows(2).any(|w| w == ["--gpus", "all"]), "{args:?}");
+        let plain = resolved();
+        let unit = plain.unit("main").unwrap();
+        let args = container_args(&plain, unit, &unit.unit.containers[0], std::path::Path::new("/e"), ContainerRun::App, &docker_gpus).unwrap();
+        assert!(!args.iter().any(|a| a == "--gpus"), "{args:?}");
     }
 
     #[test]
@@ -1515,6 +1526,33 @@ mod tests {
         assert_eq!((crashed.cause, crashed.count), (RestartCause::Exited { code: 1 }, 2));
         restart_seen(&h).await.unwrap();
         assert_eq!(docker.calls_to("events").len(), 1, "read once, then kept");
+    }
+
+    /// A service that crashes comes back without weft doing anything:
+    /// every app container runs under Docker's `--restart unless-stopped`
+    /// (an init container runs once and is removed), and while Docker
+    /// brings one back the unit reads as not ready, saying it keeps
+    /// restarting, then ready again once it runs.
+    #[tokio::test]
+    async fn a_crashed_container_is_brought_back_by_docker_and_reads_not_ready_meanwhile() {
+        let node = resolved();
+        let unit = node.unit("main").unwrap();
+        let app = container_args(&node, unit, &unit.unit.containers[0], std::path::Path::new("/e"), ContainerRun::App, &cfg(GpuAccess::None)).unwrap();
+        assert!(app.windows(2).any(|w| w == ["--restart", "unless-stopped"]), "{app:?}");
+        let init = container_args(&node, unit, &unit.unit.init_containers[0], std::path::Path::new("/e"), ContainerRun::Init, &cfg(GpuAccess::None)).unwrap();
+        assert!(init.iter().any(|a| a == "--rm") && !init.iter().any(|a| a == "--restart"), "{init:?}");
+
+        let docker = Arc::new(FakeDocker::new());
+        docker.answer(&["port"], "127.0.0.1:40000\n");
+        docker.answer(&["info"], "\"2026-10-27T13:00:00Z\"\n");
+        let h = host(docker.clone(), false);
+        let state = || async { h.observe("local", node_ref().project).await.unwrap()[0].state.clone() };
+        let crashed = "2026-10-27T12:20:06Z";
+        unit_is(&docker, "restarting", &stop_line("restarting", 1, false, 1, crashed));
+        let UnitRunState::NotReady { why } = state().await else { panic!("a restarting container is not ready") };
+        assert!(why.contains("pg keeps restarting"), "{why}");
+        unit_is(&docker, "running", &stop_line("running", 1, false, 0, crashed));
+        assert_eq!(state().await, UnitRunState::Ready);
     }
 
     /// The `--since` a look asked Docker's events from.

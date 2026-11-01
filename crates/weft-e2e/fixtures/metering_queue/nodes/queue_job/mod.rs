@@ -9,10 +9,6 @@
 //! route spends, which response reports on an earlier spend, and how to
 //! read the figure off it. It never polls; the worker watches the
 //! node's own read.
-//!
-//! `readBack` is the lever the rig pulls. Left off, the job is submitted
-//! and never read, so nothing will ever state what it cost and the only
-//! honest record is a spend with no figure on it.
 
 use async_trait::async_trait;
 
@@ -45,7 +41,6 @@ pub struct QueueJobNode;
 #[async_trait]
 impl Node for QueueJobNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let read_back: bool = ctx.inputs.get_or("readBack", false)?;
         let account = ctx.inputs.get("connection")?;
         let conn = ctx.open(&account).await?;
 
@@ -66,20 +61,16 @@ impl Node for QueueJobNode {
             .unwrap_or_default()
             .to_string();
 
-        // Read the answer back, or deliberately do not. Walking away is
-        // an ordinary thing for a node to do (a cancel, a branch that
-        // stops caring), and the spend is just as real either way.
-        if read_back {
-            let _: serde_json::Value = conn
-                .client()
-                .get(format!("{API}/result/{request_id}"))
-                .send()
-                .await
-                .node_err("queue_fake")?
-                .json()
-                .await
-                .node_err("queue_fake")?;
-        }
+        // Read the answer back: this is where the figure is stated.
+        let _: serde_json::Value = conn
+            .client()
+            .get(format!("{API}/result/{request_id}"))
+            .send()
+            .await
+            .node_err("queue_fake")?
+            .json()
+            .await
+            .node_err("queue_fake")?;
 
         ctx.pulse_downstream(NodeOutput::new().set("requestId", request_id)).await
     }

@@ -49,9 +49,6 @@ pub struct RunHead {
     pub born: Option<Born>,
     /// What its rows here say about it.
     pub written: Written,
-    /// It stored files of its own (so far), which its ending's sweep
-    /// reclaims.
-    pub wrote_files: bool,
     /// The secrets it made since its last batch (`weft_core::secret`):
     /// one is made before any row names it, so the batch that carries
     /// the first row naming a secret carries its value too, or an earlier
@@ -141,7 +138,6 @@ mod tests {
                     row_sizes: sizes.to_vec(),
                     born: None,
                     written: Written::default(),
-                    wrote_files: false,
                     secrets: Vec::new(),
                 })
                 .collect(),

@@ -437,3 +437,87 @@
         assert_eq!(*took.lock().unwrap(), vec![0, 1, 2, 3, 4], "every item was delivered again");
         assert_eq!(started_nodes(&rows), vec!["consumer"]);
     }
+
+    /// Asks a person, writes down that it ran, and sends the answer on.
+    struct Asks {
+        ran: Ran,
+    }
+    test_manifest!(Asks, "Asks");
+    #[async_trait]
+    impl Node for Asks {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            self.ran.lock().unwrap().push("asks".into());
+            let answer = ctx
+                .await_signal(weft_core::signal::Form {
+                    form_type: "human_query".into(),
+                    schema: weft_core::signal::FormSchema { fields: Vec::new() },
+                    title: None,
+                    description: None,
+                    consumer_kind: None,
+                })
+                .await?;
+            ctx.pulse_downstream(NodeOutput::new().set("value", answer)).await
+        }
+    }
+
+    /// The parent ran `a -> b -> c` with `b` asking a person, who
+    /// answered; the child, seeded with `b` and `c` stale and told to
+    /// reuse the answers `b` was given, runs `b` again and `b` takes the
+    /// answer from the parent's record: nothing new is asked (the child's
+    /// clients register no wait at all), `a` is inherited, and `c` reads
+    /// the answer the person gave.
+    #[tokio::test]
+    async fn a_seeded_run_reuses_the_answer_a_person_gave() {
+        use super::engine_test_rig::{drive_on, AwaitTasks, MemJournal};
+        let program = chain(["Source", "Asks", "Echo"], &[("a", "b"), ("b", "c")]);
+        let ran: Ran = Default::default();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let nodes = || {
+            catalog(vec![
+                ("Source", Box::new(Source { id: "a", value: json!("A"), ran: ran.clone() })),
+                ("Asks", Box::new(Asks { ran: ran.clone() })),
+                ("Echo", Box::new(Echo { id: "echo", ran: ran.clone(), seen: seen.clone() })),
+            ])
+        };
+
+        // The parent: parks on the question, is answered, completes.
+        let parent = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        journal.seed(&[birth(parent, &program, &Default::default(), None, None), kick(parent, "a", None)]);
+        let tasks = AwaitTasks::new();
+        let with_tasks = || EngineClients { tasks: tasks.clone(), ..super::engine_test_rig::clients(journal.clone()) };
+        let parked = drive_on(Arc::new(program.clone()), nodes(), parent, journal.clone(), with_tasks(), CancellationFlag::new_arc(), None)
+            .await
+            .expect("the parent's first drive")
+            .outcome;
+        assert!(matches!(parked, RunOutcome::Stalled), "{parked:?}");
+        let token = tasks.minted().expect("the question was registered");
+        journal.seed(&[RunEvent::wait_answered(parent, token, weft_core::primitive::WaitAnswer::Given { value: json!("approve") }, 1)]);
+        let answered = drive_on(Arc::new(program.clone()), nodes(), parent, journal.clone(), with_tasks(), CancellationFlag::new_arc(), None)
+            .await
+            .expect("the parent's second drive")
+            .outcome;
+        assert!(matches!(answered, RunOutcome::Completed), "{answered:?}");
+        ran.lock().unwrap().clear();
+        seen.lock().unwrap().clear();
+
+        // The child: `a` inherited, `b` and `c` run again, `b`'s answer
+        // reused. Its clients register no wait: one asked would fail `b`.
+        let child = uuid::Uuid::new_v4();
+        let (cut, cut_given) = seeded_cut(&program, &["b", "c"], &[("a", "value", json!("A"), parent)]);
+        let reuse = Seed {
+            parent,
+            origins: [(weft_core::frames::Located::top("a"), parent)].into_iter().collect(),
+            answers: [weft_core::frames::Located::top("b")].into_iter().collect(),
+        };
+        let rows = vec![birth(child, &cut, &cut_given, Some(&program), Some(reuse))];
+        let (outcome, child_rows) = drive_seeded(cut, nodes(), child, journal.events_of(parent), vec![program], rows).await;
+        assert!(matches!(outcome, RunOutcome::Completed), "nobody answered the child, and it completed: {outcome:?}");
+        assert_eq!(ran_of(&ran), vec!["asks", "echo"], "a is inherited, b runs again, then c");
+        assert_eq!(*seen.lock().unwrap(), vec!["approve"], "c reads the answer the person gave the parent");
+        assert_eq!(started_nodes(&child_rows), vec!["b", "c"]);
+        assert!(
+            !child_rows.iter().any(|row| matches!(row, RunEvent::NodeSuspended { .. })),
+            "nothing parks in the child: {child_rows:?}"
+        );
+    }

@@ -1,7 +1,8 @@
 //! Gated routes: the gateway refuses a caller the route's auth connection
 //! does not verify, and admits one it does with the established identity
 //! on the trigger's `caller` port. Two schemes end to end (a key set, a
-//! signing secret); the overlap refusal at activation rides along.
+//! signing secret), and a browser page on another origin reaching a gated
+//! route through the install's CORS answer.
 #![cfg(feature = "e2e")]
 
 use reqwest::Method;
@@ -61,6 +62,35 @@ async fn api_keys_and_a_signing_secret_gate_their_routes() -> anyhow::Result<()>
     let v: Value = serde_json::from_slice(&body)?;
     assert_eq!(v["caller"], json!({ "key": 0 }));
 
+    // A browser page on another origin: the install answers the
+    // preflight itself and stamps the reply with CORS headers, else the
+    // browser refuses what the worker sent. The policy allows every
+    // origin, answered as `*` or as the origin that asked, which a browser
+    // accepts alike.
+    let origin = "http://postcards.example";
+    let call = live::browser_post_json(&disp, &secure, origin, &[("x-api-key", "k-two")], &payload).await?;
+    let allows_page = |headers: &reqwest::header::HeaderMap| {
+        headers
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == "*" || v == origin)
+    };
+    assert!(call.preflight_status.is_success(), "preflight -> HTTP {}", call.preflight_status);
+    assert!(allows_page(&call.preflight_headers), "{:?}", call.preflight_headers);
+    assert!(
+        call.preflight_headers
+            .get("access-control-allow-methods")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|m| m == "*" || m.contains("POST")),
+        "{:?}", call.preflight_headers
+    );
+    assert!(call.status.is_success(), "browser POST -> HTTP {}: {}", call.status, String::from_utf8_lossy(&call.body));
+    assert!(allows_page(&call.headers), "{:?}", call.headers);
+    assert!(
+        call.headers.get("access-control-expose-headers").is_some(),
+        "the page may read the headers the program set: {:?}", call.headers
+    );
+
     // The signing secret: the exact bytes are signed with a timestamp;
     // a good signature admits (an anonymous identity), a tampered body
     // and a stale timestamp are refused.
@@ -117,38 +147,4 @@ async fn api_keys_and_a_signing_secret_gate_their_routes() -> anyhow::Result<()>
     project.finish().await?;
     keys.finish().await?;
     secret.finish().await
-}
-
-/// Two PROJECTS of one account serving the same path. Each project's
-/// routes sit under its own id on the install's shared address, so both
-/// activate and each call reaches the project its address names.
-///
-/// Two routes of ONE file colliding is answered earlier, by the compiler
-/// (`route-overlap`), so a program that collides with itself never gets
-/// this far.
-#[tokio::test]
-async fn two_projects_serve_the_same_path_each_at_its_own_address() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let mut first = Project::prepare("api_overlap", disp.clone()).await?;
-    // The bare path is what goes in the file; the callable one carries
-    // the tenant and project the dispatcher serves it under, and is what
-    // a caller dials.
-    let path = first.bare_live_path();
-    let first_base = first.mount_at(&path)?;
-    first.activate().await?;
-
-    // The same path, from a second project of the same account.
-    let mut second = Project::prepare("api_overlap", disp.clone()).await?;
-    let second_base = second.mount_at(&path)?;
-    second.activate().await?;
-    anyhow::ensure!(first_base != second_base, "each project is called at its own address");
-
-    for (base, project) in [(&first_base, &first), (&second_base, &second)] {
-        let call = format!("{base}/chat/anything");
-        let (status, _, _) = live::http_json(&disp, Method::POST, &call, &[], &serde_json::json!({})).await?;
-        anyhow::ensure!(status.is_success(), "{} serves its route at {call}: {status}", project.id());
-    }
-
-    second.finish().await?;
-    first.finish().await
 }

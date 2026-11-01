@@ -349,6 +349,9 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     if let (Some(name), Some(spec)) = (&args.save, &mut spec) {
         spec.name = name.clone();
     }
+    // Before `--save` writes it: an example whose cut is refused is not
+    // kept.
+    refuse_before_building(project, spec.as_ref(), &args)?;
     if let Some(name) = &args.save {
         let spec = spec.as_ref().expect("saving constructs a run spec");
         if super::versions::read_spec_if_present(project, name)?.is_some_and(|existing| existing.is_frozen()) {
@@ -411,6 +414,29 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     }
     let outcome = super::follow::follow_run_id(&handle.client, ctx.on(), &run_id.to_string(), Some(&handle.built.definition)).await?;
     Ok(outcome.exit_code())
+}
+
+/// Refuse a run whose cut the folder's program cannot make before anything
+/// is built: where it starts and ends (a loop it holds one end of, a node
+/// no program has), and the bounds of its seed, walked here the way the
+/// install walks them, so a refused cut costs no build. Only the cut: the
+/// rest of what can stop a run (an input it gets nothing for, a value that
+/// does not read) needs the run's values, which the install resolves, and
+/// it judges the whole run again before it builds any image. A program
+/// that does not compile as a whole is the build's to report, with its
+/// diagnostics.
+fn refuse_before_building(project: &weft_compiler::project::Project, spec: Option<&RunSpec>, args: &RunArgs) -> anyhow::Result<()> {
+    let Ok((definition, _)) = weft_compiler::hash::load_program_with_diagnostics(project) else {
+        return Ok(());
+    };
+    let graph = weft_core::project::graph::ProjectGraph::new(&definition);
+    let seed = weft_core::run_spec::judge::seed_bounds(&args.seed_until, &args.seed_before);
+    for bounds in spec.map(RunSpec::bounds).into_iter().chain(seed) {
+        if let Err(why) = weft_core::project::cut::walk(&graph, &bounds) {
+            bail!("the run cannot start:\n{why}");
+        }
+    }
+    Ok(())
 }
 
 /// [`judge`] over what `weft run` was asked: whether it seeds, and the
@@ -616,6 +642,19 @@ mod tests {
         assert_eq!(example_in_version(root, "/home/me/shop/examples/chain.json").unwrap(), "examples/chain.json");
         assert!(format!("{:#}", example_in_version(root, "/tmp/chain.json").unwrap_err()).contains("outside the project"));
         assert!(example_in_version(root, "../chain.json").is_err());
+    }
+
+    /// `--seed-until` and `--seed-before` bound a seed, so either one
+    /// without `--seed` is refused before anything is read, saved or built.
+    #[test]
+    fn seed_bounds_without_a_seed_are_refused() {
+        let before = RunArgs { seed_before: vec!["out".into()], ..Default::default() };
+        let why = seed_bounds_need_a_seed(&before).unwrap_err().to_string();
+        assert!(why.contains("--seed-before") && why.contains("need --seed"), "{why}");
+        let until = RunArgs { seed_until: vec!["mid".into()], ..Default::default() };
+        assert!(seed_bounds_need_a_seed(&until).is_err());
+        assert!(seed_bounds_need_a_seed(&RunArgs { seed: Some(String::new()), ..before }).is_ok());
+        assert!(seed_bounds_need_a_seed(&RunArgs::default()).is_ok());
     }
 
     /// The build is held to the run it is for: what it starts with, and

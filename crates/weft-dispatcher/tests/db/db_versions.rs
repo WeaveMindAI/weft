@@ -321,3 +321,54 @@ async fn trigger_runs_sum_the_lanes_and_name_the_newest_run(pool: Pool) {
     assert_eq!(counted["v1"].runs, 5);
     assert_eq!(counted["v1"].last, newer);
 }
+
+/// The stores a checkpoint writes through, under the project's lock, keep
+/// two checkouts recording different edits at once apart: each is a
+/// working copy with its own head, so both versions land, each becomes the
+/// head of the checkout that recorded it, and both parent on the version
+/// the two started from. Each side reads its copy's head, records the
+/// version under it and moves that copy's head compare-and-set, the steps
+/// the checkpoint action takes (`stamp_locked`, which needs a whole
+/// dispatcher and is not driven here).
+#[weft_db_macros::test]
+async fn two_checkouts_recording_at_once_each_move_their_own_head(pool: Pool) {
+    let (_, projects, versions) = setup(&pool).await;
+    let copies = PostgresWorkingCopyStore::new(pool.clone());
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let base = version(project, &manifest(&[("main.weft", "0")]), None, None, 1);
+    versions.upsert_version(&base).await.unwrap();
+    let on_base = Head { head_version: Some(base.id.clone()), head_run: None };
+    let mut folders = Vec::new();
+    for (path, file) in [("/home/me/one", "1"), ("/home/me/two", "2")] {
+        let folder = copies.register_folder(project, "box", path, &manifest(&[("main.weft", file)]), &on_base, 2).await.unwrap();
+        folders.push(folder.id);
+    }
+
+    let checkpoint = |copy: Uuid| {
+        let (pool, copies, versions) = (pool.clone(), &copies, &versions);
+        async move {
+            weft_dispatcher::lease::with_project_transition_lock(&pool, project, || async {
+                let row = copies.get(copy).await?.expect("the copy");
+                let recorded = version(project, &row.working, row.head.head_version.as_deref(), None, 3);
+                assert!(versions.upsert_version(&recorded).await?, "a new version");
+                let to = Head { head_version: Some(recorded.id.clone()), head_run: None };
+                assert!(copies.move_head(copy, &row.head, &to, 3).await?, "its own head moved");
+                Ok(recorded.id)
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let (first, second) = tokio::join!(checkpoint(folders[0]), checkpoint(folders[1]));
+
+    assert_ne!(first, second, "two edits are two versions");
+    let tree = versions.versions(project).await.unwrap();
+    for landed in [&first, &second] {
+        let row = tree.iter().find(|v| &v.id == landed).expect("recorded, not just answered");
+        assert_eq!(row.parent_id.as_deref(), Some(base.id.as_str()), "under the version both started from");
+    }
+    for (copy, landed) in [(folders[0], &first), (folders[1], &second)] {
+        assert_eq!(copies.get(copy).await.unwrap().unwrap().head.head_version.as_ref(), Some(landed), "each checkout's head is its own version");
+    }
+}

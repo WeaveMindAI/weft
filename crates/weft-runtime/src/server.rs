@@ -24,6 +24,7 @@ use axum::Router;
 use weft_platform_traits::roles::TICK_PATH;
 use weft_platform_traits::{Alarm, CoreRole, WakeCall};
 use weft_task_store::drain::{Pass, PassFailed, TickBody};
+use weft_task_store::stopping::Stopping;
 use weft_task_store::unanswered::{self, Callee};
 
 /// One pass of a role's loops ([`Tick::run`]): what the tick was called
@@ -136,20 +137,19 @@ pub fn tick_route(t: Tick) -> Router {
     Router::new().route(TICK_PATH, post(tick)).with_state(t)
 }
 
-/// Serve `app` on `listener` until the process is told to stop
-/// ([`shutdown`]) or its copy steps aside (`aside`, for a copy of another
-/// revision that started serving after it: `crate::superseded`), with the
-/// peer's address on every request (the public door counts callers by
-/// it). Either way it takes no new call and answers the ones in flight;
-/// what stays open for good (an event stream, a worker's line) is ended by
-/// its role as it steps aside.
+/// Serve `app` on `listener` until its copy is stopping (`stopping`, which
+/// [`stop_on`] begins once the process is told to stop), with the peer's
+/// address on every request (the public door counts callers by it). It
+/// then takes no new call and answers the ones in flight; what stays open
+/// for good (an event stream, a worker's line) is ended by its role as it
+/// stops, so the server's wait for its open connections ends too.
 ///
 /// Every accepted connection sends at once (`TCP_NODELAY`). An answer
 /// whose headers and body leave in two writes otherwise holds the body
 /// until the caller acknowledges the headers, and a caller on a kept-alive
 /// connection delays that acknowledgement by up to 40 ms: every call after
 /// the first on a connection paid it.
-pub async fn serve(listener: tokio::net::TcpListener, app: Router, aside: weft_task_store::aside::StepAside) -> anyhow::Result<()> {
+pub async fn serve(listener: tokio::net::TcpListener, app: Router, stopping: Stopping) -> anyhow::Result<()> {
     use axum::serve::ListenerExt as _;
     let listener = listener.tap_io(|connection| {
         if let Err(e) = connection.set_nodelay(true) {
@@ -157,21 +157,17 @@ pub async fn serve(listener: tokio::net::TcpListener, app: Router, aside: weft_t
         }
     });
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(stop_or_step_aside(aside))
+        .with_graceful_shutdown(async move { stopping.begun().await })
         .await?;
     Ok(())
 }
 
-/// Until the process is told to stop ([`shutdown`]) or its copy steps
-/// aside.
-fn stop_or_step_aside(aside: weft_task_store::aside::StepAside) -> impl std::future::Future<Output = ()> {
-    let stop = shutdown();
-    async move {
-        tokio::select! {
-            _ = stop => {}
-            _ = aside.stepped() => tracing::info!(target: "weft_runtime", "a newer copy of this role serves; taking no new call"),
-        }
-    }
+/// Begin `stopping` once `told` ends: the one place a process's copy
+/// learns it stops, given [`shutdown`] by the runtime. Everything holding
+/// `stopping` winds down from there (`weft_task_store::stopping`).
+pub async fn stop_on(told: impl std::future::Future<Output = ()>, stopping: Stopping) {
+    told.await;
+    stopping.begin();
 }
 
 /// Until the process is told to stop (SIGTERM, or Ctrl+C). The SIGTERM
@@ -273,6 +269,51 @@ mod tests {
         let answer = tick_route(t).oneshot(call(&again[0], now_ms())).await.unwrap();
         assert_eq!(answer.status(), StatusCode::OK);
         assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1, "at its moment it runs");
+    }
+
+    /// Told to stop, a copy ends what it held open (a stream that ends
+    /// once it is stopping, as the dispatcher's event streams do) and its
+    /// server, which waits for its open connections, returns.
+    #[tokio::test]
+    async fn told_to_stop_a_copy_ends_its_streams_and_stops_serving() {
+        use futures::StreamExt as _;
+        let stopping = Stopping::new();
+        let (tell, told) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(stop_on(
+            async move {
+                let _ = told.await;
+            },
+            stopping.clone(),
+        ));
+        let ends = stopping.clone();
+        let app = Router::new().route(
+            "/stream",
+            axum::routing::get(move || {
+                let ends = ends.clone();
+                async move {
+                    let open = futures::stream::pending::<Result<axum::response::sse::Event, std::convert::Infallible>>();
+                    axum::response::sse::Sse::new(open.take_until(async move { ends.begun().await }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = tokio::spawn(serve(listener, app, stopping.clone()));
+        let client = weft_core::net::http_client().build().unwrap();
+        let stream = client.get(format!("http://{address}/stream")).send().await.unwrap();
+        assert_eq!(stream.status(), StatusCode::OK);
+        assert!(!serving.is_finished() && !stopping.has_begun());
+
+        tell.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.bytes())
+            .await
+            .expect("the stream ends once its copy is stopping")
+            .expect("it ends cleanly");
+        tokio::time::timeout(std::time::Duration::from_secs(5), serving)
+            .await
+            .expect("the server returns once nothing is open")
+            .unwrap()
+            .unwrap();
     }
 
     /// A pass that could not write down how it went answers its tick as a

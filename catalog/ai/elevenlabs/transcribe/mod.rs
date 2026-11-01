@@ -586,7 +586,7 @@ impl Node for ElevenLabsTranscribeNode {
             .await?;
         }
         // A long session's transcript is more than a wire carries, so it
-        // always travels as a file, kept past the run.
+        // always travels as a file.
         let file = store_json(&ctx, &transcript.document(&session), "transcript.json").await?;
         let mut out = NodeOutput::new().set("transcript", file);
         if let Some(language) = transcript.language.take() {

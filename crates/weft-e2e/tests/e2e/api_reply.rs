@@ -1,290 +1,23 @@
-//! Request-response with zero custom Rust: five routes in one project,
-//! each answered by a Reply or a Close, plus the gateway's own answers
-//! (405 for a served path with the wrong verb, 404 for an unknown one).
-//! One ends on a bare Close, one is the "if it did not work, stop
-//! here" shape (a Switch on the outcome, a Reply on the passing case and
-//! a Close carrying its reason as the body on the failing one), and one
-//! is a 304 whose Close carries its own caching headers.
+//! Request-response with zero custom Rust, at the project's own address
+//! and at the install's shared one: a route answered by a Reply, the
+//! `503` a caller gets while the trigger is down, and the answer once it
+//! is back.
 #![cfg(feature = "e2e")]
 
 use reqwest::Method;
-use serde_json::{json, Value};
-use weft_e2e::{ensure, live, project::Project, run::SettledRun, status};
-
-use crate::common;
+use serde_json::Value;
+use weft_e2e::{ensure, live, project::Project, status};
 
 fn header<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-#[tokio::test]
-async fn routes_answer_with_status_headers_and_bodies() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let mut project = Project::prepare("api_reply", disp.clone()).await?;
-    let base = project.unique_live_path()?;
-    project.activate().await?;
-
-    // POST hello: the declared body key reaches the graph, the Reply's
-    // status and header reach the caller, the fixed ports carried the
-    // path and the headers.
-    let (status, headers, body) = live::http_json(
-        &disp,
-        Method::POST,
-        &format!("{base}/hello"),
-        &[("user-agent", "weft-e2e")],
-        &json!({ "name": "ada", "ignored": true }),
-    )
-    .await?;
-    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
-    assert_eq!(header(&headers, "x-run"), Some("e2e"));
-    assert_eq!(header(&headers, "content-type"), Some("application/json"));
-    let v: Value = serde_json::from_slice(&body)?;
-    assert_eq!(v["greeting"], "hello ada");
-    assert_eq!(v["agent"], "weft-e2e");
-    assert!(v["path"].as_str().unwrap().ends_with("/hello"), "the path as called: {v}");
-
-    // GET users/{id}: the capture and the query reach the graph; the
-    // graph decides the status.
-    let (status, _, body) =
-        live::http_request(&disp, Method::GET, &format!("{base}/users/42?verbose=1"), &[], None).await?;
-    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
-    let v: Value = serde_json::from_slice(&body)?;
-    assert_eq!(v, json!({ "id": "42", "name": "Ada", "verbose": "1" }));
-    let (status, _, body) =
-        live::http_request(&disp, Method::GET, &format!("{base}/users/7"), &[], None).await?;
-    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
-    let v: Value = serde_json::from_slice(&body)?;
-    assert_eq!(v["error"], "no user 7");
-
-    // POST say (a text route): the whole body on one port, text back.
-    let (status, headers, body) = live::http_request(
-        &disp,
-        Method::POST,
-        &format!("{base}/say"),
-        &[("content-type", "text/plain")],
-        Some(b"quiet please".to_vec()),
-    )
-    .await?;
-    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
-    assert_eq!(header(&headers, "content-type"), Some("text/plain; charset=utf-8"));
-    assert_eq!(String::from_utf8_lossy(&body), "QUIET PLEASE");
-
-    // DELETE gone: a bodiless answer through Close, ordered by a Boolean
-    // decision on its `_should_flow`.
-    let (status, _, body) =
-        live::http_request(&disp, Method::DELETE, &format!("{base}/gone"), &[], None).await?;
-    assert_eq!(status, 204, "{}", String::from_utf8_lossy(&body));
-    assert!(body.is_empty());
-
-    // DELETE sweep/{what}: the Switch picks the Reply when something was
-    // removed, and the Close, whose reason is the body, when nothing was.
-    let (status, _, body) =
-        live::http_request(&disp, Method::DELETE, &format!("{base}/sweep/cards"), &[], None).await?;
-    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
-    assert_eq!(serde_json::from_slice::<Value>(&body)?, json!(3));
-    let (status, headers, body) =
-        live::http_request(&disp, Method::DELETE, &format!("{base}/sweep/nothing"), &[], None).await?;
-    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
-    assert_eq!(header(&headers, "content-type"), Some("application/json"));
-    assert_eq!(serde_json::from_slice::<Value>(&body)?, json!("nothing to sweep"));
-
-    // GET cached: an ending with no body still has a head, so a 304
-    // carries the caching header the next request will send back. A
-    // Close that could not set one left the client reusing whatever it
-    // had stored, and the graph unable to say so.
-    let (status, headers, body) =
-        live::http_request(&disp, Method::GET, &format!("{base}/cached"), &[], None).await?;
-    assert_eq!(status, 304, "{}", String::from_utf8_lossy(&body));
-    assert_eq!(header(&headers, "etag"), Some("v1"));
-    assert_eq!(header(&headers, "cache-control"), Some("max-age=60"));
-    assert!(body.is_empty(), "a 304 carries no body");
-
-    // The gateway's own answers, before any run starts: a served path
-    // with the wrong verb names the verbs it serves; an unknown path is
-    // not found.
-    let (status, _, body) =
-        live::http_request(&disp, Method::GET, &format!("{base}/hello"), &[], None).await?;
-    assert_eq!(status, 405, "{}", String::from_utf8_lossy(&body));
-    assert!(String::from_utf8_lossy(&body).contains("POST"), "{}", String::from_utf8_lossy(&body));
-    let (status, _, _) =
-        live::http_request(&disp, Method::GET, &format!("{base}/nowhere"), &[], None).await?;
-    assert_eq!(status, 404);
-
-    project.finish().await
-}
-
-/// A route whose body fields are all optional, built back into an
-/// object by a JsonObject gated on the route: a caller sending `{}`
-/// gets `{}`, where the object used to be skipped with every key
-/// absent and the caller left with "the run ended without answering".
-#[tokio::test]
-async fn an_empty_body_builds_an_empty_object() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let mut project = Project::prepare("api_reply", disp.clone()).await?;
-    let base = project.unique_live_path()?;
-    project.activate().await?;
-
-    let (status, _, body) =
-        live::http_json(&disp, Method::POST, &format!("{base}/note"), &[], &json!({})).await?;
-    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
-    assert_eq!(serde_json::from_slice::<Value>(&body)?, json!({}));
-
-    let (status, _, body) =
-        live::http_json(&disp, Method::POST, &format!("{base}/note"), &[], &json!({ "title": "hi" })).await?;
-    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
-    assert_eq!(serde_json::from_slice::<Value>(&body)?, json!({ "title": "hi" }));
-
-    project.finish().await
-}
-
-/// A route declaring its body's type answers a body that does not fit
-/// 400, naming the field, before the run starts: a missing required
-/// field, and a key the type does not declare.
-#[tokio::test]
-async fn a_typed_body_that_does_not_fit_is_answered_400() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let mut project = Project::prepare("api_reply", disp.clone()).await?;
-    let base = project.unique_live_path()?;
-    project.activate().await?;
-
-    let (status, _, body) =
-        live::http_json(&disp, Method::POST, &format!("{base}/signup"), &[], &json!({ "age": 3 })).await?;
-    assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
-    let v: Value = serde_json::from_slice(&body)?;
-    assert!(v["error"].as_str().is_some_and(|e| e.contains("missing required field 'email'")), "{v}");
-
-    let (status, _, body) = live::http_json(
-        &disp,
-        Method::POST,
-        &format!("{base}/signup"),
-        &[],
-        &json!({ "email": "a@b.c", "userId": 1 }),
-    )
-    .await?;
-    assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
-    let v: Value = serde_json::from_slice(&body)?;
-    assert!(v["error"].as_str().is_some_and(|e| e.contains("unknown field 'userId'")), "{v}");
-
-    let (status, _, body) = live::http_json(
-        &disp,
-        Method::POST,
-        &format!("{base}/signup"),
-        &[],
-        &json!({ "email": "a@b.c", "age": 30 }),
-    )
-    .await?;
-    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
-    assert_eq!(serde_json::from_slice::<Value>(&body)?, json!({ "email": "a@b.c", "age": 30 }));
-
-    project.finish().await
-}
-
-/// The fast loop: a route answered with NO install reachable from
-/// outside, no activation and no listener armed.
-///
-/// `--fire` serves the request itself. The trigger reads the body off
-/// what was typed, and a stand-in caller stands in for the socket
-/// nobody opened and records what comes back, so the Reply at the end
-/// runs for real and its answer is in the journal. Before this a
-/// route's program could not be run at all offline: the trigger asked
-/// for the caller, found nobody, and failed before a single node of
-/// the author's own graph ran.
-#[tokio::test]
-async fn a_fired_route_runs_its_whole_program_and_answers() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let project = Project::prepare("api_reply", disp.clone()).await?;
-    // The path still has to resolve, but nothing listens on it: this
-    // run never goes near the gateway.
-    project.unique_live_path()?;
-
-    // Bake prepares the triggers without arming them, which is what
-    // gives the fire the trigger's signal spec to serve the request
-    // under. No activate, so no listener and no URL.
-    project.weft(&["bake", "--json"]).await?;
-    let stdout = project
-        .weft(&[
-            "run",
-            "--json",
-            "--fire",
-            r#"hello={"method":"POST","path":"hello","headers":[["user-agent","weft-e2e"]],"body":{"name":"ada"}}"#,
-        ])
-        .await?;
-    let settled = SettledRun::observe(project.dispatcher(), common::run_id_of(&stdout)?).await?;
-    settled.completed()?;
-
-    // The author's own nodes ran on the body, which is the whole point:
-    // the trigger took the request apart and the python node saw it.
-    settled.assert_completed("greet")?;
-    settled.assert_input("greet", "name", &json!("ada"))?;
-
-    // And the conversation records what actually happened, which is
-    // that nobody said anything: there is no caller on a fired run, so
-    // there is no inbound message. The body the author typed is visible
-    // where it really arrived, on the trigger's own firing (the `greet`
-    // input asserted above), not as a message in an exchange nobody had.
-    let asked = settled.caller_requests();
-    anyhow::ensure!(asked.is_empty(), "nobody sent anything, yet: {asked:?}");
-
-    // And the Reply ran for real: this is what a caller WOULD have
-    // received, recorded the same way a real exchange is recorded.
-    let answered = settled.caller_final_answer();
-    anyhow::ensure!(
-        answered
-            == Some(json!({
-                "greeting": "hello ada",
-                "path": "hello",
-                "agent": "weft-e2e",
-            })),
-        "the program's answer: {answered:?}"
-    );
-
-    project.finish().await
-}
-
-/// The same loop for a GET, whose natural spelling carries no body at
-/// all. This is the case that broke: a payload with no `body` key was
-/// read as "no caller", and the trigger then failed asking to be
-/// triggered through a Route, which is exactly the node being fired.
-/// A GET has no body, so the spelling that has to work is the one
-/// without one.
-#[tokio::test]
-async fn firing_a_get_route_needs_no_body() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let project = Project::prepare("api_reply", disp.clone()).await?;
-    project.unique_live_path()?;
-    project.weft(&["bake", "--json"]).await?;
-
-    // No `body` key, and the path's capture supplied the way the
-    // gateway would have matched it.
-    let stdout = project
-        .weft(&[
-            "run",
-            "--json",
-            "--fire",
-            r#"user={"method":"GET","path":"users/42","params":{"id":"42"},"query":{"verbose":"1"}}"#,
-        ])
-        .await?;
-    let settled = SettledRun::observe(project.dispatcher(), common::run_id_of(&stdout)?).await?;
-    settled.completed()?;
-
-    // The author's node saw the capture and the query, so the request
-    // really was served rather than the run limping on without one.
-    settled.assert_completed("lookup")?;
-    settled.assert_completed("found")?;
-
-    // And the Reply answered, which only happens with a caller attached.
-    let answered = settled.caller_final_answer();
-    anyhow::ensure!(
-        answered == Some(json!({ "id": "42", "name": "Ada", "verbose": "1" })),
-        "the program's answer: {answered:?}"
-    );
-
-    project.finish().await
-}
-
 /// A caller reaches the project's own address straight, with nothing of
 /// weft's in between: its routes answer there at the root, and while the
-/// trigger is down the worker itself refuses with a `503`.
+/// trigger is down the worker itself refuses with a `503`. A caller is
+/// never held: at the install's shared address too, a call is refused at
+/// once with a `503` and a `Retry-After`, the way any server that is down
+/// answers, and the call made once the trigger is back is answered.
 #[tokio::test]
 async fn the_project_answers_at_its_own_address() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
@@ -307,95 +40,17 @@ async fn the_project_answers_at_its_own_address() -> anyhow::Result<()> {
     let refused = http.get(format!("{url}/{path}/users/42")).send().await?;
     assert_eq!(refused.status(), 503);
     assert!(refused.headers().get("retry-after").is_some(), "the caller is told when to try again");
-
-    project.finish().await
-}
-
-/// A caller is never held: while a route's trigger is down, even with a
-/// door that holds what arrives, a call is refused at once with a `503`
-/// and a `Retry-After`, the way any server that is down answers, and the
-/// call made once it is back is answered. A door that refuses with nothing
-/// kept takes the route away with its trigger's signals.
-#[tokio::test]
-async fn a_route_taken_down_refuses_its_caller_until_it_is_back() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let mut project = Project::prepare("api_reply", disp.clone()).await?;
-    let base = project.unique_live_path()?;
-    project.activate().await?;
-
-    project.weft(&["deactivate", "--running", "cancel"]).await?;
-    status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
-    let (status, headers, body) =
+    let (code, headers, body) =
         live::http_request(&disp, Method::GET, &format!("{base}/users/42"), &[], None).await?;
-    assert_eq!(status, 503, "{}", String::from_utf8_lossy(&body));
-    assert!(header(&headers, "retry-after").is_some(), "the caller is told when to try again");
+    assert_eq!(code, 503, "{}", String::from_utf8_lossy(&body));
+    assert!(header(&headers, "retry-after").is_some(), "the caller at the shared address is told when to try again");
 
     project.activate().await?;
-    let (status, _, body) =
+    let (code, _, body) =
         live::http_request(&disp, Method::GET, &format!("{base}/users/42"), &[], None).await?;
-    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
     let body: Value = serde_json::from_slice(&body)?;
     assert_eq!(body["name"], "Ada", "{body}");
-
-    project.weft(&["deactivate", "--door", "refuse", "--held", "drop", "--running", "cancel"]).await?;
-    status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
-    let (status, _, body) =
-        live::http_request(&disp, Method::GET, &format!("{base}/users/42"), &[], None).await?;
-    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
-
-    project.finish().await
-}
-
-/// Taking the triggers down lets a call that is running finish on its
-/// own version and answers only once it has (`--running wait`, the
-/// default), while a call arriving once they are down is refused like any
-/// other while the trigger is not on.
-#[tokio::test]
-async fn taking_down_waits_for_a_running_call_and_refuses_new_ones() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let mut project = Project::prepare("api_reply", disp.clone()).await?;
-    let base = project.unique_live_path()?;
-    project.activate().await?;
-
-    // Each side notes when it ended, so the order they ended in is read
-    // off the clock rather than off which one the test happened to join
-    // first.
-    let running = {
-        let disp = disp.clone();
-        let path = format!("{base}/slow");
-        tokio::spawn(async move {
-            let answered = live::http_request(&disp, Method::GET, &path, &[], None).await;
-            (answered, std::time::Instant::now())
-        })
-    };
-    // The slow call is under way (it sleeps four seconds).
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let deactivate = {
-        let deactivate = common::spawn_weft(&project, vec!["deactivate".into(), "--json".into()]);
-        tokio::spawn(async move { (deactivate.await, std::time::Instant::now()) })
-    };
-    status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
-    let (status, headers, body) =
-        live::http_request(&disp, Method::GET, &format!("{base}/users/42"), &[], None).await?;
-    anyhow::ensure!(status == 503, "a call once the triggers are down: {status} {}", String::from_utf8_lossy(&body));
-    anyhow::ensure!(header(&headers, "retry-after").is_some(), "no Retry-After on the refusal");
-
-    let (answered, call_ended) = running.await?;
-    let (status, _, body) = answered?;
-    assert_eq!(status, 200, "the running call is answered: {}", String::from_utf8_lossy(&body));
-    let body: Value = serde_json::from_slice(&body)?;
-    assert_eq!(body["slept"], true, "{body}");
-
-    let (out, deactivate_ended) = deactivate.await?;
-    let out = out??;
-    anyhow::ensure!(out.success, "the deactivate failed: {}\n{}", out.stdout, out.stderr);
-    let said = common::summary_of(&out.stdout);
-    anyhow::ensure!(said.contains("1 run waited for, finishing on their own version"), "{said}");
-    anyhow::ensure!(
-        deactivate_ended >= call_ended,
-        "the deactivate answered {:?} before the call it waits for was answered",
-        call_ended - deactivate_ended
-    );
 
     project.finish().await
 }

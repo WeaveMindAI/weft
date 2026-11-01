@@ -17,7 +17,7 @@
 
 use serde_json::{json, Value};
 
-use weft::storage::{FileHandle, KeepTtl, StorageScope};
+use weft::storage::{FileHandle, StorageScope};
 use weft::weft_type::FileKind;
 use weft::{RunContext, WeftError, WeftResult};
 
@@ -215,7 +215,7 @@ pub async fn incoming_history(
 /// the shape the turn was made from. The file is edited in place
 /// (`StorageHandle::edit`): a turn another run or a parallel iteration
 /// appended in the meantime is kept, and this one lands after it. With
-/// no file, the turn starts a new conversation file, kept past the run.
+/// no file, the turn starts a new conversation file of the run.
 /// Returns the file's value, to go out on `historyFile`.
 pub async fn append_turn(
     ctx: &RunContext,
@@ -228,12 +228,9 @@ pub async fn append_turn(
         let mut conversation = Vec::new();
         normalize(&mut conversation)?;
         conversation.extend_from_slice(turn);
-        // The conversation is the run's product, like a generated
-        // image: kept past the run (default access-renewed lifetime) so
-        // the file still reads once the run has ended.
         return ctx
             .storage(StorageScope::Run)
-            .put(conversation_bytes(&conversation)?, "application/json", "conversation.json", Some(KeepTtl::Default))
+            .put(conversation_bytes(&conversation)?, "application/json", "conversation.json", None)
             .await;
     };
     ctx.storage(StorageScope::Project)

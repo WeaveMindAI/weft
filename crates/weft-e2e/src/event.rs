@@ -56,7 +56,7 @@ impl Event {
 
     /// The call sites this event's frames carry, outermost first: which
     /// use of an included file the firing belongs to.
-    pub fn call_path(&self) -> Vec<String> {
+    fn call_path(&self) -> Vec<String> {
         self.frames().as_array().map(|frames| frames.iter()
             .filter_map(|f| f.get("site").and_then(Value::as_str).map(str::to_string)).collect())
             .unwrap_or_default()
@@ -65,7 +65,7 @@ impl Event {
     /// True when this event names `node` under exactly the call `path`
     /// (an event without a frames field, such as a cost row, is taken at
     /// the top).
-    pub fn is_node_at(&self, node: &str, path: &[String]) -> bool {
+    pub(crate) fn is_node_at(&self, node: &str, path: &[String]) -> bool {
         self.is_node(node) && self.call_path() == path
     }
 }
@@ -96,11 +96,6 @@ impl Replay {
         self.events.iter().find(|e| e.kind() == kind)
     }
 
-    /// Every event naming `node`, any kind, in order.
-    pub fn for_node<'a>(&'a self, node: &'a str) -> impl Iterator<Item = &'a Event> + 'a {
-        self.events.iter().filter(move |e| e.is_node(node))
-    }
-
     /// True once the run has ended: some event is a run's ending,
     /// by the one rule weft-core keeps (`DispatcherEvent::is_run_terminal`).
     /// A row that does not decode as a [`ValuedEvent`] is an error, never
@@ -114,11 +109,6 @@ impl Replay {
             }
         }
         Ok(false)
-    }
-
-    /// True if any event has a kind in `kinds`.
-    pub fn has_any_kind(&self, kinds: &[&str]) -> bool {
-        self.events.iter().any(|e| kinds.contains(&e.kind()))
     }
 }
 

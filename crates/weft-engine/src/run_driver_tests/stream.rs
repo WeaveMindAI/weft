@@ -1201,6 +1201,53 @@
         }
     );
 
+    /// A stream handed in by a person (`--emit producer.out=[...]`), a
+    /// finite list standing in for its producer, drives a loop over it
+    /// one item per iteration, and an empty one closes the loop with an
+    /// empty gather. The producer's body never runs.
+    #[tokio::test]
+    async fn a_loop_over_a_handed_in_finite_stream_gathers_each_item_and_none() {
+        for (handed, gathered) in [(json!([3, 5]), vec![json!(6.0), json!(10.0)]), (json!([]), vec![])] {
+            let log: Log = Arc::new(StdMutex::new(Vec::new()));
+            let whole = stream_loop_project(false);
+            let top = |ids: &[&str]| ids.iter().map(|id| weft_core::frames::Located::top(*id)).collect();
+            let stand_in = weft_core::project::StandIn {
+                ports: [("out".to_string(), weft_core::project::GivenPort::Value { value: handed.clone() })].into(),
+                origin: weft_core::project::GivenOrigin::Emitted,
+            };
+            let mut given = weft_core::project::Given { inputs: Default::default(), outputs: [(weft_core::frames::Located::top("producer"), stand_in)].into() };
+            let walk = weft_core::project::cut::Walk {
+                runs: top(&["lp__in", "doubler", "lp__out", "sink"]),
+                stand_ins: given.outputs.keys().cloned().collect(),
+                ..Default::default()
+            };
+            let cut = weft_core::project::cut::cut(&whole, &walk, &mut given).expect("a cut");
+            let run_id = uuid::Uuid::new_v4();
+            let rows = vec![RunEvent::RunStarted { given: Box::new(given),
+                run_id, project_id: cut.id, entry_node: "lp__in".into(), phase: Phase::Fire,
+                definition_hash: Some(weft_core::project::hash::compute_definition_hash(&cut).unwrap()),
+                cut_from: Some(weft_core::project::hash::compute_definition_hash(&whole).unwrap()),
+                binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
+                seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                settings: Default::default(),
+            }];
+            let cat = catalog(vec![
+                ("Yielder", Box::new(Yielder { count: 5, delivered: false, fail_after: None, log: log.clone() })),
+                ("Doubler", Box::new(Doubler)),
+                ("Sink", Box::new(Sink { log: log.clone() })),
+            ]);
+            let (outcome, _) = super::engine_test_rig::drive_seeded(cut, cat, run_id, Vec::new(), Vec::new(), rows).await;
+            assert!(matches!(outcome, RunOutcome::Completed), "{handed}: {outcome:?}");
+            let entries = log.lock().unwrap().clone();
+            assert!(!entries.iter().any(|entry| entry.starts_with("sent")), "{handed}: the producer never ran: {entries:?}");
+            assert_eq!(
+                entries.iter().filter(|entry| entry.starts_with("sink")).cloned().collect::<Vec<_>>(),
+                vec![format!("sink {gathered:?}")],
+                "{handed}: one iteration per item handed in"
+            );
+        }
+    }
+
     // ----- Unwired, mistyped, and multi-stream edges --------------------
 
     weft_core::stress_test!(

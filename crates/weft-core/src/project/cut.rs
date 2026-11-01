@@ -12,14 +12,25 @@
 //! ends:   --target N, --before N (N does not run), or with neither: as far
 //!         as the wires go
 //!
-//! 1. down along wires from the starts
+//! 1. down along wires from the starts (reaching a loop's start takes the
+//!    loop whole)
 //! 2. back UP from the ends, stopping at a start, at a trigger nobody fired,
-//!    and at a node with no inputs (a loop is taken whole); the gate of a
-//!    scope around something reached is walked too, unless a start sits
-//!    in that scope (the start opens it: its gate is not walked, and a
-//!    gate nothing in the run feeds lets the scope run)
+//!    and at a node with no inputs (reaching a loop's end takes the loop
+//!    whole); the gate of a scope around something reached is walked too,
+//!    unless a start sits in that scope (the start opens it: its gate is
+//!    not walked, and a gate nothing in the run feeds lets the scope run)
 //! 3. everything step 2 touches runs
 //! ```
+//!
+//! A cut may sit anywhere, inside a loop's body too, as long as it does not
+//! cut a loop in half: it holds both of a loop's ends (its `LoopIn` and its
+//! `LoopOut`), and the loop runs whole as it always does, or neither, and
+//! nothing of the loop runs. A part of the cut inside the bodies of loops
+//! it holds neither end of runs inside iteration 0 of each, opened for the
+//! run and never launched (`super::scopes::Scope::entered`); what those
+//! loops would have handed in reaches it like any value from outside a cut,
+//! handed at a start or refused as missing ([`validate_loops`] says the
+//! rest).
 //!
 //! The cut ([`cut`]) is then a real program: the nodes the walk keeps,
 //! with their original ids, the wires between them, the scopes something
@@ -36,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::frames::Located;
 use super::graph::{GraphView, ProjectGraph};
 use super::places::{
-    enclosing_loops, every_place_in, incoming, loop_around, members_in, named, outgoing, scopes_around, Named,
+    enclosing_loops, every_place_in, incoming, members_in, named, outgoing, scopes_around, Named,
 };
 use super::{CrossingSide, Edge, Given, GroupDefinition, GroupKind, ProjectDefinition};
 
@@ -128,29 +139,21 @@ impl Bounds {
 }
 
 /// A node or a group named as an end of a cut: one that does not compile
-/// is refused with the compiler's own reason, before any rule about where
-/// an end may sit (an infra node inside a loop is refused for being there,
-/// never told to select the loop); then one inside a loop, which runs
-/// whole, is refused naming the loop.
-fn endpoint(g: &ProjectGraph, found: &Named, spelled: &str) -> Result<(), String> {
-    refuse_broken(&g.project().broken, &BTreeSet::from([found.place().id.as_str()]), &BTreeSet::from([found.place().clone()]))?;
-    match loop_around(g, found) {
-        Some(around) => Err(format!(
-            "cannot cut at '{spelled}' inside loop '{}'; select the whole loop",
-            super::group_address(g.project(), &around.id, &around.path)
-        )),
-        None => Ok(()),
-    }
+/// is refused with the compiler's own reason, before any rule about what
+/// the cut holds (an infra node inside a loop is refused for being there,
+/// never for where it cuts).
+fn endpoint(g: &ProjectGraph, found: &Named) -> Result<(), String> {
+    refuse_broken(&g.project().broken, &BTreeSet::from([found.place().id.as_str()]), &BTreeSet::from([found.place().clone()]))
 }
 
 /// Resolve `bounds` against the program. Refuses bounds that name
-/// nothing, name something inside a loop, or contradict each other.
+/// nothing or contradict each other.
 pub fn resolve(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Bounds, String> {
     let project = g.project();
     let mut resolved = Bounds { given: bounds.baked.clone(), ..Bounds::default() };
     for spelled in &bounds.from {
         let found = named(g, spelled)?;
-        endpoint(g, &found, spelled)?;
+        endpoint(g, &found)?;
         let fresh = match found {
             Named::Group(place) => resolved.group_starts.insert(place),
             Named::Node(place) => resolved.node_starts.insert(place),
@@ -167,7 +170,7 @@ pub fn resolve(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Bounds, Str
         let Named::Group(place) = &found else {
             return Err(format!("'{group}' is a node, and --group takes a group"));
         };
-        endpoint(g, &found, group)?;
+        endpoint(g, &found)?;
         let place = place.clone();
         resolved.targets.extend(members_in(g, &place.id, &place.path));
         resolved.group_starts.insert(place);
@@ -177,12 +180,12 @@ pub fn resolve(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Bounds, Str
         if let Named::Group(_) = found {
             return Err(format!("cannot supply outputs of group '{spelled}'; use --from {spelled} with its input payload"));
         }
-        endpoint(g, &found, spelled)?;
+        endpoint(g, &found)?;
         resolved.emits.insert(found.into_place());
     }
     if let Some(spelled) = &bounds.fire {
         let found = named(g, spelled)?;
-        endpoint(g, &found, spelled)?;
+        endpoint(g, &found)?;
         if !g.is_trigger(&found.place().id) {
             return Err(format!("'{spelled}' is not a trigger"));
         }
@@ -194,7 +197,7 @@ pub fn resolve(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Bounds, Str
     for (inclusive, ends) in [(true, &bounds.target), (false, &bounds.before)] {
         for spelled in ends {
             let found = named(g, spelled)?;
-            endpoint(g, &found, spelled)?;
+            endpoint(g, &found)?;
             let endpoints: Vec<Located> = match found {
                 Named::Group(place) => members_in(g, &place.id, &place.path),
                 Named::Node(place) => vec![place],
@@ -213,21 +216,23 @@ pub fn resolve(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Bounds, Str
 }
 
 /// Walk `bounds` over the program: [`resolve`] then [`walk_bounds`],
-/// refusing a walk that would hold part of a loop.
+/// refusing a walk that cuts a loop in half ([`validate_loops`]).
 pub fn walk(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Walk, String> {
-    let walked = walk_bounds(g, &resolve(g, bounds)?);
-    validate_loops(g, &walked)?;
+    let resolved = resolve(g, bounds)?;
+    let walked = walk_bounds(g, &resolved);
+    validate_loops(g, &resolved, &walked)?;
     Ok(walked)
 }
 
 /// The walk a setup phase of `targets` runs ([`Bounds::setup`]), refusing
-/// a target inside a loop and a walk that would hold part of one.
+/// a target that does not compile and a walk that cuts a loop in half.
 pub fn walk_setup(g: &ProjectGraph, targets: &[Located]) -> Result<Walk, String> {
     for target in targets {
-        endpoint(g, &Named::Node(target.clone()), &super::address_of(g.project(), &target.id, &target.path))?;
+        endpoint(g, &Named::Node(target.clone()))?;
     }
-    let walked = walk_bounds(g, &Bounds::setup(targets));
-    validate_loops(g, &walked)?;
+    let bounds = Bounds::setup(targets);
+    let walked = walk_bounds(g, &bounds);
+    validate_loops(g, &bounds, &walked)?;
     Ok(walked)
 }
 
@@ -334,13 +339,14 @@ struct Stops {
 
 /// Every place downstream of `seeds`, the seeds included: along wires, a
 /// gate's wire into a group taking the whole group (the gate decides
-/// whether all of it runs), and a loop taken whole.
+/// whether all of it runs), and a loop whose start is reached taken whole
+/// (its start launches all of it).
 pub fn downstream(g: &ProjectGraph, seeds: &[Located]) -> BTreeSet<Located> {
     let mut reached = BTreeSet::new();
     let mut pending: Vec<Located> = seeds.to_vec();
     while let Some(place) = pending.pop() {
         if !reached.insert(place.clone()) { continue; }
-        pending.extend(whole_loop(g, &place));
+        pending.extend(whole_loop_at(g, &place, super::GroupBoundaryRole::In));
         for (edge, target) in outgoing(g, &place) {
             if g.group(&edge.target).is_some() {
                 pending.extend(members_in(g, &target.id, &target.path));
@@ -364,7 +370,7 @@ fn walk_up(g: &ProjectGraph, ends: &[Located], stops: &Stops, starts: &[Located]
         if stops.nodes.contains(&place) || stops.stand_ins.contains(&place) || unfired_trigger {
             continue;
         }
-        pending.extend(whole_loop(g, &place));
+        pending.extend(whole_loop_at(g, &place, super::GroupBoundaryRole::Out));
         // The scopes whose gates decide whether `place` gets what it
         // reads: the ones around it, and a group sending to it from its own
         // port (the group comes along to send) with the ones around that.
@@ -439,12 +445,22 @@ fn group_inside(g: &ProjectGraph, group: &Located, scope: &Located) -> bool {
     group == scope || super::places::scopes_around_group(g, group).contains(scope)
 }
 
-/// The whole loop around `place` (the outermost), at its place: reaching
-/// any part of one runs all of it.
-fn whole_loop(g: &ProjectGraph, place: &Located) -> Vec<Located> {
-    enclosing_loops(g, place).into_iter().next()
-        .map(|around| members_in(g, &around.id, &around.path))
+/// Every member of the loop `place` is the `role` boundary of, at its
+/// place, both boundaries among them; nothing for any other place. Reaching
+/// a loop's start on the way down, or its end on the way up, is reaching
+/// the loop from outside it: it runs whole. Reaching the other end from
+/// inside its body takes only that end, and a cut that then holds one end
+/// without the other is refused ([`validate_loops`]).
+fn whole_loop_at(g: &ProjectGraph, place: &Located, role: super::GroupBoundaryRole) -> Vec<Located> {
+    loop_bounded_by(g, place).filter(|(_, at)| *at == role)
+        .map(|(around, _)| members_in(g, &around.id, &around.path))
         .unwrap_or_default()
+}
+
+/// The loop `place` is a boundary of, at its place, and which boundary.
+fn loop_bounded_by(g: &ProjectGraph, place: &Located) -> Option<(Located, super::GroupBoundaryRole)> {
+    let boundary = g.node(&place.id)?.group_boundary.as_ref().filter(|boundary| g.is_loop(&boundary.group_id))?;
+    Some((Located::new(boundary.group_id.clone(), place.path.clone()), boundary.role))
 }
 
 /// The nodes `feed` asks to run: for each fed start, the node feeding
@@ -452,7 +468,9 @@ fn whole_loop(g: &ProjectGraph, place: &Located) -> Vec<Located> {
 /// input of the group), found along the wire across any group border.
 /// Only that node; what feeds IT stays outside unless the cut already
 /// reaches it. A loop's result comes out of the loop as a whole: a loop
-/// feeding a start runs whole.
+/// feeding a start runs whole. A start inside a loop's body fed by the
+/// loop's start gets that start alone, which the cut refuses for holding
+/// one end of the loop ([`validate_loops`]).
 fn feeders_of(
     g: &ProjectGraph,
     feed: &[String],
@@ -488,25 +506,81 @@ fn feeders_of(
         }
         for source in sources {
             if g.group(&source.id).is_some() { continue; }
-            match enclosing_loops(g, &source).into_iter().next() {
-                Some(around) => feeders.extend(members_in(g, &around.id, &around.path)),
-                None => { feeders.insert(source); }
+            match whole_loop_at(g, &source, super::GroupBoundaryRole::Out) {
+                whole if whole.is_empty() => { feeders.insert(source); }
+                whole => feeders.extend(whole),
             }
         }
     }
     Ok(feeders)
 }
 
-/// Refuse a walk that holds part of a loop: a loop runs whole.
-fn validate_loops(g: &ProjectGraph, walked: &Walk) -> Result<(), String> {
+/// Refuse a walk that cuts a loop in half. A loop the walk holds one end
+/// of (its start, `LoopIn`, or its end, `LoopOut`) without the other is
+/// refused, naming the loop and the end it lacks. A loop it holds both
+/// ends of runs whole (the walk took every member of it), and a bound
+/// named inside it (a start, an `--emit`, a `--before`, a group started
+/// inside it) is refused: it would have to apply to every iteration. A
+/// loop it holds neither end of is fine: the part of the walk inside its
+/// body runs inside its iteration 0.
+///
+/// A loop in an included file is one loop under every site that calls the
+/// file, and whether the cut entered it (holds part of its body without
+/// its ends) is decided per loop, not per site (`Scope::entered`). So a
+/// walk that runs one site's copy whole and part of another site's body
+/// is refused too, naming both: run them in two runs.
+pub fn validate_loops(g: &ProjectGraph, bounds: &Bounds, walked: &Walk) -> Result<(), String> {
+    let project = g.project();
     let kept = walked.kept();
-    let mut checked = BTreeSet::new();
-    for place in &kept {
-        for around in enclosing_loops(g, place) {
-            if !checked.insert(around.clone()) { continue; }
-            if members_in(g, &around.id, &around.path).iter().any(|member| !kept.contains(member)) {
-                return Err(format!("cannot cut inside loop '{}'; select the whole loop", super::group_address(g.project(), &around.id, &around.path)));
-            }
+    // Every loop the walk keeps anything of: one it keeps an end of, and
+    // one around a kept place (entered when the walk keeps neither end).
+    let held: BTreeSet<Located> = kept.iter().flat_map(|place| enclosing_loops(g, place)).collect();
+    let mut whole: BTreeMap<&str, &Located> = BTreeMap::new();
+    let mut entered: BTreeMap<&str, &Located> = BTreeMap::new();
+    for around in &held {
+        let spelled = super::group_address(project, &around.id, &around.path);
+        let start = kept.contains(&Located::new(super::loop_in_id(&around.id), around.path.clone()));
+        let end = kept.contains(&Located::new(super::loop_out_id(&around.id), around.path.clone()));
+        if start != end {
+            let (has, lacks) = if start { ("start", "end") } else { ("end", "start") };
+            return Err(format!(
+                "the run holds loop '{spelled}''s {has} but not its {lacks}: include both to run the loop, or neither to run part of its body"
+            ));
+        }
+        if !start {
+            entered.entry(around.id.as_str()).or_insert(around);
+            continue;
+        }
+        whole.entry(around.id.as_str()).or_insert(around);
+        let inside = |place: &Located| enclosing_loops(g, place).contains(around);
+        let bound = bounds.node_starts.iter().chain(&bounds.emits).chain(&bounds.befores).chain(bounds.fired.iter())
+            .find(|place| inside(place))
+            .map(|place| super::address_of(project, &place.id, &place.path))
+            .or_else(|| bounds.group_starts.iter()
+                .find(|start| super::places::scopes_around_group(g, start).contains(around))
+                .map(|start| super::group_address(project, &start.id, &start.path)));
+        if let Some(bound) = bound {
+            return Err(format!(
+                "'{bound}' is inside loop '{spelled}', and the run holds both of the loop's ends, so it runs the loop whole: \
+                 a run cannot start, stand in or stop inside a loop it runs whole. To run part of the loop's body, end the run \
+                 inside the body too (--target a node in it), so the run holds neither end; to run the loop, start or end at the loop"
+            ));
+        }
+        if let Some(left_out) = members_in(g, &around.id, &around.path).into_iter().find(|member| !kept.contains(member)) {
+            return Err(format!(
+                "the run holds both ends of loop '{spelled}' but not '{}' inside it: a loop runs whole or not at all",
+                super::address_of(project, &left_out.id, &left_out.path)
+            ));
+        }
+    }
+    for (id, run_whole) in &whole {
+        if let Some(part) = entered.get(id) {
+            return Err(format!(
+                "the run holds all of loop '{}' and part of the body of loop '{}', which is the same loop under another site: \
+                 a loop runs whole or in part in one run, not both. Run them in two runs",
+                super::group_address(project, &run_whole.id, &run_whole.path),
+                super::group_address(project, &part.id, &part.path)
+            ));
         }
     }
     Ok(())
@@ -526,7 +600,9 @@ fn validate_loops(g: &ProjectGraph, walked: &Walk) -> Result<(), String> {
 /// ports (the group sends it when it opens), or its gate is written or
 /// handed (a `false` keeps everything inside off). A call site and the
 /// body it calls are kept whenever anything under the call is (the call
-/// frame is what tells the calls apart), and a loop is whole or absent.
+/// frame is what tells the calls apart). A loop is whole, absent, or held
+/// without its two ends when the cut sits inside its body: kept as the
+/// scope whose iteration 0 that part runs in.
 ///
 /// `given` is what the run is given; it keeps only what goes to a place
 /// the cut keeps, and the cut says where that is.

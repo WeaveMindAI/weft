@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
-use weft::storage::{FileHandle, KeepTtl, StorageScope};
+use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::fal::{merge_params, run_queued};
@@ -68,9 +68,7 @@ impl Node for FalEditImageNode {
         let ty = ctx.output_type("image")?;
         let stored = ctx
             .storage(StorageScope::Run)
-            // The edited image is the run's product: keep it past the
-            // run (default 30-day access-bumped TTL).
-            .internalize(&Value::String(url.to_string()), &ty, Some(KeepTtl::Default))
+            .internalize(&Value::String(url.to_string()), &ty, None)
             .await?;
         ctx.pulse_downstream(NodeOutput::new().set("image", stored)).await
     }

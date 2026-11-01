@@ -9,9 +9,6 @@
   ],
   "icon": "TableProperties",
   "color": "#f82b60",
-  "features": {
-    "keepsInputsPastRun": true
-  },
   "inputs": [
     {
       "name": "account",

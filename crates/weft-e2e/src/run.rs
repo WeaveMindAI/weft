@@ -59,39 +59,20 @@ pub async fn run_and_settle(project: &mut Project) -> Result<SettledRun> {
     SettledRun::observe(project.dispatcher(), run_id).await
 }
 
-/// Fire an AIMED run (`weft run --target <node>` per target) and wait
-/// for it to settle. The dispatcher kicks only the roots the targets
-/// need; pulses then run whatever those roots reach.
-pub async fn run_targeted_and_settle(
-    project: &mut Project,
-    targets: &[&str],
-) -> Result<SettledRun> {
-    let mut args = vec!["run", "--json"];
-    for t in targets {
-        args.push("--target");
-        args.push(t);
-    }
-    let stdout = project.weft(&args).await?;
-    let run_id =
-        parse_run_id(&stdout).context("parse run from `weft run --target --json` output")?;
-    SettledRun::observe(project.dispatcher(), run_id).await
-}
-
 /// Extract the run from `weft run --json` NDJSON. The CLI emits a
-/// `dispatcher_call_done` event whose `detail` carries `{ run_id, project_id }`
+/// `dispatcher_call_done` event whose `detail` carries `{ runId, projectId }`
 /// (see crates/weft-cli/src/commands/run.rs). We scan for the first event that
-/// carries a `run_id`, which is unambiguous across the build/register noise.
+/// carries a `runId`, which is unambiguous across the build/register noise.
+/// Under `--json` every stdout line is one event (crates/weft-cli/src/progress.rs),
+/// so a line that is not JSON is an error, never skipped.
 fn parse_run_id(stdout: &str) -> Result<Uuid> {
     for line in stdout.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let Ok(ev): std::result::Result<Value, _> = serde_json::from_str(line) else {
-            // Non-JSON line (shouldn't happen under --json, but tolerate it
-            // rather than fail the whole parse).
-            continue;
-        };
+        let ev: Value = serde_json::from_str(line)
+            .with_context(|| format!("`weft run --json` printed a line that is not JSON: {line}\n{stdout}"))?;
         // The run rides in the event's `detail` object.
         if let Some(run_id) = ev
             .get("detail")
@@ -195,7 +176,7 @@ pub async fn wait_for_triggered_runs(
 
 /// The current status string of `run_id` from `/runs/{run_id}`
 /// (`running`, `waiting_for_input`, `completed`, `failed`, `cancelled`).
-pub async fn status_of(disp: &Dispatcher, run_id: Uuid) -> Result<String> {
+async fn status_of(disp: &Dispatcher, run_id: Uuid) -> Result<String> {
     let v: Value = disp.get_json(&format!("/runs/{run_id}")).await?;
     v.get("status")
         .and_then(Value::as_str)

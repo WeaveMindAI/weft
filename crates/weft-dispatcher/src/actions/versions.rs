@@ -146,19 +146,24 @@ pub(crate) async fn stamp_locked(
         ));
     }
     let upsert = commit_version(state, project, &row.working, label, root, row.head.head_version.as_deref()).await?;
-    // Head's run stays while the code is the version head already is: a
-    // stamp of unchanged code changes nothing, and the next `--seed`
-    // still inherits from that run.
-    let to = match row.head.head_version.as_deref() == Some(upsert.version.as_str()) {
-        true => row.head.clone(),
-        false => Head { head_version: Some(upsert.version.clone()), head_run: None },
-    };
+    let to = head_after_stamp(&row.head, &upsert.version);
     if to == row.head {
         return Ok((upsert, row));
     }
     move_head_or_conflict(state, &row, &to).await?;
     announce(state, project, row.id).await;
     Ok((upsert, WorkingCopyRow { head: to, ..row }))
+}
+
+/// Where a working copy's head goes once its files are recorded as
+/// `version`. Head's run stays while the code is the version head already
+/// is: a stamp of unchanged code changes nothing, and the next `--seed`
+/// still inherits from that run.
+fn head_after_stamp(head: &Head, version: &str) -> Head {
+    match head.head_version.as_deref() == Some(version) {
+        true => head.clone(),
+        false => Head { head_version: Some(version.to_string()), head_run: None },
+    }
 }
 
 /// Tell whoever watches the project (the editor's view of the tree) that
@@ -1052,6 +1057,19 @@ pub(crate) async fn program_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A checkpoint of the code head is already on leaves head where it
+    /// is, its run included, so the next `--seed` still inherits from that
+    /// run; a checkpoint of changed code moves head to the new version,
+    /// with no run on it yet.
+    #[test]
+    fn a_checkpoint_of_unchanged_code_keeps_heads_run() {
+        let run = uuid::Uuid::from_u128(7);
+        let on_v1 = Head { head_version: Some("v1".into()), head_run: Some(run) };
+        assert_eq!(head_after_stamp(&on_v1, "v1"), on_v1);
+        assert_eq!(head_after_stamp(&on_v1, "v2"), Head { head_version: Some("v2".into()), head_run: None });
+        assert_eq!(head_after_stamp(&Head::default(), "v1"), Head { head_version: Some("v1".into()), head_run: None });
+    }
 
     /// A hash two versions share makes one key.
     #[test]

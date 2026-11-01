@@ -3,8 +3,7 @@
 # project needs an entry trigger to be activatable. The entry here is a plain
 # on-demand trigger (TestSseTrigger): a pushed event starts a fresh run
 # that hits HumanQuery and suspends. This fixture asserts the RESUME form's
-# enumeration + answer; entry-trigger FORM enumeration is covered separately by
-# the human_trigger_enum fixture, so the entry here is a non-form trigger.
+# enumeration + answer, so the entry here is a non-form trigger.
 #
 # The rig: activate -> push an event to start a run -> wait for the
 # HumanQuery form -> answer it (approve) -> assert the approval (true) reached

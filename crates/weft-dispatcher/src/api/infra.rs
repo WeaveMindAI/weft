@@ -179,7 +179,7 @@ pub async fn command_status(
     Path((id, cmd_id)): Path<(uuid::Uuid, i64)>,
     Query(hold): Query<super::HoldQuery>,
 ) -> Result<Json<CommandStatus>, Refused> {
-    Ok(Json(actions::infra::command(&state, &operator(caller), id, cmd_id, hold.hold()).await?))
+    Ok(Json(actions::infra::command(&state, &operator(caller), id, cmd_id, hold.hold(&state.stopping)).await?))
 }
 
 /// Whose copy a per-node read or press is about, or whose in-flight
@@ -1181,6 +1181,12 @@ pub(crate) async fn live_endpoint_url(
             Some(instance) => (StatusCode::NOT_FOUND, format!("instance '{instance}' has no copy of infra node '{node}'")),
             None => (StatusCode::NOT_FOUND, "no such infra node".to_string()),
         })?;
+    live_endpoint_of(&row, node, live_endpoint)
+}
+
+/// Where copy `row` of the infra node at `node` serves its display, its
+/// endpoint named `live_endpoint`, or the 404 saying why it has none.
+pub(crate) fn live_endpoint_of(row: &infra_node::InfraNodeRow, node: &str, live_endpoint: &str) -> Result<String, (StatusCode, String)> {
     // A copy that is not up has nothing behind its address (a stopped
     // one runs nothing, a starting one is not ready yet), so
     // asking it would be a connection error. Nothing to show is a 404,

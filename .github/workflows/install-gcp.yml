@@ -435,6 +435,19 @@ jobs:
           TF_VAR_database_listen_url: ${{ secrets.WEFT_DATABASE_LISTEN_URL }}
         run: terraform apply -input=false -auto-approve
 
+      # The apply rolled each role's new revision out and waited for it to
+      # be ready. Deleting the older revisions stops their copies (Cloud
+      # Run sends each SIGTERM, and it finishes what it was answering,
+      # closes what it held open and exits), so the old weft does not keep
+      # taking work beside the new one. A service whose latest revision is
+      # not ready, or does not get all of its requests, fails this step
+      # naming it, and nothing is deleted.
+      - name: stop the old copies
+        working-directory: deploy/terraform/gcp
+        run: |
+          mapfile -t services < <(terraform output -json role_services | jq -r '.[]')
+          "$GITHUB_WORKSPACE/scripts/delete-old-role-revisions.sh" "${{ vars.GCP_PROJECT_ID }}" "${{ vars.GCP_REGION }}" "${services[@]}"
+
       # The standard library's files, stored in the install now, so a
       # project's first deploy uploads only its own files (a local install
       # does the same each time it starts). The key goes from Secret

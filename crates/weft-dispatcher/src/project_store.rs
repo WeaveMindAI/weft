@@ -1206,6 +1206,9 @@ impl ProjectStoreOps for PostgresProjectStore {
         weft_access_store::forget_project_access(&tx, id).await?;
         crate::store::postgres::revoke_project_instance_tokens(&tx, id).await?;
         tx.commit().await?;
+        // The erased runs' files were queued through the announcement
+        // outbox (`erase_run_ids`), which goes out once poked.
+        weft_task_store::announce::committed(&self.pool);
         Ok(Some(signals))
     }
 

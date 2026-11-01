@@ -66,9 +66,13 @@ async fn a_project_runs_on_a_real_gcp_install_and_idles_at_zero() -> anyhow::Res
     let mut project = Project::prepare("web_trigger", disp.clone()).await?;
     let path = project.unique_live_path()?;
     project.activate().await?;
-    let bytes = live::http_post(&disp, &path, &json!({ "message": "weft-e2e-gcp" })).await?;
+    let (status, _, bytes) =
+        live::http_json(&disp, reqwest::Method::POST, &path, &[], &json!({ "message": "weft-e2e-gcp" })).await?;
     let body = String::from_utf8_lossy(&bytes);
-    anyhow::ensure!(body.contains("\"port_said\":\"weft-e2e-gcp\""), "the route did not answer through the install: {body}");
+    anyhow::ensure!(
+        status.is_success() && body.contains("\"port_said\":\"weft-e2e-gcp\""),
+        "the route did not answer through the install (HTTP {status}): {body}"
+    );
 
     // The worker service scales to zero when nobody calls.
     let pid = project.id();

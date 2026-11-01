@@ -363,5 +363,38 @@ class RoleResetTest(unittest.TestCase):
                 setattr(bootstrap, name, value)
 
 
+class ProgramResetTest(unittest.TestCase):
+    """The program's Reset button: a new password, set on the role, written,
+    handed to the pooler, readable again, and told to weft, so the program's
+    next run signs in with it."""
+
+    def setUp(self):
+        self.names = ("verifier", "set_password", "write_password", "tell_the_pooler", "push_password", "sealed_file")
+        self.kept = {name: getattr(bootstrap, name) for name in self.names}
+        self.done = []
+        bootstrap.verifier = lambda role: STORED
+        bootstrap.set_password = lambda role, password: self.done.append(("database", role, password))
+        bootstrap.write_password = lambda role, password: self.done.append(("disk", role, password))
+        bootstrap.tell_the_pooler = lambda: self.done.append(("pooler",))
+        bootstrap.push_password = lambda password: self.done.append(("weft", password))
+        self.seal = os.path.join(tempfile.mkdtemp(), "sealed")
+        open(self.seal, "w").close()
+        bootstrap.sealed_file = lambda role: self.seal
+
+    def tearDown(self):
+        for name, value in self.kept.items():
+            setattr(bootstrap, name, value)
+
+    def test_the_program_s_reset_mints_a_new_password_and_tells_weft(self):
+        self.assertIsNone(bootstrap.reset_password("app"))
+        fresh = self.done[0][2]
+        self.assertTrue(fresh != "pw" and len(fresh) >= 32, fresh)
+        self.assertEqual(self.done, [("database", "app", fresh), ("disk", "app", fresh), ("pooler",), ("weft", fresh)])
+        self.assertFalse(os.path.exists(self.seal), "readable again")
+        self.done.clear()
+        self.assertIsNone(bootstrap.reset_password("app"))
+        self.assertNotEqual(self.done[0][2], fresh, "every press mints another")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 {
   "type": "S3GetObject",
   "label": "S3: Get Object",
-  "description": "Read an object from an S3-compatible bucket into storage and emit its stored-file reference (streamed, so large objects are fine). The file is run-scoped; wire it through KeepFile to keep it for later runs.",
+  "description": "Read an object from an S3-compatible bucket into storage and emit its stored-file reference (streamed, so large objects are fine). The file is stored with the run and deleted with it (once the run's record goes); wire it through KeepFile to keep it past that.",
   "tags": [
     "s3",
     "storage",

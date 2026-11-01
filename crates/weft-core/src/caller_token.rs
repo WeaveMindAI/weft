@@ -307,6 +307,9 @@ mod tests {
             "socket ticket expired"
         );
         assert!(p.validate_ticket(&tok, 2_000).is_err());
+        // What the late caller reads: the reason, and to ask again.
+        let told = refusal(&p.validate_ticket(&tok, 2_000).unwrap_err());
+        assert!(told.contains("expired") && told.contains("Ask for a new one"), "{told}");
     }
 
     #[test]

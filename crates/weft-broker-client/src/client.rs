@@ -223,16 +223,15 @@ pub fn turned_away(sent: &Result<Answer>) -> bool {
 
 /// Whether a call was turned away busy with nothing of it run: the broker
 /// answered that it could not get a database connection for it
-/// ([`NOT_DONE`]), or that its copy is stepping aside for a newer one
-/// ([`STEPPING_ASIDE`]: sent again, the call goes out on a line to a
-/// current copy), or the platform in front of it answered 429 because
+/// ([`NOT_DONE`]), or that its copy is stopping ([`STOPPING`]: sent
+/// again, the call goes out on a line to a running copy), or the platform in front of it answered 429 because
 /// every copy of the broker it may run was busy and it handed the call to
 /// none (Cloud Run at its most copies). The broker never answers 429
 /// itself, so a 429 is always the platform's.
 // SYNC: NOT_DONE <-> crates/weft-broker/src/handlers.rs unavailable_or_internal
 pub fn answered_busy(status: reqwest::StatusCode, body: &[u8]) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        || (status == reqwest::StatusCode::SERVICE_UNAVAILABLE && (body == NOT_DONE.as_bytes() || body == STEPPING_ASIDE.as_bytes()))
+        || (status == reqwest::StatusCode::SERVICE_UNAVAILABLE && (body == NOT_DONE.as_bytes() || body == STOPPING.as_bytes()))
 }
 
 /// The first wait before asking again after the broker could not answer

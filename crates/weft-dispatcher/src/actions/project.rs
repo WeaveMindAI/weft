@@ -55,7 +55,7 @@ pub(crate) async fn program_call(
         // One look that waits for nothing: the program parks on a timer
         // between looks, so no task of the dispatcher's is held open.
         ProjectCall::Follow { task } => {
-            answered(&follow(state, actor, project, *task, std::time::Duration::ZERO).await.map_err(StatusError::into_parts)?)
+            answered(&follow(state, actor, project, *task, weft_task_store::stopping::Deadline::at(tokio::time::Instant::now())).await.map_err(StatusError::into_parts)?)
         }
     }
 }
@@ -528,10 +528,10 @@ pub(crate) async fn remove(state: &DispatcherState, actor: &Actor, id: uuid::Uui
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     state.builder.prunes.request(state, None);
-    // Reclaim the project's instance-specific stored data through the ONE hook.
-    // The default frees the project's `project/`-scoped runtime files; a reclaimer
-    // that also stores project content elsewhere (a versioned project-editing
-    // history) extends it. `shared/`-scoped runtime files are the owner's and are
+    // Reclaim the project's stored data through the ONE hook. The default
+    // frees the project's `project/`- and `instance/`-scoped runtime files; a
+    // reclaimer that also stores project content elsewhere (a versioned
+    // project-editing history) extends it. `shared/`-scoped runtime files are the owner's and are
     // deliberately NOT touched (they outlive the project). MUST run before the
     // project row is dropped: a row-cascade would otherwise erase the bookkeeping
     // this reclaim reads, stranding bytes. A failure aborts the rm (a retry
@@ -609,11 +609,11 @@ pub(crate) async fn follow(
     actor: &Actor,
     id: uuid::Uuid,
     task: uuid::Uuid,
-    look: std::time::Duration,
+    look: weft_task_store::stopping::Deadline,
 ) -> Result<Following, StatusError> {
     actor.may_act_on(state, id).await?;
     let internal = |what: &str, e: String| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e}"));
-    let outcome = weft_task_store::terminal::wait_for_terminal_in_project(&state.pg_pool, &state.signals, task, id, look)
+    let outcome = weft_task_store::terminal::wait_for_terminal_in_project_before(&state.pg_pool, &state.signals, task, id, look)
         .await
         .map_err(|e| internal("follow the task", format!("{e:#}")))?
         .ok_or((StatusCode::NOT_FOUND, format!("project {id} has no task {task} to follow")))?;

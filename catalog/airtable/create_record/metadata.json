@@ -9,9 +9,6 @@
   ],
   "icon": "Grid2x2Plus",
   "color": "#f82b60",
-  "features": {
-    "keepsInputsPastRun": true
-  },
   "inputs": [
     {
       "name": "account",

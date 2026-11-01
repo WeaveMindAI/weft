@@ -101,10 +101,10 @@ async fn surrender_requeues_only_while_claim_is_ours(pool: Pool) {
     assert_eq!((status.as_str(), claimed_by.as_deref()), ("claimed", Some("disp-2")));
 }
 
-/// A picker whose copy stepped aside claims nothing: the task waiting
-/// stays for a current copy's picker.
+/// A picker whose copy is stopping claims nothing: the task waiting
+/// stays for a running copy's picker.
 #[weft_db_macros::test]
-async fn a_picker_whose_copy_stepped_aside_claims_nothing(pool: Pool) {
+async fn a_picker_whose_copy_is_stopping_claims_nothing(pool: Pool) {
     use std::sync::Arc;
     use weft_task_store::drain::DrainStep;
     setup(&pool).await;
@@ -113,17 +113,17 @@ async fn a_picker_whose_copy_stepped_aside_claims_nothing(pool: Pool) {
     #[async_trait::async_trait]
     impl weft_task_store::TaskExecutor<()> for Unused {
         async fn execute(&self, _: &(), task: &tasks::Task) -> anyhow::Result<serde_json::Value> {
-            anyhow::bail!("a copy that stepped aside ran {}", task.id)
+            anyhow::bail!("a stopping copy ran {}", task.id)
         }
     }
     let registry = weft_task_store::TaskRegistry::<()>::every_kind(|_| Arc::new(Unused));
-    let aside = weft_task_store::aside::StepAside::new();
-    let picker = weft_task_store::dispatcher_picker_loop(store, (), registry, "disp-old".into(), aside.clone());
+    let stopping = weft_task_store::stopping::Stopping::new();
+    let picker = weft_task_store::dispatcher_picker_loop(store, (), registry, "disp-old".into(), stopping.clone());
     let waiting = tasks::enqueue(&pool, dispatcher_task("waiting")).await.unwrap();
-    aside.step_aside();
+    stopping.begin();
     assert_eq!((picker.drain)().await.unwrap(), DrainStep::Done);
     let status: String = pool.scalar("SELECT status FROM task WHERE id = $1", &[&waiting]).await.unwrap();
-    assert_eq!(status, "pending", "left for a current copy");
+    assert_eq!(status, "pending", "left for a running copy");
 }
 
 /// The picker run dry looks again when the earliest claim it may have to
@@ -145,7 +145,7 @@ async fn a_dry_picker_prunes_and_looks_at_its_earliest_claim_lapse(pool: Pool) {
         }
     }
     let registry = weft_task_store::TaskRegistry::<()>::every_kind(|_| Arc::new(Unused));
-    let picker = weft_task_store::dispatcher_picker_loop(store, (), registry, "disp-1".into(), weft_task_store::aside::StepAside::new());
+    let picker = weft_task_store::dispatcher_picker_loop(store, (), registry, "disp-1".into(), weft_task_store::stopping::Stopping::new());
     assert_eq!((picker.drain)().await.unwrap(), DrainStep::Done, "no claim out");
 
     let old = tasks::enqueue(&pool, dispatcher_task("old")).await.unwrap();

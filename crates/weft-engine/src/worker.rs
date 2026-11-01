@@ -1864,6 +1864,11 @@ mod tests {
     }
 
     fn worker_with(clients: EngineClients) -> Worker {
+        worker_running(Arc::new(NoCatalog), clients)
+    }
+
+    /// A worker running `catalog`'s nodes over `clients`.
+    fn worker_running(catalog: Arc<dyn NodeCatalog>, clients: EngineClients) -> Worker {
         let config = config();
         let door = crate::door::Door::new(
             config.project_id,
@@ -1874,7 +1879,7 @@ mod tests {
             config.secret.clone(),
             crate::door::RunPermits::new(64, std::time::Duration::from_secs(30)),
         );
-        new_worker(Arc::new(NoCatalog), clients, &config, door)
+        new_worker(catalog, clients, &config, door)
     }
 
     fn worker_over(runs: Arc<Runs>, line: Arc<crate::context::TestLine>) -> Worker {
@@ -2446,5 +2451,179 @@ mod tests {
         let run_id = weft_core::new_run_id();
         assert_eq!(worker.carry_on_run(run_id).await.unwrap(), Some(RunAnswer::NothingToRun));
         assert!(!worker.cancels.contains(run_id), "nothing claimed, nothing registered");
+    }
+
+    /// The metadata of a node written here, which has no metadata.json.
+    fn bare_metadata(node_type: &str) -> weft_core::node::NodeMetadata {
+        serde_json::from_value(serde_json::json!({ "type": node_type, "label": node_type, "description": "" })).expect("metadata")
+    }
+
+    /// Panics as it runs.
+    struct Boom;
+    impl weft_core::NodeManifest for Boom {
+        fn manifest(&self) -> &'static weft_core::node::NodeMetadata {
+            static M: std::sync::OnceLock<weft_core::node::NodeMetadata> = std::sync::OnceLock::new();
+            M.get_or_init(|| bare_metadata("Boom"))
+        }
+    }
+    #[async_trait::async_trait]
+    impl weft_core::Node for Boom {
+        async fn run(&self, _ctx: weft_core::RunContext) -> weft_core::error::WeftResult<()> {
+            panic!("the node broke");
+        }
+    }
+
+    /// Sends `value` on, writing down that it ran under the name it was
+    /// given.
+    struct Sends {
+        name: &'static str,
+        ran: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+    impl weft_core::NodeManifest for Sends {
+        fn manifest(&self) -> &'static weft_core::node::NodeMetadata {
+            static M: std::sync::OnceLock<weft_core::node::NodeMetadata> = std::sync::OnceLock::new();
+            M.get_or_init(|| bare_metadata("Sends"))
+        }
+    }
+    #[async_trait::async_trait]
+    impl weft_core::Node for Sends {
+        async fn run(&self, ctx: weft_core::RunContext) -> weft_core::error::WeftResult<()> {
+            self.ran.lock().unwrap().push(self.name);
+            ctx.pulse_downstream(weft_core::node::NodeOutput::new().set("value", serde_json::json!("ok"))).await
+        }
+    }
+
+    /// `first -> after`, `first` of `first_type`.
+    fn two_steps(first_type: &str) -> weft_core::ProjectDefinition {
+        let node = |id: &str, node_type: &str, input: bool| serde_json::json!({
+            "id": id, "nodeType": node_type, "position": { "x": 0, "y": 0 },
+            "inputs": if input { serde_json::json!([{ "name": "value", "portType": "String", "required": true }]) } else { serde_json::json!([]) },
+            "outputs": [{ "name": "value", "portType": "String", "required": false }]
+        });
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [node("first", first_type, false), node("after", "After", true)],
+            "edges": [{ "id": "e", "source": "first", "sourceHandle": "value", "target": "after", "targetHandle": "value" }]
+        }))
+        .expect("two steps")
+    }
+
+    /// Drive one run of `project` on `worker`, born now with `settings`
+    /// and holding `slot`, the way the worker drives a run its door bore.
+    /// Answers its id once its record is written.
+    async fn drive_here(
+        worker: &Worker,
+        project: weft_core::ProjectDefinition,
+        settings: weft_core::run_settings::RunSettings,
+        slot: Option<crate::door::Slot>,
+    ) -> RunId {
+        use crate::run_driver::engine_test_rig::{claimed, handle};
+        let run_id = weft_core::new_run_id();
+        let birth = vec![
+            RunEvent::RunStarted { given: Default::default(),
+                run_id, project_id: project.id, entry_node: "first".into(),
+                phase: weft_core::context::Phase::Fire,
+                definition_hash: Some(weft_core::project::hash::compute_definition_hash(&project).unwrap()),
+                cut_from: None, binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
+                seed: None, instance: None, fired_trigger: None, stand_in: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                settings,
+            },
+            RunEvent::NodeKicked { run_id, node_id: "first".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
+        ];
+        // Born the way the worker's door bears a run: its birth handed
+        // under this worker's own name.
+        let journal = handle(&worker.clients, run_id, &birth, 0, Vec::new());
+        weft_journal::JournalClient::record_events(journal.as_ref(), &birth, Some(&worker.replica)).await.expect("a birth is handed");
+        let project = Arc::new(project);
+        let read = claimed(&worker.clients, run_id, &project, &birth).await;
+        let registered = worker.cancels.claim(run_id).expect("a fresh run");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            worker.drive(RunStart {
+                run_id,
+                journal,
+                program: Arc::new(ProgramTables::new(project)),
+                starts_from: StartsFrom::Record(Box::new(read)),
+                exchange: None,
+                registered,
+                slot,
+            }),
+        )
+        .await
+        .expect("the drive ends")
+        .expect("the drive runs");
+        worker.clients.writer.written().await;
+        run_id
+    }
+
+    /// A node that panics fails its run and leaves nothing of the run on
+    /// its worker: no cancel registered, no hold, no record waiting to
+    /// be written, so the worker has nothing under way and may retire.
+    /// The same worker then takes the next run and carries it through.
+    #[tokio::test]
+    async fn a_panicking_node_fails_its_run_and_leaves_the_worker_free() {
+        let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let catalog = crate::run_driver::engine_test_rig::catalog(vec![
+            ("Boom", Box::new(Boom)),
+            ("Sends", Box::new(Sends { name: "first", ran: ran.clone() })),
+            ("After", Box::new(Sends { name: "after", ran: ran.clone() })),
+        ]);
+        let journal = Arc::new(MemJournal::default());
+        let worker = worker_running(catalog, clients(journal.clone()));
+
+        let broke = drive_here(&worker, two_steps("Boom"), Default::default(), None).await;
+        let record = journal.events_of(broke);
+        assert!(
+            record.iter().any(|e| matches!(e, RunEvent::RunFailed { error, .. } if error.contains("panicked"))),
+            "the run fails on the panic: {record:?}"
+        );
+        assert!(ran.lock().unwrap().is_empty(), "nothing behind the panicking node ran: {:?}", ran.lock().unwrap());
+        assert_eq!(worker.cancels.count(), 0, "the panicking run's cancel is gone");
+        assert!(worker.holds.held_still().is_empty(), "nothing of it is held");
+        assert_eq!(worker.under_way(60), crate::door::UnderWay::Nothing, "the worker has nothing under way, so it may retire");
+
+        let fine = drive_here(&worker, two_steps("Sends"), Default::default(), None).await;
+        assert!(journal.events_of(fine).iter().any(|e| matches!(e, RunEvent::RunCompleted { .. })), "{:?}", journal.events_of(fine));
+        assert_eq!(*ran.lock().unwrap(), vec!["first", "after"], "the same worker carried the next run through");
+        assert_eq!(worker.under_way(60), crate::door::UnderWay::Nothing);
+    }
+
+    /// A run its entry lets one of at a time holds the entry's room while
+    /// it runs and gives it back as it ends, an unrecorded run included:
+    /// a caller arriving meanwhile is turned away, one arriving after it
+    /// ended is let in.
+    #[tokio::test]
+    async fn an_unrecorded_run_gives_its_entrys_room_back_as_it_ends() {
+        let mut one_at_a_time = crate::door::fake::route("t1", "route", "status");
+        crate::door::fake::armed(&mut one_at_a_time).spec.limits = weft_core::signal::EntryLimits { at_once: Some(1), ..Default::default() };
+        let mut clients = clients(Arc::new(MemJournal::default()));
+        clients.door_broker = crate::door::fake::FakeDoorBroker::new(vec![one_at_a_time]);
+        let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let catalog = crate::run_driver::engine_test_rig::catalog(vec![
+            ("Sends", Box::new(Sends { name: "first", ran: ran.clone() })),
+            ("After", Box::new(Sends { name: "after", ran })),
+        ]);
+        let worker = worker_running(catalog, clients);
+        let headers = {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", "127.0.0.1:9000".parse().unwrap());
+            headers
+        };
+        let call = || crate::door::Call {
+            method: "GET", raw_path: "/status", raw_query: "", headers: &headers,
+            peer: "10.0.0.1".parse().unwrap(), relayed: false, route_prefix: "",
+        };
+        let crate::door::Arrived::Run(admitted, _) = worker.door.arrive(call(), axum::body::Body::empty()).await else { panic!("the first caller is let in") };
+        assert!(
+            matches!(worker.door.arrive(call(), axum::body::Body::empty()).await, crate::door::Arrived::Answer(_)),
+            "while its run goes, the entry has no room"
+        );
+
+        let unrecorded = weft_core::run_settings::RunSettings::new(weft_core::run_settings::Keeping::Fast, false).unwrap();
+        drive_here(&worker, two_steps("Sends"), unrecorded, Some(admitted.slot)).await;
+        assert!(
+            matches!(worker.door.arrive(call(), axum::body::Body::empty()).await, crate::door::Arrived::Run(..)),
+            "the run ended, so its room is free again"
+        );
     }
 }

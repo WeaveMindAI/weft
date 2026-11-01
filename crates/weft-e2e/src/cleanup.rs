@@ -38,8 +38,7 @@ pub async fn clean_kept() -> Result<()> {
     for cell in crate::kept::kept_cells()? {
         println!("removing cell {cell}");
         let install = weft_core::infra::Install::named(&cell).map_err(anyhow::Error::msg)?;
-        // Real time: removing a cell runs none of its timers.
-        crate::cell::daemon(&install, "remove", 1.0).await?;
+        crate::cell::daemon(&install, "remove").await?;
         crate::kept::cell_gone(&cell)?;
     }
 

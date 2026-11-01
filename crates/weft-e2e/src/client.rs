@@ -4,8 +4,8 @@
 //!   - [`Dispatcher`]: a thin HTTP client over the dispatcher's public API
 //!     (where the install under test, or a test's cell, answers). Used for
 //!     reads (run status / replay, storage, infra status) and
-//!     outside-world pokes (firing signals, the live-caller handshake). This is the same contract the CLI and the
-//!     VS Code extension speak.
+//!     outside-world pokes (firing signals). This is the same contract the
+//!     CLI and the VS Code extension speak.
 //!   - [`cli`]: shells out to the installed `weft` binary in a project
 //!     directory. Used for the lifecycle that must go through the real build
 //!     path (build, register, activate, resync, infra, rm), because driving
@@ -179,23 +179,6 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// POST `body` as JSON to `path` and return the raw status + body without
-    /// requiring 2xx. Used by negative transition tests that assert a verb is
-    /// REJECTED with a specific status (the reconciliation table's REJ cells),
-    /// where a 2xx would be the failure.
-    pub async fn post_raw(&self, path: &str, body: &Value) -> Result<(reqwest::StatusCode, String)> {
-        let url = self.url(path);
-        let resp = self
-            .authed(self.http.post(&url))
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        Ok((status, text))
-    }
-
     /// GET `path` presenting a SIGNAL TOKEN as bearer, returning the raw
     /// status + body without requiring 2xx. The pair to `get_json_bearer`,
     /// for the doors whose REFUSAL is the thing under test (a token that was
@@ -214,7 +197,7 @@ impl Dispatcher {
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.with_context(|| format!("GET {url}: read the body"))?;
         Ok((status, body))
     }
 
@@ -222,7 +205,7 @@ impl Dispatcher {
     /// status + body without requiring 2xx. The pair to `get_raw_bearer`, for
     /// a door whose REFUSAL is the thing under test (pressing a button on a
     /// display that carries none).
-    pub async fn post_raw_bearer(
+    pub(crate) async fn post_raw_bearer(
         &self,
         path: &str,
         bearer: &str,
@@ -238,14 +221,14 @@ impl Dispatcher {
             .await
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.with_context(|| format!("POST {url}: read the body"))?;
         Ok((status, body))
     }
 
     /// GET `path` and return the raw status + body without requiring 2xx. Used
     /// where the rig must assert on a specific status code (e.g. a 404 after
     /// teardown) rather than treat non-2xx as an error.
-    pub async fn get_raw(&self, path: &str) -> Result<(reqwest::StatusCode, String)> {
+    pub(crate) async fn get_raw(&self, path: &str) -> Result<(reqwest::StatusCode, String)> {
         let url = self.url(path);
         let resp = self
             .authed(self.http.get(&url))
@@ -253,14 +236,14 @@ impl Dispatcher {
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.with_context(|| format!("GET {url}: read the body"))?;
         Ok((status, body))
     }
 
     /// GET an ABSOLUTE url (not under the dispatcher base) and return raw
-    /// status + body. Used for the live-caller URL and for storage
-    /// capability URLs, which the dispatcher hands out whole.
-    pub async fn get_abs_raw(&self, url: &str) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+    /// status + body. Used for storage capability URLs, which the
+    /// dispatcher hands out whole.
+    pub(crate) async fn get_abs_raw(&self, url: &str) -> Result<(reqwest::StatusCode, Vec<u8>)> {
         let resp = self
             .http
             .get(url)
@@ -268,7 +251,7 @@ impl Dispatcher {
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
-        let bytes = resp.bytes().await.unwrap_or_default().to_vec();
+        let bytes = resp.bytes().await.with_context(|| format!("GET {url}: read the body"))?.to_vec();
         Ok((status, bytes))
     }
 }
@@ -278,7 +261,7 @@ impl Dispatcher {
 /// so the "fail loud with the server's message" rule holds uniformly.
 async fn read_ok(resp: reqwest::Response, verb: &str, url: &str) -> Result<String> {
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = resp.text().await.with_context(|| format!("{verb} {url} -> HTTP {status}: read the body"))?;
     if status.is_success() {
         Ok(body)
     } else {
@@ -366,20 +349,6 @@ pub struct CliOutput {
     pub stdout: String,
     pub stderr: String,
     pub invocation: String,
-}
-
-/// The last `n` bytes of `s`, snapped forward to a char boundary so
-/// the slice is always valid UTF-8. For "show me the end of a big log"
-/// error messages.
-pub fn tail(s: &str, n: usize) -> &str {
-    if s.len() <= n {
-        return s;
-    }
-    let mut start = s.len() - n;
-    while !s.is_char_boundary(start) {
-        start += 1;
-    }
-    &s[start..]
 }
 
 /// The most one test may take: past it the runner stops the test and

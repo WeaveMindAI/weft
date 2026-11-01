@@ -70,12 +70,12 @@ pub async fn status(
     // Every read is scoped to this project. A client waiting on a run
     // holds here until it finishes, or the hold runs out, instead of
     // asking on a timer; a zero hold is one read.
-    let outcome = weft_task_store::terminal::wait_for_terminal_in_project(
+    let outcome = weft_task_store::terminal::wait_for_terminal_in_project_before(
         &state.pg_pool,
         &state.signals,
         task_id,
         id,
-        hold.hold(),
+        hold.hold(&state.stopping),
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?

@@ -376,7 +376,7 @@ pub async fn complete(ctx: &RunContext) -> WeftResult<(LlmCall, CompletionRespon
 /// `historyFile` that came in, in place, and that same file goes out on
 /// `historyFile`, so a conversation grows turn after turn whatever its
 /// size. With no file in, a wired `historyFile` output starts a new
-/// conversation file holding this turn, kept past the run; unwired, the call
+/// conversation file of the run holding this turn; unwired, the call
 /// is a one-shot and keeps nothing.
 pub async fn finish(
     ctx: &RunContext,

@@ -1,10 +1,10 @@
 //! Shared scaffolding for the e2e suites that drive a project through
 //! verbs and read what the CLI printed: the `lifecycle` fixture's graph
-//! shapes, the HoldGate release protocol, the drive/observe helpers built
-//! on them (`lifecycle_transitions.rs`, `version_tree_edges.rs`), and the
-//! readers of a `weft run`'s output (a run id, a summary, the
-//! warnings, the version tree) that the run, include and version-tree
-//! suites share. One definition, used by every module that needs it.
+//! shapes, the HoldGate release protocol and the drive/observe helpers
+//! built on them (`lifecycle_transitions.rs`), and the readers of a
+//! command's output (a run id, a summary, the warnings, the version tree)
+//! that the version-tree, working-copy, instance and loop suites share.
+//! One definition, used by every module that needs it.
 //!
 //! Without the `e2e` feature no test module is compiled, so nothing uses
 //! these; the allow keeps that from spraying dead-code warnings.
@@ -22,22 +22,6 @@ pub const INFRA_NODE: &str = "svc";
 /// Bodies the HoldGate polls for: anything without "release" holds.
 pub const HOLD: &str = "hold";
 pub const RELEASE: &str = "release";
-
-/// Graph: kick -> HoldGate -> Debug. No infra, no trigger. The base shape.
-pub fn graph_hold(release_url: &str) -> String {
-    format!(
-        "kick = Text {{ value: \"go\" }}\n\
-         hold = HoldGate {{ url: \"{release_url}\" }}\n\
-         hold.arm = kick.value\n\
-         out = Debug\n\
-         out.data = hold.done\n"
-    )
-}
-
-/// Graph: MiniService only (the infra_min shape).
-pub fn graph_infra() -> String {
-    "svc = MiniService\nout = Debug\nout.data = svc.status\n".to_string()
-}
 
 /// Graph: MiniService + the HoldGate chain, both roots. A run fires both; the
 /// svc branch settles fast, the hold branch keeps the run running until
@@ -70,14 +54,6 @@ pub fn graph_trigger_hold(sse_url: &str, event_name: &str, release_url: &str) ->
     )
 }
 
-/// Graph: trigger + hold chain + MiniService (all three concerns at once).
-pub fn graph_trigger_infra_hold(sse_url: &str, event_name: &str, release_url: &str) -> String {
-    format!(
-        "{}svc = MiniService\nsvc_out = Debug\nsvc_out.data = svc.status\n",
-        graph_trigger_hold(sse_url, event_name, release_url)
-    )
-}
-
 /// Spawn a `weft` invocation in the background (for verbs that BLOCK on a
 /// drain the test is about to observe from the outside). Returns the join
 /// handle; the test joins it once the drain resolves.
@@ -91,17 +67,6 @@ pub fn spawn_weft(
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         cli(&disp, &dir, &arg_refs).await
     })
-}
-
-/// Assert a POST to a project verb is REJECTED (a REJ cell): non-2xx, with
-/// the offending status in the failure message.
-pub async fn assert_verb_rejected(disp: &Dispatcher, path: &str, why: &str) -> anyhow::Result<()> {
-    let (code, body) = disp.post_raw(path, &json!({})).await?;
-    anyhow::ensure!(
-        !code.is_success(),
-        "POST {path} must be rejected ({why}), but got HTTP {code}: {body}"
-    );
-    Ok(())
 }
 
 /// Assert a whole-graph RUN is refused, and by the gate the test means.
@@ -161,7 +126,7 @@ pub async fn fire_until_run(
     let mut last_err = None;
     for _ in 0..2 {
         feed.wait_for_subscriber(Duration::from_secs(60)).await?;
-        feed.push_event(event, &json!({ "value": "go" }).to_string());
+        feed.push_event(event, &json!({ "value": "go" }).to_string())?;
         // Full settle deadline: only a genuine "nothing ever started" times out
         // here, so a timeout is real evidence the push was dropped, not just a slow
         // cold start.
@@ -204,14 +169,14 @@ pub async fn push_until_held(feed: &SseFake, disp: &Dispatcher, pid: &Uuid, even
     let mut last_err = None;
     for _ in 0..2 {
         feed.wait_for_subscriber(Duration::from_secs(60)).await?;
-        feed.push_event(event, &json!({ "value": "go" }).to_string());
+        feed.push_event(event, &json!({ "value": "go" }).to_string())?;
         match weft_e2e::status::wait_until(disp, pid, "the event to be held", Duration::from_secs(60), |s| {
-            s.trigger_held(trigger, None).0 >= 1
+            s.trigger_held(trigger).0 >= 1
         })
         .await
         {
             Ok(s) => {
-                let held = s.trigger_held(trigger, None).0;
+                let held = s.trigger_held(trigger).0;
                 anyhow::ensure!(held == 1, "one event pushed, {held} held");
                 return Ok(());
             }
@@ -258,23 +223,6 @@ pub fn summary_of(stdout: &str) -> String {
         }
     }
     String::new()
-}
-
-/// The warnings a verb reported, in the order it reported them.
-///
-/// One shape for every verb: a `warning` phase carrying a `message`.
-pub fn warnings_of(stdout: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in stdout.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
-        if v.get("phase").and_then(Value::as_str) != Some("warning") {
-            continue;
-        }
-        if let Some(m) = v.pointer("/detail/message").and_then(Value::as_str) {
-            out.push(m.to_string());
-        }
-    }
-    out
 }
 
 /// The version tree, as `weft tree --json` answers it: the install's

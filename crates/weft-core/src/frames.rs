@@ -87,7 +87,8 @@ pub fn call_path(frames: &LoopFrames) -> Vec<&str> {
 /// places in a run, with their own gates, wires, handed values and
 /// results: what a cut, a kick plan and a seed are keyed by. The loop
 /// iterations a place runs in are not part of it (see
-/// `FiringLocation` for one run).
+/// `FiringLocation` for one run), so the frames a place fires at are the
+/// program's to say (`crate::project::ProgramIndex::frames_at`).
 ///
 /// Written as one string, `one/Clean.strip` (the path, then the id,
 /// `/`-joined; a top-level place is its id), so it keys a JSON object.
@@ -113,12 +114,6 @@ impl Located {
     /// call sites on the stack, iterations left out.
     pub fn at(id: impl Into<String>, frames: &LoopFrames) -> Self {
         Self { id: id.into(), path: call_path(frames).into_iter().map(str::to_string).collect() }
-    }
-
-    /// The frames a node kicked at this place fires at: one call frame
-    /// per site, outermost first.
-    pub fn frames(&self) -> LoopFrames {
-        self.path.iter().map(|site| Frame::Call { site: site.clone() }).collect()
     }
 
     /// The same place one site deeper: inside the body `site` calls.

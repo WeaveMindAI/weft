@@ -224,7 +224,6 @@ async fn worker_writes_unrecorded(pool: &Pool, project: Uuid, then: impl FnOnce(
             row_sizes: rows.iter().map(|row| row.len() as u32).collect(),
             born: Born::of(&events[0], weft_core::run_settings::KeepFor::WEFT_DEFAULT),
             written: Written::of(&events),
-            wrote_files: false,
             secrets: Vec::new(),
         }],
         programs: Vec::new(),
@@ -680,7 +679,8 @@ async fn a_run_whose_program_does_not_read_is_indexed_by_its_words(pool: Pool) {
 
 /// A run whose record carries NUL characters (a scraped page in a node's
 /// output) is indexed like any other: the search finds it by the words
-/// around them, its queue drains, and the run beside it is found too.
+/// around them and by the node it ran, its queue drains, and the run
+/// beside it is found too.
 #[weft_db_macros::test]
 async fn a_run_carrying_nul_characters_is_indexed(pool: Pool) {
     let (store, projects) = setup(&pool).await;
@@ -692,6 +692,12 @@ async fn a_run_carrying_nul_characters_is_indexed(pool: Pool) {
     let queued: i64 = pool.scalar("SELECT count(*) FROM run_search_queue", &[]).await.unwrap();
     assert_eq!(queued, 0, "the queue drained");
     assert_eq!(found_carrying(&store, "clean@example.com").await, vec![clean]);
+    let through = weft_dispatcher::store::RunListQuery { limit: 10, node: Some("wait".into()), ..Default::default() };
+    let mut ran: Vec<_> = store.list_runs(TENANT, &through).await.unwrap().runs.into_iter().map(|s| s.run_id).collect();
+    ran.sort();
+    let mut both = vec![scraped, clean];
+    both.sort();
+    assert_eq!(ran, both, "found through the node it ran");
 }
 
 /// One ended run of `project`, whose record carries `word`.
@@ -800,4 +806,45 @@ async fn a_flagged_ending_reads_its_instance_and_keeps_each_jobs_flag(pool: Pool
     tx.commit().await.unwrap();
     let tx = conn.transaction().await.unwrap();
     assert!(take_flagged(&tx, run_id).await.unwrap().is_none(), "nothing is left to do");
+}
+
+/// A run's summary carries its phase, and the listing keeps only the runs
+/// of the phase asked for: a run started by hand is a fire, and the run an
+/// activate starts to prepare a trigger is a trigger setup.
+#[weft_db_macros::test]
+async fn the_listing_says_each_runs_phase_and_filters_by_it(pool: Pool) {
+    use weft_core::context::Phase;
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let fire = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let setup_run = weft_core::new_run_id();
+    let birth = RunEvent::RunStarted { given: Default::default(),
+        run_id: setup_run, project_id: project, entry_node: "start".into(), phase: Phase::TriggerSetup,
+        definition_hash: Some("def-1".into()), binary_hash: Some("bin-A".into()), run_kind: weft_core::run::RunKind::Project,
+        source_version: Some("source".into()), cut_from: None, seed: None,
+        instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 2,
+        settings: Default::default(),
+    };
+    let queued = Queued {
+        events: std::slice::from_ref(&birth), tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
+        watch_end: false, stale: &[], spec: None, example: None, program: None,
+    };
+    assert!(store.queue_run(queued, false).await.unwrap());
+
+    let listed = |phase: Option<Phase>| {
+        let store = &store;
+        async move {
+            let query = weft_dispatcher::store::RunListQuery { limit: 10, project_id: Some(project), phase, ..Default::default() };
+            let mut runs: Vec<(weft_core::RunId, weft_core::primitive::Phase)> =
+                store.list_runs(TENANT, &query).await.unwrap().runs.into_iter().map(|s| (s.run_id, s.phase)).collect();
+            runs.sort_by_key(|(run, _)| *run);
+            runs
+        }
+    };
+    let mut both = vec![(fire, Phase::Fire), (setup_run, Phase::TriggerSetup)];
+    both.sort_by_key(|(run, _)| *run);
+    assert_eq!(listed(None).await, both, "each summary says its phase");
+    assert_eq!(listed(Some(Phase::Fire)).await, vec![(fire, Phase::Fire)]);
+    assert_eq!(listed(Some(Phase::TriggerSetup)).await, vec![(setup_run, Phase::TriggerSetup)]);
 }

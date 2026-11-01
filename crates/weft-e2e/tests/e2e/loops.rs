@@ -1,54 +1,51 @@
-//! Loop: a sequential map over a LIST, doubling each element (the
-//! stream-driven loop path is gated by `stream_rows`).
+//! Loop: part of a loop's body run on its own, through the CLI, the
+//! install and a real worker.
 #![cfg(feature = "e2e")]
 
+use crate::common;
+
 use serde_json::json;
-use weft_e2e::{ensure, project::Project, run};
+use weft_e2e::{ensure, project::Project};
 
+/// Part of a loop's body runs on its own: from a group in the body to the
+/// end of a stretch after it, with what the loop would hand the group
+/// handed in. Only that part runs, once, inside the loop's iteration 0,
+/// and nothing of the loop or of the program around it does. A run that
+/// starts in the body and ends past the loop holds the whole loop, which
+/// it cannot start inside: the CLI refuses it before anything is built
+/// (the install's own refusal says "this build").
 #[tokio::test]
-async fn sequential_map_doubles_each_element() -> anyhow::Result<()> {
+async fn part_of_a_loop_body_runs_on_its_own_inside_iteration_zero() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("loop_map", disp).await?;
-
-    let settled = run::run_and_settle(&mut project).await?;
-    settled.completed()?;
-    // Five list elements -> 5 iterations.
-    settled.assert_loop_iterations("doubler", 5)?;
-    // The assembled list reaches Debug's `data` input. A weft Number is
-    // one type whatever its JSON spelling, and the rig compares numbers
-    // by value, so this passes whether the producer emitted `0` (this
-    // fixture's Python source) or `0.0` (a Rust node).
-    settled.assert_input("out", "data", &json!([0, 2, 4, 6, 8]))?;
-    // The unwired `factor` inside the loop fired once per iteration and
-    // never once more at the loop's own level (which left `double` holding
-    // a `by` with no `n`, and the run stuck, before the fix).
-    for node in ["doubler.factor", "doubler.double"] {
-        let fired = settled.node_outputs(node).len();
-        anyhow::ensure!(fired == 5, "{node} fired {fired} times, expected one per iteration");
+    let project = Project::prepare("loop_map", disp).await?;
+    project.set_main(
+        "src = ExecPython() -> (items: List[String]) {\n  code: \"return {'items': ['a', 'b']}\"\n}\n\
+         clips = Loop(items: List[String]) -> (results: List[String | Null]) {\n  over: [\"items\"]\n\
+           edit = Group(clip: String, at: Number) -> (cut: String) {\n\
+             trim = ExecPython(clip: String, at: Number) -> (out: String) {\n      code: \"return {'out': f'{clip}@{at}'}\"\n    }\n\
+             trim.clip = self.clip\n    trim.at = self.at\n    self.cut = trim.out\n  }\n\
+           edit.clip = self.items\n  edit.at = self.index\n\
+           caption = ExecPython(text: String) -> (out: String) {\n    code: \"return {'out': text + '!'}\"\n  }\n\
+           caption.text = edit.cut\n\
+           upper = ExecPython(text: String) -> (out: String) {\n    code: \"return {'out': text.upper()}\"\n  }\n\
+           upper.text = caption.out\n  self.results = upper.out\n}\n\
+         clips.items = src.items\nout = Debug\nout.data = clips.results\n",
+    )?;
+    let refused = project.weft_refused(&["run", "--from", r#"clips.edit={"clip":"intro","at":3}"#, "--target", "out"]).await?;
+    anyhow::ensure!(
+        refused.contains("the run cannot start") && refused.contains("'clips.edit' is inside loop 'clips'") && !refused.contains("this build"),
+        "refused before building: {refused}"
+    );
+    let stdout = project.weft(&["run", "--json", "--from", r#"clips.edit={"clip":"intro","at":3}"#, "--target", "clips.upper"]).await?;
+    let settled = project.settled(common::run_id_of(&stdout)?).await?;
+    settled.completed()?
+        .assert_output("clips.upper", &json!({ "out": "INTRO@3!" }))?
+        .assert_untouched("src")?
+        .assert_untouched("out")?;
+    for node in ["clips.edit.trim", "clips.caption", "clips.upper"] {
+        let frames: Vec<serde_json::Value> = settled.events_of(node).filter(|e| e.kind() == "node_completed").map(|e| e.frames().clone()).collect();
+        anyhow::ensure!(frames == vec![json!([{ "index": 0 }])], "{node} ran once, inside iteration 0: {frames:?}");
     }
-
-    project.finish().await
-}
-
-/// A loop with no output port ends, over items and over an empty list:
-/// nothing writes into its end, which used to start once at the loop's
-/// own level, wait on an iteration that never opens there, and leave the
-/// run stuck (`... never started, waiting on its scope to open`).
-#[tokio::test]
-async fn a_loop_with_no_output_ends_over_items_and_over_nothing() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let mut project = Project::prepare("loop_map", disp).await?;
-    for (items, iterations) in [("[1, 2]", 2), ("[]", 0)] {
-        project.set_main(&format!(
-            "src = ExecPython() -> (items: List[Number]) {{\n  code: \"return {{'items': {items}}}\"\n}}\n\
-             each = Loop(values: List[Number]) -> () {{\n  over: [\"values\"]\n  log = Debug\n  log.data = self.values\n}}\n\
-             each.values = src.items\n"
-        ))?;
-        let settled = run::run_and_settle(&mut project).await?;
-        settled.completed()?;
-        settled.assert_loop_iterations("each", iterations)?;
-        let logged = settled.events_of("each.log").filter(|e| e.kind() == "node_completed").count();
-        anyhow::ensure!(logged == iterations, "the body ran once per item: {logged} for {items}");
-    }
+    settled.assert_loop_iterations("clips", 0)?;
     project.finish().await
 }

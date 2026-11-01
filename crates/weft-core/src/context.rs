@@ -714,21 +714,21 @@ impl RunContext {
 
     // ----- Storage primitive ------------------------------------------
 
-    /// Open a handle on the tenant's storage, walled to `scope`
-    /// (`StorageScope::Run` is the default: per-run scratch,
-    /// swept on terminate unless kept). Big bytes flow worker<->broker<->bucket;
-    /// only the small self-describing stored-file reference
-    /// the handle returns ever rides edges / the journal.
+    /// Open a handle on the tenant's storage that writes into `scope`
+    /// (`StorageScope::Run` is the default: a file deleted with its run's
+    /// record). Big bytes flow worker<->broker<->bucket; only the small
+    /// self-describing stored-file reference the handle returns ever rides
+    /// edges / the journal.
     ///
     /// The scope governs WRITES and LISTS (`put` builds keys under
-    /// the scope's prefix; `list` enumerates it). Key-addressed verbs
+    /// the scope's prefix; `list` enumerates it) and says how long a
+    /// file lives, never who may read it. Key-addressed verbs
     /// (`get`/`delete`/`keep`/the links) act on the key's OWN scope
-    /// (the key encodes its prefix), so a downstream node can `get` a
-    /// stored-file value without knowing which scope produced it; the box
-    /// still enforces the wall (own run, own project, granted
-    /// shared names). `copy` is both: it reads the key's own scope and
-    /// writes the handle's, which is how a file crosses from one scope
-    /// to another.
+    /// (the key encodes its prefix), so any run of any project of the
+    /// tenant can `get` a stored-file value without knowing which scope
+    /// produced it; only another tenant is refused. `copy` is both: it
+    /// reads the key's own scope and writes the handle's, which is how a
+    /// file moves to a scope that lives longer.
     pub fn storage(&self, scope: crate::storage::StorageScope) -> StorageHandle {
         StorageHandle {
             handle: self.handle.clone(),
@@ -2060,15 +2060,12 @@ impl StorageHandle {
     /// is a NEW file under a fresh key; to change a file's content in
     /// place, use [`Self::replace`].
     ///
-    /// `keep` is how long the file lives, renewed by every access. On a
-    /// run file it also makes the file survive the end of its run;
-    /// `None` there leaves it run-scoped (swept shortly after the run
-    /// ends): right for scratch bytes, wrong for a node's user-facing
-    /// media output, which should pass a keep TTL so the artifact
-    /// outlives the run. On a project, shared or instance file (which
-    /// outlive runs anyway) `None` and `KeepTtl::Never` mean it lives
-    /// until deleted, and any other TTL makes it expire once nobody has
-    /// touched it for that long.
+    /// `keep` is the file's deadline, renewed by every access: the file
+    /// is deleted once nobody has touched it for that long, or with its
+    /// owner if that comes first. `None` and `KeepTtl::Never` give it
+    /// none, so it lives as long as its scope says: a run file until its
+    /// run's record is deleted, a project file until its project is, an
+    /// instance or shared file until somebody deletes it.
     pub async fn put(
         &self,
         bytes: impl Into<bytes::Bytes>,
@@ -2286,10 +2283,9 @@ impl StorageHandle {
     /// stored-file value to emit downstream. A stored file is copied
     /// inside storage (no byte leaves it, whatever it weighs), and the
     /// copy keeps the source's mime type, filename and size. The source
-    /// is untouched: a run-scoped original is still swept when its run
-    /// ends, which is the point when the handle's scope is `Project`:
-    /// the copy is the one later runs can read, because a run file is
-    /// walled to the run that made it. A url-backed handle is fetched
+    /// is untouched: a run-scoped original is still deleted with its run,
+    /// which is the point when the handle's scope is `Project`: the copy
+    /// lasts as long as the project. A url-backed handle is fetched
     /// and stored like [`Self::put_from_url`]. See [`Self::put`] for what
     /// `keep` means.
     pub async fn copy(
@@ -2383,13 +2379,12 @@ impl StorageHandle {
         self.handle.storage_list(&self.scope).await
     }
 
-    /// Set how long an existing file lives from now on (the
-    /// after-the-fact twin of `put(.., keep)`), renewed by every access.
-    /// On a run file it also marks the file to survive the
-    /// terminate sweep, and that mark is ADDITIVE: there is no un-keep.
-    /// On a project, shared or instance file it is only the lifetime,
-    /// and `KeepTtl::Never` clears one. Bucket-only: a url-backed file
-    /// has nothing in storage to keep and errors loud.
+    /// Set an existing file's deadline from now on (the after-the-fact
+    /// twin of `put(.., keep)`), renewed by every access: the file is
+    /// deleted when it arrives, or with its owner (its run, its project)
+    /// if that comes first. `KeepTtl::Never` clears it, and the file lives
+    /// as long as its scope says. Bucket-only: a url-backed file has
+    /// nothing in storage to keep and errors loud.
     pub async fn keep(
         &self,
         file: &crate::storage::FileHandle,
@@ -2973,8 +2968,8 @@ pub trait ContextHandle: Send + Sync {
     /// run's inspector. A run that keeps no journal records nothing.
     async fn record_file_edit(&self, edit: crate::storage::FileEdit) -> WeftResult<()>;
 
-    /// Set a stored file's access-renewed lifetime from now on; on a
-    /// run file this also makes it survive the terminate sweep.
+    /// Set a stored file's access-renewed deadline from now on
+    /// (`KeepTtl::Never` clears it).
     async fn storage_keep(&self, key: &str, ttl: crate::storage::KeepTtl) -> WeftResult<()>;
 
     /// A link to `key` for `reach` (see `StorageHandle::internal_link`,
@@ -3377,7 +3372,6 @@ mod value_bag_tests {
             mime_type: "image/png".into(),
             size_bytes: 3,
             filename: "p.png".into(),
-            keep: false,
             expires_at_unix: None,
             keep_ttl_secs: None,
             created_at_unix: 0,
@@ -3433,7 +3427,10 @@ mod value_bag_tests {
             self.note(format!("get {key}"));
             Ok((probe_meta(key), crate::storage::bytes_stream(bytes::Bytes::from_static(b"png"))))
         }
-        async fn storage_get_url(&self, _: &str, _: &str, _: &str, _: u64, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> { unreachable!() }
+        async fn storage_get_url(&self, url: &str, _: &str, _: &str, _: u64, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> {
+            self.note(format!("get_url {url}"));
+            Ok((probe_meta(""), crate::storage::bytes_stream(bytes::Bytes::from_static(b"from the url"))))
+        }
         async fn storage_delete(&self, _: &str) -> WeftResult<()> { unreachable!() }
         async fn storage_list(&self, _: &crate::storage::StorageScope) -> WeftResult<Vec<crate::storage::StoredFileMeta>> { unreachable!() }
         async fn storage_replace(&self, key: &str, expected: Option<u64>, data: crate::storage::ByteStream, _: Option<u64>) -> WeftResult<crate::storage::ReplaceOutcome> {
@@ -3658,6 +3655,24 @@ mod value_bag_tests {
             .unwrap();
         let s = out.as_str().unwrap();
         assert!(s.starts_with("data:image/png;base64,"), "{s}");
+    }
+
+    /// A file value whose handle is a url (what `@asset("https://...")`
+    /// builds to) reads through the same `get_bytes` as a stored one: the
+    /// worker's handle fetches the url, once, and storage is never asked.
+    #[tokio::test]
+    async fn a_url_file_is_read_from_its_url_once_and_never_from_storage() {
+        let probe = Arc::new(StorageProbeHandle::new(true));
+        let storage = probe_ctx(probe.clone()).storage(crate::storage::StorageScope::Project);
+        let file = crate::storage::FileHandle::Url {
+            url: "https://cdn.example/a.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            filename: "a.bin".into(),
+            size_bytes: 12,
+        };
+        let (_, bytes) = storage.get_bytes(&file).await.unwrap();
+        assert_eq!(&bytes[..], b"from the url");
+        assert_eq!(probe.calls(), ["get_url https://cdn.example/a.bin"]);
     }
 
     /// `external_file` answers the link, mime and filename together: a

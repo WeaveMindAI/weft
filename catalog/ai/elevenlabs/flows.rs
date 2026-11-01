@@ -20,7 +20,7 @@ use weft::access::client::{get_json, json_call, post_json, send_error, Multipart
 use weft::context::LogLevel;
 use weft::reqwest::StatusCode;
 use weft::signal::{PollEndpoint, Predicate};
-use weft::storage::{FileHandle, KeepTtl, StorageScope, StoredFile};
+use weft::storage::{FileHandle, StorageScope, StoredFile};
 use weft::{node_error, Access, RunContext, NodeErrExt, WeftError, WeftResult};
 
 use super::elevenlabs::API;
@@ -304,7 +304,7 @@ pub fn failure(what: &str, job: &Value) -> weft::WeftError {
 }
 
 /// Download a completed output of `kind` (`image`, `video`, `audio`)
-/// into the run's storage, kept past the run, and answer the stored
+/// into the run's storage, and answer the stored
 /// file to emit. The file is stored as the type ElevenLabs reported on
 /// the job, not whatever the download's header says: everything
 /// downstream reads the stored type as the truth about the bytes, and
@@ -322,7 +322,7 @@ pub async fn store_output(ctx: &RunContext, kind: &str, output: &Value) -> WeftR
 }
 
 /// Download a finished output from the signed `url` ElevenLabs handed
-/// back into the run's storage, kept past the run, as `mime` (the type
+/// back into the run's storage, as `mime` (the type
 /// ElevenLabs stated, never the download's header: everything
 /// downstream reads the stored type as the truth about the bytes) under
 /// `filename`.
@@ -332,7 +332,7 @@ pub async fn store_download(ctx: &RunContext, url: &str, mime: &str, filename: &
     // goes out on the plain client, so the account's key never travels
     // with it.
     let resp = ctx.http().get(url).send().await.map_err(|e| node_error(format!("{what}: {}", send_error(e))))?;
-    ctx.storage(StorageScope::Run).put_response(resp, &what, Some(mime), filename, Some(KeepTtl::Default)).await
+    ctx.storage(StorageScope::Run).put_response(resp, &what, Some(mime), filename, None).await
 }
 
 /// Make one generation: POST what `build` returns to the route for

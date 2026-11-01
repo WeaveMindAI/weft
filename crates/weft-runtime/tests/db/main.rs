@@ -10,4 +10,3 @@ mod heads_move;
 mod infra_units_move;
 mod schema_agreement;
 mod stored_documents;
-mod superseded;

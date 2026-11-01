@@ -37,13 +37,7 @@ pub async fn run(ctx: Ctx, files: Vec<String>, keep: Keep) -> Result<()> {
         }
         return Ok(());
     }
-    for (copy, origin) in &picked {
-        let copy_at = root.join(copy);
-        match keep {
-            Keep::Folder => std::fs::remove_file(&copy_at).with_context(|| format!("delete {copy}"))?,
-            Keep::Incoming => std::fs::rename(&copy_at, root.join(origin)).with_context(|| format!("move {copy} over {origin}"))?,
-        }
-    }
+    settle(&root, &picked, keep)?;
     let landed = super::copy::this_copy(&ctx, None).await.context("send the result to the install")?;
     let mut resolved: Vec<&str> = picked.iter().map(|(_, origin)| origin.as_str()).collect();
     resolved.sort();
@@ -58,6 +52,20 @@ pub async fn run(ctx: Ctx, files: Vec<String>, keep: Keep) -> Result<()> {
     println!("{side}: {}", resolved.join(", "));
     if !landed.copy.conflicts.is_empty() {
         println!("conflict copies still here: {}", landed.copy.conflicts.join(", "));
+    }
+    Ok(())
+}
+
+/// Settle each `(copy, origin)` of `picked` in the folder at `root`: the
+/// conflict copy deleted (`Keep::Folder`), or moved over its file
+/// (`Keep::Incoming`).
+fn settle(root: &std::path::Path, picked: &[(String, String)], keep: Keep) -> Result<()> {
+    for (copy, origin) in picked {
+        let copy_at = root.join(copy);
+        match keep {
+            Keep::Folder => std::fs::remove_file(&copy_at).with_context(|| format!("delete {copy}"))?,
+            Keep::Incoming => std::fs::rename(&copy_at, root.join(origin)).with_context(|| format!("move {copy} over {origin}"))?,
+        }
     }
     Ok(())
 }
@@ -126,5 +134,28 @@ mod tests {
         let why = pick(&copies(), &["prompts/tone.txt".into()], Keep::Incoming).unwrap_err().to_string();
         assert!(why.contains("prompts/tone.txt has 2 conflict copies") && why.contains("name the one"), "{why}");
         assert_eq!(pick(&copies(), &["prompts/tone.txt".into()], Keep::Folder).unwrap().len(), 2, "both copies go");
+    }
+
+    /// Taking the incoming side puts the conflict copy's bytes in its
+    /// file's place and the copy goes; keeping the folder's leaves the
+    /// file as it is and deletes the copy.
+    #[test]
+    fn settling_a_conflict_moves_or_drops_the_copy_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        let file = "prompts/greeting.txt";
+        let copy = "prompts/greeting.weft-conflict-aaaa1111.txt";
+        let both = |mine: &str| {
+            std::fs::write(root.join(file), mine).unwrap();
+            std::fs::write(root.join(copy), "hello").unwrap();
+            pick(&[copy.to_string()], &[file.to_string()], Keep::Incoming).unwrap()
+        };
+        settle(root, &both("mine"), Keep::Incoming).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join(file)).unwrap(), "hello");
+        assert!(!root.join(copy).exists());
+        settle(root, &both("mine again"), Keep::Folder).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join(file)).unwrap(), "mine again");
+        assert!(!root.join(copy).exists());
     }
 }

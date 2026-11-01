@@ -62,11 +62,3 @@ pub async fn answer_form(
         .context("discovered form has no signal token to submit to")?;
     signal::fire_token(disp, token, answer).await
 }
-
-/// Skip a discovered form, as a person declining the question does.
-pub async fn skip_form(disp: &Dispatcher, form: &DiscoveredSignal) -> Result<()> {
-    let token = form
-        .token()
-        .context("discovered form has no signal token to skip")?;
-    signal::skip_token(disp, token).await
-}

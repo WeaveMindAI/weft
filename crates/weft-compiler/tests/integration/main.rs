@@ -10,6 +10,7 @@ mod fires_with;
 mod gated_fire;
 mod highlighting_vocabulary;
 mod include_cuts;
+mod loop_cuts;
 mod metadata_ports;
 mod infra_image_enum;
 mod node_test_sweep;

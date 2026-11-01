@@ -405,6 +405,35 @@ mod tests {
         assert_eq!(install.working.lock().unwrap()["prompts/tone.txt"], mine, "and holds what the person sees");
     }
 
+    /// Build output beside a node (cargo's `target` next to its
+    /// `Cargo.toml`, installed `node_modules`) never goes up as part of the
+    /// working copy, and the working copy moving to another version (a
+    /// branch back) removes the source files it no longer holds and leaves
+    /// the build output on disk; a source folder merely called `target`
+    /// is source and goes up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_output_never_goes_up_and_a_branch_back_leaves_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "main.weft", "a = Text");
+        write(root, "nodes/pkg/Cargo.toml", "[package]");
+        write(root, "nodes/pkg/target/debug/build.log", "stale build output");
+        write(root, "nodes/pkg/node_modules/left-pad/index.js", "module.exports = 1;");
+        write(root, "prompts/target/tone.txt", "a prompt folder called target");
+        let install = Install::default();
+        let mut pushed = sync(root, &install).await.pushed;
+        pushed.sort();
+        assert_eq!(pushed, ["main.weft", "nodes/pkg/Cargo.toml", "prompts/target/tone.txt"]);
+
+        install.working.lock().unwrap().remove("prompts/target/tone.txt");
+        let synced = sync(root, &install).await;
+        assert_eq!(synced.written, vec!["prompts/target/tone.txt"]);
+        assert!(!root.join("prompts/target/tone.txt").exists(), "a source file the version does not hold goes");
+        assert!(root.join("nodes/pkg/target/debug/build.log").is_file() && root.join("nodes/pkg/node_modules/left-pad/index.js").is_file(),
+            "build output stays where it was");
+        assert!(synced.pushed.is_empty(), "{synced:?}");
+    }
+
     /// Somebody changes the file this pass was pushing: the install answers
     /// stale, and the next pass finds both sides moved.
     #[tokio::test(flavor = "multi_thread")]

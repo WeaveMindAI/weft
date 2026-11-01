@@ -407,7 +407,7 @@ pub async fn follow(
     if kind.as_deref() != Some(weft_task_store::TaskKind::MaintenanceLift.as_str()) {
         return Err((StatusCode::NOT_FOUND, format!("no lift {task} to follow (a finished one is forgotten after an hour)")));
     }
-    let outcome = weft_task_store::terminal::wait_for_terminal(&state.pg_pool, &state.signals, task, hold.hold())
+    let outcome = weft_task_store::terminal::wait_for_terminal_before(&state.pg_pool, &state.signals, task, hold.hold(&state.stopping))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("follow the lift: {e:#}")))?;
     match outcome.status {

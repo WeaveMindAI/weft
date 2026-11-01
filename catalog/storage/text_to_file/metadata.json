@@ -45,7 +45,7 @@
         ]
       },
       "label": "Store in",
-      "description": "`run`: only this run can read it. `project`: every later run can."
+      "description": "`run`: deleted with this run (once its record goes). `project`: deleted with the project, so it outlives the run. Any run can read it either way."
     },
     {
       "name": "ttlDays",
@@ -55,15 +55,14 @@
         "min": 0,
         "step": 1
       },
-      "label": "Keep for (days, 0 = forever)",
-      "description": "Lifetime since last access (any read, download or link resets it); 0 never expires. Empty: a run file is swept soon after its run, a project file lives until deleted."
+      "label": "Deadline (idle days, empty or 0 = none)",
+      "description": "The file is deleted once nobody has touched it for this many days (any read, download or link resets the count), or with its run or project if that comes first. Empty or 0: no deadline, it lives as long as its scope says."
     }
   ],
   "outputs": [
     {
       "name": "file",
       "type": "File",
-      "fileScopeFrom": "scope",
       "narrowable": true,
       "description": "The stored file."
     },

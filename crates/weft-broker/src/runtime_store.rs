@@ -1,7 +1,7 @@
 //! The runtime-file plane (`ctx.storage`): the files a running project
 //! reads and writes (assets it fetches, run outputs, scratch). Bytes live
 //! in the object-store bucket under the `runtime/` prefix; the file's
-//! metadata (mime, name, size, keep/expiry) lives in the `runtime_file`
+//! metadata (mime, name, size, expiry) lives in the `runtime_file`
 //! Postgres table. The broker is the single gatekeeper: a worker holds no
 //! bucket credentials; the broker verifies the caller (the pure `key` wall),
 //! charges the tenant's byte quota at reservation time, and mints presigned
@@ -31,19 +31,10 @@ use weft_platform_traits::{CopyProgress, GetLink, ObjectStore, PresignAudience};
 
 use crate::entitlement::{lock_tenant_storage, EntitlementSource};
 
-/// Default TTL of a kept file or retired source asset (30 days). Access bumps
-/// the expiry back to now + TTL, so an actively-used survivor never expires.
+/// Default deadline of a kept file or retired source asset (30 days). Access
+/// bumps it back to now + TTL, so an actively-used file never reaches it.
 /// `KeepTtl::Default` resolves to this; defined beside `KeepTtl` in core.
 pub use weft_core::storage::DEFAULT_KEEP_TTL_SECS;
-
-/// How long an UN-KEPT completed run file lingers after its run terminates
-/// before it expires. The terminate sweep stamps
-/// `expires_at_unix = now + this` instead of deleting outright, so a user can
-/// still open the files list and download a run's output right after the run
-/// ends. It reads as gone once the deadline passes and the expiry loop
-/// removes it then, and the stamped expiry is what the file lists surface as
-/// the remaining lifetime.
-pub const RUN_LINGER_TTL_SECS: i64 = 5 * 60;
 
 /// How long the link to upload one part works: a PUT may start until then.
 /// Every part link is signed for this ([`RuntimeStore::reserve_parts`],
@@ -193,8 +184,8 @@ fn reap_lapsed(now_param: &str) -> String {
 /// look is booked for it and the expiry loop never retries it on its own.
 /// It is shown in `weft status`, and retried, once each time, by exactly
 /// these: a delete of its key ([`RuntimeStore::delete`]), a wipe of a
-/// prefix holding it ([`RuntimeStore::wipe_prefix`]), the end-of-run sweep
-/// of its run ([`RuntimeStore::sweep_run`]), and a begin (or a slot's
+/// prefix holding it ([`RuntimeStore::wipe_prefix`], the deletion of a
+/// run's files among them), and a begin (or a slot's
 /// check) of its tenant refused for space ([`RuntimeStore::reap_marked`]).
 const MARKED: &str = "(status = 'reaping' AND reap_error IS NOT NULL AND progressed_at_unix = 0)";
 
@@ -324,9 +315,10 @@ pub enum RuntimeStoreError {
     /// bytes.
     #[error("not its content: {0}")]
     NotItsContent(String),
-    /// A slot has no upload to receive: nothing came through it, or its
-    /// upload ended with it. Said in those words, never as a missing
-    /// file key.
+    /// No upload is in flight where one was named: a slot nothing came
+    /// through (or whose upload ended with it), or an upload that was never
+    /// begun, ended, or was cancelled. Said in those words, never as a
+    /// missing file key ([`Self::NotFound`] carries only a key).
     #[error("no upload: {0}")]
     NoUpload(String),
     /// A removal (a delete, a wipe) left rows the storage bucket refused to
@@ -541,7 +533,7 @@ mod stream_layout_tests {
 /// The columns a [`FileRow`] reads, in every SELECT and RETURNING that
 /// builds one, so a column added to the file's metadata is added once.
 const FILE_ROW_COLUMNS: &str =
-    "key, mime_type, filename, size_bytes, keep, expires_at_unix, keep_ttl_secs, created_at_unix, version";
+    "key, mime_type, filename, size_bytes, expires_at_unix, keep_ttl_secs, created_at_unix, version";
 
 /// The runtime-file plane's schema. The broker owns it (it is the only
 /// reader/writer); the boot applies it with every other group, in one pass
@@ -589,14 +581,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- landed and waits for the run that receives it; nothing reads
             -- it until then, and it goes when its slot ends (its expiry).
             status             TEXT NOT NULL DEFAULT 'active',
-            -- True iff this run-scoped file is flagged to survive the
-            -- terminate sweep. Always false in the other scopes, which
-            -- outlive runs without a flag. Set at begin; a PENDING kept
-            -- row is still sweepable (only kept ACTIVE files are spared).
-            keep               BOOLEAN NOT NULL DEFAULT FALSE,
-            -- Unix seconds at which the file expires (access-bumped), in
-            -- any scope: a kept run file, a project/shared/instance
-            -- file stored with a lifetime, a retired asset, an upload
+            -- Unix seconds at which the file's deadline arrives (access-
+            -- bumped), in any scope: a file stored with a lifetime, a
+            -- retired asset, an upload
             -- nobody received (its slot's end, set at begin). NULL = no
             -- expiry. Otherwise set at complete, never on a pending row.
             expires_at_unix    BIGINT,
@@ -879,7 +866,6 @@ struct FileRow {
     mime_type: String,
     filename: String,
     size_bytes: i64,
-    keep: bool,
     expires_at_unix: Option<i64>,
     keep_ttl_secs: Option<i64>,
     created_at_unix: i64,
@@ -900,7 +886,6 @@ impl FileRow {
             mime_type: row.try_get("mime_type")?,
             filename: row.try_get("filename")?,
             size_bytes: row.try_get("size_bytes")?,
-            keep: row.try_get("keep")?,
             expires_at_unix: row.try_get("expires_at_unix")?,
             keep_ttl_secs: row.try_get("keep_ttl_secs")?,
             created_at_unix: row.try_get("created_at_unix")?,
@@ -914,7 +899,6 @@ impl FileRow {
             mime_type: self.mime_type.clone(),
             size_bytes: self.size_bytes as u64,
             filename: self.filename.clone(),
-            keep: self.keep,
             expires_at_unix: self.expires_at_unix,
             keep_ttl_secs: self.keep_ttl_secs.map(|s| s as u64),
             created_at_unix: self.created_at_unix,
@@ -947,13 +931,11 @@ pub struct GrantedLink {
     pub visitor_address: Option<String>,
 }
 
-/// What a sweep needs to know per row: spare it (kept ACTIVE file) or reap
-/// its bucket state (aborting the in-flight upload of a pending row).
+/// What a sweep needs to know per row to reap its bucket state (aborting
+/// the in-flight upload of a pending row).
 #[derive(Debug)]
 struct SweepEntry {
     key: String,
-    kept_active: bool,
-    status: String,
     upload_id: Option<String>,
     /// The file a replacement upload overwrites: its multipart targets
     /// THAT file's object, so reaping it aborts the upload and must never
@@ -1040,8 +1022,6 @@ impl PendingUpload {
     fn sweep_entry(&self, key: &str) -> SweepEntry {
         SweepEntry {
             key: key.to_string(),
-            kept_active: false,
-            status: self.status.clone(),
             upload_id: self.upload_id.clone(),
             replaces: self.replaces.clone(),
         }
@@ -1055,18 +1035,6 @@ enum Bucket {
     /// The final verdict: the upload cannot be completed. `overwritten`
     /// when a replaced file's object may no longer hold that file's bytes.
     Lost { why: String, overwritten: bool },
-}
-
-/// What the end-of-run sweep did ([`RuntimeStore::sweep_run`]).
-#[derive(Debug)]
-pub struct RunSweep {
-    /// Rows removed now.
-    pub reaped: u64,
-    /// Finished files stamped to expire after the run's linger.
-    pub lingering: u64,
-    /// Rows the bucket refused to remove, each `'<key>': <why>`, left
-    /// marked ([`MARKED`]) and shown in `weft status`.
-    pub refused: Vec<String>,
 }
 
 /// What one reap of a fenced row did ([`RuntimeStore::reap_unrecorded`]).
@@ -1107,8 +1075,6 @@ impl FromRow for SweepEntry {
     fn from_row(row: Row) -> db::Result<Self> {
         Ok(Self {
             key: row.try_get("key")?,
-            kept_active: row.try_get("kept_active")?,
-            status: row.try_get("status")?,
             upload_id: row.try_get("upload_id")?,
             replaces: row.try_get("replaces")?,
         })
@@ -1118,7 +1084,7 @@ impl FromRow for SweepEntry {
 impl SweepEntry {
     /// A finished file's row as a reap sees it: an object, no upload.
     fn file(key: &str) -> Self {
-        Self { key: key.to_string(), kept_active: false, status: "active".into(), upload_id: None, replaces: None }
+        Self { key: key.to_string(), upload_id: None, replaces: None }
     }
 }
 
@@ -1126,7 +1092,7 @@ impl SweepEntry {
 /// the longest-lived link handed out for the row being updated
 /// (`links_until_unix`). Every write to `runtime_file.expires_at_unix`
 /// that could SHORTEN a deadline goes through this, so no path (access
-/// bump, keep, linger stamp) can pull a file's death forward under a live
+/// bump, keep) can pull a file's death forward under a live
 /// link: a link is a promise the bytes stay fetchable for its life.
 fn expiry_honoring_links(param: &str) -> String {
     format!("GREATEST({param}, COALESCE(links_until_unix, 0))")
@@ -1141,7 +1107,7 @@ impl RuntimeStore {
     /// A write just gave a file the expiry `at`: ring the expiry loop when
     /// no ring of this copy's covers it ([`crate::notices::EarliestRung`]).
     /// Only writes that can make an expiry sooner call this (a keep, a new
-    /// lifetime, the linger stamp); an access pushes an expiry later and
+    /// lifetime); an access pushes an expiry later and
     /// rings nothing. A ring that cannot be sent is logged: the loop then
     /// looks when its booking or a later ring says.
     async fn ring_for(&self, at: Option<i64>) {
@@ -1214,7 +1180,7 @@ impl RuntimeStore {
             .pool
             .all(
                 &format!(
-                    "SELECT key, FALSE AS kept_active, status, upload_id, replaces FROM runtime_file WHERE tenant_id = $1 AND {MARKED} \
+                    "SELECT key, upload_id, replaces FROM runtime_file WHERE tenant_id = $1 AND {MARKED} \
                      ORDER BY key"
                 ),
                 &[&tenant],
@@ -1454,9 +1420,8 @@ impl RuntimeStore {
                 "a file identity is a non-empty label of at most 512 characters".into(),
             ));
         }
-        // A lifetime applies in every scope a node writes: on a run
-        // file it also spares it from the end-of-run sweep, on the others
-        // (which outlive runs already) it is simply when the file expires.
+        // A deadline applies in every scope a node writes: the file is
+        // deleted when it arrives, or with its owner if that comes first.
         // The asset scope's lifetime belongs to the source that references
         // it, so a node-chosen one is refused rather than dropped.
         if keep.is_some() && matches!(scope, StorageScope::Asset) {
@@ -1542,10 +1507,8 @@ impl RuntimeStore {
         // byte-quota check (known size), and the pending-row insert run in one
         // transaction under the tenant lock, so K concurrent begins serialize and
         // each sees the previous reservations. The row carries the file's metadata
-        // (mime/filename/keep) AND its `upload_id` from the start; only the size and
-        // expiry are finalized at complete. `keep` on a PENDING row does NOT spare
-        // it from sweeps (they spare kept ACTIVE files only), so an abandoned
-        // kept-file upload is still reaped. Any rejection/failure here aborts the
+        // (mime/filename/lifetime) AND its `upload_id` from the start; only the size
+        // and expiry are finalized at complete. Any rejection/failure here aborts the
         // multipart opened above (`abort_reserve`), so a rejected begin leaves
         // nothing in the bucket.
         let reserve = self
@@ -1707,19 +1670,15 @@ impl RuntimeStore {
                 self.admit_new_file(&tx, entitlements, &tenant, declared_size, now).await?;
                 tx.execute(
                     "INSERT INTO runtime_file \
-                     (key, tenant_id, mime_type, filename, size_bytes, status, keep, expires_at_unix, \
+                     (key, tenant_id, mime_type, filename, size_bytes, status, expires_at_unix, \
                       keep_ttl_secs, created_at_unix, upload_id, part_size, declared_size, \
                       reserved_bytes, progressed_at_unix, identity, upload_slot, slot_accepts, version) \
-                     VALUES ($1, $2, $3, $4, 0, 'pending', $5, $13, $6, COALESCE($16::BIGINT, $7), $8, $9, $10, $11, $7, $12, $14, $15, $17)",
+                     VALUES ($1, $2, $3, $4, 0, 'pending', $12, $5, COALESCE($15::BIGINT, $6), $7, $8, $9, $10, $6, $11, $13, $14, $16)",
                     &[
                         &key,
                         &tenant,
                         &mime,
                         &filename,
-                        // The flag is the end-of-run sweep's exemption, which
-                        // only a run file needs; elsewhere a lifetime is just
-                        // a ttl.
-                        &(keep.is_some() && matches!(scope, StorageScope::Run)),
                         &ttl.map(|s| s as i64),
                         &now,
                         &upload_id,
@@ -1915,10 +1874,10 @@ impl RuntimeStore {
                 }
                 tx.execute(
                     "INSERT INTO runtime_file \
-                     (key, tenant_id, mime_type, filename, size_bytes, status, keep, expires_at_unix, \
+                     (key, tenant_id, mime_type, filename, size_bytes, status, expires_at_unix, \
                       keep_ttl_secs, created_at_unix, upload_id, part_size, declared_size, \
                       reserved_bytes, progressed_at_unix, identity, replaces) \
-                     VALUES ($1, $2, $3, $4, 0, 'pending', FALSE, NULL, NULL, $5, $6, $7, $8, $9, $5, NULL, $10)",
+                     VALUES ($1, $2, $3, $4, 0, 'pending', NULL, NULL, $5, $6, $7, $8, $9, $5, NULL, $10)",
                     &[
                         &key,
                         &tenant,
@@ -2533,7 +2492,7 @@ impl RuntimeStore {
                     .map_err(RuntimeStoreError::Other)?;
                 drop(conn);
                 self.reap_fenced(&pending.sweep_entry(key)).await.map_err(RuntimeStoreError::Other)?;
-                return Err(RuntimeStoreError::NotFound(format!(
+                return Err(RuntimeStoreError::NoUpload(format!(
                     "'{replaced}' was removed while its replacement '{key}' was uploading; the \
                      replacement was cancelled"
                 )));
@@ -2623,7 +2582,7 @@ impl RuntimeStore {
         .map_err(RuntimeStoreError::Other)?;
         let Some(pending) = row else {
             return Self::completed_meta(&self.pool, key).await?.ok_or_else(|| {
-                RuntimeStoreError::NotFound(format!(
+                RuntimeStoreError::NoUpload(format!(
                     "no upload in flight for key '{key}' (never begun, aborted, swept, or a \
                      replacement a later one has since overtaken)"
                 ))
@@ -3057,10 +3016,9 @@ impl RuntimeStore {
     }
 
     /// Flip a completed upload's row to active with its final size and drop
-    /// its part rows. The expiry is stamped NOW (completion is when a kept
-    /// file starts existing), unless the row already carries one: the
-    /// run sweep's linger stamp on an upload still completing when
-    /// its run ended ([`Self::sweep_run`]), or a slot's end. An upload
+    /// its part rows. The expiry is stamped NOW (completion is when a file
+    /// with a deadline starts existing), unless the row already carries
+    /// one: a slot's end. An upload
     /// through a slot lands 'uploaded' instead, waiting for the run that
     /// receives it ([`Self::claim_uploads`]), as the type `mime` its
     /// landing found ([`Self::landed_mime`]). `reserved_bytes` is set to the
@@ -3158,7 +3116,7 @@ impl RuntimeStore {
                 Some(_) => Err(RuntimeStoreError::Invalid(format!(
                     "upload '{key}' already completed; nothing to resume"
                 ))),
-                None => Err(RuntimeStoreError::NotFound(format!(
+                None => Err(RuntimeStoreError::NoUpload(format!(
                     "no upload in flight for key '{key}'"
                 ))),
             };
@@ -3876,10 +3834,10 @@ impl RuntimeStore {
             .opt(
                 &format!(
                     "UPDATE runtime_file SET status = 'active', size_bytes = declared_size, declared_size = NULL, receives = NULL, \
-                       upload_slot = $3, mime_type = $4, keep = $5, expires_at_unix = $6, keep_ttl_secs = $7, created_at_unix = $8 \
+                       upload_slot = $3, mime_type = $4, expires_at_unix = $5, keep_ttl_secs = $6, created_at_unix = $7 \
                      WHERE key = $1 AND status = 'completing' AND receives = $2 RETURNING {FILE_ROW_COLUMNS}"
                 ),
-                &[&copy.target, &key, &claims.sid, &mime, &claims.keep.is_some(), &ttl.map(|t| now + t), &ttl, &now],
+                &[&copy.target, &key, &claims.sid, &mime, &ttl.map(|t| now + t), &ttl, &now],
             )
             .await
         .context("runtime claim: receive the run's copy")
@@ -3968,7 +3926,7 @@ impl RuntimeStore {
     /// The metadata row for an ACTIVE (finalized) file, or None if absent, still
     /// pending, or expired. Every user-facing read (meta/get/download/keep/link)
     /// goes through here, so a half-uploaded 'pending' file reads as not-found
-    /// until it finalizes. Access does NOT bump a kept file's expiry here (a
+    /// until it finalizes. Access does NOT bump a file's deadline here (a
     /// metadata peek is not an access); the byte `get`/`download_url` bumps it.
     async fn row(&self, key: &str) -> Result<Option<FileRow>> {
         self.pool
@@ -4305,18 +4263,20 @@ impl RuntimeStore {
     }
 
 
-    /// Every key under a prefix REGARDLESS of status (active + pending), with
-    /// what a sweep needs: is it a kept ACTIVE file (spared by the terminate
-    /// sweep), and the in-flight upload id to abort (pending rows). Sweeps use
+    /// Every key under any of `prefixes` REGARDLESS of status (active +
+    /// pending), with what a sweep needs: the in-flight upload id to abort
+    /// (pending rows). Sweeps use
     /// this (not `list`) so a half-uploaded file's bucket state is cleaned
-    /// too; the bucket never keeps state whose row a sweep removed.
-    async fn keys_under(&self, prefix: &str) -> Result<Vec<SweepEntry>> {
-        let pattern = like_prefix(prefix);
+    /// too; the bucket never keeps state whose row a sweep removed. (`LIKE
+    /// ANY` takes no `ESCAPE`: the backslash [`like_prefix`] escapes with is
+    /// LIKE's own.)
+    async fn keys_under(&self, prefixes: &[String]) -> Result<Vec<SweepEntry>> {
+        let patterns: Vec<String> = prefixes.iter().map(|prefix| like_prefix(prefix)).collect();
         self.pool
             .all(
-                "SELECT key, (keep AND status = 'active') AS kept_active, status, upload_id, replaces \
-                 FROM runtime_file WHERE key LIKE $1 ESCAPE '\\' ORDER BY key",
-                &[&pattern],
+                "SELECT key, upload_id, replaces \
+                 FROM runtime_file WHERE key LIKE ANY($1) ORDER BY key",
+                &[&patterns],
             )
             .await
             .context("runtime keys_under")
@@ -4391,18 +4351,16 @@ impl RuntimeStore {
         Ok(())
     }
 
-    /// Set how long a file lives from now on, access-renewed. On a
-    /// run file this also flags it to survive the terminate sweep;
-    /// in the scopes that outlive runs already it is only the lifetime
-    /// (`KeepTtl::Never` there clears one). An asset's lifetime follows
-    /// the source, so it is refused.
+    /// Set a file's deadline from now on, access-renewed
+    /// (`KeepTtl::Never` clears it, and the file lives as long as its
+    /// scope says). An asset's lifetime follows the source, so it is
+    /// refused.
     pub async fn keep(&self, parsed: &ParsedKey, ttl: KeepTtl) -> StoreResult<StoredFileMeta> {
         if matches!(parsed.scope, weft_core::storage::key::KeyScope::Asset) {
             return Err(RuntimeStoreError::Invalid(
                 "an asset's lifetime follows the source that references it; it takes no keep".into(),
             ));
         }
-        let run_scoped = matches!(parsed.scope, weft_core::storage::key::KeyScope::Run { .. });
         let key = parsed.to_key();
         let ttl_secs = ttl.secs();
         let now = self.clock.now_unix();
@@ -4414,14 +4372,14 @@ impl RuntimeStore {
             .pool
             .opt(
                 &format!(
-                    "UPDATE runtime_file SET keep = keep OR $4, keep_ttl_secs = $1, \
+                    "UPDATE runtime_file SET keep_ttl_secs = $1, \
                          expires_at_unix = CASE WHEN $2::bigint IS NULL THEN NULL ELSE {} END \
                      WHERE key = $3 AND status <> 'reaping' AND {live} \
                      RETURNING {FILE_ROW_COLUMNS}",
                     expiry_honoring_links("$2"),
-                    live = unexpired("$5"),
+                    live = unexpired("$4"),
                 ),
-                &[&ttl_secs.map(|s| s as i64), &expires_at, &key, &run_scoped, &now],
+                &[&ttl_secs.map(|s| s as i64), &expires_at, &key, &now],
             )
             .await
         .context("runtime keep")
@@ -4456,7 +4414,7 @@ impl RuntimeStore {
     /// The link is signed at the start of its window ([`link_window`]), so
     /// the same file asked for again within the window gets the same
     /// link, for everyone, with no row kept: a page that refreshes keeps
-    /// its video playing. Asking counts as access (renews a kept file's
+    /// its video playing. Asking counts as access (renews a file's
     /// expiry), and with `hands_out` (a link somebody fetches later) the
     /// file's expiry is pushed past the link's end, so the bytes outlive
     /// every link handed out; a read made now (`hands_out` false) needs no
@@ -4505,6 +4463,19 @@ impl RuntimeStore {
     /// [`RuntimeStoreError::RemovalIncomplete`]; only rows a live claim holds
     /// make it [`RuntimeStoreError::Completing`] (ask again shortly).
     pub async fn wipe_prefix(&self, prefix: &str) -> StoreResult<u64> {
+        let wiped = self.wipe_under(std::slice::from_ref(&prefix.to_string()), &format!("'{prefix}'")).await?;
+        // A whole-tenant wipe takes the tenant's asset references with its
+        // assets; every narrower prefix names no asset, so this matches none.
+        self.pool
+            .execute("DELETE FROM asset_reference WHERE key LIKE $1 ESCAPE '\\'", &[&like_prefix(prefix)])
+            .await
+            .context("drop the wiped assets' references")?;
+        Ok(wiped)
+    }
+
+    /// [`Self::wipe_prefix`]'s pass over every file under any of `prefixes`
+    /// (each wall-validated), the leftovers named against `what`.
+    async fn wipe_under(&self, prefixes: &[String], what: &str) -> StoreResult<u64> {
         // ALL keys under the prefix (active + pending), so a half-uploaded
         // file's bucket state (in-flight upload + any object) is wiped too.
         // Same fenced three-step reap as the sweeps (fence the row to
@@ -4528,7 +4499,7 @@ impl RuntimeStore {
         let (mut completing, mut claimed) = (0, 0);
         let mut failed = Vec::new();
         let mut record = false;
-        let entries = self.keys_under(prefix).await.map_err(RuntimeStoreError::BeforeWrites)?;
+        let entries = self.keys_under(prefixes).await.map_err(RuntimeStoreError::BeforeWrites)?;
         let pass: Result<u64> = async {
             let mut removed = 0;
             for entry in entries {
@@ -4558,12 +4529,6 @@ impl RuntimeStore {
         }
         .await;
         let removed = self.finish_pass(record, pass).await?;
-        // A whole-tenant wipe takes the tenant's asset references with its
-        // assets; every narrower prefix names no asset, so this matches none.
-        self.pool
-            .execute("DELETE FROM asset_reference WHERE key LIKE $1 ESCAPE '\\'", &[&like_prefix(prefix)])
-            .await
-            .context("drop the wiped assets' references")?;
         let mut left = Vec::new();
         if !failed.is_empty() {
             left.push(format!(
@@ -4578,7 +4543,7 @@ impl RuntimeStore {
         if claimed > 0 {
             left.push(format!("{claimed} another removal in progress holds"));
         }
-        let left = format!("wiped {removed} files under '{prefix}' and left {}", left.join(", "));
+        let left = format!("wiped {removed} files under {what} and left {}", left.join(", "));
         // A row a live claim holds clears by itself, so that alone is the
         // "ask again" answer; a refusal does not clear by waiting, so any
         // refused row makes the whole answer a refusal.
@@ -4591,124 +4556,20 @@ impl RuntimeStore {
         }
     }
 
-    /// Terminate sweep: close out a run's un-kept run files (the
-    /// `<tenant>/run/<run_id>/` prefix, kept files excepted).
-    ///
-    /// - A COMPLETED un-kept file is not deleted here: it gets
-    ///   `expires_at_unix = now + RUN_LINGER_TTL_SECS` stamped, so the user
-    ///   can still list/download a run's output right after the run ends; the
-    ///   expiry loop removes it once the linger passes (the stamp rings it,
-    ///   [`Self::ring_for`]). The stamped deadline
-    ///   is what the file lists surface as the remaining lifetime.
-    /// - A PENDING row (a crashed/abandoned upload) is reaped immediately,
-    ///   in-flight multipart aborted: a half-uploaded file has nothing worth
-    ///   downloading (even a kept-flagged one: keep only spares a COMPLETED
-    ///   file). A leftover 'reaping' row whose claim lapsed, or a marked one,
-    ///   is retried.
-    ///
-    /// A row the bucket refuses is no failure of the sweep: it stays marked
-    /// and is answered in [`RunSweep::refused`], so the run's end is done
-    /// with and `weft status` shows the one record of the cause.
-    pub async fn sweep_run(&self, tenant: &str, run_id: &str) -> StoreResult<RunSweep> {
+    /// Delete every file of the runs of `tenant` whose records were
+    /// deleted: each one's `<tenant>/run/<run_id>/` prefix, whatever each
+    /// file's deadline, in one look for all of them (most runs stored
+    /// nothing, and a run with no file costs nothing more). The leftovers
+    /// are named as [`Self::wipe_prefix`] names them.
+    pub async fn delete_run_files(&self, tenant: &str, run_ids: &[String]) -> StoreResult<u64> {
         // Rendered through the key grammar (never hand-built): validates both
         // segments and keeps the scope tag single-sourced.
-        let prefix = weft_core::storage::key::run_prefix(tenant, run_id)
-            .map_err(|e| RuntimeStoreError::Invalid(format!("sweep_run: {e}")))?;
-        let mut reaped = 0;
-        let mut lingering = 0;
-        let mut refused = Vec::new();
-        let mut record = false;
-        let entries = self.keys_under(&prefix).await.map_err(RuntimeStoreError::BeforeWrites)?;
-        let pass: Result<()> = async {
-            for entry in entries {
-                if entry.kept_active {
-                    continue;
-                }
-                // A completion in flight lands first (driving it here is safe
-                // even if its own caller is still driving it), so the file it
-                // becomes gets the linger stamp below like any finished file.
-                if entry.status == "completing" {
-                    if let Err(e) = self.drive_completion(&entry.key, false).await {
-                        tracing::error!(
-                            target: "weft_broker::runtime_store",
-                            key = %entry.key, error = %e,
-                            "a run's completing upload did not land; it gets the linger \
-                             stamp now and the expiry loop lands it once its claim lapsed"
-                        );
-                    }
-                }
-                if entry.status == "active" || entry.status == "completing" {
-                    // Completed un-kept file: stamp the linger deadline. A
-                    // completion still landing is stamped too, and its fold keeps
-                    // the stamp ([`Self::flip_active`]), so a file that lands after
-                    // its run ended lingers like the run's other files. The guard
-                    // re-checks the row is still un-kept (a keep that
-                    // landed since the scan wins and the file survives untouched),
-                    // and only stamps a NULL expiry so a re-delivered terminate
-                    // sweep (the queue is idempotent) can't keep pushing the
-                    // deadline out. The deadline honors every link handed out
-                    // for the file (`links_until_unix`: a link is a promise the
-                    // bytes stay fetchable for its stated lifetime).
-                    let stamped: Option<Option<i64>> = self
-                        .pool
-                        .scalar_opt(
-                            &format!(
-                                "UPDATE runtime_file SET expires_at_unix = {} \
-                                 WHERE key = $1 AND status IN ('active', 'completing') AND NOT keep \
-                                   AND expires_at_unix IS NULL \
-                                 RETURNING expires_at_unix",
-                                expiry_honoring_links("$2")
-                            ),
-                            &[&entry.key, &(self.clock.now_unix() + RUN_LINGER_TTL_SECS)],
-                        )
-                        .await
-                        .context("linger stamp")?;
-                    if let Some(at) = stamped {
-                        lingering += 1;
-                        // The expiry loop must look by the linger's end; one
-                        // ring covers the run's other files, stamped later.
-                        self.ring_for(at).await;
-                    }
-                    continue;
-                }
-                // FENCE first: flip the row to 'reaping', atomically re-checking it
-                // is still a pending row or a reap whose claim lapsed (a completion
-                // that landed since the scan wins: the row is 'active' now and the
-                // clause spares it; so does another call's reap in progress).
-                // The flip locks out every writer and reader (record_part/reserve
-                // gate on 'pending'; keep/get/download gate on 'active'), so the
-                // bucket reap below can never race an in-flight upload, and a
-                // crash at any point leaves a 'reaping' row this sweep's retry
-                // (and the expiry loop) re-finds. Neither delete-object-first (a
-                // charged row pointing at gone bytes on crash) nor
-                // delete-row-first (an orphan object nothing row-driven ever
-                // revisits) has that property.
-                if self
-                    .fence_for_reap(
-                        &entry.key,
-                        &format!("AND (status = 'pending' OR {} OR {MARKED})", reap_lapsed("$2")),
-                        self.clock.now_unix(),
-                    )
-                    .await?
-                    != Fence::Fenced
-                {
-                    continue;
-                }
-                // A row the bucket refuses stays marked, shown in `weft status`
-                // as the one record of it; the sweep goes on with the run's
-                // other rows and answers it among the refused.
-                let outcome = self.reap_fenced_once(&entry).await?;
-                record |= outcome.changes_record;
-                match outcome.refused {
-                    None => reaped += 1,
-                    Some(e) => refused.push(format!("'{}': {e:#}", entry.key)),
-                }
-            }
-            Ok(())
-        }
-        .await;
-        self.finish_pass(record, pass).await?;
-        Ok(RunSweep { reaped, lingering, refused })
+        let prefixes = run_ids
+            .iter()
+            .map(|run_id| weft_core::storage::key::run_prefix(tenant, run_id))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| RuntimeStoreError::Invalid(format!("delete_run_files: {e}")))?;
+        self.wipe_under(&prefixes, &format!("the spaces of {} runs", run_ids.len())).await
     }
 
     /// The expiry loop's pass: remove every file whose expiry passed (the
@@ -4777,7 +4638,7 @@ impl RuntimeStore {
         let entries: Vec<SweepEntry> = self
             .pool
             .all(
-                &format!("SELECT key, FALSE AS kept_active, status, upload_id, replaces FROM runtime_file WHERE {}", doomed("$1")),
+                &format!("SELECT key, upload_id, replaces FROM runtime_file WHERE {}", doomed("$1")),
                 &[&now],
             )
             .await

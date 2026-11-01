@@ -4,7 +4,6 @@
 # asserts the echoes come back. TWO echoes read the same connection: inbound
 # is broadcast to every ctx reader (no node steals messages from another), so
 # every message the caller sends must come back twice, once from each echo.
-# The zero-Rust socket path (a Loop over `inbound`) is the socket_loop fixture.
 
 sock = Socket { path: "__E2E_PATH__" }
 echo = LiveWsEcho

@@ -561,37 +561,19 @@ pub(crate) fn run_query(project: Option<uuid::Uuid>, filter: &weft_core::program
 }
 
 /// THE removal of one run (`weft clean <run_id>`, and each run a
-/// prune drops): its storage folder, then its journal, its tags, its
-/// resume tokens (on the process that served them too), and its row in
-/// the version tree, together; then the word to every client.
+/// prune drops): its journal, its tags, its resume tokens (on the
+/// process that served them too), and its row in the version tree,
+/// together; then the word to every client. Its files go with its
+/// record: the erase queues them for the broker in its own transaction
+/// (`crate::storage::process_sweep_queue`).
 pub(crate) async fn clean_run(
     state: &DispatcherState,
     caller: &crate::tenant::TenantId,
     run_id: RunId,
 ) -> Result<uuid::Uuid, crate::api::storage::ApiError> {
     // The gate already read the owning row; keep it rather than asking
-    // again. Its tenant is the one the storage prefix was WRITTEN
-    // under, so the wipe below addresses the same bytes the run
-    // created even for a project that has since been removed (asking
-    // the project store for the tenant would fail exactly there).
+    // again.
     let owner = authorize_run(&*state.runs, caller, run_id).await?;
-    // Wipe the run's storage folder (kept survivors included:
-    // `weft clean <run_id>` IS the explicit removal verb for them)
-    // BEFORE the journal rows go, while the run's row still exists.
-    // A spent run's storage address dies with its journal history;
-    // every failure below aborts so a retry can still wipe, never
-    // orphaning the prefix. The store's own answer goes back as it is:
-    // what it left and why, and whether waiting is enough.
-    crate::storage::wipe_prefix(state, &format!("{}/run/{run_id}/", owner.tenant))
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "weft_dispatcher::storage",
-                %run_id, error = %e,
-                "could not wipe run storage; aborting clean so a retry can"
-            );
-            crate::api::storage::storage_err(e)
-        })?;
     // Head stops pointing at the run first: a failure after it leaves
     // the run whole and reachable, and the same command retries.
     state.working_copies.forget_head_run(run_id).await.map_err(|e| {

@@ -27,7 +27,7 @@ async fn stores(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(file.mime_type, "image/png");
     let png = base64::engine::general_purpose::STANDARD.decode(PNG_BASE64).expect("base64");
     assert_eq!(rig.stored_bytes(&file.key)?.as_ref(), png.as_slice(), "the bytes are the computer's PNG");
-    assert!(rig.stored_meta(&file.key)?.keep, "kept past the run: a conversation may hold it");
+    assert_eq!(rig.stored_meta(&file.key)?.keep_ttl_secs, None, "no deadline: it reads for as long as the run is kept");
     assert_eq!(asked(&rig), vec![("screenshot".to_string(), json!({}))]);
     Ok(())
 }

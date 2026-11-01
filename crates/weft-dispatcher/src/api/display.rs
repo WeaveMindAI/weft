@@ -152,10 +152,7 @@ pub async fn list_displays(
                     let row = crate::infra_node::get(&state.pg_pool, summary.id, address, copy)
                         .await
                         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?;
-                    // SYNC: never-started copy word <-> catalog/instances/instance_infra_status/mod.rs run,
-                    // tangle/*/.*/skills/weft-consumers/SKILL.md (displays row, status list),
-                    // tangle/*/.*/skills/weft-frontend/SKILL.md (start button)
-                    Some(row.map_or("none", |row| row.status.as_str()))
+                    Some(copy_status(row.as_ref()))
                 }
                 DisplayKind::Trigger => None,
             };
@@ -171,6 +168,15 @@ pub async fn list_displays(
         }
     }
     Ok(Json(out))
+}
+
+/// Where the copy `row` behind an infra display stands, as the listing
+/// says it: the row's status, or `none` when the copy was never started.
+fn copy_status(row: Option<&crate::infra_node::InfraNodeRow>) -> &'static str {
+    // SYNC: never-started copy word <-> catalog/instances/instance_infra_status/mod.rs run,
+    // tangle/*/.*/skills/weft-consumers/SKILL.md (displays row, status list),
+    // tangle/*/.*/skills/weft-frontend/SKILL.md (start button)
+    row.map_or("none", |row| row.status.as_str())
 }
 
 /// `GET /signal-token/displays/{project_id}/{node}`, where `{node}` is
@@ -225,15 +231,16 @@ pub async fn press_display(
         DisplayKind::Infra => Ok(Json(
             crate::api::infra::press_live(&state, id, &address, copy.as_ref(), &body.kind, &body.payload).await?,
         )),
-        // Named the way the CALLER named it: they asked for
-        // `bridge.whatsapp`, so hearing about some other spelling of
-        // that node would send them looking for a thing they never
-        // wrote.
-        DisplayKind::Trigger => Err((
-            StatusCode::BAD_REQUEST,
-            format!("'{address}' is a trigger, and a trigger's display is read-only"),
-        )),
+        DisplayKind::Trigger => Err(trigger_press_refused(&address)),
     }
+}
+
+/// The refusal a press on the trigger display at `address` gets. Named
+/// the way the CALLER named it: they asked for `bridge.whatsapp`, so
+/// hearing about some other spelling of that node would send them looking
+/// for a thing they never wrote.
+fn trigger_press_refused(address: &str) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, format!("'{address}' is a trigger, and a trigger's display is read-only"))
 }
 
 /// Every display of a project, as the deciders on this surface read
@@ -896,5 +903,60 @@ mod display_kind_tests {
     #[test]
     fn an_ordinary_node_has_none() {
         assert_eq!(display_kind(&node(false, None, false)), None);
+    }
+
+    /// Copy `ada` of the infra node `panel`, standing at `status`, serving
+    /// its display on the endpoint `http`.
+    fn ada_copy(status: crate::infra_node::InfraNodeStatus) -> crate::infra_node::InfraNodeRow {
+        crate::infra_node::InfraNodeRow {
+            project_id: uuid::Uuid::nil(),
+            node_id: "panel".into(),
+            instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()),
+            copy_id: "c1".into(),
+            status,
+            failure_stage: None,
+            failure_message: None,
+            applied_spec_hash: None,
+            applied_at_unix: None,
+            endpoints: [("http".to_string(), "http://panel-ada:8080".to_string())].into(),
+            public_paths: Default::default(),
+            doors: Default::default(),
+            keep_disks: Vec::new(),
+            units: Default::default(),
+            notes: Vec::new(),
+            waiting: None,
+            provisioning_since_unix: None,
+            source_hash: None,
+        }
+    }
+
+    /// An infra display says where the copy behind it stands: `running`
+    /// while it is up, and its display is read from it; `stopped` once it
+    /// stopped, and reading it is a 404 that names that state instead of
+    /// a failed connection; `none` once there is no copy at all.
+    #[test]
+    fn an_infra_display_says_where_its_copy_stands() {
+        use crate::infra_node::InfraNodeStatus;
+        let running = ada_copy(InfraNodeStatus::Running);
+        assert_eq!(copy_status(Some(&running)), "running");
+        assert_eq!(crate::api::infra::live_endpoint_of(&running, "panel", "http").unwrap(), "http://panel-ada:8080");
+
+        let stopped = ada_copy(InfraNodeStatus::Stopped);
+        assert_eq!(copy_status(Some(&stopped)), "stopped");
+        let (status, why) = crate::api::infra::live_endpoint_of(&stopped, "panel", "http").unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(why, "infra node 'panel' is stopped, so it has nothing to show yet");
+
+        assert_eq!(copy_status(None), "none");
+    }
+
+    /// Pressing a trigger's display is refused with a 400 saying it is
+    /// read-only, naming the display the way the caller wrote it.
+    #[test]
+    fn a_press_on_a_trigger_display_is_refused_as_read_only() {
+        assert_eq!(display_kind(&node(false, None, true)), Some(DisplayKind::Trigger));
+        let (status, why) = trigger_press_refused("one.door");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(why, "'one.door' is a trigger, and a trigger's display is read-only");
     }
 }
