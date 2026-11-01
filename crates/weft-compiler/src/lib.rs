@@ -30,12 +30,15 @@
 //!    ports and `@require_one_of`, loops, trigger and infra placement,
 //!    each node's declarative rules). `Structural` gates the build;
 //!    `Runtime` adds the rules a sketch may leave open (a provider with
-//!    no model named yet).
-//! 5. The dispatcher resolves file-typed `@asset` markers into stored
-//!    files, then `build_plan::plan_build_from` computes the three hashes
+//!    no model named yet). Once everything has read them, the build's
+//!    compile names each `@file`'s text by its content
+//!    (`file_ref::name_contents`, `weft_core::content`).
+//! 5. The dispatcher resolves `@asset` markers (a file kind into a
+//!    stored file, a text kind into its named content), then `build_plan::plan_build_from` computes the three hashes
 //!    (binary and infra in `hash`; the definition hash is weft-core's
 //!    `compute_definition_hash`, re-exported there) and stages what it
-//!    needs: `build::build_project` validates the resolved definition,
+//!    needs: `build::build_project` validates the resolved definition
+//!    with every named content's value put back (`unsettled`),
 //!    `codegen::emit` writes the worker cargo crate (one crate per
 //!    referenced node package, plus the registry and `main.rs`; the
 //!    definition itself is never baked in, a worker fetches it from the
@@ -321,13 +324,32 @@ pub fn compile_program(
     fs: CompileFs,
     catalog: &dyn MetadataCatalog,
 ) -> Result<ProjectDefinition, Vec<Diagnostic>> {
+    compile_program_with_contents(source, project_id, fs, catalog).map(|(program, _)| program)
+}
+
+/// [`compile_program`], with the value of each file content the program
+/// names (`weft_core::content`): what a build hands its own gate
+/// ([`unsettled`]), which checks the program as it runs.
+pub fn compile_program_with_contents(
+    source: &str,
+    project_id: Uuid,
+    fs: CompileFs,
+    catalog: &dyn MetadataCatalog,
+) -> Result<(ProjectDefinition, weft_core::content::ContentValues), Vec<Diagnostic>> {
     // A broken part names its file from the project root: the install
     // compiles in a directory of its own, whose path means nothing to
     // whoever reads the refusal.
     let root = root_identity(&fs)?;
     catalog.type_registry().scoped(|| {
-        let (mut project, parse_errors) =
-            weft_compiler::compile_lenient(source, project_id, fs, weft_compiler::IncludeMode::Full, None);
+        let mut reads = Vec::new();
+        let (mut project, parse_errors) = weft_compiler::compile_lenient_reading(
+            source,
+            project_id,
+            fs,
+            weft_compiler::IncludeMode::Full,
+            None,
+            Some(&mut reads),
+        );
         let mut diagnostics: Vec<Diagnostic> = parse_errors.iter().map(|e| e.diagnostic("parse")).collect();
         // An entry file that does not parse leaves a partial program, and
         // the later stages would only add findings about the gap.
@@ -339,7 +361,10 @@ pub fn compile_program(
         }
         diagnostics.extend(validate::validate_with_mode(&project, catalog, validate::ValidationMode::Structural));
         settle(&mut project, catalog, diagnostics, root.as_deref())?;
-        Ok(project)
+        // Every check has read the `@file` contents; the program the
+        // build keeps names each by its content.
+        let contents = file_ref::name_contents(&mut project, reads);
+        Ok((project, contents))
     })
 }
 
@@ -361,11 +386,26 @@ fn root_identity(fs: &CompileFs) -> Result<Option<std::path::PathBuf>, Vec<Diagn
 /// error nobody recorded. `fs` is the view of the project it was compiled
 /// through ([`compile_program`]'s), whose root the files of broken parts
 /// are spelled from, however this caller spells that root.
-pub fn unsettled(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, fs: CompileFs) -> Vec<Diagnostic> {
+///
+/// `contents` holds the value of each file content the program names
+/// ([`compile_program_with_contents`], and the build's text `@asset`s):
+/// the checks read the program with every value put back, as the compile
+/// checked it and as a worker runs it, never a marker.
+pub fn unsettled(
+    project: &ProjectDefinition,
+    contents: &weft_core::content::ContentValues,
+    catalog: &dyn MetadataCatalog,
+    fs: CompileFs,
+) -> Vec<Diagnostic> {
     let root = match root_identity(&fs) {
         Ok(root) => root,
         Err(diagnostics) => return diagnostics,
     };
+    let mut project = project.clone();
+    if let Err(why) = weft_core::content::resolve_program(&mut project, contents) {
+        return vec![Diagnostic::at(Default::default(), Severity::Error, "content-not-read", why)];
+    }
+    let project = &project;
     let hiding = hiding_nodes(project, catalog);
     validate::validate_with_mode(project, catalog, validate::ValidationMode::Structural)
         .into_iter()

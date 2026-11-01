@@ -26,6 +26,8 @@ use serde_json::Value;
 
 #[cfg(feature = "runtime")]
 use crate::bus::WirePayload;
+#[cfg(feature = "runtime")]
+use crate::content_cache::json_bytes;
 
 /// Content bigger than this is recorded trimmed, never whole.
 ///
@@ -424,11 +426,6 @@ fn cut_strings(value: &Value, cap: usize) -> Value {
         ),
         other => other.clone(),
     }
-}
-
-#[cfg(feature = "runtime")]
-fn json_bytes(value: &Value) -> usize {
-    serde_json::to_vec(value).expect("a serde_json::Value always serializes").len()
 }
 
 /// Which way one message of a caller conversation went.

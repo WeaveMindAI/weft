@@ -123,15 +123,6 @@ fn one_copy(node: &str, instance: &Option<InstanceId>, take_down: &TakeDownChoic
     StopRequest { take_down: *take_down, instances: InstanceTarget::of(instance.clone()), nodes: vec![node.to_string()], force: false }
 }
 
-/// The project's registered definition, or the refusal when it is gone.
-pub(crate) async fn load_project(state: &DispatcherState, project_id: uuid::Uuid) -> Result<weft_core::ProjectDefinition, Refused> {
-    state
-        .projects
-        .project(project_id)
-        .await
-        .map_err(failed("project"))?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".to_string()))
-}
 
 /// Refuse a project `weft rm` marked: it takes no verb.
 async fn unless_removing(state: &DispatcherState, project_id: uuid::Uuid) -> Result<(), Refused> {
@@ -156,15 +147,15 @@ pub(crate) async fn start(state: &DispatcherState, actor: &Actor, project_id: uu
     actor.may_act_on(state, project_id).await?;
     let owners = machinery::copy_owners(state, project_id, &request.instances, true).await?;
     let asked = owners.len();
-    let registered = load_project(state, project_id).await?;
+    let registered = crate::api::project::registered_program(state, project_id).await?;
     let mut refused: Vec<(Option<InstanceId>, Refused)> = Vec::new();
     // Whether an owner's start went ahead: then the answer is no longer
     // one nothing of the request ran.
     let mut any_started = false;
     for instance in owners {
-        let Some(nodes) = machinery::owner_nodes(&registered, &request.instances, &request.nodes, instance.as_ref()) else { continue };
+        let Some(nodes) = machinery::owner_nodes(&registered.program, &request.instances, &request.nodes, instance.as_ref()) else { continue };
         let started: Result<(), Refused> = async {
-            let begun = machinery::begin_sync(state, project_id, &request.build, instance.as_ref(), &nodes, request.instances.is_shared(), SyncKind::Start)
+            let begun = machinery::begin_sync(state, project_id, &registered, &request.build, instance.as_ref(), &nodes, request.instances.is_shared(), SyncKind::Start)
                 .await
                 .map_err(|e| e.into_parts())?;
             if let Some(begun) = begun {
@@ -217,9 +208,9 @@ async fn request_start(
     actor.may_act_on(state, project_id).await?;
     // The node must be one this instance has a copy of: refused now, to
     // the program, naming the fix.
-    let project = load_project(state, project_id).await?;
-    machinery::resolve_infra_nodes(&project, &[node.to_string()], instance)?;
-    let copies = infra_node::observe(&state.pg_pool, project_id, &project).await.map_err(failed("infra copies"))?;
+    let registered = crate::api::project::registered_program(state, project_id).await?;
+    machinery::resolve_infra_nodes(&registered.program, &[node.to_string()], instance)?;
+    let copies = infra_node::observe(&state.pg_pool, project_id, &registered.program).await.map_err(failed("infra copies"))?;
     match copies.status_of(node, instance) {
         Some(InfraNodeStatus::Running) => return Ok(InfraStartAnswer::AlreadyRunning),
         Some(InfraNodeStatus::Provisioning) => return Ok(InfraStartAnswer::AlreadyStarting),
@@ -227,7 +218,7 @@ async fn request_start(
     }
     // Up to the setup run being journaled, here; the rest of the sync runs
     // on after the answer. A start never takes a run down.
-    let begun = match machinery::begin_sync(state, project_id, &Default::default(), instance, &[node.to_string()], instance.is_none(), SyncKind::Start)
+    let begun = match machinery::begin_sync(state, project_id, &registered, &Default::default(), instance, &[node.to_string()], instance.is_none(), SyncKind::Start)
         .await
         .map_err(|refused| refused.into_parts())
     {
@@ -288,15 +279,16 @@ pub(crate) async fn upgrade(
     // already on it. Nothing of that kind anywhere is nothing to do, with
     // nothing checked or taken down: what a deploy that runs it on every
     // push meets on its first one.
-    let registered = load_project(state, project_id).await?;
+    // The program is read once, here, and every check below reads it.
+    let loaded = crate::api::project::registered_program(state, project_id).await?;
+    let registered = &*loaded.program;
     let binary_hash = state.projects.running_binary_hash(project_id).await.map_err(failed("running hashes"))?;
-    let definition_hash = state.projects.running_definition_hash(project_id).await.map_err(failed("running hashes"))?;
-    let desired = crate::api::project::Desired::registered(state, project_id, &registered, binary_hash.as_deref(), definition_hash.as_deref()).await?;
-    let observed = infra_node::observe(&state.pg_pool, project_id, &registered).await.map_err(failed("infra copies"))?;
+    let desired = crate::api::project::Desired::registered(state, project_id, &loaded, binary_hash.as_deref()).await?;
+    let observed = infra_node::observe(&state.pg_pool, project_id, registered).await.map_err(failed("infra copies"))?;
     let mut behind_by_owner = Vec::new();
     for instance in machinery::copy_owners(state, project_id, &sync.instances, false).await? {
-        let Some(nodes) = machinery::owner_nodes(&registered, &sync.instances, &sync.nodes, instance.as_ref()) else { continue };
-        let targeted = machinery::resolve_infra_nodes(&registered, &nodes, instance.as_ref())?;
+        let Some(nodes) = machinery::owner_nodes(registered, &sync.instances, &sync.nodes, instance.as_ref()) else { continue };
+        let targeted = machinery::resolve_infra_nodes(registered, &nodes, instance.as_ref())?;
         let running: std::collections::BTreeSet<String> =
             targeted.into_keys().filter(|place| machinery::upgrades(&observed, &desired, place, instance.as_ref())).collect();
         if !running.is_empty() {
@@ -307,7 +299,7 @@ pub(crate) async fn upgrade(
     // a refusal leaves everything as it was.
     let mut planned = Vec::new();
     for (instance, nodes, running) in behind_by_owner {
-        let registered = machinery::gate_sync(state, project_id, &sync.build, instance.as_ref(), &nodes, SyncKind::Upgrade, sync.instances.is_shared())
+        machinery::gate_sync(state, project_id, &loaded, &sync.build, instance.as_ref(), &nodes, SyncKind::Upgrade, sync.instances.is_shared())
             .await
             .map_err(|e| e.into_parts())?;
         if let Some(command_id) = infra_lifecycle_command::upgrade_in_flight(&state.pg_pool, project_id, instance.as_ref().map(|m| m.as_str()))
@@ -317,7 +309,7 @@ pub(crate) async fn upgrade(
             return Err(infra_lifecycle_command::upgrade_in_flight_refusal(command_id));
         }
         let reach = crate::infra_reach::InfraReach { places: running.clone(), copies: Copies::of(instance.clone()) };
-        let live = machinery::triggers_reached(state, project_id, &registered, &reach).await?;
+        let live = machinery::triggers_reached(state, project_id, &loaded, &reach).await?;
         planned.push((instance, nodes, running, reach, live));
     }
     let stops_asker = asker_reaches(state, actor, project_id, planned.iter().map(|(_, _, _, reach, _)| reach), stop_self).await?;
@@ -409,15 +401,16 @@ pub(crate) async fn take_down_copies(
         return Err((StatusCode::BAD_REQUEST, "`force` brings down the units that stay up on a stop; a terminate removes every unit anyway".into()));
     }
     unless_removing(state, project_id).await?;
-    let project = load_project(state, project_id).await?;
-    let (observed, pending) = infra_node::observe_with(&state.pg_pool, project_id, &project).await.map_err(failed("infra copies"))?;
+    let registered = crate::api::project::registered_program(state, project_id).await?;
+    let project = &*registered.program;
+    let (observed, pending) = infra_node::observe_with(&state.pg_pool, project_id, project).await.map_err(failed("infra copies"))?;
     // Every owner is checked before the first one's triggers come down, so
     // a refusal leaves everything as it was.
     let mut planned = Vec::new();
     let mut any_copy = false;
     for instance in machinery::copy_owners(state, project_id, &request.instances, false).await? {
-        let Some(nodes) = machinery::owner_nodes(&project, &request.instances, &request.nodes, instance.as_ref()) else { continue };
-        let plan = machinery::plan_copies_down(state, project_id, &project, instance.clone(), &nodes).await?;
+        let Some(nodes) = machinery::owner_nodes(project, &request.instances, &request.nodes, instance.as_ref()) else { continue };
+        let plan = machinery::plan_copies_down(state, project_id, &registered, instance.clone(), &nodes).await?;
         let named = |node: &str| nodes.is_empty() || nodes.iter().any(|n| n == node);
         let places: Vec<&String> = if nodes.is_empty() { plan.reach.places.iter().collect() } else { nodes.iter().collect() };
         let starts: Vec<RunId> = places.iter().flat_map(|place| pending.setups_starting(place, instance.as_ref())).collect();
@@ -452,7 +445,7 @@ pub(crate) async fn take_down_copies(
             Teardown::Stop { .. } => "infra_stop",
             Teardown::Terminate { .. } => "infra_terminate",
         };
-        crate::api::project::require_action(state, project_id, &[action]).await?;
+        crate::api::project::require_action(state, project_id, &registered, &[action]).await?;
     }
     for setup in planned.iter().flat_map(|(_, starts)| starts) {
         crate::api::run::cancel_run_id(state, *setup, &weft_core::run::CancelCause::User).await.map_err(failed("cancel the copy's start"))?;
@@ -529,8 +522,8 @@ pub(crate) struct ObservedCopy {
 /// progress from when it was asked for. The rows first, then the copies a
 /// start is bringing up that have none yet.
 pub(crate) async fn read_copies(state: &DispatcherState, project_id: uuid::Uuid) -> Result<Vec<ObservedCopy>, Refused> {
-    let project = load_project(state, project_id).await?;
-    let copies = infra_node::observe(&state.pg_pool, project_id, &project)
+    let registered = crate::api::project::registered_program(state, project_id).await?;
+    let copies = infra_node::observe(&state.pg_pool, project_id, &registered.program)
         .await
         .map_err(|e| crate::api::unavailable_or_internal("read the infra copies", e))?;
     let starting: Vec<ObservedCopy> = copies

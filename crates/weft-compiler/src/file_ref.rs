@@ -8,7 +8,8 @@
 //! build (the parse's reader is walled to the project, and an asset may sit
 //! anywhere on the machine, at a URL, or under a stored-file key). A
 //! file-typed one (Image, Audio, ...) goes through the asset sync; a
-//! text-typed one is read or fetched by the build driver and inlined.
+//! text-typed one is read or fetched by the build driver ([`read_texts`])
+//! and named by its content (`weft_core::content`).
 //! `@file`'s type defaults to `String`; `@asset` always names its
 //! type (a value carries exactly one concrete marker, and the compiler
 //! never guesses a kind from a name or from bytes), so it is `Image`,
@@ -194,10 +195,14 @@ pub fn is_deferred_ref(file_ref: &FileRef) -> bool {
 }
 
 /// The type a written constant has, for the type check and the cast: a
-/// `@file`/`@asset` marker is the type it declares (the value it stands
-/// for, never the marker text), a list is a list of its elements' types,
+/// `@file`/`@asset` marker, and the content a build named one by
+/// (`weft_core::content`), is the type it declares (the value it stands
+/// for, never the marker), a list is a list of its elements' types,
 /// and anything else is what `WeftType::infer` reads off the JSON.
 pub fn literal_type(value: &serde_json::Value) -> WeftType {
+    if let Some(content) = weft_core::content::ContentRef::from_value(value) {
+        return content.ty().clone();
+    }
     match value {
         serde_json::Value::String(s) => match parse_marker(s) {
             Some(Ok(file_ref)) => file_ref.ty,
@@ -243,14 +248,31 @@ fn each_string(value: &serde_json::Value, visit: &mut impl FnMut(&str)) {
 /// to (a stored-file value). Visits every leaf, string or not, so the
 /// caller decides what to do with it.
 fn each_value_mut(value: &mut serde_json::Value, visit: &mut impl FnMut(&mut serde_json::Value)) {
+    each_leaf_at(value, &mut String::new(), &mut |leaf, _| visit(leaf));
+}
+
+/// [`each_value_mut`], handing each leaf its JSON pointer from `value`
+/// (`/0/name`; empty for `value` itself).
+fn each_leaf_at(value: &mut serde_json::Value, at: &mut String, visit: &mut impl FnMut(&mut serde_json::Value, &str)) {
+    let len = at.len();
     match value {
         serde_json::Value::Array(items) => {
-            items.iter_mut().for_each(|v| each_value_mut(v, visit))
+            for (index, item) in items.iter_mut().enumerate() {
+                at.push('/');
+                at.push_str(&index.to_string());
+                each_leaf_at(item, at, visit);
+                at.truncate(len);
+            }
         }
         serde_json::Value::Object(map) => {
-            map.values_mut().for_each(|v| each_value_mut(v, visit))
+            for (key, item) in map.iter_mut() {
+                at.push('/');
+                at.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                each_leaf_at(item, at, visit);
+                at.truncate(len);
+            }
         }
-        leaf => visit(leaf),
+        leaf => visit(leaf, at),
     }
 }
 
@@ -267,28 +289,11 @@ pub trait MarkedValues {
 
 impl MarkedValues for weft_core::project::ProjectDefinition {
     fn marked_values(&self) -> Vec<&serde_json::Value> {
-        self.nodes
-            .iter()
-            .flat_map(|node| {
-                node.config.as_object().map(|o| o.values()).into_iter().flatten().chain(node.port_literals.values())
-            })
-            .chain(self.groups.iter().flat_map(|group| group.port_literals.values()))
-            .collect()
+        self.written_values().collect()
     }
 
     fn marked_values_mut(&mut self) -> Vec<&mut serde_json::Value> {
-        self.nodes
-            .iter_mut()
-            .flat_map(|node| {
-                node.config
-                    .as_object_mut()
-                    .map(|o| o.values_mut())
-                    .into_iter()
-                    .flatten()
-                    .chain(node.port_literals.values_mut())
-            })
-            .chain(self.groups.iter_mut().flat_map(|group| group.port_literals.values_mut()))
-            .collect()
+        self.written_values_mut().collect()
     }
 }
 
@@ -351,25 +356,90 @@ pub fn collect_runtime_key_refs(target: &impl MarkedValues) -> Vec<FileRef> {
 
 /// Collect every TEXT-typed `@asset`: a URL, a stored-file key, or a disk
 /// path (in the project or anywhere on the machine). The parse reads none
-/// of them; the build driver fetches or reads the bytes, casts them to the
-/// declared type through [`resolve_text_bytes`], and puts the value into
-/// the same map. Deduplicated like every collector (see `collect_refs`).
+/// of them; the build driver reads them through [`read_texts`] and puts
+/// each value into the same map. Deduplicated like every collector (see
+/// `collect_refs`).
 pub fn collect_text_refs(target: &impl MarkedValues) -> Vec<FileRef> {
     collect_refs(target, |r| !r.ty.references_file())
 }
 
-/// Turn the bytes a build driver fetched for a text-typed remote `@asset`
-/// into the value the program reads: the declared type's own cast of the
-/// text (the same cast a project-file `@file` gets at parse), so `Number`
-/// and JSON shapes work from a URL exactly as from disk. The error names
-/// the source.
-pub fn resolve_text_bytes(file_ref: &FileRef, bytes: &[u8]) -> Result<serde_json::Value, String> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|e| format!("@asset({:?}, {}): the content is not UTF-8 text: {e}", file_ref.path, file_ref.ty))?;
-    file_ref
-        .ty
-        .cast_text(text)
-        .map_err(|e| format!("@asset({:?}, {}): {e}", file_ref.path, file_ref.ty))
+/// How a resolution step spells the value of a text-typed `@asset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextValues {
+    /// Named by its content (`weft_core::content`): a program's, which a
+    /// worker puts back when it reads the program. The driver stores the
+    /// bytes among the tenant's assets.
+    Named,
+    /// The value itself: a run's handed values, which no worker puts
+    /// back.
+    Inline,
+}
+
+/// Where a build driver reads the bytes of a text-typed `@asset`, by the
+/// kind of place its ref names. Only the transport is the driver's; which
+/// one a ref takes, the cast and the errors are [`read_texts`]'s.
+pub trait TextSource {
+    /// The body of a GET of `url`.
+    fn url(&self, url: &str) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send;
+    /// The stored file under the tenant-less key `key`.
+    fn stored(&self, key: &str) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send;
+    /// The file at `path`, spelled from the project root or absolute.
+    fn path(&self, path: &str) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send;
+}
+
+/// One text `@asset` [`read_texts`] read: its ref, the bytes, the content
+/// they are and the value they were cast to.
+#[derive(Debug)]
+pub struct TextRead {
+    pub file_ref: FileRef,
+    pub bytes: Vec<u8>,
+    pub content: weft_core::content::ContentRef,
+    pub value: serde_json::Value,
+}
+
+impl TextRead {
+    /// The value the ref resolves to, spelled as `spelled` says.
+    pub fn resolution(&self, spelled: TextValues) -> serde_json::Value {
+        match spelled {
+            TextValues::Named => self.content.to_value(),
+            TextValues::Inline => self.value.clone(),
+        }
+    }
+}
+
+/// Read every text `@asset` `target` names through `source`, once per
+/// place (one path cast to two types is read once, so both casts are of
+/// the same bytes), and cast it to its declared type (the same cast a
+/// project-file `@file` gets at parse, so `Number` and JSON shapes work
+/// from a URL exactly as from disk). Every ref that cannot be read or cast
+/// is named at once.
+pub async fn read_texts(target: &impl MarkedValues, source: &impl TextSource) -> Result<Vec<TextRead>, Vec<String>> {
+    let mut read = Vec::new();
+    let mut failed = Vec::new();
+    let mut fetched: std::collections::BTreeMap<String, Result<Vec<u8>, String>> = std::collections::BTreeMap::new();
+    for file_ref in collect_text_refs(target) {
+        if !fetched.contains_key(&file_ref.path) {
+            let bytes = if is_url_ref(&file_ref) {
+                source.url(&file_ref.path).await
+            } else if is_runtime_key_ref(&file_ref) {
+                source.stored(&file_ref.path).await
+            } else {
+                source.path(&file_ref.path).await
+            };
+            fetched.insert(file_ref.path.clone(), bytes);
+        }
+        let bytes = fetched[&file_ref.path].clone();
+        let cast = bytes.and_then(|bytes| {
+            let text = std::str::from_utf8(&bytes).map_err(|e| format!("the content is not UTF-8 text: {e}"))?;
+            let (content, value) = weft_core::content::ContentRef::of_text(text, &file_ref.ty, &file_ref.path)?;
+            Ok((content, value, bytes))
+        });
+        match cast {
+            Ok((content, value, bytes)) => read.push(TextRead { file_ref, bytes, content, value }),
+            Err(why) => failed.push(format!("@asset({:?}, {}): {why}", file_ref.path, file_ref.ty)),
+        }
+    }
+    if failed.is_empty() { Ok(read) } else { Err(failed) }
 }
 
 /// Resolve runtime-key refs (from [`collect_runtime_key_refs`]) against a
@@ -419,8 +489,9 @@ pub fn resolve_runtime_key_refs(
 /// What resolving one `@file` marker produced.
 #[derive(Debug, PartialEq)]
 enum Resolved {
-    /// The value to substitute into config.
-    Value(serde_json::Value),
+    /// The value to substitute into config, and the content it was cast
+    /// from, which the build names it by ([`name_contents`]).
+    Read(weft_core::content::ContentRef, serde_json::Value),
     /// Editor/lenient defer: keep the raw `@file(...)` string, but record the
     /// ref so the UI knows the field is file-backed.
     Deferred,
@@ -476,7 +547,7 @@ fn resolve(file_ref: &FileRef, fs: &CompileFs) -> Result<Resolved, String> {
         .reader
         .resolve_and_read(root, root, std::path::Path::new(&file_ref.path))
         .map_err(|e| format!("{} {e}", file_ref.marker.directive()))?;
-    file_ref.ty.cast_text(&resolved.content).map(Resolved::Value)
+    weft_core::content::ContentRef::of_text(&resolved.content, &file_ref.ty, &file_ref.path).map(|(content, value)| Resolved::Read(content, value))
 }
 
 /// Put a disk ref into its one spelling. A relative path is relative to
@@ -545,10 +616,15 @@ fn spell_from_root(mut file_ref: FileRef, home: Option<&std::path::Path>) -> Res
 /// have been flattened. Every ref is first put into its one spelling (see
 /// [`spell_from_root`]), so everything resolves against the project root
 /// and the ref's path means the same thing to every consumer.
+///
+/// `reads`, when given, gets every `@file` read into a node's or a
+/// group's field, for the build to name by its content once every check
+/// has read the value ([`name_contents`]).
 pub(crate) fn resolve_project_file_refs(
     project: &mut weft_core::project::ProjectDefinition,
     root_fs: &CompileFs,
     errors: &mut Vec<SourceError>,
+    mut reads: Option<&mut Vec<ContentRead>>,
 ) {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     for node in &mut project.nodes {
@@ -566,12 +642,27 @@ pub(crate) fn resolve_project_file_refs(
         let source_file = field.map(|s| s.source_file.as_deref()).unwrap_or(node.source_file.as_deref());
         // Every marker resolves, at the top of a field or inside a list;
         // only a field that is one marker is recorded ([`is_one_marker`]).
+        if let Some(why) = written_content(value) {
+            errors.push(SourceError::at(span, why).in_file(source_file).about(&part));
+            continue;
+        }
         let single = is_one_marker(value);
-        each_value_mut(value, &mut |leaf| match resolve_leaf(leaf, root_fs, home.as_deref(), single) {
-            Ok(Some(file_ref)) if single => {
-                node.file_refs.insert(key.clone(), file_ref);
+        each_leaf_at(value, &mut String::new(), &mut |leaf, at| match resolve_leaf(leaf, root_fs, home.as_deref(), single) {
+            Ok(Some(resolved)) => {
+                if let (Some(reads), Some(content)) = (reads.as_deref_mut(), resolved.content) {
+                    reads.push(ContentRead {
+                        owner: ReadOwner::Node(node.id.clone()),
+                        field: key.clone(),
+                        at: at.to_string(),
+                        content,
+                        value: leaf.clone(),
+                    });
+                }
+                if single {
+                    node.file_refs.insert(key.clone(), resolved.file_ref);
+                }
             }
-            Ok(_) => {}
+            Ok(None) => {}
             // A file that is not there breaks the node that reads it, and
             // only that node.
             Err(msg) => errors.push(SourceError::at(span, msg).in_file(source_file).about(&part)),
@@ -580,27 +671,45 @@ pub(crate) fn resolve_project_file_refs(
     }
     // A literal on a group's own port (`g.x = @file(...)`, or
     // `alias.x = ...` on an include site) resolves the same way: the
-    // group sends it to the members that read the port. A loop's literals
-    // sit on its `LoopIn` too, resolved with the nodes above.
-    for group in project.groups.iter_mut().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+    // group sends it to the members that read the port. A loop holds
+    // none: its sit on its `LoopIn`, resolved with the nodes above.
+    for group in &mut project.groups {
         let spans = &group.port_literal_spans;
         for (key, value) in group.port_literals.iter_mut() {
             let field = spans.get(key);
             let span = field.map(|s| s.span).unwrap_or(group.header_span.or(group.span).unwrap_or_default());
             let source_file = field.map(|s| s.source_file.as_deref()).unwrap_or(group.source_file.as_deref());
+            if let Some(why) = written_content(value) {
+                errors.push(SourceError::at(span, why).in_file(source_file).about(&group.id));
+                continue;
+            }
             let single = is_one_marker(value);
-            each_value_mut(value, &mut |leaf| match resolve_leaf(leaf, root_fs, home.as_deref(), single) {
-                Ok(Some(file_ref)) if single => {
-                    group.file_refs.insert(key.clone(), file_ref);
+            each_leaf_at(value, &mut String::new(), &mut |leaf, at| match resolve_leaf(leaf, root_fs, home.as_deref(), single) {
+                Ok(Some(resolved)) => {
+                    if let (Some(reads), Some(content)) = (reads.as_deref_mut(), resolved.content) {
+                        reads.push(ContentRead {
+                            owner: ReadOwner::Group(group.id.clone()),
+                            field: key.clone(),
+                            at: at.to_string(),
+                            content,
+                            value: leaf.clone(),
+                        });
+                    }
+                    if single {
+                        group.file_refs.insert(key.clone(), resolved.file_ref);
+                    }
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(msg) => errors.push(SourceError::at(span, msg).in_file(source_file).about(&group.id)),
             });
         }
     }
     // A metadata port's value (`self.tool = @file("tool.json", LlmTool)`)
     // resolves in place too: what a metadata wire writes into an input is
-    // the content, as if typed there. An include's opaque node carries its
+    // the content, as if typed there. It stays the content in the built
+    // program too (it is never named by its content): the compiler reads
+    // it, a key path into it (`search.tool.name`) or a spread of it
+    // (`[...screen.tools]`) included. An include's opaque node carries its
     // file's, resolved the same way. A call site carries a copy of its
     // body's: the body's is read once, then copied, so a file is read (and
     // a missing one reported) once whatever the number of sites.
@@ -613,6 +722,10 @@ pub(crate) fn resolve_project_file_refs(
         for port in ports.iter_mut() {
             let span = port.span.or(owner_span).unwrap_or_default();
             let Some(value) = port.value.as_mut() else { continue };
+            if let Some(why) = written_content(value) {
+                errors.push(SourceError::at(span, why).in_file(source_file).about(owner));
+                continue;
+            }
             let single = is_one_marker(value);
             each_value_mut(value, &mut |leaf| {
                 if let Err(msg) = resolve_leaf(leaf, root_fs, home.as_deref(), single) {
@@ -636,6 +749,93 @@ pub(crate) fn resolve_project_file_refs(
     }
 }
 
+/// Why a written value cannot hold what it does: a marker naming stored
+/// content (`weft_core::content`) is the build's, made from a `@file` or
+/// an `@asset` it read, and one written by hand would name content
+/// nothing of this program stored.
+fn written_content(value: &serde_json::Value) -> Option<String> {
+    weft_core::content::ContentRef::claimed_in(value).then(|| {
+        format!(
+            "this value holds `{}`, which only a build writes, for the content of a file it read; \
+             name the file instead: @file(\"path\") or @asset(\"path\", Type)",
+            weft_core::content::CONTENT_MARKER_KEY
+        )
+    })
+}
+
+/// One `@file` a build's compile read into a field: whose field, where
+/// in it (a JSON pointer from the field's value, empty for the field
+/// itself), the content, and the value it was cast to.
+pub(crate) struct ContentRead {
+    owner: ReadOwner,
+    field: String,
+    at: String,
+    content: weft_core::content::ContentRef,
+    value: serde_json::Value,
+}
+
+/// Whose field a [`ContentRead`] is in, by id.
+pub(crate) enum ReadOwner {
+    Node(String),
+    Group(String),
+}
+
+/// Name every `@file` the build's compile read by its content: where it
+/// was read, the value cast from the file becomes the marker naming that
+/// content (`weft_core::content`), so the program that is hashed, cut,
+/// stored and sent to workers carries a hash-sized value where the text
+/// was. Run once every check has read the values, so the checks read the
+/// content itself. Hands back the value of each content named, which a
+/// later check of the program puts back ([`crate::unsettled`]).
+///
+/// A value inside an `@instance_filled` stays the content: the install
+/// reads an instance's fallback (to show it, to check what an instance
+/// sends against it), and no worker is there to put it back. A value a
+/// later pass rewrote (a cast to the port's type) is the pass's value, no
+/// longer the file's text, and stays as the pass left it.
+pub(crate) fn name_contents(
+    project: &mut weft_core::project::ProjectDefinition,
+    reads: Vec<ContentRead>,
+) -> weft_core::content::ContentValues {
+    /// The value at `at` in `field`, unless the way there crosses an
+    /// `@instance_filled`.
+    fn read_at<'a>(field: &'a mut serde_json::Value, at: &str) -> Option<&'a mut serde_json::Value> {
+        let mut value = field;
+        for token in at.split('/').skip(1) {
+            if weft_core::instance::as_instance_filled(value).is_some() {
+                return None;
+            }
+            let token = token.replace("~1", "/").replace("~0", "~");
+            value = match value {
+                serde_json::Value::Object(fields) => fields.get_mut(&token)?,
+                serde_json::Value::Array(items) => items.get_mut(token.parse::<usize>().ok()?)?,
+                _ => return None,
+            };
+        }
+        Some(value)
+    }
+    let mut named = weft_core::content::ContentValues::new();
+    for read in reads {
+        let field = match &read.owner {
+            ReadOwner::Node(id) => project.nodes.iter_mut().find(|node| &node.id == id).and_then(|node| node.written_value_mut(&read.field)),
+            ReadOwner::Group(id) => {
+                project.groups.iter_mut().find(|group| &group.id == id).and_then(|group| group.port_literals.get_mut(&read.field))
+            }
+        };
+        let Some(value) = field.and_then(|field| read_at(field, &read.at)).filter(|value| **value == read.value) else { continue };
+        *value = read.content.to_value();
+        named.insert(read.content.id(), std::sync::Arc::new(read.value));
+    }
+    named
+}
+
+/// What [`resolve_leaf`] found in a value that was a marker.
+struct ResolvedLeaf {
+    file_ref: FileRef,
+    /// For a `@file`, the content its value was cast from.
+    content: Option<weft_core::content::ContentRef>,
+}
+
 /// Resolve the marker one written value holds, in place, the way the
 /// parse does: a `@file` is read and cast to its type, a deferred
 /// `@asset` stays a marker respelled under the root (so the asset sync
@@ -653,7 +853,7 @@ fn resolve_leaf(
     fs: &CompileFs,
     home: Option<&std::path::Path>,
     whole: bool,
-) -> Result<Option<FileRef>, String> {
+) -> Result<Option<ResolvedLeaf>, String> {
     let Some(raw) = leaf.as_str() else { return Ok(None) };
     let file_ref = match parse_marker(raw) {
         None => return Ok(None),
@@ -662,11 +862,17 @@ fn resolve_leaf(
         Some(Err(msg)) => return Err(msg),
     };
     let file_ref = spell_from_root(file_ref, home)?;
-    *leaf = match resolve(&file_ref, fs)? {
-        Resolved::Value(resolved) => resolved,
-        Resolved::Deferred => serde_json::Value::String(marker_text(&file_ref)),
+    let content = match resolve(&file_ref, fs)? {
+        Resolved::Read(content, resolved) => {
+            *leaf = resolved;
+            Some(content)
+        }
+        Resolved::Deferred => {
+            *leaf = serde_json::Value::String(marker_text(&file_ref));
+            None
+        }
     };
-    Ok(Some(file_ref))
+    Ok(Some(ResolvedLeaf { file_ref, content }))
 }
 
 /// Resolve every `@file` in values written outside a source file (a

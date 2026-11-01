@@ -29,9 +29,10 @@ async fn tick_counting(pool: &Pool, replica: &str, until: i64, counts: &[(&str, 
     let hits: Vec<i64> = counts.iter().map(|(_, h, _)| *h).collect();
     let reasons: Vec<Option<&str>> = counts.iter().map(|(_, _, r)| *r).collect();
     let none = std::collections::BTreeMap::<String, u32>::new();
+    let room: Option<i64> = None;
     pool.scalar::<db::Json<serde_json::Value>>(
-        "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-        &[&replica, &PROJECT, &"tenant-1", &"bin-A", &until, &db::Json(db::WeftMade(&none)), &0i64, &keys, &hits, &reasons, &shortens],
+        "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+        &[&replica, &PROJECT, &"tenant-1", &"bin-A", &until, &db::Json(db::WeftMade(&none)), &0i64, &keys, &hits, &reasons, &shortens, &room, &room, &room],
     )
     .await
     .unwrap()

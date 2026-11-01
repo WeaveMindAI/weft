@@ -284,7 +284,8 @@ impl SourceTree for VersionFiles {
     }
 }
 
-/// Compile the materialized project: the definition, its catalog, and the
+/// Compile the materialized project: the definition, the value of each
+/// file content it names (`weft_core::content`), its catalog, and the
 /// project handle the plan reads. Blocking, every file read through
 /// `files` (the `weft.toml` from `root`, where [`materialize`] laid it
 /// out). What does not compile stays in the definition as its broken parts
@@ -295,12 +296,12 @@ impl SourceTree for VersionFiles {
 pub fn compile(
     root: &Path,
     files: Arc<VersionFiles>,
-) -> Result<(weft_core::ProjectDefinition, weft_catalog::FsCatalog, weft_compiler::project::Project)> {
+) -> Result<(weft_core::ProjectDefinition, weft_core::content::ContentValues, weft_catalog::FsCatalog, weft_compiler::project::Project)> {
     let project = weft_compiler::project::Project::load(root).map_err(|e| anyhow!("{e}"))?;
-    let (definition, catalog) = weft_compiler::hash::load_program_in(&project, files)
+    let (definition, catalog, contents) = weft_compiler::hash::load_program_in(&project, files)
         // SYNC: "compile failed:" <-> crates/weft-cli/src/commands/ensure.rs compile_failure
         .map_err(|e| anyhow!("compile failed:\n{e}"))?;
-    Ok((definition, catalog, project))
+    Ok((definition, contents, catalog, project))
 }
 
 #[cfg(test)]

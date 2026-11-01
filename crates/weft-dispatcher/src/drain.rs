@@ -262,14 +262,11 @@ impl Reached {
             Reaching::Fired { keys, tokens } => return Self::fired(state, scope.project_id, keys, tokens).await,
             Reaching::Builds(builds) => return Self::on_builds(state, scope.project_id, builds).await,
         };
-        let project = state
-            .projects
-            .project(scope.project_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("project {} is gone", scope.project_id))?;
+        let registered = state.registered(scope.project_id).await?.ok_or_else(|| anyhow::anyhow!("project {} is gone", scope.project_id))?;
+        let cuts = state.trigger_cuts(scope.project_id, &registered).await?;
         let activations = state.activations.list(scope.project_id).await?;
         let keys: Vec<weft_core::activation::ActivationKey> =
-            crate::infra_reach::activations_reached(reach, &activations, &project).into_iter().map(|a| a.key.clone()).collect();
+            crate::infra_reach::activations_reached(reach, &activations, &cuts).into_iter().map(|a| a.key.clone()).collect();
         let mut tokens = crate::store::postgres::entry_tokens(&state.pg_pool, scope.project_id, &keys).await?;
         tokens.extend(taken_down.iter().cloned());
         tokens.sort();

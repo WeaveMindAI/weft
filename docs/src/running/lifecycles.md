@@ -69,6 +69,10 @@ Deleting the node does not delete the container. `weft status` warns you:
 WARNING: live infra exists whose node the source does not declare (removed from it, or inside a part that does not compile); it keeps running (and consuming resources) until stopped/terminated via the infra verbs
 ```
 
+If you deleted it from the source and have not built since, its own line under
+`infra:` says so too, as `orphaned: the source declares it no more`, rather
+than calling it behind.
+
 It keeps running, and costing, until you stop or terminate it, and `weft infra
 stop --infra <node>` still reaches a node the program no longer declares.
 
@@ -121,7 +125,11 @@ recorded when it was set up, and it decides two things.
 
 A trigger is **behind** when its cut or the code it runs changed since it was
 set up. `weft status` shows it as ``on, behind the source (`weft resync` brings
-it up to date)``, and a resync moves only those.
+it up to date)``, and a resync moves only those. If a trigger's cut no longer
+works out in the source (it sits inside a loop that runs only in part), it
+shows as behind too while it is on. If you deleted a trigger from the source
+and it is still on, `weft status` says the program has it no more, with
+`weft deactivate --trigger <name>` to take it down.
 
 The infra a trigger depends on is what its runs reach plus any infra its
 setup reads an address from (infra it reads only through [baked

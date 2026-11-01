@@ -17,14 +17,17 @@ ctx](../nodes/ctx.md#a-projects-code)), or `weft branch` moves your folder, the
 runtime writes those files into it.
 
 Every command that builds (`run`, `build`, `bake`, `activate`, `resync`, `infra
-start`, `infra upgrade`) or works on the tree (`checkpoint`, `branch`, `tree`,
-`freeze`) also syncs the folder before it does anything, and says what it
-moved:
+start`, `infra upgrade`) or moves this folder in the tree (`checkpoint`,
+`branch`, `resolve`) also syncs the folder before it does anything, and says
+what it moved:
 
 ```text
 sent your changes to the install: src/main.weft, prompts/tone.txt
 brought the install's changes into this folder: nodes/greeter/mod.rs
 ```
+
+If a command only reads (`tree`, `freeze`) or acts on another working copy
+(`forget-copy`, `branch --copy`), it leaves your folder alone and syncs nothing.
 
 On a cloud install nothing watches your folder, so that sync is the only one.
 
@@ -324,7 +327,7 @@ pass the start of the one you mean.
 If a folder you once ran a weft command in is gone, forget its copy: its head stays
 where it was until you do. Forgetting a folder that is still there lasts only
 until the next command in it that syncs the folder (one that builds, or
-`weft tree`, `checkpoint`, `branch`, `freeze` or `forget-copy`), which registers it again, so
+`weft checkpoint`, `branch` or `resolve`), which registers it again, so
 `forget-copy` refuses this folder's own copy.
 
 Updating to 0.2.274 gave each project that had a head a program copy on that

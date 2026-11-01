@@ -148,6 +148,10 @@ pub struct DispatcherState {
     /// own (`PostgresStore::programs`), which a search's pass reads through
     /// too, so the bound is the whole process's.
     pub programs: Programs,
+    /// Each registered version's trigger cuts, by project and definition
+    /// hash (see [`DispatcherState::trigger_cuts`]): what a registration
+    /// walked never changes under its hash either.
+    pub trigger_cuts: TriggerCuts,
     /// The rows every live call reads, held in memory and read again when
     /// they change (`crate::held`).
     pub held: Arc<crate::held::Held>,
@@ -170,36 +174,54 @@ pub struct DispatcherState {
 /// weigh ([`programs_cache`]).
 pub type Programs = Arc<weft_core::content_cache::ContentCache<(uuid::Uuid, String), weft_core::ProjectDefinition>>;
 
-/// An empty [`Programs`], weighed by [`program_json_bytes`] and bounded by
+/// An empty [`Programs`], weighed by their JSON
+/// (`weft_core::content_cache::json_bytes`) and bounded by
 /// [`PROGRAMS_JSON_BYTES`].
 pub fn programs_cache() -> Programs {
-    Arc::new(weft_core::content_cache::ContentCache::weighed(PROGRAMS_JSON_BYTES, program_json_bytes))
+    Arc::new(weft_core::content_cache::ContentCache::weighed(PROGRAMS_JSON_BYTES, weft_core::content_cache::json_bytes))
 }
 
 /// How many bytes of JSON the programs a dispatcher keeps parsed
-/// ([`DispatcherState::programs`]) may weigh together
-/// ([`program_json_bytes`]). A parsed program holds about three times its
-/// JSON (`tests/resync_memory.rs` measures it), so they hold about 90 MiB
-/// at most, inside the 512Mi a dispatcher is never given less than.
+/// ([`DispatcherState::programs`]) may weigh together. A parsed program
+/// holds about three times its JSON (`tests/resync_memory.rs` measures
+/// it), so they hold about 90 MiB at most, inside the 512Mi a dispatcher
+/// is never given less than.
 pub const PROGRAMS_JSON_BYTES: usize = 32 * 1024 * 1024;
 
-/// What `program` weighs in [`DispatcherState::programs`]: the length of
-/// its JSON, counted as it is written out, nothing kept. Run once per
-/// program read from the store, never on a cache hit.
-pub fn program_json_bytes(program: &weft_core::ProjectDefinition) -> usize {
-    struct Counted(usize);
-    impl std::io::Write for Counted {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 += bytes.len();
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counted = Counted(0);
-    serde_json::to_writer(&mut counted, program).expect("a program read from its JSON writes back as JSON");
-    counted.0
+/// Registered versions' trigger cuts by project and definition hash,
+/// bounded by what they weigh ([`trigger_cuts_cache`]).
+pub type TriggerCuts = Arc<weft_core::content_cache::ContentCache<(uuid::Uuid, String), weft_core::run_spec::TriggerCuts>>;
+
+/// An empty [`TriggerCuts`], weighed by the text each holds and bounded by
+/// [`TRIGGER_CUTS_BYTES`].
+pub fn trigger_cuts_cache() -> TriggerCuts {
+    Arc::new(weft_core::content_cache::ContentCache::weighed(TRIGGER_CUTS_BYTES, cuts_bytes))
+}
+
+/// How many bytes of text the trigger cuts a dispatcher keeps may hold
+/// together: a trigger's cut is its address, a hash and a few infra
+/// places, so this keeps tens of thousands of triggers' worth.
+pub const TRIGGER_CUTS_BYTES: usize = 4 * 1024 * 1024;
+
+/// What one version's cuts weigh in [`TriggerCuts`]: the text they hold.
+fn cuts_bytes(cuts: &weft_core::run_spec::TriggerCuts) -> usize {
+    cuts.iter()
+        .map(|(trigger, cut)| {
+            trigger.len()
+                + match cut {
+                    Ok(cut) => cut.fingerprint.len() + cut.depends_on.iter().map(String::len).sum::<usize>(),
+                    Err(why) => why.len(),
+                }
+        })
+        .sum()
+}
+
+/// The program a project runs now ([`DispatcherState::registered`]).
+#[derive(Clone)]
+pub struct Registered {
+    /// Its hash; `None` for the empty program of a project never built.
+    pub definition_hash: Option<String>,
+    pub program: Arc<weft_core::ProjectDefinition>,
 }
 
 /// The base for outside URLs of one answer
@@ -262,6 +284,53 @@ impl DispatcherState {
         let program = Arc::new(program);
         self.programs.put((project, hash.to_string()), program.clone());
         Ok(Some(program))
+    }
+
+    /// The program project `id` runs now, with its hash: its running
+    /// build's, read through the programs this process keeps
+    /// ([`Self::program`]), or the empty program of a project declared and
+    /// never built. `None` for no such project. THE way the dispatcher
+    /// reads a project's program.
+    pub async fn registered(&self, id: uuid::Uuid) -> anyhow::Result<Option<Registered>> {
+        match self.projects.running_definition(id).await? {
+            None => Ok(None),
+            Some(Some(hash)) => {
+                let program = self
+                    .program(id, &hash)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("project {id} runs program {hash}, which was never recorded"))?;
+                Ok(Some(Registered { definition_hash: Some(hash), program }))
+            }
+            Some(None) => Ok(self.projects.project(id).await?.map(|program| Registered { definition_hash: None, program: Arc::new(program) })),
+        }
+    }
+
+    /// Each trigger's cut in `registered`: what its registration walked
+    /// (`program_trigger_cut`), kept once read; none for a project never
+    /// built, whose program has no trigger. THE way the dispatcher reads a
+    /// version's cuts; none walks them again.
+    pub async fn trigger_cuts(&self, id: uuid::Uuid, registered: &Registered) -> anyhow::Result<Arc<weft_core::run_spec::TriggerCuts>> {
+        match registered.definition_hash.as_deref() {
+            Some(hash) => self.version_cuts(id, hash).await,
+            None => Ok(Arc::default()),
+        }
+    }
+
+    /// [`Self::trigger_cuts`] of the version registered under `hash`. A
+    /// program whose cuts were never walked (a cut a run kept) is no
+    /// registered version, which only a caller's bug asks this of.
+    pub async fn version_cuts(&self, id: uuid::Uuid, hash: &str) -> anyhow::Result<Arc<weft_core::run_spec::TriggerCuts>> {
+        if let Some(cuts) = self.trigger_cuts.get(&(id, hash.to_string())) {
+            return Ok(cuts);
+        }
+        let cuts = self
+            .projects
+            .trigger_cuts(id, hash)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("program {hash} of project {id} is no version a build registered: its triggers' cuts were never walked"))?;
+        let cuts = Arc::new(cuts);
+        self.trigger_cuts.put((id, hash.to_string()), cuts.clone());
+        Ok(cuts)
     }
 
     /// The program identity of the run whose rows are `events`

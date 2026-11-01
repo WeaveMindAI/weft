@@ -43,6 +43,18 @@ pub struct DoorFire {
     pub released: bool,
 }
 
+/// A queued run handed to a worker to carry on (`POST /_weft/run/<run_id>`),
+/// with the program it runs (`run.definition_hash`): the worker reads that
+/// program, and the files it names, before it claims the run, so a store
+/// that does not answer leaves the run queued rather than ending it
+/// ([`RunAnswer::NotNow`]).
+// SYNC: the run call <-> crates/weft-engine/src/worker.rs (run_handler), crates/weft-dispatcher/src/delivery.rs (run_on_worker)
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunDelivery {
+    pub definition_hash: String,
+}
+
 /// How a call to carry on one queued run ended, as the worker answers
 /// `/_weft/run/<run_id>` and the dispatcher reads it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -55,6 +67,14 @@ pub enum RunAnswer {
     /// Nothing to run: the run is not queued (another worker claimed it,
     /// or it ended).
     NothingToRun,
+    /// Not carried on now, and `error` says why: the program the run runs,
+    /// or a file it names, could not be read (the store or the broker did
+    /// not answer), or the broker could not be asked to claim it. The run
+    /// stays queued, to be handed out again; a claim whose answer was lost
+    /// on its way may have landed, and the lost-run sweep queues it again
+    /// then. A program or file that is gone for good is no such answer:
+    /// the worker claims the run and ends it Failed with that.
+    NotNow { error: String },
 }
 
 /// What a worker made of a [`DoorFire`], on the first line of its answer.
@@ -312,10 +332,26 @@ mod wire_tests {
 
     #[test]
     fn a_run_answer_says_how_it_ended() {
-        for a in [RunAnswer::Completed, RunAnswer::Failed { error: "boom".into() }, RunAnswer::NothingToRun] {
+        for a in [
+            RunAnswer::Completed,
+            RunAnswer::Failed { error: "boom".into() },
+            RunAnswer::NothingToRun,
+            RunAnswer::NotNow { error: "the store did not answer".into() },
+        ] {
             assert_eq!(serde_json::from_value::<RunAnswer>(serde_json::to_value(&a).unwrap()).unwrap(), a);
         }
         assert_eq!(serde_json::to_value(RunAnswer::NothingToRun).unwrap(), serde_json::json!({ "ended": "nothing_to_run" }));
+        assert_eq!(
+            serde_json::to_value(RunAnswer::NotNow { error: "e".into() }).unwrap(),
+            serde_json::json!({ "ended": "not_now", "error": "e" })
+        );
+    }
+
+    #[test]
+    fn a_run_delivery_names_its_program_in_camel_case() {
+        let delivery = RunDelivery { definition_hash: "h1".into() };
+        assert_eq!(serde_json::to_value(&delivery).unwrap(), serde_json::json!({ "definitionHash": "h1" }));
+        assert_eq!(serde_json::from_value::<RunDelivery>(serde_json::json!({ "definitionHash": "h1" })).unwrap(), delivery);
     }
 
     #[test]

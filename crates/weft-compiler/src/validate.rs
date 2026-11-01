@@ -214,7 +214,7 @@ fn check_instance_filled(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         "'{name}.{field}' is the port of a group, a loop or an included file, so it passes a value \
          on rather than using one; write `@instance_filled` on the input of the node inside \
          that reads it");
-    for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+    for group in &project.groups {
         for (field, value) in &group.port_literals {
             if weft_core::instance::as_instance_filled(value).is_none() { continue; }
             let (span, file) = group_literal_anchor(group, field);
@@ -1462,8 +1462,8 @@ fn check_double_driven_ports(project: &ProjectDefinition, d: &mut Vec<Diagnostic
             _ => None,
         })
         .collect();
-    // A loop's literals sit on its `LoopIn` too, where the node rule reads them.
-    for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+    // A loop holds none: its sit on its `LoopIn`, where the node rule reads them.
+    for group in &project.groups {
         for (name, value) in &group.port_literals {
             if value.is_null() { continue; }
             // A gate's wire lands on the group itself, no port of it.
@@ -1536,7 +1536,7 @@ fn check_two_gates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             );
         }
     }
-    for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+    for group in &project.groups {
         let driven = |port: &str| {
             group.port_literals.get(port).is_some_and(|v| !v.is_null())
                 || project.edges.iter().any(|e| e.target == group.id && e.target_port() == port && !e.to_group_port())
@@ -2284,9 +2284,9 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 
     // config-type-mismatch on a group's own ports: the literal written on
     // an input (`g.x = 5`) is held to the type the group declares there.
-    // A loop's sit on its `LoopIn` too, where the node rule below reads
-    // them.
-    for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+    // A loop holds none: its sit on its `LoopIn`, where the node rule
+    // below reads them.
+    for group in &project.groups {
         for (key, value) in &group.port_literals {
             if let Some(why) = refuse_written_secret(value, &weft_core::project::plain_id(&group.id), key) {
                 let (span, file) = group_literal_anchor(group, key);
@@ -2507,7 +2507,7 @@ fn check_container_inputs(project: &ProjectDefinition, root: Option<&str>, d: &m
 /// a Boolean, as on a node. A loop's sits on its `LoopIn`, where the node
 /// rule reads it.
 fn check_group_gates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
-    for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+    for group in &project.groups {
         for (key, value) in group.port_literals.iter().filter(|(key, _)| weft_core::run::skip::is_gate_port(key)) {
             if value.is_boolean() || value.is_null() { continue; }
             let (span, file) = group_literal_anchor(group, key);

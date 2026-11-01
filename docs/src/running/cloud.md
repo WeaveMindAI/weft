@@ -195,7 +195,11 @@ trigger's open connection (512Mi when unset, at least 512Mi). The install sets e
 change by hand in the Cloud Run console is put back the next time the workflow
 runs. The dispatcher gets more because every version is compiled there, and on
 Cloud Run the files a build writes are held in memory, beside the programs the
-dispatcher keeps read (about 90 MiB at most).
+dispatcher keeps read (about 90 MiB at most). A build's files may take up to a
+quarter of the dispatcher's memory, with room kept beside them for the version
+files the dispatcher fetched before: a build that needs more fails with `No space
+left on device` and leaves the copy serving everything else, and raising
+`WEFT_DISPATCHER_MEMORY` raises that quarter with it.
 
 These are repository variables on your fork, like the ones above, so
 merging a new weft into the fork keeps them. After you change one, run the

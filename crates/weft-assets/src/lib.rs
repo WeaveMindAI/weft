@@ -292,6 +292,33 @@ pub async fn publish_files(
         .collect())
 }
 
+/// Publish contents the caller already holds whole (the text of an
+/// `@asset` a build fetched from a URL or read off the machine), each by
+/// the path it was named with, which gives its media type and the
+/// upload's filename: [`publish_hashed`] over the bytes in memory, so a
+/// content the tenant already stores costs one question.
+pub async fn publish_held(contents: &BTreeMap<String, Vec<u8>>, store: &dyn AssetStore) -> Result<()> {
+    let hashed = contents
+        .iter()
+        .map(|(path, bytes)| {
+            let (hash, size, head) = hash_reader_peeking(bytes.as_slice())?;
+            Ok(HashedFile { path: path.clone(), hash, size, mime: media_type(&head, path) })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    publish_hashed(&hashed, &Held(contents), store).await?;
+    Ok(())
+}
+
+/// Contents in memory as an [`AssetSource`], by path.
+struct Held<'a>(&'a BTreeMap<String, Vec<u8>>);
+
+impl AssetSource for Held<'_> {
+    fn open(&self, path: &str) -> Result<Box<dyn Read + Send>> {
+        let bytes = self.0.get(path).with_context(|| format!("'{path}' is not among the contents held"))?;
+        Ok(Box::new(std::io::Cursor::new(bytes.clone())))
+    }
+}
+
 /// Ensure `refs` are uploaded and return the compiler's resolution map
 /// (`FileRef::resolution_key -> stored-file value`).
 ///

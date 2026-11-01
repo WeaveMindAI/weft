@@ -16,7 +16,8 @@
 //! names is one of the project's asset references, so the store never
 //! expires it ([`publish_references`]): published after a working copy's
 //! files change, after a stamp, a switch or a prune, and when a build
-//! registers.
+//! registers. What the program of a run not yet ended reads is kept too,
+//! so a run waiting on a build since replaced still finds it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -924,9 +925,10 @@ pub fn blob_keys<'a>(manifests: impl Iterator<Item = (&'a str, &'a BTreeMap<Stri
 
 /// The keys the project's registered build reads, from the resolutions
 /// it was built with (`BuildInputs::assets`): every stored file a
-/// resolution names, and every `@asset` that names a stored key itself
-/// (a text-typed stored asset is inlined into the build, and its source
-/// file is what a later build reads again).
+/// resolution names, the content a text resolution names
+/// (`weft_core::content`), which its workers read, and every `@asset`
+/// that names a stored key itself (its source file is what a later build
+/// reads again).
 fn program_asset_keys(inputs: &weft_core::builds::BuildInputs) -> Vec<String> {
     let mut keys = BTreeSet::new();
     for (key, value) in &inputs.assets {
@@ -934,20 +936,61 @@ fn program_asset_keys(inputs: &weft_core::builds::BuildInputs) -> Vec<String> {
         if path.starts_with("asset/") && weft_core::storage::key::is_scope_key(path) {
             keys.insert(path.to_string());
         }
-        for file in weft_core::storage::stored_files_within(value) {
-            if weft_core::storage::key::parse_key(&file.key).is_ok_and(|k| k.scope == weft_core::storage::key::KeyScope::Asset) {
-                // Stored with its tenant; the publish anchors every key on
-                // the tenant again.
-                keys.insert(file.key.split_once('/').map(|(_, rest)| rest.to_string()).unwrap_or(file.key));
-            }
-        }
+        asset_keys_within(value, &mut keys);
     }
     keys.into_iter().collect()
 }
 
+/// The keys of the tenant's assets `program`'s workers read: the content
+/// each value it carries by name stands for (`weft_core::content`), a
+/// version's file or a text a build stored alike, and every stored file
+/// of the tenant's assets a value names.
+pub fn asset_keys_read_by(program: &weft_core::ProjectDefinition) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for value in program.written_values() {
+        asset_keys_within(value, &mut keys);
+    }
+    keys
+}
+
+/// Add to `keys` the content `value` names and the stored files of the
+/// tenant's assets it names, at any depth, tenant-less.
+fn asset_keys_within(value: &serde_json::Value, keys: &mut BTreeSet<String>) {
+    for content in weft_core::content::refs_in_value(value) {
+        keys.insert(content.asset_key());
+    }
+    for file in weft_core::storage::stored_files_within(value) {
+        if weft_core::storage::key::parse_key(&file.key).is_ok_and(|k| k.scope == weft_core::storage::key::KeyScope::Asset) {
+            // Stored with its tenant; the publish anchors every key on
+            // the tenant again.
+            keys.insert(file.key.split_once('/').map(|(_, rest)| rest.to_string()).unwrap_or(file.key));
+        }
+    }
+}
+
+/// The keys the programs of the project's unfinished runs read
+/// ([`asset_keys_read_by`]): a run waiting on a build the project has
+/// since replaced still needs what that build stored. Read as the
+/// references are published, never as a run starts, pauses or ends: a
+/// run that ended lets go of them at the project's next publish.
+async fn unfinished_runs_asset_keys(state: &DispatcherState, project: uuid::Uuid) -> Result<BTreeSet<String>, Refused> {
+    let hashes = state.runs.unfinished_programs(project).await.map_err(|e| internal("unfinished runs' programs", e))?;
+    let mut keys = BTreeSet::new();
+    for hash in hashes {
+        let program = state
+            .program(project, &hash)
+            .await
+            .map_err(|e| internal("an unfinished run's program", e))?
+            .ok_or_else(|| internal("an unfinished run's program", anyhow::anyhow!("a run of project {project} runs program {hash}, which was never recorded")))?;
+        keys.extend(asset_keys_read_by(&program));
+    }
+    Ok(keys)
+}
+
 /// Publish the project's asset references: every blob any of its
-/// versions or working copies names, and every file its registered build
-/// reads, are kept; `required` must be stored, or nothing changes and the
+/// versions or working copies names, every file its registered build
+/// reads, and every file the programs of its unfinished runs read, are
+/// kept; `required` must be stored, or nothing changes and the
 /// call is refused (a write naming a blob that never landed). What no
 /// project of the tenant references any more starts expiring.
 ///
@@ -983,6 +1026,7 @@ pub(crate) async fn publish_references(state: &DispatcherState, project: uuid::U
     if let Some(build) = state.projects.running_build(project).await.map_err(|e| internal("running build", e))? {
         kept.extend(program_asset_keys(&build.inputs));
     }
+    kept.extend(unfinished_runs_asset_keys(state, project).await?);
     let anchor = |key: &str| format!("{tenant}/{key}");
     let request = weft_core::storage::AssetReferencesRequest {
         project: project.to_string(),
@@ -1000,7 +1044,7 @@ pub(crate) async fn publish_references(state: &DispatcherState, project: uuid::U
         .missing
         .iter()
         .map(|key| {
-            let versions = named_by.get(key).map(|v| v.join(", ")).unwrap_or_else(|| "a working copy or the registered build".into());
+            let versions = named_by.get(key).map(|v| v.join(", ")).unwrap_or_else(|| "a working copy, the registered build or an unfinished run".into());
             tracing::warn!(%project, key, %versions, "a version names a stored file that no longer exists");
             format!(
                 "{versions} name(s) a stored file that no longer exists in storage ({}); a version that lost it cannot be \
@@ -1057,6 +1101,24 @@ pub(crate) async fn program_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registered build keeps alive the content a text resolution names
+    /// (`weft_core::content`), which its workers read, beside the stored
+    /// files a file resolution names.
+    #[test]
+    fn a_build_keeps_the_content_its_text_resolutions_name() {
+        let text = weft_core::weft_type::WeftType::primitive(weft_core::weft_type::WeftPrimitive::String);
+        let (content, _) = weft_core::content::ContentRef::of_text("terms", &text, "https://example.com/terms.txt").unwrap();
+        let inputs = weft_core::builds::BuildInputs {
+            node_set: weft_core::builds::NodeSet::Referenced,
+            assets: [(
+                weft_core::project::ResolutionKey { path: "https://example.com/terms.txt".into(), ty: "String".into() },
+                content.to_value(),
+            )]
+            .into(),
+        };
+        assert_eq!(program_asset_keys(&inputs), vec![content.asset_key()]);
+    }
 
     /// A checkpoint of the code head is already on leaves head where it
     /// is, its run included, so the next `--seed` still inherits from that

@@ -6,6 +6,7 @@
 mod broken_parts;
 mod computer_includes;
 mod enrich_tests;
+mod file_contents;
 mod fires_with;
 mod gated_fire;
 mod highlighting_vocabulary;

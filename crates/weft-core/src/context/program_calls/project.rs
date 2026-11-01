@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 
 use crate::deactivation::Following;
 use crate::program::project::ProjectCall;
-use crate::projects::{DeclareRequest, ProjectRemoved, ProjectStatusResponse, ProjectSummary, QuiesceRequest, Quiesced, StatusQuery};
+use crate::projects::{DeclareRequest, ProjectRemoved, ProjectStatusResponse, ProjectSummary, QuiesceRequest, Quiesced, StatusRequest};
 use crate::signal::timer::{Timer, TimerSpec};
 use serde_json::Value;
 
@@ -85,7 +85,7 @@ impl<'a> ProjectCalls<'a> {
     /// its infra, its runs, its builds in flight, what is behind the
     /// registered build, and the verbs it accepts right now.
     pub async fn status(self) -> WeftResult<ProjectStatusResponse> {
-        self.call(ProgramCall::Project(ProjectCall::Status { query: StatusQuery::default() }), StopSelf::Keep).await
+        self.call(ProgramCall::Project(ProjectCall::Status { request: StatusRequest::default() }), StopSelf::Keep).await
     }
 
     /// Cancel the project's build in flight (`weft cancel-build`): every

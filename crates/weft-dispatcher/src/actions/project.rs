@@ -12,7 +12,7 @@ use weft_core::program::project::ProjectCall;
 use weft_core::program::ProgramCallOutcome;
 use weft_core::projects::{
     DeclareRequest, GoingRun, ProjectDrift, ProjectRemoved, ProjectRunsSummary, ProjectStatusResponse, ProjectSummary, QuiesceRequest, Quiesced,
-    StatusQuery,
+    StatusRequest,
 };
 use weft_core::ProjectDefinition;
 use weft_task_store::db::Client as _;
@@ -48,7 +48,7 @@ pub(crate) async fn program_call(
         ProjectCall::List => answered(&list(state, actor).await?),
         ProjectCall::Get => answered(&get(state, actor, project).await.map_err(StatusError::into_parts)?),
         ProjectCall::Declare { request } => answered(&declare(state, actor, request).await?),
-        ProjectCall::Status { query } => answered(&status(state, actor, project, query).await.map_err(StatusError::into_parts)?),
+        ProjectCall::Status { request } => answered(&status(state, actor, project, request).await.map_err(StatusError::into_parts)?),
         ProjectCall::CancelBuild => answered(&cancel_build(state, actor, project).await?),
         ProjectCall::Quiesce { request } => answered(&quiesce(state, actor, project, request).await.map_err(StatusError::into_parts)?),
         ProjectCall::Remove { force } => answered(&remove(state, actor, project, *force).await.map_err(StatusError::into_parts)?),
@@ -199,14 +199,14 @@ pub(crate) async fn get(state: &DispatcherState, actor: &Actor, id: uuid::Uuid) 
 
 /// Aggregate view for `weft status`: registration, listener state,
 /// per-node infra state, each trigger's state, a rollup of recent runs,
-/// drift (against the hashes the query names, else the registered
+/// drift (against the hashes the request names, else the registered
 /// build's), and the verbs valid right now. One answer, no stitching
 /// required by a client.
 pub(crate) async fn status(
     state: &DispatcherState,
     actor: &Actor,
     id: uuid::Uuid,
-    query: &StatusQuery,
+    request: &StatusRequest,
 ) -> Result<ProjectStatusResponse, StatusError> {
     // The marked gate: a client asking about a project it has not
     // registered yet (a brand-new `weft run`) reads the marker as "not
@@ -221,25 +221,26 @@ pub(crate) async fn status(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get project: {e}")))?
         .ok_or(StatusError::NotMyProject)?;
-    let project = state
-        .projects
-        .project(id)
+    let registered = state
+        .registered(id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e:#}")))?
         // A registered project missing its definition is a real
         // inconsistency, NOT "no such project": Other (no marker), so
         // the CLI bubbles it loudly instead of skipping the gate.
         .ok_or((StatusCode::NOT_FOUND, "project definition missing".to_string()))?;
+    let project = &registered.program;
     let listener_running = crate::listener::project_is_listening(&state.pg_pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listener status: {e}")))?;
 
     let internal = |what: &'static str| move |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
     let binary_hash = state.projects.running_binary_hash(id).await.map_err(internal("running_binary_hash"))?;
-    let definition_hash = state.projects.running_definition_hash(id).await.map_err(internal("running_definition_hash"))?;
-    let desired = Desired::of_query(state, id, &project, query, binary_hash.as_deref(), definition_hash.as_deref()).await?;
-    let snapshot = gather_action_snapshot(state, id, &project, &desired).await?;
-    let (infra, instance_infra) = infra_entries(&project, &snapshot.infra, &snapshot.activations, &desired);
+    let definition_hash = registered.definition_hash.clone();
+    let cuts = state.trigger_cuts(id, &registered).await.map_err(crate::api::project::cuts_refused)?;
+    let desired = Desired::registered(state, id, &registered, binary_hash.as_deref()).await?.requested_by(request);
+    let snapshot = gather_action_snapshot(state, id, project, &desired).await?;
+    let (infra, instance_infra) = infra_entries(project, &cuts, &snapshot.infra, &snapshot.activations, &desired);
     let traffic = crate::api::project::TriggerTraffic::of(&state.pg_pool, id, crate::lease::now_unix()).await.map_err(internal("trigger traffic"))?;
     let has_infra = snapshot.has_infra;
     let has_triggers = snapshot.has_triggers;
@@ -293,6 +294,11 @@ pub(crate) async fn status(
         running,
     };
 
+    // The registered build's orphans, and the copies of places the source
+    // the caller compiled has no more.
+    let orphaned_infra = snapshot.orphaned_infra
+        || infra.iter().any(|entry| entry.orphaned)
+        || instance_infra.iter().any(|entry| entry.orphaned);
     let drift = ProjectDrift {
         infra_drift: infra.iter().any(|entry| entry.behind) || instance_infra.iter().any(|entry| entry.behind),
         binary_drift: desired.binary_drifts(binary_hash.as_deref()),
@@ -334,13 +340,13 @@ pub(crate) async fn status(
             })
             .collect(),
         address: project_address(state, id).await,
-        orphaned_infra: snapshot.orphaned_infra,
+        orphaned_infra,
         infra_rollup,
         infra_busy: snapshot.infra_busy,
         drift,
         available_actions,
         instance_infra,
-        triggers: trigger_entries(&project, &snapshot.activations, &traffic, &desired, binary_hash.as_deref(), crate::lease::now_unix()),
+        triggers: trigger_entries(project, &cuts, &snapshot.activations, &traffic, &desired, binary_hash.as_deref(), crate::lease::now_unix()),
         instances,
         limited: limited_entries(state, id)
             .await

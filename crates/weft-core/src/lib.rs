@@ -22,6 +22,9 @@ pub mod caller_token;
 pub mod door_fire;
 pub mod casing;
 pub mod comma_list;
+// What a program carries for the text of a file it names: a marker
+// naming the stored content, put back by the worker that reads it.
+pub mod content;
 #[cfg(feature = "runtime")]
 pub mod cancellation;
 #[cfg(feature = "runtime")]

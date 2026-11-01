@@ -156,11 +156,23 @@ pub struct Version {
 /// first built with ([`Kept`]).
 #[async_trait::async_trait]
 pub trait Prepare: Send + Sync {
-    /// What each of `definition`'s `@asset`s stands for, by resolution key.
-    async fn assets(&self, storage: &dyn ProjectStorage, tenant: &str, definition: &weft_core::ProjectDefinition) -> Result<weft_core::project::AssetResolutions>;
+    /// What each of `definition`'s `@asset`s stands for.
+    async fn assets(&self, storage: &dyn ProjectStorage, tenant: &str, definition: &weft_core::ProjectDefinition) -> Result<Assets>;
     /// Refuse (a [`RunRefused`]) the run this build is for, held to the
     /// compiled program, when it could not start.
     async fn check(&self, definition: &weft_core::ProjectDefinition) -> Result<()>;
+}
+
+/// What a build's `@asset`s stand for ([`Prepare::assets`]).
+#[derive(Debug)]
+pub struct Assets {
+    /// Each `@asset`'s value, by resolution key: a stored file, or the
+    /// marker naming a text's content (`weft_core::content`). What the
+    /// program carries, and what the build keeps (`BuildInputs::assets`).
+    pub resolutions: weft_core::project::AssetResolutions,
+    /// The value of each text content those name, which the build's gate
+    /// reads (`weft_compiler::unsettled`).
+    pub contents: weft_core::content::ContentValues,
 }
 
 /// Why a build refused the run it was for: the refusal the run itself
@@ -180,13 +192,16 @@ impl std::error::Error for RunRefused {}
 /// The resolutions a registered version was first built with, taken as
 /// they were (`BuildInputs::assets`). A stored-file resolution is still
 /// rebuilt from what the store records for its key, which must be this
-/// tenant's and of the kind the ref declares; a text resolution is
-/// program data, taken as it is.
+/// tenant's and of the kind the ref declares; a text resolution names
+/// its content (`weft_core::content`), whose bytes are read back from the
+/// tenant's assets (held to their hash), and one an older weft kept as the
+/// text itself is stored and named now, so the build this registers keeps
+/// the name.
 pub struct Kept<'a>(pub &'a weft_core::project::AssetResolutions);
 
 #[async_trait::async_trait]
 impl Prepare for Kept<'_> {
-    async fn assets(&self, storage: &dyn ProjectStorage, tenant: &str, definition: &weft_core::ProjectDefinition) -> Result<weft_core::project::AssetResolutions> {
+    async fn assets(&self, storage: &dyn ProjectStorage, tenant: &str, definition: &weft_core::ProjectDefinition) -> Result<Assets> {
         kept_assets(storage, tenant, definition, self.0).await
     }
 
@@ -208,6 +223,12 @@ pub trait ProjectStorage: Send + Sync {
     async fn download(&self, key: &str, dest: &std::path::Path) -> Result<()>;
     /// What the store records about one stored file.
     async fn meta(&self, key: &str) -> Result<weft_core::storage::StoredFileMeta>;
+    /// Store `texts` (bytes by the path they were read from, which names
+    /// the media type) among `tenant`'s assets, each by its content: the
+    /// text a program's `@asset`s name, so a worker that reads the program
+    /// finds it (`assets::Resolving`, and [`Kept`] for the text an older
+    /// weft inlined).
+    async fn store_texts(&self, tenant: &str, texts: &BTreeMap<String, Vec<u8>>) -> Result<()>;
 }
 
 /// Everything a build needs that belongs to the install rather than the
@@ -255,12 +276,13 @@ impl VersionBuilder {
         let packaging = self.images.worker_packaging();
         let images = self.images.clone();
         // The compile and the staging are blocking filesystem work.
-        let (mut compiled, catalog, project) = tokio::task::spawn_blocking(move || source::compile(&root, files))
+        let (mut compiled, mut contents, catalog, project) = tokio::task::spawn_blocking(move || source::compile(&root, files))
             .await
             .context("the compile task panicked")??;
-        let assets = prepare.assets(storage.as_ref(), tenant, &compiled).await?;
+        let Assets { resolutions: assets, contents: asset_contents } = prepare.assets(storage.as_ref(), tenant, &compiled).await?;
         weft_compiler::file_ref::apply_asset_resolutions(&mut compiled, &assets)
             .map_err(|errs| anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
+        contents.extend(asset_contents);
         prepare.check(&compiled).await?;
         let name = project.manifest.package.name.clone();
         // Every file was checked against the version as it was laid out, so
@@ -270,6 +292,7 @@ impl VersionBuilder {
             let plan = weft_compiler::build_plan::plan_build_from(
                 &project,
                 &compiled,
+                &contents,
                 &catalog,
                 // `source::compile` read the project from disk.
                 weft_compiler::CompileFs::disk(&project.root),
@@ -629,7 +652,7 @@ async fn kept_assets(
     tenant: &str,
     definition: &weft_core::ProjectDefinition,
     sent: &weft_core::project::AssetResolutions,
-) -> Result<weft_core::project::AssetResolutions> {
+) -> Result<Assets> {
     let mut map = BTreeMap::new();
     let mut refused = Vec::new();
     let file_refs = weft_compiler::file_ref::collect_asset_refs(definition)
@@ -666,15 +689,58 @@ async fn kept_assets(
         }
         map.insert(key, weft_core::storage::typed_file_value(&file, &r.ty));
     }
+    // A text resolution is the content's name (`weft_core::content`),
+    // whose bytes the first build stored: read back and held to their
+    // hash, so a content the store lost is refused here, naming the file,
+    // rather than in every run. One a weft from before names kept holds
+    // the text itself: read as a String it is the file's bytes, stored
+    // now and named; read as another type it no longer says what the file
+    // held, and the version is built again from its files, by its person.
+    let string = weft_core::weft_type::WeftType::Primitive(weft_core::weft_type::WeftPrimitive::String);
+    let mut contents = weft_core::content::ContentValues::new();
+    let mut kept_text: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for r in weft_compiler::file_ref::collect_text_refs(definition) {
-        if let Some(value) = sent.get(&r.resolution_key()) {
-            map.insert(r.resolution_key(), value.clone());
+        let Some(value) = sent.get(&r.resolution_key()) else { continue };
+        if let Some(content) = weft_core::content::ContentRef::from_value(value) {
+            if contents.contains_key(&content.id()) {
+                map.insert(r.resolution_key(), value.clone());
+                continue;
+            }
+            let read = storage.read(&format!("{tenant}/{}", content.asset_key())).await.map_err(|e| format!("{e:#}"));
+            match read.and_then(|bytes| content.value_of(&bytes)) {
+                Ok(read) => {
+                    contents.insert(content.id(), std::sync::Arc::new(read));
+                    map.insert(r.resolution_key(), value.clone());
+                }
+                Err(why) => refused.push(format!(
+                    "@asset({:?}, {}): the text this build kept cannot be read back ({why}); run `weft resync` in the \
+                     project's folder to build it again from its files",
+                    r.path, r.ty
+                )),
+            }
+            continue;
+        }
+        match value {
+            serde_json::Value::String(text) if r.ty == string => {
+                let (content, read) = weft_core::content::ContentRef::of_text(text, &r.ty, &r.path).map_err(anyhow::Error::msg)?;
+                kept_text.insert(r.path.clone(), text.as_bytes().to_vec());
+                contents.insert(content.id(), std::sync::Arc::new(read));
+                map.insert(r.resolution_key(), content.to_value());
+            }
+            _ => refused.push(format!(
+                "@asset({:?}, {}): this build kept the text read as {}, as weft did before it stored a file's text, and \
+                 that no longer says what the file held; run `weft resync` in the project's folder to build it again from its files",
+                r.path, r.ty, r.ty
+            )),
         }
     }
     if !refused.is_empty() {
         bail!("assets the build cannot use:\n  {}", refused.join("\n  "));
     }
-    Ok(map)
+    if !kept_text.is_empty() {
+        storage.store_texts(tenant, &kept_text).await.context("store the text a build from an older weft kept")?;
+    }
+    Ok(Assets { resolutions: map, contents })
 }
 
 /// Every infra place's image refs, from the plan: the images belong to

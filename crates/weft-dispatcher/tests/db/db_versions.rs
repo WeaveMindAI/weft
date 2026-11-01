@@ -227,6 +227,53 @@ async fn cleaning_a_run_erases_it_and_clears_head_run(pool: Pool) {
     assert_eq!(versions.versions(project).await.unwrap().len(), 1, "the version stays");
 }
 
+/// A text a build stored (here a page a URL answered) that only an older
+/// build's program names stays among what the project's asset references
+/// keep while a run of that program has not ended, parked on a wait
+/// included, though a newer build replaced it; once the run ended,
+/// nothing keeps it, so the next publish lets it go (what the store does
+/// with a key a publish stops naming is the broker's
+/// `asset_lifetime_keeps_current_and_expires_removed_files_after_last_access`).
+#[weft_db_macros::test]
+async fn an_unfinished_run_keeps_what_its_replaced_program_reads(pool: Pool) {
+    let (store, projects, versions) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    let text = weft_core::weft_type::WeftType::primitive(weft_core::weft_type::WeftPrimitive::String);
+    let (terms, _) = weft_core::content::ContentRef::of_text("terms", &text, "https://example.com/terms.txt").unwrap();
+    let old: ProjectDefinition = serde_json::from_value(json!({
+        "id": project,
+        "nodes": [{
+            "id": "a", "nodeType": "Wait", "label": null, "config": { "terms": terms.to_value() },
+            "position": { "x": 0.0, "y": 0.0 }, "inputs": [], "outputs": [],
+            "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+        }],
+        "edges": []
+    }))
+    .expect("the old program");
+    projects
+        .register_with_hashes(old, "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None, None, None, None, None)
+        .await
+        .expect("register the old build");
+    let v = version(project, &manifest(&[("main.weft", "aaa")]), None, None, 1);
+    versions.upsert_version(&v).await.unwrap();
+    let run = start_run(&store, project, &v.id, None, None, 5).await;
+    pool.execute("UPDATE run SET state = 'parked' WHERE run_id = $1", &[&run]).await.unwrap();
+    projects
+        .register_with_hashes(rig_project(project), "db-rig", "", TENANT, Some("bin-B"), Some("def-2"), None, None, None, None, None, None)
+        .await
+        .expect("register the new build");
+
+    assert_eq!(store.unfinished_programs(project).await.unwrap(), vec!["def-1".to_string()]);
+    let program = projects.program(project, "def-1").await.unwrap().expect("the old program is kept");
+    let keys = weft_dispatcher::actions::versions::asset_keys_read_by(&program);
+    assert!(keys.contains(&terms.asset_key()), "the parked run's program reads the text: {keys:?}");
+    let current = projects.program(project, "def-2").await.unwrap().expect("the new program");
+    assert!(weft_dispatcher::actions::versions::asset_keys_read_by(&current).is_empty(), "the new build names no text");
+
+    pool.execute("UPDATE run SET state = 'ended', outcome = 'completed' WHERE run_id = $1", &[&run]).await.unwrap();
+    assert!(store.unfinished_programs(project).await.unwrap().is_empty(), "an ended run keeps nothing");
+}
+
 /// Two writers of one file of a working copy: the one that read the file
 /// before the other wrote is refused whole, nothing of it lands, and the
 /// revision moves only with a change of the files.

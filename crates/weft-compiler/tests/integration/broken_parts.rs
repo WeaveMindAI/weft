@@ -196,7 +196,7 @@ fn a_broken_part_is_named_the_same_through_a_symlinked_root() {
     assert_eq!(compiled[0].broken, compiled[1].broken);
     for program in &compiled {
         for root in [&real, &linked] {
-            let left = weft_compiler::unsettled(program, &catalog, CompileFs::disk(root));
+            let left = weft_compiler::unsettled(program, &Default::default(), &catalog, CompileFs::disk(root));
             assert!(left.is_empty(), "{root:?}: {left:?}");
         }
     }
@@ -232,9 +232,9 @@ fn the_gate_places_findings_through_the_reader_that_compiled() {
         "{:?}",
         program.broken
     );
-    let left = weft_compiler::unsettled(&program, &catalog, fs);
+    let left = weft_compiler::unsettled(&program, &Default::default(), &catalog, fs);
     assert!(left.is_empty(), "{left:?}");
-    assert!(!weft_compiler::unsettled(&program, &catalog, CompileFs::disk(root)).is_empty());
+    assert!(!weft_compiler::unsettled(&program, &Default::default(), &catalog, CompileFs::disk(root)).is_empty());
 }
 
 /// A finding about one place of a file included twice breaks that place

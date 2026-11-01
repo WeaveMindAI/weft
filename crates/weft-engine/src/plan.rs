@@ -23,11 +23,12 @@
 //! reads a new one, and its version makes that call build a new plan.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use weft_broker_client::protocol::ArmedEntry;
+use weft_core::content_cache::{json_bytes, ContentCache, LoadFailed};
 use weft_core::frames::FiringLocation;
 use weft_core::project::{DeclaredInfra, ProgramIndex, NodeDefinition};
 use weft_core::pulse::PulseTable;
@@ -184,6 +185,12 @@ pub(crate) struct RunPlan {
     pub(crate) keep_for: weft_core::run_settings::KeepFor,
     /// The run it starts, or why it cannot start now.
     pub(crate) start: Result<Startable, Unready>,
+    /// Whether the worker keeps it for the fires after this one: not when
+    /// it is refused for a content its cut names that is gone
+    /// (`crate::contents::Gone`), since `weft resync` stores the content
+    /// again under the same name, and may leave everything else a plan is
+    /// keyed by as it was. The next fire reads the content again.
+    keep: bool,
 }
 
 /// The run a plan starts.
@@ -207,40 +214,79 @@ pub(crate) struct Startable {
 }
 
 impl RunPlan {
-    fn build(
-        program_of: impl FnOnce(ProjectDefinition, &str) -> Arc<ProgramTables>,
+    /// What a plan weighs in a worker's [`Plans`]: itself, and the cut it
+    /// keeps written out for its runs' births ([`RunsProgram`]). Its cut's
+    /// tables are weighed where they are kept, with the programs.
+    fn weight(&self) -> usize {
+        std::mem::size_of::<Self>() + self.start.as_ref().map_or(0, |start| start.runs.json_bytes())
+    }
+
+    /// The plan of a fire of `trigger` in `project`, its cut's tables made
+    /// by `program_of` (handed the cut and its definition hash): only the
+    /// contents the cut names are read, so a fire never waits on, or fails
+    /// for, a file only other triggers' runs read. A content the cut names
+    /// that is gone refuses the plan; one whose read failed is the error
+    /// this answers, and no plan is made.
+    async fn build<Fut>(
+        program_of: impl FnOnce(ProjectDefinition, String) -> Fut,
         project: &Arc<ProjectDefinition>,
         trigger: &Arc<HeldTrigger>,
         entry: &Arc<ArmedEntry>,
         instance: Option<&weft_core::instance::InstanceId>,
         facts: &weft_broker_client::protocol::DoorRunFacts,
-    ) -> Self {
+    ) -> anyhow::Result<Self>
+    where
+        Fut: std::future::Future<Output = Result<Arc<ProgramTables>, LoadFailed>>,
+    {
         let saved = weft_core::infra::bake::saved_for_run(project, &facts.infra, instance);
-        // The firing kick's payload is the call's: the cut does not read it.
-        let start = weft_core::run_spec::compute_trigger_fire(project, &trigger.node_id, &Value::Null, entry.port_snapshot.as_ref(), &saved)
-            .map_err(Unready::Refused)
-            .and_then(|fire| {
-                weft_core::run_spec::refuse_instanceless(&fire.program, instance)
-                    .map_err(|refusal| Unready::Refused(refusal.to_string()))?;
-                let ready = run_facts_gate(&fire.program, instance, facts).map_err(Unready::Waits)?;
-                let runs = RunsProgram::of(&entry.definition_hash, project.id, &fire.program)
-                    .map_err(|e| Unready::Refused(format!("the cut a fire of '{}' runs does not serialize: {e:#}", trigger.node_id)))?;
-                Ok(Startable {
-                    program: program_of(fire.program, runs.definition_hash()),
-                    runs,
-                    kicks: fire.kicks,
-                    given: Arc::new(fire.given),
-                    baked: fire.baked,
-                    ready,
-                })
-            });
-        Self {
+        let mut keep = true;
+        let start = async {
+            // The firing kick's payload is the call's: the cut does not read it.
+            let fire =
+                weft_core::run_spec::compute_trigger_fire(project, &trigger.node_id, &Value::Null, entry.port_snapshot.as_ref(), &saved)
+                    .map_err(Unready::Refused)?;
+            weft_core::run_spec::refuse_instanceless(&fire.program, instance).map_err(|refusal| Unready::Refused(refusal.to_string()))?;
+            let ready = run_facts_gate(&fire.program, instance, facts).map_err(Unready::Waits)?;
+            let runs = RunsProgram::of(&entry.definition_hash, project.id, &fire.program)
+                .map_err(|e| Unready::Refused(format!("the cut a fire of '{}' runs does not serialize: {e:#}", trigger.node_id)))?;
+            let program = program_of(fire.program, runs.definition_hash().to_string()).await.map_err(|e| {
+                let cut = format!("the cut a fire of '{}' runs", trigger.node_id);
+                if e.downcast_ref::<crate::contents::Gone>().is_some() {
+                    keep = false;
+                    Stopped::Unready(Unready::Refused(format!("{cut}: {e}")))
+                } else {
+                    Stopped::Unread(anyhow::Error::new(e).context(cut))
+                }
+            })?;
+            Ok::<_, Stopped>(Startable { program, runs, kicks: fire.kicks, given: Arc::new(fire.given), baked: fire.baked, ready })
+        }
+        .await;
+        let start = match start {
+            Ok(startable) => Ok(startable),
+            Err(Stopped::Unready(unready)) => Err(unready),
+            Err(Stopped::Unread(e)) => return Err(e),
+        };
+        Ok(Self {
             trigger: trigger.clone(),
             entry: entry.clone(),
             instance: instance.cloned(),
             keep_for: entry.spec.settings.kept_for(project.defaults.keep_for()),
             start,
-        }
+            keep,
+        })
+    }
+}
+
+/// Why [`RunPlan::build`] stopped short of a run that starts: what the
+/// plan says ([`Unready`]), or a read that failed, which makes no plan.
+enum Stopped {
+    Unready(Unready),
+    Unread(anyhow::Error),
+}
+
+impl From<Unready> for Stopped {
+    fn from(unready: Unready) -> Self {
+        Self::Unready(unready)
     }
 }
 
@@ -326,36 +372,20 @@ fn run_facts_gate(
     Ok(Ready { instance_values, picks })
 }
 
-/// A map of at most `cap` entries that forgets the oldest-inserted one
-/// first. Not a true LRU: what a worker keeps here is read in bursts of one
-/// program, one trigger, so insertion order tracks recency closely enough,
-/// and a read stays a plain map lookup.
-struct Bounded<K, V> {
-    map: HashMap<K, V>,
-    order: std::collections::VecDeque<K>,
-    cap: usize,
-}
-
-impl<K: std::hash::Hash + Eq + Clone, V: Clone> Bounded<K, V> {
-    fn new(cap: usize) -> Self {
-        Self { map: HashMap::new(), order: std::collections::VecDeque::new(), cap }
-    }
-
-    fn get(&self, key: &K) -> Option<V> {
-        self.map.get(key).cloned()
-    }
-
-    fn insert(&mut self, key: K, value: V) {
-        if self.map.insert(key.clone(), value).is_none() {
-            self.order.push_back(key);
-            while self.order.len() > self.cap {
-                if let Some(evicted) = self.order.pop_front() {
-                    self.map.remove(&evicted);
-                }
-            }
-        }
-    }
-}
+/// How many bytes of JSON what one of a worker's caches keeps may weigh
+/// together, whatever one entry weighs: a count of programs bounds nothing
+/// when one is a few kilobytes and another tens of megabytes. Each of
+/// [`Plans`]' three is held to it: the programs parsed and the tables made
+/// of them, both weighed by their program's JSON
+/// (`weft_core::content_cache::json_bytes`), and the plans by the cut they
+/// keep written out ([`RunPlan::weight`]). A parsed program holds about
+/// three times its JSON, so the three hold about 110 MiB at most (less
+/// when a table and its program share one parse), a tenth of the 1Gi a
+/// copy gets unless its project sets another (`weft workers set --memory`).
+/// A program heavier than this on its own is kept anyway, alone in its
+/// cache (`ContentCache::weighed`), so a cache holds at most this or that
+/// one program, whichever weighs more.
+pub(crate) const KEPT_JSON_BYTES: usize = 16 * 1024 * 1024;
 
 /// Which program a table set is for: its definition hash.
 type ProgramKey = String;
@@ -371,39 +401,45 @@ pub(crate) struct Plans {
     /// (`weft_core::NodeCatalog::left_out`): a fire whose cut uses one of
     /// those node types is refused before it starts.
     left_out: &'static weft_core::builds::LeftOut,
-    projects: Mutex<Bounded<String, Arc<ProjectDefinition>>>,
-    programs: Mutex<Bounded<ProgramKey, Arc<ProgramTables>>>,
-    plans: Mutex<Bounded<PlanKey, Arc<RunPlan>>>,
+    /// Programs as stored: what is cut and hashed. Each content one names
+    /// (`weft_core::content`) is a marker here, put back only in its
+    /// tables (`programs`).
+    projects: ContentCache<String, ProjectDefinition>,
+    programs: ContentCache<ProgramKey, ProgramTables>,
+    plans: ContentCache<PlanKey, RunPlan>,
+    contents: crate::contents::Contents,
 }
 
 impl Plans {
-    pub(crate) fn new(project_id: uuid::Uuid, left_out: &'static weft_core::builds::LeftOut) -> Self {
+    /// `tenant` is the project's, whose contents its programs name.
+    pub(crate) fn new(project_id: uuid::Uuid, tenant: String, left_out: &'static weft_core::builds::LeftOut) -> Self {
         Self {
             project_id,
             left_out,
-            projects: Mutex::new(Bounded::new(8)),
-            programs: Mutex::new(Bounded::new(64)),
-            plans: Mutex::new(Bounded::new(256)),
+            contents: crate::contents::Contents::new(tenant),
+            projects: ContentCache::weighed(KEPT_JSON_BYTES, json_bytes),
+            programs: ContentCache::weighed(KEPT_JSON_BYTES, |tables| json_bytes(&*tables.project)),
+            plans: ContentCache::weighed(KEPT_JSON_BYTES, RunPlan::weight),
         }
     }
 
     /// The program whose definition hash is `definition_hash`: kept, else
-    /// fetched from the broker, which reads it from the project's
-    /// append-only history, so a run carried on after the project was
-    /// built again still runs the shape it started on.
-    pub(crate) async fn project(&self, clients: &crate::context::EngineClients, definition_hash: &str) -> anyhow::Result<Arc<ProjectDefinition>> {
-        if let Some(project) = self.projects.lock().expect("project cache").get(&definition_hash.to_string()) {
-            return Ok(project);
-        }
-        let project = clients.project.fetch_definition(self.project_id, definition_hash).await?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "no row in project_definition for project {} hash {definition_hash}: a run was started for a program that was never recorded",
-                self.project_id
-            )
-        })?;
-        let project = Arc::new(project);
-        self.projects.lock().expect("project cache").insert(definition_hash.to_string(), project.clone());
-        Ok(project)
+    /// fetched from the broker (once, however many runs ask at the same
+    /// moment), which reads it from the project's append-only history, so
+    /// a run carried on after the project was built again still runs the
+    /// shape it started on. One the history does not hold is
+    /// [`crate::contents::Gone`].
+    pub(crate) async fn project(&self, clients: &crate::context::EngineClients, definition_hash: &str) -> Result<Arc<ProjectDefinition>, LoadFailed> {
+        self.projects
+            .get_or_load(definition_hash.to_string(), || async {
+                clients.project.fetch_definition(self.project_id, definition_hash).await?.ok_or_else(|| {
+                    anyhow::Error::new(crate::contents::Gone(format!(
+                        "no row in project_definition for project {} hash {definition_hash}: a run was started for a program that was never recorded",
+                        self.project_id
+                    )))
+                })
+            })
+            .await
     }
 
     /// `project` as this worker can run it: what its build left out added
@@ -418,27 +454,45 @@ impl Plans {
         Arc::new(runnable)
     }
 
-    /// The tables of `project`, whose definition hash is `definition_hash`.
-    pub(crate) fn program(&self, project: &Arc<ProjectDefinition>, definition_hash: &str) -> Arc<ProgramTables> {
-        let key = definition_hash.to_string();
-        if let Some(tables) = self.programs.lock().expect("program cache").get(&key) {
-            return tables;
-        }
-        let tables = Arc::new(ProgramTables::new(project.clone()));
-        self.programs.lock().expect("program cache").insert(key, tables.clone());
-        tables
+    /// The tables of `project`, whose definition hash is
+    /// `definition_hash`: kept, else made once however many runs ask at
+    /// the same moment ([`Self::tables`]). A failure says whether a content
+    /// it names is gone (`crate::contents::Gone`).
+    pub(crate) async fn program(
+        &self,
+        clients: &crate::context::EngineClients,
+        project: &ProjectDefinition,
+        definition_hash: &str,
+    ) -> Result<Arc<ProgramTables>, LoadFailed> {
+        self.programs.get_or_load(definition_hash.to_string(), || self.tables(clients, project, definition_hash)).await
+    }
+
+    /// The tables of `project` (whose definition hash is
+    /// `definition_hash`), made of it with every content it names put back
+    /// (`crate::contents`), read through the worker's storage unless kept.
+    async fn tables(
+        &self,
+        clients: &crate::context::EngineClients,
+        project: &ProjectDefinition,
+        definition_hash: &str,
+    ) -> anyhow::Result<ProgramTables> {
+        let values = self.contents.of(clients.storage.as_ref(), project, definition_hash).await?;
+        Ok(ProgramTables::new(Arc::new(crate::contents::runnable(project, &values)?)))
     }
 
     /// The tables of `cut` (whose definition hash is `definition_hash`),
     /// kept like a program fetched by its hash: a run born on it and one
-    /// carried on from its record share them.
-    fn cut(&self, cut: ProjectDefinition, definition_hash: &str) -> Arc<ProgramTables> {
-        if let Some(tables) = self.programs.lock().expect("program cache").get(&definition_hash.to_string()) {
-            return tables;
-        }
-        let cut = Arc::new(cut);
-        self.projects.lock().expect("project cache").insert(definition_hash.to_string(), cut.clone());
-        self.program(&cut, definition_hash)
+    /// carried on from its record share them. Only the contents the cut
+    /// names are read; a failure says whether one is gone
+    /// (`crate::contents::Gone`).
+    async fn cut(&self, clients: &crate::context::EngineClients, cut: ProjectDefinition, definition_hash: &str) -> Result<Arc<ProgramTables>, LoadFailed> {
+        self.programs
+            .get_or_load(definition_hash.to_string(), || async {
+                let cut = Arc::new(cut);
+                self.projects.put(definition_hash.to_string(), cut.clone());
+                self.tables(clients, &cut, definition_hash).await
+            })
+            .await
     }
 
     /// The plan of `trigger` (armed as `entry`, from the held triggers of
@@ -473,19 +527,24 @@ impl Plans {
         facts: &crate::door::RunFacts,
     ) -> anyhow::Result<Arc<RunPlan>> {
         let key = (trigger.token.clone(), instance.cloned(), triggers_version, facts.version);
-        if let Some(plan) = self.plans.lock().expect("plan cache").get(&key) {
+        if let Some(plan) = self.plans.get(&key) {
             return Ok(plan);
         }
         let project = self.runnable(self.project(clients, &entry.definition_hash).await?);
-        let plan = Arc::new(RunPlan::build(
-            |cut, definition_hash| self.cut(cut, definition_hash),
-            &project,
-            trigger,
-            entry,
-            instance,
-            &facts.facts,
-        ));
-        self.plans.lock().expect("plan cache").insert(key, plan.clone());
+        let plan = Arc::new(
+            RunPlan::build(
+                |cut, definition_hash| async move { self.cut(clients, cut, &definition_hash).await },
+                &project,
+                trigger,
+                entry,
+                instance,
+                &facts.facts,
+            )
+            .await?,
+        );
+        if plan.keep {
+            self.plans.put(key, plan.clone());
+        }
         Ok(plan)
     }
 }
@@ -497,17 +556,41 @@ pub(crate) mod tests {
 
     /// A plan of `trigger` in `project`, armed as a live timer of this
     /// worker's program, over `facts`: what a door's first call builds.
-    pub(crate) fn plan_of(project: &Arc<ProjectDefinition>, trigger: &str, facts: &weft_broker_client::protocol::DoorRunFacts) -> RunPlan {
-        plan_for(project, trigger, None, facts)
+    pub(crate) async fn plan_of(project: &Arc<ProjectDefinition>, trigger: &str, facts: &weft_broker_client::protocol::DoorRunFacts) -> RunPlan {
+        plan_for(project, trigger, None, facts).await
     }
 
     /// [`plan_of`], its runs for `instance`.
-    pub(crate) fn plan_for(
+    pub(crate) async fn plan_for(
         project: &Arc<ProjectDefinition>,
         trigger: &str,
         instance: Option<&weft_core::instance::InstanceId>,
         facts: &weft_broker_client::protocol::DoorRunFacts,
     ) -> RunPlan {
+        let (held, entry) = armed(trigger);
+        RunPlan::build(|cut, _| async move { Ok(Arc::new(ProgramTables::new(Arc::new(cut)))) }, project, &held, &entry, instance, facts)
+            .await
+            .expect("a plan whose tables are made in memory reads nothing")
+    }
+
+    /// A fake storage, and engine clients reading contents through it.
+    fn storage_clients() -> (Arc<crate::storage::FakeWorkerStorage>, crate::context::EngineClients) {
+        use crate::run_driver::engine_test_rig::{clients, MemJournal};
+        let storage = crate::storage::FakeWorkerStorage::new();
+        let clients = crate::context::EngineClients { storage: storage.clone(), ..clients(Arc::new(MemJournal::default())) };
+        (storage, clients)
+    }
+
+    /// What `plans` answers for a fire of `trigger` ([`armed`]), over no
+    /// run facts.
+    async fn planned(plans: &Plans, clients: &crate::context::EngineClients, trigger: &str) -> anyhow::Result<Arc<RunPlan>> {
+        let (held, entry) = armed(trigger);
+        plans.plan_over(clients, &held, &entry, None, 1, &crate::door::RunFacts::of(Default::default())).await
+    }
+
+    /// `trigger` armed as a live timer of the program whose definition hash
+    /// is `def-1`.
+    fn armed(trigger: &str) -> (Arc<HeldTrigger>, Arc<ArmedEntry>) {
         let spec: weft_core::primitive::SignalSpec = serde_json::from_value(json!({ "kind": "timer", "config": {} })).unwrap();
         let entry = Arc::new(ArmedEntry {
             spec,
@@ -524,8 +607,8 @@ pub(crate) mod tests {
             },
             instance: None,
         });
-        let held = Arc::new(HeldTrigger::new("t1".into(), trigger.into(), crate::door::HeldEntry::Armed(entry.clone()), None));
-        RunPlan::build(|cut, _| Arc::new(ProgramTables::new(Arc::new(cut))), project, &held, &entry, instance, facts)
+        let held = Arc::new(HeldTrigger::new(format!("token-{trigger}"), trigger.into(), crate::door::HeldEntry::Armed(entry.clone()), None));
+        (held, entry)
     }
 
     /// A trigger feeding two nodes, one behind the other.
@@ -591,13 +674,28 @@ pub(crate) mod tests {
         )
     }
 
+    /// A plan weighs the cut it keeps written out, byte for byte, and one
+    /// that cannot start keeps none.
+    #[tokio::test]
+    async fn a_plan_weighs_the_cut_it_keeps() {
+        let project = chain();
+        let plan = plan_of(&project, "trig", &Default::default()).await;
+        let Ok(start) = &plan.start else { panic!("a chain's fire starts") };
+        let cut = serde_json::to_string(&*start.program.project).unwrap();
+        assert_eq!(plan.weight(), std::mem::size_of::<RunPlan>() + cut.len());
+        assert_eq!(json_bytes(&*start.program.project), cut.len());
+        let refused = plan_of(&project, "a", &Default::default()).await;
+        assert!(refused.start.is_err());
+        assert_eq!(refused.weight(), std::mem::size_of::<RunPlan>());
+    }
+
     /// A run started from a plan, once its drive's first pass over its
     /// scopes ran, holds exactly what the fold of its own birth holds: the
     /// roots kicked (the firing one with the call's payload), the baked
     /// value its stand-in sent, the group that value opened, the same
     /// part of the program.
-    #[test]
-    fn a_run_from_a_plan_starts_where_the_fold_of_its_birth_does() {
+    #[tokio::test]
+    async fn a_run_from_a_plan_starts_where_the_fold_of_its_birth_does() {
         let project = baked_group();
         let facts = weft_broker_client::protocol::DoorRunFacts {
             infra: vec![weft_core::infra::run_gate::InfraCopyUp {
@@ -608,7 +706,7 @@ pub(crate) mod tests {
             }],
             ..Default::default()
         };
-        let plan = plan_of(&project, "trig", &facts);
+        let plan = plan_of(&project, "trig", &facts).await;
         let startable = plan.start.as_ref().map_err(|_| "unready").expect("a plan that starts");
         let program = &startable.program;
         let run_id = RunId::from_u128(4);
@@ -774,8 +872,8 @@ pub(crate) mod tests {
     /// A worker whose build left a package out refuses, before it starts,
     /// a fire whose cut uses one of its node types, naming the package and
     /// its first error; a worker built whole plans the same fire.
-    #[test]
-    fn a_fire_reaching_a_left_out_package_is_refused_up_front() {
+    #[tokio::test]
+    async fn a_fire_reaching_a_left_out_package_is_refused_up_front() {
         let left_out: &'static weft_core::builds::LeftOut = Box::leak(Box::new(weft_core::builds::LeftOut {
             packages: vec![weft_core::builds::LeftOutPackage {
                 package: "relay".into(),
@@ -783,10 +881,10 @@ pub(crate) mod tests {
                 error: "error[E0425]: cannot find value `x`".into(),
             }],
         }));
-        let whole = Plans::new(uuid::Uuid::from_u128(9), Box::leak(Box::default()));
-        assert!(!matches!(plan_of(&whole.runnable(chain()), "trig", &Default::default()).start, Err(Unready::Refused(_))));
-        let missing = Plans::new(uuid::Uuid::from_u128(9), left_out);
-        let refused = plan_of(&missing.runnable(chain()), "trig", &Default::default());
+        let whole = Plans::new(uuid::Uuid::from_u128(9), "t1".into(), Box::leak(Box::default()));
+        assert!(!matches!(plan_of(&whole.runnable(chain()), "trig", &Default::default()).await.start, Err(Unready::Refused(_))));
+        let missing = Plans::new(uuid::Uuid::from_u128(9), "t1".into(), left_out);
+        let refused = plan_of(&missing.runnable(chain()), "trig", &Default::default()).await;
         assert!(
             matches!(&refused.start, Err(Unready::Refused(why)) if why.contains("package 'relay' didn't compile: error[E0425]")),
             "{:?}",
@@ -794,25 +892,116 @@ pub(crate) mod tests {
         );
     }
 
+    /// The tables a run runs have every content their program names put
+    /// back (`crate::contents`), while the program kept for cutting and
+    /// hashing keeps its marker; two versions naming one content read it
+    /// once.
+    #[tokio::test]
+    async fn a_programs_tables_read_the_contents_it_names_once() {
+        let (storage, clients) = storage_clients();
+        let sql = "SELECT 1;\n".repeat(10_000);
+        storage.hold_content(sql.as_bytes());
+        let (query, _) =
+            weft_core::content::ContentRef::of_text(&sql, &WeftType::Primitive(weft_core::WeftPrimitive::String), "sql/q.sql").unwrap();
+        let version = |label: &str| {
+            let mut program = (*chain()).clone();
+            program.nodes[1].label = Some(label.into());
+            program.nodes[1].port_literals.insert("query".into(), query.to_value());
+            program
+        };
+        let plans = Plans::new(uuid::Uuid::from_u128(9), "t1".into(), Box::leak(Box::default()));
+        for (hash, program) in [("v1", version("one")), ("v2", version("two"))] {
+            let tables = plans.program(&clients, &program, hash).await.unwrap();
+            assert_eq!(tables.project.nodes[1].port_literals["query"], json!(sql), "the run reads the content");
+            assert_eq!(program.nodes[1].port_literals["query"], query.to_value(), "the program keeps its marker");
+        }
+        assert_eq!(storage.content_reads().len(), 1, "one content, read once: {:?}", storage.content_reads());
+    }
+
+    /// A fire reads only the contents its own cut names: a file only
+    /// another trigger's runs read is never read for it, and its being
+    /// gone refuses only that other trigger's fires, naming the file and
+    /// the way back. That refusal is not kept: the next fire reads again.
+    #[tokio::test]
+    async fn a_fire_reads_only_the_contents_its_cut_names() {
+        let (storage, clients) = storage_clients();
+        let (gone, _) =
+            weft_core::content::ContentRef::of_text("SELECT 2;", &WeftType::Primitive(weft_core::WeftPrimitive::String), "sql/gone.sql").unwrap();
+        let string = |name: &str| json!({ "name": name, "portType": "String", "required": false });
+        let mut project: ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::from_u128(9),
+            "nodes": [
+                { "id": "ta", "nodeType": "Trig", "position": { "x": 0.0, "y": 0.0 },
+                  "outputs": [string("value")], "features": { "isTrigger": true } },
+                { "id": "a", "nodeType": "Pass", "position": { "x": 1.0, "y": 0.0 }, "inputs": [string("value")] },
+                { "id": "tb", "nodeType": "Trig", "position": { "x": 0.0, "y": 1.0 },
+                  "outputs": [string("value")], "features": { "isTrigger": true } },
+                { "id": "b", "nodeType": "Query", "position": { "x": 1.0, "y": 1.0 }, "inputs": [string("value"), string("query")] }
+            ],
+            "edges": [
+                { "id": "e1", "source": "ta", "target": "a", "sourceHandle": "value", "targetHandle": "value" },
+                { "id": "e2", "source": "tb", "target": "b", "sourceHandle": "value", "targetHandle": "value" }
+            ]
+        }))
+        .unwrap();
+        project.nodes[3].port_literals.insert("query".into(), gone.to_value());
+        let plans = Plans::new(uuid::Uuid::from_u128(9), "t1".into(), Box::leak(Box::default()));
+        plans.projects.put("def-1".into(), Arc::new(project));
+        let a = planned(&plans, &clients, "ta").await.unwrap();
+        assert!(a.start.is_ok(), "{:?}", a.start.as_ref().err());
+        assert!(storage.content_reads().is_empty(), "a's cut names no content: {:?}", storage.content_reads());
+        for read in 1..=2 {
+            let b = planned(&plans, &clients, "tb").await.unwrap();
+            let Err(Unready::Refused(why)) = &b.start else { panic!("b's cut names a gone file: {:?}", b.start.as_ref().err()) };
+            assert!(why.contains("reads 'sql/gone.sql' (String)") && why.contains("weft resync"), "{why}");
+            assert_eq!(storage.content_reads().len(), read, "a refusal for a gone file is not kept");
+        }
+        assert!(planned(&plans, &clients, "ta").await.unwrap().start.is_ok(), "b's file being gone leaves a's fires alone");
+    }
+
+    /// A fire whose cut names a content the store could not be asked for
+    /// is not refused: no plan is made, the error comes back (the door
+    /// answers it as "try again in a moment"), and the next fire once the
+    /// store answers again plans.
+    #[tokio::test]
+    async fn a_fire_whose_contents_could_not_be_read_is_tried_again() {
+        let (storage, clients) = storage_clients();
+        let sql = "SELECT 1;";
+        storage.hold_content(sql.as_bytes());
+        let (query, _) =
+            weft_core::content::ContentRef::of_text(sql, &WeftType::Primitive(weft_core::WeftPrimitive::String), "sql/q.sql").unwrap();
+        let mut project = (*chain()).clone();
+        project.nodes[1].port_literals.insert("query".into(), query.to_value());
+        let plans = Plans::new(uuid::Uuid::from_u128(9), "t1".into(), Box::leak(Box::default()));
+        plans.projects.put("def-1".into(), Arc::new(project));
+        storage.contents_down(true);
+        let Err(e) = planned(&plans, &clients, "trig").await else { panic!("an outage makes no plan, refused or not") };
+        assert!(format!("{e:#}").contains("reads 'sql/q.sql' (String)") && !format!("{e:#}").contains("weft resync"), "{e:#}");
+        storage.contents_down(false);
+        let plan = planned(&plans, &clients, "trig").await.unwrap();
+        let Ok(start) = &plan.start else { panic!("the store answers again: {:?}", plan.start.as_ref().err()) };
+        assert_eq!(start.program.project.nodes[1].port_literals["query"], json!(sql));
+    }
+
     /// A plan of a node that is no trigger never starts a run, and says why.
-    #[test]
-    fn a_plan_of_no_trigger_refuses() {
-        let plan = plan_of(&chain(), "a", &Default::default());
+    #[tokio::test]
+    async fn a_plan_of_no_trigger_refuses() {
+        let plan = plan_of(&chain(), "a", &Default::default()).await;
         assert!(matches!(plan.start, Err(Unready::Refused(_))));
     }
 
     /// A run that reaches a node per instance is planned for the instance
     /// its call names: with none it is refused, naming the node, and with
     /// one its plan (and the birth of its runs) is for that instance.
-    #[test]
-    fn a_plan_is_for_the_instance_its_call_names() {
+    #[tokio::test]
+    async fn a_plan_is_for_the_instance_its_call_names() {
         let mut project = (*chain()).clone();
         project.nodes[1].per_instance = Some(weft_core::instance::PerInstance::Marked);
         let project = Arc::new(project);
-        let refused = plan_of(&project, "trig", &Default::default());
+        let refused = plan_of(&project, "trig", &Default::default()).await;
         assert!(matches!(&refused.start, Err(Unready::Refused(why)) if why.contains("once per instance")), "{:?}", refused.start.as_ref().err());
         let ada = weft_core::instance::InstanceId::new("ada").unwrap();
-        let plan = plan_for(&project, "trig", Some(&ada), &Default::default());
+        let plan = plan_for(&project, "trig", Some(&ada), &Default::default()).await;
         assert_eq!(plan.instance, Some(ada));
         assert!(!matches!(plan.start, Err(Unready::Refused(_))), "{:?}", plan.start.as_ref().err());
     }

@@ -581,6 +581,17 @@ impl RunStore for FakeStore {
         Ok(out.into_iter().map(|(_, run_id, phase)| (run_id, phase)).collect())
     }
 
+    async fn unfinished_programs(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<String>> {
+        let g = self.inner.lock().unwrap();
+        let hashes: std::collections::BTreeSet<String> = g
+            .runs
+            .values()
+            .filter(|row| row.project_id == project_id && row.state != "ended")
+            .filter_map(|row| row.definition_hash.clone())
+            .collect();
+        Ok(hashes.into_iter().collect())
+    }
+
     async fn settled_run_ids_for_project(
         &self,
         project_id: uuid::Uuid,

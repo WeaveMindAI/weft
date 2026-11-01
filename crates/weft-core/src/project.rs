@@ -99,6 +99,22 @@ impl ProjectDefinition {
     pub fn hides_nodes(&self) -> bool {
         self.broken.iter().any(|part| part.hides)
     }
+
+    /// Every value this program writes: each node's config fields and port
+    /// literals, each group's port literals. Where a `@file` or `@asset`
+    /// is written, and where a build leaves the marker naming a file's
+    /// content (`crate::content`).
+    pub fn written_values(&self) -> impl Iterator<Item = &Value> {
+        self.nodes.iter().flat_map(NodeDefinition::written_values).chain(self.groups.iter().flat_map(|group| group.port_literals.values()))
+    }
+
+    /// [`Self::written_values`], to rewrite in place.
+    pub fn written_values_mut(&mut self) -> impl Iterator<Item = &mut Value> {
+        self.nodes
+            .iter_mut()
+            .flat_map(NodeDefinition::written_values_mut)
+            .chain(self.groups.iter_mut().flat_map(|group| group.port_literals.values_mut()))
+    }
 }
 
 /// One part of a program that does not compile
@@ -432,8 +448,9 @@ pub struct GroupDefinition {
     /// from outside, or `_should_flow: false` in the braces. A wired value
     /// is an ordinary edge and never appears here. What a member reads off
     /// a filled port reaches it over the wire whose source is the group
-    /// itself ([`Edge::via`]), sent when the group opens. A loop's sit on
-    /// its `LoopIn` instead, which delivers them like any node.
+    /// itself ([`Edge::via`]), sent when the group opens. A loop's is empty:
+    /// its sit on its `LoopIn` alone, which delivers them like any node and
+    /// which the editor reads them from for the loop box.
     // SYNC: port_literals <-> packages/weft-graph/src/protocol.ts GroupDefinition.portLiterals
     #[serde(default, rename = "portLiterals")]
     pub port_literals: std::collections::BTreeMap<String, Value>,
@@ -965,6 +982,25 @@ impl NodeDefinition {
     /// and after the normalization reads the same value.
     pub fn written_value(&self, key: &str) -> Option<&Value> {
         self.port_literals.get(key).or_else(|| self.config.get(key))
+    }
+
+    /// Every value this node writes: its config fields and its port
+    /// literals, the two homes [`Self::written_value`] reads.
+    pub fn written_values(&self) -> impl Iterator<Item = &Value> {
+        self.config.as_object().into_iter().flat_map(|o| o.values()).chain(self.port_literals.values())
+    }
+
+    /// [`Self::written_values`], to rewrite in place.
+    pub fn written_values_mut(&mut self) -> impl Iterator<Item = &mut Value> {
+        self.config.as_object_mut().into_iter().flat_map(|o| o.values_mut()).chain(self.port_literals.values_mut())
+    }
+
+    /// [`Self::written_value`], to rewrite in place.
+    pub fn written_value_mut(&mut self, key: &str) -> Option<&mut Value> {
+        match self.port_literals.get_mut(key) {
+            Some(value) => Some(value),
+            None => self.config.get_mut(key),
+        }
     }
 
     /// The source entry of `written_value`'s home, same two-home rule.

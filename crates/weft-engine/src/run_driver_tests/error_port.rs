@@ -6,7 +6,7 @@
     //! catch applying to that failure.
 
     use super::*;
-    use super::engine_test_rig::{catalog, drive, drive_journal, test_manifest};
+    use super::engine_test_rig::{catalog, drive, drive_journal, drive_journal_lost, test_manifest};
     use async_trait::async_trait;
     use serde_json::json;
     use weft_core::error::{WeftError, WeftResult};
@@ -232,6 +232,29 @@
             .filter(|e| matches!(e, RunEvent::NodeStarted { node_id, .. } | RunEvent::NodeResumed { node_id, .. } if node_id == "node"))
             .count();
         assert_eq!(starts, 1, "only the dead worker's start: {events:?}");
+    }
+
+    /// The worker that died in the node went away with its memory nearly
+    /// full, and its claim says so: the failure says it ran out of memory
+    /// and which lever raises it. A worker that left no note only went
+    /// away.
+    #[tokio::test]
+    async fn a_node_the_worker_ran_out_of_memory_in_says_so() {
+        let note = weft_broker_client::protocol::MemoryNote { used_bytes: 966 << 20, limit_bytes: 1 << 30, at_unix: 101 };
+        let project = project("NeverAgain", false);
+        let run_id = uuid::Uuid::new_v4();
+        let rows = crashed_rows(&project, run_id);
+        let (outcome, events) = drive_journal_lost(project.clone(), nodes(), run_id, rows.clone(), Some(note)).await;
+        assert!(matches!(outcome.expect("the drive runs"), RunOutcome::Failed { .. }));
+        let error = failed(&events, "node").expect("the node is failed");
+        assert!(
+            error.starts_with("the worker running 'node' ran out of memory while it was running (it was at 94% of its 1Gi); raise it with `weft workers set --memory`"),
+            "{error}"
+        );
+        assert!(error.contains("not run again"), "{error}");
+
+        let (_, events) = drive_journal_lost(project, nodes(), run_id, rows, None).await;
+        assert!(failed(&events, "node").is_some_and(|e| e.contains("went away while it was running")), "{events:?}");
     }
 
     /// A run's birth and its kick, with how it is kept: what the next

@@ -113,17 +113,17 @@ function doorWords(mode: TriggerCopy['mode']): string {
 /// "3 of 5 on", each instance's own state on hover.
 export function triggerBadge(entry: TriggerEntry): LifecycleBadge {
 	if (!entry.perInstance) {
-		const copy = entry.shared ?? { state: 'off' as const, mode: 'registered' as const };
+		const copy = entry.shared ?? { state: 'off' as const, on: false, mode: 'registered' as const };
 		return { ...copyBadge(copy), detail: copyDetail(copy) };
 	}
 	const copies = entry.copies ?? [];
 	if (copies.length === 0) {
 		return { label: 'off', tone: 'off', detail: 'One per instance, and no instance has turned it on.' };
 	}
-	const on = copies.filter((c) => c.state === 'on' || c.state === 'behind').length;
+	const on = copies.filter((c) => c.on).length;
 	const tone: BadgeTone = copies.some((c) => c.state === 'turning_on')
 		? 'busy'
-		: copies.some((c) => c.dropped && (c.state === 'on' || c.state === 'behind'))
+		: copies.some((c) => c.dropped && c.on)
 			? 'warn'
 			: copies.some((c) => c.state === 'behind')
 			? 'behind'

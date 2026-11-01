@@ -855,9 +855,9 @@ pub fn enrich_collecting(
     }
     // A literal on a group's own port is cast the same way, against the
     // type the group declares there: the group sends it to every member
-    // that reads the port (`weft_core::run::scope`). A loop's sit on its
-    // `LoopIn`, cast above.
-    for group in project.groups.iter_mut().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+    // that reads the port (`weft_core::run::scope`). A loop holds none:
+    // its sit on its `LoopIn`, cast above.
+    for group in &mut project.groups {
         for input in &group.in_ports {
             if input.port_type.is_unresolved() { continue; }
             let Some(value) = group.port_literals.get(&input.name).cloned() else { continue };

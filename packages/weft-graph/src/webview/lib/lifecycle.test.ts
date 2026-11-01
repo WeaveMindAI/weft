@@ -18,7 +18,7 @@ const plain = (place: string): SelectedNode => ({ place, isTrigger: false, isInf
 const shared = (node: string, state: TriggerState): TriggerEntry => ({
 	node,
 	perInstance: false,
-	shared: { state, mode: state === 'off' ? 'take' : 'active' },
+	shared: { state, on: state === 'on' || state === 'behind', mode: state === 'off' ? 'take' : 'active' },
 });
 
 const place = (node: string, status: string, over: Partial<InfraPlacementStatus> = {}): InfraPlacementStatus => ({
@@ -72,7 +72,7 @@ describe('the contextual bar counts', () => {
 
 	it('asks for an instance before acting on a per-instance node', () => {
 		const s = status({
-			triggers: [{ node: 'inbox', perInstance: true, copies: [{ instance: 'ada', state: 'on', mode: 'active' }] }],
+			triggers: [{ node: 'inbox', perInstance: true, copies: [{ instance: 'ada', state: 'on', on: true, mode: 'active' }] }],
 			infraNodes: [place('box', 'per_instance', { instanceCopyCount: 1 })],
 		});
 		const selection = [trigger('inbox', true), infra('box', true), trigger('door')];
@@ -91,7 +91,7 @@ describe('the contextual bar counts', () => {
 
 	it('acts on every instance weft holds anything for with all_instances', () => {
 		const s = status({
-			triggers: [{ node: 'inbox', perInstance: true, copies: [{ instance: 'ada', state: 'on', mode: 'active' }] }],
+			triggers: [{ node: 'inbox', perInstance: true, copies: [{ instance: 'ada', state: 'on', on: true, mode: 'active' }] }],
 			instances: [
 				{ instance: 'ada', values: 0, connections: 0, tokens: 0, copies: [], triggers: [] },
 				{ instance: 'bob', values: 0, connections: 0, tokens: 0, copies: [], triggers: [] },
@@ -110,7 +110,7 @@ describe('the contextual bar counts', () => {
 	it('acts on the shared ones and every instance with all', () => {
 		const s = status({
 			triggers: [
-				{ node: 'inbox', perInstance: true, copies: [{ instance: 'ada', state: 'on', mode: 'active' }] },
+				{ node: 'inbox', perInstance: true, copies: [{ instance: 'ada', state: 'on', on: true, mode: 'active' }] },
 				shared('door', 'behind'),
 			],
 			infraNodes: [place('box', 'per_instance', { instanceCopyCount: 0 })],
@@ -161,14 +161,14 @@ describe('the badges', () => {
 		const holding = triggerBadge({
 			node: 'a',
 			perInstance: false,
-			shared: { state: 'off', mode: 'take', held: { arrivals: 2, paused: 1 } },
+			shared: { state: 'off', on: false, mode: 'take', held: { arrivals: 2, paused: 1 } },
 		});
 		expect(holding.label).toBe('held 3');
 		expect(holding.detail).toContain('2 arrivals and 1 paused run');
 		const heldBack = triggerBadge({
 			node: 'a',
 			perInstance: false,
-			shared: { state: 'off', mode: 'take', downWith: 'health', heldBack: 'other triggers are on another build. `weft resync --all` moves them' },
+			shared: { state: 'off', on: false, mode: 'take', downWith: 'health', heldBack: 'other triggers are on another build. `weft resync --all` moves them' },
 		});
 		expect(heldBack.label).toBe('held back');
 		expect(heldBack.detail).toContain('Held back: other triggers are on another build. `weft resync --all` moves them');
@@ -178,7 +178,7 @@ describe('the badges', () => {
 		const dropping = triggerBadge({
 			node: 'a',
 			perInstance: false,
-			shared: { state: 'on', mode: 'active', dropped: { count: 3, lastReason: "package 'relay' didn't compile" } },
+			shared: { state: 'on', on: true, mode: 'active', dropped: { count: 3, lastReason: "package 'relay' didn't compile" } },
 		});
 		expect(dropping).toMatchObject({ label: 'dropping', tone: 'warn' });
 		expect(dropping.detail).toContain("3 fires or calls dropped in the last minute or two (refused before any run started), the last because: package 'relay' didn't compile");
@@ -186,8 +186,8 @@ describe('the badges', () => {
 			node: 'inbox',
 			perInstance: true,
 			copies: [
-				{ instance: 'ada', state: 'on', mode: 'active', dropped: { count: 1, lastReason: 'the trigger is gone' } },
-				{ instance: 'bob', state: 'on', mode: 'active' },
+				{ instance: 'ada', state: 'on', on: true, mode: 'active', dropped: { count: 1, lastReason: 'the trigger is gone' } },
+				{ instance: 'bob', state: 'on', on: true, mode: 'active' },
 			],
 		});
 		expect(perInstance).toMatchObject({ label: '2 of 2 on', tone: 'warn', detail: 'ada: dropping\nbob: on' });
@@ -198,9 +198,9 @@ describe('the badges', () => {
 			node: 'inbox',
 			perInstance: true,
 			copies: [
-				{ instance: 'ada', state: 'on', mode: 'active' },
-				{ instance: 'bob', state: 'behind', mode: 'active' },
-				{ instance: 'cy', state: 'off', mode: 'take' },
+				{ instance: 'ada', state: 'on', on: true, mode: 'active' },
+				{ instance: 'bob', state: 'behind', on: true, mode: 'active' },
+				{ instance: 'cy', state: 'off', on: false, mode: 'take' },
 			],
 		});
 		expect(badge.label).toBe('2 of 3 on');

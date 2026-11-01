@@ -211,18 +211,22 @@ pub(crate) struct ClaimedRecord {
     pub(crate) fold: weft_journal::LiveFold,
     /// Its last row: a write of this worker goes after it.
     pub(crate) last_seq: i32,
+    /// The memory note of the worker it was lost by, when that worker went
+    /// away full, as the claim read it (`weft_journal::record::Claimed`).
+    pub(crate) lost_full: Option<weft_broker_client::protocol::MemoryNote>,
 }
 
 impl ClaimedRecord {
     /// Read run `run_id`'s record through `page` (one page of a run's
     /// record after a row, `weft_journal::decoded_page`), folding it over
     /// `project`, its seed's ancestors read the same way and their
-    /// programs from `projects`.
+    /// programs from `projects`. `lost_full` is the claim's memory note.
     pub(crate) async fn read<P, Fut>(
         page: P,
         projects: &dyn crate::context::ProjectClient,
         run_id: RunId,
         project: Arc<ProjectDefinition>,
+        lost_full: Option<weft_broker_client::protocol::MemoryNote>,
     ) -> anyhow::Result<Self>
     where
         P: Fn(RunId, Option<i32>) -> Fut,
@@ -250,7 +254,7 @@ impl ClaimedRecord {
         read = weft_journal::on_blocking_pool(move || read.take(first).map(|()| read)).await?;
         let read = weft_journal::record::fold_pages(|after| page(run_id, after), Some(last), read, |read: &mut Reading, rows| read.take(rows)).await?;
         let Reading { fold, charges, firing_payload, last_seq } = read;
-        Ok(Self { birth, firing_payload, charges, chain, fold, last_seq })
+        Ok(Self { birth, firing_payload, charges, chain, fold, last_seq, lost_full })
     }
 }
 
@@ -840,7 +844,7 @@ async fn drive_run_id(
             (born_with, RunFold::unborn(run_id, project_arc.clone()))
         }
         StartsFrom::Record(claimed) => {
-            let ClaimedRecord { birth, charges, chain, fold, .. } = *claimed;
+            let ClaimedRecord { birth, charges, chain, fold, lost_full, .. } = *claimed;
             reopen_charges(clients, record, replica, run_id, cancellation, charges);
             let born_with = BornWith::of_birth(run_id, &birth)?;
             let (fold, snap) = RunFold::of_live(run_id, project_arc.clone(), chain, fold).await?;
@@ -852,7 +856,7 @@ async fn drive_run_id(
             // Cancelled below, a body a dead drive left behind included.
             if !cancellation.is_cancelled() {
                 fail_crashed_firings(
-                    crashed, run_id, project, program_idx, &mut pulses, &mut firings,
+                    crashed, lost_full.as_ref(), run_id, project, program_idx, &mut pulses, &mut firings,
                     journal, replica,
                 )
                 .await;
@@ -1462,32 +1466,100 @@ struct CrashedFiring {
     consumed_a_stream: bool,
 }
 
-/// The message a firing a dead worker left running fails with.
-fn crashed_firing_message(firing: &CrashedFiring) -> String {
+/// The message a firing a dead worker left running fails with. `lost_full`
+/// is that worker's memory note, when it went away with its memory nearly
+/// full: the message then says it ran out of memory and which lever
+/// raises it.
+fn crashed_firing_message(firing: &CrashedFiring, lost_full: Option<&weft_broker_client::protocol::MemoryNote>) -> String {
     let node = &firing.loc.node_id;
+    let doing = if firing.consumed_a_stream { "reading a stream" } else { "running" };
+    let cause = match lost_full {
+        Some(note) => format!(
+            "the worker running '{node}' ran out of memory while it was {doing} (it was at {}% of its {}); \
+             raise it with `weft workers set --memory`",
+            note.used_bytes.saturating_mul(100) / note.limit_bytes.max(1),
+            memory_size(note.limit_bytes),
+        ),
+        None => format!("the worker running '{node}' went away while it was {doing}"),
+    };
     if firing.consumed_a_stream {
         format!(
-            "the worker running '{node}' went away while it was reading a stream; it was not \
-             run again, because the items it had already read are gone from the stream and \
-             it may have partly acted on them. Re-run the run to start the stream over \
-             once you have checked what it did."
+            "{cause}; it was not run again, because the items it had already read are gone from \
+             the stream and it may have partly acted on them. Re-run the run to start the stream \
+             over once you have checked what it did."
         )
     } else {
         format!(
-            "the worker running '{node}' went away while it was running; it was not run \
-             again, because it may have partly happened. Re-run from here once you have \
-             checked what it did."
+            "{cause}; it was not run again, because it may have partly happened. Re-run from here \
+             once you have checked what it did."
         )
+    }
+}
+
+/// `bytes` the way `weft workers set --memory` takes a size: whole `Gi`
+/// when it is some, else `Mi`.
+fn memory_size(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB && bytes.is_multiple_of(GIB) {
+        format!("{}Gi", bytes / GIB)
+    } else {
+        format!("{}Mi", bytes / MIB)
+    }
+}
+
+// Layer 1: what a firing a dead worker left running fails with, with and
+// without that worker's memory note.
+#[cfg(test)]
+mod crashed_firing_message_tests {
+    use super::*;
+    use weft_broker_client::protocol::MemoryNote;
+
+    fn crashed(consumed_a_stream: bool) -> CrashedFiring {
+        CrashedFiring { loc: FiringLocation::new("load", vec![]), consumed_a_stream }
+    }
+
+    /// A worker that went away full names the memory and the lever, at
+    /// what share of which size; one that left no note went away, and
+    /// that is all the message says.
+    #[test]
+    fn a_worker_that_went_away_full_ran_out_of_memory() {
+        let note = MemoryNote { used_bytes: 486 << 20, limit_bytes: 512 << 20, at_unix: 100 };
+        let running = crashed(false);
+        assert_eq!(
+            crashed_firing_message(&running, Some(&note)),
+            "the worker running 'load' ran out of memory while it was running (it was at 94% of its 512Mi); \
+             raise it with `weft workers set --memory`; it was not run again, because it may have partly \
+             happened. Re-run from here once you have checked what it did."
+        );
+        let went_away = "the worker running 'load' went away while it was running; it was not run again";
+        assert!(crashed_firing_message(&running, None).starts_with(went_away));
+
+        let streaming = crashed(true);
+        let message = crashed_firing_message(&streaming, Some(&note));
+        assert!(message.starts_with("the worker running 'load' ran out of memory while it was reading a stream (it was at 94% of its 512Mi)"), "{message}");
+        assert!(message.contains("Re-run the run to start the stream over"), "{message}");
+        assert!(crashed_firing_message(&streaming, None).starts_with("the worker running 'load' went away while it was reading a stream; it was not"));
+    }
+
+    #[test]
+    fn a_limit_reads_the_way_the_lever_takes_it() {
+        assert_eq!(memory_size(1 << 30), "1Gi");
+        assert_eq!(memory_size(4 << 30), "4Gi");
+        assert_eq!(memory_size(512 << 20), "512Mi");
+        assert_eq!(memory_size(1536 << 20), "1536Mi");
     }
 }
 
 /// Fail each firing `apply_snapshot` found a dead worker left running:
 /// a loud `NodeFailed` with the cause, downstream closures included,
 /// through the one failure door, so with `_error` wired the message
-/// goes there and the branch carries on.
+/// goes there and the branch carries on. `lost_full` is that worker's
+/// memory note, read with the claim, when it went away full.
 #[allow(clippy::too_many_arguments)]
 async fn fail_crashed_firings(
     crashed: Vec<CrashedFiring>,
+    lost_full: Option<&weft_broker_client::protocol::MemoryNote>,
     run_id: RunId,
     project: &ProjectDefinition,
     program_idx: &ProgramIndex,
@@ -1497,7 +1569,7 @@ async fn fail_crashed_firings(
     replica: &str,
 ) {
     for firing in crashed {
-        let err = crashed_firing_message(&firing);
+        let err = crashed_firing_message(&firing, lost_full);
         let loc = &firing.loc;
         // The record came out of the refold with the ports the firing
         // had already emitted on; those keep their values, as on the
@@ -2396,8 +2468,12 @@ async fn drive(
 
             // Input values for provisioning: the same one bag the
             // run-time dispatch built above, so provision bodies read
-            // the same view a `run` body would.
-            let provision_input = inputs.clone();
+            // the same view a `run` body would. Copied only for an infra
+            // node's provisioning, which reads it beside its `run`: any
+            // other firing hands its one bag to its body.
+            let is_infra_setup_provision =
+                matches!(phase, weft_core::context::Phase::InfraSetup) && node_def.requires_infra;
+            let provision_input = is_infra_setup_provision.then(|| inputs.clone());
             let ctx = RunContext::new(
                 project.id,
                 node_id.clone(),
@@ -2467,8 +2543,6 @@ async fn drive(
             let run_id_task = group.run_id;
             // node_impl is &'static dyn Node (see NodeCatalog::lookup
             // contract). No allocation or unsafe needed.
-            let is_infra_setup_provision =
-                matches!(phase, weft_core::context::Phase::InfraSetup) && node_def.requires_infra;
             let provision_project_id = project.id;
             let provision_project = project.id;
             let provision_place = place;
@@ -2500,7 +2574,7 @@ async fn drive(
                         return;
                     }
                 }
-                if is_infra_setup_provision {
+                if let Some(provision_input) = provision_input {
                     // 1. Call the node's provision body.
                     let infra_ctx = weft_core::infra::InfraProvisionContext::new(
                         provision_project_id,

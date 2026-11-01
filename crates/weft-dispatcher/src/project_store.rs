@@ -160,7 +160,16 @@ pub trait ProjectStoreOps: Send + Sync {
     /// row (caller decides whether to 404). `Err` = DB failure, and
     /// nothing was removed.
     async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<Option<Vec<crate::store::SignalRegistration>>>;
+    /// The program on the project's row: its running build's, or the
+    /// empty one a project declared and never built holds. Readers go
+    /// through `DispatcherState::registered`, which reads a built one
+    /// through the programs it keeps.
     async fn project(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectDefinition>>;
+
+    /// Whether project `id` is there, and the hash of its running build's
+    /// program: `None` for no such project, `Some(None)` for one declared
+    /// and never built.
+    async fn running_definition(&self, id: uuid::Uuid) -> anyhow::Result<Option<Option<String>>>;
 
     /// Read the stored binary hash. `Ok(None)` if never set
     /// (project registered but never built / activated /
@@ -190,6 +199,13 @@ pub trait ProjectStoreOps: Send + Sync {
     /// `definition_hash` (`BuiltProgram::infra_places`); empty for a
     /// version registered without them.
     async fn infra_places(&self, id: uuid::Uuid, definition_hash: &str) -> anyhow::Result<std::collections::BTreeMap<String, String>>;
+
+    /// Each trigger's cut in the registered version `definition_hash`, as
+    /// its registration walked them (`program_trigger_cut`); `None` for a
+    /// program whose cuts were never walked (a cut a run kept, or no
+    /// program at all). Readers go through `DispatcherState::trigger_cuts`,
+    /// which keeps what it read.
+    async fn trigger_cuts(&self, id: uuid::Uuid, definition_hash: &str) -> anyhow::Result<Option<weft_core::run_spec::TriggerCuts>>;
 
     /// The infra image tags the last build registered (empty before the
     /// first build, or for a program without infra). `Ok(None)` = no such
@@ -565,14 +581,77 @@ pub const RESYNC_FILLS: &[weft_task_store::documents::Fill] = &[weft_task_store:
     sql: "UPDATE project SET resync_driver = (resync::jsonb->>'driver')::uuid WHERE resync_version = 1",
 }];
 
-/// The `project` + `project_definition` tables. The canonical CREATEs
-/// live here, edited in place; an existing database is carried to them
-/// by a migration written with `./setup.sh --migration <name>` (the
-/// whole contract is `weft_task_store::schema_guard`'s header). The
-/// boot applies this group with every other (`crate::app::DISPATCHER_GROUPS`).
+/// Record `cuts`, the triggers' cuts of version `hash` of project `id`
+/// (`program_trigger_cut`). The same program walks to the same cuts, so
+/// one recorded already is kept as it is.
+async fn record_trigger_cuts(db: &impl Client, id: uuid::Uuid, hash: &str, cuts: &weft_core::run_spec::TriggerCuts) -> anyhow::Result<()> {
+    for (trigger, cut) in cuts {
+        let (fingerprint, depends_on, unwalkable) = match cut {
+            Ok(cut) => (Some(&cut.fingerprint), cut.depends_on.as_slice(), None),
+            Err(why) => (None, &[][..], Some(why)),
+        };
+        db.execute(
+            "INSERT INTO program_trigger_cut (project_id, definition_hash, trigger, fingerprint, depends_on, unwalkable) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+            &[&id, &hash, trigger, &fingerprint, &depends_on, &unwalkable],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// How many programs [`walk_trigger_cuts`] reads at once.
+const WALK_PAGE: i64 = 50;
+
+/// The data step behind `project_definition.trigger_cuts_walked`: every
+/// program kept with no answer yet, read a page at a time (a program may
+/// be megabytes), has its triggers' cuts walked and recorded when it is a
+/// version a build registered, as [`ProjectStoreOps::register_with_hashes`]
+/// walks them, and none when it is a cut a run kept. A program that does
+/// not read fails the boot, naming it.
+fn walk_trigger_cuts<'c>(tx: &'c db::Transaction<'c>) -> futures::future::BoxFuture<'c, anyhow::Result<()>> {
+    Box::pin(async move {
+        loop {
+            let rows = tx
+                .query(
+                    "SELECT project_id, definition_hash, project_json, project_json_version, cut_from IS NOT NULL \
+                     FROM project_definition WHERE trigger_cuts_walked IS NULL \
+                     ORDER BY project_id, definition_hash LIMIT $1",
+                    &[&WALK_PAGE],
+                )
+                .await?;
+            if rows.is_empty() {
+                return Ok(());
+            }
+            for row in &rows {
+                let (id, hash): (uuid::Uuid, String) = (row.get(0), row.get(1));
+                let registered = !row.get::<_, bool>(4);
+                if registered {
+                    let json: String = row.get(2);
+                    let program = ProjectDefinition::STORED
+                        .decode(json.as_str(), row.get(3))
+                        .map_err(|e| e.at(format_args!("program {hash} of project {id}")))?;
+                    record_trigger_cuts(tx, id, &hash, &weft_core::run_spec::trigger_cuts(&program)).await?;
+                }
+                tx.execute(
+                    "UPDATE project_definition SET trigger_cuts_walked = $3 WHERE project_id = $1 AND definition_hash = $2",
+                    &[&id, &hash, &registered],
+                )
+                .await?;
+            }
+        }
+    })
+}
+
+/// The `project`, `project_definition` and `program_trigger_cut` tables.
+/// The canonical CREATEs live here, edited in place; an existing database
+/// is carried to them by a migration written with `./setup.sh --migration
+/// <name>` (the whole contract is `weft_task_store::schema_guard`'s
+/// header). The boot applies this group with every other
+/// (`crate::app::DISPATCHER_GROUPS`).
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "project",
-    tables: &["project", "project_definition", "project_code"],
+    tables: &["project", "project_definition", "project_code", "program_trigger_cut"],
     // project: one row per registered project.
     //
     // Which triggers listen, and how the ones that stopped went down,
@@ -808,15 +887,50 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- an apply of that place stamps on its copy, and what tells a
             -- copy behind. NULL for a cut, and for a build that named none.
             infra_places JSONB,
+            -- Whether its triggers' cuts are in `program_trigger_cut`,
+            -- walked as it registered: every version a build registered,
+            -- never a cut a run kept (`cut_from`), whose triggers' cuts
+            -- nothing reads. A version an older weft registered has its
+            -- own walked as this weft first boots (the data step below).
+            trigger_cuts_walked BOOLEAN NOT NULL,
             PRIMARY KEY (project_id, definition_hash)
             -- No foreign key to `project`: the project's removal erases
             -- its runs first and drops these in its own transaction
             -- (`ProjectStoreOps::remove`), so no run is ever left without
             -- the program it ran against.
         )"#,
+        // Each trigger's cut in a version a build registered
+        // (`weft_core::run_spec::trigger_cuts`), walked once as it
+        // registers: what tells a trigger on behind it, and the infra a
+        // trigger depends on. No rows for a version without triggers or a
+        // cut (`project_definition.trigger_cuts_walked` says which).
+        r#"CREATE TABLE IF NOT EXISTS program_trigger_cut (
+            project_id UUID NOT NULL,
+            definition_hash TEXT NOT NULL,
+            -- The trigger's address (`door`, `one.door`).
+            trigger TEXT NOT NULL,
+            -- Its cut's fingerprint; NULL when the cut cannot be walked.
+            fingerprint TEXT,
+            -- The infra places it depends on, sorted.
+            depends_on TEXT[] NOT NULL,
+            -- Why its cut cannot be walked.
+            unwalkable TEXT,
+            CHECK ((fingerprint IS NULL) = (unwalkable IS NOT NULL)),
+            PRIMARY KEY (project_id, definition_hash, trigger),
+            FOREIGN KEY (project_id, definition_hash) REFERENCES project_definition (project_id, definition_hash) ON DELETE CASCADE
+        )"#,
     ],
     seed: &[],
     data_steps: &[
+        // The versions an older weft registered, before their triggers'
+        // cuts were recorded, have them walked from the program each
+        // keeps, as a registration walks them; a cut a run kept is marked
+        // as having none.
+        weft_task_store::DataStep {
+            table: "project_definition",
+            until: weft_task_store::Until::NotNull("trigger_cuts_walked"),
+            work: weft_task_store::StepWork::Code(walk_trigger_cuts),
+        },
         // A project's head moved off its row onto its working copies
         // (`crate::working_copies`): the head it had becomes its program
         // copy's, with that version's files as the copy's working files,
@@ -927,6 +1041,9 @@ impl ProjectStoreOps for PostgresProjectStore {
         // adds (or drops) an infra node flips placement.
         let has_infra = weft_core::has_infra(&project);
         let project_json = serde_json::to_string(&project)?;
+        // Walked once here, before the transaction holds anything: every
+        // reader of the version reads them from then on.
+        let trigger_cuts = definition_hash.map(|_| weft_core::run_spec::trigger_cuts(&project));
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
         let now = crate::lease::now_unix();
@@ -990,13 +1107,16 @@ impl ProjectStoreOps for PostgresProjectStore {
             // hash is the same program, and is now a registered version
             // too.
             tx.execute(
-                "INSERT INTO project_definition (project_id, definition_hash, project_json, project_json_version, recorded_at_unix, infra_places) \
-                 VALUES ($1, $2, $3, $6, $4, $5) \
-                 ON CONFLICT (project_id, definition_hash) DO UPDATE SET cut_from = NULL, \
+                "INSERT INTO project_definition (project_id, definition_hash, project_json, project_json_version, recorded_at_unix, infra_places, trigger_cuts_walked) \
+                 VALUES ($1, $2, $3, $6, $4, $5, TRUE) \
+                 ON CONFLICT (project_id, definition_hash) DO UPDATE SET cut_from = NULL, trigger_cuts_walked = TRUE, \
                      infra_places = COALESCE(EXCLUDED.infra_places, project_definition.infra_places)",
                 &[&id, &hash, &project_json, &now, &infra_places.map(|places| db::Json(db::WeftMade(places))), &ProjectDefinition::STORED.version()],
             )
             .await?;
+            if let Some(cuts) = &trigger_cuts {
+                record_trigger_cuts(&tx, id, hash, cuts).await?;
+            }
         }
         if let Some(code) = code {
             let binary = binary_hash.ok_or_else(|| anyhow::anyhow!("implementation fingerprints require a worker binary hash"))?;
@@ -1218,6 +1338,10 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(row.flatten())
     }
 
+    async fn running_definition(&self, id: uuid::Uuid) -> anyhow::Result<Option<Option<String>>> {
+        Ok(self.pool.scalar_opt("SELECT running_definition_hash FROM project WHERE id = $1", &[&id]).await?)
+    }
+
     async fn running_definition_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
         let row: Option<Option<String>> =
             self.pool.scalar_opt("SELECT running_definition_hash FROM project WHERE id = $1", &[&id]).await?;
@@ -1237,6 +1361,35 @@ impl ProjectStoreOps for PostgresProjectStore {
             )
             .await?;
         Ok(row.flatten().map(|places| places.0).unwrap_or_default())
+    }
+
+    async fn trigger_cuts(&self, id: uuid::Uuid, definition_hash: &str) -> anyhow::Result<Option<weft_core::run_spec::TriggerCuts>> {
+        // One row per cut, or one with no trigger for a version without
+        // triggers; none for a program whose cuts were never walked.
+        let rows = self
+            .pool
+            .query(
+                "SELECT c.trigger, c.fingerprint, c.depends_on, c.unwalkable FROM project_definition d \
+                 LEFT JOIN program_trigger_cut c ON c.project_id = d.project_id AND c.definition_hash = d.definition_hash \
+                 WHERE d.project_id = $1 AND d.definition_hash = $2 AND d.trigger_cuts_walked",
+                &[&id, &definition_hash],
+            )
+            .await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        rows.iter()
+            .filter_map(|row| row.get::<_, Option<String>>(0).map(|trigger| (trigger, row)))
+            .map(|(trigger, row)| {
+                let cut = match (row.get::<_, Option<String>>(1), row.get::<_, Option<String>>(3)) {
+                    (Some(fingerprint), None) => Ok(weft_core::run_spec::TriggerCut { fingerprint, depends_on: row.get(2) }),
+                    (None, Some(why)) => Err(why),
+                    _ => anyhow::bail!("trigger '{trigger}' of program {definition_hash} has a recorded cut that is both walked and not"),
+                };
+                Ok((trigger, cut))
+            })
+            .collect::<anyhow::Result<_>>()
+            .map(Some)
     }
 
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {

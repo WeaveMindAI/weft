@@ -170,8 +170,8 @@ async fn run_and_complete(state: &DispatcherState, row: ClaimedCommand) {
 /// next pass.
 async fn drain_then_hand_over(state: &DispatcherState, row: &ClaimedCommand) {
     let replica = state.replica.as_str();
-    let project = match state.projects.project(row.project_id).await {
-        Ok(Some(project)) => project,
+    let project = match state.registered(row.project_id).await {
+        Ok(Some(registered)) => registered.program,
         Ok(None) => {
             let outcome = RunOutcome::Cancelled(format!("project {} no longer exists", row.project_id));
             if let Err(e) = complete(&state.pg_pool, row.id, replica, &outcome).await {
@@ -495,11 +495,12 @@ async fn run_deactivate(
     // take-down aimed at nothing fails loud here rather than taking the
     // wrong branch downstream.
     take_down.validate().map_err(|m| anyhow::anyhow!("invalid health take-down: {m}"))?;
-    let Some(project) = state.projects.project(project_id).await? else {
+    let Some(registered) = state.registered(project_id).await? else {
         return Ok(RunOutcome::Cancelled(format!("project {project_id} no longer exists")));
     };
+    let cuts = state.trigger_cuts(project_id, &registered).await?;
     let activations = state.activations.list(project_id).await?;
-    let targets = health_take_down_targets(&project, &activations, &take_down.broken);
+    let targets = health_take_down_targets(&cuts, &activations, &take_down.broken);
     if targets.is_empty() {
         // Nothing listening is reached: nothing to take down.
         return Ok(RunOutcome::Succeeded);
@@ -533,13 +534,13 @@ async fn run_deactivate(
 /// infra verb on that copy takes down), and nothing whose cut has only
 /// healthy infra.
 fn health_take_down_targets(
-    project: &weft_core::ProjectDefinition,
+    cuts: &weft_core::run_spec::TriggerCuts,
     activations: &[crate::activation_store::Activation],
     broken: &[weft_broker_client::protocol::InfraCopy],
 ) -> Vec<weft_core::activation::ActivationKey> {
     let mut keys: Vec<weft_core::activation::ActivationKey> = broken
         .iter()
-        .flat_map(|copy| crate::infra_reach::live_triggers_reached(&copy_reach(copy), activations, project))
+        .flat_map(|copy| crate::infra_reach::live_triggers_reached(&copy_reach(copy), activations, cuts))
         .collect();
     keys.sort();
     keys.dedup();
@@ -561,22 +562,24 @@ async fn run_reactivate(
 ) -> Result<RunOutcome> {
     // A NotFound anywhere below means the project was removed between
     // enqueue and claim: same Cancelled semantic as the deactivate arm.
-    let Some(project) = state.projects.project(project_id).await? else {
+    let Some(registered) = state.registered(project_id).await? else {
         return Ok(RunOutcome::Cancelled(format!("project {project_id} no longer exists")));
     };
+    let cuts = state.trigger_cuts(project_id, &registered).await?;
+    let project = &*registered.program;
     // The copies expected to run: one stopped by a person, being worked
     // on by an infra command, or never applied is not up, whatever the
     // health check saw of the rest.
-    let observed = crate::infra_node::observe(&state.pg_pool, project_id, &project).await?;
+    let observed = crate::infra_node::observe(&state.pg_pool, project_id, project).await?;
     let up: std::collections::HashSet<weft_broker_client::protocol::InfraCopy> = observed
         .rows
         .iter()
         .filter(|row| matches!(row.status, crate::infra_node::InfraNodeStatus::Running | crate::infra_node::InfraNodeStatus::Flaky))
         .map(|row| weft_broker_client::protocol::InfraCopy { node_id: row.node_id.clone(), instance: row.instance.clone() })
         .collect();
-    let declared = weft_core::project::DeclaredInfra::of(&project);
+    let declared = weft_core::project::DeclaredInfra::of(project);
     let targets = health_restore_targets(
-        &project,
+        &cuts,
         |place| declared.per_instance(place) == Some(true),
         &state.activations.list(project_id).await?,
         &restore.still_broken,
@@ -623,7 +626,7 @@ async fn run_reactivate(
 /// back another's triggers. A trigger's cut holds the shared copy of a
 /// shared node and its owner's copy of a per-instance one.
 fn health_restore_targets(
-    project: &weft_core::ProjectDefinition,
+    cuts: &weft_core::run_spec::TriggerCuts,
     per_instance_of: impl Fn(&str) -> bool,
     activations: &[crate::activation_store::Activation],
     still_broken: &[weft_broker_client::protocol::InfraCopy],
@@ -633,7 +636,7 @@ fn health_restore_targets(
         .iter()
         .filter(|a| a.lifecycle.down_by_health())
         .filter(|a| {
-            crate::infra_reach::depends_on(a, project)
+            crate::infra_reach::depends_on(a, cuts)
                 .into_iter()
                 .map(|infra| weft_broker_client::protocol::InfraCopy {
                     instance: if per_instance_of(&infra) { a.key.instance().cloned() } else { None },
@@ -682,10 +685,6 @@ mod tests {
         Owner::Instance(InstanceId::new("ada").unwrap())
     }
 
-    fn empty() -> weft_core::ProjectDefinition {
-        serde_json::from_value(serde_json::json!({ "id": uuid::Uuid::nil(), "nodes": [], "edges": [] })).unwrap()
-    }
-
     /// An instance's broken copy takes down only that instance's live
     /// triggers whose cut contains the node: never a trigger whose cut has
     /// no infra (the program's shared `mint`), never another instance's,
@@ -704,10 +703,10 @@ mod tests {
             activation("look", bob.clone(), Inactive, &["db"]),
         ];
         let ada_svc = InfraCopy { node_id: "svc".into(), instance: Some(InstanceId::new("ada").unwrap()) };
-        assert_eq!(health_take_down_targets(&empty(), &activations, &[ada_svc]), vec![ActivationKey::new("up", ada())]);
+        assert_eq!(health_take_down_targets(&Default::default(), &activations, &[ada_svc]), vec![ActivationKey::new("up", ada())]);
         let shared_db = InfraCopy { node_id: "db".into(), instance: None };
         assert_eq!(
-            health_take_down_targets(&empty(), &activations, &[shared_db]),
+            health_take_down_targets(&Default::default(), &activations, &[shared_db]),
             vec![ActivationKey::new("look", Owner::Shared), ActivationKey::new("look", ada())]
         );
     }
@@ -731,7 +730,7 @@ mod tests {
         ];
         let still_broken = vec![InfraCopy { node_id: "svc".into(), instance: Some(InstanceId::new("bob").unwrap()) }];
         assert_eq!(
-            health_restore_targets(&empty(), |place| place == "svc", &activations, &still_broken, |_| true),
+            health_restore_targets(&Default::default(), |place| place == "svc", &activations, &still_broken, |_| true),
             vec![ActivationKey::new("up", ada()), ActivationKey::new("look", Owner::Shared)]
         );
     }
@@ -745,9 +744,9 @@ mod tests {
     fn a_trigger_reading_a_copy_that_is_not_up_stays_down() {
         let activations = vec![by_health("look", Owner::Shared, &["cache", "db"])];
         let db = InfraCopy { node_id: "db".into(), instance: None };
-        assert!(health_restore_targets(&empty(), |_| false, &activations, &[], |copy| copy == &db).is_empty());
+        assert!(health_restore_targets(&Default::default(), |_| false, &activations, &[], |copy| copy == &db).is_empty());
         assert_eq!(
-            health_restore_targets(&empty(), |_| false, &activations, &[], |_| true),
+            health_restore_targets(&Default::default(), |_| false, &activations, &[], |_| true),
             vec![ActivationKey::new("look", Owner::Shared)]
         );
     }
@@ -804,7 +803,8 @@ mod tests {
     fn a_health_take_down_reaches_what_weft_infra_stop_of_the_copy_reaches() {
         use weft_broker_client::activation::ActivationLifecycle;
         let project = door_and_tick();
-        assert_eq!(crate::infra_reach::depends_on(&set_up(&project, "door", Owner::Shared, ActivationLifecycle::active()), &project), vec!["svc"]);
+        let cuts = weft_core::run_spec::trigger_cuts(&project);
+        assert_eq!(crate::infra_reach::depends_on(&set_up(&project, "door", Owner::Shared, ActivationLifecycle::active()), &cuts), vec!["svc"]);
         let bob = Owner::Instance(InstanceId::new("bob").unwrap());
         let activations = vec![
             set_up(&project, "door", Owner::Shared, ActivationLifecycle::active()),
@@ -817,15 +817,15 @@ mod tests {
         // What `weft infra stop` of the copy takes down
         // (`crate::api::infra::triggers_reached`).
         let infra_stop_reaches = |copy: &InfraCopy| -> Vec<ActivationKey> {
-            let mut keys = crate::infra_reach::live_triggers_reached(&copy_reach(copy), &activations, &project);
+            let mut keys = crate::infra_reach::live_triggers_reached(&copy_reach(copy), &activations, &cuts);
             keys.sort();
             keys
         };
         let ada_svc = InfraCopy { node_id: "svc".into(), instance: Some(InstanceId::new("ada").unwrap()) };
         let shared_svc = InfraCopy { node_id: "svc".into(), instance: None };
-        assert_eq!(health_take_down_targets(&project, &activations, std::slice::from_ref(&ada_svc)), vec![ActivationKey::new("door", ada())]);
-        assert_eq!(health_take_down_targets(&project, &activations, std::slice::from_ref(&ada_svc)), infra_stop_reaches(&ada_svc));
-        let shared = health_take_down_targets(&project, &activations, std::slice::from_ref(&shared_svc));
+        assert_eq!(health_take_down_targets(&cuts, &activations, std::slice::from_ref(&ada_svc)), vec![ActivationKey::new("door", ada())]);
+        assert_eq!(health_take_down_targets(&cuts, &activations, std::slice::from_ref(&ada_svc)), infra_stop_reaches(&ada_svc));
+        let shared = health_take_down_targets(&cuts, &activations, std::slice::from_ref(&shared_svc));
         assert_eq!(shared, vec![ActivationKey::new("door", Owner::Shared), ActivationKey::new("door", ada()), ActivationKey::new("door", bob)]);
         assert_eq!(shared, infra_stop_reaches(&shared_svc));
     }
@@ -853,11 +853,14 @@ mod tests {
         ];
         let per_instance = |place: &str| place == "svc";
         assert_eq!(
-            health_restore_targets(&project, per_instance, &activations, &[], |_| true),
+            health_restore_targets(&weft_core::run_spec::trigger_cuts(&project), per_instance, &activations, &[], |_| true),
             vec![ActivationKey::new("door", ada()), ActivationKey::new("door", dee.clone())]
         );
         let dee_svc = InfraCopy { node_id: "svc".into(), instance: Some(InstanceId::new("dee").unwrap()) };
-        assert_eq!(health_restore_targets(&project, per_instance, &activations, &[dee_svc], |_| true), vec![ActivationKey::new("door", ada())]);
+        assert_eq!(
+            health_restore_targets(&weft_core::run_spec::trigger_cuts(&project), per_instance, &activations, &[dee_svc], |_| true),
+            vec![ActivationKey::new("door", ada())]
+        );
     }
 
     /// `RunOutcome::Cancelled` MUST project to `LifecycleOutcome::Cancelled`

@@ -292,9 +292,10 @@ impl Failed {
             Failed::Role(_) => "weft rings it again on the next change that needs it",
             Failed::Workers => {
                 "a queued run refused 3 times ends, and one its workers could not be reached for 3 times waits until a worker of the \
-                 project comes up or a build of it registers; one they keep answering busy (which spends no try) is tried again \
-                 after a pause that grows to a minute, for as long as they do; changing the project's worker settings (more memory, for a worker \
-                 that stays busy) tries every queued run afresh"
+                 project comes up or a build of it registers; one they keep answering busy (memory full, or unable to read its program \
+                 and files from the store or to claim it from the broker; it spends no try) is tried again after a pause that grows to \
+                 a minute, for as long as they do; `weft workers set` (more memory, for a worker that stays busy) tries every queued run \
+                 of the project again at once, whichever of these it waits on"
             }
             Failed::Loop { .. } => {
                 "weft tries it again a few times by itself, then stops; after that, the next change that concerns it tries it again, \

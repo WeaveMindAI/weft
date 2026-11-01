@@ -13,6 +13,174 @@ use serde_json::Value;
 
 use crate::metadata::MetadataTokens;
 
+/// How much of an upload goes in one request ([`Google::upload_streamed`]):
+/// a multiple of 256 KiB, as Cloud Storage asks of every part of a
+/// resumable upload but the last, and the 8 MiB it recommends.
+pub const UPLOAD_PART: usize = 8 * 1024 * 1024;
+
+/// What a producer hands [`Google::upload_streamed`].
+pub enum Streamed {
+    /// The next bytes of the object: [`UPLOAD_PART`] of them, unless it
+    /// is the last part.
+    Part(Vec<u8>),
+    /// Nothing comes after: the object is complete.
+    End,
+}
+
+/// The `Content-Range` of `len` bytes at `offset` of an upload: the total
+/// is said only with the last part (`*` until then), and a last part with
+/// no bytes says only the total.
+fn content_range(offset: u64, len: u64, last: bool) -> String {
+    match (len, last) {
+        (0, true) => format!("bytes */{offset}"),
+        (_, true) => format!("bytes {offset}-{}/{}", offset + len - 1, offset + len),
+        (_, false) => format!("bytes {offset}-{}/*", offset + len - 1),
+    }
+}
+
+/// How many bytes of an upload Cloud Storage holds, from the `Range` of
+/// its 308 (`bytes=0-N`, or no header for none yet).
+fn received_up_to(range: Option<&str>) -> anyhow::Result<u64> {
+    let Some(range) = range else { return Ok(0) };
+    let last = range
+        .strip_prefix("bytes=0-")
+        .and_then(|end| end.parse::<u64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("Cloud Storage said it holds `{range}` of an upload, which is no range from its start"))?;
+    Ok(last + 1)
+}
+
+/// How many requests in a row may move no bytes of a part before the
+/// upload gives up: enough to ride out a dropped connection or a 5xx
+/// blip, few enough that an upload Cloud Storage keeps refusing to take
+/// fails while somebody still waits on it.
+const UPLOAD_TRIES: u32 = 3;
+
+/// What Cloud Storage answered one request of an upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Answer {
+    /// A 308: it holds the object up to this byte, and wants the rest.
+    Holds(u64),
+    /// A 200 or 201: the object is complete.
+    Complete,
+    /// No answer came back (the request failed on the way), or one Cloud
+    /// Storage says to try again (`why`): what the session holds is
+    /// unknown until it is asked.
+    Lost(String),
+}
+
+/// What an answer to a request of an upload means: [`Answer::Holds`] for
+/// a 308 (its `Range`, [`received_up_to`]), [`Answer::Complete`] for a
+/// 200 or 201, [`Answer::Lost`] for the answers Cloud Storage says to try
+/// again on (a 5xx, 408 and 429). Any other status is Google refusing the
+/// upload, an [`ApiError`] with its `body`: sending again would be
+/// refused again.
+fn answer_of(status: u16, range: Option<&str>, body: String) -> anyhow::Result<Answer> {
+    match status {
+        308 => Ok(Answer::Holds(received_up_to(range)?)),
+        200 | 201 => Ok(Answer::Complete),
+        408 | 429 | 500..=599 => Ok(Answer::Lost(ApiError { status, body }.to_string())),
+        _ => Err(ApiError { status, body }.into()),
+    }
+}
+
+/// What the upload of a part sends next ([`PartUpload::read`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// The bytes of the part from [`PartUpload::held`] on.
+    Send,
+    /// Nothing: it asks the session what it holds ([`PartUpload::asking_range`]).
+    Ask,
+    /// Nothing more: Cloud Storage holds the whole part.
+    Done,
+}
+
+/// Where the upload of one part stands, read off each answer Cloud
+/// Storage gives it. The part runs to `end`; the session holds the object
+/// up to `held`, which only moves forward.
+#[derive(Debug)]
+struct PartUpload {
+    held: u64,
+    end: u64,
+    last: bool,
+    /// Sends in a row that moved no bytes, and what the last one said.
+    stalled: u32,
+    stalled_on: String,
+    /// The request out is a question of where the session stands, not a
+    /// send: its answer moves no bytes by nature, so it is never a stall.
+    asking: bool,
+}
+
+impl PartUpload {
+    /// `len` bytes at `offset`, all of the session's bytes before them.
+    fn new(offset: u64, len: u64, last: bool) -> Self {
+        Self { held: offset, end: offset + len, last, stalled: 0, stalled_on: String::new(), asking: false }
+    }
+
+    /// The `Content-Range` of the bytes still to send.
+    fn sending_range(&self) -> String {
+        content_range(self.held, self.end - self.held, self.last)
+    }
+
+    /// The `Content-Range` of an empty request asking the session what it
+    /// holds: the total once it is known (with the last part), `*` until
+    /// then.
+    fn asking_range(&self) -> String {
+        match self.last {
+            true => format!("bytes */{}", self.end),
+            false => "bytes */*".to_string(),
+        }
+    }
+
+    /// What `answer` means for this part. A 308 moves `held` to what it
+    /// says and sends the rest, or ends a part that is all held (the last
+    /// part is done only once Cloud Storage says the object is complete:
+    /// a 308 holding all of it sends its total again, which completes
+    /// it). A lost request asks where the session stands. A complete
+    /// object before the last part, or a 308 holding less than it held
+    /// before or more than was sent, is no upload this sent: it fails.
+    /// [`UPLOAD_TRIES`] sends in a row that move no bytes fail it too,
+    /// naming what the last one said, so a session that never takes
+    /// anything ends instead of looping. The question asked after a lost
+    /// send is no send: a 308 answering it counts nothing, and only the
+    /// question itself being lost counts.
+    fn read(&mut self, answer: Answer) -> anyhow::Result<Next> {
+        let asked = std::mem::take(&mut self.asking);
+        let (next, moved) = match answer {
+            Answer::Complete if self.last => return Ok(Next::Done),
+            Answer::Complete => anyhow::bail!("Cloud Storage completed the object before its last part was sent"),
+            Answer::Holds(held) if held < self.held || held > self.end => {
+                anyhow::bail!("Cloud Storage holds {held} bytes of an upload it held {} of and sent up to {}", self.held, self.end)
+            }
+            Answer::Holds(held) => {
+                let moved = held > self.held;
+                self.held = held;
+                if held == self.end && !self.last {
+                    return Ok(Next::Done);
+                }
+                self.stalled_on = format!("Cloud Storage held {held} of the {} bytes sent", self.end);
+                (Next::Send, moved)
+            }
+            Answer::Lost(why) => {
+                self.stalled_on = why;
+                (Next::Ask, false)
+            }
+        };
+        self.asking = next == Next::Ask;
+        if moved {
+            self.stalled = 0;
+            return Ok(next);
+        }
+        if asked && next == Next::Send {
+            return Ok(next);
+        }
+        self.stalled += 1;
+        if self.stalled >= UPLOAD_TRIES {
+            anyhow::bail!("{UPLOAD_TRIES} sends in a row moved no bytes of the upload past byte {}; the last: {}", self.held, self.stalled_on);
+        }
+        Ok(next)
+    }
+}
+
 /// How often an operation still running is looked at again.
 const OPERATION_POLL: Duration = Duration::from_secs(2);
 
@@ -193,10 +361,108 @@ impl Google {
         self.send(self.http.patch(url).json(body)).await.with_context(|| format!("PATCH {url}"))
     }
 
-    pub async fn put_bytes(&self, url: &str, content_type: &str, body: Vec<u8>) -> anyhow::Result<Value> {
-        self.send(self.http.post(url).header("content-type", content_type).body(body))
-            .await
-            .with_context(|| format!("upload to {url}"))
+    /// Upload what `parts` yields, in order, to Cloud Storage as one object,
+    /// holding no more of it than the part in flight: a resumable upload
+    /// started at `start_url` (the bucket's `uploadType=resumable` URL
+    /// naming the object). Every part but the last is [`UPLOAD_PART`]
+    /// long, as Cloud Storage asks; the object is completed only on
+    /// [`Streamed::End`]. A failure from the producer, or parts that stop
+    /// before their end, fail the upload and cancel it, so no cut-off
+    /// object is ever left.
+    pub async fn upload_streamed(
+        &self,
+        start_url: &str,
+        content_type: &str,
+        mut parts: tokio::sync::mpsc::Receiver<anyhow::Result<Streamed>>,
+    ) -> anyhow::Result<()> {
+        let started = Self::success(
+            self.send_raw(self.http.post(start_url).header("x-upload-content-type", content_type).header("content-length", "0"))
+                .await
+                .with_context(|| format!("start an upload at {start_url}"))?,
+        )
+        .await
+        .with_context(|| format!("start an upload at {start_url}"))?;
+        let session = started
+            .headers()
+            .get("location")
+            .and_then(|l| l.to_str().ok())
+            .ok_or_else(|| anyhow::anyhow!("Cloud Storage started an upload at {start_url} without saying where to send it"))?
+            .to_string();
+        let sent = self.send_parts(&session, &mut parts).await;
+        if sent.is_err() {
+            // Cancelled, so the session holds nothing; one this cannot
+            // cancel ends on its own a week on, with nothing in the bucket.
+            if let Err(e) = self.send_raw(self.http.delete(&session)).await {
+                tracing::warn!(target: "weft_platform_gcp::api", error = %format!("{e:#}"), "an upload that failed could not be cancelled");
+            }
+        }
+        sent
+    }
+
+    /// The parts of [`Self::upload_streamed`], to its `session`.
+    async fn send_parts(&self, session: &str, parts: &mut tokio::sync::mpsc::Receiver<anyhow::Result<Streamed>>) -> anyhow::Result<()> {
+        // A part goes once the next is known: only the one before the
+        // end is sent as the last.
+        let mut offset: u64 = 0;
+        let mut pending: Option<Vec<u8>> = None;
+        loop {
+            match parts.recv().await {
+                Some(Ok(Streamed::Part(part))) => {
+                    if let Some(ahead) = pending.replace(part) {
+                        offset = self.send_part(session, offset, ahead, false).await?;
+                    }
+                }
+                Some(Ok(Streamed::End)) => {
+                    self.send_part(session, offset, pending.take().unwrap_or_default(), true).await?;
+                    return Ok(());
+                }
+                Some(Err(e)) => return Err(e.context("make what is uploaded")),
+                None => anyhow::bail!("what is uploaded stopped before its end"),
+            }
+        }
+    }
+
+    /// Send `part`, starting at `offset` of the object, until Cloud Storage
+    /// holds all of it, answering the offset after it. What each answer
+    /// means is [`PartUpload::read`]'s: the part stays in memory until it
+    /// is all held, so a request lost on the way, or a 5xx, asks the
+    /// session where it stands and sends again from there, waiting a
+    /// second longer each time nothing moved.
+    async fn send_part(&self, session: &str, offset: u64, part: Vec<u8>, last: bool) -> anyhow::Result<u64> {
+        let part = bytes::Bytes::from(part);
+        let mut upload = PartUpload::new(offset, part.len() as u64, last);
+        let mut next = Next::Send;
+        loop {
+            let req = match next {
+                Next::Done => return Ok(upload.end),
+                Next::Send => self
+                    .http
+                    .put(session)
+                    .header("content-range", upload.sending_range())
+                    .body(part.slice((upload.held - offset) as usize..)),
+                Next::Ask => self.http.put(session).header("content-range", upload.asking_range()).header("content-length", "0"),
+            };
+            if upload.stalled > 0 {
+                tokio::time::sleep(Duration::from_secs(upload.stalled as u64)).await;
+            }
+            let answer = self.upload_answer(req).await.with_context(|| format!("upload the part at byte {offset}"))?;
+            next = upload.read(answer).with_context(|| format!("upload the part at byte {offset}"))?;
+        }
+    }
+
+    /// What Cloud Storage answered `req`, one request of an upload
+    /// ([`answer_of`]): a request that got no answer is [`Answer::Lost`].
+    /// The status and headers are the answer; a body that breaks off is
+    /// said in its place.
+    async fn upload_answer(&self, req: reqwest::RequestBuilder) -> anyhow::Result<Answer> {
+        let resp = match self.send_raw(req).await {
+            Ok(resp) => resp,
+            Err(e) => return Ok(Answer::Lost(format!("{e:#}"))),
+        };
+        let status = resp.status().as_u16();
+        let range = resp.headers().get("range").and_then(|r| r.to_str().ok()).map(str::to_string);
+        let body = resp.text().await.unwrap_or_else(|e| format!("(the answer's body broke off: {e:#})"));
+        answer_of(status, range.as_deref(), body)
     }
 
     /// `DELETE`, with a 404 read as "already gone".
@@ -239,6 +505,138 @@ impl Google {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each part says where it sits; the total is said with the last one
+    /// only, and a last part with no bytes says only the total.
+    #[test]
+    fn a_part_says_where_it_sits_and_the_last_the_total() {
+        assert_eq!(content_range(0, 8, false), "bytes 0-7/*");
+        assert_eq!(content_range(8, 4, true), "bytes 8-11/12");
+        assert_eq!(content_range(12, 0, true), "bytes */12");
+        assert_eq!(content_range(0, 0, true), "bytes */0");
+    }
+
+    /// What Cloud Storage holds is read off its `Range`, none without one;
+    /// anything else is refused rather than guessed at.
+    #[test]
+    fn what_cloud_storage_holds_is_read_off_its_range() {
+        assert_eq!(received_up_to(None).unwrap(), 0);
+        assert_eq!(received_up_to(Some("bytes=0-8388607")).unwrap(), 8_388_608);
+        assert!(received_up_to(Some("bytes=5-9")).is_err());
+        assert!(received_up_to(Some("bytes=0-")).is_err());
+    }
+
+    /// A 308 says what is held, a 200 or 201 a complete object, a 5xx a
+    /// request to ask about again; anything else is Google refusing, with
+    /// its words.
+    #[test]
+    fn an_answer_to_an_upload_is_read_off_its_status() {
+        assert_eq!(answer_of(308, Some("bytes=0-99"), String::new()).unwrap(), Answer::Holds(100));
+        assert_eq!(answer_of(308, None, String::new()).unwrap(), Answer::Holds(0));
+        assert!(answer_of(308, Some("bytes=3-9"), String::new()).is_err());
+        assert_eq!(answer_of(200, None, "{}".into()).unwrap(), Answer::Complete);
+        assert_eq!(answer_of(201, None, "{}".into()).unwrap(), Answer::Complete);
+        assert_eq!(answer_of(503, None, "busy".into()).unwrap(), Answer::Lost("Google answered 503: busy".into()));
+        for again in [408, 429] {
+            assert!(matches!(answer_of(again, None, "later".into()).unwrap(), Answer::Lost(_)), "{again} is tried again");
+        }
+        let refused = answer_of(403, None, "no".into()).unwrap_err();
+        assert!(is_status(&refused, 403), "{refused:#}");
+        assert_eq!(refused.to_string(), "Google answered 403: no");
+        assert!(is_status(&answer_of(404, None, String::new()).unwrap_err(), 404), "a session gone is refused at once");
+    }
+
+    /// Every part but the last ends once all of it is held; a 308 holding
+    /// only its start sends the rest from there.
+    #[test]
+    fn a_part_ends_once_all_of_it_is_held() {
+        let mut part = PartUpload::new(8, 8, false);
+        assert_eq!(part.sending_range(), "bytes 8-15/*");
+        assert_eq!(part.read(Answer::Holds(12)).unwrap(), Next::Send);
+        assert_eq!(part.sending_range(), "bytes 12-15/*", "only what it does not hold goes again");
+        assert_eq!(part.read(Answer::Holds(16)).unwrap(), Next::Done);
+    }
+
+    /// The last part takes the same resend path: a 308 holding its start
+    /// sends the rest, a 308 holding all of it sends the total again,
+    /// and only a complete object ends it.
+    #[test]
+    fn the_last_part_is_resent_like_any_other_and_ends_complete() {
+        let mut part = PartUpload::new(8, 4, true);
+        assert_eq!(part.sending_range(), "bytes 8-11/12");
+        assert_eq!(part.read(Answer::Holds(10)).unwrap(), Next::Send);
+        assert_eq!(part.sending_range(), "bytes 10-11/12");
+        assert_eq!(part.read(Answer::Holds(12)).unwrap(), Next::Send);
+        assert_eq!(part.sending_range(), "bytes */12", "all held: the total alone completes it");
+        assert_eq!(part.read(Answer::Complete).unwrap(), Next::Done);
+        let mut empty = PartUpload::new(12, 0, true);
+        assert_eq!(empty.sending_range(), "bytes */12");
+        assert_eq!(empty.read(Answer::Complete).unwrap(), Next::Done);
+    }
+
+    /// A complete object before the last part, or a 308 holding less than
+    /// was held or more than was sent, is no upload this sent.
+    #[test]
+    fn an_answer_no_upload_could_give_fails_it() {
+        let e = PartUpload::new(0, 8, false).read(Answer::Complete).unwrap_err().to_string();
+        assert!(e.contains("before its last part"), "{e}");
+        let mut part = PartUpload::new(8, 8, false);
+        assert!(part.read(Answer::Holds(4)).is_err(), "less than it held");
+        assert!(PartUpload::new(8, 8, false).read(Answer::Holds(17)).is_err(), "more than was sent");
+        let mut part = PartUpload::new(0, 8, false);
+        part.read(Answer::Holds(4)).unwrap();
+        assert!(part.read(Answer::Holds(2)).is_err(), "a held byte is never given back");
+    }
+
+    /// A request lost on the way asks the session where it stands, and
+    /// the part goes on from what it says; the session's question takes
+    /// the total once it is known.
+    #[test]
+    fn a_lost_request_asks_and_resumes_from_what_is_held() {
+        let mut part = PartUpload::new(0, 8, false);
+        assert_eq!(part.read(Answer::Lost("connection reset".into())).unwrap(), Next::Ask);
+        assert_eq!(part.asking_range(), "bytes */*");
+        assert_eq!(part.read(Answer::Holds(6)).unwrap(), Next::Send);
+        assert_eq!(part.stalled, 0, "bytes moved: the count starts over");
+        assert_eq!(part.sending_range(), "bytes 6-7/*");
+        assert_eq!(part.read(Answer::Lost("Google answered 503: busy".into())).unwrap(), Next::Ask);
+        assert_eq!(part.read(Answer::Holds(8)).unwrap(), Next::Done, "the lost request had landed whole");
+
+        let mut last = PartUpload::new(8, 4, true);
+        assert_eq!(last.read(Answer::Lost("timed out".into())).unwrap(), Next::Ask);
+        assert_eq!(last.asking_range(), "bytes */12");
+        assert_eq!(last.read(Answer::Complete).unwrap(), Next::Done, "the lost request completed the object");
+    }
+
+    /// Sends that move no bytes, lost ones and 308s alike, fail the part
+    /// at the [`UPLOAD_TRIES`]th in a row, naming the last; the question
+    /// asked after a lost send is no try of its own; one that moves bytes
+    /// starts the count over.
+    #[test]
+    fn sends_that_move_nothing_fail_the_part_after_the_tries() {
+        let mut part = PartUpload::new(0, 8, false);
+        for _ in 0..2 {
+            assert_eq!(part.read(Answer::Lost("reset".into())).unwrap(), Next::Ask);
+            assert_eq!(part.read(Answer::Holds(0)).unwrap(), Next::Send, "the answer to the question counts nothing");
+        }
+        let e = part.read(Answer::Lost("Google answered 502: gateway".into())).unwrap_err().to_string();
+        assert!(e.contains("3 sends in a row") && e.contains("502: gateway"), "{e}");
+
+        let mut part = PartUpload::new(0, 8, false);
+        assert_eq!(part.read(Answer::Lost("reset".into())).unwrap(), Next::Ask);
+        assert_eq!(part.read(Answer::Lost("reset".into())).unwrap(), Next::Ask, "a lost question counts");
+        assert_eq!(part.read(Answer::Holds(2)).unwrap(), Next::Send, "bytes moved");
+        part.read(Answer::Holds(2)).unwrap();
+        part.read(Answer::Holds(2)).unwrap();
+        let e = part.read(Answer::Holds(2)).unwrap_err().to_string();
+        assert!(e.contains("held 2 of the 8 bytes sent"), "a 308 that never moves cannot loop forever: {e}");
+
+        let mut last = PartUpload::new(8, 4, true);
+        last.read(Answer::Holds(12)).unwrap();
+        last.read(Answer::Holds(12)).unwrap();
+        last.read(Answer::Holds(12)).unwrap();
+        assert!(last.read(Answer::Holds(12)).is_err(), "a last part held whole that never completes ends too");
+    }
 
     /// Cloud Run refusing to read a worker pool, the way Google answers a
     /// permission not granted yet: the permission is in the message, and

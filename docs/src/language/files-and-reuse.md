@@ -65,6 +65,12 @@ place you edit it.
 That is also why a `@file` cannot name a URL or a file type. There would be
 nothing to write back to. The error points you at `@asset`.
 
+The built program does not carry the text. It carries the file's name and a
+hash of what the file holds, and the version stores the file, so a 2 MB SQL
+script costs the program a few bytes, and a file two versions share is stored
+once. The worker that runs the program reads the file and gives the node the
+value, as if you had typed it in.
+
 ## @asset
 
 ```weft
@@ -85,7 +91,8 @@ kind: `Image`, `Video`, `Audio` or `Blob`. `File` and `Media` are refused:
 each covers several kinds, and weft has to know which one the file is.
 
 It is resolved when you build. If it is a URL with a text type, the build
-fetches it once and the program holds the text. If it is a URL with a file
+fetches it once and stores the text, which the program names the way it
+names a `@file`'s. If it is a URL with a file
 type, the node gets the address, and the file is fetched when the run reads it.
 
 ### Where an @asset is read
@@ -97,8 +104,8 @@ version, so nothing is read off your disk or uploaded for it.
 
 If the version does not hold the file (an absolute path, `~/...`, or a project
 file outside those folders), an install on your machine reads it off your disk
-(a relative path from your project folder): with a file type it stores the
-file, and with a text type the program holds the text. A cloud install
+(a relative path from your project folder) and stores it, with a file type and
+a text type alike. A cloud install
 cannot reach your machine, so it refuses the build:
 
 ```text

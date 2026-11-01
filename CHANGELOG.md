@@ -4,6 +4,53 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-11-02 (0.2.288)
+
+**What breaks after this update:**
+
+**A build no longer copies a `@file`'s text into the program.** The program
+names the file by a hash of its content, the version stores the file, and the
+worker that runs the program reads it, so a large SQL script or prompt no
+longer makes every copy of the program large. A text `@asset` is stored the
+same way. `weft maintenance off` stores the text an older build kept for a
+text `@asset` read as a `String` and builds it again as usual; one read as
+another type (a `Number`, a JSON shape) no longer says what the file held, so
+that project is not built again, and the lift names the file: run `weft
+resync` in its folder.
+
+**`weft status` asks the install in a POST.** Only a CLI from this update can
+ask an install from this update, which `./setup.sh` gives you both of.
+
+**The rest:**
+
+**`weft activate` says which triggers it leaves behind** the build it used,
+and `weft activate --no-build` turns triggers on with the build the install
+has registered without building the folder (for a deploy's exit trap).
+
+**`weft status --json` says `on` for each trigger copy**, true when it is on,
+behind the build or not.
+
+**A 502, 503 or 504 that weft did not write says what it most often means**
+(the dispatcher's copy ran out of memory) and how to raise it, and a read is
+asked once more first.
+
+**`weft tree` and `weft freeze` no longer sync the folder.**
+
+**A worker that ran out of memory says so** in the error of the node it was
+running, with how full it was and `weft workers set --memory`.
+
+**A run carried on while its files could not be read waits instead of
+failing.** When the store (or the broker) does not answer as a worker picks a
+run up again, the run stays queued, unclaimed, and the worker counts as busy:
+the run is handed out again after a pause that grows to a minute, for as long
+as that lasts, and `weft status` shows the last error under the project's
+workers. `weft workers set` hands it out again at once. A file that is gone
+for good still fails the run, naming `weft resync`.
+
+**On a cloud install, a build's files may take up to a quarter of the
+dispatcher's memory**: a larger one fails on its own instead of stopping the
+copy serving every other request.
+
 ## 2026-11-01 (0.2.287)
 
 **What breaks after this update:**

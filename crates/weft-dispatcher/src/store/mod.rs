@@ -349,6 +349,13 @@ pub trait RunStore: Send + Sync {
         project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<(RunId, weft_core::context::Phase)>>;
 
+    /// The program of every run of `project_id` that has not ended
+    /// (queued, running, parked), by definition hash, once each: what the
+    /// project's asset references keep beside its running build's, so
+    /// the content an older build stored outlives the build while a run
+    /// of it waits.
+    async fn unfinished_programs(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<String>>;
+
     /// Every run of `project_id` that ended or is parked on a wait: the
     /// runs that write nothing until something answers them.
     async fn settled_run_ids_for_project(

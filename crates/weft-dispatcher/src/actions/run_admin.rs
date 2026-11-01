@@ -1070,8 +1070,8 @@ pub async fn delete(state: &DispatcherState, actor: &Actor, run_id: RunId) -> Re
 /// with the run and never changed.
 pub async fn costs(state: &DispatcherState, actor: &Actor, project_id: uuid::Uuid, filter: &CostFilter) -> Result<Vec<CostRecord>, Refused> {
     actor.may_act_on(state, project_id).await?;
-    let project = state.projects.project(project_id).await.map_err(failed("project"))?;
-    weft_journal::costs::list(&state.pg_pool, project_id, project.as_ref(), filter).await.map_err(failed("costs"))
+    let registered = state.registered(project_id).await.map_err(failed("project"))?;
+    weft_journal::costs::list(&state.pg_pool, project_id, registered.as_ref().map(|registered| &*registered.program), filter).await.map_err(failed("costs"))
 }
 
 // ----- a program's calls on runs ------------------------------------------

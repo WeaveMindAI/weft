@@ -276,9 +276,9 @@ async fn follow_version(
 /// again: its connection failed on the way, or it was taken and not
 /// answered within its time limit ([`crate::client::connection_failed`],
 /// [`crate::client::NoAnswerInTime`]), or the gateway in front of it
-/// answered that it cannot reach it right now (a 502, 503 or 504 the
-/// install did not give itself: down or starting). Every request this is
-/// read on (asking for the build, which joins the one already asked for,
+/// answered that it cannot reach it right now
+/// ([`crate::client::platform_lost_the_copy`]: down or starting). Every
+/// request this is read on (asking for the build, which joins the one already asked for,
 /// reading where it is, looking at a task) is safe to send again, which
 /// only its caller knows. The client already waits out, for every
 /// request, the answers that are safe to send again whatever the request
@@ -287,14 +287,10 @@ async fn follow_version(
 /// itself when anything else answered, the install's own 500 or 502
 /// included: that one does not lift by waiting (its database refusing for
 /// good, its storage down), and looking again on it would follow forever.
-// SYNC: look_again_after <-> extension-vscode/src/dispatcher.ts (worthTryingAgain)
 pub(crate) fn look_again_after(e: anyhow::Error) -> Result<String> {
-    use reqwest::StatusCode;
-    let busy = crate::client::refusal(&e).is_some_and(|refused| {
-        !refused.is_the_installs()
-            && matches!(refused.status(), StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT)
-    });
-    if busy || crate::client::connection_failed(&e) {
+    let lost_copy = crate::client::refusal(&e)
+        .is_some_and(|refused| crate::client::platform_lost_the_copy(refused.status(), refused.is_the_installs()));
+    if lost_copy || crate::client::connection_failed(&e) {
         return Ok(format!("{e:#}"));
     }
     Err(e)

@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use weft_broker_client::line::{ACCESS_CHANNEL, INFRA_STATUS_CHANNEL, TRIGGERS_CHANNEL};
 use weft_broker_client::protocol::{
     ArmedEntry, CallerVerified, CallerVerifyRequest, DoorEntry, DoorParked, DoorRunFacts, DoorTick, DoorTickRequest, DoorTrigger,
+    MemoryNote,
 };
 use weft_core::instance::InstanceId;
 use weft_task_store::held_copy::{Changed, HeldCopy};
@@ -44,6 +45,9 @@ pub trait DoorBroker: Send + Sync {
     /// names nobody here.
     async fn instance_token(&self, token: &str) -> anyhow::Result<Option<InstanceId>>;
     async fn tick(&self, request: &DoorTickRequest) -> anyhow::Result<DoorTick>;
+    /// Keep this worker's memory state on its lease row: `full` while it
+    /// is nearly full, `None` once it has room again (`MemoryNote`).
+    async fn memory(&self, full: Option<MemoryNote>) -> anyhow::Result<()>;
     /// Put a fire in its trigger's queue.
     async fn park_fire(&self, token: &str, fire: &weft_task_store::parked_fires::Waiting, held_by: Option<&str>) -> anyhow::Result<DoorParked>;
 }
@@ -223,6 +227,10 @@ impl DoorBroker for HeldDoorBroker {
 
     async fn tick(&self, request: &DoorTickRequest) -> anyhow::Result<DoorTick> {
         self.client.tick(request).await
+    }
+
+    async fn memory(&self, full: Option<MemoryNote>) -> anyhow::Result<()> {
+        self.client.memory(full).await
     }
 
     async fn park_fire(&self, token: &str, fire: &weft_task_store::parked_fires::Waiting, held_by: Option<&str>) -> anyhow::Result<DoorParked> {

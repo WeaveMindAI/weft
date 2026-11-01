@@ -43,6 +43,7 @@ export interface RawStatusPayload {
     instanceCopyCount?: number;
     progress?: ChangeProgress;
     behind?: boolean;
+    orphaned?: boolean;
     takesDown?: OwnerTriggers[];
     lastRestart?: LastRestart;
   }>;
@@ -143,6 +144,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
     ...(n.instanceCopyCount !== undefined ? { instanceCopyCount: n.instanceCopyCount } : {}),
     ...(n.progress !== undefined ? { progress: progressOnLocalClock(n.progress, localNowUnix) } : {}),
     ...(n.behind ? { behind: true } : {}),
+    ...(n.orphaned ? { orphaned: true } : {}),
     ...(n.takesDown?.length ? { takesDown: n.takesDown } : {}),
     ...(n.lastRestart !== undefined ? { lastRestart: n.lastRestart } : {}),
   }));

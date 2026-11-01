@@ -83,83 +83,44 @@ impl ProjectTransition {
     }
 }
 
-/// `GET /projects/{id}/status`'s query: the hashes the client computed
-/// for its current source, each compared with what the project runs. A
-/// hash left out is compared with the registered build's instead.
+/// `POST /projects/{id}/status`'s body: the hashes the client computed
+/// for its current source, each compared with what the project runs. What
+/// it leaves out is compared with the registered build's instead. A body,
+/// never a URL: a program with many triggers names a hash for each.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct StatusQuery {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StatusRequest {
     /// Compared against the running binary hash: "the worker image
     /// needs rebuilding", and, for a trigger that is on, whether its fires
     /// run older code.
-    #[serde(default, rename = "desiredBinaryHash", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desired_binary_hash: Option<String>,
     /// The same build's binary hash with the whole catalog compiled in
     /// (`weft run --full`). A running image built either way is
     /// current: drift means the running hash matches neither.
-    #[serde(default, rename = "desiredFullBinaryHash", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desired_full_binary_hash: Option<String>,
     /// Compared against the running definition hash: "the project shape
     /// has changed" (a config or topology edit not registered yet).
-    #[serde(default, rename = "desiredDefinitionHash", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desired_definition_hash: Option<String>,
-    /// Each trigger's cut fingerprint in the current source
-    /// (`weft_core::run_spec::trigger_fingerprints`), [`NamedHashes`]-encoded:
-    /// a trigger that is on whose recorded cut differs is behind. A trigger
-    /// it leaves out is compared with the registered build's.
-    #[serde(default, rename = "desiredTriggerCuts", skip_serializing_if = "Option::is_none")]
-    pub desired_trigger_cuts: Option<String>,
-    /// Each infra place's hash in the current source, [`NamedHashes`]-
-    /// encoded: a copy applied from another is behind. A place it leaves
-    /// out is compared with the registered build's.
-    #[serde(default, rename = "desiredInfraPlaces", skip_serializing_if = "Option::is_none")]
-    pub desired_infra_places: Option<String>,
-}
-
-impl StatusQuery {
-    /// The query string, `?` included; empty when nothing is named.
-    pub fn to_query_string(&self) -> String {
-        let pairs = [
-            ("desiredBinaryHash", &self.desired_binary_hash),
-            ("desiredFullBinaryHash", &self.desired_full_binary_hash),
-            ("desiredDefinitionHash", &self.desired_definition_hash),
-            ("desiredTriggerCuts", &self.desired_trigger_cuts),
-            ("desiredInfraPlaces", &self.desired_infra_places),
-        ];
-        let named: Vec<String> =
-            pairs.iter().filter_map(|(key, value)| value.as_ref().map(|v| format!("{key}={v}"))).collect();
-        if named.is_empty() {
-            String::new()
-        } else {
-            format!("?{}", named.join("&"))
-        }
-    }
-}
-
-/// A hash per name (a trigger's address, an infra place), as one query
-/// value: `name:hash` pairs joined by `,`. A program's addresses are
-/// identifiers joined by `.`, and a hash is hex, so neither holds `:` or
-/// `,`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NamedHashes(pub std::collections::BTreeMap<String, String>);
-
-impl NamedHashes {
-    pub fn encode(&self) -> String {
-        self.0.iter().map(|(name, hash)| format!("{name}:{hash}")).collect::<Vec<_>>().join(",")
-    }
-
-    /// Back from [`Self::encode`]; a pair that is not `name:hash` is
-    /// refused naming it.
-    pub fn decode(encoded: &str) -> Result<Self, String> {
-        let mut out = std::collections::BTreeMap::new();
-        for pair in encoded.split(',').filter(|p| !p.is_empty()) {
-            let (name, hash) = pair.split_once(':').ok_or_else(|| format!("'{pair}' is not a `name:hash` pair"))?;
-            if name.is_empty() || hash.is_empty() {
-                return Err(format!("'{pair}' is not a `name:hash` pair"));
-            }
-            out.insert(name.to_string(), hash.to_string());
-        }
-        Ok(Self(out))
-    }
+    /// Every trigger of the current source by address, with its cut's
+    /// fingerprint (`crate::run_spec::trigger_fingerprints`), `null` for
+    /// one whose cut cannot be walked: the whole of the source's triggers,
+    /// so a trigger that is on is behind when its recorded cut differs or
+    /// its cut cannot be walked, and gone when the source has it no more.
+    /// Left out when the source did not compile: the triggers are then
+    /// compared with the registered build's cuts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_trigger_cuts: Option<std::collections::BTreeMap<String, Option<String>>>,
+    /// Every infra place of the current source with its hash: the whole
+    /// of the source's places, so a copy applied from another hash is
+    /// behind, and a copy of a place the source has no more is orphaned.
+    /// Left out when the
+    /// source's hashes could not be worked out: the copies are then
+    /// compared with the registered build's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_infra_places: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// What a person is told when something of a project is refused because
@@ -168,7 +129,7 @@ impl NamedHashes {
 // SYNC: PROJECT_BEING_REMOVED <-> packages/weft-graph/src/status.ts PROJECT_BEING_REMOVED
 pub const PROJECT_BEING_REMOVED: &str = "the project is being removed; run `weft rm` again to finish removing it";
 
-/// `GET /projects/{id}/status`: everything a client renders about one
+/// `POST /projects/{id}/status`: everything a client renders about one
 /// project in one answer (registration, listener, infra, runs,
 /// drift, and the verbs the dispatcher accepts right now).
 // SYNC: ProjectStatusResponse <-> packages/weft-graph/src/status.ts RawStatusPayload
@@ -227,7 +188,7 @@ pub struct ProjectStatusResponse {
     /// row flips): the window where every verb but cancel is refused.
     pub infra_busy: bool,
     /// Desired vs running hash drift. Each bit is only meaningful when
-    /// the caller named the matching hash in the [`StatusQuery`].
+    /// the caller named the matching hash in the [`StatusRequest`].
     pub drift: ProjectDrift,
     /// Verbs the dispatcher accepts right now, from its state machine.
     /// Clients render the action bar from this list directly.
@@ -441,6 +402,9 @@ pub struct InstanceInfraEntry {
     /// ([`ProjectInfraEntry::behind`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub behind: bool,
+    /// The source declares its place no more ([`ProjectInfraEntry::orphaned`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orphaned: bool,
     /// The latest restart of its containers since weft last started it
     /// ([`ProjectInfraEntry::last_restart`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -461,6 +425,14 @@ crate::wire_enum! {
         /// On, firing an older program: its cut, or the code it runs,
         /// changed since it was set up. `weft resync` brings it up to date.
         Behind = "behind",
+    }
+}
+
+impl TriggerState {
+    /// Whether a trigger in this state is on: its door takes fires, the
+    /// program it fires current (`On`) or older (`Behind`).
+    pub fn is_on(self) -> bool {
+        matches!(self, Self::On | Self::Behind)
     }
 }
 
@@ -521,6 +493,11 @@ pub struct TriggerCopy {
     /// Whose: absent for the shared one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<crate::instance::InstanceId>,
+    /// Goes on the wire with `on` beside it ([`TriggerState::is_on`]), so
+    /// a script reading `weft status --json` needs not know which states
+    /// are on. `on` is written from the state and never read back, so the
+    /// two cannot disagree.
+    #[serde(flatten, with = "state_and_on")]
     pub state: TriggerState,
     /// Where it stands in detail: for one taken down, what its door does.
     pub mode: crate::activation::ActivationMode,
@@ -556,6 +533,32 @@ pub struct TriggerCopy {
     /// before any run started, which nothing tries again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dropped: Option<Dropped>,
+}
+
+/// [`TriggerCopy::state`] on the wire: `state`, and `on` beside it.
+mod state_and_on {
+    use super::TriggerState;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    struct Written {
+        state: TriggerState,
+        on: bool,
+    }
+
+    /// `on` is left unread: it is the state's, said again.
+    #[derive(Deserialize)]
+    struct Read {
+        state: TriggerState,
+    }
+
+    pub fn serialize<S: Serializer>(state: &TriggerState, serializer: S) -> Result<S::Ok, S::Error> {
+        Written { state: *state, on: state.is_on() }.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<TriggerState, D::Error> {
+        Ok(Read::deserialize(deserializer)?.state)
+    }
 }
 
 /// The fires and calls of a trigger dropped in the last minute or two:
@@ -672,6 +675,13 @@ pub struct ProjectInfraEntry {
     /// `weft infra upgrade --infra <node>` brings it up to date.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub behind: bool,
+    /// Its copy is live and the source declares its place no more (the
+    /// person deleted the node): an orphan, counted in
+    /// [`ProjectStatusResponse::orphaned_infra`], that keeps running until
+    /// `weft infra stop` or `weft infra terminate` takes it down. Never
+    /// [`Self::behind`] too: nothing brings it up to date.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orphaned: bool,
     /// The triggers on whose cut contains it (each instance's too for a
     /// shared one), by owner: what taking it down takes down with it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -753,6 +763,47 @@ mod tests {
         assert!(resting.get("progress").is_none());
     }
 
+    /// A trigger is on when its door takes fires, whichever program they
+    /// run.
+    #[test]
+    fn a_trigger_on_or_behind_is_on() {
+        assert!(TriggerState::On.is_on());
+        assert!(TriggerState::Behind.is_on());
+        assert!(!TriggerState::Off.is_on());
+        assert!(!TriggerState::TurningOn.is_on());
+    }
+
+    /// Every copy carries `on` beside its state, said from the state; it
+    /// reads back as written, and `on` is never read, so a copy written
+    /// without it reads the same.
+    #[test]
+    fn a_trigger_copy_says_whether_it_is_on() {
+        for (state, on) in
+            [(TriggerState::Off, false), (TriggerState::TurningOn, false), (TriggerState::On, true), (TriggerState::Behind, true)]
+        {
+            let copy = TriggerCopy {
+                instance: Some(crate::instance::InstanceId::new("ada").unwrap()),
+                state,
+                mode: crate::activation::ActivationMode::Active,
+                down_with: None,
+                held_back: None,
+                held: HeldWork::default(),
+                waiting: None,
+                version: Some("v4".into()),
+                progress: None,
+                dropped: None,
+            };
+            let wire = serde_json::to_value(&copy).unwrap();
+            assert_eq!(wire["state"], serde_json::json!(state.as_str()));
+            assert_eq!(wire["on"], serde_json::json!(on), "{state:?}");
+            let read: TriggerCopy = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&read).unwrap(), wire, "{state:?} reads back as written");
+            let mut without_on = wire;
+            without_on.as_object_mut().unwrap().remove("on");
+            assert_eq!(serde_json::from_value::<TriggerCopy>(without_on).unwrap().state, state);
+        }
+    }
+
     /// A trigger that dropped fires or calls says how many and why, in the
     /// editor's spelling; one that dropped none says nothing of it.
     #[test]
@@ -781,28 +832,39 @@ mod tests {
         );
     }
 
-    /// Names and hashes read back as written, a program's addresses
-    /// included; a pair that is not `name:hash` is refused naming it.
+    /// The status body's wire shape: camelCase keys, the hashes by name
+    /// as maps, a trigger whose cut cannot be walked as `null`, nothing a
+    /// client leaves out written (a source with no trigger or no infra
+    /// still sends its empty map), and an unknown key (a misspelt one, which would
+    /// silently compare nothing) refused.
     #[test]
-    fn named_hashes_read_back_as_written() {
-        let named = NamedHashes([("door".to_string(), "ab12".to_string()), ("one.work.inbox".to_string(), "cd34".to_string())].into());
-        assert_eq!(named.encode(), "door:ab12,one.work.inbox:cd34");
-        assert_eq!(NamedHashes::decode(&named.encode()).unwrap(), named);
-        assert_eq!(NamedHashes::decode("").unwrap(), NamedHashes::default());
-        for broken in ["door", ":ab12", "door:", "door:ab12,inbox"] {
-            assert!(NamedHashes::decode(broken).unwrap_err().contains("is not a `name:hash` pair"), "{broken}");
-        }
-    }
-
-    #[test]
-    fn status_query_string_names_only_the_hashes_given() {
-        assert_eq!(StatusQuery::default().to_query_string(), "");
-        let q = StatusQuery {
+    fn a_status_request_names_only_the_hashes_given() {
+        assert_eq!(serde_json::to_value(StatusRequest::default()).unwrap(), serde_json::json!({}));
+        let request = StatusRequest {
             desired_binary_hash: Some("b".into()),
-            desired_infra_places: Some("db:i".into()),
+            desired_trigger_cuts: Some([("one.door".to_string(), Some("c1".to_string())), ("one.loop".to_string(), None)].into()),
+            desired_infra_places: Some([("db".to_string(), "i".to_string())].into()),
             ..Default::default()
         };
-        assert_eq!(q.to_query_string(), "?desiredBinaryHash=b&desiredInfraPlaces=db:i");
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "desiredBinaryHash": "b",
+                "desiredTriggerCuts": { "one.door": "c1", "one.loop": null },
+                "desiredInfraPlaces": { "db": "i" }
+            })
+        );
+        assert_eq!(serde_json::from_value::<StatusRequest>(wire).unwrap(), request);
+        let no_trigger = StatusRequest {
+            desired_trigger_cuts: Some(Default::default()),
+            desired_infra_places: Some(Default::default()),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&no_trigger).unwrap();
+        assert_eq!(wire, serde_json::json!({ "desiredTriggerCuts": {}, "desiredInfraPlaces": {} }));
+        assert_eq!(serde_json::from_value::<StatusRequest>(wire).unwrap(), no_trigger);
+        assert!(serde_json::from_value::<StatusRequest>(serde_json::json!({ "desired_binary_hash": "b" })).is_err());
     }
 }
 

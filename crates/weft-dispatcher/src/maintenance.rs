@@ -495,13 +495,14 @@ async fn fence(state: &DispatcherState, id: uuid::Uuid) -> anyhow::Result<()> {
 /// node keeps up on a plain stop included (`force`): nothing of the old
 /// install keeps running. Disks are kept, as on any stop.
 async fn stop_copies(state: &DispatcherState, id: uuid::Uuid, take_down: &TakeDown, went: &mut ProjectWentDown) -> Result<(), String> {
-    let Some(project) = state.projects.project(id).await.map_err(|e| format!("{e:#}"))? else { return Ok(()) };
+    let Some(registered) = state.registered(id).await.map_err(|e| format!("{e:#}"))? else { return Ok(()) };
+    let project = &*registered.program;
     if crate::api::project::infra_setup_in_flight(state, id, None).await.map_err(|e| format!("{e:#}"))? {
         went.refused.push("its infra is being started; wait for it or cancel it (`weft infra cancel`), then run `weft maintenance on` again".into());
     }
     // Read as `weft status` reads them: a stop already asked for reads
     // `stopping` and is left to land, a start asked for `provisioning`.
-    let observed = crate::infra_node::observe(&state.pg_pool, id, &project).await.map_err(|e| format!("{e:#}"))?;
+    let observed = crate::infra_node::observe(&state.pg_pool, id, project).await.map_err(|e| format!("{e:#}"))?;
     let being_started = |node: &str, instance: Option<&InstanceId>| {
         format!(
             "infra copy {} is being started; wait for it or cancel it (`weft infra cancel`), then run `weft maintenance on` again",
@@ -525,7 +526,7 @@ async fn stop_copies(state: &DispatcherState, id: uuid::Uuid, take_down: &TakeDo
         // record would leave a copy nothing brings back.
         record_copies(&state.pg_pool, id, instance.as_ref(), &nodes, now).await.map_err(|e| format!("{e:#}"))?;
         let stop = crate::infra_lifecycle_command::Teardown::Stop { force: true };
-        match crate::api::infra::take_copies_down(state, id, &project, instance.as_ref(), &nodes, stop, take_down, crate::take_down::TakeDownAsker::Outside).await {
+        match crate::api::infra::take_copies_down(state, id, &registered, instance.as_ref(), &nodes, stop, take_down, crate::take_down::TakeDownAsker::Outside).await {
             Ok(_) => went.copies.extend(nodes.into_iter().map(|node| CopyRef { node, instance: instance.clone() })),
             Err((_, why)) => went.refused.push(format!("stopping {}: {why}", nodes.join(", "))),
         }
@@ -793,15 +794,16 @@ async fn start_copies(
     setups: &tokio::sync::Semaphore,
     lifted: &mut ProjectLifted,
 ) -> anyhow::Result<()> {
-    let Some(project) = state.projects.project(id).await? else { return Ok(()) };
+    let Some(registered) = state.registered(id).await? else { return Ok(()) };
+    let project = &*registered.program;
     // Read as `weft status` reads them: a copy whose stop has not landed
     // yet reads `stopping`, so it is started again rather than taken for
     // one that runs.
-    let observed = crate::infra_node::observe(&state.pg_pool, id, &project).await?;
+    let observed = crate::infra_node::observe(&state.pg_pool, id, project).await?;
     let mut done = Vec::new();
     let mut to_start = Vec::new();
     for node in nodes {
-        let declared = crate::api::infra::resolve_infra_nodes(&project, std::slice::from_ref(node), instance).is_ok();
+        let declared = crate::api::infra::resolve_infra_nodes(project, std::slice::from_ref(node), instance).is_ok();
         match (observed.status_of(node, instance), declared) {
             (None, _) => {
                 lifted.skipped.push(format!("infra copy {} was terminated during the maintenance", copy_words(node, instance)));
@@ -830,7 +832,7 @@ async fn start_copies(
     let started = async {
         let begun = {
             let _turn = setups.acquire().await.expect("a lift's semaphore is never closed");
-            crate::api::infra::begin_sync(state, id, &Default::default(), instance, &to_start, false, crate::api::infra::SyncKind::Lift)
+            crate::api::infra::begin_sync(state, id, &registered, &Default::default(), instance, &to_start, false, crate::api::infra::SyncKind::Lift)
                 .await
                 .map_err(|e| e.into_parts().1)?
         };
@@ -868,11 +870,12 @@ async fn start_copies(
 /// side never share one claim's rest, and a resync's request, which holds
 /// no claim, brings back the same way.
 async fn bring_back(state: &DispatcherState, id: uuid::Uuid, owner: &Owner, triggers: Vec<String>, lifted: &mut ProjectLifted) {
-    let (triggers, gone) = match state.projects.project(id).await {
-        Ok(Some(project)) => {
-            let declared: std::collections::BTreeSet<String> = weft_core::project::trigger_places(&project)
+    let (triggers, gone) = match state.registered(id).await {
+        Ok(Some(registered)) => {
+            let project = &*registered.program;
+            let declared: std::collections::BTreeSet<String> = weft_core::project::trigger_places(project)
                 .iter()
-                .map(|place| weft_core::project::address_of(&project, &place.id, &place.path))
+                .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
                 .collect();
             triggers.into_iter().partition::<Vec<String>, _>(|trigger| declared.contains(trigger))
         }

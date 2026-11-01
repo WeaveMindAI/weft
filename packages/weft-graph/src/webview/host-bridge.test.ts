@@ -213,6 +213,44 @@ describe('translateProject', () => {
     expect(byId.get('g')?.portLiterals).toEqual({ prompt: marker, other: 'plain' });
     expect(byId.get('n')?.portLiterals).toEqual({ text: marker });
   });
+
+  it("draws a loop's written values, `@file` marker included, from its LoopIn", () => {
+    const ref = { path: 'prefix.txt', type: 'String', marker: 'file' as const };
+    const span = { span: { startLine: 8, startColumn: 1, endLine: 8, endColumn: 30 }, origin: 'connection' as const };
+    const host = {
+      id: 'p1',
+      nodes: [{
+        id: 'each__in', nodeType: 'LoopIn', label: null, config: {},
+        position: { x: 0, y: 0 }, scope: [], groupBoundary: { groupId: 'each', role: 'In' },
+        inputs: [], outputs: [], features: {},
+        portLiterals: { prefix: 'resolved content', items: ['a'] },
+        portLiteralSpans: { prefix: span },
+        fileRefs: { prefix: ref },
+      }],
+      edges: [],
+      groups: [{
+        id: 'each', kind: 'loop' as const, label: null, loopConfig: {},
+        inPorts: [], outPorts: [],
+        parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
+      }],
+    } as unknown as HostProject;
+
+    const loop = translateProject(host, 'src', '').nodes.find((n) => n.id === 'each')!;
+    expect(loop.portLiterals).toEqual({ prefix: { __weftFileRef: ref }, items: ['a'] });
+    expect(loop.portLiteralSpans).toEqual({ prefix: span });
+  });
+
+  it('refuses a loop with no LoopIn, which the compiler never gives', () => {
+    const host = {
+      id: 'p1', nodes: [], edges: [],
+      groups: [{
+        id: 'each', kind: 'loop' as const, label: null, loopConfig: {},
+        inPorts: [], outPorts: [],
+        parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
+      }],
+    } as unknown as HostProject;
+    expect(() => translateProject(host, 'src', '')).toThrow("loop 'each' has no 'each__in'");
+  });
 });
 
 /** The compiled program has one wire per value, end to end, naming the
@@ -412,6 +450,11 @@ describe('metadata ports and wires', () => {
         metadataPorts: [{ name: 'schema', type: 'JsonDict', value: { type: 'object' } }],
       },
       {
+        id: 'calls__in', nodeType: 'LoopIn', label: null, config: {},
+        position: { x: 0, y: 0 }, scope: [], groupBoundary: { groupId: 'calls', role: 'In' },
+        inputs: [], outputs: [], features: {},
+      },
+      {
         id: 'calls__out', nodeType: 'LoopOut', label: null, config: {},
         position: { x: 0, y: 0 }, scope: [], groupBoundary: { groupId: 'calls', role: 'Out' },
         inputs: [], outputs: [], features: {},
@@ -478,9 +521,13 @@ describe("a container port's widget", () => {
         inPorts: [{ name: 'failed', portType: 'Boolean', required: true, widget: { kind: 'checkbox' } }],
         outPorts: [],
         parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
+      }],
+      nodes: [{
+        id: 'calls__in', nodeType: 'LoopIn', label: null, config: {},
+        position: { x: 0, y: 0 }, scope: [], groupBoundary: { groupId: 'calls', role: 'In' },
+        inputs: [], outputs: [], features: {},
         portLiterals: { failed: false },
       }],
-      nodes: [],
       edges: [],
     } as unknown as HostProject;
     const loop = translateProject(host, 'src', '').nodes.find((n) => n.id === 'calls')!;
@@ -510,12 +557,19 @@ describe("a container input's passesThrough", () => {
         parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
       },
     ],
-    nodes: [{
-      id: 'inc', nodeType: 'IncludedGroup', label: null, config: {},
-      position: { x: 0, y: 0 }, scope: [], groupBoundary: null,
-      inputs: [{ name: 'q', portType: 'String', required: true, passesThrough: true }],
-      outputs: [], features: {},
-    }],
+    nodes: [
+      {
+        id: 'inc', nodeType: 'IncludedGroup', label: null, config: {},
+        position: { x: 0, y: 0 }, scope: [], groupBoundary: null,
+        inputs: [{ name: 'q', portType: 'String', required: true, passesThrough: true }],
+        outputs: [], features: {},
+      },
+      {
+        id: 'each__in', nodeType: 'LoopIn', label: null, config: {},
+        position: { x: 0, y: 0 }, scope: [], groupBoundary: { groupId: 'each', role: 'In' },
+        inputs: [], outputs: [], features: {},
+      },
+    ],
     edges: [],
   } as unknown as HostProject;
   const byId = new Map(translateProject(host, 'src', '').nodes.map((n) => [n.id, n]));
@@ -536,7 +590,6 @@ describe('a metadata wire into a loop', () => {
       inPorts: [{ name: 'spec', portType: 'LlmTool', required: true }],
       outPorts: [],
       parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
-      portLiterals: { spec: tool },
     }],
     nodes: [
       {
@@ -549,6 +602,7 @@ describe('a metadata wire into a loop', () => {
         id: 'calls__in', nodeType: 'LoopIn', label: null, config: {},
         position: { x: 0, y: 0 }, scope: [], groupBoundary: { groupId: 'calls', role: 'In' },
         inputs: [], outputs: [], features: {},
+        portLiterals: { spec: tool },
       },
     ],
     edges: [],
@@ -556,7 +610,7 @@ describe('a metadata wire into a loop', () => {
   }) as unknown as HostProject;
   const wire = { id: 'm', source: 'source', sourceHandle: 'tool', target: 'calls__in', targetHandle: 'spec' };
 
-  it('fills the loop box, the value read off the loop\'s own written values', () => {
+  it('fills the loop box, the value read off its LoopIn\'s written values', () => {
     const loop = translateProject(host([wire]), 'src', '').nodes.find((n) => n.id === 'calls')!;
     expect(loop.metadataInputs).toEqual({ spec: { from: { kind: 'port', source: 'source', port: 'tool' }, value: tool } });
     expect(loop.portLiterals).toEqual({});

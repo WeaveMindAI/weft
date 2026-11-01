@@ -25,7 +25,7 @@ async fn the_project_answers_at_its_own_address() -> anyhow::Result<()> {
     let base = project.unique_live_path()?;
     project.activate().await?;
 
-    let status: Value = disp.get_json(&format!("/projects/{}/status", project.id())).await?;
+    let status = status::fetch(&disp, &project.id()).await?.0;
     anyhow::ensure!(status["address"]["state"] == "serving", "the project's address: {}", status["address"]);
     let url = status["address"]["url"].as_str().expect("a serving address has a url").to_string();
     let path = base.trim_start_matches(&format!("local/{}/", project.id()));

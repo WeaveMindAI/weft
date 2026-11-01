@@ -21,8 +21,8 @@ use serde_json::Value;
 use weft_task_store::db::{self, Client, Pool, Row};
 
 use weft_broker_client::protocol::{
-    ArmedEntry, DoorEntry, DoorInstanceToken, DoorInstanceTokenRequest, DoorLetGo, DoorLetGoRequest, DoorParkRequest, DoorParked,
-    DoorMount, DoorRunFacts, DoorRunFactsRequest, DoorTick, DoorTickRequest, DoorTrigger, DoorTriggers, DoorTriggersRequest,
+    ArmedEntry, DoorEntry, DoorInstanceToken, DoorInstanceTokenRequest, DoorLetGo, DoorLetGoRequest, DoorMemory, DoorMemoryRequest, DoorParkRequest,
+    DoorParked, DoorMount, DoorRunFacts, DoorRunFactsRequest, DoorTick, DoorTickRequest, DoorTrigger, DoorTriggers, DoorTriggersRequest,
     InfraCopyUp, LetGo, SIGNAL_ACTIVATION_JOIN,
 };
 
@@ -40,6 +40,7 @@ pub fn routes() -> Router<Arc<BrokerState>> {
         .route("/v1/door/run_facts", post(door_run_facts))
         .route("/v1/door/instance_token", post(door_instance_token))
         .route("/v1/door/tick", post(door_tick))
+        .route("/v1/door/memory", post(door_memory))
         .route("/v1/door/let_go", post(door_let_go))
 }
 
@@ -302,15 +303,25 @@ async fn door_instance_token(
 }
 
 
-/// `POST /v1/door/tick`: see [`DoorTick`]. One statement renews the
-/// worker's lease (as long as it vouched for, when it did), stores its
-/// counts and reads the other copies', so a tick is one round trip.
+/// `POST /v1/door/tick`: see [`DoorTick`].
 async fn door_tick(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<DoorTickRequest>,
 ) -> Resp<DoorTick> {
     let (tenant, project, replica) = worker(&caller)?;
+    let tick = tick(&state.pool, DoorWorker { tenant, project, replica }, &req)
+        .await
+        .map_err(|e| unavailable_or_internal(e.context("tick")))?;
+    Ok(Json(tick))
+}
+
+/// One tick of `worker`'s door (`DoorTickRequest`). One statement renews
+/// its lease (as long as it vouched for, when it did) with its memory
+/// note, stores its counts and reads the other copies', so a tick is one
+/// round trip.
+pub async fn tick(pool: &Pool, worker: DoorWorker<'_>, req: &DoorTickRequest) -> anyhow::Result<DoorTick> {
+    let DoorWorker { tenant, project, replica } = worker;
     let now = chrono::Utc::now().timestamp();
     let keys: Vec<&str> = req.counts.iter().map(|c| c.key.as_str()).collect();
     let hits: Vec<i64> = req.counts.iter().map(|c| c.hits).collect();
@@ -320,10 +331,10 @@ async fn door_tick(
         weft_core::time_scale::scaled_secs(weft_task_store::worker_door::WORKER_LEASE_SECS),
         req.vouch_until,
     );
-    let db::Json(answer): db::Json<Value> = state
-        .pool
+    let (memory_full_at, memory_used, memory_limit) = weft_task_store::worker_door::memory_columns(req.memory_full.as_ref())?;
+    let db::Json(answer): db::Json<Value> = pool
         .scalar(
-            "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
             &[
                 &replica,
                 &project,
@@ -337,13 +348,28 @@ async fn door_tick(
                 &hits,
                 &reasons,
                 &req.shortens,
+                &memory_full_at,
+                &memory_used,
+                &memory_limit,
             ],
         )
+        .await?;
+    serde_json::from_value(answer).map_err(|e| anyhow::anyhow!("read a tick's answer: {e}"))
+}
+
+/// `POST /v1/door/memory`: see [`DoorMemoryRequest`]. Kept on the asking
+/// worker's own lease row; one with none (it drives no run) keeps it
+/// nowhere.
+async fn door_memory(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<DoorMemoryRequest>,
+) -> Resp<DoorMemory> {
+    let (_, project, replica) = worker(&caller)?;
+    weft_task_store::worker_door::keep_memory_state(&state.pool, replica, project, req.full.as_ref())
         .await
-        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("tick")))?;
-    let tick: DoorTick =
-        serde_json::from_value(answer).map_err(|e| unavailable_or_internal(anyhow::anyhow!("read a tick's answer: {e}")))?;
-    Ok(Json(tick))
+        .map_err(|e| unavailable_or_internal(e.context("keep a worker's memory state")))?;
+    Ok(Json(DoorMemory {}))
 }
 
 /// `POST /v1/door/let_go`: see [`DoorLetGoRequest`]. Only the worker
@@ -405,7 +431,14 @@ pub async fn let_go(pool: &Pool, worker: DoorWorker<'_>, run_id: weft_core::RunI
     if locked.owner.as_deref() != Some(worker.replica) || locked.state != "running" {
         return Ok(false);
     }
-    tx.execute("UPDATE run SET state = $2, owner = NULL, delivered_until = NULL WHERE run_id = $1", &[&run_id, &to]).await?;
+    // Let go of by a worker still there: no memory note of a worker that
+    // went away is left on it (`run.lost_memory_full_at`).
+    tx.execute(
+        "UPDATE run SET state = $2, owner = NULL, delivered_until = NULL, \
+             lost_memory_full_at = NULL, lost_memory_used = NULL, lost_memory_limit = NULL WHERE run_id = $1",
+        &[&run_id, &to],
+    )
+    .await?;
     let locked = weft_journal::record::Locked { state: to.to_string(), owner: None, ..locked };
     // An answer handed to the run while its worker drove it, and not taken
     // before it let go, goes on its record now, and the run is queued to

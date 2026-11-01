@@ -45,11 +45,11 @@ describe('parseStatusPayload', () => {
       ],
       instanceInfra: [{ node: 'box', instance: 'ada', status: 'stopped', behind: true }],
       triggers: [
-        { node: 'door', perInstance: false, shared: { state: 'behind', mode: 'active', version: 'v4' }, dependsOn: ['db'] },
+        { node: 'door', perInstance: false, shared: { state: 'behind', on: true, mode: 'active', version: 'v4' }, dependsOn: ['db'] },
         {
           node: 'inbox',
           perInstance: true,
-          copies: [{ instance: 'ada', state: 'off', mode: 'take', held: { arrivals: 3, paused: 1 } }],
+          copies: [{ instance: 'ada', state: 'off', on: false, mode: 'take', held: { arrivals: 3, paused: 1 } }],
         },
       ],
       instances: [{ instance: 'ada', values: 2, connections: 1, tokens: 0, copies: [], triggers: [], lastRunUnix: 99 }],
@@ -73,7 +73,7 @@ describe('parseStatusPayload', () => {
 
   it('refuses a trigger state it does not know rather than drawing it', () => {
     expect(() => parseStatusPayload({
-      triggers: [{ node: 'door', perInstance: false, shared: { state: 'mystery' as never, mode: 'active' } }],
+      triggers: [{ node: 'door', perInstance: false, shared: { state: 'mystery' as never, on: false, mode: 'active' } }],
     })).toThrow(/cannot read/);
   });
 
@@ -150,7 +150,7 @@ describe('infra progress', () => {
   it('moves a trigger turning on onto this machine\'s clock too', () => {
     vi.useFakeTimers();
     vi.setSystemTime(9_000_000);
-    const turningOn = { state: 'turning_on' as const, mode: 'registered' as const, progress: { sinceUnix: 100, asOfUnix: 340, waiting: 'its setup run r1' } };
+    const turningOn = { state: 'turning_on' as const, on: false, mode: 'registered' as const, progress: { sinceUnix: 100, asOfUnix: 340, waiting: 'its setup run r1' } };
     const snap = parseStatusPayload({ triggers: [{ node: 'door', perInstance: false, shared: turningOn }] });
     const progress = snap.triggers[0].shared!.progress!;
     expect(progress).toEqual({ sinceUnix: 8_760, asOfUnix: 9_000, waiting: 'its setup run r1' });

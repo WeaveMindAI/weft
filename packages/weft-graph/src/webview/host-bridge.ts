@@ -159,7 +159,7 @@ export function legsOfAll(edges: readonly HostEdge[], loopIds: Set<string>): V1E
 /// The wire stops where the value lands (a node's input, or a group's or a
 /// loop's input seen from outside), which is the end of its last leg: a
 /// loop's `LoopIn` draws as the loop box, so the fill is keyed on the
-/// loop, whose own `portLiterals` hold the value. Its source
+/// loop, which draws its `LoopIn`'s `portLiterals`. Its source
 /// is the port it leaves: a group's own port when the wire starts there
 /// (`via[0]` is that port's crossing), a loop's port when it leaves the
 /// loop's `LoopOut`, otherwise the node's.
@@ -258,7 +258,9 @@ function withFileMarkers(
   return out;
 }
 
-function groupToNodeInstance(g: HostGroup): NodeInstance {
+/// `loopIn` is the loop's `LoopIn` for a loop (its written values live
+/// there alone, so the loop box draws them from it), absent for a group.
+function groupToNodeInstance(g: HostGroup, loopIn: HostNode | undefined): NodeInstance {
   // `kind` is required on the wire; if it lands as anything other
   // than the two the editor draws, the host/webview view of the project
   // has drifted (version skew, corruption, or a full-mode parse: the
@@ -270,6 +272,12 @@ function groupToNodeInstance(g: HostGroup): NodeInstance {
     throw new Error(`host-bridge: unknown container kind '${String(g.kind)}' for id '${g.id}'`);
   }
   const isLoop = g.kind === 'loop';
+  // The compiler mints a `LoopIn` for every loop it compiles; a loop
+  // without one is a view of the project that has drifted.
+  if (isLoop && !loopIn) {
+    throw new Error(`host-bridge: loop '${g.id}' has no '${loopInId(g.id)}'`);
+  }
+  const written = loopIn ?? g;
   const parentId = g.parentGroupId ?? undefined;
   return {
     id: g.id,
@@ -303,8 +311,8 @@ function groupToNodeInstance(g: HostGroup): NodeInstance {
     sourceLine: g.headerSpan?.startLine ?? g.span?.startLine,
     // A container's interface-port literals reach the view the same way a
     // node's do, so everything downstream reads one place for both.
-    portLiterals: withFileMarkers(g.portLiterals, g.fileRefs),
-    portLiteralSpans: g.portLiteralSpans,
+    portLiterals: withFileMarkers(written.portLiterals, written.fileRefs),
+    portLiteralSpans: written.portLiteralSpans,
     inputs: g.inPorts.map(copyPort),
     outputs: g.outPorts.map(copyPort),
     ...(g.metadataPorts ? { metadataPorts: g.metadataPorts.map((m) => ({ ...m })) } : {}),
@@ -366,10 +374,11 @@ export function translateProject(
   const groupIds = new Set(host.groups.map((g) => g.id));
   const loopIds = new Set(host.groups.filter((g) => g.kind === 'loop').map((g) => g.id));
   const filled = metadataFills(host.metadataWires ?? [], loopIds);
+  const loopIns = new Map(host.nodes.filter((n) => n.groupBoundary?.role === 'In').map((n) => [n.groupBoundary!.groupId, n]));
   const structuralNodes: NodeInstance[] = [];
   // Groups first (v1 requires parent-before-child order).
   for (const g of host.groups) {
-    structuralNodes.push(withMetadataInputs(groupToNodeInstance(g), filled.get(g.id)));
+    structuralNodes.push(withMetadataInputs(groupToNodeInstance(g, loopIns.get(g.id)), filled.get(g.id)));
   }
   for (const n of host.nodes) {
     // A loop's LoopIn / LoopOut draw as the loop box's two faces.

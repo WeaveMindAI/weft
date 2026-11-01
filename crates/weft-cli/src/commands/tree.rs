@@ -13,19 +13,25 @@ use weft_core::versions::{VersionRun, VersionSummary, VersionTree};
 use weft_core::working_copy::{WorkingCopy, WorkingCopyId, WorkingCopyKind};
 use super::Ctx;
 
+/// A read: the folder is looked up, never synced, so nothing goes up and
+/// nothing is written here.
 pub async fn run(ctx: Ctx) -> anyhow::Result<()> {
-    let here = super::copy::this_copy(&ctx, None).await?;
+    let here = super::copy::look_up_this_copy(&ctx).await?;
     let (tree, mut raw) = fetch_tree_raw(&here.client, &here.project_id).await?;
     if ctx.json() {
         // The tree as the dispatcher answered it, plus the one fact only
-        // this side knows: which working copy is this folder's.
+        // this side knows: which working copy is this folder's (`null`
+        // when the install does not know the folder).
         if let Some(obj) = raw.as_object_mut() {
-            obj.insert("workingCopy".into(), serde_json::Value::String(here.copy.id.to_string()));
+            obj.insert("workingCopy".into(), serde_json::to_value(here.id())?);
         }
         ctx.json_out(&raw)?;
         return Ok(());
     }
-    for line in render(&tree, Some(here.copy.id), &super::utc_time) {
+    if here.id().is_none() {
+        println!("this folder: not registered (`{}` or `{}` from here registers it)", ctx.weft("checkpoint"), ctx.weft("run"));
+    }
+    for line in render(&tree, here.id(), &super::utc_time) {
         println!("{line}");
     }
     Ok(())

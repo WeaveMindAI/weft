@@ -10,9 +10,10 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use weft_assets::upload::{ContentStore, UploadPlane};
 use weft_assets::{AssetSource, AssetStore};
+use weft_compiler::file_ref::TextValues;
 
 use crate::client::DispatcherClient;
 
@@ -27,7 +28,7 @@ pub async fn resolve_run_values(client: &DispatcherClient, root: &std::path::Pat
     let fs = weft_compiler::CompileFs::disk(root);
     weft_compiler::file_ref::resolve_file_markers(spec, &fs)
         .map_err(|errs| anyhow::anyhow!("a run value cannot be read:\n  {}", errs.join("\n  ")))?;
-    let map = resolve_asset_map(client, &DiskSource::new(root.to_path_buf()), &*spec).await?;
+    let map = resolve_asset_map(client, &DiskSource::new(root.to_path_buf()), &*spec, TextValues::Inline).await?;
     weft_compiler::file_ref::apply_asset_resolutions(spec, &map)
         .map_err(|errs| anyhow::anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
     Ok(())
@@ -35,8 +36,8 @@ pub async fn resolve_run_values(client: &DispatcherClient, root: &std::path::Pat
 
 /// The asset step both callers share: name the stored file each file-kind
 /// `@asset` on disk is (or would be, uploaded), look up the stored-key
-/// ones, fetch and cast the text ones. Hands back every resolved value by
-/// resolution key. Nothing is uploaded.
+/// ones, fetch and cast the text ones, spelled as `texts` says. Hands back
+/// every resolved value by resolution key. Nothing is uploaded.
 ///
 /// `files` is where a path a ref names is read: project-relative, or
 /// anywhere on the machine when absolute.
@@ -44,6 +45,7 @@ async fn resolve_asset_map(
     client: &DispatcherClient,
     files: &dyn weft_assets::AssetSource,
     target: &impl weft_compiler::file_ref::MarkedValues,
+    texts: TextValues,
 ) -> Result<weft_core::project::AssetResolutions> {
     let refs = weft_compiler::file_ref::collect_asset_refs(target);
     let mut map = if refs.is_empty() {
@@ -65,38 +67,18 @@ async fn resolve_asset_map(
         weft_compiler::file_ref::resolve_runtime_key_refs(&key_refs, &listing.files, &mut map)
             .map_err(|errs| anyhow::anyhow!("stored files of the wrong kind:\n  {}", errs.join("\n  ")))?;
     }
-    // Text values: read once per build (a URL fetched, a stored file
-    // downloaded, a disk path read from wherever it points, the project
-    // root or anywhere on the machine), cast, and substituted like every
-    // other deferred ref. Nothing is uploaded for a text asset: its value
-    // is inlined into the build, so no stored copy would be referenced.
-    let text_refs = weft_compiler::file_ref::collect_text_refs(target);
-    if !text_refs.is_empty() {
-        let http = weft_core::net::http_client().build()?;
-        let mut failed: Vec<String> = Vec::new();
-        for r in &text_refs {
-            let fetched: Result<Vec<u8>> = if weft_compiler::file_ref::is_url_ref(r) {
-                fetch_url_bytes(&http, &r.path).await
-            } else if weft_compiler::file_ref::is_runtime_key_ref(r) {
-                crate::commands::files::download_bytes(client, &r.path).await
-            } else {
-                files.open(&r.path).and_then(|mut file| {
-                    let mut bytes = Vec::new();
-                    file.read_to_end(&mut bytes).with_context(|| format!("read {}", r.path))?;
-                    Ok(bytes)
-                })
-            };
-            match fetched.and_then(|bytes| {
-                weft_compiler::file_ref::resolve_text_bytes(r, &bytes).map_err(anyhow::Error::msg)
-            }) {
-                Ok(value) => {
-                    map.insert(r.resolution_key(), value);
-                }
-                Err(e) => failed.push(format!("{}: {e:#}", r.path)),
-            }
-        }
-        if !failed.is_empty() {
-            bail!("text assets could not be fetched:\n  {}", failed.join("\n  "));
+    // Text values: read once (a URL fetched, a stored file downloaded, a
+    // disk path read from wherever it points, the project root or
+    // anywhere on the machine), cast, and substituted like every other
+    // deferred ref: named by their content in a program, as the
+    // install's build names them, which also stores them.
+    if !weft_compiler::file_ref::collect_text_refs(target).is_empty() {
+        let source = MachineTexts { http: weft_core::net::http_client().build()?, client, files };
+        let read = weft_compiler::file_ref::read_texts(target, &source)
+            .await
+            .map_err(|failed| anyhow::anyhow!("text assets could not be read:\n  {}", failed.join("\n  ")))?;
+        for text in &read {
+            map.insert(text.file_ref.resolution_key(), text.resolution(texts));
         }
     }
     Ok(map)
@@ -110,19 +92,37 @@ pub async fn resolve_project_assets(
     project_root: &std::path::Path,
     definition: &mut weft_core::project::ProjectDefinition,
 ) -> Result<()> {
-    let map = resolve_asset_map(client, &DiskSource::new(project_root.to_path_buf()), &*definition).await?;
+    let map = resolve_asset_map(client, &DiskSource::new(project_root.to_path_buf()), &*definition, TextValues::Named).await?;
     weft_compiler::file_ref::apply_asset_resolutions(definition, &map)
         .map_err(|errs| anyhow::anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))
 }
 
-/// One GET of a text asset's URL, whole body in memory (a prompt, a JSON
-/// shape: small by contract). A non-2xx answer is the loud build error.
-async fn fetch_url_bytes(http: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
-    let resp = http.get(url).send().await.with_context(|| format!("GET {url}"))?;
-    if !resp.status().is_success() {
-        bail!("GET {url} answered {}", resp.status());
+/// Where this machine reads a text `@asset` ([`weft_compiler::file_ref::read_texts`]):
+/// a URL fetched whole (a prompt, a JSON shape: small by contract), a
+/// stored file downloaded through the install, a path read from `files`.
+struct MachineTexts<'a> {
+    http: reqwest::Client,
+    client: &'a DispatcherClient,
+    files: &'a dyn weft_assets::AssetSource,
+}
+
+impl weft_compiler::file_ref::TextSource for MachineTexts<'_> {
+    async fn url(&self, url: &str) -> Result<Vec<u8>, String> {
+        weft_core::net::get_body(&self.http, url).await
     }
-    Ok(resp.bytes().await.with_context(|| format!("read {url}"))?.to_vec())
+
+    async fn stored(&self, key: &str) -> Result<Vec<u8>, String> {
+        crate::commands::files::download_bytes(self.client, key).await.map_err(|e| format!("{e:#}"))
+    }
+
+    async fn path(&self, path: &str) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        self.files
+            .open(path)
+            .and_then(|mut file| file.read_to_end(&mut bytes).with_context(|| format!("read {path}")))
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(bytes)
+    }
 }
 
 /// Local project files: paths resolve against the project root; an absolute
@@ -156,7 +156,7 @@ pub(crate) struct DispatcherPlane<'a>(pub(crate) &'a DispatcherClient);
 impl UploadPlane for DispatcherPlane<'_> {
     async fn held(&self, hashes: &[String]) -> Result<weft_core::storage::AssetsHeldResponse> {
         let request = weft_core::storage::AssetsHeldRequest { hashes: hashes.to_vec() };
-        let resp = self.0.post_json("/storage/assets/held", &serde_json::to_value(request)?).await?;
+        let resp = self.0.ask_json("/storage/assets/held", &serde_json::to_value(request)?).await?;
         serde_json::from_value(resp).context("parse the stored-contents answer")
     }
 

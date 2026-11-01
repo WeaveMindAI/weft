@@ -27,7 +27,7 @@ export class SseRefused extends Error {
  *  "nothing of this ran, the same request goes through later" (its
  *  database busy, for one). Anything else the install says itself (the
  *  run is gone, the key is refused) stays said. */
-// SYNC: worthTryingAgain <-> crates/weft-core/src/install.rs (asks_again), crates/weft-cli/src/client.rs (busy_answer), crates/weft-cli/src/commands/ensure.rs (look_again_after)
+// SYNC: worthTryingAgain <-> crates/weft-core/src/install.rs (asks_again), crates/weft-cli/src/client.rs (busy_answer, platform_lost_the_copy)
 export function worthTryingAgain(err: unknown): boolean {
     if (!(err instanceof SseRefused)) return true;
     return err.fromInstall ? err.status === 503 : [429, 502, 503, 504].includes(err.status);

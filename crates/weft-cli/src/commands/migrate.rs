@@ -186,7 +186,7 @@ async fn connections(ctx: &Ctx, source: &DispatcherClient, target: &DispatcherCl
         ),
     };
     let request = ExportConnections { selection, public_key: key.as_ref().map(|k| k.public_key.clone()) };
-    let exported: ExportedConnections = serde_json::from_value(source.waiting_on_its_work().post_json("/access/migrate/export", &serde_json::to_value(&request)?).await?)
+    let exported: ExportedConnections = serde_json::from_value(source.waiting_on_its_work().ask_json("/access/migrate/export", &serde_json::to_value(&request)?).await?)
         .context("read the connections to copy")?;
     let outcomes: BTreeMap<uuid::Uuid, Outcome> = match (key, &exported.sealed) {
         (Some(key), Some(sealed)) => {

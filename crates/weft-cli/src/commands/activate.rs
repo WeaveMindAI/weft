@@ -1,6 +1,7 @@
 //! `weft activate [project]`. Without arg: discover cwd project,
 //! ensure registered, activate. With arg: treat it as a project id
-//! and activate directly (assume already registered).
+//! and activate directly (assume already registered). `--no-build`: the
+//! cwd project, activated directly on the build the install registered.
 //!
 //! The activation is carried out by a task of the install's, which the
 //! request answers at once; this follows it in short looks until it ends
@@ -28,13 +29,14 @@ use crate::progress::ActionVerb;
 pub async fn run(
     ctx: Ctx,
     project: Option<String>,
+    no_build: bool,
     held: ReleaseHeld,
     port: Option<u16>,
     scope: weft_core::activation::ActivationScope,
 ) -> anyhow::Result<()> {
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Activate, |progress| async move {
-        run_inner(&ctx_inner, &progress, project, held, port, scope).await
+        run_inner(&ctx_inner, &progress, project, no_build, held, port, scope).await
     })
     .await
 }
@@ -43,15 +45,21 @@ async fn run_inner(
     ctx: &Ctx,
     progress: &crate::progress::Progress,
     project: Option<String>,
+    no_build: bool,
     held: ReleaseHeld,
     port: Option<u16>,
     scope: weft_core::activation::ActivationScope,
 ) -> anyhow::Result<()> {
     // The hashes of the build just made, which the dispatcher checks is
-    // still the registered one. The "activate by id" path builds nothing
-    // and sends none: it activates whatever is registered.
+    // still the registered one. The "activate by id" path, and
+    // `--no-build`, build nothing and send none: they activate whatever is
+    // registered.
     let (client, id, name, build) = match project {
         Some(id) => (ctx.client()?, id.clone(), id, Default::default()),
+        None if no_build => {
+            let here = ctx.project()?;
+            (ctx.client()?, here.id().to_string(), here.manifest.package.name.clone(), Default::default())
+        }
         None => {
             // The build makes every place's images, an instance's copies
             // included, so a program starting an instance's copy later finds
@@ -110,6 +118,9 @@ async fn run_inner(
         }
         None => format!("{name} ({id}): {did}"),
     };
+    if let Some(note) = behind_note(&answer.behind, ctx.on()) {
+        progress.warn(&note);
+    }
     super::ensure::warn_broken(progress, &answer.broken);
     progress.complete_with(&summary, serde_json::to_value(&answer)?);
     Ok(())
@@ -130,6 +141,23 @@ fn what_it_did(answer: &ActivateResponse) -> String {
         _ => String::new(),
     };
     format!("turned on {}{held}", weft_core::activation::OwnerTriggers::list_words(&answer.turned_on))
+}
+
+/// What a person is told about the triggers on that an activate leaves
+/// behind the build it used: they fire older code or an older cut of the
+/// program until a resync brings them up to it.
+fn behind_note(behind: &[weft_core::activation::OwnerTriggers], on: Option<&str>) -> Option<String> {
+    if behind.is_empty() {
+        return None;
+    }
+    let count: usize = behind.iter().map(|owner| owner.triggers.len()).sum();
+    Some(format!(
+        "{count} trigger{} on {} behind the build this activated with ({}), firing an older one; `{}` brings them up",
+        if count == 1 { "" } else { "s" },
+        if count == 1 { "is" } else { "are" },
+        weft_core::activation::OwnerTriggers::list_words(behind),
+        super::weft_on(on, "resync")
+    ))
 }
 
 /// What a person is told about the per-instance triggers a plain activate
@@ -170,5 +198,22 @@ mod tests {
         let said = super::what_it_did(&answer);
         assert!(said.starts_with("turned on 'door'; 'inbox' of instance 'ada'; "), "{said}");
         assert!(said.ends_with("released, at half each trigger's limits"), "{said}");
+    }
+
+    /// An activate that leaves triggers on behind the build it used says
+    /// how many, which, and what brings them up; one that leaves none says
+    /// nothing.
+    #[test]
+    fn an_activate_says_what_it_left_behind() {
+        assert_eq!(super::behind_note(&[], None), None);
+        let behind = [
+            OwnerTriggers { owner: Owner::Shared, triggers: vec!["door".into(), "tick".into()] },
+            OwnerTriggers { owner: Owner::Instance(InstanceId::new("ada").unwrap()), triggers: vec!["inbox".into()] },
+        ];
+        let said = super::behind_note(&behind, None).unwrap();
+        assert!(said.starts_with("3 triggers on are behind the build this activated with ('door', 'tick'; 'inbox' of instance 'ada')"), "{said}");
+        assert!(said.ends_with("`weft resync` brings them up"), "{said}");
+        let one = super::behind_note(&behind[1..], None).unwrap();
+        assert!(one.starts_with("1 trigger on is behind"), "{one}");
     }
 }
