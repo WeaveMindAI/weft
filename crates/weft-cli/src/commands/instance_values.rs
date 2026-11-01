@@ -226,7 +226,9 @@ pub async fn run(ctx: Ctx, instance: InstanceId, set: Vec<String>, clear: Vec<St
     as_instance(&ctx, &client, &which, |door| async move {
         if !set.is_empty() || !clear.is_empty() {
             let changed: ValuesChanged = crate::client::read_answer(
-                door.put_json("/instance/values", &serde_json::to_value(ValuesRequest { set, clear })?).await?,
+                // It answers once the triggers that read the change are set
+                // up again, however long their setup takes.
+                door.waiting_on_its_work().put_json("/instance/values", &serde_json::to_value(ValuesRequest { set, clear })?).await?,
                 "the install's answer to the change",
             )?;
             let rearmed = changed.rearmed;

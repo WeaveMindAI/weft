@@ -363,6 +363,7 @@ pub fn task_registry() -> crate::task_executor::TaskRegistry {
         TaskKind::RemovalWait => Arc::new(crate::task_kinds::RemovalWaitExecutor),
         TaskKind::MaintenanceLift => Arc::new(crate::task_kinds::MaintenanceLiftExecutor),
         TaskKind::Activate => Arc::new(crate::task_kinds::ActivateExecutor),
+        TaskKind::StartRun => Arc::new(crate::task_kinds::StartRunExecutor),
     })
 }
 

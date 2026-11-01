@@ -639,7 +639,7 @@ where
     loop {
         match work().await {
             Ok(done) => return Ok(done),
-            Err(e) if contended(&e) && started.elapsed() < CONTENDED_FOR => {
+            Err(e) if contended(&e).is_some() && started.elapsed() < CONTENDED_FOR => {
                 tracing::warn!(
                     target: "weft_task_store::schema_guard",
                     error = %format!("{e:#}"),
@@ -649,7 +649,13 @@ where
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(CONTENDED_LONGEST);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                let gave_up = contended(&e).map(|given_up| gave_up_waiting(&given_up));
+                return Err(match gave_up {
+                    Some(why) => e.context(why),
+                    None => e,
+                });
+            }
         }
     }
 }
@@ -662,16 +668,56 @@ const CONTENDED_FIRST: std::time::Duration = std::time::Duration::from_millis(50
 const CONTENDED_LONGEST: std::time::Duration = std::time::Duration::from_secs(10);
 const CONTENDED_FOR: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// How the database gave up a lock for the schema's work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GivenUp {
+    /// It broke a deadlock (40P01) rather than letting the wait run out
+    /// (55P03).
+    deadlock: bool,
+    /// Where it was waiting, when the database says ("while updating tuple
+    /// (0,5) in relation \"run\""); a wait for a whole table names none.
+    waiting: Option<String>,
+}
+
 /// Whether `e` is the database giving up a lock (its wait ran out, or it
-/// broke a deadlock with a write): the whole transaction rolled back and can
-/// be tried again as it was.
-fn contended(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        cause
-            .downcast_ref::<crate::db::Error>()
-            .and_then(|e| e.code())
-            .is_some_and(|code| code == "55P03" || code == "40P01")
+/// broke a deadlock with a write), and how: the whole transaction rolled
+/// back and can be tried again as it was.
+fn contended(e: &anyhow::Error) -> Option<GivenUp> {
+    e.chain().find_map(|cause| {
+        let db = cause.downcast_ref::<crate::db::Error>()?.as_db_error()?;
+        let deadlock = match db.code().code() {
+            "40P01" => true,
+            "55P03" => false,
+            _ => return None,
+        };
+        Some(GivenUp { deadlock, waiting: db.where_().map(str::to_string) })
     })
+}
+
+/// What a person reads when the schema's work gave up waiting for a lock
+/// for [`CONTENDED_FOR`]. Every table and row lock it takes is one another
+/// session of the database holds (the advisory lock, taken first and
+/// waited on as long as it takes, keeps every other schema pass out), so
+/// what holds it is the install's own work or something else connected to
+/// the database.
+fn gave_up_waiting(given_up: &GivenUp) -> String {
+    let how = if given_up.deadlock {
+        "and the last try met a transaction in a deadlock, which the database ended by cancelling the schema's side".to_string()
+    } else {
+        format!("each try waiting at most {LOCK_WAIT} for each lock")
+    };
+    let waiting = given_up.waiting.as_deref().map(|at| format!(" The database says it was waiting {at}.")).unwrap_or_default();
+    format!(
+        "the schema's changes gave up after trying for {}s to lock what they change (a table, or rows of one), \
+         {how}: another session of this database held a lock they needed.{waiting} That session is this \
+         install's own work (a run, a trigger being set up, a request another copy of weft is serving) or \
+         anything else connected to the database, never another copy's schema changes, which wait their turn. \
+         The transaction that gave up was rolled back whole, so running it again (restarting this copy, or the \
+         release command) starts it over. If it keeps happening, look for the transaction that stays open while it waits: \
+         SELECT pid, xact_start, state, left(query, 200) FROM pg_stat_activity WHERE datname = current_database() \
+         AND xact_start IS NOT NULL ORDER BY xact_start;",
+        CONTENDED_FOR.as_secs()
+    )
 }
 
 /// Whether the database already holds everything `groups` and `migrations`
@@ -3430,6 +3476,23 @@ mod tests {
     #[test]
     fn a_whole_identifier_is_replaced_never_part_of_one() {
         assert_eq!(super::replace_ident("old_member_id, member_id)", "member_id", "instance_id"), "old_member_id, instance_id)");
+    }
+
+    #[test]
+    fn giving_up_a_lock_says_how_long_it_tried_and_where_it_waited() {
+        use super::{gave_up_waiting, GivenUp, CONTENDED_FOR, LOCK_WAIT};
+        let timed_out = gave_up_waiting(&GivenUp { deadlock: false, waiting: None });
+        assert!(timed_out.contains(&format!("trying for {}s", CONTENDED_FOR.as_secs())), "{timed_out}");
+        assert!(timed_out.contains(&format!("at most {LOCK_WAIT} for each lock")), "{timed_out}");
+        assert!(!timed_out.contains("The database says"), "{timed_out}");
+        assert!(timed_out.contains("pg_stat_activity"), "{timed_out}");
+
+        let deadlocked =
+            gave_up_waiting(&GivenUp { deadlock: true, waiting: Some("while updating tuple (0,5) in relation \"run\"".into()) });
+        assert!(deadlocked.contains("deadlock"), "{deadlocked}");
+        assert!(!deadlocked.contains(&format!("at most {LOCK_WAIT}")), "{deadlocked}");
+        assert!(deadlocked.contains("The database says it was waiting while updating tuple (0,5) in relation \"run\"."), "{deadlocked}");
+        assert!(!deadlocked.contains('\u{2014}') && !timed_out.contains('\u{2014}'));
     }
 
     // Layer-1 tests for the pure parts: the fingerprint, and which migrations

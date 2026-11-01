@@ -1607,6 +1607,17 @@ export interface TriggerCopy {
   version?: string;
   /// While it turns on: since when, and what its activation waits on.
   progress?: ChangeProgress;
+  /// The fires and calls dropped in the last minute or two.
+  dropped?: Dropped;
+}
+
+/// The fires and calls of a trigger dropped in the last minute or two:
+/// refused before any run started, which nothing tries again.
+// SYNC: Dropped <-> crates/weft-core/src/projects.rs Dropped
+export interface Dropped {
+  count: number;
+  /// Why the last one was dropped, as the door said it.
+  lastReason: string;
 }
 
 /// One trigger place of the program, with its state and each instance's
@@ -2239,11 +2250,19 @@ export type CliPhase =
   /// happens on the dispatcher: without it the command looks hung. A
   /// resync sends it again each time the runs it waits for change, with
   /// `waitsFor`: `{ runId, sinceUnix }` per run on the old version, empty
-  /// once every run named before has ended. A run a worker accepted but
-  /// has not recorded yet is waited for without being listed, so an
-  /// empty list can still be waiting.
+  /// once every run named before has ended, and `turningOn`
+  /// (`ChangeProgress`) while it turns an owner's triggers back on; again
+  /// every half minute while neither changes, each time with
+  /// `elapsedSeconds`, how long it has been followed. A run a worker
+  /// accepted but has not recorded yet is waited for without being
+  /// listed, so an empty list can still be waiting.
   // SYNC: the drain_wait detail's waitsFor <-> crates/weft-cli/src/progress.rs Progress::resync_waits_for
   | 'drain_wait'
+  /// The run is being prepared, and what its start is doing, said once it
+  /// changes and every half minute while it lasts. Detail carries
+  /// `elapsedSeconds` and `doing` ("reading the results of seed run ...").
+  // SYNC: the run_starting detail <-> crates/weft-cli/src/progress.rs Progress::run_starting, packages/weft-graph/src/webview/lib/components/project/ActionBar.svelte (run_starting)
+  | 'run_starting'
   /// Something the person should know that is not a failure; the verb
   /// carries on and still ends `complete`. Detail carries `message`.
   | 'warning'

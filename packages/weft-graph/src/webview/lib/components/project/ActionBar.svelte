@@ -115,6 +115,12 @@
 			// The call waits for the runs going to end before it lands:
 			// without this the bar looks hung for as long as they take.
 			case 'drain_wait': return 'Waiting for the runs still going...';
+			case 'run_starting': {
+				// SYNC: the run_starting detail <-> crates/weft-cli/src/progress.rs (Progress::run_starting), packages/weft-graph/src/protocol.ts (CliPhase run_starting)
+				const doing = typeof detail?.doing === 'string' ? `: ${detail.doing}` : '...';
+				const elapsed = typeof detail?.elapsedSeconds === 'number' ? ` (${detail.elapsedSeconds}s)` : '';
+				return `Starting the run${elapsed}${doing}`;
+			}
 			case 'warning': {
 				// Something the person should know that is not a failure;
 				// the verb carries on and still ends `complete`.

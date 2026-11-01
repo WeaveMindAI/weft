@@ -57,11 +57,31 @@ pub struct TriggerBake {
     pub at_unix: u64,
 }
 
-/// An earlier bake a trigger setup replaced because it no longer read
-/// ([`BakeStore::finish_trigger_setup`]): why, its row named.
+/// A stored bake that no longer reads: the program it was baked on (its
+/// row's `program_hash`, `ProgramIdentity::digest`), and why, its row
+/// named. Read past by [`BakeStore::trigger_bakes`], and replaced by the
+/// next setup of the same program ([`BakeStore::finish_trigger_setup`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnreadablePriorBake {
+pub struct UnreadableBake {
+    pub program_hash: String,
     pub error: String,
+}
+
+/// One owner's bakes ([`BakeStore::trigger_bakes`]): those that read, and
+/// apart those that no longer do, so one row that does not read never
+/// hides the others.
+#[derive(Debug, Clone, Default)]
+pub struct Bakes {
+    pub read: Vec<TriggerBake>,
+    pub unreadable: Vec<UnreadableBake>,
+}
+
+impl Bakes {
+    /// The bake of the program `program` when it no longer reads.
+    pub fn unreadable_for(&self, program: &weft_core::project::hash::ProgramIdentity) -> Option<&UnreadableBake> {
+        let digest = program.digest();
+        self.unreadable.iter().find(|bake| bake.program_hash == digest)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -508,11 +528,12 @@ pub trait BakeStore: Send + Sync {
     /// that no longer reads is replaced by this one, which carries nothing
     /// of it: answered, so the caller says which triggers lost their bake
     /// (`crate::run_ends::land_trigger_bake`).
-    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&TriggerBake>) -> anyhow::Result<Option<UnreadablePriorBake>>;
+    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&TriggerBake>) -> anyhow::Result<Option<UnreadableBake>>;
 
     /// The bakes of one owner's triggers: the shared ones for `None`, an
-    /// instance's for `Some`.
-    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Vec<TriggerBake>>;
+    /// instance's for `Some`. A row that no longer reads is answered
+    /// apart, never failing the read of the others.
+    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Bakes>;
 }
 
 /// Durable replacement for the in-RAM `SignalTracker` row.

@@ -60,15 +60,37 @@ pub fn validate_fire_bake(node: &str, program: &crate::project::hash::ProgramIde
     if bakes.iter().any(|bake| bake.program == *program && bake.captured.iter().any(|id| id == node)) {
         return Ok(());
     }
-    // A bake is per code, so ANY edit to the graph leaves the last one
-    // behind. That is the cause every single time somebody reads this,
-    // so it leads; the hashes are for the rare case where it is not.
-    let older = bakes.iter().filter(|bake| bake.captured.iter().any(|id| id == node))
-        .max_by_key(|bake| bake.at_unix)
+    // A bake is per program, so what moved since the last one leads: an
+    // edit to the graph, a node's code, or the worker built again from
+    // both unchanged, which an update of weft does to every program
+    // (its engine is part of every worker). The hashes are for the rare
+    // case where none of those reads right.
+    // A bake of this very program that left the trigger out (a setup of
+    // other triggers) means nothing moved: the trigger was never prepared
+    // here, whatever an older program's bake of it says.
+    let baked_here = bakes.iter().any(|bake| bake.program == *program);
+    let older = bakes
+        .iter()
+        .filter(|bake| !baked_here && bake.captured.iter().any(|id| id == node))
+        .max_by_key(|bake| bake.at_unix);
+    let moved = match older {
+        None => format!("trigger '{node}' has not been prepared for this program yet"),
+        Some(bake) if bake.program.definition_hash != program.definition_hash => {
+            format!("the graph changed since trigger '{node}' was last prepared, so its bake is stale")
+        }
+        Some(bake) if bake.program.implementations != program.implementations => {
+            format!("a node's code changed since trigger '{node}' was last prepared, so its bake is stale")
+        }
+        Some(_) => format!(
+            "the program's worker was built again since trigger '{node}' was last prepared, from the same graph and node code \
+             (an update of weft builds every program again), so its bake is stale"
+        ),
+    };
+    let hashes = older
         .map(|bake| format!(" (the last one was made for graph {} and binary {})", bake.program.definition_hash, bake.program.binary_hash))
         .unwrap_or_default();
     Err(Refusal::error(format!(
-        "the code changed since trigger '{node}' was last prepared, so its bake is stale{older}. Prepare it again: `weft bake` does it and changes nothing that listens; if the trigger is off, `weft activate` does it and turns it on; if it is on, `weft resync` brings it onto the new build and prepares it there"
+        "{moved}{hashes}. Prepare it again: `weft bake` does it and changes nothing that listens; if the trigger is off, `weft activate` does it and turns it on; if it is on, `weft resync` brings it onto the new build and prepares it there"
     )))
 }
 
@@ -1616,11 +1638,24 @@ mod tests {
         };
         let mut bake = BakeSummary { program: program.clone(), captured: vec!["trigger".into()], run_id: RunId::nil(), at_unix: 1 };
         assert!(validate_fire_bake("trigger", &program, &[bake.clone()]).is_ok());
-        assert!(validate_fire_bake("trigger", &program, &[]).unwrap_err().to_string().contains("weft bake"));
+        let never = validate_fire_bake("trigger", &program, &[]).unwrap_err().to_string();
+        assert!(never.starts_with("trigger 'trigger' has not been prepared for this program yet. ") && never.contains("weft bake"), "{never}");
         bake.captured.clear();
         assert!(validate_fire_bake("trigger", &program, &[bake.clone()]).is_err());
         bake.captured.push("trigger".into());
-        for changed in ["graph", "binary", "implementation"] {
+        // This program baked other triggers only, and an older one baked
+        // this trigger: the trigger was never prepared here, whatever
+        // moved since the older one.
+        let others_only = BakeSummary { program: program.clone(), captured: vec!["other".into()], run_id: RunId::nil(), at_unix: 2 };
+        let mut older = bake.clone();
+        older.program.definition_hash.push('0');
+        let left_out = validate_fire_bake("trigger", &program, &[older, others_only]).unwrap_err().to_string();
+        assert!(left_out.starts_with("trigger 'trigger' has not been prepared for this program yet. ") && !left_out.contains("made for graph"), "{left_out}");
+        for (changed, moved) in [
+            ("graph", "the graph changed since"),
+            ("implementation", "a node's code changed since"),
+            ("binary", "the program's worker was built again since trigger 'trigger' was last prepared, from the same graph and node code (an update of weft"),
+        ] {
             let mut other = program.clone();
             match changed {
                 "graph" => other.definition_hash.push('2'),
@@ -1628,10 +1663,9 @@ mod tests {
                 _ => { other.implementations.insert("T".into(), "changed".into()); }
             }
             let refusal = validate_fire_bake("trigger", &other, &[bake.clone()]).unwrap_err().to_string();
-            // The cause leads (every reader of this got here by editing
-            // the graph); the hashes stay, for the rare case where it
-            // was something else.
-            assert!(refusal.contains("the code changed since"), "{refusal}");
+            // What moved leads; the hashes stay, for the rare case where
+            // it reads wrong.
+            assert!(refusal.starts_with(moved), "{changed}: {refusal}");
             assert!(refusal.contains("weft bake"), "it names the fix: {refusal}");
             assert!(refusal.contains("made for graph"), "{refusal}");
         }

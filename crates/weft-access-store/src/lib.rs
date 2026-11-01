@@ -39,7 +39,7 @@ pub use flows::{
 };
 pub use picks::{change_install_picks, install_picks, move_stored, stored_fields, PickWrite};
 pub use subscriptions::{
-    drop_subscriptions_for_signal, ensure_subscription, needs_renewal, no_public_url_error,
+    check_subscription, drop_subscriptions_for_signal, ensure_subscription, needs_renewal, no_public_url_error,
     run_connect_call, subscription_by_id, EnsureSubscription, EnsuredSubscription, Subscription,
 };
 pub use resolve::{

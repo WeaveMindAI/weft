@@ -508,7 +508,7 @@ mod tests {
     }
 
     fn program() -> Actor {
-        Actor::Program { tenant: TenantId::local(), project: uuid::Uuid::from_u128(1), run: uuid::Uuid::from_u128(2) }
+        Actor::Program { tenant: TenantId::local(), project: uuid::Uuid::from_u128(1), run: uuid::Uuid::from_u128(2), call: uuid::Uuid::from_u128(3) }
     }
 
     #[test]

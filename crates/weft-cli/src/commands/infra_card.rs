@@ -42,7 +42,8 @@ impl Card {
     /// Send `press` (a button's, or a reader's `taken`) and hand back what
     /// the node answered.
     pub async fn press(&self, press: &weft_core::live::LivePress) -> Result<Value> {
-        self.client.post_json(&format!("{}/action{}", self.base, self.query), &serde_json::to_value(press)?).await
+        // It answers once the node's own action did, with no limit there.
+        self.client.waiting_on_its_work().post_json(&format!("{}/action{}", self.base, self.query), &serde_json::to_value(press)?).await
     }
 }
 
@@ -50,7 +51,8 @@ impl Card {
 /// answer once its infra setup ended.
 pub async fn run_rebake(ctx: Ctx, node: &str, instance: Option<&weft_core::instance::InstanceId>) -> Result<()> {
     let card = Card::open(&ctx, node, instance).await?;
-    card.client.post_json(&format!("{}/rebake{}", card.base, card.query), &serde_json::json!({})).await?;
+    // It answers once the copy's setup run ended, however long.
+    card.client.waiting_on_its_work().post_json(&format!("{}/rebake{}", card.base, card.query), &serde_json::json!({})).await?;
     if !ctx.json_out(&serde_json::json!({ "node": card.place, "rebaked": true }))? {
         println!("baked {} again: every fire reads its new values from now on", card.place);
     }

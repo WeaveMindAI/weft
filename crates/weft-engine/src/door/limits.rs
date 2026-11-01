@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use weft_core::signal::ResolvedLimits;
 
 pub use weft_core::signal::limits::{Limited, Refused};
-use weft_core::signal::limits::{failed_key, ran_key, window};
+use weft_core::signal::limits::{drop_reason, dropped_key, failed_key, ran_key, window};
 
 /// The counts one copy keeps (see the module doc).
 pub struct Limits {
@@ -58,6 +58,9 @@ struct Counts {
     window_start: i64,
     /// What this copy counted this minute.
     mine: HashMap<String, i64>,
+    /// The last reason this copy gave for a count of `mine` that keeps
+    /// one (a dropped fire's), by its key.
+    reasons: HashMap<String, String>,
     /// What the other copies counted this minute, as of the last tick.
     others: HashMap<String, i64>,
     /// Copies alive at the last tick, this one included.
@@ -69,6 +72,15 @@ struct Counts {
     /// differ.
     changes: u64,
     reported: u64,
+}
+
+/// One of this copy's counts of the minute, as a tick states it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mine {
+    pub key: String,
+    pub hits: i64,
+    /// The last reason given for it, for a count that keeps one.
+    pub reason: Option<String>,
 }
 
 /// Held for as long as an admitted run goes: it counts toward its entry's
@@ -200,18 +212,39 @@ impl Limits {
         self.ticking.wake();
     }
 
+    /// A fire or a call of the entry `token` was dropped for `reason`:
+    /// refused before any run started (a fire is acknowledged, so nothing
+    /// tries it again). It is counted this minute with its reason, for
+    /// `weft status`.
+    pub fn dropped(&self, token: &str, reason: &str, now: i64) {
+        {
+            let mut counts = self.state.lock().expect("door limits");
+            counts.roll(window(now).0);
+            let key = dropped_key(token);
+            counts.reasons.insert(key.clone(), drop_reason(reason));
+            counts.add(key, 1);
+        }
+        self.ticking.wake();
+    }
+
     /// How many runs of each entry go on this copy right now: what a drain
     /// of those entries waits for, stated at a tick.
     pub fn going(&self) -> std::collections::BTreeMap<String, u32> {
         self.state.lock().expect("door limits").going.iter().map(|(token, going)| (token.clone(), *going)).collect()
     }
 
-    /// This copy's counts of the minute, to state at a tick, and the
+    /// This copy's counts of the minute, each with the last reason it
+    /// keeps when it keeps one, to state at a tick, and the
     /// [`Self::reported`] mark they are as of.
-    pub fn mine(&self, now: i64) -> (i64, Vec<(String, i64)>, u64) {
+    pub fn mine(&self, now: i64) -> (i64, Vec<Mine>, u64) {
         let mut counts = self.state.lock().expect("door limits");
         let start = counts.roll(window(now).0);
-        (start, counts.mine.iter().map(|(key, hits)| (key.clone(), *hits)).collect(), counts.changes)
+        let mine = counts
+            .mine
+            .iter()
+            .map(|(key, hits)| Mine { key: key.clone(), hits: *hits, reason: counts.reasons.get(key).cloned() })
+            .collect();
+        (start, mine, counts.changes)
     }
 
     /// A tick that carried the counts as of `mark` (from [`Self::mine`])
@@ -260,6 +293,7 @@ impl Counts {
         if start > self.window_start {
             self.window_start = start;
             self.mine.clear();
+            self.reasons.clear();
             self.others.clear();
         }
         self.window_start
@@ -320,7 +354,7 @@ mod tests {
             assert!(door.admit("tok", "ip:a", &l, 0).is_err());
         }
         let (_, mine, _) = door.mine(0);
-        let mine: HashMap<String, i64> = mine.into_iter().collect();
+        let mine: HashMap<String, i64> = mine.into_iter().map(|count| (count.key, count.hits)).collect();
         assert_eq!(mine["c:tok:ip:a"], 1);
         assert_eq!(mine["refused:tok:per_caller"], 3);
     }
@@ -372,6 +406,25 @@ mod tests {
         door.admit("tok", "ip:a", &l, 0).unwrap().uncount();
         let _a = door.admit("tok", "ip:a", &l, 1).expect("the uncounted one left the minute's count and its room");
         assert_eq!(door.admit("tok", "ip:a", &l, 2).unwrap_err().reason, Limited::PerEntry);
+    }
+
+    /// A dropped fire is counted under its trigger with the last reason
+    /// given, and a new minute starts both from nothing.
+    #[test]
+    fn a_dropped_fire_is_counted_with_its_last_reason() {
+        let door = Limits::new(crate::door::ticks::Ticking::new());
+        door.dropped("tok", "the trigger is gone", 0);
+        door.dropped("tok", "package 'relay' didn't compile", 1);
+        let (_, mine, _) = door.mine(1);
+        assert_eq!(
+            mine,
+            vec![Mine { key: "dropped:tok".into(), hits: 2, reason: Some("package 'relay' didn't compile".into()) }]
+        );
+        let (_, mine, _) = door.mine(60);
+        assert!(mine.is_empty(), "{mine:?}");
+        door.admit("tok", "ip:a", &limits(None, None, None), 61).unwrap().uncount();
+        let (_, mine, _) = door.mine(61);
+        assert!(mine.iter().all(|count| count.reason.is_none()), "a count with no reason states none: {mine:?}");
     }
 
     #[test]

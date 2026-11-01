@@ -150,10 +150,10 @@ pub struct ResyncResponse {
     pub brought_back: Option<crate::maintenance::ProjectLifted>,
 }
 
-/// Where a resync is, as its task says while it runs: the `going` answer
-/// of `/projects/{id}/follow/{task}`, and what `weft status` shows of a
-/// resync under way. Its task says it each time the runs it waits for
-/// change, and says none once it waits for no more.
+/// Where a resync is, as its task says while it runs (its task's
+/// progress), and what `weft status` shows of a resync under way. Its
+/// task says it each time the runs it waits for change, and says none
+/// once it waits for no more.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResyncProgress {
@@ -162,6 +162,20 @@ pub struct ResyncProgress {
     /// not put on record yet is waited for too, and is not named here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waits_for: Vec<RunGoing>,
+}
+
+/// Where a resync is, as its follower is answered (the `going` answer of
+/// `/projects/{id}/follow/{task}`): what its task said, and the
+/// activation it drives now, read off the activation rows it claimed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResyncGoing {
+    #[serde(flatten)]
+    pub progress: ResyncProgress,
+    /// While it turns an owner's triggers back on: since when, and what
+    /// that activation waits on now ("its setup run <id>").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turning_on: Option<crate::infra::wire::ChangeProgress>,
 }
 
 /// A run going, since `since_unix` (when it started, on the install's
@@ -197,6 +211,15 @@ mod tests {
         assert_eq!(wire["waitsFor"][0]["sinceUnix"], 7);
         assert_eq!(serde_json::from_value::<ResyncProgress>(wire).unwrap(), progress);
         assert_eq!(serde_json::to_value(ResyncProgress::default()).unwrap(), serde_json::json!({}));
+        // A follower is answered what the task said, flat, beside what it
+        // turns on now.
+        let going = ResyncGoing {
+            progress,
+            turning_on: Some(crate::infra::wire::ChangeProgress { since_unix: 8, as_of_unix: 9, waiting: Some("its setup run r1".into()) }),
+        };
+        let wire = serde_json::to_value(&going).unwrap();
+        assert_eq!((wire["waitsFor"][0]["sinceUnix"].as_i64(), wire["turningOn"]["waiting"].as_str()), (Some(7), Some("its setup run r1")));
+        assert_eq!(serde_json::from_value::<ResyncGoing>(wire).unwrap(), going);
     }
 
     #[test]

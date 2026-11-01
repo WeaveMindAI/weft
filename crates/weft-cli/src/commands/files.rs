@@ -497,7 +497,8 @@ pub async fn rm(ctx: Ctx, target: String, yes: bool) -> anyhow::Result<()> {
         weft_core::storage::RemoveFilesRequest { key: Some(target), prefix: None }
     };
     let removed: weft_core::storage::FilesRemoved =
-        serde_json::from_value(client.delete_with_body("/storage/files", &serde_json::to_value(&body)?).await?)
+        // A prefix takes as long as removing every file under it.
+        serde_json::from_value(client.waiting_on_its_work().delete_with_body("/storage/files", &serde_json::to_value(&body)?).await?)
             .context("read the removal answer")?;
     println!("removed {} file(s)", removed.removed);
     Ok(())

@@ -82,6 +82,49 @@ pub struct EnsuredSubscription {
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// What subscribing `req` takes, out of the connection's `source`: the
+/// calls it makes and the values their templates read (the trigger's
+/// params under the connection's own values, which params may not
+/// replace), or `None` when the provider pushes without being asked (an
+/// app-level events URL). A topic the service does not declare, one with
+/// no webhook transport, or params naming a stored value, are refused.
+/// Pure, so a check and a subscribe decide it the same way.
+fn subscribe_plan<'a>(
+    source: &'a weft_core::access::events::ResolvedEventSource,
+    req: &EnsureSubscription,
+) -> anyhow::Result<Option<(&'a weft_core::access::events::SubscriptionCalls, BTreeMap<String, String>)>> {
+    let Some(topic) = source.events.get(&req.topic) else {
+        return Err(AccessError::Invalid(format!("'{}' declares no event topic named '{}'", req.service, req.topic)).into());
+    };
+    let Some(webhook) = &topic.webhook else {
+        return Err(AccessError::Invalid(format!(
+            "'{}.{}' declares no webhook transport, so there is nothing to subscribe",
+            req.service, req.topic
+        ))
+        .into());
+    };
+    let Some(calls) = &webhook.subscribe else { return Ok(None) };
+    Ok(Some((calls, call_values(&source.values, &source.recipe_values, &req.params)?)))
+}
+
+/// Whether [`ensure_subscription`] could subscribe `req` on this install,
+/// decided without subscribing or writing anything: what it takes is what
+/// the connection's service declares ([`subscribe_plan`]), and, when the
+/// provider must be told where to send, this weft has an address the
+/// internet can reach (`receiver_url`). What only the provider can say (a
+/// refusal of the subscribe itself) is not known until it is asked.
+pub async fn check_subscription<F, Fut>(pool: &Pool, req: &EnsureSubscription, receiver_url: F) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Option<String>>>,
+{
+    let source = resolve_event_source(pool, &req.tenant, crate::GrantUser::of(req.for_instance.as_ref()), req.access_id, &req.service, &[]).await?;
+    if subscribe_plan(&source, req)?.is_some() && receiver_url().await?.is_none() {
+        return Err(AccessError::Invalid(no_public_url_error(&req.service)).into());
+    }
+    Ok(())
+}
+
 /// Make sure a live provider subscription serves this signal:
 /// subscribe when none exists, renew (fresh id + token, then stop the
 /// old channel) when the recorded one is inside its renewal margin,
@@ -108,21 +151,7 @@ where
     Fut: std::future::Future<Output = anyhow::Result<Option<String>>>,
 {
     let source = resolve_event_source(pool, &req.tenant, crate::GrantUser::of(req.for_instance.as_ref()), req.access_id, &req.service, &[]).await?;
-    let Some(topic) = source.events.get(&req.topic) else {
-        return Err(AccessError::Invalid(format!(
-            "'{}' declares no event topic named '{}'",
-            req.service, req.topic
-        ))
-        .into());
-    };
-    let Some(webhook) = &topic.webhook else {
-        return Err(AccessError::Invalid(format!(
-            "'{}.{}' declares no webhook transport, so there is nothing to subscribe",
-            req.service, req.topic
-        ))
-        .into());
-    };
-    let Some(calls) = &webhook.subscribe else {
+    let Some((calls, planned)) = subscribe_plan(&source, req)? else {
         // The provider pushes without being asked (an app-level
         // events URL); nothing to keep alive.
         return Ok(EnsuredSubscription { expires_at: None });
@@ -154,7 +183,7 @@ where
         };
         let minted_id = uuid::Uuid::new_v4().to_string();
         let minted_token = mint_token();
-        let mut values = call_values(&source.values, &source.recipe_values, &req.params)?;
+        let mut values = planned.clone();
         values.insert(MINTED_ID.to_string(), minted_id.clone());
         values.insert(MINTED_TOKEN.to_string(), minted_token.clone());
         values.insert(RECEIVER_URL.to_string(), receiver_url);

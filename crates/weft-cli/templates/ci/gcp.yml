@@ -116,7 +116,8 @@ jobs:
       # only the triggers that are on and behind it: taken down with what
       # arrives meanwhile held, their paused runs moved onto the new
       # build, and back on once the old version is done (this log names the
-      # runs it waits for meanwhile, each time they change). Neither turns
+      # runs it waits for meanwhile, each time they change, and says every
+      # 30 seconds that it is still going). Neither turns
       # anything on, so on a first deploy they leave the version ready for
       # `weft infra start --on <target>` and `weft activate --on <target>`,
       # run once by hand; a trigger or infra someone took down stays down.
@@ -188,7 +189,17 @@ jobs:
           rm "$RUNNER_TEMP/front-env.yaml"
           # The address weft recorded for it, the same shape as the
           # install's own (Cloud Run's main `status.url` is another one).
-          url=$(weft frontend ls --on ${{ vars.WEFT_TARGET }} --json | jq -r --arg name "${{ vars.WEFT_FRONTEND_NAME }}" '.[] | select(.name == $name) | .url')
+          # A failing weft prints its one error line and exits non-zero:
+          # checked before jq reads it, so the step fails with weft's reason.
+          if ! frontends=$(weft frontend ls --on ${{ vars.WEFT_TARGET }} --json); then
+            echo "$frontends" >&2
+            exit 1
+          fi
+          url=$(jq -r --arg name "${{ vars.WEFT_FRONTEND_NAME }}" '.[] | select(.name == $name) | .url // empty' <<<"$frontends")
+          if [ -z "$url" ]; then
+            echo "::error::the install lists no frontend named ${{ vars.WEFT_FRONTEND_NAME }} with an address; run \`weft target export ${{ vars.WEFT_TARGET }} --github\` again"
+            exit 1
+          fi
           echo "frontend: $url" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # The frontend now calls with the token this deploy gave it (named by

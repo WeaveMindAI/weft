@@ -139,7 +139,10 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
         // Idempotent: a marker-404 ("no such project") on a delete means the
         // project is already gone, which is rm's desired end state (a retry
         // after a lost success response must not fail).
+        // It answers once what the project held is taken off the install
+        // (its services, its stored data), however long that takes.
         let removed = client
+            .waiting_on_its_work()
             .delete_idempotent_json(&unregister_path)
             .await
             .context("dispatcher unregister")?
@@ -206,7 +209,9 @@ async fn drop_journal_rows(
             );
         }
         for run_id in fresh {
+            // A run that stored many files takes as long as removing them.
             client
+                .waiting_on_its_work()
                 .delete(&format!("/runs/{run_id}"))
                 .await
                 .with_context(|| format!("delete run {run_id}"))?;

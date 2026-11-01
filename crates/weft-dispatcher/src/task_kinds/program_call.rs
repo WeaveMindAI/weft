@@ -17,7 +17,10 @@
 //! whose answer was lost is issued again, so every call is safe to repeat:
 //! starting a running copy, taking down what is already down, activating
 //! what is active, forgetting what is gone all answer without doing
-//! anything.
+//! anything. A run a call starts is named after the call
+//! (`weft_core::program::program_call_id`, of the task's dedup key), so
+//! the call issued again answers the run it started instead of starting
+//! another.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -36,10 +39,14 @@ impl TaskExecutor<DispatcherState> for ProgramCallExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
         let payload: ProgramCallPayload = serde_json::from_value(task.payload.clone())?;
         let asker_project = task.project_id.ok_or_else(|| anyhow::anyhow!("program_call task names no project"))?;
+        // The worker keys every call to its step (`weft_engine` context's
+        // program_call), and the broker refuses one with no key.
+        let step = task.dedup_key.as_deref().ok_or_else(|| anyhow::anyhow!("program_call task names no step"))?;
         let actor = crate::actions::Actor::Program {
             tenant: crate::tenant::TenantId(task.tenant_id.clone()),
             project: asker_project,
             run: payload.by,
+            call: weft_core::program::program_call_id(step),
         };
         let target = payload.project.unwrap_or(asker_project);
         let outcome = crate::actions::program_call(state, &actor, target, &payload.call, payload.stop_self)
