@@ -629,6 +629,7 @@ async fn ensure_standard_worker(target: &str, base: &str) -> Result<()> {
     let build = weft_compiler::build::build_project(
         &stock.project,
         &stock.definition,
+        &stock.contents,
         &stock.catalog,
         // `StockProject::materialize` compiled it from disk.
         weft_compiler::CompileFs::disk(&stock.project.root),

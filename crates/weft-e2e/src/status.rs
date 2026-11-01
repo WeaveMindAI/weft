@@ -1,6 +1,6 @@
 //! Project status + available-actions observation.
 //!
-//! `GET /projects/{id}/status` is the dispatcher's single reconciliation
+//! `POST /projects/{id}/status` is the dispatcher's single reconciliation
 //! surface: the lifecycle status, the transition marker, the derived infra
 //! rollup, and `available_actions` (the reconciliation table as a list).
 //! Transition tests drive verbs and then assert THIS payload, because the
@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use serde_json::Value;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::client::{poll_until, Dispatcher};
@@ -20,7 +20,7 @@ use crate::client::{poll_until, Dispatcher};
 pub const STATUS_DEADLINE: Duration = Duration::from_secs(120);
 const STATUS_POLL: Duration = Duration::from_millis(300);
 
-/// One `GET /projects/{id}/status` payload, with typed accessors over the
+/// One `POST /projects/{id}/status` payload, with typed accessors over the
 /// fields the transition tests assert on.
 #[derive(Debug, Clone)]
 pub struct ProjectStatus(pub Value);
@@ -162,7 +162,7 @@ impl ProjectStatus {
 
 /// Fetch the current status snapshot.
 pub async fn fetch(disp: &Dispatcher, id: &Uuid) -> Result<ProjectStatus> {
-    let v: Value = disp.get_json(&format!("/projects/{id}/status")).await?;
+    let v: Value = disp.post_json(&format!("/projects/{id}/status"), &json!({})).await?;
     Ok(ProjectStatus(v))
 }
 

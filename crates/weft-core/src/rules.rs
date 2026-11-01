@@ -189,13 +189,16 @@ impl CustomPorts {
 enum Written<'a> {
     Known(Option<&'a Value>),
     /// `@instance_filled` with no fallback, or a connection picked on the
-    /// install (`crate::picks`): there, with a value nobody knows.
+    /// install (`crate::picks`): there, with a value nobody knows. Also a
+    /// file's content a build named (`crate::content`): there, and read
+    /// only by the worker that runs it (the compile ruled on the content
+    /// itself before naming it).
     Unknown,
 }
 
 fn written<'a>(node: &'a NodeDefinition, field: &str) -> Written<'a> {
     match node.written_value(field) {
-        Some(value) if crate::picks::is_install_picked(value) => Written::Unknown,
+        Some(value) if crate::picks::is_install_picked(value) || crate::content::ContentRef::from_value(value).is_some() => Written::Unknown,
         Some(value) => match crate::instance::as_instance_filled(value) {
             Some(filled) => match filled.fallback {
                 Some(fallback) => Written::Known(Some(fallback)),

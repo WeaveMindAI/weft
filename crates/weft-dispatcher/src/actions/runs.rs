@@ -19,7 +19,7 @@ use weft_core::versions::{RunStarted, RunStarting, StartRun, StartingRun, Versio
 use weft_core::RunId;
 
 use super::{internal, with_tree_lock, Actor, Refused};
-use crate::api::project::{coherent_definition, require_action};
+use crate::api::project::{as_registered, coherent_definition, require_action};
 use crate::state::DispatcherState;
 use crate::versions::{resolve_seed, SeedChoice};
 
@@ -250,11 +250,12 @@ pub(crate) async fn run(
         return Ok(started);
     }
     crate::maintenance::refuse_while_on(&state.pg_pool).await?;
-    require_action(state, id, &["run"]).await?;
+    // One read of the registered build for the verb's check and the run.
+    let (program, project) = coherent_definition(state, id).await?;
+    require_action(state, id, &as_registered(&program, &project), &["run"]).await?;
     if (!body.seed_until.is_empty() || !body.seed_before.is_empty()) && !body.seed && body.seed_run.is_none() {
         return Err((StatusCode::BAD_REQUEST, "`--seed-until` and `--seed-before` need `--seed`".into()));
     }
-    let (program, project) = coherent_definition(state, id).await?;
     let definition_hash = program.definition_hash.clone();
     if definition_hash != body.definition_hash {
         return Err((

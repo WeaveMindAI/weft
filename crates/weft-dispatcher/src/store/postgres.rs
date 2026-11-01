@@ -336,6 +336,18 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             state TEXT NOT NULL,
             -- The worker replica driving it, while it runs.
             owner TEXT,
+            -- The memory note of the worker that last let it go by going
+            -- away (`weft_task_store::worker_door::MemoryNote`): copied
+            -- off that worker's lease row by the lost-run sweep, in the
+            -- write that takes the run from it, when its memory was
+            -- nearly full then. NULL when it was not, when the run was
+            -- never lost, or when its last owner let it go itself (handed
+            -- it back, parked it, gave it up). The worker that claims it
+            -- next reads it with its claim, to say why a firing it left
+            -- running went away.
+            lost_memory_full_at BIGINT,
+            lost_memory_used BIGINT,
+            lost_memory_limit BIGINT,
             -- The owner's fencing token: raised by every claim and by the
             -- lost-run sweep, so a batch from an owner that lost the run is
             -- refused.
@@ -364,8 +376,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- saying when, until something that can fix it starts them
             -- again (`weft_dispatcher::delivery::UNREACHED_TO_STOP`).
             unreached SMALLINT NOT NULL DEFAULT 0,
-            -- When its workers first answered it busy since it was last
-            -- claimed (unix seconds); NULL while they have not. Its pause
+            -- When its workers first answered it busy (memory full, or
+            -- unable to read its program and files or claim it,
+            -- `RunAnswer::NotNow`) since it was last claimed (unix
+            -- seconds); NULL while they have not. Its pause
             -- before the next try grows with it, and past the install's
             -- alert delay it is written down for `weft status`
             -- (`weft_dispatcher::delivery::busy`).
@@ -1036,9 +1050,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- refused birth keeps nothing, and nothing but a cut a
                 -- birth names goes in.
                 INSERT INTO project_definition (project_id, definition_hash, project_json, project_json_version,
-                                                recorded_at_unix, cut_from)
+                                                recorded_at_unix, cut_from, trigger_cuts_walked)
                     SELECT r.project_id, r.definition_hash, c->>'project_json',
-                           (c->>'project_json_version')::integer, p_now, r.cut_from
+                           (c->>'project_json_version')::integer, p_now, r.cut_from, FALSE
                     FROM jsonb_array_elements(p_programs) AS c
                         JOIN unnest(p_ids, v_fates) AS v(id, fate) ON v.fate = 'insert'
                         JOIN run r ON r.run_id = v.id
@@ -1365,8 +1379,13 @@ impl RunStore for PostgresStore {
             return Ok(Lost::Ended);
         }
         let durable = locked.keeping == weft_core::run_settings::Keeping::Durable.as_str();
+        // The memory note of the worker it is taken from goes on the run
+        // (`run.lost_memory_full_at`), for the worker that claims it next:
+        // that worker's lease row may be pruned by then.
         tx.execute(
             "UPDATE run SET owner = NULL, epoch = epoch + 1, delivered_until = NULL, \
+                 (lost_memory_full_at, lost_memory_used, lost_memory_limit) = \
+                     (SELECT l.memory_full_at, l.memory_used, l.memory_limit FROM worker_lease l WHERE l.replica = run.owner), \
                  state = CASE WHEN $2::boolean THEN 'queued' ELSE state END WHERE run_id = $1",
             &[&run_id, &durable],
         )
@@ -1563,6 +1582,18 @@ impl RunStore for PostgresStore {
             )
             .await?;
         Ok(rows.into_iter().map(|(run_id, phase)| (run_id, phase_from_column(&phase))).collect())
+    }
+
+    async fn unfinished_programs(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<String>> {
+        // `run_live` serves it: a project's runs that have not ended.
+        Ok(self
+            .pool
+            .scalars(
+                "SELECT DISTINCT definition_hash FROM run \
+                 WHERE project_id = $1 AND state <> 'ended' AND definition_hash IS NOT NULL ORDER BY definition_hash",
+                &[&project_id],
+            )
+            .await?)
     }
 
     async fn live_tagged_runs(

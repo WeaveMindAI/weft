@@ -576,6 +576,73 @@ async fn a_late_batch_after_the_lost_sweep_is_refused(pool: Pool) {
     assert_eq!(row(&pool, run).await, ("queued".into(), None, 2, 0, 0));
 }
 
+/// The memory note of a worker that went away full is read by the worker
+/// that claims the run it lost, with its claim, and by a claim given again,
+/// though the lost worker's lease row was pruned before the claim (the
+/// sweep put the note on the run), and though the worker crossed before
+/// its lease row was written: the tick that wrote the row carried it. A
+/// run its worker handed back, or one whose worker had room again when it
+/// went away, reads none.
+#[weft_db_macros::test]
+async fn the_worker_that_carries_on_a_lost_run_reads_its_last_workers_memory_note(pool: Pool) {
+    use weft_task_store::worker_door::{keep_memory_state, MemoryNote};
+    schema(&pool).await;
+    let store = weft_dispatcher::store::postgres::PostgresStore::from_pool(pool.clone());
+    let run = weft_core::new_run_id();
+    let conn = pool.get().await.unwrap();
+    let claim = |owner: &'static str| {
+        let conn = &conn;
+        async move { weft_journal::record::claim(conn, run, PROJECT, owner).await.unwrap().expect("claimed").lost_full }
+    };
+    driven_by_a_dead_worker(&pool, run).await;
+    let note = MemoryNote { used_bytes: 990, limit_bytes: 1000, at_unix: 12 };
+    keep_memory_state(&pool, "w1", PROJECT, Some(&note)).await.unwrap();
+    keep_memory_state(&pool, "nobody", PROJECT, Some(&note)).await.unwrap();
+    let kept: i64 = pool.scalar("SELECT COUNT(*) FROM worker_lease", &[]).await.unwrap();
+    assert_eq!(kept, 1, "a worker with no lease row keeps its note nowhere");
+    assert_eq!(store.let_go_of_lost(run, i64::MAX, None).await.unwrap(), Lost::Requeued);
+    pool.execute("DELETE FROM worker_lease WHERE replica = 'w1'", &[]).await.unwrap();
+    assert_eq!(claim("w2").await, Some(note), "the note is on the run, whatever became of w1's lease row");
+    assert_eq!(claim("w2").await, Some(note), "a claim given again reads it again");
+
+    // w2 hands it back: it did not go away, so the next claim reads no
+    // note.
+    let w2 = weft_broker::door::DoorWorker { tenant: TENANT, project: PROJECT, replica: "w2" };
+    assert!(weft_broker::door::let_go(&pool, w2, run, weft_broker_client::protocol::LetGo::HandedBack).await.unwrap());
+    assert_eq!(claim("w3").await, None);
+
+    // w3 was full for a while, had room again, then went away.
+    pool.execute(
+        "INSERT INTO worker_lease (replica, project_id, tenant_id, leased_until_unix) VALUES ('w3', $1, $2, 0)",
+        &[&PROJECT, &TENANT],
+    )
+    .await
+    .unwrap();
+    keep_memory_state(&pool, "w3", PROJECT, Some(&note)).await.unwrap();
+    keep_memory_state(&pool, "w3", PROJECT, None).await.unwrap();
+    assert_eq!(store.let_go_of_lost(run, i64::MAX, None).await.unwrap(), Lost::Requeued);
+    assert_eq!(claim("w4").await, None);
+
+    // w4 crossed before its first tick wrote its lease row: told at once,
+    // the note lands nowhere, and the tick that writes the row carries it.
+    keep_memory_state(&pool, "w4", PROJECT, Some(&note)).await.unwrap();
+    let rows: i64 = pool.scalar("SELECT COUNT(*) FROM worker_lease WHERE replica = 'w4'", &[]).await.unwrap();
+    assert_eq!(rows, 0);
+    let w4 = weft_broker::door::DoorWorker { tenant: TENANT, project: PROJECT, replica: "w4" };
+    let tick = weft_broker_client::protocol::DoorTickRequest {
+        binary_hash: Some("bin-1".into()),
+        in_flight: Default::default(),
+        window_start: weft_core::signal::limits::window(chrono::Utc::now().timestamp()).0,
+        counts: Vec::new(),
+        vouch_until: None,
+        shortens: false,
+        memory_full: Some(note),
+    };
+    weft_broker::door::tick(&pool, w4, &tick).await.unwrap();
+    assert_eq!(store.let_go_of_lost(run, i64::MAX, None).await.unwrap(), Lost::Requeued);
+    assert_eq!(claim("w5").await, Some(note));
+}
+
 /// A late batch that holds the run's row when the sweep comes goes in
 /// first, and the sweep then lets go of the run from where the batch left
 /// it, without either waiting on the other for ever.

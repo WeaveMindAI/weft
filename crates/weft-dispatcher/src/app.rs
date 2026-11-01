@@ -303,6 +303,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         ),
         http,
         programs,
+        trigger_cuts: crate::state::trigger_cuts_cache(),
         held,
         project_ports: match &config.platform {
             weft_platform_traits::config::PlatformConfig::Local(local) => {

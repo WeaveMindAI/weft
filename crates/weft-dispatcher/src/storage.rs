@@ -412,6 +412,10 @@ impl crate::build::ProjectStorage for BrokerStorage {
     async fn meta(&self, key: &str) -> Result<StoredFileMeta> {
         file_meta(&self.0, key).await
     }
+
+    async fn store_texts(&self, tenant: &str, texts: &std::collections::BTreeMap<String, Vec<u8>>) -> Result<()> {
+        weft_assets::publish_held(texts, &asset_store(&self.0, tenant)).await
+    }
 }
 
 /// Wipe a whole scope/tenant prefix (`weft files rm <prefix>` / project-delete).

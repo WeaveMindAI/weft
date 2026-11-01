@@ -1494,3 +1494,41 @@ async fn a_lapsed_claim_is_never_passed_to_a_waiting_version(pool: Pool) {
     assert_eq!(versions, 0, "no version written down");
     assert_eq!(status_of(&pool, image_ref).await, "cancelled", "what it started is stopped");
 }
+
+/// A program with triggers, registered under a hash, records each
+/// trigger's cut as its registration walked it, read back as walked; the
+/// same program registered again records nothing twice; and the cuts go
+/// with the project.
+#[weft_db_macros::test]
+async fn a_registration_records_its_triggers_cuts(pool: Pool) {
+    setup(&pool).await;
+    let id = uuid::Uuid::new_v4();
+    let projects = project_store(&pool, &[]).await;
+    let node = |id: &str, trigger: bool, input: bool| serde_json::json!({
+        "id": id, "nodeType": if trigger { "Cron" } else { "Debug" }, "label": null, "config": {}, "position": { "x": 0.0, "y": 0.0 },
+        "inputs": if input { serde_json::json!([{ "name": "data", "portType": "String", "required": true }]) } else { serde_json::json!([]) },
+        "outputs": [{ "name": "out", "portType": "String", "required": false }],
+        "features": if trigger { serde_json::json!({ "isTrigger": true }) } else { serde_json::json!({}) },
+        "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+    });
+    let program: weft_core::ProjectDefinition = serde_json::from_value(serde_json::json!({
+        "id": id, "name": "p", "description": null,
+        "nodes": [node("tick", true, false), node("seen", false, true), node("tock", true, false)],
+        "edges": [{ "id": "e", "source": "tick", "sourceHandle": "out", "target": "seen", "targetHandle": "data" }],
+        "groups": [], "createdAt": "1970-01-01T00:00:00Z", "updatedAt": "1970-01-01T00:00:00Z"
+    }))
+    .unwrap();
+    let walked = weft_core::run_spec::trigger_cuts(&program);
+    assert_eq!(walked.len(), 2);
+    for _ in 0..2 {
+        projects
+            .register_with_hashes(program.clone(), "p", "", TENANT, Some("bin"), Some("def-1"), Some("infra"), None, None, None, None, None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(projects.trigger_cuts(id, "def-1").await.unwrap(), Some(walked));
+    assert_eq!(projects.trigger_cuts(id, "def-2").await.unwrap(), None, "no such version, no cuts");
+    projects.remove(id).await.unwrap();
+    let left: i64 = pool.scalar("SELECT count(*) FROM program_trigger_cut WHERE project_id = $1", &[&id]).await.unwrap();
+    assert_eq!(left, 0, "the cuts go with the project");
+}

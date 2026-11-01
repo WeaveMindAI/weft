@@ -529,8 +529,8 @@ async fn an_apply_that_succeeds_stamps_its_copy_with_its_build(pool: Pool) {
     node_row(&pool, "running", serde_json::json!({})).await;
     for (hash, places, cut_from) in [("program", Some(serde_json::json!({ NODE: "h-2" })), None), ("cut", None, Some("program"))] {
         pool.execute(
-            "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from, infra_places, project_json_version) \
-             VALUES ($1, $2, '{}', 0, $3, $4::text::jsonb, $5)",
+            "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from, infra_places, project_json_version, trigger_cuts_walked) \
+             VALUES ($1, $2, '{}', 0, $3, $4::text::jsonb, $5, $3::text IS NULL)",
             &[&PROJECT, &hash, &cut_from, &places.map(|places| places.to_string()), &weft_core::ProjectDefinition::STORED.version()],
         )
         .await

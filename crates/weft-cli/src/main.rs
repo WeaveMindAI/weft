@@ -537,8 +537,17 @@ enum Cmd {
     /// they were down, paced at half each trigger's own limits so new
     /// arrivals still get through; `--held drop` deletes the held events
     /// and cancels the runs paused on them.
+    ///
+    /// It says which triggers on it leaves behind the build it used (they
+    /// fire older code or an older cut until `weft resync`).
     Activate {
         project: Option<String>,
+        /// Turn the triggers on with the build the install has registered,
+        /// building nothing from this folder (what `weft activate
+        /// <project-id>` does): for a script, such as a deploy's exit
+        /// trap, that must not move the project onto the folder's code.
+        #[arg(long, conflicts_with = "project")]
+        no_build: bool,
         /// What happens to the work the triggers held while they were down.
         #[arg(long, value_name = "run|drop", default_value = "run")]
         held: weft_core::ReleaseHeld,
@@ -2168,8 +2177,8 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         Cmd::Bake { project, referenced, scope } => {
             commands::bake::run(ctx, project, node_set(referenced), scope.try_into()?).await
         }
-        Cmd::Activate { project, held, port, scope } => {
-            commands::activate::run(ctx, project, held, port, scope.try_into()?).await
+        Cmd::Activate { project, no_build, held, port, scope } => {
+            commands::activate::run(ctx, project, no_build, held, port, scope.try_into()?).await
         }
         Cmd::Deactivate { project, take_down, scope } => {
             commands::deactivate::run(ctx, project, take_down.into(), scope.try_into()?).await

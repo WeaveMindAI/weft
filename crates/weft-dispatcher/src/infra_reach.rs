@@ -11,7 +11,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use weft_core::instance::Copies;
-use weft_core::project::ProjectDefinition;
+use weft_core::run_spec::TriggerCuts;
 use weft_core::RunId;
 use weft_task_store::db::Client as _;
 
@@ -44,7 +44,7 @@ impl InfraReach {
     /// for an instance's, all of them for every copy), or of the one
     /// `node` names: what an infra command over the whole owner, or over one
     /// node, takes down.
-    pub fn of_command(project: &ProjectDefinition, node: Option<&str>, copies: Copies) -> Self {
+    pub fn of_command(project: &weft_core::ProjectDefinition, node: Option<&str>, copies: Copies) -> Self {
         let places = match node {
             Some(node) => BTreeSet::from([node.to_string()]),
             None => {
@@ -65,26 +65,33 @@ impl InfraReach {
 
 /// The infra places the activation's trigger depends on: what its setup
 /// recorded, or, for one whose first setup has not finished, what the
-/// program says.
-pub fn depends_on(activation: &Activation, project: &ProjectDefinition) -> Vec<String> {
+/// registered build's cut of it says (`cuts`, as its registration walked
+/// them: `DispatcherState::trigger_cuts`).
+pub fn depends_on(activation: &Activation, cuts: &TriggerCuts) -> Vec<String> {
     match &activation.cut {
         Some(cut) => cut.depends_on.clone(),
-        None => weft_core::run_spec::trigger_cut(project, &activation.key.trigger).map(|cut| cut.depends_on).unwrap_or_default(),
+        None => registered_depends_on(cuts, &activation.key.trigger),
     }
+}
+
+/// What the registered build's cut of `trigger` depends on: nothing for a
+/// trigger the build does not have, or whose cut cannot be walked.
+pub fn registered_depends_on(cuts: &TriggerCuts, trigger: &str) -> Vec<String> {
+    cuts.get(trigger).and_then(|cut| cut.as_ref().ok()).map(|cut| cut.depends_on.clone()).unwrap_or_default()
 }
 
 /// Of `activations`, the ones whose trigger's cut contains one of the
 /// copies `reach` names.
-pub fn activations_reached<'a>(reach: &InfraReach, activations: &'a [Activation], project: &ProjectDefinition) -> Vec<&'a Activation> {
-    activations.iter().filter(|a| reach.reaches(&depends_on(a, project), a.key.instance())).collect()
+pub fn activations_reached<'a>(reach: &InfraReach, activations: &'a [Activation], cuts: &TriggerCuts) -> Vec<&'a Activation> {
+    activations.iter().filter(|a| reach.reaches(&depends_on(a, cuts), a.key.instance())).collect()
 }
 
 /// The triggers on whose cut contains a copy `reach` names: what taking
 /// those copies down takes down with them, whoever takes them down (an
 /// infra verb, `crate::api::infra::triggers_reached`, or the health check,
 /// `crate::lifecycle_claimer`).
-pub fn live_triggers_reached(reach: &InfraReach, activations: &[Activation], project: &ProjectDefinition) -> Vec<weft_core::activation::ActivationKey> {
-    activations_reached(reach, activations, project)
+pub fn live_triggers_reached(reach: &InfraReach, activations: &[Activation], cuts: &TriggerCuts) -> Vec<weft_core::activation::ActivationKey> {
+    activations_reached(reach, activations, cuts)
         .into_iter()
         .filter(|a| a.lifecycle.status == crate::activation_store::ProjectStatus::Active)
         .map(|a| a.key.clone())
@@ -170,10 +177,6 @@ mod tests {
         }
     }
 
-    fn empty() -> ProjectDefinition {
-        serde_json::from_value(serde_json::json!({ "id": uuid::Uuid::nil(), "nodes": [], "edges": [] })).unwrap()
-    }
-
     /// A shared copy reaches every owner's triggers whose cut contains it;
     /// an instance's copy only that instance's; a trigger whose cut has no
     /// infra is never reached.
@@ -189,7 +192,7 @@ mod tests {
         ];
         let reached = |places: &[&str], copies: Copies| -> Vec<String> {
             let reach = InfraReach { places: places.iter().map(|s| s.to_string()).collect(), copies };
-            activations_reached(&reach, &rows, &empty()).into_iter().map(|a| a.key.to_string()).collect()
+            activations_reached(&reach, &rows, &TriggerCuts::new()).into_iter().map(|a| a.key.to_string()).collect()
         };
         assert_eq!(reached(&["db"], Copies::Shared), vec!["'door'", "'inbox' of instance 'ada'"]);
         assert_eq!(reached(&["bridge"], Copies::Instance(InstanceId::new("bob").unwrap())), vec!["'inbox' of instance 'bob'"]);

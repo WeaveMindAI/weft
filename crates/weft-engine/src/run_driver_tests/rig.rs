@@ -654,6 +654,23 @@
         (drove.map(|d| d.outcome), events)
     }
 
+    /// `drive_journal`, its claim carrying `lost_full` as the memory note
+    /// of the worker the run was lost by.
+    pub(super) async fn drive_journal_lost(
+        project: ProjectDefinition,
+        catalog: Arc<dyn NodeCatalog>,
+        run_id: RunId,
+        rows: Vec<RunEvent>,
+        lost_full: Option<weft_broker_client::protocol::MemoryNote>,
+    ) -> (anyhow::Result<RunOutcome>, Vec<RunEvent>) {
+        let journal = Arc::new(MemJournal::default());
+        journal.seed(&rows);
+        let clients = clients(journal.clone());
+        let drove = drive_on_lost(Arc::new(project), catalog, run_id, journal.clone(), clients, CancellationFlag::new_arc(), None, lost_full).await;
+        let events = journal.events.lock().unwrap().clone();
+        (drove.map(|d| d.outcome), events)
+    }
+
     /// `drive_journal`, keeping the worker's tables.
     pub(super) async fn drive_journal_observed(
         project: ProjectDefinition,
@@ -823,6 +840,7 @@
             &*clients.project,
             run_id,
             project.clone(),
+            None,
         )
         .await
         .expect("the run's record reads")
@@ -842,9 +860,30 @@
         hand_back: Option<&HandBack>,
         holds: &Arc<crate::run_holds::Holds>,
     ) -> anyhow::Result<Drove> {
+        run_on_claimed(project, catalog, clients, run_id, journal, first, cancellation, caller, hand_back, holds, None).await
+    }
+
+    /// [`run_on_holding`], its claim carrying `lost_full` as the memory
+    /// note of the worker the run was lost by.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_on_claimed(
+        project: Arc<ProjectDefinition>,
+        catalog: Arc<dyn NodeCatalog>,
+        clients: &EngineClients,
+        run_id: RunId,
+        journal: Arc<crate::journal_writer::DriveJournal>,
+        first: Vec<RunEvent>,
+        cancellation: Arc<CancellationFlag>,
+        caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
+        hand_back: Option<&HandBack>,
+        holds: &Arc<crate::run_holds::Holds>,
+        lost_full: Option<weft_broker_client::protocol::MemoryNote>,
+    ) -> anyhow::Result<Drove> {
         // The tables a worker's claim builds for the run's program.
         let program = Arc::new(crate::plan::ProgramTables::new(project));
-        let starts_from = crate::run_driver::StartsFrom::Record(Box::new(claimed(clients, run_id, &program.project, &first).await));
+        let mut record = claimed(clients, run_id, &program.project, &first).await;
+        record.lost_full = lost_full;
+        let starts_from = crate::run_driver::StartsFrom::Record(Box::new(record));
         let hold = Some(holds.of(run_id, None));
         let run = RunDrive { run_id, journal, program, starts_from, cancellation, exchange: caller.map(exchange), hand_back, hold };
         tokio::time::timeout(
@@ -871,11 +910,28 @@
         cancellation: Arc<CancellationFlag>,
         caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
     ) -> anyhow::Result<Drove> {
+        drive_on_lost(project, catalog, run_id, journal, clients, cancellation, caller, None).await
+    }
+
+    /// [`drive_on`], its claim carrying `lost_full` as the memory note of
+    /// the worker the run was lost by.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_on_lost(
+        project: Arc<ProjectDefinition>,
+        catalog: Arc<dyn NodeCatalog>,
+        run_id: RunId,
+        journal: Arc<MemJournal>,
+        clients: EngineClients,
+        cancellation: Arc<CancellationFlag>,
+        caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
+        lost_full: Option<weft_broker_client::protocol::MemoryNote>,
+    ) -> anyhow::Result<Drove> {
         let projects = clients.project.clone();
         // What a worker's claim would hand the drive: the run's record so far.
         let first = journal.events_of(run_id);
         let run = handle(&clients, run_id, &first, 1, Vec::new());
-        let drove = run_on(project.clone(), catalog, &clients, run_id, run, first, cancellation, caller, None).await;
+        let holds = crate::run_holds::Holds::new(Box::new(|| {}));
+        let drove = run_on_claimed(project.clone(), catalog, &clients, run_id, run, first, cancellation, caller, None, &holds, lost_full).await;
         // A fast run lets go of its record once its ending is handed over;
         // the checks below read the record whole, as the next reader does.
         clients.writer.written().await;

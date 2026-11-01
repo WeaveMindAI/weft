@@ -2599,8 +2599,7 @@ fn check_scope_meaning(
         }
         let marker_counts = |definition: &weft_core::project::NodeDefinition| {
             let mut counts = std::collections::HashMap::<weft_core::project::ResolutionKey, usize>::new();
-            for value in definition.config.as_object().into_iter().flat_map(|map| map.values())
-                .chain(definition.port_literals.values()) {
+            for value in definition.written_values() {
                 for reference in crate::file_ref::refs_in_value(value) {
                     *counts.entry(reference.resolution_key()).or_default() += 1;
                 }

@@ -81,6 +81,22 @@ describe('secret markers', () => {
 	});
 });
 
+describe('content markers', () => {
+	const marker = { __weft_content__: { sha256: 'a'.repeat(64), type: 'String', path: 'sql/import.sql' } };
+
+	it('renders the file a program names by its content, wherever it sits', () => {
+		expect(jsonTokens(marker)).toEqual([{ text: 'content of sql/import.sql (String)', kind: 'content' }]);
+		expect(render({ query: marker })).toBe(`{\n  "query": content of sql/import.sql (String)\n}`);
+		expect(valueSummary(marker)).toBe('file content · String');
+	});
+
+	it('shows a malformed marker as the object it is', () => {
+		const short = { __weft_content__: { sha256: 'abc', type: 'String', path: 'x' } };
+		expect(render(short)).toBe(JSON.stringify(short, null, 2));
+		expect(valueSummary(short)).toBe('object · 1 key');
+	});
+});
+
 describe('valueSummary', () => {
 	it('counts what there is, pluralised', () => {
 		expect(valueSummary('abc')).toBe('text · 3 chars');

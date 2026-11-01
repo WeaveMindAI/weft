@@ -1642,14 +1642,15 @@ fn distinct_names(statements: &[Statement]) -> Vec<String> {
 /// PostgresExecuteQuery holds the two to each other.
 // SYNC: placeholders <-> catalog/postgres/execute_query/metadata.json placeholdersAreInputs.pattern, catalog/postgres/watch_query/metadata.json placeholdersAreInputs.pattern
 pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
-    let chars: Vec<char> = sql.chars().collect();
-    // The whole text with placeholders numbered per statement, which
-    // is what each statement sends.
-    let mut out = String::with_capacity(sql.len());
+    // Read byte by byte: everything this looks for is ASCII, and no byte
+    // of a multi-byte character is, so a run of text between two marks is
+    // copied whole, as written, and every mark lands on a character.
+    let bytes = sql.as_bytes();
+    // The statement being read, its placeholders numbered: what it sends.
+    // The first one is most often the whole query.
+    let mut current = String::with_capacity(sql.len());
     let mut names: Vec<String> = Vec::new();
     let mut statements: Vec<Statement> = Vec::new();
-    // Where the current statement began in `out`.
-    let mut statement_start = 0usize;
     // The first `$1`-shaped tag seen, if any: what it means depends on
     // whether this turns out to be one statement or a script.
     let mut positional: Option<String> = None;
@@ -1657,129 +1658,109 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
     // and comments, so a trailing `;` (or `;;`) does not count an
     // empty statement.
     let mut statement_has_text = false;
-    // Close the statement being read: its numbered SQL and the ports
-    // it names, then start a fresh numbering.
-    fn close_statement(
-        out: &mut String,
-        names: &mut Vec<String>,
-        statements: &mut Vec<Statement>,
-        statement_start: &mut usize,
-    ) {
-        statements.push(Statement {
-            sql: out[*statement_start..].trim().to_string(),
-            names: std::mem::take(names),
-        });
-        *statement_start = out.len();
+    // Close the statement being read: its numbered SQL, trimmed in
+    // place, and the ports it names, then start a fresh numbering.
+    fn close_statement(current: &mut String, names: &mut Vec<String>, statements: &mut Vec<Statement>) {
+        let mut sql = std::mem::take(current);
+        sql.truncate(sql.trim_end().len());
+        let leading = sql.len() - sql.trim_start().len();
+        sql.drain(..leading);
+        sql.shrink_to_fit();
+        statements.push(Statement { sql, names: std::mem::take(names) });
     }
-    let ident_start = |c: char| c.is_ascii_alphabetic() || c == '_';
-    let ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
+    let ident_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        match c {
+    while i < bytes.len() {
+        let next = bytes.get(i + 1).copied();
+        match bytes[i] {
             // Line comment: copied through, never scanned.
-            '-' if next == Some('-') => {
-                while i < chars.len() && chars[i] != '\n' {
-                    out.push(chars[i]);
-                    i += 1;
-                }
+            b'-' if next == Some(b'-') => {
+                let end = sql[i..].find('\n').map_or(sql.len(), |at| i + at);
+                current.push_str(&sql[i..end]);
+                i = end;
             }
             // Block comment, nested the way Postgres nests them.
-            '/' if next == Some('*') => {
+            b'/' if next == Some(b'*') => {
+                let begin = i;
                 let mut depth = 0usize;
                 loop {
-                    if i >= chars.len() {
+                    if i >= bytes.len() {
                         mistake!("the SQL opens a /* comment it never closes");
                     }
-                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    if bytes[i..].starts_with(b"/*") {
                         depth += 1;
-                        out.push_str("/*");
                         i += 2;
-                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    } else if bytes[i..].starts_with(b"*/") {
                         depth -= 1;
-                        out.push_str("*/");
                         i += 2;
                         if depth == 0 {
                             break;
                         }
                     } else {
-                        out.push(chars[i]);
                         i += 1;
                     }
                 }
+                current.push_str(&sql[begin..i]);
             }
             // String literal (`''` is the escape; an `E'...'` string also
             // escapes with a backslash) and quoted identifier.
-            '\'' | '"' => {
-                let quote = c;
+            quote @ (b'\'' | b'"') => {
                 // The `e` has to start a token of its own: after a word
                 // character or a `$` (part of an identifier like `a$e`,
                 // or of a placeholder `$E`) it ends that token instead.
-                let escapes_with_backslash = quote == '\''
+                let escapes_with_backslash = quote == b'\''
                     && i > 0
-                    && matches!(chars[i - 1], 'e' | 'E')
-                    && (i < 2 || !(ident_char(chars[i - 2]) || chars[i - 2] == '$'));
+                    && matches!(bytes[i - 1], b'e' | b'E')
+                    && (i < 2 || !(ident_char(bytes[i - 2]) || bytes[i - 2] == b'$'));
                 statement_has_text = true;
-                out.push(quote);
+                let begin = i;
                 i += 1;
                 loop {
-                    let Some(&ch) = chars.get(i) else {
-                        mistake!("the SQL opens a {quote} quote it never closes");
+                    let Some(&b) = bytes.get(i) else {
+                        mistake!("the SQL opens a {} quote it never closes", quote as char);
                     };
-                    if ch == '\\' && escapes_with_backslash {
-                        out.push(ch);
-                        if let Some(&escaped) = chars.get(i + 1) {
-                            out.push(escaped);
-                        }
+                    if b == b'\\' && escapes_with_backslash {
+                        // The escaped character's first byte; the rest of
+                        // a multi-byte one is neither a quote nor a `\`.
                         i += 2;
                         continue;
                     }
-                    out.push(ch);
                     i += 1;
-                    if ch == quote {
-                        if chars.get(i) == Some(&quote) {
-                            out.push(quote);
+                    if b == quote {
+                        if bytes.get(i) == Some(&quote) {
                             i += 1;
                             continue;
                         }
                         break;
                     }
                 }
+                current.push_str(&sql[begin..i]);
             }
             // `$` inside an identifier (`x$y` is a legal name) is the name.
-            '$' if i > 0 && ident_char(chars[i - 1]) => {
-                out.push('$');
+            b'$' if i > 0 && ident_char(bytes[i - 1]) => {
+                current.push('$');
                 i += 1;
             }
-            '$' => {
+            b'$' => {
                 // The tag between this `$` and the next: empty for `$$`,
                 // an identifier for `$tag$`. Digits after `$` cannot be
                 // a tag, so `$1` is a positional parameter.
                 let mut j = i + 1;
-                while j < chars.len() && ident_char(chars[j]) {
+                while j < bytes.len() && ident_char(bytes[j]) {
                     j += 1;
                 }
-                let tag: String = chars[i + 1..j].iter().collect();
-                let is_tag = tag.is_empty() || ident_start(tag.chars().next().unwrap_or(' '));
-                if is_tag && chars.get(j) == Some(&'$') {
+                let tag = &sql[i + 1..j];
+                let is_tag = tag.is_empty() || ident_start(tag.as_bytes()[0]);
+                if is_tag && bytes.get(j) == Some(&b'$') {
                     // Dollar-quoted body: copy through to the closing tag.
-                    let close: Vec<char> = format!("${tag}$").chars().collect();
-                    let body_start = j + 1;
-                    let mut k = body_start;
-                    let mut found = None;
-                    while k + close.len() <= chars.len() {
-                        if chars[k..k + close.len()] == close[..] {
-                            found = Some(k);
-                            break;
-                        }
-                        k += 1;
-                    }
-                    let Some(end) = found else {
+                    let close = format!("${tag}$");
+                    let Some(at) = sql[j + 1..].find(&close) else {
                         mistake!("the SQL opens a ${tag}$ quote it never closes");
                     };
-                    out.extend(&chars[i..end + close.len()]);
-                    i = end + close.len();
+                    let end = j + 1 + at + close.len();
+                    current.push_str(&sql[i..end]);
+                    i = end;
                     statement_has_text = true;
                     continue;
                 }
@@ -1789,10 +1770,9 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                 // ... $1` is the author's own SQL), so it is copied
                 // through and the refusal is left to the end, where the
                 // statement count is known.
-                if !tag.is_empty() && !ident_start(tag.chars().next().unwrap_or(' ')) {
-                    positional.get_or_insert_with(|| tag.clone());
-                    out.push('$');
-                    out.push_str(&tag);
+                if !is_tag {
+                    positional.get_or_insert_with(|| tag.to_string());
+                    current.push_str(&sql[i..j]);
                     i = j;
                     statement_has_text = true;
                     continue;
@@ -1800,43 +1780,52 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                 if tag.is_empty() {
                     // A bare `$` (an operator such as `$>` in some
                     // extensions) is SQL, not a placeholder.
-                    out.push('$');
+                    current.push('$');
                     i += 1;
                     statement_has_text = true;
                     continue;
                 }
-                let position = match names.iter().position(|n| n == &tag) {
+                let position = match names.iter().position(|n| n == tag) {
                     Some(p) => p + 1,
                     None => {
-                        names.push(tag.clone());
+                        names.push(tag.to_string());
                         names.len()
                     }
                 };
-                out.push_str(&format!("${position}"));
+                current.push('$');
+                current.push_str(&position.to_string());
                 i = j;
                 statement_has_text = true;
             }
-            ';' => {
+            b';' => {
                 if statement_has_text {
-                    close_statement(&mut out, &mut names, &mut statements, &mut statement_start);
+                    close_statement(&mut current, &mut names, &mut statements);
                     statement_has_text = false;
+                } else {
+                    // Only whitespace and comments since the last one: the
+                    // separator belongs to no statement, and neither do they.
+                    current.clear();
                 }
-                out.push(';');
-                // The separator belongs to no statement.
-                statement_start = out.len();
                 i += 1;
             }
             _ => {
-                if !c.is_whitespace() {
+                // Everything else, up to the next byte that could start a
+                // mark, copied whole.
+                let end = bytes[i + 1..]
+                    .iter()
+                    .position(|b| matches!(b, b'-' | b'/' | b'\'' | b'"' | b'$' | b';'))
+                    .map_or(bytes.len(), |at| i + 1 + at);
+                let text = &sql[i..end];
+                if !statement_has_text && !text.chars().all(char::is_whitespace) {
                     statement_has_text = true;
                 }
-                out.push(c);
-                i += 1;
+                current.push_str(text);
+                i = end;
             }
         }
     }
     if statement_has_text {
-        close_statement(&mut out, &mut names, &mut statements, &mut statement_start);
+        close_statement(&mut current, &mut names, &mut statements);
     }
     if statements.is_empty() {
         mistake!(

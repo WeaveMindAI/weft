@@ -775,18 +775,14 @@ pub(crate) fn resolve(project: &mut ProjectDefinition, catalog: &dyn MetadataCat
         match owner {
             Owner::Node(at) => {
                 let node = &mut project.nodes[at];
-                match node.group_boundary.as_ref().map(|b| b.group_id.clone()) {
+                match node.group_boundary {
                     // A loop's literals sit on its `LoopIn`, which enrich
-                    // never moves, and on the loop itself, where the editor
-                    // shows them: a value typed on a loop's port is kept
-                    // in both, and so is one a metadata wire writes there.
-                    Some(loop_id) => {
-                        node.port_literals.insert(port.clone(), value.clone());
-                        node.port_literal_spans.insert(port.clone(), field.clone());
-                        node.port_literal_types.insert(port.clone(), ty.clone());
-                        if let Some(&group) = index.groups.get(&loop_id) {
-                            write_on_group(&mut project.groups[group], port, value, ty, field);
-                        }
+                    // never moves, and where the editor reads them for the
+                    // loop box: one a metadata wire writes lands there too.
+                    Some(_) => {
+                        node.port_literals.insert(port.clone(), value);
+                        node.port_literal_spans.insert(port.clone(), field);
+                        node.port_literal_types.insert(port, ty);
                     }
                     None => {
                         let config = node.config.as_object_mut().expect("a node's config is an object");

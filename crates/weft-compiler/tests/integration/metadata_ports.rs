@@ -669,7 +669,7 @@ search.tool = made.value
 }
 
 /// A metadata wire into a loop's input lands where a value typed there
-/// does: on its `LoopIn`, and on the loop, where the editor shows it.
+/// does: on its `LoopIn` alone, which the editor reads for the loop box.
 #[test]
 fn a_metadata_wire_into_a_loop_input_lands_like_a_typed_value() {
     let project = clean(
@@ -692,7 +692,7 @@ each.tool = g.tool
     let tool = json!({ "name": "g" });
     assert_eq!(node(&project, "each__in").port_literals.get("tool"), Some(&tool));
     let each = project.groups.iter().find(|g| g.id == "each").unwrap();
-    assert_eq!(each.port_literals.get("tool"), Some(&tool));
+    assert!(each.port_literals.is_empty(), "the loop keeps no copy: {:?}", each.port_literals);
 }
 
 /// A name in a gathered value reads like a name where it is written: a

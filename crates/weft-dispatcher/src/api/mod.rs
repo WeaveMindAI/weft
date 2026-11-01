@@ -297,7 +297,7 @@ fn core_routes(state: DispatcherState) -> Router<DispatcherState> {
         .route("/projects/{id}/working-copies/{wc}/sync", post(versions::sync))
         .route("/projects/{id}/trigger-bakes", get(versions::trigger_bakes))
         .route("/projects/{id}/versions/{version}", axum::routing::delete(versions::prune))
-        .route("/projects/{id}/status", get(project::status))
+        .route("/projects/{id}/status", post(project::status))
         .route("/projects/{id}/instances", get(project::instances))
         .route("/projects/{id}/builds/{build}", get(project::version_build))
         // The connections the program's own access nodes use on this

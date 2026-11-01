@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use weft_platform_traits::config::GcpPlatform;
 use weft_platform_traits::{BuildHandle, BuildRequest, BuildStatus, ImageBuilder, ImageDeleted};
 
-use crate::api::Google;
+use crate::api::{Google, Streamed, UPLOAD_PART};
 
 /// The longest Cloud Build lets a build run; a build is the user's own
 /// compile, so weft sets the platform's ceiling rather than a deadline of
@@ -198,12 +198,58 @@ fn status_of(build: &Value) -> BuildStatus {
     }
 }
 
-fn tar_context(dir: &Path) -> anyhow::Result<Vec<u8>> {
-    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    let mut archive = tar::Builder::new(gz);
-    archive.follow_symlinks(false);
-    archive.append_dir_all(".", dir)?;
-    Ok(archive.into_inner()?.finish()?)
+/// The build context at `dir`, tarred and gzipped into `parts` as it is
+/// made, a part at a time ([`Parts`]), then its end: no copy of the whole
+/// archive is ever held. A failure is handed on as the last thing sent.
+fn tar_context(dir: &Path, parts: tokio::sync::mpsc::Sender<anyhow::Result<Streamed>>) {
+    let mut out = Parts { held: Vec::with_capacity(UPLOAD_PART), parts: parts.clone() };
+    let made = (|| {
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(&mut out, flate2::Compression::fast()));
+        archive.follow_symlinks(false);
+        archive.append_dir_all(".", dir)?;
+        archive.into_inner()?.finish()?;
+        anyhow::Ok(())
+    })();
+    let last = made.and_then(|()| {
+        let held = std::mem::take(&mut out.held);
+        if !held.is_empty() {
+            out.send(held)?;
+        }
+        Ok(Streamed::End)
+    });
+    // The uploader gone has failed already, saying why.
+    let _ = parts.blocking_send(last);
+}
+
+/// What the archive is written into: it hands on every [`UPLOAD_PART`]
+/// bytes as a part, holding only the part being filled.
+struct Parts {
+    held: Vec<u8>,
+    parts: tokio::sync::mpsc::Sender<anyhow::Result<Streamed>>,
+}
+
+impl Parts {
+    fn send(&self, part: Vec<u8>) -> std::io::Result<()> {
+        self.parts
+            .blocking_send(Ok(Streamed::Part(part)))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the upload of the build context stopped"))
+    }
+}
+
+impl std::io::Write for Parts {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.held.extend_from_slice(bytes);
+        while self.held.len() >= UPLOAD_PART {
+            let rest = self.held.split_off(UPLOAD_PART);
+            let part = std::mem::replace(&mut self.held, rest);
+            self.send(part)?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A build for a worker packaged as a host binary is refused: workers
@@ -239,19 +285,34 @@ impl ImageBuilder for CloudBuildImages {
     async fn start(&self, req: BuildRequest) -> anyhow::Result<BuildHandle> {
         refuse_host_recipe(&req)?;
         let dir = req.context_dir.clone();
-        let bytes = tokio::task::spawn_blocking(move || tar_context(&dir)).await??;
         let object = Self::context_object(&req.name);
-        self.google
-            .put_bytes(
+        // One part being made while the one before is sent.
+        let (parts, sent) = tokio::sync::mpsc::channel(1);
+        let made = tokio::task::spawn_blocking(move || tar_context(&dir, parts));
+        let uploaded = self
+            .google
+            .upload_streamed(
                 &format!(
-                    "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={}",
+                    "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=resumable&name={}",
                     self.gcp.build_bucket,
                     object.replace('/', "%2F")
                 ),
                 "application/gzip",
-                bytes,
+                sent,
             )
-            .await?;
+            .await;
+        // The upload's own failure comes first: a producer that died
+        // (a panic) shows only as parts that stopped, so its join failure
+        // is added to the upload's words rather than said instead of them.
+        let made = made.await;
+        match (uploaded, made) {
+            (Ok(()), Ok(())) => {}
+            (Err(e), Ok(())) => return Err(e.context(format!("upload the build context of {}", req.name))),
+            (Err(e), Err(join)) => {
+                return Err(e.context(format!("upload the build context of {} (what made it failed: {join})", req.name)));
+            }
+            (Ok(()), Err(join)) => anyhow::bail!("the build context of {} was uploaded, but what made it failed: {join}", req.name),
+        }
         let op = self.google.post(&self.builds_url(), &build_body(&req, &self.gcp.build_bucket, &object, &format!("projects/{}/serviceAccounts/{}", self.gcp.project, self.gcp.builder_service_account), self.gcp.build_machine.as_deref())).await?;
         let id = op
             .pointer("/metadata/build/id")
@@ -333,6 +394,59 @@ impl ImageBuilder for CloudBuildImages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The context is handed on as parts the upload can send: every part
+    /// but the last exactly [`UPLOAD_PART`] long, then the end, and the
+    /// parts together are the whole archive.
+    #[test]
+    fn the_context_goes_out_in_parts_then_its_end() {
+        let dir = std::env::temp_dir().join(format!("weft-context-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Bytes gzip cannot shrink, so the archive takes several parts.
+        let mut seed: u64 = 7;
+        let noise: Vec<u8> = (0..(UPLOAD_PART * 2 + 1000))
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (seed >> 33) as u8
+            })
+            .collect();
+        std::fs::write(dir.join("noise.bin"), &noise).unwrap();
+        let (parts, mut sent) = tokio::sync::mpsc::channel(64);
+        tar_context(&dir, parts);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let mut archive = Vec::new();
+        let mut sizes = Vec::new();
+        while let Streamed::Part(part) = sent.try_recv().expect("an end is sent").unwrap() {
+            sizes.push(part.len());
+            archive.extend(part);
+        }
+        assert!(sizes.len() >= 3, "{sizes:?}");
+        assert!(sizes[..sizes.len() - 1].iter().all(|size| *size == UPLOAD_PART), "{sizes:?}");
+        let mut read = tar::Archive::new(flate2::read::GzDecoder::new(archive.as_slice()));
+        let mut found = None;
+        for entry in read.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().ends_with("noise.bin") {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+                found = Some(bytes);
+            }
+        }
+        assert!(found.as_deref() == Some(noise.as_slice()), "the archive holds the file as it was");
+    }
+
+    /// A context that cannot be read ends in its failure, never in an
+    /// end, so no cut-off archive is ever completed.
+    #[test]
+    fn a_context_that_cannot_be_read_ends_in_its_failure() {
+        let (parts, mut sent) = tokio::sync::mpsc::channel(64);
+        tar_context(std::path::Path::new("/no/such/weft/context"), parts);
+        let mut last = None;
+        while let Ok(item) = sent.try_recv() {
+            last = Some(item);
+        }
+        assert!(matches!(last, Some(Err(_))));
+    }
 
     #[test]
     fn a_repository_address_is_read_and_a_ref_split_in_it() {

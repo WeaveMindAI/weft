@@ -111,6 +111,7 @@ fn stage_standard_program() -> Result<(weft_compiler::build::StockProject, weft_
         weft_compiler::build::build_project(
             &stock.project,
             &stock.definition,
+            &stock.contents,
             &stock.catalog,
             weft_compiler::CompileFs::disk(&stock.project.root),
             &packaging,

@@ -46,6 +46,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use weft_core::cancellation::CancellationFlag;
+use weft_core::content_cache::LoadFailed;
 use weft_core::door_fire::RunAnswer;
 use weft_core::caller::{InboundMessage, OutboundChunk};
 use weft_core::{RunId, NodeCatalog};
@@ -306,13 +307,21 @@ impl Worker {
         CutLook::Stopped
     }
 
-    /// Claim queued run `run_id` and carry it on to its end, on a
-    /// task of its own so whoever handed it here can go away without
-    /// stopping it (a run stops itself before the platform's cap, see
-    /// `RUN_CAP_MARGIN`). `None` once this worker is stopping: a run
-    /// claimed then would only be handed back, and weft hands it to another
-    /// worker instead.
-    async fn carry_on_run(&self, run_id: RunId) -> Result<Option<RunAnswer>> {
+    /// Claim queued run `run_id`, which runs the program `definition_hash`
+    /// names, and carry it on to its end, on a task of its own so whoever
+    /// handed it here can go away without stopping it (a run stops itself
+    /// before the platform's cap, see `RUN_CAP_MARGIN`). `None` once this
+    /// worker is stopping: a run claimed then would only be handed back,
+    /// and weft hands it to another worker instead.
+    ///
+    /// The program, and every file it names, is read before the claim: a
+    /// read that failed (the store or the broker did not answer) claims
+    /// nothing and answers [`RunAnswer::NotNow`], as does a claim the
+    /// broker could not be asked for, and weft hands the run out again
+    /// later. A program or file that is gone for good
+    /// (`crate::contents::Gone`) is claimed and ended with it, since no
+    /// later read gets past it.
+    async fn carry_on_run(&self, run_id: RunId, definition_hash: &str) -> Result<Option<RunAnswer>> {
         // Registered before the claim: a cancel announced once the claim
         // committed finds the run here.
         let registered = tokio::select! {
@@ -325,46 +334,77 @@ impl Worker {
         if self.stopping.is_cancelled() {
             return Ok(None);
         }
+        let program = match self.program_of(definition_hash).await {
+            Err(e) if e.downcast_ref::<crate::contents::Gone>().is_none() => {
+                tracing::warn!(target: "weft_engine::worker", %run_id, error = %e, "could not read what the run runs; it stays queued");
+                return Ok(Some(RunAnswer::NotNow { error: e.to_string() }));
+            }
+            read => read.map_err(anyhow::Error::new),
+        };
         // The claim makes the run this worker's on record, which its lease
         // keeps: the registration woke the door's tick, and the claim does
         // not wait for it.
-        let Some(claimed) = self.clients.runs.claim(run_id).await.context("claim the run")? else {
-            return Ok(Some(RunAnswer::NothingToRun));
+        let claimed = match self.clients.runs.claim(run_id).await {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => return Ok(Some(RunAnswer::NothingToRun)),
+            Err(e) if weft_broker_client::client::broker_unavailable(&e) => {
+                return Ok(Some(RunAnswer::NotNow { error: format!("the broker could not be asked to claim the run: {e:#}") }));
+            }
+            Err(e) => return Err(e.context("claim the run")),
         };
         if let Some(cause) = claimed.cancel_requested.clone() {
             registered.flag.cancel_because(cause);
         }
         let worker = self.clone();
         let token = self.background.token();
+        let program = program.and_then(|program| match claimed.definition_hash == definition_hash {
+            true => Ok(program),
+            false => Err(anyhow::anyhow!(
+                "run {run_id} was handed here to run program {definition_hash}, but its claim says it runs {}",
+                claimed.definition_hash
+            )),
+        });
         let drive = tokio::spawn(async move {
             let _token = token;
-            answer_of(worker.carry_on(run_id, claimed, registered).await)
+            answer_of(worker.carry_on(run_id, claimed, program, registered).await)
         });
         drive.await.map(Some).context("the drive panicked outside its guard")
     }
 
-    /// Carry on a run this worker just claimed, from its record, read a
+    /// The program whose definition hash is `definition_hash`, as a run
+    /// runs it: fetched unless kept, with every file it names put back
+    /// (`crate::plan::Plans::program`).
+    async fn program_of(&self, definition_hash: &str) -> Result<Arc<ProgramTables>, LoadFailed> {
+        let project = self.plans.project(&self.clients, definition_hash).await?;
+        self.plans.program(&self.clients, &project, definition_hash).await
+    }
+
+    /// Carry on a run this worker just claimed, which runs `program` (read
+    /// before the claim, [`Self::carry_on_run`]), from its record, read a
     /// page at a time.
     async fn carry_on(
         &self,
         run_id: RunId,
         claimed: weft_journal::record::Claimed,
+        program: Result<Arc<ProgramTables>>,
         registered: Registered,
     ) -> Result<()> {
         let record = &**self.clients.writer.record();
-        let project = self.plans.project(&self.clients, &claimed.definition_hash).await;
-        // A record this worker cannot read, a program it cannot fetch, or a
-        // stand-in it cannot serve still ends the run: it is this worker's
-        // now.
-        let keep_for = project.as_ref().map_or(weft_core::run_settings::KeepFor::WEFT_DEFAULT, |project| project.defaults.keep_for());
-        // A program that cannot be fetched is why the record cannot be read.
-        let read = match project {
-            Ok(project) => {
-                let program = self.plans.program(&project, &claimed.definition_hash);
-                crate::run_driver::ClaimedRecord::read(|run, after| weft_journal::decoded_page(record, run, after), &*self.clients.project, run_id, program.project.clone())
-                    .await
-                    .map(|read| (program, read))
-            }
+        // A record this worker cannot read, a program or a file it names
+        // that is gone, or a stand-in it cannot serve still ends the run:
+        // it is this worker's now.
+        let keep_for = program.as_ref().map_or(weft_core::run_settings::KeepFor::WEFT_DEFAULT, |program| program.project.defaults.keep_for());
+        // A program that is gone is why the record cannot be read.
+        let read = match program {
+            Ok(program) => crate::run_driver::ClaimedRecord::read(
+                |run, after| weft_journal::decoded_page(record, run, after),
+                &*self.clients.project,
+                run_id,
+                program.project.clone(),
+                claimed.lost_full,
+            )
+            .await
+            .map(|read| (program, read)),
             Err(e) => Err(e),
         };
         let (settings, next_seq, read) = match read {
@@ -1080,7 +1120,7 @@ fn new_worker(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: &Wo
         replica: config.replica.clone(),
         tenant_id: config.tenant_id.clone(),
         cancels,
-        plans: Arc::new(crate::plan::Plans::new(config.project_id, left_out)),
+        plans: Arc::new(crate::plan::Plans::new(config.project_id, config.tenant_id.clone(), left_out)),
         background: weft_core::in_flight::InFlight::new("worker run"),
         stopping,
         stopping_overdue: tokio_util::sync::CancellationToken::new(),
@@ -1135,14 +1175,19 @@ async fn healthz(State(state): State<ServerState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "driving": state.worker.cancels.count() }))
 }
 
-async fn run_handler(State(state): State<ServerState>, headers: HeaderMap, Path(run_id): Path<String>) -> Response {
+// SYNC: the run call <-> weft_core::door_fire::RunDelivery, crates/weft-dispatcher/src/delivery.rs (run_on_worker)
+async fn run_handler(State(state): State<ServerState>, headers: HeaderMap, Path(run_id): Path<String>, body: axum::body::Bytes) -> Response {
     if !state.weft_credential.admits_headers(&headers) {
         return (StatusCode::UNAUTHORIZED, "this worker answers the install only").into_response();
     }
     let Ok(run_id) = run_id.parse::<RunId>() else {
         return (StatusCode::BAD_REQUEST, "not a run id").into_response();
     };
-    match state.worker.carry_on_run(run_id).await {
+    let delivery: weft_core::door_fire::RunDelivery = match serde_json::from_slice(&body) {
+        Ok(delivery) => delivery,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("not a run delivery: {e}")).into_response(),
+    };
+    match state.worker.carry_on_run(run_id, &delivery.definition_hash).await {
         Ok(Some(answer)) => Json(answer).into_response(),
         Ok(None) => (StatusCode::SERVICE_UNAVAILABLE, "this worker is stopping").into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
@@ -1161,6 +1206,7 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
     let listener = crate::listen::bind(config.port).await?;
     let budget = crate::busy::Budget::of_cgroup();
     tracing::info!(target: "weft_engine::worker", ?budget, "this worker's memory budget");
+    let memory = Arc::new(crate::busy::MemoryGuard::default());
     let door = crate::door::Door::new(
         config.project_id,
         config.tenant_id.clone(),
@@ -1169,6 +1215,7 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
         config.edge,
         config.secret.clone(),
         crate::door::RunPermits::from_env(budget)?,
+        memory.clone(),
     );
     // The line is held open while runs are driven (the line watch) and
     // while records wait to be written (the writer's own calls); idle, it
@@ -1200,7 +1247,13 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
         canceller: Arc::new(RegistryCanceller { cancels: worker.cancels.clone() }),
         starter: Arc::new(LiveStarter { worker: worker.clone() }),
     }));
-    let app = app.layer(axum::middleware::from_fn_with_state(crate::busy::MemoryGuard::start(budget), crate::busy::refuse_when_busy));
+    // Each crossing of the line, either way, tells the broker the worker's
+    // memory note at once; every door tick carries it too.
+    let told = crate::busy::MemoryTold::new(worker.clients.door_broker.clone(), worker.clients.io.clone(), &memory);
+    memory.start(budget, move |_| {
+        told.tell();
+    });
+    let app = app.layer(axum::middleware::from_fn_with_state(memory, crate::busy::refuse_when_busy));
     // Told to stop, or nearing the cut of its line while its runs only
     // wait, the worker hands its recorded runs back and takes no new call,
     // while the calls it holds go on to their end. While it works, its line
@@ -1869,7 +1922,11 @@ mod tests {
 
     /// A worker running `catalog`'s nodes over `clients`.
     fn worker_running(catalog: Arc<dyn NodeCatalog>, clients: EngineClients) -> Worker {
-        let config = config();
+        worker_configured(catalog, clients, &config())
+    }
+
+    /// A worker as `config` says, running `catalog`'s nodes over `clients`.
+    fn worker_configured(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: &WorkerConfig) -> Worker {
         let door = crate::door::Door::new(
             config.project_id,
             config.tenant_id.clone(),
@@ -1878,8 +1935,9 @@ mod tests {
             crate::door::Edge::default(),
             config.secret.clone(),
             crate::door::RunPermits::new(64, std::time::Duration::from_secs(30)),
+            Arc::default(),
         );
-        new_worker(catalog, clients, &config, door)
+        new_worker(catalog, clients, config, door)
     }
 
     fn worker_over(runs: Arc<Runs>, line: Arc<crate::context::TestLine>) -> Worker {
@@ -2447,10 +2505,141 @@ mod tests {
 
     #[tokio::test]
     async fn a_call_for_a_run_that_is_not_queued_says_so() {
-        let worker = worker_over(Arc::new(Runs::default()), crate::context::TestLine::new());
+        let (worker, _storage) = worker_carrying(Arc::new(Runs::default()), [("def-1", (*crate::plan::tests::chain()).clone())]);
         let run_id = weft_core::new_run_id();
-        assert_eq!(worker.carry_on_run(run_id).await.unwrap(), Some(RunAnswer::NothingToRun));
+        assert_eq!(worker.carry_on_run(run_id, "def-1").await.unwrap(), Some(RunAnswer::NothingToRun));
         assert!(!worker.cancels.contains(run_id), "nothing claimed, nothing registered");
+    }
+
+    /// The broker's side of queued runs this worker carries on: every claim
+    /// counted and given, for the program the call named, unless the
+    /// broker answers the status in `refused`.
+    #[derive(Default)]
+    struct Claims {
+        claimed: std::sync::Mutex<Vec<RunId>>,
+        definition_hash: std::sync::Mutex<String>,
+        refused: std::sync::Mutex<Option<reqwest::StatusCode>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::context::RunClient for Claims {
+        async fn claim(&self, run_id: RunId) -> anyhow::Result<Option<weft_journal::record::Claimed>> {
+            if let Some(status) = *self.refused.lock().unwrap() {
+                return Err(weft_broker_client::BrokerRefused { path: "/v1/run/claim".into(), status, body: String::new() }.into());
+            }
+            self.claimed.lock().unwrap().push(run_id);
+            Ok(Some(weft_journal::record::Claimed {
+                epoch: 2,
+                attempts: 1,
+                definition_hash: self.definition_hash.lock().unwrap().clone(),
+                cancel_requested: None,
+                lost_full: None,
+            }))
+        }
+        async fn let_go(&self, _run_id: RunId, _why: weft_broker_client::protocol::LetGo) -> anyhow::Result<()> {
+            unreachable!("no run here is let go of")
+        }
+        async fn answers(&self, _run_id: RunId, _taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
+            Ok(Vec::new())
+        }
+        async fn rechecked(&self) -> anyhow::Result<weft_broker_client::protocol::RunRecheckedResponse> {
+            Ok(weft_broker_client::protocol::RunRecheckedResponse { cancels: Vec::new(), answers: Vec::new() })
+        }
+    }
+
+    /// The project's history of programs, by definition hash.
+    struct Programs(std::collections::HashMap<String, weft_core::ProjectDefinition>);
+
+    #[async_trait::async_trait]
+    impl crate::context::ProjectClient for Programs {
+        async fn fetch_definition(&self, _project_id: uuid::Uuid, expected_hash: &str) -> anyhow::Result<Option<weft_core::ProjectDefinition>> {
+            Ok(self.0.get(expected_hash).cloned())
+        }
+    }
+
+    /// A worker of tenant `t1` (whose contents the fake storage it reads
+    /// through holds) claiming through `runs`, its project's history
+    /// holding `programs`.
+    fn worker_carrying<const N: usize>(
+        runs: Arc<dyn crate::context::RunClient>,
+        programs: [(&str, weft_core::ProjectDefinition); N],
+    ) -> (Worker, Arc<crate::storage::FakeWorkerStorage>) {
+        let storage = crate::storage::FakeWorkerStorage::new();
+        let mut clients = clients(Arc::new(MemJournal::default()));
+        clients.runs = runs;
+        clients.storage = storage.clone();
+        clients.project = Arc::new(Programs(programs.into_iter().map(|(hash, program)| (hash.to_string(), program)).collect()));
+        let config = WorkerConfig { tenant_id: "t1".into(), ..config() };
+        (worker_configured(Arc::new(NoCatalog), clients, &config), storage)
+    }
+
+    /// The chain program, its second node reading the file `path` holding
+    /// `text`.
+    fn reading_file(path: &str, text: &str) -> weft_core::ProjectDefinition {
+        let string = weft_core::weft_type::WeftType::Primitive(weft_core::WeftPrimitive::String);
+        let (file, _) = weft_core::content::ContentRef::of_text(text, &string, path).unwrap();
+        let mut program = (*crate::plan::tests::chain()).clone();
+        program.nodes[1].port_literals.insert("query".into(), file.to_value());
+        program
+    }
+
+    /// A run handed here whose program names a file the store cannot be
+    /// asked for now is not claimed: the worker answers that it could not
+    /// read it, and the run stays queued for weft to hand out again. Once
+    /// the store answers, the next hand-off claims it.
+    #[tokio::test]
+    async fn a_run_whose_program_cannot_be_read_now_stays_queued() {
+        let claims = Arc::new(Claims::default());
+        *claims.definition_hash.lock().unwrap() = "def-1".into();
+        let (worker, storage) = worker_carrying(claims.clone(), [("def-1", reading_file("sql/q.sql", "SELECT 1;"))]);
+        storage.hold_content(b"SELECT 1;");
+        storage.contents_down(true);
+        let run_id = weft_core::new_run_id();
+        let Some(RunAnswer::NotNow { error }) = worker.carry_on_run(run_id, "def-1").await.unwrap() else {
+            panic!("a store that does not answer leaves the run queued")
+        };
+        assert!(error.contains("reads 'sql/q.sql' (String)") && !error.contains("weft resync"), "{error}");
+        assert!(claims.claimed.lock().unwrap().is_empty(), "nothing claimed");
+        assert!(!worker.cancels.contains(run_id), "nothing registered");
+
+        storage.contents_down(false);
+        let answer = worker.carry_on_run(run_id, "def-1").await.unwrap();
+        assert_eq!(*claims.claimed.lock().unwrap(), [run_id], "the store answers again: claimed, {answer:?}");
+    }
+
+    /// A claim the broker could not answer now (its 503) leaves the run
+    /// queued for a later try, like a read that failed; any other refusal
+    /// of the claim is the worker's answer.
+    #[tokio::test]
+    async fn a_claim_the_broker_cannot_answer_now_leaves_the_run_queued() {
+        let claims = Arc::new(Claims::default());
+        let (worker, _storage) = worker_carrying(claims.clone(), [("def-1", (*crate::plan::tests::chain()).clone())]);
+        let run_id = weft_core::new_run_id();
+        *claims.refused.lock().unwrap() = Some(reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let Some(RunAnswer::NotNow { error }) = worker.carry_on_run(run_id, "def-1").await.unwrap() else {
+            panic!("a broker that cannot answer now leaves the run queued")
+        };
+        assert!(error.contains("could not be asked to claim the run"), "{error}");
+        *claims.refused.lock().unwrap() = Some(reqwest::StatusCode::BAD_REQUEST);
+        assert!(worker.carry_on_run(run_id, "def-1").await.is_err(), "a refusal is the worker's answer");
+    }
+
+    /// A run whose program names a file the store no longer holds, or
+    /// whose program the install never recorded, is claimed and ends
+    /// failed with why: no later read gets past it.
+    #[tokio::test]
+    async fn a_run_whose_program_is_gone_is_claimed_and_ends() {
+        let claims = Arc::new(Claims::default());
+        let (worker, _storage) = worker_carrying(claims.clone(), [("def-1", reading_file("sql/gone.sql", "SELECT 2;"))]);
+        for (hash, says) in [("def-1", "weft resync"), ("def-2", "never recorded")] {
+            *claims.definition_hash.lock().unwrap() = hash.into();
+            let run_id = weft_core::new_run_id();
+            let Some(RunAnswer::Failed { error }) = worker.carry_on_run(run_id, hash).await.unwrap() else {
+                panic!("a program that is gone ends the run")
+            };
+            assert!(error.contains(says), "{error}");
+            assert_eq!(claims.claimed.lock().unwrap().last(), Some(&run_id));
+        }
     }
 
     /// The metadata of a node written here, which has no metadata.json.

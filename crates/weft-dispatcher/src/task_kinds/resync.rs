@@ -962,10 +962,10 @@ async fn retry_if_back(state: &DispatcherState, id: uuid::Uuid, plan: &ResyncPla
                 .any(|a| keys.contains(&a.key) && a.lifecycle.status == crate::activation_store::ProjectStatus::Activating)
         }
         Some(ResyncWait::Infra) => {
-            let Some(project) = state.projects.project(id).await? else { return Ok(()) };
+            let Some(registered) = state.registered(id).await? else { return Ok(()) };
             let mut up = true;
             for owner in plan.remaining() {
-                up &= crate::api::project::require_trigger_infra(state, id, &project, &owner.keys(&owner.on)).await.is_ok();
+                up &= crate::api::project::require_trigger_infra(state, id, &registered.program, &owner.keys(&owner.on)).await.is_ok();
             }
             up
         }

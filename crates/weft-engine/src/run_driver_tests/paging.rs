@@ -76,6 +76,7 @@
             &engine_test_rig::NoopProject,
             run_id,
             project.clone(),
+            None,
         )
         .await
         .unwrap();

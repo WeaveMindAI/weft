@@ -246,6 +246,24 @@ resource "google_cloud_run_v2_service" "role" {
       }
     }
 
+    # The dispatcher builds a version in its temporary folder, which Cloud
+    # Run keeps in memory, and keeps there too the version files it fetched
+    # before (its blob cache, 64Mi at most). The volume holding that folder
+    # is a quarter of its memory for builds plus the cache's 64Mi, so a
+    # build too large for its quarter fails on its own ("No space left on
+    # device") instead of taking down the copy and every request on it.
+    dynamic "volumes" {
+      for_each = each.value == "dispatcher" ? [1] : []
+      content {
+        name = "build"
+        empty_dir {
+          medium = "MEMORY"
+          # SYNC: the blob cache's 64Mi <-> crates/weft-dispatcher/src/build/blob_cache.rs (IN_MEMORY_CAP_BYTES)
+          size_limit = "${floor(local.role_memory_mi[each.value] / 4) + 64}Mi"
+        }
+      }
+    }
+
     dynamic "volumes" {
       for_each = google_secret_manager_secret.access_apps
       content {
@@ -294,6 +312,20 @@ resource "google_cloud_run_v2_service" "role" {
       volume_mounts {
         name       = "config"
         mount_path = "/etc/weft"
+      }
+      dynamic "volume_mounts" {
+        for_each = each.value == "dispatcher" ? [1] : []
+        content {
+          name       = "build"
+          mount_path = "/weft-build"
+        }
+      }
+      dynamic "env" {
+        for_each = each.value == "dispatcher" ? [1] : []
+        content {
+          name  = "TMPDIR"
+          value = "/weft-build"
+        }
       }
       dynamic "env" {
         for_each = google_secret_manager_secret.access_apps

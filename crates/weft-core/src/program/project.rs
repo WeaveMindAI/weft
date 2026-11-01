@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::projects::{DeclareRequest, QuiesceRequest, StatusQuery};
+use crate::projects::{DeclareRequest, QuiesceRequest, StatusRequest};
 
 /// One call on a project, each carrying what its command sends (`weft
 /// ps`, `weft status`, `weft cancel-build`, `weft rm`).
@@ -21,8 +21,8 @@ pub enum ProjectCall {
     /// built yet; one of the owner's already there is left as it is.
     Declare { request: DeclareRequest },
     /// Everything about the project now, drift against the hashes the
-    /// query names.
-    Status { query: StatusQuery },
+    /// request names.
+    Status { request: StatusRequest },
     /// Cancel the build in flight.
     CancelBuild,
     /// `weft rm`'s first step: mark the project being removed and take it
@@ -86,8 +86,8 @@ mod tests {
         let id = uuid::Uuid::now_v7();
         let declare = round_trip(ProjectCall::Declare { request: DeclareRequest { id, name: "helper".into() } });
         assert_eq!((declare["call"].as_str(), declare["request"]["name"].as_str()), (Some("declare"), Some("helper")));
-        let status = round_trip(ProjectCall::Status { query: StatusQuery { desired_binary_hash: Some("b".into()), ..Default::default() } });
-        assert_eq!((status["call"].as_str(), status["query"]["desiredBinaryHash"].as_str()), (Some("status"), Some("b")));
+        let status = round_trip(ProjectCall::Status { request: StatusRequest { desired_binary_hash: Some("b".into()), ..Default::default() } });
+        assert_eq!((status["call"].as_str(), status["request"]["desiredBinaryHash"].as_str()), (Some("status"), Some("b")));
         assert_eq!(round_trip(ProjectCall::CancelBuild)["call"], "cancel_build");
         let quiesce = round_trip(ProjectCall::Quiesce { request: QuiesceRequest { every_run: true } });
         assert_eq!((quiesce["call"].as_str(), quiesce["request"]["everyRun"].as_bool()), (Some("quiesce"), Some(true)));

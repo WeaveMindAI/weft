@@ -17,7 +17,7 @@ use weft_task_store::db::Client as _;
 
 use super::{answered, failed, stop_asker, Actor, Refused};
 use crate::api::project::{
-    activate_with, coherent_definition, deactivate_scope, end_unfinished_activation, instances_with_triggers_on, keys_by_owner,
+    activate_with, as_registered, coherent_definition, deactivate_scope, end_unfinished_activation, instances_with_triggers_on, keys_by_owner,
     keys_to_take_down, on_another_binary, on_another_binary_refusal, prepare_trigger_setup, refuse_unrunnable, require_action,
     require_registered_build, require_trigger_infra, resolve_scope, run_trigger_setup, ActivateAsker, ActivateError, Desired, StatusError,
     Unrunnable,
@@ -400,13 +400,11 @@ pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uui
 
     // 1. Which triggers: the scope's, as the registered build has them, of
     //    which the ones on and behind it are refreshed and the ones off
-    //    are named in the answer.
-    let registered = state
-        .projects
-        .project(id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".to_string()))?;
+    //    are named in the answer. One read of it serves every check
+    //    below.
+    let (program, runnable) = coherent_definition(state, id).await?;
+    let loaded = as_registered(&program, &runnable);
+    let registered = &*loaded.program;
     let activations = state
         .activations
         .list(id)
@@ -419,11 +417,10 @@ pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uui
         true => instances_with_triggers_on(state, id).await?,
         false => Vec::new(),
     };
-    let keys = request.scope.resolve(&registered, &on).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    let keys = request.scope.resolve(registered, &on).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
     let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("running hashes: {e:#}"));
     let binary_hash = state.projects.running_binary_hash(id).await.map_err(internal)?;
-    let definition_hash = state.projects.running_definition_hash(id).await.map_err(internal)?;
-    let desired = Desired::registered(state, id, &registered, binary_hash.as_deref(), definition_hash.as_deref()).await?;
+    let desired = Desired::registered(state, id, &loaded, binary_hash.as_deref()).await?;
     let row = |key: &weft_core::activation::ActivationKey| activations.iter().find(|a| &a.key == key);
     // Off: never turned on, or down. One being switched on is not.
     let off: Vec<weft_core::activation::ActivationKey> = keys
@@ -472,17 +469,16 @@ pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uui
     //    worker runs it, what it left out included). Every owner is
     //    checked before the first comes down. Each activate below re-reads
     //    and re-checks; this is what keeps the project whole.
-    require_action(state, id, &["resync"]).await?;
-    let (_, runnable) = coherent_definition(state, id).await?;
+    require_action(state, id, &loaded, &["resync"]).await?;
     for owner in &owners {
-        require_trigger_infra(state, id, &registered, &owner.keys(&owner.on)).await?;
+        require_trigger_infra(state, id, registered, &owner.keys(&owner.on)).await?;
         refuse_unrunnable(state, id, &runnable, &owner.keys(&owner.on)).await.map_err(|unrunnable| match unrunnable {
             Unrunnable::Cannot(why) => (StatusCode::UNPROCESSABLE_ENTITY, format!("{why}\n{RESYNC_TOOK_NOTHING_DOWN}")),
             Unrunnable::Lacks(why) => (StatusCode::PRECONDITION_FAILED, format!("{why}\n{RESYNC_TOOK_NOTHING_DOWN}")),
             Unrunnable::Unchecked(failed) => failed,
         })?;
     }
-    crate::install_picks::require_activation_picks(state, id, &registered).await?;
+    crate::install_picks::require_activation_picks(state, id, registered).await?;
     refuse_what_cannot_come_up(state, id, &behind).await?;
     let brought_back = bring_back().await?;
 

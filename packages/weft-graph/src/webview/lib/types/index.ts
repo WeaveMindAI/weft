@@ -23,7 +23,7 @@ export type { NodeFiringStatus };
 export type { NodeFeaturesWire as NodeFeatures } from '../../../protocol';
 // The accepts/widget vocabulary IS the wire type, re-exported for the
 // same one-definition reason.
-import { ACCESS_MARKER_KEY, INFRA_MARKER_KEY, isSecretMarker, type Accepts, type CodeLanguage, type InputDefinition, type Widget, type WidgetKind } from '../../../protocol';
+import { ACCESS_MARKER_KEY, INFRA_MARKER_KEY, contentMarker, isSecretMarker, type Accepts, type CodeLanguage, type InputDefinition, type Widget, type WidgetKind } from '../../../protocol';
 export type { Accepts, Widget, WidgetKind };
 
 // =============================================================================
@@ -458,6 +458,11 @@ export function inferTypeFromValue(value: unknown): WeftType {
 		if (INFRA_MARKER_KEY in obj) return { kind: 'infra' };
 		// A marker names a secret, never what it holds.
 		if (isSecretMarker(obj)) return { kind: 'secret', inner: { kind: 'typevar', name: 'T' } };
+		// A file's content a built program names is of the type it is
+		// read as (one this editor cannot read is the object it is).
+		const content = contentMarker(obj);
+		const declared = content && parseWeftType(content.type);
+		if (declared) return declared;
 		const values = Object.values(obj);
 		if (values.length === 0) {
 			return { kind: 'dict', value: { kind: 'primitive', value: 'Empty' } };

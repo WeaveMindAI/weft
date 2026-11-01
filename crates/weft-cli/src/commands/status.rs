@@ -1,6 +1,6 @@
 //! `weft status`: discover the cwd project, compute current source
-//! hashes, hit the dispatcher's `/projects/{id}/status` aggregator
-//! with those hashes as query params (drives drift detection).
+//! hashes, ask the dispatcher's `/projects/{id}/status` aggregator
+//! about them in the request's body (drives drift detection).
 //! Print a human-readable summary or, with `--json`, emit the full
 //! status payload as a single JSON line for consumption by the
 //! VS Code extension's action bar.
@@ -67,11 +67,15 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                             weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full, &packaging, &weft_compiler::hash::DISK),
                         ),
                         or_warn("the project definition's hash", weft_compiler::hash::compute_definition_hash(&def)),
-                        Some(weft_core::projects::NamedHashes(weft_core::run_spec::trigger_fingerprints(&def)).encode()),
+                        // Every trigger the source has, one whose cut cannot be
+                        // walked included: the install reads one left out as
+                        // gone from the source.
+                        Some(weft_core::run_spec::trigger_fingerprints(&weft_core::run_spec::trigger_cuts(&def))),
+                        // Every infra place the source has: the install reads a
+                        // copy of one left out as behind.
                         or_warn(
                             "each infra place's hash",
-                            weft_compiler::hash::compute_infra_place_hashes(&def, &project.root, &weft_root, &catalog, &weft_compiler::hash::DISK)
-                                .map(|places| weft_core::projects::NamedHashes(places).encode()),
+                            weft_compiler::hash::compute_infra_place_hashes(&def, &project.root, &weft_root, &catalog, &weft_compiler::hash::DISK),
                         ),
                     ),
                     // An asset that cannot resolve is what a build will
@@ -89,20 +93,20 @@ pub async fn run(ctx: Ctx) -> Result<()> {
             }
         };
 
-    let query = weft_core::projects::StatusQuery {
+    let request = weft_core::projects::StatusRequest {
         desired_binary_hash,
         desired_full_binary_hash,
         desired_definition_hash,
         desired_trigger_cuts,
         desired_infra_places,
     };
-    let path = format!("/projects/{project_id}/status{}", query.to_query_string());
+    let path = format!("/projects/{project_id}/status");
 
     // A project that exists on disk but was never registered is not an error:
     // it is the state every project starts in, and the answer is the
     // command that leaves it. The marked 404 is how the dispatcher says
     // "no project I know under this id" (as opposed to a missing route).
-    let Some(data) = ctx.client()?.get_json_if_found(&path).await? else {
+    let Some(data) = ctx.client()?.ask_json_if_found(&path, &serde_json::to_value(&request)?).await? else {
         if !ctx.json_out(&serde_json::json!({ "registered": false, "projectId": project_id }))? {
             // A program with infra of its own has it started before its
             // triggers are switched on: a trigger reads its infra.
@@ -186,8 +190,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                     println!("    {node}: one copy per instance ({counted}, listed under instance infra)");
                 }
                 st => {
-                    let behind = if entry.behind { ", behind the source" } else { "" };
-                    println!("    {node}: {st}{behind} ({})", entry.endpoint_url.as_deref().unwrap_or("-"));
+                    let standing = copy_standing(entry.behind, entry.orphaned, |verb| ctx.weft(verb));
+                    println!("    {node}: {st}{standing} ({})", entry.endpoint_url.as_deref().unwrap_or("-"));
                     if let Some(progress) = &entry.progress {
                         println!("      {}", progress.describe(progress.as_of_unix));
                     }
@@ -220,8 +224,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     if !data.instance_infra.is_empty() {
         println!("  instance infra:");
         for entry in &data.instance_infra {
-            let behind = if entry.behind { ", behind the source" } else { "" };
-            println!("    {} (instance {}): {}{behind}", entry.node, entry.instance, entry.status);
+            let standing = copy_standing(entry.behind, entry.orphaned, |verb| ctx.weft(verb));
+            println!("    {} (instance {}): {}{standing}", entry.node, entry.instance, entry.status);
             if let Some(progress) = &entry.progress {
                 println!("      {}", progress.describe(progress.as_of_unix));
             }
@@ -367,9 +371,22 @@ fn warn_no_drift(why: &str, e: &anyhow::Error) {
     eprintln!("warning: {why}, so whether the running program is behind the source is not checked ({e:#})");
 }
 
+/// How an infra copy stands against the source, as its line ends: behind
+/// it, or an orphan of a place the source declares no more, with what
+/// takes it down; nothing when it is current.
+fn copy_standing(behind: bool, orphaned: bool, weft: impl Fn(&str) -> String) -> String {
+    if orphaned {
+        format!(", orphaned: the source declares it no more; it keeps running until `{}` or `{}` takes it down", weft("infra stop"), weft("infra terminate"))
+    } else if behind {
+        ", behind the source".to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// One desired hash, or `None` with a warning naming what could not be
 /// worked out.
-fn or_warn(what: &str, hash: Result<String>) -> Option<String> {
+fn or_warn<T>(what: &str, hash: Result<T>) -> Option<T> {
     hash.map_err(|e| warn_no_drift(&format!("{what} cannot be worked out"), &e)).ok()
 }
 
@@ -426,7 +443,7 @@ fn trigger_lines(entry: &weft_core::projects::TriggerEntry) -> Vec<String> {
     match &entry.shared {
         Some(copy) => lines.push(format!("{}: {}{reads}{gone}", entry.node, copy_words(copy))),
         None => {
-            let on = entry.copies.iter().filter(|c| matches!(c.state, TriggerState::On | TriggerState::Behind)).count();
+            let on = entry.copies.iter().filter(|c| c.state.is_on()).count();
             lines.push(format!("{}: once per instance, {on} of {} on{reads}{gone}", entry.node, entry.copies.len()));
         }
     }
@@ -493,6 +510,18 @@ mod tests {
 
     fn copy(instance: Option<&str>, state: TriggerState, mode: ActivationMode) -> TriggerCopy {
         TriggerCopy { instance: instance.map(|i| InstanceId::new(i).unwrap()), state, mode, down_with: None, held_back: None, held: HeldWork::default(), waiting: None, version: None, progress: None, dropped: None }
+    }
+
+    /// An infra copy's line says whether it is behind the source, or an
+    /// orphan of a place the source declares no more with what takes it
+    /// down, and nothing more when it is current.
+    #[test]
+    fn an_infra_copy_says_whether_it_is_behind_or_orphaned() {
+        let weft = |verb: &str| format!("weft {verb}");
+        assert_eq!(super::copy_standing(false, false, weft), "");
+        assert_eq!(super::copy_standing(true, false, weft), ", behind the source");
+        let orphaned = super::copy_standing(false, true, weft);
+        assert!(orphaned.contains("orphaned") && orphaned.contains("`weft infra stop`") && orphaned.contains("`weft infra terminate`"), "{orphaned}");
     }
 
     /// A resync that stopped says so, why, and what comes next, never
