@@ -721,6 +721,13 @@ impl BrokerDoorClient {
         self.http.post(DOOR_TICK, request).await
     }
 
+    /// This worker's memory just crossed the busy guard's line: `full`
+    /// into nearly full, `None` back to having room (`DoorMemoryRequest`).
+    pub async fn memory(&self, full: Option<MemoryNote>) -> Result<()> {
+        let _: DoorMemory = self.http.post(DOOR_MEMORY, &DoorMemoryRequest { full }).await?;
+        Ok(())
+    }
+
     /// What a caller of a gated route proved; `Ok(None)` when the broker
     /// refused them (the reason is in its log).
     pub async fn verify_caller(&self, request: &CallerVerifyRequest) -> Result<Option<CallerVerified>> {

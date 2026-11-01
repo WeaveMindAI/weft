@@ -150,6 +150,11 @@ impl RunsProgram {
     pub fn kept(&self) -> Option<&std::sync::Arc<StoredProgram>> {
         self.cut_from.is_some().then_some(&self.stored)
     }
+
+    /// How many bytes the program's JSON, held written out here, weighs.
+    pub fn json_bytes(&self) -> usize {
+        self.stored.project_json.len()
+    }
 }
 
 /// A run's record as read, raw: its rows from some `seq` on.
@@ -670,8 +675,8 @@ pub async fn notify_queued_in(db: &impl Client, project_id: uuid::Uuid) -> anyho
 pub async fn insert_cut_in(db: &impl Client, program: &RunsProgram) -> anyhow::Result<()> {
     let Some(cut) = program.kept() else { return Ok(()) };
     db.execute(
-        "INSERT INTO project_definition (project_id, definition_hash, project_json, project_json_version, recorded_at_unix, cut_from) \
-         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (project_id, definition_hash) DO NOTHING",
+        "INSERT INTO project_definition (project_id, definition_hash, project_json, project_json_version, recorded_at_unix, cut_from, trigger_cuts_walked) \
+         VALUES ($1, $2, $3, $4, $5, $6, FALSE) ON CONFLICT (project_id, definition_hash) DO NOTHING",
         &[&cut.project_id, &cut.definition_hash, &cut.project_json, &cut.project_json_version, &unix_now(), &program.cut_from()],
     )
     .await?;
@@ -927,7 +932,13 @@ pub async fn give_up_in(db: &impl Client, run_id: RunId, owner: &str, why: &str)
     if locked.state != "running" || locked.owner.as_deref() != Some(owner) {
         return Ok(GaveUp::NotOwned);
     }
-    db.execute("UPDATE run SET owner = NULL WHERE run_id = $1", &[&run_id]).await?;
+    // Its worker gives it up itself: no memory note of a worker that went
+    // away is left on it (`run.lost_memory_full_at`).
+    db.execute(
+        "UPDATE run SET owner = NULL, lost_memory_full_at = NULL, lost_memory_used = NULL, lost_memory_limit = NULL WHERE run_id = $1",
+        &[&run_id],
+    )
+    .await?;
     locked.owner = None;
     let at_unix = unix_now() as u64;
     // A record that does not read still ends: the run's ending is what
@@ -966,20 +977,25 @@ pub async fn give_up_in(db: &impl Client, run_id: RunId, owner: &str, why: &str)
 
 /// A queued run as the worker that claimed it starts from: how it is
 /// fenced (its epoch, which its batches carry), how many times it was
-/// handed to a worker, its program, and a cancel already waiting for it.
-/// Its record the worker reads after, page by page ([`read_page`]).
+/// handed to a worker, its program, a cancel already waiting for it, and
+/// the memory note of the worker it was lost by, when that worker went
+/// away with its memory nearly full (`run.lost_memory_full_at`,
+/// `weft_task_store::worker_door::MemoryNote`). Its record the worker
+/// reads after, page by page ([`read_page`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claimed {
     pub epoch: i32,
     pub attempts: i32,
     pub definition_hash: String,
     pub cancel_requested: Option<CancelCause>,
+    pub lost_full: Option<weft_task_store::worker_door::MemoryNote>,
 }
 
 /// What a claim reads off the run row: its new epoch, its attempts, its
-/// program, and a cancel already asked for. All but the cancel are there
-/// exactly when the run was claimed, which a run of no program never is.
-type ClaimedRow = (Option<i32>, Option<i32>, Option<String>, Option<JsonText<CancelCause>>);
+/// program, a cancel already asked for, and the memory note of the worker
+/// it was lost by (its three columns). The first three are there exactly
+/// when the run was claimed, which a run of no program never is.
+type ClaimedRow = (Option<i32>, Option<i32>, Option<String>, Option<JsonText<CancelCause>>, Option<i64>, Option<i64>, Option<i64>);
 
 /// Until when a run claimed or born by a worker at `now` counts as
 /// delivered to that worker though its lease is not written yet
@@ -1009,6 +1025,9 @@ pub fn delivered_until(now: i64) -> i64 {
 /// under a new epoch: the answer of one that committed may have been lost
 /// on its way, and the worker never drives a run twice (it asks only for
 /// a run it is not driving), so nothing was written under the old epoch.
+/// The claim leaves the run's memory note (`run.lost_memory_full_at`) as
+/// it is: a claim given again reads the same note, and whatever lets the
+/// run go next writes it anew.
 pub async fn claim(db: &impl Client, run_id: RunId, project_id: uuid::Uuid, owner: &str) -> anyhow::Result<Option<Claimed>> {
     // The row is locked first and its mark read off the version the lock
     // waited for (a `busy` that committed meanwhile included), then
@@ -1025,17 +1044,21 @@ pub async fn claim(db: &impl Client, run_id: RunId, project_id: uuid::Uuid, owne
          claimed AS (UPDATE run SET state = 'running', owner = $3, epoch = epoch + 1, attempts = attempts + 1, delivered_until = $4, \
                          refusals = 0, unreached = 0, busy_since = NULL, waited_on_workers = FALSE \
                       FROM was WHERE run.run_id = $1 AND was.runs_a_program \
-                      RETURNING run.epoch, run.attempts, run.definition_hash, run.cancel_requested, was.waited_on_workers), \
+                      RETURNING run.epoch, run.attempts, run.definition_hash, run.cancel_requested, run.lost_memory_full_at, \
+                                run.lost_memory_used, run.lost_memory_limit, was.waited_on_workers), \
          ended AS ({ended} AND EXISTS (SELECT 1 FROM claimed WHERE claimed.waited_on_workers)) \
-         SELECT claimed.epoch, claimed.attempts, claimed.definition_hash, claimed.cancel_requested FROM was LEFT JOIN claimed ON TRUE",
+         SELECT claimed.epoch, claimed.attempts, claimed.definition_hash, claimed.cancel_requested, \
+                claimed.lost_memory_full_at, claimed.lost_memory_used, claimed.lost_memory_limit \
+         FROM was LEFT JOIN claimed ON TRUE",
         ended = weft_task_store::unanswered::delivery_waits_ended_sql("$2", Some("$1")),
     );
     let claimed: Option<ClaimedRow> = db.opt(&sql, &[&run_id, &project_id, &owner, &delivered_until(unix_now())]).await?;
     let Some(claimed) = claimed else { return Ok(None) };
-    let (Some(epoch), Some(attempts), Some(definition_hash), cancel_requested) = claimed else {
+    let (Some(epoch), Some(attempts), Some(definition_hash), cancel_requested, full_at, used, limit) = claimed else {
         anyhow::bail!("run {run_id} runs no program, so no worker can claim it");
     };
-    Ok(Some(Claimed { epoch, attempts, definition_hash, cancel_requested: cancel_requested.map(|cause| cause.0) }))
+    let lost_full = weft_task_store::worker_door::memory_note_of(full_at, used, limit)?;
+    Ok(Some(Claimed { epoch, attempts, definition_hash, cancel_requested: cancel_requested.map(|cause| cause.0), lost_full }))
 }
 
 /// The most rows one page of a record holds ([`read_page`]): enough that

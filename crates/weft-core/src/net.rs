@@ -70,6 +70,17 @@ pub fn http_client() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
 }
 
+/// The whole body of a GET of `url` (a text a program names: a prompt, a
+/// JSON shape, small by contract). An answer that is not a success is the
+/// error, naming the address and the status.
+pub async fn get_body(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+    let resp = http.get(url).send().await.map_err(|e| format!("GET {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GET {url} answered {}", resp.status()));
+    }
+    Ok(resp.bytes().await.map_err(|e| format!("read {url}: {e}"))?.to_vec())
+}
+
 /// Dial `host:port` and wrap the pipe in TLS, verifying the peer
 /// against the system's trust roots (SNI from the host part).
 pub async fn tls_connect(address: &str) -> Result<TlsStream<TcpStream>, String> {

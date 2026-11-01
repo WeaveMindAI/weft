@@ -118,12 +118,12 @@ pub async fn fields(State(state): State<DispatcherState>, headers: HeaderMap) ->
 }
 
 /// The program the caller's token is for, as it runs now.
-async fn caller_project(state: &DispatcherState, caller: &InstanceCaller) -> Result<weft_core::ProjectDefinition, ApiError> {
+async fn caller_project(state: &DispatcherState, caller: &InstanceCaller) -> Result<std::sync::Arc<weft_core::ProjectDefinition>, ApiError> {
     state
-        .projects
-        .project(caller.project)
+        .registered(caller.project)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e:#}")))?
+        .map(|registered| registered.program)
         .ok_or((StatusCode::NOT_FOUND, "this token's project no longer exists".to_string()))
 }
 

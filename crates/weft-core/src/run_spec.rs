@@ -728,10 +728,14 @@ pub fn instanceless_fire_reaches(
 }
 
 /// Every trigger place's [`TriggerCut`] by address, or why its cut cannot
-/// be walked (a trigger inside a half-selected loop): what `weft status`
-/// sends as the source's cuts (`StatusQuery::desired_trigger_cuts`) and
-/// the dispatcher compares the registered program's with.
-pub fn trigger_cuts(project: &ProjectDefinition) -> BTreeMap<String, Result<TriggerCut, String>> {
+/// be walked (a trigger inside a half-selected loop).
+pub type TriggerCuts = BTreeMap<String, Result<TriggerCut, String>>;
+
+/// The [`TriggerCuts`] of `project`: what `weft status` reads the
+/// source's cuts from ([`trigger_fingerprints`]), and what a build's
+/// registration records for the program it registers, which the install
+/// reads from then on instead of walking them again.
+pub fn trigger_cuts(project: &ProjectDefinition) -> TriggerCuts {
     crate::project::trigger_places(project)
         .iter()
         .map(|place| {
@@ -742,15 +746,14 @@ pub fn trigger_cuts(project: &ProjectDefinition) -> BTreeMap<String, Result<Trig
         .collect()
 }
 
-/// Each trigger's fingerprint by address ([`trigger_cuts`]), the ones whose
-/// cut can be walked: what the source's cuts are compared by, on the
-/// client that sends them (`StatusQuery::desired_trigger_cuts`) and on the
-/// dispatcher that reads the registered program's. A trigger left out is
-/// one whose cut cannot be walked; its activation says why.
-pub fn trigger_fingerprints(project: &ProjectDefinition) -> BTreeMap<String, String> {
-    trigger_cuts(project)
-        .into_iter()
-        .filter_map(|(trigger, cut)| cut.ok().map(|cut| (trigger, cut.fingerprint)))
+/// Each trigger of `cuts` by address, with its cut's fingerprint, `None`
+/// for one whose cut cannot be walked (its activation says why): what a
+/// trigger that is on is compared by, on the client that sends the
+/// source's (`crate::projects::StatusRequest::desired_trigger_cuts`) and on
+/// the dispatcher that reads the registered program's.
+pub fn trigger_fingerprints(cuts: &TriggerCuts) -> BTreeMap<String, Option<String>> {
+    cuts.iter()
+        .map(|(trigger, cut)| (trigger.clone(), cut.as_ref().ok().map(|cut| cut.fingerprint.clone())))
         .collect()
 }
 
@@ -1911,6 +1914,20 @@ mod tests {
         assert_eq!(fingerprint(&before, "hear"), fingerprint(&edited, "hear"), "an edit outside its cut");
         assert_ne!(fingerprint(&before, "tick"), fingerprint(&edited, "tick"), "an edit inside its cut");
         assert_eq!(fingerprint(&before, "hear"), fingerprint(&before.clone(), "hear"), "a function of the source alone");
+    }
+
+    /// Every trigger is fingerprinted, one whose cut cannot be walked as
+    /// `None`: the source's set is whole, so a trigger it leaves out is one
+    /// it has no more.
+    #[test]
+    fn every_trigger_is_fingerprinted_one_that_does_not_walk_as_none() {
+        let project = two_triggers();
+        let mut cuts = trigger_cuts(&project);
+        cuts.insert("looped".into(), Err("inside a loop run in part".into()));
+        let fingerprints = trigger_fingerprints(&cuts);
+        assert_eq!(fingerprints.keys().cloned().collect::<Vec<_>>(), vec!["hear".to_string(), "looped".to_string(), "tick".to_string()]);
+        assert_eq!(fingerprints["hear"], Some(trigger_cut(&project, "hear").unwrap().fingerprint));
+        assert_eq!(fingerprints["looped"], None);
     }
 
     /// What runs in front of a trigger runs at its setup, never at a

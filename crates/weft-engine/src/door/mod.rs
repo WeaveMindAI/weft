@@ -90,6 +90,9 @@ pub struct Door {
     /// When the door ticks (`ticks`).
     ticking: Arc<ticks::Ticking>,
     permits: Arc<RunPermits>,
+    /// Its worker's memory: every tick carries its note to the lease row
+    /// it writes (`crate::busy`).
+    memory: Arc<crate::busy::MemoryGuard>,
     edge: Edge,
     /// The project's secret: socket tickets are signed with a key of its
     /// own.
@@ -212,6 +215,7 @@ impl Door {
         edge: Edge,
         secret: weft_core::caller_token::ProjectSecret,
         permits: Arc<RunPermits>,
+        memory: Arc<crate::busy::MemoryGuard>,
     ) -> Arc<Self> {
         let ticking = ticks::Ticking::new();
         Arc::new(Self {
@@ -222,6 +226,7 @@ impl Door {
             limits: Limits::new(ticking.clone()),
             ticking,
             permits,
+            memory,
             edge,
             secret,
         })
@@ -692,11 +697,15 @@ impl Door {
     /// about to sleep with only waiting runs, and saying when a stopping
     /// worker's lease got shorter than it vouched for last (`shortens`):
     /// whether it reported nothing in flight. Its counts are marked heard once it lands.
+    /// It carries the worker's memory note, so the lease row it writes
+    /// holds it whenever that row is written, taking its turn with a
+    /// crossing told at once (`crate::busy::MemoryTold`).
     pub(crate) async fn tick(&self, vouch_until: Option<i64>, shortens: bool) -> anyhow::Result<bool> {
         let now = crate::now_unix() as i64;
         let (window_start, mine, mark) = self.limits.mine(now);
         let in_flight = self.limits.going();
         let quiet = in_flight.is_empty();
+        let (_turn, memory_full) = self.memory.note_to_write().await;
         let request = DoorTickRequest {
             binary_hash: Some(self.binary_hash.clone()),
             in_flight,
@@ -704,6 +713,7 @@ impl Door {
             counts: mine.into_iter().map(|count| DoorCount { key: count.key, hits: count.hits, reason: count.reason }).collect(),
             vouch_until,
             shortens,
+            memory_full,
         };
         let heard = self.broker.tick(&request).await?;
         self.limits.reported(mark);
@@ -793,6 +803,9 @@ pub(crate) mod fake {
         pub heard: Mutex<(Vec<weft_broker_client::protocol::DoorCount>, u32)>,
         /// The fires parked, in order, with their token.
         pub parked: Mutex<Vec<(String, weft_task_store::parked_fires::Waiting)>>,
+        /// The memory states kept, in order: a note while full, `None`
+        /// once it had room.
+        pub memory_states: Mutex<Vec<Option<weft_broker_client::protocol::MemoryNote>>>,
     }
 
     impl FakeDoorBroker {
@@ -813,6 +826,7 @@ pub(crate) mod fake {
                 tick_fails: std::sync::atomic::AtomicBool::new(false),
                 heard: Mutex::new((Vec::new(), 1)),
                 parked: Mutex::new(Vec::new()),
+                memory_states: Mutex::new(Vec::new()),
             }
         }
     }
@@ -854,6 +868,10 @@ pub(crate) mod fake {
             }
             let (others, copies) = self.heard.lock().unwrap().clone();
             Ok(DoorTick { others, copies })
+        }
+        async fn memory(&self, full: Option<weft_broker_client::protocol::MemoryNote>) -> anyhow::Result<()> {
+            self.memory_states.lock().unwrap().push(full);
+            Ok(())
         }
         async fn park_fire(
             &self,
@@ -917,6 +935,11 @@ pub(crate) mod fake {
     }
 
     pub(crate) fn door(broker: Arc<FakeDoorBroker>) -> Arc<Door> {
+        door_with_memory(broker, Arc::default())
+    }
+
+    /// [`door`], its worker's memory read from `memory`.
+    pub(crate) fn door_with_memory(broker: Arc<FakeDoorBroker>, memory: Arc<crate::busy::MemoryGuard>) -> Arc<Door> {
         Door::new(
             PROJECT,
             "local".into(),
@@ -925,6 +948,7 @@ pub(crate) mod fake {
             Edge { trusted_hops: 0, invalid_tokens_per_minute: Some(2) },
             weft_core::caller_token::ProjectSecret::of(SECRET, PROJECT),
             RunPermits::new(64, std::time::Duration::from_secs(30)),
+            memory,
         )
     }
 }

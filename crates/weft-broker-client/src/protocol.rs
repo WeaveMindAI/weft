@@ -2736,6 +2736,10 @@ pub struct DoorTickRequest {
     /// booked for the vouch and nothing else would bring forward.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shortens: bool,
+    /// Its memory note while its memory is nearly full, `None` while it
+    /// has room: written on the lease row with it, so the row holds it
+    /// however late it was written ([`DOOR_MEMORY`] tells it at once).
+    pub memory_full: Option<MemoryNote>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2756,6 +2760,28 @@ pub struct DoorTick {
     /// How many copies of the project are alive, this one included.
     pub copies: u32,
 }
+
+/// A worker's memory state. Harmless twice: the second sets what the
+/// first set.
+pub const DOOR_MEMORY: BrokerCall = BrokerCall { path: "/v1/door/memory", twice: Twice::Harmless };
+
+pub use weft_task_store::worker_door::MemoryNote;
+
+/// `POST /v1/door/memory`: the worker's memory just crossed the busy
+/// guard's line (`weft_engine::busy`), one way or the other, once per
+/// crossing, never per request. Kept on the worker's own lease row
+/// (`weft_task_store::worker_door::keep_memory_state`) when there is one
+/// already; its door's ticks carry it too ([`DoorTickRequest::memory_full`]),
+/// so a row written later holds it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorMemoryRequest {
+    /// Its note while its memory is nearly full; `None` once it has room
+    /// again, which takes the note off.
+    pub full: Option<MemoryNote>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorMemory {}
 
 /// One raw push, as the dispatcher forwards it to the broker: the
 /// exact bytes (signatures hash them; base64 so the wrapper stays
@@ -2854,6 +2880,42 @@ mod supervisor_protocol_tests {
         assert_eq!(first, json!({ "run_id": run_id, "after": null }));
         let old_record = serde_json::from_value::<RecordOfRequest>(json!({ "run_id": run_id })).unwrap_err();
         assert!(old_record.to_string().contains("missing field `after`"), "{old_record}");
+    }
+
+    /// A worker's memory goes out full with its note, or with room as
+    /// none; the note comes back to the next worker inside its claim.
+    #[test]
+    fn a_memory_note_round_trip() {
+        let note = MemoryNote { used_bytes: 990, limit_bytes: 1000, at_unix: 12 };
+        let sent = json!({ "used_bytes": 990, "limit_bytes": 1000, "at_unix": 12 });
+        assert_eq!(serde_json::to_value(DoorMemoryRequest { full: Some(note) }).unwrap(), json!({ "full": sent }));
+        assert_eq!(serde_json::to_value(DoorMemoryRequest { full: None }).unwrap(), json!({ "full": null }));
+        assert_eq!(serde_json::from_value::<DoorMemoryRequest>(json!({ "full": sent })).unwrap().full, Some(note));
+        let tick = DoorTickRequest {
+            binary_hash: None,
+            in_flight: Default::default(),
+            window_start: 60,
+            counts: Vec::new(),
+            vouch_until: None,
+            shortens: false,
+            memory_full: Some(note),
+        };
+        assert_eq!(serde_json::to_value(&tick).unwrap()["memory_full"], sent);
+        let room = serde_json::to_value(DoorTickRequest { memory_full: None, ..tick }).unwrap();
+        assert_eq!(room["memory_full"], json!(null));
+        assert_eq!(serde_json::from_value::<DoorTickRequest>(room).unwrap().memory_full, None);
+
+        let claimed = |lost_full: serde_json::Value| {
+            serde_json::from_value::<RunClaimResponse>(json!({
+                "claimed": { "epoch": 2, "attempts": 1, "definition_hash": "h", "cancel_requested": null, "lost_full": lost_full },
+            }))
+            .unwrap()
+            .claimed
+            .expect("claimed")
+            .lost_full
+        };
+        assert_eq!(claimed(sent), Some(note));
+        assert_eq!(claimed(json!(null)), None);
     }
 
     #[test]
@@ -4029,9 +4091,10 @@ pub const ADMIN_DOORS: BrokerCall = BrokerCall { path: "/v1/access/admin/doors",
 /// A key pair for one move of a tenant's connections. Not safe twice: each
 /// call makes a new key.
 pub const ADMIN_MIGRATE_KEY: BrokerCall = BrokerCall { path: "/v1/access/admin/migrate/key", twice: Twice::NotSafe };
-/// A tenant's picked connections, sealed to another install's key. Not
-/// shown harmless twice, so never sent again.
-pub const ADMIN_MIGRATE_EXPORT: BrokerCall = BrokerCall { path: "/v1/access/admin/migrate/export", twice: Twice::NotSafe };
+/// A tenant's picked connections, sealed to another install's key.
+/// Harmless twice: it only reads them (`weft_access_store::migrate::export`),
+/// and a second copy is a second sealing of the same connections.
+pub const ADMIN_MIGRATE_EXPORT: BrokerCall = BrokerCall { path: "/v1/access/admin/migrate/export", twice: Twice::Harmless };
 /// Connections sealed to this install's key, written as the tenant's. Not
 /// safe twice: it writes them.
 pub const ADMIN_MIGRATE_IMPORT: BrokerCall = BrokerCall { path: "/v1/access/admin/migrate/import", twice: Twice::NotSafe };

@@ -917,18 +917,20 @@ mod fs_hashes {
     pub fn load_program_with_diagnostics(
         project: &Project,
     ) -> std::result::Result<(ProjectDefinition, FsCatalog), CompileLoadError> {
-        load_program_in(project, std::sync::Arc::new(weft_catalog::DiskTree))
+        load_program_in(project, std::sync::Arc::new(weft_catalog::DiskTree)).map(|(definition, catalog, _)| (definition, catalog))
     }
 
     /// [`load_program_with_diagnostics`] with every file read from `tree`:
     /// the entry file, the files it includes and reads, and both node
     /// roots. A command reads its project once into a snapshot and
     /// compiles from that, so nothing written to disk meanwhile reaches
-    /// it.
+    /// it. A build compiles this way, and also gets the value of each file
+    /// content the program names ([`crate::compile_program_with_contents`]),
+    /// which its gate reads.
     pub fn load_program_in(
         project: &Project,
         tree: std::sync::Arc<dyn weft_catalog::SourceTree>,
-    ) -> std::result::Result<(ProjectDefinition, FsCatalog), CompileLoadError> {
+    ) -> std::result::Result<(ProjectDefinition, FsCatalog, weft_core::content::ContentValues), CompileLoadError> {
         let main_weft = project.main_weft();
         let source = tree
             .read_to_string(&main_weft)
@@ -939,12 +941,12 @@ mod fs_hashes {
         let src_dir = project.src_dir();
         let reader = crate::file_reader::TreeFileReader::new(tree.as_ref());
         let fs = crate::CompileFs::with_reader(&reader, Some(&project.root)).anchored_at(Some(&src_dir));
-        let mut definition =
-            crate::compile_program(&source, project.id(), fs, &catalog).map_err(CompileLoadError::Diagnostics)?;
+        let (mut definition, contents) =
+            crate::compile_program_with_contents(&source, project.id(), fs, &catalog).map_err(CompileLoadError::Diagnostics)?;
         // What weft.toml says for every run and trigger rides in the
         // program, so a version reads the defaults it was built with.
         definition.defaults = project.manifest.defaults();
-        Ok((definition, catalog))
+        Ok((definition, catalog, contents))
     }
 
     /// Error envelope for the diagnostic-bearing loader. `Read` covers

@@ -181,6 +181,7 @@ fn plan(project: &weft_compiler::project::Project, stock: &weft_compiler::build:
     plan_build_from(
         project,
         &stock.definition,
+        &stock.contents,
         &stock.catalog,
         weft_compiler::CompileFs::disk(&stock.project.root),
         packaging,

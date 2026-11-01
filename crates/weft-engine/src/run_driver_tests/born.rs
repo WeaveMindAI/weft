@@ -193,7 +193,7 @@
     #[tokio::test]
     async fn a_run_born_from_a_plan_runs_to_its_end_without_a_fold() {
         let project = crate::plan::tests::chain();
-        let plan = crate::plan::tests::plan_of(&project, "trig", &Default::default());
+        let plan = crate::plan::tests::plan_of(&project, "trig", &Default::default()).await;
         let Ok(startable) = plan.start.as_ref() else { panic!("a plan that starts") };
         let run_id = weft_core::new_run_id();
         let payload = json!({ "tick": 1 });

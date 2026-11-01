@@ -22,10 +22,15 @@ pub const DEFAULT_CAP_BYTES: u64 = 1 << 30;
 /// The ceiling where the replica's files take its memory
 /// (`Placement::files_take_memory`): a cache of [`DEFAULT_CAP_BYTES`] there
 /// would outgrow the whole replica, which runs out of memory on a build
-/// like any other allocation.
+/// like any other allocation. On Cloud Run the cache shares the in-memory
+/// volume a build writes to, which is sized as a quarter of the
+/// dispatcher's memory for builds plus this cap, so the cache never eats
+/// into a build's quarter.
+// SYNC: IN_MEMORY_CAP_BYTES <-> deploy/terraform/gcp/serverless.tf (the `build` volume's size_limit)
 pub const IN_MEMORY_CAP_BYTES: u64 = 64 << 20;
-// At most a quarter of the least memory a role is given (512Mi).
-const _: () = assert!(IN_MEMORY_CAP_BYTES * 4 <= 512 << 20);
+// That volume (a quarter of the memory plus this cap) leaves at least half
+// of the least memory a role is given (512Mi) to the replica itself.
+const _: () = assert!((512 << 20) / 4 + IN_MEMORY_CAP_BYTES <= (512 << 20) / 2);
 
 #[derive(Debug, Clone)]
 pub struct BlobCache {

@@ -129,11 +129,10 @@ pub async fn list_displays(
         if !token.covers_project(&summary.id) {
             continue;
         }
-        let Some(project) = state
-            .projects
-            .project(summary.id)
+        let Some(crate::state::Registered { program: project, .. }) = state
+            .registered(summary.id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e:#}")))?
         else {
             // Listed a moment ago, gone now (a wipe raced this read).
             continue;
@@ -419,10 +418,10 @@ pub(crate) async fn canonical_display_grants(
             return Err((StatusCode::NOT_FOUND, format!("no such project: {project_id}")));
         }
         let project = state
-            .projects
-            .project(project_id)
+            .registered(project_id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e:#}")))?
+            .map(|registered| registered.program)
             .ok_or((
                 StatusCode::CONFLICT,
                 format!("project {project_id} was removed while this token was being minted"),
@@ -554,10 +553,10 @@ async fn resolve(
         return Err(not_found());
     }
     let project = state
-        .projects
-        .project(id)
+        .registered(id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e:#}")))?
+        .map(|registered| registered.program)
         .ok_or_else(not_found)?;
     let (_, per_instance, kind) = display_for_token(&token, &id, &project, address).ok_or_else(not_found)?;
     // Whose copy the token reads: an instance token reads its instance's copy

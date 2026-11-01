@@ -6,10 +6,13 @@
 //! run row. This loop takes queued runs ([`take`], which also marks each
 //! delivered for a while so no sibling hands it out twice) and calls a
 //! worker for each: `POST /_weft/run/<run_id>` on the project's
-//! workers at the run's image. The worker claims the run (its row goes
-//! `running`, owned by that worker, its epoch raised) and drives it from
-//! its record. A worker that never claims leaves the delivery to run out,
-//! and the run is handed out again.
+//! workers at the run's image, naming the program it runs
+//! (`weft_core::door_fire::RunDelivery`). The worker reads that program,
+//! then claims the run (its row goes `running`, owned by that worker, its
+//! epoch raised) and drives it from its record. A worker that never claims
+//! leaves the delivery to run out, and the run is handed out again; one
+//! that could not read the program or ask for the claim answers so, and
+//! the run is given back as to a worker that answered busy ([`busy`]).
 //!
 //! The call is held open until the worker answers (the run ended or waits
 //! on something outside it), on a task of its own so one run never holds
@@ -22,7 +25,6 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use weft_core::net::EmptyBody;
 use weft_core::RunId;
 use weft_task_store::db::{self, Client, FromRow, Pool, Row};
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
@@ -91,9 +93,11 @@ pub struct Delivery {
     pub run_id: RunId,
     pub project_id: uuid::Uuid,
     pub tenant_id: String,
-    /// The image it runs on; `None` for a run of no program, which no
-    /// worker can claim.
+    /// The image it runs on and the program it runs; both `None` for a
+    /// run of no program, which no worker can claim
+    /// (`run_program_identity_whole`).
     pub binary_hash: Option<String>,
+    pub definition_hash: Option<String>,
 }
 
 impl FromRow for Delivery {
@@ -103,6 +107,7 @@ impl FromRow for Delivery {
             project_id: row.try_get("project_id")?,
             tenant_id: row.try_get("tenant_id")?,
             binary_hash: row.try_get("binary_hash")?,
+            definition_hash: row.try_get("definition_hash")?,
         })
     }
 }
@@ -155,7 +160,7 @@ pub async fn take(pool: &Pool, now: i64, limit: i64) -> anyhow::Result<Vec<Deliv
                         OR (r.unreached >= $4 AND EXISTS (SELECT 1 FROM worker_lease l \
                                                           WHERE l.project_id = r.project_id AND l.alive_since >= r.delivered_until))) \
                  ORDER BY r.started_at LIMIT $3 FOR UPDATE SKIP LOCKED) \
-             RETURNING run_id, project_id, tenant_id, binary_hash",
+             RETURNING run_id, project_id, tenant_id, binary_hash, definition_hash",
             &[&now, &delivery_lease_secs(), &limit, &UNREACHED_TO_STOP],
         )
         .await?)
@@ -215,16 +220,22 @@ pub async fn busy(pool: &Pool, run_id: RunId) -> anyhow::Result<Option<i64>> {
 }
 
 /// What `weft status` shows for a project whose workers answered a run
-/// busy for `secs` seconds.
-fn busy_for_words(secs: i64) -> String {
+/// busy for `secs` seconds, for `with`.
+fn busy_for_words(secs: i64, with: &BusyWith) -> String {
     let lasted = match secs / 60 {
         0 => format!("{secs} seconds"),
         1 => "1 minute".to_string(),
         minutes => format!("{minutes} minutes"),
     };
-    format!(
-        "this project's worker has answered busy for {lasted} (memory full); raise its memory (`weft workers set --memory <size>`)"
-    )
+    match with {
+        BusyWith::Room => format!(
+            "this project's worker has answered busy for {lasted} (memory full); raise its memory (`weft workers set --memory <size>`)"
+        ),
+        BusyWith::Reads(error) => format!(
+            "this project's worker has answered busy for {lasted}: it could not read the run's program or files from the store, \
+             or claim it from the broker: {error}"
+        ),
+    }
 }
 
 /// Count one more refusal of a queued run by its workers: it is given back
@@ -416,7 +427,7 @@ async fn deliver(state: &DispatcherState, delivery: Delivery) {
     // What this side reads and writes around the call is work: the
     // database is listened to for it, and only for it.
     let busy = state.signals.busy().await;
-    let Some(binary_hash) = &delivery.binary_hash else {
+    let (Some(binary_hash), Some(definition_hash)) = (&delivery.binary_hash, &delivery.definition_hash) else {
         if let Err(e) = end_undeliverable(state, run_id, "it runs no program").await {
             tracing::error!(target: "weft_dispatcher::delivery", %run_id, error = %format!("{e:#}"), "could not end an undeliverable run; its delivery runs out and it is tried again");
         }
@@ -432,26 +443,30 @@ async fn deliver(state: &DispatcherState, delivery: Delivery) {
             return;
         }
         Err(e) => Err(e),
-        Ok(target) => run_on_worker(state, &target, run_id).await,
+        Ok(target) => run_on_worker(state, &target, run_id, definition_hash).await,
     };
-    match outcome {
-        Ok(weft_core::door_fire::RunAnswer::Failed { error }) => tracing::warn!(
-            target: "weft_dispatcher::delivery",
-            %run_id,
-            %error,
-            "the worker's drive of the run failed"
-        ),
-        Ok(answer) => tracing::debug!(target: "weft_dispatcher::delivery", %run_id, ?answer, "worker answered"),
-        Err(e) => {
-            let _busy = state.signals.busy().await;
-            // The worker may have claimed the run before the call broke:
-            // whether it went away with it is for the `lapses` loop to
-            // notice, once the grace the claim gave it runs out.
-            crate::lapses::book_after_or_log(state, crate::worker_door::lost_margin_secs() * 2).await;
-            if let Err(e) = hand_back(state, &delivery, &e).await {
-                tracing::warn!(target: "weft_dispatcher::delivery", %run_id, error = %format!("{e:#}"), "could not give the delivery back; it is made again once its lease runs out");
-            }
+    let not_taken = match outcome {
+        Ok(weft_core::door_fire::RunAnswer::Failed { error }) => {
+            tracing::warn!(target: "weft_dispatcher::delivery", %run_id, %error, "the worker's drive of the run failed");
+            return;
         }
+        Ok(weft_core::door_fire::RunAnswer::NotNow { error }) => {
+            WorkerBusy { why: format!("the worker could not carry the run on now: {error}"), with: BusyWith::Reads(error) }.into()
+        }
+        Ok(answer) => {
+            tracing::debug!(target: "weft_dispatcher::delivery", %run_id, ?answer, "worker answered");
+            return;
+        }
+        Err(e) => e,
+    };
+    let _busy = state.signals.busy().await;
+    // The worker may have claimed the run before the call broke, or
+    // before the answer to its claim was lost: whether it went away with
+    // it is for the `lapses` loop to notice, once the grace the claim gave
+    // it runs out.
+    crate::lapses::book_after_or_log(state, crate::worker_door::lost_margin_secs() * 2).await;
+    if let Err(e) = hand_back(state, &delivery, &not_taken).await {
+        tracing::warn!(target: "weft_dispatcher::delivery", %run_id, error = %format!("{e:#}"), "could not give the delivery back; it is made again once its lease runs out");
     }
 }
 
@@ -463,7 +478,10 @@ async fn deliver(state: &DispatcherState, delivery: Delivery) {
 /// too busy now is up: the run waits a growing pause and counts no try
 /// ([`busy`]), and once the workers answered it busy for the install's
 /// alert delay (`DispatcherState::alert_after_secs`) that is written down
-/// for `weft status` on each try. A refusal (the worker, the platform or
+/// for `weft status` on each try. So does a worker that could not carry
+/// it on now ([`BusyWith::Reads`]), up but unable to read the run's
+/// program or files or to claim it: that one is written down on every
+/// try, with its error, since no worker ever answers it in normal work. A refusal (the worker, the platform or
 /// the project's worker settings said no) waits a little longer each
 /// time, and the last one ends the run naming who refused it. Anything
 /// else (no answer, this side's own read failing) waits the same way and
@@ -493,9 +511,9 @@ async fn hand_back(state: &DispatcherState, delivery: &Delivery, e: &anyhow::Err
             );
             wait_for_worker(&state.pg_pool, run_id).await
         }
-        GiveBack::WorkerBusy => {
+        GiveBack::WorkerBusy(with) => {
             let Some(busy_for) = busy(&state.pg_pool, run_id).await? else { return Ok(()) };
-            if busy_for < state.alert_after_secs {
+            if busy_for < state.alert_after_secs && with == BusyWith::Room {
                 tracing::debug!(
                     target: "weft_dispatcher::delivery",
                     %run_id,
@@ -518,7 +536,7 @@ async fn hand_back(state: &DispatcherState, delivery: &Delivery, e: &anyhow::Err
             // the install's alert delay counts from the first busy answer.
             // A stretch a sibling replica's clock puts in the future began now.
             let lasted = std::time::Duration::from_secs(busy_for.max(0).unsigned_abs());
-            weft_task_store::unanswered::failed_for(&state.pg_pool, workers, None, &busy_for_words(busy_for), lasted).await?.log();
+            weft_task_store::unanswered::failed_for(&state.pg_pool, workers, None, &busy_for_words(busy_for, &with), lasted).await?.log();
             Ok(())
         }
         GiveBack::Refused(by) => {
@@ -601,7 +619,7 @@ pub async fn queued_on_build(pool: &Pool, project: uuid::Uuid, binary_hash: Opti
 #[derive(Debug, PartialEq, Eq)]
 enum GiveBack {
     WorkerStarting,
-    WorkerBusy,
+    WorkerBusy(BusyWith),
     Refused(RefusedBy),
     WontStart,
     NotDelivered,
@@ -613,8 +631,8 @@ impl GiveBack {
             GiveBack::WorkerStarting
         } else if weft_platform_traits::WorkerWontStart::is(e) {
             GiveBack::WontStart
-        } else if e.downcast_ref::<WorkerBusy>().is_some() {
-            GiveBack::WorkerBusy
+        } else if let Some(busy) = e.downcast_ref::<WorkerBusy>() {
+            GiveBack::WorkerBusy(busy.with.clone())
         } else if let Some(refusal) = e.downcast_ref::<Refusal>() {
             GiveBack::Refused(refusal.by)
         } else if weft_platform_traits::runner::PlatformRefused::is(e) {
@@ -654,12 +672,26 @@ impl std::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-/// The worker answered that it cannot take the run now (its memory nearly
-/// full, or it is stopping): it is up, and will have room once its runs
-/// leave it or the platform adds a copy.
+/// The worker answered that it cannot take the run now, `with` saying
+/// why: it is up, and the run is tried again after a pause ([`busy`]).
 #[derive(Debug)]
 struct WorkerBusy {
     why: String,
+    with: BusyWith,
+}
+
+/// Why a worker that is up could not take a run now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BusyWith {
+    /// Its memory nearly full, or it is stopping (its own busy `503`,
+    /// `weft_engine::busy`): it has room once its runs leave it or the
+    /// platform adds a copy.
+    Room,
+    /// It could not read the run's program or files from the store, or
+    /// claim the run from the broker, and claimed nothing
+    /// ([`weft_core::door_fire::RunAnswer::NotNow`]), with its error: it
+    /// takes the run once they answer again.
+    Reads(String),
 }
 
 impl std::fmt::Display for WorkerBusy {
@@ -701,12 +733,14 @@ impl NotTaken {
     }
 }
 
-/// Call the project's workers for one run and hold the call until the
-/// worker answers.
+/// Call the project's workers for one run, which runs the program
+/// `definition_hash` names, and hold the call until the worker answers.
+// SYNC: the run call <-> weft_core::door_fire::RunDelivery, crates/weft-engine/src/worker.rs (run_handler)
 async fn run_on_worker(
     state: &DispatcherState,
     target: &weft_platform_traits::WorkerTarget,
     run_id: RunId,
+    definition_hash: &str,
 ) -> anyhow::Result<weft_core::door_fire::RunAnswer> {
     // The platform refusing to give an address (permission denied, a
     // quota, an invalid request) is a no, kept typed through the context;
@@ -724,7 +758,7 @@ async fn run_on_worker(
         .http
         .post(format!("{}/_weft/run/{run_id}", endpoint.base_url.trim_end_matches('/')))
         .header(weft_platform_traits::WORKER_AUTH_HEADER, endpoint.auth_value())
-        .empty_body()
+        .json(&weft_core::door_fire::RunDelivery { definition_hash: definition_hash.to_string() })
         .send()
         .await
         .map_err(|e| {
@@ -738,7 +772,7 @@ async fn run_on_worker(
         let body = resp.text().await.unwrap_or_else(|e| format!("(its body could not be read: {e})"));
         let at = &endpoint.base_url;
         return Err(match NotTaken::of(call) {
-            NotTaken::WorkerBusy => WorkerBusy { why: format!("the worker at {at} is busy ({status}): {body}") }.into(),
+            NotTaken::WorkerBusy => WorkerBusy { why: format!("the worker at {at} is busy ({status}): {body}"), with: BusyWith::Room }.into(),
             NotTaken::WorkerRefused => Refusal { by: RefusedBy::Worker, why: format!("the worker answered {status}: {body}") }.into(),
             NotTaken::PlatformRefused if call.platform_refused() => Refusal {
                 by: RefusedBy::Platform,
@@ -773,8 +807,12 @@ mod tests {
     fn a_refusal_is_told_apart_from_a_worker_starting_and_from_no_answer() {
         let starting = anyhow::Error::new(weft_platform_traits::WorkerStarting { what: "w".into() }).context("endpoint");
         assert_eq!(GiveBack::of(&starting), GiveBack::WorkerStarting, "found through a context");
-        let busy = anyhow::Error::new(super::WorkerBusy { why: "the worker at http://w is busy".into() }).context("deliver");
-        assert_eq!(GiveBack::of(&busy), GiveBack::WorkerBusy, "found through a context");
+        let busy = anyhow::Error::new(super::WorkerBusy { why: "the worker at http://w is busy".into(), with: super::BusyWith::Room })
+            .context("deliver");
+        assert_eq!(GiveBack::of(&busy), GiveBack::WorkerBusy(super::BusyWith::Room), "found through a context");
+        let reads = super::BusyWith::Reads("the store did not answer".into());
+        let not_now = anyhow::Error::new(super::WorkerBusy { why: "could not carry it on now".into(), with: reads.clone() });
+        assert_eq!(GiveBack::of(&not_now), GiveBack::WorkerBusy(reads), "a worker that could not carry the run on now is busy, never unreached");
         let refused = anyhow::Error::new(super::Refusal { by: RefusedBy::Worker, why: "the worker answered 500".into() }).context("deliver");
         assert_eq!(GiveBack::of(&refused), GiveBack::Refused(RefusedBy::Worker), "found through a context");
         let platform = anyhow::Error::new(weft_platform_traits::runner::PlatformRefused { why: "Google answered 403".into() })
@@ -819,10 +857,21 @@ mod tests {
     /// the unit a person reads, and what to do about it.
     #[test]
     fn a_busy_worker_is_shown_with_how_long_and_what_to_raise() {
-        assert!(super::busy_for_words(30).contains("answered busy for 30 seconds (memory full); raise its memory"));
-        assert!(super::busy_for_words(90).contains("for 1 minute (memory full)"));
-        assert!(super::busy_for_words(7 * 60 + 5).contains("for 7 minutes (memory full)"));
-        assert!(super::busy_for_words(300).contains("`weft workers set --memory <size>`"));
+        let room = super::BusyWith::Room;
+        assert!(super::busy_for_words(30, &room).contains("answered busy for 30 seconds (memory full); raise its memory"));
+        assert!(super::busy_for_words(90, &room).contains("for 1 minute (memory full)"));
+        assert!(super::busy_for_words(7 * 60 + 5, &room).contains("for 7 minutes (memory full)"));
+        assert!(super::busy_for_words(300, &room).contains("`weft workers set --memory <size>`"));
+    }
+
+    /// A worker that could not carry a run on now is shown busy with the
+    /// reason and its last error, never as memory.
+    #[test]
+    fn a_worker_that_could_not_read_a_run_is_shown_busy_with_its_error() {
+        let words = super::busy_for_words(90, &super::BusyWith::Reads("the bucket answered 503".into()));
+        assert!(words.contains("answered busy for 1 minute: it could not read the run's program or files from the store"), "{words}");
+        assert!(words.ends_with("or claim it from the broker: the bucket answered 503"), "{words}");
+        assert!(!words.contains("memory"), "{words}");
     }
 
     /// The cause a refused run ends with names who refused it.

@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use weft_core::activation::{ActivateRequest, ActivateResponse, ActivationUrl, BakeRequest};
 use weft_core::deactivation::{DeactivateRequest, DeactivateResponse, ResyncAnswer, ResyncRequest};
-use weft_core::projects::{DeclareRequest, InstanceInfraEntry, LimitedEntry, ProjectInfraEntry, ProjectStatusResponse, ProjectSummary, StatusQuery};
+use weft_core::projects::{DeclareRequest, InstanceInfraEntry, LimitedEntry, ProjectInfraEntry, ProjectStatusResponse, ProjectSummary, StatusRequest};
 use weft_core::take_down::ReleaseHeld;
 use weft_core::infra::wire::{INFRA_NOT_STARTED, INFRA_PER_INSTANCE};
 use weft_core::frames::Located;
@@ -328,7 +328,7 @@ pub(crate) async fn coherent_definition(
                 StatusCode::PRECONDITION_FAILED,
                 format!(
                     "project {id} has no production code identity; build it (`weft build`, or any \
-                     verb that runs it) before starting a run"
+                     verb that runs it) first"
                 ),
             )
         })?;
@@ -1049,11 +1049,11 @@ async fn given_up_resync_left_down(
         return Ok(None);
     }
     let project = state
-        .projects
-        .project(project_id)
+        .registered(project_id)
         .await
         .map_err(|e| internal("the project", e))?
-        .ok_or_else(|| internal("the project", anyhow::anyhow!("project {project_id} has no registered program")))?;
+        .ok_or_else(|| internal("the project", anyhow::anyhow!("project {project_id} has no registered program")))?
+        .program;
     let down = given_up.still_down(&project);
     if down.is_empty() {
         return Ok(None);
@@ -1142,14 +1142,14 @@ impl IntoResponse for StatusError {
 }
 
 
-/// `GET /projects/{id}/status` (`weft status`): see [`project_actions::status`].
+/// `POST /projects/{id}/status` (`weft status`): see [`project_actions::status`].
 pub async fn status(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
-    axum::extract::Query(query): axum::extract::Query<StatusQuery>,
+    Json(request): Json<StatusRequest>,
 ) -> Result<Json<ProjectStatusResponse>, StatusError> {
-    Ok(Json(project_actions::status(&state, &operator(caller), id, &query).await?))
+    Ok(Json(project_actions::status(&state, &operator(caller), id, &request).await?))
 }
 
 /// `GET /projects/{id}/instances` (`weft instances`): every instance weft
@@ -1165,7 +1165,7 @@ pub async fn instances(
 
 /// What the program as it is now holds, that a trigger on and an infra
 /// copy are compared with to tell whether they are behind it: the hashes
-/// the caller computed from its source (`StatusQuery`), each left out read
+/// the caller computed from its source (`StatusRequest`), each left out read
 /// off the build registered last.
 pub(crate) struct Desired {
     pub binary: Option<String>,
@@ -1173,81 +1173,72 @@ pub(crate) struct Desired {
     /// way is current.
     pub full_binary: Option<String>,
     pub definition: Option<String>,
-    /// Each trigger's cut fingerprint, by address: `None` for a trigger
-    /// the program has whose cut cannot be walked (it needs a part that
-    /// does not compile), which no trigger on was set up from, so one on
-    /// is behind and bringing it up is refused, saying why.
+    /// Every trigger of the program as it is now, by address, with its cut
+    /// fingerprint: `None` for one whose cut cannot be walked (it needs a
+    /// part that does not compile), which no trigger on was set up from,
+    /// so one on is behind and bringing it up is refused, saying why. A
+    /// trigger absent is one the program has no more: nothing to bring it
+    /// up to, and its entry says it is gone.
     pub trigger_cuts: std::collections::BTreeMap<String, Option<String>>,
-    /// Each infra place's hash, by place; empty when neither the caller nor
-    /// the registered build named them.
-    pub infra_places: std::collections::BTreeMap<String, String>,
+    /// Each infra place's hash, by place: `None` for a place the registered
+    /// build has and a source the caller compiled has no more, so a copy of
+    /// it is an orphan ([`Self::infra_orphaned`]). Empty when neither the
+    /// caller nor the registered build named them.
+    pub infra_places: std::collections::BTreeMap<String, Option<String>>,
 }
 
 impl Desired {
-    /// The registered build, as it is.
+    /// The registered build, as it is: its trigger cuts as its
+    /// registration walked them.
     pub(crate) async fn registered(
         state: &DispatcherState,
         id: uuid::Uuid,
-        project: &ProjectDefinition,
+        registered: &crate::state::Registered,
         binary_hash: Option<&str>,
-        definition_hash: Option<&str>,
     ) -> Result<Self, (StatusCode, String)> {
+        let definition_hash = registered.definition_hash.as_deref();
         Ok(Self {
             binary: binary_hash.map(str::to_string),
             full_binary: None,
             definition: definition_hash.map(str::to_string),
-            trigger_cuts: weft_core::run_spec::trigger_cuts(project)
-                .into_iter()
-                .map(|(trigger, cut)| (trigger, cut.ok().map(|cut| cut.fingerprint)))
-                .collect(),
+            trigger_cuts: weft_core::run_spec::trigger_fingerprints(&*state.trigger_cuts(id, registered).await.map_err(cuts_refused)?),
             infra_places: match definition_hash {
                 Some(hash) => state
                     .projects
                     .infra_places(id, hash)
                     .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the build's infra places: {e:#}")))?,
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the build's infra places: {e:#}")))?
+                    .into_iter()
+                    .map(|(place, hash)| (place, Some(hash)))
+                    .collect(),
                 None => Default::default(),
             },
         })
     }
 
-    /// The hashes `query` names, the registered build's for the rest: each
-    /// trigger's and each place's on its own, so one the client could not
-    /// work out (a cut that cannot be walked) is read off the registered
-    /// build rather than taken as absent.
-    pub(crate) async fn of_query(
-        state: &DispatcherState,
-        id: uuid::Uuid,
-        project: &ProjectDefinition,
-        query: &StatusQuery,
-        binary_hash: Option<&str>,
-        definition_hash: Option<&str>,
-    ) -> Result<Self, (StatusCode, String)> {
-        let registered = Self::registered(state, id, project, binary_hash, definition_hash).await?;
-        Ok(Self {
-            binary: query.desired_binary_hash.clone().or(registered.binary),
-            full_binary: query.desired_full_binary_hash.clone(),
-            definition: query.desired_definition_hash.clone().or(registered.definition),
-            trigger_cuts: Self::named_over(registered.trigger_cuts, query.desired_trigger_cuts.as_deref(), "desiredTriggerCuts", Some)?,
-            infra_places: Self::named_over(registered.infra_places, query.desired_infra_places.as_deref(), "desiredInfraPlaces", |hash| hash)?,
-        })
-    }
-
-    /// The registered build's hashes by name, each the query named
-    /// (`encoded`, the `what` parameter, each hash read by `read`) put in
-    /// its place: one the client left out is the registered one.
-    fn named_over<T>(
-        registered: std::collections::BTreeMap<String, T>,
-        encoded: Option<&str>,
-        what: &str,
-        read: impl Fn(String) -> T,
-    ) -> Result<std::collections::BTreeMap<String, T>, (StatusCode, String)> {
-        let mut merged = registered;
-        if let Some(encoded) = encoded {
-            let named = weft_core::projects::NamedHashes::decode(encoded).map_err(|e| (StatusCode::BAD_REQUEST, format!("{what}: {e}")))?;
-            merged.extend(named.0.into_iter().map(|(name, hash)| (name, read(hash))));
+    /// The registered build's (this, from [`Self::registered`]) as
+    /// `request` asks: each hash it names in place of the registered one.
+    /// Its triggers and its infra places, when it names them (the source
+    /// compiled), are the whole of the source's: a trigger the source has
+    /// no more is gone from the program, and a place it has no more leaves
+    /// its copies orphaned. When it names none, the registered build's
+    /// stand.
+    pub(crate) fn requested_by(self, request: &StatusRequest) -> Self {
+        let trigger_cuts = request.desired_trigger_cuts.clone().unwrap_or(self.trigger_cuts);
+        let infra_places = match &request.desired_infra_places {
+            None => self.infra_places,
+            Some(source) => {
+                let gone = self.infra_places.into_keys().filter(|place| !source.contains_key(place));
+                gone.map(|place| (place, None)).chain(source.iter().map(|(place, hash)| (place.clone(), Some(hash.clone())))).collect()
+            }
+        };
+        Self {
+            binary: request.desired_binary_hash.clone().or(self.binary),
+            full_binary: request.desired_full_binary_hash.clone(),
+            definition: request.desired_definition_hash.clone().or(self.definition),
+            trigger_cuts,
+            infra_places,
         }
-        Ok(merged)
     }
 
     /// Whether a worker built from `have` runs other code than this.
@@ -1278,13 +1269,57 @@ impl Desired {
         cut_moved || code_moved
     }
 
+    /// The triggers on, of `activations`, that stay [`Self::behind`] once
+    /// `moving` come on on this build, by owner.
+    pub(crate) fn left_behind(
+        &self,
+        activations: &[crate::activation_store::Activation],
+        moving: &[weft_core::activation::ActivationKey],
+    ) -> Vec<weft_core::activation::OwnerTriggers> {
+        let behind: Vec<weft_core::activation::ActivationKey> =
+            activations.iter().filter(|a| !moving.contains(&a.key) && self.behind(a)).map(|a| a.key.clone()).collect();
+        weft_core::activation::by_owner(&behind)
+    }
+
     /// Whether a copy applied from `applied` (its place's hash, `None`
     /// when it was applied before hashes were recorded) is behind `place`.
+    /// A copy of a place the source has no more is orphaned instead.
     pub(crate) fn infra_behind(&self, place: &str, applied: Option<&str>) -> bool {
-        self.infra_places.get(place).is_some_and(|want| applied != Some(want.as_str()))
+        matches!(self.infra_places.get(place), Some(Some(want)) if applied != Some(want.as_str()))
+    }
+
+    /// Whether `place` is one the registered build has and the source the
+    /// caller compiled has no more, so a live copy of it is an orphan.
+    pub(crate) fn infra_orphaned(&self, place: &str) -> bool {
+        matches!(self.infra_places.get(place), Some(None))
     }
 }
 
+
+/// The program project `id` runs now (`DispatcherState::registered`), or
+/// the refusal when there is no such project.
+pub(crate) async fn registered_program(state: &DispatcherState, id: uuid::Uuid) -> Result<crate::state::Registered, (StatusCode, String)> {
+    state
+        .registered(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e:#}")))?
+        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))
+}
+
+/// The program `coherent_definition` read (`program`, `project`) as
+/// the registered build a verb is checked against (`require_action`): the
+/// build the verb then runs, so one read serves the check and the work.
+pub(crate) fn as_registered(
+    program: &weft_core::project::hash::ProgramIdentity,
+    project: &std::sync::Arc<ProjectDefinition>,
+) -> crate::state::Registered {
+    crate::state::Registered { definition_hash: Some(program.definition_hash.clone()), program: project.clone() }
+}
+
+/// A failure to read a version's trigger cuts, as an answer.
+pub(crate) fn cuts_refused(e: anyhow::Error) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("the build's trigger cuts: {e:#}"))
+}
 
 /// What each activation's door and queue did with what arrived, by
 /// activation: the work it holds while down, the fires waiting in its
@@ -1312,6 +1347,7 @@ impl TriggerTraffic {
 /// `TriggerEntry`), then the activations of triggers it has no more.
 pub(crate) fn trigger_entries(
     project: &ProjectDefinition,
+    cuts: &weft_core::run_spec::TriggerCuts,
     activations: &[crate::activation_store::Activation],
     traffic: &TriggerTraffic,
     desired: &Desired,
@@ -1374,12 +1410,14 @@ pub(crate) fn trigger_entries(
             TriggerEntry {
                 node: node.clone(),
                 per_instance,
-                gone: false,
+                // The registered build has it and the source the caller
+                // compiled has it no more.
+                gone: !desired.trigger_cuts.contains_key(node),
                 shared: (!per_instance).then(|| shared.map(copy).unwrap_or_else(never_on)),
                 copies: rows.iter().copied().filter(|a| a.key.instance().is_some()).map(copy).collect(),
                 depends_on: match shared {
-                    Some(shared) => crate::infra_reach::depends_on(shared, project),
-                    None => weft_core::run_spec::trigger_cut(project, node).map(|cut| cut.depends_on).unwrap_or_default(),
+                    Some(shared) => crate::infra_reach::depends_on(shared, cuts),
+                    None => crate::infra_reach::registered_depends_on(cuts, node),
                 },
             }
         })
@@ -1414,6 +1452,7 @@ pub(crate) fn trigger_entries(
 /// rollup) so the infra controls never vanish while it lives.
 pub(crate) fn infra_entries(
     project: &ProjectDefinition,
+    cuts: &weft_core::run_spec::TriggerCuts,
     copies: &crate::infra_node::ObservedCopies,
     activations: &[crate::activation_store::Activation],
     desired: &Desired,
@@ -1430,7 +1469,7 @@ pub(crate) fn infra_entries(
     let takes_down = |place: &str, copies: weft_core::instance::Copies| -> Vec<weft_core::activation::OwnerTriggers> {
         let reach = crate::infra_reach::InfraReach { places: std::collections::BTreeSet::from([place.to_string()]), copies };
         let keys: Vec<weft_core::activation::ActivationKey> =
-            crate::infra_reach::activations_reached(&reach, &up, project).into_iter().map(|a| a.key.clone()).collect();
+            crate::infra_reach::activations_reached(&reach, &up, cuts).into_iter().map(|a| a.key.clone()).collect();
         weft_core::activation::by_owner(&keys)
     };
     let mut instance_infra: Vec<InstanceInfraEntry> = copies
@@ -1443,6 +1482,7 @@ pub(crate) fn infra_entries(
                 status: row.status.as_str().to_string(),
                 progress: copies.progress_of(&row.node_id, row.instance.as_ref()),
                 behind: desired.infra_behind(&row.node_id, row.source_hash.as_deref()),
+                orphaned: desired.infra_orphaned(&row.node_id),
                 last_restart: row.last_restart(),
             })
         })
@@ -1453,6 +1493,7 @@ pub(crate) fn infra_entries(
                 status: crate::infra_node::InfraNodeStatus::Provisioning.as_str().to_string(),
                 progress: copies.progress_of(node, instance.as_ref()),
                 behind: false,
+                orphaned: false,
                 last_restart: None,
             })
         }))
@@ -1473,6 +1514,7 @@ pub(crate) fn infra_entries(
             instance_copy_count: None,
             progress: None,
             behind: false,
+            orphaned: false,
             takes_down: Vec::new(),
             last_restart: None,
         };
@@ -1493,6 +1535,7 @@ pub(crate) fn infra_entries(
                 failure_message: row.failure_message.clone(),
                 progress: copies.progress_of(&spelled, None),
                 behind: desired.infra_behind(&spelled, row.source_hash.as_deref()),
+                orphaned: desired.infra_orphaned(&spelled),
                 takes_down,
                 last_restart: row.last_restart(),
                 ..entry(row.status.as_str().to_string())
@@ -1763,6 +1806,7 @@ fn infra_standing(project: &ProjectDefinition, observed: &crate::infra_node::Obs
 pub(crate) async fn require_action(
     state: &DispatcherState,
     id: uuid::Uuid,
+    registered: &crate::state::Registered,
     verbs: &[&str],
 ) -> Result<ActionSnapshot, (StatusCode, String)> {
     // A project `weft rm` marked takes no verb, said in its own words
@@ -1774,17 +1818,10 @@ pub(crate) async fn require_action(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get project: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?
         .unless_removing()?;
-    let project = state
-        .projects
-        .project(id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
     let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("running hashes: {e:#}"));
     let binary_hash = state.projects.running_binary_hash(id).await.map_err(internal)?;
-    let definition_hash = state.projects.running_definition_hash(id).await.map_err(internal)?;
-    let desired = Desired::registered(state, id, &project, binary_hash.as_deref(), definition_hash.as_deref()).await?;
-    let snapshot = gather_action_snapshot(state, id, &project, &desired).await?;
+    let desired = Desired::registered(state, id, registered, binary_hash.as_deref()).await?;
+    let snapshot = gather_action_snapshot(state, id, &registered.program, &desired).await?;
     // The registered definition lags the source the moment a person
     // edits it, and a verb's own handler checks the infra against the
     // definition it builds (`require_trigger_infra`, `versions::run`'s
@@ -2501,7 +2538,7 @@ async fn activate_trigger_setup_window(
     // Each trigger's cut, recorded with the code its listeners fire: what
     // tells whether it is behind, and what an infra command takes down
     // with it.
-    let cuts = trigger_cuts_of(project, keys).map_err(unstick)?;
+    let cuts = trigger_cuts_of(state, id, program, keys).await.map_err(unstick)?;
     let recorded = state
         .activations
         .record_activation_source(id, activation, &bake.program, &bake.source_version, &cuts)
@@ -2670,21 +2707,47 @@ async fn armed_already(
     Ok((claimed, already))
 }
 
-/// Each of `keys`' trigger's cut in `project`, by trigger, as its
-/// activation records it.
-fn trigger_cuts_of(
-    project: &ProjectDefinition,
+/// Each of `keys`' trigger's cut in the registered build `program` names,
+/// by trigger, as its activation records it: the cuts its registration
+/// walked.
+async fn trigger_cuts_of(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    program: &weft_core::project::hash::ProgramIdentity,
     keys: &[weft_core::activation::ActivationKey],
 ) -> Result<std::collections::BTreeMap<String, crate::activation_store::RecordedCut>, (StatusCode, String)> {
+    let cuts = state.version_cuts(id, &program.definition_hash).await.map_err(cuts_refused)?;
     keys.iter()
-        .map(|key| {
-            weft_core::run_spec::trigger_cut(project, &key.trigger)
-                .map(|cut| (key.trigger.clone(), cut.into()))
-                .map_err(|why| (StatusCode::BAD_REQUEST, format!("the cut of trigger {key}: {why}")))
+        .map(|key| match cuts.get(&key.trigger) {
+            Some(Ok(cut)) => Ok((key.trigger.clone(), cut.clone().into())),
+            Some(Err(why)) => Err((StatusCode::BAD_REQUEST, format!("the cut of trigger {key}: {why}"))),
+            None => Err((StatusCode::BAD_REQUEST, format!("the cut of trigger {key}: the registered build has no trigger '{}'", key.trigger))),
         })
         .collect()
 }
 
+
+/// The triggers on, of `activations`, that stay behind the registered
+/// build `program` names once `moving` come on on it
+/// ([`Desired::behind`], read off the cuts its registration walked), by
+/// owner.
+async fn left_behind(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    program: &weft_core::project::hash::ProgramIdentity,
+    activations: &[crate::activation_store::Activation],
+    moving: &[weft_core::activation::ActivationKey],
+) -> Result<Vec<weft_core::activation::OwnerTriggers>, ActivateError> {
+    let cuts = state.version_cuts(id, &program.definition_hash).await.map_err(cuts_refused)?;
+    let desired = Desired {
+        binary: Some(program.binary_hash.clone()),
+        full_binary: None,
+        definition: Some(program.definition_hash.clone()),
+        trigger_cuts: weft_core::run_spec::trigger_fingerprints(&cuts),
+        infra_places: Default::default(),
+    };
+    Ok(desired.left_behind(activations, moving))
+}
 
 /// Why [`activate_with`] did not activate.
 #[derive(Debug)]
@@ -2861,6 +2924,13 @@ pub(crate) async fn activate_with(
     let ActivateRequest { build, scope, held, port } = request;
     let activations = state.activations.list(id).await.map_err(|e| ActivateError::failed("activations", e))?;
     let carried = activations.iter().any(|a| a.driver_task == Some(claim.task()));
+    // One coherent (hash, shape) pair for everything below: the check
+    // against the reconciliation, the trigger checks here AND the kicks
+    // the activate window computes must come from the definition recorded
+    // under the hash that trigger-setup will journal (see
+    // `coherent_definition`).
+    let (program, project) = coherent_definition(state, id).await?;
+    let registered = as_registered(&program, &project);
     // Enforce against the reconciliation: a build or a resync in flight,
     // triggers being switched on, infra changing, a project `weft rm`
     // marked refuse it here. The table is the shared triggers' (an
@@ -2873,7 +2943,7 @@ pub(crate) async fn activate_with(
     // checked again, below, once its plan says so.
     let checks_table = matches!(asker, ActivateAsker::Outside) && scope.instances.is_shared();
     if checks_table && !carried {
-        require_action(state, id, &["activate"]).await?;
+        require_action(state, id, &registered, &["activate"]).await?;
     }
     // Every trigger an activate switches on is checked for a setup or a
     // fire that could never run, whoever asks (a person, a program's run,
@@ -2893,12 +2963,6 @@ pub(crate) async fn activate_with(
     // hashes named here only check the caller means that build.
     require_registered_build(state, id, &build).await?;
 
-    // One coherent (hash, shape) pair for everything below: the
-    // trigger checks here AND the kicks the activate window computes
-    // must come from the definition recorded under the hash that
-    // trigger-setup will journal (see `coherent_definition`).
-    let (program, project) = coherent_definition(state, id).await?;
-
     // Activate is the trigger-setup verb. A program without a trigger
     // for this owner has nothing to register; refuse loudly so the CLI /
     // extension / program knows the verb doesn't apply.
@@ -2913,7 +2977,7 @@ pub(crate) async fn activate_with(
     let keys = resolve_scope_to_turn_on(state, id, &project, &scope).await?;
     let plan = plan_activation(keys, &activations, claim.task(), rearm.is_some());
     if checks_table && carried && !plan.claim.is_empty() {
-        require_action(state, id, &["activate"]).await?;
+        require_action(state, id, &registered, &["activate"]).await?;
     }
     if plan.is_empty() {
         // Nothing to turn on is no error: CI runs this on every deploy.
@@ -2921,6 +2985,7 @@ pub(crate) async fn activate_with(
         // it, is said all the same: the front is never moved onto a build
         // the triggers on do not fire.
         return Ok(Json(ActivateResponse {
+            behind: left_behind(state, id, &program, &activations, &[]).await?,
             per_instance_left_out: scope.per_instance_left_out(&project),
             address: project_address(state, id).await,
             broken: project.broken.clone(),
@@ -2933,6 +2998,11 @@ pub(crate) async fn activate_with(
     // checked then.
     let units = plan.units();
     let moving: Vec<weft_core::activation::ActivationKey> = units.iter().flat_map(|unit| unit.keys.iter().cloned()).collect();
+    // The triggers on that this leaves behind the registered build (their
+    // fires run older code or an older cut), read now, before anything
+    // moves: past the Active flip nothing may fail the call. The ones it
+    // turns on come on on the registered build.
+    let behind = left_behind(state, id, &program, &activations, &moving).await?;
     let elsewhere = on_another_binary(&activations, &moving, &program.binary_hash);
     if !plan.claim.is_empty() && !elsewhere.is_empty() {
         return Err(ActivateError::Failed(StatusCode::CONFLICT, on_another_binary_refusal(&elsewhere)));
@@ -2984,6 +3054,7 @@ pub(crate) async fn activate_with(
         format!("infra not running: {listed}. Activating does not start it; if anything uses it, run {fix}.")
     });
     answer.per_instance_left_out = scope.per_instance_left_out(&project);
+    answer.behind = behind;
     // The program the project now runs answers its callers at the
     // project's own address, straight (`crate::front`).
     answer.address = crate::front::serve_or_log(state, id, port).await;
@@ -3695,18 +3766,17 @@ pub(crate) async fn resync_take_down_owner(
     // with the builds they fire and their entry tokens, before they come
     // down, so a run of the task again brings back exactly these, never
     // one that was off, and waits for exactly their runs.
-    let registered = state
-        .projects
-        .project(id)
+    let loaded = state
+        .registered(id)
         .await
         .map_err(failing("project"))?
         .ok_or_else(|| Halt::from((StatusCode::NOT_FOUND, "project not found".to_string())))?;
+    let registered = &*loaded.program;
     // Against the registered build, its own hashes beside its own cuts:
     // what the setup brings them to (the request's build is checked
     // against it as they come back on).
     let binary_hash = state.projects.running_binary_hash(id).await.map_err(failing("running hashes"))?;
-    let definition_hash = state.projects.running_definition_hash(id).await.map_err(failing("running hashes"))?;
-    let desired = Desired::registered(state, id, &registered, binary_hash.as_deref(), definition_hash.as_deref()).await.map_err(Halt::from)?;
+    let desired = Desired::registered(state, id, &loaded, binary_hash.as_deref()).await.map_err(Halt::from)?;
     let still_on: Vec<&crate::activation_store::Activation> = owner
         .on
         .iter()
@@ -3770,7 +3840,7 @@ pub(crate) async fn resync_take_down_owner(
     // record does not fit that cut fails, saying so, when it resumes.
     if take_down.held == weft_core::take_down::Held::Keep && !owner.down.is_empty() {
         plan.moved_runs +=
-            move_paused_runs(state, id, &registered, &owner.keys(&owner.down)).await.map_err(failing("move the paused runs onto the new build"))?;
+            move_paused_runs(state, id, registered, &owner.keys(&owner.down)).await.map_err(failing("move the paused runs onto the new build"))?;
         if !state.projects.write_resync(id, plan).await.map_err(failing("write down the runs moved"))? {
             return Err(Halt::Given);
         }
@@ -3795,11 +3865,11 @@ pub(crate) async fn resync_bring_back_owner(
         return Ok(Vec::new());
     }
     let registered = state
-        .projects
-        .project(id)
+        .registered(id)
         .await
         .map_err(crate::task_kinds::resync::failing("project"))?
-        .ok_or_else(|| Halt::from((StatusCode::NOT_FOUND, "project not found".to_string())))?;
+        .ok_or_else(|| Halt::from((StatusCode::NOT_FOUND, "project not found".to_string())))?
+        .program;
     let down = owner.keys(&owner.down);
     // The infra their setup reads, checked apart so a stop over it waits
     // for that infra to run again ([`ResyncWait::Infra`]).
@@ -5410,23 +5480,6 @@ mod available_actions_tests {
 mod behind_tests {
     use super::*;
 
-    /// What the client names replaces the registered build's hash of the
-    /// same name, and what it leaves out (a cut it could not walk) is read
-    /// off the registered build; a malformed list is refused naming it.
-    #[test]
-    fn the_queried_hashes_go_over_the_registered_ones() {
-        let registered: std::collections::BTreeMap<String, String> =
-            [("door".to_string(), "r1".to_string()), ("feed".to_string(), "r2".to_string())].into();
-        let merged = Desired::named_over(registered.clone(), Some("feed:q2,inbox:q3"), "desiredTriggerCuts", |hash| hash).unwrap();
-        let want: std::collections::BTreeMap<String, String> =
-            [("door", "r1"), ("feed", "q2"), ("inbox", "q3")].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        assert_eq!(merged, want);
-        assert_eq!(Desired::named_over(registered.clone(), None, "desiredTriggerCuts", |hash| hash).unwrap(), registered);
-        let (status, message) = Desired::named_over(registered, Some("feed"), "desiredTriggerCuts", |hash| hash).unwrap_err();
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(message.starts_with("desiredTriggerCuts"), "{message}");
-    }
-
     use crate::activation_store::{Activation, ActivationLifecycle, RecordedCut};
     use weft_core::activation::ActivationKey;
     use weft_core::instance::Owner;
@@ -5437,7 +5490,7 @@ mod behind_tests {
             full_binary: Some("full-code".into()),
             definition: Some("graph".into()),
             trigger_cuts: [("door".to_string(), Some("cut-2".to_string())), ("broken".to_string(), None)].into(),
-            infra_places: [("db".to_string(), "db-2".to_string())].into(),
+            infra_places: [("db".to_string(), Some("db-2".to_string()))].into(),
         }
     }
 
@@ -5471,6 +5524,21 @@ mod behind_tests {
         assert!(d.behind(&activation(None, Some("new-code"))));
     }
 
+    /// What an activate leaves behind: the triggers on and behind the
+    /// build, less the ones it turns on with it, by owner.
+    #[test]
+    fn an_activate_leaves_behind_the_others_on_and_behind() {
+        let d = desired();
+        let mut feed = activation(Some("cut-2"), Some("old-code"));
+        feed.key = ActivationKey::new("feed", Owner::Shared);
+        let rows = [activation(Some("cut-1"), Some("old-code")), feed, activation(Some("cut-2"), Some("new-code"))];
+        assert_eq!(
+            d.left_behind(&rows, &[ActivationKey::new("door", Owner::Shared)]),
+            vec![weft_core::activation::OwnerTriggers { owner: Owner::Shared, triggers: vec!["feed".into()] }]
+        );
+        assert!(d.left_behind(&rows[2..], &[]).is_empty(), "a trigger on the build is not behind it");
+    }
+
     /// A trigger the program still has, whose cut can no longer be walked
     /// (it needs a part that does not compile), is behind: never read as
     /// gone, so a resync takes it up and refuses naming the part.
@@ -5494,6 +5562,60 @@ mod behind_tests {
         assert!(!d.behind(&gone));
     }
 
+    /// What the client names replaces the registered build's hash of the
+    /// same name, and what it leaves out is read off the registered build:
+    /// a source that did not compile names no trigger and no infra place.
+    #[test]
+    fn the_named_hashes_go_over_the_registered_ones() {
+        let request = StatusRequest { desired_binary_hash: Some("source-code".into()), ..Default::default() };
+        let d = desired().requested_by(&request);
+        assert_eq!((d.binary.as_deref(), d.full_binary, d.definition.as_deref()), (Some("source-code"), None, Some("graph")));
+        assert_eq!(d.trigger_cuts, desired().trigger_cuts);
+        assert_eq!(d.infra_places, desired().infra_places);
+    }
+
+    /// A source that compiled names every trigger it has: one on whose cut
+    /// that source cannot walk is behind it, though the registered build's
+    /// cut is the one it was set up from; one whose cut is the source's is
+    /// not; one the source has no more is gone from the program, which
+    /// nothing brings up to date, so never behind.
+    #[test]
+    fn desired_reads_a_trigger_broken_in_the_source_as_behind_and_one_gone_as_gone() {
+        let current = activation(Some("cut-2"), Some("new-code"));
+        assert!(!desired().behind(&current));
+        let source = |cuts: &[(&str, Option<&str>)]| StatusRequest {
+            desired_trigger_cuts: Some(cuts.iter().map(|(t, c)| (t.to_string(), c.map(str::to_string))).collect()),
+            ..Default::default()
+        };
+        assert!(!desired().requested_by(&source(&[("door", Some("cut-2"))])).behind(&current));
+        let broken = desired().requested_by(&source(&[("door", None)]));
+        assert!(broken.behind(&current), "its cut does not walk in the source");
+        let gone = desired().requested_by(&source(&[("feed", Some("cut-9"))]));
+        assert_eq!(gone.trigger_cuts, [("feed".to_string(), Some("cut-9".to_string()))].into(), "the source's triggers, whole");
+        assert!(!gone.behind(&current), "the source has it no more");
+    }
+
+    /// A source that compiled names every infra place it has: a copy of
+    /// one whose hash moved is behind it; a copy of one the source has no
+    /// more is orphaned, never behind; a copy on the source's hash is
+    /// neither, and so is a place neither has.
+    #[test]
+    fn desired_reads_an_infra_place_moved_in_the_source_as_behind_and_one_gone_as_orphaned() {
+        let source = |places: &[(&str, &str)]| StatusRequest {
+            desired_infra_places: Some(places.iter().map(|(p, h)| (p.to_string(), h.to_string())).collect()),
+            ..Default::default()
+        };
+        let same = desired().requested_by(&source(&[("db", "db-2")]));
+        assert!(!same.infra_behind("db", Some("db-2")) && !same.infra_orphaned("db"));
+        let moved = desired().requested_by(&source(&[("db", "db-3")]));
+        assert!(moved.infra_behind("db", Some("db-2")) && !moved.infra_orphaned("db"), "its hash moved in the source");
+        let gone = desired().requested_by(&source(&[("cache", "cache-1")]));
+        assert!(gone.infra_orphaned("db") && !gone.infra_behind("db", Some("db-2")), "the source has it no more");
+        assert!(!gone.infra_behind("cache", Some("cache-1")) && !gone.infra_orphaned("cache"));
+        assert!(!gone.infra_behind("queue", None) && !gone.infra_orphaned("queue"), "a place neither has");
+        assert!(!desired().infra_orphaned("db"), "the registered build has every place it names");
+    }
+
     /// An infra copy is behind when its place's hash moved since it was
     /// applied, or it was applied before hashes were recorded; a place the
     /// program names no hash for is never behind.
@@ -5504,57 +5626,6 @@ mod behind_tests {
         assert!(d.infra_behind("db", Some("db-1")));
         assert!(d.infra_behind("db", None));
         assert!(!d.infra_behind("cache", None));
-    }
-}
-
-#[cfg(test)]
-mod status_query_wire_shape_tests {
-    use super::*;
-
-    /// `StatusQuery`'s wire shape is the contract with the CLI's URL
-    /// builder (and any future direct caller from the extension).
-    /// A typo in one of the `rename = "desiredXyz"`
-    /// attributes silently sets the field to `None`, the drift
-    /// comparison bypasses, and no compile error fires. Pin the
-    /// camelCase wire shape here so a rename is loud.
-    ///
-    /// Tested via the JSON serde shape because Query at runtime
-    /// flows through `serde_urlencoded` (transitive dep of axum,
-    /// not directly in the dispatcher's dev-dep set). The `rename`
-    /// attribute applies to BOTH formats, so a JSON round-trip is
-    /// enough to catch a typo in the rename string.
-    #[test]
-    fn status_query_round_trips_camelcase_keys() {
-        let json = serde_json::json!({
-            "desiredBinaryHash": "abc",
-            "desiredFullBinaryHash": "full",
-            "desiredDefinitionHash": "def",
-            "desiredTriggerCuts": "door:c1",
-            "desiredInfraPlaces": "db:h1",
-        });
-        let q: StatusQuery = serde_json::from_value(json)
-            .expect("camelCase keys must deserialize");
-        assert_eq!(q.desired_binary_hash.as_deref(), Some("abc"));
-        assert_eq!(q.desired_full_binary_hash.as_deref(), Some("full"));
-        assert_eq!(q.desired_definition_hash.as_deref(), Some("def"));
-        assert_eq!(q.desired_trigger_cuts.as_deref(), Some("door:c1"));
-        assert_eq!(q.desired_infra_places.as_deref(), Some("db:h1"));
-    }
-
-    /// Snake_case used to be accepted via `alias`. The Round 4
-    /// alias-drop removed that compatibility; pin it as not-aliased
-    /// so a future regression that re-adds the alias is loud.
-    #[test]
-    fn status_query_ignores_snake_case_keys() {
-        let json = serde_json::json!({
-            "desired_binary_hash": "abc",
-        });
-        let q: StatusQuery = serde_json::from_value(json)
-            .expect("deserialize never fails on optional-only fields");
-        // The snake_case key is unknown; the camelCase field stays
-        // None. If anyone re-adds `alias = "desired_binary_hash"`,
-        // this flips to Some("abc") and the test fails.
-        assert_eq!(q.desired_binary_hash, None);
     }
 }
 
@@ -5617,7 +5688,7 @@ mod infra_entries_tests {
                 .into(),
             as_of_unix: 130,
         };
-        let (infra, instance_entries) = infra_entries(&project, &copies, &[], &no_hashes());
+        let (infra, instance_entries) = infra_entries(&project, &Default::default(), &copies, &[], &no_hashes());
         let listed: Vec<(&str, &str, Option<usize>)> =
             infra.iter().map(|e| (e.node.as_str(), e.status.as_str(), e.instance_copy_count)).collect();
         assert_eq!(
@@ -5647,7 +5718,7 @@ mod infra_entries_tests {
     #[test]
     fn a_program_without_infra_lists_none() {
         let project = super::infra_kick_and_dep_tests::project(&[("plain", false, false)], &[]);
-        let (infra, instances) = infra_entries(&project, &ObservedCopies::default(), &[], &no_hashes());
+        let (infra, instances) = infra_entries(&project, &Default::default(), &ObservedCopies::default(), &[], &no_hashes());
         assert!(infra.is_empty() && instances.is_empty());
     }
 
@@ -5718,14 +5789,11 @@ mod trigger_entries_tests {
         }
     }
 
+    /// The program's own cuts, with `cuts` in place of the ones they name.
     fn desired(cuts: &[(&str, &str)]) -> Desired {
-        Desired {
-            binary: None,
-            full_binary: None,
-            definition: None,
-            trigger_cuts: cuts.iter().map(|(t, c)| (t.to_string(), Some(c.to_string()))).collect(),
-            infra_places: Default::default(),
-        }
+        let mut trigger_cuts = weft_core::run_spec::trigger_fingerprints(&weft_core::run_spec::trigger_cuts(&program()));
+        trigger_cuts.extend(cuts.iter().map(|(t, c)| (t.to_string(), Some(c.to_string()))));
+        Desired { binary: None, full_binary: None, definition: None, trigger_cuts, infra_places: Default::default() }
     }
 
     /// One entry per trigger of the program, the shared one with its own
@@ -5740,7 +5808,7 @@ mod trigger_entries_tests {
             row("inbox", ada, ActivationLifecycle::active(), Some(("inbox-1", &[]))),
             row("old", Owner::Shared, ActivationLifecycle::holding(), None),
         ];
-        let entries = trigger_entries(&program(), &rows, &Default::default(), &desired(&[("door", "door-1"), ("inbox", "inbox-2")]), None, 0);
+        let entries = trigger_entries(&program(), &weft_core::run_spec::trigger_cuts(&program()), &rows, &Default::default(), &desired(&[("door", "door-1"), ("inbox", "inbox-2")]), None, 0);
         let nodes: Vec<&str> = entries.iter().map(|e| e.node.as_str()).collect();
         assert_eq!(nodes, ["door", "inbox", "old"]);
         let door = &entries[0];
@@ -5752,10 +5820,20 @@ mod trigger_entries_tests {
         let old = &entries[2];
         assert!(old.gone && !old.per_instance);
         assert_eq!(old.shared.as_ref().map(|c| c.state), Some(TriggerState::Off));
+        assert!(!door.gone && !inbox.gone);
+
+        // A trigger the registered build has and the source the caller
+        // compiled has no more is gone, the way to take it down said: on,
+        // and never behind, since nothing would bring it up to date.
+        let mut source = desired(&[]);
+        source.trigger_cuts.remove("door");
+        let entries = trigger_entries(&program(), &weft_core::run_spec::trigger_cuts(&program()), &rows, &Default::default(), &source, None, 0);
+        assert!(entries[0].gone);
+        assert_eq!(entries[0].shared.as_ref().map(|c| c.state), Some(TriggerState::On));
 
         // A shared trigger never turned on is listed off, its cut read off
         // the program.
-        let never = trigger_entries(&program(), &[], &Default::default(), &desired(&[]), None, 0);
+        let never = trigger_entries(&program(), &weft_core::run_spec::trigger_cuts(&program()), &[], &Default::default(), &desired(&[]), None, 0);
         assert_eq!(never[0].shared.as_ref().map(|c| c.state), Some(TriggerState::Off));
         assert_eq!(never[0].depends_on, vec!["db".to_string()]);
     }
@@ -5778,7 +5856,7 @@ mod trigger_entries_tests {
         inbox.program = Some(identity("old"));
         let rows = [door.clone(), inbox];
         let held_back = |rows: &[Activation], registered: &str| {
-            trigger_entries(&program(), rows, &Default::default(), &desired(&[]), Some(registered), 0)[0]
+            trigger_entries(&program(), &weft_core::run_spec::trigger_cuts(&program()), rows, &Default::default(), &desired(&[]), Some(registered), 0)[0]
                 .shared
                 .as_ref()
                 .unwrap()
@@ -5801,7 +5879,7 @@ mod trigger_entries_tests {
             row("door", Owner::Shared, ActivationLifecycle::active(), Some(("door-1", &["db"]))),
             row("door", Owner::Instance(InstanceId::new("bob").unwrap()), ActivationLifecycle::holding(), Some(("door-1", &["db"]))),
         ];
-        let (infra, _) = infra_entries(&program(), &Default::default(), &rows, &desired(&[]));
+        let (infra, _) = infra_entries(&program(), &weft_core::run_spec::trigger_cuts(&program()), &Default::default(), &rows, &desired(&[]));
         let db = infra.iter().find(|e| e.node == "db").unwrap();
         assert_eq!(db.takes_down.iter().map(|owned| owned.words()).collect::<Vec<_>>(), ["'door'"]);
     }

@@ -223,6 +223,10 @@ impl WorkerStorageOps for RecordFirst<dyn WorkerStorageOps> {
         self.first_for_storage(run_id).await?;
         self.inner.claim_uploads(run_id, claims).await
     }
+    /// Names no run, so no record has to be written first.
+    async fn content(&self, key: &str) -> WeftResult<Option<Vec<u8>>> {
+        self.inner.content(key).await
+    }
 }
 
 #[cfg(test)]

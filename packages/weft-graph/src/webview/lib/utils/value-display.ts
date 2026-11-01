@@ -7,14 +7,22 @@
 // (an LLM reply, a prompt, a log line) would colour as garbage. Walking
 // gets it right by construction and is what the tests pin.
 
-import { isSecretMarker } from '../../../protocol';
+import { contentMarker, isSecretMarker, type ContentMarker } from '../../../protocol';
 
 /** `secret` is a secret's marker, wherever it sits in the value: the
- *  run's record holds only the marker, so there is no value to show. */
-export type JsonTokenKind = 'key' | 'string' | 'number' | 'boolean' | 'null' | 'punct' | 'secret';
+ *  run's record holds only the marker, so there is no value to show.
+ *  `content` is a built program's marker for the text of a file it
+ *  names, shown as the file it names. */
+export type JsonTokenKind = 'key' | 'string' | 'number' | 'boolean' | 'null' | 'punct' | 'secret' | 'content';
 
 /** What a secret's marker renders as, in the value and in its badge. */
 export const SECRET_TEXT = 'secret (not shown)';
+
+/** What a content marker renders as in the value: the file whose text
+ *  the program holds by name, and the type it is read as. */
+export function contentText(content: ContentMarker): string {
+	return `content of ${content.path} (${content.type})`;
+}
 
 export interface JsonToken {
 	text: string;
@@ -36,6 +44,8 @@ export function isPlainText(value: unknown): value is string {
 export function valueSummary(value: unknown): string {
 	if (value === null) return 'null';
 	if (isSecretMarker(value)) return 'secret';
+	const content = contentMarker(value);
+	if (content) return `file content · ${content.type}`;
 	if (Array.isArray(value)) {
 		return `array · ${value.length} ${value.length === 1 ? 'item' : 'items'}`;
 	}
@@ -76,6 +86,8 @@ function write(out: JsonToken[], value: unknown, depth: number): void {
 	if (value === undefined) return push(out, 'undefined', 'null');
 	if (Array.isArray(value)) return writeArray(out, value, depth);
 	if (isSecretMarker(value)) return push(out, SECRET_TEXT, 'secret');
+	const content = contentMarker(value);
+	if (content) return push(out, contentText(content), 'content');
 	switch (typeof value) {
 		case 'string':
 			return push(out, JSON.stringify(value), 'string');

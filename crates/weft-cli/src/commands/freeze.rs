@@ -17,13 +17,16 @@ pub async fn run(ctx: Ctx, name: String, run_id: Option<String>, expect: Vec<Str
     // `write_spec` enforces, said before any work is done.
     super::versions::validate_example_name(&name)?;
     let project = ctx.project()?;
-    let here = super::copy::this_copy(&ctx, None).await?;
+    // The run is read and the example written here, which the next sync
+    // sends up: nothing of the folder has to go up first, so it is only
+    // looked up, for its head's run.
+    let here = super::copy::look_up_this_copy(&ctx).await?;
     let (client, project_id) = (&here.client, here.project_id.as_str());
     let tree = fetch_tree(client, project_id).await?;
     let run = match run_id {
         Some(c) => resolve_run(&tree, &c)?.clone(),
         None => {
-            let head = here.copy.head.head_run.ok_or_else(|| {
+            let head = here.copy.as_ref().and_then(|copy| copy.head.head_run).ok_or_else(|| {
                 anyhow::anyhow!("this folder's head has no run to freeze; name a run (`{}` lists them) or run first", ctx.weft("tree"))
             })?;
             resolve_run(&tree, &head.to_string())?.clone()

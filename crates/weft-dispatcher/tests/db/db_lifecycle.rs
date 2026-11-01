@@ -1390,7 +1390,7 @@ async fn a_vouching_workers_runs_are_its_own_until_its_vouch_passes(pool: Pool) 
         async move {
             let in_flight = std::collections::BTreeMap::from([("t1".to_string(), 1u32)]);
             let weft_task_store::db::Json(answer): weft_task_store::db::Json<serde_json::Value> = pool.scalar(
-                "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
                 &[
                     &replica,
                     &id,
@@ -1403,6 +1403,9 @@ async fn a_vouching_workers_runs_are_its_own_until_its_vouch_passes(pool: Pool) 
                     &Vec::<i64>::new(),
                     &Vec::<Option<String>>::new(),
                     &false,
+                    &None::<i64>,
+                    &None::<i64>,
+                    &None::<i64>,
                 ],
             )
             .await
@@ -4011,6 +4014,19 @@ async fn a_run_its_workers_keep_answering_busy_is_tried_again_with_a_growing_pau
     claim(&pool, back, id, "worker-a").await;
     assert_eq!(written().await, 0, "a run they failed reaching a worker clears it, its tries started again or not");
     assert_eq!(run_column::<bool>(&pool, "waited_on_workers", back).await, Some(false), "a claim clears the mark");
+
+    // A run its worker keeps answering busy (a worker that could not read
+    // it from the store answers the same way) never stops being tried,
+    // however many answers in a row: each is handed out again once its
+    // pause runs out.
+    let again = queued_run(&store, id).await;
+    for _ in 0..=UNREACHED_TO_STOP {
+        busy(&pool, again).await.unwrap().expect("queued");
+    }
+    assert_eq!(run_column::<i16>(&pool, "unreached", again).await, Some(0), "counting no try");
+    let due: i64 = run_column(&pool, "delivered_until", again).await.unwrap();
+    let taken: Vec<_> = take(&pool, due + 1, 32).await.unwrap().into_iter().map(|d| d.run_id).collect();
+    assert!(taken.contains(&again), "handed out again after its pause: {taken:?}");
 }
 
 /// A drain marks the runs it waits on watched, and the ones waiting to

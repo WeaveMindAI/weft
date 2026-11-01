@@ -78,6 +78,46 @@ pub async fn this_copy(ctx: &Ctx, progress: Option<&Progress>) -> Result<FolderC
     Ok(FolderCopy { project_id, client, copy: synced.copy })
 }
 
+/// This folder's working copy as the install has it, read without syncing
+/// or registering anything: for a verb that only reads, or acts on
+/// another working copy.
+pub struct FolderSeen {
+    /// The project's id, as its routes name it.
+    pub project_id: String,
+    pub client: DispatcherClient,
+    /// The working copy, `None` when the install does not know this folder.
+    pub copy: Option<WorkingCopy>,
+}
+
+impl FolderSeen {
+    /// The working copy's id, when the install knows this folder.
+    pub fn id(&self) -> Option<weft_core::working_copy::WorkingCopyId> {
+        self.copy.as_ref().map(|copy| copy.id)
+    }
+}
+
+/// This folder's working copy as the install has it ([`FolderSeen`]),
+/// without [`this_copy`]'s sync: nothing is sent, registered or written.
+pub async fn look_up_this_copy(ctx: &Ctx) -> Result<FolderSeen> {
+    let project = ctx.project()?;
+    let client = ctx.client()?;
+    let project_id = project.id().to_string();
+    let (host, path) = folder_named(project.root.as_path())?;
+    let copy = find_folder(&client, &project_id, &host, &path).await?.map(|found| found.copy);
+    Ok(FolderSeen { project_id, client, copy })
+}
+
+/// How the install names the folder at `root`: this machine and the
+/// folder's path.
+fn folder_named(root: &std::path::Path) -> Result<(String, String)> {
+    let path = root
+        .to_str()
+        .with_context(|| format!("the project's folder {} is not a UTF-8 path, which a working copy cannot be named by", root.display()))?
+        .to_string();
+    let host = weft_core::working_copy::this_machine().map_err(anyhow::Error::msg)?;
+    Ok((host, path))
+}
+
 /// Sync this folder with its working copy (see [`this_copy`]): the
 /// project's id, the client it was synced through, and what the sync did.
 /// `tell` says each file sent, when the command prints.
@@ -87,11 +127,7 @@ async fn sync_folder(ctx: &Ctx, tell: bool) -> Result<(String, DispatcherClient,
     let client = ctx.client()?;
     let project_id = project.id().to_string();
     let root = project.root.as_path();
-    let path = root
-        .to_str()
-        .with_context(|| format!("the project's folder {} is not a UTF-8 path, which a working copy cannot be named by", root.display()))?
-        .to_string();
-    let host = weft_core::working_copy::this_machine().map_err(anyhow::Error::msg)?;
+    let (host, path) = folder_named(root)?;
 
     let copy = match find_folder(&client, &project_id, &host, &path).await? {
         Some(found) => found.copy,

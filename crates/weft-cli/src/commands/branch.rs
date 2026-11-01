@@ -2,7 +2,7 @@
 //! means its version) and write its files here. A run becomes the head's
 //! run, so the next `--seed` inherits from it; a version clears it. With
 //! `--copy`, another working copy moves instead (the program copy, or a
-//! folder elsewhere), and nothing is written here.
+//! folder elsewhere), and this folder is neither synced nor written.
 //!
 //! `weft forget-copy <copy>`: keep a working copy's files as a version and
 //! remove the copy, for a folder that is gone or the program copy, whose
@@ -23,36 +23,20 @@ use super::versions::{fetch_tree, resolve_run, resolve_version, short};
 use super::Ctx;
 
 pub async fn run(ctx: Ctx, reference: String, copy: Option<String>) -> anyhow::Result<()> {
+    // Another working copy moves without this folder being synced: nothing
+    // of it is read or written.
+    if let Some(named) = &copy {
+        let seen = super::copy::look_up_this_copy(&ctx).await?;
+        let tree = fetch_tree(&seen.client, &seen.project_id).await?;
+        let other = resolve_copy(&tree, named)?;
+        if Some(other.id) != seen.id() {
+            let body = SwitchRequest { working_copy: WorkingCopyRef { working_copy: Some(other.id) }, to: switch_to(&tree, &reference)? };
+            return switch_other(&ctx, &seen, other, &body).await;
+        }
+    }
     let here = super::copy::this_copy(&ctx, None).await?;
     let tree = fetch_tree(&here.client, &here.project_id).await?;
-    // A run means its version and becomes the head's run.
-    let to = match resolve_run(&tree, &reference) {
-        Ok(run) => SwitchTo { run: Some(run.run_id), version: None },
-        Err(_) => SwitchTo { version: Some(resolve_version(&tree, &reference)?.id.clone()), run: None },
-    };
-    let other = match &copy {
-        Some(named) => Some(resolve_copy(&tree, named)?).filter(|c| c.id != here.copy.id),
-        None => None,
-    };
-    if let Some(other) = other {
-        let body = SwitchRequest { working_copy: WorkingCopyRef { working_copy: Some(other.id) }, to };
-        let answer = here
-            .client
-            .post_json(&format!("/projects/{}/versions/switch", here.project_id), &serde_json::to_value(&body)?)
-            .await
-            .with_context(|| format!("switch {}", copy_name(other)))?;
-        let switched: Switched = serde_json::from_value(answer).context("read the switch answer")?;
-        if ctx.json_out(&switched)? {
-            return Ok(());
-        }
-        let at = switched.copy.head.head_version.as_deref().map(short).unwrap_or("no version");
-        println!("{} is now at version {at}", copy_name(other));
-        if let Some(saved) = &switched.saved {
-            println!("its files as they were are version {}", short(saved));
-        }
-        return Ok(());
-    }
-    let body = SwitchRequest { working_copy: here.named(), to };
+    let body = SwitchRequest { working_copy: here.named(), to: switch_to(&tree, &reference)? };
     let answer = here
         .client
         .post_json(&format!("/projects/{}/versions/switch", here.project_id), &serde_json::to_value(&body)?)
@@ -80,10 +64,40 @@ pub async fn run(ctx: Ctx, reference: String, copy: Option<String>) -> anyhow::R
     Ok(())
 }
 
+/// Where `reference` moves a working copy to: a run means its version and
+/// becomes the head's run.
+fn switch_to(tree: &VersionTree, reference: &str) -> anyhow::Result<SwitchTo> {
+    Ok(match resolve_run(tree, reference) {
+        Ok(run) => SwitchTo { run: Some(run.run_id), version: None },
+        Err(_) => SwitchTo { version: Some(resolve_version(tree, reference)?.id.clone()), run: None },
+    })
+}
+
+/// Move `other`, a working copy that is not this folder's, as `body` asks.
+async fn switch_other(ctx: &Ctx, seen: &super::copy::FolderSeen, other: &WorkingCopy, body: &SwitchRequest) -> anyhow::Result<()> {
+    let answer = seen
+        .client
+        .post_json(&format!("/projects/{}/versions/switch", seen.project_id), &serde_json::to_value(body)?)
+        .await
+        .with_context(|| format!("switch {}", copy_name(other)))?;
+    let switched: Switched = serde_json::from_value(answer).context("read the switch answer")?;
+    if ctx.json_out(&switched)? {
+        return Ok(());
+    }
+    let at = switched.copy.head.head_version.as_deref().map(short).unwrap_or("no version");
+    println!("{} is now at version {at}", copy_name(other));
+    if let Some(saved) = &switched.saved {
+        println!("its files as they were are version {}", short(saved));
+    }
+    Ok(())
+}
+
+/// Forget another working copy: this folder is only looked up, to refuse
+/// its own, and nothing of it is synced.
 pub async fn forget(ctx: Ctx, named: String) -> anyhow::Result<()> {
-    let here = super::copy::this_copy(&ctx, None).await?;
+    let here = super::copy::look_up_this_copy(&ctx).await?;
     let tree = fetch_tree(&here.client, &here.project_id).await?;
-    let copy = copy_to_forget(&tree, &named, here.copy.id)?;
+    let copy = copy_to_forget(&tree, &named, here.id())?;
     let answer = here
         .client
         .delete_json(&format!("/projects/{}/working-copies/{}", here.project_id, copy.id))
@@ -106,11 +120,12 @@ pub async fn forget(ctx: Ctx, named: String) -> anyhow::Result<()> {
 }
 
 /// The working copy `named` names, for `weft forget-copy` run from the
-/// folder whose own copy is `here`: never that one, which every command
-/// run in the folder registers again at once.
-fn copy_to_forget<'a>(tree: &'a VersionTree, named: &str, here: WorkingCopyId) -> anyhow::Result<&'a WorkingCopy> {
+/// folder whose own copy is `here` (`None` when the install does not know
+/// the folder): never that one, which every command run in the folder
+/// registers again at once.
+fn copy_to_forget<'a>(tree: &'a VersionTree, named: &str, here: Option<WorkingCopyId>) -> anyhow::Result<&'a WorkingCopy> {
     let copy = resolve_copy(tree, named)?;
-    if copy.id == here {
+    if Some(copy.id) == here {
         bail!("{named} is this folder's working copy, which every command run here registers again at once; run this from another folder");
     }
     Ok(copy)
@@ -218,11 +233,12 @@ mod tests {
             versions: Vec::new(),
             runs: Vec::new(),
         };
-        let here = uuid::Uuid::from_u128(1);
+        let here = Some(uuid::Uuid::from_u128(1));
         for named in ["/srv/here", "/srv/here/", "00000000-0000-0000-0000-000000000001"] {
             let why = copy_to_forget(&tree, named, here).unwrap_err().to_string();
             assert!(why.contains("this folder's working copy") && why.contains("from another folder"), "{named}: {why}");
         }
         assert_eq!(copy_to_forget(&tree, "/srv/gone", here).unwrap().id, uuid::Uuid::from_u128(2));
+        assert_eq!(copy_to_forget(&tree, "/srv/gone", None).unwrap().id, uuid::Uuid::from_u128(2), "from a folder the install does not know");
     }
 }

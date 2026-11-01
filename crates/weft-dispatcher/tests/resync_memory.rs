@@ -239,7 +239,7 @@ fn resync_memory() {
         }
     };
     let by_count = weft_core::content_cache::ContentCache::new(64);
-    let by_weight = weft_core::content_cache::ContentCache::weighed(weft_dispatcher::state::PROGRAMS_JSON_BYTES, weft_dispatcher::state::program_json_bytes);
+    let by_weight = weft_core::content_cache::ContentCache::weighed(weft_dispatcher::state::PROGRAMS_JSON_BYTES, weft_core::content_cache::json_bytes);
     for (bound, cache) in [("by count (64, before)", &by_count), ("by weight (after)", &by_weight)] {
         let (_, took) = measure(|| fill(cache));
         report(&format!("the program cache once every trigger fired, {bound}"), &took);

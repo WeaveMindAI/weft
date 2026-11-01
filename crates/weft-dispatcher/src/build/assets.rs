@@ -21,7 +21,9 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use axum::http::StatusCode;
+use weft_compiler::file_ref::{TextRead, TextValues};
 use weft_core::project::hash::Manifest;
 use weft_core::project::FileRef;
 use weft_core::run_spec::RunSpec;
@@ -134,9 +136,15 @@ fn asset_key(hash: &str) -> Result<String, Refused> {
 
 /// Resolve every `@asset` `target` names (see the module doc), answering
 /// the resolution map by `FileRef::resolution_key`, which the caller
-/// applies (`weft_compiler::file_ref::apply_asset_resolutions`). Every ref
-/// that cannot be used is named at once.
-pub async fn resolve(reach: &Reach<'_>, target: &impl weft_compiler::file_ref::MarkedValues) -> Result<weft_core::project::AssetResolutions, Refused> {
+/// applies (`weft_compiler::file_ref::apply_asset_resolutions`), and every
+/// text it read. A text value is spelled as `texts` says; a caller that
+/// names it by its content stores the text it read. Every ref that cannot
+/// be used is named at once.
+pub async fn resolve(
+    reach: &Reach<'_>,
+    target: &impl weft_compiler::file_ref::MarkedValues,
+    texts: TextValues,
+) -> Result<(weft_core::project::AssetResolutions, Vec<TextRead>), Refused> {
     let mut map = BTreeMap::new();
     let mut refused: Vec<String> = Vec::new();
     // Files: the version's become stored files at once; the machine's are
@@ -177,27 +185,38 @@ pub async fn resolve(reach: &Reach<'_>, target: &impl weft_compiler::file_ref::M
         }
     }
     // Text: read once (a URL fetched, a stored file read, a path read
-    // from wherever it is) and cast. Nothing is uploaded for one: its value
-    // is inlined into what is resolved.
-    for r in weft_compiler::file_ref::collect_text_refs(target) {
-        let bytes = if weft_compiler::file_ref::is_url_ref(&r) {
-            fetch_url(reach.state, &r.path).await
-        } else if weft_compiler::file_ref::is_runtime_key_ref(&r) {
-            crate::storage::read_file(reach.state, &format!("{}/{}", reach.tenant, r.path)).await.map_err(|e| format!("{e:#}"))
-        } else {
-            reach.read_any(&r.path).await
-        };
-        match bytes.and_then(|bytes| weft_compiler::file_ref::resolve_text_bytes(&r, &bytes)) {
-            Ok(value) => {
-                map.insert(r.resolution_key(), value);
-            }
-            Err(why) => refused.push(format!("@asset({:?}, {}): {why}", r.path, r.ty)),
+    // from wherever it is) and cast.
+    let read = match weft_compiler::file_ref::read_texts(target, reach).await {
+        Ok(read) => read,
+        Err(why) => {
+            refused.extend(why);
+            Vec::new()
         }
-    }
+    };
     if !refused.is_empty() {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("assets that cannot be used:\n  {}", refused.join("\n  "))));
     }
-    Ok(map)
+    for text in &read {
+        map.insert(text.file_ref.resolution_key(), text.resolution(texts));
+    }
+    Ok((map, read))
+}
+
+/// Where a text `@asset` of the version is read ([`weft_compiler::file_ref::read_texts`]).
+impl weft_compiler::file_ref::TextSource for Reach<'_> {
+    async fn url(&self, url: &str) -> Result<Vec<u8>, String> {
+        // No limit beyond the connect one: the address is the person's,
+        // part of a build they wait on and can stop.
+        weft_core::net::get_body(&self.state.http, url).await
+    }
+
+    async fn stored(&self, key: &str) -> Result<Vec<u8>, String> {
+        crate::storage::read_file(self.state, &format!("{}/{key}", self.tenant)).await.map_err(|e| format!("{e:#}"))
+    }
+
+    async fn path(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.read_any(path).await
+    }
 }
 
 /// The value an `@asset` of the version's blob `hash` stands for: the
@@ -225,18 +244,6 @@ async fn stored_value(reach: &Reach<'_>, r: &FileRef, hash: &str) -> Result<serd
         }
     }
     Ok(weft_core::storage::typed_file_value(&file, &r.ty))
-}
-
-/// One GET of a text asset's URL, whole body in memory (a prompt, a JSON
-/// shape: small by contract). A non-2xx answer is the refusal.
-async fn fetch_url(state: &DispatcherState, url: &str) -> Result<Vec<u8>, String> {
-    // No limit beyond the connect one: the address is the person's, part
-    // of a build they wait on and can stop.
-    let resp = state.http.get(url).send().await.map_err(|e| format!("GET {url}: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("GET {url} answered {}", resp.status()));
-    }
-    Ok(resp.bytes().await.map_err(|e| format!("read {url}: {e}"))?.to_vec())
 }
 
 /// Files of the machine an `@asset` names, by the path it is written
@@ -279,7 +286,7 @@ pub async fn run_spec(reach: &Reach<'_>, shape: &RunShape) -> Result<Option<RunS
     };
     let Some(spec) = spec.as_mut() else { return Ok(None) };
     resolve_file_markers(reach, spec).await?;
-    let map = resolve(reach, &*spec).await?;
+    let (map, _) = resolve(reach, &*spec, TextValues::Inline).await?;
     weft_compiler::file_ref::apply_asset_resolutions(spec, &map)
         .map_err(|errs| (StatusCode::UNPROCESSABLE_ENTITY, format!("unresolved assets:\n  {}", errs.join("\n  "))))?;
     Ok(Some(spec.clone()))
@@ -349,13 +356,23 @@ fn as_error((_, why): Refused) -> anyhow::Error {
 
 #[async_trait::async_trait]
 impl super::Prepare for Resolving<'_> {
+    /// Each `@asset` from the version, a text one named by its content and
+    /// stored among the tenant's assets (a version's file is there already,
+    /// and storing it again asks once and sends nothing), so a worker that
+    /// reads the program finds it.
     async fn assets(
         &self,
-        _storage: &dyn super::ProjectStorage,
-        _tenant: &str,
+        storage: &dyn super::ProjectStorage,
+        tenant: &str,
         definition: &weft_core::ProjectDefinition,
-    ) -> anyhow::Result<weft_core::project::AssetResolutions> {
-        resolve(&self.reach, definition).await.map_err(as_error)
+    ) -> anyhow::Result<super::Assets> {
+        let (resolutions, read) = resolve(&self.reach, definition, TextValues::Named).await.map_err(as_error)?;
+        let texts: BTreeMap<String, Vec<u8>> = read.iter().map(|text| (text.file_ref.path.clone(), text.bytes.clone())).collect();
+        if !texts.is_empty() {
+            storage.store_texts(tenant, &texts).await.context("store the text the program's `@asset`s name")?;
+        }
+        let contents = read.into_iter().map(|text| (text.content.id(), std::sync::Arc::new(text.value))).collect();
+        Ok(super::Assets { resolutions, contents })
     }
 
     async fn check(&self, definition: &weft_core::ProjectDefinition) -> anyhow::Result<()> {

@@ -24,6 +24,7 @@
 			case 'null': return 'text-zinc-400 italic';
 			case 'punct': return 'text-zinc-400';
 			case 'secret': return 'text-rose-700 italic';
+			case 'content': return 'text-emerald-700 italic';
 		}
 	}
 

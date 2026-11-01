@@ -7,6 +7,14 @@ fn text_ref(path: &str, ty: WeftType) -> FileRef {
     FileRef { path: path.into(), ty, marker: FileMarker::File }
 }
 
+/// What resolving a `@file` of `text` cast to `ty` gives: the value, and
+/// the content it was read from.
+fn read(path: &str, text: &str, ty: WeftType, value: serde_json::Value) -> Resolved {
+    let (content, cast) = weft_core::content::ContentRef::of_text(text, &ty, path).unwrap();
+    assert_eq!(cast, value);
+    Resolved::Read(content, value)
+}
+
 /// A file-typed `@asset` ref (the deferred pull-only form).
 fn asset_ref(path: &str, ty: WeftType) -> FileRef {
     FileRef { path: path.into(), ty, marker: FileMarker::Asset }
@@ -146,7 +154,7 @@ fn resolve_string_verbatim() {
     let fr = text_ref("p.txt", WeftType::Primitive(WeftPrimitive::String));
     assert_eq!(
         resolve(&fr, &crate::file_reader::CompileFs::disk(dir.path())).unwrap(),
-        Resolved::Value(serde_json::json!("you are a helpful poet"))
+        read("p.txt", "you are a helpful poet", WeftType::Primitive(WeftPrimitive::String), serde_json::json!("you are a helpful poet"))
     );
     // A text-typed `@asset` is deferred like every asset: the build reads
     // it, from anywhere on the machine, and the parse keeps the marker.
@@ -161,7 +169,7 @@ fn resolve_json_dict() {
     let fr = text_ref("c.json", WeftType::JsonDict);
     assert_eq!(
         resolve(&fr, &crate::file_reader::CompileFs::disk(dir.path())).unwrap(),
-        Resolved::Value(serde_json::json!({"model": "gpt", "temp": 0.7}))
+        read("c.json", r#"{"model": "gpt", "temp": 0.7}"#, WeftType::JsonDict, serde_json::json!({"model": "gpt", "temp": 0.7}))
     );
 }
 
@@ -192,8 +200,8 @@ fn file_marker_rejects_types_without_bidirectional_edit() {
 
 #[test]
 fn text_typed_asset_from_a_url_or_a_stored_file_defers_to_the_build() {
-    // Nothing on disk to read at parse: the build fetches the bytes and
-    // casts them (`resolve_text_bytes`); the parse keeps the marker.
+    // Nothing on disk to read at parse: the build reads the bytes and
+    // casts them ([`read_texts`]); the parse keeps the marker.
     let dir = tempfile::tempdir().unwrap();
     let fs = crate::file_reader::CompileFs::disk(dir.path());
     let url = asset_ref("https://ex.com/a.txt", WeftType::Primitive(WeftPrimitive::String));
@@ -203,9 +211,74 @@ fn text_typed_asset_from_a_url_or_a_stored_file_defers_to_the_build() {
         WeftType::Primitive(WeftPrimitive::Number),
     );
     assert_eq!(resolve(&key, &fs).unwrap(), Resolved::Deferred);
-    assert_eq!(resolve_text_bytes(&key, b"42").unwrap().as_f64(), Some(42.0));
-    let err = resolve_text_bytes(&key, b"forty-two").unwrap_err();
-    assert!(err.contains("@asset(\"project/"), "the error names the source: {err}");
+}
+
+/// A driver's text source answering from a map, by the kind of place
+/// asked: `url:`, `stored:` or `path:` before what was asked.
+struct MapTexts(std::collections::BTreeMap<String, Vec<u8>>, std::sync::Mutex<usize>);
+
+impl TextSource for MapTexts {
+    async fn url(&self, url: &str) -> Result<Vec<u8>, String> {
+        *self.1.lock().unwrap() += 1;
+        self.0.get(&format!("url:{url}")).cloned().ok_or_else(|| format!("GET {url} answered 404"))
+    }
+    async fn stored(&self, key: &str) -> Result<Vec<u8>, String> {
+        self.0.get(&format!("stored:{key}")).cloned().ok_or_else(|| format!("no stored file {key}"))
+    }
+    async fn path(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.0.get(&format!("path:{path}")).cloned().ok_or_else(|| format!("no file {path}"))
+    }
+}
+
+/// Polls a future whose every await is ready at once (a [`MapTexts`]
+/// read) to its end.
+fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    match future.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+        std::task::Poll::Ready(value) => value,
+        std::task::Poll::Pending => panic!("a map read is never pending"),
+    }
+}
+
+/// Each text `@asset` is read from the place its ref names, once, and
+/// cast to its type: named by its content in a program, the value itself
+/// in a run. Every one that cannot be read or cast is named once, with
+/// its source.
+#[test]
+fn text_assets_are_read_from_where_they_are_and_cast() {
+    let key = "project/11111111-2222-3333-4444-555555555555/f1";
+    let values = serde_json::json!({
+        "n": format!("@asset(\"{key}\", Number)"),
+        "u": "@asset(\"https://ex.com/a.txt\", String)",
+        "u2": "@asset(\"https://ex.com/a.txt\", JsonDict)",
+        "p": "@asset(\"/tmp/b.txt\", String)",
+    });
+    let source = MapTexts(
+        [
+            (format!("stored:{key}"), b"42".to_vec()),
+            ("url:https://ex.com/a.txt".to_string(), br#"{"a": 1}"#.to_vec()),
+            ("path:/tmp/b.txt".to_string(), b"from a path".to_vec()),
+        ]
+        .into(),
+        Default::default(),
+    );
+    let program = definition_with_config(values);
+    let read = ready(read_texts(&program, &source)).unwrap();
+    assert_eq!(*source.1.lock().unwrap(), 1, "one URL cast two ways is fetched once");
+    let dict = read.iter().find(|r| r.file_ref.ty == WeftType::parse("JsonDict").unwrap()).unwrap();
+    assert_eq!(dict.value, serde_json::json!({ "a": 1 }));
+    let number = read.iter().find(|r| r.file_ref.path == key).unwrap();
+    assert_eq!(number.resolution(TextValues::Inline).as_f64(), Some(42.0));
+    let content = weft_core::content::ContentRef::from_value(&number.resolution(TextValues::Named)).expect("named by its content");
+    assert_eq!(content.sha256(), weft_core::project::hash::sha256_hex(b"42"));
+    assert_eq!(number.bytes, b"42");
+    assert_eq!(read.iter().find(|r| r.file_ref.path == "/tmp/b.txt").unwrap().value, serde_json::json!("from a path"));
+
+    let broken = MapTexts([(format!("stored:{key}"), b"forty-two".to_vec())].into(), Default::default());
+    let errors = ready(read_texts(&program, &broken)).unwrap_err();
+    assert_eq!(errors.len(), 4, "{errors:?}");
+    assert!(errors.iter().any(|e| e.starts_with(&format!("@asset(\"{key}\", Number): "))), "{errors:?}");
+    assert!(errors.iter().all(|e| e.matches("@asset(").count() == 1), "each source is named once: {errors:?}");
 }
 
 #[test]
@@ -298,7 +371,7 @@ fn file_marker_keeps_disk_semantics_for_scope_tag_shaped_paths() {
     let fr = text_ref("project/p1/note.txt", WeftType::Primitive(WeftPrimitive::String));
     assert_eq!(
         resolve(&fr, &fs).unwrap(),
-        Resolved::Value(serde_json::Value::String("hello".into()))
+        read("project/p1/note.txt", "hello", WeftType::Primitive(WeftPrimitive::String), serde_json::Value::String("hello".into()))
     );
 }
 
@@ -910,4 +983,39 @@ mod run_values {
         let number = WeftType::Primitive(WeftPrimitive::Number);
         assert!(weft_core::run_spec::validate_supplied_value(&number, &audio).is_err());
     }
+}
+
+/// Each `@file` is named exactly where it was read, however deep: in a
+/// list, under a key holding `/` or `~`. One inside an `@instance_filled`
+/// stays the text, and so does a value a later pass rewrote. Every value
+/// named is handed back for the build's gate.
+#[test]
+fn a_file_is_named_at_the_place_it_was_read() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "beta").unwrap();
+    let fs = crate::file_reader::CompileFs::disk(dir.path());
+    let mut program = definition_with_config(serde_json::json!({
+        "list": ["@file(\"a.txt\")", "@file(\"b.txt\")"],
+        "deep": { "k/~x": ["@file(\"a.txt\")"] },
+        "filled": weft_core::instance::instance_filled_literal(Some(serde_json::json!("@file(\"b.txt\")"))),
+        "rewritten": "@file(\"b.txt\")",
+    }));
+    let mut errors = Vec::new();
+    let mut reads = Vec::new();
+    resolve_project_file_refs(&mut program, &fs, &mut errors, Some(&mut reads));
+    assert!(errors.is_empty(), "{errors:?}");
+    *program.nodes[0].config.get_mut("rewritten").unwrap() = serde_json::json!("cast by a later pass");
+    let named = name_contents(&mut program, reads);
+
+    let config = &program.nodes[0].config;
+    let path_at = |value: &serde_json::Value| weft_core::content::ContentRef::from_value(value).map(|c| c.path().to_string());
+    assert_eq!(path_at(&config["list"][0]).as_deref(), Some("a.txt"));
+    assert_eq!(path_at(&config["list"][1]).as_deref(), Some("b.txt"));
+    assert_eq!(path_at(&config["deep"]["k/~x"][0]).as_deref(), Some("a.txt"));
+    let filled = weft_core::instance::as_instance_filled(&config["filled"]).expect("still the instance's field");
+    assert_eq!(filled.fallback, Some(&serde_json::json!("beta")), "an instance's fallback stays the text");
+    assert_eq!(config["rewritten"], serde_json::json!("cast by a later pass"));
+    let values: std::collections::BTreeSet<String> = named.values().map(|v| v.as_str().unwrap().to_string()).collect();
+    assert_eq!(values, ["alpha", "beta"].map(String::from).into());
 }

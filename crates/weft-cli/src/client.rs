@@ -364,18 +364,51 @@ impl DispatcherClient {
     /// plain sleep, so Ctrl+C stops the command at once: nothing in this
     /// path catches it, and a verb that does catch it (`tokio::signal::ctrl_c`
     /// in a `select!`) drops this request, sleep and all.
+    ///
+    /// A read the platform answered for a copy of the install that stopped
+    /// ([`send_once_more`]) is sent once more, and a line on stderr says
+    /// so: the platform sends it to another copy. A request sent with a
+    /// safe method is a read; one with a body that only reads says so
+    /// ([`Self::send_reading`]).
     async fn send(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> anyhow::Result<reqwest::Response> {
+        self.send_as(Sent::of(&method), method, path, body).await
+    }
+
+    /// [`Self::send`] of a request that only reads, whatever its method: a
+    /// question too large for a URL (`weft status`'s hashes) is a POST.
+    async fn send_reading(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.send_as(Sent::Read, method, path, body).await
+    }
+
+    async fn send_as(
+        &self,
+        sent: Sent,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<reqwest::Response> {
         let started = std::time::Instant::now();
         let mut waits = 0u32;
+        let mut sent_again = false;
         loop {
             let resp = self.send_once(method.clone(), path, body).await?;
             let from_install = resp.headers().contains_key(weft_core::install::INSTALL_ANSWER_HEADER);
             let status = resp.status();
+            if send_once_more(sent, status, from_install, sent_again) {
+                sent_again = true;
+                eprintln!("warning: {}; asking it once more", platform_failure_text(status));
+                continue;
+            }
             if !busy_answer(status, from_install) {
                 return Ok(resp);
             }
@@ -383,7 +416,7 @@ impl DispatcherClient {
             // The answer's own words say why; one that cannot be read
             // still says the install is busy, by its status.
             let body = resp.text().await.unwrap_or_default();
-            say_busy(&failure_text(status, content_type.as_deref(), &body), started.elapsed());
+            say_busy(&failure_text(status, from_install, content_type.as_deref(), &body), started.elapsed());
             tokio::time::sleep(busy_wait(waits, jitter())).await;
             waits = waits.saturating_add(1);
         }
@@ -477,7 +510,7 @@ impl DispatcherClient {
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
         let body = self.text(resp).await.with_context(|| format!("read the body of a {status} answer"))?;
-        let message = failure_text(status, content_type.as_deref(), &body);
+        let message = failure_text(status, from_install, content_type.as_deref(), &body);
         Err(anyhow::Error::new(Refused { status, message, from_install, marked }))
     }
 
@@ -537,6 +570,25 @@ impl DispatcherClient {
     /// gone.
     pub async fn delete_idempotent_json(&self, path: &str) -> anyhow::Result<Option<serde_json::Value>> {
         let resp = self.send(reqwest::Method::DELETE, path, None).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND && resp.headers().contains_key("x-weft-not-found") {
+            return Ok(None);
+        }
+        Ok(Some(self.answer(resp).await?))
+    }
+
+    /// POST of a question that only reads (a body too large or too
+    /// structured for a URL), answering JSON. It is sent again like any
+    /// read the platform lost ([`send_once_more`]); any failure is an
+    /// error.
+    pub async fn ask_json(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let resp = self.send_reading(reqwest::Method::POST, path, Some(body)).await?;
+        self.answer(resp).await
+    }
+
+    /// [`Self::ask_json`], `None` on a 404 carrying the `x-weft-not-found`
+    /// marker, as [`Self::get_json_if_found`].
+    pub async fn ask_json_if_found(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<Option<serde_json::Value>> {
+        let resp = self.send_reading(reqwest::Method::POST, path, Some(body)).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND && resp.headers().contains_key("x-weft-not-found") {
             return Ok(None);
         }
@@ -641,7 +693,8 @@ const BUSY_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(4);
 /// Every other answer is the answer, shown with its words, the platform's
 /// `503` among them: it may be the install down for good, and waiting on
 /// one that never lifts would leave the command saying "busy" forever. A
-/// caller that knows its request is safe to send again and that the
+/// read the platform answered so is sent once more ([`send_once_more`]),
+/// and a caller that knows its request is safe to send again and that the
 /// install may be starting up reads the rest itself
 /// (`crate::commands::ensure::look_again_after`).
 // SYNC: busy_answer <-> crates/weft-core/src/install.rs (asks_again), extension-vscode/src/dispatcher.ts (worthTryingAgain)
@@ -650,6 +703,55 @@ pub(crate) fn busy_answer(status: reqwest::StatusCode, from_install: bool) -> bo
         reqwest::StatusCode::TOO_MANY_REQUESTS => !from_install,
         _ => weft_core::install::asks_again(status.as_u16(), from_install),
     }
+}
+
+/// Whether an answer with `status` is the platform in front of the install
+/// saying the copy of it that should serve the request is not there: a
+/// 502, 503 or 504 the install did not give itself (`from_install`
+/// false). The copy stopped, or is starting; the same request may get
+/// through on another one.
+// SYNC: platform_lost_the_copy <-> extension-vscode/src/dispatcher.ts (worthTryingAgain)
+pub(crate) fn platform_lost_the_copy(status: reqwest::StatusCode, from_install: bool) -> bool {
+    !from_install
+        && matches!(status, reqwest::StatusCode::BAD_GATEWAY | reqwest::StatusCode::SERVICE_UNAVAILABLE | reqwest::StatusCode::GATEWAY_TIMEOUT)
+}
+
+/// What sending a request again does on the install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sent {
+    /// Nothing: it only reads.
+    Read,
+    /// It may change something there.
+    Write,
+}
+
+impl Sent {
+    /// A request sent with `method`: a safe method only reads.
+    pub(crate) fn of(method: &reqwest::Method) -> Self {
+        if method.is_safe() { Sent::Read } else { Sent::Write }
+    }
+}
+
+/// Whether a request that is `sent` and answered `status` is sent once
+/// more: a read (which changes nothing on the install however often it
+/// is sent) the platform answered because the copy serving it stopped
+/// ([`platform_lost_the_copy`]), not `sent_again` already. Once, so an
+/// install that is down for good is said at once rather than waited on: a
+/// caller that knows the install may be starting up looks again itself
+/// (`crate::commands::ensure::look_again_after`).
+pub(crate) fn send_once_more(sent: Sent, status: reqwest::StatusCode, from_install: bool, sent_again: bool) -> bool {
+    sent == Sent::Read && !sent_again && platform_lost_the_copy(status, from_install)
+}
+
+/// What an answer the platform gave for a copy of the install that stopped
+/// ([`platform_lost_the_copy`]) means, and what raises the limit it most
+/// often ran into.
+pub(crate) fn platform_failure_text(status: reqwest::StatusCode) -> String {
+    format!(
+        "the install's address answered {status}, but weft did not write it: the platform in front of it did, which happens \
+         when the copy serving the request stopped mid-request, most often because it ran out of memory (its log says \
+         `Memory limit of ... exceeded`); raise it with the `WEFT_DISPATCHER_MEMORY` repository variable (docs/src/running/cloud.md)"
+    )
 }
 
 /// How long to wait before asking a busy install again, after `waits`
@@ -711,11 +813,16 @@ fn warn_once_on_version_note(resp: &reqwest::Response) {
     WARNED.call_once(|| eprintln!("warning: {note}"));
 }
 
-/// The error a failed answer turns into. An HTML page did not come from
-/// weft (which answers in text or JSON) but from something in front of it,
-/// a load balancer or a proxy, so it is named with its title rather than
-/// printed whole. Any other body is the refusal weft wrote.
-fn failure_text(status: reqwest::StatusCode, content_type: Option<&str>, body: &str) -> String {
+/// The error a failed answer turns into. The platform answering for a
+/// copy of the install that stopped says so and what to do
+/// ([`platform_failure_text`]). An HTML page did not come from weft (which
+/// answers in text or JSON) but from something in front of it, a load
+/// balancer or a proxy, so it is named with its title rather than printed
+/// whole. Any other body is the refusal weft wrote.
+fn failure_text(status: reqwest::StatusCode, from_install: bool, content_type: Option<&str>, body: &str) -> String {
+    if platform_lost_the_copy(status, from_install) {
+        return platform_failure_text(status);
+    }
     let html = content_type.is_some_and(|t| t.trim_start().to_ascii_lowercase().starts_with("text/html"));
     if html {
         let title = html_title(body).map(|t| format!(" (\"{t}\")")).unwrap_or_default();
@@ -835,8 +942,8 @@ mod tests {
     use futures::StreamExt;
     use super::fake::{closed, install, Then};
     use super::{
-        busy_answer, busy_line, busy_wait, connection_failed, failure_text, is_loopback_address, refusal, refusal_text, DispatcherClient,
-        InstallUnreachable, BUSY_WAIT_MAX,
+        busy_answer, busy_line, busy_wait, connection_failed, failure_text, is_loopback_address, platform_failure_text, platform_lost_the_copy,
+        refusal, refusal_text, send_once_more, DispatcherClient, Sent, InstallUnreachable, BUSY_WAIT_MAX,
     };
     use reqwest::StatusCode;
 
@@ -919,8 +1026,75 @@ mod tests {
         assert_eq!(format!("{e:#}"), "quota exceeded", "the install's 500 is the answer, in its own words");
 
         let platform_down = DispatcherClient::new(install(Then::Answers(&[PLATFORM_DOWN, ANSWERED])).await, None);
-        let e = platform_down.get_json("/install").await.unwrap_err();
-        assert_eq!(refusal(&e).map(|r| r.status()), Some(StatusCode::SERVICE_UNAVAILABLE), "the platform's 503 is the answer: {e:#}");
+        let e = platform_down.post_json("/projects", &serde_json::json!({})).await.unwrap_err();
+        assert_eq!(refusal(&e).map(|r| r.status()), Some(StatusCode::SERVICE_UNAVAILABLE), "the platform's 503 to a write is the answer: {e:#}");
+    }
+
+    /// Only the platform's 502, 503 or 504 says the copy serving the
+    /// request is gone; the install's own, and any other status, never.
+    #[test]
+    fn only_the_platforms_gateway_failure_is_a_lost_copy() {
+        for status in [StatusCode::BAD_GATEWAY, StatusCode::SERVICE_UNAVAILABLE, StatusCode::GATEWAY_TIMEOUT] {
+            assert!(platform_lost_the_copy(status, false), "{status}");
+            assert!(!platform_lost_the_copy(status, true), "the install's own {status}");
+        }
+        for status in [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS, StatusCode::INTERNAL_SERVER_ERROR, StatusCode::NOT_FOUND] {
+            assert!(!platform_lost_the_copy(status, false), "{status}");
+        }
+    }
+
+    /// A read the platform answered for a lost copy is sent once more, and
+    /// only once; a write never is, nor anything the install answered.
+    #[test]
+    fn a_read_the_platform_lost_is_sent_once_more() {
+        use reqwest::Method;
+        assert!(send_once_more(Sent::of(&Method::GET), StatusCode::SERVICE_UNAVAILABLE, false, false));
+        assert!(send_once_more(Sent::of(&Method::GET), StatusCode::BAD_GATEWAY, false, false));
+        assert!(!send_once_more(Sent::of(&Method::GET), StatusCode::SERVICE_UNAVAILABLE, false, true), "already sent again");
+        assert!(!send_once_more(Sent::of(&Method::GET), StatusCode::SERVICE_UNAVAILABLE, true, false), "the install's own 503");
+        assert!(!send_once_more(Sent::of(&Method::GET), StatusCode::INTERNAL_SERVER_ERROR, false, false));
+        for write in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(!send_once_more(Sent::of(&write), StatusCode::SERVICE_UNAVAILABLE, false, false), "{write}");
+        }
+        // A question too large for a URL is a POST that only reads.
+        assert!(send_once_more(Sent::Read, StatusCode::SERVICE_UNAVAILABLE, false, false));
+    }
+
+    /// The platform's answer for a lost copy says weft did not write it,
+    /// why it happens, and what raises the limit.
+    #[test]
+    fn a_lost_copy_says_what_happened_and_what_raises_the_limit() {
+        assert_eq!(
+            platform_failure_text(StatusCode::SERVICE_UNAVAILABLE),
+            "the install's address answered 503 Service Unavailable, but weft did not write it: the platform in front of it \
+             did, which happens when the copy serving the request stopped mid-request, most often because it ran out of \
+             memory (its log says `Memory limit of ... exceeded`); raise it with the `WEFT_DISPATCHER_MEMORY` repository \
+             variable (docs/src/running/cloud.md)"
+        );
+        assert_eq!(
+            failure_text(StatusCode::BAD_GATEWAY, false, Some("text/html"), "<html><title>Bad Gateway</title></html>"),
+            platform_failure_text(StatusCode::BAD_GATEWAY),
+            "said over the platform's own page"
+        );
+    }
+
+    /// A read the platform answered for a lost copy goes through on the
+    /// next copy, a POST that only reads too; one lost twice fails saying
+    /// what the platform's answer means.
+    #[tokio::test]
+    async fn a_read_is_sent_once_more_after_a_lost_copy() {
+        const LOST: &str = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 11\r\n\r\nunavailable";
+        const ANSWERED: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 7\r\n\r\n{\"a\":1}";
+        let once = DispatcherClient::new(install(Then::Answers(&[LOST, ANSWERED])).await, None);
+        assert_eq!(once.get_json("/install").await.unwrap(), serde_json::json!({ "a": 1 }));
+        let asked = DispatcherClient::new(install(Then::Answers(&[LOST, ANSWERED])).await, None);
+        assert_eq!(asked.ask_json("/access/lookup", &serde_json::json!({})).await.unwrap(), serde_json::json!({ "a": 1 }));
+
+        let twice = DispatcherClient::new(install(Then::Answers(&[LOST, LOST, ANSWERED])).await, None);
+        let e = twice.get_json("/install").await.unwrap_err();
+        assert_eq!(refusal(&e).map(|r| r.status()), Some(StatusCode::SERVICE_UNAVAILABLE), "{e:#}");
+        assert!(refusal(&e).is_some_and(|r| !r.is_the_installs()));
+        assert_eq!(e.to_string(), platform_failure_text(StatusCode::SERVICE_UNAVAILABLE));
     }
 
     fn unreachable(e: &anyhow::Error) -> bool {
@@ -1040,18 +1214,23 @@ mod tests {
         let length_required = reqwest::StatusCode::LENGTH_REQUIRED;
         let page = "<!DOCTYPE html><html><head><TITLE>Error 411 (Length Required)!!1</TITLE><style>body{}</style></head><body><p>long page</p></body></html>";
         assert_eq!(
-            failure_text(length_required, Some("text/html; charset=UTF-8"), page),
+            failure_text(length_required, false, Some("text/html; charset=UTF-8"), page),
             "the install's address answered 411 Length Required with an HTML page (\"Error 411 (Length Required)!!1\"), \
              which comes from something in front of weft, not from weft itself"
         );
         assert_eq!(
-            failure_text(reqwest::StatusCode::BAD_GATEWAY, Some("text/html"), "<html><title>\n </title>oops</html>"),
-            "the install's address answered 502 Bad Gateway with an HTML page, which comes from something in front of weft, not from weft itself"
+            failure_text(reqwest::StatusCode::FORBIDDEN, false, Some("text/html"), "<html><title>\n </title>oops</html>"),
+            "the install's address answered 403 Forbidden with an HTML page, which comes from something in front of weft, not from weft itself"
         );
         assert_eq!(
-            failure_text(reqwest::StatusCode::CONFLICT, Some("text/plain; charset=utf-8"), "project is already activating"),
+            failure_text(reqwest::StatusCode::CONFLICT, true, Some("text/plain; charset=utf-8"), "project is already activating"),
             "project is already activating"
         );
-        assert_eq!(failure_text(reqwest::StatusCode::NOT_FOUND, None, ""), "dispatcher returned 404 Not Found");
+        assert_eq!(failure_text(reqwest::StatusCode::NOT_FOUND, true, None, ""), "dispatcher returned 404 Not Found");
+        assert_eq!(
+            failure_text(reqwest::StatusCode::BAD_GATEWAY, true, None, "the store did not answer"),
+            "the store did not answer",
+            "the install's own 502 is its own words"
+        );
     }
 }

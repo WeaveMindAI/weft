@@ -35,6 +35,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::basic("placeholders_become_positions_in_first_use_order", placeholder_order),
         NodeTest::basic("placeholders_leave_quotes_comments_and_dollar_bodies_alone", placeholder_quoting),
         NodeTest::basic("placeholders_count_statements_and_refuse_positions", placeholder_statements),
+        NodeTest::basic("placeholders_keep_text_in_any_alphabet_as_written", placeholder_unicode),
         NodeTest::basic("plan_reads_the_query_as_a_query_or_a_script", plan_mismatches),
         NodeTest::basic("only_a_statement_that_opens_a_transaction_counts_as_one", opening_statements),
         NodeTest::basic("a_refusal_names_the_port_not_the_position", spelled_parameters),
@@ -191,6 +192,25 @@ fn placeholder_statements() -> WeftResult<()> {
     // Nothing to run is a refusal, not an empty answer.
     let err = placeholders("-- fill this in later").expect_err("an empty query is refused").to_string();
     assert!(err.contains("empty"), "{err}");
+    Ok(())
+}
+
+/// Text in any alphabet around a placeholder, inside quotes, comments
+/// and dollar bodies, and as the character after an `E'...'` escape,
+/// comes through byte for byte, and a non-breaking space is whitespace.
+fn placeholder_unicode() -> WeftResult<()> {
+    let p = placeholders("SELECT 'café ☕', \"naïve\" FROM t WHERE nom = $nom AND ville = 'Zürich'")?;
+    assert_eq!(p.statements[0].sql, "SELECT 'café ☕', \"naïve\" FROM t WHERE nom = $1 AND ville = 'Zürich'");
+    assert_eq!(p.statements[0].names, vec!["nom"]);
+    let p = placeholders("-- 日本語 $no;\nSELECT $$ 🎉; $$, E'\\é$no', /* ü /* ß */ */ $ja; SELECT $ja")?;
+    assert_eq!(p.statements.len(), 2);
+    assert_eq!(p.statements[0].sql, "-- 日本語 $no;\nSELECT $$ 🎉; $$, E'\\é$no', /* ü /* ß */ */ $1");
+    assert_eq!(p.statements[0].names, vec!["ja"]);
+    assert_eq!(p.statements[1].sql, "SELECT $1");
+    // A statement of nothing but a no-break space and a comment is none.
+    assert_eq!(placeholders("SELECT 1;\u{a0}/* été */;")?.statements.len(), 1);
+    assert_eq!(placeholders("\u{3000}SELECT ‘x’\u{a0}")?.statements[0].sql, "SELECT ‘x’");
+    assert!(placeholders("SELECT 'é").is_err(), "an unclosed quote after text in another alphabet");
     Ok(())
 }
 

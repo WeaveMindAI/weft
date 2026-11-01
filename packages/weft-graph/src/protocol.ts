@@ -884,7 +884,8 @@ export interface GroupDefinition {
   description?: string | null;
   /// Literals written on the container's interface ports: `g.x = "hi"` from
   /// outside, or `_should_flow: false` in the braces. A wired value is an
-  /// ordinary edge and never appears here.
+  /// ordinary edge and never appears here. A loop's is empty: its sit on
+  /// its `LoopIn` alone, with their spans and file refs.
   portLiterals?: Record<string, unknown>;
   /// Where each `portLiterals` entry was written, and in which form, so an
   /// edit rewrites the value where it already lives.
@@ -1152,6 +1153,40 @@ export function isSecretMarker(value: unknown): boolean {
   const id = (payload as Record<string, unknown>).secretId;
   return fields.length === 1 && fields[0] === 'secretId' && typeof id === 'string' && UUID.test(id);
 }
+
+/** The on-wire sentinel key tagging the content of a file a built program
+ *  names instead of holding its text:
+ *  `{"__weft_content__": {"sha256": "<hex>", "type": "String", "path": "sql/a.sql"}}`. */
+// SYNC: CONTENT_MARKER_KEY <-> crates/weft-core/src/content.rs CONTENT_MARKER_KEY
+export const CONTENT_MARKER_KEY = '__weft_content__';
+
+/** What a content marker names: the file it was read from and the type
+ *  its text is cast to. */
+export interface ContentMarker {
+  sha256: string;
+  type: string;
+  path: string;
+}
+
+/** The content `value` is the marker of: an object holding the sentinel
+ *  key alone, whose payload holds a sha256, a type and a path and nothing
+ *  else. `null` for anything else, a malformed marker included. */
+// SYNC: contentMarker <-> crates/weft-core/src/content.rs ContentRef::from_value
+export function contentMarker(value: unknown): ContentMarker | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || keys[0] !== CONTENT_MARKER_KEY) return null;
+  const payload = (value as Record<string, unknown>)[CONTENT_MARKER_KEY];
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
+  const fields = payload as Record<string, unknown>;
+  if (Object.keys(fields).length !== 3) return null;
+  const { sha256, type, path } = fields;
+  if (typeof sha256 !== 'string' || !SHA256.test(sha256) || typeof type !== 'string' || typeof path !== 'string') return null;
+  return { sha256, type, path };
+}
+
+/** A sha256 in the lowercase hex the backend names content by. */
+const SHA256 = /^[0-9a-f]{64}$/;
 
 /** A uuid in the hyphenated form the backend writes a `SecretId` in. */
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1608,6 +1643,9 @@ export interface TriggerCopy {
   /// Whose: absent for the shared one.
   instance?: string;
   state: TriggerState;
+  /// Whether it is on: `on` or `behind`, said by the dispatcher from the
+  /// state so nothing here has to know which states are on.
+  on: boolean;
   mode: ActivationMode;
   /// For one taken down by something other than a person, what.
   downWith?: DownWith;
@@ -1665,6 +1703,8 @@ export interface InstanceInfraEntry {
   progress?: ChangeProgress;
   /// Applied from other infra than the source holds now.
   behind?: boolean;
+  /// The source declares its place no more (`InfraPlacementStatus.orphaned`).
+  orphaned?: boolean;
   /// The latest restart of its containers since weft last started it.
   lastRestart?: LastRestart;
 }
@@ -2475,6 +2515,11 @@ export interface InfraPlacementStatus {
   /// Its copy was applied from other infra than the source holds now:
   /// `weft infra upgrade --infra <node>` brings it up to date.
   behind?: boolean;
+  /// Its copy is live and the source declares its place no more: an
+  /// orphan, counted in `orphanedInfra`, that keeps running until
+  /// `weft infra stop` or `weft infra terminate` takes it down. Never
+  /// `behind` too.
+  orphaned?: boolean;
   /// The triggers whose cut contains it (each instance's too, for a
   /// shared one), by owner: what taking it down takes down with it.
   takesDown?: OwnerTriggers[];

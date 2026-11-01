@@ -154,7 +154,9 @@ impl ProgramIdentity {
 /// - per node: `fileRefs` (records that a config field came from
 ///   `@file("path", Type)`; the RESOLVED value already lives in `config`,
 ///   which IS hashed, so the path here is editor-routing metadata: renaming
-///   the file with identical content must not flip the hash) and
+///   the file with identical content must not flip the hash; in a built
+///   program the value is the content named by its hash
+///   (`crate::content`), whose `path` is stripped for the same reason) and
 ///   `includePath` (an interface-parse-only pointer to an `@include`d file;
 ///   the file's PATH is non-semantic, its expanded topology is what runs)
 ///   and `sourceFile` (the absolute path a diagnostic anchors to; the same
@@ -190,17 +192,9 @@ impl ProgramIdentity {
 /// built is kept under the hash it claims, at its own version, by the
 /// same rule.
 pub fn compute_definition_hash(project: &ProjectDefinition) -> anyhow::Result<SourceHash> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"weft-definition-v1\n");
-    let mut value = serde_json::to_value(project)
-        .map_err(|e| anyhow::anyhow!("serialize ProjectDefinition: {e}"))?;
-    // Field names are the camelCase `#[serde(rename)]` wire names. A
-    // ProjectDefinition ALWAYS serializes to a JSON object; if it somehow didn't,
-    // silently skipping the strips would hash the un-stripped value (timestamps
-    // included) and produce a wrong, unstable hash. Fail loud instead.
-    let obj = value
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("ProjectDefinition did not serialize to a JSON object"))?;
+    // Every field named, so a field added to the program does not compile
+    // here until it is said whether it is hashed.
+    //
     // `id` is the project's DB identity, NOT part of the runtime shape. It is
     // already the OTHER half of the `(project_id, definition_hash)` identity key,
     // so hashing it here too is redundant. Worse, it makes the hash context-
@@ -208,30 +202,108 @@ pub fn compute_definition_hash(project: &ProjectDefinition) -> anyhow::Result<So
     // NIL uuid (the id is not a parse input), while the build/dispatcher computes
     // the stored hash with the real project id. If `id` were hashed, those two
     // would NEVER agree and the "out of sync / resync" light would be stuck on.
-    for key in ["id", "createdAt", "updatedAt"] {
-        obj.remove(key);
+    // What does not compile (`broken`) follows from the nodes and wires
+    // (a placeholder, a port type), and its wording carries line numbers, so
+    // moving a broken line would otherwise read as a new program. A metadata
+    // wire never runs: its value is already written into the input it
+    // points at (`portLiterals`, hashed with the node), and the wire itself
+    // is only drawn.
+    let ProjectDefinition { id: _, created_at: _, updated_at: _, broken: _, metadata_wires: _, nodes, edges, groups, defaults, given } =
+        project;
+    // The canonical JSON of what is left (every strip made, every object's
+    // keys sorted: `defaults`, `edges`, `given`, `groups`, `nodes`, each
+    // written when serde writes it), streamed into the hasher an element
+    // at a time: a program's whole JSON is never held, only one node's.
+    let mut out = Hashing(Sha256::new());
+    out.0.update(b"weft-definition-v1\n");
+    let mut fields = CanonicalObject::open(&mut out);
+    if !defaults.is_default() {
+        fields.field("defaults")?;
+        write_canonical(fields.out, serde_json::to_value(defaults)?)?;
     }
-    // What does not compile follows from the nodes and wires above (a
-    // placeholder, a port type), and its wording carries line numbers, so
-    // moving a broken line would otherwise read as a new program.
-    obj.remove("broken");
-    // A metadata wire never runs: its value is already written into the
-    // input it points at (`portLiterals`, hashed with the node), and the
-    // wire itself is only drawn.
-    obj.remove("metadataWires");
-    strip_keys(obj.get_mut("nodes"), NODE_HASH_STRIPS);
-    strip_keys(obj.get_mut("edges"), EDGE_HASH_STRIPS);
-    strip_crossing_spans(obj.get_mut("edges"));
-    strip_keys(obj.get_mut("groups"), GROUP_HASH_STRIPS);
-    strip_port_presentation(obj.get_mut("nodes"));
-    strip_port_presentation(obj.get_mut("groups"));
-    canonicalize_key_order(&mut value);
-    let json = serde_json::to_vec(&value)
-        .map_err(|e| anyhow::anyhow!("re-serialize ProjectDefinition: {e}"))?;
-    hasher.update(&json);
-    Ok(hex(&hasher.finalize()))
+    fields.field("edges")?;
+    write_canonical_list(fields.out, edges, canonical_edge)?;
+    if !given.is_empty() {
+        fields.field("given")?;
+        write_canonical(fields.out, serde_json::to_value(given)?)?;
+    }
+    fields.field("groups")?;
+    write_canonical_list(fields.out, groups, canonical_group)?;
+    fields.field("nodes")?;
+    write_canonical_list(fields.out, nodes, canonical_node)?;
+    fields.close();
+    Ok(hex(&out.0.finalize()))
 }
 
+/// A hasher written to as a byte sink.
+struct Hashing(Sha256);
+
+impl std::io::Write for Hashing {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A canonical JSON object written field by field, in the order its keys
+/// sort, as serde_json writes one compact.
+struct CanonicalObject<'w> {
+    out: &'w mut Hashing,
+    first: bool,
+}
+
+impl<'w> CanonicalObject<'w> {
+    fn open(out: &'w mut Hashing) -> Self {
+        out.0.update(b"{");
+        Self { out, first: true }
+    }
+
+    /// The next field's key; its value is written next.
+    fn field(&mut self, key: &str) -> anyhow::Result<()> {
+        if !self.first {
+            self.out.0.update(b",");
+        }
+        self.first = false;
+        serde_json::to_writer(&mut *self.out, key)?;
+        self.out.0.update(b":");
+        Ok(())
+    }
+
+    fn close(self) {
+        self.out.0.update(b"}");
+    }
+}
+
+/// `value` in its canonical form ([`canonicalize_key_order`]), written.
+fn write_canonical(out: &mut Hashing, mut value: serde_json::Value) -> anyhow::Result<()> {
+    canonicalize_key_order(&mut value);
+    serde_json::to_writer(out, &value)?;
+    Ok(())
+}
+
+/// A list, each element serialized on its own, made canonical by
+/// `strip`, and written.
+fn write_canonical_list<T: Serialize>(
+    out: &mut Hashing,
+    items: &[T],
+    strip: fn(&mut serde_json::Value),
+) -> anyhow::Result<()> {
+    out.0.update(b"[");
+    for (at, item) in items.iter().enumerate() {
+        if at > 0 {
+            out.0.update(b",");
+        }
+        let mut value = serde_json::to_value(item)?;
+        strip(&mut value);
+        write_canonical(out, value)?;
+    }
+    out.0.update(b"]");
+    Ok(())
+}
 
 /// Fold `closure`'s slice of the definition into `hasher`: the
 /// closure's nodes and groups (ids in `closure`) and the wires between
@@ -270,13 +342,15 @@ pub fn hash_definition_slice(
         .map(serde_json::to_value)
         .collect::<Result<_, _>>()
         .map_err(|e| anyhow::anyhow!("serialize slice edge: {e}"))?;
-    let mut slice = serde_json::json!({ "nodes": sorted(nodes), "groups": sorted(groups), "edges": sorted(edges) });
-    strip_keys(slice.get_mut("nodes"), NODE_HASH_STRIPS);
-    strip_keys(slice.get_mut("groups"), GROUP_HASH_STRIPS);
-    strip_keys(slice.get_mut("edges"), EDGE_HASH_STRIPS);
-    strip_crossing_spans(slice.get_mut("edges"));
-    strip_port_presentation(slice.get_mut("nodes"));
-    strip_port_presentation(slice.get_mut("groups"));
+    let canonical = |mut values: Vec<serde_json::Value>, strip: fn(&mut serde_json::Value)| {
+        values.iter_mut().for_each(strip);
+        sorted(values)
+    };
+    let mut slice = serde_json::json!({
+        "nodes": canonical(nodes, canonical_node),
+        "groups": canonical(groups, canonical_group),
+        "edges": canonical(edges, canonical_edge),
+    });
     canonicalize_key_order(&mut slice);
     hasher.update(b"definition-slice:");
     hasher.update(
@@ -309,13 +383,29 @@ const EDGE_HASH_STRIPS: &[&str] = &["span", "sourceFile"];
 // `metadataPorts` is a node's own strip.
 const GROUP_HASH_STRIPS: &[&str] = &["span", "headerSpan", "portLiteralSpans", "sourceFile", "description", "fileRefs", "metadataPorts"];
 
-/// Strip each wire's crossings of where their legs were written (a
-/// crossing's `span` and `sourceFile`, the same strips as the wire's own):
-/// formatting the source must not move a digest.
-fn strip_crossing_spans(edges: Option<&mut serde_json::Value>) {
-    let Some(serde_json::Value::Array(edges)) = edges else { return };
-    for edge in edges {
-        strip_keys(edge.get_mut("via"), EDGE_HASH_STRIPS);
+/// A node's serialized value stripped of what is not its runtime shape:
+/// [`NODE_HASH_STRIPS`], each port's presentation, and the path of every
+/// content its values name.
+fn canonical_node(node: &mut serde_json::Value) {
+    strip_element(node, NODE_HASH_STRIPS);
+    strip_ports(node);
+    strip_content_paths(node);
+}
+
+/// A group's, as [`canonical_node`] with [`GROUP_HASH_STRIPS`].
+fn canonical_group(group: &mut serde_json::Value) {
+    strip_element(group, GROUP_HASH_STRIPS);
+    strip_ports(group);
+    strip_content_paths(group);
+}
+
+/// A wire's: [`EDGE_HASH_STRIPS`], and each of its crossings' (a
+/// crossing's `span` and `sourceFile`, the same strips as the wire's
+/// own): formatting the source must not move a digest.
+fn canonical_edge(edge: &mut serde_json::Value) {
+    strip_element(edge, EDGE_HASH_STRIPS);
+    if let Some(serde_json::Value::Array(via)) = edge.get_mut("via") {
+        via.iter_mut().for_each(|crossing| strip_element(crossing, EDGE_HASH_STRIPS));
     }
 }
 
@@ -329,32 +419,37 @@ fn strip_crossing_spans(edges: Option<&mut serde_json::Value>) {
 /// label, would otherwise flip the hash and light a resync for a
 /// cosmetic change).
 const PORT_HASH_STRIPS: &[&str] = &["declaredType", "description", "label", "placeholder"];
-fn strip_port_presentation(array: Option<&mut serde_json::Value>) {
-    let Some(serde_json::Value::Array(items)) = array else { return };
-    for item in items {
-        for list in ["inputs", "outputs", "inPorts", "outPorts"] {
-            if let Some(serde_json::Value::Array(ports)) = item.get_mut(list) {
-                for port in ports {
-                    if let Some(obj) = port.as_object_mut() {
-                        for key in PORT_HASH_STRIPS {
-                            obj.remove(*key);
-                        }
-                    }
-                }
-            }
+fn strip_ports(item: &mut serde_json::Value) {
+    for list in ["inputs", "outputs", "inPorts", "outPorts"] {
+        if let Some(serde_json::Value::Array(ports)) = item.get_mut(list) {
+            ports.iter_mut().for_each(|port| strip_element(port, PORT_HASH_STRIPS));
         }
     }
 }
 
-/// Remove `keys` from every object in a JSON array. Top level of
-/// each element only: deliberately does NOT recurse into `config`.
-fn strip_keys(array: Option<&mut serde_json::Value>, keys: &[&str]) {
-    let Some(serde_json::Value::Array(items)) = array else { return };
-    for item in items {
-        if let Some(obj) = item.as_object_mut() {
-            for key in keys {
-                obj.remove(*key);
-            }
+/// The path a content a build named (`crate::content`) was read from is
+/// where it came from, like a `fileRefs` record: renaming a file with
+/// the same content names the same content, and must not flip the hash.
+fn strip_content_paths(value: &mut serde_json::Value) {
+    if crate::content::ContentRef::from_value(value).is_some() {
+        if let Some(payload) = value.get_mut(crate::content::CONTENT_MARKER_KEY).and_then(serde_json::Value::as_object_mut) {
+            payload.remove("path");
+        }
+        return;
+    }
+    match value {
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(strip_content_paths),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_content_paths),
+        _ => {}
+    }
+}
+
+/// Remove `keys` from one element's object. Top level only: deliberately
+/// does NOT recurse into `config`.
+fn strip_element(item: &mut serde_json::Value, keys: &[&str]) {
+    if let Some(obj) = item.as_object_mut() {
+        for key in keys {
+            obj.remove(*key);
         }
     }
 }
@@ -623,6 +718,68 @@ mod slice_tests {
         written.nodes[1].port_literals.insert("tool".into(), serde_json::json!("about a"));
         assert_ne!(compute_definition_hash(&drawn).unwrap(), compute_definition_hash(&written).unwrap());
         assert_ne!(slice_of(&drawn, "b"), slice_of(&written, "b"));
+    }
+
+    /// The definition hash as it was computed before it was streamed: the
+    /// whole program as one JSON value, stripped and sorted, then written
+    /// out. The streamed one must give the same digest, or every stored
+    /// program and running hash would read as another program.
+    fn whole_value_hash(project: &ProjectDefinition) -> String {
+        let mut value = serde_json::to_value(project).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        for key in ["id", "createdAt", "updatedAt", "broken", "metadataWires"] {
+            obj.remove(key);
+        }
+        for (list, strip) in [("nodes", canonical_node as fn(&mut serde_json::Value)), ("edges", canonical_edge), ("groups", canonical_group)] {
+            if let Some(serde_json::Value::Array(items)) = obj.get_mut(list) {
+                items.iter_mut().for_each(strip);
+            }
+        }
+        canonicalize_key_order(&mut value);
+        let mut hasher = Sha256::new();
+        hasher.update(b"weft-definition-v1\n");
+        hasher.update(serde_json::to_vec(&value).unwrap());
+        hex(&hasher.finalize())
+    }
+
+    /// The streamed hash is the whole-value one, with every top-level
+    /// field present or left out, every list empty or not.
+    #[test]
+    fn the_streamed_definition_hash_is_the_whole_value_one() {
+        let mut full = project_wired("a1", "b1", "x1", 0.0, &[("a", "b"), ("b", "x")]);
+        assert_eq!(compute_definition_hash(&full).unwrap(), whole_value_hash(&full));
+        full.nodes[0].inputs.push(serde_json::from_value(serde_json::json!({
+            "name": "in", "portType": "String", "required": false, "description": "prose", "label": "In", "declaredType": "String"
+        })).unwrap());
+        full.nodes[0].port_literals.insert("in".into(), serde_json::json!({ "z": [1, { "b": 2, "a": 1 }], "a": "\"quoted\"" }));
+        full.groups = serde_json::from_value(serde_json::json!([{ "id": "g", "kind": "body", "nodeIds": [], "description": "a group" }])).unwrap();
+        full.given.outputs.insert(crate::frames::Located::top("x"));
+        full.defaults.keep_for = Some(crate::run_settings::KeepFor::WEFT_DEFAULT);
+        full.metadata_wires = full.edges.clone();
+        assert_eq!(compute_definition_hash(&full).unwrap(), whole_value_hash(&full));
+        let mut empty = full.clone();
+        empty.nodes.clear();
+        empty.edges.clear();
+        empty.groups.clear();
+        assert_eq!(compute_definition_hash(&empty).unwrap(), whole_value_hash(&empty));
+    }
+
+    /// A value named by its content hashes by the content and its type:
+    /// the same content read from another path is the same program,
+    /// another content another one.
+    #[test]
+    fn a_named_content_hashes_by_what_it_names_not_where_it_was_read() {
+        let string = crate::weft_type::WeftType::primitive(crate::weft_type::WeftPrimitive::String);
+        let with = |text: &str, path: &str| {
+            let mut program = project("a1", "b1", "x1", 0.0);
+            let (content, _) = crate::content::ContentRef::of_text(text, &string, path).unwrap();
+            program.nodes[1].port_literals.insert("query".into(), serde_json::json!([content.to_value()]));
+            program
+        };
+        let hash = |program: &ProjectDefinition| compute_definition_hash(program).unwrap();
+        assert_eq!(hash(&with("SELECT 1;", "sql/a.sql")), hash(&with("SELECT 1;", "sql/renamed.sql")));
+        assert_ne!(hash(&with("SELECT 1;", "sql/a.sql")), hash(&with("SELECT 2;", "sql/a.sql")));
+        assert_eq!(slice_of(&with("SELECT 1;", "sql/a.sql"), "b"), slice_of(&with("SELECT 1;", "sql/renamed.sql"), "b"));
     }
 
     #[test]
