@@ -2803,18 +2803,23 @@ async fn a_provider_naming_the_client_differently_gets_that_name_everywhere(pool
     .unwrap();
     let consent = url::Url::parse(&started.consent_url).unwrap();
     let query: BTreeMap<String, String> = consent.query_pairs().into_owned().collect();
-    assert_eq!(query.get("client_key").map(String::as_str), Some("cid"), "{consent}");
-    assert!(!query.contains_key("client_id"), "{consent}");
-    assert_eq!(query.get("app").map(String::as_str), Some("cid"), "{consent}");
+    // Failures name the consent URL's keys only: the URL carries the
+    // flow's state, which is never printed.
+    let keys: Vec<&String> = query.keys().collect();
+    assert_eq!(query.get("client_key").map(String::as_str), Some("cid"), "{keys:?}");
+    assert!(!query.contains_key("client_id"), "{keys:?}");
+    assert_eq!(query.get("app").map(String::as_str), Some("cid"), "{keys:?}");
     let scopes: Vec<&str> = query.get("scope").map(|s| s.split([' ', ',']).collect()).unwrap_or_default();
-    assert!(scopes.contains(&"read"), "the consent asks for every permission the connect carries: {consent}");
+    assert!(scopes.contains(&"read"), "the consent asks for every permission the connect carries: {scopes:?}");
     let grant = complete_oauth(&pool, &started.state, "the-code").await.unwrap().grant;
     expire_now(&pool, grant.id).await;
 
+    // The token calls' bodies carry the client secret and the tokens, so
+    // a failure says which check failed, never the body.
     let exchange = last_call(&fake, "/token");
-    assert!(exchange.contains("client_key=cid") && exchange.contains("client_secret=sec"), "{exchange}");
-    assert!(!exchange.contains("client_id="), "{exchange}");
-    assert!(exchange.contains("audience=cid-api"), "{exchange}");
+    assert!(exchange.contains("client_key=cid") && exchange.contains("client_secret=sec"), "the exchange names the client by client_key");
+    assert!(!exchange.contains("client_id="), "the exchange sends no client_id");
+    assert!(exchange.contains("audience=cid-api"), "the exchange carries the audience");
 
     *fake.next_token.lock().unwrap() = "tok-fresh".into();
     *fake.expires_in.lock().unwrap() = Some(3600);
@@ -2823,9 +2828,9 @@ async fn a_provider_naming_the_client_differently_gets_that_name_everywhere(pool
         .expect("the refresh succeeds");
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-fresh"));
     let refresh = last_call(&fake, "/token");
-    assert!(refresh.contains("grant_type=refresh_token"), "{refresh}");
-    assert!(refresh.contains("client_key=cid") && !refresh.contains("client_id="), "{refresh}");
-    assert!(refresh.contains("audience=cid-api"), "{refresh}");
+    assert!(refresh.contains("grant_type=refresh_token"), "the refresh is a refresh_token grant");
+    assert!(refresh.contains("client_key=cid") && !refresh.contains("client_id="), "the refresh names the client by client_key");
+    assert!(refresh.contains("audience=cid-api"), "the refresh carries the audience");
 }
 
 /// The Instagram shape: the exchange answers a short-lived token nested
