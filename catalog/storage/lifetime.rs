@@ -7,10 +7,9 @@ use weft::{WeftError, WeftResult};
 
 /// The scope a `scope` setting names: `run` or `project`.
 pub fn scope_named(name: &str) -> WeftResult<StorageScope> {
-    match name {
-        "run" => Ok(StorageScope::Run),
-        "project" => Ok(StorageScope::Project),
-        other => Err(WeftError::Input(format!("`scope` is '{other}'; it is `run` or `project`"))),
+    match StorageScope::named(name) {
+        Some(scope @ (StorageScope::Run | StorageScope::Project)) => Ok(scope),
+        _ => Err(WeftError::Input(format!("`scope` is '{name}'; it is `run` or `project`"))),
     }
 }
 

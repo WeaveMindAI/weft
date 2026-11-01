@@ -56,7 +56,7 @@ impl Node for LlmInferenceJsonNode {
 /// and held to `declared` (an open record's undeclared keys dropped).
 /// The error says what was wrong, in words the model can be shown on a
 /// retry. The value is held to the type's structure, so the reason
-/// names the field (`value: missing required field "score"`) once,
+/// names the field (`value: missing required field 'score'`) once,
 /// after the declared name.
 pub fn parse_answer(text: &str, declared: &WeftType) -> Result<Value, String> {
     let repaired = minillmlib::repair_json(text, &minillmlib::RepairOptions::default())

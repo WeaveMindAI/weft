@@ -32,7 +32,7 @@ fn answer_rules() -> WeftResult<()> {
     let dict = WeftType::parse("JsonDict").expect("JsonDict parses");
     assert_eq!(parse_answer("Here is the JSON: ```json {'a': 1} ```", &dict), Ok(json!({ "a": 1 })), "prose around a fence, single quotes");
     let why = parse_answer(r#"{"label": "ok"}"#, &verdict()).unwrap_err();
-    assert_eq!(why, r#"the model's answer does not fit Verdict: value: missing required field "score""#);
+    assert_eq!(why, "the model's answer does not fit Verdict: value: missing required field 'score'");
     let why = parse_answer(r#"{"label": "ok", "score": 1, "extra": true}"#, &verdict()).unwrap_err();
     assert!(why.starts_with("the model's answer does not fit Verdict") && why.contains("extra"), "a closed record refuses an undeclared key: {why}");
     let why = parse_answer("[1, 2]", &dict).unwrap_err();
@@ -106,7 +106,7 @@ async fn missing_field(rig: FakeRig) -> WeftResult<()> {
         .await
         .ok()?;
     let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
-    assert!(error.contains(r#"the model's answer does not fit Verdict: value: missing required field "score""#), "{error}");
+    assert!(error.contains("the model's answer does not fit Verdict: value: missing required field 'score'"), "{error}");
     for port in ["response", "historyFile", "toolCalls"] {
         assert!(!outcome.outputs.contains_key(port), "a rejected answer emits nothing on {port}");
     }

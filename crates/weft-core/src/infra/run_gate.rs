@@ -34,7 +34,7 @@ pub fn copies_read<'a>(
         if within.is_some_and(|set| !set.contains(&spelled)) {
             continue;
         }
-        let per_instance = crate::project::is_per_instance(project, &place.id);
+        let per_instance = crate::project::is_per_instance(project, &place);
         // Nobody named, so there is no copy to look at: activate's note
         // over the whole project lands here (it leaves these out), and a
         // run never does ([`require_run_infra`] refuses it first).

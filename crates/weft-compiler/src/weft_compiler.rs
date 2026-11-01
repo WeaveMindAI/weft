@@ -4254,7 +4254,7 @@ fn push_loop_boundaries(group: &ParsedGroup, nodes: &mut Vec<NodeDefinition>) {
         place_types: Vec::new(),
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::In }),
-        requires_infra: false, per_instance: None,
+        requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
         images: Vec::new(),
         fires_with: Default::default(), baked_outputs: Default::default(),
         published_service: None,
@@ -4347,7 +4347,7 @@ fn push_loop_boundaries(group: &ParsedGroup, nodes: &mut Vec<NodeDefinition>) {
         place_types: Vec::new(),
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::Out }),
-        requires_infra: false, per_instance: None,
+        requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
         images: Vec::new(),
         fires_with: Default::default(), baked_outputs: Default::default(),
         published_service: None,
@@ -4426,6 +4426,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         // The mark only; enrich checks the node may carry it and the
         // propagation adds every node that reads from one.
         per_instance: pn.per_instance.then_some(weft_core::instance::PerInstance::Marked),
+        per_instance_paths: Default::default(),
         images: Vec::new(),
         fires_with: Default::default(), baked_outputs: Default::default(),
         published_service: None,

@@ -133,7 +133,7 @@ impl Bounds {
 /// never told to select the loop); then one inside a loop, which runs
 /// whole, is refused naming the loop.
 fn endpoint(g: &ProjectGraph, found: &Named, spelled: &str) -> Result<(), String> {
-    refuse_broken(&g.project().broken, &BTreeSet::from([found.place().id.as_str()]))?;
+    refuse_broken(&g.project().broken, &BTreeSet::from([found.place().id.as_str()]), &BTreeSet::from([found.place().clone()]))?;
     match loop_around(g, found) {
         Some(around) => Err(format!(
             "cannot cut at '{spelled}' inside loop '{}'; select the whole loop",
@@ -611,6 +611,10 @@ pub fn cut(project: &ProjectDefinition, walked: &Walk, given: &mut Given) -> Res
     let nodes: Vec<super::NodeDefinition> = project.nodes.iter().filter(|node| kept_ids.contains(node.id.as_str())).map(|node| {
         let mut node = node.clone();
         node.scope.retain(|scope| !dissolved.contains(scope));
+        // Only the places the cut keeps: a site the cut does not run says
+        // nothing about this cut (and would move its hash, so a trigger's
+        // fingerprint, when an unrelated site changes).
+        node.per_instance_paths.retain(|path| kept.contains(&Located::new(node.id.clone(), path.clone())));
         node
     }).collect();
     let edges: Vec<Edge> = project.edges.iter().filter(|edge| edge_ids.contains(edge.id.as_str())).map(|edge| {
@@ -676,7 +680,7 @@ pub fn cut(project: &ProjectDefinition, walked: &Walk, given: &mut Given) -> Res
         .chain(group_ids.iter().map(String::as_str))
         .chain(project.edges.iter().filter(|edge| edge_ids.contains(edge.id.as_str())).flat_map(|edge| edge.via.iter().map(|crossing| crossing.group.as_str())))
         .collect();
-    refuse_broken(&project.broken, &in_cut)?;
+    refuse_broken(&project.broken, &in_cut, &kept)?;
 
     given.inputs.retain(|place, _| kept.contains(place) || group_ids.contains(&place.id));
     given.outputs.retain(|place, _| walked.stand_ins.contains(place));
@@ -696,12 +700,13 @@ pub fn cut(project: &ProjectDefinition, walked: &Walk, given: &mut Given) -> Res
     })
 }
 
-/// The refusal of a cut whose nodes and groups are `in_cut` and which
-/// needs some of `broken`: every one it needs, in the program's order.
-fn refuse_broken(broken: &[super::Broken], in_cut: &BTreeSet<&str>) -> Result<(), String> {
+/// The refusal of a cut whose nodes and groups are `in_cut`, at the places
+/// `kept`, and which needs some of `broken`: every one it needs, in the
+/// program's order.
+fn refuse_broken(broken: &[super::Broken], in_cut: &BTreeSet<&str>, kept: &BTreeSet<Located>) -> Result<(), String> {
     // A reason over several lines (an included file's parse errors) keeps
     // its own lines under its first.
-    let needed: Vec<String> = broken.iter().filter(|part| part.needed_by(in_cut)).map(|part| part.why.replace('\n', "\n    ")).collect();
+    let needed: Vec<String> = broken.iter().filter(|part| part.needed_by(in_cut, kept)).map(|part| part.why.replace('\n', "\n    ")).collect();
     if needed.is_empty() {
         return Ok(());
     }

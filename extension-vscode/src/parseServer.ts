@@ -38,6 +38,11 @@ interface ParseServerRequestBase {
   source: string;
   file?: string;
   reloadCatalog?: boolean;
+  /** The place the graph shows `file` at (the include sites walked into
+   *  from the entry file, outermost first), when the view is a place:
+   *  each node is then told whether it runs per instance THERE, which a
+   *  file included at several sites cannot say alone. */
+  callPath?: string[];
 }
 
 /** A parse-server request. A union on `kind` so each pipeline's required

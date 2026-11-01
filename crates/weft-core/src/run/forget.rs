@@ -88,6 +88,19 @@ impl Forgetting {
             + self.finished.values().map(Indices::runs).sum::<usize>()
     }
 
+    /// Whether `iteration` was launched and is not forgotten yet: what a
+    /// test of an iteration outliving its loop reads.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn holds_iteration(&self, iteration: &ScopeCopy) -> bool {
+        self.iterations.contains_key(iteration)
+    }
+
+    /// Whether iteration `index` of `key` was forgotten.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn forgot_iteration(&self, key: &LoopInstanceKey, index: u32) -> bool {
+        self.finished.get(key).is_some_and(|done| done.contains(&index))
+    }
+
     /// Learn what happened to the loops' iterations since last time
     /// (`LoopRuntime::take_news`, which this asks to be told).
     pub fn hear(&mut self, loop_runtime: &mut LoopRuntime) {
@@ -106,7 +119,8 @@ impl Forgetting {
                         self.due.insert(copy);
                     }
                 }
-                // Every iteration of an ended loop has run all it will.
+                // The loop launches nothing more; an iteration is forgotten
+                // once nothing inside it is alive.
                 LoopNews::Ended(key) => {
                     self.due.extend(self.iterations.iter().filter(|(_, (of, _))| *of == key).map(|(copy, _)| copy.clone()));
                 }
@@ -363,8 +377,7 @@ impl Places<'_> {
     /// in an included body a site inside the loop calls.
     pub fn can_sit_in(&self, target: &str, group: &str) -> bool {
         let mut at = match self.index.node(self.project, target) {
-            Some(def) if def.group_boundary.as_ref().is_some_and(|b| b.group_id == group)
-                && def.node_type == crate::project::boundary_types::LOOP_OUT => return true,
+            Some(def) if crate::project::scopes::fires_per_iteration_of(def) == Some(group) => return true,
             Some(def) => def.scope.last().cloned(),
             None => Some(target.to_string()),
         };

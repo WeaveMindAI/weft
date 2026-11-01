@@ -37,7 +37,7 @@ the language refuses to allow.
 |---|---|---|
 | `over: ["cards"]` | `[]` | Which inputs to iterate. Each has to be a `List[T]` or a `Generator[T]` |
 | `carry: ["total"]` | `[]` | Values threaded from one iteration to the next |
-| `parallel: true` | `false` | Launch every iteration at once, rather than one at a time |
+| `parallel: true` | `false` | Launch every iteration at once, rather than each once the one before it reaches the loop's edge |
 | `maxIters: 50` | no cap | A hard limit. `0` is legal and means no iterations |
 | `trimOnMismatch: false` | `true` | With several `over` lists of different lengths: trim to the shortest, or fail |
 
@@ -59,7 +59,9 @@ in its slot. If you declare it without `| Null`, the build stops with
 
 The list that comes out is built for every gathered port, even one that no
 iteration ever wrote, because a port that produces nothing at all would leave
-whatever is downstream waiting forever.
+whatever is downstream waiting forever. A port nothing inside the loop writes
+at all is refused when you build (`loop-output-unwritten`): it could only
+gather nulls.
 
 A carried value that an iteration does not write keeps what it had, as long as
 nothing broke: a branch not taken or a gate that said no is fine.
@@ -93,9 +95,19 @@ Both only appear if you did not declare a port of that name yourself. And
 
 ## One at a time, or all at once
 
-Sequential is the default. Each iteration finishes before the next launches,
-which is what makes `carry` possible: the next iteration reads the value the
-last one wrote.
+Sequential is the default. The next iteration launches once this one's values
+reach the loop's edge: its carried values, what it gathers, and its
+`self.done`. That is what makes `carry` possible: the next iteration reads the
+value the last one wrote. Nothing else holds the next iteration back, so a
+loop with no outputs launches its iterations back to back. If one item's work
+has to finish before the next item starts (a database write the next item
+reads), carry a value out of that work into the next iteration.
+
+A loop launches its iterations and does not own them. Work inside an
+iteration that does not feed the loop's edge keeps running after the loop has
+moved on, and after the loop has ended. That is what lets a loop start twenty
+agents, each holding a bus, gather the buses and exit, so the nodes after the
+loop can talk to every agent while they all keep running.
 
 `parallel: true` launches every iteration up front. Three things it refuses:
 

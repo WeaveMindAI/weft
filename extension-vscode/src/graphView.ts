@@ -883,6 +883,7 @@ export class GraphViewController {
         source,
         file: doc.uri.fsPath,
         reloadCatalog,
+        callPath: this.placeCallPath(),
       });
       if (seq !== this.parseSeq) return; // superseded by a newer parse
       this.applyParseResult(response, source, { code: layoutCode });
@@ -1902,6 +1903,7 @@ export class GraphViewController {
           ...req,
           source: openDoc.getText(),
           file: key,
+          callPath: this.placeCallPath(),
         });
         if (openDoc.version !== versionBefore) {
           return { aborted: true as const };
@@ -1973,6 +1975,7 @@ export class GraphViewController {
           kind: 'parse',
           source,
           file: key,
+          callPath: this.placeCallPath(),
         });
         return { response, source };
       });
@@ -2154,6 +2157,14 @@ export class GraphViewController {
   /// is meant: such a view draws the graph and nothing that belongs to
   /// a place (runs, displays, the action bar). A `.weft` outside any
   /// project is its own entry.
+  /// The call path a parse is asked at: this view's, when the view is a
+  /// place below the entry file (see `viewPlace`); none otherwise, where
+  /// the file's own answer is the only one there is.
+  private placeCallPath(): string[] | undefined {
+    const { callPath, interactive } = this.viewPlace();
+    return interactive && callPath.length > 0 ? callPath : undefined;
+  }
+
   private viewPlace(): { callPath: string[]; interactive: boolean } {
     const callPath = this.navStack.map((f) => f.alias);
     // The call path is a place only when it starts at the entry file:

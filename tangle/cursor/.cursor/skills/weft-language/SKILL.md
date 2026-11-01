@@ -935,8 +935,8 @@ pay = Route -> (body: JsonDict) {
 }
 ```
 
-With `durable` off you get a fast run: it waits for its record only where weft has to act on it (a pause, a call to weft that names the run), and if its worker dies the run ends cancelled and is not run again. With it on, everything a run did is on record before a node that could act outside it starts (a pure node does not wait), and an answer to a caller is on record before it leaves. If the worker dies, another worker picks the run up and keeps every finished node; a node that was running is failed rather than run twice, unless it belongs to a `pure` node, read no stream and had sent nothing on: that one simply runs again. If a caller started the run, that caller's connection died with the old worker, so a node that answers it then fails, saying no live caller is attached. A
-run with `recorded: false` cannot be tagged, and `durable` or `outlivesCaller` (on any trigger that answers a live caller) with `recorded: false` is the `run-settings` error.
+With `durable` off you get a fast run: it waits for its record only where weft has to act on it (a pause, a call to weft that names the run), and if its worker dies the run ends cancelled and is not run again. With it on, everything a run did is on record before a node that could act outside it starts (a pure node does not wait), and an answer to a caller is on record before it leaves. If the worker dies, another worker picks the run up and keeps every finished node; a node that was running is failed rather than run twice, unless it belongs to a `pure` node, read no stream and had sent nothing on: that one simply runs again. If a caller started the run, that caller's connection died with the old worker, so a node that answers it then fails, saying no live caller is attached.
+`durable` or `outlivesCaller` (on any trigger that answers a live caller) with `recorded: false` is the `run-settings` error.
 A run that cannot pause (`recorded: false`, a caller on the line with `outlivesCaller` off, a bus between its nodes open) holds a wait (a timer, a form) in its worker instead of pausing, and the answer carries it on there. Every trigger has `holdSecs` (default 60, `0` to never wait, at most 30 days): when nothing has moved in the run for that long, the waiting node fails saying it gave up, which it may handle itself or send to `_error`. If the run can pause again (its last bus closed), the wait pauses after all.
 A run you start by hand is always recorded. If it fires a trigger (`weft run --fire`), it is kept the way that trigger's `durable` and `keepRunsFor` say, and any other hand-started run is fast. `--durable`, `--fast`, `--keep-for` and `--hold-secs` override that for the one run. For polling routes and answering early, go and read the `weft-api` skill.
 
@@ -1275,7 +1275,9 @@ and wired from the group (`run = Loop(db: Access, ...) { ... }` then
 carry), sequential map, fold (carry), while (no over, stop vote or
 `maxIters`), side effect (no over, no carry). Refused: parallel with carry;
 parallel with empty over; parallel with any `self.done` write; a port in both
-`over` and `carry`; a sequential loop with nothing that can end it.
+`over` and `carry`; a sequential loop with nothing that can end it; an output
+nothing inside the loop writes (`loop-output-unwritten`: it could only gather
+nulls, or carry its first value unchanged).
 
 When something inside an iteration fails: a carried value the failure left
 unwritten stops the loop and fails it: `loop '<loop>' stopped at iteration
@@ -1350,9 +1352,10 @@ conversation, plus the reason the last try failed, which the carried
 A `Generator[T]` port in `over` pulls the stream (must be the only over
 port).
 
-What the language promises about timing is this: the next iteration starts
-once every value of this one has reached the loop's edge (its outputs: a
-carry, a gather, `self.done`). Nothing else holds it back. A loop is a
+What the language promises about timing is this: with `parallel: false`,
+the next iteration starts once every value of this one has reached the
+loop's edge (its outputs: a carry, a gather, `self.done`). Nothing else
+holds it back, so a loop with no outputs starts its iterations back to back. A loop is a
 launcher, not an owner: work started inside an iteration that is not wired
 to the edge keeps running after the loop moves on, and even after the loop
 exits. That is on purpose: a loop can start twenty agents and return their
@@ -1389,14 +1392,23 @@ with `photo["public"]` False when the open internet cannot open that link,
 so the script sends that service the bytes instead), and its description
 says how.
 
-A stored file lives as long as its scope says: a run's files are swept when
-the run ends, a project's stay. The storage nodes `TextToFile`,
+A file a storage node keeps lives as long as its `ttlDays` says, and its
+scope says who can open it: a `run` file only the run that made it, a `project` file every later
+run of the project. The storage nodes `TextToFile`,
 `FetchToStorage` and `KeepFile` all take `scope` (`run` or `project`)
 and `ttlDays`, and emit `file`, `filename`, `mimeType` and `sizeBytes` like
 every node that makes a file. `ttlDays` works in both scopes: the file
 expires that many days after anybody last touched it, since every read,
-download or link resets the clock, and `0` keeps it for ever. Any other node
-that makes a file (an S3, Slack or Drive download, a generated picture)
+download or link resets the clock, and `0` keeps it for ever. If a later run
+needs the file, store it with `scope: project`, whatever its `ttlDays`: `run`
+is the default, and a later run reading a `run` file's reference back (from a
+table row, an instance's values) is refused with `run-scoped file belongs to
+a different run`. A run that stores the file and reads it back itself works,
+so one test run does not catch it. The compiler warns
+`run-file-kept-past-run` when a storage node set to `scope: run` feeds a node
+that keeps its inputs past the run (a table write, a record, an instance's
+values). Any node besides the storage
+nodes that makes a file (an S3, Slack or Drive download, a generated picture)
 stores it for its run only: if you want it longer, or in a later run, wire
 it through `KeepFile`. Every write makes a new file, except where a node
 keeps a growing value: it edits the file it was handed, in place, and its
@@ -1407,7 +1419,7 @@ video somebody watches for an hour), pass the file through `LinkOptions {
 file: clip.file, minutes: 120 }` (seven days at most): every link made from
 its output lives that long.
 
-If you want a stored file gone before its scope ends, `DeleteFile { file:
+If you want a stored file gone before it expires, `DeleteFile { file:
 old.file }` deletes it now. A file that lives at a URL is refused.
 
 `@file` is bidirectional (the editor writes edits back into the file), so

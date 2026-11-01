@@ -451,3 +451,42 @@ async fn resync_reaches_an_instances_trigger_only_when_told_to() -> anyhow::Resu
     anyhow::ensure!(!s.offers("resync"), "nothing is behind any more: {:?}", s.available_actions());
     project.finish().await
 }
+
+/// One file included by a shared route and by a group whose infra runs
+/// once per instance: the file's nodes are per instance only under the
+/// group's include, so a call to the shared route, which names no
+/// instance, runs through its own include and is answered (it used to be
+/// refused, the whole file read as per instance). A shared trigger wired
+/// straight into the per-instance part has no instance to run for, and
+/// the build refuses it.
+#[tokio::test]
+async fn a_file_shared_with_a_per_instance_part_stays_shared_at_its_shared_site() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let project = Project::prepare("instances", disp.clone()).await?;
+    project.add_node_from_fixture("infra_min", "mini_service")?;
+    project.write_file(
+        "src/lib/carry.weft",
+        "Group(text: String) -> (out: String) {\n  carry = Format(text: String) { template: \"got {{text}}\" }\n  \
+         carry.text = self.text\n  self.out = carry.text\n}\n",
+    )?;
+    let main = "door = Route -> (body: { text: String }) { path: \"__E2E_PATH__/in\", method: \"POST\" }\n\
+                shared = @include(\"lib/carry.weft\")\nshared.text = door.body.text\nreply = Reply\nreply.body = shared.out\n\
+                space = Group() -> () {\n  svc = MiniService {\n    @per_instance\n  }\n  \
+                mine = @include(\"lib/carry.weft\")\n  mine.text = svc.status\n  log = Debug\n  log.data = mine.out\n}\n";
+    project.set_main(main)?;
+    let base = project.unique_live_path()?;
+    project.weft(&["activate", "--trigger", "door"]).await?;
+    let (status, _, body) = live::http_json(&disp, Method::POST, &format!("{base}/in"), &[], &json!({ "text": "hi" })).await?;
+    let body = String::from_utf8_lossy(&body);
+    anyhow::ensure!(status == 200, "the shared route is answered: {status} {body}");
+    anyhow::ensure!(body.contains("got hi"), "{body}");
+
+    project.set_main(&main.replace(
+        "  log.data = mine.out\n}",
+        "  log.data = mine.out\n  tick = Cron { cron: \"0 0 3 * * *\" }\n  ping = Debug\n  ping.data = svc.status\n  \
+         ping._should_flow = tick.scheduledTime\n}",
+    ))?;
+    let refused = project.weft_refused(&["activate", "--trigger", "space.tick"]).await?;
+    anyhow::ensure!(refused.contains("Trigger 'space.tick' is shared by every instance"), "{refused}");
+    project.finish().await
+}

@@ -36,6 +36,16 @@ node that makes a file, a download from S3, Slack or Drive included, stores
 it for its run only. If you want such a file longer, or in a later run, wire
 it through `KeepFile`.
 
+If a later run needs the file, `scope: run` is the wrong keep however many
+days you give it: the file lives on, but only the run that made it can read
+it, so a later run that reads its reference back (from a table row, from an
+instance's values) is refused with `run-scoped file belongs to a different
+run`. A test inside one run passes, which is what makes this easy to miss. Use
+`scope: project` instead. If a storage node keeps a file with `scope: run` (or
+that default) and the file is wired straight into a node that keeps what it is
+given past the run, the compiler warns (`run-file-kept-past-run`). It does not
+see a file another node made, or one packed into a larger value on the way.
+
 There is no un-keep. A file marked to survive survives until somebody removes
 it.
 

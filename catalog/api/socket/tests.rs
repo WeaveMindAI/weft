@@ -138,7 +138,7 @@ async fn misfit_refused(rig: FakeRig) -> WeftResult<()> {
     match conn.chunks().first() {
         Some(weft::caller::OutboundChunk::Json(answer)) => {
             let error = answer["error"].as_str().expect("an error field");
-            assert!(error.contains("missing required field \"y\""), "{error}");
+            assert!(error.contains("missing required field 'y'"), "{error}");
         }
         other => panic!("the caller hears what was wrong, got {other:?}"),
     }

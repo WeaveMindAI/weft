@@ -112,6 +112,15 @@ pub struct Broken {
     /// group, the two ends for a wire (a cut that keeps only one end does
     /// not carry the wire).
     pub parts: Vec<String>,
+    /// The places the problem holds at, when it holds at some of them
+    /// only: a finding about one place of a node inside a file included
+    /// at several sites (a shared trigger at one site reaching what is
+    /// per instance there). A cut needs the part only when it keeps one
+    /// of these places. Empty: at every place its parts run, which is
+    /// what a part stored before places were named meant too.
+    // SYNC: Broken.places <-> packages/weft-graph/src/protocol.ts Broken.places
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub places: Vec<Located>,
     /// What is wrong, as the compiler says it, with the file and line.
     pub why: String,
     /// The part may stand for nodes the program cannot see: an included
@@ -124,9 +133,13 @@ pub struct Broken {
 }
 
 impl Broken {
-    /// Whether a cut whose nodes and groups are `kept` needs this part.
-    pub fn needed_by(&self, kept: &std::collections::BTreeSet<&str>) -> bool {
-        !self.parts.is_empty() && self.parts.iter().all(|part| kept.contains(part.as_str()))
+    /// Whether a cut whose nodes and groups are `kept`, at the places
+    /// `kept_places`, needs this part: it keeps every one of its parts,
+    /// and, for a part that holds at some places only, one of those.
+    pub fn needed_by(&self, kept: &std::collections::BTreeSet<&str>, kept_places: &std::collections::BTreeSet<Located>) -> bool {
+        !self.parts.is_empty()
+            && self.parts.iter().all(|part| kept.contains(part.as_str()))
+            && (self.places.is_empty() || self.places.iter().any(|place| kept_places.contains(place)))
     }
 }
 
@@ -604,18 +617,30 @@ pub struct NodeDefinition {
     /// NodeMetadata.requires_infra at enrich time.
     #[serde(default, rename = "requiresInfra")]
     pub requires_infra: bool,
-    /// Whether this node exists once per instance of the program, and why:
-    /// `Marked` when the source says `@per_instance` in its braces (only an
-    /// infra node may, see `NodeMetadata::per_instance_eligible`), `Filled`
-    /// when one of its fields is written `@instance_filled`, `Derived` when
-    /// it reads a value that comes from a per-instance node, found by the
-    /// compiler along the wires. `None` for a node every instance shares. Written by the
-    /// lowering (the mark) and the compiler's propagation (the rest), and
-    /// only ever READ downstream: the runtime and the editor never
-    /// recompute it.
+    /// Whether this node exists once per instance of the program at every
+    /// place it runs, and why: `Marked` when the source says
+    /// `@per_instance` in its braces (only an infra node may, see
+    /// `NodeMetadata::per_instance_eligible`), `Filled` when one of its
+    /// fields is written `@instance_filled`, `Derived` when it reads a
+    /// value that comes from a per-instance node at each of its places,
+    /// found by the compiler along the wires. `None` for a node every
+    /// instance shares, or one per instance at some of its places only
+    /// ([`Self::per_instance_paths`]). Written by the lowering (the mark)
+    /// and the compiler's propagation (the rest), and only ever READ
+    /// downstream: the runtime and the editor never recompute it.
+    /// [`Self::per_instance_at`] is the one reading.
     // SYNC: per_instance <-> packages/weft-graph/src/protocol.ts NodeDefinition.perInstance
     #[serde(default, rename = "perInstance", skip_serializing_if = "Option::is_none")]
     pub per_instance: Option<crate::instance::PerInstance>,
+    /// The places (each a call path, outermost site first) where this node
+    /// reads a per-instance value, when its places disagree: a node inside
+    /// a file included both where an instance's value reaches it and where
+    /// none does is per instance (`Derived`) at the first place and shared
+    /// at the second. Empty when every place agrees, [`Self::per_instance`]
+    /// being the answer at all of them.
+    // SYNC: per_instance_paths <-> packages/weft-graph/src/protocol.ts NodeDefinition.perInstancePaths
+    #[serde(default, rename = "perInstancePaths", skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub per_instance_paths: std::collections::BTreeSet<Vec<String>>,
     /// Image source dirs built for this node. Mirrored from
     /// NodeMetadata.images at enrich time. A version build walks this to
     /// know which Dockerfiles to build (`weft-dispatcher::build`).
@@ -897,6 +922,24 @@ impl NodeDefinition {
     /// call path, outermost site first; empty at the top).
     pub fn types_at<S: AsRef<str>>(&self, path: &[S]) -> TypesAt<'_> {
         TypesAt { own: Own::Node(self), place: self.place_of(path).map(|index| &self.place_types[index]) }
+    }
+
+    /// Whether this node exists once per instance at the place `path`
+    /// reaches (an include call path, outermost site first; empty at the
+    /// top), and why: its own mark, which holds at every place, or
+    /// `Derived` where it reads an instance's value there.
+    pub fn per_instance_at<S: AsRef<str>>(&self, path: &[S]) -> Option<crate::instance::PerInstance> {
+        self.per_instance.or_else(|| {
+            self.per_instance_paths
+                .iter()
+                .any(|p| p.len() == path.len() && p.iter().zip(path).all(|(a, b)| a == b.as_ref()))
+                .then_some(crate::instance::PerInstance::Derived)
+        })
+    }
+
+    /// Whether this node exists once per instance at any place it runs.
+    pub fn per_instance_somewhere(&self) -> bool {
+        self.per_instance.is_some() || !self.per_instance_paths.is_empty()
     }
 
     /// Which [`Self::place_types`] entry is the place `path` reaches,
@@ -2050,12 +2093,14 @@ pub fn infra_reached(program: &ProjectDefinition) -> std::collections::BTreeSet<
         .collect()
 }
 
-/// Whether the node `id` exists once per instance (`@per_instance`): every
-/// copy of it (its infra, its trigger's activation) is an instance's, and
-/// none is shared. Asked of a place by its `id`, of a spelled place
-/// after `resolve_address`.
-pub fn is_per_instance(project: &ProjectDefinition, id: &str) -> bool {
-    project.nodes.iter().any(|n| n.id == id && n.per_instance.is_some())
+/// Whether the node at `place` exists once per instance there: every copy
+/// of it (its infra, its trigger's activation) is an instance's, and none
+/// is shared. Asked of a place, since a node inside a file included at
+/// several sites can be per instance at one and shared at another
+/// ([`NodeDefinition::per_instance_at`]); of a spelled place after
+/// `resolve_address`.
+pub fn is_per_instance(project: &ProjectDefinition, place: &Located) -> bool {
+    project.nodes.iter().any(|n| n.id == place.id && n.per_instance_at(&place.path).is_some())
 }
 
 /// A node's validation rules, for checking an instance's values on it.
@@ -2134,7 +2179,7 @@ impl DeclaredInfra {
     pub fn of(project: &ProjectDefinition) -> Self {
         let places = infra_place_spellings(project)
             .into_iter()
-            .map(|(spelled, place)| (spelled, is_per_instance(project, &place.id)))
+            .map(|(spelled, place)| (spelled, is_per_instance(project, &place)))
             .collect();
         Self { places, hides: project.hides_nodes() }
     }
@@ -2222,6 +2267,7 @@ mod trigger_dependency_tests {
             features: NodeFeatures { is_trigger, ..Default::default() },
             requires_infra,
             per_instance: None,
+            per_instance_paths: Default::default(),
             images: vec![],
             published_service: None,
             instance_service: None,
@@ -2535,7 +2581,7 @@ mod project_wire_tests {
             inputs: vec![input.clone()],
             outputs: vec![],
             features: Default::default(),
-            requires_infra: false, per_instance: None,
+            requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
             images: vec![],
             fires_with: Default::default(), baked_outputs: Default::default(),
             published_service: None,
@@ -2674,6 +2720,7 @@ mod project_wire_tests {
             features: Default::default(),
             requires_infra,
             per_instance: None,
+            per_instance_paths: Default::default(),
             images: vec![],
             fires_with: Default::default(), baked_outputs: Default::default(),
             published_service: None,
@@ -2726,6 +2773,35 @@ mod project_wire_tests {
         assert!(has_infra(&with_infra), "one infra node flips it true");
     }
 
+    /// A node per instance at some of its places carries those places, on
+    /// the wire as `perInstancePaths`, and answers per place; a stored node
+    /// without the key reads as before (its mark, or none, at every place).
+    #[test]
+    fn a_per_instance_mark_is_read_per_place() {
+        use crate::instance::PerInstance;
+        let mut carry = node_with_infra("Carry.carry", false);
+        carry.per_instance_paths = [vec!["space.mine".to_string()]].into();
+        let json = serde_json::to_value(&carry).unwrap();
+        assert_eq!(json["perInstancePaths"], serde_json::json!([["space.mine"]]));
+        assert!(json.get("perInstance").is_none());
+        let back: NodeDefinition = serde_json::from_value(json).unwrap();
+        assert_eq!(back.per_instance_paths, carry.per_instance_paths);
+        assert_eq!(back.per_instance_at(&["space.mine"]), Some(PerInstance::Derived));
+        assert_eq!(back.per_instance_at(&["shared"]), None);
+        assert_eq!(back.per_instance_at::<&str>(&[]), None);
+        assert!(back.per_instance_somewhere());
+        let project = project_with_nodes(vec![back]);
+        assert!(is_per_instance(&project, &Located::new("Carry.carry", vec!["space.mine".to_string()])));
+        assert!(!is_per_instance(&project, &Located::new("Carry.carry", vec!["shared".to_string()])));
+
+        let mut older = serde_json::to_value(node_with_infra("bridge", true)).unwrap();
+        older["perInstance"] = serde_json::json!("marked");
+        let older: NodeDefinition = serde_json::from_value(older).unwrap();
+        assert!(older.per_instance_paths.is_empty());
+        assert_eq!(older.per_instance_at(&["any", "path"]), Some(PerInstance::Marked));
+        assert_eq!(older.per_instance_at::<&str>(&[]), Some(PerInstance::Marked));
+    }
+
     #[test]
     fn declared_infra_names_each_place_and_its_side() {
         let mut per_instance = node_with_infra("mine", true);
@@ -2760,9 +2836,9 @@ mod project_wire_tests {
     #[test]
     fn a_program_hiding_nodes_proves_no_copy_gone() {
         let mut project = project_with_nodes(vec![node_with_infra("db", true)]);
-        project.broken = vec![Broken { parts: vec!["db".into()], why: "a wire".into(), hides: false }];
+        project.broken = vec![Broken { parts: vec!["db".into()], places: Vec::new(), why: "a wire".into(), hides: false }];
         assert!(DeclaredInfra::of(&project).gone("other", false), "a wire hides no node");
-        project.broken.push(Broken { parts: vec!["lib".into()], why: "lib.weft does not parse".into(), hides: true });
+        project.broken.push(Broken { parts: vec!["lib".into()], places: Vec::new(), why: "lib.weft does not parse".into(), hides: true });
         let declared = DeclaredInfra::of(&project);
         assert!(project.hides_nodes());
         assert!(!declared.gone("other", false), "it may be inside lib.weft");
@@ -2928,8 +3004,8 @@ mod setup_cut_tests {
             &[("a", &[], "b"), ("trig", &[], "out")],
         );
         p.broken = vec![
-            Broken { parts: vec!["a".into(), "b".into()], why: "src/main.weft:3:1 a.v cannot feed b.v".into(), hides: false },
-            Broken { parts: vec!["g".into()], why: "src/main.weft:5:1 the group g is broken\nsecond line".into(), hides: false },
+            Broken { parts: vec!["a".into(), "b".into()], places: Vec::new(), why: "src/main.weft:3:1 a.v cannot feed b.v".into(), hides: false },
+            Broken { parts: vec!["g".into()], places: Vec::new(), why: "src/main.weft:5:1 the group g is broken\nsecond line".into(), hides: false },
         ];
         assert!(setup_cut(&p, &places(&["a"])).is_ok(), "a alone does not carry the wire");
         let refused = setup_cut(&p, &places(&["b"])).unwrap_err();
@@ -2947,13 +3023,32 @@ mod setup_cut_tests {
         );
         let (dissolved, _) = setup_cut(&fed, &places(&["g.c"])).unwrap();
         assert!(dissolved.groups.is_empty(), "the cut keeps no scope for g: {:?}", dissolved.groups);
-        fed.broken = vec![Broken { parts: vec!["g".into()], why: "a stream through g's port".into(), hides: false }];
+        fed.broken = vec![Broken { parts: vec!["g".into()], places: Vec::new(), why: "a stream through g's port".into(), hides: false }];
         assert!(setup_cut(&fed, &places(&["g.c"])).unwrap_err().contains("a stream through g's port"));
         let fire = compute_trigger_fire(&p, "trig", &serde_json::Value::Null, None, &Default::default()).unwrap();
         assert!(fire.program.broken.is_empty(), "a cut carries nothing broken");
-        p.broken.push(Broken { parts: vec!["out".into()], why: "out did not load".into(), hides: true });
+        p.broken.push(Broken { parts: vec!["out".into()], places: Vec::new(), why: "out did not load".into(), hides: true });
         let refused = compute_trigger_fire(&p, "trig", &serde_json::Value::Null, None, &Default::default()).unwrap_err();
         assert!(refused.starts_with("a fire of 'trig' cannot run") && refused.contains("out did not load"), "{refused}");
+    }
+
+    /// A broken part stored before parts named their places reads as
+    /// broken at every place, as it meant; one naming a place is needed
+    /// only by a cut that keeps that place.
+    #[test]
+    fn a_broken_part_names_its_places_and_an_older_one_holds_everywhere() {
+        let older: Broken = serde_json::from_value(serde_json::json!({ "parts": ["Lib.tick"], "why": "lib.weft:3:1 nope" })).unwrap();
+        assert!(older.places.is_empty());
+        let kept_ids = std::collections::BTreeSet::from(["Lib.tick"]);
+        let at = |site: &str| Located::new("Lib.tick", vec![site.to_string()]);
+        assert!(older.needed_by(&kept_ids, &std::collections::BTreeSet::from([at("one")])));
+        assert!(older.needed_by(&kept_ids, &std::collections::BTreeSet::from([at("two")])));
+        let placed = Broken { places: vec![at("one")], ..older };
+        let json = serde_json::to_value(&placed).unwrap();
+        assert_eq!(json["places"], serde_json::json!(["one/Lib.tick"]));
+        assert_eq!(serde_json::from_value::<Broken>(json).unwrap(), placed);
+        assert!(placed.needed_by(&kept_ids, &std::collections::BTreeSet::from([at("one")])));
+        assert!(!placed.needed_by(&kept_ids, &std::collections::BTreeSet::from([at("two")])));
     }
 
     /// A trigger is kicked at the top wherever it sits; the copies around

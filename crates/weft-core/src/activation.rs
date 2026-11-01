@@ -111,7 +111,7 @@ impl ActivationScope {
             .map(|place| {
                 (
                     crate::project::address_of(project, &place.id, &place.path),
-                    crate::project::is_per_instance(project, &place.id),
+                    crate::project::is_per_instance(project, place),
                 )
             })
             .collect();
@@ -186,7 +186,7 @@ impl ActivationScope {
         }
         let mut left: Vec<String> = crate::project::trigger_places(project)
             .iter()
-            .filter(|place| crate::project::is_per_instance(project, &place.id))
+            .filter(|place| crate::project::is_per_instance(project, place))
             .map(|place| crate::project::address_of(project, &place.id, &place.path))
             .collect();
         left.sort();

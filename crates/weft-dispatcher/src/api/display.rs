@@ -138,17 +138,17 @@ pub async fn list_displays(
             // Listed a moment ago, gone now (a wipe raced this read).
             continue;
         };
-        for (node, kind, address) in &displays_of(&project) {
+        for (node, per_instance, kind, address) in &displays_of(&project) {
             if !token_reaches_display(&token, &summary.id, address) {
                 continue;
             }
             // An instance token lists its instance's own copies alone.
-            if token.instance.is_some() && node.per_instance.is_none() {
+            if token.instance.is_some() && per_instance.is_none() {
                 continue;
             }
             let status = match kind {
                 DisplayKind::Infra => {
-                    let copy = weft_core::instance::copy_owner(node.per_instance, token.instance.as_ref());
+                    let copy = weft_core::instance::copy_owner(*per_instance, token.instance.as_ref());
                     let row = crate::infra_node::get(&state.pg_pool, summary.id, address, copy)
                         .await
                         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?;
@@ -237,17 +237,20 @@ pub async fn press_display(
 }
 
 /// Every display of a project, as the deciders on this surface read
-/// it: the node, what serves its panel, and the address a person
-/// writes to name it.
+/// it: the node, whether it exists once per instance at that place (a
+/// node inside a file included twice can be at one site and not the
+/// other), what serves its panel, and the address a person writes to
+/// name it.
 ///
 /// Built ONCE per request and passed down. Each decider used to build
 /// its own, which made one listing cost a project walk per display per
 /// grant, on a door meant to be polled.
 type Displays<'a> =
-    Vec<(&'a weft_core::project::NodeDefinition, DisplayKind, String)>;
+    Vec<(&'a weft_core::project::NodeDefinition, Option<weft_core::instance::PerInstance>, DisplayKind, String)>;
 
 /// The display `address` names, if a person could have written that
-/// address for one: the node behind it and what serves its panel.
+/// address for one: the node behind it, whether it is per instance
+/// there, and what serves its panel.
 ///
 /// THE lookup on this surface. The door asks it of the name in its
 /// path and mint asks it of the name being granted, so no spelling can
@@ -260,8 +263,8 @@ type Displays<'a> =
 fn display_at<'a>(
     displays: &Displays<'a>,
     address: &str,
-) -> Option<(&'a weft_core::project::NodeDefinition, DisplayKind)> {
-    displays.iter().find(|(_, _, addr)| addr == address).map(|(node, kind, _)| (*node, *kind))
+) -> Option<(&'a weft_core::project::NodeDefinition, Option<weft_core::instance::PerInstance>, DisplayKind)> {
+    displays.iter().find(|(_, _, _, addr)| addr == address).map(|(node, per_instance, kind, _)| (*node, *per_instance, *kind))
 }
 
 /// THE question both display doors ask: may this token reach the
@@ -316,7 +319,7 @@ fn display_for_token<'a>(
     project_id: &uuid::Uuid,
     project: &'a weft_core::project::ProjectDefinition,
     address: &str,
-) -> Option<(&'a weft_core::project::NodeDefinition, DisplayKind)> {
+) -> Option<(&'a weft_core::project::NodeDefinition, Option<weft_core::instance::PerInstance>, DisplayKind)> {
     let found = display_at(&displays_of(project), address)?;
     token_reaches_display(token, project_id, address).then_some(found)
 }
@@ -342,7 +345,7 @@ fn displays_of(project: &weft_core::project::ProjectDefinition) -> Displays<'_> 
             let node = *by_id.get(place.id.as_str())?;
             let kind = display_kind(node)?;
             let address = weft_core::project::address_of(project, &place.id, &place.path);
-            Some((node, kind, address))
+            Some((node, node.per_instance_at(&place.path), kind, address))
         })
         .collect()
 }
@@ -431,7 +434,7 @@ pub(crate) async fn canonical_display_grants(
                     if available.is_empty() {
                         "none".to_string()
                     } else {
-                        available.iter().map(|(_, _, a)| a.clone()).collect::<Vec<_>>().join(", ")
+                        available.iter().map(|(_, _, _, a)| a.clone()).collect::<Vec<_>>().join(", ")
                     }
                 ),
             ));
@@ -549,11 +552,10 @@ async fn resolve(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or_else(not_found)?;
-    let (node, kind) = display_for_token(&token, &id, &project, address).ok_or_else(not_found)?;
+    let (_, per_instance, kind) = display_for_token(&token, &id, &project, address).ok_or_else(not_found)?;
     // Whose copy the token reads: an instance token reads its instance's copy
-    // of a node that exists once per instance, and the shared one of any
-    // other node; any other token reads the shared copies.
-    let per_instance = node.per_instance;
+    // of a node that exists once per instance at this place, and the shared
+    // one of any other; any other token reads the shared copies.
     // An instance token reaches its instance's own copies alone: a shared
     // node's display (the shared bridge's pairing code) is the author's.
     if token.instance.is_some() && per_instance.is_none() {
@@ -681,7 +683,7 @@ mod scope_tests {
         let p = project_with_include();
         let t = token(&[display_grant(&project_a(), "test.whatsapp")], false);
         assert!(reaches(&t, &project_a(), &p, "test.whatsapp"));
-        let addresses: Vec<String> = displays_of(&p).into_iter().map(|(_, _, a)| a).collect();
+        let addresses: Vec<String> = displays_of(&p).into_iter().map(|(_, _, _, a)| a).collect();
         assert_eq!(addresses, vec!["test.whatsapp".to_string()]);
     }
 
@@ -725,10 +727,10 @@ mod scope_tests {
         // a grant for one says nothing about the other.
         let p = project_with_two_sites();
         let displays = displays_of(&p);
-        let names: Vec<String> = displays.iter().map(|(_, _, a)| a.clone()).collect();
+        let names: Vec<String> = displays.iter().map(|(_, _, _, a)| a.clone()).collect();
         assert_eq!(names, vec!["one.whatsapp".to_string(), "two.whatsapp".to_string()]);
         for asked in &names {
-            let (node, kind) = super::display_at(&displays, asked).expect("each name is a display");
+            let (node, _, kind) = super::display_at(&displays, asked).expect("each name is a display");
             assert_eq!((node.id.as_str(), kind), ("Bridge.whatsapp", super::DisplayKind::Trigger));
         }
         let t = token(&[display_grant(&project_a(), "one.whatsapp")], false);
@@ -746,7 +748,7 @@ mod scope_tests {
         // nobody could be granted by.
         let p = project_with_include();
         let displays = displays_of(&p);
-        let (node, kind) = super::display_at(&displays, "test.whatsapp").expect("the name they write finds it");
+        let (node, _, kind) = super::display_at(&displays, "test.whatsapp").expect("the name they write finds it");
         assert_eq!(node.id, "Test.whatsapp");
         assert_eq!(kind, super::DisplayKind::Trigger);
         for not_a_name in ["Test.whatsapp", "", "whatsapp"] {

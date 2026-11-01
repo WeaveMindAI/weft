@@ -520,8 +520,7 @@ fn scope_settled(project: &ProjectDefinition, index: &ProgramIndex, snapshot: &R
         .is_some_and(|record| matches!(record.status(), NodeFiringStatus::Completed | NodeFiringStatus::Skipped));
     for node in &project.nodes {
         if !index.admits(&node.id, frames) || index.stands_in(&node.id, frames) { continue; }
-        let own_out = node.node_type == crate::project::boundary_types::LOOP_OUT
-            && node.group_boundary.as_ref().is_some_and(|b| b.group_id == scope);
+        let own_out = crate::project::scopes::fires_per_iteration_of(node) == Some(scope);
         let inside = frame_scope(project, node.scope.iter()) == Some(scope);
         if !inside && !own_out { continue; }
         if scope_skipped_at(project, index, snapshot, &node.id, frames) { continue; }

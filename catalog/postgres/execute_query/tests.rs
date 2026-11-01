@@ -810,6 +810,6 @@ async fn declared_misfits(rig: FakeRig) -> WeftResult<()> {
         .run(&Answered(vec![json!({ "id": "1", "name": "ada" })]), json!({}))
         .await
         .failure()?;
-    assert!(err.contains("missing required field \"email\""), "{err}");
+    assert!(err.contains("missing required field 'email'"), "{err}");
     Ok(())
 }
