@@ -4,7 +4,35 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-11-01 (0.2.283)
+
+**What breaks after this update:**
+
+**`weft run` starts the run through a task on the install.** The install
+answers the start at once and the command follows it, so a CLI from before
+this update cannot start a run on an install after it, and the other way
+round: update the CLI with the install (`./setup.sh` does both). What the
+command prints is the same, plus a line every half minute while the run is
+being prepared (reading the seed run's results, checking the files they
+name, waiting for the project's lock). The start goes on if the command
+stops, and the same request sent again never starts a second run.
+
+**Every CLI request now has a time limit.** Two minutes for an ordinary
+request, or a long look's hold and half a minute; a request the install
+answers only once its own work is done (an infra start, `weft rm`, a bake,
+a connection) still has none. A look that runs out is said and asked again,
+so a copy of the install replaced in the middle of a request is noticed
+instead of leaving `weft infra upgrade` or a build silent for an hour. If
+you wrapped weft in a script that relied on a request waiting longer than
+that, it now gets an error saying the install did not answer in time.
+
+**If you script `weft ... --json`, check the exit code** (or the one line's
+`"phase": "error"`) before reading fields such as `.triggers`: on any
+failure the command prints that error line and exits with a failure code.
+The deploy workflow `weft ci add` writes now does this; run `weft ci add`
+again to get it.
+
+**What is new:**
 
 **`weft status` shows the fires and calls a trigger drops.** A fire refused
 before any run starts (the program cannot run a part the fire reaches, the
@@ -14,17 +42,13 @@ only logged, so a trigger could drop every fire for days with nothing in
 the last minute or two and why the last one was dropped, and the editor
 marks it `dropping`.
 
-**The CLI no longer waits forever on an install that stopped answering.**
-Every request now has a time limit (two minutes, or a long look's hold and
-half a minute), and a look that runs out is said and asked again, so a copy
-of the install replaced in the middle of a request is noticed instead of
-leaving `weft infra upgrade` or a build silent for an hour.
-
-**`weft run` says what it is doing while the run is prepared.** The run is
-now started by a task on the install, which goes on if the command stops,
-and the command says every half minute what the start is doing (reading the
-seed run's results, checking the files they name, waiting for the project's
-lock). The same request sent again never starts a second run.
+**`weft resync` refuses before taking anything down when a trigger could
+not come back here.** A trigger whose connection needs the service to send
+events to your weft, on an install the internet cannot reach, used to be
+refused only once it was already down, and stayed down. The resync now asks
+before it takes anything down, and names each such trigger and the fix.
+It also says where it is every half minute, including which triggers it is
+turning back on and what their setup waits on.
 
 **A stale bake says what moved.** `weft run --fire` refused after an update
 saying the code changed, when only weft had: an update builds every program
@@ -32,23 +56,9 @@ again. It now says whether the graph, a node's code or only the program's
 worker changed, and still names `weft bake`. A stored bake that no longer
 reads no longer fails the read of the others; a fire that needs it names it.
 
-**`weft resync` refuses before taking anything down when a trigger could
-not come back here.** A trigger whose connection needs the service to send
-events to your weft, on an install the internet cannot reach, used to be
-refused only once it was already down, and stayed down. The resync now asks
-before it takes anything down, and names each such trigger and the fix.
-
 **A run a program starts is started once.** A program's call that starts a
 run and is sent again (its answer lost on the way) now answers the run it
 started instead of starting a second one.
-
-**`weft resync` says where it is every half minute**, including which
-triggers it is turning back on and what their setup waits on.
-
-**If you script `weft ... --json`, check the exit code** (or the one line's
-`"phase": "error"`) before reading fields such as `.triggers`: on any
-failure the command prints that error line and exits with a failure code.
-The deploy workflow `weft ci add` writes now does this.
 
 **A schema change that gives up waiting on a lock says what held it** and
 how to find it.
