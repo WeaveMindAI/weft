@@ -240,8 +240,7 @@ pub(crate) async fn status(
     let desired = Desired::of_query(state, id, &project, query, binary_hash.as_deref(), definition_hash.as_deref()).await?;
     let snapshot = gather_action_snapshot(state, id, &project, &desired).await?;
     let (infra, instance_infra) = infra_entries(&project, &snapshot.infra, &snapshot.activations, &desired);
-    let waiting = crate::api::signal::waiting_fires(&state.pg_pool, id).await.map_err(internal("waiting fires"))?;
-    let held = crate::store::postgres::held_by_activation(&state.pg_pool, id).await.map_err(internal("held work"))?;
+    let traffic = crate::api::project::TriggerTraffic::of(&state.pg_pool, id, crate::lease::now_unix()).await.map_err(internal("trigger traffic"))?;
     let has_infra = snapshot.has_infra;
     let has_triggers = snapshot.has_triggers;
     let infra_rollup = snapshot.infra_rollup.clone();
@@ -341,7 +340,7 @@ pub(crate) async fn status(
         drift,
         available_actions,
         instance_infra,
-        triggers: trigger_entries(&project, &snapshot.activations, &held, &waiting, &desired, binary_hash.as_deref(), crate::lease::now_unix()),
+        triggers: trigger_entries(&project, &snapshot.activations, &traffic, &desired, binary_hash.as_deref(), crate::lease::now_unix()),
         instances,
         limited: limited_entries(state, id)
             .await
@@ -626,16 +625,38 @@ pub(crate) async fn follow(
             .map_err(|e| internal("read the task", e.to_string()))?;
         Ok::<_, StatusError>(kind.as_deref().and_then(weft_task_store::TaskKind::parse))
     };
-    let activate = Some(weft_task_store::TaskKind::Activate);
+    use weft_task_store::TaskKind;
     match outcome.status {
-        weft_core::task::TaskStatus::Pending | weft_core::task::TaskStatus::Claimed => Ok(Following::Going(match kind().await? == activate {
-            true => crate::task_kinds::activate::progress(state, id, task).await.map_err(|e| internal("read where the activation is", format!("{e:#}")))?,
-            false => weft_task_store::tasks::progress(&state.pg_pool, task).await.map_err(|e| internal("read where the task is", format!("{e:#}")))?,
-        })),
-        weft_core::task::TaskStatus::Complete if kind().await? == activate => {
-            Ok(Following::Done(crate::task_kinds::activate::followed(outcome.result).map_err(|(status, why)| StatusError::Other(status, why))?))
+        weft_core::task::TaskStatus::Pending | weft_core::task::TaskStatus::Claimed => {
+            let said = || async {
+                weft_task_store::tasks::progress(&state.pg_pool, task).await.map_err(|e| internal("read where the task is", format!("{e:#}")))
+            };
+            let turning_on = || async {
+                crate::task_kinds::activate::progress(state, id, task).await.map_err(|e| internal("read where the activation is", format!("{e:#}")))
+            };
+            Ok(Following::Going(match kind().await? {
+                Some(TaskKind::Activate) => turning_on().await?.map(serde_json::to_value).transpose().map_err(|e| internal("where the activation is", e.to_string()))?,
+                // What the resync's task said, with the activation it
+                // drives now: the bring-back of an owner can take minutes.
+                Some(TaskKind::Resync) => {
+                    let progress: weft_core::deactivation::ResyncProgress = match said().await? {
+                        Some(said) => serde_json::from_value(said).map_err(|e| internal("read where the resync is", e.to_string()))?,
+                        None => Default::default(),
+                    };
+                    let going = weft_core::deactivation::ResyncGoing { progress, turning_on: turning_on().await? };
+                    Some(serde_json::to_value(going).map_err(|e| internal("where the resync is", e.to_string()))?)
+                }
+                _ => said().await?,
+            }))
         }
-        weft_core::task::TaskStatus::Complete => Ok(Following::Done(outcome.result.unwrap_or(serde_json::Value::Null))),
+        weft_core::task::TaskStatus::Complete => {
+            let ended = match kind().await? {
+                Some(TaskKind::Activate) => crate::task_kinds::activate::followed(outcome.result),
+                Some(TaskKind::StartRun) => crate::task_kinds::start_run::followed(outcome.result),
+                _ => Ok(outcome.result.unwrap_or(serde_json::Value::Null)),
+            };
+            Ok(Following::Done(ended.map_err(|(status, why)| StatusError::Other(status, why))?))
+        }
         weft_core::task::TaskStatus::Failed => {
             let error = outcome.error.unwrap_or_else(|| "it ended without saying why".into());
             if kind().await? != Some(weft_task_store::TaskKind::Resync) {
@@ -675,7 +696,7 @@ mod tests {
     #[test]
     fn a_program_cannot_remove_its_own_project() {
         let (own, other) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
-        let program = Actor::Program { tenant: TenantId::local(), project: own, run: uuid::Uuid::now_v7() };
+        let program = Actor::Program { tenant: TenantId::local(), project: own, run: uuid::Uuid::now_v7(), call: uuid::Uuid::now_v7() };
         let (status, why) = refuse_own_removal(&program, own).unwrap_err().into_parts();
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(why.contains("cannot remove its own project"), "{why}");

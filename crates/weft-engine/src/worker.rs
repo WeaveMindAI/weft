@@ -1545,8 +1545,12 @@ impl Worker {
             }
             // The program cannot run this way (a run it would start needs
             // an instance the call did not name): a refusal of the run, the
-            // same status the install's own run refusals answer with.
-            Turned::Unready(Unready::Refused(why)) => failed(StatusCode::UNPROCESSABLE_ENTITY, why),
+            // same status the install's own run refusals answer with,
+            // counted as dropped where `weft status` reads it, like a fire.
+            Turned::Unready(Unready::Refused(why)) => {
+                self.door.dropped(&admitted.trigger.token, &why);
+                failed(StatusCode::UNPROCESSABLE_ENTITY, why)
+            }
             Turned::Unready(Unready::Waits(RunGate::InfraDown(missing))) => {
                 // The fix is the operator's (logged); the caller is told
                 // what is true for them.
@@ -1565,14 +1569,29 @@ impl Worker {
     }
 
     /// A trigger's event at this worker's door ([`weft_core::door_fire::DoorFire`]):
-    /// its front (the trigger as held, its holder, its program, its
-    /// standing, its limits), then [`Self::admit`], and the drive of the run
-    /// it started. A fire that cannot become a run now is put in its
-    /// trigger's queue for later, which this answers rather than holding
-    /// the fire. A refusal read off the held triggers is confirmed against
-    /// the broker's answer now: a trigger armed or taken over a moment ago
-    /// may not have been heard yet.
+    /// [`Self::take_event`], and a fire it dropped counted at the door
+    /// with its reason. A drop is acknowledged (nothing tries a refusal
+    /// again), so the count is what `weft status` shows of it.
     async fn admit_event(
+        &self,
+        fire: weft_core::door_fire::DoorFire,
+    ) -> Result<(weft_core::door_fire::Fired, Option<tokio::task::JoinHandle<RunAnswer>>), Response> {
+        let token = fire.token.clone();
+        let taken = self.take_event(fire).await;
+        if let Ok((weft_core::door_fire::Fired::Dropped { reason }, _)) = &taken {
+            self.door.dropped(&token, reason);
+        }
+        taken
+    }
+
+    /// A trigger's event: its front (the trigger as held, its holder, its
+    /// program, its standing, its limits), then [`Self::admit`], and the
+    /// drive of the run it started. A fire that cannot become a run now is
+    /// put in its trigger's queue for later, which this answers rather
+    /// than holding the fire. A refusal read off the held triggers is
+    /// confirmed against the broker's answer now: a trigger armed or taken
+    /// over a moment ago may not have been heard yet.
+    async fn take_event(
         &self,
         fire: weft_core::door_fire::DoorFire,
     ) -> Result<(weft_core::door_fire::Fired, Option<tokio::task::JoinHandle<RunAnswer>>), Response> {
@@ -1927,6 +1946,24 @@ mod tests {
         assert!(matches!(fired(&worker, a_fire("t1")).await, weft_core::door_fire::Fired::Dropped { .. }));
         assert!(matches!(fired(&worker, a_fire("gone")).await, weft_core::door_fire::Fired::Dropped { .. }));
         assert!(broker.parked.lock().unwrap().is_empty());
+    }
+
+    /// A dropped fire is acknowledged, and counted at the door with its
+    /// reason: the next tick states it, where `weft status` reads it.
+    #[tokio::test]
+    async fn a_dropped_fire_is_counted_with_its_reason_on_the_next_tick() {
+        let (worker, broker) = worker_firing(|_, trigger| {
+            entry(trigger).standing.status = weft_core::projects::ProjectStatus::Inactive;
+            entry(trigger).standing.accepting_fires = false;
+        });
+        let weft_core::door_fire::Fired::Dropped { reason } = fired(&worker, a_fire("t1")).await else { panic!("dropped") };
+        worker.door.tick(None, false).await.unwrap();
+        let ticks = broker.ticks.lock().unwrap();
+        let counts = &ticks.last().expect("a tick").counts;
+        let dropped: Vec<_> = counts.iter().filter(|count| count.key == "dropped:t1").collect();
+        assert_eq!(dropped.len(), 1, "{counts:?}");
+        assert_eq!((dropped[0].hits, dropped[0].reason.as_deref()), (1, Some(reason.as_str())));
+        assert!(counts.iter().filter(|count| count.key != "dropped:t1").all(|count| count.reason.is_none()), "{counts:?}");
     }
 
     /// A fire for a trigger armed on another version of the program waits

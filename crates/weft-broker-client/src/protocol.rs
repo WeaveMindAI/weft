@@ -2407,8 +2407,15 @@ pub use weft_core::access::events::ResolvedEventSource as ListenerResolvedSource
 /// signal's lock, one still fresh is answered as it is.
 pub const SUBSCRIPTION_ENSURE: BrokerCall = BrokerCall { path: "/v1/access/subscription/ensure", twice: Twice::Harmless };
 
+/// Whether keeping a provider-side subscription alive could work on this
+/// install, asked before anything is subscribed (a resync, before it takes
+/// the trigger down): the same request as [`SUBSCRIPTION_ENSURE`]. Reads
+/// only, so harmless twice.
+pub const SUBSCRIPTION_CHECK: BrokerCall = BrokerCall { path: "/v1/access/subscription/check", twice: Twice::Harmless };
+
 /// Ask the broker to make sure a live provider subscription serves
-/// this signal (subscribing or renewing as needed).
+/// this signal (subscribing or renewing as needed), or, at
+/// [`SUBSCRIPTION_CHECK`], whether it could.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionEnsureRequest {
     pub tenant: String,
@@ -2735,6 +2742,11 @@ pub struct DoorTickRequest {
 pub struct DoorCount {
     pub key: String,
     pub hits: i64,
+    /// The last reason given for the count, for a key that keeps one (a
+    /// dropped fire's, `weft_core::signal::limits::dropped_key`). A tick's
+    /// answer carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

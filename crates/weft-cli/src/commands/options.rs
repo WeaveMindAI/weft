@@ -95,7 +95,7 @@ pub async fn run(ctx: Ctx, node_name: &str, field: &str, search: Option<&str>) -
                 label: label.clone(),
                 value: value.clone(),
             };
-            let items: Vec<LookupItem> = serde_json::from_value(client.post_json("/access/granted", &serde_json::to_value(&body)?).await?)
+            let items: Vec<LookupItem> = serde_json::from_value(client.waiting_on_its_work().post_json("/access/granted", &serde_json::to_value(&body)?).await?)
                 .context("parse the recorded choices")?;
             if !items.is_empty() {
                 pages.push(LookupPage { items, next_cursor: None });
@@ -114,7 +114,7 @@ pub async fn run(ctx: Ctx, node_name: &str, field: &str, search: Option<&str>) -
         let mut seen: HashSet<String> = HashSet::new();
         loop {
             let body = lookup_request(lookup, signing.as_ref().map(|s| (s.access_id, s.service.as_str())), query, &parents, cursor.as_deref());
-            let page: LookupPage = serde_json::from_value(client.post_json("/access/lookup", &serde_json::to_value(&body)?).await?)
+            let page: LookupPage = serde_json::from_value(client.waiting_on_its_work().post_json("/access/lookup", &serde_json::to_value(&body)?).await?)
                 .context("parse the lookup answer")?;
             let next = page.next_cursor.clone();
             pages.push(LookupPage { items: narrow(lookup, query, page.items), next_cursor: next.clone() });

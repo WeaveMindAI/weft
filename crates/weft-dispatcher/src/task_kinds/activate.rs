@@ -265,21 +265,22 @@ pub(crate) fn followed(result: Option<Value>) -> Result<Value, (StatusCode, Stri
 /// waits on (`weft_core::infra::wire::ChangeProgress`), read off the rows
 /// it claimed; `None` while it drives none (before its claim, between two
 /// owners, after it landed).
-pub(crate) async fn progress(state: &DispatcherState, id: uuid::Uuid, task: uuid::Uuid) -> anyhow::Result<Option<Value>> {
+pub(crate) async fn progress(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    task: uuid::Uuid,
+) -> anyhow::Result<Option<weft_core::infra::wire::ChangeProgress>> {
     let rows = state.activations.list(id).await?;
     let now = crate::lease::now_unix();
     let driving = rows
         .iter()
         .filter(|a| a.driver_task == Some(task))
         .find_map(|a| Some((a.activating?, a.lifecycle.activating_run_id?)));
-    Ok(match driving {
-        Some((activating, run)) => Some(serde_json::to_value(weft_core::infra::wire::ChangeProgress {
-            since_unix: activating.since_unix,
-            as_of_unix: now,
-            waiting: Some(activating.step.waiting(run)),
-        })?),
-        None => None,
-    })
+    Ok(driving.map(|(activating, run)| weft_core::infra::wire::ChangeProgress {
+        since_unix: activating.since_unix,
+        as_of_unix: now,
+        waiting: Some(activating.step.waiting(run)),
+    }))
 }
 
 #[cfg(test)]

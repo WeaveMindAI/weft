@@ -181,17 +181,17 @@ async fn connections(ctx: &Ctx, source: &DispatcherClient, target: &DispatcherCl
     let key: Option<TransferKey> = match picks.dry_run {
         true => None,
         false => Some(
-            serde_json::from_value(target.post_json("/access/migrate/key", &serde_json::json!({})).await?)
+            serde_json::from_value(target.waiting_on_its_work().post_json("/access/migrate/key", &serde_json::json!({})).await?)
                 .with_context(|| format!("read {}'s transfer key", picks.to))?,
         ),
     };
     let request = ExportConnections { selection, public_key: key.as_ref().map(|k| k.public_key.clone()) };
-    let exported: ExportedConnections = serde_json::from_value(source.post_json("/access/migrate/export", &serde_json::to_value(&request)?).await?)
+    let exported: ExportedConnections = serde_json::from_value(source.waiting_on_its_work().post_json("/access/migrate/export", &serde_json::to_value(&request)?).await?)
         .context("read the connections to copy")?;
     let outcomes: BTreeMap<uuid::Uuid, Outcome> = match (key, &exported.sealed) {
         (Some(key), Some(sealed)) => {
             let request = ImportConnections { key_id: key.key_id, sealed: sealed.clone() };
-            let imported: ImportedConnections = serde_json::from_value(target.post_json("/access/migrate/import", &serde_json::to_value(&request)?).await?)
+            let imported: ImportedConnections = serde_json::from_value(target.waiting_on_its_work().post_json("/access/migrate/import", &serde_json::to_value(&request)?).await?)
                 .with_context(|| format!("read what {} did with the connections", picks.to))?;
             imported.connections.into_iter().map(|c| (c.id, c.outcome)).collect()
         }

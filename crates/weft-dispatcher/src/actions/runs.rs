@@ -15,7 +15,7 @@ use serde_json::Value;
 use weft_core::frames::Located;
 use weft_core::run_spec::{resolve_seeded, resolve_spec, Refusal, RunSpec};
 use weft_core::seeding::{inheritable_nodes, seed_plan, SeedOutcome};
-use weft_core::versions::{RunStarted, VersionRunRequest};
+use weft_core::versions::{RunStarted, RunStarting, StartRun, StartingRun, VersionRunRequest};
 use weft_core::RunId;
 
 use super::{internal, with_tree_lock, Actor, Refused};
@@ -134,33 +134,82 @@ async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run_id: RunId) 
 /// or gone no longer holds it. Only what stands in for itself here
 /// (`stand_ins`) hands this run anything; a place reused and read by
 /// nothing that runs hands it nothing. Every such output is named at
-/// once, so one refusal says everything to hand in or re-run.
+/// once, so one refusal says everything to hand in or re-run. Each file
+/// is one look at the store, said first ([`RunStarting::CheckingFiles`]).
 async fn refuse_moved_files(
     state: &DispatcherState,
     project: &weft_core::ProjectDefinition,
     stand_ins: &BTreeMap<Located, weft_core::project::StandIn>,
+    starting: &Starting<'_>,
 ) -> Result<(), Refused> {
-    let mut refusals = Vec::new();
+    let mut handed = Vec::new();
     for (place, stand_in) in stand_ins {
         for (port, given) in &stand_in.ports {
             let weft_core::project::GivenPort::Value { value } = given else { continue };
-            for file in weft_core::storage::stored_files_within(value) {
-                let now = match crate::storage::file_meta(state, &file.key).await {
-                    Ok(meta) => weft_core::seeding::FileNow::At(meta.version),
-                    Err(e) if e.downcast_ref::<crate::storage::StorageNotFound>().is_some() => {
-                        weft_core::seeding::FileNow::Gone
-                    }
-                    Err(e) => return Err(internal("read a reused output's file", e)),
-                };
-                let node = weft_core::project::address_of(project, &place.id, &place.path);
-                refusals.extend(weft_core::seeding::moved_file_refusal(&node, port, &file, now));
-            }
+            handed.extend(weft_core::storage::stored_files_within(value).into_iter().map(|file| (place, port, file)));
         }
+    }
+    if handed.is_empty() {
+        return Ok(());
+    }
+    starting.at(RunStarting::CheckingFiles { files: handed.len() }).await;
+    let mut refusals = Vec::new();
+    for (place, port, file) in handed {
+        let now = match crate::storage::file_meta(state, &file.key).await {
+            Ok(meta) => weft_core::seeding::FileNow::At(meta.version),
+            Err(e) if e.downcast_ref::<crate::storage::StorageNotFound>().is_some() => weft_core::seeding::FileNow::Gone,
+            Err(e) => return Err(internal("read a reused output's file", e)),
+        };
+        let node = weft_core::project::address_of(project, &place.id, &place.path);
+        refusals.extend(weft_core::seeding::moved_file_refusal(&node, port, &file, now));
     }
     if refusals.is_empty() {
         return Ok(());
     }
     Err((StatusCode::CONFLICT, refusals.join("\n")))
+}
+
+/// Where a run being started says it is ([`RunStarting`]): on its task,
+/// for the person following it, or nowhere for a start nobody follows (a
+/// program's, which waits on its own call).
+pub(crate) enum Starting<'a> {
+    Task { pool: &'a weft_task_store::db::Pool, task: uuid::Uuid },
+    Unfollowed,
+}
+
+impl Starting<'_> {
+    /// Say the start is at `stage`. A line for the person following, so a
+    /// write the database did not take is logged and the start goes on:
+    /// it is never a reason to refuse the run.
+    async fn at(&self, stage: RunStarting) {
+        let Starting::Task { pool, task } = self else { return };
+        let said = match serde_json::to_value(&stage) {
+            Ok(stage) => weft_task_store::tasks::set_progress(pool, *task, &stage).await,
+            Err(e) => Err(e.into()),
+        };
+        if let Err(e) = said {
+            tracing::warn!(target: "weft_dispatcher::runs", %task, error = %format!("{e:#}"), "where a run's start is could not be said");
+        }
+    }
+}
+
+/// `POST /projects/{id}/versions/runs`: hand a person's run to its task
+/// ([`crate::task_kinds::start_run`]), under the id the ask carries, and
+/// answer that task to follow. What a run can be refused at once (the
+/// project is not the asker's, or it is the asking program's own) is
+/// refused here; the task holds every other check, and reads them again.
+/// The same ask sent again joins its task.
+pub async fn start(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, ask: &StartRun) -> Result<StartingRun, Refused> {
+    actor.may_act_on(state, id).await?;
+    refuse_own_run(actor, id)?;
+    let task = crate::task_kinds::start_run::task(actor.tenant().as_str(), id, ask)?;
+    match weft_task_store::tasks::enqueue_as(&state.pg_pool, ask.task, task)
+        .await
+        .map_err(|e| crate::api::unavailable_or_internal("hand the run to its task", e))?
+    {
+        weft_task_store::tasks::Enqueued::Inserted | weft_task_store::tasks::Enqueued::Joined => Ok(StartingRun { task: ask.task }),
+        weft_task_store::tasks::Enqueued::Refused(why) => Err((StatusCode::CONFLICT, why)),
+    }
 }
 
 /// A program starting a run of its own project starts one more run each
@@ -182,10 +231,24 @@ pub(crate) fn refuse_own_run(actor: &Actor, project: uuid::Uuid) -> Result<(), R
 }
 
 /// Start a run that records itself in the tree, from a working copy, of
-/// a version a build registered (see the module doc).
-pub async fn run(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, body: &VersionRunRequest) -> Result<RunStarted, Refused> {
+/// a version a build registered (see the module doc), as `run_id`, saying
+/// where it is on the way when somebody follows it (`starting`). The same
+/// start asked again under its id (an ask, a program's call, a task's
+/// claim rescued: each names the run before it starts) answers the run
+/// it started ([`started_before`]) instead of starting another.
+pub(crate) async fn run(
+    state: &DispatcherState,
+    actor: &Actor,
+    id: uuid::Uuid,
+    body: &VersionRunRequest,
+    run_id: RunId,
+    starting: &Starting<'_>,
+) -> Result<RunStarted, Refused> {
     actor.may_act_on(state, id).await?;
     refuse_own_run(actor, id)?;
+    if let Some(started) = started_before(state, id, run_id, body.working_copy).await? {
+        return Ok(started);
+    }
     crate::maintenance::refuse_while_on(&state.pg_pool).await?;
     require_action(state, id, &["run"]).await?;
     if (!body.seed_until.is_empty() || !body.seed_before.is_empty()) && !body.seed && body.seed_run.is_none() {
@@ -262,7 +325,7 @@ pub async fn run(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, body: &
         // An instance's trigger was baked with that instance's values: the
         // fire replays the instance's bake.
         state.bakes.trigger_bakes(id, spec.instance.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?
-    } else { Vec::new() };
+    } else { crate::store::Bakes::default() };
     // A fired CALLER trigger (a Route) gets a stand-in caller: there is
     // no socket coming, so the run serves the body the author typed and
     // the program's answer goes to the journal. Without it a route's
@@ -289,9 +352,20 @@ pub async fn run(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, body: &
         // through its call frames before the lookup.
         let address = crate::api::project::kick_place(&project, kick);
         fired_trigger = Some(address.clone());
-        weft_core::run_spec::validate_fire_bake(&address, &program, &bakes.iter().map(|bake| bake.summary()).collect::<Vec<_>>())
+        // This program's bake no longer reads (another program's, which
+        // the fire does not replay, is read past): what it captured is
+        // gone, and a setup of the trigger makes it again. `weft bake` does
+        // that whether the trigger is on or off, and changes nothing that
+        // listens.
+        if let Some(unreadable) = bakes.unreadable_for(&program) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("{}; `weft bake` prepares trigger '{address}' again and replaces it", unreadable.error.trim_end_matches('.')),
+            ));
+        }
+        weft_core::run_spec::validate_fire_bake(&address, &program, &bakes.read.iter().map(|bake| bake.summary()).collect::<Vec<_>>())
             .map_err(|refusal| refused(&refusal))?;
-        let capture = bakes.iter().find(|bake| bake.program == program)
+        let capture = bakes.read.iter().find(|bake| bake.program == program)
             .and_then(|bake| bake.captured.get(&address))
             .expect("validated bake contains this trigger for this program");
         fired_ports = Some(capture.ports.clone());
@@ -330,11 +404,12 @@ pub async fn run(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, body: &
     let mut starting_parameters = spec.clone();
     let (mut resolved, seed) = match seed_run {
         Some(seed_run) => {
+            starting.at(RunStarting::ReadingSeed { seed: seed_run }).await;
             let from = fold_seed(state, id, seed_run).await?;
             let planned = seed_plan(&project, &program, &authored, &spec, &from.outcomes, &from.answered,
                 &body.seed_until, &body.seed_before)
                 .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-            refuse_moved_files(state, &project, &planned.stand_ins).await?;
+            refuse_moved_files(state, &project, &planned.stand_ins, starting).await?;
             starting_parameters = weft_core::seeding::starting_parameters(&project, &spec, &authored.walk, &planned, &from.outcomes)
                 .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
             let mut resolved = resolve_seeded(&spec, &project, &saved, Some(&planned)).map_err(|r| refused(&r))?;
@@ -378,7 +453,6 @@ pub async fn run(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, body: &
     let run_program = crate::api::project::runs_program(&program, &resolved.program)?;
     let stale = resolved.runs.clone();
     let kicks = resolved.kicks.clone();
-    let run_id = weft_core::new_run_id();
     let now = crate::lease::now_unix() as u64;
     let birth_rows = weft_journal::birth::baked_rows(run_id, &resolved.baked, now);
     // An empty `entry_node` is the journal's marker for a row that no
@@ -425,7 +499,8 @@ pub async fn run(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, body: &
     // this handler does, the seed fold above and the response below,
     // stays outside it.
     let stale_vec: Vec<String> = stale.iter().map(spell).collect::<BTreeSet<_>>().into_iter().collect();
-    let moved = with_tree_lock(state, id, || async {
+    starting.at(RunStarting::WaitingForLock).await;
+    let recorded = with_tree_lock(state, id, || async {
         // Head is read again in here. The one read outside chose the
         // seed, which is this run's own business; the version's PARENT
         // has to be where head is at the moment the row is written, or
@@ -479,7 +554,14 @@ pub async fn run(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, body: &
             .map_err(|e| internal("set head", e))?;
         Ok(moved)
     })
-    .await?;
+    .await;
+    let moved = match recorded {
+        Ok(moved) => moved,
+        // Another claim of this same start recorded it first (a task's
+        // claim rescued while the first claimant still ran): that run is
+        // this start's, and is answered as it recorded itself.
+        Err(refused) => return started_before(state, id, run_id, body.working_copy).await?.ok_or(refused),
+    };
 
     // A head that would not move is reported, never refused.
     //
@@ -495,16 +577,7 @@ pub async fn run(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, body: &
     // between the two.
     let mut warnings = resolved.warnings.clone();
     if !moved {
-        warnings.push(format!(
-            "this run started and is recorded under version {} (`weft tree` shows it), but head \
-             could not be moved to it: head changed under this call, which happens when the run \
-             head pointed at was cleaned, or when the project was removed while this was being \
-             prepared. If the project is gone, this run outlives it and `weft clean {}` is what \
-             removes it. Otherwise `weft branch {}` moves head here.",
-            version.id,
-            &run_id.to_string()[..8],
-            &run_id.to_string()[..8],
-        ));
+        warnings.push(head_not_moved(&version.id, run_id));
     }
 
     super::versions::announce(state, id, copy.id).await;
@@ -617,6 +690,109 @@ async fn gate_headers(
 
 // ----- a program's calls on runs -----------------------------------------
 
+/// The run started under `run_id` before (the same start asked again
+/// after its answer was lost), read back off what the run recorded: its
+/// row in the version tree, written with it, and its birth. `None` when
+/// no run has that id. A run of that id in another project refuses: the
+/// id was not this start's. One that started and whose answer cannot be
+/// read again (its version was pruned since) refuses loudly, naming it.
+/// The warnings the first answer carried are not kept; whether head (of
+/// `working_copy`, the copy the start moves) points at the run is read
+/// again and said when it does not, and the tree announced (the first
+/// start may have stopped before either), while that copy is still there.
+async fn started_before(
+    state: &DispatcherState,
+    project: uuid::Uuid,
+    run_id: RunId,
+    working_copy: weft_core::working_copy::WorkingCopyRef,
+) -> Result<Option<RunStarted>, Refused> {
+    let Some(owner) = state.runs.run_owner(run_id).await.map_err(|e| internal("the run started under this id", e))? else {
+        return Ok(None);
+    };
+    if owner.project_id != project {
+        return Err((StatusCode::CONFLICT, format!("run id {run_id} is taken; ask again under a new id")));
+    }
+    let Some(recorded) = state.versions.run(run_id).await.map_err(|e| internal("the run started under this id", e))? else {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "run {run_id} was started by this same request already, and the version it ran was pruned since, so what \
+                 it started with cannot be read again; `weft runs` lists it"
+            ),
+        ));
+    };
+    let birth = crate::projection::run_birth(state, run_id)
+        .await
+        .map_err(|e| internal("the birth of the run started under this id", e))?
+        .map_err(|e| internal("the birth of the run started under this id", e))?
+        // The row and the birth are written in one transaction.
+        .ok_or_else(|| internal("the run started under this id", format!("run {run_id} is in the version tree with no record")))?;
+    let reused: Vec<Located> = match birth.event {
+        weft_journal::RunEvent::RunStarted { seed: Some(seed), .. } => seed.origins.into_keys().collect(),
+        _ => Vec::new(),
+    };
+    // Only what it reused needs the program it ran, to spell those places.
+    let inherited = match reused.is_empty() {
+        true => Vec::new(),
+        false => {
+            let program = state
+                .program(project, &recorded.definition_hash)
+                .await
+                .map_err(|e| internal("the program the run ran", e))?
+                .ok_or_else(|| internal("the program the run ran", format!("program {} is no longer recorded", recorded.definition_hash)))?;
+            let spelled: BTreeSet<String> =
+                reused.iter().map(|place| weft_core::project::address_of(&*program, &place.id, &place.path)).collect();
+            spelled.into_iter().collect()
+        }
+    };
+    let mut started = started_as_recorded(recorded, inherited);
+    // The copy is read only for the warning and the announcement: one
+    // forgotten since is no reason to refuse the run's answer.
+    let copy = match working_copy.working_copy {
+        Some(named) => state.working_copies.get(named).await.map_err(|e| internal("working copy", e))?.filter(|copy| copy.project_id == project),
+        None => Some(super::versions::copy_of(state, project, working_copy).await?),
+    };
+    if let Some(copy) = copy {
+        if copy.head.head_run != Some(run_id) {
+            let short = &run_id.to_string()[..8];
+            started.warnings.push(format!(
+                "this run was started by this same request before, and its first answer was lost; head is not on it \
+                 now, because it moved on since or because the first start stopped before moving it. `weft branch \
+                 {short}` moves head here, if that is where you want it."
+            ));
+        }
+        super::versions::announce(state, project, copy.id).await;
+    }
+    Ok(Some(started))
+}
+
+/// What a run's first answer says when head was not moved to it: why that
+/// happens, and the way through.
+fn head_not_moved(version: &str, run_id: RunId) -> String {
+    let short = &run_id.to_string()[..8];
+    format!(
+        "this run started and is recorded under version {version} (`weft tree` shows it), but head \
+         could not be moved to it: head changed under this call, which happens when the run head pointed \
+         at was cleaned, or when the project was removed while this was being prepared. If the project is \
+         gone, this run outlives it and `weft clean {short}` is what removes it. Otherwise `weft branch \
+         {short}` moves head here."
+    )
+}
+
+/// What a run's start answered, as the run recorded it: its row in the
+/// version tree (`recorded`) and the places it reused (`inherited`,
+/// spelled and sorted).
+fn started_as_recorded(recorded: crate::versions::RunRow, inherited: Vec<String>) -> RunStarted {
+    RunStarted {
+        run_id: recorded.run_id,
+        version: recorded.version_id,
+        seed: recorded.seed_run_id,
+        inherited,
+        ran: recorded.stale,
+        warnings: Vec::new(),
+    }
+}
+
 /// Carry out one run call of `actor` on project `project_id`: a start
 /// here, every other call on runs in [`super::run_admin`].
 pub(crate) async fn program_call(
@@ -628,8 +804,52 @@ pub(crate) async fn program_call(
 ) -> Result<weft_core::program::ProgramCallOutcome, Refused> {
     use weft_core::program::runs::RunCall;
     match call {
-        RunCall::Start { request } => super::answered(&run(state, actor, project_id, request).await?),
+        // The run is named after the call, so the call issued again (its
+        // answer lost before the run journaled it) finds the run it
+        // started instead of starting another.
+        RunCall::Start { request } => {
+            let Actor::Program { call, .. } = actor else {
+                return Err(internal("a program's call", "a run call reached the program calls with no program asking"));
+            };
+            super::answered(&run(state, actor, project_id, request, *call, &Starting::Unfollowed).await?)
+        }
         other => super::run_admin::program_call(state, actor, project_id, other, stop_self).await,
+    }
+}
+
+#[cfg(test)]
+mod started_before_tests {
+    use super::*;
+
+    /// A start asked again is answered with the run its first ask
+    /// started, as that run recorded it: its id, version, seed, what it
+    /// reused and what it runs.
+    #[test]
+    fn a_start_asked_again_answers_the_run_as_it_recorded() {
+        let run_id = RunId::from_u128(4);
+        let recorded = crate::versions::RunRow {
+            run_id,
+            project_id: uuid::Uuid::from_u128(1),
+            version_id: "v2".into(),
+            seed_run_id: Some(RunId::from_u128(3)),
+            stale: vec!["a".into(), "one.b".into()],
+            spec: None,
+            definition_hash: "d".into(),
+            example: None,
+            created_at: 7,
+        };
+        let started = started_as_recorded(recorded, vec!["start".into()]);
+        assert_eq!(
+            started,
+            RunStarted {
+                run_id,
+                version: "v2".into(),
+                seed: Some(RunId::from_u128(3)),
+                inherited: vec!["start".into()],
+                ran: vec!["a".into(), "one.b".into()],
+                warnings: Vec::new(),
+            }
+        );
     }
 }
 

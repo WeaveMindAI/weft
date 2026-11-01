@@ -174,6 +174,25 @@ describe('the badges', () => {
 		expect(heldBack.detail).toContain('Held back: other triggers are on another build. `weft resync --all` moves them');
 	});
 
+	it('warn while a trigger that is on drops what arrives, saying how many and why', () => {
+		const dropping = triggerBadge({
+			node: 'a',
+			perInstance: false,
+			shared: { state: 'on', mode: 'active', dropped: { count: 3, lastReason: "package 'relay' didn't compile" } },
+		});
+		expect(dropping).toMatchObject({ label: 'dropping', tone: 'warn' });
+		expect(dropping.detail).toContain("3 fires or calls dropped in the last minute or two (refused before any run started), the last because: package 'relay' didn't compile");
+		const perInstance = triggerBadge({
+			node: 'inbox',
+			perInstance: true,
+			copies: [
+				{ instance: 'ada', state: 'on', mode: 'active', dropped: { count: 1, lastReason: 'the trigger is gone' } },
+				{ instance: 'bob', state: 'on', mode: 'active' },
+			],
+		});
+		expect(perInstance).toMatchObject({ label: '2 of 2 on', tone: 'warn', detail: 'ada: dropping\nbob: on' });
+	});
+
 	it('count a per-instance trigger\'s instances that are on', () => {
 		const badge = triggerBadge({
 			node: 'inbox',

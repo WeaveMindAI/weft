@@ -40,7 +40,8 @@ pub async fn run(ctx: Ctx, action: WorkersAction) -> anyhow::Result<()> {
     };
     let answer = match project {
         None => current,
-        Some(project) => read(client.put_json(&path, &serde_json::to_value(&project)?).await?)?,
+        // On a cloud install it answers once the workers' service took the levers.
+        Some(project) => read(client.waiting_on_its_work().put_json(&path, &serde_json::to_value(&project)?).await?)?,
     };
     if ctx.json_out(&answer)? {
         return Ok(());

@@ -277,7 +277,7 @@ pub(crate) async fn land_trigger_bake(
 /// What a person is told when `bake` replaced an earlier bake that no
 /// longer read (`lost`): which triggers it baked, that every other one
 /// the earlier bake held has none now, and how to bake them again.
-fn replaced_bake_reason(lost: &crate::store::UnreadablePriorBake, bake: &crate::store::TriggerBake) -> String {
+fn replaced_bake_reason(lost: &crate::store::UnreadableBake, bake: &crate::store::TriggerBake) -> String {
     let baked: Vec<&str> = if bake.targets.is_empty() {
         bake.captured.keys().map(String::as_str).collect()
     } else {
@@ -406,7 +406,7 @@ mod tests {
     /// for the triggers' owner.
     #[test]
     fn a_replaced_bake_names_what_it_baked_and_how_to_bake_the_rest() {
-        let lost = crate::store::UnreadablePriorBake { error: "the bake of the shared triggers: no".into() };
+        let lost = crate::store::UnreadableBake { program_hash: "p".into(), error: "the bake of the shared triggers: no".into() };
         let mut bake = crate::store::TriggerBake {
             project_id: uuid::Uuid::nil(),
             instance: None,

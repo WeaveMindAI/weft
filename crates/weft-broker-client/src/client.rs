@@ -559,6 +559,13 @@ impl BrokerEventsClient {
         self.http.post(SUBSCRIPTION_ENSURE, req).await
     }
 
+    /// Whether `req`'s subscription could be made on this install,
+    /// subscribing nothing: an error says why not.
+    pub async fn subscription_check(&self, req: &SubscriptionEnsureRequest) -> Result<()> {
+        let _: serde_json::Value = self.http.post(SUBSCRIPTION_CHECK, req).await?;
+        Ok(())
+    }
+
     pub async fn subscription_drop(&self, req: &SubscriptionDropRequest) -> Result<()> {
         let _: serde_json::Value = self.http.post(SUBSCRIPTION_DROP, req).await?;
         Ok(())

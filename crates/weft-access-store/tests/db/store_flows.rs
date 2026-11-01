@@ -1593,6 +1593,45 @@ async fn a_subscribe_topic_without_a_public_address_teaches_the_fix(pool: Pool) 
     );
 }
 
+/// Whether a subscription could be made is told without making it: no
+/// internet-reachable address teaches the same fix the subscribe would,
+/// params naming a value the subscribe mints are refused as the subscribe
+/// refuses them, and an install that could subscribe is let through. No call
+/// reaches the provider and no row is written either way.
+#[weft_db_macros::test]
+async fn a_subscription_is_checked_without_being_made(pool: Pool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = events_spec(&base);
+    let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    let ask = |params: &[(&str, &str)]| weft_access_store::EnsureSubscription {
+        tenant: TENANT_A.into(),
+        service: "fakeoauth".into(),
+        topic: "things".into(),
+        access_id: grant.id,
+        for_instance: None,
+        signal_token: "sig-x".into(),
+        params: params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+    };
+    let unreachable = weft_access_store::check_subscription(&pool, &ask(&[("target", "f")]), || async { anyhow::Ok(None) })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(unreachable.contains("--public-url"), "{unreachable}");
+    let replacing = weft_access_store::check_subscription(&pool, &ask(&[("subscriptionId", "x")]), || async { anyhow::Ok(Some("https://weft.test".into())) })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(replacing.contains("may not replace the connection's stored value 'subscriptionId'"), "{replacing}");
+    weft_access_store::check_subscription(&pool, &ask(&[("target", "f")]), || async { anyhow::Ok(Some("https://weft.test".into())) })
+        .await
+        .expect("an install the internet reaches could subscribe");
+    assert!(fake.calls.lock().unwrap().iter().all(|c| !c.starts_with("/watch/")), "no provider channel was opened");
+    let rows: i64 = pool.scalar("SELECT count(*) FROM signal_subscription", &[]).await.unwrap();
+    assert_eq!(rows, 0, "nothing is written");
+}
+
 /// A connection to a service with no events section still resolves
 /// for the listener (a held raw pipe needs only the stored values);
 /// the recipe map simply comes back empty. A subscription needing a

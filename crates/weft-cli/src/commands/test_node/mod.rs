@@ -1257,17 +1257,22 @@ async fn run_one_live_test(
     let mut last_breadcrumb = std::time::Instant::now();
     let report = loop {
         // Held by the dispatcher until the run finishes or the hold runs
-        // out, so the loop asks again at once either way.
-        let status: weft_core::node_test::NodeTestRunStatus = serde_json::from_value(
-            client
-                .get_json(&format!(
-                    "/projects/{project_id}/node-tests/runs/{task_id}?wait_ms={}",
-                    RUN_HOLD.as_millis()
-                ))
-                .await
-                .context("wait on the node-test run")?,
-        )
-        .context("read the node-test run's status")?;
+        // out, so the loop asks again at once either way. A look the
+        // install did not answer is said and looked at again.
+        let looked = client
+            .waiting_up_to(RUN_HOLD)
+            .get_json(&format!("/projects/{project_id}/node-tests/runs/{task_id}?wait_ms={}", RUN_HOLD.as_millis()))
+            .await;
+        let status = match looked {
+            Ok(status) => status,
+            Err(e) => {
+                let why = crate::commands::ensure::look_again_after(e).map_err(|e| e.context("wait on the node-test run"))?;
+                progress.note(&format!("could not look at the node-test run just now ({why}); looking again"));
+                tokio::time::sleep(crate::commands::follow::TASK_LOOK_AGAIN_AFTER).await;
+                continue;
+            }
+        };
+        let status: weft_core::node_test::NodeTestRunStatus = serde_json::from_value(status).context("read the node-test run's status")?;
         match status.status {
             TaskStatus::Complete => break status.report.context("completed without a report")?,
             TaskStatus::Failed => bail!(

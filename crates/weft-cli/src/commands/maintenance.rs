@@ -96,7 +96,11 @@ async fn on(ctx: &Ctx, running: Option<Running>) -> anyhow::Result<()> {
         spinner.show_one("taking down every trigger and stopping every infra copy", crate::progress::now_unix() as i64);
     }
     let answer: MaintenanceOn =
-        crate::client::read_answer(client.post_json("/install/maintenance", &serde_json::to_value(&request)?).await?, "what `weft maintenance on` did")?;
+        // It goes through every project of the install before it answers.
+        crate::client::read_answer(
+            client.waiting_on_its_work().post_json("/install/maintenance", &serde_json::to_value(&request)?).await?,
+            "what `weft maintenance on` did",
+        )?;
     drop(spinner);
     if !ctx.json() {
         println!("in maintenance since {}", when(answer.since_unix));

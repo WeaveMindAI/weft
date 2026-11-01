@@ -7,7 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
-use weft_core::versions::{CheckpointRequest, PruneResponse, RunStarted, RunUpdate, RunningSource, SweepResponse, VersionRunRequest, VersionTree, VersionUpsert};
+use weft_core::versions::{CheckpointRequest, PruneResponse, RunUpdate, RunningSource, StartRun, StartingRun, SweepResponse, VersionTree, VersionUpsert};
 use weft_core::working_copy::{Applied, ChangeFiles, RegisterFolder, SwitchRequest, Switched, SyncReport, WorkingCopy, WorkingCopyRef, WorkingState};
 use weft_core::RunId;
 
@@ -29,14 +29,15 @@ pub async fn checkpoint(
     Ok(Json(versions::checkpoint(&state, &operator(caller), id, &body).await?))
 }
 
-/// `POST /projects/{id}/versions/runs`: start a run of a version.
+/// `POST /projects/{id}/versions/runs`: start a run of a version, through
+/// its task, answered at once to follow.
 pub async fn run(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
-    Json(body): Json<VersionRunRequest>,
-) -> Result<Json<RunStarted>, Refused> {
-    Ok(Json(crate::actions::runs::run(&state, &operator(caller), id, &body).await?))
+    Json(ask): Json<StartRun>,
+) -> Result<(StatusCode, Json<StartingRun>), Refused> {
+    Ok((StatusCode::ACCEPTED, Json(crate::actions::runs::start(&state, &operator(caller), id, &ask).await?)))
 }
 
 /// Whose bakes a preview asks about: the shared triggers' by default.
@@ -59,7 +60,10 @@ pub async fn trigger_bakes(
         .trigger_bakes(id, query.instance.as_ref())
         .await
         .map_err(|error| crate::actions::internal("read trigger bakes", error))?;
-    Ok(Json(bakes.iter().map(|bake| bake.summary()).collect()))
+    // One that no longer reads previews as none: the trigger reads as
+    // not prepared, which `weft bake` fixes, and the run that fires it
+    // names the row (`crate::actions::runs::run`).
+    Ok(Json(bakes.read.iter().map(|bake| bake.summary()).collect()))
 }
 
 pub async fn running(State(state): State<DispatcherState>, caller: CallerTenant, Path(id): Path<uuid::Uuid>) -> Result<Json<RunningSource>, Refused> {

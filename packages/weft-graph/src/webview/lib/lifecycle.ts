@@ -6,6 +6,7 @@
 
 import type {
 	ActionAvailability,
+	Dropped,
 	HeldWork,
 	InfraCopyRead,
 	InfraPlacementStatus,
@@ -44,21 +45,30 @@ export function describeHeld(held: HeldWork): string {
 	return `${counted(held.arrivals, 'arrival', 'arrivals')} and ${counted(held.paused, 'paused run', 'paused runs')}`;
 }
 
+/// "3 fires or calls dropped in the last minute or two (refused before any
+/// run started), the last because: ...".
+// SYNC: describeDropped <-> crates/weft-core/src/projects.rs Dropped::describe
+export function describeDropped(dropped: Dropped): string {
+	const what = dropped.count === 1 ? '1 fire or call' : `${dropped.count} fires or calls`;
+	return `${what} dropped in the last minute or two (refused before any run started), the last because: ${dropped.lastReason}`;
+}
+
 function heldCount(copy: TriggerCopy): number {
 	return (copy.held?.arrivals ?? 0) + (copy.held?.paused ?? 0);
 }
 
 /// One activation as a badge reads it: `on`, `off`, `behind`, `held back`
 /// (taken down, and its bring-back refused), `held N` (off with work
-/// waiting for it), `turning on...`.
+/// waiting for it), `turning on...`, and `dropping` for one that is
+/// on while what arrives for it is dropped.
 function copyBadge(copy: TriggerCopy): LifecycleBadge {
 	switch (copy.state) {
 		case 'turning_on':
 			return { label: 'turning on...', tone: 'busy' };
 		case 'on':
-			return { label: 'on', tone: 'on' };
+			return copy.dropped ? { label: 'dropping', tone: 'warn' } : { label: 'on', tone: 'on' };
 		case 'behind':
-			return { label: 'behind', tone: 'behind' };
+			return copy.dropped ? { label: 'dropping', tone: 'warn' } : { label: 'behind', tone: 'behind' };
 		case 'off':
 			if (copy.heldBack) return { label: 'held back', tone: 'held' };
 			return heldCount(copy) > 0 ? { label: `held ${heldCount(copy)}`, tone: 'held' } : { label: 'off', tone: 'off' };
@@ -85,6 +95,7 @@ function copyDetail(copy: TriggerCopy): string {
 	if (copy.heldBack) lines.push(`Held back: ${copy.heldBack}`);
 	if (copy.held && heldCount(copy) > 0) lines.push(`Holding ${describeHeld(copy.held)} for when it is back.`);
 	if (copy.waiting) lines.push(`${copy.waiting.fires} fire(s) waiting: ${copy.waiting.reason}`);
+	if (copy.dropped) lines.push(describeDropped(copy.dropped));
 	if (copy.version) lines.push(`Fires run version ${copy.version.slice(0, 8)}.`);
 	return lines.join('\n');
 }
@@ -112,7 +123,9 @@ export function triggerBadge(entry: TriggerEntry): LifecycleBadge {
 	const on = copies.filter((c) => c.state === 'on' || c.state === 'behind').length;
 	const tone: BadgeTone = copies.some((c) => c.state === 'turning_on')
 		? 'busy'
-		: copies.some((c) => c.state === 'behind')
+		: copies.some((c) => c.dropped && (c.state === 'on' || c.state === 'behind'))
+			? 'warn'
+			: copies.some((c) => c.state === 'behind')
 			? 'behind'
 			: on > 0 ? 'on' : copies.some((c) => heldCount(c) > 0) ? 'held' : 'off';
 	const detail = copies.map((c) => `${c.instance}: ${copyBadge(c).label}`).join('\n');

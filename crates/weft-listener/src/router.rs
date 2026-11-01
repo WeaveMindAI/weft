@@ -5,6 +5,9 @@
 //!
 //!   POST /prepare      compute a new signal's row (routing, kind
 //!                      state, consumer payload); starts nothing
+//!   POST /check        whether entry signals could be registered and
+//!                      come up on this install; registers and starts
+//!                      nothing
 //!   POST /fresh_places the state entry signals start from once a door
 //!                      that refuses takes their place in what they read
 //!   POST /start       bring up a signal whose row was just committed
@@ -44,7 +47,7 @@ use serde_json::Value;
 use crate::kinds;
 use crate::ListenerState;
 use weft_core::signal::listener_protocol::{
-    FreshPlace, FreshPlacesRequest, FreshPlacesResponse, LiveRequest, LiveResponse, MatchPushRequest, MatchPushResponse, ProcessOutcome, ProcessRequest,
+    CheckRefused, CheckRequest, CheckResponse, FreshPlace, FreshPlacesRequest, FreshPlacesResponse, LiveRequest, LiveResponse, MatchPushRequest, MatchPushResponse, ProcessOutcome, ProcessRequest,
     PrepareRequest, PrepareResponse, StartRequest, UnregisterRequest, WakeByHandRequest, WakeByHandResponse,
 };
 
@@ -52,6 +55,7 @@ pub fn router(state: ListenerState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/prepare", post(prepare))
+        .route("/check", post(check))
         .route("/fresh_places", post(fresh_places))
         .route("/start", post(start))
         .route("/unregister", post(unregister))
@@ -124,6 +128,46 @@ async fn prepare(
         rendered: prepared.rendered.unwrap_or(Value::Null),
         holds: prepared.holds,
     }))
+}
+
+/// Whether each asked entry signal could be registered and come up on
+/// this install ([`kinds::check_signal`]): the ones that could not, each
+/// with why, every one asked about, whatever the others answer. A check
+/// that could not be made (the broker out of reach, or failing itself) is
+/// no answer about the install: it fails the whole request with a 503,
+/// naming the signal, and the asker tries again.
+async fn check(State(state): State<ListenerState>, Json(req): Json<CheckRequest>) -> Result<Json<CheckResponse>, (StatusCode, String)> {
+    let asked_at_unix_ms = chrono::Utc::now().timestamp_millis();
+    let mut refused = Vec::new();
+    for signal in req.signals {
+        let (token, node_id) = (signal.token.clone(), signal.node_id.clone());
+        let identity = kinds::SignalIdentity {
+            token: signal.token,
+            tenant_id: signal.tenant_id,
+            node_id: signal.node_id,
+            is_resume: false,
+            run_id: None,
+            spec: signal.spec,
+        };
+        match kinds::check_signal(&state, identity, signal.for_instance, asked_at_unix_ms).await {
+            Ok(()) => {}
+            Err(e) if could_not_ask(&e) => {
+                return Err((StatusCode::SERVICE_UNAVAILABLE, format!("could not check whether '{node_id}' can come up: {e:#}")));
+            }
+            Err(e) => refused.push(CheckRefused { token, node_id, why: format!("{e:#}") }),
+        }
+    }
+    Ok(Json(CheckResponse { refused }))
+}
+
+/// Whether `e` is the broker not answering a check (its line down or
+/// broken, or a failure of its own) rather than an answer about the
+/// signal: a refusal it gave (a 4xx) and a kind's own verdict are answers.
+fn could_not_ask(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause.downcast_ref::<weft_broker_client::line::LineError>().is_some()
+            || cause.downcast_ref::<weft_broker_client::BrokerRefused>().is_some_and(|refused| refused.status.is_server_error())
+    })
 }
 
 /// The state each of the asked entry signals starts from with its place in
@@ -325,4 +369,27 @@ async fn list_signals(State(state): State<ListenerState>) -> Json<Vec<HeldSignal
             .map(|(token, sig)| HeldSignal { token, node_id: sig.node_id, kind: sig.spec.kind })
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::could_not_ask;
+
+    /// The broker failing or out of reach is no answer about a signal; its
+    /// refusal, and a kind's own verdict, are.
+    #[test]
+    fn only_a_broker_that_did_not_answer_is_a_check_not_made() {
+        let refused = |status: u16| {
+            anyhow::Error::new(weft_broker_client::BrokerRefused {
+                path: "/v1/access/subscription/check".into(),
+                status: reqwest::StatusCode::from_u16(status).unwrap(),
+                body: "no".into(),
+            })
+            .context("subscription check")
+        };
+        assert!(could_not_ask(&refused(503)));
+        assert!(!could_not_ask(&refused(400)));
+        assert!(could_not_ask(&anyhow::Error::new(weft_broker_client::line::LineError::Dropped("gone".into()))));
+        assert!(!could_not_ask(&anyhow::anyhow!("this trigger cannot be served on the 'svc' connection")));
+    }
 }

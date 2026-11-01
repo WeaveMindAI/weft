@@ -75,7 +75,8 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
             Ok(())
         }
         DomainAction::Rm { name } => {
-            client.delete(&format!("/install/domains/{name}")).await?;
+            // On a cloud install it answers once the load balancer let go of it.
+            client.waiting_on_its_work().delete(&format!("/install/domains/{name}")).await?;
             println!("removed {name}; you can delete its DNS record at your registrar (the door in front of the domains goes with the last one)");
             Ok(())
         }
@@ -92,7 +93,8 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
                 (_, Some(_)) => anyhow::bail!("--to is only for a frontend domain"),
             };
             let domain = Domain { name: name.clone(), serves };
-            let answer = client.post_json("/install/domains", &serde_json::to_value(AddDomain { domain, accept_cost })?).await?;
+            // On a cloud install it answers once the load balancer serves it.
+            let answer = client.waiting_on_its_work().post_json("/install/domains", &serde_json::to_value(AddDomain { domain, accept_cost })?).await?;
             if ctx.json_out(&answer)? {
                 return Ok(());
             }
