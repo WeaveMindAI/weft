@@ -1800,6 +1800,29 @@ async fn a_completed_file_is_immutable(pool: Pool) {
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
 }
 
+/// Two publishers of the same content share one upload: the one resuming
+/// it while the other completes it is told it is completing (and waits
+/// for the file), and once it has landed that it already completed.
+#[weft_db_macros::test]
+async fn a_resume_beside_a_completion_is_told_what_the_upload_is_now(pool: Pool) {
+    let (s, bucket, _c) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let (key, part_size) = begin_via(&s, &w, &StorageScope::Project, "b", "f", None, &big(), None)
+        .await
+        .unwrap();
+    let part = &s.reserve_parts(&w, &key, &[ask(1, 5)], &big(), &WORKER).await.unwrap()[0];
+    let etag = bucket.put_part(&part.url, body(b"bytes")).unwrap();
+    s.record_part(&w, &key, part.part_number, &etag).await.unwrap();
+    assert!(part_size >= 5);
+    pool.execute("UPDATE runtime_file SET status = 'completing' WHERE key = $1", &[&key]).await.unwrap();
+    let err = s.resume_upload(&w, &key, &big(), &WORKER).await.unwrap_err();
+    assert!(matches!(err, RuntimeStoreError::Completing(_)), "{err:?}");
+    pool.execute("UPDATE runtime_file SET status = 'pending' WHERE key = $1", &[&key]).await.unwrap();
+    s.complete_upload(&w, &key).await.unwrap();
+    let err = s.resume_upload(&w, &key, &big(), &WORKER).await.unwrap_err();
+    assert!(matches!(err, RuntimeStoreError::Invalid(ref said) if said.contains("already completed")), "{err:?}");
+}
+
 #[weft_db_macros::test]
 async fn wipe_prefix_does_not_touch_a_sibling_run_id_prefix(pool: Pool) {
     // The trailing-slash invariant: deleting run `c1`'s files must never

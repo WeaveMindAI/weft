@@ -4,6 +4,19 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-11-02 (0.2.289)
+
+**A group's or a loop's `@file` value now shows and edits in the editor.** A
+value written on a group's or a loop's port with `@file` (or a text `@asset`)
+shows the file's content in the box's config strip, like a node's field does,
+and editing it saves to the file. The badge beside it switches between `@file`
+and `@asset`.
+
+**Two commands publishing the same file at once no longer fail.** When two
+`weft` commands uploaded a file with the same content at the same moment, the
+second could stop with "the unfinished upload ... could not be picked up". It
+now waits for the first to finish and uses that file.
+
 ## 2026-11-02 (0.2.288)
 
 **What breaks after this update:**

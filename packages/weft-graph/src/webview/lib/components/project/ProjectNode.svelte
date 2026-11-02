@@ -16,12 +16,13 @@
 	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2, FileSymlink, Pencil } from '@lucide/svelte';
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
-	import { emptyToUnset, isFileRefValue, type WeftFileRefValue } from '../../value-format';
+	import { emptyToUnset, type WeftFileRefValue } from '../../value-format';
 	import { openPortMenu, buildPortMenuItems, instanceFilledMenuItem, type InstanceFilledToggle } from "../../utils/port-context-menu";
 	import { portMarkerStyle, requirednessNote } from "../../utils/port-marker";
 	import { metadataRefLabel } from "../../utils/metadata-expr";
 	import MetadataRefChip from './MetadataRefChip.svelte';
-	import { isScopeKey } from "../../utils/storage-key";
+	import { textFileRefOf, remoteTextSource, fileFieldState as fileFieldStateOf, fileFieldReadonly as isFileFieldReadonly, fileFieldDisplay, fileFieldNotice, fileFieldReadonlyReason, fileFieldSave, flipFileMarker, throttledPerKey } from "../../utils/file-field";
+	import FileRefChip from './FileRefChip.svelte';
 	import { nodeIsTrigger } from "../../utils/node-roles";
 	import { declarationRule, nodeInputRequiredness, portDeleteAction } from "../../projection/header-ports";
 	import { errorMarker, fieldForInput, fieldForSpecField, gateField, inputRendersField, inputsOf, nextPortLiterals, outputRows, outputsOf } from "../../utils/input-field";
@@ -39,7 +40,7 @@
 	import FlowDock from './FlowDock.svelte';
 	import ErrorDock from './ErrorDock.svelte';
 	import type { FileValueWire } from "../../../../protocol";
-	import { parseFileValue, typeReferencesFile, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, instanceFilled, instanceFilledValue, installPicked, portVar } from "../../../../protocol";
+	import { parseFileValue, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, instanceFilled, instanceFilledValue, installPicked, portVar } from "../../../../protocol";
 
 	const edgesState = useEdges();
 	const nodesState = useNodes();
@@ -643,56 +644,13 @@
 		}
 	}
 
-	/** If the port literal for `key` is a `@file`/`@asset` marker whose
-	 *  CONTENT is text the host ships (both markers with text types), its
-	 *  ref. The per-field test for "this field displays a referenced
-	 *  file's text". A file-typed `@asset` is NOT: the marker itself is
-	 *  the field's value (the file-drop field sets/clears it); nothing
-	 *  text-shaped exists to display, and routing its edits into a file
-	 *  write would clobber the media file. The host bridge puts every
-	 *  marker into the port literal, the one home a port's value has. */
-	function fileRefOf(key: string): { path: string; type: string; marker: 'file' | 'asset' } | null {
-		const v = ownValue(portLiterals, key);
-		if (!isFileRefValue(v)) return null;
-		return typeReferencesFile(v.__weftFileRef.type) ? null : v.__weftFileRef;
-	}
-
-	/** A text `@asset` whose source is a URL or a stored-file key has no
-	 *  file on disk for the host to read: the build fetches it. The graph
-	 *  shows the source itself, read-only. */
-	function remoteTextSource(key: string): string | null {
-		const ref = fileRefOf(key);
-		if (!ref || ref.marker !== 'asset') return null;
-		const remote = /^https?:\/\//.test(ref.path) || isScopeKey(ref.path);
-		return remote ? ref.path : null;
-	}
-
-	/** Resolved state of a file-backed field, from the host's fileContents
-	 *  map. `loading` = content not yet delivered (brief, transient).
-	 *  `error` = the file couldn't be read (fail loudly, no fallback). */
-	function fileFieldState(key: string): { path: string; marker: 'file' | 'asset'; content?: string; error?: string; loading: boolean } | null {
-		const ref = fileRefOf(key);
-		if (!ref) return null;
-		// Fetched at build, never by the host: the source is the display.
-		const remote = remoteTextSource(key);
-		if (remote !== null) return { path: ref.path, marker: 'asset', content: remote, loading: false };
-		const entry = ownValue(data.fileContents, ref.path) as FileContent | undefined;
-		// Undefined (not delivered) OR an explicit `{loading}` (bytes still being
-		// fetched lazily) both render the non-interactive loading state.
-		if (entry === undefined || 'loading' in entry) return { path: ref.path, marker: ref.marker, loading: true };
-		if ('error' in entry) return { path: ref.path, marker: ref.marker, error: entry.error, loading: false };
-		return { path: ref.path, marker: ref.marker, content: entry.content, loading: false };
-	}
-
-	/** A file-backed field is read-only when its content isn't loaded yet
-	 *  (its display is a status string, not editable content) or when the ref
-	 *  is an `@asset` (pull-only by contract: nothing ever writes back).
-	 *  False for a normal field or a loaded `@file` field. The single
-	 *  editability rule applied across every editable field branch. */
-	function fileFieldReadonly(key: string): boolean {
-		const fs = fileFieldState(key);
-		return fs ? fs.content === undefined || fs.marker === 'asset' : false;
-	}
+	/// A field a text file backs, per `utils/file-field` (the rules every
+	/// box that draws port fields shares). The host bridge puts every
+	/// marker into the port literal, the one home a port's value has.
+	const fileRefOf = (key: string) => textFileRefOf(portLiterals, key);
+	const fileFieldState = (key: string) => fileFieldStateOf(portLiterals, data.fileContents, key);
+	/// The single editability rule applied across every editable field branch.
+	const fileFieldReadonly = (key: string) => isFileFieldReadonly(fileFieldState(key));
 
 	/// Field keys this node renders itself rather than delegating to the
 	/// shared FieldStrip primitive renderer: only the exotic types (code,
@@ -771,26 +729,11 @@
 		}, () => { fieldContextMenu = null; });
 	});
 
-	/// FieldStrip display override: for a file-backed field, the store
-	/// value is the resolved file content (or a loading status), never
-	/// the `@file` marker that config holds. `undefined` for normal
-	/// fields. A read error is not a value: `fileNotice` replaces the
-	/// control with it.
-	function fileDisplayOverride(key: string): string | undefined {
-		const fs = fileFieldState(key);
-		if (!fs) return undefined;
-		if (fs.content !== undefined) return fs.content;
-		return `loading ${fs.path}...`;
-	}
-
-	/// The failure to show IN PLACE OF a file-backed field's control when
-	/// its file could not be read: what was looked for and why it failed,
-	/// as an error block, so nobody edits an error message as content.
-	function fileNotice(key: string): string | undefined {
-		const fs = fileFieldState(key);
-		if (!fs || fs.error === undefined) return undefined;
-		return `cannot read ${fs.path}: ${fs.error}`;
-	}
+	/// FieldStrip display override: a file-backed field shows the file's
+	/// content (or a loading status), never the marker.
+	const fileDisplayOverride = (key: string) => fileFieldDisplay(fileFieldState(key));
+	/// What replaces a file-backed field's control when its file could not be read.
+	const fileNotice = (key: string) => fileFieldNotice(fileFieldState(key));
 
 	/// File-backed fields whose content isn't loaded (loading / read
 	/// error) are read-only in FieldStrip so the status text can't be
@@ -805,37 +748,21 @@
 
 	/// Typing into a read-only file-backed field: explain WHY it's locked,
 	/// throttled per field so held-down keys don't stack toasts.
-	const readonlyToastAt = new Map<string, number>();
+	const readonlyToast = throttledPerKey((message) => toast.error(message));
 	function explainReadonlyField(key: string) {
 		const fs = fileFieldState(key);
-		if (!fs) return;
-		const now = Date.now();
-		const last = readonlyToastAt.get(key) ?? 0;
-		if (now - last < 4000) return;
-		readonlyToastAt.set(key, now);
-		if (fs.marker === 'asset') {
-			toast.error(`This field pulls its value from @asset(${fs.path}); it can't be edited here. Switch it to @file (the badge next to the label) to edit.`);
-		} else {
-			toast.error(`Cannot edit ${fs.path}: ${fs.error ?? 'still loading'}`);
-		}
+		if (fs) readonlyToast(key, fileFieldReadonlyReason(fs));
 	}
 
-	/// Flip a text-file-backed field between `@file` (editable, writes back)
-	/// and `@asset` (pull-only). A DIRECT port-literal write, deliberately
-	/// not `updateFieldValue` (which routes a `@file` field's edit into the
-	/// referenced file's content); switching the marker edits the marker.
-	/// A remote text source (a URL, a stored key) has nothing to write
-	/// back to, so it stays `@asset`.
+	/// Flip a text-file-backed field between `@file` and `@asset`. A
+	/// DIRECT port-literal write, deliberately not `updateFieldValue`
+	/// (which routes a `@file` field's edit into the referenced file's
+	/// content); switching the marker edits the marker.
 	function switchFileMarker(key: string) {
-		const v = ownValue(portLiterals, key);
-		if (!isFileRefValue(v)) return;
-		if (remoteTextSource(key) !== null) {
-			toast.error(`@asset(${v.__weftFileRef.path}) is fetched at build; a URL or a stored file has no file to edit back, so it stays @asset.`);
-			return;
-		}
-		const r = v.__weftFileRef;
-		const flipped = { __weftFileRef: { ...r, marker: r.marker === 'file' ? 'asset' as const : 'file' as const } };
-		data.onUpdate?.({ portLiterals: { ...portLiterals, [key]: flipped } });
+		const flipped = flipFileMarker(portLiterals, key);
+		if (!flipped) return;
+		if ('error' in flipped) toast.error(flipped.error);
+		else data.onUpdate?.({ portLiterals: flipped.portLiterals });
 	}
 
 	// `extra`: additional config keys committed IN THE SAME update as the
@@ -845,32 +772,13 @@
 		// File-backed field: the edit goes to the referenced file, never to the
 		// weft source. The `@file(...)` marker in config (and source) is left
 		// untouched; only the file's content changes.
+		// The read-only rendering should make a refused edit unreachable;
+		// guard loudly anyway.
 		const fs = fileFieldState(key);
 		if (fs) {
-			// An `@asset` is pull-only: nothing ever writes back to the
-			// referenced file, and the field is read-only. Guard loudly (the
-			// readonly rendering should make this unreachable).
-			if (fs.marker === 'asset') {
-				toast.error(`${fs.path} is an @asset (read-only); use @file for an editable reference`);
-				return;
-			}
-			// Only a loaded field is editable. Editing while loading or on a
-			// read error must not write (it would clobber the file with a
-			// status string); the field is read-only in those states, but
-			// guard loudly here too.
-			if (fs.content === undefined) {
-				toast.error(`Cannot edit ${fs.path}: ${fs.error ?? 'still loading'}`);
-				return;
-			}
-			// A cleared box (null) empties the file; there is no "unset" for
-			// file-backed content, the file IS the value.
-			const content =
-				value === null || value === undefined
-					? ''
-					: typeof value === 'string'
-						? value
-						: JSON.stringify(value, null, 2);
-			data.onSaveFileRef?.(fs.path, content);
+			const save = fileFieldSave(fs, value);
+			if ('error' in save) toast.error(save.error);
+			else data.onSaveFileRef?.(save.path, save.content);
 			return;
 		}
 		if (data.onUpdate) {
@@ -2203,29 +2111,11 @@
 				</div>
 
 				{#snippet headerBadge(field: FieldDefinition)}
-					{#if fileRefOf(field.key)}
-						{@const ref = fileRefOf(field.key)}
-						{@const remote = remoteTextSource(field.key) !== null}
-						<!-- The chip doubles as the marker toggle: @file (editable,
-						     edits save to the file) <-> @asset (pull-only). Only
-						     text-backed refs reach here (fileRefOf is null for
-						     file-typed assets, which the file-drop field owns). A
-						     remote source (a URL, a stored file) is fetched at
-						     build and cannot flip: nothing to write back to. -->
-						<button
-							type="button"
-							class="text-[9px] font-mono px-1 py-0.5 rounded nodrag transition-colors
-								{ref?.marker === 'asset' ? 'bg-amber-100 text-amber-800 hover:bg-amber-200' : 'bg-muted text-muted-foreground hover:bg-accent'}"
-							title={remote
-								? `@asset(${ref?.path}): fetched at build, shown as its source.`
-								: ref?.marker === 'asset'
-									? `@asset(${ref?.path}): pull-only, not editable here. Click to switch to @file (editable).`
-									: `@file(${ref?.path}): edits save to this file. Click to switch to @asset (pull-only).`}
-							aria-label={ref?.marker === 'asset'
-								? `Switch ${ref?.path} to editable @file`
-								: `Switch ${ref?.path} to pull-only @asset`}
-							onclick={(e) => { e.stopPropagation(); switchFileMarker(field.key); }}
-						><span aria-hidden="true">{ref?.marker === 'asset' ? '🔒' : '📄'}</span> {ref?.path}</button>
+					{@const ref = fileRefOf(field.key)}
+					{#if ref}
+						<!-- Only text-backed refs reach here (fileRefOf is null for
+						     file-typed assets, which the file-drop field owns). -->
+						<FileRefChip {ref} remote={remoteTextSource(portLiterals, field.key) !== null} onFlip={() => switchFileMarker(field.key)} />
 					{:else if metadataInputs[field.key]}
 						<!-- Where a value a metadata wire brings comes from: a
 						     link that takes the person there. -->
