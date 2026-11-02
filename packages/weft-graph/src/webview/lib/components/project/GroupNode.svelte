@@ -24,7 +24,9 @@
 	import { fieldForInput, nextPortLiterals } from '../../utils/input-field';
 	import { FIELD_PX, METADATA_VALUE_BOX_PX, configStripOpenPx, containerStripFields, expressionBoxPx, type StripField } from '../../utils/config-strip';
 	import { measureTextWidth, stripFonts } from '../../utils/measure-text';
-	import type { MetadataPort } from "../../../../protocol";
+	import type { MetadataPort, FileContent } from "../../../../protocol";
+	import { textFileRefOf, remoteTextSource, fileFieldState, fileFieldReadonly, fileFieldDisplay, fileFieldNotice, fileFieldReadonlyReason, fileFieldSave, flipFileMarker, throttledPerKey } from '../../utils/file-field';
+	import FileRefChip from './FileRefChip.svelte';
 
 
 	/// A boundary port seen from INSIDE the container: the port's colour,
@@ -65,6 +67,11 @@
 			/// Take the person to a node or group by its scoped id (a "comes
 			/// from" link). Absent on a view that cannot move.
 			onReveal?: (id: string) => void;
+			/// The content of each text file a written value names
+			/// (`@file` / `@asset`), keyed by the marker's path, which a
+			/// file-backed field shows and edits in place of the marker.
+			fileContents?: Record<string, FileContent>;
+			onSaveFileRef?: (path: string, content: string) => void;
 			onUpdate?: (updates: NodeDataUpdates) => void;
 			/// Flip the gate between `_should_flow` and
 			/// `_should_not_flow`. Its own hook rather than a
@@ -260,7 +267,34 @@
 		data.onUpdate({ metadataValue: { port, value } });
 	}
 
+	/// A port value a text file backs shows and edits the file's content,
+	/// the same rules as a node's body (`utils/file-field`).
+	const fileStateOf = (key: string) => fileFieldState(portLiterals, data.fileContents, key);
+	const fileReadonlyKeys = $derived(new Set(ordinaryFields.filter((f) => fileFieldReadonly(fileStateOf(f.key))).map((f) => f.key)));
+	const readonlyToast = throttledPerKey((message) => toast.error(message));
+	function explainReadonlyField(key: string) {
+		const fs = fileStateOf(key);
+		if (fs) readonlyToast(key, fileFieldReadonlyReason(fs));
+	}
+	/// Flip a text-file-backed value between `@file` and `@asset`: a direct
+	/// port-literal write, never a write into the file.
+	function switchFileMarker(key: string) {
+		if (!data.onUpdate) return;
+		const flipped = flipFileMarker(portLiterals, key);
+		if (!flipped) return;
+		if ('error' in flipped) toast.error(flipped.error);
+		else data.onUpdate({ portLiterals: flipped.portLiterals });
+	}
+
 	function updateStripField(key: string, value: unknown, portDriven?: boolean) {
+		// An edit of a file-backed value goes to the file, never the source.
+		const fs = portDriven ? fileStateOf(key) : null;
+		if (fs) {
+			const save = fileFieldSave(fs, value);
+			if ('error' in save) toast.error(save.error);
+			else data.onSaveFileRef?.(save.path, save.content);
+			return;
+		}
 		if (!data.onUpdate) return;
 		if (portDriven) {
 			// Same write rule as ProjectNode's port strip: a cleared
@@ -699,6 +733,13 @@
 	/>
 {/snippet}
 
+{#snippet stripFileBadge(field: FieldDefinition)}
+	{@const ref = textFileRefOf(portLiterals, field.key)}
+	{#if ref}
+		<FileRefChip {ref} remote={remoteTextSource(portLiterals, field.key) !== null} onFlip={() => switchFileMarker(field.key)} />
+	{/if}
+{/snippet}
+
 {#snippet stripCustomField(field: FieldDefinition)}
 	<!-- The metadata fields, laid out as FieldStrip lays out every field (a
 	     label row, then the control), each box at a fixed height that
@@ -829,6 +870,11 @@
 						customFieldKeys={customStripKeys}
 						fixedTextareas
 						renderCustom={stripCustomField}
+						displayValueOf={(key) => fileFieldDisplay(fileStateOf(key))}
+						noticeOf={(key) => fileFieldNotice(fileStateOf(key))}
+						readonlyKeys={fileReadonlyKeys}
+						onReadonlyEdit={explainReadonlyField}
+						headerBadge={stripFileBadge}
 					/>
 				</div>
 			{/if}

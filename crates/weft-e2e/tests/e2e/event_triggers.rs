@@ -48,13 +48,16 @@ fn slack_signature(signing_secret: &str, timestamp: i64, body: &str) -> String {
     format!("v0={digest}")
 }
 
-/// Seed the connection an inbound event routes to: workspace T0E2E,
+/// Seed the connection an inbound event routes to: workspace `team`,
 /// made through the operator's app (the client_id pin), and the
 /// service recipe the receiver reads (normally recorded when a
-/// project's access node renders; the seed writes it directly).
+/// project's access node renders; the seed writes it directly). Each
+/// test seeds its own workspace: one app holds one connection per
+/// workspace, so two tests running at once on one would collide.
 async fn seed_slack_grant(
     pool: &Pool,
     client_id: &str,
+    team: &str,
 ) -> Result<(uuid::Uuid, SeededGrant)> {
     let spec = catalog_spec("slack", "access")?;
     // The recipe hash that scopes routing: computed exactly as the
@@ -71,17 +74,19 @@ async fn seed_slack_grant(
            (id, tenant_id, service, registration_sealed, client_id, project_id, spec,
             events_recipe_hash, values_sealed, granted_scopes, permissions_verified,
             identity, provider_account, spec_version, exclusive)
-         VALUES ($1, 'local', 'slack', $2, $3, NULL, $4, $5, $6, '[]', FALSE, 'events-e2e',
-                 'T0E2E', $7, $8)",
+         VALUES ($1, 'local', 'slack', $2, $3, NULL, $4, $5, $6, '[]', FALSE, $9,
+                 $10, $7, $8)",
         &[
             &grant_id,
             &weft_access_store::seal_json(&json!({ "label": "E2E app", "client_id": client_id }))?,
             &client_id,
             &db::JsonText(&spec),
             &recipe_hash,
-            &weft_access_store::seal_json(&json!({ "token": "xoxb-never-used", "teamId": "T0E2E" }))?,
+            &weft_access_store::seal_json(&json!({ "token": "xoxb-never-used", "teamId": team }))?,
             &weft_core::AccessSpec::STORED.version(),
             &(spec.get("grants") == Some(&json!("exclusive"))),
+            &format!("events-e2e-{team}"),
+            &team,
         ],
     )
     .await?;
@@ -141,7 +146,7 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
     let disp = ensure::up().await?;
     let pool = weft_e2e::platform::database(&db_url).await.context("connect WEFT_E2E_DATABASE_URL")?;
 
-    let (grant_id, seeded) = seed_slack_grant(&pool, &client_id).await?;
+    let (grant_id, seeded) = seed_slack_grant(&pool, &client_id, "T0E2E").await?;
 
     // The trigger project: fires on messages in channel C0E2E.
     let mut project = Project::prepare("slack_receive", disp.clone()).await?;
@@ -253,7 +258,7 @@ async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
         <[String; 3]>::try_from(env).expect("three vars requested");
     let disp = ensure::up().await?;
     let pool = weft_e2e::platform::database(&db_url).await.context("connect WEFT_E2E_DATABASE_URL")?;
-    let (grant_id, seeded) = seed_slack_grant(&pool, &client_id).await?;
+    let (grant_id, seeded) = seed_slack_grant(&pool, &client_id, "T0E2EI").await?;
 
     let mut project = Project::prepare("slack_await", disp.clone()).await?;
     let pid = project.id();
@@ -288,7 +293,7 @@ async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
     // over the RAW form bytes, exactly as Slack delivers it.
     let payload = json!({
         "type": "block_actions",
-        "team": { "id": "T0E2E" },
+        "team": { "id": "T0E2EI" },
         "user": { "id": "U9", "username": "approver" },
         "channel": { "id": "C0E2E" },
         "message": {

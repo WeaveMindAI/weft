@@ -725,6 +725,13 @@ export class GraphViewController {
       // file left the graph showing the old parse.
       for (const rel of n.includeContents?.files ?? []) includeRootRel.add(rel);
     }
+    // A group's written values name files the same way (a loop's sit on
+    // its LoopIn, one of the nodes above).
+    for (const g of (response.project.groups ?? []) as Array<{ fileRefs?: Record<string, { path: string; type: string }> }>) {
+      for (const ref of Object.values(g.fileRefs ?? {})) {
+        if (!typeReferencesFile(ref.type)) fileRel.add(ref.path);
+      }
+    }
     // Record the resolution base + @file set so saveFileRef and the watcher
     // reship from the same source of truth.
     this.fileBaseDir = rootDir;

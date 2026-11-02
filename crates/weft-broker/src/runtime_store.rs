@@ -3091,6 +3091,31 @@ impl RuntimeStore {
         Ok((offsets, sizes, missing))
     }
 
+    /// Why the upload under `key` cannot be resumed, read as it is now:
+    /// another call is completing it (the caller waits for the file), it
+    /// already completed, or there is none in flight.
+    async fn not_resumable(&self, key: &str) -> RuntimeStoreError {
+        let conn = match self.pool.get().await.context("runtime resume_upload: re-read") {
+            Ok(conn) => conn,
+            Err(e) => return RuntimeStoreError::Other(e),
+        };
+        match Self::pending_row(&conn, key).await {
+            Err(e) => return RuntimeStoreError::Other(e),
+            Ok(Some(pending)) => {
+                if let Err(completing) = pending.refuse_if_completing(key) {
+                    return completing;
+                }
+            }
+            Ok(None) => {}
+        }
+        drop(conn);
+        match self.row(key).await {
+            Err(e) => RuntimeStoreError::Other(e),
+            Ok(Some(_)) => RuntimeStoreError::Invalid(format!("upload '{key}' already completed; nothing to resume")),
+            Ok(None) => RuntimeStoreError::NoUpload(format!("no upload in flight for key '{key}'")),
+        }
+    }
+
     /// Resume an interrupted upload: re-presign exactly the reserved parts
     /// that were never reported done. Returns the upload's part size + those
     /// parts. (A part that was uploaded but whose done-report was lost is
@@ -3108,18 +3133,8 @@ impl RuntimeStore {
             .await
             .map_err(RuntimeStoreError::Other)?;
         drop(conn);
-        if let Some(pending) = &pending {
-            pending.refuse_if_completing(key)?;
-        }
-        let Some(pending) = pending else {
-            return match self.row(key).await.map_err(RuntimeStoreError::Other)? {
-                Some(_) => Err(RuntimeStoreError::Invalid(format!(
-                    "upload '{key}' already completed; nothing to resume"
-                ))),
-                None => Err(RuntimeStoreError::NoUpload(format!(
-                    "no upload in flight for key '{key}'"
-                ))),
-            };
+        let Some(pending) = pending.filter(|pending| pending.status == "pending") else {
+            return Err(self.not_resumable(key).await);
         };
         let upload_id = pending.upload_id.clone().ok_or_else(|| {
             RuntimeStoreError::Other(anyhow::anyhow!(
@@ -3137,10 +3152,11 @@ impl RuntimeStore {
             .context("runtime resume_upload: bump progress clock")
             .map_err(RuntimeStoreError::BeforeWrites)?;
         if alive == 0 {
-            return Err(RuntimeStoreError::Invalid(format!(
-                "upload '{key}' is no longer pending (a completion claimed it, or it was swept); call complete, \
-                 or begin the upload again"
-            )));
+            // A completion claimed it, or a sweep cleared it, between the
+            // read above and this write: answer what it is now, so a second
+            // publisher of the same content waits for the file instead of
+            // failing.
+            return Err(self.not_resumable(key).await);
         }
         // Missing parts and the resume position must describe the same rows.
         // A reservation arriving between separate reads could otherwise move
