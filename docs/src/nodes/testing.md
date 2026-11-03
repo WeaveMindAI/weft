@@ -80,12 +80,12 @@ attaches, a signal nobody answers.
 | Canned HTTP | `rig.respond(method, path, body)`, `rig.respond_status(...)`, `rig.respond_raw(...)`, `rig.respond_with_headers(...)` for an answer that lives partly in a header (a created id, an ETag) |
 | A server it cannot reach at all | `rig.fail_connection(method, path)`: the call errors with no status and no body |
 | Check what it sent | `rig.requests()`, `rig.assert_sent(method, path)` |
-| What `ctx.run` recorded | `rig.recorded_steps(&node)`. Run the node twice on one rig and the second run replays the first's steps and the signals it was answered with, like a resumed run, so a publish that must happen once is something you can prove: two runs, one request. Each node keeps its own, so two nodes on one rig never replay each other's |
+| What it saved, and a resume | `rig.saved_state(&node)` is the state its body last saved. Run the node a second time on the same rig and it picks the firing up the way a resumed run does: the body gets that state back, a wait it already made hands back its answer, and a stream input skips what it took. So a publish that must happen once is something you can prove: two runs, one request. Each node keeps its own, so two nodes on one rig never pick up each other's |
 | A connection | `rig.access("slack")`, `rig.connection_value(...)`, `rig.connection_permissions(...)` |
 | A trigger's event | `rig.wake(payload)`, `rig.signal(payload)` |
 | A live caller | `rig.attach_caller(conn)` |
 | A bus going in | `rig.seed_bus(opts)`, giving you a writer and a marker |
-| A bus it emitted | `rig.bus(&outcome.outputs["channel"])` |
+| A bus it emitted | `rig.bus(&outcome.outputs["channel"])?`, then read it from its oldest entry with `.cursor_from_start()?` and `cursor.next(&mut HarnessRead)` (`weft::context::HarnessRead`, for test code only: a node body handing it to a read fails) |
 | A stored file | `rig.store_file(filename, mime, bytes)` going in; `rig.stored_bytes(key)`, `rig.stored_meta(key)` and `rig.stored_files(scope)` for what the node stored; `rig.file_edits()` for every in-place change, with the file, the versions and the diff |
 | An infra endpoint | `rig.declare_endpoint(name, url)`, `rig.answer_endpoint(...)`, `rig.refuse_endpoint(...)` |
 | What it asked for | `rig.registered_signals()`, `rig.awaited_signals()`, `rig.logs()`, `rig.run_tags()`, `rig.stops()` |
@@ -94,13 +94,54 @@ attaches, a signal nobody answers.
 | A server that is there and will not talk, for a node that opens its own socket | `rig.hang_up_server()`, a local port that hangs up on every connection. It is for raw socket clients (a database driver, a mail client): web calls in a fake test never reach the network, so for those use `rig.fail_connection`. If you want a refused connection, use this rather than a closed port: on some machines a closed port hangs until a timeout |
 
 The outcome gives you `.ok()` for the happy path, `.failure()` for the error
-string, `.output(port)` for one port, `.infra_spec()` for an infra run, and
+string, `.paused()` for a run that paused in the body, `.output(port)` for one port, `.infra_spec()` for an infra run, and
 `.outputs` for the map. The rig refuses a value over 100 KB with the same error
 a run gives, so a test catches an output no wire would carry.
 
 Note the last group: in a fake test nothing is really stopped and nothing is
 really tagged. The rig records what your node **asked for**, and that is what
 you assert on.
+
+In a node test, every `state.wait` takes its answer from what you queued with
+`rig.signal`, in the same call. If you want to check what a resume does, run
+the node twice on one rig. This one waits for a click, then posts, and the
+second run finds both in its saved state:
+
+```rust
+rig.respond("POST", "/api/send", json!({"id": "post-1"}));
+rig.signal(json!({"ok": true}));
+let inputs = json!({"account": rig.access("probe")});
+
+rig.run(&AskThenPost, inputs.clone()).await.ok().expect("waits, is answered, posts");
+let again = rig.run(&AskThenPost, inputs).await.ok().expect("picks up from its state");
+
+assert_eq!(again.outputs["reply"], json!({"id": "post-1"}));
+assert_eq!(rig.requests().len(), 1, "one post across the two runs");
+assert_eq!(rig.awaited_signals().len(), 1, "one wait across the two runs");
+```
+
+If you want to prove the node carries on across a pause without doing again
+what it did before, queue `rig.signal_paused()`: the node's next wait pauses
+the run there, as production does once every node waits, and
+`outcome.paused()` says so. The next `rig.run` of the node picks the firing up
+at that wait and takes the next answer you queued. A body that does something
+else first (reads a bus, yields, saves) is refused with the same message as in
+production:
+
+```rust
+rig.respond("POST", "/api/send", json!({"id": "post-1"}));
+rig.signal_paused();
+rig.signal(json!({"ok": true}));
+let inputs = json!({"account": rig.access("probe")});
+
+let first = rig.run(&PostThenAsk, inputs.clone()).await;
+assert!(first.paused(), "paused on its wait");
+rig.run(&PostThenAsk, inputs).await.ok().expect("picks up at the wait");
+assert_eq!(rig.requests().len(), 1, "posted once across the pause");
+```
+
+A node that creates a bus gets the same bus back on its second run, as a
+resumed body does.
 
 ## Rig reference
 
@@ -118,8 +159,9 @@ Setting the run up:
 | `respond_raw(&self, method: &str, path: &str, status: u16, content_type: &str, body: impl Into<Bytes>)` | Raw bytes with a content type (XML, CSV, a picture, an event stream) |
 | `respond_with_headers(&self, method: &str, path: &str, status: u16, content_type: &str, headers: &[(&str, &str)], body: impl Into<Bytes>)` | The same plus response headers. The content type is its own argument, never a header here |
 | `fail_connection(&self, method: &str, path: &str)` | A matching request fails before any response, like a server that is down |
-| `signal(&self, payload: Value)` | Queues the answer to the node's next `ctx.await_signal`, in order |
-| `signal_given_up(&self)` | Queues a wait given up instead: the node's next `ctx.await_signal` fails with `WeftError::WaitGaveUp`, the way it does when a run that cannot pause holds the wait past its `holdSecs` |
+| `signal(&self, payload: Value)` | Queues the answer to the node's next `state.wait`, in order |
+| `signal_paused(&self)` | Queues a pause instead: the node's next `state.wait` pauses the run there (`outcome.paused()` is true), and the next `rig.run` of the node picks it up at that wait with the next queued answer |
+| `signal_given_up(&self)` | Queues a wait given up instead: the node's next `state.wait` fails with `WeftError::WaitGaveUp`, the way it does when a run that cannot pause holds the wait past its `holdSecs` |
 | `wake(&self, payload: Value)` | The next run's `ctx.wake`: what a firing trigger received |
 | `instance(&self, id: &str)` | Makes every run on the rig a run for that instance |
 | `attach_caller(&self, conn: Arc<FakeCallerConnection>)` | Puts a scripted live caller on the runs, what a Route or Socket run carries |
@@ -144,7 +186,7 @@ Running it:
 
 | Signature | What it does |
 |---|---|
-| `run(&self, node: &dyn Node, inputs: Value) -> RigOutcome` (async) | Runs the node's body with `inputs` (a JSON object of input name to value) |
+| `run(&self, node: &dyn Node, inputs: Value) -> RigOutcome` (async) | Runs the node's body with `inputs` (a JSON object of input name to value). A second call for the same node picks its firing up from the state it saved |
 | `run_setup_trigger(&self, node: &dyn Node, inputs: Value) -> RigOutcome` (async) | Runs a trigger's setup |
 | `run_provision_infra(&self, node: &dyn Node, inputs: Value) -> RigOutcome` (async) | Runs an infra node's `provision_infra` |
 
@@ -158,11 +200,11 @@ Looking at what happened:
 | `stored_meta(&self, key: &str) -> WeftResult<StoredFileMeta>` | What storage records for it: its deadline (`expires_at_unix`, `keep_ttl_secs`), the size |
 | `stored_files(&self, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>>` | Every file stored in a scope |
 | `file_edits(&self) -> Vec<FileEdit>` | Every change made to a stored file in place, in order: the file, the versions, the diff |
-| `bus(&self, marker: &Value) -> WeftResult<BusHandle>` | The bus behind a marker the node emitted |
+| `bus(&self, marker: &Value) -> WeftResult<BusHandle>` | The bus behind a marker the node emitted, as a handle of the test's own |
 | `endpoint_calls(&self) -> Vec<EndpointCall>` | Every call to the node's own infrastructure, in order |
 | `registered_signals(&self) -> Vec<(SignalSpec, Value)>` | What a trigger's setup registered |
 | `awaited_signals(&self) -> Vec<SignalSpec>` | Every signal the node parked on |
-| `recorded_steps(&self, node: &dyn Node) -> Vec<AwaitedEntry>` | Every `ctx.run` step and signal the node's run recorded |
+| `saved_state(&self, node: &dyn Node) -> Option<Value>` | The state the node's body last saved (`ctx.keep`), as JSON; `None` before it saved anything |
 | `logs(&self) -> Vec<(LogLevel, String)>` | Every `ctx.log` line |
 | `run_tags(&self) -> Vec<Vec<String>>` | The tags, one list per `ctx.tag_run` |
 | `stops(&self) -> Vec<(String, StopSelf)>` | Every `ctx.stop_tagged` asked for |
@@ -260,7 +302,7 @@ the shell you run `weft test-node` from, and the test reads it with
 `rig.fixture("CHAT_ID")`. If any fixture is missing, the runner lists every
 variable to set, with its label, before it runs anything.
 
-If your node waits on a signal (`ctx.await_signal`), a live test keeps the
+If your node waits on a signal (`state.wait`), a live test keeps the
 node's call open and waits for the real answer, the way [a run that cannot
 pause](durable-execution.md#when-the-run-cannot-pause) does, except that it
 always holds for the longest time allowed, 30 days, whatever `holdSecs` the

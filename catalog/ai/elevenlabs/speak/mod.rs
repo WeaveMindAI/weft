@@ -30,6 +30,11 @@
 //! they speak (relative to the frame's own audio, ElevenLabs's
 //! reference point), and the node places them on the whole speech by
 //! the audio bytes relayed before the frame.
+//!
+//! The node holds its run while it speaks (`ctx.hold()`): a session with
+//! ElevenLabs, and the audio gathered for the stored file, cannot be
+//! picked up from the middle, so the run does not pause while it waits on
+//! the text bus, even when every other node waits.
 
 use std::time::Duration;
 
@@ -39,7 +44,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use weft::access::socket::SocketMessage;
-use weft::bus::{BusEntryKind, BusOptions, BusPayloadKind, WirePayload};
+use weft::bus::{BusOptions, BusPayloadKind};
 use weft::stream_journal::JournalPolicy;
 use weft::context::PendingBus;
 use weft::node::NodeOutput;
@@ -392,6 +397,7 @@ impl Node for ElevenLabsSpeakNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+        let mut holding = ctx.hold();
         let account: Access = ctx.inputs.get("account")?;
         let voice: String = ctx.inputs.get("voice")?;
         let session = Session::read(&ctx.inputs, voice_settings(&ctx)?, ctx.is_output_wired("alignment"))?;
@@ -401,7 +407,7 @@ impl Node for ElevenLabsSpeakNode {
         let text = ctx.bus_from_input("text")?;
         // Read from the earliest message still buffered: the producer
         // may have started before this node attached.
-        let mut chunks = text.cursor_from_start();
+        let mut chunks = text.cursor_from_start()?;
 
         let conn = ctx.open(&account).await?;
         let mut socket = conn.socket(&session.url(&voice)).await?;
@@ -455,12 +461,9 @@ impl Node for ElevenLabsSpeakNode {
                         .send(SocketMessage::text(json!({ "text": " " }).to_string()))
                         .await?;
                 }
-                entry = chunks.next() => match entry {
+                entry = chunks.next(&mut holding) => match entry? {
                     Some(entry) => {
-                        if let BusEntryKind::Message {
-                            payload: Some(WirePayload::Json(p)), ..
-                        } = &entry.kind
-                        {
+                        if let Some((_, p)) = entry.as_json() {
                             if let Some(t) = text_of(p).filter(|t| !t.is_empty()) {
                                 spoke |= t.chars().any(|c| !c.is_whitespace());
                                 socket

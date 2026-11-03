@@ -28,7 +28,7 @@ async fn order(rig: FakeRig) -> WeftResult<()> {
     assert!(rig.stored_meta(&key(&theirs)?).is_err(), "the instance's files go too");
     assert!(rig.stored_meta(&key(&other)?).is_ok(), "another instance's files stay");
     let calls = rig.program_calls();
-    let names: Vec<&str> = calls.iter().map(|(c, _)| c.journal_name()).collect();
+    let names: Vec<&str> = calls.iter().map(|(c, _)| c.name()).collect();
     assert_eq!(
         names,
         vec![

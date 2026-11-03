@@ -1570,6 +1570,10 @@
 	:global(.node-waiting) .collapsed-node {
 		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 0 0 2px rgba(6, 182, 212, 0.45);
 	}
+	/* A member inside only paused with its run (`.node-paused-glow`). */
+	:global(.node-paused) .collapsed-node {
+		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 0 0 2px rgba(148, 163, 184, 0.5);
+	}
 	:global(.node-completed) .collapsed-node {
 		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 0 0 2px rgba(16, 185, 129, 0.3);
 	}

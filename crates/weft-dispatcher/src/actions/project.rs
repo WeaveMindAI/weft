@@ -47,7 +47,16 @@ pub(crate) async fn program_call(
     match call {
         ProjectCall::List => answered(&list(state, actor).await?),
         ProjectCall::Get => answered(&get(state, actor, project).await.map_err(StatusError::into_parts)?),
-        ProjectCall::Declare { request } => answered(&declare(state, actor, request).await?),
+        ProjectCall::Declare { name, id } => {
+            // Unset, the project takes the call's own id, the same each
+            // time the call is carried again under its key.
+            let id = match (id, actor) {
+                (Some(id), _) => *id,
+                (None, Actor::Program { call, .. }) => *call,
+                (None, Actor::Operator { .. }) => return Err((StatusCode::BAD_REQUEST, "a declare by hand names its project's id".into())),
+            };
+            answered(&declare(state, actor, &DeclareRequest { id, name: name.clone() }).await?)
+        }
         ProjectCall::Status { request } => answered(&status(state, actor, project, request).await.map_err(StatusError::into_parts)?),
         ProjectCall::CancelBuild => answered(&cancel_build(state, actor, project).await?),
         ProjectCall::Quiesce { request } => answered(&quiesce(state, actor, project, request).await.map_err(StatusError::into_parts)?),

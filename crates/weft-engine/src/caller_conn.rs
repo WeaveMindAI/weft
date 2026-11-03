@@ -388,6 +388,11 @@ pub struct LiveCallerConnection {
     /// apart from `connected` so the row is written BEFORE anyone waiting
     /// on `connected` wakes (see `mark_disconnected`).
     disconnect_recorded: AtomicBool,
+    /// Why the caller is being let go, once the platform's limit on its
+    /// connection came while its run outlives it ([`Self::letting_go`]).
+    leaving: std::sync::OnceLock<String>,
+    /// Whether that caller was let go ([`Self::let_go`]): once.
+    let_go: AtomicBool,
     /// Whether the caller's arrival is on the exchange's record: at once
     /// for a socket; for an HTTP call only once it streams, since a call
     /// answered in one piece records none of it ([`Self::caller_arrived`]).
@@ -547,17 +552,11 @@ struct ConnInner {
     wire_started: bool,
 }
 
-/// Why an exchange whose run parked ends here: the run outlives its
-/// caller (`outlivesCaller`), so its worker leaves while it waits and
-/// whatever it says once resumed goes nowhere. Said to the caller (an
-/// error before the first byte, in-band after it, a `1013` close on a
-/// socket) and recorded on the exchange.
-pub const PARKED: &str = "the run is waiting on a signal and carries on without this caller \
-     (its route outlives its caller): no answer will come on this request";
-
 /// Why an exchange whose run was handed back ends here: the worker it
 /// reached is stopping, so the run carries on in another one, which this
-/// caller's connection does not reach. Said and recorded like [`PARKED`].
+/// caller's connection does not reach. Said to the caller (an error before
+/// the first byte, in-band after it, a `1013` close on a socket) and
+/// recorded on the exchange.
 pub const HANDED_BACK: &str = "the copy of the program serving this request is stopping, so the run \
      carries on in another one without this caller: no answer will come on this request";
 
@@ -721,13 +720,42 @@ impl LiveCallerConnection {
         }
     }
 
-    /// The run carries on without this caller (it parked on a wait,
-    /// [`PARKED`], or was handed back, [`HANDED_BACK`]): it has NOT ended,
+    /// The platform's limit on this connection came while its run
+    /// outlives its caller: from here the caller no longer keeps the run
+    /// on this worker (`holds_the_run`), so the run may pause and hand
+    /// itself back, while the line stays open for what its running nodes
+    /// still send. `why` goes to the caller when it is let go
+    /// ([`Self::let_go`]).
+    pub(crate) fn letting_go(&self, why: String) {
+        let _ = self.leaving.set(why);
+    }
+
+    /// Let a caller being let go ([`Self::letting_go`]) go, once: told why,
+    /// as a time limit (unless the program already ended the exchange),
+    /// and disconnected. Nothing for any other caller.
+    pub(crate) async fn let_go(&self) {
+        let Some(why) = self.leaving.get() else { return };
+        if self.let_go.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if self.take_end(|_| ()).is_some() {
+            self.record.errored(why);
+            self.outbound.push_terminal(Outbound::Error { ending: Ending::TimeLimit });
+        }
+        self.mark_disconnected("the platform's limit on one connection");
+    }
+
+    /// The run carries on without this caller (it was handed back,
+    /// [`HANDED_BACK`]): it has NOT ended,
     /// so this never says it did. Whatever the exchange was doing, it
     /// stops here with `why`, as a stop ([`Ending::Stopped`]): asking again
     /// would start a second run beside the one that goes on. A program that
-    /// already terminated the exchange is left alone.
+    /// already terminated the exchange is left alone. A caller being let
+    /// go at the platform's limit is told that instead ([`Self::let_go`]).
     pub async fn run_carries_on(&self, why: &str) {
+        if self.leaving.get().is_some() {
+            return self.let_go().await;
+        }
         if self.take_end(|_| ()).is_none() {
             return;
         }
@@ -791,6 +819,10 @@ impl CallerConnection for LiveCallerConnection {
 
     fn is_connected(&self) -> bool {
         *self.connected.borrow()
+    }
+
+    fn holds_the_run(&self) -> bool {
+        self.is_connected() && self.leaving.get().is_none()
     }
 
     async fn disconnected(&self) {
@@ -1245,6 +1277,8 @@ pub(crate) fn new_connection(
         inner: Mutex::new(ConnInner { terminated: false, wire_started: false }),
         connected: tokio::sync::watch::Sender::new(true),
         disconnect_recorded: AtomicBool::new(false),
+        leaving: std::sync::OnceLock::new(),
+        let_go: AtomicBool::new(false),
         arrival_recorded: AtomicBool::new(false),
         held: Mutex::new(None),
         held_note: tokio::sync::Notify::new(),
@@ -3407,20 +3441,37 @@ mod tests {
         plain_failure_of(&body);
     }
 
-    /// A run that parked has not ended: its caller hears that it
-    /// carries on without them, as a stop (`503`), never that it ended
-    /// unanswered, and is not told to retry. A run handed back the same.
+    /// A run handed back has not ended: its caller hears that it carries
+    /// on without them, as a stop (`503`), never that it ended unanswered,
+    /// and is not told to retry.
     #[tokio::test]
-    async fn a_run_that_parks_says_so_and_never_claims_it_ended() {
-        for why in [PARKED, HANDED_BACK] {
-            let (status, headers, body) = exchange("{}", move |conn| async move {
-                conn.run_carries_on(why).await;
-            })
-            .await;
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(header(&headers, "retry-after"), None, "a retry would start a second run");
-            plain_failure_of(&body);
-        }
+    async fn a_run_handed_back_says_so_and_never_claims_it_ended() {
+        let (status, headers, body) = exchange("{}", move |conn| async move {
+            conn.run_carries_on(HANDED_BACK).await;
+        })
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(header(&headers, "retry-after"), None, "a retry would start a second run");
+        plain_failure_of(&body);
+    }
+
+    /// A caller being let go at the platform's limit stays on the line but
+    /// no longer keeps its run here, so the run may pause; when the run
+    /// hands itself back, the caller is let go as a time limit (`504`),
+    /// not as the plain hand-back's stop.
+    #[tokio::test]
+    async fn a_caller_let_go_at_the_limit_hears_why_when_its_run_is_handed_back() {
+        let (status, _headers, body) = exchange("{}", move |conn| async move {
+            conn.letting_go("reconnect to talk to the program again".into());
+            assert!(conn.is_connected(), "the line stays open through the window");
+            assert!(!conn.holds_the_run(), "the caller no longer keeps the run here");
+            assert!(crate::held_waits::unsuspendable(Some(&(conn.clone() as Arc<dyn CallerConnection>)), Default::default()).is_none());
+            conn.run_carries_on(HANDED_BACK).await;
+            assert!(!conn.is_connected(), "let go");
+        })
+        .await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "a time limit, not the plain hand-back's stop");
+        plain_failure_of(&body);
     }
 
     #[tokio::test]

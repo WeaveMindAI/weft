@@ -44,12 +44,15 @@ registered, until you run `weft resync`.
 `cancelled`, or it parks at `waiting_for_input` while a node waits on a person
 or a service. Parking costs nothing: weft lets the run's worker shut down, and
 a new worker picks the run back up when the answer lands, however many days
-later. The worker stays up only while the run cannot pause: a caller is still
-on the line and its trigger leaves `outlivesCaller` off, the trigger has
-`recorded` off, or the run is still using a
-[bus](../language/streams-and-buses.md#buses). Such a run holds the wait in its
-worker instead, and if nothing moves in the run for its trigger's `holdSecs`
-(60 seconds unless you set it), the waiting node fails.
+later. Once everything in the run waits, the worker first stays up a few
+seconds (the trigger's `pauseAfterSecs`, 10 unless you set it), so an answer
+that comes quickly carries the run on right there, before it parks.
+Otherwise the worker stays up only while the run cannot pause: a caller is still
+on the line, or the trigger has `recorded` off. Such a run holds the wait in its
+worker instead. Without a caller, if nothing moves in the run for its
+trigger's `holdSecs` (60 seconds unless you set it), the waiting node fails;
+while a caller is on the line, the wait holds for as long as the caller
+stays, unless `holdSecs` is `0`, which fails it at once.
 
 ## The rest
 

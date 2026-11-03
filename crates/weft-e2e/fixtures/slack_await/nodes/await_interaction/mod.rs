@@ -6,6 +6,8 @@
 //! fixture proves the park + signed-push + resume machinery alone.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use weft::node::NodeOutput;
 use weft::signal::{Predicate, PredicateOp, ProviderEvents};
@@ -14,20 +16,31 @@ use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 #[derive(NodeManifest)]
 pub struct AwaitInteractionNode;
 
+/// The click, once it came: the body run again after the park finds the
+/// wait answered.
+#[derive(Default, Serialize, Deserialize)]
+struct Clicked {
+    click: Option<Value>,
+}
+
 #[async_trait]
 impl Node for AwaitInteractionNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
-        let click = ctx
-            .await_signal(ProviderEvents::new(
-                &access,
-                "interactions",
-                vec![Predicate {
-                    field: "callbackId".into(),
-                    op: PredicateOp::Eq,
-                    value: Some("cb-e2e".into()),
-                }],
-            ))
+        let mut state = ctx.keep(Clicked::default()).await?;
+        let click = state
+            .wait(
+                |s| &mut s.click,
+                ProviderEvents::new(
+                    &access,
+                    "interactions",
+                    vec![Predicate {
+                        field: "callbackId".into(),
+                        op: PredicateOp::Eq,
+                        value: Some("cb-e2e".into()),
+                    }],
+                ),
+            )
             .await?;
         let action = click["action"].as_str().unwrap_or_default().to_string();
         let user = click["user"].as_str().unwrap_or_default().to_string();

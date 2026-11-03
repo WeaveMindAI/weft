@@ -9,7 +9,19 @@
   ],
   "icon": "MessageCircle",
   "color": "#8b5cf6",
-  "inputs": [],
+  "inputs": [
+    {
+      "name": "pauseSeconds",
+      "type": "Number",
+      "default": 0,
+      "label": "Pause seconds",
+      "description": "Seconds the host waits on a timer after the first exchange, its bus open, before it goes on. 0 does not wait.",
+      "widget": {
+        "kind": "number",
+        "min": 0
+      }
+    }
+  ],
   "outputs": [
     {
       "name": "channel",

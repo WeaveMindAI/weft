@@ -32,10 +32,10 @@ race between the cancel arriving and your next look.
 
 If your node waits on something itself (a sleep, a long call to somebody
 else, a read that could block for minutes), race it against
-`cancel.cancelled()` in a `select!` like the one above. The waits weft parks
-for you need none: `ctx.await_signal`, `ctx.await_signal_with_cancel`, and the
-ctx calls that wait through them, like `infra(..).start()`. Cancelling the run
-takes those down for you.
+`cancel.cancelled()` in a `select!` like the one above. The waits weft
+holds for you need none: `state.wait`, and the ctx calls that wait through
+it, like `infra(..).start(&mut state)`. Cancelling the run takes those down
+for you.
 
 If the wait is on a job a provider runs, and you want the provider
 told too, go and read [if the run is cancelled while the job
@@ -90,7 +90,7 @@ becomes `49151_s_whatsapp_net-` followed by sixteen hex characters. Both calls
 and the runs list's tag filter do this the same way, so the same value always
 lands on the same tag, and two values that only differ in the swapped
 characters never share one. Tagging twice with the same tag does nothing,
-which is what makes it safe to replay.
+so a body that runs again after a pause can tag again.
 
 ## In a test
 

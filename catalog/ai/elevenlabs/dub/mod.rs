@@ -8,18 +8,18 @@
 use std::path::Path;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use weft::access::client::{get_json, json_call, post_json, send_error, Multipart};
+use weft::access::client::{get_json, json_call, post_json, Multipart};
 use weft::context::LogLevel;
 use weft::node::NodeOutput;
-use weft::reqwest::StatusCode;
 use weft::signal::{PollEndpoint, Predicate};
 use weft::storage::{FileHandle, StorageScope, StoredFile};
 use weft::{node_error, Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 use super::elevenlabs::{link_filename, API};
-use super::flows::store_download;
+use super::flows::{delete_quietly, store_download, wait_for_job};
 
 type Client = weft::reqwest_middleware::ClientWithMiddleware;
 
@@ -73,15 +73,17 @@ impl Node for ElevenLabsDubNode {
         let http = ctx.client(&account).await?;
         let projects = format!("{API}/dubbing/project");
 
-        // Creating the project is paid (one language's dub up front), and
-        // the body replays from the top when the wait resumes: journaled,
-        // the replay reads the project back instead of paying for a second
-        // one (and never reads the recording again). The language rides
-        // on the create whenever it can, so a language ElevenLabs does not
-        // dub is refused before anything is charged; a cloning strength
-        // can only be set on a language added on its own.
-        let created = ctx
-            .run("elevenlabs_create_dub_project", || async {
+        let mut state = ctx.keep(Dub::default()).await?;
+
+        // Creating the project is paid (one language's dub up front), so
+        // it runs once: a run resumed after the wait finds the project in
+        // its state instead of paying for a second one (and never reads
+        // the recording again). The language rides on the create whenever
+        // it can, so a language ElevenLabs does not dub is refused before
+        // anything is charged; a cloning strength can only be set on a
+        // language added on its own.
+        let created = state
+            .once(|s| &mut s.created, async |_| {
                 let mut form = Multipart::form_data().text("model_id", &model);
                 let filename = match &recording {
                     Recording::File(file) => {
@@ -119,24 +121,18 @@ impl Node for ElevenLabsDubNode {
                 .await?;
                 let project = answer["project_id"]
                     .as_str()
-                    .node_err("ElevenLabs created the dub project but its answer has no project_id")?;
-                Ok(json!({ "project": project, "filename": filename, "language": answer["language_ids"][0] }))
+                    .node_err("ElevenLabs created the dub project but its answer has no project_id")?
+                    .to_string();
+                let language = answer["language_ids"][0].as_str().map(str::to_string);
+                Ok(Created { project, filename, language })
             })
             .await?;
-        let project =
-            created["project"].as_str().node_err("the dub project this run recorded has no project id")?.to_string();
-        let filename =
-            created["filename"].as_str().node_err("the dub project this run recorded has no filename")?.to_string();
+        let Created { project, filename, language } = created;
 
-        let language = match (created["language"].as_str(), cloning) {
-            (Some(language), None) => language.to_string(),
+        let language = match (language, cloning) {
+            (Some(language), None) => language,
             (None, None) => {
-                let fate = if keep {
-                    "it stays on the account behind this node's key, where the first language you add uses that prepaid dub; or delete it there"
-                } else {
-                    discard(&ctx, &http, &projects, &project).await?;
-                    "it was deleted"
-                };
+                let fate = project_fate(&ctx, &http, &projects, &project, keep).await?;
                 weft::node_bail!(
                     "ElevenLabs created the dub project {project} but did not say it started the dub into \
                      '{target}'. Creating the project already cost one language's dub, and {fate}"
@@ -145,8 +141,8 @@ impl Node for ElevenLabsDubNode {
             // A step of its own: by now the project holds its prepaid
             // language, so a failure here says what became of it.
             (_, Some(strength)) => {
-                let added = ctx
-                    .run("elevenlabs_add_dub_language", || async {
+                state
+                    .once(|s| &mut s.added, async |_| {
                         let body = json!({ "target_language": target, "voice_settings": { "cloning_strength": strength } });
                         let url = format!("{projects}/{project}/language");
                         let added =
@@ -154,25 +150,19 @@ impl Node for ElevenLabsDubNode {
                         let answer = match added {
                             Ok(answer) => answer,
                             Err(e) => {
-                                let fate = if keep {
-                                    "it stays on the account behind this node's key, where the first language you add uses that prepaid dub; or delete it there"
-                                } else {
-                                    discard(&ctx, &http, &projects, &project).await?;
-                                    "it was deleted"
-                                };
+                                let fate = project_fate(&ctx, &http, &projects, &project, keep).await?;
                                 return Err(node_error(format!(
                                     "adding '{target}' to the dub project {project} failed: {e}. Creating the project \
                                      already cost one language's dub, and {fate}"
                                 )));
                             }
                         };
-                        let language = answer["language_id"]
+                        Ok(answer["language_id"]
                             .as_str()
-                            .node_err("ElevenLabs added the language but its answer has no language_id")?;
-                        Ok(json!({ "language": language }))
+                            .node_err("ElevenLabs added the language but its answer has no language_id")?
+                            .to_string())
                     })
-                    .await?;
-                added["language"].as_str().node_err("the dub language this run recorded has no language id")?.to_string()
+                    .await?
             }
         };
         let target_url = format!("{projects}/{project}/language/{language}");
@@ -182,45 +172,54 @@ impl Node for ElevenLabsDubNode {
         // being waited on for ever. The wait carries only the status; the
         // read after it carries the rest, with the download URL signed
         // now rather than whenever the wait ended (it lasts an hour).
-        let waited = ctx
-            .await_signal(PollEndpoint {
-                url: target_url.clone(),
-                interval_secs: 10,
-                access: Some(weft::primitive::AccessRef::from(&account)),
-                filters: vec![Predicate::neq("status", "queued"), Predicate::neq("status", "processing")],
-                carry: vec!["status".into()],
-                ..Default::default()
-            })
-            .await;
-        match waited {
-            Ok(_) => {}
-            // The run gave the dub up without its answer (the wait ran out
-            // of time, or a person skipped it): nothing will read it.
-            Err(e @ (WeftError::WaitGaveUp(_) | WeftError::WaitSkipped(_))) => {
-                if !keep {
-                    discard(&ctx, &http, &projects, &project).await?;
-                }
-                return Err(e);
+        let poll = PollEndpoint {
+            url: target_url.clone(),
+            interval_secs: 10,
+            access: Some(weft::primitive::AccessRef::from(&account)),
+            filters: vec![Predicate::neq("status", "queued"), Predicate::neq("status", "processing")],
+            carry: vec!["status".into()],
+            ..Default::default()
+        };
+        wait_for_job(&mut state, |s| &mut s.ended, poll, || async {
+            if !keep {
+                discard(&ctx, &http, &projects, &project).await?;
             }
-            // Anything else, the park above all (the body stops here and
-            // replays once the dub has ended), leaves the project alone.
-            Err(e) => return Err(e),
-        }
+            Ok(())
+        })
+        .await?;
 
-        // Journaled, so a body replaying after a crash that followed the
-        // delete below reads the stored dub back instead of reading a
-        // project that is gone.
-        let dubbed = ctx
-            .run("elevenlabs_store_dub", || async {
-                Ok(finished(&ctx, &http, &projects, &project, &target, &target_url, &filename).await?.to_value())
-            })
+        // Kept, so a body run again after a crash that followed the
+        // delete below finds the stored dub in its state instead of
+        // reading a project that is gone.
+        let dubbed = state
+            .once(|s| &mut s.dubbed, async |_| finished(&ctx, &http, &projects, &project, &target, &target_url, &filename).await)
             .await;
         if !keep {
             discard(&ctx, &http, &projects, &project).await?;
         }
-        let stored = StoredFile::from_value(&dubbed?)?;
-        ctx.pulse_downstream(NodeOutput::stored_file(stored).set("projectId", project)).await
+        ctx.pulse_downstream(NodeOutput::stored_file(dubbed?).set("projectId", project)).await
     }
+}
+
+/// Where the dub stands: the project created (and the language it
+/// started), the language added on its own when a cloning strength is
+/// set, the status the wait ended on, and the dubbed audio stored.
+#[derive(Default, Serialize, Deserialize)]
+struct Dub {
+    created: Option<Created>,
+    added: Option<String>,
+    ended: Option<Value>,
+    dubbed: Option<StoredFile>,
+}
+
+/// The dub project the create made.
+#[derive(Clone, Serialize, Deserialize)]
+struct Created {
+    project: String,
+    /// The recording's name, which names the dubbed file.
+    filename: String,
+    /// The language the create started, when it started one.
+    language: Option<String>,
 }
 
 /// Where the recording to dub comes from.
@@ -307,25 +306,23 @@ async fn finished(
     store_download(ctx, url, "audio/flac", &format!("dubbed_{target}_{stem}.flac")).await
 }
 
-/// Delete a dub project nobody keeps. One already gone counts as
-/// deleted (the body can replay after a crash that followed the delete);
-/// one that cannot be deleted never fails the node, since the dub it
-/// served is already paid for: it is named on the node's log instead.
+/// Delete a dub project nobody keeps ([`delete_quietly`]).
 async fn discard(ctx: &RunContext, http: &Client, projects: &str, project: &str) -> WeftResult<()> {
-    let refused = match http.delete(format!("{projects}/{project}")).send().await {
-        Ok(resp) if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND => return Ok(()),
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            format!("ElevenLabs answered {status}: {}", body.chars().take(300).collect::<String>())
-        }
-        Err(e) => send_error(e),
-    };
-    ctx.log(
-        LogLevel::Warn,
-        format!("the dub project {project} is still on the ElevenLabs account ({refused}); delete it from that account"),
-    )
+    delete_quietly(ctx, http, &format!("{projects}/{project}"), |refused| {
+        format!("the dub project {project} is still on the ElevenLabs account ({refused}); delete it from that account")
+    })
     .await
+}
+
+/// What became of a project whose dub could not start: kept on the
+/// account (`keep`), where its prepaid dub serves the first language
+/// added, or deleted. Its words finish the failure's sentence.
+async fn project_fate(ctx: &RunContext, http: &Client, projects: &str, project: &str, keep: bool) -> WeftResult<&'static str> {
+    if keep {
+        return Ok("it stays on the account behind this node's key, where the first language you add uses that prepaid dub; or delete it there");
+    }
+    discard(ctx, http, projects, project).await?;
+    Ok("it was deleted")
 }
 
 /// The failure ElevenLabs reported in an `error` object (a dub target's

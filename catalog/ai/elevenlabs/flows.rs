@@ -13,7 +13,7 @@ use std::future::Future;
 use std::sync::Mutex;
 
 use base64::Engine as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use weft::access::client::{get_json, json_call, post_json, send_error, Multipart};
@@ -21,7 +21,7 @@ use weft::context::LogLevel;
 use weft::reqwest::StatusCode;
 use weft::signal::{PollEndpoint, Predicate};
 use weft::storage::{FileHandle, StorageScope, StoredFile};
-use weft::{node_error, Access, RunContext, NodeErrExt, WeftError, WeftResult};
+use weft::{node_error, Access, Kept, RunContext, NodeErrExt, WeftError, WeftResult};
 
 use super::elevenlabs::API;
 
@@ -168,53 +168,63 @@ impl<'a> References<'a> {
     }
 }
 
-/// A job ElevenLabs accepted: its create answer, and the temporary
-/// assets it reads.
+/// Where a job stands, the state of a node that runs one: nothing yet,
+/// accepted ([`Submitted`]), or ended (the status the wait ended on). A
+/// run that pauses while ElevenLabs works comes back with the job, so
+/// the paid create is never sent twice.
+#[derive(Default, Serialize, Deserialize)]
+pub struct Job {
+    submitted: Option<Submitted>,
+    ended: Option<Value>,
+}
+
+/// A job ElevenLabs accepted: its id, and the temporary assets it reads.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Submitted {
-    pub answer: Value,
+    pub id: String,
     uploads: Vec<String>,
 }
 
 /// Build a request with `build` (which turns files into references
-/// through `refs`) and POST it to `url`, once: the step is journaled,
-/// so the body replaying after the wait reads the answer back instead
-/// of paying for a second job. A request that fails takes its
+/// through `refs`) and POST it to `url`, once: a resumed body finds the
+/// job in its state instead of paying for a second one. `no_id` is the
+/// refusal when the answer names no job. A request that fails takes its
 /// temporary uploads with it.
 pub async fn submit<F, Fut>(
-    ctx: &RunContext,
-    http: &Client,
+    state: &mut Kept<Job>,
     refs: &References<'_>,
     url: &str,
     what: &str,
+    no_id: &str,
     build: F,
 ) -> WeftResult<Submitted>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = WeftResult<Value>>,
 {
-    let journaled = ctx
-        .run("elevenlabs_submit", || async {
+    state
+        .once(|s| &mut s.submitted, async |_| {
             let sent = async {
                 let body = build().await?;
-                post_json(http, url, &body, what).await
+                post_json(refs.http, url, &body, what).await
             }
             .await;
-            match sent {
-                Ok(answer) => Ok(json!({ "answer": answer, "uploads": refs.uploads() })),
+            let answer = match sent {
+                Ok(answer) => answer,
                 Err(e) => {
-                    remove_uploads(ctx, http, &refs.uploads()).await?;
-                    Err(e)
+                    remove_uploads(refs.ctx, refs.http, &refs.uploads()).await?;
+                    return Err(e);
                 }
-            }
+            };
+            // A job accepted with no id cannot be followed: nothing will
+            // read the uploads, so they go before the refusal.
+            let Some(id) = answer["id"].as_str() else {
+                remove_uploads(refs.ctx, refs.http, &refs.uploads()).await?;
+                return Err(node_error(no_id));
+            };
+            Ok(Submitted { id: id.to_string(), uploads: refs.uploads() })
         })
-        .await?;
-    let uploads = journaled["uploads"]
-        .as_array()
-        .node_err("the journaled submit has no uploads")?
-        .iter()
-        .filter_map(|id| id.as_str().map(str::to_string))
-        .collect();
-    Ok(Submitted { answer: journaled["answer"].clone(), uploads })
+        .await
 }
 
 /// Park until the job at `url` leaves `pending` and `generating`,
@@ -224,74 +234,92 @@ where
 ///
 /// The wait carries only `status`; the read after it carries the rest,
 /// with content URLs signed now rather than whenever the wait ended,
-/// and none of them lands in the journal. Any status that is not in
+/// and none of them lands in the state. Any status that is not in
 /// flight ends the wait, so one this package does not know is refused
 /// by the caller instead of waited on for ever. A run stopped while it
 /// waits runs none of this, so its temporary uploads stay in the
 /// workspace's assets.
 pub async fn finish(
     ctx: &RunContext,
+    state: &mut Kept<Job>,
     account: &Access,
     http: &Client,
     url: &str,
     poll_secs: u64,
     submitted: &Submitted,
 ) -> WeftResult<Value> {
-    let ended = ctx
-        .await_signal(PollEndpoint {
-            url: url.to_string(),
-            interval_secs: poll_secs,
-            access: Some(weft::primitive::AccessRef::from(account)),
-            filters: vec![Predicate::neq("status", "pending"), Predicate::neq("status", "generating")],
-            carry: vec!["status".into()],
-            ..Default::default()
-        })
-        .await;
-    match ended {
-        Ok(_) => {}
-        // The run gave the job up without its answer (the wait ran out
-        // of time, or a person skipped it): nothing will read the job
-        // again, so its uploads go now.
-        Err(e @ (WeftError::WaitGaveUp(_) | WeftError::WaitSkipped(_))) => {
-            remove_uploads(ctx, http, &submitted.uploads).await?;
-            return Err(e);
-        }
-        // Anything else leaves the job its files, the park above all:
-        // the body stops here while ElevenLabs works and replays from
-        // the top once the job has ended.
-        Err(e) => return Err(e),
-    }
+    let poll = PollEndpoint {
+        url: url.to_string(),
+        interval_secs: poll_secs,
+        access: Some(weft::primitive::AccessRef::from(account)),
+        filters: vec![Predicate::neq("status", "pending"), Predicate::neq("status", "generating")],
+        carry: vec!["status".into()],
+        ..Default::default()
+    };
+    wait_for_job(state, |s| &mut s.ended, poll, || remove_uploads(ctx, http, &submitted.uploads)).await?;
     remove_uploads(ctx, http, &submitted.uploads).await?;
     get_json(http, url, "read the finished ElevenLabs job").await
 }
 
-/// Delete the temporary assets a job read. One already gone counts as
-/// removed (the body can replay after a crash that followed the
-/// delete). One that cannot be removed never fails the node, since the
-/// job it served is already paid for: it is named on the node's log,
-/// with where to delete it, because it stays in the workspace and
-/// counts against its storage.
+/// Wait on `poll` for a job ElevenLabs works on, through `field` of the
+/// node's state. A wait the run gave up without its answer (it ran out of
+/// time, or a person skipped it) leaves nothing to read the job again, so
+/// `abandon` runs before the error goes up. Anything else leaves the job
+/// alone, the pause above all: the run lets go while ElevenLabs works, and
+/// the body runs again from its top, the job in its state, once it ended.
+pub async fn wait_for_job<S, F, Fut>(
+    state: &mut Kept<S>,
+    field: impl Fn(&mut S) -> &mut Option<Value>,
+    poll: PollEndpoint,
+    abandon: F,
+) -> WeftResult<()>
+where
+    S: Serialize + serde::de::DeserializeOwned + Send,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = WeftResult<()>>,
+{
+    match state.wait(field, poll).await {
+        Ok(_) => Ok(()),
+        Err(e @ (WeftError::WaitGaveUp(_) | WeftError::WaitSkipped(_))) => {
+            abandon().await?;
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Delete the temporary assets a job read. One that cannot be removed
+/// stays in the workspace and counts against its storage, so its log
+/// line says where to delete it ([`delete_quietly`]).
 async fn remove_uploads(ctx: &RunContext, http: &Client, uploads: &[String]) -> WeftResult<()> {
     for id in uploads {
-        let refused = match http.delete(format!("{API}/assets/{id}")).send().await {
-            Ok(resp) if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND => continue,
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                format!("ElevenLabs answered {status}: {}", body.chars().take(300).collect::<String>())
-            }
-            Err(e) => send_error(e),
-        };
-        ctx.log(
-            LogLevel::Warn,
+        delete_quietly(ctx, http, &format!("{API}/assets/{id}"), |refused| {
             format!(
                 "the temporary asset {id} is still in the ElevenLabs workspace ({refused}); delete it in the \
                  Assets section of ElevenLabs, where it counts against the workspace's storage"
-            ),
-        )
+            )
+        })
         .await?;
     }
     Ok(())
+}
+
+/// Delete what `url` names on ElevenLabs. One already gone counts as
+/// deleted (a body run again after a crash that followed the delete
+/// deletes it again). One that cannot be deleted never fails the node,
+/// since the work it served is already paid for: it is named on the
+/// node's log instead, in the words `stays` makes of the refusal.
+pub async fn delete_quietly(ctx: &RunContext, http: &Client, url: &str, stays: impl FnOnce(&str) -> String) -> WeftResult<()> {
+    let refused = match http.delete(url).send().await {
+        Ok(resp) if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND => return Ok(()),
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            format!("ElevenLabs answered {status}: {}", body.chars().take(300).collect::<String>())
+        }
+        Err(e) => send_error(e),
+    };
+    ctx.log(LogLevel::Warn, stays(&refused)).await
 }
 
 /// The failure ElevenLabs reported on a finished job or output.
@@ -339,6 +367,7 @@ pub async fn store_download(ctx: &RunContext, url: &str, mime: &str, filename: &
 /// `media`, wait for the job, and answer the stored output.
 pub async fn generate<F, Fut>(
     ctx: &RunContext,
+    state: &mut Kept<Job>,
     account: &Access,
     http: &Client,
     refs: &References<'_>,
@@ -351,13 +380,17 @@ where
 {
     let noun = media.noun();
     let route = format!("{API}/flows/{noun}");
-    let submitted =
-        submit(ctx, http, refs, &route, &format!("start the ElevenLabs {noun} generation"), build).await?;
-    let id = submitted.answer["id"]
-        .as_str()
-        .node_err("ElevenLabs answered no generation id when the generation was started")?
-        .to_string();
-    let job = finish(ctx, account, http, &format!("{route}/{id}"), media.poll_secs(), &submitted).await?;
+    let submitted = submit(
+        state,
+        refs,
+        &route,
+        &format!("start the ElevenLabs {noun} generation"),
+        "ElevenLabs answered no generation id when the generation was started",
+        build,
+    )
+    .await?;
+    let id = &submitted.id;
+    let job = finish(ctx, state, account, http, &format!("{route}/{id}"), media.poll_secs(), &submitted).await?;
     match job["status"].as_str().unwrap_or_default() {
         "completed" => store_output(ctx, noun, &job).await,
         "failed" => Err(failure(&format!("the {noun} generation {id}"), &job)),

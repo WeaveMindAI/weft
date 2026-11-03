@@ -1,11 +1,13 @@
 //! Wait: park this branch for a number of seconds, then carry on.
 //!
-//! The pause is a timer signal the run suspends on (`ctx.await_signal`),
-//! so a waiting run holds no worker: ten thousand branches sleeping for
-//! an hour are ten thousand journal rows. When the listener fires the
-//! timer, a worker resumes the firing here and it emits.
+//! The pause is a timer signal the run suspends on (`state.wait`), so a
+//! waiting run holds no worker: ten thousand branches sleeping for an
+//! hour are ten thousand journal rows. When the listener fires the
+//! timer, a worker runs the body again, the wait hands the wake over,
+//! and it emits.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use weft::signal::{Timer, TimerSpec};
@@ -15,6 +17,12 @@ use super::timers::output_after;
 
 #[derive(NodeManifest)]
 pub struct WaitNode;
+
+/// The timer's wake, once it fired.
+#[derive(Default, Serialize, Deserialize)]
+struct Parked {
+    wake: Option<Value>,
+}
 
 #[cfg(feature = "node-tests")]
 mod tests;
@@ -45,7 +53,8 @@ impl Node for WaitNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let seconds: f64 = ctx.inputs.get("seconds")?;
         let value: Option<Value> = ctx.inputs.raw("value").cloned();
-        let wake = ctx.await_signal(timer_for(seconds)?).await?;
+        let mut state = ctx.keep(Parked::default()).await?;
+        let wake = state.wait(|s| &mut s.wake, timer_for(seconds)?).await?;
         ctx.pulse_downstream(output_after(value, &wake)?).await
     }
 }

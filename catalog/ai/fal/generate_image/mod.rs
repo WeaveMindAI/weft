@@ -10,7 +10,7 @@ use weft::node::NodeOutput;
 use weft::storage::{StorageScope};
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::fal::{merge_params, run_queued};
+use super::fal::{merge_params, run_queued, Queued};
 
 #[derive(NodeManifest)]
 pub struct FalGenerateImageNode;
@@ -47,8 +47,9 @@ impl Node for FalGenerateImageNode {
         merge_params(&mut payload, params.as_ref());
 
         let http = ctx.client(&account).await?;
+        let mut job = ctx.keep(Queued::default()).await?;
         let answer =
-            run_queued(&ctx, &account, &http, &model, &payload, "fal: generate the image").await?;
+            run_queued(&mut job, &account, &http, &model, &payload, "fal: generate the image").await?;
 
         let urls: Vec<Value> = answer["images"]
             .as_array()

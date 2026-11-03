@@ -245,7 +245,7 @@ moment it is asked for, before the container itself moves.
 From your program, `ctx.infra` names the node and the instance:
 
 ```rust
-ctx.infra("bridge").instance("user-42").start().await?;
+ctx.infra("bridge").instance("user-42").start(&mut state).await?;
 let copy = ctx.infra("bridge").instance("user-42").status().await?; // None: no copy
 let every = ctx.infra("bridge").copies().await?;                     // shared + each instance's
 ```
@@ -398,11 +398,13 @@ let minted = ctx.tokens().mint_for_instance("user-42", Duration::from_secs(7 * 8
 ctx.tokens().instance("user-42").revoke().await?;
 ```
 
-The token comes out once, because weft keeps only a hash of it. So when a run is
-replayed after a restart, weft cannot hand back the token it minted the first
-time: it mints a fresh value for the same token, and the old value stops
-working. If your program already handed the first value to a browser, that
-browser needs the new one.
+The token comes out once, because weft keeps only a hash of it. So if a node's
+body makes this call again after a crash, from a state saved before the mint,
+weft cannot hand back the value it minted the first time: it mints a fresh
+value for the same token, and the old value stops working. If your program
+already handed the first value to a browser, that browser needs the new one.
+After a pause, a body that runs the mint again makes a second token beside
+the first, so make the mint after the last place your node can pause.
 
 ## An instance's files
 
@@ -464,9 +466,10 @@ argument decides what happens to it:
 - `StopSelf::Include`: it is cancelled with the rest, once the take-down is
   queued; the call never returns.
 
-If a run is replayed after a restart, a copy it terminated is never terminated
-twice (for why, go and read [your project beyond this
-run](../nodes/ctx.md#your-project-beyond-this-run)).
+If a node's body runs again after a pause and terminates the copy again, the
+second call finds it already gone and answers `NoCopy`, so nothing is
+terminated twice (for the answers, go and read [the project's
+infra](../nodes/ctx.md#the-projects-infra-triggers-instances-and-settings)).
 
 ## Cleaning up after instances
 

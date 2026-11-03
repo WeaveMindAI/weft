@@ -14,9 +14,14 @@ describe('containerStatus', () => {
 	});
 
 	it('a member parked on a human holds the container: waiting, not running', () => {
-		expect(containerStatus('completed', rows('completed', 'waiting_for_input'))).toBe('waiting_for_input');
+		expect(containerStatus('completed', rows('completed', 'waiting'))).toBe('waiting');
 		// Unless something else inside is still actually running.
-		expect(containerStatus('completed', rows('waiting_for_input', 'running'))).toBe('running');
+		expect(containerStatus('completed', rows('waiting', 'running'))).toBe('running');
+	});
+
+	it('a member paused with its run holds the container paused, unless another waits on its own', () => {
+		expect(containerStatus('completed', rows('completed', 'paused'))).toBe('paused');
+		expect(containerStatus('completed', rows('paused', 'waiting'))).toBe('waiting');
 	});
 
 	it('a failed member fails the container', () => {

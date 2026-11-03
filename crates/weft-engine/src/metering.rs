@@ -646,7 +646,7 @@ impl CostSink {
     }
 
     /// Write the figure down: a `CostReported` on the run's record, one per
-    /// physical call (a replayed body that calls again spends again), and
+    /// physical call (a body run again that calls again spends again), and
     /// on record at once whatever the run is kept as, since it is money:
     /// an unrecorded run leaves a note of itself for it
     /// (`weft_journal::unrecorded`). A figure that cannot be written is

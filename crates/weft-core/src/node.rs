@@ -77,7 +77,7 @@ mod node_trait {
         }
 
         /// The node's normal body. `ctx` provides language primitives
-        /// (`pulse_downstream`, `create_bus`, `bus`, `await_signal`,
+        /// (`pulse_downstream`, `create_bus`, `bus`, `keep` and its waits,
         /// `log`, `endpoint`). The ONLY way to fire
         /// downstream is `ctx.pulse_downstream(output)`. For a plain
         /// (non-trigger) node the engine calls this in every lifecycle
@@ -2690,8 +2690,7 @@ pub struct NodeFeatures {
     #[serde(default, rename = "isTrigger", skip_serializing_if = "std::ops::Not::not")]
     pub is_trigger: bool,
     /// The node's body does nothing outside the run that weft does not put
-    /// on record first: no network, no connection, no wait, no `ctx.run`,
-    /// no tag, no storage beyond this run's own files. It may answer its
+    /// on record first: no network, no connection, no wait, no tag, no storage beyond this run's own files. It may answer its
     /// caller (a durable run's answer leaves only once it is on record) and
     /// read and store the run's files. So running it twice changes nothing
     /// anybody can see: a

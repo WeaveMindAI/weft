@@ -14,11 +14,6 @@ use crate::tag::StopSelf;
 
 use super::{required_instance, ProjectCalls};
 
-/// The name an instance token's mint is journaled under. Only the token's id
-/// is recorded (never its value): a replay revokes that one and mints a
-/// fresh token, since the value cannot be read back.
-const MINT_JOURNAL_NAME: &str = "weft.tokens.mint";
-
 impl<'a> ProjectCalls<'a> {
     /// What an instance provides for the program's `@instance_filled`
     /// fields: `ctx.values().instance(id)`.
@@ -173,33 +168,20 @@ impl<'a> TokenCalls<'a> {
     /// most). The value is in the answer once and never again; the
     /// runtime keeps only its hash.
     ///
-    /// The token's id is chosen here and journaled BEFORE the mint, so a
-    /// run replayed past this call mints under the same id: the token is
-    /// replaced (a new value, since the old one cannot be read back, and
-    /// the old value stops working), never left beside a second one.
+    /// The token's id comes from where the mint is made (the run, the
+    /// firing and its program-call number), so a body that mints again
+    /// under the same number (one resumed without its state recording
+    /// the mint) replaces the token (a new value, since the old one cannot
+    /// be read back, and the old value stops working), never leaves a
+    /// second beside it.
     pub async fn mint_for_instance(self, instance: impl Into<String>, expires_in: std::time::Duration) -> WeftResult<MintedInstanceToken> {
         let instance = required_instance(&instance.into())?;
-        // The expiry is refused before the id is journaled, so a refused
-        // mint leaves no record of a token that never existed.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| WeftError::NodeFailed(format!("the clock is before 1970: {e}")))?
             .as_secs();
         crate::signal_token::expiry_at(now, expires_in.as_secs()).map_err(WeftError::Input)?;
-        let (call_index, replayed) = self.at.ctx.handle.run_step(MINT_JOURNAL_NAME).await?;
-        let id = match replayed {
-            Some(recorded) => recorded
-                .get("id")
-                .and_then(Value::as_str)
-                .and_then(|id| id.parse::<uuid::Uuid>().ok())
-                .ok_or_else(|| WeftError::NodeFailed(format!("the journaled instance token mint is unreadable: {recorded}")))?,
-            None => {
-                let id = uuid::Uuid::new_v4();
-                self.at.ctx.handle.run_record(MINT_JOURNAL_NAME, call_index, &serde_json::json!({ "id": id })).await?;
-                id
-            }
-        };
-        self.at.ctx.handle.mint_instance_token(&instance, expires_in.as_secs(), true, id, self.at.project).await
+        self.at.ctx.handle.mint_instance_token(&instance, expires_in.as_secs(), true, self.at.project).await
     }
 
     /// Every signal token of the project's owner (`weft token ls`): what

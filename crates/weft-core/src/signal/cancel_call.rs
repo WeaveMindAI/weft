@@ -2,7 +2,7 @@
 //! if the run is cancelled while it waits.
 //!
 //! A node that started a job on an outside service (a video render, a
-//! crawl) waits for it with `ctx.await_signal_with_cancel`, naming the
+//! crawl) waits for it with `state.wait(.., kind.cancel_with(call))`, naming the
 //! service's own cancel address. Cancelling the run takes the wait down,
 //! and without this the service would keep working and charging for a
 //! result nobody reads any more. The call goes once, as the connection

@@ -1,7 +1,7 @@
 //! `weft node-state <run> <node>`: where one node of a run stands, the
 //! same answer a program reads with `GetNodeState`. A node waiting on an
 //! outside job shows the raw last answer its wait saw, as the service sent
-//! it.
+//! it; one paused only because its run paused says so.
 
 use weft_core::program::{NodeState, NodeStatus};
 use weft_core::signal::listener_protocol::LastAnswer;
@@ -31,6 +31,7 @@ fn lines(node: &str, state: &NodeState) -> Vec<String> {
         (Some(LastAnswer::Kept(live)), _) => out.push(format!("last answer: {live}")),
         (Some(LastAnswer::TooLarge(bytes)), _) => out.push(format!("last answer: {bytes} bytes, too large for the wait to keep")),
         (None, NodeStatus::Waiting) => out.push("last answer: none yet".to_string()),
+        (None, NodeStatus::Paused) => out.push("no wait of its own: its run paused with it inside, and it carries on when the run does".to_string()),
         (None, _) => {}
     }
     out
@@ -49,6 +50,11 @@ mod tests {
         assert_eq!(lines("render", &quiet), vec!["render: waiting", "last answer: none yet"]);
         let large = state(NodeStatus::Waiting, Some(LastAnswer::TooLarge(70_000)), None);
         assert_eq!(lines("render", &large), vec!["render: waiting", "last answer: 70000 bytes, too large for the wait to keep"]);
+        let paused = state(NodeStatus::Paused, None, None);
+        assert_eq!(
+            lines("read", &paused),
+            vec!["read: paused", "no wait of its own: its run paused with it inside, and it carries on when the run does"]
+        );
         let failed = state(NodeStatus::Failed, None, Some("boom"));
         assert_eq!(lines("one.render", &failed), vec!["one.render: failed", "error: boom"]);
         let done = state(NodeStatus::Completed, None, None);

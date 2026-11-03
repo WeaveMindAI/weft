@@ -60,7 +60,10 @@ impl Node for StreamNode {
         // registers (a closed bus refuses a registration, and closing it
         // is the producer's act).
         let bus = ctx.bus_from_input("bus")?;
-        let mut messages = bus.cursor_from_start();
+        let mut messages = bus.cursor_from_start()?;
+        // Answering a caller cannot be picked up from the middle: the
+        // node holds its run while it streams.
+        let mut holding = ctx.hold();
         // The header every streaming API has, sent ahead of the feed
         // and framed exactly like it. It rides the same path as a bus
         // message so the caller cannot tell the two apart, which is the
@@ -87,7 +90,7 @@ impl Node for StreamNode {
                         write_chunk(&http, &mut head, chunk).await?;
                     }
                 }
-                while let Some(entry) = messages.next().await {
+                while let Some(entry) = messages.next(&mut holding).await? {
                     let BusEntryKind::Message { payload: Some(payload), .. } = entry.kind else { continue };
                     refuse_secret(&payload)?;
                     let Some(chunk) = http.drop_or_fail(framed(&ctx, format, data_type, payload).await)? else { continue };
@@ -111,7 +114,7 @@ impl Node for StreamNode {
                         ws.send(chunk).await?;
                     }
                 }
-                while let Some(entry) = messages.next().await {
+                while let Some(entry) = messages.next(&mut holding).await? {
                     let BusEntryKind::Message { payload: Some(payload), .. } = entry.kind else { continue };
                     refuse_secret(&payload)?;
                     // A socket message is a frame: no HTTP framing.

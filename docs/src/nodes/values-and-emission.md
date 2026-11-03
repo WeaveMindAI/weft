@@ -68,9 +68,9 @@ node 'reply' touched port 'text' twice in one firing. Each output port can be
 emitted or closed AT MOST ONCE per firing
 ```
 
-If your node emits, waits on `ctx.await_signal`, and its body replays from the
-top when the answer comes, the replayed emit does not count as a second one:
-it does nothing, and the first value stands. For why the body replays, go and
+If your node emits, pauses on a wait, and its body runs again from the top
+when the answer comes, the emit made again does not count as a second one: it
+does nothing, and the first value stands. For why the body runs again, go and
 read [surviving a restart](durable-execution.md).
 
 **Several calls are fine if they touch different ports.** That is how you

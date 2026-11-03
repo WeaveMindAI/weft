@@ -12,7 +12,7 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("mints_for_the_instance", mints),
         NodeTest::fake("a_token_always_expires", never),
-        NodeTest::fake("a_replayed_mint_replaces_the_same_token", replayed),
+        NodeTest::fake("a_mint_run_again_replaces_the_same_token", run_again),
         NodeTest::fake("under_a_second_is_refused", fraction),
         NodeTest::fake("decimal_hours_round_to_the_nearest_second", decimal),
     ]
@@ -32,10 +32,10 @@ async fn mints(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// A run replayed past the mint mints again (the value cannot be read
-/// back), under the id the first mint journaled: the token is replaced,
-/// never doubled.
-async fn replayed(rig: FakeRig) -> WeftResult<()> {
+/// A body run again past the mint mints again (the value cannot be
+/// read back), under the same id, which derives from where in the
+/// firing the mint is made: the token is replaced, never doubled.
+async fn run_again(rig: FakeRig) -> WeftResult<()> {
     let input = json!({ "instance": "ada", "expiresInHours": 1 });
     rig.run(&MintInstanceTokenNode, input.clone()).await.ok()?;
     rig.run(&MintInstanceTokenNode, input).await.ok()?;
@@ -49,7 +49,6 @@ async fn never(rig: FakeRig) -> WeftResult<()> {
     let err = rig.run(&MintInstanceTokenNode, json!({ "instance": "ada", "expiresInHours": 0 })).await.failure()?;
     assert!(err.contains("between 1 second"), "{err}");
     assert!(rig.minted_tokens().is_empty());
-    assert!(rig.recorded_steps(&MintInstanceTokenNode).is_empty(), "a refused mint journals no id");
     Ok(())
 }
 

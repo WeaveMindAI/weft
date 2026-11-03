@@ -99,7 +99,8 @@ a source and a port where a value belongs is how you connect two nodes, and it
 is the only wiring syntax there is.
 
 While a run is going, each box glows: amber while it works, cyan while it waits
-for something, green when it finished, red when it failed. Click the magnifying
+for something, grey while it is paused only because its run paused, green when
+it finished, red when it failed. Click the magnifying
 glass on a box to see exactly what went in and what came out.
 ![A run in progress: working, waiting, finished and failed](../img/graph-status.png)
 

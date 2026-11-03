@@ -207,7 +207,7 @@ pub use reqwest;
 #[cfg(feature = "runtime")]
 pub use bus::{
     BusCursor, BusEntry, BusEntryKind, BusHandle, BusInner, BusLookupError, BusOptions,
-    BusRegistry, CursorError, RegisterError, SendError, WaitError,
+    BusRegistry, RegisterError, SendError,
 };
 #[cfg(feature = "runtime")]
 pub use liveness::{
@@ -219,7 +219,7 @@ pub use generator::{Generator, StreamEnd, TryNext};
 pub use cancellation::CancellationFlag;
 #[cfg(feature = "runtime")]
 pub use context::{
-    ContextHandle, EndpointHandle, EndpointMethod, RunContext, Phase, ValueBag,
+    ContextHandle, EndpointHandle, EndpointMethod, Kept, PausePoint, RunContext, Phase, ValueBag,
     StorageHandle,
 };
 pub use access::spec::{AccessSpec, AppRegistration};
@@ -254,7 +254,7 @@ pub use node_test::{
 #[cfg(feature = "runtime")]
 pub use primitive::RunSnapshot;
 pub use primitive::{
-    AwaitedEntry, AwaitedEntryKind, KickedNode, SignalAuth, SignalRouting, SignalSpec,
+    KickedNode, RecordedWait, SignalAuth, SignalRouting, SignalSpec,
     SignalSurface, SuspensionInfo,
 };
 pub use project::{

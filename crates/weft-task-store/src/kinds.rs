@@ -148,14 +148,14 @@ pub struct RegisterSignalPayload {
     pub frames: weft_core::frames::LoopFrames,
     pub spec: weft_core::primitive::SignalSpec,
     pub is_resume: bool,
-    /// 0-based ordinal of the `await_signal` call within this
-    /// (run, node_id, frames). Set by the worker, which stamps it on
-    /// the `SuspensionRegistered` it records, so replay can rebuild the
-    /// per-(node, frames) sequence in order. Must not vary across replays
-    /// of the same body, so the dedup key and the resume token include it.
-    /// Required: a missing field would silently default to 0 and collide
-    /// every await on the same frame stack.
-    pub call_index: u32,
+    /// The wait's number within its firing
+    /// (`weft_core::run::saved::Counters::waits`), 0 for an entry
+    /// registration. Set by the worker, which stamps it on the
+    /// `SuspensionRegistered` it records. A resumed body makes the same
+    /// wait under the same number, so the dedup key and the resume token
+    /// include it. Required: a missing field would silently default to 0
+    /// and collide every wait on the same frame stack.
+    pub wait_index: u32,
     /// The trigger's delivered port values at registration time (an
     /// entry registration only; `None` on resumes). Stored on the
     /// signal row and replayed onto the trigger's ports at every fire.

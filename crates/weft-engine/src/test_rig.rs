@@ -11,7 +11,7 @@
 //!   - each RUNNER is one run, so a test's spends attribute to it, however
 //!     many times its body fires the rig;
 //!   - the run has no program, so it never pauses: a wait the node makes
-//!     (`ctx.await_signal`) holds in its call, the way a wait of a run that
+//!     (`state.wait`) holds in its call, the way a wait of a run that
 //!     cannot pause does, kept by the same pieces a drive keeps it with
 //!     (`crate::outside_waits::keep_held`), its answer heard on the same
 //!     line a worker hears it on (`crate::line_watch`).
@@ -63,12 +63,12 @@ pub struct LiveTestRunner {
     /// Every handle a rig minted, so `settle` can release the
     /// runtime-owned connections their bodies opened.
     handles: Arc<Mutex<Vec<Arc<RunnerHandle>>>>,
-    /// The one numbering of the run's `await_signal` and `ctx.run`
-    /// calls, which every handle a rig mints counts on. Each `rig.run`
-    /// fires the node under the same run and node id, so a
-    /// numbering of its own would give its first wait the identity, and
-    /// the already-given answer, of an earlier run's first wait.
-    call_numbering: Arc<std::sync::atomic::AtomicU32>,
+    /// The one numbering of the run's waits and program calls, which
+    /// every handle a rig mints counts on. Each `rig.run` fires the node
+    /// under the same run and node id, so a numbering of its own would
+    /// give its first wait the identity, and the already-given answer, of
+    /// an earlier run's first wait.
+    counters: Arc<std::sync::Mutex<weft_core::run::saved::Counters>>,
     /// The package's catalog, so a node under test that publishes a
     /// connection is known by the service it publishes.
     catalog: &'static dyn weft_core::NodeCatalog,
@@ -218,7 +218,7 @@ impl LiveTestRunner {
             project_id,
             run_id,
             handles: Arc::new(Mutex::new(Vec::new())),
-            call_numbering: Default::default(),
+            counters: Default::default(),
             catalog,
             services,
             rigs: Mutex::new(Vec::new()),
@@ -240,7 +240,7 @@ impl LiveTestRunner {
         let tenant_id = self.tenant_id.clone();
         let project_id = self.project_id;
         let handles = self.handles.clone();
-        let call_numbering = self.call_numbering.clone();
+        let counters = self.counters.clone();
         let run_id = self.run_id;
         let catalog = self.catalog;
         let services = self.services.clone();
@@ -318,7 +318,7 @@ impl LiveTestRunner {
             })
         };
         self.rigs.lock().unwrap().push(RigKeeping { waits: waits.clone(), tasks: [watchdog, keeper] });
-        let factory: LiveHandleFactory = Arc::new(move |role, declared, has_generator_input| {
+        let factory: LiveHandleFactory = Arc::new(move |role, declared| {
             // The role decides the firing identity: the test code's
             // waits (a cursor it reads, a bus it seeds) must never be
             // attributed to the node under test, or the parked-body
@@ -358,14 +358,8 @@ impl LiveTestRunner {
                 // Likewise the wired outputs: the capturing wrapper
                 // answers them from the case (`LiveRig::wire_output`).
                 std::collections::HashSet::new(),
-                // From the node's manifest, so a stream consumer's
-                // `await_signal` is refused in a live test exactly as
-                // in a run (the rig DOES serve stream consumers:
-                // the input bag registers real feeds).
-                has_generator_input,
             );
-            let handle =
-                Arc::new(handle.with_settings(settings).without_program().with_call_numbering(call_numbering.clone()));
+            let handle = Arc::new(handle.with_settings(settings).without_program().with_counters(counters.clone()));
             handles.lock().unwrap().push(handle.clone());
             Ok(handle as Arc<dyn ContextHandle>)
         });
@@ -392,7 +386,7 @@ impl LiveTestRunner {
         // dispatcher's `run_ends`), a wait whose call was dropped included.
         for rig in self.rigs.lock().unwrap().drain(..) {
             rig.stop();
-            rig.waits.held().give_up("the node test ended before its wait was answered");
+            rig.waits.held().give_up("the node test ended before its wait was answered", false);
         }
         self.line_watch.abort();
         if let Some(capped) = &self.capped {
@@ -506,7 +500,7 @@ mod tests {
     impl Node for Waits {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let timer = weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 600_000 } };
-            let value = ctx.await_signal(timer).await?;
+            let value = crate::run_driver::engine_test_rig::wait_once(&ctx, timer).await?;
             ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
         }
     }

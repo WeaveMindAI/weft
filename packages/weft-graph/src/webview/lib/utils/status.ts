@@ -1,5 +1,6 @@
-// Node statuses (mirror Rust `weft_core::run::NodeFiringStatus`):
-// running, waiting_for_input, completed, skipped, failed, cancelled.
+// Firing statuses (mirror Rust `weft_core::program::NodeStatus`, less
+// `pending`): running, waiting, paused, completed, skipped, failed,
+// cancelled.
 // The TS union (`NodeFiringStatus` in protocol.ts) is the
 // single source of truth for the closed set; helpers here only need
 // to handle those values.
@@ -11,7 +12,8 @@ export function getStatusIcon(status: NodeFiringStatus): string {
 	switch (status) {
 		case 'completed': return '✓';
 		case 'running': return '●';
-		case 'waiting_for_input': return '◉';
+		case 'waiting': return '◉';
+		case 'paused': return '◌';
 		case 'failed': return '✕';
 		case 'cancelled': return '■';
 		case 'skipped': return '⊘';
@@ -19,14 +21,17 @@ export function getStatusIcon(status: NodeFiringStatus): string {
 }
 
 /// Override color for status badges so waiting reads "frozen /
-/// parked" (cyan), distinct from running (the node's own color) and
-/// from completed/failed which carry semantic glyph coloring
-/// elsewhere. Returns `undefined` for statuses that should keep the
-/// node's own color.
+/// parked" (cyan) and paused reads "held with its run" (slate),
+/// distinct from running (the node's own color) and from
+/// completed/failed which carry semantic glyph coloring elsewhere.
+/// Returns `undefined` for statuses that should keep the node's own
+/// color.
 export function getStatusBadgeColor(status: NodeFiringStatus): string | undefined {
 	switch (status) {
-		case 'waiting_for_input':
+		case 'waiting':
 			return '#06b6d4';
+		case 'paused':
+			return '#94a3b8';
 		case 'cancelled':
 			return '#71717a';
 		default:
@@ -85,7 +90,8 @@ export function displayStatus(status: NodeFiringStatus): string {
 		case 'running': return 'Running';
 		case 'failed': return 'Failed';
 		case 'cancelled': return 'Cancelled';
-		case 'waiting_for_input': return 'Waiting';
+		case 'waiting': return 'Waiting';
+		case 'paused': return 'Paused';
 		case 'skipped': return 'Skipped';
 	}
 }

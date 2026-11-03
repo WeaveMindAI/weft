@@ -237,10 +237,10 @@ it started (a small row that goes when its trigger's `keepRunsFor`
 ends), so a stop by that tag still reaches it while it runs.
 
 A run that cannot pause (an unrecorded one, or one whose caller is still on
-the line with `outlivesCaller` off) still waits on a timer or a form: the wait
-holds the worker and the call open, and the answer carries the run on. If
-nothing moves in the run for the route's `holdSecs` (60 by default, `0` to
-never wait), the waiting node fails saying it gave up, and the caller gets a 504 with the plain failure body and the run id (the reason stays on the run, for you).
+the line, whatever `outlivesCaller` says) still waits on a timer or a form: the wait
+holds the worker and the call open, and the answer carries the run on. While the caller stays on the line, the wait holds for as long as it stays. Once no caller is connected, if
+nothing moves in the run for the route's `holdSecs` (60 by default; `0` refuses
+every such wait at once, caller or not), the waiting node fails saying it gave up, and the caller gets a 504 with the plain failure body and the run id (the reason stays on the run, for you).
 
 A route also has two settings for what a streamed answer leaves on the run's record: `journalEphemeral` (on keeps only counts and sizes, never what was said; off by default) and `journalWindowMs` (messages sent within one window share one record row; 100 to 60000, 1000 by default; shorter shows them in the inspector sooner, longer writes fewer rows for a fast stream).
 

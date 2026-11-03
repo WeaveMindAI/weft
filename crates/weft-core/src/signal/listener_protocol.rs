@@ -116,7 +116,7 @@ pub struct PrepareSource {
     #[serde(default)]
     pub prior: Option<PriorRow>,
     /// When the registration was asked for, in ms since the epoch: the
-    /// moment a node called `await_signal`, or the activation. A relative
+    /// moment a node started its wait, or the activation. A relative
     /// wait counts from here, so the trip through the dispatcher to the
     /// listener is not added to it.
     pub asked_at_unix_ms: i64,

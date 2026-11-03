@@ -203,15 +203,17 @@
 	const glowClass = $derived(
 		displayedStatus === 'running'
 			? 'node-running-glow'
-			: displayedStatus === 'waiting_for_input'
+			: displayedStatus === 'waiting'
 				? 'node-waiting-glow'
-				: displayedStatus === 'failed'
-					? 'node-failed-glow'
-					: latestFiring?.inheritedFrom
-						? 'node-inherited-glow'
-						: displayedStatus === 'completed'
-							? 'node-completed-glow'
-							: '',
+				: displayedStatus === 'paused'
+					? 'node-paused-glow'
+					: displayedStatus === 'failed'
+						? 'node-failed-glow'
+						: latestFiring?.inheritedFrom
+							? 'node-inherited-glow'
+							: displayedStatus === 'completed'
+								? 'node-completed-glow'
+								: '',
 	);
 	// Per-bus IRC log this node took part in. Empty `[]` for nodes
 	// that never touched a bus.
@@ -2381,10 +2383,14 @@
 								|| 'Cancelled'}
 						</span>
 					</div>
-				{:else if displayedStatus === 'running' || displayedStatus === 'waiting_for_input'}
+				{:else if displayedStatus === 'running' || displayedStatus === 'waiting'}
 					<div class="debug-placeholder running">
 						<span class="debug-spinner"></span>
-						<span>{displayedStatus === 'waiting_for_input' ? 'Suspended' : 'Processing...'}</span>
+						<span>{displayedStatus === 'waiting' ? 'Suspended' : 'Processing...'}</span>
+					</div>
+				{:else if displayedStatus === 'paused'}
+					<div class="debug-placeholder waiting">
+						<span>Paused with its run</span>
 					</div>
 				{:else}
 					<div class="debug-placeholder waiting">
@@ -2411,10 +2417,10 @@
 						<span>✓</span>
 						<span>No file received</span>
 					</div>
-				{:else if displayedStatus === 'running' || displayedStatus === 'waiting_for_input'}
+				{:else if displayedStatus === 'running' || displayedStatus === 'waiting' || displayedStatus === 'paused'}
 					<div class="debug-placeholder running">
 						<span class="debug-spinner"></span>
-						<span>Processing...</span>
+						<span>{displayedStatus === 'paused' ? 'Paused with its run' : 'Processing...'}</span>
 					</div>
 				{:else}
 					<div class="debug-placeholder waiting">

@@ -308,9 +308,10 @@ runs (the `Weft-Instance-Token` header on a live route), answers its waits,
 shows its displays and connects its accounts. It always expires.
 `MintInstanceToken` mints one for any instance id at any time, not only when
 the instance is created, so a page can drive an instance started elsewhere
-(by a cron, by another route). weft keeps only a hash of it, so a replayed run
-cannot hand back the value it minted: it mints a new value for the same
-token, and the old value stops working. Its `token` comes out as a
+(by a cron, by another route). weft keeps only a hash of it, so a node that mints
+again after running from the top (its state did not record the mint) cannot
+get the value back: it mints a new value for the same token, and the old
+value stops working. Its `token` comes out as a
 `Secret[String]`, so the run's record holds only its marker: wired straight
 into a `Reply`'s `body` it goes to the browser revealed, and inside an object
 it does too once that object's type says which field is the secret
@@ -366,7 +367,7 @@ something they do not cover calls the ctx directly in a node of its own:
 | Call | What it does |
 |---|---|
 | `ctx.instance()` | Which instance this run is for (the `CurrentInstance` node fires `instance` or `nobody`) |
-| `ctx.infra("bridge").instance(id).start()` / `.request_start()` / `.stop(take_down, stop_self)` / `.terminate(take_down, stop_self)` / `.wipe(take_down, stop_self)` / `.upgrade(take_down, stop_self)` / `.status()` | One instance's container; `terminate` keeps the disks listed in `keepOnTerminate`, `wipe` deletes them too. `take_down` and `stop_self` are explained beside the same calls in the `weft-node-authoring` skill |
+| `ctx.infra("bridge").instance(id).start(&mut state)` / `.request_start(&mut state)` / `.stop(take_down, stop_self)` / `.terminate(take_down, stop_self)` / `.wipe(take_down, stop_self)` / `.upgrade(take_down, stop_self)` / `.status()` | One instance's container; `terminate` keeps the disks listed in `keepOnTerminate`, `wipe` deletes them too. `take_down` and `stop_self` are explained beside the same calls in the `weft-node-authoring` skill |
 | `ctx.infra("bridge").copies()` | Every copy of the node: the shared one and each instance's (the `ListInstanceInfra` node) |
 | `ctx.triggers().instance(id).activate(held)` / `.deactivate(take_down, stop_self)` | An instance's triggers (`.only([..])` narrows, `.all_instances()` takes every instance's); `held`, `take_down` and `stop_self` are explained beside the same calls in the `weft-node-authoring` skill |
 | `ctx.values().instance(id).get()` / `.set(node, field, value)` / `.clear(node, field)` / `.apply()` / `.forget()` | What was given for an instance's `@instance_filled` fields: read (the `GetInstanceValues` node), change in one go (the `SetInstanceValues` node; `apply()` returns the triggers it set up again), or forget all |
@@ -383,12 +384,13 @@ project's code and one run's calls (`ctx.code()`, `ctx.run_by_id(run)`), and
 the three things a program cannot do on its own project, go and read the
 `weft-node-authoring` skill.
 
-`start()` returns once the container is running, however long that takes
-(the run parks between looks and holds no worker), so you can activate the
+`start(&mut state)` returns once the container is running, however long
+that takes (the run parks between looks and holds no worker; the state is
+the node's `ctx.keep`, the `weft-node-authoring` skill's "Pausing"), so you can activate the
 instance's triggers right after it. If the container never comes up,
-`start()` fails with the reason, and so it does if somebody stops the
+`start` fails with the reason, and so it does if somebody stops the
 container while it waits (it never starts it again behind a pause).
-`request_start()` returns as soon as weft accepts the start, without waiting
+`request_start(&mut state)` returns as soon as weft accepts the start, without waiting
 for the container (`StartInfra` with `waitUntilRunning` off); a start
 refused for a passing reason, such as a build in progress, is asked again
 until it is accepted. Every

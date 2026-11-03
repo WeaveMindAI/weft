@@ -10,7 +10,7 @@ use weft::node::NodeOutput;
 use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::fal::{merge_params, run_queued};
+use super::fal::{image_url, merge_params, run_queued, Queued};
 
 #[derive(NodeManifest)]
 pub struct FalEditImageNode;
@@ -41,11 +41,11 @@ impl Node for FalEditImageNode {
         // a dead end: `params: { "image_urls": null }` takes it back off,
         // which is what a null extra means.
         let storage = ctx.storage(StorageScope::Run);
-        let image_url = storage.external_file(&image).await?.url;
+        let source = storage.external_file(&image).await?.url;
         let mut payload = json!({
             "prompt": prompt,
-            "image_url": image_url.clone(),
-            "image_urls": [image_url],
+            "image_url": source.clone(),
+            "image_urls": [source],
         });
         if let Some(mask) = &mask {
             payload["mask_url"] = json!(storage.external_file(mask).await?.url);
@@ -53,17 +53,11 @@ impl Node for FalEditImageNode {
         merge_params(&mut payload, params.as_ref());
 
         let http = ctx.client(&account).await?;
+        let mut job = ctx.keep(Queued::default()).await?;
         let answer =
-            run_queued(&ctx, &account, &http, &model, &payload, "fal: edit the image").await?;
+            run_queued(&mut job, &account, &http, &model, &payload, "fal: edit the image").await?;
 
-        // Edit models answer `images`; a single-image model answers
-        // `image`. Take whichever arrived.
-        let url: Option<&str> = answer["images"]
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|i| i["url"].as_str())
-            .or_else(|| answer["image"]["url"].as_str());
-        let url = url.node_err("fal answered no image for this edit")?;
+        let url = image_url(&answer).node_err("fal answered no image for this edit")?;
 
         let ty = ctx.output_type("image")?;
         let stored = ctx

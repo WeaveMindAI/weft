@@ -112,6 +112,13 @@ html, body, #app {
     0 4px 12px rgba(0, 0, 0, 0.05),
     0 0 0 2px rgba(6, 182, 212, 0.45) !important;
 }
+/* Paused with its run: no wait of its own, held until the run carries on. */
+.node-paused-glow {
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.08),
+    0 4px 12px rgba(0, 0, 0, 0.05),
+    0 0 0 2px rgba(148, 163, 184, 0.5) !important;
+}
 .node-completed-glow {
   box-shadow:
     0 1px 3px rgba(0, 0, 0, 0.08),

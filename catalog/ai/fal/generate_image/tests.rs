@@ -1,5 +1,6 @@
 //! FalGenerateImage self-tests: the queue dance (submit, the parked
-//! wait on the status, result) and the internalized image outputs.
+//! wait on the status, result), a resumed run picking up from its
+//! state, and the internalized image outputs.
 
 use serde_json::json;
 
@@ -119,9 +120,10 @@ fn fox(rig: &FakeRig) -> serde_json::Value {
     })
 }
 
-/// The body replays from the top when the wait resumes. The paid
-/// submit is journaled, so the second pass reads the request id back
-/// instead of queueing a second generation.
+/// A resumed body runs from its top with the state it saved: the
+/// request id from the paid submit and the status the wait ended on. The
+/// second pass sends no second submit and asks fal nothing about the
+/// status again; it only reads the result.
 async fn resumed(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/fal-ai/flux/dev", json!({ "request_id": "req-7" }));
     rig.signal(json!({ "status": "COMPLETED" }));
@@ -131,9 +133,15 @@ async fn resumed(rig: FakeRig) -> WeftResult<()> {
         json!({ "images": [{ "url": "data:image/png;base64,aWpn" }] }),
     );
     rig.run(&FalGenerateImageNode, fox(&rig)).await.ok()?;
+    assert_eq!(
+        rig.saved_state(&FalGenerateImageNode),
+        Some(json!({ "request_id": "req-7", "status": { "status": "COMPLETED" } })),
+        "the state says the request was submitted and left the queue"
+    );
     rig.run(&FalGenerateImageNode, fox(&rig)).await.ok()?;
     let submits = rig.requests().iter().filter(|r| r.method == "POST").count();
-    assert_eq!(submits, 1, "the replay reads the journaled submit back");
+    assert_eq!(submits, 1, "the resumed body reads the request id back from its state");
+    assert_eq!(rig.awaited_signals().len(), 1, "the answered wait is not made again");
     Ok(())
 }
 

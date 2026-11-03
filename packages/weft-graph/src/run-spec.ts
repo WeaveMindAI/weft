@@ -46,6 +46,9 @@ export interface RunSettings {
   /** How long, in seconds, a wait holds the run's worker while the run
    *  cannot pause, from the last time anything moved in it. */
   holdSecs?: number;
+  /** How long, in seconds, the run stays quiet on its worker before it
+   *  pauses; anything that arrives meanwhile carries it on there. */
+  pauseAfterSecs?: number;
 }
 
 /// An instance id: the grammar of one storage key segment.

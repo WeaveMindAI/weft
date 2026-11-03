@@ -2,7 +2,10 @@
 //! clean markdown. Submits the crawl job, then parks on the job without
 //! holding a worker until it reaches a terminal state (a crawl the user
 //! asked for takes as long as it takes, so there is no deadline here;
-//! cancelling the run cancels the wait and the crawl).
+//! cancelling the run cancels the wait and the crawl). The node's state
+//! holds the crawl's job id and, once the wait ended, how it ended, so
+//! the body run again after the wait starts no second crawl and comes
+//! straight back to the wait on the same job.
 //!
 //! A crawl's pages weigh far more than the 100 KB a wire carries, so
 //! they come out as one stored file, a JSON line per page, with the
@@ -16,11 +19,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use weft::access::client::get_json;
 use weft::node::NodeOutput;
-use weft::signal::{CancelCall, PollEndpoint, Predicate};
+use weft::signal::{CancelCall, CancelWith, PollEndpoint, Predicate};
 use weft::reqwest_middleware::ClientWithMiddleware;
 use weft::storage::{ByteStream, StorageScope};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
@@ -30,6 +34,14 @@ mod tests;
 
 #[derive(NodeManifest)]
 pub struct CrawlSiteNode;
+
+/// Where the crawl stands: the job Firecrawl started, then the status
+/// (and error) that ended the wait on it.
+#[derive(Default, Serialize, Deserialize)]
+struct Crawl {
+    job: Option<String>,
+    ended: Option<Value>,
+}
 
 #[async_trait]
 impl Node for CrawlSiteNode {
@@ -49,15 +61,16 @@ impl Node for CrawlSiteNode {
             "limit": limit as u64,
             "scrapeOptions": { "formats": ["markdown"] },
         });
-        // Starting the crawl is the paid call, and the body replays from
-        // the top when the wait resumes: journaled, the replay reads this
-        // job id back instead of starting a second crawl.
-        let started = ctx
-            .run("firecrawl_start_crawl", || async {
-                super::firecrawl::call(&http, "crawl", &body, "firecrawl: start the crawl").await
+        // Starting the crawl is the paid call, and the body runs again
+        // from its top when the wait resumes: the job id in the state
+        // stands for the crawl started, so no second one is.
+        let mut state = ctx.keep(Crawl::default()).await?;
+        let job = state
+            .once(|s| &mut s.job, async |_| {
+                let started = super::firecrawl::call(&http, "crawl", &body, "firecrawl: start the crawl").await?;
+                Ok(started["id"].as_str().node_err("firecrawl: crawl carries no id")?.to_string())
             })
             .await?;
-        let job = started["id"].as_str().node_err("firecrawl: crawl carries no id")?.to_string();
 
         // "scraping" is the one status Firecrawl documents for a crawl
         // still in flight; any other ends the wait, so a status this node
@@ -69,23 +82,19 @@ impl Node for CrawlSiteNode {
         // crawl too, with the DELETE Firecrawl documents for it
         // (https://docs.firecrawl.dev/api-reference/endpoint/crawl-delete).
         let status_url = format!("{}/crawl/{job}", super::firecrawl::API);
-        let answer = ctx
-            .await_signal_with_cancel(
-                PollEndpoint {
-                    url: status_url.clone(),
-                    interval_secs: 5,
-                    access: Some(weft::primitive::AccessRef::from(&access)),
-                    filters: vec![Predicate::neq("status", "scraping")],
-                    carry: vec!["status".into(), "error".into()],
-                    ..Default::default()
-                },
-                CancelCall::delete(status_url.clone()),
-            )
-            .await?;
+        let status = PollEndpoint {
+            url: status_url.clone(),
+            interval_secs: 5,
+            access: Some(weft::primitive::AccessRef::from(&access)),
+            filters: vec![Predicate::neq("status", "scraping")],
+            carry: vec!["status".into(), "error".into()],
+            ..Default::default()
+        };
+        let answer = state.wait(|s| &mut s.ended, status.cancel_with(CancelCall::delete(status_url.clone()))).await?;
         match answer["status"].as_str().unwrap_or_default() {
             "completed" => {}
-            state @ ("failed" | "cancelled") => weft::node_bail!(
-                "the crawl ended {state}: {}",
+            how @ ("failed" | "cancelled") => weft::node_bail!(
+                "the crawl ended {how}: {}",
                 answer["error"].as_str().unwrap_or("no detail")
             ),
             other => weft::node_bail!(

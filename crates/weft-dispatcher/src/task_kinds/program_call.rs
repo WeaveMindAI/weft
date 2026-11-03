@@ -12,9 +12,10 @@
 //! answer says so (`stops_asker`), so the worker waits for its own cancel
 //! instead of running on.
 //!
-//! A replayed run never issues a call twice: the worker journals each
-//! answer (`ctx.run`) and a replay reads it back. A call that did run but
-//! whose answer was lost is issued again, so every call is safe to repeat:
+//! A call issued again under the same number (its answer lost on the way
+//! back, or its body run again after a crash before its next save) is the
+//! same task under the same dedup key while that task lives, and once it
+//! ended it is issued again, so every call is safe to repeat:
 //! starting a running copy, taking down what is already down, activating
 //! what is active, forgetting what is gone all answer without doing
 //! anything. A run a call starts is named after the call

@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::projects::{DeclareRequest, QuiesceRequest, StatusRequest};
+use crate::projects::{QuiesceRequest, StatusRequest};
 
 /// One call on a project, each carrying what its command sends (`weft
 /// ps`, `weft status`, `weft cancel-build`, `weft rm`).
@@ -17,9 +17,15 @@ pub enum ProjectCall {
     List,
     /// The project, as the list has it.
     Get,
-    /// Make the project the request names, under the owner, with nothing
-    /// built yet; one of the owner's already there is left as it is.
-    Declare { request: DeclareRequest },
+    /// Make the project named `name`, under the owner, with nothing built
+    /// yet; one of the owner's already there under `id` is left as it is.
+    /// Unset, the project's id is the call's own
+    /// ([`crate::program::program_call_id`]): a call carried again under
+    /// the same number (its answer lost, or its body run again after a
+    /// crash before its next save) finds the project the first one made.
+    /// A body that makes the call again after a pause makes it under a new
+    /// number, so a declare that must happen once goes in `state.once`.
+    Declare { name: String, id: Option<uuid::Uuid> },
     /// Everything about the project now, drift against the hashes the
     /// request names.
     Status { request: StatusRequest },
@@ -39,7 +45,7 @@ pub enum ProjectCall {
 }
 
 impl ProjectCall {
-    pub const JOURNAL_NAMES: &'static [&'static str] = &[
+    pub const NAMES: &'static [&'static str] = &[
         "weft.projects.list",
         "weft.projects.get",
         "weft.projects.declare",
@@ -50,7 +56,7 @@ impl ProjectCall {
         "weft.projects.follow",
     ];
 
-    pub fn journal_name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             ProjectCall::List => "weft.projects.list",
             ProjectCall::Get => "weft.projects.get",
@@ -84,8 +90,10 @@ mod tests {
         assert_eq!(round_trip(ProjectCall::List)["call"], "list");
         assert_eq!(round_trip(ProjectCall::Get)["call"], "get");
         let id = uuid::Uuid::now_v7();
-        let declare = round_trip(ProjectCall::Declare { request: DeclareRequest { id, name: "helper".into() } });
-        assert_eq!((declare["call"].as_str(), declare["request"]["name"].as_str()), (Some("declare"), Some("helper")));
+        let declare = round_trip(ProjectCall::Declare { name: "helper".into(), id: Some(id) });
+        assert_eq!((declare["call"].as_str(), declare["name"].as_str()), (Some("declare"), Some("helper")));
+        let no_id = round_trip(ProjectCall::Declare { name: "helper".into(), id: None });
+        assert!(no_id["id"].is_null(), "unset, the call's own id is the project's: {no_id}");
         let status = round_trip(ProjectCall::Status { request: StatusRequest { desired_binary_hash: Some("b".into()), ..Default::default() } });
         assert_eq!((status["call"].as_str(), status["request"]["desiredBinaryHash"].as_str()), (Some("status"), Some("b")));
         assert_eq!(round_trip(ProjectCall::CancelBuild)["call"], "cancel_build");

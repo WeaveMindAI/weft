@@ -68,11 +68,14 @@ impl Node for SocketNode {
         let declared = ctx.output_type("inbound")?;
         let item = declared.as_generator().cloned().unwrap_or(declared);
         let data_type = ctx.caller_data_type().unwrap_or_default();
+        // A socket's session cannot be picked up from the middle: the node
+        // holds its run for the socket's whole life.
+        let mut holding = ctx.hold();
         let mut turn: u64 = 0;
         while let Some(message) = ws.recv_next().await? {
             turn += 1;
             match wire::take_message(&ctx, message, None, &format!("message-{turn}"), &item).await? {
-                Ok(value) => ctx.yield_downstream(NodeOutput::new().set("inbound", value)).await?,
+                Ok(value) => ctx.yield_downstream(NodeOutput::new().set("inbound", value), &mut holding).await?,
                 Err(why) => {
                     let refusal = match data_type {
                         DataType::Json => OutboundChunk::Json(serde_json::json!({ "error": why })),

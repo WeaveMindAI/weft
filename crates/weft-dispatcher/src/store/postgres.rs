@@ -914,7 +914,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // tied, which is what the last-one-wins rule compares (unix
         // seconds would tie two runs of the same user inside one
         // second). The (run, tag) uniqueness is what makes a body
-        // replayed after a durable wait land on the same row instead of moving
+        // run again after a pause or a crash land on the same row instead of moving
         // the run's place in the order. Rows go with the run.
         r#"CREATE TABLE IF NOT EXISTS run_tag (
             seq BIGSERIAL PRIMARY KEY,

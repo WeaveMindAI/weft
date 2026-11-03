@@ -11,6 +11,7 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::basic("a_wait_must_be_positive_and_representable", positive),
         NodeTest::fake("parks_on_a_timer_and_passes_the_value_through", parks_and_passes),
+        NodeTest::fake("a_resumed_body_takes_the_kept_wake_without_a_second_timer", resumed),
         NodeTest::fake("with_no_value_it_is_a_pure_delay", pure_delay),
     ]
 }
@@ -52,5 +53,20 @@ async fn pure_delay(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig.run(&WaitNode, json!({ "seconds": 0.2 })).await.ok()?;
     assert!(outcome.outputs.get("value").is_none(), "no value in, no value out");
     assert_eq!(outcome.outputs["wokeAt"], json!("2026-09-02T21:00:01Z"));
+    Ok(())
+}
+
+/// The body runs again from its top after the timer fired (a pause or a
+/// crash): the wake is in its state, so it emits again and sets no
+/// second timer.
+async fn resumed(rig: FakeRig) -> WeftResult<()> {
+    rig.signal(json!({ "scheduledTime": "2999-09-03T09:00:00Z", "actualTime": "2999-09-03T09:00:01Z" }));
+    let inputs = json!({ "seconds": 10, "value": { "id": 7 } });
+    rig.run(&WaitNode, inputs.clone()).await.ok()?;
+    assert_eq!(rig.saved_state(&WaitNode).expect("the wait saved the state")["wake"]["actualTime"], json!("2999-09-03T09:00:01Z"));
+    // No second answer queued: a second timer would fail the run.
+    let again = rig.run(&WaitNode, inputs).await.ok()?;
+    assert_eq!(again.outputs["wokeAt"], json!("2999-09-03T09:00:01Z"));
+    assert_eq!(rig.awaited_signals().len(), 1, "one timer across the two runs");
     Ok(())
 }

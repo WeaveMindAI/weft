@@ -419,12 +419,13 @@
     #[async_trait]
     impl Node for Reader {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
             let bus = ctx.bus_from_input("bus")?;
-            let mut cursor = bus.cursor_from_start();
+            let mut cursor = bus.cursor_from_start()?;
             let mut pieces = Vec::new();
-            while let Some(entry) = cursor.next().await {
-                if let weft_core::bus::BusEntryKind::Message { payload: Some(payload), .. } = entry.kind {
-                    pieces.push(payload.into_json().expect("a json bus"));
+            while let Some(entry) = cursor.next(&mut state).await? {
+                if let weft_core::bus::BusEntryKind::Message { .. } = entry.kind {
+                    pieces.push(entry.as_json().expect("a json message").1.clone());
                 }
             }
             *self.read.lock().unwrap() = Some((pieces, bus.end()));
@@ -544,8 +545,9 @@
     #[async_trait]
     impl Node for Puller {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
             let rows = ctx.inputs.get::<weft_core::Generator<i64>>("rows")?;
-            while rows.next().await?.is_some() {}
+            while rows.next(&mut state).await?.is_some() {}
             Ok(())
         }
     }

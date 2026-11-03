@@ -113,10 +113,10 @@ async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run_id: RunId) 
         });
     }
     // The places that waited here and were answered, each with its code's
-    // fingerprint: what a run that runs one again replays.
+    // fingerprint: what a run that runs one again takes the answers of.
     let mut answered = BTreeMap::new();
-    let waited: BTreeSet<Located> = snapshot.awaited_sequences.iter()
-        .filter(|(_, entries)| !weft_core::primitive::answered_steps(entries).is_empty())
+    let waited: BTreeSet<Located> = snapshot.recorded_waits.iter()
+        .filter(|(_, waits)| !weft_core::primitive::answered_waits(waits).is_empty())
         .map(|(at, _)| Located::at(&at.node_id, &at.frames))
         .collect();
     if !waited.is_empty() {

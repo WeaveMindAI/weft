@@ -7,7 +7,7 @@ use weft::node::NodeOutput;
 use weft::storage::FileHandle;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::flows::{generate, video_request, Media, References};
+use super::flows::{generate, video_request, Job, Media, References};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsGenerateVideoNode;
@@ -30,7 +30,8 @@ impl Node for ElevenLabsGenerateVideoNode {
 
         let http = ctx.client(&account).await?;
         let refs = References::new(&ctx, &http);
-        let video = generate(&ctx, &account, &http, &refs, Media::Video, || async {
+        let mut job = ctx.keep(Job::default()).await?;
+        let video = generate(&ctx, &mut job, &account, &http, &refs, Media::Video, || async {
             if let Some(start) = &start {
                 body["start_frame"] = refs.of(start).await?;
             }

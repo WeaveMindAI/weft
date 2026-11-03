@@ -321,7 +321,8 @@ enum Cmd {
         check: bool,
         /// Clear a saved setting before applying explicit flags: from,
         /// emit, target, before, group, feed, fire, instance, keeping
-        /// (what `--durable` or `--fast` saved), keep_for or hold_secs.
+        /// (what `--durable` or `--fast` saved), keep_for, hold_secs or
+        /// pause_after_secs.
         /// Repeatable.
         #[arg(long, value_name = "field")]
         clear: Vec<String>,
@@ -344,12 +345,20 @@ enum Cmd {
         #[arg(long, value_name = "duration")]
         keep_for: Option<weft_core::run_settings::KeepFor>,
         /// How long, in seconds, a wait holds the run's worker while the
-        /// run cannot pause (a bus between its nodes is open), counted from
-        /// the last time anything moved in the run; then the waiting call
-        /// fails. 0 fails such a wait at once; at most 30 days. Unset, the
-        /// fired trigger's `holdSecs`, else 60.
+        /// run cannot pause, counted from the last time anything moved in
+        /// the run; then the waiting call fails. With its caller on the
+        /// line (a `--fire` of a route) the wait holds for as long as the
+        /// caller stays instead. 0 fails such a wait at once; at most 30
+        /// days. Unset, the fired trigger's `holdSecs`, else 60.
         #[arg(long, value_name = "seconds")]
         hold_secs: Option<u32>,
+        /// How long, in seconds, the run stays on its worker before it
+        /// pauses, once every node it runs waits and its next move comes
+        /// from outside; an answer that arrives meanwhile goes straight
+        /// into the waiting node. 0 pauses at once; at most an hour.
+        /// Unset, the fired trigger's `pauseAfterSecs`, else 10.
+        #[arg(long, value_name = "seconds")]
+        pause_after_secs: Option<u32>,
     },
     /// Record this folder's files as a version under its head, with no
     /// run and no build: a point to branch back to.
@@ -2133,7 +2142,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
             .await
         }
         Cmd::NodeTestHash { target } => commands::test_node::hash(ctx, target),
-        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, instance, save, check, clear, durable, fast, keep_for, hold_secs } => {
+        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, instance, save, check, clear, durable, fast, keep_for, hold_secs, pause_after_secs } => {
             return commands::run::run(
                 ctx,
                 commands::run::RunArgs {
@@ -2144,7 +2153,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
                     seed_until,
                     seed_before,
                     root,
-                    flags: weft_core::run_flags::RunFlags { from, target, before, group, feed, fire, emit, instance, clear, durable, fast, keep_for, hold_secs },
+                    flags: weft_core::run_flags::RunFlags { from, target, before, group, feed, fire, emit, instance, clear, durable, fast, keep_for, hold_secs, pause_after_secs },
                     save,
                     check,
                 },

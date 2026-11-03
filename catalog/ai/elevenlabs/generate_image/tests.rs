@@ -191,7 +191,9 @@ async fn resumed(rig: FakeRig) -> WeftResult<()> {
     rig.run(&ElevenLabsGenerateImageNode, inputs(&rig, json!({}))).await.ok()?;
     rig.run(&ElevenLabsGenerateImageNode, inputs(&rig, json!({}))).await.ok()?;
     let creates = rig.requests().iter().filter(|r| r.method == "POST" && r.path == "/v1/flows/image").count();
-    assert_eq!(creates, 1, "the replay reads the journaled create back instead of paying twice");
+    assert_eq!(creates, 1, "the resumed body finds the job in its state instead of paying twice");
+    assert_eq!(rig.awaited_signals().len(), 1, "and the wait it already got an answer to is not made again");
+    assert_eq!(rig.saved_state(&ElevenLabsGenerateImageNode).expect("a saved state")["submitted"]["id"], json!("g5"));
     Ok(())
 }
 

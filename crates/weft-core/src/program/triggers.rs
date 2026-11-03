@@ -31,7 +31,7 @@ pub enum TriggerCall {
 }
 
 impl TriggerCall {
-    pub const JOURNAL_NAMES: &'static [&'static str] = &[
+    pub const NAMES: &'static [&'static str] = &[
         "weft.triggers.activate",
         "weft.triggers.deactivate",
         "weft.triggers.cancel_activate",
@@ -40,7 +40,7 @@ impl TriggerCall {
         "weft.triggers.resume_resync",
     ];
 
-    pub fn journal_name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             TriggerCall::Activate { .. } => "weft.triggers.activate",
             TriggerCall::Deactivate { .. } => "weft.triggers.deactivate",

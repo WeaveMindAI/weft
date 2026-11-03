@@ -32,6 +32,11 @@
 //! segment once, final. Left out on purpose: `keepalive_interval_ms`,
 //! which exists for a client or proxy that closes a quiet connection,
 //! and the runtime's socket closes none.
+//!
+//! The node holds its run while it transcribes (`ctx.hold()`): a session
+//! with ElevenLabs cannot be picked up from the middle, so the run does
+//! not pause while it waits on the audio bus, even when every other node
+//! waits.
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -486,6 +491,7 @@ impl Node for ElevenLabsTranscribeNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+        let mut holding = ctx.hold();
         let account: Access = ctx.inputs.get("account")?;
         let session = Session::read(&ctx)?;
         if let Some(refusal) = session.refusal() {
@@ -496,7 +502,7 @@ impl Node for ElevenLabsTranscribeNode {
         // Read from the earliest frame still buffered: the producer may
         // have started before this node attached (its ephemeral window
         // is the allowed head start).
-        let mut frames = audio.cursor_from_start();
+        let mut frames = audio.cursor_from_start()?;
 
         let conn = ctx.open(&account).await?;
         let url = format!("{WS_API}/speech-to-text/realtime?{}", session.query(&format));
@@ -517,7 +523,7 @@ impl Node for ElevenLabsTranscribeNode {
         // up by the drain below, never abandoned.
         loop {
             tokio::select! {
-                next = frames.next_bytes("audio") => match next.node_err("reading the audio stream")? {
+                next = frames.next_bytes("audio", &mut holding) => match next? {
                     Some((_, audio)) => {
                         let chunk = audio_chunk(&audio, rate, previous_text.take().as_deref(), false);
                         socket.send(SocketMessage::text(chunk)).await?;

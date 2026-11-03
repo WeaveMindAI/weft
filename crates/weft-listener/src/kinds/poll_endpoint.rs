@@ -8,7 +8,7 @@
 //! polls start failing, fail long enough to say so loudly, or work again.
 //!
 //! As an entry trigger every fire starts a fresh run. As a parked
-//! run's wait (`await_signal`, a node waiting for an outside job to
+//! run's wait (`state.wait`, a node waiting for an outside job to
 //! finish) the first poll runs at once, so a job already done resumes
 //! the run without waiting an interval, and the first answer that passes
 //! the signal's filter resumes it; after that the signal polls no more.

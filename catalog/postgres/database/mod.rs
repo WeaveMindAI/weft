@@ -35,8 +35,9 @@
 //! (`weft_core::infra::VALUES_URL_ENV`), which writes it into the
 //! connection this node published: no run of this node is involved.
 //!
-//! Nothing here is memoized with `ctx.run`, and it does not need to
-//! be: the body never waits, so it is never replayed, and every call
+//! Nothing here is kept in a saved state (`state.once`), and it does not
+//! need to be: the body never waits, so it never runs again after a
+//! pause, and every call
 //! it makes is safe to repeat when somebody runs the node again. Reading the password is a
 //! read; publishing REPLACES one row keyed by this node; retiring is
 //! the same request with the same password, which the credential

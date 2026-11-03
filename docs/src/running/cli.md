@@ -114,16 +114,17 @@ Flags on `weft run`:
 | `--group <group>=<json>` | Run one group, or one included file, on its own, with the values you hand it, a group inside a loop's body too. A port a node inside needs that you do not hand is refused before the run starts |
 | `--feed <start>` | Also run what feeds this start: for each input you did not hand a value, the node that feeds it (through any groups and included files on the way) and nothing above it. Names a `--from` or `--group` start. Repeatable |
 | `--fire <trigger>=<json>` | Fire exactly one trigger with this event, using its bake. One per run |
-| `--seed[=<run>]` | Reuse, from head's run or the run you name, everything whose slice of the program did not change (any finished run of the project, one a trigger started or one that failed included). A node that runs again and waited for an answer there gets that answer replayed, if its code did not change |
+| `--seed[=<run>]` | Reuse, from head's run or the run you name, everything whose slice of the program did not change (any finished run of the project, one a trigger started or one that failed included). A node that runs again and waited for answers there gets those answers back, matched to its waits in order, if its code did not change |
 | `--seed-until <node>` / `--seed-before <node>` | Where reuse stops. Both need `--seed` |
 | `--root` | Start a new version tree, parented on nothing. Refused beside `--seed`, since a new tree has nothing before it to reuse |
 | `--check` | Only check that the run could start, building and running nothing: it prints `the run can start` and the infra the run reads, and exits 0, or prints the refusal and exits 1. With `--json`, the infra is the `infraRead` list, and with several targets `targets` says what stops each one if it ran alone |
 | `--save <name>` | Write these settings to `examples/<name>.json` before running |
-| `--clear <field>` | Clear a saved setting before applying flags: `from`, `emit`, `target`, `before`, `group`, `feed`, `fire`, `instance`, `keeping` (what `--durable` or `--fast` saved), `keep_for`, `hold_secs` |
+| `--clear <field>` | Clear a saved setting before applying flags: `from`, `emit`, `target`, `before`, `group`, `feed`, `fire`, `instance`, `keeping` (what `--durable` or `--fast` saved), `keep_for`, `hold_secs`, `pause_after_secs` |
 | `--durable` | If the run has to carry on after its worker dies: another worker picks it up where it stopped, and a node caught halfway is failed rather than run twice. For what that costs in speed, go and read [when a run waits for its writes](the-journal.md#when-a-run-waits-for-its-writes) |
 | `--fast` | If the run fires a durable trigger and you want it fast anyway: it lives in its worker's memory and ends if that worker dies |
 | `--keep-for <duration>` | If you want this run kept longer or shorter after it ends than its trigger or project says: `30m`, `12h`, `7d`, or `forever`. For the project and trigger settings, go and read [how long a run is kept](the-journal.md#how-long-a-run-is-kept) |
-| `--hold-secs <seconds>` | If a wait in this run should hold longer or shorter than its trigger's `holdSecs` while the run cannot pause (a bus between its nodes is open): `0` fails such a wait at once, at most 30 days. For when a run cannot pause, go and read [triggers and routes](../language/triggers-and-routes.md#when-a-run-cannot-pause) |
+| `--hold-secs <seconds>` | If a wait in this run should hold longer or shorter than its trigger's `holdSecs` while the run cannot pause: `0` fails such a wait at once, at most 30 days. For when a run cannot pause, go and read [triggers and routes](../language/triggers-and-routes.md#when-a-run-cannot-pause) |
+| `--pause-after-secs <seconds>` | If this run should stay on its worker longer or shorter than its trigger's `pauseAfterSecs` before it pauses: `0` pauses at once, at most an hour. For when a run pauses, go and read [triggers and routes](../language/triggers-and-routes.md#when-a-run-pauses) |
 | `--instance <id>` | Run for this instance of the program. Needed when the run reaches a node that exists once per instance (see [programs with instances](instances.md)) |
 
 The cut flags (`--target`, `--before`, `--from`, `--emit`, `--group`,
@@ -135,8 +136,9 @@ details, go and read [running part of a loop's
 body](../language/loops.md#running-part-of-its-body).
 
 A run that fires a trigger (`--fire`) follows the trigger's `durable`,
-`keepRunsFor` and `holdSecs`, and `--durable`, `--fast`, `--keep-for` and
-`--hold-secs` override them for that run; a run
+`keepRunsFor`, `holdSecs` and `pauseAfterSecs`, and `--durable`, `--fast`,
+`--keep-for`, `--hold-secs` and `--pause-after-secs` override them for that
+run; a run
 that fires nothing is fast unless a flag says otherwise. A run you start by
 hand is always recorded, even when its trigger has `recorded` off, so you can
 always find it in `weft runs`. For what each of these does when you set it on a

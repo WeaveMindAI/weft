@@ -155,7 +155,7 @@ async fn match_signals(
 ) -> anyhow::Result<Vec<MatchedSignal>> {
     // Entry AND resume signals both feed from pushes: a trigger fires
     // a fresh run, an awaited signal (a node parked on
-    // `await_signal(ProviderEvents...)`, e.g. a Slack button wait)
+    // a wait on `ProviderEvents`, e.g. a Slack button wait)
     // resumes its run. The lifecycle gate downstream already
     // routes each by its row's own is_resume; a resume signal always
     // carries a predicate pinning it to its minted correlation id

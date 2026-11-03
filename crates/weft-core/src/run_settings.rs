@@ -25,11 +25,17 @@
 //!   says (a trigger's `keepRunsFor`, `weft run --keep-for`), else its
 //!   project's `[runs] keep_for`, else a week.
 //! - **How long it holds when it cannot pause** ([`RunSettings::hold_secs`]):
-//!   a run that cannot pause (its caller is on the line and its route does
-//!   not outlive it, it is unrecorded, or a bus between its nodes is open)
-//!   keeps its worker while its waits are the only thing left, for at most
-//!   this many seconds of nothing moving; then the waiting `ctx` call
-//!   fails.
+//!   a run that cannot pause keeps its worker while its waits are the only
+//!   thing left. With its caller on the line it holds for as long as the
+//!   caller stays; an unrecorded run with no caller holds for at most this
+//!   many seconds of nothing moving, then the waiting `ctx` call fails.
+//!   `0` refuses every such wait at once, caller or not.
+//! - **How long it stays before it pauses**
+//!   ([`RunSettings::pause_after_secs`]): a run that can pause, every node
+//!   it runs waiting and the next move coming from outside, stays on its
+//!   worker this many seconds, quiet, its waits held in their calls, before
+//!   it pauses them all together; an answer within them goes straight into
+//!   the waiting call. `0` pauses at once.
 
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +93,23 @@ fn default_hold() -> u32 {
     DEFAULT_HOLD_SECS
 }
 
+/// How long a run that can pause stays on its worker, quiet, before it
+/// pauses, unless what started it says otherwise.
+pub const DEFAULT_PAUSE_AFTER_SECS: u32 = 10;
+
+/// The longest a run may stay quiet before it pauses: an hour, the most one
+/// stretch of a run lasts on a cloud install, and the stay is never
+/// unbounded, so a worker nobody uses still stops.
+pub const MAX_PAUSE_AFTER_SECS: u32 = 3600;
+
+fn is_default_pause_after(secs: &u32) -> bool {
+    *secs == DEFAULT_PAUSE_AFTER_SECS
+}
+
+fn default_pause_after() -> u32 {
+    DEFAULT_PAUSE_AFTER_SECS
+}
+
 /// How a run is kept: the one value every way of starting a run states.
 /// Built only through [`RunSettings::new`] (or the defaults), which
 /// refuses a durable run that is not recorded; reading one off the wire
@@ -103,6 +126,9 @@ pub struct RunSettings {
     /// How long, in seconds, the run holds its worker when it cannot pause
     /// and its waits are all that is left ([`RunSettings::hold_secs`]).
     hold_secs: u32,
+    /// How long, in seconds, the run stays on its worker, quiet, before it
+    /// pauses ([`RunSettings::pause_after_secs`]).
+    pause_after_secs: u32,
 }
 
 /// [`RunSettings`] as it is written: each default left out.
@@ -117,24 +143,38 @@ struct SettingsWire {
     keep_for: Option<KeepFor>,
     #[serde(default = "default_hold", skip_serializing_if = "is_default_hold")]
     hold_secs: u32,
+    #[serde(default = "default_pause_after", skip_serializing_if = "is_default_pause_after")]
+    pause_after_secs: u32,
 }
 
 impl TryFrom<SettingsWire> for RunSettings {
     type Error = String;
     fn try_from(wire: SettingsWire) -> Result<Self, String> {
-        Self::new(wire.keeping, wire.recorded)?.keeping_for(wire.keep_for).holding_for(wire.hold_secs)
+        Self::new(wire.keeping, wire.recorded)?.keeping_for(wire.keep_for).holding_for(wire.hold_secs)?.pausing_after(wire.pause_after_secs)
     }
 }
 
 impl From<RunSettings> for SettingsWire {
     fn from(settings: RunSettings) -> Self {
-        Self { keeping: settings.keeping, recorded: settings.recorded, keep_for: settings.keep_for, hold_secs: settings.hold_secs }
+        Self {
+            keeping: settings.keeping,
+            recorded: settings.recorded,
+            keep_for: settings.keep_for,
+            hold_secs: settings.hold_secs,
+            pause_after_secs: settings.pause_after_secs,
+        }
     }
 }
 
 impl Default for RunSettings {
     fn default() -> Self {
-        Self { keeping: Keeping::default(), recorded: true, keep_for: None, hold_secs: DEFAULT_HOLD_SECS }
+        Self {
+            keeping: Keeping::default(),
+            recorded: true,
+            keep_for: None,
+            hold_secs: DEFAULT_HOLD_SECS,
+            pause_after_secs: DEFAULT_PAUSE_AFTER_SECS,
+        }
     }
 }
 
@@ -229,6 +269,10 @@ pub struct SettingsChoice {
     /// --hold-secs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_secs: Option<u32>,
+    /// How long the run stays quiet before it pauses (`weft run
+    /// --pause-after-secs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_after_secs: Option<u32>,
 }
 
 impl SettingsChoice {
@@ -238,10 +282,12 @@ impl SettingsChoice {
 
     /// The settings of a run whose trigger keeps its runs as `base`, with
     /// what this choice names put over it, recorded (see the type).
-    /// Refused when the hold it names is longer than [`MAX_HOLD_SECS`].
+    /// Refused when the hold it names is longer than [`MAX_HOLD_SECS`], or
+    /// the stay before a pause longer than [`MAX_PAUSE_AFTER_SECS`].
     pub fn over(self, base: RunSettings) -> Result<RunSettings, String> {
-        RunSettings { keeping: self.keeping.unwrap_or(base.keeping), recorded: true, keep_for: self.keep_for.or(base.keep_for), hold_secs: base.hold_secs }
-            .holding_for(self.hold_secs.unwrap_or(base.hold_secs))
+        RunSettings { keeping: self.keeping.unwrap_or(base.keeping), recorded: true, keep_for: self.keep_for.or(base.keep_for), ..base }
+            .holding_for(self.hold_secs.unwrap_or(base.hold_secs))?
+            .pausing_after(self.pause_after_secs.unwrap_or(base.pause_after_secs))
     }
 }
 
@@ -257,6 +303,9 @@ pub const KEEP_FOR_FIELD: &str = "keepRunsFor";
 pub const OUTLIVES_CALLER_FIELD: &str = "outlivesCaller";
 /// How long the trigger's runs hold their worker when they cannot pause.
 pub const HOLD_SECS_FIELD: &str = "holdSecs";
+/// How long the trigger's runs stay on their worker, quiet, before they
+/// pause.
+pub const PAUSE_AFTER_SECS_FIELD: &str = "pauseAfterSecs";
 
 /// A trigger's switch (`durable`, `recorded`, `outlivesCaller`) off its
 /// inputs: absent or null is `default`, a boolean is itself, anything else
@@ -266,6 +315,20 @@ pub fn read_switch(fields: &serde_json::Map<String, serde_json::Value>, field: &
         None | Some(serde_json::Value::Null) => Ok(default),
         Some(serde_json::Value::Bool(b)) => Ok(*b),
         Some(other) => Err(format!("{field} is on or off (true or false), got {other}")),
+    }
+}
+
+/// A trigger's number of seconds (`holdSecs`, `pauseAfterSecs`) off its
+/// inputs: absent or null is `default`, a whole number that fits is itself,
+/// anything else is refused.
+fn read_seconds(fields: &serde_json::Map<String, serde_json::Value>, field: &str, default: u32) -> Result<u32, String> {
+    match fields.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| format!("{field} is a whole number of seconds, got {n}")),
+        Some(other) => Err(format!("{field} is a whole number of seconds, got {other}")),
     }
 }
 
@@ -294,14 +357,14 @@ impl RunSettings {
                  back on, or `{DURABLE_FIELD}` off"
             ));
         }
-        Ok(Self { keeping, recorded, keep_for: None, hold_secs: DEFAULT_HOLD_SECS })
+        Ok(Self { keeping, recorded, ..Self::default() })
     }
 
     /// The settings of the runtime's own bookkeeping runs (a trigger's
     /// setup, an infra's setup): durable, recorded, kept as long as the
     /// project says.
     pub fn bookkeeping() -> Self {
-        Self { keeping: Keeping::Durable, recorded: true, keep_for: None, hold_secs: DEFAULT_HOLD_SECS }
+        Self { keeping: Keeping::Durable, ..Self::default() }
     }
 
     /// These settings, kept for `keep_for` once the run ended (`None`: as
@@ -322,15 +385,43 @@ impl RunSettings {
         Ok(Self { hold_secs: secs, ..self })
     }
 
-    /// How long, in seconds, the run holds its worker when it cannot pause
-    /// (its caller is on the line and its route does not outlive it, it is
-    /// unrecorded, or a bus between its nodes is open) and its waits are
-    /// all that is left: the clock runs only while nothing moves (no node
-    /// working, nothing said on a bus) and starts again when something
-    /// does. When it runs out, every `ctx.await_signal` still waiting fails
-    /// at the call. `0` fails such a wait at once.
+    /// These settings, staying `secs` quiet on the worker before the run
+    /// pauses; refused past [`MAX_PAUSE_AFTER_SECS`].
+    pub fn pausing_after(self, secs: u32) -> Result<Self, String> {
+        if secs > MAX_PAUSE_AFTER_SECS {
+            return Err(format!(
+                "`{PAUSE_AFTER_SECS_FIELD}` is at most {MAX_PAUSE_AFTER_SECS} seconds (an hour): a run staying \
+                 before it pauses keeps a whole worker up, so the stay is never unbounded; got {secs}"
+            ));
+        }
+        Ok(Self { pause_after_secs: secs, ..self })
+    }
+
+    /// How long, in seconds, a run that cannot pause (its caller on the
+    /// line, or unrecorded) holds its worker when its waits are all that
+    /// is left. While its caller is on the line it holds for as long as
+    /// the caller stays; otherwise the clock runs only while nothing moves
+    /// (no node working, nothing said on a bus), and starts again when
+    /// something does. When it runs out, every `state.wait` still waiting
+    /// fails at the call. `0` fails such a wait at once, its caller on the
+    /// line or not.
     pub fn hold_secs(&self) -> u32 {
         self.hold_secs
+    }
+
+    /// How long, in seconds, a run that can pause stays on its worker,
+    /// quiet, before it pauses: every node it runs waits, and what moves it
+    /// next comes from outside (an answer to a wait). Each wait holds in its
+    /// node's call meanwhile, so an answer within that time goes straight
+    /// into it, with no pause and no restart of the body; anything that
+    /// moves the run starts the count over the next time it goes quiet.
+    /// When it runs out, every waiting call pauses together, the only way
+    /// a run pauses. `0` pauses at once. A hand-back (its worker stopping,
+    /// or its caller leaving where a worker must follow the call) pauses it
+    /// at once whatever this says, and so does the run's cap on its worker
+    /// coming before the end of the stay.
+    pub fn pause_after_secs(&self) -> u32 {
+        self.pause_after_secs
     }
 
     /// How long the run is kept once it ends: what its start said, else
@@ -368,15 +459,9 @@ impl RunSettings {
             }
             Some(other) => return Err(refused(KEEP_FOR_FIELD)(format!("{KEEP_FOR_FIELD} is how long to keep a run (`7d`, `forever`), got {other}"))),
         };
-        let hold_secs = match fields.get(HOLD_SECS_FIELD) {
-            None | Some(serde_json::Value::Null) => DEFAULT_HOLD_SECS,
-            Some(serde_json::Value::Number(n)) => n
-                .as_u64()
-                .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| format!("{HOLD_SECS_FIELD} is a whole number of seconds, got {n}"))
-                .map_err(refused(HOLD_SECS_FIELD))?,
-            Some(other) => return Err(refused(HOLD_SECS_FIELD)(format!("{HOLD_SECS_FIELD} is a whole number of seconds, got {other}"))),
-        };
+        let seconds = |field: &'static str, default: u32| read_seconds(fields, field, default).map_err(refused(field));
+        let hold_secs = seconds(HOLD_SECS_FIELD, DEFAULT_HOLD_SECS)?;
+        let pause_after_secs = seconds(PAUSE_AFTER_SECS_FIELD, DEFAULT_PAUSE_AFTER_SECS)?;
         // A combination refused is about `recorded`: turning it back on is
         // the one change that settles either.
         Self::new(keeping, switch(RECORDED_FIELD, true)?)
@@ -385,7 +470,9 @@ impl RunSettings {
             .map_err(refused(RECORDED_FIELD))?
             .keeping_for(keep_for)
             .holding_for(hold_secs)
-            .map_err(refused(HOLD_SECS_FIELD))
+            .map_err(refused(HOLD_SECS_FIELD))?
+            .pausing_after(pause_after_secs)
+            .map_err(refused(PAUSE_AFTER_SECS_FIELD))
     }
 
     /// These settings for a run that may go on after its caller left
@@ -443,8 +530,8 @@ impl RunSettings {
                  node, and why); one that reported a cost or asked weft for something its worker does not already hold \
                  (a stored file, a new connection or infrastructure address, a task such as starting or \
                  stopping its infra, a stop through `ctx.stop_tagged`) is listed with its costs and how it ended; any other leaves only a count in `weft status`. \
-                 A run started by hand is always recorded. An unrecorded run cannot wait (timer, form), \
-                 cannot tag itself, and cannot be durable.",
+                 A run started by hand is always recorded. An unrecorded run cannot pause, so a wait \
+                 (timer, form) holds its worker (see `holdSecs`); it cannot tag itself, and cannot be durable.",
             ),
             serde_json::from_value(serde_json::json!({
                 "name": KEEP_FOR_FIELD,
@@ -463,21 +550,38 @@ impl RunSettings {
                 "widget": { "kind": "number", "min": 0, "max": MAX_HOLD_SECS, "step": 1 },
                 "label": "Hold seconds when a run cannot pause",
                 "description": "How long, in seconds, a wait (a form, a timer) holds the run's worker when \
-                 the run cannot pause: its caller is on the line and it does not outlive it, it is not \
-                 recorded, or a bus between its nodes is open. The clock runs only while nothing moves in \
-                 the run (no node working, nothing said on a bus), and starts over when something does. \
-                 When it runs out, the waiting node fails, saying it gave up, and the node may handle that \
-                 itself. `0` fails such a wait at once; at most 30 days.",
+                 the run cannot pause: its caller is on the line, or it is not recorded. While its caller \
+                 is on the line the wait holds for as long as the caller stays; otherwise the clock runs \
+                 only while nothing moves in the run (no node working, nothing said on a bus), and starts \
+                 over when something does. When it runs out, the waiting node fails, saying it gave up, \
+                 and the node may handle that itself. `0` fails such a wait at once, its caller on the \
+                 line or not; at most 30 days.",
             }))
             .expect("the hold input is a valid InputSpec"),
+            serde_json::from_value(serde_json::json!({
+                "name": PAUSE_AFTER_SECS_FIELD,
+                "type": "Number",
+                "default": DEFAULT_PAUSE_AFTER_SECS,
+                "widget": { "kind": "number", "min": 0, "max": MAX_PAUSE_AFTER_SECS, "step": 1 },
+                "label": "Seconds before a run pauses",
+                "description": "How long, in seconds, a run stays on its worker before it pauses, once every \
+                 node it runs is waiting (on a form, a timer, a message, a bus) and what moves it next has to \
+                 come from outside. Meanwhile each wait stays open in its node, and an answer that arrives \
+                 goes straight into it: the run carries on right there instead of pausing and being picked up \
+                 again, which is what a run fed by frequent messages wants. When the time runs out, everything \
+                 pauses together. `0` pauses at once; at most an hour. A worker that is stopping pauses the run \
+                 at once, and a run that cannot pause holds instead (see `holdSecs`).",
+            }))
+            .expect("the pause-after input is a valid InputSpec"),
         ];
         if holds_caller {
             inputs.push(boolean(
                 OUTLIVES_CALLER_FIELD,
                 false,
                 "May outlive the caller",
-                "Off (default): the caller leaving cancels the run, and a wait holds the worker for \
-                 `holdSecs` instead of pausing. On: the run can answer early and keep working after the caller has gone, so \
+                "While the caller is on the line, the run stays on its worker and a wait holds there. \
+                 Off (default): the caller leaving cancels the run. On: the run can answer early and keep \
+                 working after the caller has gone (and pause on a wait once it has), so \
                  whatever runs after the answer must end by itself; anything that watches or loops needs \
                  `maxSessionSecs` or a TagRun/StopTagged pair. It needs `recorded` on, because on a cloud \
                  install the run carries on from its record once the caller leaves.",
@@ -541,6 +645,35 @@ mod tests {
         assert_eq!(serde_json::from_value::<RunSettings>(wire).unwrap(), held);
     }
 
+    /// A trigger says how long its runs stay quiet before they pause, the
+    /// way it says how long they hold: a whole number of seconds, `0` to
+    /// pause at once, never more than the cap; one started by hand can say
+    /// otherwise; the default leaves nothing on the wire.
+    #[test]
+    fn a_trigger_says_how_long_its_runs_stay_before_they_pause() {
+        assert_eq!(RunSettings::default().pause_after_secs(), DEFAULT_PAUSE_AFTER_SECS);
+        assert_eq!(RunSettings::bookkeeping().pause_after_secs(), DEFAULT_PAUSE_AFTER_SECS);
+        let at_once = RunSettings::from_node_fields(&fields(serde_json::json!({ "pauseAfterSecs": 0 }))).unwrap();
+        assert_eq!((at_once.pause_after_secs(), at_once.hold_secs()), (0, DEFAULT_HOLD_SECS));
+        assert!(RunSettings::from_node_fields(&fields(serde_json::json!({ "pauseAfterSecs": MAX_PAUSE_AFTER_SECS + 1 }))).is_err());
+        let refused = RunSettings::from_node_fields(&fields(serde_json::json!({ "pauseAfterSecs": "soon" }))).unwrap_err();
+        assert_eq!(refused.field, PAUSE_AFTER_SECS_FIELD, "a refusal names the input it is about: {refused}");
+        let refused = RunSettings::from_node_fields(&fields(serde_json::json!({ "pauseAfterSecs": 1.5 }))).unwrap_err();
+        assert_eq!(refused.field, PAUSE_AFTER_SECS_FIELD, "{refused}");
+        let too_long = RunSettings::from_node_fields(&fields(serde_json::json!({ "pauseAfterSecs": MAX_PAUSE_AFTER_SECS + 1 }))).unwrap_err();
+        assert_eq!(too_long.field, PAUSE_AFTER_SECS_FIELD, "{too_long}");
+        let by_hand = SettingsChoice { pause_after_secs: Some(120), ..SettingsChoice::default() }.over(at_once).unwrap();
+        assert_eq!(by_hand.pause_after_secs(), 120);
+        assert_eq!(SettingsChoice::default().over(at_once).unwrap().pause_after_secs(), 0, "nothing by hand follows the trigger");
+        assert!(SettingsChoice { pause_after_secs: Some(MAX_PAUSE_AFTER_SECS + 1), ..SettingsChoice::default() }.over(at_once).is_err());
+        let wire = serde_json::to_value(at_once).unwrap();
+        assert_eq!(wire, serde_json::json!({ "pauseAfterSecs": 0 }));
+        assert_eq!(serde_json::from_value::<RunSettings>(wire).unwrap(), at_once);
+        assert!(serde_json::from_value::<RunSettings>(serde_json::json!({ "pauseAfterSecs": MAX_PAUSE_AFTER_SECS + 1 })).is_err());
+        let choice = SettingsChoice { pause_after_secs: Some(0), ..SettingsChoice::default() };
+        assert_eq!(serde_json::to_value(choice).unwrap(), serde_json::json!({ "pauseAfterSecs": 0 }));
+    }
+
     #[test]
     fn keep_for_reads_back_as_written() {
         for text in ["30m", "12h", "7d", "forever"] {
@@ -591,7 +724,10 @@ mod tests {
     #[test]
     fn every_trigger_gets_the_same_switches_and_a_caller_one_the_lifetime_switch() {
         let names = |holds_caller| RunSettings::node_inputs(holds_caller).into_iter().map(|i| i.name).collect::<Vec<_>>();
-        assert_eq!(names(false), vec![DURABLE_FIELD, RECORDED_FIELD, KEEP_FOR_FIELD, HOLD_SECS_FIELD]);
-        assert_eq!(names(true), vec![DURABLE_FIELD, RECORDED_FIELD, KEEP_FOR_FIELD, HOLD_SECS_FIELD, OUTLIVES_CALLER_FIELD]);
+        assert_eq!(names(false), vec![DURABLE_FIELD, RECORDED_FIELD, KEEP_FOR_FIELD, HOLD_SECS_FIELD, PAUSE_AFTER_SECS_FIELD]);
+        assert_eq!(
+            names(true),
+            vec![DURABLE_FIELD, RECORDED_FIELD, KEEP_FOR_FIELD, HOLD_SECS_FIELD, PAUSE_AFTER_SECS_FIELD, OUTLIVES_CALLER_FIELD]
+        );
     }
 }

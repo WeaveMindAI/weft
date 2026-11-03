@@ -122,7 +122,7 @@ async fn tag_rows_are_ordered_by_write_and_idempotent(pool: Pool) {
 
     tag(&pool, first, &["user_7"], 10).await;
     tag(&pool, second, &["user_7", "batch_a"], 11).await;
-    // Re-tagging the first run (a body replayed after a durable wait) must not
+    // Re-tagging the first run (a body run again after a pause) must not
     // move it after the second in the order.
     tag(&pool, first, &["user_7"], 12).await;
 

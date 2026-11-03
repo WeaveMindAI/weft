@@ -43,7 +43,9 @@ pub async fn start_durable(project: &mut Project) -> Result<Uuid> {
     start_with(project, &["--durable"]).await
 }
 
-async fn start_with(project: &mut Project, flags: &[&str]) -> Result<Uuid> {
+/// [`start`], with the `weft run` flags `flags` (such as
+/// `--pause-after-secs 0`).
+pub async fn start_with(project: &mut Project, flags: &[&str]) -> Result<Uuid> {
     // `--json` makes the CLI emit one progress event per line and detach (it
     // does not stream logs), so we get the run without holding the run open.
     let mut args = vec!["run", "--json"];

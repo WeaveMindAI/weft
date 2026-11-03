@@ -204,7 +204,7 @@ catalog refuses to load the metadata and names the output.
 
 Every time the infrastructure is applied (`weft infra start`, `weft infra
 upgrade`, `weft infra rebake <node>`, or a program's own
-`ctx.infra(..).start()`), weft runs your node's `run` right after and saves what it sent on its baked outputs
+`ctx.infra(..).start(&mut state)`), weft runs your node's `run` right after and saves what it sent on its baked outputs
 alongside that infrastructure. A baked output your `run` sent nothing on keeps the value saved
 last time.
 
@@ -344,7 +344,7 @@ it reaches the copy that belongs to the run's instance.
 If your service runs something long (a render, a training run), have it answer
 `POST /jobs` with an id at once and a status route like `GET /jobs/<id>`, then
 wait on that route the way a node waits on a provider's job: start it inside
-`ctx.run` and park with `PollEndpoint` on `format!("{}/jobs/{id}", api.url())`.
+a `state.once` and wait with `PollEndpoint` on `format!("{}/jobs/{id}", api.url())`.
 For the whole pattern, go and read
 [waiting on a job a service runs](durable-execution.md#waiting-on-a-job-a-service-runs).
 

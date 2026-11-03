@@ -8,6 +8,7 @@
 //! the call audio.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use weft::access::client::get_json;
@@ -45,8 +46,13 @@ impl Node for ElevenLabsGetConversationNode {
         // that is not in flight (still ringing, talking, or
         // post-processing), so a status this node does not know ends the
         // wait and is refused below instead of being waited on forever.
+        // The wait carries only the status, which the state keeps, so a
+        // run resumed after it waits no more; the conversation itself
+        // (its transcript can run past 100 KB) is read after the wait,
+        // and a finished conversation reads the same however often.
+        let mut state = ctx.keep(Waited::default()).await?;
         let answer = if wait {
-            ctx.await_signal(PollEndpoint {
+            let poll = PollEndpoint {
                 url: url.clone(),
                 interval_secs: 5,
                 access: Some(weft::primitive::AccessRef::from(&account)),
@@ -55,9 +61,11 @@ impl Node for ElevenLabsGetConversationNode {
                     Predicate::neq("status", "in-progress"),
                     Predicate::neq("status", "processing"),
                 ],
+                carry: vec!["status".into()],
                 ..Default::default()
-            })
-            .await?
+            };
+            state.wait(|s| &mut s.ended, poll).await?;
+            get_json(&http, &url, "read the finished ElevenLabs conversation").await?
         } else {
             get_json(&http, &url, "read the ElevenLabs conversation").await?
         };
@@ -168,6 +176,12 @@ impl Node for ElevenLabsGetConversationNode {
         }
         ctx.pulse_downstream(out).await
     }
+}
+
+/// What the node keeps: the status its wait ended on, when it waits.
+#[derive(Default, Serialize, Deserialize)]
+struct Waited {
+    ended: Option<Value>,
 }
 
 /// The number ElevenLabs answered, as it answered it, or `None` when it

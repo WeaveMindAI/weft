@@ -1,9 +1,9 @@
 //! Live caller connection: the node-facing surface for a held connection
 //! to an outside caller (see `crate::signal::live_connection`).
 //!
-//! Two run worlds exist. The DURABLE world (`ctx.await_signal`) is
-//! a disconnected wait: the worker parks, dies, journals, and a fresh
-//! worker resumes later. The LIVE world (this module) is a caller
+//! Two run worlds exist. The DURABLE world (a wait, `state.wait`) is
+//! a disconnected wait: the run pauses, its worker lets go, and a fresh
+//! worker resumes it later from the state its nodes saved. The LIVE world (this module) is a caller
 //! attached over a held connection for the life of the request/session;
 //! the worker stays alive because it is awaiting on the open socket. It
 //! is NOT durable: the connection is pinned to the one worker that
@@ -604,6 +604,14 @@ pub trait CallerConnection: Send + Sync {
 
     /// Is the caller attached right now? Never fails; pure status read.
     fn is_connected(&self) -> bool;
+
+    /// Does the caller keep its run on this worker: attached, and not
+    /// being let go. A caller being let go (the platform's limit on its
+    /// connection came while its run outlives it) stays on the line only
+    /// until its run hands itself back, so the run may pause meanwhile.
+    fn holds_the_run(&self) -> bool {
+        self.is_connected()
+    }
 
     /// Resolves once the caller is gone, at once when it already is.
     /// Lets a wait that holds for a caller notice a hang-up the moment

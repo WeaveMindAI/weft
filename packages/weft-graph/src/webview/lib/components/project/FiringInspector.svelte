@@ -489,10 +489,12 @@
 				<div class="flex items-center gap-1.5 text-[11px] text-green-600">
 					<span>{getStatusIcon('completed')}</span> Completed successfully
 				</div>
-			{:else if selected.status === 'running' || selected.status === 'waiting_for_input'}
+			{:else if selected.status === 'running' || selected.status === 'waiting'}
 				<div class="text-[11px] text-blue-600 animate-pulse">
-					{selected.status === 'waiting_for_input' ? 'Waiting for input...' : 'Running...'}
+					{selected.status === 'waiting' ? 'Waiting for input...' : 'Running...'}
 				</div>
+			{:else if selected.status === 'paused'}
+				<div class="text-[11px] text-zinc-500">Paused with its run: it waits on nothing of its own and carries on when the run does</div>
 			{:else if selected.status === 'skipped'}
 				<div class="text-[11px] text-zinc-500">Skipped: {skipReasonText(selected.skipReason)}</div>
 			{:else}

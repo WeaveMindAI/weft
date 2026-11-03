@@ -135,14 +135,16 @@ rather than only from now: `cursor()`, `cursor_from_start()`,
 A caller is a socket in one worker. It is not written down and it cannot be
 rebuilt.
 
-So while the caller is on the line, on a `Route` or `Socket` that leaves its
-`outlivesCaller` setting off, the run keeps its worker, and `ctx.await_signal`
-waits inside your call instead of pausing the run (go and read [when the run
-cannot pause](durable-execution.md#when-the-run-cannot-pause)). With
-`outlivesCaller` on, the run can pause. If it pauses before your node has
-answered, weft ends the caller's request with an error saying no answer will
-come (on a socket, a `1013` close), and the run carries on without them. For that setting, go and read [how a run is
-kept](../language/triggers-and-routes.md#how-a-run-is-kept).
+So while the caller is on the line, the run keeps its worker, whatever the
+route's `outlivesCaller` setting says, and `state.wait` waits inside your call
+instead of pausing the run (go and read [when the run cannot
+pause](durable-execution.md#when-the-run-cannot-pause)). The trigger's
+`holdSecs` does not count down meanwhile, so a wait does not cut a caller who
+is still there, unless `holdSecs` is `0`, which fails the wait at once. `outlivesCaller` only decides what the caller leaving does: off, the
+run is cancelled; on, it carries on without them, and pauses once everything
+in it waits on something from outside. For that setting, and for what happens
+when a connection reaches a cloud install's one-hour limit, go and read [how a
+run is kept](../language/triggers-and-routes.md#how-a-run-is-kept).
 
 If the caller goes away, that is not your node failing. It reads as the run
 being cancelled, which your node can notice with `ctx.is_cancelled()` and stop

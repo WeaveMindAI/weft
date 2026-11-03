@@ -141,7 +141,7 @@ pub struct Woken {
     pub now_ms: i64,
     /// The signal's durable state as read just now.
     pub stored: RowState,
-    /// True when the signal is a parked run's wait (`await_signal`)
+    /// True when the signal is a parked run's wait (`state.wait`)
     /// rather than an entry trigger, read off the row like the state.
     pub is_resume: bool,
 }
@@ -281,7 +281,7 @@ pub trait KindHandler: Send + Sync {
     /// after the registration finds the version moved and loses.
     ///
     /// `asked_at_unix_ms` is when the registration was asked for (the
-    /// node's `await_signal`, or the activation), for a kind whose state
+    /// node's wait, or the activation), for a kind whose state
     /// counts from that moment. `is_resume` says which of the two it is,
     /// for a kind that behaves differently while a run waits on it.
     fn compute_initial_state(&self, _spec: &SignalSpec, _asked_at_unix_ms: i64, _is_resume: bool) -> Result<Value> {
@@ -308,7 +308,7 @@ pub trait KindHandler: Send + Sync {
     }
 
     /// Refuse a spec this kind cannot serve as a parked run's wait
-    /// (`await_signal`), naming why. Called at registration, only for a
+    /// (`state.wait`), naming why. Called at registration, only for a
     /// resume. Default: every spec the kind validates can be awaited.
     fn check_resume(&self, _spec: &SignalSpec) -> Result<()> {
         Ok(())
@@ -513,7 +513,7 @@ pub async fn prepare_signal(
     if !is_resume && spec.on_cancel.is_some() {
         anyhow::bail!(
             "a '{}' entry trigger carries a last call on cancel, which only a run's wait can send; \
-             wait with `ctx.await_signal_with_cancel` instead",
+             wait with `state.wait(field, kind.cancel_with(call))` instead",
             spec.kind,
         );
     }

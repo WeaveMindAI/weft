@@ -220,11 +220,13 @@ fn format_event(value: &Value) -> String {
             short(value.get("runId")),
             value.get("entryNode").and_then(|v| v.as_str()).unwrap_or("?")
         ),
-        "node_suspended" => format!(
-            "… suspended at {} token={}",
-            value.get("node").and_then(|v| v.as_str()).unwrap_or("?"),
-            short(value.get("token"))
-        ),
+        "node_suspended" => {
+            let node = value.get("node").and_then(|v| v.as_str()).unwrap_or("?");
+            match value.get("token").filter(|token| !token.is_null()) {
+                Some(token) => format!("… suspended at {node} token={}", short(Some(token))),
+                None => format!("… paused at {node} (with its run)"),
+            }
+        }
         "run_completed" => format!("✓ completed run={}", short(value.get("runId"))),
         "run_failed" => format!(
             "✗ failed run={}: {}",
@@ -540,6 +542,14 @@ mod tests {
         assert_eq!(line, "$ billing cost unknown");
         let line = format_event(&json!({"kind":"cost_reported","service":"billing","amountUsd":0.0}));
         assert_eq!(line, "$ billing +0.0000");
+    }
+
+    #[test]
+    fn a_node_paused_with_its_run_says_so_where_a_wait_names_its_token() {
+        let waiting = json!({ "kind": "node_suspended", "node": "ask", "token": "abcdefghijk" });
+        assert_eq!(format_event(&waiting), "… suspended at ask token=abcdefgh");
+        let paused = json!({ "kind": "node_suspended", "node": "read", "token": null });
+        assert_eq!(format_event(&paused), "… paused at read (with its run)");
     }
 
     #[test]

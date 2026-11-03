@@ -235,12 +235,32 @@ pub enum RunEvent {
         at_unix: u64,
     },
 
+    /// The firing paused, its state saved first (`NodeStateSaved`): on
+    /// the wait `token`, which its answer resumes, or, with no token,
+    /// inside the run (a bus read, a stream pull, a yield) while the
+    /// whole run paused, which it resumes with. Always written (`null`
+    /// counts): a row lacking the field is a truncated row and fails to
+    /// decode.
     NodeSuspended {
         #[serde(skip)]
         run_id: RunId,
         node_id: String,
         frames: LoopFrames,
-        token: String,
+        #[serde(deserialize_with = "present")]
+        token: Option<String>,
+        at_unix: u64,
+    },
+
+    /// A firing saved its state (`ctx.keep`): the node's own value with
+    /// the runtime's positions and counters beside it
+    /// (`weft_core::run::saved`). The latest one per firing is what its
+    /// body gets back when it runs again, after a pause or a crash.
+    NodeStateSaved {
+        #[serde(skip)]
+        run_id: RunId,
+        node_id: String,
+        frames: LoopFrames,
+        saved: weft_core::run::saved::SavedState,
         at_unix: u64,
     },
 
@@ -256,9 +276,9 @@ pub enum RunEvent {
         ///   entry for `token`.
         /// - `None`: a group boundary the worker was firing when it
         ///   went away, re-fired by the next worker (its state is all
-        ///   journaled, so the re-fire is safe; a NODE a dead worker
-        ///   left running is failed, never re-run). No suspension
-        ///   token to clear.
+        ///   journaled, so the re-fire is safe), a node that saved a
+        ///   state run again from it, or a firing that paused inside the
+        ///   run. No suspension token to clear.
         /// Either way the fold absorbs every pulse pending at the
         /// location, as it does for a `NodeStarted`: a resume can
         /// absorb fresh pulses that arrived while the firing was
@@ -439,7 +459,9 @@ pub enum RunEvent {
         frames: LoopFrames,
         token: String,
         spec: SignalSpec,
-        call_index: u32,
+        /// The wait's number within its firing
+        /// (`weft_core::run::saved::Counters::waits`).
+        wait_index: u32,
         at_unix: u64,
     },
 
@@ -453,8 +475,9 @@ pub enum RunEvent {
 
     /// The wait `token` was given up: the run could not pause on it, held
     /// it in its worker, and the hold ran out (or was zero). The waiting
-    /// `ctx` call failed with `error`, and a replay of its body fails the
-    /// same call the same way. An answer that comes after it is ignored.
+    /// `state.wait` failed with `error`, and a body run again that comes
+    /// back to that wait fails it the same way. An answer that comes
+    /// after it is ignored.
     SuspensionGaveUp {
         #[serde(skip)]
         run_id: RunId,
@@ -464,24 +487,14 @@ pub enum RunEvent {
     },
 
     /// A person skipped the wait `token` (its `/skip` door): the waiting
-    /// `ctx` call ends its node's firing skipped, and a replay of its body ends the
-    /// same call the same way. The wait's other ending, an answer, is
-    /// `SuspensionResolved`; the first one on record stands.
+    /// `state.wait` ends its node's firing skipped, and a body run again
+    /// that comes back to that wait ends the same way. The wait's other
+    /// ending, an answer, is `SuspensionResolved`; the first one on
+    /// record stands.
     SuspensionSkipped {
         #[serde(skip)]
         run_id: RunId,
         token: String,
-        at_unix: u64,
-    },
-
-    RunOutput {
-        #[serde(skip)]
-        run_id: RunId,
-        node_id: String,
-        frames: LoopFrames,
-        call_index: u32,
-        name: String,
-        value: Value,
         at_unix: u64,
     },
 
@@ -616,6 +629,23 @@ pub enum RunEvent {
         /// truncated row and fails to decode.
         #[serde(deserialize_with = "present")]
         cause: Option<weft_core::run::CancelCause>,
+        at_unix: u64,
+    },
+
+    /// A firing created a bus whose marker goes out on its output `port`:
+    /// everything a worker needs to open it again, with the same id,
+    /// after the run paused (`weft_core::bus::BusHandle::reopen`).
+    BusCreated {
+        #[serde(skip)]
+        run_id: RunId,
+        bus_id: String,
+        node_id: String,
+        frames: LoopFrames,
+        port: String,
+        payload: weft_core::bus::BusPayloadKind,
+        meta: Value,
+        window: usize,
+        journal: weft_core::stream_journal::JournalPolicy,
         at_unix: u64,
     },
 
@@ -783,6 +813,7 @@ macro_rules! run_id_of {
             | Self::NodeFailed { run_id, .. }
             | Self::NodeSkipped { run_id, .. }
             | Self::NodeSuspended { run_id, .. }
+            | Self::NodeStateSaved { run_id, .. }
             | Self::NodeResumed { run_id, .. }
             | Self::NodeCancelled { run_id, .. }
             | Self::PortEmitted { run_id, .. }
@@ -798,7 +829,6 @@ macro_rules! run_id_of {
             | Self::SuspensionResolved { run_id, .. }
             | Self::SuspensionGaveUp { run_id, .. }
             | Self::SuspensionSkipped { run_id, .. }
-            | Self::RunOutput { run_id, .. }
             | Self::CostReported { run_id, .. }
             | Self::ChargeOpened { run_id, .. }
             | Self::LogLine { run_id, .. }
@@ -807,6 +837,7 @@ macro_rules! run_id_of {
             | Self::RunCompleted { run_id, .. }
             | Self::RunFailed { run_id, .. }
             | Self::RunCancelled { run_id, .. }
+            | Self::BusCreated { run_id, .. }
             | Self::BusJoined { run_id, .. }
             | Self::BusLeft { run_id, .. }
             | Self::BusWindow { run_id, .. }
@@ -890,6 +921,7 @@ impl RunEvent {
             | Self::NodeFailed { at_unix, .. }
             | Self::NodeSkipped { at_unix, .. }
             | Self::NodeSuspended { at_unix, .. }
+            | Self::NodeStateSaved { at_unix, .. }
             | Self::NodeResumed { at_unix, .. }
             | Self::NodeCancelled { at_unix, .. }
             | Self::PortEmitted { at_unix, .. }
@@ -905,7 +937,6 @@ impl RunEvent {
             | Self::SuspensionResolved { at_unix, .. }
             | Self::SuspensionGaveUp { at_unix, .. }
             | Self::SuspensionSkipped { at_unix, .. }
-            | Self::RunOutput { at_unix, .. }
             | Self::CostReported { at_unix, .. }
             | Self::ChargeOpened { at_unix, .. }
             | Self::LogLine { at_unix, .. }
@@ -914,6 +945,7 @@ impl RunEvent {
             | Self::RunCompleted { at_unix, .. }
             | Self::RunFailed { at_unix, .. }
             | Self::RunCancelled { at_unix, .. }
+            | Self::BusCreated { at_unix, .. }
             | Self::BusJoined { at_unix, .. }
             | Self::BusLeft { at_unix, .. }
             | Self::BusWindow { at_unix, .. }
@@ -934,6 +966,7 @@ impl RunEvent {
             Self::NodeFailed { .. } => "node_failed",
             Self::NodeSkipped { .. } => "node_skipped",
             Self::NodeSuspended { .. } => "node_suspended",
+            Self::NodeStateSaved { .. } => "node_state_saved",
             Self::NodeResumed { .. } => "node_resumed",
             Self::NodeCancelled { .. } => "node_cancelled",
             Self::PortEmitted { .. } => "port_emitted",
@@ -949,7 +982,6 @@ impl RunEvent {
             Self::SuspensionResolved { .. } => "suspension_resolved",
             Self::SuspensionGaveUp { .. } => "suspension_gave_up",
             Self::SuspensionSkipped { .. } => "suspension_skipped",
-            Self::RunOutput { .. } => "run_output",
             Self::CostReported { .. } => "cost_reported",
             Self::ChargeOpened { .. } => "charge_opened",
             Self::LogLine { .. } => "log_line",
@@ -958,6 +990,7 @@ impl RunEvent {
             Self::RunCompleted { .. } => "run_completed",
             Self::RunFailed { .. } => "run_failed",
             Self::RunCancelled { .. } => "run_cancelled",
+            Self::BusCreated { .. } => "bus_created",
             Self::BusJoined { .. } => "bus_joined",
             Self::BusLeft { .. } => "bus_left",
             Self::BusWindow { .. } => "bus_window",
@@ -1000,11 +1033,23 @@ impl RunEvent {
             | Self::NodeSkipped { node_id, frames: at, .. }
             | Self::FileEdited { node_id, frames: at, .. } => node_id.len() + frames(at),
             Self::NodeFailed { node_id, frames: at, error: text, .. }
-            | Self::NodeSuspended { node_id, frames: at, token: text, .. }
             | Self::NodeCancelled { node_id, frames: at, reason: text, .. }
             | Self::SuspensionRegistered { node_id, frames: at, token: text, .. } => node_id.len() + frames(at) + text.len(),
-            Self::NodeResumed { node_id, frames: at, token, .. } => {
+            Self::NodeSuspended { node_id, frames: at, token, .. } | Self::NodeResumed { node_id, frames: at, token, .. } => {
                 node_id.len() + frames(at) + token.as_ref().map_or(0, String::len)
+            }
+            Self::NodeStateSaved { node_id, frames: at, saved, .. } => {
+                node_id.len()
+                    + frames(at)
+                    + value_bytes(&saved.state)
+                    + saved
+                        .positions
+                        .buses
+                        .iter()
+                        .map(|(bus, position)| bus.len() + std::mem::size_of_val(&position.cursor) + position.registered.as_ref().map_or(0, |r| r.name.len()))
+                        .sum::<usize>()
+                    + saved.positions.taken.keys().map(String::len).sum::<usize>()
+                    + saved.positions.drained.values().flatten().map(value_bytes).sum::<usize>()
             }
             Self::PortEmitted { node_id, frames: at, port, value, .. } => {
                 node_id.len() + frames(at) + port.len() + value_bytes(value)
@@ -1022,9 +1067,6 @@ impl RunEvent {
             Self::SuspensionResolved { token, value, .. } => token.len() + value_bytes(value),
             Self::SuspensionGaveUp { token, error, .. } => token.len() + error.len(),
             Self::SuspensionSkipped { token, .. } => token.len(),
-            Self::RunOutput { node_id, frames: at, name, value, .. } => {
-                node_id.len() + frames(at) + name.len() + value_bytes(value)
-            }
             Self::CostReported { node_id, frames: at, cost_id, service, model, metadata, charge, .. } => {
                 node_id.len()
                     + frames(at)
@@ -1045,6 +1087,7 @@ impl RunEvent {
             | Self::CallerConnected { protocol: text, .. }
             | Self::CallerErrored { message: text, .. } => text.len(),
             Self::CallerDisconnected { reason, dropped, .. } => reason.len() + std::mem::size_of_val(dropped.as_slice()),
+            Self::BusCreated { bus_id, node_id, frames: at, port, meta, .. } => bus_id.len() + node_id.len() + frames(at) + port.len() + value_bytes(meta),
             Self::BusJoined { bus_id, name, .. } | Self::BusLeft { bus_id, name, .. } => bus_id.len() + name.len(),
             Self::BusClosed { bus_id, .. } => bus_id.len(),
             Self::BusWindow { bus_id, messages, totals, .. } => {
@@ -1208,12 +1251,17 @@ mod wire_tests {
     /// fails to decode instead of reading as a re-fire.
     #[test]
     fn a_resume_row_always_carries_its_token_field() {
-        let row = RunEvent::NodeResumed { run_id: run_id(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 };
-        let json = round_trip(row);
-        assert!(json.get("token").is_some_and(Value::is_null));
-        let mut without = json.clone();
-        without.as_object_mut().unwrap().remove("token");
-        assert!(serde_json::from_value::<RunEvent>(without).is_err());
+        let rows = [
+            RunEvent::NodeResumed { run_id: run_id(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 },
+            RunEvent::NodeSuspended { run_id: run_id(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 },
+        ];
+        for row in rows {
+            let json = round_trip(row);
+            assert!(json.get("token").is_some_and(Value::is_null));
+            let mut without = json.clone();
+            without.as_object_mut().unwrap().remove("token");
+            assert!(serde_json::from_value::<RunEvent>(without).is_err(), "a row missing its token is truncated: {json}");
+        }
         let with = RunEvent::NodeResumed { run_id: run_id(), node_id: "n".into(), frames: vec![], token: Some("t".into()), at_unix: 1 };
         assert_eq!(round_trip(with)["token"], json!("t"));
     }
@@ -1312,7 +1360,32 @@ mod wire_tests {
             RunEvent::NodeSkipped { run_id: run_id(), node_id: "n".into(), frames: vec![], reason: weft_core::run::skip::SkipReason::RequiredInputClosed { port: "in".into(), failure: None }, at_unix: 1 },
             RunEvent::NodeSkipped { run_id: run_id(), node_id: "n".into(), frames: vec![], reason: weft_core::run::skip::SkipReason::RequiredInputClosed { port: "in".into(), failure: Some(weft_core::pulse::Failure { node: "auth.query".into(), error: "down".into() }) }, at_unix: 1 },
             RunEvent::NodeSkipped { run_id: run_id(), node_id: "n".into(), frames: vec![], reason: weft_core::run::skip::SkipReason::WatchedNodeFailed { failure: weft_core::pulse::Failure { node: "q".into(), error: "down".into() } }, at_unix: 1 },
-            RunEvent::NodeSuspended { run_id: run_id(), node_id: "n".into(), frames: vec![], token: "t".into(), at_unix: 1 },
+            RunEvent::NodeSuspended { run_id: run_id(), node_id: "n".into(), frames: vec![], token: Some("t".into()), at_unix: 1 },
+            RunEvent::NodeSuspended { run_id: run_id(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 },
+            RunEvent::NodeStateSaved {
+                run_id: run_id(),
+                node_id: "n".into(),
+                frames: vec![weft_core::frames::Frame::Loop { index: 1 }],
+                saved: weft_core::run::saved::SavedState {
+                    state: json!({ "posted": { "ts": "1.2" }, "manager": null }),
+                    positions: weft_core::run::saved::Positions {
+                        buses: std::collections::BTreeMap::from([(
+                            "b".to_string(),
+                            weft_core::run::saved::BusPosition {
+                                cursor: Some(4),
+                                registered: Some(weft_core::run::saved::Registration { name: "host".into(), joined_offset: 0 }),
+                            },
+                        )]),
+                        taken: std::collections::BTreeMap::from([("rows".to_string(), 3)]),
+                        ended: std::collections::BTreeMap::from([("rows".to_string(), weft_core::primitive::StreamEnd::Failed { error: "upstream".into() })]),
+                        drained: std::collections::BTreeMap::from([("rows".to_string(), vec![json!(1)])]),
+                        yielded: 2,
+                    },
+                    counters: weft_core::run::saved::Counters { waits: 1, program_calls: 4 },
+                    helper: Some(weft_core::run::saved::PausedHelper { helper: "infra.start".into(), call: "c0ffee".into(), place: json!({ "accepted": true }) }),
+                },
+                at_unix: 1,
+            },
             RunEvent::NodeResumed { run_id: run_id(), node_id: "n".into(), frames: vec![], token: Some("t".into()), at_unix: 1 },
             RunEvent::NodeResumed { run_id: run_id(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 },
             RunEvent::NodeCancelled { run_id: run_id(), node_id: "n".into(), frames: vec![], reason: "stopped".into(), at_unix: 1 },
@@ -1326,10 +1399,11 @@ mod wire_tests {
             RunEvent::LoopStreamEnded { run_id: run_id(), group_id: "lp".into(), parent_frames: vec![], end: weft_core::primitive::StreamEnd::Failed { error: "upstream".into() }, at_unix: 1 },
             RunEvent::LoopTerminated { run_id: run_id(), group_id: "lp".into(), parent_frames: vec![], reason: LoopTerminationReason::DoneVoted, at_unix: 1 },
             RunEvent::RunCompleted { run_id: run_id(), at_unix: 1 },
-            RunEvent::SuspensionRegistered { run_id: run_id(), node_id: "n".into(), frames: vec![], token: "t".into(), spec, call_index: 2, at_unix: 1 },
+            RunEvent::TriggerCaptured { run_id: run_id(), node_id: "n".into(), spec: spec.clone(), port_snapshot: json!({ "path": "/x" }), at_unix: 1 },
+            RunEvent::SuspensionRegistered { run_id: run_id(), node_id: "n".into(), frames: vec![], token: "t".into(), spec, wait_index: 2, at_unix: 1 },
             RunEvent::SuspensionResolved { run_id: run_id(), token: "t".into(), value: json!("v"), at_unix: 1 },
             RunEvent::SuspensionGaveUp { run_id: run_id(), token: "t".into(), error: "gave up".into(), at_unix: 1 },
-            RunEvent::RunOutput { run_id: run_id(), node_id: "n".into(), frames: vec![], call_index: 1, name: "decide".into(), value: json!("go-left"), at_unix: 1 },
+            RunEvent::SuspensionSkipped { run_id: run_id(), token: "t".into(), at_unix: 1 },
             RunEvent::CostReported {
                 run_id: run_id(),
                 node_id: "n".into(),
@@ -1386,6 +1460,18 @@ mod wire_tests {
             RunEvent::RunFailed { run_id: run_id(), error: "boom".into(), at_unix: 1 },
             RunEvent::RunCancelled { run_id: run_id(), reason: "stopped".into(), cause: Some(weft_core::run::CancelCause::User), at_unix: 1 },
             RunEvent::RunCancelled { run_id: run_id(), reason: "stopped".into(), cause: None, at_unix: 1 },
+            RunEvent::BusCreated {
+                run_id: run_id(),
+                bus_id: "b".into(),
+                node_id: "host".into(),
+                frames: vec![],
+                port: "channel".into(),
+                payload: weft_core::bus::BusPayloadKind::Bytes,
+                meta: json!({ "sample_rate": 16000 }),
+                window: 64,
+                journal: weft_core::stream_journal::JournalPolicy::ephemeral(),
+                at_unix: 1,
+            },
             RunEvent::BusJoined { run_id: run_id(), bus_id: "b".into(), offset: 0, name: "a".into(), at_unix: 1 },
             RunEvent::BusLeft { run_id: run_id(), bus_id: "b".into(), offset: 1, name: "a".into(), at_unix: 1 },
             RunEvent::BusWindow {
@@ -1474,7 +1560,7 @@ mod wire_tests {
         let mut kinds: Vec<&'static str> = rows.iter().map(|r| r.kind_str()).collect();
         kinds.sort_unstable();
         kinds.dedup();
-        assert_eq!(kinds.len(), 37, "a variant has no row above: {kinds:?}");
+        assert_eq!(kinds.len(), 40, "a variant has no row above: {kinds:?}");
         for row in rows {
             let kind = row.kind_str();
             let json = round_trip(row);

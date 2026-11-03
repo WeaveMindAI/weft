@@ -2569,7 +2569,7 @@ async fn activate_trigger_setup_window(
         let arming = crate::task_kinds::register_signal::RegisterSignalExecutor::arm(state,
             weft_task_store::RegisterSignalPayload {
                 run_id: bake.run_id, node_id: key.trigger.clone(), frames: Vec::new(),
-                spec: capture.spec.clone(), is_resume: false, call_index: 0,
+                spec: capture.spec.clone(), is_resume: false, wait_index: 0,
                 port_snapshot: Some(capture.ports.clone()),
                 asked_at_unix_ms: chrono::Utc::now().timestamp_millis(),
             }, listened).await;

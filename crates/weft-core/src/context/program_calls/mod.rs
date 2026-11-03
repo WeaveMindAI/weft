@@ -5,9 +5,16 @@
 //! same owner. Each builder here ends in one call, carried to the
 //! dispatcher as the calling run (`crate::program::ProgramCall`).
 //!
-//! Every answer is journaled (`ctx.run`), so a body replayed after a
-//! durable wait reads it back instead of asking again: a program that
-//! terminated a copy does not terminate it twice. A call that takes
+//! Every call is keyed by the firing's program-call number
+//! (`crate::run::saved::Counters::program_calls`) and its content, so a
+//! call carried twice while its task lives (its answer lost on the way) is
+//! one call. A body run again after a pause makes its calls again under
+//! new numbers: one that must not be made twice goes in `state.once` like
+//! anything else. A helper that follows something slow (a copy coming up,
+//! a build) waits between its looks, which is where the run can pause, so
+//! it takes the firing's state, and a body resumed inside it comes back to
+//! its wait without making its calls again (`crate::context::Kept::follow`).
+//! A call that takes
 //! something down never reaches the run that made it, unless it passes
 //! `StopSelf::Include` and the run is among what it reaches; the call then
 //! does not return, and the run ends with the rest.
@@ -149,21 +156,12 @@ pub struct ProjectCalls<'a> {
 }
 
 impl<'a> ProjectCalls<'a> {
-    /// Carry one call as this run, journaled so a replay reads the
-    /// answer back, and decode its answer. The call is keyed on its
-    /// journal step, which a replay reaches at the same index, so a call
-    /// carried again (its answer lost) is the same call.
+    /// Carry one call as this run and decode its answer. The call is
+    /// keyed by the firing's next program-call number, so a call carried
+    /// again under it (its answer lost) is the same call.
     pub(super) async fn call<T: DeserializeOwned>(self, call: ProgramCall, stop_self: StopSelf) -> WeftResult<T> {
-        let name = call.journal_name();
-        let (call_index, replayed) = self.ctx.handle.run_step(name).await?;
-        let value = match replayed {
-            Some(value) => value,
-            None => {
-                let value = self.ctx.handle.program_call(call, stop_self, call_index, self.project).await?;
-                self.ctx.handle.run_record(name, call_index, &value).await?;
-                value
-            }
-        };
+        let name = call.name();
+        let value = self.ctx.handle.program_call(call, stop_self, self.project).await?;
         serde_json::from_value(value)
             .map_err(|e| {
                 WeftError::NodeFailed(format!(

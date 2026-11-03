@@ -412,7 +412,12 @@ async fn resumed(rig: FakeRig) -> WeftResult<()> {
     rig.run(&ElevenLabsDubNode, given.clone()).await.ok()?;
     rig.run(&ElevenLabsDubNode, given).await.ok()?;
     let posts = |path: &str| rig.requests().iter().filter(|r| r.method == "POST" && r.path == path).count();
-    assert_eq!(posts("/v1/dubbing/project"), 1, "the replay reads the journaled project back instead of paying twice");
+    assert_eq!(posts("/v1/dubbing/project"), 1, "the resumed body finds the project in its state instead of paying twice");
+    assert_eq!(rig.awaited_signals().len(), 1, "and does not wait again on a dub whose end it already has");
+    let saved = rig.saved_state(&ElevenLabsDubNode).expect("a saved state");
+    assert!(saved["dubbed"].is_object(), "the stored dub is in the state, so the project is never read again: {saved}");
+    let reads = rig.requests().iter().filter(|r| r.method == "GET" && r.path == TARGET_PATH).count();
+    assert_eq!(reads, 1, "the finished dub was read once");
     Ok(())
 }
 

@@ -587,8 +587,9 @@ async fn resumed(rig: FakeRig) -> WeftResult<()> {
     let sent = rig.requests();
     let reads = sent.iter().filter(|r| r.method == "GET" && r.path == TEMPLATE).count();
     let runs = sent.iter().filter(|r| r.method == "POST" && r.path == RUNS).count();
-    assert_eq!(reads, 1, "the replay reads the journaled submit back, template read included");
+    assert_eq!(reads, 1, "the resumed body finds the job in its state, so it never reads the template again");
     assert_eq!(runs, 1, "and never pays for a second run");
+    assert_eq!(rig.awaited_signals().len(), 1, "nor waits again on a job whose end it already has");
     Ok(())
 }
 

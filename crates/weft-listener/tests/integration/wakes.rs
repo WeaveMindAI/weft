@@ -1032,7 +1032,7 @@ async fn an_entry_trigger_with_a_last_call_is_refused() {
     let mut spec = quiet_poll("http://127.0.0.1:1/status");
     spec.on_cancel = Some(weft_core::signal::CancelCall::delete("http://127.0.0.1:1/jobs/7"));
     let refused = register(&rig, "poll", &spec, now_ms()).await.unwrap_err().to_string();
-    assert!(refused.contains("await_signal_with_cancel"), "{refused}");
+    assert!(refused.contains("kind.cancel_with(call)"), "{refused}");
 }
 
 // ---------- The last call of a cancelled wait ----------

@@ -4,6 +4,117 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## Unreleased
+
+**What breaks after this update:**
+
+**A node picks up after a pause from a state it saves, instead of running
+its body again over a record of what it did.** `ctx.run` and
+`ctx.await_signal` are gone. A node that waits now keeps a state and waits
+through it:
+
+```rust
+#[derive(Default, Serialize, Deserialize)]
+struct Approval { posted: Option<Posted>, manager: Option<Value> }
+
+let mut state = ctx.keep(Approval::default()).await?;
+let posted = state.once(|s| &mut s.posted, async |_| post_buttons(&ctx).await).await?;
+let manager = state.wait(|s| &mut s.manager, form).await?;
+```
+
+`once` runs its work only while its field is empty, `wait` waits only while
+its field is empty, and both save the state. A wait with a call to make if
+the run is cancelled is `state.wait(field, kind.cancel_with(call))`. Your own
+nodes need this change before they build again.
+
+**Every call where a run can pause takes the state.** Bus reads
+(`cursor.next(&mut state)`, `next_json`, `next_message`, `next_bytes`),
+`bus.wait_for(name, &mut state)`, stream pulls (`gen.next(&mut state)`,
+`try_next(&state)`, `drain(&mut state)`) and `ctx.yield_downstream(output, &mut
+state)`, and the program-call helpers that wait in a loop (`infra.start`,
+`request_start`, `rebake`, `follow_command`, a build or run that follows,
+`resync`, `resume_resync`, `remove`). A node whose work cannot be picked up
+from the middle (a provider session, an answer to a caller) passes
+`&mut ctx.hold()` instead: while a `ctx.hold()` value of the firing exists,
+no wait of that firing pauses (its `state.wait` and helpers' waits included);
+each waits open in its call, as in a run that cannot pause, up to the
+trigger's `holdSecs` with nobody on the line, then gives up. `ctx.create_bus` now takes the output port its marker goes out on.
+
+**A node reads a bus through one reader, and reads directly only where a
+pause cannot catch it out.** `bus.cursor()`, `cursor_at(offset)` and
+`cursor_from_start()` return a `Result`, and opening a second reader on a bus
+the body already opened one on fails the node, naming both lines. The first
+time a run of the body reaches a place it can pause (a bus read, a stream
+pull, `state.read`, `state.wait`, a yield; a place is its line and the bus,
+stream or state field it reads, so buses read in turn at one line are a place
+each), no direct read (a bus reader's
+`next`, `next_json`, `next_message` or `next_bytes`, a stream's `next`,
+`try_next` or `drain`) may have happened before it in that run, except inside
+a `state.once` that finished; otherwise the node fails there, naming both
+lines (`read directly (not through its state) at ... before it ...`). The
+check runs on every run, so a body that takes another path on its resume
+fails where the paths split. Reads made while the firing holds its run
+(`ctx.hold()`) are exempt while it holds; once the hold is dropped, its last
+held read counts as a direct read for every place after. `bus.wait_for` is not
+a read. If you need a
+message again after a pause, read it with the new
+`state.read(|s| &mut s.field, &mut reader)`, which hands back the item in the
+field when it is filled and reads into it otherwise, saving it with the rest
+of the state at the next save (a pause, `save()`, or the end of a `once` or
+`wait`). `state.once`'s work now gets the state,
+`state.once(|s| &mut s.f, async |st| { .. })`, so a finished phase of reads
+can go inside it. A message's kind and JSON value come from the new
+`BusEntry::as_json()`. For the rule and the shapes it allows, go and read
+"Reading a bus or a stream across a pause" in the node docs.
+
+**A run paused before this update fails when it picks up**, naming the node
+and saying to start it again with `weft run --seed=<run>`, which reuses what
+it already did. Runs that are not paused are not affected.
+
+**The rest:**
+
+**A bus or a stream no longer keeps a run from pausing.** When every node
+waits and one of them waits on something outside the run (a timer, a form),
+the run pauses with its buses open; the next worker opens them again with the
+same members, and every node carries on where it stopped. A node that paused
+behind messages the bus no longer holds when it comes back (an ephemeral bus
+keeps none over a pause, and any bus drops what falls out of its window) fails
+saying so, instead of skipping them. A node holds one name per bus. A node
+reading a whole stream with `drain` can pause too: weft saves the items it
+was holding with the node's state, and the resumed `drain` starts from them
+and takes the rest, so a node draining a stream fed by a node waiting on a
+person no longer keeps the worker up for as long as that person takes. A
+pausing run writes its buses' open journal windows at once, instead of
+waiting for each window to run out (a second by default) before it lets go
+of its worker.
+
+**A node that saves a state runs again from it when its worker dies**,
+instead of being failed, in a durable run.
+
+**A run stays on its worker a while before it pauses.** A trigger's new
+`pauseAfterSecs` (default 10, `0` pauses at once as before, at most 3600, and
+`weft run --pause-after-secs` for one run) is how long a run that can pause
+stays on its worker, quiet, once every node it is running waits, before it
+pauses: a wait's answer that arrives in that time goes straight into the
+waiting call, so a run fed by frequent messages no longer pauses and resumes
+for each one. A run now pauses in one way only: every node it runs waits,
+the window runs out, and every waiting call pauses together. A hand-back (the
+cloud's 59-minute limit, a worker stopping, maintenance) pauses at once.
+
+**A caller on the line is never cut off by a wait.** While a route's caller
+is connected, a wait holds the run on its worker for as long as the caller
+stays (`holdSecs` only counts once nobody is on the line, or with `0`, which
+still refuses such a wait at once). At a cloud install's 59-minute limit on
+one connection, a route with `outlivesCaller` on gives the nodes its run is
+running 5 seconds to end, then ends its caller's connection with a `504`
+(the reason, saying to reconnect, is on the run's record for `weft logs`) and
+the run goes on in a fresh worker (a node still running then runs again from its saved
+state, or fails as cut short if it keeps none); with it off, the run is
+cancelled as before.
+
+**`ctx.projects().declare` without an id** takes one from the call, so a call
+carried again after a lost answer finds the project the first one made.
+
 ## 2026-11-02 (0.2.289)
 
 **A group's or a loop's `@file` value now shows and edits in the editor.** A

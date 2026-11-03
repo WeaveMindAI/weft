@@ -1760,9 +1760,10 @@
     impl weft_core::Node for Server {
         async fn run(&self, ctx: weft_core::RunContext) -> weft_core::error::WeftResult<()> {
             let item: serde_json::Value = ctx.inputs.get("value")?;
+            let mut state = ctx.keep(()).await?;
             let bus = ctx.open_bus("bus", Default::default(), "server").await?;
-            let mut asks = bus.cursor();
-            let asked = asks.next_json("ask").await.map_err(|e| weft_core::error::WeftError::NodeFailed(format!("read the ask: {e:?}")))?;
+            let mut asks = bus.cursor()?;
+            let asked = asks.next_json("ask", &mut state).await?;
             let Some((from, ask)) = asked else {
                 return Err(weft_core::error::WeftError::NodeFailed("the bus closed before anyone asked".into()));
             };
@@ -1771,8 +1772,19 @@
         }
     }
 
+    /// What the asker keeps: the bus it is on, whether it asked there, and
+    /// the answer it is reading.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct Asking {
+        index: usize,
+        sent: bool,
+        answer: Option<weft_core::bus::BusEntry>,
+    }
+
     /// After the loop: asks every gathered bus, in gather order, with its
-    /// index, and writes down `(index, who answered, the answer)`.
+    /// index, and writes down `(index, who answered, the answer)`. Each
+    /// answer is read through the state: buses read directly in turn at one
+    /// line would be a new place each, after a direct read.
     struct Asker {
         answers: Arc<StdMutex<Vec<(usize, String, serde_json::Value)>>>,
     }
@@ -1782,14 +1794,22 @@
         async fn run(&self, ctx: weft_core::RunContext) -> weft_core::error::WeftResult<()> {
             let failed = |what: &str, e: &dyn std::fmt::Debug| weft_core::error::WeftError::NodeFailed(format!("{what}: {e:?}"));
             let buses: Vec<serde_json::Value> = ctx.inputs.get("buses")?;
-            for (index, marker) in buses.iter().enumerate() {
+            let mut state = ctx.keep(Asking::default()).await?;
+            while let Some(marker) = buses.get(state.index) {
                 let mut bus = ctx.bus(marker)?;
                 bus.register("asker").map_err(|e| failed("register", &e))?;
-                let mut answers = bus.cursor();
-                bus.send("ask", serde_json::json!(index)).map_err(|e| failed("send the ask", &e))?;
-                let answered = answers.next_json("answer").await.map_err(|e| failed("read the answer", &e))?;
-                let (from, answer) = answered.ok_or_else(|| failed("the bus closed unanswered", &index))?;
-                self.answers.lock().unwrap().push((index, from, answer));
+                let mut answers = bus.cursor()?.with_filter(|entry| entry.as_json().is_some_and(|(kind, _)| kind == "answer"));
+                if !state.sent {
+                    bus.send("ask", serde_json::json!(state.index)).map_err(|e| failed("send the ask", &e))?;
+                    state.sent = true;
+                }
+                let answered = state.read(|s| &mut s.answer, &mut answers).await?.ok_or_else(|| failed("the bus closed unanswered", &state.index))?;
+                let weft_core::bus::BusEntryKind::Message { from, .. } = &answered.kind else { unreachable!("the filter keeps messages") };
+                let (_, answer) = answered.as_json().expect("the filter keeps JSON answers");
+                self.answers.lock().unwrap().push((state.index, from.clone(), answer.clone()));
+                state.answer = None;
+                state.sent = false;
+                state.index += 1;
             }
             Ok(())
         }

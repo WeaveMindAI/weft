@@ -4,7 +4,7 @@
 //! a node." Each kind (timer, form, sse_subscribe, route, socket, ...) is
 //! a plain data struct in this module. Node code constructs one and passes
 //! it directly to `ctx.register_signal(...)` (entry trigger) or
-//! `ctx.await_signal(...)` (mid-run resume). The framework
+//! `state.wait(...)` (a wait mid-run, `crate::context::Kept::wait`). The framework
 //! projects the typed kind onto the internal `SignalSpec` wire
 //! shape via the `Signal` trait.
 //!
@@ -205,6 +205,53 @@ pub fn to_spec<K: Signal>(kind: K) -> SignalSpec {
         on_cancel: None,
     }
 }
+
+/// What a node waits on with `state.wait` (`crate::context::Kept::wait`):
+/// any signal kind, or one that sends its service a cancel if the run is
+/// cancelled while it waits ([`CancelWith::cancel_with`]).
+#[cfg(feature = "runtime")]
+pub trait WaitOn {
+    fn into_spec(self) -> SignalSpec;
+}
+
+#[cfg(feature = "runtime")]
+impl<K: Signal> WaitOn for K {
+    fn into_spec(self) -> SignalSpec {
+        to_spec(self)
+    }
+}
+
+/// A wait on a job running on an outside service that, if the run is
+/// cancelled while it waits, sends the service's own cancel for the job
+/// once, as the connection the signal carries, so the service stops
+/// working and charging ([`cancel_call`]). Never sent when the wait is
+/// answered or the run ends any other way. Made by [`CancelWith::cancel_with`].
+#[cfg(feature = "runtime")]
+pub struct Cancelling<K> {
+    kind: K,
+    on_cancel: CancelCall,
+}
+
+#[cfg(feature = "runtime")]
+impl<K: Signal> WaitOn for Cancelling<K> {
+    fn into_spec(self) -> SignalSpec {
+        let mut spec = to_spec(self.kind);
+        spec.on_cancel = Some(self.on_cancel);
+        spec
+    }
+}
+
+/// `kind.cancel_with(call)`: wait on `kind`, and send `call` if the run
+/// is cancelled meanwhile ([`Cancelling`]).
+#[cfg(feature = "runtime")]
+pub trait CancelWith: Signal {
+    fn cancel_with(self, on_cancel: CancelCall) -> Cancelling<Self> {
+        Cancelling { kind: self, on_cancel }
+    }
+}
+
+#[cfg(feature = "runtime")]
+impl<K: Signal> CancelWith for K {}
 
 /// Inventory entry registering a kind's tag + a JSON-driven validator.
 /// Each `weft-core/src/signal/<name>.rs` file submits one of these.

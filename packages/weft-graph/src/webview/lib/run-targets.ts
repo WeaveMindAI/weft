@@ -49,7 +49,7 @@ export function runProgress(
   let done = 0;
   for (const rows of Object.values(firings)) {
     const last = rows[rows.length - 1];
-    if (last && last.status !== 'running' && last.status !== 'waiting_for_input') done += 1;
+    if (last && last.status !== 'running' && last.status !== 'waiting' && last.status !== 'paused') done += 1;
   }
   return { done, total: Array.isArray(scope) ? scope.length : null };
 }

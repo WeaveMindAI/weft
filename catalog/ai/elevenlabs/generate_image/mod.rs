@@ -8,7 +8,7 @@ use weft::node::NodeOutput;
 use weft::storage::FileHandle;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::flows::{generate, set_some, Media, References};
+use super::flows::{generate, set_some, Job, Media, References};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsGenerateImageNode;
@@ -37,7 +37,8 @@ impl Node for ElevenLabsGenerateImageNode {
 
         let http = ctx.client(&account).await?;
         let refs = References::new(&ctx, &http);
-        let image = generate(&ctx, &account, &http, &refs, Media::Image, || async {
+        let mut job = ctx.keep(Job::default()).await?;
+        let image = generate(&ctx, &mut job, &account, &http, &refs, Media::Image, || async {
             let mut body = json!({ "model_id": model, "prompt": prompt });
             if !images.is_empty() {
                 body["images"] = json!(refs.of_each(&images).await?);

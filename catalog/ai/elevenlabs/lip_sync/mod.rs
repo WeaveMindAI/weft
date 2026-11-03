@@ -8,7 +8,7 @@ use weft::node::NodeOutput;
 use weft::storage::FileHandle;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::flows::{generate, set_some, Media, References};
+use super::flows::{generate, set_some, Job, Media, References};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsLipSyncNode;
@@ -34,7 +34,8 @@ impl Node for ElevenLabsLipSyncNode {
 
         let http = ctx.client(&account).await?;
         let refs = References::new(&ctx, &http);
-        let video = generate(&ctx, &account, &http, &refs, Media::Video, || async {
+        let mut job = ctx.keep(Job::default()).await?;
+        let video = generate(&ctx, &mut job, &account, &http, &refs, Media::Video, || async {
             let picture = refs.of(&image).await?;
             let speech = refs.of(&audio).await?;
             let mut body = json!({ "model_id": model, "image": picture, "audio": speech });

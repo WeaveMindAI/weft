@@ -3,13 +3,15 @@
 //! its run that weft does not put on record first, which is what lets a
 //! durable run start it without first putting what came before on record,
 //! and run it again when its worker died while it ran. So every call that
-//! reaches outside on its own (the network, a connection, a wait,
-//! `ctx.run`, the broker's steering, storage beyond this run) fails here,
+//! reaches outside on its own (the network, a connection, a wait on a
+//! signal, the broker's steering, storage beyond this run) fails here,
 //! naming the flag: a node marked pure by mistake fails loudly at its
 //! first such call, where it runs, in a node test exactly as in a run.
 //!
 //! What stays open is the run itself: inputs, outputs, ports, buses, logs,
-//! the process-wide shared values, and `register_signal`, which is a
+//! the state it keeps (`ctx.keep`, written to the run's own record, which
+//! is what lets a pure bus reader or stream consumer pause), the
+//! process-wide shared values, and `register_signal`, which is a
 //! trigger arming itself in its setup run, never something a run it fires
 //! does. And the run's own caller and files: answering the caller (a
 //! durable run's answer leaves only once its record is written, and after
@@ -81,8 +83,24 @@ impl ContextHandle for PureHandle {
             .build()
     }
 
-    async fn await_signal(&self, _spec: SignalSpec) -> WeftResult<Value> {
+    async fn keep_state(&self, initial: Value) -> WeftResult<Value> {
+        self.inner.keep_state(initial).await
+    }
+
+    async fn save_state(&self, state: Value, at: super::SaveAt) -> WeftResult<()> {
+        self.inner.save_state(state, at).await
+    }
+
+    fn resumed_helper(&self) -> Option<crate::run::saved::PausedHelper> {
+        self.inner.resumed_helper()
+    }
+
+    async fn wait(&self, _spec: SignalSpec) -> WeftResult<Value> {
         self.refused("wait for a signal")
+    }
+
+    fn places(&self) -> &super::Places {
+        self.inner.places()
     }
 
     async fn register_signal(&self, spec: SignalSpec, port_snapshot: Value) -> WeftResult<()> {
@@ -103,14 +121,6 @@ impl ContextHandle for PureHandle {
 
     async fn endpoint_call(&self, _url: &str, _method: EndpointMethod, _path: &str, _body: Option<Value>) -> WeftResult<Value> {
         self.refused("call an endpoint")
-    }
-
-    async fn run_step(&self, _name: &str) -> WeftResult<(u32, Option<Value>)> {
-        self.refused("record a step with `ctx.run`")
-    }
-
-    async fn run_record(&self, _name: &str, _call_index: u32, _value: &Value) -> WeftResult<()> {
-        self.refused("record a step with `ctx.run`")
     }
 
     async fn open_connection(&self, _access: &crate::access::Access, _window: std::time::Duration) -> WeftResult<crate::access::OpenedConnection> {
@@ -147,7 +157,7 @@ impl ContextHandle for PureHandle {
         self.refused("stop tagged runs")
     }
 
-    async fn program_call(&self, _call: crate::program::ProgramCall, _stop_self: StopSelf, _call_index: u32, _project: Option<uuid::Uuid>) -> WeftResult<Value> {
+    async fn program_call(&self, _call: crate::program::ProgramCall, _stop_self: StopSelf, _project: Option<uuid::Uuid>) -> WeftResult<Value> {
         self.refused("call on its program")
     }
 
@@ -156,7 +166,6 @@ impl ContextHandle for PureHandle {
         _instance: &crate::instance::InstanceId,
         _expires_in_secs: u64,
         _displays: bool,
-        _id: uuid::Uuid,
         _project: Option<uuid::Uuid>,
     ) -> WeftResult<crate::program::MintedInstanceToken> {
         self.refused("mint an instance token")
@@ -182,8 +191,8 @@ impl ContextHandle for PureHandle {
         self.inner.firing_buses()
     }
 
-    async fn pulse_downstream(&self, output: crate::node::NodeOutput, wait_delivered: bool) -> WeftResult<()> {
-        self.inner.pulse_downstream(output, wait_delivered).await
+    async fn pulse_downstream(&self, output: crate::node::NodeOutput, delivery: crate::context::Delivery) -> WeftResult<()> {
+        self.inner.pulse_downstream(output, delivery).await
     }
 
     fn set_max_buffered_items(&self, port: &str, items: usize) -> WeftResult<()> {
@@ -194,8 +203,8 @@ impl ContextHandle for PureHandle {
         self.inner.close_port(port).await
     }
 
-    fn create_bus(&self, opts: crate::bus::BusOptions) -> WeftResult<(crate::bus::BusHandle, Value)> {
-        self.inner.create_bus(opts)
+    fn create_bus(&self, port: &str, opts: crate::bus::BusOptions) -> WeftResult<(crate::bus::BusHandle, Value)> {
+        self.inner.create_bus(port, opts)
     }
 
     fn bus(&self, marker: &Value) -> WeftResult<crate::bus::BusHandle> {

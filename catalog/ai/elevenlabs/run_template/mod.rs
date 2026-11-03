@@ -14,8 +14,8 @@
 //! template takes needs a port whose type fits, and every port needs an
 //! input or an output of the template to belong to. Every mismatch is
 //! named in one refusal, as the program mistake it is. The read happens
-//! inside the journaled submit, so the replay after the wait reads the
-//! answer back and never reads the template again.
+//! inside the submit, which runs once: a run resumed after its wait finds
+//! the job in its state and never reads the template again.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -31,7 +31,7 @@ use weft::{
 };
 
 use super::elevenlabs::API;
-use super::flows::{finish, store_output, submit, References};
+use super::flows::{finish, store_output, submit, Job, References};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsRunTemplateNode;
@@ -82,12 +82,13 @@ impl Node for ElevenLabsRunTemplateNode {
         let http = ctx.client(&account).await?;
         let refs = References::new(&ctx, &http);
         let route = format!("{API}/flows/templates/{template}");
+        let mut job = ctx.keep(Job::default()).await?;
         let submitted = submit(
-            &ctx,
-            &http,
+            &mut job,
             &refs,
             &format!("{route}/runs"),
             &format!("start a run of the ElevenLabs template {template}"),
+            "ElevenLabs answered no run id when the template run was started",
             || async {
                 let read = get_json(
                     &http,
@@ -120,11 +121,9 @@ impl Node for ElevenLabsRunTemplateNode {
             },
         )
         .await?;
-        let run_id = submitted.answer["id"]
-            .as_str()
-            .node_err("ElevenLabs answered no run id when the template run was started")?
-            .to_string();
-        let run = finish(&ctx, &account, &http, &format!("{route}/runs/{run_id}"), POLL_SECS, &submitted).await?;
+        let run_id = &submitted.id;
+        let run =
+            finish(&ctx, &mut job, &account, &http, &format!("{route}/runs/{run_id}"), POLL_SECS, &submitted).await?;
         match run["status"].as_str().unwrap_or_default() {
             "completed" => {
                 let mut emitted = NodeOutput::new();

@@ -58,7 +58,7 @@ pub enum RunCall {
 }
 
 impl RunCall {
-    pub const JOURNAL_NAMES: &'static [&'static str] = &[
+    pub const NAMES: &'static [&'static str] = &[
         "weft.runs.start",
         "weft.runs.clean",
         "weft.runs.list",
@@ -75,7 +75,7 @@ impl RunCall {
         "weft.runs.delete",
     ];
 
-    pub fn journal_name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             RunCall::Start { .. } => "weft.runs.start",
             RunCall::Clean { .. } => "weft.runs.clean",

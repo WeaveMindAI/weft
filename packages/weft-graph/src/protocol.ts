@@ -1353,16 +1353,20 @@ export function isLanguagePort(name: string): boolean {
   return isGatePort(name) || name === ERROR_PORT;
 }
 
-// SYNC: NodeFiringStatus <-> crates/weft-core/src/run/firing.rs NodeFiringStatus
-/// Adding a state requires adding it on both sides; the UI lookup
-/// tables in `webview/lib/utils/status.ts` exhaust this union so
-/// drift compiles as an error. The earlier shape had ghost variants
-/// (`pending` / `suspended` / `accumulating`) the dispatcher never
-/// emitted; they painted states the engine could not produce and
-/// `suspended` doubled-up with the real `waiting_for_input` event.
+// SYNC: NodeFiringStatus <-> crates/weft-core/src/program.rs NodeStatus, catalog/logic/get_node_state/metadata.json (the `state` output's description)
+/// Where one firing stands, in the words `weft node-state` and
+/// `GetNodeState` use (`NodeStatus`), less `pending`: a firing the graph
+/// paints has started. A firing is `waiting` while a wait of its own is
+/// open, whether its worker holds the wait (a `wait_started` with no
+/// ending yet) or the run parked on it (its suspension names a token),
+/// and `paused` when it only paused with its run. Adding a state
+/// requires adding it on every side; the UI lookup tables in
+/// `webview/lib/utils/status.ts` exhaust this union so drift compiles as
+/// an error.
 export type NodeFiringStatus =
   | 'running'
-  | 'waiting_for_input'
+  | 'waiting'
+  | 'paused'
   | 'completed'
   | 'skipped'
   | 'failed'
@@ -2095,6 +2099,8 @@ export type CorruptionSite =
   /// The run's birth gives values where its program says nothing is
   /// given, or misses one it says.
   | 'RunGiven'
+  /// A bus row names its bus by an id that is no bus id.
+  | 'Bus'
   | 'UndecodableRow'
   /// Not one row: the whole run. The code it ran is no longer
   /// recorded, so no value can be worked out from the journal. Shown

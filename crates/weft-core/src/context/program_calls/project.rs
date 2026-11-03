@@ -9,8 +9,12 @@ use serde::de::DeserializeOwned;
 
 use crate::deactivation::Following;
 use crate::program::project::ProjectCall;
-use crate::projects::{DeclareRequest, ProjectRemoved, ProjectStatusResponse, ProjectSummary, QuiesceRequest, Quiesced, StatusRequest};
+use crate::projects::{ProjectRemoved, ProjectStatusResponse, ProjectSummary, QuiesceRequest, Quiesced, StatusRequest};
+use crate::context::kept::Step;
+use crate::context::Kept;
 use crate::signal::timer::{Timer, TimerSpec};
+use crate::signal::to_spec;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::{WeftError, WeftResult};
@@ -21,7 +25,7 @@ use super::ProjectCalls;
 
 /// How long a call following a task (a resync, a removal's wait) waits
 /// between looks at it.
-const FOLLOW_LOOK_AGAIN: Timer = Timer { spec: TimerSpec::After { duration_ms: 3_000 } };
+pub(super) const FOLLOW_LOOK_AGAIN: Timer = Timer { spec: TimerSpec::After { duration_ms: 3_000 } };
 
 /// [`RunContext::projects`](crate::context::RunContext::projects).
 pub struct ProjectList<'a> {
@@ -52,8 +56,11 @@ pub struct Declare<'a> {
 impl Declare<'_> {
     /// The project's id (what its `weft.toml` will say): one of the
     /// owner's projects already under it is answered as it is, and one
-    /// of another owner's is refused as if it did not exist. Unset, a new
-    /// id.
+    /// of another owner's is refused as if it did not exist. Unset, an id
+    /// the call takes from its number in the firing: a call carried again
+    /// under that number (its answer lost, a crash before the next save)
+    /// finds the same project; one made again after a pause makes another,
+    /// so a declare that must happen once goes in `state.once`.
     pub fn id(mut self, id: uuid::Uuid) -> Self {
         self.id = Some(id);
         self
@@ -66,11 +73,9 @@ impl<'a> IntoFuture for Declare<'a> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            // A new id is made here: a replay reads the answer back, and a
-            // call carried again is the first one (deduplicated by its
-            // journal step), so one declare never makes two projects.
-            let request = DeclareRequest { id: self.id.unwrap_or_else(uuid::Uuid::now_v7), name: self.name };
-            self.at.call(ProgramCall::Project(ProjectCall::Declare { request }), StopSelf::Keep).await
+            // Unset, the id is the call's own, so the call carried again
+            // under its number finds the project the first one made.
+            self.at.call(ProgramCall::Project(ProjectCall::Declare { name: self.name, id: self.id }), StopSelf::Keep).await
         })
     }
 }
@@ -99,36 +104,33 @@ impl<'a> ProjectCalls<'a> {
     /// kept, its runs cancelled, its infra terminated, its stored data
     /// reclaimed, and the project gone. Chain `.force()` or `.journal()`
     /// before awaiting it. Refused on this run's own project, whose
-    /// removal would cancel this run.
-    pub fn remove(self) -> Remove<'a> {
-        Remove { at: self, force: false, every_run: false }
+    /// removal would cancel this run. Waiting for what it quiesces pauses
+    /// the run on a timer between looks, where `state` comes in.
+    pub fn remove<'k, S>(self, state: &'k mut Kept<S>) -> Remove<'a, 'k, S> {
+        Remove { at: self, state, force: false, every_run: false }
     }
 
-    /// Follow `task` in looks until it ends, parked on a timer between
-    /// them, and read what it ended with. One that failed fails this with
-    /// its refusal.
-    pub(super) async fn follow<T: DeserializeOwned>(self, task: uuid::Uuid) -> WeftResult<T> {
-        loop {
-            match self.call::<Following>(ProgramCall::Project(ProjectCall::Follow { task }), StopSelf::Keep).await? {
-                Following::Going(_) => {}
-                Following::Done(value) => {
-                    return serde_json::from_value(value)
-                        .map_err(|e| WeftError::NodeFailed(format!("task {task} ended with an answer this node cannot read: {e}")))
-                }
-            }
-            self.ctx.await_signal(FOLLOW_LOOK_AGAIN).await?;
+    /// One look at `task`: what it ended with, or `None` while it goes on.
+    /// One that failed fails this with its refusal.
+    pub(super) async fn task_ended<T: DeserializeOwned>(self, task: uuid::Uuid) -> WeftResult<Option<T>> {
+        match self.call::<Following>(ProgramCall::Project(ProjectCall::Follow { task }), StopSelf::Keep).await? {
+            Following::Going(_) => Ok(None),
+            Following::Done(value) => serde_json::from_value(value)
+                .map(Some)
+                .map_err(|e| WeftError::NodeFailed(format!("task {task} ended with an answer this node cannot read: {e}"))),
         }
     }
 }
 
 /// [`ProjectCalls::remove`], awaited to carry it out.
-pub struct Remove<'a> {
+pub struct Remove<'a, 'k, S> {
     at: ProjectCalls<'a>,
+    state: &'k mut Kept<S>,
     force: bool,
     every_run: bool,
 }
 
-impl Remove<'_> {
+impl<S> Remove<'_, '_, S> {
     /// Skip the wait for its infra to terminate, and go on past what the
     /// cloud cannot remove (named in the answer) (`weft rm --force`).
     /// Workers that cannot be stopped still stop the removal.
@@ -146,16 +148,34 @@ impl Remove<'_> {
     }
 }
 
-impl<'a> IntoFuture for Remove<'a> {
+impl<'a, 'k, S: Serialize + DeserializeOwned + Send> IntoFuture for Remove<'a, 'k, S>
+where
+    'a: 'k,
+{
     type Output = WeftResult<ProjectRemoved>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'k>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             let at = self.at;
-            let quiesce = ProjectCall::Quiesce { request: QuiesceRequest { every_run: self.every_run } };
-            let quiesced: Quiesced = at.call(ProgramCall::Project(quiesce), StopSelf::Keep).await?;
-            at.follow::<Value>(quiesced.waiting).await?;
+            let every_run = self.every_run;
+            // The project is quiesced once (the task it hands back is kept
+            // with a pause), then that task is followed until it ends.
+            self.state
+                .follow("project.remove", &(at.project, every_run), to_spec(FOLLOW_LOOK_AGAIN), None::<uuid::Uuid>, move |waiting| async move {
+                    let waiting = match waiting {
+                        Some(task) => task,
+                        None => {
+                            let quiesce = ProjectCall::Quiesce { request: QuiesceRequest { every_run } };
+                            at.call::<Quiesced>(ProgramCall::Project(quiesce), StopSelf::Keep).await?.waiting
+                        }
+                    };
+                    Ok(match at.task_ended::<Value>(waiting).await? {
+                        Some(_) => Step::Done(()),
+                        None => Step::LookAgain(Some(waiting)),
+                    })
+                })
+                .await?;
             at.call(ProgramCall::Project(ProjectCall::Remove { force: self.force }), StopSelf::Keep).await
         })
     }

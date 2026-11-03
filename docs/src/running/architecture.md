@@ -739,12 +739,12 @@ policy](https://github.com/WeaveMindAI/weft/blob/main/SECURITY.md).
 
 ## What happens when something dies
 
-A worker that dies takes its fast runs with it. The exception is a run whose
-every branch is waiting on a timer or a form: its whole record is written
-before it pauses, so a new worker picks it up when the wait ends. That
-exception does not hold while a caller is still on the line and the route
-leaves `outlivesCaller` off, or while a bus between its nodes is open: such a
-run holds its worker instead of pausing. Nobody can
+A worker that dies takes its fast runs with it. The exception is a run that
+paused: every node still running in it was waiting (on a timer, a form, a bus
+or a stream), each saved its state, and its whole record was written before it
+let go, so a new worker picks it up when the wait ends. That exception does
+not hold for a run that cannot pause (a caller still on the line, or
+`recorded: false`): such a run holds its worker instead. Nobody can
 tell which of a fast run's nodes ran after the last row that reached the
 database, and running it again could repeat them, so a fast run whose worker
 died ends cancelled and is not run again, with this reason: `the worker running this run went away; a fast run lives in its
@@ -765,8 +765,9 @@ person's answer while the run cannot pause, or the next message of a caller
 on a socket) stops reporting, so the database is not woken every second for
 a wait that can last hours. Its last report says it is alive until the first
 of those waits would give up, plus 15 seconds. A wait on a person gives up
-when its `holdSecs` runs out. A wait for a caller's next message has no
-time limit of its own, so the worker's last report covers it until the
+when its `holdSecs` runs out, unless a caller is on the line. A wait while a
+caller is on the line, and a wait for a caller's next message, have no time
+limit of their own, so the worker's last report covers it until the
 run's hour ends or the route's or socket's `maxSessionSecs` runs out (the
 longest one connection may stay open; unset, there is none), whichever
 comes first. On your machine a run has no hour limit, so for a route or
@@ -792,8 +793,9 @@ first wait would have given up.
 In that same check, a durable run whose worker died is queued again, and the
 dispatcher hands it to another worker at once, which carries it on from its
 record. A node that had started but not finished is failed on the new worker
-rather than run again, apart from some pure nodes. For which ones,
-and what to do about a failed node, go and read [surviving a
+rather than run again, apart from a node that saved a state, which runs again
+from its last save, and some pure nodes. For which ones, and what to do about
+a failed node, go and read [surviving a
 restart](../nodes/durable-execution.md#when-the-worker-dies-mid-run).
 
 On a cloud install, when Cloud Run replaces a worker or scales one away, it
@@ -801,17 +803,15 @@ sends the worker `SIGTERM`, the signal that asks a process to stop on its own,
 and kills it 10 seconds later. Every run on the worker then leaves it if it
 can:
 
-- A run that can pause starts no new node. Once the nodes it is running have
-  ended, its record is written whole and it is handed back, so another worker
-  carries it on straight away. A node still running 5 seconds after the
-  `SIGTERM` is stopped where it is, and the next worker fails that node, the
-  same as if the worker had died. If its caller is still on the line (a route
-  with `outlivesCaller` on), the run carries on with nobody there, and the
-  caller hears `the copy of the program serving this request is stopping, so
-  the run carries on in another one without this caller`.
-- Three kinds of run cannot pause: an unrecorded run, a run tied to the caller
-  still on the line (a route without `outlivesCaller`), and a run with a bus
-  open, since a bus lives in its worker's memory alone. Each keeps running,
+- A run that can pause starts no new node. Once each node it is running has
+  ended or is waiting inside the run (on a bus, a stream or a yield), it
+  pauses: every waiting node saves its state, its record is written whole,
+  and it is handed back, so another worker carries it on straight away, buses
+  included. A node still running 5 seconds after the `SIGTERM` is stopped
+  where it is, and the next worker treats it as if the worker had died: it
+  runs again from its last save if it saved a state, and is failed otherwise.
+- Two kinds of run cannot pause: an unrecorded run, and a run whose caller is
+  still on the line, whatever its route's `outlivesCaller` says. Each keeps running,
   starting new nodes as usual, until the platform stops the process. If it has
   not ended by then, that is the same as its worker dying: a fast run ends
   cancelled, and a durable one is carried on by another worker. An unrecorded

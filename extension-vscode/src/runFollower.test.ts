@@ -363,3 +363,66 @@ describe('which followed run has not ended', () => {
     follower.stop();
   });
 });
+
+describe('waits', () => {
+  type NodeEvent = { kind: string; node?: string; token?: string | null; seq: number };
+  function event({ kind, node = 'n', token, seq }: NodeEvent): DispatcherEvent {
+    const base = { eventId: `journal:${seq}:0:0`, runId: 'a', projectId: 'p', node, frames: [], atUnix: seq };
+    switch (kind) {
+      case 'node_started': return { ...base, kind, input: {}, closedPorts: [] };
+      case 'wait_started': return { ...base, kind, token: token as string };
+      case 'wait_ended': return { ...base, kind, token: token as string, ended: { type: 'skipped' } };
+      case 'node_suspended': return { ...base, kind, token: token ?? null };
+      case 'node_resumed': return { ...base, kind, token: token ?? null };
+      default: return { ...base, kind: 'node_completed', output: {} };
+    }
+  }
+
+  /** The states the graph was told the firing at `n` stood in, in order. */
+  async function states(events: NodeEvent[]): Promise<string[]> {
+    const { client, follower, posted } = rig();
+    await follower.replay('a');
+    client.subscriptions[0].handlers.onOpen?.();
+    for (const e of events) client.subscriptions[0].send(JSON.stringify(event(e)));
+    follower.stop();
+    return posted.flatMap((m) => (m.kind === 'firingEvent' ? [m.event.state] : []));
+  }
+
+  it('paints a firing waiting while its worker holds a wait, and running again once the wait ends', async () => {
+    expect(await states([
+      { kind: 'node_started', seq: 1 },
+      { kind: 'wait_started', token: 't', seq: 2 },
+      { kind: 'wait_ended', token: 't', seq: 3 },
+      { kind: 'node_completed', seq: 4 },
+    ])).toEqual(['running', 'waiting', 'running', 'completed']);
+  });
+
+  it('keeps a parked firing waiting when its wait ends, until it resumes', async () => {
+    expect(await states([
+      { kind: 'node_started', seq: 1 },
+      { kind: 'wait_started', token: 't', seq: 2 },
+      { kind: 'node_suspended', token: 't', seq: 3 },
+      { kind: 'wait_ended', token: 't', seq: 4 },
+      { kind: 'node_resumed', token: 't', seq: 5 },
+    ])).toEqual(['running', 'waiting', 'waiting', 'running']);
+  });
+
+  it('paints a firing that resumes with its own wait still open as waiting on it again', async () => {
+    expect(await states([
+      { kind: 'node_started', seq: 1 },
+      { kind: 'wait_started', token: 't', seq: 2 },
+      { kind: 'node_suspended', token: 't', seq: 3 },
+      { kind: 'node_resumed', token: null, seq: 4 },
+    ])).toEqual(['running', 'waiting', 'waiting', 'waiting']);
+  });
+
+  it('repaints nothing for a wait that ends after its firing did, or one answered before it was registered', async () => {
+    expect(await states([
+      { kind: 'node_started', seq: 1 },
+      { kind: 'wait_ended', token: 'early', seq: 2 },
+      { kind: 'wait_started', token: 't', seq: 3 },
+      { kind: 'node_completed', seq: 4 },
+      { kind: 'wait_ended', token: 't', seq: 5 },
+    ])).toEqual(['running', 'waiting', 'completed']);
+  });
+});
