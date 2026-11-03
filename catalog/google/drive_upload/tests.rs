@@ -51,8 +51,12 @@ async fn uploads(rig: FakeRig) -> WeftResult<()> {
         .ok()?;
     assert_eq!(outcome.outputs["fileId"], json!("f1"));
     let sent = &rig.requests()[0];
-    let body = sent.body_text.as_ref().expect("multipart body is buffered text");
+    assert!(sent.body_streamed, "the upload streams the stored file");
+    let content_type = sent.header("content-type").expect("a content type");
+    assert!(content_type.starts_with("multipart/related; boundary="), "{content_type}");
+    let body = sent.body_text.as_ref().expect("the rig reads the streamed body");
     assert!(body.contains(r#""parents":["dest"]"#), "folder rides the metadata part: {body}");
+    assert!(body.contains(r#""name":"notes.txt""#), "the stored name rides the metadata part: {body}");
     assert!(body.contains("hello"), "the stored bytes ride the media part");
     Ok(())
 }

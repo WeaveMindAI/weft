@@ -260,7 +260,7 @@ async fn connections(ctx: &Ctx, source: &DispatcherClient, target: &DispatcherCl
     if !picks_to_set.is_empty() {
         println!("these nodes use the copied connections here; to pick them on {} too, run in each project's folder:", picks.to);
         for p in picks_to_set {
-            println!("  project {}: weft connect --node {} --grant {} --on {}   (its field {})", p.project_id, p.node, p.grant_id, picks.to, p.field);
+            println!("  project {}: weft connect {} --grant {} --on {}   (its field {})", p.project_id, p.node, p.grant_id, picks.to, p.field);
         }
     }
     Ok(())

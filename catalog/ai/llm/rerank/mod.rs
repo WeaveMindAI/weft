@@ -23,27 +23,25 @@ impl Node for LlmRerankNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let (model, account) = super::provider::read_for(&ctx, "openrouter", "reranking")?;
+        let (model, account) = super::provider::openrouter(&ctx, "reranking")?;
         let query: String = ctx.inputs.get("query")?;
+        // At least one document, by the node's `documents` rule.
         let documents: Vec<String> = ctx.inputs.get("documents")?;
-        let top_n: Option<f64> = ctx.inputs.opt("topN")?;
+        let top_n: Option<u64> = ctx.inputs.opt("topN")?;
 
-        if documents.is_empty() {
-            weft::node_bail!("documents is empty; nothing to rerank");
-        }
         let mut body = json!({
             "model": model,
             "query": query,
             "documents": documents,
         });
         if let Some(n) = top_n {
-            body["top_n"] = json!(n as u64);
+            body["top_n"] = json!(n);
         }
 
         let http = ctx.client(&account).await?;
         let answer = weft::access::client::post_json(
             &http,
-            &format!("{}/rerank", super::provider::OPENROUTER_API),
+            weft::access::client::url(super::provider::OPENROUTER_API, &["rerank"])?.as_str(),
             &body,
             "openrouter: rerank",
         )

@@ -412,7 +412,7 @@ pub fn unqualified(name: &str) -> &str {
 }
 
 /// One node of the folder's program, from the way a person spells it
-/// (`weft options`, `weft connect --node`, the infra verbs): what it names
+/// (`weft options`, `weft connect <node>`, the infra verbs): what it names
 /// in the compiled definition, its id and the call path that use of it
 /// runs under (`auth.check` is the node `Auth.check` under `["auth"]`).
 /// The spelling is read the one way every surface reads one

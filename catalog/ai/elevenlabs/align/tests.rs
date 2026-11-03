@@ -129,7 +129,9 @@ async fn aligns(rig: FakeRig) -> WeftResult<()> {
     );
     assert_eq!(outcome.outputs["loss"], json!(0.12));
 
-    let form = rig.requests()[0].body_text.clone().expect("a buffered multipart body");
+    let sent = &rig.requests()[0];
+    assert!(sent.body_streamed, "the recording streams out of storage, never held whole");
+    let form = sent.body_text.clone().expect("the rig reads a streamed body whole");
     assert!(form.contains("name=\"text\"\r\n\r\nhi yo\r\n"), "{form}");
     assert!(form.contains("name=\"file\"; filename=\"take.mp3\""), "{form}");
     Ok(())

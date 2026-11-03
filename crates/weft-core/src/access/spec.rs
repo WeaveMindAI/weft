@@ -49,7 +49,14 @@ impl CallbackAddress {
 /// The steps a stored [`AccessSpec`] (a connection's snapshot of its
 /// recipe, a program's published or instance service) takes from the
 /// shape an older weft wrote; `crate::stored` says how they run.
-pub const ACCESS_SPEC_UPGRADES: &[&[crate::stored::Op]] = &[ACCESS_SPEC_V2];
+pub const ACCESS_SPEC_UPGRADES: &[&[crate::stored::Op]] = &[ACCESS_SPEC_V2, ACCESS_SPEC_V3];
+
+/// Version 3: a recipe no longer says how a route checks its callers (a
+/// Route or Socket names its scheme in its own `auth`,
+/// `crate::access::callers`), so the `verify` block a connection's
+/// snapshot kept is dropped. Its stored values stay, under the names the
+/// scheme reads.
+pub const ACCESS_SPEC_V3: &[crate::stored::Op] = &[crate::stored::Op::DropKey { at: "", key: "verify" }];
 
 /// Version 2: a route gate's scheme and every push recipe's scheme moved
 /// to the shape where the signature and the timestamp are each a place in
@@ -161,17 +168,6 @@ pub struct AccessSpec {
     /// trigger on it cannot be served and says so at registration.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub events: BTreeMap<String, crate::access::events::EventsSpec>,
-    /// How a CALLER presenting a connection of this service is checked
-    /// when a live route is gated by it (`Route { auth: ... }`): the
-    /// scheme (a shared-key set, an identity token, an HMAC) is data
-    /// here, and the connection's stored values hold the material by
-    /// the names the scheme reserves (`keys`, `signingSecret`,
-    /// `publicKey`, `audience`; an `oidc` scheme names its addresses
-    /// as templates over the fields). The broker runs it, secret-free
-    /// from the gateway's side. Absent = connections of this service
-    /// cannot gate a route.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verify: Option<crate::access::events::VerifyKind>,
     /// Named groups of OPTIONAL fields, for a service whose optional
     /// fields come in sets that each unlock one capability (a
     /// mailbox's receiving server and its sending server).
@@ -2451,36 +2447,6 @@ impl AccessSpec {
             }
         }
         crate::access::events::validate_topics(&self.service, &self.events)?;
-        if let Some(verify) = &self.verify {
-            // The scheme reads the connection: every value it needs must
-            // be a field the paste page declares, or no connection of
-            // this service could ever verify anyone.
-            let declared = self.own_fields();
-            for name in verify.required_value_names()? {
-                match declared.iter().find(|f| f.name == name) {
-                    None => {
-                        return Err(format!(
-                            "service '{}' declares a `{}` verify that reads the stored value \
-                             '{name}', but no credential field of that name is declared; add it \
-                             to the acquisition fields",
-                            self.service,
-                            verify.tag()
-                        ))
-                    }
-                    Some(field) if field.optional => {
-                        return Err(format!(
-                            "service '{}' declares a `{}` verify that reads the stored value \
-                             '{name}' on every check, but its field is `optional`, so a connection \
-                             left without it could verify nobody; drop `optional` from the field",
-                            self.service,
-                            verify.tag()
-                        ))
-                    }
-                    Some(_) => {}
-                }
-            }
-            verify.validate(&self.service, crate::access::events::VerifySide::Caller)?;
-        }
         if let Some(page) = &self.own_page {
             if let Some(mint) = &page.mint {
                 validate_captures(&mint.captures)?;
@@ -3639,61 +3605,6 @@ mod tests {
         assert_eq!(lookup_path(&v, "channels.1.id"), Some(&json!("C2")));
         assert_eq!(lookup_path(&v, "missing.path"), None);
         assert_eq!(lookup_path(&v, "team.name.deeper"), None);
-    }
-
-    fn verifier_spec(fields: &[&str], verify: serde_json::Value) -> serde_json::Result<AccessSpec> {
-        serde_json::from_value(json!({
-            "service": "api_key_auth",
-            "acquisition": {
-                "kind": "static",
-                "fields": fields.iter().map(|f| json!({ "name": f })).collect::<Vec<_>>()
-            },
-            "verify": verify
-        }))
-    }
-
-    /// A caller-verify recipe round-trips and is refused when it reads
-    /// a value the paste page does not declare.
-    #[test]
-    fn a_verify_block_must_name_declared_fields() {
-        let ok = verifier_spec(&["keys"], json!({ "kind": "api_keys" })).unwrap();
-        ok.validate().expect("keys is declared");
-        assert!(matches!(ok.verify, Some(crate::access::events::VerifyKind::ApiKeys { .. })));
-        let v = serde_json::to_value(&ok).unwrap();
-        assert_eq!(v["verify"], json!({ "kind": "api_keys" }), "defaults stay off the wire");
-
-        let missing = verifier_spec(&["token"], json!({ "kind": "api_keys" })).unwrap();
-        let err = missing.validate().expect_err("keys is not declared");
-        assert!(err.contains("'keys'"), "{err}");
-
-        let oidc = verifier_spec(
-            &["jwksUrl", "issuer", "audience"],
-            json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwksUrl": "{jwksUrl}" }),
-        )
-        .unwrap();
-        oidc.validate().expect("templated addresses over declared fields");
-        let short = verifier_spec(
-            &["issuer"],
-            json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwksUrl": "{jwksUrl}" }),
-        )
-        .unwrap();
-        let err = short.validate().expect_err("jwksUrl is not declared");
-        assert!(err.contains("'jwksUrl'"), "{err}");
-
-        let echo = verifier_spec(&["token"], json!({ "kind": "token_echo" })).unwrap();
-        let err = echo.validate().expect_err("token echo cannot gate callers");
-        assert!(err.contains("token_echo"), "{err}");
-
-        // A gate's signing scheme meets the same rules a push recipe
-        // does: one signing {timestamp} with nowhere to read it from is
-        // refused here, never verified at runtime with no replay check.
-        let unsourced = verifier_spec(
-            &["signingSecret"],
-            json!({ "kind": "hmac", "signature": { "in": "header:X-Signature" }, "concat": "{timestamp}.{body}" }),
-        )
-        .unwrap();
-        let err = unsourced.validate().expect_err("a signed timestamp needs a source");
-        assert!(err.contains("no timestamp source"), "{err}");
     }
 
     /// The oidc scheme resolves its templates against a connection's

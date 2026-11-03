@@ -1,6 +1,5 @@
-//! MistralParseDocument self-tests: the upload -> signed-url -> OCR
-//! dance against canned answers (fake), and one real one-page OCR
-//! (live).
+//! MistralParseDocument self-tests: the OCR call against canned answers
+//! (fake), and one real one-page OCR (live).
 
 use serde_json::json;
 
@@ -14,21 +13,16 @@ const TINY_PDF: &[u8] = include_bytes!("fixture.pdf");
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
-        NodeTest::fake("uploads_signs_and_emits_the_pages_markdown", ocr_dance),
+        NodeTest::fake("reads_the_document_from_its_link_and_emits_the_pages_markdown", ocr),
+        NodeTest::fake("an_image_is_sent_as_an_image_url", image_ocr),
         NodeTest::fake("a_document_heavier_than_a_wire_is_stored_whole", heavy_document),
-        NodeTest::fake("a_refused_upload_fails_the_run_when_error_is_unwired", refused_upload),
-        NodeTest::fake("a_refused_upload_comes_out_on_error_when_it_is_wired", refused_upload_wired),
+        NodeTest::fake("a_refused_ocr_fails_the_run_when_error_is_unwired", refused_ocr),
+        NodeTest::fake("a_refused_ocr_comes_out_on_error_when_it_is_wired", refused_ocr_wired),
         NodeTest::live("one_real_page_ocr", "mistral", live_ocr),
     ]
 }
 
-async fn ocr_dance(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("POST", "/v1/files", json!({ "id": "file-1" }));
-    rig.respond(
-        "GET",
-        "/v1/files/file-1/url?expiry=1",
-        json!({ "url": "https://signed.example/doc" }),
-    );
+async fn ocr(rig: FakeRig) -> WeftResult<()> {
     rig.respond(
         "POST",
         "/v1/ocr",
@@ -37,7 +31,6 @@ async fn ocr_dance(rig: FakeRig) -> WeftResult<()> {
             { "index": 1, "markdown": "Page two" },
         ]}),
     );
-    rig.respond("DELETE", "/v1/files/file-1", json!({ "deleted": true }));
     let file = rig.store_file("doc.pdf", "application/pdf", TINY_PDF.to_vec());
     let outcome = rig
         .run(
@@ -56,21 +49,31 @@ async fn ocr_dance(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(outcome.outputs["pageCount"], json!(2.0));
 
     let sent = rig.requests();
-    assert_eq!(sent.len(), 4, "upload, sign, ocr, delete-upload");
-    assert_eq!(sent[3].method, "DELETE", "the upload never outlives the OCR");
-    let ocr_body = sent[2].body.as_ref().expect("ocr body");
-    assert_eq!(ocr_body["document"]["document_url"], json!("https://signed.example/doc"));
+    assert_eq!(sent.len(), 1, "the OCR call alone: nothing is uploaded to Mistral");
+    let document = &sent[0].body.as_ref().expect("ocr body")["document"];
+    assert_eq!(document["type"], json!("document_url"));
+    let link = document["document_url"].as_str().expect("a link");
+    assert!(link.starts_with("data:application/pdf;base64,") || link.starts_with("http"), "{link}");
+    Ok(())
+}
+
+async fn image_ocr(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("POST", "/v1/ocr", json!({ "pages": [{ "index": 0, "markdown": "Total: 12" }] }));
+    let file = rig.store_file("receipt.png", "image/png", vec![0x89, b'P', b'N', b'G']);
+    rig.run(&MistralParseDocumentNode, json!({ "account": rig.access("mistral"), "file": file }))
+        .await
+        .ok()?;
+    let document = &rig.requests()[0].body.clone().expect("ocr body")["document"];
+    assert_eq!(document["type"], json!("image_url"));
+    assert!(document["image_url"].is_string(), "{document}");
     Ok(())
 }
 
 /// Forty pages of 5 KB weigh 200 KB of markdown, twice what a wire
 /// carries: every byte of the paid OCR is kept, in the files.
 async fn heavy_document(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("POST", "/v1/files", json!({ "id": "file-2" }));
-    rig.respond("GET", "/v1/files/file-2/url?expiry=1", json!({ "url": "https://signed.example/big" }));
     let pages: Vec<_> = (0..40).map(|i| json!({ "index": i, "markdown": "x".repeat(5 * 1024) })).collect();
     rig.respond("POST", "/v1/ocr", json!({ "pages": pages }));
-    rig.respond("DELETE", "/v1/files/file-2", json!({ "deleted": true }));
     let file = rig.store_file("book.pdf", "application/pdf", TINY_PDF.to_vec());
     let outcome = rig
         .run(&MistralParseDocumentNode, json!({ "account": rig.access("mistral"), "file": file }))
@@ -84,9 +87,9 @@ async fn heavy_document(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn refused_upload(rig: FakeRig) -> WeftResult<()> {
+async fn refused_ocr(rig: FakeRig) -> WeftResult<()> {
     // Mistral's real refusal envelope carries `detail`, not `message`.
-    rig.respond_status("POST", "/v1/files", 401, json!({ "detail": "bad key" }));
+    rig.respond_status("POST", "/v1/ocr", 401, json!({ "detail": "bad key" }));
     let file = rig.store_file("doc.pdf", "application/pdf", TINY_PDF.to_vec());
     let outcome = rig
         .run(
@@ -99,8 +102,8 @@ async fn refused_upload(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn refused_upload_wired(rig: FakeRig) -> WeftResult<()> {
-    rig.respond_status("POST", "/v1/files", 401, json!({ "detail": "bad key" }));
+async fn refused_ocr_wired(rig: FakeRig) -> WeftResult<()> {
+    rig.respond_status("POST", "/v1/ocr", 401, json!({ "detail": "bad key" }));
     rig.wire_output("_error");
     let file = rig.store_file("doc.pdf", "application/pdf", TINY_PDF.to_vec());
     let outcome = rig

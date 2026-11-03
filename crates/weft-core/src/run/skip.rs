@@ -348,6 +348,9 @@ pub fn check_should_skip(
     }
 
     // oneOfRequired groups: skip when EVERY port in a group is closed.
+    // A blank text where a blank is no value (`ready::blank_is_absent`)
+    // is not given either: a literal one is never in `filled`, and a
+    // wired one counts as closed.
     for group in &node.features.one_of_required {
         if group.is_empty() {
             continue;
@@ -364,7 +367,7 @@ pub fn check_should_skip(
             if super::ready::is_generator_input(node, port_name) {
                 return false;
             }
-            port_arrived_closed(group_pulses, port_name)
+            port_arrived_closed(group_pulses, port_name) || arrived_blank(node, group_pulses, port_name)
         });
         if all_closed {
             let failure = first_failure(group_pulses, group.iter().map(String::as_str));
@@ -373,6 +376,14 @@ pub fn check_should_skip(
     }
 
     None
+}
+
+/// Whether what arrived on `port_name` is a blank text the input counts
+/// as no value ([`super::ready::blank_is_absent`]).
+fn arrived_blank(node: &NodeDefinition, group_pulses: &[&Pulse], port_name: &str) -> bool {
+    super::ready::resolve_port_value(group_pulses, port_name).is_some_and(|pulse| {
+        node.inputs.iter().find(|p| p.name == port_name).is_some_and(|input| super::ready::blank_is_absent(input, &pulse.value))
+    })
 }
 
 fn port_arrived_closed(group_pulses: &[&Pulse], port_name: &str) -> bool {
@@ -630,6 +641,34 @@ mod tests {
             check_should_skip(&node, &view(&pulses), &HashSet::new(), &wired, &HashSet::new()),
             Some(SkipReason::NothingJoined { failure: Some(failure_on_a) }),
         );
+    }
+
+    /// A blank text on an optional String input of the node's own is not
+    /// given: a group whose every other member closed skips on it, and an
+    /// input that keeps blanks counts it given.
+    #[test]
+    fn a_blank_text_is_not_given_to_a_one_of_group() {
+        let node = |keeps: bool| {
+            let mut node = node_all_optional();
+            node.inputs = ["text", "file"]
+                .iter()
+                .map(|name| {
+                    serde_json::from_value(json!({ "name": name, "portType": "String", "required": false, "optional": true, "fromSpec": true, "keepsBlank": keeps && *name == "text" }))
+                        .expect("port")
+                })
+                .collect();
+            node.features.one_of_required = vec![vec!["text".into(), "file".into()]];
+            node
+        };
+        let wired: HashSet<&str> = ["text", "file"].into_iter().collect();
+        let pulses = vec![data_pulse("text", json!("  ")), closure_pulse("file")];
+        assert!(matches!(
+            check_should_skip(&node(false), &view(&pulses), &HashSet::new(), &wired, &HashSet::new()),
+            Some(SkipReason::OneOfGroupClosed { .. })
+        ));
+        assert_eq!(check_should_skip(&node(true), &view(&pulses), &HashSet::new(), &wired, &HashSet::new()), None);
+        let pulses = vec![data_pulse("text", json!("hi")), closure_pulse("file")];
+        assert_eq!(check_should_skip(&node(false), &view(&pulses), &HashSet::new(), &wired, &HashSet::new()), None);
     }
 
     fn data_pulse(port: &str, value: serde_json::Value) -> Pulse {

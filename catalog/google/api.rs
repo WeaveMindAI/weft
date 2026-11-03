@@ -1,32 +1,16 @@
 //! Shared plumbing for the whole google package, across its API
-//! families: path-segment encoding, page sizes, and one page of a list
-//! endpoint, paged by the `nextPageToken` Drive and Calendar speak.
+//! families: one page of a list endpoint, paged by the `nextPageToken`
+//! Drive and Calendar speak, and the Calendar API's base.
 
 use serde_json::Value;
 
-use weft::access::client::get_json;
+use weft::access::client::{get_json, Url};
 use weft::reqwest_middleware::ClientWithMiddleware;
 use weft::storage::over_wire;
 use weft::WeftResult;
 
-/// One URL path segment from an id the caller supplied (a file, doc,
-/// message, spreadsheet, label or calendar id), percent-encoded so a
-/// `/`, `?`, `#` or `%` in it addresses that id instead of reshaping
-/// the request path.
-pub fn segment(raw: &str) -> String {
-    urlencoding::encode(raw).into_owned()
-}
-
-/// A page-size setting, at least 1. A wired or written value skips the
-/// widget's minimum, and a page of 0 items would never move a cursor
-/// on, so anything below 1 is refused naming the setting.
-pub fn page_size(inputs: &weft::ValueBag, name: &str) -> WeftResult<usize> {
-    let size: f64 = inputs.get(name)?;
-    if size < 1.0 {
-        return Err(weft::WeftError::Config(format!("`{name}` is {size}; a page holds at least 1 item")));
-    }
-    Ok(size as usize)
-}
+/// The Calendar API, which both calendar nodes address.
+pub const CALENDAR_API: &str = "https://www.googleapis.com/calendar/v3";
 
 /// One page of a Google listing, and Google's token for the next.
 pub struct ListPage {
@@ -46,18 +30,15 @@ pub struct ListPage {
 /// makes pages lighter.
 pub async fn list_page(
     http: &ClientWithMiddleware,
-    base: &str,
+    base: Url,
     items: &str,
-    page_token: &str,
+    page_token: Option<&str>,
     shape: impl Fn(&Value) -> Value,
     what: &str,
     size_setting: &str,
 ) -> WeftResult<ListPage> {
-    let url = match page_token.trim() {
-        "" => base.to_string(),
-        token => format!("{base}&pageToken={}", urlencoding::encode(token)),
-    };
-    let answer = get_json(http, &url, what).await?;
+    let url = base.query_opt("pageToken", page_token);
+    let answer = get_json(http, url.as_str(), what).await?;
     // A page with no hits leaves the array out.
     let items: Vec<Value> = answer[items].as_array().into_iter().flatten().map(shape).collect();
     if let Some(weight) = over_wire(&items) {

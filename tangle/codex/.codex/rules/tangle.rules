@@ -83,7 +83,7 @@ prefix_rule(
     decision = "allow",
     justification = "picking a stored connection, minting a scoped token, copying the connect library into the frontend, an instance's own values",
     match = [
-        "weft connect --node db --list",
+        "weft connect db --list",
         "weft connect-lib",
         "weft instance-values --instance alice",
     ],

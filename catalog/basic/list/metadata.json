@@ -23,5 +23,14 @@
     "pure": true,
     "canAddInputPorts": true,
     "customInputType": "T"
-  }
+  },
+  "validate": [
+    {
+      "when": { "kind": "not", "of": { "kind": "custom_inputs_declared" } },
+      "then": {
+        "message": "List '{id}' declares no input ports, so there are no items to build. Declare one port per item, `List(first: String, second: String)`, and wire each.",
+        "level": "structural"
+      }
+    }
+  ]
 }

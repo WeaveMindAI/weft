@@ -71,6 +71,22 @@
         "message": "DecisionChoice '{id}' has nothing to decide about: add one input for each piece of what the model should judge, named after it and typed, like `DecisionChoice(email: String, attachment: Image)`.",
         "level": "structural"
       }
+    },
+    {
+      "when": { "kind": "not", "of": { "kind": "value", "field": "options", "count": { "min": 2 } } },
+      "then": {
+        "message": "DecisionChoice '{id}' has fewer than two `options`: give the model at least two to pick from.",
+        "level": "structural",
+        "field": "options"
+      }
+    },
+    {
+      "when": { "kind": "all", "of": [{ "kind": "value", "field": "options" }, { "kind": "not", "of": { "kind": "value", "field": "options", "unique": true } }] },
+      "then": {
+        "message": "DecisionChoice '{id}' lists an option twice in `options`: name each option once.",
+        "level": "structural",
+        "field": "options"
+      }
     }
   ]
 }

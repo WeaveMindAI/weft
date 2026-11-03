@@ -74,6 +74,12 @@ reqwest = { workspace = true, optional = true }
 # `Content-Disposition` carries (`storage`, in the pure layer too).
 percent-encoding = "2"
 http = { version = "1", optional = true }
+# The node-test rig's fake provider reads a streamed request body whole, so
+# a test sees what an upload streamed from storage sent.
+http-body-util = { version = "0.1", optional = true }
+# The body a rebuilt response carries (`net::with_body_stream`), which keeps
+# the size the original answer stated.
+http-body = { version = "1", optional = true }
 # Raw outbound pipes (`net`): TLS over TCP with the system's trust roots,
 # for everything that holds a non-HTTP connection (the listener's raw-pipe
 # engine, node code handing a connected stream to a protocol library).
@@ -110,6 +116,8 @@ runtime = [
     "dep:reqwest-middleware",
     "dep:reqwest",
     "dep:http",
+    "dep:http-body-util",
+    "dep:http-body",
     "dep:tokio-rustls",
     "dep:rustls-native-certs",
     "dep:lru",

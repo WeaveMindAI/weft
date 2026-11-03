@@ -14,7 +14,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_resumed_run_never_submits_twice", resumed),
         NodeTest::fake("an_unknown_status_fails_loud", unknown_status),
         NodeTest::fake("a_failed_generation_surfaces_fals_words", failed_generation),
-        NodeTest::fake("a_traversal_model_id_fails_the_run_even_when_error_is_wired", bad_model),
         NodeTest::fake("a_refused_submit_fails_the_run_when_error_is_unwired", refused_unwired),
         NodeTest::fake("a_refused_submit_comes_out_on_error_when_it_is_wired", refused_wired),
         NodeTest::live("one_real_small_generation", "fal", live_generate),
@@ -182,28 +181,6 @@ async fn failed_generation(rig: FakeRig) -> WeftResult<()> {
         .await;
     let err = outcome.result.expect_err("a failed generation must refuse").to_string();
     assert!(err.contains("content policy violation"), "{err}");
-    Ok(())
-}
-
-/// A malformed model id is a mistake in the program, not fal's answer:
-/// a wired `_error` must not swallow it.
-async fn bad_model(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    let err = rig
-        .run(
-            &FalGenerateImageNode,
-            json!({
-                "account": rig.access("fal"),
-                "prompt": "x",
-                "model": "../../etc",
-                "imageSize": "square",
-                "count": 1,
-            }),
-        )
-        .await
-        .failure()?;
-    assert!(err.starts_with("input error"), "{err}");
-    assert!(err.contains("not a fal model id"), "{err}");
     Ok(())
 }
 

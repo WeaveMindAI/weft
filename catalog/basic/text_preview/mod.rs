@@ -14,7 +14,7 @@ use futures::StreamExt;
 
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, StorageScope};
-use weft::{Node, NodeErrExt, NodeManifest, RunContext, WeftError, WeftResult};
+use weft::{Node, NodeManifest, RunContext, WeftError, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct TextPreviewNode;
@@ -31,7 +31,8 @@ mod tests;
 pub const MAX_CHARS_LIMIT: usize = 16_000;
 
 /// Which part of the text the reader sees.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Keep {
     Start,
     End,
@@ -59,27 +60,13 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Read the settings as the node receives them. Their bounds are the
+    /// The settings as the node receives them. Their bounds are the
     /// metadata's widgets (whole numbers, `maxChars` up to
     /// [`MAX_CHARS_LIMIT`], `startShare` from 0 to 1), which the compiler
     /// holds a written value to and the runtime a wired one, so a value
     /// here is already within them.
-    pub fn new(keep: &str, max_lines: f64, max_chars: f64, start_share: f64) -> WeftResult<Self> {
-        let keep = match keep {
-            "start" => Keep::Start,
-            "end" => Keep::End,
-            "both" => Keep::Both,
-            other => {
-                return Err(WeftError::Input(format!(
-                    "`keep` is `{other}`; it is one of `start`, `end` or `both`"
-                )))
-            }
-        };
-        Ok(Settings {
-            keep,
-            max: Budget { lines: max_lines as usize, chars: max_chars as usize },
-            start_share,
-        })
+    pub fn new(keep: Keep, max_lines: usize, max_chars: usize, start_share: f64) -> Self {
+        Settings { keep, max: Budget { lines: max_lines, chars: max_chars }, start_share }
     }
 
     /// What the start and the end each get. For `both`, the start gets
@@ -359,15 +346,13 @@ impl Utf8Decoder {
 /// Feed a stored file into `preview` as it streams.
 async fn read_file(ctx: &RunContext, file: &FileHandle, preview: &mut Preview) -> WeftResult<()> {
     let (_meta, mut stream) = ctx.storage(StorageScope::Run).get(file).await?;
-    let cancel = ctx.cancellation();
     let mut decoder = Utf8Decoder::default();
-    loop {
-        let chunk = tokio::select! {
-            chunk = stream.next() => chunk,
-            err = cancel.cancelled_err() => return Err(err),
-        };
-        let Some(chunk) = chunk else { break };
-        let chunk = chunk.node_err("reading the file")?;
+    while let Some(chunk) = stream.next().await {
+        // A read the run's cancel ended unwinds as cancelled.
+        let chunk = chunk.map_err(|e| match weft::cancellation::is_cancel(&e) {
+            true => WeftError::Cancelled,
+            false => weft::node_error(format!("reading the file: {e}")),
+        })?;
         preview.push(&decoder.push(&chunk));
     }
     preview.push(&decoder.finish());
@@ -382,29 +367,18 @@ impl Node for TextPreviewNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let keep: String = ctx.inputs.get("keep")?;
         let settings = Settings::new(
-            &keep,
+            ctx.inputs.get("keep")?,
             ctx.inputs.get("maxLines")?,
             ctx.inputs.get("maxChars")?,
             ctx.inputs.get("startShare")?,
-        )?;
-        let text: Option<String> = ctx.inputs.opt("text")?;
-        let file: Option<FileHandle> = ctx.inputs.opt("file")?;
+        );
+        // Exactly one of the two arrives: `oneOfRequired` skips the node
+        // when neither does, and the metadata refuses both.
         let mut preview = Preview::new(&settings);
-        match (text, file) {
-            (Some(_), Some(_)) => {
-                return Err(WeftError::Input(
-                    "both `text` and `file` are given: give the text one way".into(),
-                ))
-            }
-            (None, None) => {
-                return Err(WeftError::Input(
-                    "there is no text to preview: give `text` or a stored text `file`".into(),
-                ))
-            }
-            (Some(text), None) => preview.push(&text),
-            (None, Some(file)) => read_file(&ctx, &file, &mut preview).await?,
+        match ctx.inputs.opt::<String>("text")? {
+            Some(text) => preview.push(&text),
+            None => read_file(&ctx, &ctx.inputs.get::<FileHandle>("file")?, &mut preview).await?,
         }
         let shown = preview.finish();
         ctx.pulse_downstream(

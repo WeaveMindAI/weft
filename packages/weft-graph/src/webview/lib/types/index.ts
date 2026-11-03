@@ -167,7 +167,12 @@ export function isCompatible(source: WeftType, target: WeftType): boolean {
 	if (target.kind === 'json') return fitsJson(source);
 	// A bus connects only to a bus; payloads are not type-checked.
 	if (source.kind === 'bus' && target.kind === 'bus') return true;
-	if (source.kind === 'access' && target.kind === 'access') return true;
+	// An access connects only to an access: one of a service into that
+	// service or into any, one of any service only into any.
+	// SYNC: access compatibility <-> crates/weft-core/src/weft_type.rs WeftType::is_compatible
+	if (source.kind === 'access' && target.kind === 'access') {
+		return !target.service || source.service === target.service;
+	}
 	if (source.kind === 'infra' && target.kind === 'infra') return true;
 	// A generator connects only to a same-element generator (invariant
 	// in T, checked both ways). A plain T never accepts a Generator[T].
@@ -454,7 +459,13 @@ export function inferTypeFromValue(value: unknown): WeftType {
 			&& !Array.isArray(obj[BUS_MARKER_KEY])) {
 			return { kind: 'bus' };
 		}
-		if (ACCESS_MARKER_KEY in obj) return { kind: 'access' };
+		if (ACCESS_MARKER_KEY in obj) {
+			// An access marker names its service, so the value is a
+			// connection to that one (one naming none is to any).
+			const payload = obj[ACCESS_MARKER_KEY] as Record<string, unknown> | null;
+			const service = payload && typeof payload === 'object' ? payload.service : undefined;
+			return typeof service === 'string' ? { kind: 'access', service } : { kind: 'access' };
+		}
 		if (INFRA_MARKER_KEY in obj) return { kind: 'infra' };
 		// A marker names a secret, never what it holds.
 		if (isSecretMarker(obj)) return { kind: 'secret', inner: { kind: 'typevar', name: 'T' } };
@@ -750,6 +761,10 @@ export interface NodeTemplate {
 	 *  keyed by service name. An access node resolves its own app here
 	 *  and sends it on connect. */
 	accessApps?: Record<string, import('../../../protocol').AppRegistration>;
+	/** On a node that checks its callers: the connection recipe its
+	 *  `auth` reads, keyed by a name `auth` takes or a record's `kind`
+	 *  (`CatalogEntry.callerRecipes`). */
+	callerRecipes?: Record<string, import('../../../protocol').AccessSpecWire>;
 	/** Dynamically resolve port types based on current port definitions.
 	 *  Returns overrides for input and output port types.
 	 *  Only needed for nodes with dynamic type behavior (Pack, Unpack, etc.). */

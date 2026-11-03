@@ -51,7 +51,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[openai]",
       "widget": {
         "kind": "access"
       },
@@ -61,7 +61,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[openai]",
       "description": "Wire into OpenAI Model nodes' `access` input."
     }
   ]

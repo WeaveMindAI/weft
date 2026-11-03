@@ -38,7 +38,7 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
     let registered = rig.registered_signals();
     assert_eq!(registered.len(), 1);
     let spec = serde_json::to_value(&registered[0].0).expect("spec serializes").to_string();
-    assert!(spec.contains(&values_url("s1", "Leads", None)), "polls the tab's values: {spec}");
+    assert!(spec.contains(values_url("s1", "Leads", None)?.as_str()), "polls the tab's values: {spec}");
     Ok(())
 }
 
@@ -46,7 +46,7 @@ async fn fire_emits_row(rig: FakeRig) -> WeftResult<()> {
     canned_tab(&rig);
     rig.respond(
         "GET",
-        &path(&values_url("s1", "Leads", Some("1:1"))),
+        &path(values_url("s1", "Leads", Some("1:1"))?.as_str()),
         json!({ "values": [["name", "email"]] }),
     );
     rig.wake(json!({ "item": ["ada", "ada@example.com"], "index": 1 }));

@@ -326,6 +326,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         published_service: None,
         instance_service: None,
         instance_rules: None,
+        recheck: Vec::new(),
         span: None,
         header_span: None,
         config_spans: Default::default(),

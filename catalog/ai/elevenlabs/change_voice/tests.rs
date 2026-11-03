@@ -85,9 +85,12 @@ fn inputs(rig: &FakeRig, audio: Value, extra: Value) -> Value {
     base
 }
 
-/// The multipart body of the one request the node sent.
+/// The multipart body of the one request the node sent (streamed, and
+/// read whole by the rig).
 fn form(rig: &FakeRig) -> String {
-    rig.requests()[0].body_text.clone().expect("the form is a buffered body the rig can read")
+    let sent = &rig.requests()[0];
+    assert!(sent.body_streamed, "the form streams the recording out of storage");
+    sent.body_text.clone().expect("the rig reads a streamed body whole")
 }
 
 /// The value of the text field `name` in the multipart `form`, if it

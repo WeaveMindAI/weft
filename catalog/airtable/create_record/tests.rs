@@ -13,7 +13,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("creates_and_emits_the_record", creates),
         NodeTest::fake("a_refused_record_fails_the_run_when_error_is_unwired", refused_unwired),
         NodeTest::fake("a_refused_record_comes_out_on_error_when_it_is_wired", refused_wired),
-        NodeTest::fake("a_bad_table_id_still_fails_the_run_when_error_is_wired", bad_id_wired),
+        NodeTest::fake("a_table_with_a_slash_stays_one_path_segment", slashed_table),
         NodeTest::live("one_real_create_and_delete", "airtable", live_create)
             .with_fixture(fixture_spec(BASE_FIXTURE, BASE_LABEL.0, BASE_LABEL.1))
             .with_fixture(fixture_spec(TABLE_FIXTURE, TABLE_LABEL.0, TABLE_LABEL.1)),
@@ -116,15 +116,15 @@ async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// A table id with a `/` is a mistake in the program, never a value
-/// for `_error`.
-async fn bad_id_wired(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    let err = rig
+/// A table holding `/` stays one segment of the address it names, so it
+/// can never reach another Airtable route.
+async fn slashed_table(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("POST", "/v0/appBase1/tbl%2F..%2Fx", json!({ "id": "recNew", "fields": {} }));
+    let outcome = rig
         .run(&AirtableCreateRecordNode, record_inputs(&rig, "tbl/../x"))
         .await
-        .failure()?;
-    assert!(err.starts_with("input error"), "{err}");
-    assert!(rig.requests().is_empty(), "nothing was sent");
+        .ok()?;
+    assert_eq!(outcome.outputs["recordId"], json!("recNew"));
+    assert_eq!(rig.requests()[0].path, "/v0/appBase1/tbl%2F..%2Fx");
     Ok(())
 }

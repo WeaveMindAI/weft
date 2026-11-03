@@ -1112,8 +1112,11 @@ impl Fold {
             // events are additionally non-durable by design (a live
             // connection dies with its worker), so they never contribute
             // to a resumed run's state. A charge's opening is read by
-            // [`ChargeBook`], which the drive reads.
+            // [`ChargeBook`], which the drive reads; a call a node owes by
+            // [`crate::OwedCalls`].
             RunEvent::ChargeOpened { .. }
+            | RunEvent::EndCallOwed { .. }
+            | RunEvent::EndCallsSettled { .. }
             | RunEvent::LogLine { .. }
             | RunEvent::FileEdited { .. }
             | RunEvent::TriggerCaptured { .. }

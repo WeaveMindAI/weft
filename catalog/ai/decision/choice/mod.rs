@@ -6,6 +6,7 @@
 //! The state, the provider and the call are the package's `decision.rs`.
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
@@ -28,7 +29,7 @@ impl Node for DecisionChoiceNode {
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let instructions: String = ctx.inputs.get("instructions")?;
-        let options = options(ctx.inputs.get("options")?)?;
+        let options = options(ctx.inputs.get("options")?);
         let state = decision::state(&ctx).await?;
         let question = json!({ "type": "choice", "instructions": instructions, "criteria": options });
         let answer = decision::ask(&ctx, state, question).await?;
@@ -56,28 +57,22 @@ impl Node for DecisionChoiceNode {
     }
 }
 
+/// The `options` input as written: an object of option to what it
+/// covers, or a list of names.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum Options {
+    Described(Map<String, Value>),
+    Named(Vec<String>),
+}
+
 /// The `options` input as the question's criteria: an object of option
 /// to what it covers as it is, a list of names as options with nothing
-/// written for them.
-pub fn options(written: Value) -> WeftResult<Map<String, Value>> {
-    let options: Map<String, Value> = match written {
-        Value::Object(options) => options,
-        Value::Array(names) => {
-            let mut options = Map::new();
-            for name in names {
-                let Value::String(name) = name else {
-                    weft::node_bail!("options lists {name}, and an option is named by a string");
-                };
-                if options.insert(name.clone(), Value::Null).is_some() {
-                    weft::node_bail!("options lists `{name}` twice");
-                }
-            }
-            options
-        }
-        other => weft::node_bail!("options is {other}; it takes a list of names or an object of name to description"),
-    };
-    if options.len() < 2 {
-        weft::node_bail!("options holds {} option(s), and a choice needs at least two", options.len());
+/// written for them. The node's rules hold it to at least two options,
+/// each named once.
+pub fn options(written: Options) -> Map<String, Value> {
+    match written {
+        Options::Described(options) => options,
+        Options::Named(names) => names.into_iter().map(|name| (name, Value::Null)).collect(),
     }
-    Ok(options)
 }

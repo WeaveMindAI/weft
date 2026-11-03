@@ -23,18 +23,6 @@ pub fn b64url_decode(data: &str) -> WeftResult<Vec<u8>> {
         .map_err(|e| weft::node_error(format!("gmail: a body part is not base64url: {e}")))
 }
 
-/// A one-or-many label input, read and blank-filtered: an unfilled
-/// text input arrives as "" and means "none given". Never split on
-/// commas, since a Gmail label name may contain one (recipients go
-/// through `weft::comma_list` instead).
-pub fn non_blank_list(inputs: &weft::ValueBag, name: &str) -> WeftResult<Vec<String>> {
-    Ok(inputs
-        .list::<String>(name)?
-        .into_iter()
-        .filter(|s| !s.trim().is_empty())
-        .collect())
-}
-
 /// One attachment ready for MIME assembly.
 pub struct OutAttachment {
     pub filename: String,
@@ -112,11 +100,7 @@ pub fn build_mime(m: &OutMessage<'_>) -> WeftResult<Vec<u8>> {
         (Some(t), Some(h)) => {
             Body::Alternative(MultiPart::alternative_plain_html(t.to_string(), h.to_string()))
         }
-        (None, None) => {
-            return Err(weft::WeftError::Input(
-                "nothing to send: provide text, html, or both".to_string(),
-            ))
-        }
+        (None, None) => weft::input_bail!("nothing to send: provide text, html, or both"),
     };
     let message = if m.attachments.is_empty() {
         match body {
@@ -203,7 +187,7 @@ async fn part_bytes(
     leaf: &Value,
     what: &str,
 ) -> WeftResult<Option<Vec<u8>>> {
-    use weft::access::client::get_json;
+    use weft::access::client::{get_json, url};
     match (
         leaf.pointer("/body/data").and_then(Value::as_str),
         leaf.pointer("/body/attachmentId").and_then(Value::as_str),
@@ -212,11 +196,7 @@ async fn part_bytes(
         (None, Some(att_id)) => {
             let att: Value = get_json(
                 http,
-                &format!(
-                    "{API}/messages/{}/attachments/{}",
-                    super::api::segment(message_id),
-                    super::api::segment(att_id)
-                ),
+                url(API, &["messages", message_id, "attachments", att_id])?.as_str(),
                 &format!("gmail: read {what}"),
             )
             .await?;
@@ -280,10 +260,10 @@ pub async fn read_message(
     include_attachments: bool,
     max_body_chars: usize,
 ) -> WeftResult<ReadMessage> {
-    use weft::access::client::get_json;
+    use weft::access::client::{get_json, url};
     let msg: Value = get_json(
         http,
-        &format!("{API}/messages/{}?format=full", super::api::segment(id)),
+        url(API, &["messages", id])?.query("format", "full").as_str(),
         "gmail: read the message",
     )
     .await?;

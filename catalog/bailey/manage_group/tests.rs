@@ -1,22 +1,21 @@
-//! BaileyManageGroup self-tests: every action's wire form and
-//! requirement gate (pure), one full create round through the fake
-//! bridge, and the soft-error path.
+//! BaileyManageGroup self-tests: every action's wire form (pure), one
+//! full create round through the fake bridge, and the soft-error path.
+//! What each action requires is the node's rules, which the compiler
+//! and the run-time recheck hold, not this rig.
 
-use serde_json::json;
+use serde_json::{json, Value};
 
-use weft::{EndpointMethod, FakeRig, NodeTest, WeftResult};
+use weft::{EndpointMethod, FakeRig, NodeTest, ValueBag, WeftResult};
 
 use super::{bridge_call, BaileyManageGroupNode};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::basic("every_action_maps_to_its_bridge_call", maps),
-        NodeTest::basic("missing_requirements_refuse_before_sending", requirements),
         NodeTest::fake("a_create_round_trip_emits_the_minted_id", creates),
         NodeTest::fake("an_edit_passes_the_group_id_through", edits),
         NodeTest::fake("a_soft_bridge_error_fails_loud", soft_error),
         NodeTest::fake("a_bridge_refusal_comes_out_on_error_when_it_is_wired", refused_wired),
-        NodeTest::fake("a_missing_setting_fails_the_run_even_with_error_wired", mistake_wired),
     ]
 }
 
@@ -42,24 +41,17 @@ async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn mistake_wired(rig: FakeRig) -> WeftResult<()> {
-    let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
-    rig.wire_output("_error");
-    let err = rig
-        .run(
-            &BaileyManageGroupNode,
-            json!({ "bridge": bridge, "action": "add", "participants": ["49@s.whatsapp.net"] }),
-        )
-        .await
-        .failure()?;
-    assert!(err.starts_with("input error") && err.contains("needs groupId"), "{err}");
-    assert!(rig.endpoint_calls().is_empty(), "a program mistake refuses before anything is sent");
-    Ok(())
+/// The inputs of one firing, as the node reads them.
+fn inputs(values: Value) -> ValueBag {
+    ValueBag::inputs(values.as_object().expect("an object").clone(), Default::default(), Vec::new())
 }
 
 fn maps() -> WeftResult<()> {
     let ps = vec!["49@s.whatsapp.net".to_string()];
-    let call = |a: &str| bridge_call(a, Some("g@g.us"), Some("Team"), Some("desc"), &ps).unwrap();
+    let call = |a: &str| {
+        bridge_call(&inputs(json!({ "action": a, "groupId": "g@g.us", "name": "Team", "description": "desc", "participants": ps })))
+            .unwrap()
+    };
     assert_eq!(call("create").0, "createGroup");
     assert_eq!(call("add").0, "groupAdd");
     assert_eq!(call("kick").0, "groupKick");
@@ -70,27 +62,9 @@ fn maps() -> WeftResult<()> {
     let (a, p) = call("describe");
     assert_eq!((a, p["description"].as_str()), ("groupUpdateDescription", Some("desc")));
     assert_eq!(call("add").1["participants"], json!(ps));
-    Ok(())
-}
-
-fn requirements() -> WeftResult<()> {
-    let ps = vec!["49@s.whatsapp.net".to_string()];
-    // Participant actions without a group refuse.
-    assert!(bridge_call("add", None, None, None, &ps).is_err());
-    // Participant actions without participants refuse.
-    assert!(bridge_call("kick", Some("g"), None, None, &[]).is_err());
-    // create without a name / without participants refuses.
-    assert!(bridge_call("create", None, None, None, &ps).is_err());
-    assert!(bridge_call("create", None, Some("Team"), None, &[]).is_err());
-    // rename without the new name refuses.
-    assert!(bridge_call("rename", Some("g"), None, None, &[]).is_err());
-    // describe with no description clears it (empty string, no refusal).
-    assert_eq!(
-        bridge_call("describe", Some("g"), None, None, &[]).unwrap().1["description"],
-        json!("")
-    );
-    // An unknown action refuses.
-    assert!(bridge_call("leave", Some("g"), None, None, &[]).is_err());
+    // describe with no description clears it.
+    let (_, p) = bridge_call(&inputs(json!({ "action": "describe", "groupId": "g" })))?;
+    assert_eq!(p["description"], json!(""));
     Ok(())
 }
 

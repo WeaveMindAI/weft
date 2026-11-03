@@ -18,6 +18,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use weft::access::client;
 use weft::node::NodeOutput;
 use weft::signal::poll_endpoint::MIN_POLL_INTERVAL_SECS;
 use weft::signal::{PollEndpoint, Predicate};
@@ -129,7 +130,7 @@ impl Node for RunCommandNode {
             // As often as a wait may look: a model waiting on the command
             // should get it back as soon as it ends.
             let status = PollEndpoint {
-                url: format!("{}{}{id}", computer.url(), actions::JOBS_PATH),
+                url: client::url(computer.url(), &[actions::JOBS, id])?.into(),
                 interval_secs: MIN_POLL_INTERVAL_SECS,
                 filters: vec![Predicate::neq("status", RUNNING)],
                 ..Default::default()
@@ -140,13 +141,7 @@ impl Node for RunCommandNode {
         };
         let (exit_code, size) = finished(&answer)?;
         let id = answer["id"].as_str().node_err(format!("the computer answered a finished command with no id: {answer}"))?;
-        // A big output is many reads off the computer: a press of stop
-        // ends them, wherever they are.
-        let cancel = ctx.cancellation();
-        let output = tokio::select! {
-            stored = storage.put_stream(output_stream(computer, id.to_string(), size), "text/plain", "output.txt", None) => stored?,
-            err = cancel.cancelled_err() => return Err(err),
-        };
+        let output = storage.put_stream(output_stream(computer, id.to_string(), size), "text/plain", "output.txt", None).await?;
         ctx.pulse_downstream(NodeOutput::new().set("output", output).set("exitCode", exit_code)).await
     }
 }

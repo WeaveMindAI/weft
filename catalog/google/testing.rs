@@ -18,7 +18,7 @@ pub async fn delete(conn: &OpenedConnection, url: &str, what: &str) -> WeftResul
 pub async fn drive_delete(conn: &OpenedConnection, id: &str) -> WeftResult<()> {
     delete(
         conn,
-        &format!("{}/files/{}", super::drive::API, super::api::segment(id)),
+        weft::access::client::url(super::drive::API, &["files", id])?.as_str(),
         "delete the test file from Drive",
     )
     .await

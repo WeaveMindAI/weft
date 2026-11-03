@@ -8,7 +8,7 @@
 
 use serde_json::{json, Value};
 
-use weft::access::client::get_json;
+use weft::access::client::{get_json, required_str, url};
 use weft::{NodeErrExt, WeftResult};
 
 pub const API: &str = "https://api.notion.com/v1";
@@ -22,15 +22,10 @@ pub async fn data_source_id(
     database: &str,
     picked: Option<&str>,
 ) -> WeftResult<String> {
-    if let Some(id) = picked.filter(|s| !s.trim().is_empty()) {
+    if let Some(id) = picked {
         return Ok(id.to_string());
     }
-    let db = get_json(
-        http,
-        &format!("{API}/databases/{database}"),
-        "notion: read the database",
-    )
-    .await?;
+    let db = get_json(http, url(API, &["databases", database])?.as_str(), "notion: read the database").await?;
     let sources: Vec<&Value> =
         db["data_sources"].as_array().into_iter().flatten().collect();
     match sources.as_slice() {
@@ -43,11 +38,11 @@ pub async fn data_source_id(
         several => {
             let names: Vec<&str> =
                 several.iter().filter_map(|s| s["name"].as_str()).collect();
-            Err(weft::WeftError::Input(format!(
+            weft::input_bail!(
                 "notion database {database} has several data sources ({}); pick one on \
                  the node's Source field",
                 names.join(", ")
-            )))
+            )
         }
     }
 }
@@ -69,20 +64,21 @@ pub fn paragraph_blocks(content: &str) -> Vec<Value> {
         .collect()
 }
 
-/// The children a writing node sends: the raw `blocks` list when one
-/// was wired (full Notion block objects, power path), else `content`
-/// as paragraphs. Empty when neither holds anything: a new page may
-/// have no body, and a node for which that is a mistake says so itself.
-pub fn children_of(content: Option<&str>, blocks: Option<&Value>) -> WeftResult<Vec<Value>> {
-    if let Some(blocks) = blocks {
-        let Some(list) = blocks.as_array() else {
-            return Err(weft::WeftError::Input(
-                "blocks must be a list of Notion block objects".to_string(),
-            ));
-        };
-        if !list.is_empty() {
-            return Ok(list.clone());
-        }
+/// The children a writing node sends: the `blocks` list when it holds
+/// any (full Notion block objects, power path), else `content` as
+/// paragraphs. Empty when neither holds anything: a new page may have
+/// no body.
+pub fn children_of(content: Option<&str>, blocks: Vec<Value>) -> Vec<Value> {
+    if !blocks.is_empty() {
+        return blocks;
     }
-    Ok(content.map(paragraph_blocks).unwrap_or_default())
+    content.map(paragraph_blocks).unwrap_or_default()
+}
+
+/// A page (or a row, which is a page) a Notion call answered with: its
+/// id and its link, the two outputs every page-writing node emits.
+pub fn page_output(page: &Value, what: &str) -> WeftResult<weft::node::NodeOutput> {
+    Ok(weft::node::NodeOutput::new()
+        .set("pageId", required_str(page, what, "id")?)
+        .set("url", page["url"].clone()))
 }

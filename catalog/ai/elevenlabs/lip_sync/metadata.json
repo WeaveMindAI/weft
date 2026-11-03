@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[elevenlabs]",
       "accepts": [
         "wire"
       ],

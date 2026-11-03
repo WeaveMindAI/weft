@@ -27,19 +27,12 @@ struct Parked {
 #[cfg(feature = "node-tests")]
 mod tests;
 
-/// The timer a wait until `when` parks on. The text has to be a full
-/// ISO-8601 date and time with a zone; the signal's own validation is
-/// what refuses a moment already past, at the point the run parks.
-pub fn timer_for(when: &str) -> WeftResult<Timer> {
-    let when: DateTime<Utc> = DateTime::parse_from_rfc3339(when.trim())
-        .map(|t| t.with_timezone(&Utc))
-        .map_err(|e| {
-            weft::error::node_error(format!(
-                "`when` is not an ISO-8601 date and time ({e}); write it like \
-                 `2026-09-03T09:00:00Z` or `2026-09-03T11:00:00+02:00`: got '{when}'"
-            ))
-        })?;
-    Ok(Timer { spec: TimerSpec::At { when } })
+/// The timer a wait until `when` parks on. The `datetime` widget holds
+/// `when` to an RFC 3339 date and time, on a wired value too; the
+/// signal's own validation is what refuses a moment already past, at the
+/// point the run parks.
+pub fn timer_for(when: DateTime<Utc>) -> Timer {
+    Timer { spec: TimerSpec::At { when } }
 }
 
 #[async_trait]
@@ -50,7 +43,7 @@ impl Node for WaitUntilNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let when: String = ctx.inputs.get("when")?;
+        let when: DateTime<Utc> = ctx.inputs.get("when")?;
         let value: Option<Value> = ctx.inputs.raw("value").cloned();
         // "Already past" is the signal's rule, checked where the run
         // parks, so it cannot be checked here: a resumed firing runs
@@ -58,7 +51,7 @@ impl Node for WaitUntilNode {
         // node-side check would fail every completed wait. The signal's
         // own refusal names the moment, which is what `when` holds.
         let mut state = ctx.keep(Parked::default()).await?;
-        let wake = state.wait(|s| &mut s.wake, timer_for(&when)?).await?;
+        let wake = state.wait(|s| &mut s.wake, timer_for(when)).await?;
         ctx.pulse_downstream(output_after(value, &wake)?).await
     }
 }

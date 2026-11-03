@@ -18,8 +18,8 @@
 //!   <dict>` in the user code supplies the output pulses.
 //!
 //! - The script runs in a Python process of its own, one of a few the
-//!   worker holds for its runs to share (`ctx.shared`), as many as
-//!   the worker has CPUs, started the first time a script needs one:
+//!   worker holds for its runs to share (`ctx.pool`), as many as the
+//!   worker has CPUs, started the first time a script needs one:
 //!   scripts run side by side. Each script's own names start fresh (its
 //!   own scope), but the process is shared on purpose: a module a script
 //!   imported stays imported for the next, and so does whatever it set on
@@ -84,10 +84,11 @@
 //!   The refusal's first way out is the one a script has (it cannot
 //!   store a file): return less, or split it across outputs.
 //!
-//! - A cancelled run stops its script at once: its process is killed
-//!   (a script inside one long C call, a `time.sleep`, a blocking read,
-//!   included), and the next script that needs one starts a fresh one.
-//!   The same happens when the engine drops the node body.
+//! - A cancelled run stops its script at once: the pool lets go of a
+//!   process a cancelled run holds, which kills it (a script inside one
+//!   long C call, a `time.sleep`, a blocking read, included), and the
+//!   next script that needs one starts a fresh one. The same happens when
+//!   the engine drops the node body.
 //!
 //! Isolation: none. The script runs in a `python3` process the worker
 //! starts, with the worker's own user, folder, files, network and
@@ -102,14 +103,14 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use weft::node::NodeOutput;
-use weft::storage::media::{media_slots, substitute_media};
+use weft::storage::media::{map_stored_files, media_slots, substitute_media};
+use weft::storage::StorageScope;
 use weft::weft_type::FileKind;
 use weft::context::ERROR_PORT;
-use weft::{node_error, RunContext, Node, NodeManifest, StoredFile, WeftError, WeftResult, WeftType};
+use weft::{node_error, NodeErrExt, RunContext, Node, NodeManifest, StoredFile, WeftError, WeftResult, WeftType};
 
 #[derive(NodeManifest)]
 pub struct ExecPythonNode;
@@ -145,17 +146,30 @@ impl Node for ExecPythonNode {
         // script a marker.
         let mut inputs: Vec<(String, Value)> = Vec::new();
         for name in ctx.inputs.created() {
-            let declared = ctx.declared_inputs().get(name);
+            let declared = ctx.declared_inputs().get(name).cloned();
             let value = match (ctx.inputs.raw(name), declared) {
-                (Some(value), Some(ty)) => unwrap_files(&ctx, &ctx.reveal_input(name, value.clone()).await?, Some(ty)).await?,
-                (Some(value), None) => unwrap_files(&ctx, value, None).await?,
+                (Some(value), Some(ty)) => script_value(&ctx, ctx.reveal_input(name, value.clone()).await?, &ty).await?,
+                (Some(value), None) => value.clone(),
                 (None, _) => Value::Null,
             };
             inputs.push((name.clone(), value));
         }
 
-        let interpreters = ctx.shared("exec_python", |()| async { Ok(Interpreters::new()) }).await?;
-        let result = run_python(&interpreters, &code, inputs, &ctx.cancellation()).await?;
+        // A process of the worker's pool, as many as it has CPUs. One that
+        // stopped running since its last script is let go at the take; one
+        // that broke during this script is let go here.
+        let cpus = std::thread::available_parallelism().map(usize::from).unwrap_or(1);
+        let mut process = ctx
+            .pool("exec_python", |()| async { Interpreter::start() })
+            .max(cpus)
+            .check(Interpreter::running)
+            .take()
+            .await?;
+        let result = run_python(&mut process, &code, inputs, &ctx.cancellation()).await;
+        if process.broken {
+            process.discard();
+        }
+        let result = result?;
 
         // Check the whole answer before anything goes out, so a wrong
         // key or type refuses the firing as the program mistake it is
@@ -222,36 +236,31 @@ fn answer_output(
 /// a file handed back drops them ([`wrap_files`]).
 const LINK_FIELDS: [&str; 3] = ["internalUrl", "externalUrl", "public"];
 
-/// The inside of every stored-file marker sitting where the port's
-/// DECLARED type says a file goes: `{"__weft_image__": {...}}` becomes
-/// `{...}`, with the file's links beside it ([`LINK_FIELDS`]: one for the
-/// script, one for another service and whether the internet opens it).
-/// The type is the question, exactly as on the way out ([`wrap_files`]),
-/// so a dict that merely happens to carry a marker key on a port
-/// declared `JsonDict` flows whole. A port with no file anywhere in its
-/// type is copied untouched.
-async fn unwrap_files(ctx: &RunContext, value: &Value, ty: Option<&WeftType>) -> WeftResult<Value> {
-    let Some(ty) = ty.filter(|ty| ty.references_file()) else {
-        return Ok(value.clone());
-    };
-    let storage = ctx.storage(weft::storage::StorageScope::Run);
-    let mut replacements = HashMap::new();
-    for slot in media_slots(value, ty) {
-        let Some(obj) = slot.as_object() else { continue };
-        let Some(kind) = FileKind::from_marker_obj(obj) else { continue };
-        let Some(mut inner) = obj.get(kind.marker_key()).and_then(Value::as_object).cloned() else { continue };
-        let handle = weft::storage::FileHandle::from_value(&slot)?;
-        let internal = storage.internal_link(&handle).await?;
-        let external = storage.external_link(&handle).await?;
-        inner.insert("internalUrl".into(), Value::String(internal.url));
-        inner.insert("externalUrl".into(), Value::String(external.url));
-        inner.insert("public".into(), Value::Bool(external.public));
-        replacements.insert(slot.to_string(), Value::Object(inner));
-    }
-    Ok(substitute_media(value, ty, &replacements))
+/// `value`, of the port's declared type `ty`, as the script receives it:
+/// the inside of every stored-file marker where the type says a file goes
+/// (`{"__weft_image__": {...}}` becomes `{...}`), with the file's links
+/// beside it ([`LINK_FIELDS`]: one for the script, one for another service
+/// and whether the internet opens it). The type is the question, exactly
+/// as on the way out ([`wrap_files`]), so a dict that merely happens to
+/// carry a marker key on a port declared `JsonDict` flows whole.
+async fn script_value(ctx: &RunContext, value: Value, ty: &WeftType) -> WeftResult<Value> {
+    let storage = ctx.storage(StorageScope::Run);
+    map_stored_files(&value, ty, |slot| {
+        let storage = &storage;
+        async move {
+            let mut inner = slot.value.get(slot.kind.marker_key()).and_then(Value::as_object).cloned().node_err("a stored file's marker holds no record")?;
+            let internal = storage.internal_link(&slot.handle).await?;
+            let external = storage.external_link(&slot.handle).await?;
+            inner.insert("internalUrl".into(), Value::String(internal.url));
+            inner.insert("externalUrl".into(), Value::String(external.url));
+            inner.insert("public".into(), Value::Bool(external.public));
+            Ok(Value::Object(inner))
+        }
+    })
+    .await
 }
 
-/// The inverse of [`unwrap_files`] on an output typed as a file: every
+/// The inverse of [`script_value`] on an output typed as a file: every
 /// media slot of `ty` holding a bare file dict (the shape the script
 /// received, either handle) is wrapped back into the marker its mime
 /// type says. A slot already carrying a marker passes; anything else
@@ -390,27 +399,20 @@ enum Answer {
     },
 }
 
-/// The Python processes a worker keeps for its scripts (see the module
-/// doc): idle ones waiting, and room for as many as the worker has CPUs.
-pub(crate) struct Interpreters {
-    idle: Mutex<Vec<Interpreter>>,
-    room: Arc<tokio::sync::Semaphore>,
-}
-
-/// One Python process serving [`SERVER`].
-struct Interpreter {
+/// One Python process serving [`SERVER`], one of the worker's pool (see
+/// the module doc).
+pub(crate) struct Interpreter {
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
     answers: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    /// The process is no good for the next script: it stopped answering,
+    /// answered something it never writes, or was left mid-script by a
+    /// cancel.
+    broken: bool,
 }
 
-impl Interpreters {
-    pub(crate) fn new() -> Self {
-        let cpus = std::thread::available_parallelism().map(usize::from).unwrap_or(1);
-        Self { idle: Mutex::new(Vec::new()), room: Arc::new(tokio::sync::Semaphore::new(cpus)) }
-    }
-
-    fn start() -> WeftResult<Interpreter> {
+impl Interpreter {
+    pub(crate) fn start() -> WeftResult<Interpreter> {
         let mut child = tokio::process::Command::new("python3")
             .args(["-u", "-c", SERVER])
             .stdin(std::process::Stdio::piped())
@@ -425,58 +427,42 @@ impl Interpreters {
             })?;
         let stdin = child.stdin.take().expect("stdin is piped");
         let stdout = child.stdout.take().expect("stdout is piped");
-        Ok(Interpreter { child, stdin, answers: tokio::io::BufReader::new(stdout).lines() })
+        Ok(Interpreter { child, stdin, answers: tokio::io::BufReader::new(stdout).lines(), broken: false })
+    }
+
+    /// Whether the process still runs: one that exited since it answered
+    /// (a thread of the last script ended it) serves nobody.
+    fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
     }
 }
 
-/// Execute `code` with the given input bindings and return the raw
-/// key-value pairs the script returned. Each way it can go wrong has
-/// its own kind: code that does not compile is an input error, an
-/// answer that is not a dict of plain values is a type error (both are
+/// Execute `code` on `interpreter` with the given input bindings and
+/// return the raw key-value pairs the script returned. Each way it can go
+/// wrong has its own kind: code that does not compile is an input error,
+/// an answer that is not a dict of plain values is a type error (both are
 /// the program's own mistakes), and an exception the script raises while
-/// it runs is a node failure, the one kind `_error` catches. A cancel
-/// kills the script's process.
+/// it runs is a node failure, the one kind `_error` catches. A cancel ends
+/// the wait with the process marked broken, mid-script: letting it go
+/// kills it.
 pub(crate) async fn run_python(
-    interpreters: &Interpreters,
+    interpreter: &mut Interpreter,
     code: &str,
     inputs: Vec<(String, Value)>,
     cancel: &weft::CancellationFlag,
 ) -> WeftResult<Vec<(String, Value)>> {
-    let _room = tokio::select! {
-        biased;
-        err = cancel.cancelled_err() => return Err(err),
-        room = interpreters.room.clone().acquire_owned() => room.map_err(|_| node_error("the Python processes were closed".to_string()))?,
-    };
-    let mut interpreter = loop {
-        let idle = interpreters.idle.lock().expect("interpreters poisoned").pop();
-        match idle {
-            // A process that exited since it answered (a thread of the last
-            // script ended it) serves nobody: it is dropped, never handed
-            // to the next script.
-            Some(mut interpreter) => {
-                if matches!(interpreter.child.try_wait(), Ok(None)) {
-                    break interpreter;
-                }
-            }
-            None => break Interpreters::start()?,
-        }
-    };
     let (names, args): (Vec<String>, Vec<Value>) = inputs.into_iter().unzip();
     let request = serde_json::json!({ "names": names, "body": indent_block(code, "    "), "args": args });
     let mut line = serde_json::to_string(&request).map_err(|e| node_error(format!("the script's inputs as JSON: {e}")))?;
     line.push('\n');
+    // Broken until it answers in full.
+    interpreter.broken = true;
     let asked = async {
         interpreter.stdin.write_all(line.as_bytes()).await?;
         interpreter.stdin.flush().await?;
         interpreter.answers.next_line().await
     };
-    let answered = tokio::select! {
-        biased;
-        // The process goes with the run: dropping it kills it.
-        err = cancel.cancelled_err() => return Err(err),
-        answered = asked => answered,
-    };
-    let line = match answered {
+    let line = match cancel.race(asked).await? {
         Ok(Some(line)) => line,
         Ok(None) | Err(_) => {
             let status = interpreter.child.wait().await.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
@@ -486,10 +472,10 @@ pub(crate) async fn run_python(
     let answer: Answer = serde_json::from_str(&line)
         .map_err(|e| node_error(format!("the script's Python process answered '{}': {e}", weft::truncate_user_string(&line, 200))))?;
     // The process is well: it serves the next script.
-    interpreters.idle.lock().expect("interpreters poisoned").push(interpreter);
+    interpreter.broken = false;
     match answer {
         Answer::Ok { ok } => Ok(ok),
-        Answer::Compile { compile } => Err(WeftError::Input(format!("the code does not compile: {compile}"))),
+        Answer::Compile { compile } => weft::input_bail!("the code does not compile: {compile}"),
         Answer::Raised { raised } => Err(node_error(format!("the script raised {raised}"))),
         Answer::Type { kind, got, key, why } => Err(WeftError::Type(match kind.as_str() {
             "none" => "the script ended without returning a dict; end it with `return {...}` keyed by output port \

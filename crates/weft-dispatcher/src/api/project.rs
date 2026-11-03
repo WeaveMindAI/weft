@@ -4445,8 +4445,8 @@ mod trigger_kick_tests {
         );
     }
 
-    /// A node that only feeds a trigger (an auth node a gated route reads
-    /// at setup) runs in the trigger's setup and in none of its fires: when
+    /// A node that only feeds a trigger (an access node a trigger reads at
+    /// setup) runs in the trigger's setup and in none of its fires: when
     /// it does not load, the fires alone would let the trigger come on, and
     /// its setup would fail halfway. The trigger is refused up front,
     /// naming the loader's message; with the node loading, it comes on.
@@ -4461,14 +4461,14 @@ mod trigger_kick_tests {
         p.broken.push(weft_core::project::Broken {
             parts: vec!["auth".into()],
             places: Vec::new(),
-            why: "node 'HmacAuth' failed to load: service.verify sets signatureHeader; run `weft catalog update`".into(),
+            why: "node 'SlackAccess' failed to load: `service.events.messages.webhook.verify` sets `signatureHeader`; run `weft catalog update`".into(),
             hides: true,
         });
         assert!(fire(&p, "hook", Value::Null).kicks.iter().all(|kick| kick.node == "hook"), "the fire does not run the auth node");
         let refused = cannot_come_on(&p, &keys, &Default::default());
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert!(
-            refused[0].starts_with("setting up hook cannot run") && refused[0].contains("HmacAuth' failed to load") && refused[0].contains("weft catalog update"),
+            refused[0].starts_with("setting up hook cannot run") && refused[0].contains("SlackAccess' failed to load") && refused[0].contains("weft catalog update"),
             "{}",
             refused[0]
         );

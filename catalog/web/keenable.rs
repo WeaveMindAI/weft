@@ -11,7 +11,7 @@
 
 use serde_json::Value;
 
-use weft::access::client::json_call;
+use weft::access::client::{json_call, url};
 use weft::reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
 use weft::{Access, RunContext, WeftResult};
 
@@ -42,23 +42,20 @@ impl Keenable {
     }
 
     /// The address of `route` (`search`, `fetch`) this client calls.
-    pub fn url(&self, route: &str) -> String {
-        if self.keyed {
-            format!("{API}/{route}")
-        } else {
-            format!("{API}/{route}/public")
-        }
+    pub fn url(&self, route: &str) -> WeftResult<String> {
+        let keyed = url(API, &[route])?;
+        Ok(if self.keyed { keyed.into() } else { keyed.segment("public")?.into() })
     }
 
     /// POST `body` to `route`, refusing a failed status loudly with
     /// Keenable's own words, and hand back the parsed answer.
     pub async fn post(&self, route: &str, body: &Value, what: &str) -> WeftResult<Value> {
-        self.call(self.http.post(self.url(route)).json(body), what).await
+        self.call(self.http.post(self.url(route)?).json(body), what).await
     }
 
     /// GET `route` with `query`, the GET twin of [`Self::post`].
     pub async fn get(&self, route: &str, query: &[(&str, &str)], what: &str) -> WeftResult<Value> {
-        self.call(self.http.get(self.url(route)).query(query), what).await
+        self.call(self.http.get(self.url(route)?).query(query), what).await
     }
 
     async fn call(&self, req: RequestBuilder, what: &str) -> WeftResult<Value> {

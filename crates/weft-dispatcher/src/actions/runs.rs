@@ -379,12 +379,7 @@ pub(crate) async fn run(
                 .unwrap_or(serde_json::Value::Null);
             let refusal = |why: String| refused(&weft_core::run_spec::Refusal::error(why));
             let request = stand_in_caller(&capture.spec, &payload, &address).map_err(refusal)?;
-            // Only a header typed by hand can be one the gate reads, so a
-            // request with none reads no connection.
-            let gate = match request.headers.is_empty() {
-                true => Vec::new(),
-                false => gate_headers(state, id, &capture.spec, spec.instance.as_ref(), &address).await?,
-            };
+            let gate = gate_headers(&capture.spec, &address).map_err(refusal)?;
             refuse_typed_credential(&request, &gate, &address).map_err(refusal)?;
             stand_in = Some(capture.spec.clone());
         }
@@ -659,34 +654,18 @@ fn refuse_typed_credential(request: &weft_core::caller::LiveRequest, gate: &[Str
     }
 }
 
-/// The headers the gate of the caller trigger `spec` (fired as `address`,
-/// for `instance` of project `project`) reads a caller's credential from:
-/// none on an open route, else what its connection's recipe names.
-async fn gate_headers(
-    state: &DispatcherState,
-    project: uuid::Uuid,
-    spec: &weft_core::primitive::SignalSpec,
-    instance: Option<&weft_core::instance::InstanceId>,
-    address: &str,
-) -> Result<Vec<String>, Refused> {
-    let refusal = |why: String| refused(&weft_core::run_spec::Refusal::error(format!("--fire {address}: {why}")));
-    let (_, config) = weft_core::signal::live_connection(spec).map_err(refusal)?;
-    let weft_core::signal::PublicEntryAuth::Connection { access_id, service } = &config.auth else {
-        return Ok(Vec::new());
-    };
-    let access_id: uuid::Uuid =
-        access_id.parse().map_err(|_| refusal(format!("the route's gate names '{access_id}', which is no connection id")))?;
-    let tenant = crate::api::infra::tenant_of(state, project).await?;
-    let scope = instance.map(|instance| weft_core::instance::InstanceScope { project_id: project, instance: instance.clone() });
-    weft_access_store::caller_credential_headers(
-        &state.pg_pool,
-        &tenant,
-        weft_access_store::GrantUser::of(scope.as_ref()),
-        access_id,
-        service,
-    )
-    .await
-    .map_err(|e| refusal(format!("the connection gating this route cannot be read: {e:#}")))
+/// The headers the gate of the caller trigger `spec` (fired as `address`)
+/// reads a caller's credential from: none on an open route, else what its
+/// check names.
+fn gate_headers(spec: &weft_core::primitive::SignalSpec, address: &str) -> Result<Vec<String>, String> {
+    let (_, config) = weft_core::signal::live_connection(spec).map_err(|why| format!("--fire {address}: {why}"))?;
+    match &config.auth {
+        weft_core::signal::PublicEntryAuth::None => Ok(Vec::new()),
+        weft_core::signal::PublicEntryAuth::Connection { verify, .. } => Ok(verify.credential_headers()),
+        weft_core::signal::PublicEntryAuth::CheckNotKept { service, .. } => {
+            Err(format!("--fire {address}: {}", weft_core::signal::auth::uncarried_gate(service)))
+        }
+    }
 }
 
 

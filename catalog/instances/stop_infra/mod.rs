@@ -5,9 +5,10 @@
 
 use async_trait::async_trait;
 
+use weft::instance::InstanceId;
 use weft::{RunContext, Node, NodeManifest, WeftResult};
 
-use super::lifecycle::{instance_if_given, stop_self, take_down_choice, taken_down};
+use super::lifecycle::{stop_self, take_down_choice, taken_down};
 
 #[derive(NodeManifest)]
 pub struct StopInfraNode;
@@ -26,7 +27,7 @@ impl Node for StopInfraNode {
         let node: String = ctx.inputs.get("node")?;
         let take_down = take_down_choice(&ctx)?;
         let mut copy = ctx.infra(node);
-        if let Some(id) = instance_if_given(&ctx)? {
+        if let Some(id) = ctx.inputs.opt::<InstanceId>("instance")? {
             copy = copy.instance(id);
         }
         let answer = copy.stop(take_down, stop_self(&ctx)?).await?;

@@ -52,7 +52,7 @@ async fn passes_on(rig: FakeRig, answer: Value) -> WeftResult<()> {
 
 async fn bad_run_id(rig: FakeRig) -> WeftResult<()> {
     let err = rig.run(&GetNodeStateNode, json!({ "runId": "run-7", "node": "render" })).await.failure()?;
-    assert!(err.contains("runId") && err.contains("'run-7'"), "{err}");
+    assert!(err.contains("'runId'"), "{err}");
     assert!(rig.program_calls().is_empty());
     Ok(())
 }

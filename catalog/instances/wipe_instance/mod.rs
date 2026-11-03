@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 
+use weft::instance::InstanceId;
 use weft::node::NodeOutput;
 use weft::{RunContext, Node, NodeManifest, WeftResult};
 
@@ -15,7 +16,7 @@ use weft::storage::{FileHandle, StorageScope};
 use weft::program::StillGoing;
 use weft::{StopSelf, TakeDown};
 
-use super::lifecycle::{instance, stop_self};
+use super::lifecycle::stop_self;
 
 #[derive(NodeManifest)]
 pub struct WipeInstanceNode;
@@ -31,7 +32,7 @@ impl Node for WipeInstanceNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let instance = instance(&ctx)?;
+        let instance = ctx.inputs.get::<InstanceId>("instance")?;
         let infra: Vec<String> = ctx.inputs.opt("infra")?.unwrap_or_default();
         // Nothing kept: the door refuses, what is held is dropped, the
         // runs going are cancelled.

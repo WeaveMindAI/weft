@@ -29,9 +29,9 @@ impl Node for ElevenLabsGenerateVideoNode {
         let mut body = video_request(&ctx)?;
 
         let http = ctx.client(&account).await?;
-        let refs = References::new(&ctx, &http);
+        let refs = References::new(&ctx, &http, &account);
         let mut job = ctx.keep(Job::default()).await?;
-        let video = generate(&ctx, &mut job, &account, &http, &refs, Media::Video, || async {
+        let video = generate(&ctx, &mut job, &account, &http, Media::Video, || async {
             if let Some(start) = &start {
                 body["start_frame"] = refs.of(start).await?;
             }

@@ -161,6 +161,56 @@ pub fn check_wire_value(node: &str, port: &str, value: &Value) -> Result<(), Str
 #[cfg(feature = "runtime")]
 pub type ByteStream = futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>;
 
+/// A stored file on its way out as a request body, streamed out of
+/// storage and never held in memory (`StorageHandle::body`): the bytes,
+/// with the file's record beside them, whose size is the body's length.
+/// Sent whole with `access::client::StoredBodyExt::stored_body`, or as a
+/// part of a form with `access::client::Multipart::stored`.
+#[cfg(feature = "runtime")]
+pub struct StoredBody {
+    meta: StoredFileMeta,
+    stream: ByteStream,
+}
+
+#[cfg(feature = "runtime")]
+impl StoredBody {
+    pub(crate) fn new(meta: StoredFileMeta, stream: ByteStream) -> Self {
+        Self { meta, stream }
+    }
+
+    /// The body's length in bytes, from the file's record: known before
+    /// a byte is read.
+    pub fn len(&self) -> u64 {
+        self.meta.size_bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The file's type, as its record states it.
+    pub fn mime_type(&self) -> &str {
+        &self.meta.mime_type
+    }
+
+    /// The file's name, as its record states it.
+    pub fn filename(&self) -> &str {
+        &self.meta.filename
+    }
+
+    /// The bytes, for a body the client libraries here do not frame.
+    pub fn into_stream(self) -> ByteStream {
+        self.stream
+    }
+}
+
+#[cfg(feature = "runtime")]
+impl std::fmt::Debug for StoredBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredBody").field("meta", &self.meta).finish_non_exhaustive()
+    }
+}
+
 /// Wrap a fully-buffered payload as a one-chunk [`ByteStream`].
 #[cfg(feature = "runtime")]
 pub fn bytes_stream(bytes: bytes::Bytes) -> ByteStream {
@@ -253,18 +303,24 @@ pub fn is_content_hash(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Derive a filename from a URL's last path segment, sans query and
-/// fragment. Falls back to `download.bin` when the URL has no usable
-/// path (ends in `/`, or is bare host). Used by the storage
-/// put-from-url capability when the caller gives no explicit name.
+/// The name a URL's path ends on (`talk.mp4` in
+/// `https://cdn.example.com/v/talk.mp4?sig=1`), past its scheme and host
+/// and without its query or fragment, or `None` when the path names
+/// nothing (a bare host, a path ending in `/`).
+pub fn name_in_url(url: &str) -> Option<&str> {
+    let address = url.split(['?', '#']).next().unwrap_or(url);
+    // Past the scheme, so the host is never taken for the file.
+    let address = address.split_once("://").map_or(address, |(_, rest)| rest);
+    let (_, path) = address.split_once('/')?;
+    path.trim_end_matches('/').rsplit('/').next().filter(|name| !name.is_empty())
+}
+
+/// Derive a filename from a URL's last path segment ([`name_in_url`]),
+/// `download.bin` when its path names nothing. Used by the storage
+/// put-from-url capability when the caller gives no explicit name; a
+/// caller with a better fallback of its own uses [`name_in_url`].
 pub fn filename_from_url(url: &str) -> String {
-    let no_query = url.split(['?', '#']).next().unwrap_or(url);
-    let last = no_query.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-    if last.is_empty() {
-        "download.bin".to_string()
-    } else {
-        last.to_string()
-    }
+    name_in_url(url).unwrap_or("download.bin").to_string()
 }
 
 /// The filename a response names for itself, out of its
@@ -1930,7 +1986,20 @@ mod tests {
         assert_eq!(filename_from_url("https://x.com/a/b/clip.ogg?token=1"), "clip.ogg");
         assert_eq!(filename_from_url("https://x.com/a/b/clip.ogg#frag"), "clip.ogg");
         assert_eq!(filename_from_url("https://x.com/dir/"), "dir");
-        assert_eq!(filename_from_url("https://x.com"), "x.com");
+    }
+
+    /// A bare host names no file: the host is never taken for one, with
+    /// or without a trailing slash, a query or a port, and the caller's
+    /// fallback (or `download.bin`) stands in.
+    #[test]
+    fn a_url_naming_no_file_falls_back() {
+        assert_eq!(filename_from_url("https://example.com"), "download.bin");
+        assert_eq!(filename_from_url("https://example.com/"), "download.bin");
+        assert_eq!(filename_from_url("https://example.com:8443?x=a/b.png"), "download.bin");
+        assert_eq!(name_in_url("https://example.com/v/talk.mp4?sig=a/b"), Some("talk.mp4"));
+        assert_eq!(name_in_url("example.com/v/talk.mp4"), Some("talk.mp4"), "no scheme, same answer");
+        assert_eq!(name_in_url("example.com"), None);
+        assert_eq!(name_in_url("https://example.com").unwrap_or("recording.mp4"), "recording.mp4");
     }
 
     #[test]

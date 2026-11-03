@@ -1849,6 +1849,7 @@ pub(crate) mod tests {
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None,
             header_span: None,
             config_spans: Default::default(),

@@ -40,6 +40,7 @@ binary already has and asks each one for its tests.
 ```bash
 weft test-node WordCount        # one node
 weft test-node slack            # one package
+weft test-node slack WordCount  # several, built together
 weft test-node                  # everything
 ```
 

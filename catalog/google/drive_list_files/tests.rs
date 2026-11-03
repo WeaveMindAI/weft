@@ -11,7 +11,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("lists_with_the_default_page_size", lists),
         NodeTest::fake("a_page_heavier_than_a_wire_names_page_size", heavy_listing),
         NodeTest::fake("a_whole_drive_page_moves_on_to_the_next_token", next_drive_page),
-        NodeTest::fake("a_page_size_below_one_is_refused", zero_page_size),
         NodeTest::live("one_real_listing", "google", live_list),
     ]
 }
@@ -73,17 +72,6 @@ async fn next_drive_page(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(rig.requests().len(), 2, "no page is read twice");
     Ok(())
 }
-
-async fn zero_page_size(rig: FakeRig) -> WeftResult<()> {
-    let err = rig
-        .run(&GoogleDriveListFilesNode, json!({ "account": rig.access("google"), "pageSize": 0 }))
-        .await
-        .failure()?;
-    assert!(err.starts_with("config error") && err.contains("`pageSize`"), "{err}");
-    assert!(rig.requests().is_empty(), "nothing is listed");
-    Ok(())
-}
-
 async fn live_list(rig: LiveRig) -> WeftResult<()> {
     // Read-only: every listed file carries the projected fields.
     let outcome = rig

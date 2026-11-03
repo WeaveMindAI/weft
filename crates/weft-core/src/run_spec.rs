@@ -2384,7 +2384,7 @@ mod tests {
         let b = project.nodes.iter_mut().find(|n| n.id == "b").unwrap();
         b.port_literals.insert("in".into(), crate::instance::instance_filled_literal(None));
         b.instance_rules = Some(serde_json::from_value(json!({ "rules": [{
-            "when": { "kind": "config_equals", "field": "in", "equals": "bad" },
+            "when": { "kind": "value", "field": "in", "equals": "bad" },
             "then": { "message": "'{id}' refuses {field}", "field": "in" }
         }]})).unwrap());
         project
@@ -2425,7 +2425,7 @@ mod tests {
         let mut project = filled_program();
         let b = project.nodes.iter_mut().find(|n| n.id == "b").unwrap();
         b.instance_rules = Some(serde_json::from_value(json!({ "rules": [{
-            "when": { "kind": "not", "of": { "kind": "config_nonempty", "field": "in" } },
+            "when": { "kind": "not", "of": { "kind": "value", "field": "in", "nonempty": true } },
             "then": { "message": "'{id}' has nothing picked; pick one on the node", "field": "in" }
         }]})).unwrap());
         let ada = crate::instance::InstanceId::new("ada").unwrap();

@@ -6,8 +6,9 @@
 //!
 //! A BUS input is followed live: each message is logged as it lands (so
 //! the inspector shows the stream as a stream), the payloads are
-//! accumulated, and the accumulated log is printed once the bus closes,
-//! as a warning naming why when the bus ended failed. Anything else is
+//! accumulated, and the accumulated log is printed once the bus closes.
+//! A bus that ended failed fails the node with why (the read past it is
+//! the failure), every message having been logged as it landed. Anything else is
 //! logged once, as before. The accumulated payloads are the node's state,
 //! so a run that pauses while it follows the bus closes with every
 //! message in the closing line, the ones from before the pause included.
@@ -15,7 +16,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft::bus::{BusEntryKind, StreamEnd};
+use weft::bus::BusEntryKind;
 use weft::context::LogLevel;
 use weft::{RunContext, Node, NodeManifest, WeftResult, WeftType};
 
@@ -75,15 +76,7 @@ impl Node for DebugNode {
             }
             let count = state.seen.len();
             let seen = Value::Array(std::mem::take(&mut state.seen));
-            match bus.end() {
-                Some(StreamEnd::Failed { error }) => {
-                    ctx.log(LogLevel::Warn, format!("[{label}] bus failed after {count} message(s) ({error}): {seen}"))
-                        .await?
-                }
-                Some(StreamEnd::Finished) | None => {
-                    ctx.log(LogLevel::Info, format!("[{label}] bus closed after {count} message(s): {seen}")).await?
-                }
-            }
+            ctx.log(LogLevel::Info, format!("[{label}] bus closed after {count} message(s): {seen}")).await?;
             return Ok(());
         }
 

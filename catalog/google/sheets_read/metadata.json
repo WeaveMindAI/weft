@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[google]", "accepts": ["wire"],
       "description": "Leave unconnected to read a sheet shared by link."
     },
     {

@@ -87,7 +87,7 @@ of [CONTRIBUTING](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#
 | `metadataPorts` | List | `[]` | Ports whose value you write here, which no run computes. Go and read [metadataPorts](#metadataports) |
 | `requiresInfra` | Boolean | `false` | The node provisions containers and must implement `provision_infra` |
 | `images` | List[String] | `[]` | Directories under the package root, each holding a Dockerfile to build |
-| `publishes` | String | none | The service whose connection this node hands out itself. Needs an `Access` output too |
+| `publishes` | String | none | The service whose connection this node hands out itself. Needs an `Access[<that service>]` output too |
 | `features` | Object | all off | Small flags about what the node is |
 | `display` | Object | none | What to render on the node's body after a firing |
 | `validate` | List | `[]` | Rules the compiler checks against the graph |
@@ -113,8 +113,31 @@ of [CONTRIBUTING](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#
 | `label` | String | the name | The field's name on the form |
 | `placeholder` | String | none | Hint text in the empty field |
 | `description` | String | none | A sentence next to the field |
-| `requiresScopes` | List[String] | none | Permissions this consumer needs on the wired connection. `Access` inputs only |
-| `requiresValues` | List[String] | none | Stored values it needs. `Access` inputs only |
+| `requiresScopes` | List[String] | none | Permissions this consumer needs on the wired connection. Connection inputs only |
+| `requiresValues` | List[String] | none | Stored values it needs. Connection inputs only |
+| `keepsBlank` | Boolean | `false` | On an optional input that takes text, a blank text is a value your node uses (a separator, a preview of what arrived). Without it, a blank counts as no value; see below |
+
+### A blank text counts as no value
+
+If you take an optional input that takes text (`String`, or a union with
+`String` in it, like `String | List[String]`), a blank text on it (empty, or
+only spaces) reaches your node as nothing at all, whether it was written in the
+program or arrived on a wire. `ctx.inputs.opt::<String>("title")?` gives
+`None`, a `default` fills it as it would fill any missing input,
+`oneOfRequired` counts it as not given, and the rules below see it as not set.
+So read it plainly, with no filter of your own:
+
+```rust
+let title = ctx.inputs.opt::<String>("title")?;
+```
+
+This holds for the inputs your `metadata.json` declares. A port the program
+adds to your node keeps whatever arrives on it, a blank included, because it
+is the program's data, and so does a required input. If a
+blank is a real value for your node, set `"keepsBlank": true` on the input; on
+a required input or one that does not take text, the node fails to load. A
+list is still a value, even an empty one: only a blank text counts as
+nothing.
 
 ## outputs
 
@@ -164,10 +187,12 @@ names the port.
 | `isTrigger` | Boolean | `false` | This node starts runs from outside instead of running inside one. Weft gives it `callsPerMinute`, `callsAtOnce`, `durable`, `recorded`, `keepRunsFor`, `holdSecs` and `pauseAfterSecs` inputs (and `outlivesCaller` too when it sets `liveConnection`), so do not declare those |
 | `liveConnection` | `"http"` or `"websocket"` | none | On a trigger whose run answers a caller holding the connection open: `"http"` for a request waiting on its response (a route), `"websocket"` for a socket. It also gets `callsPerMinutePerCaller`, `journalEphemeral` and `journalWindowMs` |
 | `journalSettings` | Boolean | `false` | Set it on a node that opens a bus and wants its users to choose how the run's record keeps it: the node gets the `journalEphemeral` and `journalWindowMs` inputs, and reads them with `ctx.journal_policy()?`. Weft refuses it together with `liveConnection` (which gives the same two inputs) and refuses a node that declares either input itself. For what they do, go and read [two modes](../language/streams-and-buses.md#two-modes) |
+| `checksCallers` | Boolean | `false` | On a `liveConnection` trigger with an `auth` setting: weft checks every caller against it, with a connection of the node's own picked on each install (`weft connect <node>`), before a run starts. `Route` and `Socket` set it. For the schemes, go and read [checking a signed request](../connections/verifying-requests.md#on-a-route) |
 | `answersCaller` | `"whole"`, `"stream"` or `"end"` | none | This node answers its run's live caller. `"whole"`: the response in one go (a Reply). `"stream"`: the response head, then the body piece by piece (a Stream). `"end"`: the end of the exchange (a Close). Set it on your own node too if it answers through the ctx, so a route's "never answers its caller" warning counts it |
 | `calledFromOutside` | Boolean | `false` | On a trigger somebody outside calls whose call ends there (a form somebody submits). It also gets `callsPerMinutePerCaller`. A `liveConnection` trigger is called from outside already, so it never sets this; a trigger that picks its events up itself (a schedule, a feed, a provider's push) has no caller and does not either |
 | `pure` | Boolean | `false` | Set it when the node's body does nothing outside its run that weft does not put on record first: no network, no connection, no wait on a signal (`state.wait`), no tag, no storage beyond the run's own files. It may answer its caller (a durable run's answer leaves only once its record is written), read stored files, store files for this run alone, hand its caller links to them, use a bus to another node of the run, and keep a state (`ctx.keep`), which goes to the run's own record. A durable run then starts it without waiting for the database, and may run it again after a crash (for when, go and read [surviving a restart](durable-execution.md#when-the-worker-dies-mid-run)). A pure node that reaches outside through the ctx anyway fails at that call, naming this flag; weft cannot see a body that opens a socket or a file on its own, so if you mark one of those pure, a durable run may do what it does twice after a crash. `Text`, `JsonObject`, `Switch`, `Route` and `Reply` are pure; `HttpRequest` and `PostgresExecuteQuery` are not, because each one reaches outside the run on its own |
-| `oneOfRequired` | List[List[String]] | `[]` | Each inner list is a group where at least one port must arrive, or the node skips |
+| `machineInputs` | `{cpu, memory}` | none | On an infrastructure node whose users pick its machine size: gives it `cpu`, `memory` and `machineType` inputs, `cpu` and `memory` defaulting to the sizes you write. Needs `requiresInfra`. For how to read them, go and read [the spec](infrastructure.md#the-spec) |
+| `oneOfRequired` | List[List[String]] | `[]` | Each inner list is a group where at least one port must arrive, or the node skips. A blank text on an optional input that takes text counts as not arrived ([a blank text counts as no value](#a-blank-text-counts-as-no-value)) |
 | `canAddInputPorts` | Boolean | `false` | Source may declare extra inputs on it |
 | `canAddOutputPorts` | Boolean | `false` | Source may declare extra outputs |
 | `addedPortsAreDataKeys` | Boolean | `false` | Set it when the ports a program adds are named after data from outside weft: a path's captures, a query's parameters, a template's ids, the keys of a JSON object it builds. The compiler's `not-camel-case` warning then leaves every port a program adds to the node alone, and still checks the name the program gives the node. The nodes that ship with weft and set it are `Route`, `JsonObject`, `ElevenLabsRunTemplate`, `PostgresExecuteQuery`, `PostgresWatchQuery` and `PostgresUpdateRows` |
@@ -201,7 +226,7 @@ Every widget, by its `kind`:
 | `code` | `language` | A code box with highlighting. `language` is one of `python`, `javascript`, `sql`, `json`, and any other word fails to load. `json` also fits a structured input (`JsonDict`, a list), edited as JSON text; the others edit a `String` |
 | `number` | `min`, `max`, `step` | A number box. `min` and `max` are real rules the runtime enforces, and a whole-number `step` (`"step": 1`) means the input takes whole numbers: a written value is checked when the program compiles, a wired one when it arrives. A fractional `step` is only the arrow keys' increment |
 | `checkbox` | | A tick box. The default for `Boolean` |
-| `datetime` | | A date and time picker, stored as ISO 8601 |
+| `datetime` | | A date and time picker. It is a real rule too: the value must be a moment written with its zone (RFC 3339, like `2026-09-03T11:00:00+02:00` or `2026-09-03T09:00:00Z`), checked when the program compiles for a written value (`literal-out-of-range`) and when it arrives for a wired one. Your node reads it as a date, `ctx.inputs.get::<chrono::DateTime<chrono::Utc>>("at")?`, once it declares `chrono = { version = "0.4", features = ["serde"] }` in its `deps.toml` (weft does not hand chrono on) |
 | `select` | `options`, `freeText` | A dropdown. `options` cannot be empty, and they are a real rule: a written, wired or instance-provided value outside them is refused, and so is a default. If the list is only suggestions (model ids, voices, anything the provider adds to), set `"freeText": true`: the editor still offers the list, lets the user type anything else, and nothing is refused |
 | `multiselect` | `options`, `freeText` | Multiple choice over a `List[String]`, each item held to `options` the same way, unless `freeText` is set |
 | `text_list` | | Short strings added one at a time. The default for `List[String]` |
@@ -291,12 +316,7 @@ The conditions are a closed list:
 | `input_satisfied` | `port` | Does this input have a value, from a wire or written in |
 | `input_wired` | `port` | Does it have a wire specifically |
 | `output_wired` | `port` | Does anybody downstream read this output |
-| `input_source_type` | `port`, `equals` | Do all wires into this port come from that node type |
-| `config_present` | `field` | Is this field set to anything non-null |
-| `config_nonempty` | `field` | Is it set and not blank or empty |
-| `config_equals` | `field`, `equals` | Does it equal this exact value |
-| `config_in_set` | `field`, `values` | Is its string one of these |
-| `config_matches` | `field`, `regex` | Does its string match. False if absent, not a string, or the regex is broken |
+| `value` | `field`, and the checks below | Is this field set to anything non-null and, when checks are given, does it pass every one |
 | `custom_inputs_declared` | | Did the source add inputs beyond the metadata's own. `{customInputs}` in the message names them |
 | `custom_outputs_declared` | | Did the source add outputs beyond the metadata's own. `{customOutputs}` in the message names them |
 | `output_type_fits` | `port`, `within` | Does this output, as the program declared it (or as your metadata types it, if the program declared nothing), fit in the type `within`. Use it when the types that make sense on a narrowable output depend on a setting: a route whose `dataType` is `text` takes only a `String` body. False when the node has no such output |
@@ -307,6 +327,43 @@ The conditions are a closed list:
 | `input_names` | `port`, `names` | Does every name written on this input name a node or a field of this program. If the input holds a String, that is the name; if a list, each String in it; if an object, each of its keys. `names` says what they name: `{"node": {}}` is a node spelled the way the program writes it (`bridge`, `one.bridge`), narrowed with `role` (`infra` or `trigger`) and `perInstance` (`true` or `false`); `{"field": {}}` is a node's field written `node.field` (`send.model`), narrowed with `instanceFilled` (`true` or `false`). Nothing written is fine. A wired or `@instance_filled` input holds names only known at run time, so it is not checked. `{names}` in the message lists the ones that fail |
 | `all` / `any` | `of` | Every one, or at least one |
 | `not` | `of` | The opposite |
+
+A `value` condition takes any of these checks, and all the ones you write must
+hold. In each `{ "min", "max" }`, both bounds are optional and both included.
+
+| Check | Holds when |
+|---|---|
+| `"nonempty": true` | The value is not blank or empty |
+| `"equals": <value>` | It equals this exact value |
+| `"oneOf": [...]` | It is one of these values, compared as JSON (a string against strings) |
+| `"matches": "<regex>"` | It is text and matches |
+| `"count": { "min", "max" }` | It holds that many items. A list counts its items, a dict its entries, any other value one |
+| `"range": { "min", "max" }` | It is a number in that range |
+| `"length": { "min", "max" }` | It is text of that many characters |
+| `"unique": true` | The items of the list are all different |
+| `"unique": "<key>"` | The records of the list all hold a different `<key>` |
+| `"each": { <checks> }` | Every item of the list passes the checks inside, a single value that is not a list counting as one item. With `"key"` inside, the checks read that key of each record. An item of the wrong kind for a check passes, since the type check owns kinds, and so does a record without the key. `each` may hold another `each` |
+
+```json
+{ "kind": "value", "field": "voice", "oneOf": ["alloy", "verse"] }
+{ "kind": "value", "field": "schedule", "each": { "range": { "min": 50, "max": 500 } } }
+{ "kind": "value", "field": "messages", "each": { "key": "role", "oneOf": ["user", "assistant"] } }
+```
+
+A check meeting the wrong kind of value is false (`matches` on a number,
+`range` on text), and a field that is absent or null fails every check. So a
+rule that refuses a bad value with `not` around a check refuses a missing one
+too. If the field is optional, put the check inside `all` with a bare `value`.
+Here an optional list that must hold at least two items when it is given:
+
+```json
+{ "when": { "kind": "all", "of": [
+    { "kind": "value", "field": "options" },
+    { "kind": "not", "of": { "kind": "value", "field": "options", "count": { "min": 2 } } } ] },
+  "then": { "message": "Pick '{id}' needs at least two `options` to choose between.", "field": "options" } }
+```
+
+On a required input, the `not` alone does it.
 
 `with` picks nodes by one feature they declare, never by type, so your own
 node counts the same as a catalog one: `{"answersCaller": true}` is any node
@@ -334,6 +391,37 @@ a key that is no field an instance fills:
 { "when": { "kind": "not", "of": { "kind": "input_names", "port": "values", "names": { "field": { "instanceFilled": true } } } },
   "then": { "message": "SetInstanceValues '{id}' gives {names} in `values`...", "port": "values" } }
 ```
+
+### Rules on a value that arrives on a wire
+
+If a rule's answer depends on a value a wire brings, the compiler cannot
+decide it. It records the rule on the node in the compiled program, and the
+rule is checked again with the values that actually arrived, before your
+node's body runs. If it fires, the node fails with the rule's own message.
+That failure is an input error, so a wired `_error` does not catch it: the fix
+is in the program. A rule asking whether an optional wired input is set
+(`input_satisfied`) is one of these too, because the wire may close empty.
+
+So a rule you write here covers every value, written or wired, and your
+node's Rust never checks it again. A node with no undecided rule pays
+nothing. Only rules with `severity: error` are recorded; a warning the
+compiler could not decide is dropped, because it could not fail a firing
+anyway.
+
+### Which connection a node takes
+
+If your node takes a connection, its input's type names the service:
+`"type": "Access[slack]"`. The compiler then refuses any other service's
+connection on that wire, so a program cannot wire a Mistral connection into
+your node and send the Mistral key to your provider. If the node works with
+several services, write a union, `Access[openai] | Access[anthropic]`. If
+your node declares its own `service`, the input it takes that connection on
+(`account`, or `connection`) is typed with that service, `Access[google]` on
+GoogleAccess, and the catalog refuses the node when it names another one. A
+bare `Access` takes any service, so write it only where the service is not
+known until the program is written (a `Route`'s `connection`, whose service
+follows its `auth`). When the node opens the connection, weft checks the
+service again and fails the node naming both if they differ.
 
 ## portsFromConfig
 

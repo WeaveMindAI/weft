@@ -11,7 +11,6 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("reorders_documents_best_first", reorders),
         NodeTest::fake("an_index_past_the_documents_fails_loud", index_out_of_range),
-        NodeTest::fake("empty_documents_are_refused", empty_documents),
         NodeTest::live("one_real_rerank", "openrouter", live_rerank),
     ]
 }
@@ -91,17 +90,5 @@ async fn index_out_of_range(rig: FakeRig) -> WeftResult<()> {
         .await;
     let err = outcome.result.expect_err("stray index must refuse").to_string();
     assert!(err.contains("past the document list"), "{err}");
-    Ok(())
-}
-
-async fn empty_documents(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig
-        .run(
-            &LlmRerankNode,
-            json!({ "provider": provider(&rig), "query": "q", "documents": [] }),
-        )
-        .await;
-    let err = outcome.result.expect_err("empty documents must refuse").to_string();
-    assert!(err.contains("empty"), "{err}");
     Ok(())
 }

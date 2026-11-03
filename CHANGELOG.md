@@ -4,7 +4,7 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-11-03 (0.2.290)
 
 **What breaks after this update:**
 
@@ -85,7 +85,106 @@ the start refuses and names the command to settle it: `weft infra take-disk
 <volume>`, run under the install whose data it is. A start also refuses a
 volume that has this install's name but belongs to another install.
 
+**A connection now carries its service in its type.** Before, wiring a
+Mistral connection into a fal node compiled, and the node sent the Mistral key
+to fal. A connection is now typed with its service, `Access[fal]`: each access
+node takes and puts out its own service's (a node of yours that declares a
+`service` types its connection input with it), every catalog node's connection
+input names the service it takes (a union like `Access[openai] | Access[anthropic]` when
+it takes several), and the compiler refuses any other. A bare `Access` takes
+any service, but a bare `Access` no longer fits an `Access[fal]` input, so if a
+group or included file of yours passes a connection through a port typed
+`Access`, write the service on it (`db: Access[postgres]`). A connection of
+another service arriving at a node's input when it runs fails the node, naming
+both.
+
+**Route and Socket check their callers themselves; ApiKeyAuth and HmacAuth
+are gone.** `auth` on a `Route` or `Socket` is now a setting: `"none"` (the
+default), `"api_keys"` (what ApiKeyAuth did: `X-Api-Key`, or a Bearer
+token), `"hmac_sha256"` (what HmacAuth did: `X-Signature` over
+`<timestamp>.<body>`), `"hmac_sha1"`, `"hmac_sha512"`, `"ed25519"` or
+`"ecdsa_p256"` (the same layout, with that algorithm), `"oidc"`, or a whole
+verify block for any other scheme. The
+keys or the secret live in a connection of the route's own, picked on each
+install, so each gated route needs it once after this update: `weft connect
+<route> --grant <id>` picks the connection the old auth node used (`weft
+connect --list` shows its id), or `weft connect <route>` stores a new one. A
+route whose `auth` names a scheme and has no connection fails to activate,
+saying so. `weft connect` now takes the node as its argument
+(`weft connect <node>`), and `--node` is gone.
+
+**A node's rules on values are written with one kind, `value`.** A node
+`metadata.json` using `config_present`, `config_nonempty`, `config_equals`,
+`config_in_set`, `config_matches`, `config_item_count`, `config_items_fit`,
+`config_in_range` or `config_field_in_set`, or an input's `minItems`, now
+fails to load, naming `value`. Write `{ "kind": "value", "field": "x" }`
+with the checks you need (`nonempty`, `equals`, `oneOf`, `matches`, `count`,
+`range`, `length`, `unique`, `each`); `minItems: 2` becomes a rule refusing
+`not { "kind": "value", "field": "x", "count": { "min": 2 } }`. A node's own
+rule `input_source_type` fails to load too: type the input with its service
+instead (`"type": "Access[slack]"`).
+
+**A node's rules now hold for values that arrive on a wire.** A rule in a
+node's `metadata.json` that the compiler could not decide, because its value
+comes from another node, is now checked before the node runs, with the value
+that arrived. A program that compiled and ran with a wired value breaking a
+rule now fails at that node with the rule's own message, and a wired `_error`
+does not catch it. Fix the value upstream.
+
+**A blank optional text counts as not given.** An optional input that takes
+text (`String`, or a union with `String` in it, like `String | List[String]`)
+that arrives empty or only spaces is treated as absent: the node gets no value
+(or the input's default), and a node needing one of several inputs counts it
+as missing. So these nodes now skip instead of failing: GmailSend when `to`,
+`cc` and `bcc` are all blank or missing, or `text` and `html` both are;
+GmailLabel when `add` and `remove` both are; NotionAppendBlocks when `content`
+is blank and `blocks` is missing.
+If your program relied on that failure, check for the skip instead.
+
+**A `datetime` setting must be a moment with its zone**, like
+`2026-09-03T11:00:00+02:00`. WaitUntil's and GoogleCalendarListEvents' dates are
+held to it: a written one at compile time, a wired one before the node runs.
+
+**A bus that ended failed now fails the node reading it**, with `the bus
+ended failed: <why>`, instead of reading as a clean end.
+
+**A message on a bus goes out to a caller with its files as links and its
+secrets revealed.** A bus carries no type, so `Stream` reads each message's
+markers instead: a stored file in it goes out as a link, and a secret as its
+value. Before, either one was refused.
+
+**For your own nodes:**
+
+- `storage.put_from_url(url, mime, filename, keep)` takes the file's type
+  second (`None` takes the server's).
+- A `PollDelta` takes `paging` (`None` for a list that fits one answer).
+- `client::cursor_paged` hands its request closure the cursor
+  (`|cursor| ..`), and `CursorPaging.param` is an `Option` (`None` when the
+  cursor goes in the body).
+
 **The rest:**
+
+**`weft test-node` takes several packages or nodes at once**
+(`weft test-node slack telegram`) and builds them together.
+
+**Poll triggers no longer lose a burst.** A trigger polling a list that
+comes in pages (Gmail's, Notion's, Airtable's new-item triggers) follows the
+pages until it meets an item it has seen, and fires every new one, instead
+of firing only the first page. More than 50 pages of new items between two
+polls fails the poll, firing nothing, and the log says so.
+
+**A cancelled run stops waiting on a slow server.** Every request a node
+sends through weft's clients, an infra endpoint's call, a storage read or a
+write of bytes or a stream, a provider socket and a bus read now end the moment the run is
+cancelled, so nodes that did not watch for a cancel themselves (an HTTP
+request, a text-to-speech call, an embedding) no longer keep a cancelled run
+alive.
+
+**A node can clean up what it made at a provider, however it ends.**
+`ctx.after_node(CancelCall::delete(url).always(), &access)` puts the call
+on the run's record and sends it once when the node ends, even after a
+crash. The ElevenLabs nodes use it for the files they upload for a job, so
+a cancelled or crashed run no longer leaves them in your account.
 
 **A durable run's record is written faster again.** Since costs and secrets
 got tables of their own, every write of a run's record paid for saving them

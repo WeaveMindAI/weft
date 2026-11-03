@@ -23,6 +23,7 @@
       "description": "Lifetime in hours, from one second to a year, rounded to the nearest second.",
       "widget": {
         "kind": "number",
+        "min": 0,
         "max": 8760
       }
     }

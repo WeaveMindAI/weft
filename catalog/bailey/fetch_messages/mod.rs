@@ -24,7 +24,7 @@ impl Node for BaileyFetchMessagesNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let chat_id: String = ctx.inputs.get("chatId")?;
-        let count: f64 = ctx.inputs.get("count")?;
+        let count: u64 = ctx.inputs.get("count")?;
 
         let result = ctx.endpoint_of(&bridge)
             .await?

@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[postgres]", "accepts": ["wire"],
       "required": true,
       "requiresValues": [
         "host",

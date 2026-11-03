@@ -70,7 +70,7 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_equals",
+            "kind": "value",
             "field": "role",
             "equals": "tool"
           },
@@ -102,13 +102,9 @@
             "kind": "any",
             "of": [
               {
-                "kind": "config_in_set",
+                "kind": "value",
                 "field": "role",
-                "values": [
-                  "user",
-                  "assistant",
-                  "system"
-                ]
+                "oneOf": ["user", "assistant", "system"]
               },
               {
                 "kind": "all",
@@ -116,7 +112,7 @@
                   {
                     "kind": "not",
                     "of": {
-                      "kind": "config_present",
+                      "kind": "value",
                       "field": "role"
                     }
                   },

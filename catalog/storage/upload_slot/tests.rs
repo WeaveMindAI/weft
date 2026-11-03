@@ -17,13 +17,13 @@ pub fn tests() -> Vec<NodeTest> {
 
 async fn settings(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig
-        .run(&UploadSlotNode, json!({ "maxMb": 1.5, "types": "Video", "minutes": 30, "scope": "run", "ttlDays": 2 }))
+        .run(&UploadSlotNode, json!({ "maxMb": 2, "types": "Video", "minutes": 30, "scope": "run", "ttlDays": 2 }))
         .await
         .ok()?;
     assert!(outcome.outputs["slot"].as_str().is_some_and(weft::storage::slot::is_slot), "{}", outcome.outputs["slot"]);
     let asked = rig.upload_slots();
     assert_eq!(asked.len(), 1);
-    assert_eq!(asked[0].max_bytes, 1_572_864);
+    assert_eq!(asked[0].max_bytes, 2_097_152);
     assert_eq!((asked[0].accepts.as_str(), asked[0].minutes), ("Video", 30));
     assert_eq!(asked[0].scope, StorageScope::Run);
     assert_eq!(asked[0].keep, Some(KeepTtl::Secs { secs: 2 * 24 * 3600 }));
@@ -34,10 +34,8 @@ async fn settings(rig: FakeRig) -> WeftResult<()> {
 
 async fn refused(rig: FakeRig) -> WeftResult<()> {
     for (settings, says) in [
-        (json!({ "maxMb": 0, "types": "File", "minutes": 60, "scope": "project" }), "maxMb"),
         (json!({ "maxMb": 1, "types": "String", "minutes": 60, "scope": "project" }), "file type"),
         (json!({ "maxMb": 1, "types": "File", "minutes": 0, "scope": "project" }), "minutes"),
-        (json!({ "maxMb": 1, "types": "File", "minutes": 60, "scope": "shared" }), "`scope`"),
     ] {
         let err = rig.run(&UploadSlotNode, settings).await.failure()?;
         assert!(err.contains(says), "{says}: {err}");

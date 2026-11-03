@@ -464,6 +464,20 @@ impl Door {
                         .map(str::to_string)
                         .ok_or_else(|| answer(StatusCode::INTERNAL_SERVER_ERROR, format!("connection auth config has no '{name}'")))
                 };
+                let service = field("service")?;
+                // No check on the row: a gate an older weft set up whose
+                // check it did not keep. Every caller is refused, naming
+                // the fix, never let through.
+                let verify = match entry.auth_config.as_ref().and_then(|cfg| cfg.get("verify")) {
+                    Some(verify) => serde_json::from_value(verify.clone()).map_err(|e| {
+                        answer(StatusCode::INTERNAL_SERVER_ERROR, format!("the route's check does not read: {e}"))
+                    })?,
+                    None => {
+                        let why = weft_core::signal::auth::uncarried_gate(&service);
+                        tracing::warn!(target: "weft_engine::door", path = %path, "{why}");
+                        return Err(answer(StatusCode::SERVICE_UNAVAILABLE, why));
+                    }
+                };
                 let request = CallerVerifyRequest {
                     tenant: self.tenant_id.clone(),
                     for_instance: entry
@@ -471,7 +485,8 @@ impl Door {
                         .clone()
                         .map(|instance| weft_core::instance::InstanceScope { project_id: self.project_id, instance }),
                     access_id: field("access_id")?,
-                    service: field("service")?,
+                    service,
+                    verify,
                     method: method.to_string(),
                     path: path.to_string(),
                     url,
@@ -1032,7 +1047,7 @@ mod tests {
     async fn a_gated_route_asks_the_broker_and_takes_its_word() {
         let mut gated = route("t1", "route", "x");
         armed(&mut gated).auth_kind = "connection".into();
-        armed(&mut gated).auth_config = Some(serde_json::json!({ "access_id": "a", "service": "s" }));
+        armed(&mut gated).auth_config = Some(serde_json::json!({ "access_id": "a", "service": "s", "verify": { "kind": "api_keys" } }));
         let broker = FakeDoorBroker::new(vec![gated]);
         let door = door(broker.clone());
         assert_eq!(status(arrive(&door, "POST", "/x", "", &headers(&[])).await).await.0, StatusCode::UNAUTHORIZED);
@@ -1042,6 +1057,22 @@ mod tests {
         assert_eq!(broker.verified.lock().unwrap().len(), 2);
     }
 
+    /// A gate whose check an older weft did not keep refuses every caller,
+    /// naming the fix, and never asks the broker.
+    #[tokio::test]
+    async fn a_gate_with_no_check_refuses_every_caller() {
+        let mut gated = route("t1", "route", "x");
+        armed(&mut gated).auth_kind = "connection".into();
+        armed(&mut gated).auth_config = Some(serde_json::json!({ "access_id": "a", "service": "jwt_auth" }));
+        let broker = FakeDoorBroker::new(vec![gated]);
+        *broker.identity.lock().unwrap() = Some(serde_json::json!({ "sub": "alice" }));
+        let door = door(broker.clone());
+        let (code, body) = status(arrive(&door, "POST", "/x", "", &headers(&[])).await).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("weft resync") && body.contains("jwt_auth"), "{body}");
+        assert!(broker.verified.lock().unwrap().is_empty());
+    }
+
     /// The broker is asked with the full address the caller used (host,
     /// the relay's route prefix, path and query as sent: what a scheme
     /// signing `{url}` covers) and every value of a repeated header.
@@ -1049,7 +1080,7 @@ mod tests {
     async fn a_gated_route_hands_the_broker_the_url_and_every_header_value() {
         let mut gated = route("t1", "route", "sms");
         armed(&mut gated).auth_kind = "connection".into();
-        armed(&mut gated).auth_config = Some(serde_json::json!({ "access_id": "a", "service": "s" }));
+        armed(&mut gated).auth_config = Some(serde_json::json!({ "access_id": "a", "service": "s", "verify": { "kind": "api_keys" } }));
         let broker = FakeDoorBroker::new(vec![gated]);
         let door = door(broker.clone());
         let mut sent = headers(&[("x-forwarded-proto", "https")]);
@@ -1166,7 +1197,7 @@ mod tests {
     async fn a_gated_sockets_ticket_carries_the_caller_and_holds_them_to_their_request() {
         let mut gated = route("t1", "socket", "feed");
         armed(&mut gated).auth_kind = "connection".into();
-        armed(&mut gated).auth_config = Some(serde_json::json!({ "access_id": "a", "service": "s" }));
+        armed(&mut gated).auth_config = Some(serde_json::json!({ "access_id": "a", "service": "s", "verify": { "kind": "api_keys" } }));
         let broker = FakeDoorBroker::new(vec![gated]);
         *broker.identity.lock().unwrap() = Some(serde_json::json!({ "sub": "alice" }));
         let door = door(broker.clone());

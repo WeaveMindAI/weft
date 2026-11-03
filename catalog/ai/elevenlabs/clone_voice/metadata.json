@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[elevenlabs]", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "voice_lab"
@@ -61,6 +61,15 @@
       "name": "requiresVerification",
       "type": "Boolean",
       "description": "Whether ElevenLabs says the new voice requires verification."
+    }
+  ],
+  "validate": [
+    {
+      "when": { "kind": "not", "of": { "kind": "value", "field": "samples", "count": { "min": 1 } } },
+      "then": {
+        "message": "ElevenLabsCloneVoice '{id}' has no recordings in `samples`, and ElevenLabs needs at least one to clone a voice: add one.",
+        "port": "samples"
+      }
     }
   ]
 }

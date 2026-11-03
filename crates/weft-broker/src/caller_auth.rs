@@ -1,9 +1,9 @@
 //! The caller-verify door: is the party opening a live route who the
-//! route's auth connection says it must be?
+//! route's check says it must be?
 //!
-//! A `Route { auth: <connection> }` names a stored connection whose
-//! service recipe declares a `verify` scheme (a set of API keys, a JWT
-//! issuer, an HMAC secret) and whose stored values hold the material.
+//! A Route (or Socket) names its check in its `auth` (a set of API keys,
+//! a JWT issuer, an HMAC secret) and the stored connection whose values
+//! hold the material; the door forwards both with the request.
 //! The dispatcher forwards the caller's opening request here and admits
 //! the run only on a yes; it never sees the material. The broker is the
 //! right side because it holds the connections, exactly as it holds the
@@ -24,7 +24,7 @@ use base64::Engine as _;
 use serde_json::Value;
 use weft_task_store::db::Pool;
 
-use weft_core::access::events::VerifyKind;
+use weft_core::access::events::{VerifyKind, VerifySide};
 use weft_core::access::verify::{
     bearer_token, needs_issuer_keys, secrets_from_values, verify_push, PushParts, VerifyError,
 };
@@ -108,11 +108,11 @@ pub struct VerifierKey {
 /// (`weft_broker_client::line::ACCESS_CHANNEL`). The process already holds
 /// the key that opens every stored connection, so keeping one open adds
 /// nothing a look at its memory would not already give.
-pub type HeldVerifiers = weft_task_store::held_copy::HeldCopy<VerifierKey, weft_access_store::CallerVerifier>;
+pub type HeldVerifiers = weft_task_store::held_copy::HeldCopy<VerifierKey, std::collections::BTreeMap<String, String>>;
 
 /// Which verifiers a notice on `weft_access` drops (its payload is
 /// `weft_access_store`'s `access_notify`).
-pub fn verifiers_changed(payload: &str) -> weft_task_store::held_copy::Changed<VerifierKey, weft_access_store::CallerVerifier> {
+pub fn verifiers_changed(payload: &str) -> weft_task_store::held_copy::Changed<VerifierKey, std::collections::BTreeMap<String, String>> {
     let payload = payload.to_string();
     weft_task_store::held_copy::Changed::Matching(Box::new(move |key: &VerifierKey, _| names(&payload, key)))
 }
@@ -132,9 +132,10 @@ fn names(payload: &str, key: &VerifierKey) -> bool {
     }
 }
 
-/// The check itself: load the connection's scheme and values (kept in
-/// `verifiers` until they change), resolve the scheme's templates against
-/// the values, run it. Answers the identity the scheme established, and
+/// The check itself: load the connection's values (kept in `verifiers`
+/// until they change; the connection must be of the service the route's
+/// scheme reads), resolve the route's scheme's templates against them,
+/// run it. Answers the identity the scheme established, and
 /// the headers it read the credential from.
 /// Separate from the route so the database tests exercise it directly.
 pub async fn verify_caller(
@@ -153,9 +154,22 @@ pub async fn verify_caller(
         access_id,
         service: req.service.clone(),
     };
-    let verifier = verifiers
+    // The route's check is held to the rules a check of callers keeps,
+    // and must read a connection of the service it names.
+    req.verify.validate(&req.service, VerifySide::Caller).map_err(CallerRefusal::Malformed)?;
+    match weft_core::access::callers::CallerScheme::of(&req.verify) {
+        Some(scheme) if scheme.service() == req.service => {}
+        _ => {
+            return Err(CallerRefusal::Malformed(format!(
+                "a {} check does not read a '{}' connection",
+                req.verify.tag(),
+                req.service
+            )))
+        }
+    }
+    let values = verifiers
         .get_or_load(key, || async {
-            weft_access_store::caller_verifier(pool, &req.tenant, weft_access_store::GrantUser::of(req.for_instance.as_ref()), access_id, &req.service)
+            weft_access_store::caller_values(pool, &req.tenant, weft_access_store::GrantUser::of(req.for_instance.as_ref()), access_id, &req.service)
                 .await
                 .map_err(|e| match e.downcast_ref::<weft_access_store::AccessError>() {
                     // A connection that is not there (or another tenant's,
@@ -167,15 +181,9 @@ pub async fn verify_caller(
                 })
         })
         .await?;
-    let Some(kind) = verifier.verify.clone() else {
-        return Err(CallerRefusal::Refused(format!(
-            "the '{}' service declares no `verify` block, so its connections cannot gate a route",
-            req.service
-        )));
-    };
-    let kind = kind.resolved(&verifier.values).map_err(CallerRefusal::Refused)?;
+    let kind = req.verify.resolved(&values).map_err(CallerRefusal::Refused)?;
     let verified = |identity: Value| CallerVerified { identity, credential_headers: kind.credential_headers() };
-    let secrets = secrets_from_values(&verifier.values);
+    let secrets = secrets_from_values(&values);
     let body = base64::engine::general_purpose::STANDARD
         .decode(&req.body_b64)
         .map_err(|e| CallerRefusal::Malformed(format!("body_b64: {e}")))?;

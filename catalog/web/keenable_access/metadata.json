@@ -52,7 +52,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[keenable]",
       "widget": {
         "kind": "access"
       },
@@ -62,7 +62,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[keenable]",
       "description": "Wire into Keenable: Web Search or Keenable: Fetch Page."
     }
   ]

@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[postgres]",
       "accepts": [
         "wire"
       ],
@@ -72,16 +72,16 @@
         "of": [
           { "kind": "output_wired", "port": "count" },
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "query",
-            "regex": "(?is)^\\s*(update|delete|insert)\\b"
+            "matches": "(?is)^\\s*(update|delete|insert)\\b"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "query",
-              "regex": "(?is)\\b(returning|select)\\b"
+              "matches": "(?is)\\b(returning|select)\\b"
             }
           }
         ]

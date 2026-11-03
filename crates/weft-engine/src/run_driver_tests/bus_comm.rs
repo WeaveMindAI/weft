@@ -331,8 +331,10 @@
             .expect("run ok");
         match outcome {
             RunOutcome::Cancelled { .. } => {} // cancel won the race
-            RunOutcome::Completed => {} // dead-end closed the bus, Waiter exited cleanly
-            other => panic!("expected Cancelled or Completed via dead-end, got {other:?}"),
+            // The dead-end detector closed the bus failed first, and the
+            // Waiter's read handed that failure on.
+            RunOutcome::Failed { error, .. } if error.contains("stuck") => {}
+            other => panic!("expected Cancelled, or Failed via the dead-end, got {other:?}"),
         }
     }
 

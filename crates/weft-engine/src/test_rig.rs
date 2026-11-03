@@ -205,7 +205,7 @@ impl LiveTestRunner {
             })
         });
         Ok(Self {
-            record: RunRecord { journal: journal.clone(), costs: crate::metering::PendingCostRecords::new() },
+            record: RunRecord::new(journal.clone()),
             journal,
             settings,
             registered,

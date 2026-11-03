@@ -843,6 +843,109 @@ async fn a_poll_failure_streak_rides_its_wakes_and_priming_is_explicit() {
     assert!(shown(&copy, "poll").await.contains("polling"));
 }
 
+// ---------- A paged poll ----------
+
+/// A feed listing `items` newest first, two to a page: a page is asked
+/// for by the index it starts at, in the query parameter `page`, and
+/// answers the next page's index as `next` while there is one. Every
+/// request's `page` (`None` for the first page) is kept, in order.
+async fn spawn_paged_feed(items: Arc<Mutex<Vec<String>>>) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let kept = asked.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new().route(
+        "/feed",
+        axum::routing::get(move |axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>| {
+            let (items, kept) = (items.clone(), kept.clone());
+            async move {
+                kept.lock().unwrap().push(query.get("page").cloned());
+                let items = items.lock().unwrap().clone();
+                let start: usize = query.get("page").map_or(0, |page| page.parse().unwrap());
+                let page: Vec<Value> = items.iter().skip(start).take(2).map(|id| json!({ "id": id })).collect();
+                let next = (start + 2 < items.len()).then(|| (start + 2).to_string());
+                axum::Json(json!({ "items": page, "next": next }))
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}/feed"), asked)
+}
+
+/// A set-mode delta poll of `url` that follows its pages.
+fn paged_poll(url: &str) -> weft_core::primitive::SignalSpec {
+    to_spec(
+        serde_json::from_value::<weft_core::signal::PollEndpoint>(json!({
+            "url": url,
+            "interval_secs": 60,
+            "delta": {
+                "items": "items", "cursor_field": "id", "mode": "set",
+                "paging": { "next": "next", "sent_in": { "query": "page" } }
+            }
+        }))
+        .unwrap(),
+    )
+}
+
+fn fired_ids(rig: &Rig) -> Vec<Value> {
+    rig.doors.fired.lock().unwrap().iter().map(|fire| fire.payload["item"]["id"].clone()).collect()
+}
+
+/// The priming poll reads the first page alone. A burst bigger than a
+/// page is followed page by page, the cursor sent back where the feed
+/// takes it, until a page holds an item already seen, and every new item
+/// fires: none is lost to the page size.
+#[tokio::test]
+async fn a_paged_poll_follows_pages_to_a_seen_item_and_fires_every_new_one() {
+    let items = Arc::new(Mutex::new(vec!["c".to_string(), "b".into(), "a".into()]));
+    let (feed, asked) = spawn_paged_feed(items.clone()).await;
+    let rig = rig(false).await;
+    register(&rig, "poll", &paged_poll(&feed), now_ms()).await.unwrap();
+
+    wake(&rig.state, last_wake(&rig, "poll")).await.unwrap();
+    assert_eq!(*asked.lock().unwrap(), vec![None], "priming reads the first page alone");
+    assert!(fired_ids(&rig).is_empty(), "priming fires nothing");
+
+    // Three new items: the newest page is all new, the second holds `c`.
+    items.lock().unwrap().splice(0..0, ["f".to_string(), "e".into(), "d".into()]);
+    asked.lock().unwrap().clear();
+    wake(&rig.state, last_wake(&rig, "poll")).await.unwrap();
+    assert_eq!(*asked.lock().unwrap(), vec![None, Some("2".to_string())], "it stops at the page holding a seen item");
+    assert_eq!(fired_ids(&rig), vec![json!("f"), json!("e"), json!("d")]);
+
+    // Nothing new: the first page holds seen items, and nothing fires.
+    asked.lock().unwrap().clear();
+    wake(&rig.state, last_wake(&rig, "poll")).await.unwrap();
+    assert_eq!(*asked.lock().unwrap(), vec![None]);
+    assert_eq!(fired_ids(&rig).len(), 3);
+}
+
+/// A burst longer than the page limit fails the poll loudly, saying so
+/// on the trigger, and fires nothing: the cursor stays where it was, so
+/// no item is dropped.
+#[tokio::test]
+async fn a_paged_poll_past_the_page_limit_fails_and_fires_nothing() {
+    let items = Arc::new(Mutex::new(vec!["seen".to_string()]));
+    let (feed, asked) = spawn_paged_feed(items.clone()).await;
+    let rig = rig(false).await;
+    register(&rig, "poll", &paged_poll(&feed), now_ms()).await.unwrap();
+    wake(&rig.state, last_wake(&rig, "poll")).await.unwrap();
+    let primed = rig.rows.lock().unwrap()["poll"]["kind_state"].clone();
+    assert_eq!(primed, json!({ "delta": { "seen": ["seen"] } }));
+
+    let burst = 2 * weft_core::access::client::MAX_PAGES + 1;
+    items.lock().unwrap().splice(0..0, (0..burst).map(|n| format!("new-{n}")));
+    asked.lock().unwrap().clear();
+    wake(&rig.state, last_wake(&rig, "poll")).await.unwrap();
+    assert_eq!(asked.lock().unwrap().len(), weft_core::access::client::MAX_PAGES, "it stops at the limit");
+    assert!(fired_ids(&rig).is_empty(), "nothing fires");
+    let state = rig.rows.lock().unwrap()["poll"]["kind_state"].clone();
+    assert_eq!(state["delta"], primed["delta"], "the cursor stays");
+    assert_eq!(state["consecutive_failures"], 1);
+    assert!(state["last_failure"].as_str().unwrap().contains("page limit"), "{state}");
+    assert!(shown(&rig.state, "poll").await.contains("page limit"));
+}
+
 // ---------- A run waiting on a poll ----------
 
 /// A job status endpoint answering each GET with the next of `script`
@@ -1056,8 +1159,8 @@ async fn spawn_cancel_target(status: u16) -> (String, Arc<Mutex<Vec<(String, Str
     (format!("http://{addr}"), calls)
 }
 
-fn cancel_request(spec: weft_core::primitive::SignalSpec) -> weft_core::signal::listener_protocol::CancelCallRequest {
-    weft_core::signal::listener_protocol::CancelCallRequest { token: "wait".into(), tenant_id: "tenant-a".into(), for_instance: None, spec }
+fn cancel_request(call: weft_core::signal::CancelCall) -> weft_core::signal::listener_protocol::CancelCallRequest {
+    weft_core::signal::listener_protocol::CancelCallRequest { token: "wait".into(), tenant_id: "tenant-a".into(), for_instance: None, call, access: None }
 }
 
 /// The last call goes once, with its verb and body, to the address it
@@ -1067,9 +1170,8 @@ async fn a_cancelled_waits_last_call_goes_once_with_its_verb_and_body() {
     let rig = rig(false).await;
     let (target, calls) = spawn_cancel_target(202).await;
     let base = serve(rig.state.clone()).await;
-    let mut spec = job_wait(&format!("{target}/status"));
-    spec.on_cancel = Some(weft_core::signal::CancelCall::post(format!("{target}/jobs/7/cancel")).with_body(json!({ "reason": "cancelled" })));
-    let resp = weft_core::net::http_client().build().unwrap().post(format!("{base}/cancel_call")).json(&cancel_request(spec)).send().await.unwrap();
+    let call = weft_core::signal::CancelCall::post(format!("{target}/jobs/7/cancel")).with_body(json!({ "reason": "cancelled" }));
+    let resp = weft_core::net::http_client().build().unwrap().post(format!("{base}/cancel_call")).json(&cancel_request(call)).send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT, "{:?}", resp.text().await);
     assert_eq!(*calls.lock().unwrap(), vec![("POST".to_string(), "/jobs/7/cancel".to_string(), json!({ "reason": "cancelled" }))]);
 }
@@ -1080,13 +1182,22 @@ async fn a_cancelled_waits_last_call_goes_once_with_its_verb_and_body() {
 #[tokio::test]
 async fn a_refused_last_call_says_who_refused_it_and_why() {
     let rig = rig(false).await;
-    let (target, calls) = spawn_cancel_target(404).await;
-    let mut spec = job_wait(&format!("{target}/status"));
-    spec.on_cancel = Some(weft_core::signal::CancelCall::delete(format!("{target}/jobs/7")));
-    let refused = weft_listener::kinds::cancel_call(&rig.state, cancel_request(spec)).await.unwrap_err();
+    let (target, calls) = spawn_cancel_target(409).await;
+    let call = weft_core::signal::CancelCall::delete(format!("{target}/jobs/7"));
+    let refused = weft_listener::kinds::cancel_call(&rig.state, cancel_request(call)).await.unwrap_err();
     let said = format!("{refused:#}");
-    assert!(said.contains("DELETE") && said.contains("/jobs/7") && said.contains("404") && said.contains("cancel answered"), "{said}");
+    assert!(said.contains("DELETE") && said.contains("/jobs/7") && said.contains("409") && said.contains("cancel answered"), "{said}");
     assert_eq!(calls.lock().unwrap().len(), 1, "sent once, never retried");
+}
+
+/// A `404` is the thing being gone already: the call counts as done.
+#[tokio::test]
+async fn a_last_call_answered_404_counts_as_done() {
+    let rig = rig(false).await;
+    let (target, calls) = spawn_cancel_target(404).await;
+    let call = weft_core::signal::CancelCall::delete(format!("{target}/uploads/1")).always();
+    weft_listener::kinds::cancel_call(&rig.state, cancel_request(call)).await.unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
 }
 
 /// A cancel takes the wait's row down and ends its next polls: the wake

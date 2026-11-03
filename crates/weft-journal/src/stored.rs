@@ -38,6 +38,13 @@ const STEPS: &[&[weft_core::stored::Op]] = &[
         weft_core::stored::Op::Code { at: "", run: drop_run_outputs },
         weft_core::stored::Op::RenameKey { at: "*", from: "call_index", to: "wait_index" },
     ],
+    // 2 -> 3: a live caller's gate names its check
+    // (`weft_core::primitive::SIGNAL_SPEC_V2`), in each spec a row keeps:
+    // a captured trigger's, a wait's, and a fired run's stand-in.
+    &[
+        weft_core::stored::Op::Within { at: "*.spec", ops: weft_core::primitive::SIGNAL_SPEC_V2 },
+        weft_core::stored::Op::Within { at: "*.stand_in", ops: weft_core::primitive::SIGNAL_SPEC_V2 },
+    ],
 ];
 
 /// Drop every `run_output` event of a row (version 1 to 2).

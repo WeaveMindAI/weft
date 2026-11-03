@@ -389,12 +389,12 @@ environment, call the doors from a `+page.server.ts` or a `+server.ts`, and
 never ship it to the browser. A program route that needs the token is called
 server side too.
 
-A route gated by `ApiKeyAuth` needs one of the keys stored on its
+A route with `auth: "api_keys"` needs one of the keys stored on its
 connection, which is a different thing from `WEFT_TOKEN` (weft's own token
 for the signal doors). Keep it in the server's environment under a name of
 its own, `WEFT_ROUTE_KEY` unless the brief names another, and send it as
-`X-Api-Key: <key>` (or `Authorization: Bearer <key>`). For any other gate,
-the gate's own description names the header.
+`X-Api-Key: <key>` (or `Authorization: Bearer <key>`). For any other scheme,
+the route's `auth` block names the header.
 
 Call a route with a plain server `fetch`.
 
@@ -499,7 +499,7 @@ The shape, unless the user asks for another:
   their BetterAuth user id. weft keeps no list of instances: an id becomes an
   instance the first time the program starts something for it.
 - **The program has manager routes**, shared (a route can never be per
-  instance) and gated by an `ApiKeyAuth` key set whose key lives only in the
+  instance) and gated by `auth: "api_keys"`, with a key that lives only in the
   frontend's server environment. They are the only way anything starts,
   stops or removes an instance's things: one that creates an instance (starts
   its container, turns on its triggers), one that mints an instance token

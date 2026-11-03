@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[elevenlabs]", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "voice_lab"
@@ -151,9 +151,9 @@
   "validate": [
     {
       "when": {
-        "kind": "config_matches",
+        "kind": "value",
         "field": "voice",
-        "regex": "^\\s*$"
+        "matches": "^\\s*$"
       },
       "then": {
         "message": "ElevenLabsRemixVoice '{id}' has an empty `voice`: pick the voice to remix, or paste its id.",
@@ -162,9 +162,9 @@
     },
     {
       "when": {
-        "kind": "config_matches",
+        "kind": "value",
         "field": "description",
-        "regex": "(?s)^.{0,4}$"
+        "matches": "(?s)^.{0,4}$"
       },
       "then": {
         "message": "ElevenLabsRemixVoice '{id}' has a `description` under 5 characters, and ElevenLabs takes 5 to 1000: say what to change in more detail.",
@@ -173,9 +173,9 @@
     },
     {
       "when": {
-        "kind": "config_matches",
+        "kind": "value",
         "field": "description",
-        "regex": "(?s)^.{1001}"
+        "matches": "(?s)^.{1001}"
       },
       "then": {
         "message": "ElevenLabsRemixVoice '{id}' has a `description` over 1000 characters, and ElevenLabs takes 5 to 1000: shorten it.",
@@ -187,14 +187,14 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "text",
-            "regex": "\\S"
+            "matches": "\\S"
           },
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "text",
-            "regex": "(?s)^.{1,99}$"
+            "matches": "(?s)^.{1,99}$"
           }
         ]
       },
@@ -208,14 +208,14 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "text",
-            "regex": "\\S"
+            "matches": "\\S"
           },
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "text",
-            "regex": "(?s)^.{1001}"
+            "matches": "(?s)^.{1001}"
           }
         ]
       },

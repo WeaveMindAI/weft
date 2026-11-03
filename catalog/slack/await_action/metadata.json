@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[slack]", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "chat:write"
@@ -95,6 +95,26 @@
       "name": "ts",
       "type": "String",
       "description": "The posted message's ts."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "value",
+          "field": "buttons",
+          "count": {
+            "min": 1
+          }
+        }
+      },
+      "then": {
+        "message": "SlackAwaitAction '{id}' has no buttons, so nobody could answer it; add at least one.",
+        "level": "structural",
+        "severity": "error",
+        "field": "buttons"
+      }
     }
   ]
 }

@@ -425,7 +425,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[slack]",
       "widget": {
         "kind": "access"
       },
@@ -435,7 +435,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[slack]",
       "description": "Wire into Slack nodes."
     }
   ]

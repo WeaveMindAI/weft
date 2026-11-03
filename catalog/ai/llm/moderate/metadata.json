@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[openai]",
       "required": true,
       "accepts": ["wire"],
       "description": "The OpenAI connection: wire an OpenAI Access node's `access` (the one feeding your OpenAI Model nodes works here too)."

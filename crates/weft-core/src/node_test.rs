@@ -413,6 +413,7 @@ pub fn fixture_spec(name: &str, label: &str, description: &str) -> InputSpec {
         description: Some(description.to_string()),
         requires_scopes: None,
         requires_values: None,
+        keeps_blank: false,
     }
 }
 
@@ -599,14 +600,13 @@ pub struct SentRequest {
     pub path: String,
     /// Raw query string, if any.
     pub query: Option<String>,
-    /// The request body as text, if the request carried a buffered body.
+    /// The request body as text (lossily decoded), if the request
+    /// carried one, buffered or streamed: a streamed body is read whole.
     pub body_text: Option<String>,
     /// The body parsed as JSON, when it parses.
     pub body: Option<Value>,
-    /// True when the request carried a STREAMED body the rig cannot
-    /// read (`body_text`/`body` are `None` then, which is not "no
-    /// body"); an assertion on the body of a streamed request should
-    /// check this first and say so.
+    /// True when the body was streamed (an upload from storage) rather
+    /// than buffered; `body_text` holds it either way.
     pub body_streamed: bool,
     /// The request's headers, names lowercased (`("content-type",
     /// "application/json")`). Non-UTF-8 values are lossily decoded.
@@ -932,6 +932,11 @@ struct FakeState {
     /// Every tag the node put on its run, in call order, one
     /// entry per `ctx.tag_run` call.
     run_tags: Mutex<Vec<Vec<String>>>,
+    /// Every call the node owes when it ends (`ctx.after_node`), in the
+    /// order it first registered each, with the connection it goes
+    /// through. The fake sends none; a test reads them to see the node
+    /// registered its clean-up.
+    owed_calls: Mutex<Vec<(crate::signal::CancelCall, Option<crate::primitive::AccessRef>)>>,
     /// Every `ctx.stop_tagged` the node asked for, in order. The fake
     /// stops nothing (there are no sibling runs here); it records the
     /// ask so a test can assert the node steered the right tag the
@@ -1106,6 +1111,7 @@ impl FakeState {
             next_storage_key: AtomicU64::new(0),
             logs: Mutex::new(Vec::new()),
             run_tags: Mutex::new(Vec::new()),
+            owed_calls: Mutex::new(Vec::new()),
             stops: Mutex::new(Vec::new()),
             program_calls: Mutex::new(Vec::new()),
             program_answers: Mutex::new(HashMap::new()),
@@ -1584,9 +1590,10 @@ impl FakeRig {
     /// Press stop, the way a person does with `weft stop` or the
     /// editor's Stop button, once the node has made `calls` outbound
     /// calls (HTTP requests and endpoint calls, counted together). The
-    /// call that reaches the count still gets its answer; the node sees
-    /// the stop at its next `ctx.is_cancelled()` or `cancelled_err()`
-    /// arm. `0` presses it before the run starts. The stop stays
+    /// call that reaches the count still gets its answer; the next call
+    /// through ctx ends with the cancelled error, as a node's own wait
+    /// raced with `ctx.cancellation().race(..)` does. `0` presses it
+    /// before the run starts. The stop stays
     /// pressed for every later run on this rig, as a cancelled run's
     /// flag does.
     pub fn stop_after_calls(&self, calls: usize) {
@@ -1743,10 +1750,13 @@ impl FakeRig {
             state: self.state.clone(),
             run_id,
             capture: Capture {
-                buses: Arc::new(match &kept.saved {
-                    Some(_) => crate::bus::FiringBuses::resumed(positions.buses.clone()),
-                    None => crate::bus::FiringBuses::default(),
-                }),
+                buses: Arc::new(
+                    match &kept.saved {
+                        Some(_) => crate::bus::FiringBuses::resumed(positions.buses.clone()),
+                        None => crate::bus::FiringBuses::default(),
+                    }
+                    .cancelled_by(self.state.cancellation.clone()),
+                ),
                 ..Capture::new(outputs, self.state.wired_outputs.lock().unwrap().clone())
             },
             declared_inputs: declared_input_map(manifest, &custom),
@@ -1942,6 +1952,14 @@ impl FakeRig {
         self.state.run_tags.lock().unwrap().clone()
     }
 
+    /// Every call the node owes when it ends (`ctx.after_node`), each
+    /// once, in the order it was first registered, with the connection
+    /// it goes through (`None`: plain). Nothing was sent: this is the
+    /// record of what production would send when the node ends.
+    pub fn owed_calls(&self) -> Vec<(crate::signal::CancelCall, Option<crate::primitive::AccessRef>)> {
+        self.state.owed_calls.lock().unwrap().clone()
+    }
+
     /// Every `ctx.stop_tagged` the node asked for, in order: the tag
     /// and whether it kept itself. Nothing was actually stopped (a
     /// fake run has no siblings); this is the record of the ask.
@@ -2019,6 +2037,7 @@ fn manifest_input_bag(
         )));
     };
     let mut feeds = RegisteredFeeds(Vec::new());
+    crate::run::ready::drop_blank_texts(&mut delivered, |name| manifest.inputs.iter().any(|i| i.name == name && crate::node::blank_is_no_value(i.required, i.keeps_blank, &i.input_type)));
     for input in &manifest.inputs {
         if let Some(default) = &input.default {
             delivered
@@ -2744,6 +2763,17 @@ impl ContextHandle for TestHandle {
         })
     }
 
+    /// Checked like production, and owed once however often the body
+    /// registers it.
+    async fn after_node(&self, call: crate::signal::CancelCall, access: Option<crate::primitive::AccessRef>) -> WeftResult<()> {
+        call.validate().map_err(|why| WeftError::Input(format!("node '{NODE_UNDER_TEST_ID}': {why}")))?;
+        let mut owed = self.state.owed_calls.lock().unwrap();
+        if !owed.iter().any(|(c, a)| *c == call && *a == access) {
+            owed.push((call, access));
+        }
+        Ok(())
+    }
+
     async fn published_access(&self) -> WeftResult<Option<Access>> {
         let service = self.published_service()?;
         let identity = self.state.published.lock().unwrap().get(&service).cloned();
@@ -3028,6 +3058,7 @@ impl ContextHandle for TestHandle {
         scope: &crate::storage::StorageScope,
         identity: Option<&str>,
         url: &str,
+        mime: Option<&str>,
         filename: Option<&str>,
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
@@ -3056,10 +3087,14 @@ impl ContextHandle for TestHandle {
         }
         // Mime and filename derive through the same core helpers
         // production funnels a fetched URL through, so a fake-passing
-        // node stores the same metadata production would.
-        let mime = crate::storage::normalize_content_type(
-            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
-        );
+        // node stores the same metadata production would: the caller's
+        // stated type wins over the canned route's.
+        let mime = match mime {
+            Some(mime) => mime.to_string(),
+            None => crate::storage::normalize_content_type(
+                resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            ),
+        };
         // The caller's name, then the one the canned route serves in
         // its Content-Disposition, then the URL: the same order as
         // production, so a test sees the name a node would.
@@ -3331,16 +3366,37 @@ struct CannedAnswerMiddleware {
 impl reqwest_middleware::Middleware for CannedAnswerMiddleware {
     async fn handle(
         &self,
-        req: reqwest::Request,
+        mut req: reqwest::Request,
         _extensions: &mut http::Extensions,
         _next: reqwest_middleware::Next<'_>,
     ) -> reqwest_middleware::Result<reqwest::Response> {
+        // The run's cancel layer sits inside this one and is never
+        // reached (this answers itself), so a stopped run's request ends
+        // here the way it would there: with the cancelled error, nothing
+        // sent.
+        if self.state.cancellation.is_cancelled() {
+            return Err(reqwest_middleware::Error::Middleware(anyhow::Error::new(crate::error::WeftError::Cancelled)));
+        }
         let method = req.method().as_str().to_ascii_uppercase();
         let path = req.url().path().to_string();
         let query = req.url().query().map(str::to_string);
-        let body_bytes = req.body().and_then(|b| b.as_bytes());
-        let body_streamed = req.body().is_some() && body_bytes.is_none();
-        let body_text = body_bytes.map(|b| String::from_utf8_lossy(b).into_owned());
+        let body_streamed = req.body().is_some_and(|b| b.as_bytes().is_none());
+        // The fake answers itself and never forwards, so a streamed body
+        // (an upload from storage) is read whole for the test to see.
+        let body_bytes = match req.body_mut().take() {
+            None => None,
+            Some(body) => match body.as_bytes() {
+                Some(bytes) => Some(bytes.to_vec()),
+                None => Some(
+                    http_body_util::BodyExt::collect(body)
+                        .await
+                        .map_err(|e| reqwest_middleware::Error::Middleware(anyhow::anyhow!("the node-test rig could not read a streamed request body: {e}")))?
+                        .to_bytes()
+                        .to_vec(),
+                ),
+            },
+        };
+        let body_text = body_bytes.as_deref().map(|b| String::from_utf8_lossy(b).into_owned());
         let body = body_text.as_deref().and_then(|t| serde_json::from_str(t).ok());
         let headers = req
             .headers()
@@ -3792,6 +3848,10 @@ impl ContextHandle for CapturingHandle {
         self.inner.published_access().await
     }
 
+    async fn after_node(&self, call: crate::signal::CancelCall, access: Option<crate::primitive::AccessRef>) -> WeftResult<()> {
+        self.inner.after_node(call, access).await
+    }
+
     fn keep_secret(&self, value: Value) -> WeftResult<crate::secret::SecretId> {
         self.inner.keep_secret(value)
     }
@@ -3905,10 +3965,11 @@ impl ContextHandle for CapturingHandle {
         scope: &crate::storage::StorageScope,
         identity: Option<&str>,
         url: &str,
+        mime: Option<&str>,
         filename: Option<&str>,
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
-        self.inner.storage_put_from_url(scope, identity, url, filename, keep).await
+        self.inner.storage_put_from_url(scope, identity, url, mime, filename, keep).await
     }
 
     async fn storage_get(
@@ -4291,7 +4352,7 @@ mod tests {
 
     /// A stop pressed mid-poll ends the run cancelled after exactly the
     /// calls made before it; a stop pressed up front ends it before the
-    /// first poll is answered past its select.
+    /// first poll goes out, as the run's cancel layer does in a real run.
     #[tokio::test]
     async fn stop_after_calls_cancels_a_polling_node() {
         let rig = FakeRig::new();
@@ -4311,7 +4372,7 @@ mod tests {
         rig.stop_after_calls(0);
         let outcome = rig.run(&PollingNode, json!({})).await;
         assert!(matches!(outcome.result, Err(crate::error::WeftError::Cancelled)));
-        assert_eq!(rig.requests().len(), 1, "one poll went out before the select saw the stop");
+        assert!(rig.requests().is_empty(), "a run stopped up front sends nothing");
     }
 
     /// A node that steers its siblings: the fake records the tags it put
@@ -4539,7 +4600,7 @@ mod tests {
                 "label": "Rig publisher",
                 "description": "test-only node",
                 "inputs": [],
-                "outputs": [{"name": "access", "type": "Access"}],
+                "outputs": [{"name": "access", "type": "Access[probedb]"}],
                 "publishes": "probedb"
             }))
             .expect("publisher manifest")
@@ -4553,7 +4614,7 @@ mod tests {
                 "label": "Rig probe database access",
                 "description": "test-only node",
                 "inputs": [],
-                "outputs": [{"name": "access", "type": "Access"}],
+                "outputs": [{"name": "access", "type": "Access[probedb]"}],
                 "service": {
                     "service": "probedb",
                     "acquisition": { "kind": "static", "fields": [

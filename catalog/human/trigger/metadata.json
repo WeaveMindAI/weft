@@ -46,8 +46,9 @@
       "when": {
         "kind": "not",
         "of": {
-          "kind": "config_nonempty",
-          "field": "fields"
+          "kind": "value",
+          "field": "fields",
+          "nonempty": true
         }
       },
       "then": {

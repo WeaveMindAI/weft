@@ -28,5 +28,34 @@
   "features": {
     "canAddInputPorts": true,
     "customInputType": "String"
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "custom_inputs_declared"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "tags",
+              "nonempty": true
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "TagRun '{id}' has no tag to put on the run. Add an input onto the node (`TagRun(sender: String)`), or give it a `tags` list.",
+        "level": "structural",
+        "severity": "error",
+        "port": "tags"
+      }
+    }
+  ]
 }

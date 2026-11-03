@@ -14,7 +14,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[elevenlabs]",
       "accepts": [
         "wire"
       ],
@@ -337,15 +337,15 @@
           {
             "kind": "not",
             "of": {
-              "kind": "config_equals",
+              "kind": "value",
               "field": "sendLevel",
               "equals": 0
             }
           },
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "outputFormat",
-            "regex": "^(pcm|ulaw|alaw)_"
+            "matches": "^(pcm|ulaw|alaw)_"
           }
         ]
       },
@@ -365,15 +365,15 @@
           {
             "kind": "not",
             "of": {
-              "kind": "config_equals",
+              "kind": "value",
               "field": "pan",
               "equals": 0
             }
           },
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "outputFormat",
-            "regex": "^(pcm|ulaw|alaw)_"
+            "matches": "^(pcm|ulaw|alaw)_"
           }
         ]
       },
@@ -387,7 +387,7 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_equals",
+            "kind": "value",
             "field": "enableLogging",
             "equals": false
           },
@@ -395,12 +395,14 @@
             "kind": "any",
             "of": [
               {
-                "kind": "input_satisfied",
-                "port": "previousRequestIds"
+                "kind": "value",
+                "field": "previousRequestIds",
+                "nonempty": true
               },
               {
-                "kind": "input_satisfied",
-                "port": "nextRequestIds"
+                "kind": "value",
+                "field": "nextRequestIds",
+                "nonempty": true
               }
             ]
           }
@@ -409,6 +411,46 @@
       "then": {
         "message": "ElevenLabsDialogue '{id}' turns `enableLogging` off, and ElevenLabs cannot carry a request it keeps no history of on from or into other requests: turn `enableLogging` on, or leave `previousRequestIds` and `nextRequestIds` empty.",
         "port": "enableLogging"
+      }
+    },
+    {
+      "when": {
+        "kind": "value",
+        "field": "pronunciationDictionaries",
+        "count": { "min": 4 }
+      },
+      "then": {
+        "message": "ElevenLabsDialogue '{id}' lists more than 3 `pronunciationDictionaries`, and ElevenLabs applies at most 3 to one request: keep 3 or fewer.",
+        "port": "pronunciationDictionaries"
+      }
+    },
+    {
+      "when": {
+        "kind": "value",
+        "field": "previousRequestIds",
+        "count": { "min": 4 }
+      },
+      "then": {
+        "message": "ElevenLabsDialogue '{id}' lists more than 3 `previousRequestIds`, and ElevenLabs takes at most 3: keep the 3 closest to this request.",
+        "port": "previousRequestIds"
+      }
+    },
+    {
+      "when": {
+        "kind": "value",
+        "field": "nextRequestIds",
+        "count": { "min": 4 }
+      },
+      "then": {
+        "message": "ElevenLabsDialogue '{id}' lists more than 3 `nextRequestIds`, and ElevenLabs takes at most 3: keep the 3 closest to this request.",
+        "port": "nextRequestIds"
+      }
+    },
+    {
+      "when": { "kind": "not", "of": { "kind": "value", "field": "lines", "count": { "min": 1 } } },
+      "then": {
+        "message": "ElevenLabsDialogue '{id}' has no `lines`, and ElevenLabs needs at least one to speak: add a line.",
+        "port": "lines"
       }
     }
   ],

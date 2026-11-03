@@ -4,27 +4,26 @@
 //! authenticated client (opened once per run by the node and passed
 //! in; its PathPrefix step aims the generic URL at
 //! `/bot<token>/<method>`), with the body the caller's `prepare` puts
-//! on the request (a JSON payload, or the pre-framed multipart media
-//! upload). The transport (send, refuse a non-success status, parse) is
-//! the core `json_call`, and Telegram's `ok` envelope is checked through
+//! on the request (a JSON payload, or the multipart media upload). The
+//! transport (send, refuse a non-success status, parse) is the core
+//! `json_call`, and Telegram's `ok` envelope is checked through
 //! the core `require_ok_flag`, so a refusal fails loudly with
 //! Telegram's own `description`, the API's exact words.
 
 use serde_json::Value;
 
-use weft::access::client::{json_call, require_ok_flag};
+use weft::access::client::{json_call, require_ok_flag, url};
 use weft::reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
 use weft::{NodeErrExt, WeftResult};
 
 /// POST a Bot API method, its body set by `prepare`
-/// (`|req| req.json(&payload)`, or a raw multipart body with its
-/// content type).
+/// (`|req| req.json(&payload)`, or a multipart form).
 pub async fn call(
     client: &ClientWithMiddleware,
     method: &str,
     prepare: impl FnOnce(RequestBuilder) -> RequestBuilder,
 ) -> WeftResult<Value> {
-    let req = prepare(client.post(format!("https://api.telegram.org/{method}")));
+    let req = prepare(client.post(url("https://api.telegram.org", &[method])?.as_str()));
     let what = format!("call telegram's {method}");
     require_ok_flag(json_call(req, &what).await?, "ok", "description", &what)
 }

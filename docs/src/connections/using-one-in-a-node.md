@@ -1,17 +1,19 @@
 # Using a connection in a node
 
-Declare an `Access` input with the connect widget:
+Declare a connection input, typed with its service, with the connect widget:
 
 ```json
 "inputs": [
-  { "name": "account", "type": "Access", "required": true,
+  { "name": "account", "type": "Access[slack]", "required": true,
     "widget": { "kind": "access" },
     "requiresScopes": ["chat:write"] }
 ]
 ```
 
 Write just `{"kind": "access"}`. The service and whether it is optional are
-filled in from your node's `service` recipe.
+filled in from your node's `service` recipe. The `[slack]` makes the compiler
+refuse any other service's connection on this input; for a node that works
+with several, go and read [which connection a node takes](../nodes/metadata.md#which-connection-a-node-takes).
 
 Then open it:
 
@@ -80,11 +82,11 @@ journaled and shows in the inspector.
 
 ## Saying what you need
 
-`requiresScopes` and `requiresValues` on your `Access` input are the important
+`requiresScopes` and `requiresValues` on your connection input are the important
 part, and they are per consuming node.
 
 ```json
-{ "name": "account", "type": "Access", "requiresScopes": ["channels:history"],
+{ "name": "account", "type": "Access[slack]", "requiresScopes": ["channels:history"],
   "requiresValues": ["teamId"] }
 ```
 
@@ -144,7 +146,7 @@ let access = ctx.publish_access(BTreeMap::from([
 ctx.pulse_downstream(NodeOutput::new().set("access", access)).await
 ```
 
-Declare it in metadata with `"publishes": "postgres"` and an `Access` output.
+Declare it in metadata with `"publishes": "postgres"` and an `Access[postgres]` output.
 
 Publishing again updates rather than duplicating, and terminating the node's
 infrastructure deletes it. `ctx.published_access()` reads back what you

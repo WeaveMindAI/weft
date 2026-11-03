@@ -1274,6 +1274,12 @@ pub struct TestWorkspace {
     /// expanded to each node's own folder, which the emission includes
     /// from), in cargo's environment as a worker's build has it.
     build_env: BTreeMap<String, String>,
+    /// This project's turn at its test workspace, held from emission
+    /// until the workspace is dropped. The workspace's `Cargo.toml`
+    /// lists only what one run tests, so a second run in the same
+    /// project emitting its own members while this one builds would
+    /// pull this run's packages out from under cargo: it waits instead.
+    _turn: std::fs::File,
 }
 
 /// Emit every package's node-test crate into `dirs` as members of one
@@ -1286,6 +1292,14 @@ pub fn prepare_test_workspace(
     dirs: &TestBuildDirs,
 ) -> BuildResult<TestWorkspace> {
     let weft_root = resolve_weft_root()?;
+    // Beside the crates folder rather than in it, so the lock file is
+    // never part of what an emission rewrites.
+    let mut lock_name = dirs.crates_root.file_name().unwrap_or_default().to_os_string();
+    lock_name.push(".lock");
+    let turn = weft_core::file_lock::hold(&dirs.crates_root.with_file_name(lock_name), || {
+        eprintln!("another weft test-node in this project is using its test workspace; waiting for it to finish")
+    })
+    .map_err(BuildError::Io)?;
     let mut crates = BTreeMap::new();
     let mut members = Vec::new();
     for package in packages {
@@ -1309,6 +1323,7 @@ pub fn prepare_test_workspace(
         root: dirs.crates_root.clone(),
         target_dir: dirs.target_dir_for(build_env.cache_tag.as_deref()),
         build_env: build_env.vars,
+        _turn: turn,
     })
 }
 

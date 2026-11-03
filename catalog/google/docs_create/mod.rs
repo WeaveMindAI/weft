@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 
+use weft::access::client::url;
 use weft::node::NodeOutput;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
@@ -30,7 +31,7 @@ impl Node for GoogleDocsCreateNode {
 
         let http = ctx.client(&account).await?;
         let answer = weft::access::client::json_call(
-            http.post("https://docs.googleapis.com/v1/documents")
+            http.post(url(super::docs::API, &["documents"])?.as_str())
                 .json(&json!({ "title": title })),
             "create the document",
         )
@@ -38,14 +39,14 @@ impl Node for GoogleDocsCreateNode {
         let doc_id = weft::access::client::required_str(&answer, "create the document", "documentId")?
             .to_string();
 
-        if let Some(t) = text.filter(|t| !t.is_empty()) {
+        if let Some(t) = text {
             append_text(&http, &doc_id, &t).await?;
         }
 
         ctx.pulse_downstream(
             NodeOutput::new()
                 .set("documentId", doc_id.clone())
-                .set("link", format!("https://docs.google.com/document/d/{}/edit", super::api::segment(&doc_id))),
+                .set("link", String::from(url("https://docs.google.com/document/d", &[&doc_id, "edit"])?)),
         )
         .await
     }

@@ -216,6 +216,8 @@ pub(crate) struct ClaimedRecord {
     pub(crate) firing_payload: Option<serde_json::Value>,
     /// The charges it leaves open.
     pub(crate) charges: weft_journal::ChargeBook,
+    /// The calls its firings owe when they end.
+    pub(crate) owed: weft_journal::OwedCalls,
     /// What the run inherits (`weft run --seed`).
     pub(crate) chain: weft_journal::SeedChain,
     /// Its fold, the whole record taken.
@@ -261,11 +263,11 @@ impl ClaimedRecord {
         let fold = weft_journal::LiveFold::new(weft_journal::Fold::new(run_id, project).driving(), &chain, &page).await?;
         // The first page is taken here, the rest walked after it.
         let last = weft_journal::record::RecordPage::last_seq(&first).expect("the first page holds the birth");
-        let mut read = Reading { fold, charges: weft_journal::ChargeBook::default(), firing_payload: None, last_seq: last };
+        let mut read = Reading { fold, charges: weft_journal::ChargeBook::default(), owed: weft_journal::OwedCalls::default(), firing_payload: None, last_seq: last };
         read = weft_journal::on_blocking_pool(move || read.take(first).map(|()| read)).await?;
         let read = weft_journal::record::fold_pages(|after| page(run_id, after), Some(last), read, |read: &mut Reading, rows| read.take(rows)).await?;
-        let Reading { fold, charges, firing_payload, last_seq } = read;
-        Ok(Self { birth, firing_payload, charges, chain, fold, last_seq, lost_full })
+        let Reading { fold, charges, owed, firing_payload, last_seq } = read;
+        Ok(Self { birth, firing_payload, charges, owed, chain, fold, last_seq, lost_full })
     }
 }
 
@@ -273,6 +275,7 @@ impl ClaimedRecord {
 struct Reading {
     fold: weft_journal::LiveFold,
     charges: weft_journal::ChargeBook,
+    owed: weft_journal::OwedCalls,
     firing_payload: Option<serde_json::Value>,
     /// The last row taken.
     last_seq: i32,
@@ -285,6 +288,7 @@ impl Reading {
         }
         for row in &page {
             self.charges.apply(&row.event);
+            self.owed.apply(&row.event);
             if let (None, RunEvent::NodeKicked { firing: true, payload, .. }) = (&self.firing_payload, &row.event) {
                 self.firing_payload = Some(payload.clone().unwrap_or_default());
             }
@@ -356,7 +360,7 @@ pub(crate) async fn run_one_observed(
     let RunDrive { run_id, journal, program, starts_from, cancellation, exchange, hand_back, hold } = run;
     // The run's spend still being worked out, which goes on its record
     // before its ending (`crate::metering`).
-    let record = RunRecord { journal: journal.clone(), costs: crate::metering::PendingCostRecords::new() };
+    let record = RunRecord::new(journal.clone());
     // The run owns its shared wait tracker; the bus coordinator,
     // the stream runtime and every firing's handle are its clients.
     //
@@ -859,8 +863,11 @@ async fn drive_run_id(
             (born_with, RunFold::unborn(run_id, project_arc.clone()))
         }
         StartsFrom::Record(claimed) => {
-            let ClaimedRecord { birth, charges, chain, fold, lost_full, .. } = *claimed;
+            let ClaimedRecord { birth, charges, owed, chain, fold, lost_full, .. } = *claimed;
             reopen_charges(clients, record, replica, run_id, cancellation, charges);
+            // What its firings owed when the drive before went away, still
+            // owed here.
+            *record.owed.lock().expect("owed calls poisoned") = owed;
             let born_with = BornWith::of_birth(run_id, &birth)?;
             let (fold, mut snap) = RunFold::of_live(run_id, project_arc.clone(), chain, fold).await?;
             let open_buses = std::mem::take(&mut snap.open_buses);
@@ -906,6 +913,7 @@ async fn drive_run_id(
             &program, run_id, &mut forgetting, &mut pulses, &mut firings, &mut kicked, &mut scopes, &mut carried,
             &mut loop_runtime, |_| false,
         );
+        crate::end_calls::settle_run(&end_call_sender(clients, record, replica, run_id, instance.as_ref()), record, project, true).await;
         return Ok(Drove { outcome: RunOutcome::Cancelled { cause }, pulses, firings, loop_runtime, kicked, scopes });
     }
 
@@ -945,6 +953,7 @@ async fn drive_run_id(
     // when the failed write surfaced as an error from inside a turn (a
     // write the turn waited on) rather than at its top: its record is a
     // prefix of what it did either way (`DriveJournal::must_hand_back`).
+    let sender = end_call_sender(clients, record, replica, run_id, instance.as_ref());
     let mut outcome = match outcome {
         Err(e) if drive_journal.must_hand_back() => {
             tracing::info!(
@@ -954,7 +963,13 @@ async fn drive_run_id(
             );
             RunOutcome::HandedBack
         }
-        outcome => outcome?,
+        Err(e) => {
+            // The run fails on this: what its firings still owe goes out
+            // as at any end that is not a cancel.
+            crate::end_calls::settle_run(&sender, record, project, false).await;
+            return Err(e);
+        }
+        Ok(outcome) => outcome,
     };
 
     // A route's caller is still waiting and nothing was ever sent: the
@@ -970,7 +985,24 @@ async fn drive_run_id(
         &program, run_id, &mut forgetting, &mut pulses, &mut firings, &mut kicked, &mut scopes, &mut Carried::default(),
         &mut loop_runtime, |_| false,
     );
+    // A run that ends for good sends what its firings still owe; one that
+    // pauses keeps it on its record for the drive that picks it up.
+    if !outcome.pauses() {
+        crate::end_calls::settle_run(&sender, record, project, matches!(outcome, RunOutcome::Cancelled { .. })).await;
+    }
     Ok(Drove { outcome, pulses, firings, loop_runtime, kicked, scopes })
+}
+
+/// What sends the calls run `run_id`'s firings owe as its drive ends
+/// (`crate::end_calls`).
+fn end_call_sender<'a>(
+    clients: &'a EngineClients,
+    record: &'a RunRecord,
+    replica: &'a str,
+    run_id: RunId,
+    instance: Option<&'a weft_core::instance::InstanceId>,
+) -> crate::end_calls::Sender<'a> {
+    crate::end_calls::Sender { clients, journal: &record.journal, replica, run_id, instance }
 }
 
 /// Hold again, before anything of the run runs, every charge its record
@@ -2491,11 +2523,16 @@ async fn drive(
             let delivered = with_instance_values(node_def, &place, instance, instance_values, bag);
             let inputs = match delivered.and_then(|delivered| {
                 weft_core::context::node_input_bag(node_def, &group.frames, delivered, &group.received.closed_ports)
+            }).and_then(|bag| {
+                // The node's rules the compile could not decide, asked on
+                // what arrived; a node with none pays nothing.
+                weft_core::rules::recheck(node_def, project, &bag).map(|()| bag).map_err(|e| e.to_string())
             }) {
                 Ok(bag) => bag,
                 // A broken spec or malformed widget handle: the node
                 // fails loud instead of running on a bag it can never
-                // read correctly. Feeds created for this dispatch are
+                // read correctly; a rule that fires on what arrived fails
+                // it with the rule's message. Feeds created for this dispatch are
                 // retired FIRST, so its terminal record (checked ahead
                 // of any feed by the routing scan) is never shadowed by
                 // an orphan feed that would swallow the stream.
@@ -5696,7 +5733,13 @@ async fn apply_one_task_msg(
             // What the firing took off its streams goes on record before
             // its ending (a pause already put it there with its save).
             record_takes_at_end(runner.as_deref(), task_run_id, &loc).await;
-            match withdrawn_at_end(outcome, runner.as_deref(), &loc, task_run_id).await {
+            let outcome = withdrawn_at_end(outcome, runner.as_deref(), &loc, task_run_id).await;
+            // A firing that ended (in any way but a pause) sends the calls
+            // it owed before its ending is written.
+            if let (Some(runner), false) = (runner.as_deref(), matches!(outcome, NodeTaskOutcome::Waiting(_))) {
+                runner.settle_end_calls().await;
+            }
+            match outcome {
             NodeTaskOutcome::Completed { saved } => {
                 retire_consumer_streams(project, &loc, task_run_id, pulses, journal, replica, stream_rt)
                     .await;
@@ -5797,6 +5840,7 @@ async fn apply_one_task_msg(
                         runner.end_body(Some(weft_core::bus::StreamEnd::Failed {
                             error: format!("node '{}' had already failed when its body paused", loc.node_id),
                         }));
+                        runner.settle_end_calls().await;
                     }
                     retire_consumer_streams(project, &loc, task_run_id, pulses, journal, replica, stream_rt).await;
                     return;
@@ -6196,6 +6240,12 @@ mod branching_tests;
 #[cfg(test)]
 #[path = "run_driver_tests/error_port.rs"]
 mod error_port_tests;
+
+// Layer 3: a call a node registers with `ctx.after_node` is sent once
+// when it ends, whether its body returned or failed.
+#[cfg(test)]
+#[path = "run_driver_tests/end_calls.rs"]
+mod end_calls_tests;
 
 // Layer 3: a baked output falls back on what its copy saved.
 #[cfg(test)]

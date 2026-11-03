@@ -1523,7 +1523,7 @@ async fn a_cancel_queues_the_last_call_of_each_wait_that_carries_one(pool: Pool)
     assert_eq!(*task_run, Some(run));
     let call: weft_core::signal::listener_protocol::CancelCallRequest = serde_json::from_value(payload.0.clone()).unwrap();
     assert_eq!(call.token, "tok-calling");
-    assert_eq!(call.spec.on_cancel, Some(weft_core::signal::CancelCall::put("https://queue.example/requests/7/cancel")));
+    assert_eq!(call.call, weft_core::signal::CancelCall::put("https://queue.example/requests/7/cancel"));
 
     let again = store.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
     assert_eq!((again.removed.len(), again.cancel_calls), (0, 0), "the waits went with the first cancel");

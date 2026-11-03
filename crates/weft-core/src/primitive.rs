@@ -92,9 +92,21 @@ pub enum RegisterSignalResult {
     Registered { token: String },
 }
 
+/// The steps a stored [`SignalSpec`] takes from the shape an older weft
+/// wrote; `crate::stored` says how they run. A document holding specs
+/// elsewhere (a trigger's bake, a run's record) applies
+/// [`SIGNAL_SPEC_V2`] where each sits.
+pub const SIGNAL_SPEC_UPGRADES: &[&[crate::stored::Op]] = &[SIGNAL_SPEC_V2];
+
+/// Version 2: a live caller's gate names its check
+/// (`crate::signal::auth::auth_to_v2`); only a live-caller kind's config
+/// has an `auth`.
+pub const SIGNAL_SPEC_V2: &[crate::stored::Op] =
+    &[crate::stored::Op::Within { at: "config", ops: crate::signal::auth::AUTH_V2 }];
+
 impl SignalSpec {
     /// A registered signal's spec, as its row stores it (`signal.spec_json`).
-    pub const STORED: crate::stored::Kind<SignalSpec> = crate::stored::Kind::new("signal spec", &[]);
+    pub const STORED: crate::stored::Kind<SignalSpec> = crate::stored::Kind::new("signal spec", SIGNAL_SPEC_UPGRADES);
 
     /// A spec carrying only a kind tag and its config: no connection,
     /// no filter, no consumer label. The shape most callers building a
@@ -201,9 +213,10 @@ pub enum SignalAuth {
     /// Open. Anyone with the URL can fire. Suitable for raw
     /// webhooks where the URL itself is the secret.
     None,
-    /// The caller is verified against a stored connection (the
-    /// service recipe's `verify` block says how). `auth_config`
-    /// shape: `{ access_id, service }`. No secret is ever on the
+    /// The caller is checked against a stored connection with the
+    /// trigger's own scheme. `auth_config` shape:
+    /// `{ access_id, service, verify }` (no `verify`: a gate whose check
+    /// was not kept, refused at the door). No secret is ever on the
     /// row: the broker holds the connection and answers the check.
     Connection,
 }
@@ -235,7 +248,7 @@ impl SignalSurface {
 ///
 /// `auth_config` is a kind-specific JSON blob the dispatcher's
 /// auth gate parses according to `auth.kind_tag()`. For
-/// `Connection` the blob is `{access_id, service}`.
+/// `Connection` the blob is `{access_id, service, verify}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalRouting {
     pub surface: SignalSurface,
@@ -262,7 +275,17 @@ impl SignalRouting {
                 auth: SignalAuth::None,
                 auth_config: Value::Null,
             },
-            crate::signal::PublicEntryAuth::Connection { access_id, service } => Self {
+            crate::signal::PublicEntryAuth::Connection { access_id, service, verify } => Self {
+                surface,
+                auth: SignalAuth::Connection,
+                auth_config: serde_json::json!({
+                    "access_id": access_id,
+                    "service": service,
+                    "verify": verify,
+                }),
+            },
+            // No `verify`: the door refuses every caller, naming the fix.
+            crate::signal::PublicEntryAuth::CheckNotKept { access_id, service } => Self {
                 surface,
                 auth: SignalAuth::Connection,
                 auth_config: serde_json::json!({

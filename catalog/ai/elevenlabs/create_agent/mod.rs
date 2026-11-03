@@ -12,9 +12,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use weft::access::client::post_json;
+use weft::access::client::{post_json, url};
 use weft::node::NodeOutput;
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::elevenlabs::{merge_json, API};
 use super::flows::set_some;
@@ -25,15 +25,8 @@ pub struct ElevenLabsCreateAgentNode;
 #[cfg(feature = "node-tests")]
 mod tests;
 
-/// The most MCP servers one agent takes (ElevenLabs's limit).
-const MAX_MCP_SERVERS: usize = 10;
 /// The longest goal one evaluation criterion takes, in characters.
 const MAX_GOAL_CHARS: usize = 2000;
-/// The value types a data collection item can have.
-const DATA_TYPES: [&str; 4] = ["string", "boolean", "integer", "number"];
-/// What a knowledge base document can be, and how the agent uses it.
-const DOCUMENT_TYPES: [&str; 4] = ["file", "url", "text", "folder"];
-const USAGE_MODES: [&str; 2] = ["auto", "prompt"];
 /// The `allowOverrides` names that are not a conversation setting:
 /// each allows one field of a call's client data, through its own flag
 /// on `platform_settings.overrides`. Every other name is a path under
@@ -56,7 +49,7 @@ impl Node for ElevenLabsCreateAgentNode {
         // Built (and refused) in full before the account is opened.
         let body = request(&ctx)?;
         let http = ctx.client(&account).await?;
-        let answer = post_json(&http, &format!("{API}/convai/agents/create"), &body, "create the ElevenLabs agent").await?;
+        let answer = post_json(&http, url(API, &["convai", "agents", "create"])?.as_str(), &body, "create the ElevenLabs agent").await?;
         let id = answer["agent_id"].as_str().node_err("ElevenLabs created the agent but its answer has no agent_id")?;
         ctx.pulse_downstream(NodeOutput::new().set("agentId", id)).await
     }
@@ -78,28 +71,27 @@ fn has_keys(value: &Value) -> bool {
 fn request(ctx: &RunContext) -> WeftResult<Value> {
     let mut config = json_input(ctx, "conversationConfig")?;
     merge_json(&mut config, conversation_config(ctx)?);
-    // The compiler refuses the written pair; this is the floor for a
-    // wired `llm`, or one picked in `conversationConfig` itself.
+    // The rule refuses `custom-llm` with no `conversationConfig` at all;
+    // what `conversationConfig` itself holds is read here.
     let prompt = &config["agent"]["prompt"];
     if prompt["llm"] == json!("custom-llm") && prompt["custom_llm"].is_null() {
-        return Err(WeftError::Input(
+        weft::input_bail!(
             "the agent's model is `custom-llm`, and ElevenLabs needs that model's definition: put it in \
              `conversationConfig` under `agent.prompt.custom_llm` (its `url` at least), or pick another `llm`"
-                .into(),
-        ));
+        );
     }
     // ElevenLabs refuses an English agent on any voice model but a turbo
     // one or eleven_flash_v2 ("English Agents must use turbo or flash
     // v2", answered live on 2026-10-11), and an agent with no language
-    // is English. The compiler refuses the written pair; this is the
-    // floor for wired values and for ones set in `conversationConfig`.
+    // is English. The rule refuses the typed pair; what
+    // `conversationConfig` itself sets is read here.
     let language = config["agent"]["language"].as_str().unwrap_or("en");
     if let Some(model) = config["tts"]["model_id"].as_str() {
         if language == "en" && !(model.contains("turbo") || model == "eleven_flash_v2") {
-            return Err(WeftError::Input(format!(
+            weft::input_bail!(
                 "the agent speaks English, and ElevenLabs takes an English agent only on a turbo voice model or \
                  eleven_flash_v2, not '{model}': set `ttsModel` to eleven_v4_turbo or eleven_flash_v2, or leave it empty"
-            )));
+            );
         }
     }
     let mut body = json!({ "name": ctx.inputs.get::<String>("name")?, "conversation_config": config });
@@ -175,12 +167,6 @@ fn prompt_config(ctx: &RunContext) -> WeftResult<Value> {
         prompt["tool_ids"] = json!(tools);
     }
     let servers: Vec<String> = ctx.inputs.list("mcpServerIds")?;
-    if servers.len() > MAX_MCP_SERVERS {
-        return Err(WeftError::Input(format!(
-            "`mcpServerIds` lists {} servers, and ElevenLabs gives one agent at most {MAX_MCP_SERVERS}",
-            servers.len()
-        )));
-    }
     if !servers.is_empty() {
         prompt["mcp_server_ids"] = json!(servers);
     }
@@ -198,7 +184,7 @@ fn prompt_config(ctx: &RunContext) -> WeftResult<Value> {
 
     let documents: Vec<Document> = ctx.inputs.list("knowledgeBase")?;
     if !documents.is_empty() {
-        prompt["knowledge_base"] = documents.into_iter().map(Document::locator).collect::<WeftResult<Vec<_>>>()?.into();
+        prompt["knowledge_base"] = documents.into_iter().map(Document::locator).collect();
     }
     Ok(prompt)
 }
@@ -216,24 +202,10 @@ struct Document {
 
 impl Document {
     /// The document as ElevenLabs's knowledge base locator.
-    fn locator(self) -> WeftResult<Value> {
-        if !DOCUMENT_TYPES.contains(&self.kind.as_str()) {
-            return Err(WeftError::Input(format!(
-                "knowledge base document '{}' has type '{}', and ElevenLabs takes one of {}",
-                self.id,
-                self.kind,
-                DOCUMENT_TYPES.join(", ")
-            )));
-        }
-        if let Some(mode) = self.usage_mode.as_deref().filter(|m| !USAGE_MODES.contains(m)) {
-            return Err(WeftError::Input(format!(
-                "knowledge base document '{}' has usageMode '{mode}', and ElevenLabs takes `auto` or `prompt`",
-                self.id
-            )));
-        }
+    fn locator(self) -> Value {
         let mut locator = json!({ "type": self.kind, "name": self.name, "id": self.id });
         set_some(&mut locator, "usage_mode", self.usage_mode);
-        Ok(locator)
+        locator
     }
 }
 
@@ -241,10 +213,10 @@ impl Document {
 /// set.
 fn platform_settings(ctx: &RunContext) -> WeftResult<Value> {
     let mut platform = json!({});
-    if let Some(items) = ctx.inputs.opt::<Map<String, Value>>("dataCollection")? {
+    if let Some(items) = ctx.inputs.opt::<BTreeMap<String, CollectionItem>>("dataCollection")? {
         let mut collection = Map::new();
         for (id, item) in items {
-            let item = data_collection_item(&id, item)?;
+            let item = item.into_item(&id)?;
             collection.insert(id, item);
         }
         platform["data_collection"] = Value::Object(collection);
@@ -260,42 +232,59 @@ fn platform_settings(ctx: &RunContext) -> WeftResult<Value> {
     Ok(platform)
 }
 
-/// One `dataCollection` entry as ElevenLabs's item: a text is the
+/// One `dataCollection` entry, as the port types it: a text is the
 /// description of a string item, an object is the item as written.
-fn data_collection_item(id: &str, item: Value) -> WeftResult<Value> {
-    let item = match item {
-        Value::String(description) => return Ok(json!({ "type": "string", "description": description })),
-        Value::Object(item) => item,
-        other => {
-            return Err(WeftError::Input(format!(
-                "data collection item '{id}' is neither a description nor an object: {other}"
-            )))
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CollectionItem {
+    Description(String),
+    Item {
+        #[serde(rename = "type")]
+        kind: String,
+        description: String,
+        #[serde(rename = "enum")]
+        values: Option<Vec<String>>,
+    },
+}
+
+/// The value types a data collection item can have.
+const DATA_TYPES: [&str; 4] = ["string", "boolean", "integer", "number"];
+
+impl CollectionItem {
+    /// The entry as ElevenLabs's item. A rule cannot look inside a dict's
+    /// values, so what ElevenLabs refuses in one is refused here: a type
+    /// it does not know, and allowed values (`enum`) on anything but a
+    /// `string` item.
+    fn into_item(self, id: &str) -> WeftResult<Value> {
+        match self {
+            CollectionItem::Description(description) => Ok(json!({ "type": "string", "description": description })),
+            CollectionItem::Item { kind, .. } if !DATA_TYPES.contains(&kind.as_str()) => weft::input_bail!(
+                "data collection item '{id}' has type '{kind}', and ElevenLabs takes one of {}",
+                DATA_TYPES.join(", ")
+            ),
+            CollectionItem::Item { kind, values: Some(_), .. } if kind != "string" => weft::input_bail!(
+                "data collection item '{id}' lists allowed values in `enum`, and ElevenLabs takes those only on a \
+                 `string` item: make it a `string`, or leave `enum` out"
+            ),
+            CollectionItem::Item { kind, description, values } => {
+                let mut item = json!({ "type": kind, "description": description });
+                set_some(&mut item, "enum", values);
+                Ok(item)
+            }
         }
-    };
-    let Some(kind) = item.get("type").and_then(Value::as_str).filter(|kind| DATA_TYPES.contains(kind)) else {
-        return Err(WeftError::Input(format!(
-            "data collection item '{id}' has type {}, and ElevenLabs takes one of {}",
-            item.get("type").map_or_else(|| "none".to_string(), Value::to_string),
-            DATA_TYPES.join(", ")
-        )));
-    };
-    if item.contains_key("enum") && kind != "string" {
-        return Err(WeftError::Input(format!(
-            "data collection item '{id}' lists allowed values in `enum`, and ElevenLabs takes those only on a \
-             `string` item: make it a `string`, or leave `enum` out"
-        )));
     }
-    Ok(Value::Object(item))
 }
 
 /// One `evaluationCriteria` entry as ElevenLabs's criterion, its id
 /// doubling as its name.
 fn criterion(id: String, goal: String) -> WeftResult<Value> {
+    // A rule cannot measure a dict's values, so the length is checked
+    // here.
     let length = goal.chars().count();
     if length > MAX_GOAL_CHARS {
-        return Err(WeftError::Input(format!(
+        weft::input_bail!(
             "evaluation criterion '{id}' has a goal of {length} characters, and ElevenLabs takes at most {MAX_GOAL_CHARS}"
-        )));
+        );
     }
     Ok(json!({ "id": id, "name": id, "conversation_goal_prompt": goal }))
 }

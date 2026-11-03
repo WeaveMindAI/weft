@@ -4,12 +4,10 @@
 //!     cron expression.
 //!
 //!   - `run`: the timer listener delivers `{scheduledTime,
-//!     actualTime}` as the wake payload. Forward them to outputs.
+//!     actualTime}` as the wake payload, fanned onto the outputs.
 
 use async_trait::async_trait;
-use serde_json::Value;
 
-use weft::node::NodeOutput;
 use weft::signal::{Timer, TimerSpec};
 use weft::{RunContext, Node, NodeManifest, WeftResult};
 
@@ -37,14 +35,9 @@ impl Node for CronNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        // Required reads fail loud on a missing field (a broken listener
-        // delivery) rather than substitute `now()`, which would silently
-        // mask it as an on-time fire.
-        let scheduled: Value = ctx.wake.get("scheduledTime")?;
-        let actual: Value = ctx.wake.get("actualTime")?;
-        ctx.pulse_downstream(NodeOutput::new()
-            .set("scheduledTime", scheduled)
-            .set("actualTime", actual)).await
+        // The trigger declares both fields (`firesWith`), so a delivery
+        // missing one is refused before this body runs.
+        ctx.pulse_downstream(ctx.fan_declared(&ctx.wake.record()?)).await
     }
 }
 

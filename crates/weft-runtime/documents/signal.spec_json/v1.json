@@ -9,5 +9,13 @@
     "kind": "provider_events",
     "config": { "service": "slack", "topic": "messages" },
     "access": { "id": "7e2b9a41-0c3d-4e5f-8a6b-1c2d3e4f5a6b", "service": "slack" }
+  },
+  {
+    "kind": "route",
+    "config": { "path": "secure", "method": "POST", "auth": { "kind": "connection", "access_id": "3b8e1f2a-6c4d-4e5f-9a0b-1c2d3e4f5a6b", "service": "api_key_auth" } }
+  },
+  {
+    "kind": "socket",
+    "config": { "path": "own", "auth": { "kind": "connection", "access_id": "4c9f2a3b-7d5e-4f60-8b1c-2d3e4f5a6b7c", "service": "jwt_auth" } }
   }
 ]

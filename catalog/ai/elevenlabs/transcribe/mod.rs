@@ -42,13 +42,15 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{json, Value};
 
+use weft::access::client::{url, Url};
 use weft::access::socket::SocketMessage;
 use weft::bus::BusOptions;
 use weft::context::{LogLevel, PendingBus};
 use weft::node::NodeOutput;
-use weft::{node_error, Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::storage::StorageScope;
+use weft::{node_error, Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::elevenlabs::{detected_entity, refuse_broken_input, store_json, text_input, WS_API};
+use super::elevenlabs::{detected_entity, WS_API};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsTranscribeNode;
@@ -61,11 +63,6 @@ const PCM_S16LE: &str = "pcm_s16le";
 /// (`ulaw_8000`).
 const ULAW: &str = "ulaw";
 const ULAW_RATE: u64 = 8_000;
-/// ElevenLabs's limits on realtime keyterms: how many, and how long each.
-const MAX_KEYTERMS: usize = 50;
-const MAX_KEYTERM_CHARS: usize = 20;
-/// The longest `transcript_edit` instruction ElevenLabs takes.
-const MAX_EDIT_CHARS: usize = 2000;
 
 /// Every session setting the node sends, read from its inputs.
 struct Session {
@@ -93,7 +90,7 @@ impl Session {
         Ok(Self {
             model: ctx.inputs.get("model")?,
             commit_strategy: ctx.inputs.get("commitStrategy")?,
-            language: text_input(ctx, "language")?,
+            language: ctx.inputs.opt("language")?,
             secondary_languages: ctx.inputs.list("secondaryLanguages")?,
             vad_silence_threshold_secs: ctx.inputs.opt("vadSilenceThresholdSecs")?,
             vad_threshold: ctx.inputs.opt("vadThreshold")?,
@@ -106,72 +103,19 @@ impl Session {
             keyterms: ctx.inputs.list("keyterms")?,
             no_verbatim: ctx.inputs.get("noVerbatim")?,
             entity_detection: ctx.inputs.list("entityDetection")?,
-            transcript_edit: text_input(ctx, "transcriptEdit")?,
+            transcript_edit: ctx.inputs.opt("transcriptEdit")?,
             filter_background_audio: ctx.inputs.get("filterBackgroundAudio")?,
             enable_logging: ctx.inputs.get("enableLogging")?,
-            previous_text: text_input(ctx, "previousText")?,
+            previous_text: ctx.inputs.opt("previousText")?,
         })
     }
 
-    /// What ElevenLabs would refuse, or what would do nothing, said before
-    /// the session opens (the compiler refuses the same shapes when they
-    /// are written; this is the floor for wired ones), or `None`.
-    fn refusal(&self) -> Option<String> {
-        let tuned = self.vad_silence_threshold_secs.is_some()
-            || self.vad_threshold.is_some()
-            || self.min_speech_duration_ms.is_some()
-            || self.min_silence_duration_ms.is_some();
-        if tuned && self.commit_strategy == "manual" {
-            return Some(
-                "the voice detection settings tune what commits a segment, and `commitStrategy` manual turns the \
-                 voice detection off: pick `vad` or `turn_prediction`, or leave those settings empty"
-                    .into(),
-            );
-        }
-        if self.filter_background_audio && self.include_timestamps {
-            return Some(
-                "ElevenLabs does not combine `filterBackgroundAudio` with `includeTimestamps`: turn one of them off"
-                    .into(),
-            );
-        }
-        if let Some(edit) = &self.transcript_edit {
-            if !self.entity_detection.is_empty() {
-                return Some(
-                    "ElevenLabs refuses a session that asks for both `transcriptEdit` and `entityDetection`: keep \
-                     one of them"
-                        .into(),
-                );
-            }
-            let chars = edit.chars().count();
-            if chars > MAX_EDIT_CHARS {
-                return Some(format!(
-                    "`transcriptEdit` is {chars} characters, and ElevenLabs takes at most {MAX_EDIT_CHARS}: shorten it"
-                ));
-            }
-        }
-        if self.keyterms.len() > MAX_KEYTERMS {
-            return Some(format!(
-                "`keyterms` lists {} terms, and a realtime session takes at most {MAX_KEYTERMS}: keep {MAX_KEYTERMS} \
-                 or fewer",
-                self.keyterms.len()
-            ));
-        }
-        if let Some(term) = self.keyterms.iter().find(|t| t.chars().count() > MAX_KEYTERM_CHARS) {
-            return Some(format!(
-                "the keyterm '{term}' is {} characters, and a realtime session takes terms of at most \
-                 {MAX_KEYTERM_CHARS}: shorten it",
-                term.chars().count()
-            ));
-        }
-        None
-    }
-
-    /// The session URL's query, under ElevenLabs's names: the model, the
-    /// audio format and the commit strategy always, then every setting
-    /// that was given and nothing left at ElevenLabs's own default. A
-    /// list goes as the parameter repeated, the way ElevenLabs's own SDK
-    /// sends it.
-    fn query(&self, audio_format: &str) -> String {
+    /// The session's address, its query under ElevenLabs's names: the
+    /// model, the audio format and the commit strategy always, then every
+    /// setting that was given and nothing left at ElevenLabs's own
+    /// default. A list goes as the parameter repeated, the way
+    /// ElevenLabs's own SDK sends it.
+    fn url(&self, audio_format: &str) -> WeftResult<Url> {
         let mut params: Vec<(&str, String)> = vec![
             ("model_id", self.model.clone()),
             ("audio_format", audio_format.to_string()),
@@ -211,7 +155,9 @@ impl Session {
         if !self.enable_logging {
             params.push(("enable_logging", "false".into()));
         }
-        params.iter().map(|(name, value)| format!("{name}={}", urlencoding::encode(value))).collect::<Vec<_>>().join("&")
+        Ok(params
+            .iter()
+            .fold(url(WS_API, &["speech-to-text", "realtime"])?, |address, (name, value)| address.query(name, value)))
     }
 }
 
@@ -494,9 +440,6 @@ impl Node for ElevenLabsTranscribeNode {
         let mut holding = ctx.hold();
         let account: Access = ctx.inputs.get("account")?;
         let session = Session::read(&ctx)?;
-        if let Some(refusal) = session.refusal() {
-            return Err(WeftError::Input(refusal));
-        }
         let audio = ctx.bus_from_input("audio")?;
         let (format, rate) = audio_format(audio.meta())?;
         // Read from the earliest frame still buffered: the producer may
@@ -505,8 +448,7 @@ impl Node for ElevenLabsTranscribeNode {
         let mut frames = audio.cursor_from_start()?;
 
         let conn = ctx.open(&account).await?;
-        let url = format!("{WS_API}/speech-to-text/realtime?{}", session.query(&format));
-        let mut socket = conn.socket(&url).await?;
+        let mut socket = conn.socket(session.url(&format)?.as_str()).await?;
 
         // The live segments bus, opened with the first segment (a
         // downstream consumer reads while segments land) and ended the
@@ -516,7 +458,6 @@ impl Node for ElevenLabsTranscribeNode {
         let mut transcript = Transcript::default();
         // The context rides the first chunk only, whichever that is.
         let mut previous_text = session.previous_text.clone();
-        let cancel = ctx.cancellation();
         // Forward audio and relay transcripts CONCURRENTLY: the session
         // speaks in both directions at once. The loop ends when the
         // audio bus closes; every server frame already queued is picked
@@ -539,12 +480,9 @@ impl Node for ElevenLabsTranscribeNode {
                     }
                     None => return Err(node_error("the session closed before the audio ended")),
                 },
-                err = cancel.cancelled_err() => return Err(err),
             }
         }
 
-        // Audio that broke off is not a recording to transcribe whole.
-        refuse_broken_input("audio", audio.end())?;
         // The audio ended: commit whatever the session still holds, then
         // drain it alone. The drain relays EVERY committed segment (the
         // flush may commit several) and what ElevenLabs annotates them
@@ -558,18 +496,10 @@ impl Node for ElevenLabsTranscribeNode {
         // frame here fails real sessions (verified live).
         let flush = audio_chunk(&[], rate, previous_text.take().as_deref(), true);
         socket.send(SocketMessage::text(flush)).await?;
-        loop {
-            tokio::select! {
-                frame = socket.recv() => match frame? {
-                    Some(msg) => {
-                        let word = classify_server_frame(&msg.into_text()?);
-                        if relay(&ctx, &mut segments_bus, &mut transcript, word).await? {
-                            break;
-                        }
-                    }
-                    None => break,
-                },
-                err = cancel.cancelled_err() => return Err(err),
+        while let Some(msg) = socket.recv().await? {
+            let word = classify_server_frame(&msg.into_text()?);
+            if relay(&ctx, &mut segments_bus, &mut transcript, word).await? {
+                break;
             }
         }
 
@@ -593,7 +523,7 @@ impl Node for ElevenLabsTranscribeNode {
         }
         // A long session's transcript is more than a wire carries, so it
         // always travels as a file.
-        let file = store_json(&ctx, &transcript.document(&session), "transcript.json").await?;
+        let file = ctx.storage(StorageScope::Run).put_json(&transcript.document(&session), "transcript.json", None).await?;
         let mut out = NodeOutput::new().set("transcript", file);
         if let Some(language) = transcript.language.take() {
             out = out.set("language", language);

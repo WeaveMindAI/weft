@@ -59,7 +59,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[openrouter]",
       "widget": {
         "kind": "access"
       },
@@ -69,7 +69,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[openrouter]",
       "description": "Wire into OpenRouter Model nodes' `access` input."
     }
   ]

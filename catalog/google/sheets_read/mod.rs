@@ -19,13 +19,12 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft::access::client::checked_send;
+use weft::access::client::{body_error, checked_send, url};
 use weft::node::NodeOutput;
 use weft::reqwest_middleware::ClientWithMiddleware;
 use weft::storage::wire_page;
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::api::page_size;
 use super::sheets::{heavy_row, read_cells, rows_from_cells, tab_title};
 
 #[derive(NodeManifest)]
@@ -46,8 +45,8 @@ impl Node for GoogleSheetsReadNode {
         // `hasHeader` declares a metadata default, so the bag holds it.
         let tab: Option<String> = ctx.inputs.opt("tab")?;
         let has_header: bool = ctx.inputs.get("hasHeader")?;
-        let offset = ctx.inputs.get::<f64>("offset")? as usize;
-        let max_rows = page_size(&ctx.inputs, "maxRows")?;
+        let offset: usize = ctx.inputs.get("offset")?;
+        let max_rows: usize = ctx.inputs.get("maxRows")?;
 
         let http = ctx.client(account.as_ref()).await?;
         let cells = match &account {
@@ -91,12 +90,10 @@ async fn read_via_public_export(http: &ClientWithMiddleware,
     id: &str,
     gid: Option<&str>,
 ) -> WeftResult<Vec<Vec<String>>> {
-    let mut url =
-        format!("https://docs.google.com/spreadsheets/d/{}/export?format=csv", super::api::segment(id));
-    if let Some(gid) = gid {
-        url.push_str(&format!("&gid={}", urlencoding::encode(gid)));
-    }
-    let req = http.get(url);
+    let url = url("https://docs.google.com/spreadsheets/d", &[id, "export"])?
+        .query("format", "csv")
+        .query_opt("gid", gid);
+    let req = http.get(url.as_str());
     let csv = checked_send(
         req,
         "export the google sheet (without a connected account, only a sheet shared \
@@ -105,7 +102,7 @@ async fn read_via_public_export(http: &ClientWithMiddleware,
     .await?
     .text()
     .await
-    .node_err("google sheets: read export")?;
+    .map_err(|e| body_error("google sheets: read export", e))?;
     // On the blocking pool, as the rows are (see `run`).
     tokio::task::spawn_blocking(move || parse_csv_cells(&csv))
         .await

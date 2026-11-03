@@ -32,7 +32,7 @@ impl Node for S3PutObjectNode {
 
         let s3 = ctx.client(&access).await?;
         let resp =
-            checked_send(s3.put(s3::object_url(&bucket, &key)?).body(content), "upload the object")
+            checked_send(s3.put(s3::object_url(&bucket, &key)?.as_str()).body(content), "upload the object")
                 .await?;
         let etag = resp
             .headers()

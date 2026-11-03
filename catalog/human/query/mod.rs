@@ -34,7 +34,7 @@ impl Node for HumanQueryNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let raw_fields = parse_form_fields(ctx.inputs.object()?)?;
+        let raw_fields = parse_form_fields(&ctx.inputs)?;
         let specs = form_specs(self.manifest())?;
 
         // Project the node's DATA inputs into a flat {key: value} map so

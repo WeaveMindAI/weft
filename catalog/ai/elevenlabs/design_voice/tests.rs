@@ -1,7 +1,6 @@
 //! ElevenLabsDesignVoice self-tests: the request the node builds from
-//! every setting, the previews stored as the format asked for, the
-//! line ElevenLabs answered, and what is refused before anything is
-//! sent.
+//! every setting, the previews stored as the format asked for, and the
+//! line ElevenLabs answered.
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -10,7 +9,7 @@ use weft::storage::StoredFile;
 use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
 use super::super::elevenlabs::audio_file_type;
-use super::{refusal, ElevenLabsDesignVoiceNode};
+use super::ElevenLabsDesignVoiceNode;
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -18,8 +17,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("designs_and_stores_the_previews", designs),
         NodeTest::fake("every_elevenlabs_setting_reaches_the_request", every_setting),
         NodeTest::fake("an_answer_without_its_line_still_hands_the_previews_on", no_line),
-        NodeTest::fake("designs_elevenlabs_would_refuse_are_refused_before_anything_is_sent", refused),
-        NodeTest::basic("the_design_requests_elevenlabs_refuses", refusals),
         NodeTest::live("one_real_design_minted_and_deleted", "elevenlabs", live_design),
         NodeTest::live("one_real_v3_design_from_a_reference_recording", "elevenlabs", live_reference_design),
     ]
@@ -180,44 +177,6 @@ async fn no_line(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig.run(&ElevenLabsDesignVoiceNode, inputs(&rig, json!({ "text": LINE }))).await.ok()?;
     assert_eq!(outcome.outputs["previews"].as_array().map(Vec::len), Some(1), "the paid previews still come out");
     assert!(!outcome.outputs.contains_key("text"), "`text` closes when ElevenLabs answers no line");
-    Ok(())
-}
-
-async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    let reference = rig.store_file("reference.mp3", "audio/mpeg", b"reference-take".to_vec());
-    for (extra, says) in [
-        (json!({ "description": "too short" }), "`description` is 9 characters"),
-        (json!({ "description": "x".repeat(1001) }), "`description` is 1001 characters"),
-        (json!({ "text": "A short line." }), "`text` is 13 characters"),
-        (json!({ "text": "x".repeat(1001) }), "`text` is 1001 characters"),
-        (json!({ "referenceAudio": reference.clone() }), "only on eleven_ttv_v3"),
-        (json!({ "model": "eleven_ttv_v3", "promptStrength": 0.5 }), "no `referenceAudio` is given"),
-    ] {
-        let err = rig.run(&ElevenLabsDesignVoiceNode, inputs(&rig, extra.clone())).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {extra}: {err}");
-        assert!(err.contains(says), "{extra}: {err}");
-    }
-    assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");
-    Ok(())
-}
-
-fn refusals() -> WeftResult<()> {
-    let v2 = "eleven_multilingual_ttv_v2";
-    let v3 = "eleven_ttv_v3";
-    let fine = "x".repeat(20);
-    assert!(refusal(&"x".repeat(19), None, v2, false, false).is_some());
-    assert!(refusal(&fine, None, v2, false, false).is_none(), "20 characters is enough");
-    assert!(refusal(&"é".repeat(20), None, v2, false, false).is_none(), "characters count, not bytes");
-    assert!(refusal(&"x".repeat(1000), None, v2, false, false).is_none());
-    assert!(refusal(&"x".repeat(1001), None, v2, false, false).is_some());
-    assert!(refusal(&fine, Some("x".repeat(99).as_str()), v2, false, false).is_some());
-    assert!(refusal(&fine, Some("x".repeat(100).as_str()), v2, false, false).is_none());
-    assert!(refusal(&fine, Some("x".repeat(1000).as_str()), v2, false, false).is_none());
-    assert!(refusal(&fine, Some("x".repeat(1001).as_str()), v2, false, false).is_some());
-    assert!(refusal(&fine, None, v2, true, false).is_some(), "reference audio is for eleven_ttv_v3 only");
-    assert!(refusal(&fine, None, v3, true, true).is_none());
-    assert!(refusal(&fine, None, v3, false, true).is_some(), "a prompt strength with nothing to weigh against");
     Ok(())
 }
 

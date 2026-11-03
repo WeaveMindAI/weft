@@ -5,12 +5,12 @@
 
 use serde_json::Value;
 
-use weft::access::client::post_json;
+use weft::access::client::{post_json, url};
 use weft::WeftResult;
 
 pub const API: &str = "https://api.firecrawl.dev/v2";
 
-/// POST `body` to `{API}/{path}`, refuse a failed status or a
+/// POST `body` to the `{API}/{path}` endpoint, refuse a failed status or a
 /// `success: false` envelope loudly with Firecrawl's own words, and
 /// hand back the parsed answer.
 pub async fn call(
@@ -19,7 +19,7 @@ pub async fn call(
     body: &Value,
     what: &str,
 ) -> WeftResult<Value> {
-    let answer = post_json(http, &format!("{API}/{path}"), body, what).await?;
+    let answer = post_json(http, url(API, &[path])?.as_str(), body, what).await?;
     if answer["success"].as_bool() != Some(true) {
         weft::node_bail!(
             "{what}: firecrawl refused: {}",

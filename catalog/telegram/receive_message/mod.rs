@@ -29,6 +29,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use weft::access::client::url;
 use weft::node::NodeOutput;
 use weft::signal::{PollDelta, PollEndpoint, Predicate};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
@@ -50,24 +51,26 @@ impl Node for TelegramReceiveMessageNode {
         let account: Access = ctx.inputs.get("account")?;
         let chat_id: Option<String> = ctx.inputs.opt("chatId")?;
         let keyword: Option<String> = ctx.inputs.opt("keyword")?;
-        let interval: f64 = ctx.inputs.get("intervalSecs")?;
+        let interval_secs: u64 = ctx.inputs.get("intervalSecs")?;
 
         // The fire payload is `{ item: <update> }`; predicates walk
         // into the update with dotted paths.
         let mut filters = vec![Predicate::exists("item.message")];
-        if let Some(c) = chat_id.filter(|c| !c.trim().is_empty()) {
+        if let Some(c) = chat_id {
             filters.push(Predicate::eq("item.message.chat.id", c));
         }
-        if let Some(k) = keyword.filter(|k| !k.trim().is_empty()) {
+        if let Some(k) = keyword {
             filters.push(Predicate::contains("item.message.text", k));
         }
 
         // The URL is generic; the connection's path-prefix step aims
         // it at /bot<token>/getUpdates.
         ctx.register_signal(PollEndpoint {
-            url: "https://api.telegram.org/getUpdates?allowed_updates=[\"message\"]&limit=100"
+            url: url("https://api.telegram.org", &["getUpdates"])?
+                .query("allowed_updates", r#"["message"]"#)
+                .query("limit", 100)
                 .into(),
-            interval_secs: interval as u64,
+            interval_secs,
             delta: Some(PollDelta {
                 items: "result".into(),
                 cursor_field: Some("update_id".into()),
@@ -79,6 +82,10 @@ impl Node for TelegramReceiveMessageNode {
                     offset: 1,
                     prime: Some(-1),
                 }),
+                // getUpdates answers no next-page cursor: the `offset`
+                // above already drains the queue a hundred updates per
+                // poll, and Telegram holds the rest until then.
+                paging: None,
             }),
             access: Some(weft::primitive::AccessRef::from(&account)),
             filters,

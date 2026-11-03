@@ -54,7 +54,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[firecrawl]",
       "widget": {
         "kind": "access"
       },
@@ -64,7 +64,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[firecrawl]",
       "description": "Wire into Fetch Page or Crawl Site."
     }
   ]

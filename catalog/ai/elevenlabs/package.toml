@@ -13,5 +13,3 @@ async-trait = "0.1"
 base64 = "0.23"
 serde_json = "1"
 tokio = "1"
-# The speech routes take their output format in the query string.
-urlencoding = "2"

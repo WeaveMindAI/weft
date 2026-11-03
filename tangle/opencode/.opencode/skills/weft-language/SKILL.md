@@ -412,7 +412,7 @@ route's run takes the whole group along, and everything the group needs
 
 ````weft
 live = Route { path: "live/count", method: "GET" }
-work = Group(db: Access) {
+work = Group(db: Access[postgres]) {
   rows = PostgresExecuteQuery { account: self.db, query: "select count(*) from cards" }
   out = Reply { body: rows.rows }
 }
@@ -588,7 +588,7 @@ with instances takes; `weft-members` adds the shape for several people.
 | opaque | `JsonDict`, compatible with any `Dict[String, V]` both ways |
 | any JSON | `Json`: text, a number, a boolean, null, or a list or object of those at any depth, for a value whose shape the program cannot know (what a device answers to an arbitrary command). Every JSON-made type fits into it (`List[List[Number]]`, a record of JSON fields, `JsonDict`); a file, `Bus`, `Generator[..]`, `Access` or `Infra` never does |
 | type variables | `T`, `T2`, unified across a node's ports, pinned by what is wired to the port or by the type the program declares on it (`Cast`'s output is `T2`: `-> (value: Card)` pins it, and so does the port it feeds); one nothing pins is `unresolved-typevar` |
-| live handles | `Bus`, `Generator[T]`, `Access`; never literals |
+| live handles | `Bus`, `Generator[T]`, `Access[service]` (fits a bare `Access`, which takes any service, never the reverse); never literals |
 
 A record is usable inline in any signature (`p: { wpm: Number, delay: Number
 }`), and a type gets a name either in a node's metadata `types` (e.g.
@@ -1252,7 +1252,7 @@ Inside a loop, `self` is the loop's own boundary, never the group around it.
 A loop nested in a group cannot read the group's `self.db` (that is
 `unknown-source-port`, naming both scopes and the two lines to write); the
 value comes in as a broadcast input of the loop, declared in its signature
-and wired from the group (`run = Loop(db: Access, ...) { ... }` then
+and wired from the group (`run = Loop(db: Access[postgres], ...) { ... }` then
 `run.db = self.db` at the group level).
 
 `parallel` defaults `false`. Five shapes: parallel map (true, over, no

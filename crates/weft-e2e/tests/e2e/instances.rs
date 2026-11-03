@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use weft_core::primitive::Phase;
 use weft_core::program::RunPage;
-use weft_e2e::access::{catalog_spec, connect_direct, set_account};
+use weft_e2e::access::{connect_direct, set_account};
 use weft_e2e::{ensure, infra, live, poll_until, project::Project, Dispatcher, SettledRun};
 
 /// A copy coming up builds and pulls an image and waits for its
@@ -135,8 +135,14 @@ async fn an_instance_picks_its_connection_and_runs_with_it() -> anyhow::Result<(
     let disp = ensure::up().await?;
     let mut project = Project::prepare("instances", disp.clone()).await?;
     let base = project.unique_live_path()?;
-    let keys = connect_direct(&disp, catalog_spec("api", "api_key_auth")?, "own", json!({ "keys": "k-backend" })).await?;
-    set_account(&project, "keys", keys.handle()).await?;
+    let keys = connect_direct(
+        &disp,
+        serde_json::to_value(weft_core::access::callers::CallerScheme::ApiKeys.recipe())?,
+        "own",
+        json!({ "keys": "k-backend" }),
+    )
+    .await?;
+    set_account(&project, "hook", keys.handle()).await?;
     project.activate().await?;
 
     let hook = format!("{base}/hook");
@@ -227,13 +233,13 @@ async fn an_instance_picks_its_connection_and_runs_with_it() -> anyhow::Result<(
     // The terminal does what an instance's connect page does: it picks
     // ada's stored key set back, connects bob one of its own, and drops
     // a pick, each for that instance alone.
-    project.weft(&["connect", "--instance", "ada", "--node", "theirs", "--grant", &grant, "--json"]).await?;
+    project.weft(&["connect", "theirs", "--instance", "ada", "--grant", &grant, "--json"]).await?;
     let (status, body) = call(vec![("Weft-Instance", "ada".into())]).await?;
     anyhow::ensure!(status == 200, "ada's pick is back: {status}: {body}");
-    project.weft(&["connect", "--instance", "bob", "--node", "theirs", "--door", "own", "--set", "keys=k-bob"]).await?;
+    project.weft(&["connect", "theirs", "--instance", "bob", "--door", "own", "--set", "keys=k-bob"]).await?;
     let (status, body) = call(vec![("Weft-Instance", "bob".into())]).await?;
     anyhow::ensure!(status == 200 && serde_json::from_str::<Value>(&body)?["instance"] == json!("bob"), "bob runs with its own: {status}: {body}");
-    project.weft(&["connect", "--instance", "ada", "--node", "theirs", "--disconnect"]).await?;
+    project.weft(&["connect", "theirs", "--instance", "ada", "--disconnect"]).await?;
     let (status, body) = call(vec![("Weft-Instance", "ada".into())]).await?;
     anyhow::ensure!(status != 200 && body.contains("has not filled 'theirs.account'"), "{status}: {body}");
     let (status, _) = call(vec![("Weft-Instance", "bob".into())]).await?;

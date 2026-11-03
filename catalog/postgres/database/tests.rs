@@ -7,7 +7,7 @@ use serde_json::json;
 use weft::{EndpointMethod, FakeRig, NodeTest, WeftResult};
 
 use super::{
-    database_name, extension_names, memory_mib, PostgresVersion, pooler_config, pooler_database, pooler_hba, postgres_version, role_list,
+    extension_names, memory_mib, PostgresVersion, pooler_config, pooler_database, pooler_hba, postgres_version, role_list,
     watch_database, PostgresDatabaseNode, Role, Tuning,
     CREDENTIAL_PATH, CREDENTIAL_STORED_PATH, HEALTH_PATH, LEAST_MEMORY_MIB,
 };
@@ -29,14 +29,12 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::basic("only_the_program_s_role_and_the_login_roles_sign_in_through_the_pooler", pooler_sign_ins),
         NodeTest::basic("a_role_name_a_program_cannot_write_or_one_kept_for_postgres_is_refused", role_names),
         NodeTest::fake("each_listed_role_is_handed_to_the_credential_server_and_the_pooler", roles),
-        NodeTest::basic("any_database_name_is_kept_as_postgres_has_it", database_names),
         NodeTest::basic("a_name_the_pooler_cannot_read_gets_a_door_of_its_own", doors),
         NodeTest::fake("a_database_named_with_a_dash_is_reached_by_that_name", dashed),
         NodeTest::fake("a_database_the_pooler_cannot_name_is_published_by_its_door", aliased),
         NodeTest::fake("each_listed_extension_is_handed_to_the_credential_server", extensions),
         NodeTest::basic("a_version_reads_as_its_tag_and_major_and_an_old_one_says_how_to_move", versions),
         NodeTest::fake("an_existing_database_on_an_old_postgres_runs_with_a_warning", old_postgres),
-        NodeTest::basic("a_pooled_connection_idle_too_long_is_never_handed_out", idle_close),
         NodeTest::basic("memory_reads_in_every_unit_the_input_takes", memory_units),
         NodeTest::basic("postgres_is_tuned_to_the_memory_it_has", tuned),
         NodeTest::basic("a_machine_too_small_for_one_worker_is_refused", too_small),
@@ -308,19 +306,15 @@ fn full_waits() -> WeftResult<()> {
 }
 
 /// The floor the refusal names is the real one (one MiB less is
-/// refused, it is not), and the `memory` input's description states
-/// the same number and the connection counts the formula gives.
+/// refused, it is not), and the node's description states the same
+/// number and the connection counts the formula gives.
 fn least_memory() -> WeftResult<()> {
     let least = Tuning::for_machine(&format!("{LEAST_MEMORY_MIB}Mi"))?;
     assert_eq!((least.query_pool, least.watch_pool), (1, 1), "{least:?}");
     assert!(Tuning::for_machine(&format!("{}Mi", LEAST_MEMORY_MIB - 1)).is_err());
     let metadata: serde_json::Value = serde_json::from_str(include_str!("metadata.json")).expect("metadata.json reads");
-    let memory = metadata["inputs"]
-        .as_array()
-        .and_then(|inputs| inputs.iter().find(|i| i["name"] == "memory"))
-        .and_then(|i| i["description"].as_str())
-        .expect("a memory input with a description");
-    let says = format!("at least {LEAST_MEMORY_MIB}Mi.");
+    let memory = metadata["description"].as_str().expect("a description");
+    let says = format!("`memory` takes at least {LEAST_MEMORY_MIB}Mi.");
     assert!(memory.contains(&says), "the description says '{says}': {memory}");
     let serves = |at: &str| Tuning::for_machine(at).map(|t| t.max_connections);
     let says = format!("at 1Gi it serves {} connections, at 2Gi {}, at 4Gi {}", serves("1Gi")?, serves("2Gi")?, serves("4Gi")?);
@@ -559,8 +553,8 @@ fn pooler_sign_ins() -> WeftResult<()> {
 }
 
 /// A role name is one a program writes unquoted, so `set role tenant_app`
-/// reaches it; the names this node and Postgres keep, and a name listed
-/// twice, are refused naming the role.
+/// reaches it; the names this node and Postgres keep are refused naming
+/// the role.
 fn role_names() -> WeftResult<()> {
     // Words Postgres reserves no further than as type or column names take
     // `set role` as they are.
@@ -581,8 +575,6 @@ fn role_names() -> WeftResult<()> {
             other => panic!("{refused:?} was not refused: {other:?}"),
         }
     }
-    let twice = role_list(vec![role("tenant_app", false, false), role("tenant_app", true, false)]);
-    assert!(matches!(&twice, Err(weft::WeftError::Input(m)) if m.contains("twice")), "{twice:?}");
     Ok(())
 }
 
@@ -608,19 +600,6 @@ async fn roles(rig: FakeRig) -> WeftResult<()> {
     misspelled["roles"] = json!([{ "name": "tenant_admin", "bypassRls": true }]);
     let failure = rig.run_provision_infra(&PostgresDatabaseNode, misspelled).await.failure()?;
     assert!(failure.contains("bypassRls"), "{failure}");
-    Ok(())
-}
-
-/// Whatever name a database was made under is the one it keeps, since
-/// a node pointing at another name points at a new, empty database. Only
-/// a name no container's settings can carry is refused.
-fn database_names() -> WeftResult<()> {
-    for kept in ["app", "my-app", " spaced ", "it's \\ odd", "naïve", "2shop", "pgbouncer", &"a".repeat(70)] {
-        assert_eq!(database_name(kept)?, kept);
-    }
-    for refused in ["", "two\nlines", "tab\there"] {
-        assert!(matches!(database_name(refused), Err(weft::WeftError::Input(_))), "{refused:?}");
-    }
     Ok(())
 }
 
@@ -761,19 +740,6 @@ async fn old_postgres(rig: FakeRig) -> WeftResult<()> {
     assert!(spec.notes.is_empty(), "{:?}", spec.notes);
     assert_eq!(credential_setting(spec, "WEFT_POSTGRES_MAJOR"), "17");
     assert_eq!(credential_setting(spec, "WEFT_POSTGRES_NOTE"), "");
-    Ok(())
-}
-
-/// A connection idle in the pool for [`IDLE_CLOSE`] or longer is never
-/// handed to a run: by then the database may have closed it, and a worker
-/// without CPU between requests cannot have closed it itself on time.
-fn idle_close() -> WeftResult<()> {
-    use super::super::postgres::{still_fresh, IDLE_CLOSE};
-    let since = std::time::Instant::now();
-    assert!(still_fresh(since, since));
-    assert!(still_fresh(since, since + IDLE_CLOSE - std::time::Duration::from_millis(1)));
-    assert!(!still_fresh(since, since + IDLE_CLOSE));
-    assert!(still_fresh(since + IDLE_CLOSE, since), "a clock read earlier is not idle at all");
     Ok(())
 }
 

@@ -175,15 +175,16 @@ enum Cmd {
     },
     /// Run node self-tests. Without a target: every package. Without
     /// --tier: the basic + fake tiers (compiled + run locally, no
-    /// install needed). With a package name or node type: just that
-    /// scope. `--tier live` adds the live tier: real credentials
-    /// through the production access path, as a test run in the
-    /// install; it can spend money, so it confirms first (persist
-    /// "don't ask again" when prompted, or pass --yes).
+    /// install needed). With package names or node types: just those
+    /// (one build for all of them). `--tier live` adds the live tier:
+    /// real credentials through the production access path, as a test
+    /// run in the install; it can spend money, so it confirms first
+    /// (persist "don't ask again" when prompted, or pass --yes).
     #[command(name = "test-node")]
     TestNode {
-        /// A package name or a node type; absent = every package.
-        target: Option<String>,
+        /// Package names or node types (several allowed); none = every
+        /// package.
+        targets: Vec<String>,
         /// Run only the test with this name.
         #[arg(long)]
         test: Option<String>,
@@ -205,8 +206,9 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
         /// Run tests concurrently: bare `--parallel` runs everything at
-        /// once, `--parallel N` caps in-flight tests at N. Applies to
-        /// the local tiers and to live runs alike.
+        /// once, `--parallel N` runs up to N packages side by side, each
+        /// with up to N of its tests in flight, and up to N live tests at
+        /// once.
         #[arg(long, num_args = 0..=1, default_missing_value = "0", value_name = "N")]
         parallel: Option<usize>,
     },
@@ -2141,11 +2143,11 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         Cmd::Options { node, field, search } => {
             commands::options::run(ctx, &node, &field, search.as_deref()).await
         }
-        Cmd::TestNode { target, test, tiers, key, connection, yes, parallel } => {
+        Cmd::TestNode { targets, test, tiers, key, connection, yes, parallel } => {
             commands::test_node::run(
                 ctx,
                 commands::test_node::TestNodeArgs {
-                    target,
+                    targets,
                     test,
                     tiers,
                     key,

@@ -304,3 +304,19 @@ async fn a_write_naming_no_version_is_refused(pool: Pool) {
         .expect_err("a write naming no version is refused");
     assert_eq!(forgot.code(), Some("23502"), "{forgot}");
 }
+
+/// The walk needs the table's key only when a row is behind: a keyless
+/// table with nothing to carry is left alone (the migration generator's
+/// database, built before the migration that adds the key), and one with a
+/// row behind stops the boot naming the missing key.
+#[weft_db_macros::test]
+async fn a_keyless_table_is_walked_only_when_a_row_is_behind(pool: Pool) {
+    static KEYLESS_DOC: Document = Document::of(&PROBE, "probe_unkeyed", "body", Encoding::Json, &[], None);
+    ledger(&pool).await;
+    pool.batch_execute("CREATE TABLE probe_unkeyed (name TEXT, body JSONB, body_version INTEGER NOT NULL)").await.unwrap();
+    apply_documents(&pool, &[&KEYLESS_DOC]).await.expect("nothing behind, nothing to walk");
+    pool.execute("INSERT INTO probe_unkeyed (name, body, body_version) VALUES ('x', '{\"a\": 1}', 1)", &[]).await.unwrap();
+    pool.execute("DELETE FROM weft_document_version WHERE table_name = 'probe_unkeyed'", &[]).await.unwrap();
+    let err = format!("{:#}", apply_documents(&pool, &[&KEYLESS_DOC]).await.unwrap_err());
+    assert!(err.contains("no primary key"), "{err}");
+}

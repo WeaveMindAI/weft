@@ -1,24 +1,22 @@
 //! ElevenLabsMusic self-tests: the request the node builds from a prompt
-//! or a composition plan, the stored file and song id it emits, and the
-//! shapes it refuses before anything is paid for.
+//! or a composition plan, and the stored file and song id it emits. The
+//! shapes ElevenLabs refuses are the metadata's rules.
 
 use serde_json::{json, Value};
 
 use weft::context::LogLevel;
 use weft::{FakeRig, LiveRig, NodeErrExt, NodeTest, WeftResult};
 
-use super::{file_type, refusal, ElevenLabsMusicNode};
+use super::{file_type, ElevenLabsMusicNode};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::basic("every_offered_output_format_has_a_file_type", file_types),
-        NodeTest::basic("the_music_settings_that_cannot_go_together", pairs),
         NodeTest::fake("composes_and_stores_the_track", composes),
         NodeTest::fake("every_prompt_setting_reaches_the_request", every_prompt_setting),
         NodeTest::fake("a_composition_plan_and_its_seed_reach_the_request", composes_from_a_plan),
         NodeTest::fake("each_format_is_stored_under_its_own_name_and_type", formats),
         NodeTest::fake("a_missing_song_id_is_said_only_to_a_program_that_reads_it", missing_song_id),
-        NodeTest::fake("settings_elevenlabs_would_refuse_are_refused_before_anything_is_sent", refused),
         NodeTest::live("one_real_three_second_track", "elevenlabs", live_track),
     ]
 }
@@ -72,43 +70,6 @@ fn file_types() -> WeftResult<()> {
     assert_eq!(file_type("auto")?, ("mp3", "audio/mpeg"));
     assert_eq!(file_type("mp3_48000_320")?, ("mp3", "audio/mpeg"));
     assert_eq!(file_type("opus_48000_192")?, ("ogg", "audio/ogg; codecs=opus"));
-    Ok(())
-}
-
-fn pairs() -> WeftResult<()> {
-    let prompt = |extra: Value| {
-        let mut body = json!({ "model_id": "music_v2_5", "prompt": "lo-fi" });
-        for (k, v) in extra.as_object().expect("extra fields are an object") {
-            body[k] = v.clone();
-        }
-        body
-    };
-    let plan = |extra: Value| {
-        let mut body = json!({ "model_id": "music_v2_5", "composition_plan": { "chunks": [] } });
-        for (k, v) in extra.as_object().expect("extra fields are an object") {
-            body[k] = v.clone();
-        }
-        body
-    };
-    assert!(refusal(&prompt(json!({})), "auto").is_none());
-    assert!(refusal(&json!({ "model_id": "music_v2_5" }), "auto").is_some(), "nothing to compose from");
-    assert!(refusal(&prompt(json!({ "composition_plan": {} })), "auto").is_some());
-    assert!(refusal(&prompt(json!({ "seed": 1 })), "auto").is_some());
-    assert!(refusal(&plan(json!({ "seed": 1 })), "auto").is_none(), "a plan takes a seed");
-    assert!(refusal(&plan(json!({ "lyrics_text": "la la" })), "auto").is_none(), "a plan takes lyrics");
-    assert!(refusal(&plan(json!({ "music_length_ms": 3000 })), "auto").is_some());
-    assert!(refusal(&plan(json!({ "force_instrumental": true })), "auto").is_some());
-    assert!(refusal(&plan(json!({ "generation_mode": "loop" })), "auto").is_some());
-    assert!(refusal(&prompt(json!({ "lyrics_text": "la", "force_instrumental": true })), "auto").is_some());
-    assert!(refusal(&prompt(json!({ "finetune_strength": 0.5 })), "auto").is_some(), "no finetune to act on");
-    assert!(refusal(&prompt(json!({ "finetune_id": "ft", "finetune_strength": 0.0 })), "auto").is_some());
-    assert!(refusal(&prompt(json!({ "finetune_id": "ft", "finetune_strength": 2.0 })), "auto").is_none());
-    assert!(refusal(&prompt(json!({ "sign_with_c2pa": true })), "auto").is_none(), "auto answers an mp3");
-    assert!(refusal(&prompt(json!({ "sign_with_c2pa": true })), "mp3_48000_192").is_none());
-    assert!(refusal(&prompt(json!({ "sign_with_c2pa": true })), "opus_48000_64").is_some());
-    assert!(refusal(&prompt(json!({ "prompt": "x".repeat(4_100) })), "auto").is_none(), "4,100 characters fit");
-    assert!(refusal(&prompt(json!({ "prompt": "é".repeat(4_101) })), "auto").is_some(), "counted in characters");
-    assert!(refusal(&prompt(json!({ "lyrics_text": "x".repeat(4_001) })), "auto").is_some());
     Ok(())
 }
 
@@ -259,30 +220,5 @@ async fn missing_song_id(rig: FakeRig) -> WeftResult<()> {
         "the program reading `songId` is told why it is empty: {:?}",
         rig.logs()
     );
-    Ok(())
-}
-
-async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    let plan = json!({ "chunks": [{ "text": "[Intro]", "duration_ms": 3000, "positive_styles": ["ambient"] }] });
-    for (extra, says) in [
-        (json!({}), "nothing to compose from"),
-        (json!({ "prompt": "lo-fi", "compositionPlan": plan }), "both `prompt` and `compositionPlan`"),
-        (json!({ "prompt": "lo-fi", "seed": 7 }), "a `seed` only with a `compositionPlan`"),
-        (json!({ "compositionPlan": plan, "lengthSecs": 30 }), "`lengthSecs` only with a `prompt`"),
-        (json!({ "compositionPlan": plan, "forceInstrumental": true }), "`forceInstrumental` only with a `prompt`"),
-        (json!({ "compositionPlan": plan, "generationMode": "loop" }), "`generationMode` only with a `prompt`"),
-        (json!({ "prompt": "lo-fi", "lyrics": "la la", "forceInstrumental": true }), "nothing is sung"),
-        (json!({ "prompt": "lo-fi", "finetuneStrength": 0.5 }), "no `finetune`"),
-        (json!({ "prompt": "lo-fi", "finetune": "ft-1", "finetuneStrength": 0 }), "above 0"),
-        (json!({ "prompt": "lo-fi", "signWithC2pa": true, "outputFormat": "pcm_44100" }), "C2PA only an mp3"),
-        (json!({ "prompt": "x".repeat(4_101) }), "at most 4100"),
-        (json!({ "prompt": "lo-fi", "lyrics": "x".repeat(4_001) }), "at most 4000"),
-    ] {
-        let err = rig.run(&ElevenLabsMusicNode, inputs(&rig, extra.clone())).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {extra}: {err}");
-        assert!(err.contains(says), "{extra}: {err}");
-    }
-    assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");
     Ok(())
 }

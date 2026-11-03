@@ -16,6 +16,7 @@
     {
       "name": "text",
       "type": "String",
+      "keepsBlank": true,
       "widget": { "kind": "textarea" },
       "label": "Text",
       "description": "The text to preview. Give this or `file`, not both."
@@ -83,5 +84,22 @@
   ],
   "features": {
     "oneOfRequired": [["text", "file"]]
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "text" },
+          { "kind": "input_satisfied", "port": "file" }
+        ]
+      },
+      "then": {
+        "message": "TextPreview '{id}' is given both `text` and `file`: give the text one way.",
+        "level": "structural",
+        "severity": "error",
+        "port": "file"
+      }
+    }
+  ]
 }

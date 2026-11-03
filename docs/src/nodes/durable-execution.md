@@ -721,8 +721,8 @@ If the provider has no way to cancel a job, wait on the plain signal.
 
 If the provider refuses the call, or does not answer within 60 seconds, weft
 does not try again, and the job may still be running. The runtime's log
-(`weft daemon logs` on your machine) says `a cancelled run's last call to its
-outside service failed`, with the address and what the provider answered.
+(`weft daemon logs` on your machine) says `a last call to an outside service
+failed`, with the address and what the provider answered.
 
 If you want to check the call in a test, read it off the wait:
 
@@ -746,6 +746,65 @@ the provider sent it. A failed check does not replace it, and an answer over
 - in a program, with the `GetNodeState` node, which takes a run's id (a run
   gets its own id from the `GetRunId` node);
 - in your own node's code, with `ctx.run_by_id(run).node_state(node)`.
+
+## Cleaning up what your node made at a provider
+
+Say your node uploads a file to a provider, starts a job that reads it, and
+waits for the job. If the run is cancelled during the wait, or the worker
+dies, the code that deletes the upload afterwards never runs, and the file
+stays in the user's account. So register the delete right after the upload
+exists, before anything else can go wrong:
+
+```rust
+use weft::access::client;
+use weft::signal::CancelCall;
+
+let id = upload(&http, &file).await?;
+ctx.after_node(CancelCall::delete(client::url(API, &["uploads", &id])?).always(), &account).await?;
+```
+
+weft sends that call once, through the connection you pass (`None` sends it
+plain), when the node ends, however it ends: it returned, failed, was
+cancelled, gave up or skipped a wait, or its worker died and the run ended
+without it. Leave out `.always()` and the call goes only if the run is
+cancelled before the node ends, for a job the provider would otherwise keep
+running.
+
+The call is on the run's record before `after_node` returns, which is what
+lets it survive a crash:
+
+- A worker that picks the run up after a crash still owes it, and so does
+  the worker that picks up a run that paused.
+- A body that runs again after a pause or a crash and registers the same
+  call again (same node, call and connection) still owes it once, so you do
+  not have to guard the `after_node` with a `once`.
+- A run that ends with no worker driving it (cancelled while it was paused,
+  or removed with its project) still sends it, from weft's own side.
+
+weft sends the calls before it writes that the node ended, so a worker that
+dies in between sends them again from the next one. Pick a call that is
+safe to send twice: a `404` counts as done, so a delete is.
+
+If the provider refuses the call, or does not answer within 60 seconds, weft
+does not try again. A call sent when the node ended shows on the node's log
+as `the call DELETE <url> this node owed when it ended did not go through:`
+followed by the provider's own words. One sent from weft's side, for a run
+nobody was driving, shows in the runtime's log, the same way as a [wait's
+cancel call](#if-the-run-is-cancelled-while-the-job-runs).
+
+`after_node` fails on a pure node, which does nothing outside the run, and
+on an address that is empty or not `http` or `https`. A wait's
+`cancel_with` takes only a call without `.always()`: its call goes with the
+wait, which is gone once answered, and an `.always()` one is refused, naming
+`ctx.after_node`.
+
+If you want to check the call in a test, `rig.owed_calls()` lists every call
+the node registered, each with the connection it goes through:
+
+```rust
+let owed = rig.owed_calls();
+assert_eq!(owed[0].0, CancelCall::delete("https://api.example/uploads/123").always());
+```
 
 ## When the run cannot pause
 

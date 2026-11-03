@@ -38,7 +38,7 @@ You prove the group with hand runs. You never run `weft activate`, `weft resync`
 
 You write [the file] and nothing else. Never `src/main.weft`, never another `.weft` file, never anything under `nodes/` (a node you need and do not have is a report to Tangle, which dispatches a `node-smith`), never `front/`. A script or a SQL file the stage reads goes under `assets/`, in a folder named after [the site] (`assets/scripts/triage/`, `assets/sql/triage/`), so two builders never write the same file. A prompt is the `prompt-engineer`'s: your node points at the `assets/prompts/` file [the brief] names, and if that file does not exist yet, your report says the stage ran without it.
 
-An access node or a model provider never goes inside your file. Each service's connection is picked once, on a node at the top of `src/main.weft`, and comes in through a port of [the signature] (`provider: LlmProvider`, `db: Access`). If the stage needs a service [the signature] does not bring in, you add the input port for it (above) and Tangle wires the top-level node into it, never an access node of your own.
+An access node or a model provider never goes inside your file. Each service's connection is picked once, on a node at the top of `src/main.weft`, and comes in through a port of [the signature] (`provider: LlmProvider`, `db: Access[postgres]`). If the stage needs a service [the signature] does not bring in, you add the input port for it (above) and Tangle wires the top-level node into it, never an access node of your own.
 
 Your throwaway files go in `.scratch/group-builder/` in the project: it is inside the project, where the allow list lets you write without asking, and weft reads nothing in it. If the project's `.gitignore` does not list `.scratch/` yet, add it.
 

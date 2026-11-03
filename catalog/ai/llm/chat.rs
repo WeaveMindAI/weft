@@ -35,13 +35,10 @@ pub fn media_part(media: &Value) -> WeftResult<Value> {
         FileKind::Image => json!({ "type": "image_url", "image_url": { "url": media } }),
         FileKind::Audio => json!({ "type": "input_audio", "input_audio": { "data": media } }),
         FileKind::Video => json!({ "type": "video_url", "video_url": { "url": media } }),
-        FileKind::Blob => {
-            return Err(WeftError::Input(
-                "a chat message carries images, audio, or video; a generic file does not \
-                 fit a provider's message parts"
-                    .to_string(),
-            ))
-        }
+        FileKind::Blob => weft::input_bail!(
+            "a chat message carries images, audio, or video; a generic file does not \
+             fit a provider's message parts"
+        ),
     })
 }
 

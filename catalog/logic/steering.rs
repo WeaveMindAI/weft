@@ -3,39 +3,18 @@
 //! on what counts as a tag. Any string works: `ctx.tag_run` and
 //! `ctx.stop_tagged` normalise each value the same way
 //! (`weft::tag::normalize_tag`), so the same value always lands on the
-//! same tag from either side.
+//! same tag from either side, and refuse an empty one.
 
-use weft::{node_bail, RunContext, WeftResult};
+use weft::{RunContext, WeftResult};
 
 /// The tags a steering node was handed: every created input (one tag
 /// each, typed `String` by both manifests) plus the optional `tags`
-/// list, created ports first, duplicates dropped. Empty is a failure: a
-/// node with nothing to tag or stop is a wiring mistake, never a silent
-/// no-op. An empty value is refused here, before anything is tagged or
-/// stopped, so the node never acts on half its tags.
+/// list, created ports first. A node with neither is refused by its
+/// rule, before it runs.
 pub fn tags_from_inputs(ctx: &RunContext) -> WeftResult<Vec<String>> {
-    let mut tags: Vec<String> = Vec::new();
     // `custom()` is the created ports only; the declared `tags` list
     // is read below.
-    for (name, value) in ctx.inputs.custom() {
-        match value.as_str() {
-            Some(tag) => tags.push(tag.to_string()),
-            None => node_bail!("input '{name}' must carry a string tag, got {value}"),
-        }
-    }
-    if let Some(list) = ctx.inputs.opt::<Vec<String>>("tags")? {
-        tags.extend(list);
-    }
-    if tags.iter().any(String::is_empty) {
-        node_bail!("a tag must not be empty");
-    }
-    let mut seen = std::collections::HashSet::new();
-    tags.retain(|t| seen.insert(t.clone()));
-    if tags.is_empty() {
-        node_bail!(
-            "no tags: wire at least one input onto the node (`TagRun(sender: String)`) or a \
-             `tags` list"
-        );
-    }
+    let mut tags = ctx.inputs.custom().map(|(name, _)| ctx.inputs.get::<String>(name)).collect::<WeftResult<Vec<_>>>()?;
+    tags.extend(ctx.inputs.opt::<Vec<String>>("tags")?.unwrap_or_default());
     Ok(tags)
 }

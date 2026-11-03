@@ -106,7 +106,7 @@ never be per instance: one that reads a per-instance container or value, even
 several nodes upstream, is a compile error naming what made it per instance.
 Keep every route shared and pick the instance per call:
 
-- a route gated by a credential (`ApiKeyAuth` on its `auth`), called by the
+- a route gated by a credential (`auth: "api_keys"`), called by the
   user's own backend with `Weft-Instance: <id>`; an open route refuses the
   header;
 - or an instance token in `Weft-Instance-Token`, for a caller that acts
@@ -164,15 +164,15 @@ session drives its own Blender container looks like this (`BlenderWorkstation`
 and `BlenderPreview` are that project's own nodes, not catalog ones):
 
 ```weft
-live = Group(keys: Access) {
+live = Group() {
   # One session's Blender and the routes that drive it
   blender = BlenderWorkstation {
     @per_instance
   }
 
-  say = Route -> (body: { text: String }) { path: "sessions/{id}/messages", method: "POST", auth: self.keys }
-  look = Route -> (view: String) { path: "sessions/{id}/preview/{view}", method: "GET", auth: self.keys }
-  shoot = Route -> (id: String) { path: "sessions/{id}/render", method: "POST", auth: self.keys }
+  say = Route -> (body: { text: String }) { path: "sessions/{id}/messages", method: "POST", auth: "api_keys" }
+  look = Route -> (view: String) { path: "sessions/{id}/preview/{view}", method: "GET", auth: "api_keys" }
+  shoot = Route -> (id: String) { path: "sessions/{id}/render", method: "POST", auth: "api_keys" }
 
   agent = @include("live/agent.weft")
   agent.workstation = blender.workstation
@@ -414,7 +414,7 @@ mounting it, go and read the `weft-frontend` skill. It draws each field with
 its own control, and a list field (its spreadsheets, its models) is read
 through the instance's own connection. An instance is never offered the
 shared key. To try an instance's path yourself before any website exists:
-`weft connect --instance <id> --node <node>` connects an account for that
+`weft connect <node> --instance <id>` connects an account for that
 instance (`--door own --set-env key=ENV_VAR`) or picks one it has (`--grant
 <id>`), and `weft instance-values --instance <id>` lists its fields, with
 `--set <node>.<field>=<value>` / `--clear <node>.<field>` changing them. Each command

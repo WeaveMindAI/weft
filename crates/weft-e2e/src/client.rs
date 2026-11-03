@@ -300,9 +300,16 @@ pub fn weft_command(install: &weft_core::infra::Install) -> Result<tokio::proces
 /// EXIT STATUS is left to the caller (some verbs are expected to fail in
 /// negative tests).
 pub async fn cli(disp: &Dispatcher, dir: &Path, args: &[&str]) -> Result<CliOutput> {
+    cli_with_env(disp, dir, args, &[]).await
+}
+
+/// [`cli`] with `env` set on the `weft` process alone (a value the command
+/// reads from its environment, like `--set-env`'s), never on the test's own.
+pub async fn cli_with_env(disp: &Dispatcher, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<CliOutput> {
     let mut cmd = weft_command(disp.install())?;
     cmd.current_dir(dir);
     cmd.args(args);
+    cmd.envs(env.iter().copied());
     cmd.env("WEFT_DISPATCHER_URL", disp.base());
     // The rig is non-interactive by construction: a verb that wants a
     // prompt must receive its answer via flags. With an inherited stdin
@@ -328,7 +335,12 @@ pub async fn cli(disp: &Dispatcher, dir: &Path, args: &[&str]) -> Result<CliOutp
 /// Run `weft` in `dir` and require a zero exit, returning stdout. Errors carry
 /// the invocation, exit code, and BOTH streams so a failure is fully legible.
 pub async fn cli_ok(disp: &Dispatcher, dir: &Path, args: &[&str]) -> Result<String> {
-    let out = cli(disp, dir, args).await?;
+    cli_ok_with_env(disp, dir, args, &[]).await
+}
+
+/// [`cli_ok`] with `env` set on the `weft` process alone ([`cli_with_env`]).
+pub async fn cli_ok_with_env(disp: &Dispatcher, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
+    let out = cli_with_env(disp, dir, args, env).await?;
     if out.success {
         Ok(out.stdout)
     } else {

@@ -11,7 +11,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[google]", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/calendar.events"
@@ -76,6 +76,34 @@
     {
       "name": "link",
       "type": "String"
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "start" },
+          { "kind": "not", "of": { "kind": "value", "field": "start", "matches": "^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2}))?$" } }
+        ]
+      },
+      "then": {
+        "message": "GoogleCalendarCreateEvent '{id}' has a `start` that is neither a moment with its zone (2026-09-03T11:00:00+02:00) nor a plain date for an all-day event (2026-09-03).",
+        "port": "start"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "end" },
+          { "kind": "not", "of": { "kind": "value", "field": "end", "matches": "^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2}))?$" } }
+        ]
+      },
+      "then": {
+        "message": "GoogleCalendarCreateEvent '{id}' has an `end` that is neither a moment with its zone (2026-09-03T11:00:00+02:00) nor a plain date for an all-day event (2026-09-03).",
+        "port": "end"
+      }
     }
   ]
 }

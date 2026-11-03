@@ -135,6 +135,10 @@ impl ContextHandle for PureHandle {
         self.refused("read a published connection")
     }
 
+    async fn after_node(&self, _call: crate::signal::CancelCall, _access: Option<crate::primitive::AccessRef>) -> WeftResult<()> {
+        self.refused("owe a call to a provider when it ends")
+    }
+
     /// A secret is the run's own, kept with its record and read back from
     /// it, so making and revealing one stay open.
     fn keep_secret(&self, value: Value) -> WeftResult<crate::secret::SecretId> {
@@ -236,6 +240,7 @@ impl ContextHandle for PureHandle {
         _scope: &crate::storage::StorageScope,
         _identity: Option<&str>,
         _url: &str,
+        _mime: Option<&str>,
         _filename: Option<&str>,
         _keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {

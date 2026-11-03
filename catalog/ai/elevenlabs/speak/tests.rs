@@ -1,18 +1,17 @@
 //! ElevenLabsSpeak self-tests. The fake rig has no provider WebSocket,
 //! so the session is tested through its parts: the URL and the opener
-//! a run's inputs make, the refusals, the frame vocabulary, the read
-//! that turns frames into bus messages, and the refusal of a text that
-//! broke off. The live test drives the whole socket.
+//! a run's inputs make, the frame vocabulary, and the read that turns
+//! frames into bus messages. The live test drives the whole socket.
 
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use weft::bus::{BusOptions, StreamEnd};
+use weft::bus::BusOptions;
 use weft::{FakeRig, LiveRig, NodeManifest, NodeTest, ValueBag, WeftResult, Widget};
 
-use super::super::elevenlabs::{audio_file_type, refuse_broken_input};
+use super::super::elevenlabs::audio_file_type;
 use super::{
-    bus_meta, byte_rate, classify_session_frame, placed, read_frame, refusal, text_of, Character,
+    bus_meta, byte_rate, classify_session_frame, placed, read_frame, text_of, Character,
     ElevenLabsSpeakNode, Session,
 };
 
@@ -25,11 +24,8 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::basic("a_bare_session_sends_only_what_it_must", bare_session),
         NodeTest::basic("every_setting_reaches_the_url_or_the_opener", every_setting),
         NodeTest::basic("a_voice_id_can_only_ever_name_a_voice", voice_id_encoded),
-        NodeTest::basic("the_streaming_settings_that_cannot_go_together", pairs),
         NodeTest::basic("characters_land_on_the_whole_speech", characters_placed),
-        NodeTest::basic("a_live_input_that_broke_off_is_refused", broken_input),
         NodeTest::basic("each_frames_timing_lands_on_one_clock", timing_relay),
-        NodeTest::fake("settings_the_socket_would_refuse_are_refused_before_it_opens", refused),
         NodeTest::fake("accepted_settings_pass_every_refusal", accepted),
         NodeTest::live("one_real_streamed_speech", "elevenlabs", live_stream),
     ]
@@ -181,7 +177,7 @@ const SOCKET: &str = "wss://api.elevenlabs.io/v1/text-to-speech";
 fn bare_session() -> WeftResult<()> {
     let session = Session::read(&bag(json!({})), None, false)?;
     assert_eq!(
-        session.url("voice-1"),
+        session.url("voice-1")?.to_string(),
         format!(
             "{SOCKET}/voice-1/stream-input?model_id=eleven_flash_v2_5&output_format=pcm_16000\
              &inactivity_timeout=180&auto_mode=true"
@@ -210,7 +206,7 @@ fn every_setting() -> WeftResult<()> {
         true,
     )?;
     assert_eq!(
-        session.url("voice-1"),
+        session.url("voice-1")?.to_string(),
         format!(
             "{SOCKET}/voice-1/stream-input?model_id=eleven_flash_v2&output_format=ulaw_8000\
              &inactivity_timeout=180&language_code=en&enable_logging=false&apply_text_normalization=on\
@@ -236,29 +232,8 @@ fn every_setting() -> WeftResult<()> {
 /// A typed voice id that looks like a path stays one path segment, so
 /// it cannot reach another ElevenLabs route.
 fn voice_id_encoded() -> WeftResult<()> {
-    let url = Session::read(&bag(json!({})), None, false)?.url("../user");
-    assert!(url.starts_with(&format!("{SOCKET}/..%2Fuser/stream-input?")), "{url}");
-    Ok(())
-}
-
-fn pairs() -> WeftResult<()> {
-    let flash = "eleven_flash_v2_5";
-    let pcm = "pcm_16000";
-    for model in ["eleven_v3", "eleven_v3_conversational", "eleven_v4", "eleven_v4_turbo"] {
-        assert!(refusal(model, false, true, &[], pcm, false).is_some(), "{model} does not stream here");
-    }
-    assert!(refusal(flash, false, true, &[], pcm, false).is_none());
-    assert!(refusal("eleven_multilingual_v2", true, true, &[], pcm, false).is_some());
-    assert!(refusal(flash, true, true, &[], pcm, false).is_none(), "Flash takes a language code");
-    assert!(refusal(flash, false, true, &[120.0], pcm, false).is_some(), "auto mode waits on no schedule");
-    assert!(refusal(flash, false, false, &[120.0, 160.0], pcm, false).is_none());
-    assert!(refusal(flash, false, false, &[49.0], pcm, false).is_some());
-    assert!(refusal(flash, false, false, &[120.0, 501.0], pcm, false).is_some());
-    assert!(refusal(flash, false, false, &[50.0, 500.0], pcm, false).is_none(), "the ends of the range are in it");
-    assert!(refusal(flash, false, true, &[], "mp3_44100_128", true).is_some());
-    assert!(refusal(flash, false, true, &[], "wav_16000", true).is_some());
-    assert!(refusal(flash, false, true, &[], "mp3_44100_128", false).is_none(), "mp3 is fine when nothing reads the timing");
-    assert!(refusal(flash, false, true, &[], "alaw_8000", true).is_none());
+    let url = Session::read(&bag(json!({})), None, false)?.url("../user")?;
+    assert!(url.as_str().starts_with(&format!("{SOCKET}/..%2Fuser/stream-input?")), "{url}");
     Ok(())
 }
 
@@ -311,18 +286,6 @@ fn timing_relay() -> WeftResult<()> {
     Ok(())
 }
 
-/// A live input that broke off is refused naming its port and why; one
-/// that finished passes, and one still open is the reader's bug.
-fn broken_input() -> WeftResult<()> {
-    let err = refuse_broken_input("text", Some(StreamEnd::Failed { error: "the model went away".into() }))
-        .expect_err("a broken input is refused")
-        .to_string();
-    assert!(err.contains("'text' broke off") && err.contains("the model went away"), "{err}");
-    refuse_broken_input("text", Some(StreamEnd::Finished))?;
-    assert!(refuse_broken_input("text", None).is_err(), "an input read to its end is closed");
-    Ok(())
-}
-
 /// The inputs of a short session on a fresh text bus, plus `extra`.
 fn inputs(rig: &FakeRig, extra: Value) -> WeftResult<Value> {
     let (_text, marker) = rig.seed_bus(BusOptions::default())?;
@@ -335,22 +298,6 @@ fn inputs(rig: &FakeRig, extra: Value) -> WeftResult<Value> {
         base[k] = v.clone();
     }
     Ok(base)
-}
-
-async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("alignment");
-    for (extra, says) in [
-        (json!({ "model": "eleven_v4" }), "takes no eleven_v3 or eleven_v4 model"),
-        (json!({ "model": "eleven_multilingual_v2", "languageCode": "fr" }), "takes no `languageCode`"),
-        (json!({ "chunkLengthSchedule": [120] }), "with `autoMode` on"),
-        (json!({ "autoMode": false, "chunkLengthSchedule": [20] }), "between 50 and 500"),
-        (json!({ "outputFormat": "mp3_44100_128" }), "'mp3_44100_128' does not pin that down"),
-    ] {
-        let err = rig.run(&ElevenLabsSpeakNode, inputs(&rig, extra.clone())?).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run: {extra}: {err}");
-        assert!(err.contains(says), "{extra}: {err}");
-    }
-    Ok(())
 }
 
 /// Every setting at once, through the real manifest and the run's own

@@ -1637,6 +1637,28 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
                     && old_by.get(&column).is_none_or(|was| !column_parts(&was.body).not_null)
             })
     };
+    // A key (a primary key, a unique) whose columns are all added in this
+    // plan and each fill every row with a value of its own (an identity,
+    // or a sequence's `nextval` default): no row can break it, so it
+    // arrives in the expand part, after its columns, rather than waiting
+    // for the contract. What runs between the two (the stored documents'
+    // carry, which walks a table by its primary key) can then lean on it.
+    let keys_itself = |thing: &Thing| {
+        thing.kind == "constraint"
+            && ["PRIMARY KEY (", "UNIQUE ("].iter().any(|opening| {
+                thing.body.strip_prefix(opening).and_then(|rest| rest.strip_suffix(')')).is_some_and(|columns| {
+                    columns.split(',').map(str::trim).all(|column| {
+                        let column = ("column".to_string(), thing.table.clone(), column.to_string());
+                        !old_by.contains_key(&column)
+                            && new_by.get(&column).is_some_and(|now| {
+                                let parts = column_parts(&now.body);
+                                parts.identity.is_some() || parts.default.as_deref().is_some_and(|d| d.starts_with("nextval("))
+                            })
+                    })
+                })
+            })
+    };
+    let mut keyed_in_expand: Vec<Planned> = Vec::new();
     let mut created: std::collections::HashSet<&str> = Default::default();
     // Types first: a column or a table may be made of a type added in the
     // same plan, and things otherwise come in name order of their kind.
@@ -1677,6 +1699,9 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
         match old_by.get(&key(thing)) {
             None => match replaced.get(&key(thing)) {
                 Some(was) => plan.push(Planned { owner: owner_of(thing), part: Part::Expand, stmt: replaced_function(was, thing) }),
+                None if old_tables.contains(thing.table.as_str()) && keys_itself(thing) => {
+                    keyed_in_expand.push(Planned { owner: owner_of(thing), part: Part::Expand, stmt: added_whole(thing) })
+                }
                 None => {
                     let backfill = backfills.iter().find(|b| b.table == thing.table && b.column == thing.name);
                     plan.extend(added(thing, backfill).into_iter().map(|(part, stmt)| Planned { owner: owner_of(thing), part, stmt }))
@@ -1688,6 +1713,7 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
             Some(_) => {}
         }
     }
+    plan.extend(keyed_in_expand);
     // A table that has gone entirely: one DROP TABLE, rather than a DROP
     // COLUMN for each of its columns.
     let new_tables: std::collections::HashSet<&str> =
@@ -3440,6 +3466,31 @@ mod tests {
     /// tightens in the contract part: a NOT NULL column with no default is
     /// added nullable first and made NOT NULL after, and a new table arrives
     /// whole, its key with it.
+    /// A key on a column the same change adds, filled from a sequence or
+    /// an identity, can refuse no row, so it comes in the expand part,
+    /// after its column; a key on a column already there still waits for
+    /// the contract.
+    #[test]
+    fn a_key_on_a_column_that_fills_itself_comes_with_the_column() {
+        use super::{plan_migration, Part, Thing};
+        let t = |table: &str, kind: &str, name: &str, body: &str| Thing { kind: kind.into(), table: table.into(), name: name.into(), body: body.into() };
+        let owner = t("b", "column", "owner", "text null=NO default=-");
+        let old = vec![owner.clone()];
+        let new = vec![
+            owner,
+            t("b", "column", "id", "bigint null=NO default=nextval('b_id_seq'::regclass)"),
+            t("b", "constraint", "b_pkey", "PRIMARY KEY (id)"),
+            t("b", "constraint", "b_owner_key", "UNIQUE (owner)"),
+        ];
+        let plan: Vec<(Part, String)> = plan_migration(&old, &new, &[], &[]).unwrap().into_iter().map(|p| (p.part, p.stmt)).collect();
+        let of = |part: Part| plan.iter().filter(|(p, _)| *p == part).map(|(_, s)| s.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            of(Part::Expand),
+            ["ALTER TABLE b ADD COLUMN id bigserial NOT NULL;", "ALTER TABLE b ADD CONSTRAINT b_pkey PRIMARY KEY (id);"]
+        );
+        assert_eq!(of(Part::Contract), ["ALTER TABLE b ADD CONSTRAINT b_owner_key UNIQUE (owner);"]);
+    }
+
     #[test]
     fn a_plan_splits_into_what_adds_and_what_drops_or_tightens() {
         use super::{plan_migration, Part, Thing};

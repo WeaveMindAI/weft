@@ -52,7 +52,7 @@ async fn bad_limit(rig: FakeRig) -> WeftResult<()> {
         assert!(err.contains("1 to 200"), "{err}");
     }
     let err = rig.run(&ListRunsNode, json!({ "limit": 2.5 })).await.failure()?;
-    assert!(err.contains("whole number"), "{err}");
+    assert!(err.contains("'limit'"), "{err}");
     assert!(rig.program_calls().is_empty());
     Ok(())
 }

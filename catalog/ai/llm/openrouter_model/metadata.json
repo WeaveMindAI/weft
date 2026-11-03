@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[openrouter]",
       "required": true,
       "accepts": ["wire"],
       "description": "The OpenRouter connection: wire an OpenRouter Access node's `access`."
@@ -67,7 +67,7 @@
         "kind": "all",
         "of": [
           { "kind": "not", "of": { "kind": "input_wired", "port": "model" } },
-          { "kind": "not", "of": { "kind": "config_nonempty", "field": "model" } }
+          { "kind": "not", "of": { "kind": "value", "field": "model", "nonempty": true } }
         ]
       },
       "then": {

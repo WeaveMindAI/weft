@@ -130,8 +130,9 @@ scripts/run-e2e.sh [name]               # the end-to-end suite
 
 The node one goes package by package and stops at the first failure. If you
 want to pick up where it stopped, `--from <name>` starts the suite at that
-package. If you want every package at once, pass `--parallel`, or
-`--parallel N` for batches of N.
+package. If you want them all in one go, pass `--parallel`: one build, then
+every package side by side, or up to N at once with `--parallel N`. It does
+not stop at a failure: every package runs.
 
 If another end-to-end run is already going on this machine, from any
 checkout, yours waits for it to finish.

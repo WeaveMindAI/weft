@@ -43,6 +43,9 @@ use serde_json::Value;
 use crate::error::WeftResult;
 use crate::signal::{Backpressure, DataType, ErrorMode, LiveConnectionConfig, Protocol};
 
+mod wire;
+pub use wire::{link_files, Format, Taken};
+
 /// What the caller sent to OPEN the exchange, as the worker's door
 /// (`weft_engine::door`) saw it: the method, path, query and headers of
 /// their call, the route's captures and the gate's verdict. One shape for

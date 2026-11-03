@@ -1,7 +1,7 @@
 //! Layer-3 contract tests for `caller_auth::verify_caller`: the real
 //! check against a REAL Postgres holding a stored connection, so the
-//! whole chain (tenant wall, the recipe's `verify` block, the stored
-//! material, the scheme) runs end to end. The identity-token scheme
+//! whole chain (tenant wall, the connection's service, the stored
+//! material, the route's own check) runs end to end. The identity-token scheme
 //! needs an issuer's published keys over the network, so only what it
 //! refuses before any fetch is covered here; the shared-key and HMAC
 //! schemes are covered whole.
@@ -12,6 +12,8 @@ use weft_task_store::db::Pool;
 use weft_access_store::connect_direct;
 use weft_broker::caller_auth::{verify_caller, CallerRefusal, HeldVerifiers};
 use weft_broker_client::protocol::CallerVerifyRequest;
+use weft_core::access::callers::{named_check, CallerScheme};
+use weft_core::access::events::VerifyKind;
 use weft_core::access::spec::Door;
 use weft_core::access::wire::ConnectDirect;
 use weft_core::AccessSpec;
@@ -28,18 +30,9 @@ fn verifiers() -> std::sync::Arc<HeldVerifiers> {
     HeldVerifiers::unfollowed(16, |_| true)
 }
 
-/// The shape of a shipped auth access node's recipe: pasted fields, no
-/// test call (a verifier never dials out), a `verify` block.
-fn auth_spec(service: &str, fields: &[&str], verify: serde_json::Value) -> AccessSpec {
-    serde_json::from_value(json!({
-        "service": service,
-        "acquisition": {
-            "kind": "static",
-            "fields": fields.iter().map(|f| json!({ "name": f })).collect::<Vec<_>>()
-        },
-        "verify": verify
-    }))
-    .expect("a valid auth recipe")
+/// A route's check, as its `auth` writes it.
+fn check(record: serde_json::Value) -> VerifyKind {
+    serde_json::from_value(record).expect("a valid check")
 }
 
 async fn store(pool: &Pool, tenant: &str, spec: AccessSpec, values: &[(&str, &str)]) -> String {
@@ -66,7 +59,7 @@ async fn store(pool: &Pool, tenant: &str, spec: AccessSpec, values: &[(&str, &st
 fn request(
     tenant: &str,
     access_id: &str,
-    service: &str,
+    verify: &VerifyKind,
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> CallerVerifyRequest {
@@ -75,7 +68,8 @@ fn request(
         tenant: tenant.into(),
         access_id: access_id.into(),
         for_instance: None,
-        service: service.into(),
+        service: CallerScheme::of(verify).expect("a caller check").service().into(),
+        verify: verify.clone(),
         method: "POST".into(),
         path: "chat/room7".into(),
         url: Some("https://acme.example/chat/room7".into()),
@@ -98,23 +92,33 @@ fn refused(r: Result<weft_broker_client::protocol::CallerVerified, CallerRefusal
 #[weft_db_macros::test]
 async fn a_stored_key_admits_and_names_which_one(pool: Pool) {
     schema(&pool).await;
-    let spec = auth_spec("api_key_auth", &["keys"], json!({ "kind": "api_keys" }));
-    let id = store(&pool, TENANT, spec, &[("keys", "first-key\nsecond-key\n")]).await;
+    let keys = named_check("api_keys").unwrap().verify();
+    let id = store(&pool, TENANT, CallerScheme::ApiKeys.recipe(), &[("keys", "first-key\nsecond-key\n")]).await;
 
-    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, "api_key_auth", &[("x-api-key", "second-key")], b""), 0)
+    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, &keys, &[("x-api-key", "second-key")], b""), 0)
         .await
         .expect("the second key verifies");
     assert_eq!(ok.identity, json!({ "key": 1 }));
     assert_eq!(ok.credential_headers, ["X-Api-Key", "authorization"], "the run never writes the key down");
-    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, "api_key_auth", &[("authorization", "Bearer first-key")], b""), 0)
+    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, &keys, &[("authorization", "Bearer first-key")], b""), 0)
         .await
         .expect("the bearer slot works");
     assert_eq!(ok.identity, json!({ "key": 0 }));
 
-    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, "api_key_auth", &[("x-api-key", "nope")], b""), 0).await);
+    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, &keys, &[("x-api-key", "nope")], b""), 0).await);
     assert!(why.contains("does not match"), "{why}");
-    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, "api_key_auth", &[], b""), 0).await);
+    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, &keys, &[], b""), 0).await);
     assert!(why.contains("X-Api-Key"), "{why}");
+
+    // The same connection under a route that reads its key elsewhere: the
+    // route's check decides, the connection only holds the keys.
+    let team = check(json!({ "kind": "api_keys", "header": "X-Team-Key", "bearer": false }));
+    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, &team, &[("x-team-key", "first-key")], b""), 0)
+        .await
+        .expect("the route's own header verifies");
+    assert_eq!(ok.credential_headers, ["X-Team-Key"]);
+    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, &team, &[("authorization", "Bearer first-key")], b""), 0).await);
+    assert!(why.contains("X-Team-Key"), "{why}");
 }
 
 /// An HMAC over the exact body with the connection's secret verifies
@@ -128,17 +132,18 @@ async fn a_signed_body_admits_with_the_stored_secret(pool: Pool) {
         "timestamp": { "in": "header:X-Timestamp" },
         "concat": "{timestamp}.{body}"
     });
-    let spec = auth_spec("hmac_auth", &["signingSecret"], verify.clone());
-    let id = store(&pool, TENANT, spec, &[("signingSecret", "s3cret")]).await;
+    assert_eq!(check(verify.clone()), named_check("hmac_sha256").unwrap().verify(), "plain hmac is this layout");
+    let id = store(&pool, TENANT, CallerScheme::Hmac.recipe(), &[("signingSecret", "s3cret")]).await;
     let now = 1_700_000_000;
     let body = br#"{"text":"hi"}"#;
     let signature = sign(&verify, "s3cret", Some("1700000000"), body, &[], None);
     let headers = [("x-signature", signature.as_str()), ("x-timestamp", "1700000000")];
-    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, "hmac_auth", &headers, body), now)
+    let hmac = check(verify);
+    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, &hmac, &headers, body), now)
         .await
         .expect("a genuine signature verifies");
     assert_eq!(ok.identity, json!({}));
-    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, "hmac_auth", &headers, b"{}"), now).await);
+    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, &hmac, &headers, b"{}"), now).await);
     assert!(why.contains("does not match"), "{why}");
 }
 
@@ -168,21 +173,17 @@ fn sign(
 #[weft_db_macros::test]
 async fn a_route_gated_by_a_url_signing_scheme_verifies_the_address_called(pool: Pool) {
     schema(&pool).await;
-    let spec = auth_spec(
-        "twilio_auth",
-        &["signingSecret"],
-        json!({
-            "kind": "hmac",
-            "signature": { "in": "header:X-Twilio-Signature" },
-            "concat": "{url}{sorted_form_params}",
-            "algorithm": "sha1",
-            "encoding": "base64"
-        }),
-    );
-    let id = store(&pool, TENANT, spec, &[("signingSecret", "12345")]).await;
+    let twilio = check(json!({
+        "kind": "hmac",
+        "signature": { "in": "header:X-Twilio-Signature" },
+        "concat": "{url}{sorted_form_params}",
+        "algorithm": "sha1",
+        "encoding": "base64"
+    }));
+    let id = store(&pool, TENANT, CallerScheme::Hmac.recipe(), &[("signingSecret", "12345")]).await;
     let body = b"CallSid=CA1234567890ABCDE&Digits=1234&From=%2B14158675309&To=%2B18005551212&Caller=%2B14158675309";
     let headers = [("x-twilio-signature", "RSOYDt4T1cUTdK1PDd93/VVr8B8=")];
-    let mut req = request(TENANT, &id, "twilio_auth", &headers, body);
+    let mut req = request(TENANT, &id, &twilio, &headers, body);
     req.url = Some("https://mycompany.com/myapp.php?foo=1&bar=2".into());
     let ok = verify_caller(&verifiers(), &pool, &req, 0).await.expect("the address called verifies");
     assert_eq!(ok.identity, json!({}));
@@ -195,35 +196,31 @@ async fn a_route_gated_by_a_url_signing_scheme_verifies_the_address_called(pool:
     assert!(why.contains("public receiver address"), "{why}");
 }
 
-/// The Standard Webhooks scheme (Svix, Resend, Whop), as a node author
-/// declares it in their own access node, gating a Route, against the
+/// The Standard Webhooks scheme (Svix, Resend, Whop), as a Route's `auth`
+/// record writes it, against the
 /// reference library's own vector; a signature header sent twice gives
 /// the gate every value, so the right one verifies whichever copy
 /// carries it.
 #[weft_db_macros::test]
 async fn a_standard_webhooks_signature_admits_from_any_header_copy(pool: Pool) {
     schema(&pool).await;
-    let spec = auth_spec(
-        "standard_webhook_auth",
-        &["signingSecret"],
-        json!({
-            "kind": "hmac",
-            "signature": { "in": "header:webhook-signature", "list": " ", "pair": ",", "key": "v1" },
-            "timestamp": { "in": "header:webhook-timestamp" },
-            "concat": "{header:webhook-id}.{timestamp}.{body}",
-            "secret": { "stripPrefix": "whsec_", "decode": "base64" },
-            "encoding": "base64"
-        }),
-    );
-    spec.validate().expect("the recipe is valid");
-    let id = store(&pool, TENANT, spec, &[("signingSecret", "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw")]).await;
+    let record = json!({
+        "kind": "hmac",
+        "signature": { "in": "header:webhook-signature", "list": " ", "pair": ",", "key": "v1" },
+        "timestamp": { "in": "header:webhook-timestamp" },
+        "concat": "{header:webhook-id}.{timestamp}.{body}",
+        "secret": { "stripPrefix": "whsec_", "decode": "base64" },
+        "encoding": "base64"
+    });
+    let standard = weft_core::access::callers::parse_auth(Some(&record)).expect("a valid auth").expect("a check");
+    let id = store(&pool, TENANT, CallerScheme::Hmac.recipe(), &[("signingSecret", "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw")]).await;
     let body = br#"{"test": 2432232314}"#;
     let ts = 1614265330;
     let base = [("webhook-id", "msg_p5jXN8AQM9LWM0D4loKWxJek"), ("webhook-timestamp", "1614265330")];
     let with = |signatures: &[&str]| {
         let mut h: Vec<(&str, &str)> = base.to_vec();
         h.extend(signatures.iter().map(|s| ("webhook-signature", *s)));
-        request(TENANT, &id, "standard_webhook_auth", &h, body)
+        request(TENANT, &id, &standard, &h, body)
     };
     let ok = verify_caller(&verifiers(), &pool, &with(&["v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE="]), ts)
         .await
@@ -239,49 +236,50 @@ async fn a_standard_webhooks_signature_admits_from_any_header_copy(pool: Pool) {
     assert!(why.contains("replay"), "{why}");
 }
 
-/// The tenant wall, a wrong service, and a service with no `verify`
-/// block all refuse (a failure of ours is the only non-refusal).
+/// The tenant wall and a connection of another service refuse; a check
+/// that does not read the service it names, or cannot check a caller, is
+/// the asker's mistake (a failure of ours is the only other answer).
 #[weft_db_macros::test]
-async fn the_wall_the_service_and_a_missing_scheme_all_refuse(pool: Pool) {
+async fn the_wall_the_service_and_a_wrong_check_all_refuse(pool: Pool) {
     schema(&pool).await;
-    let spec = auth_spec("api_key_auth", &["keys"], json!({ "kind": "api_keys" }));
-    let id = store(&pool, TENANT, spec, &[("keys", "k")]).await;
+    let keys = named_check("api_keys").unwrap().verify();
+    let id = store(&pool, TENANT, CallerScheme::ApiKeys.recipe(), &[("keys", "k")]).await;
     let headers = [("x-api-key", "k")];
 
-    let why = refused(verify_caller(&verifiers(),&pool, &request("tenant-b", &id, "api_key_auth", &headers, b""), 0).await);
+    let why = refused(verify_caller(&verifiers(),&pool, &request("tenant-b", &id, &keys, &headers, b""), 0).await);
     assert!(why.contains("no such connection"), "{why}");
 
-    match verify_caller(&verifiers(),&pool, &request(TENANT, &id, "other_service", &headers, b""), 0).await {
-        Err(CallerRefusal::Failed(e)) => assert!(format!("{e:#}").contains("other_service"), "{e:#}"),
+    // An hmac check against the api_keys connection: the store refuses a
+    // connection of another service than the one asked for.
+    let hmac = named_check("hmac_sha256").unwrap().verify();
+    match verify_caller(&verifiers(),&pool, &request(TENANT, &id, &hmac, &headers, b""), 0).await {
+        Err(CallerRefusal::Failed(e)) => assert!(format!("{e:#}").contains("hmac_auth"), "{e:#}"),
         other => panic!("a wrong service is a loud failure, got {other:?}"),
     }
 
-    let plain: AccessSpec = serde_json::from_value(json!({
-        "service": "plain",
-        "acquisition": { "kind": "static", "fields": [{ "name": "token" }] }
-    }))
-    .unwrap();
-    let plain_id = store(&pool, TENANT, plain, &[("token", "t")]).await;
-    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &plain_id, "plain", &headers, b""), 0).await);
-    assert!(why.contains("no `verify` block"), "{why}");
+    let mut mismatched = request(TENANT, &id, &keys, &headers, b"");
+    mismatched.service = "hmac_auth".into();
+    match verify_caller(&verifiers(),&pool, &mismatched, 0).await {
+        Err(CallerRefusal::Malformed(why)) => assert!(why.contains("api_keys") && why.contains("hmac_auth"), "{why}"),
+        other => panic!("a check naming another service is the asker's mistake, got {other:?}"),
+    }
+    let mut echo = request(TENANT, &id, &keys, &headers, b"");
+    echo.verify = check(json!({ "kind": "token_echo" }));
+    match verify_caller(&verifiers(),&pool, &echo, 0).await {
+        Err(CallerRefusal::Malformed(why)) => assert!(why.contains("token_echo"), "{why}"),
+        other => panic!("a check that cannot check a caller is the asker's mistake, got {other:?}"),
+    }
 
-    match verify_caller(&verifiers(),&pool, &request(TENANT, "not-a-uuid", "api_key_auth", &headers, b""), 0).await {
+    match verify_caller(&verifiers(),&pool, &request(TENANT, "not-a-uuid", &keys, &headers, b""), 0).await {
         Err(CallerRefusal::Malformed(why)) => assert!(why.contains("not-a-uuid"), "{why}"),
         other => panic!("a malformed id is the asker's mistake, got {other:?}"),
     }
 }
 
-/// An identity-token gate, as a node author declares it in their own
-/// access node: the connection stores the issuer, its key address and the
-/// audience.
+/// An identity-token gate (`auth: "oidc"`): the connection stores the
+/// issuer, its key address and the audience.
 fn jwt_spec() -> AccessSpec {
-    let spec = auth_spec(
-        "jwt_auth",
-        &["issuer", "jwksUrl", "audience"],
-        json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwksUrl": "{jwksUrl}" }),
-    );
-    spec.validate().expect("the recipe is valid");
-    spec
+    CallerScheme::Oidc.recipe()
 }
 
 /// A JWT gate needs an audience: the issuer signs tokens for every app it
@@ -322,7 +320,7 @@ async fn a_jwt_gate_with_an_http_key_address_is_refused(pool: Pool) {
     let values = [("issuer", "https://auth.example"), ("jwksUrl", "http://auth.example/jwks.json"), ("audience", "my-app")];
     let id = store(&pool, TENANT, jwt_spec(), &values).await;
     let why = refused(
-        verify_caller(&verifiers(), &pool, &request(TENANT, &id, "jwt_auth", &[("authorization", "Bearer a.b.c")], b""), 0).await,
+        verify_caller(&verifiers(), &pool, &request(TENANT, &id, &named_check("oidc").unwrap().verify(), &[("authorization", "Bearer a.b.c")], b""), 0).await,
     );
     assert!(why.contains("not an https:// address"), "{why}");
 }

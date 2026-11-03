@@ -1,10 +1,12 @@
 //! ElevenLabsVideoFromReferences self-tests: how each model takes the
 //! reference material (Veo with a role per image, Seedance plain), the
-//! style images refused before anything is sent to a model that has no
-//! roles, the stored video, and the two ways a generation fails.
+//! stored video, and the two ways a generation fails. Style images on a
+//! model with no roles are refused by a metadata rule, which this rig
+//! does not run.
 
 use serde_json::{json, Value};
 
+use weft::signal::SendWhen;
 use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
 use crate::testing::{completes, create_body, emitted_file, fails, inline};
@@ -15,8 +17,7 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("veo_sends_subjects_and_styles_with_their_roles", veo_roles),
         NodeTest::fake("seedance_sends_subjects_clips_and_sounds_plain", seedance_plain),
-        NodeTest::fake("a_clip_that_cannot_go_inline_is_a_temporary_asset_deleted_after", clip_through_an_asset),
-        NodeTest::fake("styles_on_a_model_other_than_veo_are_refused_before_anything_is_sent", styles_refused),
+        NodeTest::fake("a_clip_that_cannot_go_inline_is_a_temporary_asset_weft_deletes_after", clip_through_an_asset),
         NodeTest::fake("a_failed_generation_fails_with_elevenlabs_reason", failed),
         NodeTest::fake("a_failed_generation_comes_out_on_error_when_it_is_wired", failed_caught),
         NodeTest::fake("a_refused_create_quotes_elevenlabs_and_never_waits", refused),
@@ -101,11 +102,10 @@ async fn seedance_plain(rig: FakeRig) -> WeftResult<()> {
 }
 
 /// A clip in a container ElevenLabs does not take inline (Matroska)
-/// goes up as a temporary asset, and is deleted once the job has ended.
+/// goes up as a temporary asset, whose delete weft owes once the node ends.
 async fn clip_through_an_asset(rig: FakeRig) -> WeftResult<()> {
     completes(&rig, "video", "r5", "video/mp4", b"mp4");
     rig.respond("POST", "/v1/assets", json!({ "asset_id": "a9" }));
-    rig.respond_status("DELETE", "/v1/assets/a9", 204, Value::Null);
     let clip = rig.store_file("dance.mkv", "video/x-matroska", b"mkv".to_vec());
     rig.run(
         &ElevenLabsVideoFromReferencesNode,
@@ -114,27 +114,10 @@ async fn clip_through_an_asset(rig: FakeRig) -> WeftResult<()> {
     .await
     .ok()?;
     assert_eq!(create_body(&rig)["videos"], json!([{ "type": "asset", "asset_id": "a9" }]));
-    let order: Vec<(String, String)> = rig.requests().into_iter().map(|r| (r.method, r.path)).collect();
-    let create = order.iter().position(|(m, p)| m == "POST" && p == "/v1/flows/video").expect("a create");
-    let delete = order.iter().position(|(m, p)| m == "DELETE" && p == "/v1/assets/a9").expect("the asset is deleted");
-    assert!(delete > create, "the clip outlives the create it was uploaded for: {order:?}");
-    Ok(())
-}
-
-async fn styles_refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    let paint = rig.store_file("watercolor.png", "image/png", b"watercolor".to_vec());
-    let err = rig
-        .run(
-            &ElevenLabsVideoFromReferencesNode,
-            inputs(&rig, json!({ "model": "bytedance-seedance-v2", "styles": [paint] })),
-        )
-        .await
-        .failure()?;
-    assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {err}");
-    assert!(err.contains("`styles`"), "{err}");
-    assert!(err.contains("bytedance-seedance-v2"), "the error names the model: {err}");
-    assert!(rig.requests().is_empty(), "nothing is uploaded or sent");
+    let owed = rig.owed_calls();
+    assert_eq!(owed.len(), 1, "{owed:?}");
+    assert!(owed[0].0.url.ends_with("/v1/assets/a9"), "{}", owed[0].0.url);
+    assert_eq!(owed[0].0.when, SendWhen::Always, "weft deletes the asset however the node ends");
     Ok(())
 }
 

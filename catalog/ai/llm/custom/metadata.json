@@ -49,7 +49,7 @@
   "inputs": [
     {
       "name": "connection",
-      "type": "Access",
+      "type": "Access[custom_llm]",
       "widget": {
         "kind": "access"
       },
@@ -87,6 +87,7 @@
     }
   ],
   "validate": [
+    { "when": { "kind": "input_wired", "port": "connection" }, "then": { "message": "CustomProvider '{id}' picks its own connection on `connection`, and no access node holds a custom endpoint's key: pick the connection on the node instead of wiring one in", "port": "connection" } },
     {
       "when": {
         "kind": "all",
@@ -101,8 +102,9 @@
           {
             "kind": "not",
             "of": {
-              "kind": "config_nonempty",
-              "field": "baseUrl"
+              "kind": "value",
+              "field": "baseUrl",
+              "nonempty": true
             }
           }
         ]
@@ -127,8 +129,9 @@
           {
             "kind": "not",
             "of": {
-              "kind": "config_nonempty",
-              "field": "model"
+              "kind": "value",
+              "field": "model",
+              "nonempty": true
             }
           }
         ]
@@ -144,15 +147,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "baseUrl"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "baseUrl",
-              "regex": "(?i)^https?://"
+              "matches": "(?i)^https?://"
             }
           }
         ]

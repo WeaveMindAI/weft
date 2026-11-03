@@ -11,7 +11,6 @@ use super::SlackAwaitActionNode;
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("posts_parks_and_delivers_the_decision", full_flow),
-        NodeTest::fake("empty_buttons_refuse_before_posting", empty_buttons),
         NodeTest::fake("a_resumed_body_posts_nothing_and_waits_on_the_same_id", resumed),
     ]
 }
@@ -59,24 +58,6 @@ async fn full_flow(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(retire["ts"], json!("1.2"), "the retire targets the posted message");
     let retired_text = retire["text"].as_str().expect("retire text");
     assert!(retired_text.contains("Approve"), "the decision is written back: {retired_text}");
-    Ok(())
-}
-
-async fn empty_buttons(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig
-        .run(
-            &SlackAwaitActionNode,
-            json!({
-                "account": rig.access("slack"),
-                "channel": "C1",
-                "text": "Ship it?",
-                "buttons": [],
-            }),
-        )
-        .await;
-    let err = outcome.result.expect_err("empty buttons must refuse").to_string();
-    assert!(err.contains("non-empty"), "{err}");
-    assert!(rig.requests().is_empty(), "nothing was posted");
     Ok(())
 }
 

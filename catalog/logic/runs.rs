@@ -3,35 +3,27 @@
 //! reach the same runs for the same inputs.
 
 use weft::context::RunQuery;
-use weft::{RunContext, WeftError, WeftResult};
+use weft::{RunContext, WeftResult};
 
-/// `ctx.runs()` narrowed by every filter input the node was given. An
-/// empty text input narrows nothing. The tag is read the way `TagRun`
-/// writes it, so the same value finds the runs `TagRun` tagged with it.
+/// `ctx.runs()` narrowed by every filter input the node was given. The
+/// tag is read the way `TagRun` writes it, so the same value finds the
+/// runs `TagRun` tagged with it.
 pub fn runs_from_inputs(ctx: &RunContext) -> WeftResult<RunQuery<'_>> {
-    let text = |name: &str| -> WeftResult<Option<String>> {
-        Ok(ctx.inputs.opt::<String>(name)?.filter(|s| !s.trim().is_empty()))
-    };
     let mut query = ctx.runs();
-    if let Some(instance) = text("instance")? {
+    if let Some(instance) = ctx.inputs.opt::<String>("instance")? {
         query = query.instance(instance);
     }
-    if let Some(status) = text("status")? {
+    if let Some(status) = ctx.inputs.opt::<String>("status")? {
         query = query.status(&status)?;
     }
-    if let Some(node) = text("node")? {
+    if let Some(node) = ctx.inputs.opt::<String>("node")? {
         query = query.node(node);
     }
-    if let Some(tag) = text("tag")? {
+    if let Some(tag) = ctx.inputs.opt::<String>("tag")? {
         query = query.tag(&tag)?;
     }
-    if let Some(secs) = ctx.inputs.opt::<f64>("olderThanSecs")? {
-        if !(secs >= 0.0) || secs.fract() != 0.0 {
-            return Err(WeftError::Input(format!(
-                "olderThanSecs is an age in whole seconds, so it cannot be {secs}"
-            )));
-        }
-        query = query.older_than(std::time::Duration::from_secs(secs as u64));
+    if let Some(secs) = ctx.inputs.opt::<u64>("olderThanSecs")? {
+        query = query.older_than(std::time::Duration::from_secs(secs));
     }
     Ok(query)
 }

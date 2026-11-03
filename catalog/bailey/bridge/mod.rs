@@ -37,7 +37,7 @@ impl Node for BaileyBridgeNode {
     ) -> WeftResult<InfraSpec> {
         // The machine, as the node's settings size it; the cloud picks
         // its cheapest that holds it.
-        let machine = MachineShape { cpu: input.opt("cpu")?, memory: input.opt("memory")?, kind: input.opt::<String>("machineType")?.filter(|t| !t.trim().is_empty()), gpu: None };
+        let machine = MachineShape::from_inputs(&input)?;
         // One unit, one copy: WhatsApp's session cannot tolerate two
         // bridges at once, and a unit never runs beside its own next
         // version.

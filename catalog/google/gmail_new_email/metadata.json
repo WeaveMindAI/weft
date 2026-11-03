@@ -1,7 +1,7 @@
 {
   "type": "GmailNewEmail",
   "label": "Gmail: On New Email",
-  "description": "Fires once per new Gmail message matching a search query (e.g. 'label:inbox -from:me', 'has:attachment invoice'), carrying the decomposed message with attachments. Starts from the mailbox as it is at activation; older mail never replays. Each poll reads up to 500 messages, so a burst larger than that within one interval fires only its newest 500. The body is cut at `maxBodyChars` (50,000 by default), and shorter if it would still weigh more than the 100 KB a wire carries; `bodyTruncated` says when.",
+  "description": "Fires once per new Gmail message matching a search query (e.g. 'label:inbox -from:me', 'has:attachment invoice'), carrying the decomposed message with attachments. Starts from the mailbox as it is at activation; older mail never replays. Each poll reads Gmail's pages of 500 until it reaches a message it has already seen, so a burst bigger than a page still fires every message; more than 50 pages of new mail within one interval fails that poll and fires nothing, so a trigger that falls that far behind needs a shorter interval. The body is cut at `maxBodyChars` (50,000 by default), and shorter if it would still weigh more than the 100 KB a wire carries; `bodyTruncated` says when.",
   "tags": [
     "google",
     "gmail",
@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[google]", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/gmail.readonly"

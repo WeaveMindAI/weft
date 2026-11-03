@@ -27,7 +27,7 @@ impl Node for FetchPageNode {
         let url: String = ctx.inputs.get("url")?;
         let only_main: bool = ctx.inputs.get("onlyMainContent")?;
         // `maxChars` declares a metadata default, so the bag holds it.
-        let max_chars: f64 = ctx.inputs.get("maxChars")?;
+        let max_chars: usize = ctx.inputs.get("maxChars")?;
 
         let http = ctx.client(&access).await?;
         let answer = super::firecrawl::call(
@@ -47,7 +47,7 @@ impl Node for FetchPageNode {
             .pointer("/data/markdown")
             .and_then(Value::as_str)
             .node_err("firecrawl: the scrape succeeded but its answer carries no markdown")?;
-        let (markdown, truncated) = weft::storage::cap_text(markdown, max_chars as usize);
+        let (markdown, truncated) = weft::storage::cap_text(markdown, max_chars);
         // A title is genuinely optional (many pages have none).
         let title = answer
             .pointer("/data/metadata/title")

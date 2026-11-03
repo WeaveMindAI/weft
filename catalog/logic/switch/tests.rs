@@ -19,10 +19,10 @@ pub fn tests() -> Vec<NodeTest> {
     ]
 }
 
-/// The metadata's spec list and `Test::read`'s kind match are the same
+/// The metadata's spec list and `Test`'s variants are the same
 /// list in two files (the JSON side cannot carry the SYNC marker), so
 /// this walks the manifest and reads a minimal entry of every declared
-/// kind: a spec added to metadata.json without a `read` arm fails HERE,
+/// kind: a spec added to metadata.json without a `Test` variant fails HERE,
 /// when the metadata is edited, instead of mid-run on the first
 /// firing that takes the new branch.
 async fn metadata_kinds_covered(rig: FakeRig) -> WeftResult<()> {

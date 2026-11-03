@@ -378,7 +378,7 @@ step changes.
 Each install keeps its own connections and its own picks of them: which
 connection each access node uses is picked on the install, never written in
 the source. A node connected on this machine has no pick on prod until one
-is made there: `weft connect --on prod --node <node> --list` shows prod's
+is made there: `weft connect <node> --on prod --list` shows prod's
 stored connections, `--grant <id>` picks one (a live trigger reading it is
 set up again).
 
@@ -394,11 +394,10 @@ A connection prod does not hold yet is added one of three ways:
   `weft` loads the project's `.env.local` and `.env` into its own
   environment when it starts in the project folder, so the value goes from
   the file to the install and never through the chat:
-  `weft connect --on prod --node <node> --door own --set-env <field>=<VARIABLE>`,
+  `weft connect <node> --on prod --door own --set-env <field>=<VARIABLE>`,
   run from the project folder as it is, with nothing in front of it.
 - **A person's own account** (a sign-in, a key a provider gave the user):
-  the user adds it, with the command you hand them (`weft connect --on prod
-  --node <node>`).
+  the user adds it, with the command you hand them (`weft connect <node> --on prod`).
 
 A run on prod that reaches a node with nothing picked there is refused
 before it starts, naming that command.

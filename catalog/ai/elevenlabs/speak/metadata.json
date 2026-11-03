@@ -14,7 +14,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[elevenlabs]", "accepts": ["wire"],
       "required": true,
       "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
     },
@@ -248,9 +248,9 @@
   "validate": [
     {
       "when": {
-        "kind": "config_matches",
+        "kind": "value",
         "field": "model",
-        "regex": "^eleven_v[34]"
+        "matches": "^eleven_v[34]"
       },
       "then": {
         "message": "ElevenLabsSpeak '{id}' picks a v3 or v4 `model`, and ElevenLabs's streaming text to speech socket takes neither: pick a Flash or Multilingual v2 `model`, or speak v3 and v4 with ElevenLabsSpeakFile.",
@@ -266,7 +266,7 @@
             "port": "languageCode"
           },
           {
-            "kind": "config_equals",
+            "kind": "value",
             "field": "model",
             "equals": "eleven_multilingual_v2"
           }
@@ -282,22 +282,16 @@
         "kind": "all",
         "of": [
           {
-            "kind": "input_satisfied",
-            "port": "chunkLengthSchedule"
+            "kind": "value",
+            "field": "chunkLengthSchedule",
+            "nonempty": true
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_equals",
+              "kind": "value",
               "field": "autoMode",
               "equals": false
-            }
-          },
-          {
-            "kind": "not",
-            "of": {
-              "kind": "input_wired",
-              "port": "autoMode"
             }
           }
         ]
@@ -316,15 +310,31 @@
             "port": "alignment"
           },
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "outputFormat",
-            "regex": "^(mp3|opus|wav)_"
+            "matches": "^(mp3|opus|wav)_"
           }
         ]
       },
       "then": {
         "message": "ElevenLabsSpeak '{id}' wires `alignment`, which places each character on the whole speech by counting the audio bytes before it, and only the pcm, ulaw and alaw formats pin that down exactly: pick one of those for `outputFormat`, or leave `alignment` unwired.",
         "port": "outputFormat"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "value", "field": "chunkLengthSchedule" },
+          {
+            "kind": "not",
+            "of": { "kind": "value", "field": "chunkLengthSchedule", "each": { "range": { "min": 50, "max": 500 } } }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsSpeak '{id}' has a `chunkLengthSchedule` number outside 50 to 500, and ElevenLabs takes each number of characters between 50 and 500: keep each one in that range.",
+        "port": "chunkLengthSchedule"
       }
     }
   ],

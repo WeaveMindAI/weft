@@ -19,12 +19,12 @@
         "kind": "any",
         "of": [
           {
-            "kind": "config_equals",
+            "kind": "value",
             "field": "step",
             "equals": 0
           },
           {
-            "kind": "config_equals",
+            "kind": "value",
             "field": "step",
             "equals": 0.0
           }

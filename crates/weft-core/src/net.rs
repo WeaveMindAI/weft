@@ -16,7 +16,9 @@
 //! shows storage, which the link's signature must match. A file link
 //! itself never is: the broker picks its address.
 //!
-//! OUTBOUND HTTP: [`EmptyBody`], for a call that sends nothing.
+//! OUTBOUND HTTP: [`EmptyBody`], for a call that sends nothing, and
+//! [`with_body_stream`], for a client layer that reads an answer's body
+//! through a stream of its own.
 
 use std::sync::Arc;
 
@@ -291,6 +293,73 @@ pub trait EmptyBody {
 impl EmptyBody for reqwest::RequestBuilder {
     fn empty_body(self) -> Self {
         self.header(reqwest::header::CONTENT_LENGTH, 0)
+    }
+}
+
+/// What an answer's body becomes when a client layer reads it through a
+/// stream of its own.
+pub type BodyChunks = futures::stream::BoxStream<'static, reqwest::Result<bytes::Bytes>>;
+
+/// `resp` with its body read through what `body` makes of its chunks:
+/// the ONE way a client layer (a run's cancellation, a metered call's
+/// tap) puts a stream between a caller and the answer. The status,
+/// version, URL, headers and extensions are kept, and so is the size the
+/// answer stated: `Response::content_length` answers on the rebuilt
+/// response exactly what it answered on `resp` (the `Content-Length` of
+/// an uncompressed answer, `None` when the server sent none).
+pub fn with_body_stream<S, E>(mut resp: reqwest::Response, body: impl FnOnce(BodyChunks) -> S) -> reqwest::Response
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+{
+    use reqwest::ResponseBuilderExt;
+    let size = resp.content_length();
+    let url = resp.url().clone();
+    let status = resp.status();
+    let version = resp.version();
+    let headers = std::mem::take(resp.headers_mut());
+    let extensions = std::mem::take(resp.extensions_mut());
+    let chunks = body(Box::pin(resp.bytes_stream()));
+    let sized = SizedBody { chunks: std::sync::Mutex::new(Box::pin(chunks)), size };
+    let mut rebuilt = http::Response::builder()
+        .status(status)
+        .version(version)
+        .url(url)
+        .body(reqwest::Body::wrap(sized))
+        .expect("parts taken from a response make a response");
+    *rebuilt.headers_mut() = headers;
+    rebuilt.extensions_mut().extend(extensions);
+    reqwest::Response::from(rebuilt)
+}
+
+/// A body read from a stream of chunks that states the size it was given.
+/// The stream sits in a mutex only because a request body must be `Sync`:
+/// it is reached through `&mut self` alone, so the lock is never taken.
+struct SizedBody<S> {
+    chunks: std::sync::Mutex<std::pin::Pin<Box<S>>>,
+    size: Option<u64>,
+}
+
+impl<S, E> http_body::Body for SizedBody<S>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>>,
+{
+    type Data = bytes::Bytes;
+    type Error = E;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<bytes::Bytes>, E>>> {
+        let chunks = self.get_mut().chunks.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
+        futures::Stream::poll_next(chunks.as_mut(), cx).map(|chunk| chunk.map(|read| read.map(http_body::Frame::data)))
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self.size {
+            Some(size) => http_body::SizeHint::with_exact(size),
+            None => http_body::SizeHint::default(),
+        }
     }
 }
 

@@ -27,10 +27,9 @@ use serde_json::{json, Value};
 
 use weft::bus::BusOptions;
 use weft::context::PendingBus;
-use weft::signal::poll_endpoint::MIN_POLL_INTERVAL_SECS;
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::postgres::{connect_alone, connect_listening, mistake, plan, query_json, ListenEvent, Plan, WrittenBy};
+use super::postgres::{connect_alone, connect_listening, plan, query_json, ListenEvent, Plan, WrittenBy};
 
 #[derive(NodeManifest)]
 pub struct PostgresWatchQueryNode;
@@ -43,20 +42,11 @@ mod tests;
 pub fn watched(query: &str) -> WeftResult<(String, Vec<String>)> {
     match plan(query)? {
         Plan::Query { sql, names } => Ok((sql, names)),
-        Plan::Script { .. } | Plan::Steps(_) => mistake!(
+        Plan::Script { .. } | Plan::Steps(_) => weft::input_bail!(
             "a watched query is one statement (its result is what is kept live); this SQL \
              holds several. Keep the SELECT here and run the rest with Postgres: Query"
         ),
     }
-}
-
-/// The cadence as a duration, refusing what would hammer the database:
-/// the same floor every polling signal has.
-pub fn cadence(interval_secs: f64) -> WeftResult<std::time::Duration> {
-    if !interval_secs.is_finite() || interval_secs < MIN_POLL_INTERVAL_SECS as f64 {
-        mistake!("intervalSecs must be at least {MIN_POLL_INTERVAL_SECS}, got {interval_secs}");
-    }
-    Ok(std::time::Duration::from_secs_f64(interval_secs))
 }
 
 #[async_trait]
@@ -69,8 +59,8 @@ impl Node for PostgresWatchQueryNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let query: String = ctx.inputs.get("query")?;
-        let interval = cadence(ctx.inputs.get("intervalSecs")?)?;
-        let channel: Option<String> = ctx.inputs.opt::<String>("channel")?.filter(|c| !c.trim().is_empty());
+        let interval = std::time::Duration::from_secs(ctx.inputs.get::<u64>("intervalSecs")?);
+        let channel: Option<String> = ctx.inputs.opt("channel")?;
         let (sql, names) = watched(&query)?;
         let values: Vec<Value> = ctx
             .inputs

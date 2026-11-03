@@ -1,5 +1,5 @@
 //! All self-tests: the yes is unanimous, one `false` is the whole
-//! answer, and nothing wired is refused rather than silently true.
+//! answer. Nothing wired is refused by the node's rule, at compile time.
 //!
 //! The "an input closed" case is not here and cannot be: a closure on a
 //! required port skips the node, so the engine answers it before the
@@ -17,7 +17,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("every_input_agreeing_is_the_yes", unanimous),
         NodeTest::fake("one_false_closes_the_answer", one_false),
         NodeTest::fake("a_value_that_is_not_false_is_a_yes", not_a_boolean),
-        NodeTest::fake("nothing_wired_is_refused", nothing_wired),
     ]
 }
 
@@ -48,13 +47,5 @@ async fn not_a_boolean(rig: FakeRig) -> WeftResult<()> {
         .await
         .ok()?;
     assert_eq!(outcome.outputs["yes"], json!(true));
-    Ok(())
-}
-
-/// "All of nothing" is true in logic, and a gate permanently open for
-/// no visible reason in a graph.
-async fn nothing_wired(rig: FakeRig) -> WeftResult<()> {
-    let error = rig.run(&AllNode, json!({})).await.failure()?;
-    assert!(error.contains("nothing is wired"), "{error}");
     Ok(())
 }

@@ -11,7 +11,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[keenable]", "accepts": ["wire"],
       "description": "Optional: a KeenableAccess node, for an API key's higher rate limits. Leave unwired to fetch without a key, rate limited per IP."
     },
     {
@@ -54,15 +54,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "url"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "url",
-              "regex": "(?i)^https?://"
+              "matches": "(?i)^https?://"
             }
           }
         ]

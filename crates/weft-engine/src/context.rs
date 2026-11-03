@@ -394,12 +394,22 @@ impl RunClient for weft_broker_client::BrokerRunClient {
 
 /// What a firing writes about its run: the run's one handle on its record
 /// (its `crate::journal_writer::DriveJournal` on a worker, nothing around
-/// a node test, which has no run), and the spend still being worked out,
-/// which the run waits for before it ends (`crate::metering`).
+/// a node test, which has no run), the spend still being worked out,
+/// which the run waits for before it ends (`crate::metering`), and the
+/// calls its firings owe when they end (`crate::end_calls`).
 #[derive(Clone)]
 pub struct RunRecord {
     pub journal: Arc<dyn JournalClient>,
     pub costs: Arc<crate::metering::PendingCostRecords>,
+    pub owed: Arc<std::sync::Mutex<weft_journal::OwedCalls>>,
+}
+
+impl RunRecord {
+    /// A run's record written through `journal`, with nothing being worked
+    /// out and nothing owed yet.
+    pub fn new(journal: Arc<dyn JournalClient>) -> Self {
+        Self { journal, costs: crate::metering::PendingCostRecords::new(), owed: Default::default() }
+    }
 }
 
 /// Trait surface over `BrokerSteeringClient` so tests can inject a
@@ -1973,7 +1983,7 @@ impl RunnerHandle {
             per_instance: None,
             run_instance: None,
             declared_infra: Arc::new(weft_core::project::DeclaredInfra::default()),
-            buses: Default::default(),
+            buses: Arc::new(weft_core::bus::FiringBuses::default().cancelled_by(cancellation.clone())),
             baked_outputs: Default::default(),
             baked_emitted: Default::default(),
             infra_made: Default::default(),
@@ -2048,6 +2058,57 @@ impl RunnerHandle {
                     .to_string(),
             )
         })
+    }
+
+    /// `ctx.after_node(call, access)`: the node owes `call` when it
+    /// ends, sent through `access` (`None`: plain) as the call's `when`
+    /// says (`weft_core::signal::cancel_call`). On the run's record before
+    /// it answers, so a worker that picks the run up after a crash still
+    /// owes it. A body run again that registers the same call again owes
+    /// it once.
+    pub async fn after_node(
+        &self,
+        call: weft_core::signal::CancelCall,
+        access: Option<weft_core::primitive::AccessRef>,
+    ) -> WeftResult<()> {
+        call.validate().map_err(|why| WeftError::Input(format!("node '{}': {why}", self.place)))?;
+        let owes = |owed: &weft_journal::OwedCalls| owed.owes(&self.node_id, &self.node_frames, &call, &access);
+        if owes(&self.record.owed.lock().expect("owed calls poisoned")) {
+            return Ok(());
+        }
+        let event = RunEvent::EndCallOwed {
+            run_id: self.run_id,
+            node_id: self.node_id.clone(),
+            frames: self.node_frames.clone(),
+            call: call.clone(),
+            access: access.clone(),
+            at_unix: now_unix(),
+        };
+        self.record
+            .journal
+            .record_event(&event, Some(&self.worker_replica))
+            .await
+            .map_err(|e| WeftError::NodeFailed(format!("put the call this node owes when it ends on the run's record: {e:#}")))?;
+        self.record.owed.lock().expect("owed calls poisoned").owe(&self.node_id, &self.node_frames, &call, &access);
+        Ok(())
+    }
+
+    /// The firing ended: send the calls it owed that go out for how it
+    /// ended (a cancel when the run's cancel is tripped, any other end
+    /// otherwise), before its ending is written (`crate::end_calls`).
+    pub(crate) async fn settle_end_calls(&self) {
+        let owed = self.record.owed.lock().expect("owed calls poisoned").take(&self.node_id, &self.node_frames);
+        if owed.is_empty() {
+            return;
+        }
+        let sender = crate::end_calls::Sender {
+            clients: &self.clients,
+            journal: &self.record.journal,
+            replica: &self.worker_replica,
+            run_id: self.run_id,
+            instance: self.run_instance.as_ref(),
+        };
+        sender.send(owed, self.cancellation.is_cancelled(), |_| self.node_type.clone()).await;
     }
 
     /// Release every runtime-owned connection this firing opened (the
@@ -2226,7 +2287,7 @@ impl RunnerHandle {
         if let Some(saved) = &resume.saved {
             *self.counters.lock().expect("counters poisoned") = saved.counters;
             *self.resumed_helper.lock().expect("resumed helper poisoned") = saved.helper.clone();
-            self.buses = Arc::new(weft_core::bus::FiringBuses::resumed(saved.positions.buses.clone()));
+            self.buses = Arc::new(weft_core::bus::FiringBuses::resumed(saved.positions.buses.clone()).cancelled_by(self.cancellation.clone()));
             self.lock_port_claims().stream_items = saved.positions.yielded;
         }
         self.lock_port_claims().items_on_record = resume.items_on_record;
@@ -3047,6 +3108,7 @@ impl ContextHandle for RunnerHandle {
         scope: &weft_core::storage::StorageScope,
         identity: Option<&str>,
         url: &str,
+        mime: Option<&str>,
         filename: Option<&str>,
         keep: Option<weft_core::storage::KeepTtl>,
     ) -> WeftResult<Value> {
@@ -3075,9 +3137,13 @@ impl ContextHandle for RunnerHandle {
                 weft_core::truncate_user_string(&body, 512)
             )));
         }
-        let mime = weft_core::storage::normalize_content_type(
-            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
-        );
+        // The caller's stated type wins over what the server says.
+        let mime = match mime {
+            Some(mime) => mime.to_string(),
+            None => weft_core::storage::normalize_content_type(
+                resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            ),
+        };
         // The caller's name wins; then whatever the server calls the
         // file (a media route serving `/media/<id>` still says
         // `voice.ogg` in its Content-Disposition); the URL last.
@@ -3516,6 +3582,14 @@ impl ContextHandle for RunnerHandle {
 
     async fn reveal_secret(&self, id: weft_core::secret::SecretId) -> WeftResult<serde_json::Value> {
         self.record.journal.reveal_secret(id).await.map_err(|e| WeftError::NodeFailed(format!("{e:#}")))
+    }
+
+    async fn after_node(
+        &self,
+        call: weft_core::signal::CancelCall,
+        access: Option<weft_core::primitive::AccessRef>,
+    ) -> WeftResult<()> {
+        RunnerHandle::after_node(self, call, access).await
     }
 
     async fn published_access(&self) -> WeftResult<Option<weft_core::access::Access>> {
@@ -5539,7 +5613,7 @@ pub(crate) mod test_journal {
 
     /// A firing's record over `journal`, its spend counted on its own.
     pub(crate) fn test_record(journal: Arc<dyn weft_journal::JournalClient>) -> RunRecord {
-        RunRecord { journal, costs: crate::metering::PendingCostRecords::new() }
+        RunRecord::new(journal)
     }
 
     /// Capturing journal client. Stores every `record_event` payload
@@ -6321,5 +6395,158 @@ mod endpoint_tests {
         assert!(first.contains("endpoint 'sql'"), "it names the endpoint: {first}");
         assert!(first.contains("db.svc:5432"), "and the address: {first}");
         assert!(first.contains("weft stop"), "and the way out: {first}");
+    }
+}
+
+/// The calls a node owes when it ends (`RunnerHandle::after_node`,
+/// `crate::end_calls`), against a provider that records what it is sent.
+#[cfg(test)]
+mod end_call_tests {
+    use super::test_journal::{test_clients, CaptureJournal};
+    use super::*;
+    use weft_core::signal::CancelCall;
+
+    /// A provider answering every call with `status` and `body`, keeping
+    /// each call's verb and path.
+    async fn provider(status: u16, body: &'static str) -> (String, Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+        let calls: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+        let seen = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(move |method: axum::http::Method, uri: axum::http::Uri| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push((method.to_string(), uri.path().to_string()));
+                (axum::http::StatusCode::from_u16(status).unwrap(), body)
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), calls)
+    }
+
+    /// A firing of node `node-x` of a run whose record is `journal` and
+    /// whose owed calls start as `owed`, with the connection `conn`.
+    fn firing(journal: Arc<CaptureJournal>, owed: weft_journal::OwedCalls, cancellation: Arc<CancellationFlag>) -> RunnerHandle {
+        let broker = FakeAccessBroker::new();
+        broker.set_bearer_connection("conn", "secret-key");
+        let record = RunRecord { owed: Arc::new(std::sync::Mutex::new(owed)), ..RunRecord::new(journal) };
+        RunnerHandle::new(
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            "node-x".into(),
+            "node-x".into(),
+            "TestNode".into(),
+            weft_core::frames::LoopFrames::default(),
+            test_clients(broker),
+            record,
+            None,
+            "instance-1".into(),
+            "tenant-1".into(),
+            cancellation,
+            crate::wait_tracker::WaitTracker::new(),
+            BusCoordinator::new(crate::wait_tracker::WaitTracker::new()),
+            Default::default(),
+            Default::default(),
+            std::collections::HashSet::new(),
+        )
+    }
+
+    fn conn() -> Option<weft_core::primitive::AccessRef> {
+        Some(weft_core::primitive::AccessRef { id: "conn".into(), service: "provider".into(), required_values: Vec::new() })
+    }
+
+    fn kinds(journal: &CaptureJournal) -> Vec<&'static str> {
+        journal.events.lock().unwrap().iter().map(RunEvent::kind_str).collect()
+    }
+
+    /// A call sent however the node ends goes once when it ends without a
+    /// cancel (returned, failed, skipped, gave up a wait: the firing's
+    /// end is the same settle), through the node's connection; a
+    /// cancel-only one does not. Registered twice, it is on the record
+    /// once, and the settlement goes on the record after it.
+    #[tokio::test]
+    async fn an_always_call_goes_once_when_the_node_ends() {
+        let (base, calls) = provider(204, "").await;
+        let journal = Arc::new(CaptureJournal::default());
+        let handle = firing(journal.clone(), Default::default(), CancellationFlag::new_arc());
+        let upload = CancelCall::delete(format!("{base}/uploads/1")).always();
+        handle.after_node(upload.clone(), conn()).await.unwrap();
+        handle.after_node(upload, conn()).await.unwrap();
+        handle.after_node(CancelCall::put(format!("{base}/jobs/2/cancel")), conn()).await.unwrap();
+        assert_eq!(kinds(&journal), vec!["end_call_owed", "end_call_owed"], "the same call is owed once");
+
+        handle.settle_end_calls().await;
+        assert_eq!(*calls.lock().unwrap(), vec![("DELETE".to_string(), "/uploads/1".to_string())]);
+        assert_eq!(kinds(&journal).last(), Some(&"end_calls_settled"));
+        handle.settle_end_calls().await;
+        assert_eq!(calls.lock().unwrap().len(), 1, "sent once");
+    }
+
+    /// A firing its run's cancel ends sends both its cancel-only and its
+    /// always calls.
+    #[tokio::test]
+    async fn every_call_goes_when_the_run_is_cancelled() {
+        let (base, calls) = provider(200, "").await;
+        let cancellation = CancellationFlag::new_arc();
+        let handle = firing(Arc::new(CaptureJournal::default()), Default::default(), cancellation.clone());
+        handle.after_node(CancelCall::delete(format!("{base}/uploads/1")).always(), conn()).await.unwrap();
+        handle.after_node(CancelCall::put(format!("{base}/jobs/2/cancel")), None).await.unwrap();
+        cancellation.cancel_because(weft_core::run::CancelCause::User);
+        handle.settle_end_calls().await;
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("DELETE".to_string(), "/uploads/1".to_string()), ("PUT".to_string(), "/jobs/2/cancel".to_string())]
+        );
+    }
+
+    /// A refusal shows on the node's log, quoting what the provider said;
+    /// a 404 is the thing gone already, and done.
+    #[tokio::test]
+    async fn a_refusal_shows_on_the_nodes_log_and_a_404_is_done() {
+        let (refusing, _) = provider(403, r#"{"error": {"message": "the key cannot delete uploads"}}"#).await;
+        let journal = Arc::new(CaptureJournal::default());
+        let handle = firing(journal.clone(), Default::default(), CancellationFlag::new_arc());
+        handle.after_node(CancelCall::delete(format!("{refusing}/uploads/1")).always(), conn()).await.unwrap();
+        handle.settle_end_calls().await;
+        let logged: Vec<String> = journal
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::LogLine { node_id, level, message, .. } if node_id == "node-x" && level == "error" => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(logged[0].contains("403") && logged[0].contains("the key cannot delete uploads"), "{}", logged[0]);
+
+        let (gone, calls) = provider(404, "not found").await;
+        let journal = Arc::new(CaptureJournal::default());
+        let handle = firing(journal.clone(), Default::default(), CancellationFlag::new_arc());
+        handle.after_node(CancelCall::delete(format!("{gone}/uploads/1")).always(), conn()).await.unwrap();
+        handle.settle_end_calls().await;
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(!kinds(&journal).contains(&"log_line"), "a 404 is done");
+    }
+
+    /// A worker that picks the run up after a crash reads what the firing
+    /// owed off its record (the claim fills the run's book from it), and
+    /// sends it when the firing ends there; the body run again that
+    /// registers the same call writes nothing more.
+    #[tokio::test]
+    async fn a_call_owed_before_a_crash_goes_from_the_next_worker() {
+        let (base, calls) = provider(204, "").await;
+        let upload = CancelCall::delete(format!("{base}/uploads/1")).always();
+        let record = [
+            RunEvent::NodeStarted { run_id: uuid::Uuid::nil(), node_id: "node-x".into(), frames: Vec::new(), at_unix: 1 },
+            RunEvent::EndCallOwed { run_id: uuid::Uuid::nil(), node_id: "node-x".into(), frames: Vec::new(), call: upload.clone(), access: conn(), at_unix: 2 },
+        ];
+        let journal = Arc::new(CaptureJournal::default());
+        let resumed = firing(journal.clone(), weft_journal::OwedCalls::of_record(&record), CancellationFlag::new_arc());
+        resumed.after_node(upload, conn()).await.unwrap();
+        assert!(kinds(&journal).is_empty(), "already owed");
+        resumed.settle_end_calls().await;
+        assert_eq!(*calls.lock().unwrap(), vec![("DELETE".to_string(), "/uploads/1".to_string())]);
     }
 }

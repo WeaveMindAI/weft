@@ -13,7 +13,7 @@ use super::{results_from, search_body, KeenableSearchNode};
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::basic("the_text_is_the_snippet_cut_at_the_cap", text_from_snippet),
-        NodeTest::basic("an_empty_site_searches_the_whole_web", empty_site),
+        NodeTest::basic("a_site_narrows_the_search_only_when_set", site_rides),
         NodeTest::fake("without_an_account_it_searches_the_public_route", keyless_search),
         NodeTest::fake("with_an_account_it_searches_the_keyed_route", keyed_search),
         NodeTest::fake("texts_heavier_than_their_characters_are_cut_to_fit", heavy_texts),
@@ -42,11 +42,10 @@ fn text_from_snippet() -> WeftResult<()> {
     Ok(())
 }
 
-fn empty_site() -> WeftResult<()> {
-    assert_eq!(search_body("q", 5, Some("  ")), json!({ "query": "q", "max_results": 5 }));
+fn site_rides() -> WeftResult<()> {
     assert_eq!(search_body("q", 5, None), json!({ "query": "q", "max_results": 5 }));
     assert_eq!(
-        search_body("q", 5, Some(" docs.rs ")),
+        search_body("q", 5, Some("docs.rs")),
         json!({ "query": "q", "max_results": 5, "site": "docs.rs" })
     );
     Ok(())

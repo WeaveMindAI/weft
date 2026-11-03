@@ -52,7 +52,7 @@
   "inputs": [
     {
       "name": "connection",
-      "type": "Access",
+      "type": "Access[http_header_key]",
       "widget": {
         "kind": "access"
       },
@@ -125,15 +125,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "url"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "url",
-              "regex": "(?i)^https?://"
+              "matches": "(?i)^https?://"
             }
           }
         ]

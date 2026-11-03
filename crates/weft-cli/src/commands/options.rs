@@ -63,7 +63,7 @@ pub async fn run(ctx: Ctx, node_name: &str, field: &str, search: Option<&str>) -
                     "'{}' is picked on a connection that no longer exists ({id}); pick \
                      another with `{}`, then `--grant <id>`",
                     target.spelling(),
-                    ctx.weft(&format!("connect --node {} --list", target.spelling()))
+                    ctx.weft(&format!("connect {} --list", target.spelling()))
                 )
             })?;
             Some(Signing { access_id: id, service: grant.service, scopes: grant.scopes })
@@ -311,13 +311,13 @@ fn nothing_to_list(
         return if own_widget {
             format!(
                 "{at} needs a connection first: pick one on this node with `{}`, then `--grant <id>`",
-                weft(&format!("connect --node {} --list", resolved.spelling))
+                weft(&format!("connect {} --list", resolved.spelling))
             )
         } else {
             format!(
                 "{at} needs a connection first: wire its `{access}` input to an access node, then \
                  pick that node's connection with `{}`, then `--grant <id>`",
-                weft("connect --node <access node> --list")
+                weft("connect <access node> --list")
             )
         };
     }
@@ -327,7 +327,7 @@ fn nothing_to_list(
         return format!(
             "{at} can only be listed with permissions the picked connection does not hold; \
              connect one that has them with `{}`",
-            weft("connect --node <access node>")
+            weft("connect <access node>")
         );
     }
     // Only the choices recorded on the connection when it was made.
@@ -340,7 +340,7 @@ fn nothing_to_list(
     format!(
         "{at} offers only the choices recorded on the connection when it was made, and it \
          recorded none; connect it again with `{}` to record them",
-        weft("connect --node <access node>")
+        weft("connect <access node>")
     )
 }
 

@@ -85,7 +85,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[email]",
       "widget": {
         "kind": "access"
       },
@@ -95,7 +95,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[email]",
       "description": "Wire into the email trigger and SendEmail."
     }
   ]

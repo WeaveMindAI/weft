@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[elevenlabs]",
       "accepts": [
         "wire"
       ],
@@ -171,5 +171,35 @@
   "display": {
     "kind": "media",
     "output": "video"
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "styles",
+            "nonempty": true
+          },
+          {
+            "kind": "value",
+            "field": "model"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "model",
+              "matches": "^veo-"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsVideoFromReferences '{id}' sets `styles`, which only Veo takes: other models take their reference images without a role, so put these images in `subjects`, or pick a veo `model`.",
+        "port": "styles"
+      }
+    }
+  ]
 }

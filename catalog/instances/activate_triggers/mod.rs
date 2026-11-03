@@ -5,10 +5,10 @@
 
 use async_trait::async_trait;
 
+use weft::instance::InstanceId;
 use weft::node::NodeOutput;
 use weft::{ReleaseHeld, RunContext, Node, NodeManifest, WeftResult};
 
-use super::lifecycle::instance_if_given;
 
 #[derive(NodeManifest)]
 pub struct ActivateTriggersNode;
@@ -24,7 +24,7 @@ impl Node for ActivateTriggersNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let instance = instance_if_given(&ctx)?;
+        let instance = ctx.inputs.opt::<InstanceId>("instance")?;
         let only: Vec<String> = ctx.inputs.opt("only")?.unwrap_or_default();
         let held: ReleaseHeld = ctx.inputs.get("held")?;
         // None named is every trigger of the owner: every shared trigger,

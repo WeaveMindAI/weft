@@ -6,7 +6,11 @@ weft provides. The runtime hands it to `run`, and to a trigger's
 
 Every call here returns `WeftResult`, and your node never names a weft error
 type. Wrap an outside error with `.node_err("what you were doing")`, and fail
-on something you detected yourself with `node_bail!`.
+on something you detected yourself with `node_bail!`. If what you detected is
+a mistake in the program (a value of the wrong shape, SQL that does not
+parse), fail with `input_bail!("...")` instead. A wired `_error` catches what
+`node_bail!` raises but never this: the fix is in the program, so the run
+fails.
 
 ## Five rules that save you a debugging session
 
@@ -115,6 +119,7 @@ you like until you close it.
 | `state.save().await` | Writes the state now | The write fails |
 | `hold()` | A `Holding` to hand bus reads, a bus's `wait_for`, stream pulls and yields instead of your state, for work that cannot be picked up from the middle: while it exists, no wait of your node pauses (its `state.wait`s and helpers' waits included), and once it is dropped the node can pause again. It saves nothing ([holding the run](durable-execution.md#holding-the-run-instead-of-keeping-a-state)) | never |
 | `register_signal(kind).await` | Sets up a trigger that starts a new run on every fire. Called during setup | Called twice for one node in one setup |
+| `after_node(call, &access).await` | Puts `call` on the run's record, to send through `access` (`None`: plain) when this node ends: however it ends with `.always()`, only on a cancel without it ([cleaning up](durable-execution.md#cleaning-up-what-your-node-made-at-a-provider)) | The node is pure, or the call's address is empty or not http(s) |
 
 For how the state carries a node through a pause, and through its worker
 dying, go and read [surviving a restart](durable-execution.md).
@@ -137,7 +142,42 @@ also covers the cancel call.
 
 On an opened connection: `client()`, `credential()`, `value(name)`,
 `identity()`, `owner()`. On an endpoint handle: `url()`,
-`host_and_port()`, and `call(method, path, body)`.
+`host_and_port()`, and `call(method, path, body)`, whose `path` starts with
+`/`.
+
+### Putting a value into an address
+
+If an id or a search term goes into a URL, build the URL with `client::url`,
+so that an id holding `/`, `?` or `#` stays one piece of the address you
+meant instead of changing which address you call:
+
+```rust
+use weft::access::client;
+
+let url = client::url(API, &["files", &id, "copy"])?
+    .query("q", &search)
+    .query("pageSize", 50)
+    .query_opt("pageToken", page_token.as_deref());
+let answer = client::get_json(&http, url.as_str(), "copy the file").await?;
+```
+
+Every path segment, and both halves of every query pair, are percent-encoded:
+anything but letters, digits and `-_.~` (a space becomes `%20`). The base is
+taken as written, with a trailing `/` dropped, so it has to be a constant of
+your node or an address weft handed you, never a value. A segment that is
+empty, `.` or `..` fails with an input error, because an address reads even
+the encoded `%2E%2E` as `..`, so a wired id of `..` would climb to another
+address; that is why `url` returns a `Result`. `.segment(s)?` adds one more
+segment, before the first query pair only (after one, it panics). If a
+value's `/` must stay, like an object store key (`photos/2024/a.jpg`),
+add it with `.key_path(key)?`, which encodes each part between the `/` and
+refuses a `.` or `..` part. `.query_opt` adds the pair only when the value is `Some`, for an optional
+input. Read the result with `.as_str()`, `format!("{url}")` or
+`String::from(url)`.
+
+For an endpoint, start from its address, `client::url(endpoint.url(),
+&["media", &id])?`, or build only the path for `call` with
+`client::url("", &["media", &id])?`, which gives `/media/<id>`.
 
 ## Secrets
 
@@ -182,25 +222,80 @@ what](../language/types.md#what-fits-into-what).
 
 ## Sharing something between runs
 
-If your node builds something on every run that is slow to build (a pool of database
-connections, a process to hand work to), let the worker's runs share one
-instead:
+If your node builds something on every run that is slow to build, let the
+worker's runs share it instead. There are two calls for that:
+
+- if each run needs one to itself for a while (a database connection a run
+  may hold a transaction on, a process that runs one script at a time), take
+  one from a pool with `ctx.pool`;
+- if runs can all use the same one at once (a client, a cache, a pool library
+  you already use), ask for it with `ctx.shared`.
+
+### One each, from a pool
 
 ```rust
-let pool = ctx.shared(&access, |opened| async move { Pool::new(&opened) }).await?;
+use std::time::Duration;
+
+let mut conn = ctx
+    .pool(&access, |opened| async move { connect(&opened).await })
+    .max(20)
+    .idle_close(Duration::from_secs(5))
+    .check(|c| !c.is_closed())
+    .reset(|c| async move { clear_session(&c).await.map(|()| c) })
+    .take()
+    .await?;
 ```
 
-The closure is async and its result is a `WeftResult` of the thing (`Pool`
-here is your own type, whose `new` returns a `WeftResult<Pool>`).
+You write only how to make one (`connect` here is your own function), and
+weft does the rest. `take` hands you the newest idle one that is still fresh
+and passes your `check`, letting go of every one that fails on the way, and
+calls your closure to make a new one when none is left. What comes back is a
+`weft::shared::pool::Lease<T>`: it derefs to the item, and goes back to the
+pool when you drop it.
+
+The first argument is the key, the same as for [`ctx.shared`](#one-for-everybody):
+a connection (your closure gets it opened, and the pool is built again once
+the connection's values change) or a name of your own (your closure gets
+`()`).
+
+| Setting | Set it when | What it does |
+|---|---|---|
+| `.max(n)` | The other end only serves so many at once | At most `n` items out at once on this worker. A take past that waits for one to come back, and the wait ends with the cancelled error if the run is cancelled. `0` is refused. Without it, nobody waits |
+| `.idle_close(d)` | The other end closes what sits idle, or should not be held idle | Lets an item go once it sat idle for `d`, and never hands out one idle for longer, even when the timer that closes it ran late. Without it, an idle item is kept for as long as the pool is |
+| `.check(\|c\| ..)` | An idle item can die on its own (a closed connection, a process that exited) | Says whether an idle item is still good. One that is not is let go, and the next is tried |
+| `.reset(\|c\| async move { .. })` | A run can leave something on the item (a session setting, an open transaction) | Runs when a lease is dropped, before the item goes back. Hand the item back if it is fit for the next run, or an error to let it go (the error goes to the worker's log). The item keeps its place under `max` while this runs |
+
+Every ask of one pool has to give the same `max` and the same `idle_close`.
+An ask that gives others fails with `the pool '<key>' is asked for with max
+.. and idle close .., and it is held with max .. and idle close ..: every ask
+of one pool says the same`, so keep the settings in one function your nodes
+call, the way the Postgres nodes do.
+
+If an item is no good for the next run (a process that stopped answering, a
+connection whose state your run cannot vouch for), call `lease.discard()`
+and weft lets it go instead of giving it back. weft does the same on its own
+for a lease dropped while its run is cancelled, since whatever the run was
+doing may still be under way on it. A make that fails takes no place under
+`max`.
+
+### One for everybody
+
+```rust
+let client = ctx.shared(&access, |opened| async move { Client::new(&opened) }).await?;
+```
+
+The closure is async and its result is a `WeftResult` of the thing (`Client`
+here is your own type, whose `new` returns a `WeftResult<Client>`).
 
 The first argument is the key weft keeps the thing under. If you pass a
 connection (`&access`), the closure gets the opened connection, and once one
 of its values changes (a new password), the next run that asks gets your
 thing built again from the new values. To notice the change, weft opens the
-connection every time a run calls `ctx.shared`. For a connection a person made or an infra node
-published, the worker answers that open from memory, so a reused thing costs
-no extra call. A connection set to **Use ours** (weft's own key) costs one
-network call to weft each time.
+connection every time a run calls `ctx.shared` (or `ctx.pool`). For a
+connection a person made or an infra node published, the worker answers
+that open from memory, so a reused thing costs no extra call. A connection
+set to **Use ours** (weft's own key) costs one network call to weft each
+time.
 
 If you pass a name of your own instead, the closure gets `()`:
 
@@ -220,36 +315,61 @@ fails keeps nothing, so the next run tries again.
 If the thing can only serve so many runs at once, say so with `with_limit`:
 
 ```rust
-let pool = ctx.shared(&access, |opened| async move { Pool::new(&opened) }).with_limit(100).await?;
+let client = ctx.shared(&access, |opened| async move { Client::new(&opened) }).with_limit(100).await?;
 ```
 
 Then at most that many handles to it exist at once on one worker, and the
 next run that calls `ctx.shared` waits until one is dropped. A run that asks again while it still
 holds a handle can end up waiting on itself once the limit is reached, so
-keep one handle per run. Only the limit of the first call that asks counts, until weft lets the thing go (after it goes idle, or after its
-connection changes), so pass the same limit everywhere you call it. The limit counts the handles to one thing on one worker: two workers can go
+keep one handle per run. Every call for one shared thing has to pass the
+same limit: a call that passes another, or none, fails, naming both. The limit counts the handles to one thing on one worker: two workers can go
 past it between them, and so can the old thing and the new one for a moment
 after a connection's values change, while runs still hold handles to the old
-one. The Postgres nodes that query through the
-shared pool ask for 20.
+one.
 
-`with_limit` only caps what one worker takes, so that its runs never leave
-its sibling workers without a connection. It cannot keep a database
-under its connection limit, because it cannot see how many workers there are. If your node talks to something that only
-serves so much (a database with a fixed number of connections, an API with a
-rate limit), assume any number of workers run your node at once: Cloud Run
-starts copies up to the project's `--max-instances` (set with `weft workers
-set`), and a change of program
-or worker settings runs the old copies beside the new ones for a while. Two
-things follow:
+If a task you spawn needs the thing after your run returns, move the handle
+into the task: it keeps its place under `with_limit` until the task drops
+it. If your task should not count against the limit, take `handle.arc()`
+instead: the `Arc` keeps the value alive but holds no place under
+`with_limit`, and weft can let go of the thing while you hold it, so the next
+run may build a new one beside yours.
+
+### How long weft keeps them
+
+By default, weft lets go of a shared thing (a pool is one too) about five
+minutes after the last run asked for it or dropped its handle, once no
+handle is left. Your thing's `Drop` runs once weft has let go of it and the
+last handle and `Arc` are gone, which is when a pool closes its connections.
+When the worker stops, it lets go of every shared thing as soon as its last
+run has ended, used recently or not, so a pool's connections go back to the
+database while the worker is still writing its last records.
+
+If you want a quiet stretch not to cost a rebuild, raise the five minutes
+with `weft workers set --shared-idle-seconds <n>` (or lower it to let go
+sooner). It is one setting for the whole project, covering every
+shared thing on its workers. The change applies from the next run: weft starts workers with the
+new value (a new revision on Cloud Run), and the old ones finish what they
+are running and stop.
+
+### When the other end only serves so many
+
+`max` and `with_limit` only cap what one worker takes, so that its runs
+never leave its sibling workers without a connection. They cannot keep a
+database under its connection limit, because they cannot see how many
+workers there are. If your node talks to something that only serves so much
+(a database with a fixed number of connections, an API with a rate limit),
+assume any number of workers run your node at once: Cloud Run starts copies
+up to the project's `--max-instances` (set with `weft workers set`), and a
+change of program or worker settings runs the old copies beside the new
+ones for a while. Two things follow:
 
 - **Hold nothing you are not using.** Close an idle connection within
   seconds, because one a copy keeps between requests is one no other copy can
   have. On Cloud Run a copy has no CPU between requests (unless the
-  project turned on `weft workers set --cpu-always-allocated true`), so a timer of yours that closes it may not
-  fire for minutes: check how long a connection sat idle when a run takes it,
-  too. The Postgres nodes close a pooled connection after 5 idle seconds and
-  never hand out one idle for longer.
+  project turned on `weft workers set --cpu-always-allocated true`), so a
+  timer that closes it may not fire for minutes, which is why `idle_close`
+  also refuses to hand out an item idle for longer. The Postgres nodes use
+  an `idle_close` of 5 seconds and a `max` of 20.
 - **Let the other end do the counting.** It is the one place that sees every
   copy, so that is where a client past the limit should wait its turn, or be
   refused with a clear answer. Your node then waits, or fails with a message
@@ -261,29 +381,6 @@ things follow:
   `SELECT set_config('idle_session_timeout', '0', false) FROM pg_settings
   WHERE name = 'idle_session_timeout'` (the `FROM pg_settings` part makes it
   do nothing on a Postgres that has no such setting, instead of failing).
-
-If a task you spawn needs the thing after your run returns (handing a
-connection back to its pool later), move the handle into the task: it keeps
-its place under `with_limit` until the task drops it, which is what the
-Postgres nodes do. If your task should not count against the limit, take `handle.arc()`
-instead: the `Arc` keeps the value alive but holds no place under
-`with_limit`, and weft can let go of the thing while you hold it, so the next
-run may build a new one beside yours.
-
-By default, weft lets go of a shared thing about five minutes after the last
-run asked for it or dropped its handle, once no handle is left. Your
-thing's `Drop` runs once weft has let go of it and the last handle and `Arc`
-are gone, which is when a pool closes its connections. When the worker
-stops, it lets go of every shared thing as soon as its last run has ended,
-used recently or not, so a pool's connections go back to the database while
-the worker is still writing its last records.
-
-If you want a quiet stretch not to cost a rebuild, raise the five minutes
-with `weft workers set --shared-idle-seconds <n>` (or lower it to let go
-sooner). It is one setting for the whole project, covering every
-shared thing on its workers. The change applies from the next run: weft starts workers with the
-new value (a new revision on Cloud Run), and the old ones finish what they
-are running and stop.
 
 ## Storage
 
@@ -302,7 +399,7 @@ For every scope, go and read [Storage](storage.md).
 | `put(bytes, mime, filename, keep)` | Stores bytes and gives back the stored-file value |
 | `put_stream(stream, mime, filename, keep)` | The same without holding the file in memory |
 | `put_response(resp, what, mime, filename, keep)` | Streams an HTTP response you already made into storage |
-| `put_from_url(url, filename, keep)` | Fetches a URL straight into storage |
+| `put_from_url(url, mime, filename, keep)` | Fetches a URL straight into storage, as `mime` when you pass one |
 | `copy(&file, keep)` | Copies a file into this handle's scope, leaving the original |
 | `edit(&file, \|old\| ...)` | Changes the file's content in place: reads it, runs your function on the bytes, writes back what it returns. Another write of the same file is never lost (it reads again and reruns the function), so your function must use nothing but the bytes it is given. Same key, name, type and lifetime, new size and version |
 | `replace(&file, bytes)` | Overwrites the file's content in place, whatever it holds now |
@@ -365,7 +462,7 @@ Read a stream input like any other value: `ctx.inputs.get::<Generator<Row>>("row
 | Call | What you get |
 |---|---|
 | `is_api_call()` / `is_websocket()` | Whether a caller of that kind is attached |
-| `caller_data_type()` | Whether this connection speaks bytes or JSON |
+| `caller_data_type()` | Whether this connection speaks `json`, `text` or `bytes` (the trigger's `dataType`), or `None` when nobody is attached |
 | `caller()` | The caller as a handle, or `None` |
 | `http_caller().await` | The HTTP caller, attached and connected, or a loud error |
 | `ws_caller().await` | The same for a WebSocket |
@@ -380,11 +477,47 @@ Read a stream input like any other value: `ctx.inputs.get::<Generator<Row>>("row
 | `tag_run(["user_7"]).await` | Tags this run. Additive and safe to repeat. Any string works: one that is not already a tag is turned into one (see below) | The list is empty, or a tag is empty |
 | `stop_tagged("user_7", StopSelf::Keep).await` | Queues a stop for every live run of this project carrying that tag, turned into a tag the same way | The tag is empty |
 | `is_cancelled()` | Whether this run was cancelled. Cheap enough to poll | never |
-| `cancellation()` | The flag itself, to `select!` against your own work | never |
+| `cancellation()` | The flag itself, to end your own work with the run ([below](#when-the-run-is-cancelled)) | never |
 
 `StopSelf::Keep` only reaches runs that took the tag before this one did, so
 two runs racing to stop each other leave the later one alive. `StopSelf::Include`
 ends this run too.
+
+## When the run is cancelled
+
+You do not have to watch for a cancel around weft's own calls. When the run
+is cancelled, each of these ends at once with the cancelled error, even in
+the middle of waiting on a slow server:
+
+- a request sent through a client from `ctx.http()`, `ctx.client(..)` or an
+  opened connection, and the read of its answer's body;
+- an endpoint handle's `call`;
+- a provider socket's `send` and `recv`;
+- a storage read, and a write of bytes or a stream (the calls listed in
+  [Storage](storage.md#storing); `put_from_url` and `copy` are not
+  among them);
+- a bus reader's read.
+
+Pass that error up with `?` and the node ends cancelled instead of failed.
+
+If your node waits on something of its own (a child process, a timer, a
+library with its own client), wrap it in `race`, which hands back the work's
+own output, or the cancelled error the moment the run is cancelled:
+
+```rust
+let status = ctx.cancellation().race(child.wait()).await?.node_err("wait for the script")?;
+```
+
+The work is dropped where it stands, so a child process you spawned with
+`kill_on_drop(true)` is killed with it.
+
+If you turn a request's error into a weft error yourself, check
+`weft::cancellation::is_cancel(&e)` first: `.node_err` makes any outside error
+a failure, a cancel included. `client::send(req, what)` keeps a cancel a
+cancel and hands back any status, for a node whose answer is the status
+itself. `checked_send` does the same and also refuses a non-success status,
+quoting the provider, and `get_json` and `post_json` add the parse.
+`client::body_error(what, e)` does it for a failed read of a body.
 
 ## Your project, and the owner's other projects
 

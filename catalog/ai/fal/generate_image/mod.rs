@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
-use weft::storage::{StorageScope};
+use weft::storage::StorageScope;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::fal::{merge_params, run_queued, Queued};
@@ -30,19 +30,17 @@ impl Node for FalGenerateImageNode {
         let model: String = ctx.inputs.get("model")?;
         let prompt: String = ctx.inputs.get("prompt")?;
         let size: String = ctx.inputs.get("imageSize")?;
-        let count: f64 = ctx.inputs.get("count")?;
-        let seed: Option<f64> = ctx.inputs.opt("seed")?;
+        let count: u64 = ctx.inputs.get("count")?;
+        let seed: Option<u64> = ctx.inputs.opt("seed")?;
         let params = ctx.inputs.opt::<Map<String, Value>>("params")?;
 
-        // `count` is bound to [1, 8] whole and `seed` to [0, 2^53] whole by
-        // their widgets, wired or written, so both casts below are exact.
         let mut payload = json!({
             "prompt": prompt,
             "image_size": size,
-            "num_images": count as u64,
+            "num_images": count,
         });
         if let Some(s) = seed {
-            payload["seed"] = json!(s as u64);
+            payload["seed"] = json!(s);
         }
         merge_params(&mut payload, params.as_ref());
 

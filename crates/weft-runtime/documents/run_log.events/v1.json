@@ -63,5 +63,14 @@
       "at_unix": 1760000300
     },
     { "kind": "run_completed", "at_unix": 1760000301 }
+  ],
+  [
+    {
+      "kind": "trigger_captured",
+      "node_id": "secure",
+      "spec": { "kind": "route", "config": { "path": "secure", "auth": { "kind": "connection", "access_id": "3b8e1f2a-6c4d-4e5f-9a0b-1c2d3e4f5a6b", "service": "api_key_auth" } } },
+      "port_snapshot": {},
+      "at_unix": 1760000400
+    }
   ]
 ]

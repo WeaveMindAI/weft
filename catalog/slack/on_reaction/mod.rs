@@ -12,12 +12,22 @@
 //! the content is needed.
 
 use async_trait::async_trait;
+use serde::Deserialize;
 
 use weft::signal::{Predicate, ProviderEvents};
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct SlackOnReactionNode;
+
+/// The `direction` select: which reaction events fire.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Direction {
+    Added,
+    Removed,
+    Both,
+}
 
 #[cfg(feature = "node-tests")]
 mod tests;
@@ -33,20 +43,19 @@ impl Node for SlackOnReactionNode {
         let account: Access = ctx.inputs.get("account")?;
         let channel: Option<String> = ctx.inputs.opt("channel")?;
         let emoji: Option<String> = ctx.inputs.opt("emoji")?;
-        let direction: String = ctx.inputs.get("direction")?;
+        let direction: Direction = ctx.inputs.get("direction")?;
 
-        let mut filters = vec![match direction.as_str() {
-            "added" => Predicate::eq("type", "reaction_added"),
-            "removed" => Predicate::eq("type", "reaction_removed"),
+        let mut filters = vec![match direction {
+            Direction::Added => Predicate::eq("type", "reaction_added"),
+            Direction::Removed => Predicate::eq("type", "reaction_removed"),
             // Both directions: one anchored pattern instead of two
             // subscriptions.
-            "both" => Predicate::regex("type", "^reaction_(added|removed)$"),
-            other => weft::node_bail!("direction must be added, removed or both, got {other:?}"),
+            Direction::Both => Predicate::regex("type", "^reaction_(added|removed)$"),
         }];
-        if let Some(c) = channel.filter(|c| !c.trim().is_empty()) {
+        if let Some(c) = channel {
             filters.push(Predicate::eq("channel", c));
         }
-        if let Some(e) = emoji.filter(|e| !e.trim().is_empty()) {
+        if let Some(e) = emoji {
             filters.push(Predicate::eq("emoji", e.trim_matches(':')));
         }
 

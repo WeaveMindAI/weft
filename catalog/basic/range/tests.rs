@@ -15,7 +15,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("walks_up_half_open_with_defaults", walks_up),
         NodeTest::fake("negative_step_walks_down", walks_down),
         NodeTest::fake("from_already_past_to_is_empty", already_past),
-        NodeTest::fake("zero_step_fails_loud", zero_step),
+        NodeTest::fake("a_step_too_small_to_move_fails_loud", stalled_step),
         NodeTest::fake("max_finite_step_yields_once_and_terminates", max_finite_step),
         NodeTest::fake("a_resumed_walk_carries_on_after_what_it_yielded", resumed_walk),
     ]
@@ -43,17 +43,19 @@ async fn already_past(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn zero_step(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig.run(&RangeNode, json!({ "to": 3, "step": 0 })).await;
-    let err = outcome.result.expect_err("zero step must refuse").to_string();
-    assert!(err.contains("step cannot be zero"), "{err}");
+/// A zero step is the metadata rule's to refuse (the rig runs no rules);
+/// a step that is not zero but too small to change the number would offer
+/// the same number for ever, and fails instead.
+async fn stalled_step(rig: FakeRig) -> WeftResult<()> {
+    let outcome = rig.run(&RangeNode, json!({ "from": 1e16, "to": 1e17, "step": 1 })).await;
+    let err = outcome.result.expect_err("a step that cannot move must refuse").to_string();
+    assert!(err.contains("does not move past"), "{err}");
     Ok(())
 }
 
 async fn max_finite_step(rig: FakeRig) -> WeftResult<()> {
-    // JSON cannot spell Infinity or NaN, so the body's non-finite
-    // guard is a backstop no test input can reach; the numeric edge a
-    // test CAN pin is the largest finite step: one yield, then
+    // JSON cannot spell Infinity or NaN, so the numeric edge a test can
+    // pin is the largest finite step: one yield, then
     // `cur += step` saturates past `to` and the walk terminates
     // instead of spinning.
     let outcome = rig

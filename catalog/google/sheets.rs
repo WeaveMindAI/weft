@@ -5,9 +5,11 @@
 
 use serde_json::{Map, Value};
 
-use weft::access::client::get_json;
+use weft::access::client::{get_json, url, Url};
 use weft::reqwest_middleware::ClientWithMiddleware;
 use weft::{node_bail, WeftResult};
+
+pub const API: &str = "https://sheets.googleapis.com/v4";
 
 /// Resolve a tab's gid to its title (the only addressing
 /// `values.get` / `values.append` accept). No gid is the spreadsheet's
@@ -19,10 +21,7 @@ pub async fn tab_title(http: &ClientWithMiddleware,
 ) -> WeftResult<String> {
     let meta: Value = get_json(
         http,
-        &format!(
-            "https://sheets.googleapis.com/v4/spreadsheets/{}?fields=sheets.properties",
-            super::api::segment(id)
-        ),
+        url(API, &["spreadsheets", id])?.query("fields", "sheets.properties").as_str(),
         "list the sheet's tabs",
     )
     .await?;
@@ -44,17 +43,23 @@ pub async fn tab_title(http: &ClientWithMiddleware,
 /// INSIDE the tab title is doubled per the A1 spec (`'Bob''s Data'`);
 /// without it, a tab named `Bob's Data` would parse as the tab `Bob`
 /// followed by garbage, across every node that addresses cells.
-pub fn values_url(id: &str, title: &str, range: Option<&str>) -> String {
+pub fn values_url(id: &str, title: &str, range: Option<&str>) -> WeftResult<Url> {
     let quoted_title = format!("'{}'", title.replace('\'', "''"));
     let addr = match range {
         Some(r) => format!("{quoted_title}!{r}"),
         None => quoted_title,
     };
-    format!(
-        "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}",
-        super::api::segment(id),
-        urlencoding::encode(&addr)
-    )
+    url(API, &["spreadsheets", id, "values", &addr])
+}
+
+/// A row value a node received (its `row` input, typed
+/// `JsonDict | List[String]`): the cells in order, or an object keyed
+/// by the header's column names.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+pub enum Row {
+    Cells(Vec<Value>),
+    Keyed(Map<String, Value>),
 }
 
 /// The header row that orders a KEYED (object) row, `None` for a list
@@ -65,18 +70,17 @@ pub fn values_url(id: &str, title: &str, range: Option<&str>) -> String {
 pub async fn header_for_row(http: &ClientWithMiddleware,
     id: &str,
     title: &str,
-    row: &Value,
+    row: &Row,
     has_header: bool,
 ) -> WeftResult<Option<Vec<String>>> {
-    if !row.is_object() {
+    let Row::Keyed(_) = row else {
         return Ok(None);
-    }
+    };
     if !has_header {
-        return Err(weft::WeftError::Input(
+        weft::input_bail!(
             "the row is keyed by column name but 'First row is a header' is off; \
              order is undefined. Pass a list of cells, or turn the header on"
-                .to_string(),
-        ));
+        );
     }
     match header_row(http, id, title).await? {
         Some(h) => Ok(Some(h)),
@@ -94,7 +98,7 @@ pub async fn header_row(http: &ClientWithMiddleware,
     title: &str,
 ) -> WeftResult<Option<Vec<String>>> {
     let values: Value =
-        get_json(http, &values_url(id, title, Some("1:1")), "read the tab's header row").await?;
+        get_json(http, values_url(id, title, Some("1:1"))?.as_str(), "read the tab's header row").await?;
     Ok(values["values"].as_array().and_then(|rows| rows.first()).map(row_to_strings))
 }
 
@@ -103,7 +107,7 @@ pub async fn read_cells(http: &ClientWithMiddleware,
     id: &str,
     title: &str,
 ) -> WeftResult<Vec<Vec<String>>> {
-    let values: Value = get_json(http, &values_url(id, title, None), "read the tab's values").await?;
+    let values: Value = get_json(http, values_url(id, title, None)?.as_str(), "read the tab's values").await?;
     Ok(values["values"]
         .as_array()
         .into_iter()
@@ -159,20 +163,18 @@ pub fn row_object(cells: Vec<String>, headers: Option<&[String]>) -> Map<String,
     row
 }
 
-/// A row VALUE a node received (an object keyed by header, or a plain
-/// list) to the positional cell list the values API wants. An object
-/// needs the header to order by; a key naming no header column is a
-/// loud error (a silent drop would lose the user's data).
-pub fn row_to_cells(row: &Value, headers: Option<&[String]>) -> WeftResult<Vec<Value>> {
+/// A [`Row`] to the positional cell list the values API wants. An
+/// object needs the header to order by; a key naming no header column
+/// is a loud error (a silent drop would lose the user's data).
+pub fn row_to_cells(row: &Row, headers: Option<&[String]>) -> WeftResult<Vec<Value>> {
     match row {
-        Value::Array(cells) => Ok(cells.clone()),
-        Value::Object(map) => {
+        Row::Cells(cells) => Ok(cells.clone()),
+        Row::Keyed(map) => {
             let Some(headers) = headers else {
-                return Err(weft::WeftError::Input(
+                weft::input_bail!(
                     "the row is an object keyed by column name, but the sheet has no header \
                      row to order by; pass a list of cells instead (or add a header)"
-                        .to_string(),
-                ));
+                );
             };
             for key in map.keys() {
                 if !headers.iter().any(|h| h == key) {
@@ -187,9 +189,6 @@ pub fn row_to_cells(row: &Value, headers: Option<&[String]>) -> WeftResult<Vec<V
                 .map(|h| map.get(h).cloned().unwrap_or(Value::String(String::new())))
                 .collect())
         }
-        other => Err(weft::WeftError::Input(format!(
-            "a row is an object keyed by column name or a list of cells, got: {other}"
-        ))),
     }
 }
 
@@ -201,38 +200,41 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn row(value: Value) -> Row {
+        serde_json::from_value(value).expect("a row reads")
+    }
+
     #[test]
     fn object_rows_order_by_the_header() {
         let headers = vec!["name".to_string(), "age".to_string()];
         let cells =
-            row_to_cells(&json!({ "age": "36", "name": "ada" }), Some(&headers)).unwrap();
+            row_to_cells(&row(json!({ "age": "36", "name": "ada" })), Some(&headers)).unwrap();
         assert_eq!(cells, vec![json!("ada"), json!("36")]);
         // A column the row doesn't mention stays an empty cell.
-        let cells = row_to_cells(&json!({ "name": "grace" }), Some(&headers)).unwrap();
+        let cells = row_to_cells(&row(json!({ "name": "grace" })), Some(&headers)).unwrap();
         assert_eq!(cells, vec![json!("grace"), json!("")]);
     }
 
     #[test]
     fn unknown_columns_and_headerless_objects_are_loud() {
         let headers = vec!["name".to_string()];
-        let err = row_to_cells(&json!({ "nom": "ada" }), Some(&headers)).unwrap_err();
+        let err = row_to_cells(&row(json!({ "nom": "ada" })), Some(&headers)).unwrap_err();
         assert!(err.to_string().contains("nom"), "{err}");
-        let err = row_to_cells(&json!({ "name": "ada" }), None).unwrap_err();
+        let err = row_to_cells(&row(json!({ "name": "ada" })), None).unwrap_err();
         assert!(err.to_string().contains("header"), "{err}");
     }
 
     #[test]
     fn list_rows_pass_through() {
-        let cells = row_to_cells(&json!(["a", 2, true]), None).unwrap();
+        let cells = row_to_cells(&row(json!(["a", 2, true])), None).unwrap();
         assert_eq!(cells, vec![json!("a"), json!(2), json!(true)]);
     }
 
     #[test]
     fn tab_titles_with_apostrophes_are_a1_escaped() {
-        let url = values_url("sheet1", "Bob's Data", None);
-        let encoded = urlencoding::encode("'Bob''s Data'");
-        assert!(url.ends_with(&*encoded), "{url}");
-        let plain = values_url("sheet1", "Data", Some("A1:B2"));
-        assert!(plain.ends_with(&*urlencoding::encode("'Data'!A1:B2")), "{plain}");
+        let url = values_url("sheet1", "Bob's Data", None).unwrap();
+        assert!(url.as_str().ends_with("/values/%27Bob%27%27s%20Data%27"), "{url}");
+        let plain = values_url("sheet1", "Data", Some("A1:B2")).unwrap();
+        assert!(plain.as_str().ends_with("/values/%27Data%27%21A1%3AB2"), "{plain}");
     }
 }

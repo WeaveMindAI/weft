@@ -20,6 +20,7 @@
     {
       "name": "instance",
       "type": "String",
+      "keepsBlank": true,
       "description": "Whose copy: an instance id your program gives it (`user-42`), for that instance's copy of a `@per_instance` node. Unwired: the program's own copy. Wired, and no id arrives (the node feeding it did not run): this node skips."
     },
     {
@@ -165,7 +166,7 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_equals",
+            "kind": "value",
             "field": "door",
             "equals": "refuse"
           },

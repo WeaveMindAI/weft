@@ -7,10 +7,10 @@
 
 use async_trait::async_trait;
 
+use weft::instance::InstanceId;
 use weft::node::NodeOutput;
 use weft::{RunContext, Node, NodeManifest, WeftResult};
 
-use super::lifecycle::instance_if_given;
 
 #[derive(NodeManifest)]
 pub struct StartInfraNode;
@@ -29,7 +29,7 @@ impl Node for StartInfraNode {
         let node: String = ctx.inputs.get("node")?;
         let wait_until_running: bool = ctx.inputs.get("waitUntilRunning")?;
         let mut copy = ctx.infra(node);
-        if let Some(id) = instance_if_given(&ctx)? {
+        if let Some(id) = ctx.inputs.opt::<InstanceId>("instance")? {
             copy = copy.instance(id);
         }
         let mut state = ctx.keep(()).await?;

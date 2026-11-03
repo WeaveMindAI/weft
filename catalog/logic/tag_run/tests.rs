@@ -70,8 +70,10 @@ async fn empty_tag_fails(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
+/// The node's rule refuses a TagRun with nothing to tag before it runs;
+/// past it, `ctx.tag_run` is the floor.
 async fn no_tags_fails(rig: FakeRig) -> WeftResult<()> {
     let err = rig.run(&TagRunNode, json!({})).await.failure()?;
-    assert!(err.contains("no tags"), "{err}");
+    assert!(err.contains("at least one tag"), "{err}");
     Ok(())
 }

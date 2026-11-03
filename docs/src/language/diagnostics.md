@@ -53,8 +53,9 @@ a slug per cause.
 | `config-type-mismatch` | A written value does not fit the input's type, including one a metadata wire writes there, or a metadata port's value does not fit the port's own type | Fix the value, or the declared type |
 | `input-accepts` | The port does not take this kind of driver: a wire on a literal-only port, a written value on a wire-only port | Use the one it takes; the message lists them |
 | `gate-not-boolean` | A written `_should_flow` or `_should_not_flow` is not a Boolean | Write `true` or `false`, or wire it |
-| `literal-out-of-range` | A written number is outside the input's `min` and `max`, or off its whole-number step | Write a value inside the declared range |
+| `literal-out-of-range` | A written number is outside the input's `min` and `max`, or off its whole-number step, or a written date on a `datetime` input is not a moment with its zone (`2026-09-03T11:00:00+02:00`) | Write a value inside the declared range, or the date with its zone |
 | `literal-not-an-option` | A written value is not one of the input's dropdown `options` (for a multiselect, one item is not). A dropdown marked `freeText` never raises it | Write one of the options; the message lists them |
+| `secret-literal` | A value written in the program is a secret's marker. A secret is made by a node while the program runs, so a program cannot write one | Wire the value from a node's `Secret` output |
 | `value-on-output` | You wrote a value for an output port | Remove it. Outputs are filled by the node, and you read them with `node.port` |
 | `undeclared-port-no-custom` | A key names no input, on a node that does not take added inputs | Fix the key, or use a node with `canAddInputPorts` |
 | `config-null-literal` (warning) | A key is written `key: null`, which does nothing | Leave the key out and let the default apply |
@@ -170,6 +171,7 @@ For why neither a trigger nor an infra node can sit inside a loop, go and read
 | `per-instance-ineligible` | `@per_instance` on a node that runs no container of its own. Only an infra node can carry it | Remove it; for a value each instance gets (its connection included), write `@instance_filled` on the field |
 | `instance-filled-wired` | An `@instance_filled` field also has a wire into it | Remove the wire, or the marker |
 | `instance-filled-place-types` | An `@instance_filled` field of a node in an included file takes a different type at each place the file is included, and one instance's value cannot be both | Declare the field's type on the node |
+| `instance-filled-secret` | An `@instance_filled` field holds a `Secret`. An instance's value comes from outside every run, and a secret is made by a node inside one | Remove the marker and wire the field from a node's `Secret` output |
 | `instance-filled-boundary` | `@instance_filled` on a group's or included file's own port | Write it on the input of the node inside that reads the value |
 | `instance-filled-not-an-input` | `@instance_filled` on a key that is not one of the node's inputs | Put it on an input |
 | `shared-trigger-reaches-per-instance` | A trigger every instance shares (so its runs are for no instance) starts runs that reach something per instance, so every fire would be refused. A route or a socket is not checked: each call can name its instance | Make the trigger per instance too (wire it from what is per instance, or write one of its fields `@instance_filled`), or keep what is per instance out of what it runs |
@@ -187,7 +189,12 @@ For what `@per_instance` and `@instance_filled` do, go and read [Programs with i
 | Slug | What it found | What to do |
 |---|---|---|
 | `rule-structural` | A rule the node's own author wrote, checked on every build | Whatever its message says |
-| `rule-runtime` | The same, but only checked at the moments listed at the top of this page | Fill what the message names. A node with no connection picked is not one of these: the install refuses the run when it starts, and the message gives the command that picks one, `weft connect --node <node>` |
+| `rule-runtime` | The same, but only checked at the moments listed at the top of this page | Fill what the message names. A node with no connection picked is not one of these: the install refuses the run when it starts, and the message gives the command that picks one, `weft connect <node>` |
+
+A rule whose answer depends on a value that arrives on a wire cannot be
+decided here, so it is checked again when the node runs, on the value that
+arrived, and fails the node with the same message. For how, go and read
+[rules on a value that arrives on a wire](../nodes/metadata.md#rules-on-a-value-that-arrives-on-a-wire).
 
 ## Things that have no slug
 

@@ -51,15 +51,8 @@ impl Node for ChatHistoryAppendNode {
         if text.is_none() && media.is_empty() {
             node_bail!("a message needs text or media");
         }
-        match (role.as_str(), &tool_call_id) {
-            ("tool", None) => {
-                node_bail!("a tool message answers one tool call; wire the call's id to toolCallId")
-            }
-            ("tool", Some(_)) | (_, None) => {}
-            (other, Some(_)) => {
-                node_bail!("toolCallId only belongs on a 'tool' message, not '{other}'")
-            }
-        }
+        // A tool message carries its call's id and no other message does,
+        // by the node's rules (rechecked on wired values).
         let mut message = chat::stored_message(
             &role,
             text.as_deref().unwrap_or(""),

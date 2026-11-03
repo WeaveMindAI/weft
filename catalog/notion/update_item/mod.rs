@@ -4,11 +4,10 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use weft::access::client::json_call;
-use weft::node::NodeOutput;
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::access::client::{json_call, url};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::notion::API;
+use super::notion::{page_output, API};
 
 #[derive(NodeManifest)]
 pub struct NotionUpdateItemNode;
@@ -39,14 +38,10 @@ impl Node for NotionUpdateItemNode {
 
         let http = ctx.client(&account).await?;
         let page = json_call(
-            http.patch(format!("{API}/pages/{page}")).json(&body),
+            http.patch(url(API, &["pages", &page])?.as_str()).json(&body),
             "notion: update the item",
         )
         .await?;
-        let id = page["id"].as_str().node_err("notion: the update answered no id")?;
-        ctx.pulse_downstream(
-            NodeOutput::new().set("pageId", id).set("url", page["url"].clone()),
-        )
-        .await
+        ctx.pulse_downstream(page_output(&page, "notion: update the item")?).await
     }
 }

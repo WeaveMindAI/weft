@@ -25,7 +25,7 @@ impl Node for GmailGetNode {
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("id")?;
         let include_attachments: bool = ctx.inputs.get("includeAttachments")?;
-        let max_body_chars = ctx.inputs.get::<f64>("maxBodyChars")? as usize;
+        let max_body_chars: usize = ctx.inputs.get("maxBodyChars")?;
 
         let http = ctx.client(&account).await?;
         let read = read_message(&ctx, &http, &id, include_attachments, max_body_chars).await?;

@@ -92,7 +92,11 @@ pub struct TriggerCapture {
 
 impl TriggerBake {
     /// A trigger's bake as its row stores it (`trigger_bake.bake_json`).
-    pub const STORED: weft_core::stored::Kind<TriggerBake> = weft_core::stored::Kind::new("trigger bake", &[]);
+    pub const STORED: weft_core::stored::Kind<TriggerBake> = weft_core::stored::Kind::new(
+        "trigger bake",
+        // 1 -> 2: a live caller's gate names its check, in each captured spec.
+        &[&[weft_core::stored::Op::Within { at: "captured.*.spec", ops: weft_core::primitive::SIGNAL_SPEC_V2 }]],
+    );
 
     /// Where a stored bake sits, for a message about it: the project, whose
     /// triggers (an instance's, or the shared ones) and the program they
@@ -693,9 +697,7 @@ impl SignalRegistration {
     /// whether it carries one is unknown.
     pub fn cancel_call(&self) -> anyhow::Result<Option<weft_core::signal::listener_protocol::CancelCallRequest>> {
         let spec = self.spec()?;
-        if spec.on_cancel.is_none() {
-            return Ok(None);
-        }
+        let Some(call) = spec.on_cancel else { return Ok(None) };
         Ok(Some(weft_core::signal::listener_protocol::CancelCallRequest {
             token: self.token.clone(),
             tenant_id: self.tenant_id.clone(),
@@ -703,7 +705,8 @@ impl SignalRegistration {
                 .instance
                 .clone()
                 .map(|instance| weft_core::instance::InstanceScope { project_id: self.project_id, instance }),
-            spec,
+            call,
+            access: spec.access,
         }))
     }
 

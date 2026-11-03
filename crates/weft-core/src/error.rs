@@ -103,6 +103,19 @@ macro_rules! node_bail {
     };
 }
 
+/// Fail the node now with an input error carrying this message: the
+/// statement door for a mistake in the program the node spotted (a value
+/// of the wrong shape, SQL that does not parse). Expands to
+/// `return Err(WeftError::Input(format!(...)))`. Unlike [`node_bail!`],
+/// a wired `_error` does not catch it: the run fails, because the fix is
+/// in the program.
+#[macro_export]
+macro_rules! input_bail {
+    ($($arg:tt)*) => {
+        return Err($crate::error::WeftError::Input(format!($($arg)*)))
+    };
+}
+
 /// The one door for wrapping an OUTSIDE error (an HTTP library, a JSON
 /// parser, any non-weft `Result` or absent `Option`) into a node
 /// failure with context.
@@ -186,6 +199,15 @@ mod node_err_tests {
             "{e}"
         );
         assert!(matches!(node_error("boom"), WeftError::NodeFailed(m) if m == "boom"));
+    }
+
+    #[test]
+    fn input_bail_fails_with_an_input_error_carrying_the_message() {
+        fn bails() -> WeftResult<()> {
+            crate::input_bail!("`count` is {}, and it takes at most 10", 12);
+        }
+        let e = bails().unwrap_err();
+        assert!(matches!(&e, WeftError::Input(m) if m == "`count` is 12, and it takes at most 10"), "{e}");
     }
 
     /// The run's own control flow passes through a `node_err` unchanged:

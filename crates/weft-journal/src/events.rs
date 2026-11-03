@@ -589,6 +589,35 @@ pub enum RunEvent {
         at_unix: u64,
     },
 
+    /// A node owes a call when it ends (`ctx.after_node`,
+    /// `weft_core::signal::cancel_call`): `call`, sent through the
+    /// connection `access` (`None`: a public address, sent plain), as the
+    /// call's `when` says. On the record so whichever worker ends the
+    /// firing, after a crash too, still sends it, until `EndCallsSettled`
+    /// says it went (`crate::OwedCalls`).
+    EndCallOwed {
+        #[serde(skip)]
+        run_id: RunId,
+        node_id: String,
+        frames: LoopFrames,
+        call: weft_core::signal::CancelCall,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        access: Option<weft_core::primitive::AccessRef>,
+        at_unix: u64,
+    },
+
+    /// The calls the firing at `node_id`/`frames` owed were sent (or, for
+    /// a run nobody drives, queued to be sent) as it ended: it owes none
+    /// any more (`crate::OwedCalls`). Written after they went, so a crash
+    /// in between sends them again rather than never.
+    EndCallsSettled {
+        #[serde(skip)]
+        run_id: RunId,
+        node_id: String,
+        frames: LoopFrames,
+        at_unix: u64,
+    },
+
     /// A node tagged its own run (`ctx.tag_run`). The
     /// record of the act, for the inspector; the SELECTABLE copy a
     /// sibling's `ctx.stop_tagged` reads lives beside the run row
@@ -833,6 +862,8 @@ macro_rules! run_id_of {
             | Self::ChargeOpened { run_id, .. }
             | Self::LogLine { run_id, .. }
             | Self::FileEdited { run_id, .. }
+            | Self::EndCallOwed { run_id, .. }
+            | Self::EndCallsSettled { run_id, .. }
             | Self::RunTagged { run_id, .. }
             | Self::RunCompleted { run_id, .. }
             | Self::RunFailed { run_id, .. }
@@ -941,6 +972,8 @@ impl RunEvent {
             | Self::ChargeOpened { at_unix, .. }
             | Self::LogLine { at_unix, .. }
             | Self::FileEdited { at_unix, .. }
+            | Self::EndCallOwed { at_unix, .. }
+            | Self::EndCallsSettled { at_unix, .. }
             | Self::RunTagged { at_unix, .. }
             | Self::RunCompleted { at_unix, .. }
             | Self::RunFailed { at_unix, .. }
@@ -986,6 +1019,8 @@ impl RunEvent {
             Self::ChargeOpened { .. } => "charge_opened",
             Self::LogLine { .. } => "log_line",
             Self::FileEdited { .. } => "file_edited",
+            Self::EndCallOwed { .. } => "end_call_owed",
+            Self::EndCallsSettled { .. } => "end_calls_settled",
             Self::RunTagged { .. } => "run_tagged",
             Self::RunCompleted { .. } => "run_completed",
             Self::RunFailed { .. } => "run_failed",
@@ -1031,7 +1066,9 @@ impl RunEvent {
             Self::NodeStarted { node_id, frames: at, .. }
             | Self::NodeCompleted { node_id, frames: at, .. }
             | Self::NodeSkipped { node_id, frames: at, .. }
-            | Self::FileEdited { node_id, frames: at, .. } => node_id.len() + frames(at),
+            | Self::FileEdited { node_id, frames: at, .. }
+            | Self::EndCallsSettled { node_id, frames: at, .. } => node_id.len() + frames(at),
+            Self::EndCallOwed { node_id, frames: at, call, .. } => node_id.len() + frames(at) + call.url.len(),
             Self::NodeFailed { node_id, frames: at, error: text, .. }
             | Self::NodeCancelled { node_id, frames: at, reason: text, .. }
             | Self::SuspensionRegistered { node_id, frames: at, token: text, .. } => node_id.len() + frames(at) + text.len(),

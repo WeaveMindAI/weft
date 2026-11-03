@@ -313,23 +313,36 @@ pub enum LastAnswer {
     TooLarge(u64),
 }
 
-/// Body for `POST /cancel_call` on the listener: send the last call of a
-/// wait whose run was cancelled (`crate::signal::cancel_call`). The wait's
-/// row is gone by now (the cancel took it down), so everything the call
-/// needs rides here: the spec carries the call and the connection it is
-/// sent as.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Body for `POST /cancel_call` on the listener: send a call weft owes
+/// for a run nobody drives any more (`crate::signal::cancel_call`): the
+/// last call of a wait whose run was cancelled, or a call a node owed when
+/// its run ended without a worker to send it. What it was recorded with is
+/// gone by now (the wait's row, the run's drive), so everything the call
+/// needs rides here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancelCallRequest {
-    /// The token the wait was registered under. The broker answers where
-    /// an infra address in the call is reached for it while the call is
-    /// queued.
+    /// What the call is for, named in what is said about it and keying
+    /// its task: the wait's token, or the node's place in its run
+    /// ([`node_call_name`]).
     pub token: String,
     pub tenant_id: String,
-    /// Whose run waited, when it was an instance's: its connection is
-    /// read through that instance's alone, as the wait's polls were.
+    /// Whose run it was, when it was an instance's: its connection is
+    /// read through that instance's alone, as the run's were.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_instance: Option<crate::instance::InstanceScope>,
-    pub spec: SignalSpec,
+    pub call: crate::signal::CancelCall,
+    /// The connection it is sent as; `None` sends it plain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<crate::primitive::AccessRef>,
+}
+
+/// What names the `index`th call the node `node_id` at `frames` of
+/// `run_id` owed ([`CancelCallRequest::token`]): one per call, so each is
+/// queued once.
+pub fn node_call_name(run_id: crate::RunId, node_id: &str, frames: &crate::frames::LoopFrames, index: usize) -> String {
+    let at = serde_json::to_string(frames).expect("frames serialize");
+    format!("{run_id}/{node_id}{at}/{index}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -570,19 +583,40 @@ mod tests {
         assert_eq!(back.mode, StartMode::Restore);
     }
 
-    /// A cancel call carries the wait's whole spec across: the call
-    /// itself and the connection it is sent as, since the row is gone.
+    /// A cancel call carries the call itself and the connection it is
+    /// sent as, since what it was recorded with is gone; a plain one
+    /// writes no connection.
     #[test]
     fn a_cancel_call_request_carries_the_call_and_its_connection() {
-        let mut spec = SignalSpec::of_kind("poll_endpoint", serde_json::json!({ "url": "https://x/status" }));
-        spec.access = Some(crate::primitive::AccessRef { id: "a1".into(), service: "fal".into(), required_values: Vec::new() });
-        spec.on_cancel = Some(crate::signal::CancelCall::put("https://x/cancel"));
-        let req = CancelCallRequest { token: "t".into(), tenant_id: "acme".into(), for_instance: None, spec };
+        let req = CancelCallRequest {
+            token: "t".into(),
+            tenant_id: "acme".into(),
+            for_instance: None,
+            call: crate::signal::CancelCall::delete("https://x/uploads/1").always(),
+            access: Some(crate::primitive::AccessRef { id: "a1".into(), service: "fal".into(), required_values: Vec::new() }),
+        };
         let wire = serde_json::to_value(&req).unwrap();
-        assert_eq!(wire["spec"]["onCancel"], serde_json::json!({ "url": "https://x/cancel", "method": "put" }));
-        let back: CancelCallRequest = serde_json::from_value(wire).unwrap();
-        assert_eq!(back.spec.on_cancel, Some(crate::signal::CancelCall::put("https://x/cancel")));
-        assert_eq!(back.spec.access.map(|a| a.id), Some("a1".to_string()));
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "token": "t", "tenant_id": "acme",
+                "call": { "url": "https://x/uploads/1", "method": "delete", "when": "always" },
+                "access": { "id": "a1", "service": "fal" }
+            })
+        );
+        assert_eq!(serde_json::from_value::<CancelCallRequest>(wire).unwrap(), req);
+        let plain = CancelCallRequest { access: None, ..req };
+        assert!(serde_json::to_value(&plain).unwrap().get("access").is_none());
+    }
+
+    /// Each call a node owed has its own name, by run, place and number.
+    #[test]
+    fn a_node_calls_name_tells_it_apart() {
+        let run = crate::RunId::from_u128(1);
+        let first = node_call_name(run, "upload", &Vec::new(), 0);
+        assert_ne!(first, node_call_name(run, "upload", &Vec::new(), 1));
+        assert_ne!(first, node_call_name(run, "other", &Vec::new(), 0));
+        assert!(first.starts_with(&run.to_string()) && first.contains("upload"), "{first}");
     }
 
     /// `ProcessTarget` is serialized over the fire path; every variant

@@ -61,7 +61,7 @@ except ValueError:
 
 DISPLAY = ":1"
 
-# SYNC: computer routes <-> catalog/computer/computer/mod.rs (HEALTH_PATH), catalog/computer/actions.rs (JOBS_PATH)
+# SYNC: computer routes <-> catalog/computer/computer/mod.rs (HEALTH_PATH), catalog/computer/actions.rs (JOBS)
 HEALTH_PATH = "/health"
 LIVE_PATH = "/live"
 ACTION_PATH = "/action"

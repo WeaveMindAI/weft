@@ -52,12 +52,35 @@ those numbers, shared-core ones included: a quarter CPU with `1Gi` is
 Compute Engine's `e2-micro`. A number left unset is the sum of the
 containers' own limits. If you need one machine type in particular,
 `machine.kind` names it (`n2-highmem-8`) and skips the pick. On your machine
-weft caps each container that has no limits of its own at the unit's numbers,
-and refuses a unit that asks for a GPU you do not have.
+the unit's numbers cap nothing: only a container's own `limits.memory` caps
+it. weft refuses a unit there that asks for a GPU you do not have.
 
 Whoever uses your node pays for that machine, so if the right size depends on
-their load, give the node inputs for it and read them into `machine`: the
-Postgres node takes `cpu`, `memory` and `machineType`. On your machine weft cannot pick a GPU by kind, so a unit that
+their load, let them set it. Declare the size your node needs by default in
+its `metadata.json`, next to `requiresInfra`:
+
+```json
+"requiresInfra": true,
+"features": { "machineInputs": { "cpu": "1", "memory": "2Gi" } }
+```
+
+weft gives the node three inputs: `cpu` and `memory`, which default to those
+sizes, and `machineType`, which has no default. A `cpu` or a `memory`
+written in the program that does not read as a size (`1`, `500m`; `2Gi`,
+`512Mi`) is refused at compile time, naming the input, and a wired one fails
+the node when it arrives. Read the three into a `MachineShape` in `provision_infra` and put it on
+the unit:
+
+```rust
+let machine = MachineShape::from_inputs(&input)?;
+```
+
+A blank `machineType` comes back as `None`, so the cloud picks the machine
+from `cpu` and `memory`. The node fails to load if it declares one of the
+three inputs itself, if it sets `machineInputs` without `requiresInfra`, or
+if a default is not a size.
+
+On your machine weft cannot pick a GPU by kind, so a unit that
 asks for any GPU gets every GPU the machine has, and `weft infra start` and
 `weft infra status` warn you about it.
 
@@ -193,7 +216,7 @@ next, so weft can save it when the infrastructure is applied and stop running
 your node just to hand it out. Mark it `baked` in `metadata.json`:
 
 ```json
-{ "name": "access", "type": "Access", "baked": true }
+{ "name": "access", "type": "Access[postgres]", "baked": true }
 ```
 
 (Baked outputs have nothing to do with `weft bake`, which prepares a

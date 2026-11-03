@@ -8,9 +8,9 @@
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
-use weft::access::client::{get_json, post_json};
+use weft::access::client::{get_json, post_json, url};
 use weft::node::NodeOutput;
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::elevenlabs::{merge_json, API};
 use super::flows::set_some;
@@ -43,30 +43,26 @@ impl Node for ElevenLabsAgentCallNode {
 
         let http = ctx.client(&account).await?;
         // The number's record says how it is wired; that decides the
-        // call route. The id is typed text that becomes a path segment:
-        // encoded, it can only ever name a phone number.
-        let number = get_json(
-            &http,
-            &format!("{API}/convai/phone-numbers/{}", urlencoding::encode(&phone_number)),
-            "read the ElevenLabs phone number",
-        )
-        .await?;
+        // call route.
+        let number =
+            get_json(&http, url(API, &["convai", "phone-numbers", &phone_number])?.as_str(), "read the ElevenLabs phone number")
+                .await?;
         let provider = number["provider"].as_str().unwrap_or_default();
         // The number is the program's own choice, so a number this node
         // cannot dial, or a Twilio setting on a number that is not
         // Twilio's, is the program's mistake: an input error, which
         // `_error` never catches.
         let Some(&(_, route, a_provider)) = PROVIDERS.iter().find(|(name, _, _)| *name == provider) else {
-            return Err(WeftError::Input(format!(
+            weft::input_bail!(
                 "phone number {phone_number} has provider '{provider}', which this node does not know how to \
                  dial through; pick a Twilio, Exotel or SIP trunk number"
-            )));
+            );
         };
         if let Some(setting) = telephony.twilio_only().filter(|_| provider != "twilio") {
-            return Err(WeftError::Input(format!(
+            weft::input_bail!(
                 "phone number {phone_number} is {a_provider} number, and `{setting}` works only on a Twilio \
                  number (ElevenLabs ignores it on any other): pick a Twilio number, or leave `{setting}` off"
-            )));
+            );
         }
 
         let mut body = json!({
@@ -83,7 +79,8 @@ impl Node for ElevenLabsAgentCallNode {
         }
 
         let answer =
-            post_json(&http, &format!("{API}/convai/{route}/outbound-call"), &body, "place the call through ElevenLabs").await?;
+            post_json(&http, url(API, &["convai", route, "outbound-call"])?.as_str(), &body, "place the call through ElevenLabs")
+                .await?;
         if answer["success"].as_bool() == Some(false) {
             weft::node_bail!("elevenlabs refused the call: {}", answer["message"].as_str().unwrap_or("no detail"));
         }

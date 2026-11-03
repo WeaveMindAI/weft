@@ -627,6 +627,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     tables: &["trigger_activation"],
     ddl: &[
         r#"CREATE TABLE IF NOT EXISTS trigger_activation (
+            -- The key the boot walks `activation_program`'s rows by when it
+            -- carries them to a newer shape: the natural key holds a
+            -- nullable `instance_id`, so it cannot be the primary key.
+            id BIGSERIAL PRIMARY KEY,
             project_id UUID NOT NULL REFERENCES project(id) ON DELETE CASCADE,
             -- The trigger, spelled the way the program reads it (`door`,
             -- `one.door` inside an included file): the same spelling the

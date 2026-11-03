@@ -62,7 +62,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[s3]",
       "widget": {
         "kind": "access"
       },
@@ -72,7 +72,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[s3]",
       "description": "Wire into the S3 nodes."
     }
   ]

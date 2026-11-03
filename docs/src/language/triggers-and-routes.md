@@ -86,6 +86,10 @@ The caller is held open while your program works, and `Reply` is what answers
 them. For streaming an answer as it is produced, and for the Rust side, go and
 read [talking to a live caller](../nodes/live-callers.md).
 
+If only some callers may call it, set its `auth` (`auth: "api_keys"`, say)
+and pick the connection holding the keys with `weft connect post`. For every
+scheme, go and read [checking a signed request](../connections/verifying-requests.md#on-a-route).
+
 The request's body comes out whole on `body`. Left undeclared, it is a
 `JsonDict`. If you declare a type on it, as `Card` above, a call whose body
 does not fit is answered `400` naming what is wrong, and no node after `post`
@@ -120,7 +124,7 @@ asking you to rename the capture.
 **A caller's credentials come out on `credentials`, never on `headers`.** The
 headers that carry one (`authorization`, `proxy-authorization`, `cookie`,
 `weft-instance-token`, and any header the route's `auth` reads, like the
-`X-Api-Key` an `ApiKeyAuth` checks) are
+`X-Api-Key` that `auth: "api_keys"` checks) are
 each made a secret the moment the call arrives, before anything of the run is
 written, so the run's record, the inspector, `weft events` and search hold a
 marker in their place and never the value. The value is still there for the

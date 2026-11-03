@@ -5,10 +5,10 @@
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
+use weft::instance::InstanceId;
 use weft::node::NodeOutput;
 use weft::{RunContext, Node, NodeManifest, WeftResult};
 
-use super::lifecycle::instance;
 
 #[derive(NodeManifest)]
 pub struct GetInstanceValuesNode;
@@ -24,7 +24,7 @@ impl Node for GetInstanceValuesNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let by_node = ctx.values().instance(instance(&ctx)?).get().await?;
+        let by_node = ctx.values().instance(ctx.inputs.get::<InstanceId>("instance")?).get().await?;
         let mut values = Map::new();
         for (node, fields) in by_node {
             for (field, value) in fields {

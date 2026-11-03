@@ -17,7 +17,6 @@ fn path(url: &str) -> String {
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("a_row_number_writes_the_whole_row", by_row_number),
-        NodeTest::fake("both_addressings_at_once_refuse", both_addressings),
         NodeTest::live("one_real_overwrite_read_back", "google", live_update).with_fixture(
             // The node's own spreadsheet input, picker widget and all.
             fixture_spec_like(
@@ -39,7 +38,7 @@ async fn by_row_number(rig: FakeRig) -> WeftResult<()> {
         "PUT",
         &format!(
             "{}?valueInputOption=USER_ENTERED",
-            path(&values_url("s1", "Log", Some("A5")))
+            path(values_url("s1", "Log", Some("A5"))?.as_str())
         ),
         json!({}),
     );
@@ -59,30 +58,6 @@ async fn by_row_number(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(outcome.outputs["done"], json!(true));
     let body = rig.requests()[1].body.clone().expect("update body");
     assert_eq!(body["values"], json!([["ada", "37"]]));
-    Ok(())
-}
-
-async fn both_addressings(rig: FakeRig) -> WeftResult<()> {
-    rig.respond(
-        "GET",
-        "/v4/spreadsheets/s1?fields=sheets.properties",
-        json!({ "sheets": [{ "properties": { "sheetId": 0, "title": "Log" } }] }),
-    );
-    let outcome = rig
-        .run(
-            &GoogleSheetsUpdateNode,
-            json!({
-                "account": rig.access("google"),
-                "spreadsheet": "s1",
-                "row": ["x"],
-                "rowNumber": 5,
-                "range": "B2:C2",
-                "hasHeader": false,
-            }),
-        )
-        .await;
-    let err = outcome.result.expect_err("two addressings must refuse").to_string();
-    assert!(err.contains("ONE addressing"), "{err}");
     Ok(())
 }
 

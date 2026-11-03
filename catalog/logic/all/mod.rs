@@ -40,23 +40,11 @@ impl Node for AllNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        // "All of nothing" is true in logic and a mis-wiring in a
-        // graph: a gate fed from here would be permanently open and
-        // nothing on screen would say why. Refuse instead of guessing.
-        let mut any = false;
-        let mut every = true;
-        for (_, value) in ctx.inputs.custom() {
-            any = true;
-            if *value == serde_json::Value::Bool(false) {
-                every = false;
-            }
-        }
-        if !any {
-            return Err(weft::node_error(
-                "nothing is wired onto this All, so there is nothing for it to agree about. \
-                 Wire the answers it should combine onto it, one input each",
-            ));
-        }
+        // "All of nothing" is true in logic and a mis-wiring in a graph
+        // (a gate fed from here would be permanently open), so the node's
+        // rule refuses an All with no input before it runs. Every input is
+        // required, so each one arrived.
+        let every = ctx.inputs.custom().all(|(_, value)| *value != serde_json::Value::Bool(false));
         let output = if every {
             NodeOutput::new().set("yes", serde_json::Value::Bool(true))
         } else {

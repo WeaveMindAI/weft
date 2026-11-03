@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use weft::node::NodeOutput;
-use weft::signal::{DeltaMode, PollDelta, PollEndpoint, PollMethod};
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::access::client::url;
+use weft::signal::{DeltaMode, PollDelta, PollEndpoint, PollMethod, PollPaging};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::notion::{data_source_id, API};
 
@@ -29,26 +30,28 @@ impl Node for NotionNewItemNode {
         let account: Access = ctx.inputs.get("account")?;
         let database: String = ctx.inputs.get("database")?;
         let source: Option<String> = ctx.inputs.opt("source")?;
-        let interval: f64 = ctx.inputs.get("intervalSecs")?;
+        let interval: u64 = ctx.inputs.get("intervalSecs")?;
 
         let http = ctx.client(&account).await?;
         let source = data_source_id(&http, &database, source.as_deref()).await?;
 
         ctx.register_signal(PollEndpoint {
-            url: format!("{API}/data_sources/{source}/query"),
+            url: url(API, &["data_sources", &source, "query"])?.into(),
             method: PollMethod::Post,
-            // Newest first, so a new row is always on the first page
-            // however big the database grows.
+            // Newest first, so the poll meets the new rows first and
+            // follows `next_cursor` only until it reaches one it has
+            // already seen.
             body: Some(json!({
                 "sorts": [{ "timestamp": "created_time", "direction": "descending" }],
                 "page_size": 100,
             })),
-            interval_secs: interval as u64,
+            interval_secs: interval,
             delta: Some(PollDelta {
                 items: "results".into(),
                 cursor_field: Some("id".into()),
                 mode: DeltaMode::Set,
                 cursor_param: None,
+                paging: Some(PollPaging::body("next_cursor", "start_cursor")),
             }),
             access: Some(weft::primitive::AccessRef::from(&account)),
             ..Default::default()
@@ -57,9 +60,9 @@ impl Node for NotionNewItemNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let wake = ctx.wake.record()?;
-        let page = wake["item"].clone();
-        let id = page["id"].as_str().node_err("the poll wake carries no page id")?.to_string();
+        let item = ctx.wake.nested("item")?;
+        let id: String = item.get("id")?;
+        let page = item.record()?;
         ctx.pulse_downstream(
             NodeOutput::new()
                 .set("page", page.clone())

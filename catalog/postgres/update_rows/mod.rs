@@ -6,12 +6,12 @@
 //! has committed.
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use weft::node::NodeOutput;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::postgres::{connect, mistake, placeholders, quote_ident, Statement, WrittenBy};
+use super::postgres::{connect, placeholders, quote_ident, Statement, WrittenBy};
 
 /// The UPDATE for a table, its SET columns, and a WHERE condition, plus
 /// the ports the condition reads in the order its `$1..$k` bind them.
@@ -26,17 +26,17 @@ pub fn update_sql(
     condition: &str,
 ) -> WeftResult<(String, Vec<String>)> {
     if columns.is_empty() {
-        mistake!("set holds no columns; nothing to update");
+        weft::input_bail!("set holds no columns; nothing to update");
     }
     if condition.trim().is_empty() {
-        mistake!(
+        weft::input_bail!(
             "where is empty; an unconditional update is almost always a mistake, write \
              `true` explicitly to update every row"
         );
     }
     let mut parsed = placeholders(condition)?;
     if parsed.statements.len() != 1 {
-        mistake!("where is one SQL condition; this one holds several statements");
+        weft::input_bail!("where is one SQL condition; this one holds several statements");
     }
     let Statement { sql: condition, names } = parsed.statements.remove(0);
     let first_set_param = names.len() + 1;
@@ -77,16 +77,15 @@ impl Node for PostgresUpdateRowsNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let table: String = ctx.inputs.get("table")?;
-        let set: Value = ctx.inputs.get("set")?;
+        let obj: Map<String, Value> = ctx.inputs.get("set")?;
         let condition: String = ctx.inputs.get("where")?;
 
-        let Some(obj) = set.as_object() else {
-            mistake!("set must be an object of column: value pairs");
-        };
         let columns: Vec<String> = obj.keys().cloned().collect();
         let (sql, names) = update_sql(&table, &columns, &condition)?;
         // The condition's placeholders and the node's own custom ports
-        // have to match both ways, as in PostgresExecuteQuery.
+        // have to match both ways. The compiler checks a `where` written
+        // in the source (`placeholdersAreInputs`); one arriving on a
+        // wire is checked here, by the ctx.
         let mut params: Vec<Value> = ctx
             .inputs
             .for_holes(

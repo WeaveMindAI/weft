@@ -81,12 +81,20 @@ async fn truncated(rig: FakeRig) -> WeftResult<()> {
     // The bus ends with the body, the failure path included, and says
     // so: the marker pulsed before the error, so a reader may be parked
     // on it, and the failed end both releases it and tells it the reply
-    // is cut. Draining to the end proves termination; the metadata names
-    // the model, as on the happy path.
+    // is cut: the read past the last message is that failure. Draining
+    // to it proves termination; the metadata names the model, as on the
+    // happy path.
     let bus = rig.bus(&outcome.outputs["stream"])?;
     assert_eq!(bus.meta()["model"], json!("test/model"));
     let mut cursor = bus.cursor_from_start().unwrap();
-    while cursor.next(&mut HarnessRead).await?.is_some() {}
+    let ended = loop {
+        match cursor.next(&mut HarnessRead).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("a cut reply must not read as a clean end"),
+            Err(e) => break e.to_string(),
+        }
+    };
+    assert!(ended.contains("truncated"), "{ended}");
     assert!(
         matches!(bus.end(), Some(StreamEnd::Failed { error }) if error.contains("truncated")),
         "{:?}",

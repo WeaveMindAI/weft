@@ -4,7 +4,7 @@ A group holds several nodes under one name and folds shut like a folder. Its
 signature says what the outside can see.
 
 ```weft
-credit = Group(db: Access, user: String) -> (paid: Boolean, refusal: String) {
+credit = Group(db: Access[postgres], user: String) -> (paid: Boolean, refusal: String) {
   # Take one credit off this account, or say why we cannot
   debit = PostgresExecuteQuery(telegram_id: String) {
     query: @file("assets/sql/spend_credit.sql")
@@ -73,7 +73,7 @@ as arrived.
 
 This is the part that surprises people.
 
-You give a group a `db: Access` input, then the thing feeding it closes. You
+You give a group a `db: Access[postgres]` input, then the thing feeding it closes. You
 would expect the whole group to skip.
 
 It does not. A group input holds nothing: whatever reaches it, a value or a

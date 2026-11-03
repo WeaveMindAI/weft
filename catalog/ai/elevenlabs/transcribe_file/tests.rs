@@ -1,36 +1,40 @@
-//! ElevenLabsTranscribeFile self-tests: the multipart request with every
-//! setting under ElevenLabs's names, the refusals said before anything is
-//! sent, and every port and the stored transcript file filled from canned
+//! ElevenLabsTranscribeFile self-tests: the multipart form with every
+//! setting under ElevenLabs's names, and every port and the stored transcript file filled from canned
 //! answers (one transcript, one per channel, a rewrite and a failed one);
 //! one real transcription of a freshly spoken sentence on the live tier.
+//! What ElevenLabs would refuse in the settings is the metadata rules',
+//! which this rig does not run. The request streams the recording out
+//! of storage, so the fake rig cannot read it: the form is checked as
+//! `Settings` builds it.
 
 use base64::Engine as _;
 use serde_json::{json, Value};
 
+use weft::access::client::Multipart;
 use weft::storage::StoredFile;
-use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
+use weft::{FakeRig, LiveRig, NodeManifest, NodeTest, ValueBag, WeftResult};
 
 use crate::testing::emitted_file;
 
-use super::{export_options, parse_answer, transcript_document, ElevenLabsTranscribeFileNode, Transcripts};
+use super::{parse_answer, transcript_document, ElevenLabsTranscribeFileNode, ExportItem, Settings, Transcripts};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::basic("an_answer_without_text_is_refused", answer_shape),
         NodeTest::basic("the_transcript_file_holds_only_what_the_answer_carries", document_parts),
-        NodeTest::basic("export_formats_go_under_elevenlabs_names_and_bad_ones_are_refused", export_formats),
-        NodeTest::fake("uploads_the_file_and_emits_the_transcript", transcribes),
-        NodeTest::fake("every_speaker_and_entity_setting_reaches_the_form_under_elevenlabs_names", every_setting),
-        NodeTest::fake("a_link_goes_instead_of_a_file_with_the_channel_settings", link_and_channels),
-        NodeTest::fake("a_rewrite_and_a_speaker_count_reach_the_form", rewrite_setting),
+        NodeTest::basic("export_formats_go_under_elevenlabs_names", export_formats),
+        NodeTest::basic("a_bare_form_carries_only_the_model", bare_form),
+        NodeTest::fake("streams_the_file_and_emits_the_transcript", transcribes),
+        NodeTest::basic("every_speaker_and_entity_setting_reaches_the_form_under_elevenlabs_names", every_setting),
+        NodeTest::fake("a_link_goes_instead_of_a_file", link),
+        NodeTest::basic("the_channel_settings_reach_the_form", channels),
+        NodeTest::basic("a_rewrite_and_a_speaker_count_reach_the_form", rewrite_setting),
         NodeTest::fake("zero_retention_rides_the_query", zero_retention),
         NodeTest::fake("the_answer_fills_every_port_and_the_transcript_file", every_port),
         NodeTest::fake("a_multichannel_answer_comes_out_per_channel", per_channel),
         NodeTest::fake("a_combined_multichannel_answer_is_one_transcript", combined),
         NodeTest::fake("a_rewritten_transcript_lands_in_the_transcript_file", rewritten),
         NodeTest::fake("a_failed_rewrite_is_logged_and_the_transcript_still_lands", rewrite_failed),
-        NodeTest::fake("settings_elevenlabs_would_refuse_are_refused_before_anything_is_sent", refused),
-        NodeTest::fake("a_file_and_a_link_together_or_neither_are_refused_before_anything_is_sent", one_recording),
         NodeTest::live("one_real_transcription_of_generated_speech", "elevenlabs", live_transcribe),
     ]
 }
@@ -49,13 +53,21 @@ fn inputs(rig: &FakeRig, extra: Value) -> Value {
     base
 }
 
-/// The multipart body of the transcription request.
-fn form(rig: &FakeRig) -> String {
-    rig.requests()
-        .into_iter()
-        .find(|r| r.method == "POST" && r.path == STT)
-        .and_then(|r| r.body_text)
-        .expect("the node sent a multipart request")
+/// The multipart form `Settings` builds from the node's defaults plus
+/// `extra`, as text.
+fn form(extra: Value) -> WeftResult<String> {
+    let mut values = serde_json::Map::new();
+    for spec in &ElevenLabsTranscribeFileNode.manifest().inputs {
+        if let Some(default) = &spec.default {
+            values.insert(spec.name.clone(), default.clone());
+        }
+    }
+    for (k, v) in extra.as_object().expect("extra inputs are an object") {
+        values.insert(k.clone(), v.clone());
+    }
+    let settings = Settings::read(&ValueBag::inputs(values, Default::default(), Vec::new()))?;
+    let (_, body) = settings.form(Multipart::form_data()).build();
+    Ok(String::from_utf8(body).expect("a form of text fields is text"))
 }
 
 /// Whether the multipart `form` holds a text field `name` set to `value`.
@@ -115,21 +127,21 @@ fn document_parts() -> WeftResult<()> {
 }
 
 fn export_formats() -> WeftResult<()> {
-    let options = export_options(&[
-        json!("srt"),
-        json!({
+    let items: Vec<ExportItem> = serde_json::from_value(json!([
+        "srt",
+        {
             "format": "txt",
             "includeSpeakers": false,
             "includeTimestamps": true,
             "segmentOnSilenceLongerThanS": 0.8,
             "maxSegmentDurationS": 4.5,
-            // A wired count arrives as a float.
-            "maxSegmentChars": 84.0,
+            "maxSegmentChars": 84,
             "maxCharactersPerLine": 42,
-        }),
-        json!({ "format": "pdf", "includeTimestamps": false }),
-    ])
-    .expect("every entry is one ElevenLabs takes");
+        },
+        { "format": "pdf", "includeTimestamps": false },
+    ]))
+    .expect("every entry reads as the port types it");
+    let options = items.into_iter().map(ExportItem::option).collect::<WeftResult<Vec<_>>>()?;
     assert_eq!(
         options,
         vec![
@@ -146,17 +158,30 @@ fn export_formats() -> WeftResult<()> {
             json!({ "format": "pdf", "include_timestamps": false }),
         ]
     );
-    for (items, says) in [
-        (vec![json!("srt"); 11], "at most 10"),
-        (vec![json!("vtt")], "'vtt' is not a format"),
-        (vec![json!({ "format": "html", "maxCharactersPerLine": 40 })], "srt and txt only"),
-        (vec![json!({ "format": "srt", "maxSegmentChars": 8.5 })], "whole number"),
-        (vec![json!({ "format": "srt", "fontSize": 3 })], "`fontSize` is not a layout option"),
-        (vec![json!({ "includeSpeakers": true })], "names no `format`"),
-        (vec![json!(3)], "a format name or"),
+    let html: ExportItem = serde_json::from_value(json!({ "format": "html", "maxCharactersPerLine": 40 }))
+        .expect("the entry reads as the port types it");
+    let err = html.option().expect_err("a line length only srt and txt take").to_string();
+    assert!(err.starts_with("input error") && err.contains("srt and txt only"), "{err}");
+    Ok(())
+}
+
+fn bare_form() -> WeftResult<()> {
+    let raw = form(json!({}))?;
+    assert!(has_field(&raw, "model_id", "scribe_v2"), "the default model rides: {raw}");
+    for left in [
+        "language_code",
+        "diarize",
+        "tag_audio_events",
+        "no_verbatim",
+        "use_multi_channel",
+        "detect_speaker_roles",
+        "use_speaker_library",
+        "timestamps_granularity",
+        "keyterms",
+        "additional_formats",
+        "entity_detection",
     ] {
-        let err = export_options(&items).expect_err("a shape ElevenLabs refuses");
-        assert!(err.contains(says), "{items:?}: {err}");
+        assert!(!has_name(&raw, left), "nothing nobody set rides, `{left}` included: {raw}");
     }
     Ok(())
 }
@@ -169,61 +194,32 @@ async fn transcribes(rig: FakeRig) -> WeftResult<()> {
     let sent = &rig.requests()[0];
     let content_type = sent.header("content-type").unwrap_or_default().to_string();
     assert!(content_type.starts_with("multipart/form-data"), "{content_type}");
-    assert!(!sent.body_streamed, "the form is a buffered body the rig can read");
+    assert!(sent.body_streamed, "the recording streams out of storage, never read whole");
     assert_eq!(sent.query, None, "logging stays on unless turned off");
-    let raw = form(&rig);
-    assert!(raw.contains("name=\"file\"; filename=\"note.ogg\"") && raw.contains("OggS-bytes"), "the bytes ride the form");
-    assert!(has_field(&raw, "model_id", "scribe_v2"), "the default model rides: {raw}");
-    assert!(has_field(&raw, "language_code", "fr"), "the language rides when set: {raw}");
-    for left in [
-        "diarize",
-        "tag_audio_events",
-        "no_verbatim",
-        "use_multi_channel",
-        "detect_speaker_roles",
-        "use_speaker_library",
-        "timestamps_granularity",
-        "keyterms",
-        "additional_formats",
-        "entity_detection",
-        "source_url",
-    ] {
-        assert!(!has_name(&raw, left), "nothing nobody set rides, `{left}` included: {raw}");
-    }
     Ok(())
 }
 
-async fn every_setting(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("POST", STT, json!({ "language_code": "eng", "text": "hi" }));
-    rig.run(
-        &ElevenLabsTranscribeFileNode,
-        inputs(
-            &rig,
-            json!({
-                "model": "scribe_v2_medical",
-                "language": "eng",
-                "diarize": true,
-                "diarizationThreshold": 0.3,
-                "detectSpeakerRoles": true,
-                "useSpeakerLibrary": true,
-                "timestampsGranularity": "character",
-                "tagAudioEvents": false,
-                "noVerbatim": true,
-                "keyterms": ["Weavemind", "weft node"],
-                "additionalFormats": ["srt", { "format": "txt", "includeSpeakers": false }],
-                "entityDetection": ["pii", "phi"],
-                "entityRedaction": ["pii"],
-                "entityRedactionMode": "redacted",
-                "temperature": 0.5,
-                // A wired number arrives as a float.
-                "seed": 42.0,
-                "fileFormat": "pcm_s16le_16",
-            }),
-        ),
-    )
-    .await
-    .ok()?;
-    let raw = form(&rig);
+fn every_setting() -> WeftResult<()> {
+    let raw = form(json!({
+        "model": "scribe_v2_medical",
+        "language": "eng",
+        "diarize": true,
+        "diarizationThreshold": 0.3,
+        "detectSpeakerRoles": true,
+        "useSpeakerLibrary": true,
+        "timestampsGranularity": "character",
+        "tagAudioEvents": false,
+        "noVerbatim": true,
+        "keyterms": ["Weavemind", "weft node"],
+        "additionalFormats": ["srt", { "format": "txt", "includeSpeakers": false }],
+        "entityDetection": ["pii", "phi"],
+        "entityRedaction": ["pii"],
+        "entityRedactionMode": "redacted",
+        "temperature": 0.5,
+        // A wired number arrives as a float.
+        "seed": 42.0,
+        "fileFormat": "pcm_s16le_16",
+    }))?;
     for (name, value) in [
         ("model_id", "scribe_v2_medical"),
         ("language_code", "eng"),
@@ -250,37 +246,30 @@ async fn every_setting(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn link_and_channels(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("POST", STT, json!({ "transcripts": [] }));
-    let mut given = inputs(
-        &rig,
-        json!({
-            "sourceUrl": "https://www.youtube.com/watch?v=abc",
-            "useMultiChannel": true,
-            "multichannelOutputStyle": "separate",
-            "timestampsGranularity": "none",
-        }),
-    );
+async fn link(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("POST", STT, json!({ "text": "hi" }));
+    let mut given = inputs(&rig, json!({ "sourceUrl": "https://www.youtube.com/watch?v=abc" }));
     given.as_object_mut().expect("inputs are an object").remove("audio");
-    rig.run(&ElevenLabsTranscribeFileNode, given).await.ok()?;
-    let raw = form(&rig);
-    assert!(has_field(&raw, "source_url", "https://www.youtube.com/watch?v=abc"), "{raw}");
-    assert!(!has_name(&raw, "file"), "ElevenLabs fetches the link itself: {raw}");
+    let outcome = rig.run(&ElevenLabsTranscribeFileNode, given).await.ok()?;
+    assert_eq!(transcript(&rig, &outcome.outputs)?, json!({ "text": "hi" }));
+    assert_eq!(rig.requests().len(), 1, "ElevenLabs fetches the link itself: one request, nothing read from storage");
+    Ok(())
+}
+
+fn channels() -> WeftResult<()> {
+    let raw = form(json!({
+        "useMultiChannel": true,
+        "multichannelOutputStyle": "separate",
+        "timestampsGranularity": "none",
+    }))?;
     assert!(has_field(&raw, "use_multi_channel", "true"), "{raw}");
     assert!(has_field(&raw, "multichannel_output_style", "separate"), "{raw}");
     assert!(has_field(&raw, "timestamps_granularity", "none"), "{raw}");
     Ok(())
 }
 
-async fn rewrite_setting(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("POST", STT, json!({ "text": "hi" }));
-    rig.run(
-        &ElevenLabsTranscribeFileNode,
-        inputs(&rig, json!({ "transcriptEdit": "Write all dates as YYYY-MM-DD.", "numSpeakers": 2.0 })),
-    )
-    .await
-    .ok()?;
-    let raw = form(&rig);
+fn rewrite_setting() -> WeftResult<()> {
+    let raw = form(json!({ "transcriptEdit": "Write all dates as YYYY-MM-DD.", "numSpeakers": 2.0 }))?;
     assert!(has_field(&raw, "transcript_edit", "Write all dates as YYYY-MM-DD."), "{raw}");
     assert!(has_field(&raw, "num_speakers", "2"), "a speaker count goes as a whole number: {raw}");
     Ok(())
@@ -516,59 +505,6 @@ async fn rewrite_failed(rig: FakeRig) -> WeftResult<()> {
         "{}",
         logs[0].1
     );
-    Ok(())
-}
-
-async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    for (extra, says) in [
-        (json!({ "diarizationThreshold": 0.3 }), "only `diarize` turns on"),
-        (json!({ "diarize": true, "diarizationThreshold": 0.3, "numSpeakers": 2 }), "only without `numSpeakers`"),
-        (json!({ "detectSpeakerRoles": true }), "`detectSpeakerRoles` names the speakers"),
-        (json!({ "detectSpeakerRoles": true, "diarize": true, "useMultiChannel": true }), "does not detect speaker roles"),
-        (json!({ "useSpeakerLibrary": true }), "`useSpeakerLibrary` matches the speakers"),
-        (json!({ "useMultiChannel": true, "diarize": true }), "needs `diarize` off"),
-        (json!({ "useMultiChannel": true, "numSpeakers": 2 }), "refuses `numSpeakers`"),
-        (json!({ "multichannelOutputStyle": "combined" }), "`useMultiChannel` is off"),
-        (
-            json!({ "useMultiChannel": true, "multichannelOutputStyle": "combined", "timestampsGranularity": "none" }),
-            "merges the channels by time",
-        ),
-        (
-            json!({ "useMultiChannel": true, "multichannelOutputStyle": "combined", "entityDetection": ["pii"] }),
-            "in the `combined` style",
-        ),
-        (json!({ "transcriptEdit": "Spell numbers out.", "entityDetection": ["pii"] }), "does not rewrite a transcript"),
-        (json!({ "transcriptEdit": "Spell numbers out.", "useMultiChannel": true }), "does not rewrite a transcript"),
-        (json!({ "transcriptEdit": "x".repeat(2001) }), "2001 characters"),
-        (json!({ "entityRedaction": ["pii"] }), "`entityDetection` is empty"),
-        (json!({ "entityRedactionMode": "redacted" }), "redacts nothing"),
-        (json!({ "model": "scribe_v1", "noVerbatim": true }), "offers `noVerbatim`"),
-        (json!({ "model": "scribe_v1", "keyterms": ["weft"] }), "offers `keyterms`"),
-        (json!({ "keyterms": vec!["term"; 1001] }), "at most 1000"),
-        (json!({ "keyterms": ["a".repeat(50)] }), "under 50"),
-        (json!({ "keyterms": ["{weft}"] }), "does not take"),
-        (json!({ "additionalFormats": vec!["srt"; 11] }), "at most 10"),
-        (json!({ "additionalFormats": ["vtt"] }), "'vtt' is not a format"),
-        (json!({ "additionalFormats": [{ "format": "docx", "maxCharactersPerLine": 40 }] }), "srt and txt only"),
-    ] {
-        let err = rig.run(&ElevenLabsTranscribeFileNode, inputs(&rig, extra.clone())).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {extra}: {err}");
-        assert!(err.contains(says), "{extra}: {err}");
-    }
-    assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");
-    Ok(())
-}
-
-async fn one_recording(rig: FakeRig) -> WeftResult<()> {
-    let both = inputs(&rig, json!({ "sourceUrl": "https://example.com/talk.mp3" }));
-    let err = rig.run(&ElevenLabsTranscribeFileNode, both).await.failure()?;
-    assert!(err.starts_with("input error") && err.contains("both `audio` and `sourceUrl`"), "{err}");
-    let mut neither = inputs(&rig, json!({ "sourceUrl": "   " }));
-    neither.as_object_mut().expect("inputs are an object").remove("audio");
-    let err = rig.run(&ElevenLabsTranscribeFileNode, neither).await.failure()?;
-    assert!(err.contains("nothing to transcribe"), "a blank link is no link: {err}");
-    assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");
     Ok(())
 }
 

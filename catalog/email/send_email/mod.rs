@@ -48,15 +48,15 @@ impl Node for SendEmailNode {
         for addr in &bcc {
             builder = builder.bcc(mailbox(addr, "a Bcc address")?);
         }
-        if let Some(id) = reply_to.filter(|s| !s.trim().is_empty()) {
+        if let Some(id) = reply_to {
             builder = builder.in_reply_to(id.clone()).references(id);
         }
-        let email = builder
-            // `None` = mint a fresh Message-ID; read back below so
-            // downstream can thread replies to what was just sent.
-            .message_id(None)
-            .body(body)
-            .map_err(|e| weft::WeftError::Input(format!("building the email: {e}")))?;
+        // `None` = mint a fresh Message-ID; read back below so
+        // downstream can thread replies to what was just sent.
+        let email = match builder.message_id(None).body(body) {
+            Ok(email) => email,
+            Err(e) => weft::input_bail!("building the email: {e}"),
+        };
         let message_id = email
             .headers()
             .get_raw("Message-ID")
@@ -78,9 +78,9 @@ impl Node for SendEmailNode {
         .credentials(Credentials::new(server.user, server.password))
         .build();
 
-        transport
-            .send(email)
-            .await
+        ctx.cancellation()
+            .race(transport.send(email))
+            .await?
             .map_err(|e| weft::WeftError::NodeFailed(format!("the SMTP server refused the send: {e}")))?;
 
         ctx.pulse_downstream(NodeOutput::new().set("messageId", message_id)).await
@@ -91,6 +91,8 @@ impl Node for SendEmailNode {
 const IMPLICIT_TLS_PORT: u16 = 465;
 
 fn mailbox(addr: &str, what: &str) -> WeftResult<Mailbox> {
-    addr.parse()
-        .map_err(|e| weft::WeftError::Input(format!("{what} ('{addr}') is not a valid email address: {e}")))
+    match addr.parse() {
+        Ok(mailbox) => Ok(mailbox),
+        Err(e) => weft::input_bail!("{what} ('{addr}') is not a valid email address: {e}"),
+    }
 }

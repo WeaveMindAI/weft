@@ -51,6 +51,6 @@ async fn chosen(rig: FakeRig) -> WeftResult<()> {
 
 async fn unknown_scope(rig: FakeRig) -> WeftResult<()> {
     let err = rig.run(&TextToFileNode, json!({ "text": "x", "scope": "forever" })).await.failure()?;
-    assert!(err.contains("`scope` is 'forever'"), "{err}");
+    assert!(err.contains("scope") && err.contains("forever"), "{err}");
     Ok(())
 }

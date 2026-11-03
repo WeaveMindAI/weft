@@ -24,7 +24,6 @@
       "widget": {
         "kind": "select",
         "options": [
-          "",
           "json",
           "text",
           "bytes",
@@ -32,7 +31,7 @@
         ]
       },
       "label": "Answer as",
-      "description": "`json`, `text` or `bytes`; empty follows the trigger's `dataType`. A GET answering a picture sets `bytes`. `redirect` (Route only) answers a file with a redirect to its link (302, or the 3xx `status` sets), so the browser fetches the file straight from where it is stored."
+      "description": "`json`, `text` or `bytes`; unset follows the trigger's `dataType`. A GET answering a picture sets `bytes`. `redirect` (Route only) answers a file with a redirect to its link (302, or the 3xx `status` sets), so the browser fetches the file straight from where it is stored."
     },
     {
       "name": "status",

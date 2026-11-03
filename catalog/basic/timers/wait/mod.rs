@@ -27,20 +27,12 @@ struct Parked {
 #[cfg(feature = "node-tests")]
 mod tests;
 
-/// The timer a wait of `seconds` parks on. Pure, so the refusal of a
-/// zero or negative wait is testable without a rig. How FAR ahead a
-/// timer can point is the signal's own rule (`Timer::validate`), which
-/// runs before the signal is registered.
-pub fn timer_for(seconds: f64) -> WeftResult<Timer> {
-    if !(seconds > 0.0) || !seconds.is_finite() {
-        weft::node_bail!("`seconds` must be more than zero; got {seconds}");
-    }
-    let timer =
-        Timer { spec: TimerSpec::After { duration_ms: (seconds * 1000.0).ceil() as u64 } };
-    if let Err(e) = weft::signal::Signal::validate(&timer) {
-        weft::node_bail!("`seconds` is {seconds}, which no timer can hold: {e}");
-    }
-    Ok(timer)
+/// The timer a wait of `seconds` parks on, to the millisecond above it.
+/// A wait of zero or less never gets here (the metadata refuses it, on a
+/// wired value too), and how FAR ahead a timer can point is the signal's
+/// own rule, checked where the run parks.
+pub fn timer_for(seconds: f64) -> Timer {
+    Timer { spec: TimerSpec::After { duration_ms: (seconds * 1000.0).ceil() as u64 } }
 }
 
 #[async_trait]
@@ -54,7 +46,7 @@ impl Node for WaitNode {
         let seconds: f64 = ctx.inputs.get("seconds")?;
         let value: Option<Value> = ctx.inputs.raw("value").cloned();
         let mut state = ctx.keep(Parked::default()).await?;
-        let wake = state.wait(|s| &mut s.wake, timer_for(seconds)?).await?;
+        let wake = state.wait(|s| &mut s.wake, timer_for(seconds)).await?;
         ctx.pulse_downstream(output_after(value, &wake)?).await
     }
 }

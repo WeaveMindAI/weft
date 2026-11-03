@@ -80,8 +80,10 @@ impl Node for ReceiveEmailNode {
             .once(|s| &mut s.messages, async |_| {
                 let conn = ctx.open(&account).await?;
                 let imap = super::mailbox::imap(&conn)?;
-                let raw = fetch_unseen(&imap.address, &imap.user, &imap.password)
-                    .await
+                let raw = ctx
+                    .cancellation()
+                    .race(fetch_unseen(&imap.address, &imap.user, &imap.password))
+                    .await?
                     .map_err(|e| weft::WeftError::NodeFailed(format!("reading the inbox over IMAP: {e}")))?;
                 Ok(raw.iter().map(|m| parse_message(m)).collect::<Vec<_>>())
             })
@@ -92,11 +94,9 @@ impl Node for ReceiveEmailNode {
         for parsed in parsed_messages {
             let from_ok = from_contains
                 .as_deref()
-                .filter(|f| !f.trim().is_empty())
                 .map_or(true, |f| text_of(&parsed, "from").contains(f));
             let subject_ok = subject_contains
                 .as_deref()
-                .filter(|f| !f.trim().is_empty())
                 .map_or(true, |f| text_of(&parsed, "subject").contains(f));
             if from_ok && subject_ok {
                 messages.push(parsed);

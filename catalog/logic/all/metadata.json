@@ -22,5 +22,20 @@
   "features": {
     "pure": true,
     "canAddInputPorts": true
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "custom_inputs_declared"
+        }
+      },
+      "then": {
+        "message": "All '{id}' has nothing wired onto it, so there is nothing for it to agree about. Wire the answers it should combine onto it, one input each.",
+        "level": "structural",
+        "severity": "error"
+      }
+    }
+  ]
 }

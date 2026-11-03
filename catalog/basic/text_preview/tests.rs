@@ -2,15 +2,16 @@
 //! start and the end never overlapping, a single long line, an empty
 //! text, an exact fit, a text fed in pieces (characters split across
 //! pieces included), the wire bound at the largest `maxChars`, and the
-//! node driven with a text, with a stored file, and with settings it
-//! refuses.
+//! node driven with a text and with a stored file. Both inputs given is
+//! the metadata's to refuse, and neither the engine's to skip, neither of
+//! which the rig runs.
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use weft::storage::{wire_weight, MAX_WIRE_VALUE_BYTES};
 use weft::{FakeRig, NodeTest, WeftResult};
 
-use super::{Preview, Settings, Shown, TextPreviewNode, Utf8Decoder, MAX_CHARS_LIMIT};
+use super::{Keep, Preview, Settings, Shown, TextPreviewNode, Utf8Decoder, MAX_CHARS_LIMIT};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -27,12 +28,16 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::basic("the_settings_bounds_are_the_metadatas", bounds_agree),
         NodeTest::fake("the_node_previews_a_wired_text", node_text),
         NodeTest::fake("the_node_previews_a_stored_file", node_file),
-        NodeTest::fake("the_node_refuses_both_or_neither_input", node_refuses),
     ]
 }
 
+/// `keep` as the node reads it off its select.
+fn keep_of(keep: &str) -> Keep {
+    serde_json::from_value(json!(keep)).expect("a keep option")
+}
+
 fn settings(keep: &str, lines: usize, chars: usize, share: f64) -> Settings {
-    Settings::new(keep, lines as f64, chars as f64, share).expect("valid settings")
+    Settings::new(keep_of(keep), lines, chars, share)
 }
 
 fn show(text: &str, s: &Settings) -> Shown {
@@ -334,7 +339,7 @@ fn bounds_agree() -> WeftResult<()> {
         Widget::Select { options, free_text } => {
             assert!(!free_text);
             for option in &options {
-                Settings::new(option, 1.0, 1.0, 0.5)?;
+                keep_of(option);
             }
             assert_eq!(options.len(), 3);
         }
@@ -377,18 +382,5 @@ async fn node_file(rig: FakeRig) -> WeftResult<()> {
         "{preview}"
     );
     assert!(preview.ends_with("\nline 4998\nline 4999\nend\u{FFFD}"), "{preview}");
-    Ok(())
-}
-
-async fn node_refuses(rig: FakeRig) -> WeftResult<()> {
-    let refused = |inputs: Value| {
-        let rig = &rig;
-        async move { rig.run(&TextPreviewNode, inputs).await.failure() }
-    };
-    let file = rig.store_file("a.txt", "text/plain", b"a".to_vec());
-    let both = refused(json!({ "text": "a", "file": file })).await?;
-    assert!(both.contains("both `text` and `file`"), "{both}");
-    let neither = refused(json!({})).await?;
-    assert!(neither.contains("give `text` or a stored text `file`"), "{neither}");
     Ok(())
 }

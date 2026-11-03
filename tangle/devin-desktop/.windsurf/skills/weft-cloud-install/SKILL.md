@@ -267,7 +267,7 @@ Each line says copied, already there, or skipped and why.
 
 Secrets travel sealed to the cloud install and keep their ids. Which
 connection each node uses is picked per install, so the command ends with
-`weft connect --node <node> --grant <id> --on prod` lines: run those
+`weft connect <node> --grant <id> --on prod` lines: run those
 yourself, in the project folder. A connection that spends the
 install's own shared key copies only when the cloud install holds that key;
 for one that is skipped, the user connects it there themselves. A run's

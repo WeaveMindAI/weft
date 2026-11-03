@@ -11,7 +11,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[firecrawl]", "accepts": ["wire"],
       "required": true,
       "description": "The Firecrawl access (wire a FirecrawlAccess node)."
     },
@@ -62,15 +62,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "url"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "url",
-              "regex": "(?i)^https?://"
+              "matches": "(?i)^https?://"
             }
           }
         ]

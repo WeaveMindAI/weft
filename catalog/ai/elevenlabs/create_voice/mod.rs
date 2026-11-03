@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use serde_json::json;
 
-use weft::access::client::post_json;
+use weft::access::client::{post_json, url};
 use weft::node::NodeOutput;
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::elevenlabs::API;
 use super::flows::set_some;
@@ -34,10 +34,6 @@ impl Node for ElevenLabsCreateVoiceNode {
         let preview_id: String = ctx.inputs.get("previewId")?;
         let labels: Option<BTreeMap<String, String>> = ctx.inputs.opt("labels")?;
 
-        if let Some(refusal) = description_refusal(&description) {
-            return Err(WeftError::Input(refusal));
-        }
-
         let mut body = json!({
             "voice_name": name,
             "voice_description": description,
@@ -46,7 +42,7 @@ impl Node for ElevenLabsCreateVoiceNode {
         set_some(&mut body, "labels", labels.filter(|l| !l.is_empty()));
 
         let http = ctx.client(&account).await?;
-        let answer = post_json(&http, &format!("{API}/text-to-voice"), &body, "create the voice on ElevenLabs").await?;
+        let answer = post_json(&http, url(API, &["text-to-voice"])?.as_str(), &body, "create the voice on ElevenLabs").await?;
         let voice_id = answer["voice_id"]
             .as_str()
             .node_err("ElevenLabs created the voice but its answer has no voice_id")?;
@@ -63,17 +59,4 @@ impl Node for ElevenLabsCreateVoiceNode {
         }
         ctx.pulse_downstream(out).await
     }
-}
-
-/// ElevenLabs keeps a voice description of 20 to 1000 characters; the
-/// refusal for one outside that, said before anything is sent (the
-/// compiler refuses a written one; this is the floor for a wired one).
-fn description_refusal(description: &str) -> Option<String> {
-    let length = description.chars().count();
-    (!(20..=1000).contains(&length)).then(|| {
-        format!(
-            "`description` is {length} characters, and ElevenLabs takes 20 to 1000: {}",
-            if length < 20 { "describe the voice in more detail" } else { "shorten it" }
-        )
-    })
 }

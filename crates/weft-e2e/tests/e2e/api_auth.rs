@@ -1,13 +1,15 @@
-//! Gated routes: the gateway refuses a caller the route's auth connection
-//! does not verify, and admits one it does with the established identity
-//! on the trigger's `caller` port. Two schemes end to end (a key set, a
-//! signing secret), and a browser page on another origin reaching a gated
-//! route through the install's CORS answer.
+//! Gated routes: the gateway refuses a caller the route's `auth` does not
+//! verify against its connection, and admits one it does with the
+//! established identity on the trigger's `caller` port. Two schemes end to
+//! end (a key set, a signing secret), each connection made and picked the
+//! way a person does it (`weft connect`), and a browser page on another
+//! origin reaching a gated route through the install's CORS answer.
 #![cfg(feature = "e2e")]
 
 use reqwest::Method;
 use serde_json::{json, Value};
-use weft_e2e::access::{catalog_spec, connect_direct, set_account};
+use weft_core::access::callers::CallerScheme;
+use weft_e2e::access::{connect_direct, connect_with_cli, set_account};
 use weft_e2e::{ensure, live, project::Project};
 
 #[tokio::test]
@@ -16,24 +18,36 @@ async fn api_keys_and_a_signing_secret_gate_their_routes() -> anyhow::Result<()>
     let mut project = Project::prepare("api_auth", disp.clone()).await?;
     let base = project.unique_live_path()?;
 
-    // The connections, stored as the editor stores them, stamped onto
-    // the access nodes.
-    let keys = connect_direct(
-        &disp,
-        catalog_spec("api", "api_key_auth")?,
-        "own",
-        json!({ "keys": "k-one, k-two" }),
+    // Before any connection, the route checking its callers is refused
+    // naming the command that connects it.
+    let refused = project.weft_refused(&["activate"]).await?;
+    assert!(
+        refused.contains("'secure' checks callers with api_keys but has no connection; run `weft connect secure`"),
+        "{refused}"
+    );
+
+    // The key set, connected from the terminal: the keys come from the
+    // environment, so they never ride the command line. A field left out
+    // is named with every field the scheme asks for.
+    let missing = project.weft_refused(&["connect", "secure", "--door", "own", "--label", "prod keys"]).await?;
+    assert!(missing.contains("keys (Accepted keys)"), "{missing}");
+    let keys = connect_with_cli(
+        &project,
+        "secure",
+        &["--door", "own", "--set-env", "keys=SECURE_KEYS", "--label", "prod keys"],
+        &[("SECURE_KEYS", "k-one, k-two")],
     )
     .await?;
-    set_account(&project, "keys", keys.handle()).await?;
+    // The signing secret, stored as the editor stores it, then picked by
+    // its id.
     let secret = connect_direct(
         &disp,
-        catalog_spec("api", "hmac_auth")?,
+        serde_json::to_value(CallerScheme::Hmac.recipe())?,
         "own",
         json!({ "signingSecret": "s3cret-e2e" }),
     )
     .await?;
-    set_account(&project, "secret", secret.handle()).await?;
+    set_account(&project, "signed", secret.handle()).await?;
     project.activate().await?;
 
     // The key set: no key and a wrong key are refused before any run
@@ -97,10 +111,9 @@ async fn api_keys_and_a_signing_secret_gate_their_routes() -> anyhow::Result<()>
     let signed = format!("{base}/signed");
     let body_bytes = serde_json::to_vec(&json!({ "text": "signed hi" }))?;
     let now = chrono::Utc::now().timestamp();
-    // The shipped HmacAuth node's own scheme signs, so the test signs
-    // exactly what the gate checks.
-    let hmac_auth: weft_core::access::events::VerifyKind =
-        serde_json::from_value(catalog_spec("api", "hmac_auth")?["verify"].clone())?;
+    // `hmac_sha256` is the check the route runs, so the test signs exactly
+    // what the gate checks.
+    let hmac_auth = weft_core::access::callers::named_check("hmac_sha256").unwrap().verify();
     let sign = |ts: i64, body: &[u8]| -> anyhow::Result<String> {
         Ok(weft_core::access::verify::hmac_digest(
             &hmac_auth,

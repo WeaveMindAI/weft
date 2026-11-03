@@ -1,18 +1,18 @@
 //! ExecPython self-tests, all on the fake tier: the script's Python
 //! process (`run_python`, which is async, and the runner already drives
 //! every test inside a runtime of its own), then the full node body
-//! (custom ports in, pulses out).
+//! (custom ports in, pulses out). Sharing the processes between runs is
+//! `ctx.pool`'s, tested in weft.
 
 use serde_json::{json, Value};
 
 use weft::{CancellationFlag, FakeRig, NodeTest, WeftError, WeftResult, WeftType};
 
-use super::{run_python, ExecPythonNode, Interpreters};
+use super::{run_python, ExecPythonNode, Interpreter};
 
-/// `run_python` on processes of its own, to its end.
+/// `run_python` on a process of its own, to its end.
 async fn python(code: &str, inputs: Vec<(String, Value)>) -> WeftResult<Vec<(String, Value)>> {
-    let interpreters = Interpreters::new();
-    run_python(&interpreters, code, inputs, &CancellationFlag::new()).await
+    run_python(&mut Interpreter::start()?, code, inputs, &CancellationFlag::new()).await
 }
 
 pub fn tests() -> Vec<NodeTest> {
@@ -79,44 +79,40 @@ pub fn tests() -> Vec<NodeTest> {
             Ok(())
         }),
         NodeTest::fake("a_script_reading_stdin_reads_nothing_and_the_next_request_still_lands", |_rig| async {
-            let interpreters = Interpreters::new();
+            let mut process = Interpreter::start()?;
             let flag = CancellationFlag::new();
-            let read = run_python(&interpreters, "import sys\nreturn {'read': sys.stdin.read()}", Vec::new(), &flag).await;
-            let next = run_python(&interpreters, "return {'ok': True}", Vec::new(), &flag).await;
+            let read = run_python(&mut process, "import sys\nreturn {'read': sys.stdin.read()}", Vec::new(), &flag).await;
+            let next = run_python(&mut process, "return {'ok': True}", Vec::new(), &flag).await;
             assert_eq!(read?, vec![("read".to_string(), json!(""))]);
             assert_eq!(next?, vec![("ok".to_string(), json!(true))]);
+            assert!(!process.broken, "a process that answered serves the next script");
             Ok(())
         }),
-        NodeTest::fake("scripts_share_processes_and_run_side_by_side", |_rig| async {
-            let interpreters = Interpreters::new();
+        NodeTest::fake("a_process_keeps_what_a_script_imported_for_the_next", |_rig| async {
+            let mut process = Interpreter::start()?;
             let flag = CancellationFlag::new();
-            let (a, b) = tokio::join!(
-                run_python(&interpreters, "import time\ntime.sleep(0.2)\nreturn {'a': 1}", Vec::new(), &flag),
-                run_python(&interpreters, "import time\ntime.sleep(0.2)\nreturn {'b': 2}", Vec::new(), &flag),
-            );
-            assert_eq!(a?, vec![("a".to_string(), json!(1))]);
-            assert_eq!(b?, vec![("b".to_string(), json!(2))]);
+            run_python(&mut process, "import json\njson.weft_mark = 7\nreturn {}", Vec::new(), &flag).await?;
+            let next = run_python(&mut process, "import json\nreturn {'mark': json.weft_mark}", Vec::new(), &flag).await?;
+            assert_eq!(next, vec![("mark".to_string(), json!(7))]);
             Ok(())
         }),
-        NodeTest::fake("a_cancel_stops_a_running_script_and_the_next_one_runs", |_rig| async {
-            let interpreters = Interpreters::new();
+        NodeTest::fake("a_cancel_ends_a_running_script_and_leaves_its_process_unfit", |_rig| async {
+            let mut process = Interpreter::start()?;
             let flag = std::sync::Arc::new(CancellationFlag::new());
             let stopping = flag.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 stopping.cancel_because(weft::run::CancelCause::User);
             });
-            let result = run_python(&interpreters, "while True:\n    pass", Vec::new(), &flag).await;
+            let result = run_python(&mut process, "while True:\n    pass", Vec::new(), &flag).await;
             assert!(matches!(result, Err(WeftError::Cancelled)), "{result:?}");
-            let next = run_python(&interpreters, "return {'ran': True}", Vec::new(), &CancellationFlag::new()).await;
-            assert_eq!(next?, vec![("ran".to_string(), json!(true))]);
+            assert!(process.broken, "a process left mid-script is let go, which kills it");
             Ok(())
         }),
         NodeTest::fake("a_cancelled_script_never_starts", |_rig| async {
-            let interpreters = Interpreters::new();
             let flag = CancellationFlag::new();
             flag.cancel_because(weft::run::CancelCause::User);
-            let result = run_python(&interpreters, "return {'ran': True}", Vec::new(), &flag).await;
+            let result = run_python(&mut Interpreter::start()?, "return {'ran': True}", Vec::new(), &flag).await;
             assert!(matches!(result, Err(WeftError::Cancelled)), "{result:?}");
             Ok(())
         }),

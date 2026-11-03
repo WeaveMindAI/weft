@@ -22,7 +22,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use weft::access::client::get_json;
+use weft::access::client::{self, get_json};
 use weft::node::NodeOutput;
 use weft::signal::{CancelCall, CancelWith, PollEndpoint, Predicate};
 use weft::reqwest_middleware::ClientWithMiddleware;
@@ -53,12 +53,12 @@ impl Node for CrawlSiteNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let url: String = ctx.inputs.get("url")?;
-        let limit: f64 = ctx.inputs.get("limit")?;
+        let limit: u64 = ctx.inputs.get("limit")?;
 
         let http = ctx.client(&access).await?;
         let body = json!({
             "url": url,
-            "limit": limit as u64,
+            "limit": limit,
             "scrapeOptions": { "formats": ["markdown"] },
         });
         // Starting the crawl is the paid call, and the body runs again
@@ -81,7 +81,7 @@ impl Node for CrawlSiteNode {
         // pages are read once it has ended. Cancelling the run cancels the
         // crawl too, with the DELETE Firecrawl documents for it
         // (https://docs.firecrawl.dev/api-reference/endpoint/crawl-delete).
-        let status_url = format!("{}/crawl/{job}", super::firecrawl::API);
+        let status_url: String = client::url(super::firecrawl::API, &["crawl", &job])?.into();
         let status = PollEndpoint {
             url: status_url.clone(),
             interval_secs: 5,

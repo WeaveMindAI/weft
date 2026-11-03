@@ -81,7 +81,7 @@ async fn run_filter(rig: FakeRig) -> WeftResult<()> {
 async fn a_bad_run(rig: FakeRig) -> WeftResult<()> {
     for run in ["run-7", ""] {
         let err = rig.run(&InstanceCostsNode, json!({ "instance": "ada", "run": run })).await.failure()?;
-        assert!(err.contains("run takes a run id") && err.contains(&format!("'{run}'")), "{err}");
+        assert!(err.contains("input 'run'"), "{err}");
     }
     assert!(rig.program_calls().is_empty());
     Ok(())

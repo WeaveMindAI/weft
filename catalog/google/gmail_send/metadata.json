@@ -1,7 +1,7 @@
 {
   "type": "GmailSend",
   "label": "Gmail: Send",
-  "description": "Sends mail as a Google account through Gmail: to/cc/bcc, text and/or HTML, attachments, and replies threaded onto an original message.",
+  "description": "Sends mail as a Google account through Gmail: to/cc/bcc, text and/or HTML, attachments, and replies threaded onto an original message. With none of to, cc and bcc given, or neither text nor html, the node is skipped.",
   "tags": [
     "google",
     "gmail",
@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[google]", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/gmail.send"

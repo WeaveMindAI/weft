@@ -2,9 +2,9 @@
 //! the end of an existing page or block.
 
 use async_trait::async_trait;
-use serde_json::json;
+use serde_json::{json, Value};
 
-use weft::access::client::json_call;
+use weft::access::client::{json_call, url};
 use weft::node::NodeOutput;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
@@ -27,20 +27,17 @@ impl Node for NotionAppendBlocksNode {
         let account: Access = ctx.inputs.get("account")?;
         let page: String = ctx.inputs.get("page")?;
         let content: Option<String> = ctx.inputs.opt("content")?;
-        let blocks = ctx.inputs.raw("blocks").cloned();
+        let blocks: Vec<Value> = ctx.inputs.list("blocks")?;
 
-        let children = children_of(content.as_deref(), blocks.as_ref())?;
-        // Appending nothing is a mistake in the program, never a value
-        // for `_error`.
-        if children.is_empty() {
-            return Err(weft::WeftError::Input(
-                "nothing to write: set content (plain text) or blocks".to_string(),
-            ));
-        }
+        // Never empty: `oneOfRequired` skips the node with neither input
+        // given, a blank `content` counts as not given, and an empty
+        // `blocks` falls back to `content`, refused when that is blank
+        // too (the node's `blocks` rule).
+        let children = children_of(content.as_deref(), blocks);
         let count = children.len() as f64;
         let http = ctx.client(&account).await?;
         json_call(
-            http.patch(format!("{API}/blocks/{page}/children"))
+            http.patch(url(API, &["blocks", &page, "children"])?.as_str())
                 .json(&json!({ "children": children })),
             "notion: append the blocks",
         )

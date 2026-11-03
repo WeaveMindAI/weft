@@ -724,85 +724,21 @@ pub async fn resolve_event_source(
     })
 }
 
-/// What verifying a CALLER against a connection needs: the scheme the
-/// connection's service recipe declares (`verify`) and the connection's
-/// stored values the scheme reads its material from. The tenant wall
-/// applies as everywhere; a connection of another service is refused
-/// by name. A stored read: the scheme keys on pasted material, so no
-/// refresh and no provider call.
-pub struct CallerVerifier {
-    pub verify: Option<weft_core::access::events::VerifyKind>,
-    pub values: BTreeMap<String, String>,
-}
-
-pub async fn caller_verifier(
+/// The stored values of connection `access_id` (of `service`) a check
+/// of a route's caller reads its material from (the route names the
+/// check). The tenant wall applies as everywhere; a connection of another
+/// service is refused by name. A stored read: the check keys on pasted
+/// material, so no refresh and no provider call.
+pub async fn caller_values(
     pool: &Pool,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
     service: &str,
-) -> anyhow::Result<CallerVerifier> {
+) -> anyhow::Result<BTreeMap<String, String>> {
     let grant =
         read_walled_grant(pool, tenant, user, access_id, service, &[], Freshness::Stored).await?;
-    let values = grant.spec.handoff_values(&grant.values);
-    Ok(CallerVerifier { verify: grant.spec.verify.clone(), values })
-}
-
-/// The request headers a route gated by connection `access_id` reads its
-/// caller's credential from (`VerifyKind::credential_headers`): what a run
-/// it admits holds as secrets, so what a request typed by hand for it
-/// (`weft run --fire`) cannot carry. A recipe that declares no `verify`
-/// block gates no route, so it is refused, as the broker refuses every
-/// call through it. Reads the recipe through the wall, never the values.
-pub async fn caller_credential_headers(
-    pool: &Pool,
-    tenant: &str,
-    user: GrantUser<'_>,
-    access_id: uuid::Uuid,
-    service: &str,
-) -> anyhow::Result<Vec<String>> {
-    let row: Option<RecipeRow> = pool
-        .opt(
-            "SELECT tenant_id, service, spec, spec_version, instance_id, project_id FROM access_grant WHERE id = $1",
-            &[&access_id],
-        )
-        .await?;
-    let Some(row) = row else {
-        return Err(AccessError::NotFound.into());
-    };
-    walled(&row.tenant_id, &row.service, row.project_id, row.instance_id.as_deref(), tenant, user, service)?;
-    let spec = spec_of(format_args!("connection {access_id}"), row.spec, row.spec_version)?;
-    match spec.verify {
-        Some(kind) => Ok(kind.credential_headers()),
-        None => Err(AccessError::Invalid(format!(
-            "the '{service}' service declares no `verify` block, so its connections cannot gate a route"
-        ))
-        .into()),
-    }
-}
-
-/// The `access_grant` columns the wall and a connection's recipe need:
-/// nothing sealed.
-struct RecipeRow {
-    tenant_id: String,
-    service: String,
-    spec: Value,
-    spec_version: weft_core::stored::Version,
-    instance_id: Option<String>,
-    project_id: Option<uuid::Uuid>,
-}
-
-impl FromRow for RecipeRow {
-    fn from_row(row: Row) -> db::Result<Self> {
-        Ok(Self {
-            tenant_id: row.try_get("tenant_id")?,
-            service: row.try_get("service")?,
-            spec: row.try_get::<_, JsonText<Value>>("spec")?.0,
-            spec_version: row.try_get("spec_version")?,
-            instance_id: row.try_get("instance_id")?,
-            project_id: row.try_get("project_id")?,
-        })
-    }
+    Ok(grant.spec.handoff_values(&grant.values))
 }
 
 /// A stable content hash of an events-recipe map: sha256 hex of its

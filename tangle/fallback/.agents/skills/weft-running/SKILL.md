@@ -210,7 +210,7 @@ and the graph print back.
 | `weft describe-nodes --list` | one line per node type; how you find one |
 | `weft describe-nodes --node <Type> --compact` | one node's wiring view; read it before wiring. With no flags you get the whole catalog as JSON, which is large |
 | `weft test-node <target>` | run node self-tests (`--tier live` spends money, asks first) |
-| `weft connect` | the editor's Connect panel as a CLI verb: `--list` the stored connections, `--node <id> --grant <id>` to pick one for a node, connect new accounts through both doors, `--upgrade`, `--forget`, `--disconnect`; `--instance <id>` does the same for one instance of the program on a node whose connection is `@instance_filled`, the way its settings page would |
+| `weft connect` | the editor's Connect panel as a CLI verb: `--list` the stored connections, `<node> --grant <id>` to pick one for a node, connect new accounts through both doors, `--upgrade`, `--forget`, `--disconnect`; `--instance <id>` does the same for one instance of the program on a node whose connection is `@instance_filled`, the way its settings page would |
 | `weft instance-values --instance <id> [--set node.field=value]... [--clear node.field]...` | what the program asks that instance to fill and what was given; with `--set` / `--clear`, changes it in one go (its live triggers reading a changed value are set up again). Through an instance token it mints and revokes |
 | `weft rm [--journal] [--local] [--all] --yes` | remove the project: it takes the project down first (every trigger off with nothing kept, every run cancelled), follows that in short looks until it is over, then unregisters it, terminates its [infra] and reclaims its data. `--journal` also drops its run history, after waiting for every run to end; `--local` its build artifacts; `--all` implies every flag. Asks first; pass `--yes`, and only after the user confirmed. Ctrl+C stops following, leaving the project down, and `weft rm` again picks the removal up. If it fails partway, the project stays marked as being removed until `weft rm` runs again in the project folder, which is the only way to finish it: the editor shows ``the project is being removed; run `weft rm` again to finish removing it`` as a banner and offers no button, that one included. Until then no new run starts and `weft ps` lists it that way. `weft status` still answers, with that line as a `WARNING:` above what is left of the project; run, activate, resync, the infra commands and every build refuse with it |
 | `weft clean --yes` | journal and image cleanup, per subject, and naming a subject takes all of it: a run id takes that one run, `--project <id>` takes a whole project's history (removing a project leaves its runs behind, so this is how you erase them), no subject takes everything older than `--keep-days` (30 by default), `--all` takes the lot. A version the deletion left bare (no runs, nothing under it, no checkpoint name, not head) goes with the runs; a named checkpoint never does. `--images` and `--build-cache` touch no journal rows. Deleting runs asks first; pass `--yes`, and only after the user confirmed |
@@ -250,13 +250,13 @@ apt-get install -y ...`, `brew install ...`) and asks before running it;
 half-wired program still builds. A run is refused before it starts when a
 node it reaches needs a connection nobody picked on this install, naming
 each one with the command that picks it (`'slack' has no slack connection
-picked on this install; pick one with weft connect --node slack`). `weft
+picked on this install; pick one with weft connect slack`). `weft
 validate --file src/main.weft < src/main.weft` reports the same gaps as
 `rule-runtime` findings in seconds, before you run. It also warns about
 every catalog folder it left out and why (a broken node folder, say), in its
 JSON's `warnings` and on stderr; those never fail validation, so read them
 when a node you expected is missing. The fix is a picked
-connection (`weft connect --node <id> --grant <id>`, or the user on the
+connection (`weft connect <id> --grant <id>`, or the user on the
 node's Connect button), never a source edit.
 
 Activate and resync refuse the same way while any connection the program

@@ -77,11 +77,6 @@ impl Node for SlackAwaitActionNode {
         let buttons: Vec<ActionButton> = ctx.inputs.get("buttons")?;
         let confirmed_text: Option<String> = ctx.inputs.opt("confirmedText")?;
 
-        // The port's type holds each button to {id, label, style?}; what
-        // it cannot say is that the list has one.
-        if buttons.is_empty() {
-            return Err(bad_buttons("buttons must be a non-empty list of { id, label } objects"));
-        }
         let mut elements = Vec::new();
         for b in &buttons {
             let mut button = json!({
@@ -221,8 +216,3 @@ impl Node for SlackAwaitActionNode {
     }
 }
 
-/// A button list the program wrote wrong: an input error, which
-/// `_error` never catches (the fix is editing the program).
-fn bad_buttons(what: &str) -> weft::WeftError {
-    weft::WeftError::Input(what.to_string())
-}

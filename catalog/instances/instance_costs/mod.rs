@@ -3,11 +3,11 @@
 
 use async_trait::async_trait;
 
+use weft::instance::InstanceId;
 use weft::node::NodeOutput;
 use weft::program::PaidBy;
-use weft::{node_bail, RunContext, RunId, Node, NodeManifest, WeftError, WeftResult};
+use weft::{RunContext, RunId, Node, NodeManifest, WeftResult};
 
-use super::lifecycle::instance;
 
 #[derive(NodeManifest)]
 pub struct InstanceCostsNode;
@@ -23,19 +23,17 @@ impl Node for InstanceCostsNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let mut query = ctx.costs().instance(instance(&ctx)?);
-        // Never skipped when blank: a run id that did not arrive must not
-        // widen the read to every run of the instance.
-        if let Some(given) = ctx.inputs.opt::<String>("run")? {
-            let run: RunId = given.trim().parse().map_err(|_| {
-                WeftError::Input(format!("run takes a run id (the one GetRunId gives), so it cannot be '{given}'"))
-            })?;
+        let mut query = ctx.costs().instance(ctx.inputs.get::<InstanceId>("instance")?);
+        // A blank `run` is kept (`keepsBlank`) and refused as no run id:
+        // a run id that did not arrive must not widen the read to every
+        // run of the instance.
+        if let Some(run) = ctx.inputs.opt::<RunId>("run")? {
             query = query.run(run);
         }
-        if let Some(service) = ctx.inputs.opt::<String>("service")?.filter(|s| !s.trim().is_empty()) {
+        if let Some(service) = ctx.inputs.opt::<String>("service")? {
             query = query.service(service);
         }
-        if let Some(node) = ctx.inputs.opt::<String>("node")?.filter(|s| !s.trim().is_empty()) {
+        if let Some(node) = ctx.inputs.opt::<String>("node")? {
             query = query.node(node);
         }
         // Read typed: a word outside the enum fails naming the input, the
@@ -43,11 +41,8 @@ impl Node for InstanceCostsNode {
         if let Some(paid_by) = ctx.inputs.opt::<PaidBy>("paidBy")? {
             query = query.paid_by(paid_by);
         }
-        if let Some(since) = ctx.inputs.opt::<f64>("since")? {
-            if !(since >= 0.0) {
-                node_bail!("since is a moment in unix seconds, so it cannot be {since}");
-            }
-            query = query.since(since as u64);
+        if let Some(since) = ctx.inputs.opt::<u64>("since")? {
+            query = query.since(since);
         }
         let records = query.list().await?;
         // Folded from 0.0: `Sum` for f64 starts at -0.0, so an instance

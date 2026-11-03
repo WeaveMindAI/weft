@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 
+use weft::access::client::url;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::elevenlabs::{audio_file_type, emit_audio, API};
@@ -39,7 +40,7 @@ impl Node for ElevenLabsSoundEffectNode {
         let filename = format!("sound_effect.{extension}");
 
         let http = ctx.client(&account).await?;
-        let url = format!("{API}/sound-generation?output_format={}", urlencoding::encode(&output_format));
-        emit_audio(&ctx, http.post(url).json(&body), "generate the sound effect on ElevenLabs", &filename, mime).await
+        let url = url(API, &["sound-generation"])?.query("output_format", &output_format);
+        emit_audio(&ctx, http.post(url.as_str()).json(&body), "generate the sound effect on ElevenLabs", &filename, mime).await
     }
 }

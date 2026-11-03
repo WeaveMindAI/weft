@@ -2,13 +2,12 @@
 //! text (or raw Notion blocks) as its body.
 
 use async_trait::async_trait;
-use serde_json::json;
+use serde_json::{json, Value};
 
-use weft::access::client::post_json;
-use weft::node::NodeOutput;
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::access::client::{post_json, url};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::notion::{children_of, API};
+use super::notion::{children_of, page_output, API};
 
 #[derive(NodeManifest)]
 pub struct NotionCreatePageNode;
@@ -28,7 +27,7 @@ impl Node for NotionCreatePageNode {
         let parent: String = ctx.inputs.get("parentPage")?;
         let title: String = ctx.inputs.get("title")?;
         let content: Option<String> = ctx.inputs.opt("content")?;
-        let blocks = ctx.inputs.raw("blocks").cloned();
+        let blocks: Vec<Value> = ctx.inputs.list("blocks")?;
 
         let mut body = json!({
             "parent": { "page_id": parent },
@@ -37,18 +36,13 @@ impl Node for NotionCreatePageNode {
             },
         });
         // A page with only a title is a page: no body, no `children`.
-        let children = children_of(content.as_deref(), blocks.as_ref())?;
+        let children = children_of(content.as_deref(), blocks);
         if !children.is_empty() {
             body["children"] = json!(children);
         }
 
         let http = ctx.client(&account).await?;
-        let page =
-            post_json(&http, &format!("{API}/pages"), &body, "notion: create the page").await?;
-        let id = page["id"].as_str().node_err("notion: the page answered no id")?;
-        ctx.pulse_downstream(
-            NodeOutput::new().set("pageId", id).set("url", page["url"].clone()),
-        )
-        .await
+        let page = post_json(&http, url(API, &["pages"])?.as_str(), &body, "notion: create the page").await?;
+        ctx.pulse_downstream(page_output(&page, "notion: create the page")?).await
     }
 }

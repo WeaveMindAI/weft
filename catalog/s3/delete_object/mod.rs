@@ -27,7 +27,7 @@ impl Node for S3DeleteObjectNode {
         let key: String = ctx.inputs.get("key")?;
 
         let s3 = ctx.client(&access).await?;
-        checked_send(s3.delete(s3::object_url(&bucket, &key)?), "delete the object").await?;
+        checked_send(s3.delete(s3::object_url(&bucket, &key)?.as_str()), "delete the object").await?;
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
     }
 }

@@ -63,9 +63,9 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_in_set",
+            "kind": "value",
             "field": "action",
-            "values": [
+            "oneOf": [
               "add",
               "kick",
               "promote",
@@ -101,7 +101,7 @@
                 "kind": "any",
                 "of": [
                   {
-                    "kind": "config_equals",
+                    "kind": "value",
                     "field": "action",
                     "equals": "create"
                   },
@@ -111,7 +111,7 @@
                       {
                         "kind": "not",
                         "of": {
-                          "kind": "config_present",
+                          "kind": "value",
                           "field": "action"
                         }
                       },
@@ -127,7 +127,7 @@
                 ]
               },
               {
-                "kind": "config_equals",
+                "kind": "value",
                 "field": "action",
                 "equals": "rename"
               }
@@ -160,7 +160,7 @@
                 "kind": "any",
                 "of": [
                   {
-                    "kind": "config_equals",
+                    "kind": "value",
                     "field": "action",
                     "equals": "create"
                   },
@@ -170,7 +170,7 @@
                       {
                         "kind": "not",
                         "of": {
-                          "kind": "config_present",
+                          "kind": "value",
                           "field": "action"
                         }
                       },
@@ -186,9 +186,9 @@
                 ]
               },
               {
-                "kind": "config_in_set",
+                "kind": "value",
                 "field": "action",
-                "values": [
+                "oneOf": [
                   "add",
                   "kick",
                   "promote",
@@ -200,8 +200,9 @@
           {
             "kind": "not",
             "of": {
-              "kind": "input_satisfied",
-              "port": "participants"
+              "kind": "value",
+              "field": "participants",
+              "nonempty": true
             }
           }
         ]

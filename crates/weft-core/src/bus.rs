@@ -129,7 +129,8 @@
 //! appear. That question depends on dispatch state, terminations, and
 //! topology, all of which live in the engine. The engine watches the
 //! run and, when it concludes a wait can never be satisfied,
-//! closes the bus. Every waiting cursor wakes; `next()` returns `None`.
+//! closes the bus, failed, naming why. Every waiting cursor wakes, and
+//! its `next()` returns that failure.
 //!
 //! ## How a bus ends
 //!
@@ -162,6 +163,7 @@ use thiserror::Error;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
+use crate::cancellation::CancellationFlag;
 use crate::context::{PausePoint, Point};
 use crate::error::{WeftError, WeftResult};
 use crate::liveness::{no_liveness, wait_or_pause, FiringLocation, WaitLiveness, WaitSource};
@@ -278,6 +280,23 @@ impl WirePayload {
         }
     }
 
+    /// The payload's JSON value by move with its type; `None` for a byte
+    /// payload. A bus declares no type for its messages, so a message's
+    /// type is read off its own markers ([`WeftType::infer`]: a stored
+    /// file is its file type, a secret a `Secret`, an access its
+    /// service's `Access`). With it, a reader handles the message the
+    /// way a typed input is handled: files found by
+    /// [`crate::storage::media::map_stored_files`], secrets revealed by
+    /// [`crate::context::RunContext::reveal_in`]. Every reader that does
+    /// either reads its message's type here.
+    ///
+    /// [`WeftType::infer`]: crate::weft_type::WeftType::infer
+    pub fn into_typed_json(self) -> Option<(Value, crate::weft_type::WeftType)> {
+        let value = self.into_json()?;
+        let ty = crate::weft_type::WeftType::infer(&value);
+        Some((value, ty))
+    }
+
     /// The payload's raw bytes by move; `None` for a JSON payload.
     pub fn into_bytes(self) -> Option<bytes::Bytes> {
         match self {
@@ -355,8 +374,8 @@ pub enum BusEntryKind {
     },
     /// Appended once at the close, saying how the bus ended. Cursors
     /// never surface it as a regular `Some(entry)`; `next()` returns
-    /// `None` when it reaches this marker, and a reader asks the handle
-    /// how it ended ([`BusHandle::end`]). Journaled so the inspector
+    /// `None` when it reaches this marker of a bus that finished, and the
+    /// failure as an error for one that ended failed. Journaled so the inspector
     /// renders where the bus closed, or failed, instead of the panel
     /// just ending.
     Closed { end: StreamEnd },
@@ -1723,7 +1742,8 @@ impl BusHandle {
             None => (CursorStart::Fresh(offset), None),
         };
         let behind = matches!(start, CursorStart::Saved(saved) if saved < self.inner.lost_through.load(Ordering::Acquire));
-        Ok(BusCursor::new(Arc::downgrade(&self.inner), self.inner.id, start.offset(), None, self.node.clone(), slot, behind))
+        let cancellation = self.firing.as_ref().and_then(|firing| firing.cancellation.clone());
+        Ok(BusCursor::new(Arc::downgrade(&self.inner), self.inner.id, start.offset(), None, self.node.clone(), slot, behind, cancellation))
     }
 
     /// A fresh cursor from the earliest entry STILL RETAINED in RAM. Not
@@ -1873,6 +1893,10 @@ pub struct FiringBuses {
     /// The firing paused: its names stay held over the pause
     /// ([`BusHandle`]'s drop).
     paused: AtomicBool,
+    /// The run's cancel: a reader of the firing ends with the cancelled
+    /// error the moment it trips ([`BusCursor::next`]). `None` outside a
+    /// run (a test's firing).
+    cancellation: Option<Arc<CancellationFlag>>,
 }
 
 #[derive(Default)]
@@ -1962,6 +1986,13 @@ impl FiringBuses {
     /// ([`crate::run::saved::Positions::buses`]).
     pub fn resumed(restored: std::collections::BTreeMap<String, BusPosition>) -> Self {
         Self { restored, ..Self::default() }
+    }
+
+    /// The same side, of a run cancelled by `cancellation`: the firing's
+    /// readers end with the cancelled error when it trips.
+    pub fn cancelled_by(mut self, cancellation: Arc<CancellationFlag>) -> Self {
+        self.cancellation = Some(cancellation);
+        self
     }
 
     /// Hold `bus` until the body ends.
@@ -2139,8 +2170,11 @@ impl Drop for BusHandle {
 type CursorFilter = Arc<dyn Fn(&BusEntry) -> bool + Send + Sync + 'static>;
 
 /// Independent read-cursor over a bus log. `next(&mut state)` returns
-/// the next matching entry, `None` when the cursor reaches a `Closed`
-/// entry or the bus's inner has been reclaimed. Every read is a place the
+/// the next matching entry, `None` when the cursor reaches the `Closed`
+/// entry of a bus that finished or the bus's inner has been reclaimed,
+/// and the failure as an error when the bus ended failed. A read of a
+/// firing ends with the cancelled error when its run is cancelled.
+/// Every read is a place the
 /// run can pause, so it takes the firing's state
 /// ([`crate::context::PausePoint`]).
 ///
@@ -2166,6 +2200,9 @@ pub struct BusCursor {
     /// The cursor of a resumed firing starts below what the bus came back
     /// from the pause without ([`BusHandle::cursor_at`]).
     behind: bool,
+    /// The run's cancel, inherited from the firing
+    /// ([`FiringBuses::cancellation`]).
+    cancellation: Option<Arc<CancellationFlag>>,
 }
 
 impl BusCursor {
@@ -2177,6 +2214,7 @@ impl BusCursor {
         node: Option<FiringLocation>,
         slot: Option<Arc<CursorSlot>>,
         behind: bool,
+        cancellation: Option<Arc<CancellationFlag>>,
     ) -> Self {
         Self {
             inner,
@@ -2186,6 +2224,7 @@ impl BusCursor {
             node,
             slot,
             behind,
+            cancellation,
         }
     }
 
@@ -2215,7 +2254,8 @@ impl BusCursor {
     }
 
     /// The next MESSAGE of kind `kind`, skipping membership entries and
-    /// other kinds: `(sender, payload)`, or `None` when the bus closes.
+    /// other kinds: `(sender, payload)`, `None` when the bus finishes, the
+    /// failure as an error when it ended failed.
     /// The typed read every plain consumer wants instead of matching
     /// the entry enum by hand. Composes with a constructed filter (both
     /// must accept).
@@ -2250,7 +2290,10 @@ impl BusCursor {
 
     /// [`Self::next_message`] for a JSON bus: `(sender, value)`. The
     /// payload shape is frozen at bus creation, so a mismatch here is a
-    /// wiring bug (a bytes bus read as JSON), and fails loudly.
+    /// wiring bug (a bytes bus read as JSON), and fails loudly. A reader
+    /// that hands the value outside weft, where a file or a secret in it
+    /// has to become what it stands for, reads it with
+    /// [`Self::next_message`] and [`WirePayload::into_typed_json`].
     #[track_caller]
     pub fn next_json<'a, P: PausePoint>(
         &'a mut self,
@@ -2289,7 +2332,10 @@ impl BusCursor {
         }
     }
 
-    /// Next matching entry, `None` on close (no more entries). A cursor
+    /// Next matching entry, `None` once the bus finished (no more
+    /// entries), the failure as an error once it ended failed: a reader
+    /// never takes a stream its producer broke off for a whole one. A
+    /// cursor
     /// pointing into a trimmed span (its offsets evicted from the
     /// in-RAM window) silently resumes at the next retained entry: only
     /// `Message` entries are ever trimmed, membership entries are
@@ -2311,7 +2357,8 @@ impl BusCursor {
     ///
     /// When the run pauses while this waits, the firing's state is saved
     /// with the cursor where it stands (nothing read) and the read
-    /// returns the suspension the body hands back with `?`.
+    /// returns the suspension the body hands back with `?`. When the run
+    /// is cancelled, the read ends with the cancelled error, nothing read.
     #[track_caller]
     pub fn next<'a, P: PausePoint>(&'a mut self, at: &'a mut P) -> impl std::future::Future<Output = WeftResult<Option<BusEntry>>> + 'a {
         self.next_at(at, Point::direct("read a bus", std::panic::Location::caller()))
@@ -2334,7 +2381,7 @@ impl BusCursor {
         let Some(inner) = self.inner.upgrade() else { return Ok(None) };
         // One destructure splits the borrows: the closure takes the
         // cursor position and filter, the wait keeps the node identity.
-        let Self { next_offset, filter, node, slot, .. } = self;
+        let Self { next_offset, filter, node, slot, cancellation, .. } = self;
         // The full search under the log lock is the wait condition:
         // `Some(Some(entry))` on a hit, `Some(None)` at end-of-stream,
         // `None` parks. The shared protocol (`liveness::wait_on`)
@@ -2390,13 +2437,28 @@ impl BusCursor {
             None
         };
         let source = inner.clone() as Arc<dyn WaitSource>;
-        let read = wait_or_pause(&inner.liveness, node, &source, pausable, evaluate).await;
+        let wait = wait_or_pause(&inner.liveness, node, &source, pausable, evaluate);
+        // The cancel is checked first, so a read of a cancelled run never
+        // hands out one more entry.
+        let read = match cancellation.as_deref() {
+            Some(cancellation) => tokio::select! {
+                biased;
+                () = cancellation.cancelled() => None,
+                read = wait => Some(read),
+            },
+            None => Some(wait.await),
+        };
         if let Some(slot) = slot {
             slot.next_offset.store(*next_offset, Ordering::Release);
         }
         match read {
-            Ok(entry) => Ok(entry),
-            Err(crate::liveness::Paused) => Err(at.paused().await),
+            None => Err(WeftError::Cancelled),
+            Some(Ok(Some(entry))) => Ok(Some(entry)),
+            Some(Ok(None)) => match inner.end() {
+                Some(StreamEnd::Failed { error }) => Err(WeftError::NodeFailed(format!("the bus ended failed: {error}"))),
+                Some(StreamEnd::Finished) | None => Ok(None),
+            },
+            Some(Err(crate::liveness::Paused)) => Err(at.paused().await),
         }
     }
 }
@@ -2714,8 +2776,8 @@ mod tests {
     }
 
     /// A firing's buses end with its body: a reader drains what was sent,
-    /// then reads how the bus ended. Dropping the handle ends nothing
-    /// on its own; the body's end does.
+    /// then reads the failure the bus ended with as an error. Dropping the
+    /// handle ends nothing on its own; the body's end does.
     #[tokio::test]
     async fn a_firings_buses_end_with_its_body() {
         let firing = FiringBuses::default();
@@ -2728,8 +2790,49 @@ mod tests {
         assert!(!bus.is_closed(), "a dropped handle leaves the bus to the body's end");
         firing.end(StreamEnd::Failed { error: "the model went away".into() });
         assert!(matches!(cursor.next_json("hi", &mut HarnessRead).await, Ok(Some((_, v))) if v == json!(1)));
-        assert!(cursor.next_json("hi", &mut HarnessRead).await.unwrap().is_none(), "ended by the body");
+        let failed = cursor.next_json("hi", &mut HarnessRead).await.unwrap_err();
+        assert!(matches!(&failed, WeftError::NodeFailed(why) if why.contains("the model went away")), "{failed}");
         assert_eq!(bus.end(), Some(StreamEnd::Failed { error: "the model went away".into() }));
+    }
+
+    /// A bus that finished reads to `None` after its last message; one
+    /// that ended failed hands its failure to every reader, also one that
+    /// opens after the end.
+    #[tokio::test]
+    async fn a_failed_bus_reads_as_its_failure() {
+        let finished = BusHandle::create();
+        let mut reader = finished.cursor().unwrap();
+        registered(&finished, "host").send("hi", json!(1)).unwrap();
+        finished.close();
+        assert!(reader.next_json("hi", &mut HarnessRead).await.unwrap().is_some());
+        assert!(reader.next_json("hi", &mut HarnessRead).await.unwrap().is_none());
+
+        let failed = BusHandle::create();
+        failed.inner_arc().close(StreamEnd::Failed { error: "the producer broke off".into() });
+        let mut late = failed.cursor_from_start().unwrap();
+        let error = late.next(&mut HarnessRead).await.unwrap_err();
+        assert!(matches!(&error, WeftError::NodeFailed(why) if why.contains("the producer broke off")), "{error}");
+    }
+
+    /// A reader of a firing waiting on a quiet bus ends with the cancelled
+    /// error the moment its run is cancelled, and a read asked after the
+    /// cancel ends at once, even with a message waiting.
+    #[tokio::test]
+    async fn a_read_ends_cancelled_when_the_run_is_cancelled() {
+        let cancellation = CancellationFlag::new_arc();
+        let firing = Arc::new(FiringBuses::default().cancelled_by(cancellation.clone()));
+        let bus = BusHandle::create();
+        let mut reader = BusHandle::from_inner(bus.inner_arc(), None, Some(firing)).cursor().unwrap();
+        let waiting = tokio::spawn(async move {
+            let read = reader.next(&mut HarnessRead).await;
+            (read, reader)
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel_because(crate::run::CancelCause::User);
+        let (read, mut reader) = tokio::time::timeout(std::time::Duration::from_secs(5), waiting).await.unwrap().unwrap();
+        assert!(matches!(read, Err(WeftError::Cancelled)), "{read:?}");
+        registered(&bus, "host").send("hi", json!(1)).unwrap();
+        assert!(matches!(reader.next(&mut HarnessRead).await, Err(WeftError::Cancelled)));
     }
 
     /// The first end stands: a bus closed on purpose stays finished when

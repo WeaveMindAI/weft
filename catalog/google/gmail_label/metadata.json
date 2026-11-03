@@ -1,7 +1,7 @@
 {
   "type": "GmailLabel",
   "label": "Gmail: Label",
-  "description": "Adds and/or removes Gmail labels on a message, by name. A missing add-label is created; a missing remove-label fails loudly.",
+  "description": "Adds and/or removes Gmail labels on a message, by name. A missing add-label is created; a missing remove-label fails loudly. With neither `add` nor `remove` given, the node is skipped.",
   "tags": [
     "google",
     "gmail",
@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[google]", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/gmail.modify"

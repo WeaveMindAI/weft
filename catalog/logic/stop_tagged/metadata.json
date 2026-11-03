@@ -36,5 +36,34 @@
   "features": {
     "canAddInputPorts": true,
     "customInputType": "String"
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "custom_inputs_declared"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "tags",
+              "nonempty": true
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "StopTagged '{id}' has no tag to stop runs by. Add an input onto the node (`StopTagged(sender: String)`), or give it a `tags` list.",
+        "level": "structural",
+        "severity": "error",
+        "port": "tags"
+      }
+    }
+  ]
 }

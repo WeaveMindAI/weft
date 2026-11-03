@@ -359,7 +359,7 @@ naming those flags.
 |---|---|
 | `weft connect` | Walks you through connecting an account |
 | `weft connect --list` | Prints what is stored, changing nothing. Works outside a project |
-| `weft connect --node <id>` | Go straight to one access node |
+| `weft connect <node>` | Go straight to one node that takes a connection: an access node, or a `Route` or `Socket` whose `auth` checks its callers |
 | `weft connect --grant <id>` | Pick a stored connection for the node |
 | `weft connect --disconnect` | Clear the node's pick, leaving the connection stored |
 | `weft connect --forget <id>` | Delete a stored connection for good |
@@ -451,13 +451,14 @@ check first, and refuse to replace anything while something is on.
 
 | Command | What it does |
 |---|---|
-| `weft test-node [<node or package>]` | Runs node tests. Without `--tier`, the basic and fake tiers, which need no install |
+| `weft test-node [<node or package>...]` | Runs node tests, one build for every target. Without `--tier`, the basic and fake tiers, which need no install |
 | `weft test-node --tier live` | Calls the real provider with a real credential, and can spend money |
 | `weft node-test-hash [<target>]` | The content hash naming a package's test inputs |
 
 Other flags: `--test <name>` for one test, `--key <service>` and
-`--connection <service>=<id>` for live credentials, `--parallel [N]`, and
-`--yes` to skip the live confirmation.
+`--connection <service>=<id>` for live credentials, `--parallel [N]` to run up
+to N packages side by side (each with up to N tests at once; bare, all of
+them), and `--yes` to skip the live confirmation.
 
 ## What the editor drives
 
@@ -510,7 +511,7 @@ hanging on an answer that will never come.
 | `weft files rm` | Confirm, naming how many files are kept ones | `--yes` |
 | `weft connect --forget` | Confirm | `--yes` |
 | `weft infra terminate` | Confirm what will be deleted | `--yes` |
-| `weft connect` | Which node, which door, which app, which permissions, the credential fields, the connection's name | `--node`, `--door`, `--shared-app`, `--permissions`, `--set`, `--label` |
+| `weft connect` | Which node, which door, which app, which permissions, the credential fields, the connection's name | `<node>`, `--door`, `--shared-app`, `--permissions`, `--set`, `--label` |
 | `weft test-node --tier live` | Confirm that this spends money | `--yes` |
 | `weft login` | The operator key, at a hidden prompt | `--key-stdin` |
 | `weft deps-install` | Whether to run the install command it printed | `--yes`, or `--print` to only print it |

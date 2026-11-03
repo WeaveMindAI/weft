@@ -22,20 +22,6 @@
 
 use serde_json::{json, Map, Value};
 
-/// Fail the node now for a mistake in the program itself: the SQL it
-/// wrote, a setting, a value of the wrong shape. Such a failure is an
-/// input error, so it fails the run even when the node's `_error`
-/// output is wired: the fix is editing the program, and nothing a
-/// program does at run time can route around it. A refusal that
-/// depends on the database's data or state stays `node_bail!`, which
-/// `_error` catches.
-macro_rules! mistake {
-    ($($arg:tt)*) => {
-        return Err(weft::WeftError::Input(format!($($arg)*)))
-    };
-}
-pub(crate) use mistake;
-
 /// A refusal from the server, as the error it is. A statement the
 /// server cannot even plan (SQLSTATE class 42: a syntax error, a
 /// table, column or function that does not exist, a parameter whose
@@ -66,11 +52,10 @@ use weft::{RunContext, WeftError, WeftResult};
 pub fn dial_config(conn: &OpenedConnection) -> WeftResult<Config> {
     let port: u16 = match conn.opt_value("port").map(str::trim).unwrap_or("") {
         "" => 5432,
-        p => p.parse().map_err(|_| {
-            WeftError::Input(
-                "the connection's port is not a number; reconnect it with a numeric port".into(),
-            )
-        })?,
+        p => match p.parse() {
+            Ok(port) => port,
+            Err(_) => weft::input_bail!("the connection's port is not a number; reconnect it with a numeric port"),
+        },
     };
     // Absent TLS means `require`, the safe default for a database
     // reached over a network; `disable` is the escape for a database
@@ -85,12 +70,10 @@ pub fn dial_config(conn: &OpenedConnection) -> WeftResult<Config> {
         "" | "require" | "verify-ca" | "verify-full" => SslMode::Require,
         "prefer" => SslMode::Prefer,
         "disable" => SslMode::Disable,
-        other => {
-            return Err(WeftError::Input(format!(
-                "the connection's TLS setting is '{other}'; reconnect it with require, \
-                 verify-ca, verify-full, prefer or disable"
-            )))
-        }
+        other => weft::input_bail!(
+            "the connection's TLS setting is '{other}'; reconnect it with require, \
+             verify-ca, verify-full, prefer or disable"
+        ),
     };
     let mut config = Config::new();
     config
@@ -229,7 +212,6 @@ impl FullWaits {
 /// waits for one to free up instead of failing: the size of the database
 /// is a limit to slow down at, and the warning names the lever.
 async fn dial_with(ctx: &RunContext, config: &Config) -> WeftResult<(tokio_postgres::Client, Connection)> {
-    let cancel = ctx.cancellation();
     let mut wait = FULL_FIRST_WAIT;
     // Counted once for the run, at its first refusal, and no longer once
     // it gets a connection or stops.
@@ -242,10 +224,7 @@ async fn dial_with(ctx: &RunContext, config: &Config) -> WeftResult<(tokio_postg
                     held_back = Some(HeldBack::begin());
                 }
                 say_full(std::time::Instant::now());
-                tokio::select! {
-                    _ = tokio::time::sleep(wait) => {}
-                    _ = cancel.cancelled() => return Err(WeftError::Cancelled),
-                }
+                ctx.cancellation().race(tokio::time::sleep(wait)).await?;
                 wait = (wait * 2).min(FULL_LONGEST_WAIT);
             }
             Err(e) => return Err(connect_failed(e)),
@@ -310,10 +289,8 @@ pub(crate) const MOST_AT_ONCE: usize = 20;
 /// of runs with one sign-in; short, because an idle connection held here
 /// is one the database cannot give anybody else, and a pooler in session
 /// mode keeps a real Postgres connection behind every one of them. A
-/// worker that loses its CPU between requests (a Cloud Run worker does)
-/// cannot close them on time itself, so a connection idle past this is
-/// also never handed out: the database may have closed it meanwhile
-/// (a PostgresDatabase does after a minute).
+/// connection idle past this is also never handed out: the database may
+/// have closed it meanwhile (a PostgresDatabase does after a minute).
 pub(crate) const IDLE_CLOSE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long a returning connection gets to clear its session before it
@@ -323,87 +300,29 @@ pub(crate) const IDLE_CLOSE: std::time::Duration = std::time::Duration::from_sec
 /// [`MOST_AT_ONCE`] while the kernel works that out.
 const CLEAR_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Connections to one database, signed in once and held by the worker for
-/// its runs to share (`ctx.shared`), instead of dialed and signed in again
-/// by every run. Built from the connection's values, so a changed
-/// password builds a fresh pool. A connection idle for [`IDLE_CLOSE`] is
-/// closed.
-pub struct Pool {
-    config: Config,
-    /// Oldest first, each with when it went idle.
-    idle: std::sync::Mutex<Vec<(tokio_postgres::Client, std::time::Instant)>>,
-}
-
-impl Pool {
-    fn new(conn: &OpenedConnection) -> WeftResult<Self> {
-        Ok(Self { config: dial_config(conn)?, idle: std::sync::Mutex::new(Vec::new()) })
-    }
-
-    /// The most recently returned connection that is still open and was
-    /// idle for less than [`IDLE_CLOSE`] at `now`, closing every one that
-    /// was idle longer (dropping a client closes its connection).
-    fn take(&self, now: std::time::Instant) -> Option<tokio_postgres::Client> {
-        let mut idle = self.idle.lock().expect("pool poisoned");
-        idle.retain(|(_, since)| still_fresh(*since, now));
-        while let Some((client, _)) = idle.pop() {
-            if !client.is_closed() {
-                return Some(client);
-            }
-        }
-        None
-    }
-
-    /// Put `client` back, idle from `now`, and close it once it has sat
-    /// idle for [`IDLE_CLOSE`] if no run took it. The close is a timer
-    /// here, so a worker without CPU between requests runs it late; the
-    /// next run's [`Pool::take`] closes it then, before anything uses it.
-    fn give_back(self: std::sync::Arc<Self>, client: tokio_postgres::Client, now: std::time::Instant) {
-        self.idle.lock().expect("pool poisoned").push((client, now));
-        let pool = std::sync::Arc::downgrade(&self);
-        tokio::spawn(async move {
-            tokio::time::sleep(IDLE_CLOSE).await;
-            if let Some(pool) = pool.upgrade() {
-                let now = std::time::Instant::now();
-                pool.idle.lock().expect("pool poisoned").retain(|(_, since)| still_fresh(*since, now));
-            }
-        });
-    }
-}
-
-/// Whether a connection idle since `since` may still be handed out at
-/// `now`. Pure, so the decision is testable.
-pub fn still_fresh(since: std::time::Instant, now: std::time::Instant) -> bool {
-    now.saturating_duration_since(since) < IDLE_CLOSE
-}
-
-/// A client of the pool, for one run's use. It goes back to the pool when
-/// dropped, once whatever the run left on its session is cleared
-/// ([`clear_session`]), unless the connection broke or the run was
-/// cancelled with it in hand (a statement may still be running on it;
-/// closing the connection is what stops it).
+/// A signed-in connection to the database, as the worker's pool holds it
+/// (`ctx.pool`): one run uses it at a time, and it goes back to the pool
+/// once whatever the run left on its session is cleared
+/// ([`clear_session`]).
 ///
 /// SQL reaches it only through its own methods, so every statement a
-/// run sends is seen on the way and the pool knows whether one of them
+/// run sends is seen on the way and the reset knows whether one of them
 /// could have left a transaction open.
-pub struct Pooled {
-    client: Option<tokio_postgres::Client>,
-    /// Held until the client is back in the pool or let go, so its place
-    /// under the pool's limit stays taken while its session is cleared.
-    pool: Option<weft::shared::SharedHandle<Pool>>,
-    cancel: std::sync::Arc<weft::CancellationFlag>,
+pub struct Session {
+    client: tokio_postgres::Client,
     /// Whether a statement this run sent opens a transaction
     /// ([`opens_transaction`]), so the one it opened may still be open.
     may_hold_transaction: bool,
 }
 
-impl Pooled {
+impl Session {
     /// The client, for sending `statements`, noting whether any of them
     /// opens a transaction.
     fn sending<'a>(&mut self, statements: impl IntoIterator<Item = &'a str>) -> &mut tokio_postgres::Client {
         if statements.into_iter().any(opens_transaction) {
             self.may_hold_transaction = true;
         }
-        self.client.as_mut().expect("a pooled client is held until it is dropped")
+        &mut self.client
     }
 
     /// [`query_json`] on this client. Only `sql` is noted: the
@@ -424,25 +343,21 @@ impl Pooled {
         let client = self.sending(steps.iter().map(|(s, _)| s.sql.as_str()));
         steps_json(client, steps).await
     }
-}
 
-impl Drop for Pooled {
-    fn drop(&mut self) {
-        let (Some(client), Some(pool)) = (self.client.take(), self.pool.take()) else { return };
-        if client.is_closed() || self.cancel.is_cancelled() {
-            return;
+    /// Clear what the run left on the session, so the pool can hand it to
+    /// the next run; an error lets it go instead.
+    async fn cleared(self) -> WeftResult<Self> {
+        if self.client.is_closed() {
+            return Err(weft::error::node_error("postgres: the connection closed"));
         }
-        let may_hold_transaction = self.may_hold_transaction;
-        tokio::spawn(async move {
-            match tokio::time::timeout(CLEAR_WITHIN, clear_session(&client, may_hold_transaction)).await {
-                Ok(Ok(())) => pool.arc().give_back(client, std::time::Instant::now()),
-                Ok(Err(e)) => tracing::warn!("postgres: a pooled connection is let go, its session could not be cleared: {e}"),
-                Err(_) => tracing::warn!(
-                    "postgres: a pooled connection is let go, its database did not answer within {}s while its session was cleared",
-                    CLEAR_WITHIN.as_secs()
-                ),
-            }
-        });
+        match tokio::time::timeout(CLEAR_WITHIN, clear_session(&self.client, self.may_hold_transaction)).await {
+            Ok(Ok(())) => Ok(Self { client: self.client, may_hold_transaction: false }),
+            Ok(Err(e)) => Err(weft::error::node_error(format!("postgres: its session could not be cleared: {e}"))),
+            Err(_) => Err(weft::error::node_error(format!(
+                "postgres: its database did not answer within {}s while its session was cleared",
+                CLEAR_WITHIN.as_secs()
+            ))),
+        }
     }
 }
 
@@ -535,25 +450,29 @@ async fn clear_session(client: &tokio_postgres::Client, may_hold_transaction: bo
     client.batch_execute(&reset).await.map_err(|e| pg_detail(&e))
 }
 
-/// A client of the database `access` connects to, from the pool this
+/// A connection to the database `access` connects to, from the pool this
 /// worker holds for it: an idle one, or a new one dialed when none is
-/// idle. The connection task of a new one lives as long as the client
+/// idle. The connection task of a new one lives as long as its client
 /// does.
-pub async fn connect(ctx: &RunContext, access: &weft::access::Access) -> WeftResult<Pooled> {
-    let pool = ctx.shared(access, |opened| async move { Pool::new(&opened) }).with_limit(MOST_AT_ONCE).await?;
-    if let Some(client) = pool.take(std::time::Instant::now()) {
-        return Ok(Pooled { client: Some(client), pool: Some(pool), cancel: ctx.cancellation(), may_hold_transaction: false });
-    }
-    let (client, connection) = dial_with(ctx, &pool.config).await?;
-    // The connection future must be driven for the client to work; it
-    // ends when the client drops. A connection failure surfaces on the
-    // next query as a loud error, so the task only logs.
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::warn!("postgres connection ended: {e}");
-        }
-    });
-    Ok(Pooled { client: Some(client), pool: Some(pool), cancel: ctx.cancellation(), may_hold_transaction: false })
+pub async fn connect(ctx: &RunContext, access: &weft::access::Access) -> WeftResult<weft::shared::pool::Lease<Session>> {
+    ctx.pool(access, |opened: OpenedConnection| async move {
+        let (client, connection) = dial_with(ctx, &dial_config(&opened)?).await?;
+        // The connection future must be driven for the client to work; it
+        // ends when the client drops. A connection failure surfaces on the
+        // next query as a loud error, so the task only logs.
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!("postgres connection ended: {e}");
+            }
+        });
+        Ok::<_, WeftError>(Session { client, may_hold_transaction: false })
+    })
+    .max(MOST_AT_ONCE)
+    .idle_close(IDLE_CLOSE)
+    .check(|session: &mut Session| !session.client.is_closed())
+    .reset(Session::cleared)
+    .take()
+    .await
 }
 
 /// A connection of its own to the wired database, for a run that holds
@@ -565,13 +484,8 @@ pub async fn connect_alone(ctx: &RunContext, conn: &OpenedConnection) -> WeftRes
     let (client, connection) = dial_watching(ctx, conn).await?;
     let cancel = ctx.cancellation();
     tokio::spawn(async move {
-        tokio::select! {
-            r = connection => {
-                if let Err(e) = r {
-                    tracing::warn!("postgres connection ended: {e}");
-                }
-            }
-            _ = cancel.cancelled() => {}
+        if let Ok(Err(e)) = cancel.race(connection).await {
+            tracing::warn!("postgres connection ended: {e}");
         }
     });
     client
@@ -913,7 +827,7 @@ pub fn params_of(values: &[Value]) -> Vec<Box<dyn ToSql + Sync + Send>> {
 /// empty one. Doubles embedded quotes, the standard escape.
 pub fn quote_ident(name: &str) -> WeftResult<String> {
     if name.trim().is_empty() {
-        mistake!("an empty identifier cannot name a table or column");
+        weft::input_bail!("an empty identifier cannot name a table or column");
     }
     Ok(format!("\"{}\"", name.replace('"', "\"\"")))
 }
@@ -1454,7 +1368,7 @@ pub fn spell_parameters(detail: &str, names: &[String]) -> String {
 /// twice. The transaction ends on every path (the commit, or the
 /// `ROLLBACK` the driver queues when it is dropped unfinished, which
 /// reaches the server before anything sent after it), so it is not one
-/// [`Pooled`] has to roll back for the next run.
+/// [`Session`] has to roll back for the next run.
 pub async fn query_json(
     client: &mut tokio_postgres::Client,
     sql: &str,
@@ -1686,7 +1600,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                 let mut depth = 0usize;
                 loop {
                     if i >= bytes.len() {
-                        mistake!("the SQL opens a /* comment it never closes");
+                        weft::input_bail!("the SQL opens a /* comment it never closes");
                     }
                     if bytes[i..].starts_with(b"/*") {
                         depth += 1;
@@ -1718,7 +1632,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                 i += 1;
                 loop {
                     let Some(&b) = bytes.get(i) else {
-                        mistake!("the SQL opens a {} quote it never closes", quote as char);
+                        weft::input_bail!("the SQL opens a {} quote it never closes", quote as char);
                     };
                     if b == b'\\' && escapes_with_backslash {
                         // The escaped character's first byte; the rest of
@@ -1756,7 +1670,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                     // Dollar-quoted body: copy through to the closing tag.
                     let close = format!("${tag}$");
                     let Some(at) = sql[j + 1..].find(&close) else {
-                        mistake!("the SQL opens a ${tag}$ quote it never closes");
+                        weft::input_bail!("the SQL opens a ${tag}$ quote it never closes");
                     };
                     let end = j + 1 + at + close.len();
                     current.push_str(&sql[i..end]);
@@ -1828,7 +1742,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
         close_statement(&mut current, &mut names, &mut statements);
     }
     if statements.is_empty() {
-        mistake!(
+        weft::input_bail!(
             "the query is empty (nothing but whitespace or comments); write the SQL to run"
         );
     }
@@ -1839,14 +1753,14 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
     if let Some(tag) = positional {
         let bound = parsed.names();
         if bound.is_empty() && parsed.statements.len() == 1 {
-            mistake!(
+            weft::input_bail!(
                 "the SQL uses `${tag}`, which is not a name this node can bind: parameters are \
                  the node's own input ports, read by name. Declare the port on the node, \
                  `(userId: String)`, and write `$userId` where its value goes"
             );
         }
         if !bound.is_empty() {
-            mistake!(
+            weft::input_bail!(
                 "the SQL mixes named parameters ({}) with `${tag}`, which is not a name this \
                  node can bind; name every parameter after the input port that carries it",
                 bound.join(", ")

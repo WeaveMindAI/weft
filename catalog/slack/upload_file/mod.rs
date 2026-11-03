@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use weft::access::client::{checked_send, required_str};
+use weft::access::client::{checked_send, required_str, StoredBodyExt};
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
@@ -41,30 +41,28 @@ impl Node for SlackUploadFileNode {
         let title: Option<String> = ctx.inputs.opt("title")?;
         let comment: Option<String> = ctx.inputs.opt("comment")?;
 
-        // The upload URL is minted for an exact length, so the bytes are
-        // collected first. Slack caps uploads at 1 GB; a workflow file
-        // that size is out of scope for a chat share.
-        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&file).await?;
+        // The upload URL is minted for an exact length, which the stored
+        // file's record already knows: the bytes stream from storage
+        // straight to Slack.
+        let body = ctx.storage(StorageScope::Run).body(&file).await?;
+        let filename = body.filename().to_string();
         // Two distinct facts: the WIRE filename (owns the extension
         // Slack derives the preview and download name from) is the
         // stored file's real name; `title` is only the display name on
         // the finished share.
-        let display_title = title.clone().unwrap_or_else(|| meta.filename.clone());
+        let display_title = title.unwrap_or_else(|| filename.clone());
         let client = ctx.client(&access).await?;
 
         let minted = api::get(
             &client,
             "files.getUploadURLExternal",
-            &[
-                ("filename", meta.filename.clone()),
-                ("length", bytes.len().to_string()),
-            ],
+            &[("filename", filename), ("length", body.len().to_string())],
         )
         .await?;
         let upload_url = required_str(&minted, "files.getUploadURLExternal", "upload_url")?;
         let file_id = required_str(&minted, "files.getUploadURLExternal", "file_id")?.to_string();
 
-        checked_send(ctx.http().post(upload_url).body(bytes), "upload the bytes to slack").await?;
+        checked_send(ctx.http().post(upload_url).stored_body(body), "upload the bytes to slack").await?;
 
         let mut complete = json!({
             "files": [{ "id": file_id, "title": display_title }],

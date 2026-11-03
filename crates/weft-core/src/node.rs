@@ -849,21 +849,30 @@ pub fn refuse_removed_metadata_keys(value: &serde_json::Value) -> Result<(), Str
 /// became is [`crate::access::events::verify_to_v2`]'s.
 const REMOVED_VERIFY_KEYS: [&str; 4] = ["signatureHeader", "timestampHeader", "prefix", "packed"];
 
-/// Refuse a `verify` block of the service's (its caller gate, or a topic's
-/// push recipe) that still carries a [`REMOVED_VERIFY_KEYS`] key, showing
-/// the block written the new way. A recorded recipe is upgraded on read
+/// Refuse the service's caller gate (`service.verify`, gone: a route checks
+/// its callers through its own `auth`), and a topic's push recipe that
+/// still carries a [`REMOVED_VERIFY_KEYS`] key, showing the block written
+/// the new way. A recorded recipe is upgraded on read
 /// (`EVENTS_V2`); a node's own metadata is source its author edits, so it
 /// is pointed at the new shape instead of meeting serde's bare "unknown
 /// field".
 fn refuse_removed_verify_keys(node: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
     let Some(service) = node.get("service") else { return Ok(()) };
-    let gate = service.get("verify").map(|verify| ("service.verify".to_string(), verify));
+    if service.get("verify").is_some() {
+        return Err(
+            "`service.verify` is gone: a recipe no longer says how a route checks its callers. A Route or \
+             Socket checks them itself through its `auth` setting (`\"api_keys\"`, `\"hmac\"`, \
+             `\"signature\"`, `\"oidc\"`, or the scheme written as a record), and its `connection` holds \
+             the secret; drop the block, and set `auth` on the route this node used to gate"
+                .to_string(),
+        );
+    }
     let pushes = service.get("events").and_then(|e| e.as_object()).into_iter().flat_map(|topics| {
         topics.iter().filter_map(|(topic, spec)| {
             spec.get("webhook")?.get("verify").map(|verify| (format!("service.events.{topic}.webhook.verify"), verify))
         })
     });
-    for (at, verify) in gate.into_iter().chain(pushes) {
+    for (at, verify) in pushes {
         let old: Vec<String> =
             REMOVED_VERIFY_KEYS.iter().filter(|key| verify.get(**key).is_some()).map(|key| format!("`{key}`")).collect();
         if old.is_empty() {
@@ -1009,7 +1018,12 @@ pub const METADATA_PLACES: &[(&[&str], MetadataPlace, &str)] = {
         (
             &["validate", "**", "equals"],
             Data,
-            "the JSON value a `config_equals` rule compares a setting against: the setting's data",
+            "the JSON value a `value` rule compares a setting against: the setting's data",
+        ),
+        (
+            &["validate", "**", "oneOf"],
+            Data,
+            "the JSON values a `value` rule's `oneOf` takes: the setting's data",
         ),
         (
             &["inputs", "[]", "widget", "sources", "[]", "where"],
@@ -1167,6 +1181,14 @@ impl NodeMetadata {
         if features.live_connection.is_some() || features.journal_settings {
             added.extend(crate::stream_journal::JournalPolicy::node_inputs());
         }
+        let mut checks = Vec::new();
+        if let Some(defaults) = &features.machine_inputs {
+            if !self.requires_infra {
+                return Err("features.machineInputs sizes the machine of an infra node, and this node declares no `requiresInfra`".into());
+            }
+            added.extend(crate::infra::MachineShape::node_inputs(defaults)?);
+            checks = crate::infra::MachineShape::node_rules(&self.node_type);
+        }
         for name in added.iter().map(|i| &i.name) {
             if self.inputs.iter().any(|i| i.name == *name) {
                 return Err(format!(
@@ -1176,6 +1198,7 @@ impl NodeMetadata {
             }
         }
         self.inputs.extend(added);
+        self.validate.extend(checks);
         let port = ERROR_PORT;
         if self.outputs.iter().any(|o| o.name == port) {
             return Err(format!(
@@ -1268,7 +1291,7 @@ impl NodeMetadata {
             }
         }
         for rule in &self.validate {
-            self.check_condition_ports(&rule.when)?;
+            self.check_condition(&rule.when)?;
         }
         let params = self.type_param_list();
         crate::weft_type::TypeParam::check_declarations(&params)
@@ -1276,12 +1299,14 @@ impl NodeMetadata {
             .map_err(|why| format!("typeParams: {why}"))
     }
 
-    /// Every port a validation rule's condition names is one of this
-    /// node's (or one a program may add, on a node that takes added
-    /// ports): a misspelled port reads as never wired, and under a `not`
-    /// the rule then fires on every program. For the same reason a rule
-    /// asking about added ports is on a node that takes them.
-    fn check_condition_ports(&self, condition: &Condition) -> Result<(), String> {
+    /// Every port or field a validation rule's condition names is one of
+    /// this node's (or one a program may add, on a node that takes added
+    /// ports): a misspelled port reads as never wired, a misspelled field
+    /// as never set, and under a `not` the rule then fires on every
+    /// program. For the same reason a rule asking about added ports is on
+    /// a node that takes them, and a `value` rule's checks are ones that
+    /// can hold.
+    fn check_condition(&self, condition: &Condition) -> Result<(), String> {
         let input = |port: &str| {
             if self.features.can_add_input_ports || self.inputs.iter().any(|i| i.name == port) {
                 Ok(())
@@ -1299,25 +1324,23 @@ impl NodeMetadata {
         match condition {
             Condition::InputSatisfied { port }
             | Condition::InputWired { port }
-            | Condition::InputSourceType { port, .. }
             | Condition::InputNames { port, .. } => input(port),
+            Condition::Value { field, checks } => {
+                input(field)?;
+                checks.check_declaration().map_err(|why| format!("a validate rule on '{field}': {why}"))
+            }
             Condition::OutputWired { port } | Condition::OutputTypeFits { port, .. } => output(port),
             Condition::All { of } | Condition::Any { of } => {
-                of.iter().try_for_each(|c| self.check_condition_ports(c))
+                of.iter().try_for_each(|c| self.check_condition(c))
             }
-            Condition::Not { of } => self.check_condition_ports(of),
+            Condition::Not { of } => self.check_condition(of),
             Condition::CustomInputsDeclared {} | Condition::CustomInputsFit { .. } if !self.features.can_add_input_ports => {
                 Err("a validate rule asks for added inputs, and this node takes none (`canAddInputPorts`)".into())
             }
             Condition::CustomOutputsDeclared {} if !self.features.can_add_output_ports => {
                 Err("a validate rule asks for added outputs, and this node takes none (`canAddOutputPorts`)".into())
             }
-            Condition::ConfigPresent { .. }
-            | Condition::ConfigNonempty { .. }
-            | Condition::ConfigEquals { .. }
-            | Condition::ConfigInSet { .. }
-            | Condition::ConfigMatches { .. }
-            | Condition::CustomInputsDeclared {}
+            Condition::CustomInputsDeclared {}
             | Condition::CustomInputsFit { .. }
             | Condition::CustomOutputsDeclared {}
             | Condition::RunReaches { .. }
@@ -1491,16 +1514,17 @@ impl NodeMetadata {
                         input.name
                     ));
                 }
-                Widget::Access { .. } if self.service.is_none() => {
+                Widget::Access { .. } if self.service.is_none() && !self.features.checks_callers => {
                     return Err(format!(
                         "input '{}': an access widget needs the node metadata to declare a \
-                         `service` recipe (the sign-in it connects)",
+                         `service` recipe (the sign-in it connects), or `features.checksCallers` \
+                         (the recipe then follows the node's `auth`)",
                         input.name
                     ));
                 }
                 Widget::RemoteSelect { access, sources, depends_on, free_text: _ } => {
                     let names_access_input = self.inputs.iter().any(|i| {
-                        i.name == *access && i.input_type == WeftType::Access
+                        i.name == *access && i.input_type.is_access()
                     });
                     if !names_access_input {
                         return Err(format!(
@@ -1528,13 +1552,13 @@ impl NodeMetadata {
                 }
                 _ => {}
             }
-            if input.requires_scopes.is_some() && input.input_type != WeftType::Access {
+            if input.requires_scopes.is_some() && !input.input_type.is_access() {
                 return Err(format!(
                     "input '{}': `requiresScopes` is only legal on an Access-typed input",
                     input.name
                 ));
             }
-            if input.requires_values.is_some() && input.input_type != WeftType::Access {
+            if input.requires_values.is_some() && !input.input_type.is_access() {
                 return Err(format!(
                     "input '{}': `requiresValues` is only legal on an Access-typed input",
                     input.name
@@ -1572,8 +1596,11 @@ impl NodeMetadata {
                 // input's declared type is Access. Typing it here is
                 // what lets the requiresScopes/requiresValues legality
                 // rules and remote_select's `access` reference bind on
-                // the access node's own input.
-                Widget::Access { .. } => Some(WeftType::Access),
+                // the access node's own input. Any connection type
+                // holds it (`Access[tg]` on an access node's own input);
+                // anything else is held to the bare one, and refused.
+                Widget::Access { .. } if input.input_type.is_access() => None,
+                Widget::Access { .. } => Some(WeftType::Access(None)),
                 // A text_list edits a list of short strings.
                 Widget::TextList => {
                     Some(WeftType::List(Box::new(WeftType::primitive(WeftPrimitive::String))))
@@ -1612,6 +1639,16 @@ impl NodeMetadata {
             // runtime's) would otherwise be the one to report it.
             if let Err(why) = input.effective_widget().check_declaration() {
                 return Err(format!("input '{}': {why}", input.name));
+            }
+            // A blank kept is a blank of an optional input that takes
+            // text: a required input is never absent, and nothing else
+            // takes a text.
+            if input.keeps_blank && (input.required || !accepts_text(&input.input_type)) {
+                return Err(format!(
+                    "input '{}': `keepsBlank` is for an optional input that takes a text, where a blank \
+                     text otherwise counts as no value",
+                    input.name
+                ));
             }
             if let Some(default) = &input.default {
                 // The one runtime gate: declared shapes (Named/Record)
@@ -1815,17 +1852,14 @@ impl NodeMetadata {
                      (lowercase letters, digits and underscores): '{service}' is not one"
                 ));
             }
-            if !self
-                .outputs
-                .iter()
-                .any(|o| matches!(o.port_type, crate::weft_type::WeftType::Access))
-            {
+            if !self.outputs.iter().any(|o| o.port_type.is_access()) {
                 return Err(format!(
-                    "this node publishes a '{service}' connection but declares no Access \
-                     output to hand it out on"
+                    "this node publishes a '{service}' connection but declares no \
+                     `Access[{service}]` output to hand it out on"
                 ));
             }
         }
+        self.check_access_outputs()?;
         if let Some(spec) = &self.service {
             spec.validate()?;
             let connect_inputs = self
@@ -1840,7 +1874,42 @@ impl NodeMetadata {
                 ));
             }
         }
+        if self.features.checks_callers {
+            crate::access::callers::check_metadata(self)?;
+        }
         Ok(())
+    }
+
+    /// Every connection this node hands out is typed with the service it
+    /// is a connection to: `Access[<publishes>]` on a node that publishes
+    /// a service, else `Access[<its recipe's service>]` on an access node.
+    /// The type is what lets the compiler refuse a wire into a node taking
+    /// another service, so an output typed otherwise would let one through.
+    fn check_access_outputs(&self) -> Result<(), String> {
+        let (service, whose) = match (&self.publishes, &self.service) {
+            (Some(published), _) => (published.as_str(), "publishes"),
+            (None, Some(spec)) => (spec.service.as_str(), "makes"),
+            (None, None) => return Ok(()),
+        };
+        let wanted = WeftType::Access(Some(service.to_string()));
+        if let Some(output) = self.outputs.iter().find(|o| o.port_type.is_access() && o.port_type != wanted) {
+            return Err(format!(
+                "output '{}' is typed {}, and this node {whose} '{service}' connections, \
+                 so it is typed `{wanted}`",
+                output.name, output.port_type
+            ));
+        }
+        // Its own connection input takes a connection to that service and no
+        // other: typed so, a connection to another service is refused when
+        // the program is built and again when the node fires.
+        match self.access_input().filter(|input| input.input_type != wanted) {
+            Some(input) => Err(format!(
+                "input '{}' is typed {}, and this node {whose} '{service}' connections from it, \
+                 so it is typed `{wanted}`",
+                input.name, input.input_type
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Is `name` a port the compiler reads to BUILD the node: the list its
@@ -1932,10 +2001,10 @@ impl NodeMetadata {
         // compiler at enrich time; stamp them here from the node's
         // own recipe so the compact view answers "can this node run
         // without a connection picked" without the recipe it drops.
-        // This covers every access widget that can exist: load
-        // validation ties an access widget to a node carrying the
-        // recipe (a widget with no recipe, or two widgets, is a load
-        // error), so there is no second stamp site to miss.
+        // Load validation ties an access widget to a node carrying the
+        // recipe (two widgets is a load error), or to a node checking its
+        // callers, whose recipe follows the `auth` a program writes and
+        // so is stamped by the compiler alone.
         if let Some(recipe) = &resolved.service {
             for input in &mut resolved.inputs {
                 if let Some(widget) = &mut input.widget {
@@ -2302,15 +2371,21 @@ pub enum RuleSeverity {
 /// Closed-grammar condition language. Each variant is evaluated
 /// against a `RuleContext` (the node being validated + the enriched
 /// project). No loops, no recursion on user data; only structural
-/// boolean combinators plus a small set of graph/config queries.
+/// boolean combinators plus a small set of graph/config queries. A
+/// `value` query on a field a wire fills is answered when the node
+/// fires, with the value that arrived (`crate::rules::recheck`).
+/// Read through [`Condition`]'s own `Deserialize`, which refuses a kind
+/// that is gone naming the one that replaced it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(remote = "Self", tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Condition {
     /// Port has a value available at compile time: either a wired
     /// incoming edge OR a body literal (where the port's literal
     /// placement allows one). This is the "is my input provided" check
     /// that handles the literal-assignment case (e.g. `Llm { prompt:
-    /// "hello" }`) the same as the wired case.
+    /// "hello" }`) the same as the wired case. A wire the node can fire
+    /// without (an optional input whose wire may close empty) leaves the
+    /// answer to the firing, which asks again with what arrived.
     InputSatisfied { port: String },
     /// Port has a wired incoming edge specifically (no config-literal
     /// shortcut). Rare; prefer `InputSatisfied`.
@@ -2321,25 +2396,26 @@ pub enum Condition {
     /// anybody reads it" expressible without shouting at every program
     /// that ignores the port.
     OutputWired { port: String },
-    /// Port's incoming edge(s) all come from a node whose
-    /// `node_type` equals `equals`. True vacuously if the port has
-    /// no wired edges (pair with `InputWired` or `InputSatisfied`
-    /// when you want to require both).
-    InputSourceType { port: String, equals: String },
-    /// Config field exists (any non-null value).
-    ConfigPresent { field: String },
-    /// Config field is present and non-empty (for strings: not ""
-    /// after trim; for arrays: length > 0; for objects: has keys).
-    ConfigNonempty { field: String },
-    /// Config field equals a specific JSON value.
-    ConfigEquals { field: String, equals: Value },
-    /// Config field's string value is in a whitelist.
-    ConfigInSet { field: String, values: Vec<String> },
-    /// Config field's string value matches a regex. Fail-closed: false if the
-    /// field is absent, non-string, or the regex is malformed (matching every
-    /// sibling ConfigX condition, which all treat an absent field as not-present).
-    /// Wrap in `not` to assert a non-match.
-    ConfigMatches { field: String, regex: String },
+    /// The value one of the node's fields holds (`field`), held to every
+    /// check in `checks` (all must hold). With no check it asks whether
+    /// the field holds a value at all (anything but null); with any check,
+    /// absent or null is false. A value nobody knows yet (`@instance_filled`,
+    /// an install pick, a content ref) is there and non-empty, and has no
+    /// answer for a check of its content; a wired one is there when the
+    /// node cannot fire without it, and otherwise has no answer. A rule
+    /// left without an answer by a wire is asked again before the body
+    /// runs, with what arrived (`crate::rules::recheck`). Read by
+    /// [`Condition`]'s own `Deserialize`, which refuses an unknown key
+    /// (the enum's `deny_unknown_fields` would refuse every check, which
+    /// sits flat beside `field`).
+    #[serde(skip_deserializing)]
+    Value {
+        field: String,
+        /// Boxed: the checks are most of a condition's size, and every
+        /// other kind carries a name or two.
+        #[serde(flatten)]
+        checks: Box<ValueChecks>,
+    },
     /// The source declared input ports beyond the metadata's own (a
     /// node with `canAddInputPorts`, written `Node(ticket: String)`).
     /// For a node whose added inputs ARE what it works on: "added
@@ -2351,7 +2427,7 @@ pub enum Condition {
     /// node with `canAddOutputPorts`, written `-> (verdict: String)`).
     /// The ingredient for "added outputs need X": a node whose added
     /// ports only fire under some setting says so with this and a
-    /// `config_equals` on the setting. `{customOutputs}` in the
+    /// `value` rule on the setting. `{customOutputs}` in the
     /// message names them.
     /// Braced (`{}`) so a stray field on it is refused like on every
     /// other kind.
@@ -2427,6 +2503,259 @@ pub enum Condition {
     Not { of: Box<Condition> },
 }
 
+impl Serialize for Condition {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Condition::serialize(self, serializer)
+    }
+}
+
+/// The derived read, after refusing a kind that is gone with the one
+/// that replaced it: every reader (a node's metadata, a stored program's
+/// rules) gets the same message, at any depth of `all` / `any` / `not`.
+/// A `value` condition is read here: its checks sit flat beside `field`,
+/// and every key that is neither is refused.
+impl<'de> Deserialize<'de> for Condition {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let mut value = Value::deserialize(deserializer)?;
+        match value.get("kind").and_then(Value::as_str) {
+            Some("value") => {
+                let map = value.as_object_mut().expect("a value with a kind is an object");
+                map.remove("kind");
+                let field = match map.remove("field") {
+                    Some(Value::String(field)) => field,
+                    Some(other) => return Err(D::Error::custom(format!("a `value` rule's `field` names an input, and {other} is not one"))),
+                    None => return Err(D::Error::custom("a `value` rule names the input it asks about in `field`")),
+                };
+                let checks = ValueChecks::take(map).map_err(D::Error::custom)?;
+                Ok(Condition::Value { field, checks: Box::new(checks) })
+            }
+            kind => match kind.and_then(retired_condition_kind) {
+                Some(why) => Err(D::Error::custom(why)),
+                None => Condition::deserialize(value).map_err(D::Error::custom),
+            },
+        }
+    }
+}
+
+/// What to write instead of a condition kind weft no longer has.
+fn retired_condition_kind(kind: &str) -> Option<String> {
+    let value = |checks: &str| {
+        Some(format!(
+            "the `{kind}` rule kind is gone: write `{{\"kind\": \"value\", \"field\": \"...\"{checks}}}`"
+        ))
+    };
+    match kind {
+        "config_present" => value(""),
+        "config_nonempty" => value(", \"nonempty\": true"),
+        "config_equals" => value(", \"equals\": ..."),
+        "config_in_set" => value(", \"oneOf\": [...]"),
+        "config_matches" => value(", \"matches\": \"...\""),
+        "config_item_count" => value(", \"count\": {\"min\": ..., \"max\": ...}"),
+        "config_items_fit" => value(", \"each\": {\"length\": {\"min\": ..., \"max\": ...}, \"matches\": \"...\"}"),
+        "config_in_range" => value(", \"range\": {\"min\": ..., \"max\": ...}"),
+        "config_field_in_set" => value(", \"each\": {\"key\": \"...\", \"oneOf\": [...]}"),
+        "input_source_type" => Some(
+            "the `input_source_type` rule kind is gone: type the input with the service it takes \
+             (`\"type\": \"Access[slack]\"`), and the compiler refuses a wire from any other"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// What a `value` condition holds a field's value to (every check given
+/// must hold), and what an `each` holds every item to. Written flat beside
+/// `field` (`{"kind": "value", "field": "x", "count": {"min": 1}}`); an
+/// unknown key is refused.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValueChecks {
+    /// Not blank: a text not empty after trimming, a list or a dict with
+    /// something in it. Any other value is non-empty.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub nonempty: bool,
+    /// Equals this JSON value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equals: Option<Value>,
+    /// Equals one of these JSON values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub one_of: Option<Vec<Value>>,
+    /// A text this regex matches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matches: Option<String>,
+    /// How many items: a list's items, a dict's entries, one for any other
+    /// value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<Bounds<u64>>,
+    /// A number within the bounds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<Bounds<f64>>,
+    /// A text whose length in characters is within the bounds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length: Option<Bounds<u64>>,
+    /// No two items alike ([`Unique`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique: Option<Unique>,
+    /// Every item holds these checks ([`EachChecks`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub each: Option<Box<EachChecks>>,
+}
+
+impl ValueChecks {
+    /// The keys a `value` condition takes beside `kind` and `field`.
+    const KEYS: &'static str = "nonempty, equals, oneOf, matches, count, range, length, unique and each";
+
+    /// No check: the condition asks only whether a value is there.
+    pub fn is_empty(&self) -> bool {
+        *self == ValueChecks::default()
+    }
+
+    /// Whether a check reads the value's content, which a value nobody
+    /// knows yet cannot answer: every check but `nonempty`.
+    pub fn reads_content(&self) -> bool {
+        ValueChecks { nonempty: false, ..self.clone() } != ValueChecks::default()
+    }
+
+    /// The checks written in `map`, taking each known key out; a key left
+    /// over is refused.
+    fn take(map: &mut serde_json::Map<String, Value>) -> Result<Self, String> {
+        fn take<T: serde::de::DeserializeOwned>(map: &mut serde_json::Map<String, Value>, key: &str) -> Result<Option<T>, String> {
+            map.remove(key).map(|v| serde_json::from_value(v).map_err(|e| format!("`{key}`: {e}"))).transpose()
+        }
+        let checks = ValueChecks {
+            nonempty: take(map, "nonempty")?.unwrap_or(false),
+            equals: take(map, "equals")?,
+            one_of: take(map, "oneOf")?,
+            matches: take(map, "matches")?,
+            count: take(map, "count")?,
+            range: take(map, "range")?,
+            length: take(map, "length")?,
+            unique: take(map, "unique")?,
+            each: take(map, "each")?,
+        };
+        match map.keys().next() {
+            Some(unknown) => Err(format!("`{unknown}` is no check of a value; the checks are {}", Self::KEYS)),
+            None => Ok(checks),
+        }
+    }
+
+    /// What is wrong with these checks as written in a node's metadata: a
+    /// regex that does not compile, bounds with neither end or the ends
+    /// crossed, an `each` checking nothing.
+    pub fn check_declaration(&self) -> Result<(), String> {
+        if let Some(regex) = &self.matches {
+            regex::Regex::new(regex).map_err(|e| format!("`matches` is no regex ({e})"))?;
+        }
+        if let Some(count) = &self.count {
+            count.check_declaration("count")?;
+        }
+        if let Some(range) = &self.range {
+            range.check_declaration("range")?;
+        }
+        if let Some(length) = &self.length {
+            length.check_declaration("length")?;
+        }
+        if let Some(each) = &self.each {
+            if each.checks.is_empty() {
+                return Err("`each` holds no check".into());
+            }
+            each.checks.check_declaration().map_err(|why| format!("in `each`, {why}"))?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for ValueChecks {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut map = serde_json::Map::deserialize(deserializer)?;
+        ValueChecks::take(&mut map).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The checks every item of a value holds (`each`): each item of a list,
+/// or the value itself when it is no list. With `key`, the checks are of
+/// each record's `key` instead, and a record without it (or holding null)
+/// passes. An item of the wrong kind for a check (a number under
+/// `matches`) passes too: the type check owns kinds.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct EachChecks {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(flatten)]
+    pub checks: ValueChecks,
+}
+
+impl<'de> Deserialize<'de> for EachChecks {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let mut map = serde_json::Map::deserialize(deserializer)?;
+        let key = match map.remove("key") {
+            None => None,
+            Some(Value::String(key)) if !key.is_empty() => Some(key),
+            Some(other) => return Err(D::Error::custom(format!("`key` names a record's key, and {other} is not one"))),
+        };
+        let checks = ValueChecks::take(&mut map).map_err(D::Error::custom)?;
+        Ok(EachChecks { key, checks })
+    }
+}
+
+/// `min` and `max`, each optional, both inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bounds<T> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<T>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<T>,
+}
+
+impl<T: PartialOrd + Copy + std::fmt::Display> Bounds<T> {
+    pub fn holds(&self, n: T) -> bool {
+        self.min.is_none_or(|min| n >= min) && self.max.is_none_or(|max| n <= max)
+    }
+
+    fn check_declaration(&self, name: &str) -> Result<(), String> {
+        match (self.min, self.max) {
+            (None, None) => Err(format!("`{name}` names neither `min` nor `max`")),
+            (Some(min), Some(max)) if min > max => Err(format!("`{name}` asks for at least {min} and at most {max}")),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// No two items alike: `true` compares the items of a list whole, and a
+/// key (`"name"`) compares the records of a list (or the values of a
+/// dict) by that key, a record without it (or holding null) left out. A
+/// dict's keys never repeat, so a dict holds `true`; any other value is
+/// one item, and holds both.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Unique {
+    Items,
+    Key(String),
+}
+
+impl Serialize for Unique {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Unique::Items => serializer.serialize_bool(true),
+            Unique::Key(key) => serializer.serialize_str(key),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Unique {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::Bool(true) => Ok(Unique::Items),
+            Value::String(key) if !key.is_empty() => Ok(Unique::Key(key)),
+            other => Err(serde::de::Error::custom(format!(
+                "`unique` is `true` (the items all differ) or a record's key (`\"name\"`), not {other}"
+            ))),
+        }
+    }
+}
+
 /// What the names of an `input_names` condition name, and what each
 /// must be: `{"node": {"role": "infra", "perInstance": true}}` or
 /// `{"field": {"instanceFilled": true}}`, or `{"state": {}}`. Each
@@ -2486,16 +2815,22 @@ mod condition_tests {
             "of": [
                 { "kind": "custom_outputs_declared" },
                 { "kind": "custom_inputs_declared" },
-                { "kind": "not", "of": { "kind": "config_equals", "field": "parseJson", "equals": true } },
+                { "kind": "not", "of": { "kind": "value", "field": "parseJson", "equals": true } },
                 { "kind": "any", "of": [
                     { "kind": "input_satisfied", "port": "prompt" },
                     { "kind": "input_wired", "port": "history" },
                     { "kind": "output_wired", "port": "count" },
-                    { "kind": "input_source_type", "port": "provider", "equals": "OpenRouter" },
-                    { "kind": "config_present", "field": "model" },
-                    { "kind": "config_nonempty", "field": "model" },
-                    { "kind": "config_in_set", "field": "mode", "values": ["a", "b"] },
-                    { "kind": "config_matches", "field": "path", "regex": "^/" },
+                    { "kind": "value", "field": "texts", "count": { "min": 1, "max": 10 } },
+                    { "kind": "value", "field": "ids", "each": { "length": { "min": 1, "max": 20 }, "matches": "^[a-z]+$" } },
+                    { "kind": "value", "field": "stability", "range": { "min": 0.0, "max": 1.0 } },
+                    { "kind": "value", "field": "documents", "each": { "key": "type", "oneOf": ["file", "url"] } },
+                    { "kind": "value", "field": "model" },
+                    { "kind": "value", "field": "model", "nonempty": true },
+                    { "kind": "value", "field": "mode", "oneOf": ["a", "b", 3] },
+                    { "kind": "value", "field": "path", "matches": "^/" },
+                    { "kind": "value", "field": "names", "unique": true },
+                    { "kind": "value", "field": "tables", "unique": "name" },
+                    { "kind": "value", "field": "grid", "each": { "each": { "range": { "max": 9 } } } },
                     { "kind": "output_type_fits", "port": "body", "within": "JsonDict | String" },
                     { "kind": "custom_inputs_fit", "oneOf": ["Json", "List[Image]"] },
                     { "kind": "run_reaches", "direction": "downstream", "with": { "answersCaller": true } },
@@ -2516,6 +2851,20 @@ mod condition_tests {
         assert!(serde_json::from_value::<Condition>(serde_json::json!({ "kind": "custom_inputs_declared", "port": "x" })).is_err(), "no fields");
         assert!(serde_json::from_value::<Condition>(serde_json::json!({ "kind": "per_instance", "port": "x" })).is_err(), "no fields");
         assert!(serde_json::from_value::<Condition>(serde_json::json!({ "kind": "custom_inputs_fit" })).is_err(), "a list of types");
+        let value = |extra: serde_json::Value| {
+            let mut rule = serde_json::json!({ "kind": "value", "field": "x" });
+            rule.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<Condition>(rule).map_err(|e| e.to_string())
+        };
+        let e = value(serde_json::json!({ "lenght": { "min": 1 } })).unwrap_err();
+        assert!(e.contains("`lenght` is no check of a value"), "{e}");
+        let e = value(serde_json::json!({ "each": { "key": "role", "values": ["a"] } })).unwrap_err();
+        assert!(e.contains("`values` is no check of a value"), "an unknown key inside `each` too: {e}");
+        assert!(value(serde_json::json!({ "count": { "least": 1 } })).is_err(), "bounds take min and max");
+        assert!(value(serde_json::json!({ "unique": false })).unwrap_err().contains("`unique` is `true`"));
+        assert!(value(serde_json::json!({ "unique": "" })).is_err());
+        assert!(value(serde_json::json!({ "each": { "key": 3 } })).is_err());
+
         let names = |named: serde_json::Value| {
             serde_json::from_value::<Condition>(serde_json::json!({ "kind": "input_names", "port": "x", "names": named }))
         };
@@ -2739,6 +3088,15 @@ pub struct NodeFeatures {
     /// Backend-only, like `liveConnection`.
     #[serde(default, rename = "journalSettings", skip_serializing_if = "std::ops::Not::not")]
     pub journal_settings: bool,
+    /// The trigger checks who calls it before a run starts: its `auth`
+    /// setting names a scheme (`crate::access::callers`), and its
+    /// `connection` field, picked on the install like an access node's,
+    /// holds what the scheme checks against. Which recipe that connection
+    /// follows comes from `auth`, never from the node's metadata
+    /// (`crate::access::callers::connection_field`).
+    // SYNC: checks_callers <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire.checksCallers
+    #[serde(default, rename = "checksCallers", skip_serializing_if = "std::ops::Not::not")]
+    pub checks_callers: bool,
     /// Webview hint: render the node's latest output as a JSON
     /// preview inline on the node body. Used by Debug.
     #[serde(default, rename = "showDebugPreview", skip_serializing_if = "std::ops::Not::not")]
@@ -2770,6 +3128,13 @@ pub struct NodeFeatures {
     /// nodes, the engine runs them inline.)
     #[serde(default, rename = "hidden", skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// The infra node sizes its machine from the program: the language
+    /// gives it the `cpu`, `memory` and `machineType` inputs
+    /// ([`crate::infra::MachineShape::node_inputs`]) and their checks,
+    /// `cpu` and `memory` defaulting to what this names, and the node
+    /// reads them back as one `MachineShape::from_inputs(&ctx.inputs)`.
+    #[serde(default, rename = "machineInputs", skip_serializing_if = "Option::is_none")]
+    pub machine_inputs: Option<crate::infra::MachineDefaults>,
 }
 
 impl NodeFeatures {
@@ -3403,7 +3768,7 @@ impl From<Accepts> for Vec<AcceptedForm> {
 /// written into source).
 // SYNC: InputSpec <-> packages/weft-graph/src/protocol.ts InputSpec
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct InputSpec {
     pub name: String,
     #[serde(rename = "type")]
@@ -3477,6 +3842,68 @@ pub struct InputSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub requires_values: Option<Vec<String>>,
+    /// On an optional `String` input, a blank text (empty, or only
+    /// whitespace) is a value the node uses rather than nothing (a
+    /// separator, a preview of what arrived). Without it a blank text on
+    /// an optional `String` input is no value at all: the node reads it
+    /// absent, `oneOfRequired` counts it not given, and a rule sees it
+    /// not set (`crate::run::ready::blank_is_absent`).
+    // SYNC: InputSpec.keeps_blank <-> packages/weft-graph/src/protocol.ts InputSpec.keepsBlank
+    #[serde(default, rename = "keepsBlank", skip_serializing_if = "std::ops::Not::not")]
+    pub keeps_blank: bool,
+}
+
+impl Serialize for InputSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        InputSpec::serialize(self, serializer)
+    }
+}
+
+/// The derived read, after refusing `minItems`, which a `value` rule's
+/// `count` replaced, naming the rule to write.
+impl<'de> Deserialize<'de> for InputSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = Value::deserialize(deserializer)?;
+        if value.get("minItems").is_some() {
+            return Err(D::Error::custom(
+                "`minItems` is gone: refuse too few items with a validate rule, \
+                 `{\"when\": {\"kind\": \"not\", \"of\": {\"kind\": \"value\", \"field\": \"...\", \"count\": {\"min\": N}}}, ...}` \
+                 (inside an `all` with `{\"kind\": \"value\", \"field\": \"...\"}` when the input is optional)",
+            ));
+        }
+        InputSpec::deserialize(value).map_err(D::Error::custom)
+    }
+}
+
+/// Whether `ty` takes a text (`String`, or a union with `String` in it,
+/// like `String | List[String]`): the inputs a blank text can be absent
+/// on. A blank arriving where a list or a record is also accepted says
+/// nothing either.
+pub fn accepts_text(ty: &WeftType) -> bool {
+    let string = WeftType::primitive(WeftPrimitive::String);
+    match ty.structural() {
+        WeftType::Union(members) => members.contains(&string),
+        other => *other == string,
+    }
+}
+
+/// Whether a blank text (empty, or only whitespace) on an input is no
+/// value: the input is optional, takes text, and does not declare
+/// `keepsBlank` ([`InputSpec::keeps_blank`]).
+pub fn blank_is_no_value(required: bool, keeps_blank: bool, ty: &WeftType) -> bool {
+    !required && !keeps_blank && accepts_text(ty)
+}
+
+/// How many items a value holds, for a `value` rule's `count`: a list's
+/// items, a dict's entries, none for null, one for anything else.
+pub fn item_count(value: &Value) -> u64 {
+    match value {
+        Value::Null => 0,
+        Value::Array(items) => items.len() as u64,
+        Value::Object(entries) => entries.len() as u64,
+        _ => 1,
+    }
 }
 
 impl InputSpec {
@@ -3619,9 +4046,11 @@ pub enum Widget {
     Number { min: Option<f64>, max: Option<f64>, step: Option<f64> },
     Checkbox,
     /// A calendar-and-clock picker for a String that holds one moment.
-    /// The stored value is ISO-8601 with the zone of whoever picked
+    /// The stored value is RFC 3339 with the zone of whoever picked
     /// it (`2026-09-03T11:00:00+02:00`), so the source says which
-    /// eleven o'clock it means.
+    /// eleven o'clock it means. [`Widget::check_value`] refuses any other
+    /// text, so a node reads the input as a moment
+    /// (`ctx.inputs.get::<chrono::DateTime<chrono::Utc>>(..)`).
     Datetime,
     /// `freeText`: the options are suggestions, not a closed set (a
     /// provider's model ids, voices, effort levels: one released after
@@ -3751,7 +4180,8 @@ impl Widget {
     /// What a widget's domain refuses: a number below `min`, above
     /// `max`, or off a whole-number `step`; a `Select` value that is not
     /// one of its closed `options`; a `Multiselect` item that is not
-    /// (a `freeText` list is suggestions and refuses nothing). `Ok(())`
+    /// (a `freeText` list is suggestions and refuses nothing); a
+    /// `Datetime` text that is not an RFC 3339 moment with its zone. `Ok(())`
     /// for every other widget and for a value of the wrong shape, which
     /// the type check owns.
     ///
@@ -3780,6 +4210,14 @@ impl Widget {
             Widget::Multiselect { options, free_text: false } => {
                 let Some(items) = value.as_array() else { return Ok(()) };
                 return items.iter().filter_map(Value::as_str).try_for_each(|picked| check_option(options, picked));
+            }
+            Widget::Datetime => {
+                return match value.as_str() {
+                    Some(moment) => chrono::DateTime::parse_from_rfc3339(moment).map(|_| ()).map_err(|why| {
+                        format!("'{moment}' is not a moment written with its zone, like 2026-09-03T11:00:00+02:00 ({why})")
+                    }),
+                    None => Ok(()),
+                };
             }
             _ => return Ok(()),
         };
@@ -4432,6 +4870,21 @@ mod deny_unknown_tests {
         }
     }
 
+    /// A datetime takes a moment written with its zone, which is what a
+    /// node reading it as a `DateTime<Utc>` needs, and nothing else.
+    #[test]
+    fn a_datetime_takes_only_a_moment_with_its_zone() {
+        let widget = Widget::Datetime;
+        assert_eq!(widget.check_value(&json!("2026-09-03T11:00:00+02:00")), Ok(()));
+        assert_eq!(widget.check_value(&json!("2026-09-03T09:00:00Z")), Ok(()));
+        let why = widget.check_value(&json!("2026-09-03T11:00")).unwrap_err();
+        assert!(why.starts_with("'2026-09-03T11:00' is not a moment written with its zone"), "{why}");
+        assert!(widget.check_value(&json!("tomorrow")).is_err());
+        assert_eq!(widget.check_value(&json!(3)), Ok(()), "another shape is the type check's");
+        let read: chrono::DateTime<chrono::Utc> = serde_json::from_value(json!("2026-09-03T11:00:00+02:00")).unwrap();
+        assert_eq!(read.to_rfc3339(), "2026-09-03T09:00:00+00:00");
+    }
+
     /// A select's options are its domain: a value outside them is
     /// refused naming the ones allowed, each item of a multiselect is
     /// held to them, and a value of another shape is the type check's.
@@ -4955,7 +5408,7 @@ mod input_semantics_tests {
     #[test]
     fn only_an_infra_nodes_output_may_be_baked() {
         let mut m = metadata_with(vec![]);
-        m.outputs.push(OutputSpec { name: "access".into(), port_type: WeftType::Access, description: None, baked: true, narrowable: None });
+        m.outputs.push(OutputSpec { name: "access".into(), port_type: WeftType::Access(None), description: None, baked: true, narrowable: None });
         assert!(m.validate_semantics().unwrap_err().contains("only an infra node's outputs are"));
         m.requires_infra = true;
         m.validate_semantics().expect("an infra node bakes");
@@ -5070,6 +5523,61 @@ mod input_semantics_tests {
         let mut limiter = metadata_with(own.clone());
         limiter.add_language_ports().expect("a plain node keeps its own names");
         assert_eq!(limiter.inputs.len(), own.len());
+    }
+
+    /// `features.machineInputs` gives an infra node the three machine
+    /// inputs, defaulted to its own sizes, and a check on each size; a
+    /// node that is no infra node, a default that is no size, and a node
+    /// declaring one of the three itself are refused.
+    #[test]
+    fn machine_inputs_add_the_sizes_and_their_checks() {
+        let names = |m: &NodeMetadata| m.inputs.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
+        let sized = |cpu: &str, memory: &str| {
+            let mut m = metadata_with(vec![]);
+            m.requires_infra = true;
+            m.features.machine_inputs = Some(crate::infra::MachineDefaults { cpu: cpu.into(), memory: memory.into() });
+            m
+        };
+        let mut node = sized("0.25", "1Gi");
+        node.add_language_ports().unwrap();
+        assert_eq!(names(&node), ["cpu", "memory", "machineType"]);
+        assert_eq!(node.inputs[0].default, Some(json!("0.25")));
+        assert_eq!(node.inputs[1].default, Some(json!("1Gi")));
+        assert!(!node.inputs.iter().any(|i| i.required), "each has a default or is a last resort");
+        assert_eq!(node.validate.len(), 2);
+        assert_eq!(node.validate[0].then.message, "T '{id}' has a `cpu` it cannot read. Write a number, or thousandths with m (1, 500m).");
+        assert_eq!(node.validate[1].then.port.as_deref(), Some("memory"));
+        node.validate_semantics().expect("the machine inputs and their checks pass the semantic rules");
+
+        let mut not_infra = sized("1", "2Gi");
+        not_infra.requires_infra = false;
+        assert!(not_infra.add_language_ports().unwrap_err().contains("requiresInfra"));
+        let e = sized("one", "2Gi").add_language_ports().unwrap_err();
+        assert!(e.contains("`cpu` of 'one'"), "{e}");
+        let e = sized("1", "2GB").add_language_ports().unwrap_err();
+        assert!(e.contains("`memory` of '2GB'"), "{e}");
+        let mut declares_cpu = sized("1", "2Gi");
+        declares_cpu.inputs.push(input("cpu", WeftType::primitive(WeftPrimitive::String)));
+        assert!(declares_cpu.add_language_ports().unwrap_err().contains("'cpu'"));
+    }
+
+    /// `keepsBlank` sits on an optional String input, and the retired
+    /// `minItems` is refused naming the `value` rule that replaced it.
+    #[test]
+    fn keeps_blank_is_held_to_its_input_and_min_items_is_gone() {
+        let e = serde_json::from_value::<InputSpec>(json!({ "name": "x", "type": "List[String]", "minItems": 1 })).unwrap_err().to_string();
+        assert!(e.contains("`minItems` is gone") && e.contains("\"count\""), "{e}");
+
+        let list = WeftType::List(Box::new(WeftType::primitive(WeftPrimitive::String)));
+        let text = WeftType::primitive(WeftPrimitive::String);
+        let with = |ty: &WeftType, edit: &dyn Fn(&mut InputSpec)| {
+            let mut i = input("x", ty.clone());
+            edit(&mut i);
+            metadata_with(vec![i]).validate_semantics()
+        };
+        assert!(with(&text, &|i| i.keeps_blank = true).is_ok());
+        assert!(with(&text, &|i| { i.keeps_blank = true; i.required = true }).unwrap_err().contains("`keepsBlank`"));
+        assert!(with(&list, &|i| i.keeps_blank = true).unwrap_err().contains("`keepsBlank`"));
     }
 
     /// Every node gets the language's `_error` output, a trigger and a
@@ -5307,9 +5815,8 @@ mod input_semantics_tests {
     }
 
     /// A node that hands out a connection to a service it runs
-    /// itself: the two rules that keeps honest are that the name IS a
-    /// service name, and that there is an output to hand the
-    /// connection out on.
+    /// itself: the name IS a service name, and there is an output typed
+    /// with that service to hand the connection out on.
     #[test]
     fn a_publishing_node_needs_a_service_name_and_an_access_output() {
         let publishing = |service: &str, outputs: Vec<OutputSpec>| {
@@ -5318,19 +5825,19 @@ mod input_semantics_tests {
             m.outputs = outputs;
             m
         };
-        let access_out = || OutputSpec {
+        let access_out = |service: Option<&str>| OutputSpec {
             name: "access".into(),
-            port_type: WeftType::Access,
+            port_type: WeftType::Access(service.map(str::to_string)),
             description: None,
             baked: false,
             narrowable: None,
         };
 
-        publishing("postgres", vec![access_out()])
+        publishing("postgres", vec![access_out(Some("postgres"))])
             .validate_semantics()
-            .expect("a service name plus an Access output is the whole rule");
+            .expect("a service name plus an Access[postgres] output is the whole rule");
 
-        let e = publishing("Postgres-DB", vec![access_out()])
+        let e = publishing("Postgres-DB", vec![access_out(Some("postgres"))])
             .validate_semantics()
             .expect_err("a name that is not a service name refuses");
         assert!(e.contains("is not one"), "{e}");
@@ -5338,7 +5845,14 @@ mod input_semantics_tests {
         let e = publishing("postgres", vec![])
             .validate_semantics()
             .expect_err("nothing to hand the connection out on refuses");
-        assert!(e.contains("no Access output"), "{e}");
+        assert!(e.contains("no `Access[postgres]` output"), "{e}");
+
+        for wrong in [None, Some("mysql")] {
+            let e = publishing("postgres", vec![access_out(wrong)])
+                .validate_semantics()
+                .expect_err("an output typed with another service, or none, refuses");
+            assert!(e.contains("this node publishes 'postgres' connections, so it is typed `Access[postgres]`"), "{e}");
+        }
     }
 
     fn input(name: &str, ty: WeftType) -> InputSpec {
@@ -5354,6 +5868,7 @@ mod input_semantics_tests {
             description: None,
             requires_scopes: None,
             requires_values: None,
+            keeps_blank: false,
         }
     }
 
@@ -5524,8 +6039,7 @@ mod input_semantics_tests {
                           "prefix": "v0=", "concat": "v0:{timestamp}:{body}" });
         let gate = json!({ "type": "T", "label": "T", "description": "", "service": { "verify": old } });
         let e = refuse_removed_metadata_keys(&gate).unwrap_err();
-        assert!(e.starts_with("`service.verify` sets `signatureHeader`, `timestampHeader`, `prefix`"), "{e}");
-        assert!(e.contains(r#""in":"header:X-Slack-Signature""#), "{e}");
+        assert!(e.starts_with("`service.verify` is gone") && e.contains("`auth` setting"), "{e}");
 
         let push = json!({ "type": "T", "label": "T", "description": "",
             "service": { "events": { "messages": { "webhook": { "verify": { "kind": "hmac", "signatureHeader": "S",
@@ -5535,7 +6049,8 @@ mod input_semantics_tests {
         assert!(e.contains(r#""in":"signature:t""#), "{e}");
 
         let new = json!({ "type": "T", "label": "T", "description": "",
-            "service": { "verify": { "kind": "hmac", "signature": { "in": "header:S" }, "concat": "{body}" } } });
+            "service": { "events": { "messages": { "webhook": { "verify": { "kind": "hmac", "signature": { "in": "header:S" },
+                "concat": "{body}" } } } } } });
         assert!(refuse_removed_metadata_keys(&new).is_ok());
     }
 
@@ -5722,7 +6237,7 @@ mod input_semantics_tests {
     /// the picker is compiler-read (the fixed rule, no `accepts`).
     #[test]
     fn validate_semantics_types_the_access_widget_input() {
-        let mut n = input("account", WeftType::Access);
+        let mut n = input("account", WeftType::Access(None));
         n.widget = Some(Widget::Access { service: None, optional: false });
         let m = metadata_with(vec![n]);
         assert!(m.is_compiler_read("account"), "the picker is compiler-read");
@@ -5747,9 +6262,24 @@ mod input_semantics_tests {
             );
             m
         };
-        assert!(with_service(WeftType::Access).validate_semantics().is_ok());
+        assert!(with_service(WeftType::Access(Some("tg".into()))).validate_semantics().is_ok());
+        let e = with_service(WeftType::Access(None)).validate_semantics().unwrap_err();
+        assert!(e.contains("so it is typed `Access[tg]`"), "{e}");
         let e = with_service(WeftType::JsonDict).validate_semantics().unwrap_err();
         assert!(e.contains("access widget edits"), "{e}");
+
+        // An access node hands out connections to its own service, typed
+        // so: an Access output naming another service, or none, refuses.
+        let with_output = |ty: WeftType| -> Result<(), String> {
+            let mut m = with_service(WeftType::Access(Some("tg".into())));
+            m.outputs.push(OutputSpec { name: "access".into(), port_type: ty, description: None, baked: false, narrowable: None });
+            m.validate_semantics()
+        };
+        with_output(WeftType::Access(Some("tg".into()))).expect("its own service");
+        for wrong in [WeftType::Access(None), WeftType::Access(Some("slack".into()))] {
+            let e = with_output(wrong).unwrap_err();
+            assert!(e.contains("this node makes 'tg' connections, so it is typed `Access[tg]`"), "{e}");
+        }
     }
 
     /// A remote_select needs at least one source, and a from_url
@@ -5757,7 +6287,7 @@ mod input_semantics_tests {
     /// metadata load instead of silently never matching a paste.
     #[test]
     fn validate_semantics_checks_remote_select_sources() {
-        let account = input("account", WeftType::Access);
+        let account = input("account", WeftType::Access(None));
         let mut field = input("sheet", WeftType::primitive(WeftPrimitive::String));
         field.widget = Some(Widget::RemoteSelect {
             access: "account".into(),
@@ -5804,7 +6334,7 @@ mod input_semantics_tests {
             raw.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             serde_json::from_value(raw).unwrap()
         };
-        let account = input("account", WeftType::Access);
+        let account = input("account", WeftType::Access(None));
         let with = |source: ResourceSource| {
             let mut field = input("channel", WeftType::primitive(WeftPrimitive::String));
             field.widget = Some(Widget::RemoteSelect {
@@ -6467,10 +6997,10 @@ mod compact_view_tests {
                 },
                 "types": { "ChatMessage": "{ role: String }" },
                 "validate": [{
-                    "when": { "kind": "config_present", "field": "title" },
+                    "when": { "kind": "value", "field": "title" },
                     "then": { "message": "fill the title" }
                 }, {
-                    "when": { "kind": "config_equals", "field": "model", "equals": { "label": "fast", "id": "gpt-x", "spare": null } },
+                    "when": { "kind": "value", "field": "model", "equals": { "label": "fast", "id": "gpt-x", "spare": null } },
                     "then": { "message": "pick a faster one", "severity": "warning" }
                 }]
             }"##,

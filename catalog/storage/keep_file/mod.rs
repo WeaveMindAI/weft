@@ -33,8 +33,8 @@ impl Node for KeepFileNode {
         // No deadline unless `ttlDays` names one: the file then lives as
         // long as its scope says.
         let ttl = ttl_days.map_or(KeepTtl::Never, lifetime::ttl_of_days);
-        let scope_name: String = ctx.inputs.get("scope")?;
-        let output = match lifetime::scope_named(&scope_name)? {
+        let scope: lifetime::Scope = ctx.inputs.get("scope")?;
+        let output = match StorageScope::from(scope) {
             StorageScope::Run => {
                 // The key carries its own scope, so the handle's scope here
                 // is just the verb's home.

@@ -1,5 +1,6 @@
-//! OpenRouterModel self-tests: the emitted `LlmProvider` object,
-//! including the routing knobs riding it verbatim.
+//! OpenRouterModel self-tests: the emitted `LlmProvider` record,
+//! including the routing knobs riding it verbatim. Every knob is set, so
+//! a knob the node declares and the closed record does not fails here.
 
 use serde_json::json;
 

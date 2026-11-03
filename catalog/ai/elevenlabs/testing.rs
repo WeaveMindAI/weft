@@ -8,7 +8,7 @@
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use weft::access::client::get_json;
+use weft::access::client::{checked_send, get_json, url};
 use weft::access::OpenedConnection;
 use weft::{FakeRig, NodeErrExt, WeftResult};
 
@@ -79,7 +79,7 @@ pub fn emitted_file(
 /// set), so speech tests never depend on a fixture.
 pub async fn first_voice_id(conn: &OpenedConnection) -> WeftResult<String> {
     let voices =
-        get_json(conn.client(), &format!("{API}/voices"), "list the ElevenLabs voices").await?;
+        get_json(conn.client(), url(API, &["voices"])?.as_str(), "list the ElevenLabs voices").await?;
     voices["voices"]
         .as_array()
         .and_then(|v| v.first())
@@ -96,45 +96,24 @@ pub async fn speech_sample(
     voice: &str,
     text: &str,
 ) -> WeftResult<Vec<u8>> {
-    let resp = conn
-        .client()
-        .post(format!(
-            "{API}/text-to-speech/{voice}?output_format=mp3_44100_128"
-        ))
-        .json(&serde_json::json!({ "text": text, "model_id": "eleven_flash_v2_5" }))
-        .send()
-        .await
-        .node_err("mint an ElevenLabs speech sample")?;
-    let status = resp.status();
-    if !status.is_success() {
-        weft::node_bail!(
-            "the sample TTS answered {status}: {}",
-            resp.text().await.unwrap_or_default().chars().take(300).collect::<String>()
-        );
-    }
+    let address = url(API, &["text-to-speech", voice])?.query("output_format", "mp3_44100_128");
+    let request = conn.client().post(address.as_str()).json(&json!({ "text": text, "model_id": "eleven_flash_v2_5" }));
+    let resp = checked_send(request, "mint an ElevenLabs speech sample").await?;
     Ok(resp.bytes().await.node_err("read the sample bytes")?.to_vec())
 }
 
-/// DELETE `url` through the test's own connection, loud on refusal:
+/// DELETE `address` through the test's own connection, loud on refusal:
 /// how minted voices and agents leave the account again.
-pub async fn delete(conn: &OpenedConnection, url: &str, what: &str) -> WeftResult<()> {
-    let resp = conn.client().delete(url).send().await.node_err(what)?;
-    let status = resp.status();
-    if !status.is_success() {
-        weft::node_bail!(
-            "the service answered {status} trying to {what}: {}",
-            resp.text().await.unwrap_or_default().chars().take(300).collect::<String>()
-        );
-    }
-    Ok(())
+pub async fn delete(conn: &OpenedConnection, address: &str, what: &str) -> WeftResult<()> {
+    checked_send(conn.client().delete(address), what).await.map(drop)
 }
 
 /// Delete a minted voice by id.
 pub async fn delete_voice(conn: &OpenedConnection, voice_id: &str) -> WeftResult<()> {
-    delete(conn, &format!("{API}/voices/{voice_id}"), "delete the test voice").await
+    delete(conn, url(API, &["voices", voice_id])?.as_str(), "delete the test voice").await
 }
 
 /// Delete a minted agent by id.
 pub async fn delete_agent(conn: &OpenedConnection, agent_id: &str) -> WeftResult<()> {
-    delete(conn, &format!("{API}/convai/agents/{agent_id}"), "delete the test agent").await
+    delete(conn, url(API, &["convai", "agents", agent_id])?.as_str(), "delete the test agent").await
 }

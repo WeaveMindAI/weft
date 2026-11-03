@@ -4,13 +4,12 @@ use serde_json::json;
 
 use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
-use super::ElevenLabsCloneVoiceNode;
+use super::{fields, ElevenLabsCloneVoiceNode};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("clones_and_emits_the_voice_id", clones),
-        NodeTest::fake("labels_ride_the_form_as_json", labels),
-        NodeTest::fake("no_samples_fails_the_run_even_when_error_is_wired", no_samples),
+        NodeTest::basic("the_text_fields_ride_the_form_only_when_set", fields_form),
         NodeTest::fake("a_refused_clone_fails_the_run_when_error_is_unwired", refused_unwired),
         NodeTest::fake("a_refused_clone_comes_out_on_error_when_it_is_wired", refused_wired),
         NodeTest::live("one_real_clone_created_and_deleted", "elevenlabs", live_clone),
@@ -59,12 +58,11 @@ async fn live_clone(rig: LiveRig) -> WeftResult<()> {
     .await
 }
 
-/// The multipart body the clone went out with.
-fn clone_form(rig: &FakeRig) -> String {
+/// The clone request the node sent.
+fn clone_request(rig: &FakeRig) -> weft::SentRequest {
     rig.requests()
         .into_iter()
         .find(|r| r.method == "POST" && r.path == "/v1/voices/add")
-        .and_then(|r| r.body_text)
         .expect("the node sent a multipart clone")
 }
 
@@ -91,55 +89,26 @@ async fn clones(rig: FakeRig) -> WeftResult<()> {
         .ok()?;
     assert_eq!(outcome.outputs["voiceId"], json!("voice-new"));
     assert_eq!(outcome.outputs["requiresVerification"], json!(false));
-
-    let form = clone_form(&rig);
-    assert!(has_field(&form, "name", "Narrator"), "{form}");
-    assert!(form.contains("name=\"files\"; filename=\"sample_a.mp3\""), "{form}");
-    assert!(form.contains("name=\"files\"; filename=\"sample_b.mp3\""), "{form}");
-    assert!(!form.contains("name=\"labels\""), "no labels given, none sent: {form}");
-    assert!(!form.contains("name=\"remove_background_noise\""), "noise removal stays off unless turned on: {form}");
+    assert!(clone_request(&rig).body_streamed, "the samples stream out of storage, never held whole");
     Ok(())
 }
 
-async fn labels(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("POST", "/v1/voices/add", json!({ "voice_id": "voice-new", "requires_verification": true }));
-    let a = rig.store_file("sample_a.mp3", "audio/mpeg", b"aaa".to_vec());
-    let outcome = rig
-        .run(
-            &ElevenLabsCloneVoiceNode,
-            json!({
-                "account": rig.access("elevenlabs"),
-                "name": "Narrator",
-                "samples": [a],
-                "labels": { "language": "en", "accent": "en-US" },
-            }),
-        )
-        .await
-        .ok()?;
-    assert_eq!(outcome.outputs["requiresVerification"], json!(true), "ElevenLabs's own flag, passed on");
-    let form = clone_form(&rig);
-    assert!(has_field(&form, "labels", r#"{"accent":"en-US","language":"en"}"#), "{form}");
-    Ok(())
-}
+/// The text fields ride the form only when set, and the labels go as
+/// their JSON.
+fn fields_form() -> WeftResult<()> {
+    let (_, bare) = fields("Narrator", None, false, None).build();
+    let bare = String::from_utf8_lossy(&bare).into_owned();
+    assert!(has_field(&bare, "name", "Narrator"), "{bare}");
+    assert!(!bare.contains("name=\"labels\""), "no labels given, none sent: {bare}");
+    assert!(!bare.contains("name=\"remove_background_noise\""), "noise removal stays off unless turned on: {bare}");
+    assert!(!bare.contains("name=\"description\""), "{bare}");
 
-/// No samples is a mistake in the program, not the service's answer:
-/// a wired `_error` must not swallow it.
-async fn no_samples(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    let err = rig
-        .run(
-            &ElevenLabsCloneVoiceNode,
-            json!({
-                "account": rig.access("elevenlabs"),
-                "name": "Narrator",
-                "samples": [],
-                "removeBackgroundNoise": false,
-            }),
-        )
-        .await
-        .failure()?;
-    assert!(err.starts_with("input error"), "{err}");
-    assert!(err.contains("at least one sample"), "{err}");
+    let labels = [("language".to_string(), "en".to_string()), ("accent".to_string(), "en-US".to_string())].into_iter().collect();
+    let (_, full) = fields("Narrator", Some("warm"), true, Some(labels)).build();
+    let full = String::from_utf8_lossy(&full).into_owned();
+    assert!(has_field(&full, "labels", r#"{"accent":"en-US","language":"en"}"#), "{full}");
+    assert!(has_field(&full, "description", "warm"), "{full}");
+    assert!(has_field(&full, "remove_background_noise", "true"), "{full}");
     Ok(())
 }
 

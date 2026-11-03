@@ -33,9 +33,9 @@ impl Node for ElevenLabsLipSyncNode {
         let audio_guidance: Option<f64> = ctx.inputs.opt("audioGuidanceScale")?;
 
         let http = ctx.client(&account).await?;
-        let refs = References::new(&ctx, &http);
+        let refs = References::new(&ctx, &http, &account);
         let mut job = ctx.keep(Job::default()).await?;
-        let video = generate(&ctx, &mut job, &account, &http, &refs, Media::Video, || async {
+        let video = generate(&ctx, &mut job, &account, &http, Media::Video, || async {
             let picture = refs.of(&image).await?;
             let speech = refs.of(&audio).await?;
             let mut body = json!({ "model_id": model, "image": picture, "audio": speech });

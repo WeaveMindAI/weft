@@ -5,7 +5,8 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use weft::{Access, RunContext, Node, NodeManifest, WeftError, WeftResult};
+use weft::access::client::url;
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::elevenlabs::{audio_file_type, emit_audio_with_id, API};
 use super::flows::set_some;
@@ -13,10 +14,6 @@ use super::flows::set_some;
 /// The output format that lets ElevenLabs pick the best one for the
 /// model.
 const AUTO: &str = "auto";
-/// The longest prompt and the longest lyrics ElevenLabs takes, in
-/// characters.
-const MAX_PROMPT_CHARS: usize = 4_100;
-const MAX_LYRICS_CHARS: usize = 4_000;
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsMusicNode;
@@ -35,16 +32,13 @@ impl Node for ElevenLabsMusicNode {
         let account: Access = ctx.inputs.get("account")?;
         let output_format: String = ctx.inputs.get("outputFormat")?;
         let body = request_body(&ctx)?;
-        if let Some(refusal) = refusal(&body, &output_format) {
-            return Err(WeftError::Input(refusal));
-        }
         let (extension, mime) = file_type(&output_format)?;
 
         let http = ctx.client(&account).await?;
-        let url = format!("{API}/music?output_format={}", urlencoding::encode(&output_format));
+        let url = url(API, &["music"])?.query("output_format", &output_format);
         let what = "compose the music on ElevenLabs";
         let filename = format!("music.{extension}");
-        emit_audio_with_id(&ctx, http.post(url).json(&body), what, &filename, mime, ("song-id", "songId")).await
+        emit_audio_with_id(&ctx, http.post(url.as_str()).json(&body), what, &filename, mime, ("song-id", "songId")).await
     }
 }
 
@@ -84,87 +78,6 @@ fn request_body(ctx: &RunContext) -> WeftResult<Value> {
         }
     }
     Ok(body)
-}
-
-/// What ElevenLabs refuses in a music request, or would take and throw
-/// away, said before anything is paid for (the compiler refuses the
-/// same shapes when they are written; this is the floor for wired
-/// ones), or `None` when `body` can go out with `output_format`. It
-/// reads the body itself, so it judges exactly what would be sent.
-fn refusal(body: &Value, output_format: &str) -> Option<String> {
-    let has = |field: &str| body.get(field).is_some();
-    match (body.get("prompt").and_then(Value::as_str), has("composition_plan")) {
-        (Some(_), true) => {
-            return Some(
-                "both `prompt` and `compositionPlan` are set, and ElevenLabs composes from one of them: keep one".into(),
-            )
-        }
-        (None, false) => return Some("there is nothing to compose from: give a `prompt` or a `compositionPlan`".into()),
-        (Some(prompt), false) => {
-            if has("seed") {
-                return Some(
-                    "ElevenLabs takes a `seed` only with a `compositionPlan`: compose from a plan, or leave `seed` empty"
-                        .into(),
-                );
-            }
-            let chars = prompt.chars().count();
-            if chars > MAX_PROMPT_CHARS {
-                return Some(format!(
-                    "`prompt` is {chars} characters, and ElevenLabs takes at most {MAX_PROMPT_CHARS}: shorten it, \
-                     or lay the song out in a `compositionPlan`"
-                ));
-            }
-        }
-        (None, true) => {
-            for (field, port) in [
-                ("music_length_ms", "lengthSecs"),
-                ("force_instrumental", "forceInstrumental"),
-                ("generation_mode", "generationMode"),
-            ] {
-                if has(field) {
-                    return Some(format!(
-                        "ElevenLabs takes `{port}` only with a `prompt`, and this composes from a \
-                         `compositionPlan`: leave `{port}` empty, or compose from a `prompt`"
-                    ));
-                }
-            }
-        }
-    }
-    if let Some(lyrics) = body.get("lyrics_text").and_then(Value::as_str) {
-        if has("force_instrumental") {
-            return Some(
-                "`lyrics` are given and `forceInstrumental` makes sure nothing is sung: keep one of them".into(),
-            );
-        }
-        let chars = lyrics.chars().count();
-        if chars > MAX_LYRICS_CHARS {
-            return Some(format!(
-                "`lyrics` are {chars} characters, and ElevenLabs takes at most {MAX_LYRICS_CHARS}: shorten them"
-            ));
-        }
-    }
-    if let Some(strength) = body.get("finetune_strength").and_then(Value::as_f64) {
-        if !has("finetune_id") {
-            return Some(
-                "`finetuneStrength` is set and no `finetune` is picked for it to act on: pick a `finetune`, or \
-                 leave `finetuneStrength` empty"
-                    .into(),
-            );
-        }
-        if strength <= 0.0 {
-            return Some(format!(
-                "`finetuneStrength` is {strength}, and ElevenLabs takes a strength above 0: raise it, or leave \
-                 `finetune` empty to compose without one"
-            ));
-        }
-    }
-    if has("sign_with_c2pa") && !(output_format == AUTO || output_format.starts_with("mp3_")) {
-        return Some(format!(
-            "ElevenLabs signs with C2PA only an mp3, and `outputFormat` is '{output_format}': pick an mp3 format \
-             or auto, or turn `signWithC2pa` off"
-        ));
-    }
-    None
 }
 
 /// The stored file's extension and mime. ElevenLabs answers `auto`

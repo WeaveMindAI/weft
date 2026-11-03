@@ -33,6 +33,7 @@
 //! price it and weft's own key travel on it.
 
 use base64::Engine;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use weft::storage::media::{classify_media_slot, data_url, holds_file_marker, MediaSlotContent};
@@ -47,10 +48,20 @@ pub const OPENROUTER_API: &str = "https://openrouter.ai/api/v1";
 // SYNC: decision::ROUTE <-> crates/weft-providers/src/providers/openrouter.rs DECISIONS
 pub const ROUTE: &str = "systemone";
 
-/// The key of the provider object holding OpenRouter's routing block
+/// The key of the provider record holding OpenRouter's routing block
 /// (`order`, `allow_fallbacks`), built by the OpenRouter Decision Model
 /// node and sent as the request's `provider` as it is.
 pub const ROUTING: &str = "routing";
+
+/// The wired `DecisionProvider` record.
+// SYNC: Provider <-> types.DecisionProvider (catalog/ai/decision/metadata.json)
+#[derive(Deserialize)]
+struct Provider {
+    kind: String,
+    model: String,
+    account: Access,
+    routing: Option<Value>,
+}
 
 /// The key the one question rides under. Question keys are for the
 /// caller and never reach the model, so any name does.
@@ -71,16 +82,18 @@ enum Shape {
 
 impl Shape {
     /// The first of [`PORT_TYPES`] `ty` fits, so a type still open is a
-    /// value. `None` for a type the compiler refuses on these nodes.
-    fn of(ty: &WeftType) -> Option<Self> {
+    /// value. The compiler held every added port to one of them
+    /// (`custom_inputs_fit`), so a port that is neither a value nor one
+    /// file is a list of files.
+    fn of(ty: &WeftType) -> Self {
         let fits = |allowed: &str| WeftType::fits_within(ty, &WeftType::parse(allowed).expect("PORT_TYPES are weft types"));
-        let [value, file, files] = PORT_TYPES;
+        let [value, file, _files] = PORT_TYPES;
         if fits(value) {
-            Some(Self::Value)
+            Self::Value
         } else if fits(file) {
-            Some(Self::File)
+            Self::File
         } else {
-            fits(files).then_some(Self::Files)
+            Self::Files
         }
     }
 }
@@ -107,11 +120,9 @@ pub async fn state(ctx: &RunContext) -> WeftResult<State> {
     let mut images = 0;
     for name in ctx.inputs.created() {
         let Some(value) = ctx.inputs.raw(name).filter(|value| !value.is_null()) else { continue };
-        let ty = declared.get(name).ok_or_else(|| {
-            WeftError::Type(format!("the added input `{name}` has no declared type"))
-        })?;
-        let content = match Shape::of(ty) {
-            Some(Shape::Value) => {
+        // Every added port is declared with its type.
+        let content = match Shape::of(&declared[name.as_str()]) {
+            Shape::Value => {
                 // A value typed as plain JSON that carries a stored file
                 // (one wired from a record with an Image field into a
                 // JsonDict) has nothing that reads the file, and its value
@@ -124,21 +135,15 @@ pub async fn state(ctx: &RunContext) -> WeftResult<State> {
                 }
                 Some(value.clone())
             }
-            Some(Shape::File) => read_file(ctx, name, value, &mut media).await?,
-            Some(Shape::Files) => {
-                let Value::Array(items) = value else {
-                    weft::node_bail!("`{name}` is a {ty}, and what arrived is not a list");
-                };
+            Shape::File => read_file(ctx, name, value, &mut media).await?,
+            Shape::Files => {
+                let items: Vec<Value> = ctx.inputs.get(name)?;
                 let mut contents = Vec::new();
                 for (at, item) in items.iter().enumerate() {
                     contents.extend(read_file(ctx, &format!("{name}[{at}]"), item, &mut media).await?);
                 }
                 (!contents.is_empty()).then_some(Value::Array(contents))
             }
-            None => weft::node_bail!(
-                "`{name}` is a {ty}, and a decision node takes, on each added input, a value made of JSON, \
-                 a file, or a list of files"
-            ),
         };
         if let Some(content) = content {
             fields.insert(name.clone(), content);
@@ -164,36 +169,27 @@ pub async fn state(ctx: &RunContext) -> WeftResult<State> {
 /// `type` included) about `state`, and hand back its answer, checked to
 /// be of the type asked.
 pub async fn ask(ctx: &RunContext, state: State, question: Value) -> WeftResult<Value> {
-    let provider = ctx.inputs.nested("provider")?;
-    let kind: String = provider.get("kind")?;
-    if kind != "openrouter" {
-        return Err(WeftError::Input(format!(
+    let provider: Provider = ctx.inputs.get("provider")?;
+    if provider.kind != "openrouter" {
+        weft::input_bail!(
             "decision nodes speak the OpenRouter Decisions API; wire an OpenRouter Decision Model \
-             (got '{kind}')"
-        )));
+             (got '{}')",
+            provider.kind
+        );
     }
-    let model: String = provider.get("model")?;
-    let account: Access = provider.get("account")?;
     let asked = question["type"].as_str().unwrap_or_default().to_string();
     let mut body = json!({
-        "model": model,
+        "model": provider.model,
         "state": state.value,
         "questions": { ANSWER: question },
     });
-    if let Some(routing) = provider.opt::<Value>(ROUTING)? {
+    if let Some(routing) = provider.routing {
         body["provider"] = routing;
     }
 
-    let http = ctx.client(&account).await?;
-    let url = format!("{OPENROUTER_API}/{ROUTE}");
-    let call = weft::access::client::post_json(&http, &url, &body, "openrouter: decision");
-    let cancelled = ctx.cancellation();
-    let response = tokio::select! {
-        // A run already stopped sends nothing.
-        biased;
-        err = cancelled.cancelled_err() => return Err(err),
-        response = call => response?,
-    };
+    let http = ctx.client(&provider.account).await?;
+    let url = weft::access::client::url(OPENROUTER_API, &[ROUTE])?;
+    let response = weft::access::client::post_json(&http, url.as_str(), &body, "openrouter: decision").await?;
     let answer = &response["answers"][ANSWER];
     if answer["type"].as_str() != Some(asked.as_str()) {
         weft::node_bail!(

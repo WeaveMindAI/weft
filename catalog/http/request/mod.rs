@@ -9,12 +9,40 @@ use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use reqwest::Method;
 use serde_json::Value;
 
+use weft::access::client::{self, body_error};
 use weft::storage::{self, diff::is_text_mime, StorageScope};
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, StorageHandle, WeftError, WeftResult, WeftType};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, StorageHandle, WeftResult, WeftType};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
 pub struct HttpRequestNode;
+
+/// The `method` select's options.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+    Head,
+    Options,
+}
+
+impl From<HttpMethod> for Method {
+    fn from(method: HttpMethod) -> Self {
+        match method {
+            HttpMethod::Get => Method::GET,
+            HttpMethod::Post => Method::POST,
+            HttpMethod::Put => Method::PUT,
+            HttpMethod::Patch => Method::PATCH,
+            HttpMethod::Delete => Method::DELETE,
+            HttpMethod::Head => Method::HEAD,
+            HttpMethod::Options => Method::OPTIONS,
+        }
+    }
+}
 
 #[cfg(feature = "node-tests")]
 mod tests;
@@ -30,9 +58,7 @@ impl Node for HttpRequestNode {
         // A failure is no answer at all or an unreadable body. An answer
         // with any status is a success: `status` and `ok` say it.
         let url: String = ctx.inputs.get("url")?;
-        let method_str: String = ctx.inputs.get("method")?;
-        let method = Method::from_bytes(method_str.as_bytes())
-            .map_err(|_| WeftError::Input(format!("bad method '{method_str}'")))?;
+        let method: HttpMethod = ctx.inputs.get("method")?;
 
         // A secret in the body or the headers (a caller's credential passed
         // on) is revealed into the request alone, where the input's type
@@ -42,11 +68,10 @@ impl Node for HttpRequestNode {
             Some(body) => Some(ctx.reveal_input("body", body).await?),
             None => None,
         };
-        let headers: Option<HashMap<String, String>> = match ctx.inputs.opt::<Value>("headers")? {
-            Some(headers) => Some(serde_json::from_value(ctx.reveal_input("headers", headers).await?).map_err(|e| {
-                WeftError::Input(format!("headers must map each name to a String or a Secret[String]: {e}"))
-            })?),
-            None => None,
+        // Revealed, every value is a String.
+        let headers: HashMap<String, String> = match ctx.inputs.opt::<Value>("headers")? {
+            Some(headers) => serde_json::from_value(ctx.reveal_input("headers", headers).await?).node_err("the revealed headers")?,
+            None => HashMap::new(),
         };
 
         // A connection carries a key and the header it goes in, so a
@@ -63,22 +88,18 @@ impl Node for HttpRequestNode {
             None => (ctx.http(), None),
         };
 
-        let mut req = client.request(method, &url);
-        if let Some(map) = headers {
-            for (k, v) in map {
-                if auth_header.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(&k)) {
-                    return Err(WeftError::Input(format!(
-                        "'{k}' is set both in `headers` and by the connection; drop it from `headers`"
-                    )));
-                }
-                req = req.header(k, v);
+        let mut req = client.request(method.into(), &url);
+        for (k, v) in headers {
+            if auth_header.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(&k)) {
+                weft::input_bail!("'{k}' is set both in `headers` and by the connection; drop it from `headers`");
             }
+            req = req.header(k, v);
         }
         if let Some(b) = body {
             req = req.json(&b);
         }
 
-        let resp = req.send().await.node_err("http send")?;
+        let resp = client::send(req, "send the request").await?;
         let status = resp.status();
         let out = NodeOutput::new().set("status", status.as_u16()).set("ok", status.is_success());
         let content_type = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -100,14 +121,14 @@ impl Node for HttpRequestNode {
                 out.set("file", file)
             }
             Some(ct) => {
-                let text = resp.text().await.node_err("http body read")?;
+                let text = resp.text().await.map_err(|e| body_error("http body read", e))?;
                 let mime = storage::normalize_content_type(Some(&ct));
                 text_out(&ctx, &files, out, text, &mime, &filename).await?
             }
             // A body that names no type is text when it reads as text,
             // and a file otherwise, typed by its first bytes.
             None => {
-                let bytes = resp.bytes().await.node_err("http body read")?;
+                let bytes = resp.bytes().await.map_err(|e| body_error("http body read", e))?;
                 match std::str::from_utf8(&bytes) {
                     Ok(text) => text_out(&ctx, &files, out, text.to_string(), "text/plain", &filename).await?,
                     Err(_) => {

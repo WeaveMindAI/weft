@@ -39,7 +39,6 @@ You never trust a report you can re-verify for the cost of one command. If you c
 
 - No port renamed, added, or dropped; the one job is still the one job; no assembled `List` or `JsonDict` input.
 - A skim of `mod.rs`: no fallbacks, no swallowed errors, no retry loops, no orchestration inside the body; failures are loud.
-- **Every loop and every long wait watches `ctx.cancellation()`.** Stopping is cooperative: nothing kills a node mid-call, so a loop with no cancellation arm is a node that cannot be stopped by anything, and the only sign is a run that never ends.
 - The `live` tests are written, with the service named and fixtures declared, and [the report] names them as not run.
 
 **The half-arsing catalog.** Each of these fails [the review] and goes back as a redispatch with the specific finding:
@@ -55,7 +54,7 @@ You never trust a report you can re-verify for the cost of one command. If you c
 - **empty rig**: `tests()` returns an empty vec, or `tests.rs` does not exist, and [the report] did not say so. An access node is the one exception: its body is the `access_node!` macro, there is nothing of the smith's to test, and it ships with no `tests.rs` at all.
 - **flaky-dismissed**: an intermittently failing test waved off as flaky instead of chased to its race. A race in the node is the node's bug; a test made tolerant of it (a retry, a sleep, a longer timeout) fails [the review] on both counts.
 - **an output with no bound**: a port whose value grows with what the service answers or what the node is given (a list of results, a page of text, a response body, a transcript) and nothing that keeps it under the 100 KB wire limit: no cap input or `LIMIT`, no paging, no stored file in its place. [the report] names each such port and its bound, and a `fake` test emits the largest value the bound allows; a port missing from that list is the finding. The rule is under The wire limit.
-- **body smells**: `.ok()` discarding an error, a default value standing in for a missing input, a retry loop, orchestration inside the node, a database client or a process opened fresh on every run where `ctx.shared` would hold one, heavy work (a big parse, image or audio work, compression, hashing a large file) done inline instead of in `tokio::task::spawn_blocking`.
+- **body smells**: `.ok()` discarding an error, a default value standing in for a missing input, a retry loop, orchestration inside the node, a database client or a process opened fresh on every run where `ctx.pool` would hold one, a hand `tokio::select!` on the cancel flag, a Rust copy of a rule the metadata states, a blank filter on an optional text, heavy work (a big parse, image or audio work, compression, hashing a large file) done inline instead of in `tokio::task::spawn_blocking`.
 - **an infra output left unbaked**: an infra node's output that holds as long as the infra does (an address, a connection, a handle) with no `"baked": true`, so every run that reads it runs the node to make it again.
 - **a dead end in an image**: a state an infra container can sit in (a dead pairing, a lost credential, a revoked session) with no button on its display that leaves it, so the user's only way out is restarting or terminating the infra. Every such state gets an action, offered in every state; the rule is under Infra node.
 - **a marker in an outbound payload**: a `__weft_<kind>__` wrapper handed to a provider, a bridge, a form spec or a live item, instead of the plain URL, `data:` URL or `{ url, mimeType, filename }` that consumer reads; the rule is under A file input.
@@ -181,7 +180,9 @@ checks the name the program gives the node.
 
 Input entry: `name`, `type`, `required`, `accepts`,
 `widget`, `default`, `label`, `placeholder`, `description`, `requiresScopes`,
-`requiresValues`.
+`requiresValues`, `keepsBlank`. A blank
+optional `String` arrives absent (`opt` gives `None`, rules and `oneOfRequired`
+count it not given); `"keepsBlank": true` keeps one where blank means something.
 
 If an unwired input means something of its own (no `instance`: the program's
 own copy), leave it optional (no `required`): unwired, the node runs without
@@ -205,14 +206,19 @@ A `code` widget's `language` is one of `python`, `javascript`, `sql`, `json`;
 any other word fails to load. `json` also fits a `JsonDict` input
 (edited as JSON text); the others edit a `String`. A `number` widget with a whole `step`
 (`"step": 1`) takes whole numbers only: the compiler checks a written value
-and the runtime a wired one, so your body can cast it to an integer.
+and the runtime a wired one, so your body can cast it to an integer. A `datetime`
+is checked the same way, so read it as `ctx.inputs.get::<chrono::DateTime<chrono::Utc>>("at")?`.
 Output entry: `name`, `type`, `description` (an output has no `required`), `narrowable`, and on an infra node `baked` (see Infra node). If only the program knows an output's shape (a model's JSON answer, a request's body, a query's rows), type it broadly and set `"narrowable": true` (any type that fits inside `type`), or a type string (anything that fits inside that type, which may be wider than `type`): the program then declares what it holds (`-> (response: Verdict)`), and each value is checked against that at run time. Without it, a program can only restate the output's own type.
 
 A `validate` rule's `when` is a closed set of conditions, combined with
 `all`, `any` and `not`: the input and config checks (`input_satisfied`,
-`input_wired`, `output_wired`, `config_present`, `config_equals`, ...), plus
-the graph checks below. A rule never names another node's type: it selects
-nodes by a feature they declare, with `with: {feature: value}`.
+`input_wired`, and `value`: `{ "kind": "value", "field": "x" }` is "set", plus
+any of `nonempty`, `equals`, `oneOf`, `matches`, `count`, `range`, `length`,
+`unique`, `each`; a list's fewest items is `not` of `count: { "min": 2 }`),
+plus the graph checks below. A rule a wired value leaves open is checked again
+on the value that arrives, so never repeat one in Rust. A connection input names
+its service in its type (`"type": "Access[fal]"`, a union for several);
+otherwise a rule selects nodes by a feature they declare, `with: {feature: value}`.
 
 - `run_reaches` (`direction: "downstream"` or `"upstream"`, `with`): the run
   this node is part of holds a node with that feature. `Route` checks
@@ -310,7 +316,8 @@ bag: `ctx.inputs.get::<T>("name")` returns the value however it arrived
 (wire, braces literal, assignment literal, or the declared `default`).
 
 You fail loudly, always: `WeftResult<()>`; `ctx.inputs.get(...)?` stamps its
-own errors; `node_bail!("message")` for conditions the node detects;
+own errors; `node_bail!("message")` for conditions the node detects
+(`input_bail!` when the fix is in the program, which `_error` does not catch);
 `.node_err("context")?` wraps an external error with context. A node body
 never names a `WeftError` variant and never falls back to a default: the
 failure is recorded in the journal where the user reads it. If you catch
@@ -342,13 +349,14 @@ node repeats, so you never write it again: `get_json` / `post_json` (send,
 refuse a non-success status quoting the provider's own words, parse),
 `json_call` for a request you prepared yourself, `checked_send` when the
 answer is not JSON, `require_ok_flag` for a service that answers 200 and says
-`ok: false` in the body, `cursor_paged` with a `CursorPaging` (its
-`past_cap_hint` tells the user what to narrow when the list runs past the page
-cap) for a cursor-paged list, and `required_str` for a field you cannot do
-without. To hand a stored file to a provider,
-`ctx.storage(scope).external_file(&file)` gives its link when the open
-internet can open it, else a `data:` URL of its bytes, with its mime type and
-filename; never write that fallback yourself. To emit a struct, use
+`ok: false` in the body, `cursor_paged` with a `CursorPaging` (its request
+closure takes the cursor: `param: Some("cursor")` for a query parameter, `None`
+when the closure puts it in the body), `required_str` for a field you cannot do
+without, and `client::url(API, &["files", id]).query("q", q).query_opt("pageToken", tok)`,
+which encodes every segment and value. To upload a stored file, stream it:
+`ctx.storage(scope).body(&file).await?` (`.len()` up front), then `.stored_body(body)` (`client::StoredBodyExt`) or
+a multipart `form.stored("file", body)`. `external_file(&file)` gives the
+file's link to a provider that fetches by link, or a `data:` URL. To emit a struct, use
 `NodeOutput::new().set_serialized(port, &value)?`.
 
 **Waiting on a provider's job** (a render, a dub, a crawl) is a `state.wait`
@@ -388,17 +396,18 @@ your code can fail on it. `delta` is refused here. Read the stdlib's
 If the service can cancel a job, hand the wait its cancel call, so a run
 stopped while it waits stops the job and its bill too:
 `state.wait(|s| &mut s.status, PollEndpoint { .. }.cancel_with(CancelCall::put(cancel_url)))`
-(`weft::signal::{CancelCall, CancelWith}`; `CancelCall` also has `post` and
-`delete`, and `.with_body(json)`). weft sends it once, with the wait's own
-`access`, when the run is cancelled while it waits, and never when the wait
-is answered or the run ends any other way. `run_queued` in that same file
-does it.
+(`weft::signal::{CancelCall, CancelWith}`; also `post`, `delete`, `.with_body(json)`),
+sent once through the wait's `access` only if the run is cancelled while it
+waits (`run_queued` does it). Something made at the provider that must not
+outlive the node (an upload) is registered right after it exists:
+`ctx.after_node(CancelCall::delete(url).always(), &account).await?`, sent
+once however the node ends, crash included (`rig.owed_calls()` in a test).
 
 You emit only through `ctx.pulse_downstream(NodeOutput::new().set(port, value))`;
 ports you did not emit are closed, which is the skip signal downstream. For
 user-added output ports use `ctx.fan_declared(...)`.
 
-**Share what is slow to build**: a client pool, a process. `ctx.shared(&access, |opened| async move { .. })` builds it the first time a run asks and hands every later run on that worker the same one; it is built again when the connection's values change, or after nobody used it for the project's idle window (300 seconds by default, `weft workers set --shared-idle-seconds`). The closure returns a `WeftResult` of the thing and you get a handle you use as the thing. `ctx.shared("name", |()| async { .. })` is the same when nothing is built from a connection, and `.with_limit(n)` before the `.await` lets at most `n` runs of a worker hold it at once. That never keeps a database under its limit, because any number of workers run a node at once. So have your pool close a connection after a few idle seconds (the Postgres nodes use 5) and never hand a run one idle for longer, because a Cloud Run copy has no CPU between requests to run your close timer, and leave the waiting to whatever sits in front of the database, such as a PostgresDatabase's pooler. If your node keeps a connection idle on purpose (one that `LISTEN`s), the database may close it (a PostgresDatabase does after a minute), so lift `idle_session_timeout` for that session when it connects, the way PostgresWatchQuery does. A database client opened on every run pays the connection each time; for a worked pool, go and read `nodes/base_catalog/postgres/postgres.rs`.
+**Share what is slow to build.** Connections go in `ctx.pool(&access, |opened| async move { dial(&opened).await }).max(20).idle_close(Duration::from_secs(5)).check(|c| !c.is_closed()).reset(|c| async move { clear(&c).await.map(|()| c) }).take().await?`: a `Lease` you use as the connection, given back when dropped (`lease.discard()` lets it go), and the wait for a free one ends on a cancel. Every ask of one pool gives the same settings. `.max` caps one worker, and any number of workers run a node, so it never keeps a database under its limit: keep `idle_close` to a few seconds (one idle longer is never handed out) and leave the waiting to whatever sits in front of the database, such as a PostgresDatabase's pooler. If your node keeps a connection idle on purpose (one that `LISTEN`s), the database may close it (a PostgresDatabase does after a minute), so lift `idle_session_timeout` for that session when it connects, the way PostgresWatchQuery does. One thing that is not a pool (a client, a loaded model) is `ctx.shared(&access, |opened| async move { .. })` (or a name and `|()|`): one per worker, built again when the connection changes or after the idle window (300 seconds, `weft workers set --shared-idle-seconds`).
 
 If the worker dies while your body runs, a fast run (the default) ends cancelled, and a durable run fails the node: its start was on record before the body began, so the next worker knows it was running and fails it rather than start it again. With `_error` wired, that failure goes to `_error` like any other. Two bodies are the exception. A firing of a `pure` node that had sent nothing on and read no stream runs again, since it did nothing anyone could see. And a firing that saved a state (below) runs again from its last save, and is handed again the stream items it took since.
 
@@ -414,28 +423,14 @@ On resume, the body runs again from its top and knows where it was only from its
 
 A run pauses when it is recorded and no caller is connected (a connected caller keeps the run on its worker, whatever `outlivesCaller` says). Open buses and streams do not stop it: once every running node waits, one of them on an answer from outside, and that has lasted the trigger's `pauseAfterSecs` (default 10), they all save together, and the next worker opens the buses again where they were. Until then `state.wait` stays open in your call, and an answer that comes goes straight into it: your body carries on from that line, never run again. Node tests never pause, but a second `rig.run(&Node, inputs)` on the same rig picks the firing up the way a resume does (its saved state back, each wait already answered handing back that answer), and `rig.saved_state(&Node)` shows what it last saved: test the resume that way. Where the run cannot pause, `state.wait` holds in your call: with a caller on the line, for as long as the caller stays; with none, if the run stays quiet for its trigger's `holdSecs`, the call fails with `WeftError::WaitGaveUp` (`0` refuses the wait at once, caller or not), which your node may match and handle (test it with `rig.signal_given_up()`).
 
-**Stopping is cooperative, and a node that ignores it cannot be stopped.**
-Nothing kills a node mid-call: a cancelled run (the caller left, a
-person pressed stop, a newer run stopped this one) only trips a flag, and
-the node is what acts on it. So anything that does not return promptly by
-itself watches that flag and returns when it trips:
-
-```rust
-let cancel = ctx.cancellation();
-loop {
-    // ... one pass of the work ...
-    tokio::select! {
-        _ = tokio::time::sleep(interval) => {}
-        _ = cancel.cancelled() => return Ok(()),
-    }
-}
-```
-
-Every loop that waits, every long external call, every read that could block
-for minutes. A node that loops without it keeps running after everything
-that asked for it is gone, and the only sign is a run that never ends. If
-you catch yourself writing a loop with no cancellation arm, stop and write:
-"Wait. Nothing else can stop this." Then add the arm.
+**Stopping is cooperative.** A cancelled run (the caller left, a person
+pressed stop, a newer run stopped this one) trips a flag, and everything the
+ctx hands out (HTTP clients and their bodies, endpoint calls, storage, bus
+reads, sockets, a pool's wait) then ends with the cancelled error, which `?`
+carries out. Work of the node's own (a child process, a timer, a library's
+call) goes through `ctx.cancellation().race(child.wait()).await?`, or it runs
+on after everyone who asked is gone; `cancellation::is_cancel(&e)` spots a
+cancel that crossed a library.
 
 **Heavy work goes through `tokio::task::spawn_blocking`.** A body runs on
 the same few threads (one per CPU) as the worker's door and its other runs,
@@ -532,7 +527,8 @@ resync` and `weft rm`, all three work.
 **Access node**: the whole body is `weft::access_node!(MyServiceAccessNode);`
 plus a `service` recipe in metadata (acquisition fields with `secret: true`,
 auth steps, a test URL, an identity template). The macro reads the `account`
-input and pulses it on `access`. It has no `tests.rs`: the macro is the whole
+input (typed with its own service, `Access[google]` on GoogleAccess; the
+catalog refuses another) and pulses it on `access`. It has no `tests.rs`: the macro is the whole
 body, so there is nothing of yours to test, and the review does not ask for
 one. The test URL must pass whatever permissions the person ticked: when it
 needs a permission of its own to learn who the account is, declare that
@@ -558,13 +554,13 @@ each value sits in the token answer (`tokenPath`, `refreshTokenPath`,
 `expiresInPath` or `expiresPath`, `scopePath`), where an error answered with a
 `200` shows (`errorPath`, `okPath`), and `{{`/`}}` writes a literal brace in a
 template. A token that renews must say where its expiry is, or declare
-`neverExpires`; connecting refuses it otherwise. A gate that checks callers (a
-webhook signature, a bearer from an identity provider) is a `verify` block.
+`neverExpires`; connecting refuses it otherwise. A provider's signed pushes
+are checked by a `verify` block in the topic's `webhook`.
 For every key and its rules, go and read
 https://weavemindai.github.io/weft/connections/declaring-a-service.html and
 https://weavemindai.github.io/weft/connections/verifying-requests.html, and
 start from the catalog access node closest to the service (Slack's declares
-`okPath`, `HmacAuth` a `verify` block).
+`okPath`). A route's own callers are checked by its `auth` setting, never by a node.
 
 **Infra node**: `"requiresInfra": true`, plus `images` (dirs with a
 Dockerfile the CLI builds) and `publishes` (the service name it hands out).
@@ -685,9 +681,10 @@ shared-core ones included (a quarter CPU with `1Gi` is Compute Engine's
 `e2-micro`, about $6 a month). `kind` names the cloud's own machine type and
 skips the pick; keep it a last resort. A local install caps each container
 without limits of its own at `cpu` and `memory`. Whoever uses your node pays
-for that machine, so if the right size depends on their load, give the node
-inputs for it and read them into `machine` (the Postgres node takes `cpu`,
-`memory` and `machineType`).
+for that machine, so if the right size depends on their load, set
+`"features": { "machineInputs": { "cpu": "1", "memory": "2Gi" } }` (your
+defaults): weft adds checked `cpu`, `memory` and `machineType` inputs, and
+`machine: MachineShape::from_inputs(&input)?` reads them.
 
 If you need a GPU on a cloud install, the kinds weft attaches are
 `nvidia-l4` (1, 2, 4 or 8), `nvidia-tesla-t4` and `nvidia-tesla-p4` (1, 2
@@ -794,8 +791,8 @@ there and hands back a handle: `api.url()`, `api.host_and_port()?`,
 answers the response as JSON (`EndpointMethod` is `weft::EndpointMethod`; GET
 and POST are the two it has). The path starts with `/`. A non-2xx answer, a
 network error or a body that is not JSON is an error. The call has no
-timeout of its own, so a call that waits on slow work never returns while a
-person presses stop: that is what the shape below is for.
+timeout of its own and holds the worker while it waits: slow work takes the
+shape below. `client::url(api.url(), &["media", id])` adds a path to it.
 
 The worker keeps what `ctx.endpoint`, `ctx.published_access`,
 `ctx.publish_access` and `ctx.open` answered from one run to the next (weft
@@ -931,6 +928,8 @@ wires it through `KeepFile` (or your node `copy`s it into
 `async fn setup_trigger(&self, ctx)`, called instead of `run` at activation,
 where the node registers its wake signal. Polling triggers carry an
 `intervalSecs` config; activation starts from now, history never replays.
+A `PollDelta` says its paging (`paging: Some(PollPaging::query("nextPageToken",
+"pageToken"))`, `PollPaging::body(..)` for a POST cursor, `None` for one page).
 Declare `firesWith` too: EVERY field the wake payload can carry, with `?` on
 the ones that only sometimes arrive. The engine checks a real firing (and a
 hand-typed `weft run --fire`) against it before your `run` even starts, and
@@ -986,10 +985,10 @@ is the stored-file marker (`__weft_image__`, `__weft_video__`,
 `__weft_audio__` or `__weft_blob__`, the kind taken from the mime type), and
 it carries no link. A Rust node takes
 the input as a `FileHandle` (`let file: FileHandle =
-ctx.inputs.get("file")?;`) and reads it with
-`ctx.storage(StorageScope::Run).get_bytes(&file).await?`, which hands
-back `(meta, bytes)`: `meta.filename` and `meta.mime_type` are the file's
-details. If you want the details without the bytes,
+ctx.inputs.get("file")?;`). Only when the node needs the bytes themselves
+(text it parses, a hash) does it read them with
+`ctx.storage(StorageScope::Run).get_bytes(&file).await?`, `(meta, bytes)`;
+an upload streams (Calling a service). If you want the details without the bytes,
 `StoredFile::from_value(&value)?` reads the value into `.key`, `.mime_type`,
 `.filename` and `.size_bytes`. Never read `mimeType` off the raw JSON: it sits
 one level down, inside the kind marker. When something needs a link, make one:
@@ -1061,11 +1060,8 @@ body fails the bus ends failed. `bus_from_input` never ends it, which is
 what an observer wants (a debug tap, a reader streaming it out), because
 ending a feed the producer still owns is a bug. Read with
 `cursor.next(&mut state).await?` for every entry, or
-`cursor.next_json("<kind>", &mut state).await?` for one kind's payloads. `None` means the bus ended: then ask `bus.end()`,
-and on `Some(StreamEnd::Failed { error })` the stream did not complete, so
-say so in your own protocol rather than presenting it as whole
-(`nodes/base_catalog/api/stream/mod.rs` calls `http.fail(&why)` or
-`ws.fail(&why)`).
+`cursor.next_json("<kind>", &mut state).await?` for one kind's payloads. `None` means the bus finished; one that
+ended failed comes back as an error (`the bus ended failed: ...`) from that read.
 
 Do every bus read and wait on your own task, and never move a handle or a
 cursor into a `tokio::spawn`. The engine works out "everyone is stuck, close

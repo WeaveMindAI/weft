@@ -717,6 +717,20 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
     let spec = serde_json::to_value(&rig.registered_signals().last().expect("a second route").0).expect("spec serializes");
     assert_eq!(spec["config"]["error_mode"], "drop_chunk");
     assert_eq!(spec["config"]["backpressure"], "drop_oldest");
+
+    // A route checking its callers registers the check with the
+    // connection it reads; one with no connection is refused, naming it.
+    let keys = weft::access::Access::new("acc-1", "api_key_auth", None).to_value();
+    rig.run_setup_trigger(&RouteNode, json!({ "path": "secure", "auth": "api_keys", "connection": keys }))
+        .await
+        .ok()?;
+    let spec = serde_json::to_value(&rig.registered_signals().last().expect("a gated route").0).expect("spec serializes");
+    assert_eq!(
+        spec["config"]["auth"],
+        json!({ "kind": "connection", "access_id": "acc-1", "service": "api_key_auth", "verify": { "kind": "api_keys" } })
+    );
+    let err = rig.run_setup_trigger(&RouteNode, json!({ "path": "secure", "auth": "hmac_sha256" })).await.failure()?;
+    assert!(err.contains("checks callers with hmac but has no connection") && err.contains("weft connect"), "{err}");
     Ok(())
 }
 

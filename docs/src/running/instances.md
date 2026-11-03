@@ -171,21 +171,21 @@ and nothing changes it afterwards:
 | A call to a gated `Route` with `Weft-Instance: user-42` | `user-42` |
 | A timer, a webhook, an open `Route`, anything else | None |
 
-A gated route is one whose `auth` input is wired from an auth node such as
-`ApiKeyAuth` (weft's messages call it a route gated by a connection), so the
-caller must present a key or a signature before a run starts. If your own backend calls your
+A gated route is one whose `auth` setting is not `"none"`, `"api_keys"` say
+(weft's messages call it a route gated by a connection), so the caller must
+present a key or a signature before a run starts. If your own backend calls your
 program for an instance, this is the route it uses. It is also the only place
 weft honours the `Weft-Instance` header: on an open route anybody could claim
 any instance, so weft refuses the header there and says why. A browser presents
 an instance token instead.
 
-If a provider signs the webhooks it sends to your route, `HmacAuth` checks a
-hex HMAC-SHA256 of `<timestamp>.<body>` sent in `X-Signature`, with the
-unix-seconds timestamp in `X-Timestamp`, refused when it is more than five
+If a provider signs the webhooks it sends to your route, `auth: "hmac_sha256"`
+checks a hex HMAC-SHA256 of `<timestamp>.<body>` sent in `X-Signature`, with
+the unix-seconds timestamp in `X-Timestamp`, refused when it is more than five
 minutes off. For any other scheme (Standard Webhooks, Stripe, signed identity
-tokens from your sign-in provider), you write a small access node of your own,
+tokens from your sign-in provider), you write the scheme's block in `auth`,
 and for how, go and read
-[checking a signed request](../connections/verifying-requests.md).
+[checking a signed request](../connections/verifying-requests.md#on-a-route).
 
 If you call a route and want the run to be for an instance, call it at one of
 its route addresses: `/connect/local/<project id>/<path>` on the install, the project's own
@@ -349,7 +349,7 @@ If you want to test that page from the terminal, two commands do what it does
 (each mints its own instance token that lasts one hour and revokes it when
 done, so the instance's own tokens are untouched):
 
-- `weft connect --instance user-42 --node openrouter --door own --set-env
+- `weft connect openrouter --instance user-42 --door own --set-env
   key=OPENROUTER_KEY` connects an account as that instance's from a key in
   your environment, and `--grant <id>` picks one it already has; `--list` and
   `--disconnect` work the same way;

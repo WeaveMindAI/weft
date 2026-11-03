@@ -1,7 +1,8 @@
 //! DeactivateTriggers self-tests: the instance's triggers go down
 //! with the node's choices, the program's own when no instance is given,
-//! taking work and keeping what is held by default, and a contradiction
-//! is refused before anything is asked.
+//! taking work and keeping what is held by default. A contradiction
+//! (`doorForMinutes` beside a refusing door) is the node's rule, which
+//! the compiler and the run-time recheck hold, not this rig.
 
 use serde_json::json;
 
@@ -14,7 +15,6 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("the_instances_triggers_go_down", down),
         NodeTest::fake("no_instance_is_the_programs_own_triggers", the_programs_own),
-        NodeTest::fake("a_refusing_door_counts_no_minutes", refusing_door_for),
         NodeTest::fake("keep_is_no_running_answer", no_keep),
     ]
 }
@@ -47,13 +47,6 @@ async fn the_programs_own(rig: FakeRig) -> WeftResult<()> {
         }
         other => panic!("unexpected call {other:?}"),
     }
-    Ok(())
-}
-
-async fn refusing_door_for(rig: FakeRig) -> WeftResult<()> {
-    let err = rig.run(&DeactivateTriggersNode, json!({ "door": "refuse", "doorForMinutes": 5 })).await.failure()?;
-    assert!(err.contains("doorForMinutes"), "{err}");
-    assert!(rig.program_calls().is_empty());
     Ok(())
 }
 

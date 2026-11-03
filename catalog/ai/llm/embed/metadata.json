@@ -20,7 +20,7 @@
       "name": "texts",
       "type": "String | List[String]",
       "required": true,
-      "description": "One text or a list; one vector comes back per text."
+      "description": "One text or a list of at least one; one vector comes back per text."
     },
     {
       "name": "dimensions",
@@ -41,6 +41,16 @@
     {
       "name": "dimensions",
       "type": "Number"
+    }
+  ],
+  "validate": [
+    {
+      "when": { "kind": "not", "of": { "kind": "value", "field": "texts", "count": { "min": 1 } } },
+      "then": {
+        "message": "LlmEmbed '{id}' has no text in `texts`: give it at least one text to embed.",
+        "level": "structural",
+        "field": "texts"
+      }
     }
   ]
 }

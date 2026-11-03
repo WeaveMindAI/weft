@@ -387,6 +387,22 @@ async fn next_batch(
         return Ok(Batch { rows: moved as usize, last: None });
     }
 
+    // A column with no row behind has nothing to walk, so it needs no key:
+    // a database built before the migration that gives its table a key
+    // (the migration generator's, replaying the history) must not stop
+    // here. A row behind on a table with no key still stops the boot below.
+    if after.is_none() {
+        let behind: bool = tx
+            .scalar(
+                &format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE {version_column} = $1 AND {column} IS NOT NULL)"),
+                &[&from],
+            )
+            .await?;
+        if !behind {
+            return Ok(Batch { rows: 0, last: None });
+        }
+    }
+
     let keys = primary_key(tx, table).await?;
     let column_type: String = tx
         .scalar(

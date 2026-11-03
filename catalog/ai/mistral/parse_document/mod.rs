@@ -1,7 +1,8 @@
 //! MistralParseDocument: a PDF/scan/image to clean markdown through
-//! Mistral's OCR. Three calls: upload the stored file (the OCR
-//! endpoint eats URLs, not bytes), mint its short-lived signed URL,
-//! run the OCR, and emit the pages' markdown.
+//! Mistral's OCR. One call: the OCR endpoint reads the document from a
+//! link (the stored file's public address, or its bytes inline as a
+//! `data:` URL where weft serves no public one), and the pages'
+//! markdown comes back.
 //!
 //! The markdown comes out as stored files, never as text on a wire: a
 //! long document's markdown weighs far more than the 100 KB a wire
@@ -12,9 +13,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::access::client::{get_json, json_call, post_json, Multipart};
+use weft::access::client::post_json;
 use weft::storage::{FileHandle, StorageScope};
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct MistralParseDocumentNode;
@@ -33,81 +34,22 @@ impl Node for MistralParseDocumentNode {
         let access: Access = ctx.inputs.get("account")?;
         let file: FileHandle = ctx.inputs.get("file")?;
 
-        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&file).await?;
+        let document = ctx.storage(StorageScope::Run).external_file(&file).await?;
+        // Mistral reads an image as an `image_url` and every other
+        // document (PDF, DOCX, PPTX, ...) as a `document_url`.
+        let source = if document.mime_type.starts_with("image/") {
+            json!({ "type": "image_url", "image_url": document.url })
+        } else {
+            json!({ "type": "document_url", "document_url": document.url })
+        };
         let http = ctx.client(&access).await?;
-
-        // 1. Upload for OCR (two fields plus the file bytes).
-        let (content_type, body) = Multipart::form_data()
-            .text("purpose", "ocr")
-            .file("file", &meta.filename, &meta.mime_type, bytes)
-            .build();
-        let uploaded = json_call(
-            http.post("https://api.mistral.ai/v1/files")
-                .header("content-type", content_type)
-                .body(body),
-            "mistral: upload the document",
+        let answer = post_json(
+            &http,
+            "https://api.mistral.ai/v1/ocr",
+            &json!({ "model": "mistral-ocr-latest", "document": source }),
+            "mistral: ocr",
         )
         .await?;
-        let file_id = uploaded["id"].as_str().node_err("mistral: upload carries no id")?;
-
-        // 2 + 3. The short-lived signed URL the OCR call reads from, then
-        // the OCR itself. Whichever way these go, the upload below is
-        // deleted before the outcome is delivered.
-        let ocr = async {
-            let signed: Value = get_json(
-                &http,
-                &format!("https://api.mistral.ai/v1/files/{file_id}/url?expiry=1"),
-                "mistral: mint the document url",
-            )
-            .await?;
-            let doc_url = signed["url"].as_str().node_err("mistral: signed url missing")?;
-            post_json(
-                &http,
-                "https://api.mistral.ai/v1/ocr",
-                &json!({
-                    "model": "mistral-ocr-latest",
-                    "document": { "type": "document_url", "document_url": doc_url },
-                }),
-                "mistral: ocr",
-            )
-            .await
-        }
-        .await;
-
-        // The upload was only ever OCR fuel: delete it so runs don't
-        // pile files onto the Mistral account, on the failure path too.
-        // The OCR outcome is what matters, so a failed delete logs
-        // loudly and still delivers it (a stray remote file is
-        // recoverable from Mistral's file list; a discarded OCR is not).
-        let deleted = http
-            .delete(format!("https://api.mistral.ai/v1/files/{file_id}"))
-            .send()
-            .await;
-        match deleted {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) => {
-                let status = resp.status();
-                ctx.log(
-                    weft::context::LogLevel::Error,
-                    format!(
-                        "mistral answered {status} deleting uploaded file {file_id} after the \
-                         OCR; remove it from the account's file list by hand"
-                    ),
-                )
-                .await?;
-            }
-            Err(e) => {
-                ctx.log(
-                    weft::context::LogLevel::Error,
-                    format!(
-                        "could not delete uploaded file {file_id} after the OCR: {e}; remove \
-                         it from the account's file list by hand"
-                    ),
-                )
-                .await?;
-            }
-        }
-        let answer = ocr?;
 
         let pages: Vec<Value> = answer["pages"]
             .as_array()
@@ -122,14 +64,11 @@ impl Node for MistralParseDocumentNode {
             .join("\n\n");
         let count = pages.len() as f64;
         let storage = ctx.storage(StorageScope::Run);
-        let stem = file_stem(&meta.filename);
+        let stem = file_stem(&document.filename);
         let markdown = storage
             .put(markdown.into_bytes(), "text/markdown", &format!("{stem}.md"), None)
             .await?;
-        let pages_json = serde_json::to_vec(&pages).node_err("mistral: write the pages as JSON")?;
-        let pages = storage
-            .put(pages_json, "application/json", &format!("{stem}.pages.json"), None)
-            .await?;
+        let pages = storage.put_json(&pages, &format!("{stem}.pages.json"), None).await?;
         ctx.pulse_downstream(
             NodeOutput::new()
                 .set("markdown", markdown)

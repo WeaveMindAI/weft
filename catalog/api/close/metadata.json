@@ -79,8 +79,8 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_present", "field": "reason" },
-          { "kind": "config_equals", "field": "status", "equals": 204 }
+          { "kind": "value", "field": "reason" },
+          { "kind": "value", "field": "status", "equals": 204 }
         ]
       },
       "then": {
@@ -93,7 +93,7 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_present", "field": "code" },
+          { "kind": "value", "field": "code" },
           { "kind": "run_reaches", "direction": "upstream", "with": { "liveConnection": ["http"] } },
           {
             "kind": "not",
@@ -111,7 +111,7 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_present", "field": "status" },
+          { "kind": "value", "field": "status" },
           { "kind": "run_reaches", "direction": "upstream", "with": { "liveConnection": ["websocket"] } },
           {
             "kind": "not",

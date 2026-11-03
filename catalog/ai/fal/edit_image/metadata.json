@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[fal]", "accepts": ["wire"],
       "required": true,
       "description": "The fal access (wire a FalAccess node)."
     },
@@ -79,5 +79,8 @@
   "display": {
     "kind": "media",
     "output": "image"
-  }
+  },
+  "validate": [
+    { "when": { "kind": "all", "of": [{ "kind": "value", "field": "model" }, { "kind": "not", "of": { "kind": "value", "field": "model", "matches": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)+$" } }] }, "then": { "message": "FalEditImage '{id}' has a `model` that is not a fal model id: write the model's route, like fal-ai/flux/dev", "field": "model" } }
+  ]
 }

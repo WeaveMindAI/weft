@@ -29,8 +29,6 @@ impl Node for SlackFindUserNode {
         let id: Option<String> = ctx.inputs.opt("id")?;
         let client = ctx.client(&access).await?;
 
-        // Which key to look up by is the program's choice, so a wrong
-        // pair is an input mistake, never a caught failure.
         let user: Value = match (email, id) {
             (Some(e), None) => {
                 let answer =
@@ -41,12 +39,7 @@ impl Node for SlackFindUserNode {
                 let answer = api::get(&client, "users.info", &[("user", u)]).await?;
                 answer["user"].clone()
             }
-            // Neither one never reaches here: `oneOfRequired` skips the node.
-            _ => {
-                return Err(weft::WeftError::Input(
-                    "pick ONE lookup key: an email or a user id, not both".to_string(),
-                ));
-            }
+            _ => unreachable!("`oneOfRequired` skips the node with neither key, and a rule refuses both"),
         };
         if user.is_null() {
             weft::node_bail!("slack returned no user object for the lookup");

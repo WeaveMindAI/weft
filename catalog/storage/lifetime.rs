@@ -2,14 +2,27 @@
 //! is stored in (`scope`), and how long it lives (`ttlDays`). One reading
 //! of each, so the nodes that offer them cannot drift apart.
 
-use weft::storage::{KeepTtl, StorageScope};
-use weft::{WeftError, WeftResult};
+use serde::Deserialize;
 
-/// The scope a `scope` setting names: `run` or `project`.
-pub fn scope_named(name: &str) -> WeftResult<StorageScope> {
-    match StorageScope::named(name) {
-        Some(scope @ (StorageScope::Run | StorageScope::Project)) => Ok(scope),
-        _ => Err(WeftError::Input(format!("`scope` is '{name}'; it is `run` or `project`"))),
+use weft::storage::{KeepTtl, StorageScope};
+
+/// A `scope` select. Each node's select lists the scopes it offers
+/// (UploadSlot alone offers `instance`, the run's own instance).
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    Run,
+    Project,
+    Instance,
+}
+
+impl From<Scope> for StorageScope {
+    fn from(scope: Scope) -> Self {
+        match scope {
+            Scope::Run => StorageScope::Run,
+            Scope::Project => StorageScope::Project,
+            Scope::Instance => StorageScope::instance(),
+        }
     }
 }
 

@@ -21,7 +21,7 @@ pg = PostgresDatabase { database: "imagebot" }
 
 ask = TelegramReceiveMessage { account: telegram.access }
 
-credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal: String) {
+credit = Group(db: Access[postgres], telegramUser: String) -> (paid: Boolean, refusal: String) {
   # Take one credit off this telegram account, or say why we cannot.
   # The query reads the sender's id as `$telegram_id`.
   debit = PostgresExecuteQuery(telegram_id: String) {

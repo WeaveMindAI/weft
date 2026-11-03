@@ -1,3 +1,0 @@
-# The output format rides the TTS URL's query string.
-[dependencies]
-urlencoding = "2"

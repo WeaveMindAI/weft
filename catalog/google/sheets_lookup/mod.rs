@@ -13,7 +13,6 @@ use weft::node::NodeOutput;
 use weft::storage::wire_page;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::api::page_size;
 use super::sheets::{heavy_row, read_cells, row_object, tab_title};
 
 #[derive(NodeManifest)]
@@ -35,8 +34,8 @@ impl Node for GoogleSheetsLookupNode {
         let gid: Option<String> = ctx.inputs.opt("tab")?;
         let column: String = ctx.inputs.get("column")?;
         let value: String = ctx.inputs.get("value")?;
-        let offset = ctx.inputs.get::<f64>("offset")? as usize;
-        let max_rows = page_size(&ctx.inputs, "maxRows")?;
+        let offset: usize = ctx.inputs.get("offset")?;
+        let max_rows: usize = ctx.inputs.get("maxRows")?;
 
         let http = ctx.client(&account).await?;
         let title = tab_title(&http, &id, gid.as_deref()).await?;

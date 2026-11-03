@@ -33,13 +33,9 @@ impl Node for DecisionYesNoNode {
         // Held to 0..1 by its widget's range, written or wired.
         let threshold: f64 = ctx.inputs.get("threshold")?;
         let mut question = json!({ "type": "noul", "instructions": instructions });
-        match (when_true, when_false) {
-            (Some(yes), Some(no)) => question["criteria"] = json!({ "true": yes, "false": no }),
-            (None, None) => {}
-            _ => weft::node_bail!(
-                "whenTrue and whenFalse go together: the model reads one against the other, so \
-                 write both or neither"
-            ),
+        // Both or neither, by the node's rule (rechecked on wired values).
+        if let (Some(yes), Some(no)) = (when_true, when_false) {
+            question["criteria"] = json!({ "true": yes, "false": no });
         }
         let state = decision::state(&ctx).await?;
         let answer = decision::ask(&ctx, state, question).await?;

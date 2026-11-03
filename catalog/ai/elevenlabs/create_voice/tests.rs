@@ -1,19 +1,16 @@
-//! ElevenLabsCreateVoice self-tests: the create request, the parts of
-//! the minted voice the node hands on, and the description ElevenLabs
-//! would refuse, refused before anything is sent.
+//! ElevenLabsCreateVoice self-tests: the create request, and the parts
+//! of the minted voice the node hands on.
 
 use serde_json::{json, Value};
 
 use weft::{FakeRig, NodeTest, WeftResult};
 
-use super::{description_refusal, ElevenLabsCreateVoiceNode};
+use super::ElevenLabsCreateVoiceNode;
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("creates_and_emits_the_voice", creates),
         NodeTest::fake("a_voice_with_no_preview_link_closes_that_port", no_preview),
-        NodeTest::fake("a_description_elevenlabs_would_refuse_is_refused_before_anything_is_sent", refused),
-        NodeTest::basic("the_description_lengths_elevenlabs_takes", description_limits),
     ]
 }
 
@@ -84,24 +81,3 @@ async fn no_preview(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    for (description, says) in
-        [("calm narrator".to_string(), "`description` is 13 characters"), ("x".repeat(1001), "`description` is 1001 characters")]
-    {
-        let err = rig.run(&ElevenLabsCreateVoiceNode, inputs(&rig, json!({ "description": description }))).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {err}");
-        assert!(err.contains(says), "{err}");
-    }
-    assert!(rig.requests().is_empty(), "nothing is sent, so no voice is minted");
-    Ok(())
-}
-
-fn description_limits() -> WeftResult<()> {
-    assert!(description_refusal(&"x".repeat(19)).is_some());
-    assert!(description_refusal(&"x".repeat(20)).is_none());
-    assert!(description_refusal(&"é".repeat(20)).is_none(), "characters count, not bytes");
-    assert!(description_refusal(&"x".repeat(1000)).is_none());
-    assert!(description_refusal(&"x".repeat(1001)).is_some());
-    Ok(())
-}

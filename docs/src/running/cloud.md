@@ -656,7 +656,7 @@ weft connect --on prod
 
 If a run on prod reaches a node with nothing picked there, it is refused
 before it starts, and the message names the node and
-`weft connect --node <node>`; add `--on prod`. An instance's own connection (a
+`weft connect <node>`; add `--on prod`. An instance's own connection (a
 field written `@instance_filled`) lives in the install it was made on, so
 your customers connect through your frontend on prod, the same way they do
 locally.
@@ -885,7 +885,7 @@ keeps asking until the install answers, and Ctrl+C stops it. If
   one. If it stays that way, the holders' logs say why.
 - **A run on prod is refused with "has no ... connection picked on this
   install"**: the node was connected on your machine, not on prod. Run the
-  `weft connect --node <node>` it names, with `--on prod`.
+  `weft connect <node>` it names, with `--on prod`.
 - **An image build fails**: the error quotes the builder's log, with the
   `cargo` or `apt` line that failed. Fix what it names and deploy again;
   only what changed rebuilds.

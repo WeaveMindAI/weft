@@ -249,6 +249,27 @@ pub async fn post_json(
     json_call(client.post(url).json(body), what).await
 }
 
+/// Send a prepared request, any status an answer: the cancelled error
+/// when the run was cancelled under it, a node failure naming `what`
+/// (without the URL) when it never got one. For a node whose answer is
+/// the status itself; [`checked_send`] refuses a non-success one.
+#[cfg(feature = "runtime")]
+pub async fn send(req: reqwest_middleware::RequestBuilder, what: &str) -> crate::WeftResult<reqwest::Response> {
+    req.send().await.map_err(|e| {
+        let cancelled = match &e {
+            reqwest_middleware::Error::Middleware(e) => {
+                matches!(e.downcast_ref::<crate::WeftError>(), Some(crate::WeftError::Cancelled))
+            }
+            reqwest_middleware::Error::Reqwest(e) => crate::cancellation::is_cancel(e),
+        };
+        if cancelled {
+            crate::WeftError::Cancelled
+        } else {
+            crate::error::node_error(format!("{what}: {}", send_error(e)))
+        }
+    })
+}
+
 /// Send a prepared request and refuse a non-success status, quoting
 /// the provider's own words (see [`error_detail`]). The success
 /// response comes back unread, for callers whose answer is not JSON (a
@@ -258,20 +279,28 @@ pub async fn checked_send(
     req: reqwest_middleware::RequestBuilder,
     what: &str,
 ) -> crate::WeftResult<reqwest::Response> {
-    use crate::error::{node_error, NodeErrExt};
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| node_error(format!("{what}: {}", send_error(e))))?;
+    use crate::error::node_error;
+    let resp = send(req, what).await?;
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
     }
-    let body = resp.text().await.node_err(what)?;
+    let body = resp.text().await.map_err(|e| body_error(what, e))?;
     Err(node_error(format!(
         "the service answered {status} trying to {what}: {}",
         error_detail(&body)
     )))
+}
+
+/// A failed read of an answer's body: the cancelled error when the run
+/// was cancelled under it, a node failure naming `what` otherwise.
+#[cfg(feature = "runtime")]
+pub fn body_error(what: &str, e: reqwest::Error) -> crate::WeftError {
+    if crate::cancellation::is_cancel(&e) {
+        crate::WeftError::Cancelled
+    } else {
+        crate::error::node_error(format!("{what}: {e}"))
+    }
 }
 
 /// The provider's own words in a failure body, when it carries one of
@@ -280,10 +309,12 @@ pub async fn checked_send(
 /// `{"message": ...}` (GitHub), `{"detail": ...}` as a string or as an
 /// object with a `message` (FastAPI services, ElevenLabs), FastAPI's
 /// validation list (`{"detail": [{"loc": [...], "msg": ...}]}`), or
-/// top-level `{"description": ...}` (Telegram). Otherwise the raw body
-/// (truncated), so an HTML 502 from a proxy is still legible.
-#[cfg(feature = "runtime")]
-pub(crate) fn error_detail(body: &str) -> String {
+/// top-level `{"description": ...}` (Telegram); or the XML error S3 and
+/// the stores that speak its API answer (`<Error><Code>NoSuchKey</Code>
+/// <Message>...</Message></Error>`, read as `NoSuchKey: ...`). Otherwise
+/// the raw body (truncated), so an HTML 502 from a proxy is still
+/// legible.
+pub fn error_detail(body: &str) -> String {
     let nested = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| {
         v["error"]["message"]
             .as_str()
@@ -295,7 +326,52 @@ pub(crate) fn error_detail(body: &str) -> String {
             .map(str::to_string)
             .or_else(|| validation_errors(&v["detail"]))
     });
-    nested.unwrap_or_else(|| body.chars().take(500).collect::<String>())
+    nested
+        .or_else(|| xml_error(body))
+        .unwrap_or_else(|| body.chars().take(500).collect::<String>())
+}
+
+/// The code and message of an S3-style XML error body, `Code: Message`
+/// (either alone when the other is missing), or `None` for a body that
+/// is no `<Error>` document.
+fn xml_error(body: &str) -> Option<String> {
+    let error = element(body, "Error")?;
+    let code = element(error, "Code").map(xml_text).filter(|c| !c.is_empty());
+    let message = element(error, "Message").map(xml_text).filter(|m| !m.is_empty());
+    match (code, message) {
+        (Some(code), Some(message)) => Some(format!("{code}: {message}")),
+        (Some(one), None) | (None, Some(one)) => Some(one),
+        (None, None) => None,
+    }
+}
+
+/// The text between `<tag>` (or `<tag attr..>`) and `</tag>`, the first
+/// such element in `xml`.
+fn element<'x>(xml: &'x str, tag: &str) -> Option<&'x str> {
+    let open = format!("<{tag}");
+    let mut from = 0;
+    let start = loop {
+        let at = from + xml[from..].find(&open)?;
+        let after = at + open.len();
+        match xml[after..].chars().next()? {
+            '>' => break after + 1,
+            c if c.is_whitespace() => break after + xml[after..].find('>')? + 1,
+            // `<ErrorCode>` when `<Error>` was asked for.
+            _ => from = after,
+        }
+    };
+    let end = start + xml[start..].find(&format!("</{tag}>"))?;
+    Some(&xml[start..end])
+}
+
+/// An XML element's text with its entities read.
+fn xml_text(raw: &str) -> String {
+    raw.trim()
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 /// A FastAPI validation list as one line, each entry where it is and
@@ -337,7 +413,7 @@ pub async fn json_call(
     what: &str,
 ) -> crate::WeftResult<serde_json::Value> {
     use crate::error::NodeErrExt;
-    let body = checked_send(req, what).await?.text().await.node_err(what)?;
+    let body = checked_send(req, what).await?.text().await.map_err(|e| body_error(what, e))?;
     serde_json::from_str(&body).node_err(what)
 }
 
@@ -373,7 +449,7 @@ pub const MAX_PAGES: usize = 50;
 
 /// How a cursor-paged list endpoint speaks: where each page's items
 /// sit, where the next cursor sits, and which query parameter carries
-/// it back. Both locations are JSON pointers (`/files`,
+/// it back, if one does. Both locations are JSON pointers (`/files`,
 /// `/response_metadata/next_cursor`). A cursor that is absent, not a
 /// string, or empty ends the listing.
 #[derive(Debug, Clone, Copy)]
@@ -382,8 +458,10 @@ pub struct CursorPaging<'a> {
     pub items: &'a str,
     /// Pointer to the next page's cursor.
     pub next: &'a str,
-    /// The query parameter the cursor is sent back in.
-    pub param: &'a str,
+    /// The query parameter the cursor is sent back in. `None` for a
+    /// service that takes it elsewhere (a field of a POST body), which
+    /// the request closure of [`cursor_paged`] puts there itself.
+    pub param: Option<&'a str>,
     /// Whether a page may leave the items array out. Some services drop
     /// an empty array from the answer (a Google list with no hits);
     /// for the others a missing array is a malformed answer and fails.
@@ -397,8 +475,12 @@ pub struct CursorPaging<'a> {
 }
 
 /// Page a cursor-paged endpoint: `request` builds the page's request
-/// (called once per page, so nothing is cloned), the cursor rides as
-/// `paging.param` from the second page on, `check` vets each parsed
+/// (called once per page, so nothing is cloned) and is handed the
+/// cursor (`None` for the first page), which also rides as
+/// `paging.param` from the second page on when the paging names one; a
+/// service that takes it in a POST body puts it there in `request`
+/// (`|cursor| http.post(url).json(&json!({ "start_cursor": cursor }))`).
+/// `check` vets each parsed
 /// answer (pass `Ok` when the status code says it all, or a closure
 /// over [`require_ok_flag`] for a service that answers 200 with an
 /// `ok` flag), and `visit` sees each page's items. `visit` returns
@@ -409,16 +491,16 @@ pub struct CursorPaging<'a> {
 pub async fn cursor_paged<T>(
     paging: CursorPaging<'_>,
     what: &str,
-    mut request: impl FnMut() -> reqwest_middleware::RequestBuilder,
+    mut request: impl FnMut(Option<&str>) -> reqwest_middleware::RequestBuilder,
     check: impl Fn(serde_json::Value) -> crate::WeftResult<serde_json::Value>,
     mut visit: impl FnMut(&[serde_json::Value]) -> crate::WeftResult<Option<T>>,
 ) -> crate::WeftResult<Option<T>> {
     use crate::error::node_error;
     let mut cursor: Option<String> = None;
     for _page in 0..MAX_PAGES {
-        let mut req = request();
-        if let Some(c) = &cursor {
-            req = req.query(&[(paging.param, c.as_str())]);
+        let mut req = request(cursor.as_deref());
+        if let (Some(param), Some(c)) = (paging.param, &cursor) {
+            req = req.query(&[(param, c.as_str())]);
         }
         let answer = check(json_call(req, what).await?)?;
         let page: &[serde_json::Value] = match answer.pointer(paging.items) {
@@ -470,26 +552,36 @@ pub fn required_str<'a>(
 /// name-addressed field shape (an upload endpoint's named fields plus
 /// a file part), `multipart/related` for the typed-part shape (a JSON
 /// metadata part plus the bytes, Drive-style). Collect the parts, then
-/// [`Multipart::build`] frames the body.
+/// send it with [`StoredBodyExt::multipart`], which streams every part a
+/// stored file fills ([`Self::stored`]) straight out of storage.
 ///
-/// The boundary is minted at random PER BUILD and verified absent from
-/// every part's headers and payload (multipart framing truncates at
-/// the first match, and part content is arbitrary workflow data);
-/// the astronomically rare collision re-mints. The scan looks for the
-/// BARE `--<boundary>` (no leading CRLF): the part header's own
+/// The boundary is minted at random PER BODY and verified absent from
+/// every part's headers and in-memory payload (multipart framing
+/// truncates at the first match, and part content is arbitrary workflow
+/// data); the astronomically rare collision re-mints. The scan looks for
+/// the BARE `--<boundary>` (no leading CRLF): the part header's own
 /// CRLF-CRLF terminator donates a newline right before the payload's
 /// first byte, so a payload STARTING with the delimiter would frame a
-/// boundary a CRLF-prefixed scan would miss.
+/// boundary a CRLF-prefixed scan would miss. A streamed part is never
+/// read ahead to be scanned: its bytes meet a boundary carrying 122
+/// random bits nobody outside this process saw.
 pub struct Multipart {
     subtype: &'static str,
     parts: Vec<MultipartPart>,
 }
 
 /// One framed part: its header lines (everything between the boundary
-/// line and the blank line) and its payload bytes.
+/// line and the blank line) and its payload.
 struct MultipartPart {
     headers: String,
-    payload: Vec<u8>,
+    payload: Payload,
+}
+
+/// What a part carries: bytes in hand, or a stored file streamed out of
+/// storage as the body is sent.
+enum Payload {
+    Bytes(Vec<u8>),
+    Stored(crate::storage::StoredBody),
 }
 
 /// A value placed inside a quoted-string parameter (a filename in a
@@ -502,22 +594,28 @@ fn quoted_param(value: &str) -> String {
         .replace(['\r', '\n'], "_")
 }
 
-/// Whether `--<boundary>` occurs in any part's headers or payload.
+/// Whether `--<boundary>` occurs in any part's headers or in-memory
+/// payload.
 fn boundary_collides(parts: &[MultipartPart], boundary: &str) -> bool {
     let marker = format!("--{boundary}");
     parts.iter().any(|p| {
         p.headers.contains(&marker)
-            || p.payload.windows(marker.len()).any(|w| w == marker.as_bytes())
+            || match &p.payload {
+                Payload::Bytes(bytes) => bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+                Payload::Stored(_) => false,
+            }
     })
 }
 
 impl Multipart {
-    /// A `multipart/form-data` body ([`Self::text`] / [`Self::file`] parts).
+    /// A `multipart/form-data` body ([`Self::text`] / [`Self::file`] /
+    /// [`Self::stored`] parts).
     pub fn form_data() -> Self {
         Self { subtype: "form-data", parts: Vec::new() }
     }
 
-    /// A `multipart/related` body ([`Self::part`] parts).
+    /// A `multipart/related` body ([`Self::part`] / [`Self::stored_part`]
+    /// parts).
     pub fn related() -> Self {
         Self { subtype: "related", parts: Vec::new() }
     }
@@ -530,12 +628,13 @@ impl Multipart {
                 "Content-Disposition: form-data; name=\"{}\"",
                 quoted_param(name)
             ),
-            payload: value.as_bytes().to_vec(),
+            payload: Payload::Bytes(value.as_bytes().to_vec()),
         });
         self
     }
 
-    /// A named file field with filename and content type (form-data).
+    /// A named file field with filename and content type (form-data),
+    /// of bytes in hand.
     pub fn file(
         mut self,
         name: &str,
@@ -545,44 +644,239 @@ impl Multipart {
     ) -> Self {
         assert_eq!(self.subtype, "form-data", "named fields belong to a form-data body");
         self.parts.push(MultipartPart {
-            headers: format!(
-                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n\
-                 Content-Type: {content_type}",
-                quoted_param(name),
-                quoted_param(filename),
-            ),
-            payload: bytes.into(),
+            headers: file_field_headers(name, filename, content_type),
+            payload: Payload::Bytes(bytes.into()),
         });
         self
     }
 
-    /// A typed part, addressed by position (related).
+    /// A named file field (form-data) filled by a stored file, under its
+    /// stored name and type, streamed out of storage as the body is sent
+    /// (`StorageHandle::body`).
+    pub fn stored(mut self, name: &str, file: crate::storage::StoredBody) -> Self {
+        assert_eq!(self.subtype, "form-data", "named fields belong to a form-data body");
+        self.parts.push(MultipartPart {
+            headers: file_field_headers(name, file.filename(), file.mime_type()),
+            payload: Payload::Stored(file),
+        });
+        self
+    }
+
+    /// A typed part, addressed by position (related), of bytes in hand.
     pub fn part(mut self, content_type: &str, bytes: impl Into<Vec<u8>>) -> Self {
         assert_eq!(self.subtype, "related", "typed parts belong to a related body");
         self.parts.push(MultipartPart {
             headers: format!("Content-Type: {content_type}"),
-            payload: bytes.into(),
+            payload: Payload::Bytes(bytes.into()),
         });
         self
     }
 
-    /// Frame the body: mints the verified boundary and returns the
-    /// Content-Type header value plus the body bytes.
-    pub fn build(self) -> (String, Vec<u8>) {
-        let boundary = loop {
+    /// A typed part (related) filled by a stored file under its stored
+    /// type, streamed out of storage as the body is sent.
+    pub fn stored_part(mut self, file: crate::storage::StoredBody) -> Self {
+        assert_eq!(self.subtype, "related", "typed parts belong to a related body");
+        self.parts.push(MultipartPart { headers: format!("Content-Type: {}", file.mime_type()), payload: Payload::Stored(file) });
+        self
+    }
+
+    /// The boundary this body is framed with: minted, then verified
+    /// absent from every part it can see.
+    fn boundary(&self) -> String {
+        loop {
             let candidate = format!("weft-{}", uuid::Uuid::new_v4().simple());
             if !boundary_collides(&self.parts, &candidate) {
-                break candidate;
+                return candidate;
             }
-        };
+        }
+    }
+
+    /// Frame a body every part of which is in memory: the Content-Type
+    /// header value plus the body bytes. A part a stored file fills is
+    /// sent with [`StoredBodyExt::multipart`] instead, which never holds
+    /// it in memory; framing one here is a bug in the calling code.
+    pub fn build(self) -> (String, Vec<u8>) {
+        let boundary = self.boundary();
         let mut body: Vec<u8> = Vec::new();
         for part in &self.parts {
             body.extend_from_slice(format!("--{boundary}\r\n{}\r\n\r\n", part.headers).as_bytes());
-            body.extend_from_slice(&part.payload);
+            match &part.payload {
+                Payload::Bytes(bytes) => body.extend_from_slice(bytes),
+                Payload::Stored(_) => panic!("a part a stored file fills is streamed with `multipart`, never framed in memory"),
+            }
             body.extend_from_slice(b"\r\n");
         }
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
         (format!("multipart/{}; boundary={boundary}", self.subtype), body)
+    }
+
+    /// Frame the body as a stream: the Content-Type header value, the
+    /// body's length, and its bytes, a stored part's read out of storage
+    /// as the body is sent.
+    fn stream(self) -> (String, u64, crate::storage::ByteStream) {
+        use futures::StreamExt;
+        let boundary = self.boundary();
+        let mut len: u64 = 0;
+        let mut pieces: Vec<crate::storage::ByteStream> = Vec::new();
+        let fixed = |text: String, len: &mut u64, pieces: &mut Vec<crate::storage::ByteStream>| {
+            *len += text.len() as u64;
+            pieces.push(crate::storage::bytes_stream(bytes::Bytes::from(text)));
+        };
+        for part in self.parts {
+            fixed(format!("--{boundary}\r\n{}\r\n\r\n", part.headers), &mut len, &mut pieces);
+            match part.payload {
+                Payload::Bytes(bytes) => {
+                    len += bytes.len() as u64;
+                    pieces.push(crate::storage::bytes_stream(bytes::Bytes::from(bytes)));
+                }
+                Payload::Stored(file) => {
+                    len += file.len();
+                    pieces.push(file.into_stream());
+                }
+            }
+            fixed("\r\n".to_string(), &mut len, &mut pieces);
+        }
+        fixed(format!("--{boundary}--\r\n"), &mut len, &mut pieces);
+        (format!("multipart/{}; boundary={boundary}", self.subtype), len, futures::stream::iter(pieces).flatten().boxed())
+    }
+}
+
+/// The header lines of a named file field.
+fn file_field_headers(name: &str, filename: &str, content_type: &str) -> String {
+    format!(
+        "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n\
+         Content-Type: {content_type}",
+        quoted_param(name),
+        quoted_param(filename),
+    )
+}
+
+/// Bodies that stream out of storage, on a request a node builds.
+pub trait StoredBodyExt {
+    /// Send `body` (`StorageHandle::body`) as the whole request body,
+    /// streamed out of storage with its `Content-Length` from the file's
+    /// record. The content type is the caller's to state (the file's is
+    /// `body.mime_type()`).
+    fn stored_body(self, body: crate::storage::StoredBody) -> Self;
+
+    /// Send `form` as the request body, with its `Content-Type` and
+    /// `Content-Length`, every stored part streamed out of storage.
+    fn multipart(self, form: Multipart) -> Self;
+}
+
+impl StoredBodyExt for reqwest_middleware::RequestBuilder {
+    fn stored_body(self, body: crate::storage::StoredBody) -> Self {
+        let len = body.len();
+        self.header(reqwest::header::CONTENT_LENGTH, len).body(reqwest::Body::wrap_stream(body.into_stream()))
+    }
+
+    fn multipart(self, form: Multipart) -> Self {
+        let (content_type, len, stream) = form.stream();
+        self.header(reqwest::header::CONTENT_TYPE, content_type)
+            .header(reqwest::header::CONTENT_LENGTH, len)
+            .body(reqwest::Body::wrap_stream(stream))
+    }
+}
+
+/// A URL built out of values: a base, then path segments each
+/// percent-encoded whole ([`super::spec::percent_encode`]), so an id
+/// holding `/`, `?` or `#` stays one segment of the address it was meant
+/// for, then query pairs, encoded the same way.
+///
+/// ```ignore
+/// let url = client::url(API, &["files", &id, "copy"])?.query("q", &q).query("pageSize", 50);
+/// http.get(url.as_str())
+/// // a path for an endpoint: `endpoint.call(Get, client::url("", &["media", &id])?.as_str(), None)`
+/// ```
+///
+/// A segment that is empty, `.` or `..` is refused (an input error):
+/// encoding cannot hold it, since an address reads `%2E%2E` as `..` too,
+/// so a wired id of `..` would climb out of the path to another address.
+///
+/// The base is taken as written (a trailing `/` dropped), so it is a
+/// constant of the node or an address weft handed it, never a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Url {
+    built: String,
+    has_query: bool,
+}
+
+/// [`Url`]: `base` followed by `segments`.
+pub fn url(base: &str, segments: &[&str]) -> crate::WeftResult<Url> {
+    let mut url = Url { built: base.trim_end_matches('/').to_string(), has_query: false };
+    for segment in segments {
+        url = url.segment(segment)?;
+    }
+    Ok(url)
+}
+
+impl Url {
+    /// One more path segment, encoded, refused as [`url`] says. Only
+    /// before the first query pair.
+    pub fn segment(mut self, segment: &str) -> crate::WeftResult<Self> {
+        assert!(!self.has_query, "a path segment goes before the query");
+        if matches!(segment, "" | "." | "..") {
+            return Err(crate::WeftError::Input(format!(
+                "`{segment}` cannot be part of an address: an empty, `.` or `..` part would call another address than the one meant"
+            )));
+        }
+        self.built.push('/');
+        self.built.push_str(&super::spec::percent_encode(segment));
+        Ok(self)
+    }
+
+    /// A value whose `/` separate parts the address keeps, such as an
+    /// object store key (`photos/2024/a.jpg`, or `photos/`, a folder
+    /// marker): each part encoded, an empty part kept since it is part of
+    /// the name, a `.` or `..` part refused, and an empty value refused
+    /// like an empty segment. Only before the first query pair.
+    pub fn key_path(mut self, key: &str) -> crate::WeftResult<Self> {
+        assert!(!self.has_query, "a path goes before the query");
+        if key.is_empty() || key.split('/').any(|part| matches!(part, "." | "..")) {
+            return Err(crate::WeftError::Input(format!(
+                "`{key}` cannot be part of an address: an empty value, or a `.` or `..` part, would call another address than the one meant"
+            )));
+        }
+        for part in key.split('/') {
+            self.built.push('/');
+            self.built.push_str(&super::spec::percent_encode(part));
+        }
+        Ok(self)
+    }
+
+    /// One query pair, both halves encoded (a space is `%20`).
+    pub fn query(mut self, name: &str, value: impl std::fmt::Display) -> Self {
+        self.built.push(if self.has_query { '&' } else { '?' });
+        self.has_query = true;
+        self.built.push_str(&super::spec::percent_encode(name));
+        self.built.push('=');
+        self.built.push_str(&super::spec::percent_encode(&value.to_string()));
+        self
+    }
+
+    /// [`Self::query`] when `value` is set, the URL unchanged otherwise:
+    /// for an optional input that is a query parameter.
+    pub fn query_opt(self, name: &str, value: Option<impl std::fmt::Display>) -> Self {
+        match value {
+            Some(value) => self.query(name, value),
+            None => self,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.built
+    }
+}
+
+impl std::fmt::Display for Url {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.built)
+    }
+}
+
+impl From<Url> for String {
+    fn from(url: Url) -> String {
+        url.built
     }
 }
 
@@ -1392,7 +1686,7 @@ mod tests {
         // boundary occurring in a payload (or a header) is refused.
         let parts = [MultipartPart {
             headers: "Content-Type: text/plain".into(),
-            payload: b"data --clash data".to_vec(),
+            payload: Payload::Bytes(b"data --clash data".to_vec()),
         }];
         assert!(boundary_collides(&parts, "clash"));
         assert!(!boundary_collides(&parts, "no-clash"));
@@ -1509,7 +1803,7 @@ mod tests {
         let paging = CursorPaging {
             items: "/files",
             next: "/nextPageToken",
-            param: "pageToken",
+            param: Some("pageToken"),
             items_may_be_absent: true,
             past_cap_hint: "narrow the query",
         };
@@ -1517,7 +1811,7 @@ mod tests {
         let none: Option<()> = cursor_paged(
             paging,
             "list files",
-            || http.get(format!("{base}/list?pageSize=2")),
+            |_| http.get(format!("{base}/list?pageSize=2")),
             Ok,
             |page| {
                 all.extend(page.iter().cloned());
@@ -1552,14 +1846,14 @@ mod tests {
         let paging = CursorPaging {
             items: "/channels",
             next: "/response_metadata/next_cursor",
-            param: "cursor",
+            param: Some("cursor"),
             items_may_be_absent: false,
             past_cap_hint: "paste the channel id instead of its name",
         };
         let found = cursor_paged(
             paging,
             "list channels",
-            || http.get(format!("{base}/conversations.list")),
+            |_| http.get(format!("{base}/conversations.list")),
             |a| require_ok_flag(a, "ok", "error", "list channels"),
             |page| Ok(page.iter().find(|c| *c == "c").cloned()),
         )
@@ -1569,7 +1863,7 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 2, "stopped once found");
 
         let (base, _) = serve(|_| (200, r#"{"ok":true}"#.to_string())).await;
-        let err = cursor_paged::<()>(paging, "list channels", || http.get(&base), Ok, |_| Ok(None))
+        let err = cursor_paged::<()>(paging, "list channels", |_| http.get(&base), Ok, |_| Ok(None))
             .await
             .unwrap_err()
             .to_string();
@@ -1585,17 +1879,51 @@ mod tests {
         let paging = CursorPaging {
             items: "/items",
             next: "/next",
-            param: "c",
+            param: Some("c"),
             items_may_be_absent: false,
             past_cap_hint: "pick one folder",
         };
-        let err = cursor_paged::<()>(paging, "list things", || http.get(&base), Ok, |_| Ok(None))
+        let err = cursor_paged::<()>(paging, "list things", |_| http.get(&base), Ok, |_| Ok(None))
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("more than 50 pages") && err.contains("list things"), "{err}");
         assert!(err.ends_with("; pick one folder"), "the caller's hint is the advice: {err}");
         assert_eq!(seen.lock().unwrap().len(), MAX_PAGES);
+    }
+
+    /// A service that takes its cursor elsewhere than a query parameter
+    /// (a field of a POST body) names no `param`: the request closure is
+    /// handed the cursor, `None` on the first page, and puts it where the
+    /// service wants it; nothing is added to the query.
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn cursor_paged_hands_the_cursor_to_the_request() {
+        let (base, seen) = serve(|target| {
+            let body = match target {
+                "/query/first" => r#"{"results":[1],"next_cursor":"c2"}"#,
+                _ => r#"{"results":[2],"next_cursor":null}"#,
+            };
+            (200, body.to_string())
+        })
+        .await;
+        let http = plain_client();
+        let paging = CursorPaging { items: "/results", next: "/next_cursor", param: None, items_may_be_absent: false, past_cap_hint: "narrow the filter" };
+        let mut all = Vec::new();
+        cursor_paged::<()>(
+            paging,
+            "query the database",
+            |cursor| http.post(format!("{base}/query/{}", cursor.unwrap_or("first"))).json(&serde_json::json!({ "start_cursor": cursor })),
+            Ok,
+            |page| {
+                all.extend(page.iter().cloned());
+                Ok(None)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(all, vec![serde_json::json!(1), serde_json::json!(2)]);
+        assert_eq!(*seen.lock().unwrap(), ["/query/first", "/query/c2"], "the cursor went where the closure put it, and nowhere else");
     }
 
     /// `require_ok_flag` passes `ok: true`, and otherwise fails quoting
@@ -1647,6 +1975,65 @@ mod tests {
         assert_eq!(error_detail(r#"{"detail":"bad key"}"#), "bad key");
         let unknown = r#"{"detail":[{"what":"no msg here"}]}"#;
         assert_eq!(error_detail(unknown), unknown, "an entry with no msg leaves the raw body");
+    }
+
+    /// An S3-style XML error reads as its code and message, entities and
+    /// all; a lookalike element (`<ErrorCode>`) is not taken for one, and
+    /// an XML body that is no error stays the raw body.
+    #[test]
+    fn error_detail_reads_an_s3_xml_error() {
+        let s3 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchKey</Code><Message>The key &quot;a&amp;b&quot; does not exist.</Message><Key>a&amp;b</Key></Error>"#;
+        assert_eq!(error_detail(s3), r#"NoSuchKey: The key "a&b" does not exist."#);
+        assert_eq!(error_detail("<Error><Code>AccessDenied</Code></Error>"), "AccessDenied");
+        assert_eq!(error_detail(r#"<Error xmlns="x"><Message>slow down</Message></Error>"#), "slow down");
+        let other = "<ErrorCode>7</ErrorCode>";
+        assert_eq!(error_detail(other), other);
+        assert_eq!(error_detail(r#"{"message":"json first"}"#), "json first");
+    }
+
+    /// Every path segment is encoded whole, so an id holding `/`, `?`,
+    /// `#`, a space or a letter outside ASCII stays one segment of the
+    /// address meant; query pairs are encoded the same way, an absent
+    /// optional one leaves the URL as it was, and a base's trailing slash
+    /// does not double.
+    #[test]
+    fn the_url_builder_encodes_every_segment_and_pair() {
+        let url = url("https://api.example.com/v1/", &["pages", "a/b?c#d", "copy"]).unwrap();
+        assert_eq!(url.as_str(), "https://api.example.com/v1/pages/a%2Fb%3Fc%23d/copy");
+        let url = url.segment("é ü").unwrap().query("q", "name = 'x y'").query("pageSize", 50).query_opt("pageToken", None::<&str>);
+        assert_eq!(
+            url.as_str(),
+            "https://api.example.com/v1/pages/a%2Fb%3Fc%23d/copy/%C3%A9%20%C3%BC?q=name%20%3D%20%27x%20y%27&pageSize=50"
+        );
+        let url = url.query_opt("pageToken", Some("t&1"));
+        assert!(url.as_str().ends_with("&pageToken=t%261"), "{url}");
+        assert_eq!(super::url("", &["media", "id 1"]).unwrap().as_str(), "/media/id%201", "a path for an endpoint");
+        assert_eq!(String::from(super::url("http://svc", &[]).unwrap()), "http://svc");
+    }
+
+    /// A segment no encoding can keep in place (empty, `.`, `..`: an
+    /// address reads `%2E%2E` as `..`) is refused as an input error.
+    #[test]
+    fn the_url_builder_refuses_a_segment_that_would_leave_its_place() {
+        for bad in ["", ".", ".."] {
+            let err = url("https://api.example.com/v1", &["pages", bad]).unwrap_err();
+            assert!(matches!(err, crate::WeftError::Input(_)), "{bad:?}: {err}");
+        }
+        assert!(url("https://api.example.com/v1", &["pages", "..a"]).is_ok(), "only a whole `..` is a dot segment");
+    }
+
+    /// A key keeps its slashes as the address's own, empty parts
+    /// included (a folder marker), and refuses a dot part or no key.
+    #[test]
+    fn a_key_path_keeps_its_parts_and_refuses_a_dot_part() {
+        let base = || url("https://s3.example.com", &["bucket"]).unwrap();
+        assert_eq!(base().key_path("photos/2024/a b.jpg").unwrap().as_str(), "https://s3.example.com/bucket/photos/2024/a%20b.jpg");
+        assert_eq!(base().key_path("photos/").unwrap().as_str(), "https://s3.example.com/bucket/photos/");
+        assert_eq!(base().key_path("a//b").unwrap().as_str(), "https://s3.example.com/bucket/a//b");
+        for bad in ["", "a/../b", "./a", "a/."] {
+            assert!(matches!(base().key_path(bad), Err(crate::WeftError::Input(_))), "{bad:?}");
+        }
     }
 
     /// `required_str` hands back a present string field and fails loud

@@ -1,12 +1,13 @@
 //! GoogleCalendarCreateEvent: put an event on a calendar. Timed
 //! events take RFC 3339 datetimes; all-day events take plain dates
-//! (YYYY-MM-DD); the shape is picked per value, so mixing (a timed
-//! start, a dated end) fails loudly at Google with its own message.
+//! (YYYY-MM-DD); the metadata's rules refuse any other text, written
+//! or wired. The shape is picked per value, so mixing (a timed start,
+//! a dated end) fails loudly at Google with its own message.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use weft::access::client::required_str;
+use weft::access::client::{required_str, url};
 use weft::node::NodeOutput;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
@@ -61,10 +62,7 @@ impl Node for GoogleCalendarCreateEventNode {
 
         let http = ctx.client(&account).await?;
         let answer = weft::access::client::json_call(
-            http.post(format!(
-                "https://www.googleapis.com/calendar/v3/calendars/{}/events",
-                super::api::segment(&calendar)
-            ))
+            http.post(url(super::api::CALENDAR_API, &["calendars", &calendar, "events"])?.as_str())
             .json(&body),
             "create the event",
         )

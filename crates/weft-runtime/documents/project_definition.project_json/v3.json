@@ -1,0 +1,2985 @@
+[
+  {
+    "id": "00000000-0000-0000-0000-000000005eed",
+    "nodes": [
+      {
+        "id": "keys",
+        "nodeType": "ApiKeyAuth",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "account",
+            "portType": "Access",
+            "required": false,
+            "accepts": [
+              "literal"
+            ],
+            "widget": {
+              "kind": "access",
+              "service": "api_key_auth"
+            },
+            "label": "Keys",
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "T__in___should_flow",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          }
+        ],
+        "outputs": [
+          {
+            "name": "access",
+            "portType": "Access",
+            "required": true,
+            "description": "Wire into a Route or Socket's `auth`."
+          },
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          }
+        ],
+        "features": {},
+        "requiresInfra": false,
+        "span": {
+          "startLine": 2,
+          "startColumn": 0,
+          "endLine": 2,
+          "endColumn": 17
+        },
+        "headerSpan": {
+          "startLine": 2,
+          "startColumn": 0,
+          "endLine": 2,
+          "endColumn": 17
+        },
+        "portLiterals": {
+          "account": {
+            "__weft_install_picked__": {}
+          }
+        }
+      },
+      {
+        "id": "hook",
+        "nodeType": "Route",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "path",
+            "portType": "String",
+            "required": false,
+            "description": "Path under the project's live URL: literal segments and `{name}` captures (`users/{id}`), or empty for the root address. No leading '/'. Two routes may overlap only when one is strictly more specific (`cards/count` beside `cards/{id}`); otherwise activation refuses the pair.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "label": "Path",
+            "fromSpec": true
+          },
+          {
+            "name": "method",
+            "portType": "String",
+            "required": false,
+            "description": "HTTP method served. Empty serves every method; another method on a served path gets 405.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "select",
+              "options": [
+                "",
+                "GET",
+                "POST",
+                "PUT",
+                "PATCH",
+                "DELETE",
+                "HEAD",
+                "OPTIONS"
+              ]
+            },
+            "label": "Method",
+            "fromSpec": true
+          },
+          {
+            "name": "dataType",
+            "portType": "String",
+            "required": false,
+            "description": "Body shape. `json`: the body is one JSON object on `body` (a record type or `JsonDict`); anything else is answered 400. `text`: the whole body is a String on `body` (declare `-> (body: String)`). `bytes`: the body is stored and its stored-file value lands on `body` (declare `File`, or `Image`, which is checked against the bytes). Reply and Stream answer in this shape unless their `answerAs` says otherwise.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "select",
+              "options": [
+                "json",
+                "text",
+                "bytes"
+              ]
+            },
+            "default": "json",
+            "label": "Body shape",
+            "fromSpec": true
+          },
+          {
+            "name": "auth",
+            "portType": "Access",
+            "required": false,
+            "description": "Auth access node (ApiKeyAuth, JwtAuth, HmacAuth, StandardWebhookAuth). Unwired, anyone with the URL may call. The established identity comes out on `caller`.",
+            "accepts": [
+              "wire"
+            ],
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "maxSessionSecs",
+            "portType": "Number",
+            "required": false,
+            "description": "Hard ceiling on one connection, no default: it cuts a healthy feed on the clock. Only for an `outlivesCaller` run that has nothing else ending it (TagRun/StopTagged is usually better).",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 1.0,
+              "max": null,
+              "step": 1.0
+            },
+            "label": "Give up on one connection after this long",
+            "fromSpec": true
+          },
+          {
+            "name": "callerSilenceSecs",
+            "portType": "Number",
+            "required": false,
+            "description": "Seconds the caller's machine may leave sent data unacknowledged before the caller counts as gone. Bounds silence, not call length: a present caller acks automatically, so hours-long feeds are untouched. Raise for clients whose link sleeps. `0` uses the OS default (about fifteen minutes).",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 0.0,
+              "max": null,
+              "step": 1.0
+            },
+            "default": 30,
+            "label": "Call the caller gone after this much silence",
+            "fromSpec": true
+          },
+          {
+            "name": "maxInboundMb",
+            "portType": "Number",
+            "required": false,
+            "description": "Largest request body in MB; bigger is answered 413. A `data:` URL inflates its bytes by about a third, so the default 16 fits roughly 12 MB of picture.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 1.0,
+              "max": null,
+              "step": 1.0
+            },
+            "default": 16,
+            "label": "Largest request body, in MB",
+            "fromSpec": true
+          },
+          {
+            "name": "whenChunkFails",
+            "portType": "String",
+            "required": false,
+            "description": "What happens when a Stream cannot turn one message into the route's `dataType` (a value that is not a String on a `text` route, a file it cannot read). `surface` (default): the Stream fails and the caller is told, with an error status if nothing was sent yet, the format's error marker after. `drop_chunk`: that message is skipped, noted on the run's record, and the stream goes on; pick it when one missing message is fine, like a frame of a live feed. A run that fails, or a bus that ends failed, is told to the caller either way.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "select",
+              "options": [
+                "surface",
+                "drop_chunk"
+              ]
+            },
+            "default": "surface",
+            "label": "When a message cannot be sent",
+            "fromSpec": true
+          },
+          {
+            "name": "whenCallerIsSlow",
+            "portType": "String",
+            "required": false,
+            "description": "What gives when a streamed answer is written faster than the caller reads it and the 256 chunks waiting for it fill up. `block` (default): the next write waits for room, so a slow caller slows the program and gets every chunk. `drop_oldest`: the oldest waiting chunk is thrown away, so the caller always gets the latest; pick it for live video or a price feed. `drop_newest`: the new chunk is thrown away and what was already waiting goes out in order. A dropped chunk never reaches the caller, so keep `block` for anything the caller must read whole.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "select",
+              "options": [
+                "block",
+                "drop_oldest",
+                "drop_newest"
+              ]
+            },
+            "default": "block",
+            "label": "When the caller reads slower than you send",
+            "fromSpec": true
+          },
+          {
+            "name": "callsPerMinutePerCaller",
+            "portType": "Number",
+            "required": false,
+            "description": "How many calls (a request, a new connection on a socket, a submitted form) one caller may make per minute, counted by the identity `auth` established, or by the caller's address when the entry is open. A call past it is refused with 429 and a `Retry-After`, before any run starts, so it costs nothing. Unset, 60; `0` is no limit, and any other number is yours to pick. With several copies of the program running, each counts the calls it takes and hears the others once a second.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 0.0,
+              "max": null,
+              "step": 1.0
+            },
+            "label": "Calls per minute from one caller",
+            "fromSpec": true
+          },
+          {
+            "name": "callsPerMinute",
+            "portType": "Number",
+            "required": false,
+            "description": "How many runs this trigger may start per minute, every caller and every event together. Unset, no limit. Set it when the run behind this trigger costs money (a paid model, an outside API), so a flood of calls or events cannot run up the bill. A call from outside past it is refused with 429 and a `Retry-After`; an event the trigger picked up itself (a schedule tick, a new message) past it waits in the trigger's queue and starts once a later minute has room.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 0.0,
+              "max": null,
+              "step": 1.0
+            },
+            "label": "Runs started per minute",
+            "fromSpec": true
+          },
+          {
+            "name": "callsAtOnce",
+            "portType": "Number",
+            "required": false,
+            "description": "How many runs this trigger may have going at the same time. Unset, 100; `0` is no limit. A call from outside past it is refused with 429 and a `Retry-After` until one of the runs ends; an event the trigger picked up itself waits until one ends.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 0.0,
+              "max": null,
+              "step": 1.0
+            },
+            "label": "Runs going at once",
+            "fromSpec": true
+          },
+          {
+            "name": "durable",
+            "portType": "Boolean",
+            "required": false,
+            "description": "Turn on if a run must carry on when its worker dies: another worker picks it up where it was, and a node that was running at that moment is failed rather than run twice (a pure node that had not passed a value on is run again instead). To make that possible, what the run did is written down before each node runs, except a pure one, and an answer before it leaves. Off (default): the run waits for its record only when it pauses or asks weft for something on its behalf, and if its worker dies mid-run the run ends cancelled and is not run again.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "checkbox"
+            },
+            "default": false,
+            "label": "Durable runs",
+            "fromSpec": true
+          },
+          {
+            "name": "recorded",
+            "portType": "Boolean",
+            "required": false,
+            "description": "Turn off for a route called every few seconds (a status a page polls). Off: no history of a run is kept. One that fails is listed in `weft runs` with its failure (which node, and why); one that reported a cost or asked weft for something its worker does not already hold (a stored file, a new connection or infrastructure address, a task such as starting or stopping its infra, a stop through `ctx.stop_tagged`) is listed with its costs and how it ended; any other leaves only a count in `weft status`. A run started by hand is always recorded. An unrecorded run cannot wait (timer, form), cannot tag itself, and cannot be durable.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "checkbox"
+            },
+            "default": true,
+            "label": "Record each run",
+            "fromSpec": true
+          },
+          {
+            "name": "keepRunsFor",
+            "portType": "String",
+            "required": false,
+            "description": "How long a run is kept once it ends, with its record, its logs, its search entry and its tags: a whole number and a unit (`30m`, `12h`, `7d`), or `forever`. Unset, as long as the project keeps runs (`[runs] keep_for` in `weft.toml`, a week when it says nothing). A run that has not ended (running, parked, or waiting for a worker) is never deleted, however old.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "label": "Keep runs for",
+            "fromSpec": true
+          },
+          {
+            "name": "holdSecs",
+            "portType": "Number",
+            "required": false,
+            "description": "How long, in seconds, a wait (a form, a timer) holds the run's worker when the run cannot pause: its caller is on the line and it does not outlive it, it is not recorded, or a bus between its nodes is open. The clock runs only while nothing moves in the run (no node working, nothing said on a bus), and starts over when something does. When it runs out, the waiting node fails, saying it gave up, and the node may handle that itself. `0` fails such a wait at once; at most 30 days.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 0.0,
+              "max": 2592000.0,
+              "step": 1.0
+            },
+            "default": 60,
+            "label": "Hold seconds when a run cannot pause",
+            "fromSpec": true
+          },
+          {
+            "name": "outlivesCaller",
+            "portType": "Boolean",
+            "required": false,
+            "description": "Off (default): the caller leaving cancels the run, and a wait holds the worker for `holdSecs` instead of pausing. On: the run can answer early and keep working after the caller has gone, so whatever runs after the answer must end by itself; anything that watches or loops needs `maxSessionSecs` or a TagRun/StopTagged pair. It needs `recorded` on, because on a cloud install the run carries on from its record once the caller leaves.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "checkbox"
+            },
+            "default": false,
+            "label": "May outlive the caller",
+            "fromSpec": true
+          },
+          {
+            "name": "journalEphemeral",
+            "portType": "Boolean",
+            "required": false,
+            "description": "On: the journal keeps only how many messages went by, how big they were and when, never what they said, so you cannot read them back when debugging either. Off (default): every message is recorded, trimmed above 100 KB. Raw bytes (audio, video) are never recorded, whichever you pick.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "checkbox"
+            },
+            "default": false,
+            "label": "Keep the messages out of the journal",
+            "fromSpec": true
+          },
+          {
+            "name": "journalWindowMs",
+            "portType": "Number",
+            "required": false,
+            "description": "How long, in milliseconds, the journal gathers messages into one record row. Every message sent within that time lands in the same row (a row also closes early once it holds 2 MB). Shorter (down to 100) gives a row per message on a slow channel and shows them in the inspector sooner; longer (up to 60000) writes fewer rows for a fast stream, like audio frames or tokens, and the inspector then trails the live channel by up to that long. Default 1000.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 100.0,
+              "max": 60000.0,
+              "step": 1.0
+            },
+            "default": 1000,
+            "label": "Group messages into one record every (ms)",
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "T__in___should_flow",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          }
+        ],
+        "outputs": [
+          {
+            "name": "fired",
+            "portType": "Boolean",
+            "required": true,
+            "description": "Always true on a call; gate work on \"the route was called\"."
+          },
+          {
+            "name": "method",
+            "portType": "String",
+            "required": true,
+            "description": "The HTTP method the caller used."
+          },
+          {
+            "name": "path",
+            "portType": "String",
+            "required": true,
+            "description": "Path as called, no leading slash (`users/42`)."
+          },
+          {
+            "name": "query",
+            "portType": "Dict[String, String]",
+            "required": true,
+            "description": "Query string parameters."
+          },
+          {
+            "name": "headers",
+            "portType": "Dict[String, String]",
+            "required": true,
+            "description": "Request headers, lowercase names."
+          },
+          {
+            "name": "caller",
+            "portType": "JsonDict | Null",
+            "required": true,
+            "description": "What the auth gate established: JWT claims, `{\"key\": <index>}` for an API key, `{}` for HMAC. Null with no `auth`."
+          },
+          {
+            "name": "body",
+            "portType": "{text?: String, ..}",
+            "required": true,
+            "description": "The request body, held to the type declared here: a record or `JsonDict` for `json`, `String` for `text`, a file kind for `bytes`. A body that does not fit is answered 400 naming the field. Closed when the request carries no body (a GET).",
+            "declaredType": "{ text?: String, .. }"
+          },
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          }
+        ],
+        "features": {
+          "canAddOutputPorts": true,
+          "addedPortsAreDataKeys": true,
+          "isTrigger": true,
+          "pure": true,
+          "liveConnection": "http"
+        },
+        "requiresInfra": false,
+        "firesWith": {
+          "baseUrl?": "String",
+          "body?": "JsonDict | String",
+          "caller?": "JsonDict",
+          "headers?": "List[List[String]]",
+          "method": "String",
+          "params?": "Dict[String, String]",
+          "path": "String",
+          "query?": "Dict[String, String]"
+        },
+        "span": {
+          "startLine": 3,
+          "startColumn": 0,
+          "endLine": 3,
+          "endColumn": 78
+        },
+        "headerSpan": {
+          "startLine": 3,
+          "startColumn": 0,
+          "endLine": 3,
+          "endColumn": 45
+        },
+        "portLiterals": {
+          "method": "POST",
+          "path": "hook"
+        },
+        "portLiteralSpans": {
+          "method": {
+            "span": {
+              "startLine": 3,
+              "startColumn": 62,
+              "endLine": 3,
+              "endColumn": 77
+            },
+            "origin": "inline"
+          },
+          "path": {
+            "span": {
+              "startLine": 3,
+              "startColumn": 48,
+              "endLine": 3,
+              "endColumn": 60
+            },
+            "origin": "inline"
+          }
+        }
+      },
+      {
+        "id": "show",
+        "nodeType": "ExecPython",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "code",
+            "portType": "String",
+            "required": true,
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "code",
+              "language": "python"
+            },
+            "label": "Python code",
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "T__in___should_flow",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "caller",
+            "portType": "JsonDict | Null",
+            "required": true,
+            "declaredType": "JsonDict | Null",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "textarea"
+            }
+          },
+          {
+            "name": "text",
+            "portType": "String",
+            "required": true,
+            "declaredType": "String",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            }
+          }
+        ],
+        "outputs": [
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          },
+          {
+            "name": "body",
+            "portType": "JsonDict",
+            "required": true,
+            "declaredType": "JsonDict"
+          }
+        ],
+        "features": {
+          "canAddInputPorts": true,
+          "canAddOutputPorts": true
+        },
+        "requiresInfra": false,
+        "span": {
+          "startLine": 5,
+          "startColumn": 0,
+          "endLine": 7,
+          "endColumn": 1
+        },
+        "headerSpan": {
+          "startLine": 5,
+          "startColumn": 0,
+          "endLine": 5,
+          "endColumn": 76
+        },
+        "portLiterals": {
+          "code": "return {'body': {'caller': caller, 'text': text}}"
+        },
+        "portLiteralSpans": {
+          "code": {
+            "span": {
+              "startLine": 6,
+              "startColumn": 2,
+              "endLine": 6,
+              "endColumn": 59
+            },
+            "origin": "inline"
+          }
+        }
+      },
+      {
+        "id": "answer",
+        "nodeType": "Reply",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "body",
+            "portType": "JsonDict",
+            "required": true,
+            "description": "Any value on json, a String on text, a stored file on bytes.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "answerAs",
+            "portType": "String",
+            "required": false,
+            "description": "`json`, `text` or `bytes`; empty follows the trigger's `dataType`. A GET answering a picture sets `bytes`. `redirect` (Route only) answers a file with a redirect to its link (302, or the 3xx `status` sets), so the browser fetches the file straight from where it is stored.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "select",
+              "options": [
+                "",
+                "json",
+                "text",
+                "bytes",
+                "redirect"
+              ]
+            },
+            "label": "Answer as",
+            "fromSpec": true
+          },
+          {
+            "name": "status",
+            "portType": "Number",
+            "required": false,
+            "description": "HTTP status (Route only).",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 100.0,
+              "max": 599.0,
+              "step": 1.0
+            },
+            "default": 200,
+            "label": "Status",
+            "fromSpec": true
+          },
+          {
+            "name": "headers",
+            "portType": "Dict[String, String]",
+            "required": false,
+            "description": "Extra response headers (Route only); a content-type here overrides the body's.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "T__in___should_flow",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          }
+        ],
+        "outputs": [
+          {
+            "name": "done",
+            "portType": "Boolean",
+            "required": true,
+            "description": "True once the message was handed to the caller. Absent when a Socket's message could not be made and its `whenChunkFails` skips it."
+          },
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          }
+        ],
+        "features": {
+          "pure": true,
+          "answersCaller": "whole"
+        },
+        "requiresInfra": false,
+        "span": {
+          "startLine": 10,
+          "startColumn": 0,
+          "endLine": 10,
+          "endColumn": 14
+        },
+        "headerSpan": {
+          "startLine": 10,
+          "startColumn": 0,
+          "endLine": 10,
+          "endColumn": 14
+        }
+      },
+      {
+        "id": "theirs",
+        "nodeType": "HmacAuth",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "account",
+            "portType": "Access",
+            "required": false,
+            "accepts": [
+              "literal"
+            ],
+            "widget": {
+              "kind": "access",
+              "service": "hmac_auth"
+            },
+            "label": "Secret",
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "T__in___should_flow",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          }
+        ],
+        "outputs": [
+          {
+            "name": "access",
+            "portType": "Access",
+            "required": true,
+            "description": "Wire into a Route's `auth`."
+          },
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          }
+        ],
+        "features": {},
+        "requiresInfra": false,
+        "perInstance": "filled",
+        "instanceService": {
+          "service": "hmac_auth",
+          "label": "Signing secret",
+          "grants": "coexisting",
+          "acquisition": {
+            "kind": "static",
+            "fields": [
+              {
+                "name": "signingSecret",
+                "label": "Signing secret",
+                "secret": true,
+                "placeholder": "the secret the caller signs with"
+              }
+            ]
+          },
+          "auth": [],
+          "identity": "Signing secret"
+        },
+        "instanceRules": {
+          "rules": [
+            {
+              "when": {
+                "kind": "not",
+                "of": {
+                  "kind": "value",
+                  "field": "account",
+                  "nonempty": true
+                }
+              },
+              "then": {
+                "message": "HmacAuth '{id}' has no Signing secret connection picked; connect one on the node.",
+                "level": "runtime",
+                "severity": "error",
+                "field": "account"
+              }
+            },
+            {
+              "when": {
+                "kind": "all",
+                "of": [
+                  {
+                    "kind": "value",
+                    "field": "account"
+                  },
+                  {
+                    "kind": "not",
+                    "of": {
+                      "kind": "value",
+                      "field": "account",
+                      "matches": "^a"
+                    }
+                  }
+                ]
+              },
+              "then": {
+                "message": "'{id}' account is odd",
+                "level": "structural",
+                "severity": "error",
+                "field": "account"
+              }
+            },
+            {
+              "when": {
+                "kind": "any",
+                "of": [
+                  {
+                    "kind": "value",
+                    "field": "account",
+                    "equals": "x"
+                  },
+                  {
+                    "kind": "value",
+                    "field": "account",
+                    "oneOf": [
+                      "a",
+                      "b"
+                    ]
+                  }
+                ]
+              },
+              "then": {
+                "message": "'{id}' account is taken",
+                "level": "runtime",
+                "severity": "error",
+                "field": "account"
+              }
+            }
+          ]
+        },
+        "span": {
+          "startLine": 12,
+          "startColumn": 0,
+          "endLine": 12,
+          "endColumn": 47
+        },
+        "headerSpan": {
+          "startLine": 12,
+          "startColumn": 0,
+          "endLine": 12,
+          "endColumn": 18
+        },
+        "portLiterals": {
+          "account": {
+            "__weft_instance_filled__": {}
+          }
+        },
+        "portLiteralSpans": {
+          "account": {
+            "span": {
+              "startLine": 12,
+              "startColumn": 20,
+              "endLine": 12,
+              "endColumn": 46
+            },
+            "origin": "inline"
+          }
+        }
+      },
+      {
+        "id": "db",
+        "nodeType": "PostgresDatabase",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "database",
+            "portType": "String",
+            "required": false,
+            "description": "Database created on first start. Changing it later creates nothing, and the connection then names a database that does not exist.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "default": "app",
+            "label": "Database name",
+            "fromSpec": true
+          },
+          {
+            "name": "storage",
+            "portType": "String",
+            "required": false,
+            "description": "Disk size, a number followed by Gi, Mi, G or M (10Gi). Read only at first creation: later changes do nothing; growing a live volume is manual, shrinking is impossible. A local install ignores it: the disk is a Docker volume, which has no size.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "default": "10Gi",
+            "label": "Disk size",
+            "fromSpec": true
+          },
+          {
+            "name": "version",
+            "portType": "String",
+            "required": false,
+            "description": "Postgres major version. Changing it on an existing database does not migrate: Postgres refuses a data directory from another major version.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "default": "17",
+            "label": "Postgres version",
+            "fromSpec": true
+          },
+          {
+            "name": "reachable",
+            "portType": "Boolean",
+            "required": false,
+            "description": "On: clients outside the program (a frontend, `psql`) may connect, at an address on the runtime's machine that `weft infra list-doors` prints (loopback only on a local install, never the internet; the password is still required). Off (default): reachable only inside the project.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "checkbox"
+            },
+            "default": false,
+            "label": "Reachable from this machine",
+            "fromSpec": true
+          },
+          {
+            "name": "cpu",
+            "portType": "String",
+            "required": false,
+            "description": "CPUs the machine sustains (`0.25`, `1`, `250m`). A cloud install picks its cheapest machine holding this and `memory`: a quarter CPU with 1Gi is Compute Engine's `e2-micro`, about $6 a month. A local install does not cap the container.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "default": "0.25",
+            "label": "CPUs",
+            "fromSpec": true
+          },
+          {
+            "name": "memory",
+            "portType": "String",
+            "required": false,
+            "description": "Memory, a number followed by Gi, Mi, G or M (`1Gi`). Sized with `cpu`; a local install does not cap the container.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "default": "1Gi",
+            "label": "Memory",
+            "fromSpec": true
+          },
+          {
+            "name": "machineType",
+            "portType": "String",
+            "required": false,
+            "description": "Last resort: a cloud's own machine type, used as is instead of the one picked from `cpu` and `memory` (`n2-standard-4` on Compute Engine). A local install ignores it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "label": "Machine type",
+            "placeholder": "picked from CPUs and memory",
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "T__in___should_flow",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          }
+        ],
+        "outputs": [
+          {
+            "name": "access",
+            "portType": "Access",
+            "required": true,
+            "description": "Wire into the Postgres query and write nodes, like a PostgresAccess node's. Baked: made when the database's infra is applied, so a run that reads only this output uses the saved connection and does not run this node."
+          },
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          }
+        ],
+        "features": {
+          "liveEndpoint": "credential"
+        },
+        "requiresInfra": true,
+        "images": [
+          "images/credential"
+        ],
+        "bakedOutputs": [
+          "access"
+        ],
+        "publishedService": {
+          "service": "postgres",
+          "label": "Postgres",
+          "grants": "coexisting",
+          "acquisition": {
+            "kind": "static",
+            "fields": [
+              {
+                "name": "host",
+                "label": "Host",
+                "secret": false,
+                "placeholder": "db.example.com"
+              },
+              {
+                "name": "port",
+                "label": "Port",
+                "optional": true,
+                "secret": false,
+                "placeholder": "5432"
+              },
+              {
+                "name": "database",
+                "label": "Database",
+                "secret": false,
+                "placeholder": "postgres"
+              },
+              {
+                "name": "user",
+                "label": "User",
+                "secret": false,
+                "placeholder": "postgres"
+              },
+              {
+                "name": "password",
+                "label": "Password",
+                "secret": true
+              },
+              {
+                "name": "sslmode",
+                "label": "TLS",
+                "optional": true,
+                "secret": false,
+                "placeholder": "require (or verify-ca / verify-full; disable turns TLS off)"
+              }
+            ]
+          },
+          "auth": [],
+          "identity": "{user}@{host}/{database}"
+        },
+        "span": {
+          "startLine": 13,
+          "startColumn": 0,
+          "endLine": 13,
+          "endColumn": 21
+        },
+        "headerSpan": {
+          "startLine": 13,
+          "startColumn": 0,
+          "endLine": 13,
+          "endColumn": 21
+        }
+      },
+      {
+        "id": "create",
+        "nodeType": "PostgresExecuteQuery",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "account",
+            "portType": "Access",
+            "required": true,
+            "description": "Wire a PostgresAccess, or a PostgresDatabase's access output.",
+            "accepts": [
+              "wire"
+            ],
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true,
+            "requiresValues": [
+              "host",
+              "database",
+              "user",
+              "password"
+            ]
+          },
+          {
+            "name": "query",
+            "portType": "String",
+            "required": true,
+            "description": "The SQL; each `$name` reads the inline-declared input port of that name.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "code",
+              "language": "sql"
+            },
+            "label": "SQL",
+            "placeholder": "SELECT * FROM users WHERE email = $email",
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "{text?: String, ..}",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          }
+        ],
+        "outputs": [
+          {
+            "name": "rows",
+            "portType": "List[JsonDict]",
+            "required": true,
+            "description": "Every row the query answered (the last statement's, for a script), keyed by column; `[]` when none. Declare `-> (rows: List[User])` to have each row checked against `User`."
+          },
+          {
+            "name": "row",
+            "portType": "JsonDict",
+            "required": true,
+            "description": "The first row, the same as the first of `rows`. Closes when the query answered none; declared `-> (row: User | Null)` it carries `null` instead."
+          },
+          {
+            "name": "count",
+            "portType": "Number",
+            "required": true,
+            "description": "Rows RETURNED (length of `rows`), not rows changed: a plain INSERT/UPDATE/DELETE gives 0; add `RETURNING id` to count them."
+          },
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          }
+        ],
+        "features": {
+          "canAddInputPorts": true,
+          "addedPortsAreDataKeys": true
+        },
+        "requiresInfra": false,
+        "span": {
+          "startLine": 14,
+          "startColumn": 0,
+          "endLine": 16,
+          "endColumn": 1
+        },
+        "headerSpan": {
+          "startLine": 14,
+          "startColumn": 0,
+          "endLine": 14,
+          "endColumn": 30
+        },
+        "portLiterals": {
+          "query": "CREATE TABLE IF NOT EXISTS notes (id serial primary key, body text)"
+        },
+        "portLiteralSpans": {
+          "query": {
+            "span": {
+              "startLine": 15,
+              "startColumn": 2,
+              "endLine": 15,
+              "endColumn": 78
+            },
+            "origin": "inline"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e-db-access-create-account",
+        "source": "db",
+        "target": "create",
+        "sourceHandle": "access",
+        "targetHandle": "account",
+        "span": {
+          "startLine": 17,
+          "startColumn": 0,
+          "endLine": 17,
+          "endColumn": 26
+        }
+      },
+      {
+        "id": "e-hook-body-create-_should_flow",
+        "source": "hook",
+        "target": "create",
+        "sourceHandle": "body",
+        "targetHandle": "_should_flow",
+        "span": {
+          "startLine": 18,
+          "startColumn": 0,
+          "endLine": 18,
+          "endColumn": 31
+        }
+      },
+      {
+        "id": "e-hook-body-show-text",
+        "source": "hook",
+        "target": "show",
+        "sourceHandle": "body",
+        "targetHandle": "text",
+        "path": [
+          "text"
+        ],
+        "span": {
+          "startLine": 9,
+          "startColumn": 0,
+          "endLine": 9,
+          "endColumn": 26
+        }
+      },
+      {
+        "id": "e-hook-caller-show-caller",
+        "source": "hook",
+        "target": "show",
+        "sourceHandle": "caller",
+        "targetHandle": "caller",
+        "span": {
+          "startLine": 8,
+          "startColumn": 0,
+          "endLine": 8,
+          "endColumn": 25
+        }
+      },
+      {
+        "id": "e-keys-access-hook-auth",
+        "source": "keys",
+        "target": "hook",
+        "sourceHandle": "access",
+        "targetHandle": "auth",
+        "span": {
+          "startLine": 4,
+          "startColumn": 0,
+          "endLine": 4,
+          "endColumn": 23
+        }
+      },
+      {
+        "id": "e-show-body-answer-body",
+        "source": "show",
+        "target": "answer",
+        "sourceHandle": "body",
+        "targetHandle": "body",
+        "span": {
+          "startLine": 11,
+          "startColumn": 0,
+          "endLine": 11,
+          "endColumn": 23
+        }
+      }
+    ],
+    "groups": [],
+    "createdAt": "2026-10-23T09:56:17.639936052Z",
+    "updatedAt": "2026-10-23T09:56:17.639936052Z"
+  },
+  {
+    "id": "00000000-0000-0000-0000-0000000000a2",
+    "nodes": [
+      {
+        "id": "keys",
+        "nodeType": "ApiKeyAuth",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "account",
+            "portType": "Access",
+            "required": false,
+            "accepts": [
+              "literal"
+            ],
+            "widget": {
+              "kind": "access",
+              "service": "api_key_auth"
+            },
+            "label": "Keys",
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "T__in___should_flow",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          }
+        ],
+        "outputs": [
+          {
+            "name": "access",
+            "portType": "Access",
+            "required": true,
+            "description": "Wire into a Route or Socket's `auth`."
+          },
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          }
+        ],
+        "features": {},
+        "requiresInfra": false,
+        "span": {
+          "startLine": 2,
+          "startColumn": 0,
+          "endLine": 2,
+          "endColumn": 17
+        },
+        "headerSpan": {
+          "startLine": 2,
+          "startColumn": 0,
+          "endLine": 2,
+          "endColumn": 17
+        },
+        "portLiterals": {
+          "account": {
+            "__weft_install_picked__": {}
+          }
+        }
+      },
+      {
+        "id": "hook",
+        "nodeType": "Route",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "path",
+            "portType": "String",
+            "required": false,
+            "description": "Path under the project's live URL: literal segments and `{name}` captures (`users/{id}`), or empty for the root address. No leading '/'. Two routes may overlap only when one is strictly more specific (`cards/count` beside `cards/{id}`); otherwise activation refuses the pair.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "label": "Path",
+            "fromSpec": true
+          },
+          {
+            "name": "method",
+            "portType": "String",
+            "required": false,
+            "description": "HTTP method served. Empty serves every method; another method on a served path gets 405.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "select",
+              "options": [
+                "",
+                "GET",
+                "POST",
+                "PUT",
+                "PATCH",
+                "DELETE",
+                "HEAD",
+                "OPTIONS"
+              ]
+            },
+            "label": "Method",
+            "fromSpec": true
+          },
+          {
+            "name": "dataType",
+            "portType": "String",
+            "required": false,
+            "description": "Body shape. `json`: the body is one JSON object on `body` (a record type or `JsonDict`); anything else is answered 400. `text`: the whole body is a String on `body` (declare `-> (body: String)`). `bytes`: the body is stored and its stored-file value lands on `body` (declare `File`, or `Image`, which is checked against the bytes). Reply and Stream answer in this shape unless their `answerAs` says otherwise.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "select",
+              "options": [
+                "json",
+                "text",
+                "bytes"
+              ]
+            },
+            "default": "json",
+            "label": "Body shape",
+            "fromSpec": true
+          },
+          {
+            "name": "auth",
+            "portType": "Access",
+            "required": false,
+            "description": "Auth access node (ApiKeyAuth, JwtAuth, HmacAuth, StandardWebhookAuth). Unwired, anyone with the URL may call. The established identity comes out on `caller`.",
+            "accepts": [
+              "wire"
+            ],
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "maxSessionSecs",
+            "portType": "Number",
+            "required": false,
+            "description": "Hard ceiling on one connection, no default: it cuts a healthy feed on the clock. Only for an `outlivesCaller` run that has nothing else ending it (TagRun/StopTagged is usually better).",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 1.0,
+              "max": null,
+              "step": 1.0
+            },
+            "label": "Give up on one connection after this long",
+            "fromSpec": true
+          },
+          {
+            "name": "callerSilenceSecs",
+            "portType": "Number",
+            "required": false,
+            "description": "Seconds the caller's machine may leave sent data unacknowledged before the caller counts as gone. Bounds silence, not call length: a present caller acks automatically, so hours-long feeds are untouched. Raise for clients whose link sleeps. `0` uses the OS default (about fifteen minutes).",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 0.0,
+              "max": null,
+              "step": 1.0
+            },
+            "default": 30,
+            "label": "Call the caller gone after this much silence",
+            "fromSpec": true
+          },
+          {
+            "name": "maxInboundMb",
+            "portType": "Number",
+            "required": false,
+            "description": "Largest request body in MB; bigger is answered 413. A `data:` URL inflates its bytes by about a third, so the default 16 fits roughly 12 MB of picture.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 1.0,
+              "max": null,
+              "step": 1.0
+            },
+            "default": 16,
+            "label": "Largest request body, in MB",
+            "fromSpec": true
+          },
+          {
+            "name": "whenChunkFails",
+            "portType": "String",
+            "required": false,
+            "description": "What happens when a Stream cannot turn one message into the route's `dataType` (a value that is not a String on a `text` route, a file it cannot read). `surface` (default): the Stream fails and the caller is told, with an error status if nothing was sent yet, the format's error marker after. `drop_chunk`: that message is skipped, noted on the run's record, and the stream goes on; pick it when one missing message is fine, like a frame of a live feed. A run that fails, or a bus that ends failed, is told to the caller either way.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "select",
+              "options": [
+                "surface",
+                "drop_chunk"
+              ]
+            },
+            "default": "surface",
+            "label": "When a message cannot be sent",
+            "fromSpec": true
+          },
+          {
+            "name": "whenCallerIsSlow",
+            "portType": "String",
+            "required": false,
+            "description": "What gives when a streamed answer is written faster than the caller reads it and the 256 chunks waiting for it fill up. `block` (default): the next write waits for room, so a slow caller slows the program and gets every chunk. `drop_oldest`: the oldest waiting chunk is thrown away, so the caller always gets the latest; pick it for live video or a price feed. `drop_newest`: the new chunk is thrown away and what was already waiting goes out in order. A dropped chunk never reaches the caller, so keep `block` for anything the caller must read whole.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "select",
+              "options": [
+                "block",
+                "drop_oldest",
+                "drop_newest"
+              ]
+            },
+            "default": "block",
+            "label": "When the caller reads slower than you send",
+            "fromSpec": true
+          },
+          {
+            "name": "callsPerMinutePerCaller",
+            "portType": "Number",
+            "required": false,
+            "description": "How many calls (a request, a new connection on a socket, a submitted form) one caller may make per minute, counted by the identity `auth` established, or by the caller's address when the entry is open. A call past it is refused with 429 and a `Retry-After`, before any run starts, so it costs nothing. Unset, 60; `0` is no limit, and any other number is yours to pick. With several copies of the program running, each counts the calls it takes and hears the others once a second.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 0.0,
+              "max": null,
+              "step": 1.0
+            },
+            "label": "Calls per minute from one caller",
+            "fromSpec": true
+          },
+          {
+            "name": "callsPerMinute",
+            "portType": "Number",
+            "required": false,
+            "description": "How many runs this trigger may start per minute, every caller and every event together. Unset, no limit. Set it when the run behind this trigger costs money (a paid model, an outside API), so a flood of calls or events cannot run up the bill. A call from outside past it is refused with 429 and a `Retry-After`; an event the trigger picked up itself (a schedule tick, a new message) past it waits in the trigger's queue and starts once a later minute has room.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 0.0,
+              "max": null,
+              "step": 1.0
+            },
+            "label": "Runs started per minute",
+            "fromSpec": true
+          },
+          {
+            "name": "callsAtOnce",
+            "portType": "Number",
+            "required": false,
+            "description": "How many runs this trigger may have going at the same time. Unset, 100; `0` is no limit. A call from outside past it is refused with 429 and a `Retry-After` until one of the runs ends; an event the trigger picked up itself waits until one ends.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 0.0,
+              "max": null,
+              "step": 1.0
+            },
+            "label": "Runs going at once",
+            "fromSpec": true
+          },
+          {
+            "name": "durable",
+            "portType": "Boolean",
+            "required": false,
+            "description": "Turn on if a run must carry on when its worker dies: another worker picks it up where it was, and a node that was running at that moment is failed rather than run twice (a pure node that had not passed a value on is run again instead). To make that possible, what the run did is written down before each node runs, except a pure one, and an answer before it leaves. Off (default): the run waits for its record only when it pauses or asks weft for something on its behalf, and if its worker dies mid-run the run ends cancelled and is not run again.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "checkbox"
+            },
+            "default": false,
+            "label": "Durable runs",
+            "fromSpec": true
+          },
+          {
+            "name": "recorded",
+            "portType": "Boolean",
+            "required": false,
+            "description": "Turn off for a route called every few seconds (a status a page polls). Off: no history of a run is kept. One that fails is listed in `weft runs` with its failure (which node, and why); one that reported a cost or asked weft for something its worker does not already hold (a stored file, a new connection or infrastructure address, a task such as starting or stopping its infra, a stop through `ctx.stop_tagged`) is listed with its costs and how it ended; any other leaves only a count in `weft status`. A run started by hand is always recorded. An unrecorded run cannot wait (timer, form), cannot tag itself, and cannot be durable.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "checkbox"
+            },
+            "default": true,
+            "label": "Record each run",
+            "fromSpec": true
+          },
+          {
+            "name": "keepRunsFor",
+            "portType": "String",
+            "required": false,
+            "description": "How long a run is kept once it ends, with its record, its logs, its search entry and its tags: a whole number and a unit (`30m`, `12h`, `7d`), or `forever`. Unset, as long as the project keeps runs (`[runs] keep_for` in `weft.toml`, a week when it says nothing). A run that has not ended (running, parked, or waiting for a worker) is never deleted, however old.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "label": "Keep runs for",
+            "fromSpec": true
+          },
+          {
+            "name": "holdSecs",
+            "portType": "Number",
+            "required": false,
+            "description": "How long, in seconds, a wait (a form, a timer) holds the run's worker when the run cannot pause: its caller is on the line and it does not outlive it, it is not recorded, or a bus between its nodes is open. The clock runs only while nothing moves in the run (no node working, nothing said on a bus), and starts over when something does. When it runs out, the waiting node fails, saying it gave up, and the node may handle that itself. `0` fails such a wait at once; at most 30 days.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 0.0,
+              "max": 2592000.0,
+              "step": 1.0
+            },
+            "default": 60,
+            "label": "Hold seconds when a run cannot pause",
+            "fromSpec": true
+          },
+          {
+            "name": "outlivesCaller",
+            "portType": "Boolean",
+            "required": false,
+            "description": "Off (default): the caller leaving cancels the run, and a wait holds the worker for `holdSecs` instead of pausing. On: the run can answer early and keep working after the caller has gone, so whatever runs after the answer must end by itself; anything that watches or loops needs `maxSessionSecs` or a TagRun/StopTagged pair. It needs `recorded` on, because on a cloud install the run carries on from its record once the caller leaves.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "checkbox"
+            },
+            "default": false,
+            "label": "May outlive the caller",
+            "fromSpec": true
+          },
+          {
+            "name": "journalEphemeral",
+            "portType": "Boolean",
+            "required": false,
+            "description": "On: the journal keeps only how many messages went by, how big they were and when, never what they said, so you cannot read them back when debugging either. Off (default): every message is recorded, trimmed above 100 KB. Raw bytes (audio, video) are never recorded, whichever you pick.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "checkbox"
+            },
+            "default": false,
+            "label": "Keep the messages out of the journal",
+            "fromSpec": true
+          },
+          {
+            "name": "journalWindowMs",
+            "portType": "Number",
+            "required": false,
+            "description": "How long, in milliseconds, the journal gathers messages into one record row. Every message sent within that time lands in the same row (a row also closes early once it holds 2 MB). Shorter (down to 100) gives a row per message on a slow channel and shows them in the inspector sooner; longer (up to 60000) writes fewer rows for a fast stream, like audio frames or tokens, and the inspector then trails the live channel by up to that long. Default 1000.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 100.0,
+              "max": 60000.0,
+              "step": 1.0
+            },
+            "default": 1000,
+            "label": "Group messages into one record every (ms)",
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "T__in___should_flow",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          }
+        ],
+        "outputs": [
+          {
+            "name": "fired",
+            "portType": "Boolean",
+            "required": true,
+            "description": "Always true on a call; gate work on \"the route was called\"."
+          },
+          {
+            "name": "method",
+            "portType": "String",
+            "required": true,
+            "description": "The HTTP method the caller used."
+          },
+          {
+            "name": "path",
+            "portType": "String",
+            "required": true,
+            "description": "Path as called, no leading slash (`users/42`)."
+          },
+          {
+            "name": "query",
+            "portType": "Dict[String, String]",
+            "required": true,
+            "description": "Query string parameters."
+          },
+          {
+            "name": "headers",
+            "portType": "Dict[String, String]",
+            "required": true,
+            "description": "Request headers, lowercase names."
+          },
+          {
+            "name": "caller",
+            "portType": "JsonDict | Null",
+            "required": true,
+            "description": "What the auth gate established: JWT claims, `{\"key\": <index>}` for an API key, `{}` for HMAC. Null with no `auth`."
+          },
+          {
+            "name": "body",
+            "portType": "{text?: String, ..}",
+            "required": true,
+            "description": "The request body, held to the type declared here: a record or `JsonDict` for `json`, `String` for `text`, a file kind for `bytes`. A body that does not fit is answered 400 naming the field. Closed when the request carries no body (a GET).",
+            "declaredType": "{ text?: String, .. }"
+          },
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          }
+        ],
+        "features": {
+          "canAddOutputPorts": true,
+          "addedPortsAreDataKeys": true,
+          "isTrigger": true,
+          "pure": true,
+          "liveConnection": "http"
+        },
+        "requiresInfra": false,
+        "firesWith": {
+          "baseUrl?": "String",
+          "body?": "JsonDict | String",
+          "caller?": "JsonDict",
+          "headers?": "List[List[String]]",
+          "method": "String",
+          "params?": "Dict[String, String]",
+          "path": "String",
+          "query?": "Dict[String, String]"
+        },
+        "span": {
+          "startLine": 3,
+          "startColumn": 0,
+          "endLine": 3,
+          "endColumn": 78
+        },
+        "headerSpan": {
+          "startLine": 3,
+          "startColumn": 0,
+          "endLine": 3,
+          "endColumn": 45
+        },
+        "portLiterals": {
+          "method": "POST",
+          "path": "hook"
+        },
+        "portLiteralSpans": {
+          "method": {
+            "span": {
+              "startLine": 3,
+              "startColumn": 62,
+              "endLine": 3,
+              "endColumn": 77
+            },
+            "origin": "inline"
+          },
+          "path": {
+            "span": {
+              "startLine": 3,
+              "startColumn": 48,
+              "endLine": 3,
+              "endColumn": 60
+            },
+            "origin": "inline"
+          }
+        }
+      },
+      {
+        "id": "show",
+        "nodeType": "ExecPython",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "code",
+            "portType": "String",
+            "required": true,
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "code",
+              "language": "python"
+            },
+            "label": "Python code",
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "T__in___should_flow",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "caller",
+            "portType": "JsonDict | Null",
+            "required": true,
+            "declaredType": "JsonDict | Null",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "textarea"
+            }
+          },
+          {
+            "name": "text",
+            "portType": "String",
+            "required": true,
+            "declaredType": "String",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            }
+          }
+        ],
+        "outputs": [
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          },
+          {
+            "name": "body",
+            "portType": "JsonDict",
+            "required": true,
+            "declaredType": "JsonDict"
+          }
+        ],
+        "features": {
+          "canAddInputPorts": true,
+          "canAddOutputPorts": true
+        },
+        "requiresInfra": false,
+        "span": {
+          "startLine": 5,
+          "startColumn": 0,
+          "endLine": 7,
+          "endColumn": 1
+        },
+        "headerSpan": {
+          "startLine": 5,
+          "startColumn": 0,
+          "endLine": 5,
+          "endColumn": 76
+        },
+        "portLiterals": {
+          "code": "return {'body': {'caller': caller, 'text': text}}"
+        },
+        "portLiteralSpans": {
+          "code": {
+            "span": {
+              "startLine": 6,
+              "startColumn": 2,
+              "endLine": 6,
+              "endColumn": 59
+            },
+            "origin": "inline"
+          }
+        }
+      },
+      {
+        "id": "answer",
+        "nodeType": "Reply",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "body",
+            "portType": "JsonDict",
+            "required": true,
+            "description": "Any value on json, a String on text, a stored file on bytes.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "answerAs",
+            "portType": "String",
+            "required": false,
+            "description": "`json`, `text` or `bytes`; empty follows the trigger's `dataType`. A GET answering a picture sets `bytes`. `redirect` (Route only) answers a file with a redirect to its link (302, or the 3xx `status` sets), so the browser fetches the file straight from where it is stored.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "select",
+              "options": [
+                "",
+                "json",
+                "text",
+                "bytes",
+                "redirect"
+              ]
+            },
+            "label": "Answer as",
+            "fromSpec": true
+          },
+          {
+            "name": "status",
+            "portType": "Number",
+            "required": false,
+            "description": "HTTP status (Route only).",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "number",
+              "min": 100.0,
+              "max": 599.0,
+              "step": 1.0
+            },
+            "default": 200,
+            "label": "Status",
+            "fromSpec": true
+          },
+          {
+            "name": "headers",
+            "portType": "Dict[String, String]",
+            "required": false,
+            "description": "Extra response headers (Route only); a content-type here overrides the body's.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "T__in___should_flow",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          }
+        ],
+        "outputs": [
+          {
+            "name": "done",
+            "portType": "Boolean",
+            "required": true,
+            "description": "True once the message was handed to the caller. Absent when a Socket's message could not be made and its `whenChunkFails` skips it."
+          },
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          }
+        ],
+        "features": {
+          "pure": true,
+          "answersCaller": "whole"
+        },
+        "requiresInfra": false,
+        "span": {
+          "startLine": 10,
+          "startColumn": 0,
+          "endLine": 10,
+          "endColumn": 14
+        },
+        "headerSpan": {
+          "startLine": 10,
+          "startColumn": 0,
+          "endLine": 10,
+          "endColumn": 14
+        }
+      },
+      {
+        "id": "theirs",
+        "nodeType": "HmacAuth",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "account",
+            "portType": "Access",
+            "required": false,
+            "accepts": [
+              "literal"
+            ],
+            "widget": {
+              "kind": "access",
+              "service": "hmac_auth"
+            },
+            "label": "Secret",
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "T__in___should_flow",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          }
+        ],
+        "outputs": [
+          {
+            "name": "access",
+            "portType": "Access",
+            "required": true,
+            "description": "Wire into a Route's `auth`."
+          },
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          }
+        ],
+        "features": {},
+        "requiresInfra": false,
+        "perInstance": "filled",
+        "instanceService": {
+          "service": "stripe_like",
+          "label": "Signing secret",
+          "grants": "coexisting",
+          "acquisition": {
+            "kind": "static",
+            "fields": [
+              {
+                "name": "signingSecret",
+                "label": "Signing secret",
+                "secret": true,
+                "placeholder": "the secret the caller signs with"
+              }
+            ]
+          },
+          "auth": [],
+          "identity": "Signing secret"
+        },
+        "instanceRules": {
+          "rules": [
+            {
+              "when": {
+                "kind": "not",
+                "of": {
+                  "kind": "value",
+                  "field": "account",
+                  "nonempty": true
+                }
+              },
+              "then": {
+                "message": "HmacAuth '{id}' has no Signing secret connection picked; connect one on the node.",
+                "level": "runtime",
+                "severity": "error",
+                "field": "account"
+              }
+            }
+          ]
+        },
+        "span": {
+          "startLine": 12,
+          "startColumn": 0,
+          "endLine": 12,
+          "endColumn": 47
+        },
+        "headerSpan": {
+          "startLine": 12,
+          "startColumn": 0,
+          "endLine": 12,
+          "endColumn": 18
+        },
+        "portLiterals": {
+          "account": {
+            "__weft_instance_filled__": {}
+          }
+        },
+        "portLiteralSpans": {
+          "account": {
+            "span": {
+              "startLine": 12,
+              "startColumn": 20,
+              "endLine": 12,
+              "endColumn": 46
+            },
+            "origin": "inline"
+          }
+        }
+      },
+      {
+        "id": "db",
+        "nodeType": "PostgresDatabase",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "database",
+            "portType": "String",
+            "required": false,
+            "description": "Database created on first start. Changing it later creates nothing, and the connection then names a database that does not exist.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "default": "app",
+            "label": "Database name",
+            "fromSpec": true
+          },
+          {
+            "name": "storage",
+            "portType": "String",
+            "required": false,
+            "description": "Disk size, a number followed by Gi, Mi, G or M (10Gi). Read only at first creation: later changes do nothing; growing a live volume is manual, shrinking is impossible. A local install ignores it: the disk is a Docker volume, which has no size.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "default": "10Gi",
+            "label": "Disk size",
+            "fromSpec": true
+          },
+          {
+            "name": "version",
+            "portType": "String",
+            "required": false,
+            "description": "Postgres major version. Changing it on an existing database does not migrate: Postgres refuses a data directory from another major version.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "default": "17",
+            "label": "Postgres version",
+            "fromSpec": true
+          },
+          {
+            "name": "reachable",
+            "portType": "Boolean",
+            "required": false,
+            "description": "On: clients outside the program (a frontend, `psql`) may connect, at an address on the runtime's machine that `weft infra list-doors` prints (loopback only on a local install, never the internet; the password is still required). Off (default): reachable only inside the project.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "checkbox"
+            },
+            "default": false,
+            "label": "Reachable from this machine",
+            "fromSpec": true
+          },
+          {
+            "name": "cpu",
+            "portType": "String",
+            "required": false,
+            "description": "CPUs the machine sustains (`0.25`, `1`, `250m`). A cloud install picks its cheapest machine holding this and `memory`: a quarter CPU with 1Gi is Compute Engine's `e2-micro`, about $6 a month. A local install does not cap the container.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "default": "0.25",
+            "label": "CPUs",
+            "fromSpec": true
+          },
+          {
+            "name": "memory",
+            "portType": "String",
+            "required": false,
+            "description": "Memory, a number followed by Gi, Mi, G or M (`1Gi`). Sized with `cpu`; a local install does not cap the container.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "default": "1Gi",
+            "label": "Memory",
+            "fromSpec": true
+          },
+          {
+            "name": "machineType",
+            "portType": "String",
+            "required": false,
+            "description": "Last resort: a cloud's own machine type, used as is instead of the one picked from `cpu` and `memory` (`n2-standard-4` on Compute Engine). A local install ignores it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "text"
+            },
+            "label": "Machine type",
+            "placeholder": "picked from CPUs and memory",
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "T__in___should_flow",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          }
+        ],
+        "outputs": [
+          {
+            "name": "access",
+            "portType": "Access",
+            "required": true,
+            "description": "Wire into the Postgres query and write nodes, like a PostgresAccess node's. Baked: made when the database's infra is applied, so a run that reads only this output uses the saved connection and does not run this node."
+          },
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          }
+        ],
+        "features": {
+          "liveEndpoint": "credential"
+        },
+        "requiresInfra": true,
+        "images": [
+          "images/credential"
+        ],
+        "bakedOutputs": [
+          "access"
+        ],
+        "publishedService": {
+          "service": "postgres",
+          "label": "Postgres",
+          "grants": "coexisting",
+          "acquisition": {
+            "kind": "static",
+            "fields": [
+              {
+                "name": "host",
+                "label": "Host",
+                "secret": false,
+                "placeholder": "db.example.com"
+              },
+              {
+                "name": "port",
+                "label": "Port",
+                "optional": true,
+                "secret": false,
+                "placeholder": "5432"
+              },
+              {
+                "name": "database",
+                "label": "Database",
+                "secret": false,
+                "placeholder": "postgres"
+              },
+              {
+                "name": "user",
+                "label": "User",
+                "secret": false,
+                "placeholder": "postgres"
+              },
+              {
+                "name": "password",
+                "label": "Password",
+                "secret": true
+              },
+              {
+                "name": "sslmode",
+                "label": "TLS",
+                "optional": true,
+                "secret": false,
+                "placeholder": "require (or verify-ca / verify-full; disable turns TLS off)"
+              }
+            ]
+          },
+          "auth": [],
+          "identity": "{user}@{host}/{database}"
+        },
+        "span": {
+          "startLine": 13,
+          "startColumn": 0,
+          "endLine": 13,
+          "endColumn": 21
+        },
+        "headerSpan": {
+          "startLine": 13,
+          "startColumn": 0,
+          "endLine": 13,
+          "endColumn": 21
+        }
+      },
+      {
+        "id": "create",
+        "nodeType": "PostgresExecuteQuery",
+        "label": null,
+        "config": {},
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "scope": [],
+        "groupBoundary": null,
+        "inputs": [
+          {
+            "name": "account",
+            "portType": "Access",
+            "required": true,
+            "description": "Wire a PostgresAccess, or a PostgresDatabase's access output.",
+            "accepts": [
+              "wire"
+            ],
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true,
+            "requiresValues": [
+              "host",
+              "database",
+              "user",
+              "password"
+            ]
+          },
+          {
+            "name": "query",
+            "portType": "String",
+            "required": true,
+            "description": "The SQL; each `$name` reads the inline-declared input port of that name.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "widget": {
+              "kind": "code",
+              "language": "sql"
+            },
+            "label": "SQL",
+            "placeholder": "SELECT * FROM users WHERE email = $email",
+            "fromSpec": true
+          },
+          {
+            "name": "_should_flow",
+            "portType": "{text?: String, ..}",
+            "required": false,
+            "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          },
+          {
+            "name": "_should_not_flow",
+            "portType": "T__in___should_not_flow",
+            "required": false,
+            "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+            "accepts": [
+              "literal",
+              "wire"
+            ],
+            "optional": true,
+            "widget": {
+              "kind": "textarea"
+            },
+            "fromSpec": true
+          }
+        ],
+        "outputs": [
+          {
+            "name": "rows",
+            "portType": "List[JsonDict]",
+            "required": true,
+            "description": "Every row the query answered (the last statement's, for a script), keyed by column; `[]` when none. Declare `-> (rows: List[User])` to have each row checked against `User`."
+          },
+          {
+            "name": "row",
+            "portType": "JsonDict",
+            "required": true,
+            "description": "The first row, the same as the first of `rows`. Closes when the query answered none; declared `-> (row: User | Null)` it carries `null` instead."
+          },
+          {
+            "name": "count",
+            "portType": "Number",
+            "required": true,
+            "description": "Rows RETURNED (length of `rows`), not rows changed: a plain INSERT/UPDATE/DELETE gives 0; add `RETURNING id` to count them."
+          },
+          {
+            "name": "_error",
+            "portType": "String",
+            "required": true,
+            "description": "Why the node failed, when this output is wired: the node then completes, unless it had already started a stream (a bus, a generator). Unwired, a failure stops the run."
+          }
+        ],
+        "features": {
+          "canAddInputPorts": true,
+          "addedPortsAreDataKeys": true
+        },
+        "requiresInfra": false,
+        "span": {
+          "startLine": 14,
+          "startColumn": 0,
+          "endLine": 16,
+          "endColumn": 1
+        },
+        "headerSpan": {
+          "startLine": 14,
+          "startColumn": 0,
+          "endLine": 14,
+          "endColumn": 30
+        },
+        "portLiterals": {
+          "query": "CREATE TABLE IF NOT EXISTS notes (id serial primary key, body text)"
+        },
+        "portLiteralSpans": {
+          "query": {
+            "span": {
+              "startLine": 15,
+              "startColumn": 2,
+              "endLine": 15,
+              "endColumn": 78
+            },
+            "origin": "inline"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e-db-access-create-account",
+        "source": "db",
+        "target": "create",
+        "sourceHandle": "access",
+        "targetHandle": "account",
+        "span": {
+          "startLine": 17,
+          "startColumn": 0,
+          "endLine": 17,
+          "endColumn": 26
+        }
+      },
+      {
+        "id": "e-hook-body-create-_should_flow",
+        "source": "hook",
+        "target": "create",
+        "sourceHandle": "body",
+        "targetHandle": "_should_flow",
+        "span": {
+          "startLine": 18,
+          "startColumn": 0,
+          "endLine": 18,
+          "endColumn": 31
+        }
+      },
+      {
+        "id": "e-hook-body-show-text",
+        "source": "hook",
+        "target": "show",
+        "sourceHandle": "body",
+        "targetHandle": "text",
+        "path": [
+          "text"
+        ],
+        "span": {
+          "startLine": 9,
+          "startColumn": 0,
+          "endLine": 9,
+          "endColumn": 26
+        }
+      },
+      {
+        "id": "e-hook-caller-show-caller",
+        "source": "hook",
+        "target": "show",
+        "sourceHandle": "caller",
+        "targetHandle": "caller",
+        "span": {
+          "startLine": 8,
+          "startColumn": 0,
+          "endLine": 8,
+          "endColumn": 25
+        }
+      },
+      {
+        "id": "e-keys-access-hook-auth",
+        "source": "keys",
+        "target": "hook",
+        "sourceHandle": "access",
+        "targetHandle": "auth",
+        "span": {
+          "startLine": 4,
+          "startColumn": 0,
+          "endLine": 4,
+          "endColumn": 23
+        }
+      },
+      {
+        "id": "e-show-body-answer-body",
+        "source": "show",
+        "target": "answer",
+        "sourceHandle": "body",
+        "targetHandle": "body",
+        "span": {
+          "startLine": 11,
+          "startColumn": 0,
+          "endLine": 11,
+          "endColumn": 23
+        }
+      }
+    ],
+    "groups": [],
+    "createdAt": "2026-10-23T09:56:17.639936052Z",
+    "updatedAt": "2026-10-23T09:56:17.639936052Z"
+  }
+]

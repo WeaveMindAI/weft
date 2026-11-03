@@ -4,7 +4,7 @@
 
 use serde_json::{json, Value};
 
-use weft::access::client::{get_json, required_str};
+use weft::access::client::{get_json, required_str, url};
 use weft::node::NodeOutput;
 use weft::WeftResult;
 
@@ -23,26 +23,18 @@ pub async fn file_meta(
     fields: &str,
     what: &str,
 ) -> WeftResult<Value> {
-    get_json(
-        http,
-        &format!(
-            "{API}/files/{}?fields={fields}&supportsAllDrives=true",
-            super::api::segment(file_id)
-        ),
-        what,
-    )
-    .await
+    let url = url(API, &["files", file_id])?.query("fields", fields).query("supportsAllDrives", true);
+    get_json(http, url.as_str(), what).await
 }
 
 /// The `{name, parents}` metadata body of a file-creating call (copy,
-/// upload): a blank name/folder input means "let Drive decide", the
-/// same skip-blank rule every optional text input follows.
+/// upload): an unset name or folder means "let Drive decide".
 pub fn file_metadata(name: Option<String>, folder: Option<String>) -> Value {
     let mut body = json!({});
-    if let Some(n) = name.filter(|n| !n.trim().is_empty()) {
+    if let Some(n) = name {
         body["name"] = json!(n);
     }
-    if let Some(f) = folder.filter(|f| !f.trim().is_empty()) {
+    if let Some(f) = folder {
         body["parents"] = json!([f]);
     }
     body
@@ -54,4 +46,20 @@ pub fn created_file_output(answer: &Value, what: &str) -> WeftResult<NodeOutput>
     Ok(NodeOutput::new()
         .set("fileId", required_str(answer, what, "id")?.to_string())
         .set("link", required_str(answer, what, "webViewLink")?.to_string()))
+}
+
+// This file is a package-level SHARED helper, not a node, so its unit
+// tests stay an ordinary `#[cfg(test)]` block.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A name and a folder ride the metadata part; an unset one is left
+    /// for Drive to decide.
+    #[test]
+    fn the_metadata_carries_what_was_given() {
+        assert_eq!(file_metadata(Some("a.txt".into()), Some("dest".into())), json!({ "name": "a.txt", "parents": ["dest"] }));
+        assert_eq!(file_metadata(Some("a.txt".into()), None), json!({ "name": "a.txt" }));
+    }
 }

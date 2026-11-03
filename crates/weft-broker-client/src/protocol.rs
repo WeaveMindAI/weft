@@ -2455,8 +2455,8 @@ pub const CALLER_VERIFY: BrokerCall = BrokerCall { path: "/v1/caller/verify", tw
 
 /// One caller of a live route, as the worker's door forwards it to the
 /// broker to check against the connection the route is gated by. The
-/// broker holds the connection (its `verify` recipe and its stored
-/// material); the door never sees a secret. The body is base64 (an
+/// route names the check (`verify`, its `auth`); the broker holds the
+/// connection's stored material; the door never sees a secret. The body is base64 (an
 /// HMAC scheme signs the exact bytes); a scheme that does not read it
 /// is handed an empty one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2468,6 +2468,9 @@ pub struct CallerVerifyRequest {
     pub for_instance: Option<weft_core::instance::InstanceScope>,
     pub access_id: String,
     pub service: String,
+    /// The check the route's `auth` names, run against the connection's
+    /// stored values.
+    pub verify: weft_core::access::events::VerifyKind,
     pub method: String,
     /// The path as called under the project (no tenant, no leading
     /// slash), for the broker's log.
@@ -4009,7 +4012,7 @@ mod supervisor_protocol_tests {
     #[test]
     fn to_routing_connection_auth_passes_config_through() {
         use weft_core::primitive::SignalAuth;
-        let cfg = json!({"access_id": "acc-1", "service": "api_key_auth"});
+        let cfg = json!({"access_id": "acc-1", "service": "api_key_auth", "verify": { "kind": "api_keys" }});
         let r = make_row(
             SignalSurfaceKind::PublicEntry,
             Some("/x"),
@@ -4029,6 +4032,7 @@ mod supervisor_protocol_tests {
             for_instance: None,
             access_id: "acc-1".into(),
             service: "hmac_auth".into(),
+            verify: serde_json::from_value(json!({ "kind": "api_keys" })).unwrap(),
             method: "POST".into(),
             path: "chat/room7".into(),
             url: Some("https://acme.example/p/chat/room7?v=1".into()),
@@ -4040,6 +4044,7 @@ mod supervisor_protocol_tests {
             v,
             json!({
                 "tenant": "alice", "access_id": "acc-1", "service": "hmac_auth",
+                "verify": { "kind": "api_keys" },
                 "method": "POST", "path": "chat/room7",
                 "url": "https://acme.example/p/chat/room7?v=1",
                 "headers": [["x-signature", "abc"], ["X-Signature", "def"]],
@@ -4050,7 +4055,7 @@ mod supervisor_protocol_tests {
         assert_eq!(back.path, "chat/room7");
         assert_eq!(back.headers.len(), 2, "a repeated header keeps every value");
         let bare: CallerVerifyRequest = serde_json::from_value(json!({
-            "tenant": "t", "access_id": "a", "service": "s", "method": "GET", "path": ""
+            "tenant": "t", "access_id": "a", "service": "s", "verify": { "kind": "api_keys" }, "method": "GET", "path": ""
         }))
         .unwrap();
         assert!(bare.headers.is_empty() && bare.url.is_none() && bare.body_b64.is_empty());

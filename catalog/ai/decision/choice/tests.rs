@@ -11,7 +11,6 @@ use super::{options, DecisionChoiceNode};
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::basic("a_list_of_names_is_options_with_nothing_written", options_from_names),
-        NodeTest::basic("fewer_than_two_or_repeated_options_are_refused", bad_options),
         NodeTest::fake("picks_one_option_with_each_probability", picks),
         NodeTest::fake("a_pick_outside_the_options_fails", pick_outside),
         NodeTest::fake("an_option_with_no_probability_fails", missing_probability),
@@ -22,25 +21,17 @@ pub fn tests() -> Vec<NodeTest> {
     ]
 }
 
-fn options_from_names() -> WeftResult<()> {
-    let written = options(json!(["red", "green"]))?;
-    assert_eq!(serde_json::Value::Object(written), json!({ "red": null, "green": null }));
-    let described = options(json!({ "red": "Warm.", "green": "Calm." }))?;
-    assert_eq!(serde_json::Value::Object(described), json!({ "red": "Warm.", "green": "Calm." }));
-    Ok(())
+/// The options as `written` would arrive on the input (its type holds it
+/// to a list of names or an object of name to description).
+fn read(written: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    options(serde_json::from_value(written).expect("options of the input's type"))
 }
 
-fn bad_options() -> WeftResult<()> {
-    let one = options(json!(["only"])).expect_err("one option").to_string();
-    assert!(one.contains("at least two"), "{one}");
-    let twice = options(json!(["a", "a"])).expect_err("a repeat").to_string();
-    assert!(twice.contains("`a` twice"), "{twice}");
-    let number = options(json!(["a", 2])).expect_err("a number").to_string();
-    assert!(number.contains("named by a string"), "{number}");
-    let lone = options(json!({ "only": "x" })).expect_err("one described option").to_string();
-    assert!(lone.contains("at least two"), "{lone}");
-    let neither = options(json!(3)).expect_err("neither a list nor an object").to_string();
-    assert!(neither.contains("takes a list of names or an object"), "{neither}");
+fn options_from_names() -> WeftResult<()> {
+    let written = read(json!(["red", "green"]));
+    assert_eq!(serde_json::Value::Object(written), json!({ "red": null, "green": null }));
+    let described = read(json!({ "red": "Warm.", "green": "Calm." }));
+    assert_eq!(serde_json::Value::Object(described), json!({ "red": "Warm.", "green": "Calm." }));
     Ok(())
 }
 

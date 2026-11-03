@@ -12,31 +12,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use weft::access::client::{get_json, post_json};
+use weft::access::client::{get_json, post_json, url};
 use weft::signal::{CancelCall, CancelWith, PollEndpoint, Predicate};
 use weft::{Access, Kept, NodeErrExt, WeftResult};
 
 pub const API: &str = "https://queue.fal.run";
-
-/// A model route is user-supplied text that becomes part of a URL:
-/// allow only the id shapes fal actually mints (at least the
-/// `owner/name` app pair, clean segments) so nothing can traverse out
-/// of the queue API and every model has an app to poll under.
-pub fn checked_model(model: &str) -> WeftResult<&str> {
-    let clean = |seg: &str| {
-        !seg.is_empty()
-            && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-            && !seg.starts_with('.')
-    };
-    let mut segs = model.split('/');
-    let ok = segs.next().is_some_and(clean) && segs.next().is_some_and(clean) && segs.all(clean);
-    if !ok {
-        return Err(weft::WeftError::Input(format!(
-            "'{model}' is not a fal model id (expected e.g. fal-ai/flux/dev)"
-        )));
-    }
-    Ok(model)
-}
 
 /// Where a queued request stands, the state of a node that runs one
 /// ([`run_queued`]): nothing yet, submitted (its id), or out of the queue
@@ -65,10 +45,12 @@ pub async fn run_queued(
     payload: &Value,
     what: &str,
 ) -> WeftResult<Value> {
-    let model = checked_model(model)?;
+    // The model is a route of the queue API, held to fal's id shape (at
+    // least the `owner/name` app pair) by every fal node's `model` rule.
+    let route: Vec<&str> = model.split('/').collect();
     let request_id = state
         .once(|s| &mut s.request_id, async |_| {
-            let submitted = post_json(http, &format!("{API}/{model}"), payload, what).await?;
+            let submitted = post_json(http, url(API, &route)?.as_str(), payload, what).await?;
             Ok(submitted["request_id"]
                 .as_str()
                 .node_err("fal: the submit answered no request_id")?
@@ -79,15 +61,14 @@ pub async fn run_queued(
     // The queue's request routes address the APP (`owner/name`), never a
     // variant subpath: a `fal-ai/flux/dev` submit is polled at
     // `fal-ai/flux/requests/...` (the full path answers 405).
-    let app: String =
-        model.split('/').take(2).collect::<Vec<_>>().join("/");
+    let request = url(API, &route[..2])?.segment("requests")?.segment(&request_id)?;
     // Resume on any status that is not in flight, so a status this node
     // does not know ends the wait and is refused below instead of
     // being waited on forever. Cancelling the run cancels the request
     // too: fal drops a queued one, and asks the runner to stop one in
     // progress (https://fal.ai/docs/model-apis/model-endpoints/queue).
     let poll = PollEndpoint {
-        url: format!("{API}/{app}/requests/{request_id}/status"),
+        url: request.clone().segment("status")?.into(),
         interval_secs: 5,
         access: Some(weft::primitive::AccessRef::from(account)),
         filters: vec![
@@ -96,7 +77,7 @@ pub async fn run_queued(
         ],
         ..Default::default()
     };
-    let cancel = CancelCall::put(format!("{API}/{app}/requests/{request_id}/cancel"));
+    let cancel = CancelCall::put(request.clone().segment("cancel")?);
     let status = state.wait(|s| &mut s.status, poll.cancel_with(cancel)).await?;
     match status.status.as_str() {
         "COMPLETED" => {}
@@ -106,7 +87,7 @@ pub async fn run_queued(
     // A failed generation still COMPLETES (the queue has no failed
     // status); the failure rides on the result body as `error` /
     // `error_type`, so read the body before trusting it.
-    let answer = get_json(http, &format!("{API}/{app}/requests/{request_id}"), what).await?;
+    let answer = get_json(http, request.as_str(), what).await?;
     if let Some(error) = answer["error"].as_str() {
         let kind = answer["error_type"].as_str().unwrap_or("no type");
         weft::node_bail!("fal failed {what} on {model}: {error} ({kind})");

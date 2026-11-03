@@ -128,6 +128,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     tables: &["infra_node", "infra_unit"],
     ddl: &[
         r#"CREATE TABLE IF NOT EXISTS infra_node (
+            -- The key the boot walks `health_rules_json`'s rows by when it
+            -- carries them to a newer shape: the natural key holds a
+            -- nullable `instance_id`, so it cannot be the primary key.
+            id                  BIGSERIAL PRIMARY KEY,
             project_id          UUID NOT NULL,
             node_id             TEXT NOT NULL,
             copy_id             TEXT NOT NULL DEFAULT '',

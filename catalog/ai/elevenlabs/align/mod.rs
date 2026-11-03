@@ -6,12 +6,12 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use weft::access::client::{json_call, Multipart};
+use weft::access::client::{json_call, url, Multipart, StoredBodyExt};
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::elevenlabs::{store_json, API};
+use super::elevenlabs::API;
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsAlignNode;
@@ -32,20 +32,12 @@ impl Node for ElevenLabsAlignNode {
         let transcript: String = ctx.inputs.get("transcript")?;
 
         let storage = ctx.storage(StorageScope::Run);
-        let (meta, bytes) = storage.get_bytes(&audio).await?;
-        let (content_type, body) = Multipart::form_data()
-            .text("text", &transcript)
-            .file("file", &meta.filename, &meta.mime_type, bytes)
-            .build();
+        let form = Multipart::form_data().text("text", &transcript).stored("file", storage.body(&audio).await?);
 
         let http = ctx.client(&account).await?;
-        let answer = json_call(
-            http.post(format!("{API}/forced-alignment"))
-                .header("content-type", content_type)
-                .body(body),
-            "align the transcript on ElevenLabs",
-        )
-        .await?;
+        let answer =
+            json_call(http.post(url(API, &["forced-alignment"])?.as_str()).multipart(form), "align the transcript on ElevenLabs")
+                .await?;
 
         // The answer's word list interleaves the spacing between words
         // as its own tokens; the file keeps the words alone.
@@ -72,7 +64,7 @@ impl Node for ElevenLabsAlignNode {
         // Each timed character weighs about 40 bytes as JSON, so a few
         // minutes of speech outgrow the 100 KB a wire carries: the
         // alignment always travels as a file.
-        let file = store_json(&ctx, &alignment, "alignment.json").await?;
+        let file = storage.put_json(&alignment, "alignment.json", None).await?;
         ctx.pulse_downstream(out.set("alignment", file)).await
     }
 }
