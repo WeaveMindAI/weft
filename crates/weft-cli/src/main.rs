@@ -1460,6 +1460,18 @@ enum InfraAction {
         #[arg(long, value_name = "id")]
         instance: Option<weft_core::instance::InstanceId>,
     },
+    /// Give a disk volume an older weft named without the install
+    /// (`wi-<node>-<hash>-<disk>`) to the install this command acts on.
+    /// For when a start refuses it because weft cannot tell whose data
+    /// it holds: two installs ran that infra on it, or it has no install
+    /// label. That install's next start of the infra copies the volume
+    /// into its own and removes it; every other install that ran it
+    /// starts that disk empty. A local install only.
+    TakeDisk {
+        /// The volume, as the refusal named it.
+        #[arg(value_name = "volume")]
+        volume: String,
+    },
     /// Print the current lifecycle state of each infra node.
     Status,
     /// Cancel in-flight infra work: halt claimed lifecycle commands
@@ -1843,6 +1855,7 @@ enum InfraRequest {
     Show(commands::infra_card::ShowArgs),
     Press(commands::infra_card::PressArgs),
     Rebake { node: String, instance: Option<weft_core::instance::InstanceId> },
+    TakeDisk { volume: String },
 }
 
 impl InfraAction {
@@ -1853,6 +1866,7 @@ impl InfraAction {
             InfraRequest::Show(args) => commands::infra_card::run_show(ctx, args).await,
             InfraRequest::Press(args) => commands::infra_card::run_press(ctx, args).await,
             InfraRequest::Rebake { node, instance } => commands::infra_card::run_rebake(ctx, &node, instance.as_ref()).await,
+            InfraRequest::TakeDisk { volume } => commands::infra_take_disk::run(ctx, &volume).await,
         }
     }
 
@@ -1890,6 +1904,7 @@ impl InfraAction {
                 return Ok(InfraRequest::Press(commands::infra_card::PressArgs { node, action, instance }));
             }
             InfraAction::Rebake { node, instance } => return Ok(InfraRequest::Rebake { node, instance }),
+            InfraAction::TakeDisk { volume } => return Ok(InfraRequest::TakeDisk { volume }),
         };
         Ok(InfraRequest::Lifecycle(verb, opts))
     }

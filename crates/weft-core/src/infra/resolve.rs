@@ -62,16 +62,30 @@ impl NodeRef {
     /// add a unit or volume name after it and stay under 63.
     // SYNC: the `wi-` prefix <-> deploy/terraform/gcp/machines.tf (the machine events' filter)
     pub fn resource_base(&self) -> String {
+        self.resource_base_within(None)
+    }
+
+    /// [`NodeRef::resource_base`] for a resource whose names other
+    /// installs share (a laptop's Docker daemon, which every install on it
+    /// uses): `scope`, the install, goes in after `wi-`, and the readable
+    /// part shortens so the name stays within the same 40 characters.
+    /// `None` is the plain one.
+    pub fn resource_base_within(&self, scope: Option<&str>) -> String {
         let digest = Sha256::digest(format!("{}|{}|{}", self.project, self.node, self.copy_id).as_bytes());
         let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
-        let mut readable: String = super::name_segment(&self.node).chars().take(20).collect();
+        let prefix = match scope {
+            Some(scope) => format!("wi-{scope}-"),
+            None => "wi-".to_string(),
+        };
+        let room = 40usize.saturating_sub(prefix.len() + hex.len() + 1).min(20);
+        let mut readable: String = super::name_segment(&self.node).chars().take(room).collect();
         while readable.ends_with('-') {
             readable.pop();
         }
         if readable.is_empty() {
-            format!("wi-{hex}")
+            format!("{prefix}{hex}")
         } else {
-            format!("wi-{readable}-{hex}")
+            format!("{prefix}{readable}-{hex}")
         }
     }
 }
@@ -591,5 +605,22 @@ mod tests {
         let mut other = node();
         other.copy_id = "i-2".into();
         assert_ne!(base, other.resource_base());
+    }
+
+    #[test]
+    fn a_scoped_resource_base_carries_its_scope_and_stays_as_short() {
+        let mut long = node();
+        long.node = "a-node-with-a-rather-long-name".into();
+        assert_eq!(long.resource_base_within(None), long.resource_base());
+        let one = long.resource_base_within(Some("resumab8d646"));
+        let two = long.resource_base_within(Some("default"));
+        assert!(one.starts_with("wi-resumab8d646-a-node"), "{one}");
+        assert!(one.len() <= 40 && two.len() <= 40, "{one} {two}");
+        assert_ne!(one, two);
+        // The same copy under any scope: the same digest at the end.
+        let tail = |s: &str| s.rsplit('-').next().unwrap().to_string();
+        assert_eq!(tail(&one), tail(&long.resource_base()));
+        // A scope never makes a name that starts the plain one's.
+        assert!(!one.starts_with(&format!("{}-", long.resource_base())));
     }
 }

@@ -468,6 +468,16 @@ what you want to keep:
   again. It asks for confirmation on a terminal; from your commands (no
   terminal, or `--json`) it needs `--yes`, which you pass only after the user
   confirmed.
+- **If a start refuses a disk volume an older weft named** (the error names
+  the volume and `weft infra take-disk`): two installs on this machine ran
+  that infra on one old volume, or it has no install label, so weft cannot
+  tell whose data it holds. Ask the user which install's data it is, then run
+  `weft infra take-disk <volume>` under that install (`WEFT_INSTALL=<name>`,
+  `default` for the default install) and start the infra again there: that
+  install copies the volume into its own, and every other install that ran it
+  starts that disk empty. Infra still running from before this naming
+  change keeps running with its doors unreachable, and a node calling it says
+  so: `weft infra stop`, then `weft infra start`, moves it over with its data.
 - **If a verb is stuck mid-way**: `weft infra cancel` stops it between
   steps; whatever it already did stays done.
 - **If a baked output went stale** (one marked `"baked": true`, which weft makes when the infra is applied and saves; it has nothing to do with `weft bake`), say a password reset whose report to weft never arrived: `weft infra rebake <node>` runs the node's infra setup again and saves those outputs. A run that reads nothing else from the node uses the saved values instead of running it, and a node that fails using a connection an infra node made names this command. If you changed what the node's code emits there, runs that skip the node keep getting the old saved value until it bakes again. If you want that without restarting anything, run `weft build` (or any `weft run`), then `weft infra rebake <node>`, which runs what was built last. `weft infra upgrade` also bakes again, but it replaces the running units to do it. For a `@per_instance` node, add `--instance <id>` for each copy.

@@ -1077,21 +1077,28 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                     WHERE v.fate = 'continue' AND r.run_id = v.id;
                 -- Each cost is named by its run's ordinal, which names the
                 -- run only when the run went in now: any other's costs go
-                -- nowhere.
-                PERFORM weft_record_costs(
-                    ARRAY(SELECT CASE WHEN v_fates[c.run] IN ('insert', 'continue') THEN p_ids[c.run] END
-                          FROM unnest(p_cost_run) WITH ORDINALITY AS c(run, n) ORDER BY c.n),
-                    p_cost_seq, p_cost_id, p_cost_idx, p_cost_node, p_cost_service, p_cost_model, p_cost_amount,
-                    p_cost_paid_by, p_cost_paid_by_instance, p_cost_at, p_cost_path_cost, p_cost_path_site);
+                -- nowhere. Called only when the batch carries costs: the
+                -- SQL function plans its query on every call, which a
+                -- durable run (one run per batch) paid on every write.
+                IF cardinality(p_cost_run) > 0 THEN
+                    PERFORM weft_record_costs(
+                        ARRAY(SELECT CASE WHEN v_fates[c.run] IN ('insert', 'continue') THEN p_ids[c.run] END
+                              FROM unnest(p_cost_run) WITH ORDINALITY AS c(run, n) ORDER BY c.n),
+                        p_cost_seq, p_cost_id, p_cost_idx, p_cost_node, p_cost_service, p_cost_model, p_cost_amount,
+                        p_cost_paid_by, p_cost_paid_by_instance, p_cost_at, p_cost_path_cost, p_cost_path_site);
+                END IF;
                 -- A run's secrets go in only when the run did, each once:
-                -- a batch sent again finds them there.
-                INSERT INTO run_secret (secret_id, project_id, run_id, sealed)
-                    SELECT s.id, r.project_id, r.run_id, s.sealed
-                    FROM unnest(p_secret_run, p_secret_id, p_secret_sealed) AS s(run, id, sealed)
-                        JOIN run r ON r.run_id = p_ids[s.run]
-                    WHERE v_fates[s.run] IN ('insert', 'continue')
-                    ORDER BY s.id
-                    ON CONFLICT (secret_id) DO NOTHING;
+                -- a batch sent again finds them there. Only when the batch
+                -- carries secrets, so a batch without any runs no statement.
+                IF cardinality(p_secret_run) > 0 THEN
+                    INSERT INTO run_secret (secret_id, project_id, run_id, sealed)
+                        SELECT s.id, r.project_id, r.run_id, s.sealed
+                        FROM unnest(p_secret_run, p_secret_id, p_secret_sealed) AS s(run, id, sealed)
+                            JOIN run r ON r.run_id = p_ids[s.run]
+                        WHERE v_fates[s.run] IN ('insert', 'continue')
+                        ORDER BY s.id
+                        ON CONFLICT (secret_id) DO NOTHING;
+                END IF;
                 INSERT INTO run_log (run_id, seq, events, events_version, writer, written_at)
                     SELECT p_ids[w.run], w.seq, w.events, p_events_version, p_writer, p_now
                     FROM unnest(p_row_run, p_row_seq, p_row_events) AS w(run, seq, events)

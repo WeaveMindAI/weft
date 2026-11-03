@@ -132,19 +132,57 @@ pub fn filter_args(labels: &[(&str, &str)]) -> Vec<String> {
 /// The containers of `install` matching every label, as `docker ps` lists
 /// them: one JSON object per line.
 pub async fn containers(docker: &dyn Docker, install: &str, labels: &[(&str, &str)]) -> anyhow::Result<Vec<ContainerRow>> {
+    let mut filter = vec![(labels::INSTALL, install)];
+    filter.extend_from_slice(labels);
+    everyones_containers(docker, &filter).await
+}
+
+/// The containers matching every label, whichever install made them:
+/// only for telling whether another install holds something, never for
+/// acting on it.
+pub async fn everyones_containers(docker: &dyn Docker, labels: &[(&str, &str)]) -> anyhow::Result<Vec<ContainerRow>> {
     let mut args = vec!["ps".to_string(), "--all".into(), "--no-trunc".into(), "--format".into(), "{{json .}}".into()];
-    args.extend(filter_args(&[(labels::INSTALL, install)]));
     args.extend(filter_args(labels));
     let out = run(docker, args).await?;
     out.lines().filter(|l| !l.trim().is_empty()).map(ContainerRow::parse).collect()
 }
 
+/// The volumes matching every label, whichever install made them: each
+/// one's name and labels.
+pub async fn everyones_volumes(docker: &dyn Docker, labels: &[(&str, &str)]) -> anyhow::Result<Vec<(String, BTreeMap<String, String>)>> {
+    let mut args = vec!["volume".to_string(), "ls".into(), "--format".into(), "{{json .}}".into()];
+    args.extend(filter_args(labels));
+    let out = run(docker, args).await?;
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let row = ContainerRow::parse(l)?;
+            let v: serde_json::Value = serde_json::from_str(l)?;
+            let name = v.get("Name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+            Ok((name, row.labels))
+        })
+        .collect()
+}
+
+/// The labels of the volume `name`, `None` when there is no such volume.
+pub async fn volume_labels(docker: &dyn Docker, name: &str) -> anyhow::Result<Option<BTreeMap<String, String>>> {
+    let args = vec!["volume".to_string(), "inspect".into(), "--format".into(), "{{json .Labels}}".into(), name.to_string()];
+    let out = docker.exec(&args).await?;
+    if !out.success() && out.stderr.to_lowercase().contains("no such volume") {
+        return Ok(None);
+    }
+    let printed = out.ok(&args)?;
+    let labels: Option<BTreeMap<String, String>> = serde_json::from_str(printed.trim())
+        .map_err(|e| anyhow::anyhow!("`docker volume inspect {name}` printed labels that are not JSON ({e}): {}", printed.trim()))?;
+    Ok(Some(labels.unwrap_or_default()))
+}
+
 /// The names of every container that mounts the volume `volume`, whoever
 /// made it.
-pub async fn containers_using(docker: &dyn Docker, volume: &str) -> anyhow::Result<Vec<String>> {
-    let args = vec!["ps".to_string(), "--all".into(), "--filter".into(), format!("volume={volume}"), "--format".into(), "{{.Names}}".into()];
+pub async fn containers_using(docker: &dyn Docker, volume: &str) -> anyhow::Result<Vec<ContainerRow>> {
+    let args = vec!["ps".to_string(), "--all".into(), "--filter".into(), format!("volume={volume}"), "--format".into(), "{{json .}}".into()];
     let out = run(docker, args).await?;
-    Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+    out.lines().filter(|l| !l.trim().is_empty()).map(ContainerRow::parse).collect()
 }
 
 /// When the container `name` last started (`State.StartedAt`, on the

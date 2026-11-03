@@ -24,6 +24,7 @@ pub mod daemon;
 pub mod infra;
 pub mod infra_card;
 pub mod infra_env;
+pub mod infra_take_disk;
 pub mod catalog;
 pub mod deps_install;
 pub mod describe_nodes;

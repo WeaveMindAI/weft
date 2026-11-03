@@ -71,7 +71,26 @@ can go inside it. A message's kind and JSON value come from the new
 and saying to start it again with `weft run --seed=<run>`, which reuses what
 it already did. Runs that are not paused are not affected.
 
+**Local infra is named after its install, so two installs on one machine
+running the same project no longer share a container or a database.**
+Before, they shared one name, so the second could not start, or started its
+database on the first one's data. Your local databases keep their data: the
+first time an install starts an infra node after this update, it copies each
+disk from its old volume into one under the new name, then removes the old
+volume. Infra still running from before keeps running, but weft can no longer
+reach its doors: a node calling it fails, saying to run `weft infra stop`
+then `weft infra start`, which moves it over. If two installs on the machine
+ran the same infra on one old volume, weft cannot tell whose data it holds, so
+the start refuses and names the command to settle it: `weft infra take-disk
+<volume>`, run under the install whose data it is. A start also refuses a
+volume that has this install's name but belongs to another install.
+
 **The rest:**
+
+**A durable run's record is written faster again.** Since costs and secrets
+got tables of their own, every write of a run's record paid for saving them
+even when it had none; it now does that work only when the run reported a
+cost or holds a secret.
 
 **A bus or a stream no longer keeps a run from pausing.** When every node
 waits and one of them waits on something outside the run (a timer, a form),

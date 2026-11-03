@@ -10,6 +10,9 @@
 //! another unit reaches the unit's ports; a project's worker, a process on
 //! the machine, reaches them where the agent publishes them (`Publish`).
 //!
+//! Every name carries the install on a laptop, where installs share one
+//! Docker daemon (`infra_names`).
+//!
 //! Disks are Docker volumes named after the copy, kept across stop and
 //! upgrade and removed by terminate (except those the node keeps on
 //! terminate, which carry the copy's labels, so the copy still shows in
@@ -32,6 +35,7 @@ use weft_core::ports::UNIT_AGENT;
 use weft_platform_traits::{EndpointAt, InfraHost, RestartCause, UnitObservation, UnitRestart, UnitRunState};
 
 use crate::docker::{self, labels, roles, ContainerRow, Docker};
+use crate::infra_names::{self, DiskLook, DiskPlan};
 
 /// Which part of a unit a container is.
 const PART: &str = "weft.part";
@@ -59,6 +63,9 @@ pub struct LocalInfraHostConfig {
     pub publish: Publish,
     /// The install these units belong to.
     pub install: weft_core::infra::Install,
+    /// Whether other installs share this Docker daemon, and so whether
+    /// every name carries the install (`infra_names::Names`).
+    pub names: infra_names::Names,
     /// How each unit's agent reaches the broker, to pass on what the
     /// unit's containers push (`weft_platform_traits::unit_agent::VALUES_PATH`).
     pub agent_broker: AgentBroker,
@@ -195,6 +202,7 @@ impl LocalInfraHost {
         let resolved = Self::unit(node, unit)?;
         let rows = self.unit_containers(&node.node, unit).await?;
         Ok(rows.len() == resolved.unit.containers.len() + 1
+            && !under_old_names(&self.cfg, &rows)
             && rows.iter().all(|c| c.label(labels::UNIT_HASH) == Some(resolved.hash.as_str()) && c.state == "running"))
     }
 
@@ -233,19 +241,9 @@ impl LocalInfraHost {
     }
 
     async fn volumes(&self, filter: &[(&str, &str)]) -> anyhow::Result<Vec<(String, BTreeMap<String, String>)>> {
-        let mut args = vec!["volume".to_string(), "ls".into(), "--format".into(), "{{json .}}".into()];
-        args.extend(docker::filter_args(&[(labels::INSTALL, self.cfg.install.label_value())]));
-        args.extend(docker::filter_args(filter));
-        let out = docker::run(self.docker.as_ref(), args).await?;
-        out.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| {
-                let row = ContainerRow::parse(l)?;
-                let v: serde_json::Value = serde_json::from_str(l)?;
-                let name = v.get("Name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
-                Ok((name, row.labels))
-            })
-            .collect()
+        let mut ours = vec![(labels::INSTALL, self.cfg.install.label_value())];
+        ours.extend_from_slice(filter);
+        docker::everyones_volumes(self.docker.as_ref(), &ours).await
     }
 
     async fn remove_volumes(&self, names: &[String]) -> anyhow::Result<()> {
@@ -263,44 +261,49 @@ impl LocalInfraHost {
         let r = &node.node;
         let name = &unit.unit.name;
         docker::ensure_network(self.docker.as_ref()).await?;
-        self.remove_unit_containers(r, name).await?;
 
         let mounted = mounted_volumes(unit);
         let mut scratch = Vec::new();
+        let mut disks = Vec::new();
         for v in node.spec.volumes.iter().filter(|v| mounted.contains(v.name.as_str())) {
             match &v.kind {
                 VolumeKind::Disk { .. } => match &self.cfg.disks {
-                    DiskBacking::Volumes => {
-                        docker::run(self.docker.as_ref(), volume_create_args(&self.cfg.install, r, name, &v.name, true)).await?;
-                    }
+                    // Planned before this install's containers go: the
+                    // ones from before names carried the install are what
+                    // says this install ran the copy on an old disk.
+                    DiskBacking::Volumes => disks.push((v.name.as_str(), self.plan_disk(r, &v.name).await?)),
                     DiskBacking::MountedUnder(root) => {
                         let at = root.join(&v.name);
                         anyhow::ensure!(at.is_dir(), "the disk '{}' of '{}' is not mounted at {}", v.name, r.node, at.display());
                     }
                 },
-                VolumeKind::Scratch { .. } => scratch.push(scratch_volume(r, name, &v.name)),
+                VolumeKind::Scratch { .. } => scratch.push(scratch_volume(&self.cfg, r, name, &v.name)),
             }
+        }
+        self.remove_unit_containers(r, name).await?;
+        for (volume, plan) in disks {
+            self.make_disk(r, name, volume, plan).await?;
         }
         // A unit's scratch space is fresh on every start, and only the
         // unit's own containers ever mount it, all removed just above: a
         // container still holding it is a leftover of an earlier start,
         // and would keep it in use, failing this start and every next one.
         for volume in &scratch {
-            let holders = docker::containers_using(self.docker.as_ref(), volume).await?;
+            let holders: Vec<String> = docker::containers_using(self.docker.as_ref(), volume).await?.into_iter().map(|c| c.name).collect();
             docker::remove_containers(self.docker.as_ref(), &holders).await?;
         }
         self.remove_volumes(&scratch).await?;
         for v in node.spec.volumes.iter().filter(|v| mounted.contains(v.name.as_str())) {
             if matches!(v.kind, VolumeKind::Scratch { .. }) {
-                docker::run(self.docker.as_ref(), volume_create_args(&self.cfg.install, r, name, &v.name, false)).await?;
+                docker::run(self.docker.as_ref(), volume_create_args(&self.cfg, r, name, &v.name, false)).await?;
             }
         }
         if let Some(gid) = unit.unit.fs_group {
-            let owned: Vec<String> = mounted.iter().map(|v| volume_name(node, name, v, &self.cfg.disks)).collect();
+            let owned: Vec<String> = mounted.iter().map(|v| volume_name(&self.cfg, node, name, v)).collect();
             docker::run(self.docker.as_ref(), own_args(&self.cfg, r, name, gid, &owned)).await?;
         }
 
-        let env_file = self.write_env_file(&format!("{}-agent", agent_name(r, name)), &self.cfg.agent_broker.env(r))?;
+        let env_file = self.write_env_file(&format!("{}-agent", agent_name(&self.cfg, r, name)), &self.cfg.agent_broker.env(r))?;
         let started = docker::run(self.docker.as_ref(), agent_args(node, unit, &env_file, &self.cfg)).await;
         let _ = std::fs::remove_file(&env_file);
         started.map_err(|e| e.context(format!("start the agent of unit '{name}' of '{}'", r.node)))?;
@@ -336,6 +339,98 @@ impl LocalInfraHost {
         Ok(())
     }
 
+    /// What to do with the disk `volume` of `node`'s copy, from what the
+    /// daemon shows (`infra_names::plan_disk`). Only a daemon other
+    /// installs share has disks named before names carried the install.
+    async fn plan_disk(&self, node: &NodeRef, volume: &str) -> anyhow::Result<DiskPlan> {
+        let infra_names::Names::PerInstall { claims } = &self.cfg.names else { return Ok(DiskPlan::Fresh) };
+        let d = self.docker.as_ref();
+        let owner = |l: BTreeMap<String, String>| l.get(labels::INSTALL).cloned();
+        let new_name = disk_volume(&self.cfg, node, volume);
+        let old_name = infra_names::old_disk(node, volume);
+        let copy = [(labels::COPY, node.copy_id.as_str())];
+        let mut holders = std::collections::BTreeSet::new();
+        let containers = docker::everyones_containers(d, &copy).await?.into_iter().map(|r| (r.name, r.labels));
+        for (name, l) in containers.chain(docker::everyones_volumes(d, &copy).await?) {
+            if name != old_name && infra_names::is_old_name(node, &name) {
+                holders.extend(owner(l));
+            }
+        }
+        let look = DiskLook {
+            install: self.cfg.install.label_value().to_string(),
+            new: docker::volume_labels(d, &new_name).await?.map(owner),
+            old: docker::volume_labels(d, &old_name).await?.map(owner),
+            holders,
+            claimed_by: crate::disk_claims::claimed_by(claims, &old_name)?,
+            new_name,
+            old_name,
+        };
+        Ok(infra_names::plan_disk(&look))
+    }
+
+    /// Carry out `plan` for the disk `volume` of `node`'s copy, once the
+    /// unit's own containers are gone.
+    async fn make_disk(&self, node: &NodeRef, unit: &str, volume: &str, plan: DiskPlan) -> anyhow::Result<()> {
+        let d = self.docker.as_ref();
+        let create = volume_create_args(&self.cfg, node, unit, volume, true);
+        match plan {
+            DiskPlan::Fresh => docker::run(d, create).await.map(|_| ()),
+            DiskPlan::Keep => Ok(()),
+            DiskPlan::Refuse(why) => anyhow::bail!("disk '{volume}' of '{}': {why}", node.node),
+            DiskPlan::CarryOver => {
+                let old = infra_names::old_disk(node, volume);
+                let new = disk_volume(&self.cfg, node, volume);
+                // This unit's containers of this install are gone, but
+                // another unit of this install, or another install that ran
+                // the copy before a `take-disk` gave the disk to this one,
+                // may still mount it: say whose, since only that install
+                // can stop them.
+                let users = docker::containers_using(d, &old).await?;
+                if !users.is_empty() {
+                    let mine = self.cfg.install.label_value();
+                    let held: Vec<String> = users
+                        .iter()
+                        .map(|c| match c.label(labels::INSTALL) {
+                            Some(install) if install == mine => format!("{} (this install: run `weft infra stop`, then `weft infra start`)", c.name),
+                            Some(install) => format!("{} (install '{install}': run `WEFT_INSTALL={install} weft infra stop` there)", c.name),
+                            None => format!("{} (no install: remove it with `docker rm -f {}`)", c.name, c.name),
+                        })
+                        .collect();
+                    anyhow::bail!(
+                        "disk '{volume}' of '{}': the volume {old} is still mounted, so it cannot be carried over to {new} \
+                         yet. Stop what mounts it, then start this infra again: {}",
+                        node.node,
+                        held.join("; ")
+                    );
+                }
+                // One there already is a carry-over cut short: start it over.
+                self.remove_volumes(std::slice::from_ref(&new)).await?;
+                docker::run(d, create).await?;
+                let mut l = base_labels(&self.cfg.install, node, unit);
+                l.insert(PART, PART_OWN.to_string());
+                let mut copy = vec!["run".to_string(), "--rm".into(), "--name".into(), format!("{}.carry", agent_name(&self.cfg, node, unit))];
+                copy.extend(docker::label_args(&l));
+                copy.extend([
+                    "--volume".into(),
+                    format!("{old}:/from:ro"),
+                    "--volume".into(),
+                    format!("{new}:/to"),
+                    "--entrypoint".into(),
+                    "sh".into(),
+                    self.cfg.agent_image.clone(),
+                    "-c".into(),
+                    "cp -a /from/. /to/".into(),
+                ]);
+                docker::run(d, copy)
+                    .await
+                    .map_err(|e| e.context(format!("copy the disk volume {old} into {new} (nothing was removed; starting the infra again tries again)")))?;
+                self.remove_volumes(std::slice::from_ref(&old)).await?;
+                let infra_names::Names::PerInstall { claims } = &self.cfg.names else { return Ok(()) };
+                crate::disk_claims::release(claims, &old)
+            }
+        }
+    }
+
     /// A container's environment: what its spec sets, and where it pushes
     /// the values that changed (`weft_core::infra::VALUES_URL_ENV`, the
     /// agent it shares a network with).
@@ -345,7 +440,7 @@ impl LocalInfraHost {
             weft_core::infra::VALUES_URL_ENV,
             format!("http://127.0.0.1:{UNIT_AGENT}{}", weft_platform_traits::unit_agent::VALUES_PATH),
         ));
-        self.write_env_file(&container_name(node, unit, &c.name), &vars)
+        self.write_env_file(&container_name(&self.cfg, node, unit, &c.name), &vars)
     }
 
     /// An environment file for the container `name`, readable by this
@@ -801,11 +896,22 @@ impl InfraHost for LocalInfraHost {
             }),
             EndpointTarget::Unit { unit, container, port } => {
                 let port = port_number(node, unit, container, port)?;
-                let agent = agent_name(&node.node, unit);
+                let agent = agent_name(&self.cfg, &node.node, unit);
                 let url = format!("http://{agent}:{port}");
                 let on_machine = match self.cfg.publish {
                     Publish::Loopback => {
-                        let printed = docker::run(self.docker.as_ref(), vec!["port".into(), agent.clone(), format!("{port}/tcp")]).await?;
+                        let printed = match docker::run(self.docker.as_ref(), vec!["port".into(), agent.clone(), format!("{port}/tcp")]).await {
+                            Ok(printed) => printed,
+                            Err(e) if under_old_names(&self.cfg, &self.unit_containers(&node.node, unit).await?) => {
+                                anyhow::bail!(
+                                    "the infra '{}' still runs under the names an older weft gave it, so its doors cannot be \
+                                     found: run `weft infra stop`, then `weft infra start`, to move it onto this weft's names \
+                                     (its disks stay and come along) ({e:#})",
+                                    node.node.node
+                                )
+                            }
+                            Err(e) => return Err(e),
+                        };
                         loopback(&printed)
                             .ok_or_else(|| anyhow::anyhow!("{agent} publishes no loopback port for {port}: {printed:?}"))?
                             .to_string()
@@ -870,40 +976,68 @@ impl InfraHost for LocalInfraHost {
     }
 }
 
-// ---------- names ----------
+// ---------- names (`infra_names`) ----------
 
-/// The unit's agent container: also the unit's name on the network.
-pub fn agent_name(node: &NodeRef, unit: &str) -> String {
-    format!("{}-{unit}", node.resource_base())
+fn base(cfg: &LocalInfraHostConfig, node: &NodeRef) -> String {
+    infra_names::base(&cfg.names, &cfg.install, node)
 }
 
-/// The volume-owning helper's name (`own_args`): beside the agent's, with
-/// a separator no container a spec declares can carry.
-fn own_name(node: &NodeRef, unit: &str) -> String {
-    format!("{}.own", agent_name(node, unit))
+fn agent_name(cfg: &LocalInfraHostConfig, node: &NodeRef, unit: &str) -> String {
+    infra_names::agent(&base(cfg, node), unit)
 }
 
-pub fn container_name(node: &NodeRef, unit: &str, container: &str) -> String {
-    format!("{}-{unit}-{container}", node.resource_base())
+fn own_name(cfg: &LocalInfraHostConfig, node: &NodeRef, unit: &str) -> String {
+    infra_names::own(&base(cfg, node), unit)
 }
 
-fn disk_volume(node: &NodeRef, volume: &str) -> String {
-    format!("{}-{volume}", node.resource_base())
+fn container_name(cfg: &LocalInfraHostConfig, node: &NodeRef, unit: &str, container: &str) -> String {
+    infra_names::container(&base(cfg, node), unit, container)
 }
 
-fn scratch_volume(node: &NodeRef, unit: &str, volume: &str) -> String {
-    format!("{}-{unit}-{volume}", node.resource_base())
+fn disk_volume(cfg: &LocalInfraHostConfig, node: &NodeRef, volume: &str) -> String {
+    infra_names::disk(&base(cfg, node), volume)
+}
+
+fn scratch_volume(cfg: &LocalInfraHostConfig, node: &NodeRef, unit: &str, volume: &str) -> String {
+    infra_names::scratch(&base(cfg, node), unit, volume)
 }
 
 /// What `docker --volume` names for `volume`: a Docker volume, or the
 /// directory a mounted disk is at.
-fn volume_name(node: &ResolvedNode, unit: &str, volume: &str, disks: &DiskBacking) -> String {
+fn volume_name(cfg: &LocalInfraHostConfig, node: &ResolvedNode, unit: &str, volume: &str) -> String {
     let is_disk = node.spec.volumes.iter().any(|v| v.name == volume && matches!(v.kind, VolumeKind::Disk { .. }));
-    match (is_disk, disks) {
-        (true, DiskBacking::Volumes) => disk_volume(&node.node, volume),
+    match (is_disk, &cfg.disks) {
+        (true, DiskBacking::Volumes) => disk_volume(cfg, &node.node, volume),
         (true, DiskBacking::MountedUnder(root)) => root.join(volume).display().to_string(),
-        (false, _) => scratch_volume(&node.node, unit, volume),
+        (false, _) => scratch_volume(cfg, &node.node, unit, volume),
     }
+}
+
+/// Whether any of `rows` (one unit's containers) has a name from before
+/// names carried the install: such a unit runs on as it was, its doors
+/// unreachable under this weft's names, until it starts again.
+fn under_old_names(cfg: &LocalInfraHostConfig, rows: &[ContainerRow]) -> bool {
+    matches!(cfg.names, infra_names::Names::PerInstall { .. })
+        && rows.iter().any(|r| node_of(&r.labels).is_some_and(|node| infra_names::is_old_name(&node, &r.name)))
+}
+
+/// The copy a container or volume of weft's belongs to, from its labels.
+fn node_of(l: &BTreeMap<String, String>) -> Option<NodeRef> {
+    Some(NodeRef {
+        tenant: l.get(labels::TENANT)?.clone(),
+        project: l.get(labels::PROJECT)?.parse().ok()?,
+        node: l.get(labels::NODE)?.clone(),
+        copy_id: l.get(labels::COPY)?.clone(),
+    })
+}
+
+/// The copy whose disk the volume `name` (with `labels`) is, when it is a
+/// disk named before names carried the install; `None` for anything else.
+pub fn old_disk_copy(name: &str, labels: &BTreeMap<String, String>) -> Option<NodeRef> {
+    let node = node_of(labels)?;
+    (labels.get(VOLUME_KIND).map(String::as_str) == Some("disk")
+        && labels.get(VOLUME).is_some_and(|volume| infra_names::old_disk(&node, volume) == name))
+    .then_some(node)
 }
 
 // ---------- pure translators ----------
@@ -929,15 +1063,15 @@ fn base_labels(install: &weft_core::infra::Install, node: &NodeRef, unit: &str) 
     l
 }
 
-fn volume_create_args(install: &weft_core::infra::Install, node: &NodeRef, unit: &str, volume: &str, disk: bool) -> Vec<String> {
-    let mut l = base_labels(install, node, unit);
+fn volume_create_args(cfg: &LocalInfraHostConfig, node: &NodeRef, unit: &str, volume: &str, disk: bool) -> Vec<String> {
+    let mut l = base_labels(&cfg.install, node, unit);
     l.insert(VOLUME, volume.to_string());
     l.insert(VOLUME_KIND, if disk { "disk" } else { "scratch" }.to_string());
     if disk {
         // A disk belongs to the copy, not to the unit that mounts it now.
         l.remove(labels::UNIT);
     }
-    let name = if disk { disk_volume(node, volume) } else { scratch_volume(node, unit, volume) };
+    let name = if disk { disk_volume(cfg, node, volume) } else { scratch_volume(cfg, node, unit, volume) };
     let mut args = vec!["volume".to_string(), "create".into()];
     args.extend(docker::label_args(&l));
     args.push(name);
@@ -955,7 +1089,7 @@ fn volume_create_args(install: &weft_core::infra::Install, node: &NodeRef, unit:
 fn own_args(cfg: &LocalInfraHostConfig, node: &NodeRef, unit: &str, gid: u32, volumes: &[String]) -> Vec<String> {
     let mut l = base_labels(&cfg.install, node, unit);
     l.insert(PART, PART_OWN.to_string());
-    let mut args = vec!["run".to_string(), "--rm".into(), "--name".into(), own_name(node, unit)];
+    let mut args = vec!["run".to_string(), "--rm".into(), "--name".into(), own_name(cfg, node, unit)];
     args.extend(docker::label_args(&l));
     let mut paths = Vec::new();
     for (i, v) in volumes.iter().enumerate() {
@@ -988,7 +1122,7 @@ fn all_ports(unit: &ResolvedUnit) -> Vec<u16> {
 /// the install's under the unit's name, and publishes its own port on
 /// loopback and the unit's ports as the machine publishes them.
 fn agent_args(node: &ResolvedNode, unit: &ResolvedUnit, env_file: &std::path::Path, cfg: &LocalInfraHostConfig) -> Vec<String> {
-    let name = agent_name(&node.node, &unit.unit.name);
+    let name = agent_name(cfg, &node.node, &unit.unit.name);
     let mut l = base_labels(&cfg.install, &node.node, &unit.unit.name);
     l.insert(labels::UNIT_HASH, unit.hash.clone());
     l.insert(PART, PART_AGENT.to_string());
@@ -1060,9 +1194,9 @@ fn container_args(
     }
     args.extend([
         "--name".into(),
-        container_name(&node.node, unit_name, &c.name),
+        container_name(cfg, &node.node, unit_name, &c.name),
         "--network".into(),
-        format!("container:{}", agent_name(&node.node, unit_name)),
+        format!("container:{}", agent_name(cfg, &node.node, unit_name)),
         "--env-file".into(),
         env_file.display().to_string(),
     ]);
@@ -1108,7 +1242,7 @@ fn container_args(
         }
     }
     for m in &c.mounts {
-        args.extend(["--mount".into(), mount_arg(node, unit_name, m, &cfg.disks)]);
+        args.extend(["--mount".into(), mount_arg(cfg, node, unit_name, m)]);
     }
     if let Some(first) = c.command.as_ref().and_then(|cmd| cmd.first()) {
         args.extend(["--entrypoint".into(), first.clone()]);
@@ -1138,8 +1272,8 @@ fn memory_cap(c: &Container) -> Result<Option<u64>, String> {
 
 /// `docker --mount` for one mount: a Docker volume (a sub-directory of it
 /// through `volume-subpath`), or a mounted disk's directory.
-fn mount_arg(node: &ResolvedNode, unit: &str, m: &weft_core::infra::Mount, disks: &DiskBacking) -> String {
-    let source = volume_name(node, unit, &m.volume, disks);
+fn mount_arg(cfg: &LocalInfraHostConfig, node: &ResolvedNode, unit: &str, m: &weft_core::infra::Mount) -> String {
+    let source = volume_name(cfg, node, unit, &m.volume);
     let is_bind = source.starts_with('/');
     let mut arg = match (is_bind, &m.sub_path) {
         (true, Some(sub)) => format!("type=bind,source={source}/{sub},target={}", m.path),
@@ -1234,16 +1368,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("weft-infra-test-{}", uuid::Uuid::new_v4().simple()));
         LocalInfraHostConfig {
             agent_image: "weft-runtime:t".into(),
-            scratch_dir: dir,
             gpu,
             disks: DiskBacking::Volumes,
             publish: Publish::Loopback,
             install: weft_core::infra::Install::default_install(),
+            names: infra_names::Names::PerInstall { claims: dir.join("claims") },
+            scratch_dir: dir,
             agent_broker: AgentBroker { url: "http://broker".into(), identity: AgentIdentity::Machine },
         }
     }
 
+    /// A host on `docker`, where a volume nothing scripted is not there.
+    /// Scripted answers go in before it, since the first rule that fits
+    /// answers.
     fn host(docker: Arc<FakeDocker>, gpu: bool) -> LocalInfraHost {
+        docker.fail(&["volume", "inspect"], "Error response from daemon: get x: no such volume");
         LocalInfraHost::new(docker, cfg(if gpu { GpuAccess::DockerGpus } else { GpuAccess::None }))
     }
 
@@ -1263,11 +1402,11 @@ mod tests {
         let unit = node.unit("main").unwrap();
         let c = &unit.unit.containers[0];
         let args = container_args(&node, unit, c, std::path::Path::new("/tmp/e.env"), ContainerRun::App, &cfg(GpuAccess::None)).unwrap();
-        let agent = agent_name(&node.node, "main");
+        let agent = agent_name(&cfg(GpuAccess::None), &node.node, "main");
         assert!(args.windows(2).any(|w| w == ["--network".to_string(), format!("container:{agent}")]));
         assert!(args.windows(2).any(|w| w == ["--entrypoint", "docker-entrypoint.sh"]));
         assert!(!args.iter().any(|a| a == "--memory" || a == "--memory-swap" || a == "--cpus"), "no limit, no cap: {args:?}");
-        assert!(args.windows(2).any(|w| w == ["--mount".to_string(), format!("type=volume,source={},target=/var/lib/postgresql", disk_volume(&node.node, "data"))]));
+        assert!(args.windows(2).any(|w| w == ["--mount".to_string(), format!("type=volume,source={},target=/var/lib/postgresql", disk_volume(&cfg(GpuAccess::None), &node.node, "data"))]));
         let at = args.iter().position(|a| a == "postgres:18").unwrap();
         assert_eq!(args[at + 1..], ["postgres", "-c", "fsync=off"], "the command's rest, then the args");
         assert!(!args.iter().any(|a| a.contains("s3cret")), "values stay off the command line");
@@ -1282,7 +1421,7 @@ mod tests {
         s.units[0].containers[0].limits = weft_core::infra::Limits { cpu: Some("2".into()), memory: Some("1G".into()) };
         let node = resolve(&s, &node_ref(), &BTreeMap::new()).unwrap();
         let unit = node.unit("main").unwrap();
-        let machine = LocalInfraHostConfig { gpu: GpuAccess::CosDriver, disks: DiskBacking::MountedUnder("/mnt/disks".into()), ..cfg(GpuAccess::None) };
+        let machine = LocalInfraHostConfig { gpu: GpuAccess::CosDriver, disks: DiskBacking::MountedUnder("/mnt/disks".into()), names: infra_names::Names::Machine, ..cfg(GpuAccess::None) };
         for on in [cfg(GpuAccess::None), machine] {
             let args = container_args(&node, unit, &unit.unit.containers[0], std::path::Path::new("/e"), ContainerRun::App, &on).unwrap();
             // 10^9 bytes is 953.67 MiB.
@@ -1323,7 +1462,7 @@ mod tests {
         assert_eq!(published, [&format!("127.0.0.1::{UNIT_AGENT}"), &"127.0.0.1::5432".to_string()]);
         assert_eq!(args[args.len() - 3..], ["weft-runtime:t", "unit-agent", "serve"]);
 
-        let machine = LocalInfraHostConfig { publish: Publish::AllPorts, ..cfg(GpuAccess::None) };
+        let machine = LocalInfraHostConfig { publish: Publish::AllPorts, names: infra_names::Names::Machine, ..cfg(GpuAccess::None) };
         let args = agent_args(&node, node.unit("main").unwrap(), std::path::Path::new("/e"), &machine);
         let published: Vec<&String> = args.windows(2).filter(|w| w[0] == "--publish").map(|w| &w[1]).collect();
         assert_eq!(published, [&format!("127.0.0.1::{UNIT_AGENT}"), &"5432:5432".to_string()], "a cloud machine publishes every port as is");
@@ -1386,7 +1525,7 @@ mod tests {
         s.units[0].machine.gpu = Some(weft_core::infra::Gpu { kind: "nvidia-l4".into(), count: 2 });
         let node = resolve(&s, &node_ref(), &BTreeMap::new()).unwrap();
         let unit = node.unit("main").unwrap();
-        let machine = LocalInfraHostConfig { gpu: GpuAccess::CosDriver, disks: DiskBacking::MountedUnder("/mnt/disks".into()), ..cfg(GpuAccess::None) };
+        let machine = LocalInfraHostConfig { gpu: GpuAccess::CosDriver, disks: DiskBacking::MountedUnder("/mnt/disks".into()), names: infra_names::Names::Machine, ..cfg(GpuAccess::None) };
         let args = container_args(&node, unit, &unit.unit.containers[0], std::path::Path::new("/e"), ContainerRun::App, &machine).unwrap();
         assert!(args.windows(2).any(|w| w == ["--device", "/dev/nvidia1:/dev/nvidia1"]));
         assert!(!args.windows(2).any(|w| w == ["--device", "/dev/nvidia2:/dev/nvidia2"]));
@@ -1403,7 +1542,7 @@ mod tests {
         let runs: Vec<String> = docker.calls_to("run").iter().map(|c| c[c.iter().position(|a| a == "--name").unwrap() + 1].clone()).collect();
         assert_eq!(
             runs,
-            [agent_name(&node.node, "main"), container_name(&node.node, "main", "init"), container_name(&node.node, "main", "pg")],
+            [agent_name(&cfg(GpuAccess::None), &node.node, "main"), container_name(&cfg(GpuAccess::None), &node.node, "main", "init"), container_name(&cfg(GpuAccess::None), &node.node, "main", "pg")],
             "agent, then init containers, then the containers"
         );
         assert_eq!(docker.calls_to("volume").iter().filter(|c| c[1] == "create").count(), 1, "the disk");
@@ -1414,11 +1553,67 @@ mod tests {
         };
         docker.answer(
             &["ps"],
-            &format!("{}\n{}\n", row(agent_name(&node.node, "main"), "agent"), row(container_name(&node.node, "main", "pg"), "app")),
+            &format!("{}\n{}\n", row(agent_name(&cfg(GpuAccess::None), &node.node, "main"), "agent"), row(container_name(&cfg(GpuAccess::None), &node.node, "main", "pg"), "app")),
         );
         let before = docker.calls_to("run").len();
         h.apply_unit(&node, "main").await.unwrap();
         assert_eq!(docker.calls_to("run").len(), before, "running as asked: nothing restarts");
+    }
+
+    /// A disk an older weft named without the install, which only this
+    /// install ran, is copied into this install's own volume before the
+    /// unit starts, and the old one goes once the copy is whole.
+    #[tokio::test]
+    async fn an_old_disk_this_install_ran_is_carried_over_before_the_unit_starts() {
+        let node = resolved();
+        let laptop = cfg(GpuAccess::None);
+        let old = infra_names::old_disk(&node.node, "data");
+        let new = disk_volume(&laptop, &node.node, "data");
+        let docker = Arc::new(FakeDocker::new());
+        docker.answer(&["volume", "inspect", "--format", "{{json .Labels}}", &old], r#"{"weft-install":"default"}"#);
+        host(docker.clone(), false).apply_unit(&node, "main").await.unwrap();
+
+        let calls = docker.calls();
+        let at = |call: &dyn Fn(&Vec<String>) -> bool, what: &str| calls.iter().position(call).unwrap_or_else(|| panic!("no {what} in {calls:?}"));
+        let created = at(&|c| c[..2] == ["volume", "create"] && c.last() == Some(&new), "volume create of the new disk");
+        let copied = at(&|c| c[0] == "run" && c.contains(&format!("{old}:/from:ro")) && c.contains(&format!("{new}:/to")), "copy");
+        let removed = at(&|c| c[..3] == ["volume", "rm", "--force"] && c.contains(&old), "removal of the old disk");
+        let agent = at(&|c| c[0] == "run" && c.contains(&agent_name(&laptop, &node.node, "main")), "agent start");
+        assert!(created < copied && copied < removed && removed < agent, "{calls:?}");
+    }
+
+    /// A disk `take-disk` gave this install while another install's old
+    /// container still mounts it: nothing is copied, and the refusal
+    /// says which install has to stop it.
+    #[tokio::test]
+    async fn a_taken_disk_another_install_still_mounts_names_that_install() {
+        let node = resolved();
+        let old = infra_names::old_disk(&node.node, "data");
+        let docker = Arc::new(FakeDocker::new());
+        docker.answer(&["volume", "inspect", "--format", "{{json .Labels}}", &old], r#"{"weft-install":"default"}"#);
+        docker.answer(
+            &["ps", "--all", "--filter", &format!("volume={old}")],
+            &format!("{}\n", r#"{"Names":"theirs","State":"running","Labels":"weft-install=other"}"#),
+        );
+        let h = host(docker.clone(), false);
+        let infra_names::Names::PerInstall { claims } = &h.cfg.names else { unreachable!() };
+        crate::disk_claims::claim(claims, &old, "default").unwrap();
+        let err = h.apply_unit(&node, "main").await.unwrap_err().to_string();
+        assert!(err.contains("theirs (install 'other': run `WEFT_INSTALL=other weft infra stop` there)"), "{err}");
+        assert!(docker.calls_to("run").is_empty(), "nothing copied or started");
+    }
+
+    /// A volume under this install's name that some other install made is
+    /// never started on.
+    #[tokio::test]
+    async fn a_volume_with_this_installs_name_but_not_its_own_stops_the_start() {
+        let node = resolved();
+        let new = disk_volume(&cfg(GpuAccess::None), &node.node, "data");
+        let docker = Arc::new(FakeDocker::new());
+        docker.answer(&["volume", "inspect", "--format", "{{json .Labels}}", &new], r#"{"weft-install":"other"}"#);
+        let err = host(docker.clone(), false).apply_unit(&node, "main").await.unwrap_err().to_string();
+        assert!(err.contains("belongs to install 'other'"), "{err}");
+        assert!(docker.calls_to("run").is_empty(), "nothing started");
     }
 
     /// The helper that hands a unit's volumes to its group is one of the
@@ -1432,9 +1627,9 @@ mod tests {
         s.units[0].containers[0].mounts.push(Mount::new("sock", "/var/run/postgresql"));
         s.volumes.push(Volume { name: "sock".into(), kind: VolumeKind::Scratch { size_limit: None } });
         let node = resolve(&s, &node_ref(), &BTreeMap::new()).unwrap();
-        let scratch = scratch_volume(&node.node, "main", "sock");
+        let scratch = scratch_volume(&cfg(GpuAccess::None), &node.node, "main", "sock");
         let docker = Arc::new(FakeDocker::new());
-        docker.answer(&["ps", "--all", "--filter", &format!("volume={scratch}")], "leftover\n");
+        docker.answer(&["ps", "--all", "--filter", &format!("volume={scratch}")], "{\"Names\":\"leftover\",\"State\":\"exited\",\"Labels\":\"\"}\n");
         host(docker.clone(), false).apply_unit(&node, "main").await.unwrap();
 
         let calls = docker.calls();
@@ -1442,7 +1637,7 @@ mod tests {
         assert!(at(&["rm", "--force", "leftover"]) < at(&["volume", "rm", "--force", &scratch]), "the holder goes before its volume");
 
         let own = docker.calls_to("run").into_iter().next().expect("the helper runs first");
-        assert!(own.windows(2).any(|w| w == ["--name".to_string(), own_name(&node.node, "main")]), "{own:?}");
+        assert!(own.windows(2).any(|w| w == ["--name".to_string(), own_name(&cfg(GpuAccess::None), &node.node, "main")]), "{own:?}");
         for label in [format!("{PART}={PART_OWN}"), format!("{}={}", labels::COPY, node.node.copy_id), format!("{}=main", labels::UNIT)] {
             assert!(own.windows(2).any(|w| w[0] == "--label" && w[1] == label), "{label} on {own:?}");
         }
