@@ -1,6 +1,3 @@
-# The provider protocol carries audio as base64 inside JSON frames;
-# the session's settings (model, format, language, ...) ride the
-# session URL's query string.
+# The provider protocol carries audio as base64 inside JSON frames.
 [dependencies]
 base64 = "0.23"
-urlencoding = "2"

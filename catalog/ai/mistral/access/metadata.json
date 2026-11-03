@@ -54,7 +54,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[mistral]",
       "widget": {
         "kind": "access"
       },
@@ -64,7 +64,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[mistral]",
       "description": "Wire into Parse Document's account input."
     }
   ]

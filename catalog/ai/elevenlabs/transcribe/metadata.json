@@ -21,7 +21,7 @@
     },
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[elevenlabs]", "accepts": ["wire"],
       "required": true,
       "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
     },
@@ -202,7 +202,7 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "commitStrategy", "equals": "manual" },
+          { "kind": "value", "field": "commitStrategy", "equals": "manual" },
           {
             "kind": "any",
             "of": [
@@ -223,8 +223,8 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "filterBackgroundAudio", "equals": true },
-          { "kind": "config_equals", "field": "includeTimestamps", "equals": true }
+          { "kind": "value", "field": "filterBackgroundAudio", "equals": true },
+          { "kind": "value", "field": "includeTimestamps", "equals": true }
         ]
       },
       "then": {
@@ -237,12 +237,51 @@
         "kind": "all",
         "of": [
           { "kind": "input_satisfied", "port": "transcriptEdit" },
-          { "kind": "input_satisfied", "port": "entityDetection" }
+          { "kind": "value", "field": "entityDetection", "nonempty": true }
         ]
       },
       "then": {
         "message": "ElevenLabsTranscribe '{id}' sets both `transcriptEdit` and `entityDetection`, and ElevenLabs refuses a session that asks for both: keep one of them.",
         "port": "transcriptEdit"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "value", "field": "transcriptEdit" },
+          {
+            "kind": "not",
+            "of": { "kind": "value", "field": "transcriptEdit", "length": { "max": 2000 } }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribe '{id}' has a `transcriptEdit` over 2000 characters, and ElevenLabs takes at most 2000: shorten it.",
+        "port": "transcriptEdit"
+      }
+    },
+    {
+      "when": { "kind": "value", "field": "keyterms", "count": { "min": 51 } },
+      "then": {
+        "message": "ElevenLabsTranscribe '{id}' lists more than 50 `keyterms`, and a realtime session takes at most 50: keep 50 or fewer.",
+        "port": "keyterms"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "value", "field": "keyterms" },
+          {
+            "kind": "not",
+            "of": { "kind": "value", "field": "keyterms", "each": { "length": { "max": 20 } } }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribe '{id}' has a keyterm over 20 characters, and a realtime session takes terms of at most 20: shorten it.",
+        "port": "keyterms"
       }
     }
   ],

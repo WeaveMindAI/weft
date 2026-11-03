@@ -3,6 +3,7 @@
 //! once instead of once per file. nextest still runs each test in its own
 //! process.
 
+mod access_types;
 mod broken_parts;
 mod computer_includes;
 mod enrich_tests;
@@ -19,6 +20,7 @@ mod parser_multiline_object;
 mod parser_tests;
 mod passthrough_include;
 mod per_instance;
+mod rechecks;
 mod rig;
 mod start_feeders;
 mod test_crate_emit;

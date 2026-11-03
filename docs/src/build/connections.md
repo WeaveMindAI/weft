@@ -43,7 +43,8 @@ weft connect
 
 Run it in the project folder, pick the node, and answer the prompts. `weft
 connect --list` prints what is already stored and changes nothing. `weft
-connect --node account` goes straight to one node. `--disconnect` clears a
+connect account` goes straight to one node: any node that takes a connection
+of its own, an access node or a route that checks its callers. `--disconnect` clears a
 node's pick and leaves the stored account alone, and `--forget <id>` deletes
 the stored account for good.
 

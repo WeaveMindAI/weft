@@ -1,6 +1,6 @@
 //! ElevenLabsDialogue self-tests: the request a script makes, the
-//! settings that travel only when set, the stored audio, and the
-//! refusals.
+//! settings that travel only when set, the stored audio, and how a
+//! refusal from ElevenLabs comes out.
 
 use serde_json::{json, Value};
 
@@ -15,7 +15,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_script_goes_as_lines_with_their_voices", script),
         NodeTest::fake("every_setting_reaches_the_request", every_setting),
         NodeTest::fake("the_shared_speech_settings_and_the_request_id", shared_settings),
-        NodeTest::fake("an_empty_script_is_refused_before_anything_is_sent", empty_script),
         NodeTest::fake("a_refused_dialogue_quotes_elevenlabs", refused),
         NodeTest::fake("a_refused_dialogue_comes_out_on_error_when_it_is_wired", refused_caught),
         NodeTest::live("one_real_two_line_dialogue_on_v4", "elevenlabs", live_dialogue),
@@ -134,15 +133,6 @@ async fn shared_settings(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(body["use_pvc_as_ivc"], json!(true));
     assert_eq!(body["audio_effects"], json!({ "environment_id": "small_room", "background_noise_id": "keyboard" }));
     assert_eq!(outcome.outputs["requestId"], json!("req-7"));
-    Ok(())
-}
-
-async fn empty_script(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    let err = rig.run(&ElevenLabsDialogueNode, inputs(&rig, json!({ "lines": [] }))).await.failure()?;
-    assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {err}");
-    assert!(err.contains("`lines` is empty"), "{err}");
-    assert!(rig.requests().is_empty(), "nothing is sent");
     Ok(())
 }
 

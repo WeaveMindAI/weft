@@ -18,14 +18,14 @@
         })
     }
 
-    fn registered(token: &str, call_index: u32) -> RunEvent {
+    fn registered(token: &str, wait_index: u32) -> RunEvent {
         RunEvent::SuspensionRegistered {
             run_id: run_id(),
             node_id: "n".into(),
             frames: vec![],
             token: token.into(),
             spec: spec(),
-            call_index,
+            wait_index,
             at_unix: 0,
         }
     }
@@ -35,9 +35,23 @@
             run_id: run_id(),
             node_id: "n".into(),
             frames: vec![],
-            token: token.into(),
+            token: Some(token.into()),
             at_unix: 0,
         }
+    }
+
+    /// `node` paused inside the run (no wait), its state saved first.
+    fn paused_in_run(node: &str) -> Vec<RunEvent> {
+        vec![
+            RunEvent::NodeStateSaved {
+                run_id: run_id(),
+                node_id: node.into(),
+                frames: vec![],
+                saved: weft_core::run::saved::SavedState { state: json!(null), positions: Default::default(), counters: Default::default(), helper: None },
+                at_unix: 0,
+            },
+            RunEvent::NodeSuspended { run_id: run_id(), node_id: node.into(), frames: vec![], token: None, at_unix: 0 },
+        ]
     }
 
     /// Multi-await body where the FIRST await resolved (and the body
@@ -139,11 +153,11 @@
         let mut pulses = PulseTable::default();
         let mut firings = NodeFiringTable::default();
         let mut kicked = weft_core::primitive::KickTable::new();
-        let mut awaited = HashMap::new();
+        let mut carried = Carried::default();
         let mut loops = LoopRuntime::new();
         let program = crate::plan::ProgramTables::new(project.clone());
         let crashed = apply_snapshot(
-            &program, snap, &mut pulses, &mut firings, &mut kicked, &mut ScopeTable::default(), &mut awaited, &mut loops,
+            &program, snap, &mut pulses, &mut firings, &mut kicked, &mut ScopeTable::default(), &mut carried, &mut loops,
             &mut weft_core::run::forget::Forgetting::new(),
         )
         .expect("the snapshot resumes");
@@ -221,7 +235,7 @@
         let mut firings = NodeFiringTable::default();
         apply_snapshot(
             &crate::plan::ProgramTables::new(project.clone()), snap, &mut pulses, &mut firings,
-            &mut weft_core::primitive::KickTable::new(), &mut ScopeTable::default(), &mut HashMap::new(), &mut LoopRuntime::new(),
+            &mut weft_core::primitive::KickTable::new(), &mut ScopeTable::default(), &mut Carried::default(), &mut LoopRuntime::new(),
             &mut weft_core::run::forget::Forgetting::new(),
         )
         .expect("the snapshot resumes")
@@ -286,6 +300,35 @@
             apply_stream(&crashed_running("producer")),
             vec![(FiringLocation::new("producer", vec![]), false)],
         );
+    }
+
+    /// A firing that saved a state said where it is: a dead worker left
+    /// it running, and it runs again from that state instead of failing,
+    /// a stream consumer included.
+    #[test]
+    fn a_crashed_firing_with_a_saved_state_runs_again() {
+        let mut events = crashed_running("consumer");
+        events.push(RunEvent::NodeStateSaved {
+            run_id: run_id(),
+            node_id: "consumer".into(),
+            frames: vec![],
+            saved: weft_core::run::saved::SavedState { state: json!({ "rows": 3 }), positions: Default::default(), counters: Default::default(), helper: None },
+            at_unix: 0,
+        });
+        assert!(apply_stream(&events).is_empty(), "it runs again from its saved state");
+    }
+
+    /// A firing that paused inside the run (no wait) carries on whenever
+    /// the run does: every worker that picks the run up runs it again.
+    #[test]
+    fn a_firing_paused_inside_the_run_redispatches() {
+        let (pid, mut events) = two_await_events();
+        let at = events.iter().position(|e| matches!(e, RunEvent::SuspensionRegistered { token, .. } if token == "t1")).expect("t1");
+        events.truncate(at);
+        events.extend(paused_in_run("n"));
+        let (pulses, firings, _) = apply(&events);
+        assert!(!taken(&pulses, "n", &pid), "a firing paused inside the run is dispatched again");
+        assert_eq!(firings.at("n", &vec![]).expect("its record").callback_id, None);
     }
 
     /// A LOOP BOUNDARY is runtime machinery whose re-fire is

@@ -1,7 +1,9 @@
 //! Stream self-tests: every bus message reaches the caller in order under
 //! the format's framing, the head rides the first chunk, the bus closing
 //! ends the HTTP response, a socket stays open, a bus that ended failed
-//! fails the exchange instead, and the pure framing.
+//! fails the exchange instead, and a message's files and secrets going
+//! out as a typed input's do. The framing
+//! itself is weft's (`weft::caller::Format`), tested there.
 
 use serde_json::json;
 
@@ -11,7 +13,6 @@ use weft::signal::DataType;
 use weft::{FakeRig, NodeTest, WeftResult};
 
 use super::StreamNode;
-use crate::framing::{ndjson_line, sse_event, Format};
 use crate::testing::{caller_skipping_unmade_chunks, http_caller, http_caller_without_body, ws_caller};
 use weft::signal::Protocol;
 
@@ -21,16 +22,13 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("raw_sends_payloads_as_they_are", raw_stream),
         NodeTest::fake("an_empty_bus_still_answers_with_the_head", empty_stream),
         NodeTest::fake("a_socket_gets_one_message_per_bus_message_and_stays_open", socket_stream),
-        NodeTest::basic("formats_parse_and_name_their_content_type", formats),
         NodeTest::fake("first_goes_out_ahead_of_the_bus", first_then_bus),
         NodeTest::fake("a_bus_that_broke_off_fails_the_answer_after_what_went_out", failed_mid_stream),
         NodeTest::fake("a_bus_that_broke_off_before_a_message_fails_with_nothing_sent", failed_before_a_message),
         NodeTest::fake("a_bus_that_broke_off_closes_a_socket_as_failed", failed_on_a_socket),
-        NodeTest::basic("sse_frames_text_per_line_and_json_whole", sse_framing),
-        NodeTest::basic("ndjson_is_one_json_value_per_line", ndjson_framing),
-        NodeTest::fake("a_redirect_is_a_replys_answer", redirect_refused),
         NodeTest::fake("a_message_it_cannot_send_fails_the_answer_or_is_skipped", unmade_message),
-        NodeTest::fake("a_secret_in_a_bus_message_fails_the_stream", secret_on_the_bus),
+        NodeTest::fake("a_secret_in_a_bus_message_goes_out_revealed", secret_on_the_bus),
+        NodeTest::fake("a_stored_file_in_a_bus_message_goes_out_as_a_link", file_on_the_bus),
         NodeTest::fake("a_secret_firsts_type_does_not_declare_fails_the_stream", undeclared_first),
     ]
 }
@@ -58,18 +56,6 @@ fn failed_bus(rig: &FakeRig, messages: &[serde_json::Value]) -> WeftResult<serde
     }
     bus.inner_arc().close(StreamEnd::Failed { error: "the model went away".into() });
     Ok(marker)
-}
-
-/// A redirect is one answer that ends the exchange, so a Stream refuses
-/// it and names the node that sends one; nothing goes out.
-async fn redirect_refused(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
-    rig.attach_caller(conn.clone());
-    let bus = closed_bus(&rig, &[json!("a")])?;
-    let err = rig.run(&StreamNode, json!({ "bus": bus, "answerAs": "redirect" })).await.failure()?;
-    assert!(err.contains("send it with a Reply"), "{err}");
-    assert!(conn.chunks().is_empty(), "{:?}", conn.chunks());
-    Ok(())
 }
 
 /// The deltas that went out stay sent; then the exchange FAILS, which the
@@ -231,33 +217,6 @@ async fn socket_stream(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-fn formats() -> WeftResult<()> {
-    assert_eq!(Format::parse("sse").map_err(weft::node_error)?, Format::Sse);
-    assert_eq!(Format::parse("ndjson").map_err(weft::node_error)?.content_type(), Some("application/x-ndjson"));
-    assert_eq!(Format::parse("raw").map_err(weft::node_error)?.content_type(), None);
-    assert!(Format::parse("xml").is_err());
-    // The filler a quiet stream writes is one a reader of the format
-    // drops: a comment event, an empty line; raw has none.
-    assert_eq!(Format::Sse.keepalive(), Some(": keepalive\n\n"));
-    assert_eq!(Format::Ndjson.keepalive(), Some("\n"));
-    assert_eq!(Format::Raw.keepalive(), None);
-    Ok(())
-}
-
-fn sse_framing() -> WeftResult<()> {
-    assert_eq!(sse_event(&json!("hel")), "data: hel\n\n");
-    assert_eq!(sse_event(&json!("two\nlines")), "data: two\ndata: lines\n\n");
-    assert_eq!(sse_event(&json!({ "a": 1 })), "data: {\"a\":1}\n\n");
-    assert_eq!(sse_event(&json!("")), "data: \n\n", "an empty delta is still an event");
-    Ok(())
-}
-
-fn ndjson_framing() -> WeftResult<()> {
-    assert_eq!(ndjson_line(&json!("hel")), "\"hel\"\n");
-    assert_eq!(ndjson_line(&json!({ "a": 1 })), "{\"a\":1}\n");
-    Ok(())
-}
-
 /// A message the caller's data type cannot carry (an object on a text
 /// route): by default the Stream fails after what already went out; a
 /// trigger set to skip such a chunk (`whenChunkFails: drop_chunk`) has it
@@ -293,18 +252,41 @@ async fn unmade_message(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// A bus carries no type, so a secret's marker in a message has nothing
-/// saying to reveal it: the node fails naming its place, after what went
-/// out before it, even behind a trigger that skips a message it cannot
-/// make.
+/// A bus declares no type, so a message's own markers give it one: a
+/// secret in it goes out revealed, as it does from an input typed
+/// `Secret`, and the run's record keeps its marker.
 async fn secret_on_the_bus(rig: FakeRig) -> WeftResult<()> {
-    let conn = caller_skipping_unmade_chunks(Protocol::Http, DataType::Json);
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
     rig.attach_caller(conn.clone());
     let token = rig.secret(json!("tok-7"));
     let bus = closed_bus(&rig, &[json!("a"), json!({ "token": token })])?;
-    let err = rig.run(&StreamNode, json!({ "bus": bus, "format": "ndjson" })).await.failure()?;
-    assert!(err.contains("a message on `bus` holds a secret at /token"), "{err}");
-    assert_eq!(conn.chunks(), vec![OutboundChunk::Text(ndjson_line(&json!("a")))]);
+    rig.run(&StreamNode, json!({ "bus": bus })).await.ok()?;
+    assert_eq!(
+        conn.chunks(),
+        vec![
+            OutboundChunk::Json(json!("a")),
+            OutboundChunk::Revealed { sent: Box::new(OutboundChunk::Json(json!({ "token": "tok-7" }))), kept: json!({ "token": token }) },
+        ]
+    );
+    Ok(())
+}
+
+/// A stored file in a message goes out as a link, as it does from an
+/// input typed as a file.
+async fn file_on_the_bus(rig: FakeRig) -> WeftResult<()> {
+    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
+    rig.attach_caller(conn.clone());
+    let file = rig.store_file("cat.png", "image/png", vec![1, 2, 3]);
+    let key = weft::storage::StoredFile::from_value(&file)?.key;
+    let bus = closed_bus(&rig, &[json!("a"), json!({ "photo": file })])?;
+    rig.run(&StreamNode, json!({ "bus": bus })).await.ok()?;
+    let link = json!({
+        "url": format!("{}/files/{key}?ttl={}", weft::node_test::FAKE_LINK_BASE, weft::storage::DEFAULT_LINK_SECS),
+        "mimeType": "image/png",
+        "filename": "cat.png",
+        "sizeBytes": 3,
+    });
+    assert_eq!(conn.chunks(), vec![OutboundChunk::Json(json!("a")), OutboundChunk::Json(json!({ "photo": link }))]);
     Ok(())
 }
 

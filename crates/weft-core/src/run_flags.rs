@@ -1,8 +1,8 @@
 //! The edits a person asks of a run by hand (`weft run --from ...`), and
 //! the spec they make: over a saved example, or over a whole run when
-//! there is none. Pure, so the CLI and the dispatcher (a program's
-//! `ctx.run()`, a run built from a saved example) read the same flags the
-//! same way.
+//! there is none. Pure, so the CLI and the dispatcher (a program's run
+//! call, `ctx.project(..).code().run()`, a run built from a saved
+//! example) read the same flags the same way.
 
 use std::collections::BTreeMap;
 
@@ -49,6 +49,10 @@ pub struct RunFlags {
     /// How long a wait holds while the run cannot pause (`--hold-secs`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hold_secs: Option<u32>,
+    /// How long the run stays quiet on its worker before it pauses
+    /// (`--pause-after-secs`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_after_secs: Option<u32>,
 }
 
 impl RunFlags {
@@ -66,6 +70,7 @@ impl RunFlags {
             && !self.fast
             && self.keep_for.is_none()
             && self.hold_secs.is_none()
+            && self.pause_after_secs.is_none()
     }
 }
 
@@ -129,7 +134,13 @@ pub fn apply_run_flags(base: &RunSpec, flags: &RunFlags) -> Result<RunSpec, Stri
             "keeping" => spec.settings.keeping = None,
             "keep_for" => spec.settings.keep_for = None,
             "hold_secs" => spec.settings.hold_secs = None,
-            _ => return Err(format!("--clear: unknown setting '{field}'; use from, emit, target, before, group, feed, fire, instance, keeping, keep_for, or hold_secs")),
+            "pause_after_secs" => spec.settings.pause_after_secs = None,
+            _ => {
+                return Err(format!(
+                    "--clear: unknown setting '{field}'; use from, emit, target, before, group, feed, fire, instance, keeping, \
+                     keep_for, hold_secs, or pause_after_secs"
+                ))
+            }
         }
     }
     if !flags.from.is_empty() {
@@ -170,6 +181,10 @@ pub fn apply_run_flags(base: &RunSpec, flags: &RunFlags) -> Result<RunSpec, Stri
         RunSettings::default().holding_for(secs)?;
         spec.settings.hold_secs = Some(secs);
     }
+    if let Some(secs) = flags.pause_after_secs {
+        RunSettings::default().pausing_after(secs)?;
+        spec.settings.pause_after_secs = Some(secs);
+    }
     for (node, ports) in parse_port_flags(&flags.emit, "--emit", false)? {
         spec.emit.entry(node).or_default().extend(ports);
     }
@@ -194,12 +209,13 @@ mod tests {
             durable: true,
             keep_for: Some(KeepFor::Forever),
             hold_secs: Some(30),
+            pause_after_secs: Some(0),
             ..RunFlags::default()
         };
         let wire = serde_json::to_value(&flags).unwrap();
         assert_eq!(
             wire,
-            json!({ "from": [r#"a={"in":1}"#], "group": "batch", "instance": "acme", "durable": true, "keepFor": "forever", "holdSecs": 30 })
+            json!({ "from": [r#"a={"in":1}"#], "group": "batch", "instance": "acme", "durable": true, "keepFor": "forever", "holdSecs": 30, "pauseAfterSecs": 0 })
         );
         assert_eq!(serde_json::from_value::<RunFlags>(wire).unwrap(), flags);
         assert_eq!(serde_json::from_value::<RunFlags>(json!({})).unwrap(), RunFlags::default());
@@ -310,6 +326,18 @@ mod tests {
         assert!(cleared.settings.is_empty(), "cleared, the run holds as its trigger says");
         let too_long = crate::run_settings::MAX_HOLD_SECS + 1;
         assert!(spec_from_flags("case", &RunFlags { hold_secs: Some(too_long), ..Default::default() }).is_err());
+    }
+
+    #[test]
+    fn pause_after_secs_is_saved_with_the_spec_checked_and_cleared_on_request() {
+        let spec = spec_from_flags("case", &RunFlags { pause_after_secs: Some(0), ..Default::default() }).unwrap();
+        assert_eq!(spec.settings.pause_after_secs, Some(0));
+        let saved: RunSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(saved.settings, spec.settings, "a saved example keeps it");
+        let cleared = apply_run_flags(&saved, &RunFlags { clear: vec!["pause_after_secs".into()], ..Default::default() }).unwrap();
+        assert!(cleared.settings.is_empty(), "cleared, the run pauses as its trigger says");
+        let too_long = crate::run_settings::MAX_PAUSE_AFTER_SECS + 1;
+        assert!(spec_from_flags("case", &RunFlags { pause_after_secs: Some(too_long), ..Default::default() }).is_err());
     }
 
     #[test]

@@ -70,11 +70,26 @@ does that). An asset lives as long as a version of the project still names it
 | `put(bytes, mime, filename, keep)` | You have the bytes |
 | `put_stream(stream, mime, filename, keep)` | You do not want the whole file in memory |
 | `put_response(resp, what, mime, filename, keep)` | You already made an authenticated request and want its body |
-| `put_from_url(url, filename, keep)` | A plain URL, fetched straight in |
+| `put_json(&value, filename, keep)` | A value too big for a wire (a transcript, a conversation), stored as `application/json` |
+| `put_from_url(url, mime, filename, keep)` | A plain URL, fetched straight in (`mime` None takes the type the server says) |
 | `copy(&file, keep)` | A file that already exists, into this scope |
 
 Every one of these makes a new file under a fresh key, so two puts never
 collide, whatever their filenames.
+
+If you know a download's type better than its server does (a provider that
+serves every file as `application/octet-stream`), pass it as `put_from_url`'s
+`mime` and it wins over what the server says. With no `filename`, the name
+comes from the response, else from the URL. If your node names a file after a
+URL itself, `storage::filename_from_url(url)` gives the last part of its path
+(`talk.mp4` in `https://cdn.example.com/v/talk.mp4?sig=1`), or `download.bin`
+when the path names nothing, and `storage::name_in_url(url)` gives `None`
+there instead, so you can pick your own fallback.
+
+If the run is cancelled, `put`, `put_stream`, `put_json` and `put_response`
+end with the cancelled error on their own and nothing is stored. So do the
+reads below (`get`, `get_range`, `get_bytes`, `body`), chunk by chunk (go and read
+[cancelling](ctx.md#when-the-run-is-cancelled)).
 
 ### Changing a file in place
 
@@ -162,8 +177,42 @@ takes one file and is received once, and an upload nobody received within
 | `get(&file)` | The bytes, as a stream |
 | `get_range(&file, range)` | Part of them |
 | `get_bytes(&file)` | The whole thing in memory. Small files only |
+| `body(&file)` | A request body that streams the file out of storage (see below) |
 | `list()` | Everything in this scope |
 | `delete(&file)` | Gone. Stored files only, not URL-backed ones. In a program, the `DeleteFile` node does the same |
+
+### Sending a stored file to a provider
+
+If you are uploading a stored file to a service, send it as a streamed body
+instead of reading it into memory with `get_bytes`:
+
+```rust
+use weft::access::client::{Multipart, StoredBodyExt};
+
+let body = ctx.storage(StorageScope::Run).body(&file).await?;
+http.post(url).header("content-type", body.mime_type()).stored_body(body)
+```
+
+`body` gives you a `StoredBody`: the bytes, read out of storage while the
+request is sent, with the file's record beside them. `len()`, `mime_type()`
+and `filename()` come from that record, so you know the length before a
+single byte is read, which is what a service that hands out an upload address
+for an exact size needs. `stored_body` sets `Content-Length` from it; the
+content type is yours to state.
+
+If the service wants a multipart form, a stored file can fill a part:
+
+```rust
+let form = Multipart::form_data().text("channel", &channel).stored("file", body);
+http.post(url).multipart(form)
+```
+
+`stored(name, body)` is a named file field of a `form_data()` form, under the
+file's stored name and type. For a `multipart/related` body (a JSON part, then
+the bytes), use `Multipart::related().part("application/json", serde_json::to_vec(&meta).node_err("encode the metadata")?).stored_part(body)`.
+`multipart` sends the form with its `Content-Type` and `Content-Length`,
+streaming every stored part. Keep `get_bytes` for when your node needs the
+bytes themselves: text it parses, a hash it computes.
 
 ## Handing a file out
 
@@ -241,6 +290,15 @@ exactly that.
 `internalize(&value, &ty, keep)` is the reverse: it takes a value full of
 `data:` URLs and external links and stores them, giving you back something you
 can emit and that will still work tomorrow.
+
+If you want some other form for each file going out (a dict a script reads,
+say), `storage::media::map_stored_files(&value, &ty, |slot| async move { .. })`
+is the walk `externalize` and a live caller's links go through: your function
+gets each stored file the type places (its handle, its kind and its marker)
+once, and returns what goes there instead. The type decides what is a file,
+so a `JsonDict` that happens to hold a marker is left whole. A `data:` URL or
+an `http(s)` link in a file place passes untouched, and anything else there
+is refused.
 
 The rule that makes it safe: **the marker never leaves weft, and a file value
 never holds a link.** So nothing you emit, park on or memoize carries one, and

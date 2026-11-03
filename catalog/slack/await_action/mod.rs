@@ -3,25 +3,28 @@
 //! button and who.
 //!
 //! Flow:
-//!   1. Mint a correlation id (journaled via `ctx.run`, so replays
-//!      reuse the same id).
+//!   1. Mint a correlation id (kept in the node's state, so the body
+//!      run again after the park reuses the same id).
 //!   2. Post the message: a section with the text, an actions block
 //!      with one button per entry, and message METADATA carrying the
 //!      correlation id. Slack echoes the metadata inside the
 //!      interaction payload, which is where the `interactions` topic's
 //!      `callbackId` field reads it back out.
-//!   3. `await_signal` on the connection's `interactions` topic,
-//!      predicated on that exact id: the run parks (the worker
-//!      is released) until the click arrives through the service's
-//!      interactivity delivery (webhook or the app's Socket Mode).
-//!   4. On resume, replace the original message through `chat.update`
-//!      on the posted (channel, ts) the node already holds (buttons
-//!      must not stay clickable after the decision, and this handle,
-//!      unlike the payload's `response_url`, is always present) and
-//!      pulse who clicked what.
+//!   3. Wait on the connection's `interactions` topic, predicated on
+//!      that exact id: the run parks (the worker is released) until the
+//!      click arrives through the service's interactivity delivery
+//!      (webhook or the app's Socket Mode).
+//!   4. On resume, the body runs from its top: the state holds the id
+//!      and the posted message, so it posts nothing and comes straight
+//!      back to the wait, which hands the click over. Then it replaces
+//!      the original message through `chat.update` on the posted
+//!      (channel, ts) the state holds (buttons must not stay clickable
+//!      after the decision, and this handle, unlike the payload's
+//!      `response_url`, is always present) and pulses who clicked what.
 
 use async_trait::async_trait;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use weft::access::client::required_str;
 use weft::signal::{Predicate, ProviderEvents};
@@ -30,11 +33,28 @@ use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 use super::api;
 
 /// One approval button, as the `buttons` port's type declares it.
-#[derive(serde::Deserialize)]
+#[derive(Deserialize)]
 struct ActionButton {
     id: String,
     label: String,
     style: Option<String>,
+}
+
+/// Where the approval stands: the id minted, the message posted, the
+/// click answered. Each filled field is a step the body skips when it
+/// runs again after the park.
+#[derive(Default, Serialize, Deserialize)]
+struct Approval {
+    callback: Option<String>,
+    posted: Option<Posted>,
+    click: Option<Value>,
+}
+
+/// The posted message, which the retire edits.
+#[derive(Clone, Serialize, Deserialize)]
+struct Posted {
+    channel: String,
+    ts: String,
 }
 
 #[derive(NodeManifest)]
@@ -57,11 +77,6 @@ impl Node for SlackAwaitActionNode {
         let buttons: Vec<ActionButton> = ctx.inputs.get("buttons")?;
         let confirmed_text: Option<String> = ctx.inputs.opt("confirmedText")?;
 
-        // The port's type holds each button to {id, label, style?}; what
-        // it cannot say is that the list has one.
-        if buttons.is_empty() {
-            return Err(bad_buttons("buttons must be a non-empty list of { id, label } objects"));
-        }
         let mut elements = Vec::new();
         for b in &buttons {
             let mut button = json!({
@@ -79,57 +94,49 @@ impl Node for SlackAwaitActionNode {
             elements.push(button);
         }
 
-        let callback = ctx
-            .run("mint_callback", || async {
-                Ok(json!(uuid::Uuid::new_v4().to_string()))
-            })
+        let mut state = ctx.keep(Approval::default()).await?;
+        // Its own step, apart from the post: a post sent again after a
+        // crash carries the same id, so a click on either message answers
+        // the wait.
+        let callback = state
+            .once(|s| &mut s.callback, async |_| { Ok(uuid::Uuid::new_v4().to_string()) })
             .await?;
-        let callback = callback
-            .as_str()
-            .node_err("the journaled callback id is not a string")?
-            .to_string();
 
         let blocks = json!([
             { "type": "section", "text": { "type": "mrkdwn", "text": text } },
             { "type": "actions", "block_id": callback, "elements": elements },
         ]);
-        // `ctx.run` journals the post: a replay after the park must
-        // not post the message again.
-        let cb = callback.clone();
-        let post_text = text.clone();
-        let posted = {
-            let ctx = &ctx;
-            let access = &access;
-            // The connection opens inside the journaled step, so a
-            // replay that reads the journaled answer opens nothing.
-            ctx.run("post_message", move || async move {
-                let client = ctx.client(access).await?;
-                api::call(
+        // The connection opens inside the step, so a body run again after
+        // the park opens nothing before the wait.
+        let posted = state
+            .once(|s| &mut s.posted, async |_| {
+                let client = ctx.client(&access).await?;
+                let posted = api::call(
                     &client,
                     "chat.postMessage",
                     json!({
                         "channel": channel,
-                        "text": post_text,
+                        "text": text,
                         "blocks": blocks,
                         "metadata": {
                             "event_type": "weft_await_action",
-                            "event_payload": { "callback": cb }
+                            "event_payload": { "callback": callback }
                         }
                     }),
                 )
-                .await
+                .await?;
+                Ok(Posted {
+                    channel: required_str(&posted, "chat.postMessage", "channel")?.to_string(),
+                    ts: required_str(&posted, "chat.postMessage", "ts")?.to_string(),
+                })
             })
-            .await?
-        };
-        let posted_ts = required_str(&posted, "chat.postMessage", "ts")?.to_string();
-        let posted_channel = required_str(&posted, "chat.postMessage", "channel")?.to_string();
+            .await?;
 
-        let click = ctx
-            .await_signal(ProviderEvents::new(
-                &access,
-                "interactions",
-                vec![Predicate::eq("callbackId", callback)],
-            ))
+        let click = state
+            .wait(
+                |s| &mut s.click,
+                ProviderEvents::new(&access, "interactions", vec![Predicate::eq("callbackId", callback)]),
+            )
             .await?;
 
         // The decision fields are load-bearing: an approval workflow
@@ -153,7 +160,8 @@ impl Node for SlackAwaitActionNode {
         // failed retire (bot removed from the channel, message
         // deleted) logs loudly and still delivers the decision: a
         // stale button is recoverable, a discarded approval is not.
-        // Journaled via ctx.run so a replay never re-updates.
+        // Nothing after it can pause, so only a crash before the
+        // decision is sent runs it again, writing the same text.
         let label = buttons
             .iter()
             .find(|b| b.id == action)
@@ -161,32 +169,26 @@ impl Node for SlackAwaitActionNode {
         let final_text = confirmed_text
             .clone()
             .unwrap_or_else(|| format!("{text}\n> *{label}* chosen by <@{user}>"));
-        let retire = {
-            let ctx = &ctx;
-            let access = &access;
-            let posted_channel = &posted_channel;
-            let posted_ts = &posted_ts;
-            // Opened after the park, not before it: the click may come
-            // days later, and this call needs a fresh sign-in then.
-            ctx.run("retire_buttons", move || async move {
-                let client = ctx.client(access).await?;
-                api::call(
-                    &client,
-                    "chat.update",
-                    json!({
-                        "channel": posted_channel,
-                        "ts": posted_ts,
-                        "text": final_text,
-                        "blocks": [
-                            { "type": "section",
-                              "text": { "type": "mrkdwn", "text": final_text } }
-                        ],
-                    }),
-                )
-                .await
-            })
+        // Opened after the park, not before it: the click may come days
+        // later, and this call needs a fresh sign-in then.
+        let retire: WeftResult<Value> = async {
+            let client = ctx.client(&access).await?;
+            api::call(
+                &client,
+                "chat.update",
+                json!({
+                    "channel": posted.channel,
+                    "ts": posted.ts,
+                    "text": final_text,
+                    "blocks": [
+                        { "type": "section",
+                          "text": { "type": "mrkdwn", "text": final_text } }
+                    ],
+                }),
+            )
             .await
-        };
+        }
+        .await;
         if let Err(e) = retire {
             // Best-effort log: even a failing log channel must not
             // stop the decision below from delivering (losing a
@@ -208,14 +210,9 @@ impl Node for SlackAwaitActionNode {
                 .set("action", action)
                 .set("user", user)
                 .set("userName", user_name)
-                .set("ts", posted_ts),
+                .set("ts", posted.ts),
         )
         .await
     }
 }
 
-/// A button list the program wrote wrong: an input error, which
-/// `_error` never catches (the fix is editing the program).
-fn bad_buttons(what: &str) -> weft::WeftError {
-    weft::WeftError::Input(what.to_string())
-}

@@ -7,6 +7,7 @@
 
 use serde_json::Value;
 
+use weft::access::client;
 use weft::storage::StorageScope;
 use weft::{EndpointHandle, EndpointMethod, RunContext, WeftResult};
 
@@ -33,12 +34,10 @@ pub async fn fetch_media(
     message_id: &str,
 ) -> WeftResult<Value> {
     let jid = account_jid(bridge).await?;
-    // The id is the bridge's to spell: escaped as one path segment, so a
-    // `/`, `?` or `#` in it cannot reach another route.
-    let url = format!("{}/media/{}", bridge.url().trim_end_matches('/'), path_segment(message_id));
+    let url = client::url(bridge.url(), &["media", message_id])?;
     ctx.storage(StorageScope::Project)
         .identified(format!("whatsapp:{jid}:{message_id}"))
-        .put_from_url(&url, None, None)
+        .put_from_url(url.as_str(), None, None, None)
         .await
 }
 
@@ -50,28 +49,5 @@ async fn account_jid(bridge: &EndpointHandle) -> WeftResult<String> {
     match outputs["jid"].as_str() {
         Some(jid) if !jid.is_empty() => Ok(jid.to_string()),
         _ => weft::node_bail!("the bridge behind {} is not paired with a WhatsApp account", bridge.infra_handle()),
-    }
-}
-
-/// `raw` percent-encoded as ONE path segment: every byte outside the
-/// URL's unreserved set (letters, digits, `-._~`) is escaped.
-fn path_segment(raw: &str) -> String {
-    raw.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::path_segment;
-
-    #[test]
-    fn a_message_id_stays_one_path_segment() {
-        assert_eq!(path_segment("3EB0C767D82B"), "3EB0C767D82B");
-        assert_eq!(path_segment("a/../b?x#y"), "a%2F..%2Fb%3Fx%23y");
-        assert_eq!(path_segment("é %"), "%C3%A9%20%25");
     }
 }

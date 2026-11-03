@@ -8,10 +8,10 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::access::client::get_json;
+use weft::access::client::{get_json, url};
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::gmail::{non_blank_list, API};
+use super::gmail::API;
 
 #[derive(NodeManifest)]
 pub struct GmailLabelNode;
@@ -29,16 +29,12 @@ impl Node for GmailLabelNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("id")?;
-        let add = non_blank_list(&ctx.inputs, "add")?;
-        let remove = non_blank_list(&ctx.inputs, "remove")?;
-        if add.is_empty() && remove.is_empty() {
-            return Err(weft::WeftError::Input(
-                "nothing to do: provide labels to add, remove, or both".to_string(),
-            ));
-        }
+        // Never split on commas: a Gmail label name may contain one.
+        let add: Vec<String> = ctx.inputs.list("add")?;
+        let remove: Vec<String> = ctx.inputs.list("remove")?;
 
         let http = ctx.client(&account).await?;
-        let listing: Value = get_json(&http, &format!("{API}/labels"), "gmail: list labels").await?;
+        let listing: Value = get_json(&http, url(API, &["labels"])?.as_str(), "gmail: list labels").await?;
         let find = |name: &str| -> Option<String> {
             listing["labels"]
                 .as_array()
@@ -59,7 +55,7 @@ impl Node for GmailLabelNode {
                     // is how workflows organize, and "create it first
                     // by hand" would be pure friction.
                     let made = weft::access::client::json_call(
-                        http.post(format!("{API}/labels")).json(&json!({ "name": name })),
+                        http.post(url(API, &["labels"])?.as_str()).json(&json!({ "name": name })),
                         "create the label",
                     )
                     .await?;
@@ -80,7 +76,7 @@ impl Node for GmailLabelNode {
         }
 
         let answer = weft::access::client::json_call(
-            http.post(format!("{API}/messages/{}/modify", super::api::segment(&id)))
+            http.post(url(API, &["messages", &id, "modify"])?.as_str())
                 .json(&json!({ "addLabelIds": add_ids, "removeLabelIds": remove_ids })),
             "modify the labels",
         )

@@ -1,7 +1,7 @@
 {
   "type": "Computer",
   "label": "Computer",
-  "description": "A computer a program works on: a screen with a window manager, a terminal and a browser (Firefox), a mouse, a keyboard, and a shell. Every action node (Screenshot, Click, TypeText, RunCommand, ...) takes its `computer` output. Its home folder is a disk kept across `weft infra stop`, so a stopped computer keeps its work, and `weft infra terminate` deletes it. No credential is inside unless the program puts one there. If you want to get into it yourself (to look around, check a build, or let a person work in it), give it `sshKeys`: it then opens SSH to the install's own network, and `weft infra list-doors` prints the address to use as `ssh -p <port> user@<host>`; that is the way in for anything interactive, rather than streaming commands through RunCommand. One computer has one screen, so agents working at the same time each want a computer of their own (a `@per_instance` Computer gives each instance one), coordinating through a shared git repository. To have a model work it, include `__catalog/base_catalog/computer/agent.weft`, or build your own agent around `__catalog/base_catalog/computer/perform.weft` (copy either into your own `src/` and change it when your case differs).",
+  "description": "A computer a program works on: a screen with a window manager, a terminal and a browser (Firefox), a mouse, a keyboard, and a shell. Every action node (Screenshot, Click, TypeText, RunCommand, ...) takes its `computer` output. Its home folder is a disk kept across `weft infra stop`, so a stopped computer keeps its work, and `weft infra terminate` deletes it. No credential is inside unless the program puts one there. If you want to get into it yourself (to look around, check a build, or let a person work in it), give it `sshKeys`: it then opens SSH to the install's own network, and `weft infra list-doors` prints the address to use as `ssh -p <port> user@<host>`; that is the way in for anything interactive, rather than streaming commands through RunCommand. One computer has one screen, so agents working at the same time each want a computer of their own (a `@per_instance` Computer gives each instance one), coordinating through a shared git repository. To have a model work it, include `__catalog/base_catalog/computer/agent.weft`, or build your own agent around `__catalog/base_catalog/computer/perform.weft` (copy either into your own `src/` and change it when your case differs). A browser wants about 1Gi of its `memory`.",
   "tags": [
     "computer",
     "desktop",
@@ -42,27 +42,6 @@
       "default": "10Gi",
       "label": "Home disk",
       "description": "Size of the disk holding the home folder, a number followed by Gi, Mi, G or M (`10Gi`)."
-    },
-    {
-      "name": "cpu",
-      "type": "String",
-      "default": "1",
-      "label": "CPUs",
-      "description": "CPUs the machine sustains (`1`, `2`, `500m`). A cloud install picks its cheapest machine holding this and `memory`. A local install does not cap the container."
-    },
-    {
-      "name": "memory",
-      "type": "String",
-      "default": "2Gi",
-      "label": "Memory",
-      "description": "Memory, a number followed by Gi, Mi, G or M (`2Gi`). A browser wants about 1Gi of it. Sized with `cpu`; a local install does not cap the container."
-    },
-    {
-      "name": "machineType",
-      "type": "String",
-      "label": "Machine type",
-      "placeholder": "picked from CPUs and memory",
-      "description": "Last resort: a cloud's own machine type, used as is instead of the one picked from `cpu` and `memory` (`n2-standard-4` on Compute Engine). A local install ignores it."
     }
   ],
   "outputs": [
@@ -78,7 +57,11 @@
     "images/computer"
   ],
   "features": {
-    "liveEndpoint": "api"
+    "liveEndpoint": "api",
+    "machineInputs": {
+      "cpu": "1",
+      "memory": "2Gi"
+    }
   },
   "validate": [
     {
@@ -86,15 +69,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "screen"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "screen",
-              "regex": "^[1-9][0-9]{2,3}x[1-9][0-9]{2,3}$"
+              "matches": "^[1-9][0-9]{2,3}x[1-9][0-9]{2,3}$"
             }
           }
         ]
@@ -111,15 +94,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "packages"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "packages",
-              "regex": "^[a-z0-9][a-z0-9.+-]*(\\s+[a-z0-9][a-z0-9.+-]*)*\\s*$"
+              "matches": "^[a-z0-9][a-z0-9.+-]*(\\s+[a-z0-9][a-z0-9.+-]*)*\\s*$"
             }
           }
         ]
@@ -136,15 +119,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "disk"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "disk",
-              "regex": "^[0-9]+(\\.[0-9]+)?(Gi|Mi|G|M)$"
+              "matches": "^[0-9]+(\\.[0-9]+)?(Gi|Mi|G|M)$"
             }
           }
         ]
@@ -161,65 +144,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
-            "field": "cpu"
-          },
-          {
-            "kind": "not",
-            "of": {
-              "kind": "config_matches",
-              "field": "cpu",
-              "regex": "^[0-9]+(\\.[0-9]+)?m?$"
-            }
-          }
-        ]
-      },
-      "then": {
-        "message": "Computer '{id}' has a `cpu` it cannot read. Write a number, or thousandths with m (1, 500m).",
-        "level": "structural",
-        "severity": "error",
-        "port": "cpu"
-      }
-    },
-    {
-      "when": {
-        "kind": "all",
-        "of": [
-          {
-            "kind": "config_present",
-            "field": "memory"
-          },
-          {
-            "kind": "not",
-            "of": {
-              "kind": "config_matches",
-              "field": "memory",
-              "regex": "^[0-9]+(\\.[0-9]+)?(Gi|Mi|G|M)$"
-            }
-          }
-        ]
-      },
-      "then": {
-        "message": "Computer '{id}' has a `memory` it cannot read. Write a number followed by Gi, Mi, G or M (2Gi).",
-        "level": "structural",
-        "severity": "error",
-        "port": "memory"
-      }
-    },
-    {
-      "when": {
-        "kind": "all",
-        "of": [
-          {
-            "kind": "config_present",
+            "kind": "value",
             "field": "sshKeys"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "sshKeys",
-              "regex": "^\\s*((ssh-|ecdsa-|sk-)\\S+\\s+\\S+[^\\n]*(\\n\\s*|$))+$"
+              "matches": "^\\s*((ssh-|ecdsa-|sk-)\\S+\\s+\\S+[^\\n]*(\\n\\s*|$))+$"
             }
           }
         ]

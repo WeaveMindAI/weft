@@ -122,7 +122,7 @@
         let mut rows = rows(&project, run_id);
         rows.retain(|row| !matches!(row, RunEvent::ChargeOpened { .. }));
         rows.push(RunEvent::NodeStarted { run_id, node_id: "node".into(), frames: vec![], at_unix: 0 });
-        rows.push(RunEvent::NodeSuspended { run_id, node_id: "node".into(), frames: vec![], token: "form".into(), at_unix: 0 });
+        rows.push(RunEvent::NodeSuspended { run_id, node_id: "node".into(), frames: vec![], token: Some("form".into()), at_unix: 0 });
         let cause = weft_core::run::CancelCause::Run { by: uuid::Uuid::new_v4(), tag: Some("user_7".into()) };
         let cancellation = CancellationFlag::new_arc();
         cancellation.cancel_because(cause.clone());

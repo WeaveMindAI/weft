@@ -156,7 +156,7 @@ fn duplicate_service_leaves_both_out() {
             dir.join("metadata.json"),
             format!(
                 r#"{{ "type": "{node_type}", "label": "{node_type}", "description": "",
-                      "inputs": [{{ "name": "account", "type": "Access",
+                      "inputs": [{{ "name": "account", "type": "Access[{service}]",
                                     "widget": {{ "kind": "access" }} }}],
                       "outputs": [],
                       "service": {{ "service": "{service}",
@@ -188,6 +188,64 @@ fn duplicate_service_leaves_both_out() {
             other => panic!("expected one problem, got {other:?}"),
         }
         assert!(cat.unavailable("Second").is_some_and(|t| t.contains("'shared' service")));
+    }
+}
+
+/// An access node hands out connections typed with its own service, and
+/// a node that publishes a service with that one: an output typed with
+/// another service (or with none) leaves the node out, naming the type
+/// it should have. An old `input_source_type` rule or `minItems` key
+/// leaves the node out naming what replaced it.
+#[test]
+fn a_connection_output_names_its_own_service() {
+    fn write_node(dir: &Path, node_type: &str, body: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("metadata.json"),
+            format!(r#"{{ "type": "{node_type}", "label": "{node_type}", "description": "", {body} }}"#),
+        )
+        .unwrap();
+        fs::write(dir.join("mod.rs"), "// node impl\n").unwrap();
+    }
+    let access_node_taking = |input: &str, output: &str| {
+        format!(
+            r#""inputs": [{{ "name": "account", "type": "{input}", "widget": {{ "kind": "access" }} }}],
+               "outputs": [{{ "name": "access", "type": "{output}" }}],
+               "service": {{ "service": "tg", "acquisition": {{ "kind": "static", "fields": [{{ "name": "token" }}] }} }}"#
+        )
+    };
+    let access_node = |output: &str| access_node_taking("Access[tg]", output);
+    let tmp = tempfile::tempdir().unwrap();
+    let nodes = tmp.path().join("nodes");
+    write_node(&nodes.join("own"), "Own", &access_node("Access[tg]"));
+    write_node(&nodes.join("other"), "Other", &access_node("Access[slack]"));
+    write_node(&nodes.join("bare"), "Bare", &access_node("Access"));
+    write_node(&nodes.join("taking_other"), "TakingOther", &access_node_taking("Access[slack]", "Access[tg]"));
+    write_node(&nodes.join("taking_any"), "TakingAny", &access_node_taking("Access", "Access[tg]"));
+    write_node(&nodes.join("publisher"), "Publisher", r#""publishes": "pg", "outputs": [{ "name": "access", "type": "Access[mysql]" }]"#);
+    write_node(
+        &nodes.join("sourced"),
+        "Sourced",
+        r#""inputs": [{ "name": "account", "type": "Access" }],
+           "validate": [{ "when": { "kind": "input_source_type", "port": "account", "oneOf": ["SlackAccess"] },
+                          "then": { "message": "x" } }]"#,
+    );
+    write_node(&nodes.join("counted"), "Counted", r#""inputs": [{ "name": "texts", "type": "List[String]", "minItems": 1 }]"#);
+
+    let cat = FsCatalog::discover(&nodes).expect("a refused node never fails the catalog");
+    assert!(cat.entry("Own").is_some(), "{:?}", cat.problems());
+    for (node_type, says) in [
+        ("Other", "so it is typed `Access[tg]`"),
+        ("Bare", "so it is typed `Access[tg]`"),
+        ("TakingOther", "input 'account' is typed Access[slack]"),
+        ("TakingAny", "input 'account' is typed Access,"),
+        ("Publisher", "so it is typed `Access[pg]`"),
+        ("Sourced", "\"type\": \"Access[slack]\""),
+        ("Counted", "`minItems` is gone"),
+    ] {
+        assert!(cat.entry(node_type).is_none(), "{node_type} is left out");
+        let told = cat.unavailable(node_type).unwrap_or_else(|| panic!("{node_type} is named"));
+        assert!(told.contains(says), "{node_type}: {told}");
     }
 }
 

@@ -43,7 +43,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[telegram]",
       "widget": {
         "kind": "access"
       },
@@ -53,7 +53,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[telegram]",
       "description": "Wire into the Telegram nodes."
     }
   ]

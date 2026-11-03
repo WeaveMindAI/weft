@@ -758,7 +758,9 @@ async fn mistake_wired(rig: FakeRig) -> WeftResult<()> {
         .run(&LlmInferenceNode, json!({ "provider": no_connection, "prompt": "hi" }))
         .await
         .failure()?;
-    assert!(err.starts_with("input error") && err.contains("carries no connection"), "{err}");
+    // An OpenRouter provider always carries its connection: the record's
+    // `openrouter` reading has `account` as a field, so the read refuses it.
+    assert!(err.starts_with("input error") && err.contains("account"), "{err}");
     assert!(rig.requests().is_empty(), "a program mistake refuses before anything is sent");
     Ok(())
 }

@@ -134,6 +134,7 @@ mod tests {
         let auth = PublicEntryAuth::Connection {
             access_id: "acc-1".into(),
             service: "api_key_auth".into(),
+            verify: Box::new(weft_core::access::callers::named_check("api_keys").unwrap().verify()),
         };
         let r = handler()
             .compute_routing(&spec("chat", &[], auth))
@@ -141,7 +142,7 @@ mod tests {
         assert!(matches!(r.auth, SignalAuth::Connection));
         assert_eq!(
             r.auth_config,
-            serde_json::json!({ "access_id": "acc-1", "service": "api_key_auth" })
+            serde_json::json!({ "access_id": "acc-1", "service": "api_key_auth", "verify": { "kind": "api_keys" } })
         );
     }
 

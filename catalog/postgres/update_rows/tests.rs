@@ -3,9 +3,10 @@
 use serde_json::json;
 
 use weft::storage::{wire_weight, MAX_WIRE_VALUE_BYTES};
-use weft::{NodeTest, WeftResult};
+use weft::{NodeManifest, NodeTest, WeftResult};
 
-use super::{capped_rows, update_sql};
+use super::super::postgres_execute_query::PostgresExecuteQueryNode;
+use super::{capped_rows, update_sql, PostgresUpdateRowsNode};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -16,7 +17,18 @@ pub fn tests() -> Vec<NodeTest> {
             a_trailing_comment_cannot_eat_the_returning,
         ),
         NodeTest::basic("changed_rows_past_a_wire_are_capped_and_say_so", capped),
+        NodeTest::basic("the_placeholder_pattern_is_postgres_query_s", same_pattern),
     ]
+}
+
+/// The compiler finds the placeholders of `where` with the same pattern
+/// as Postgres: Query's, which its own test holds to `placeholders()`.
+fn same_pattern() -> WeftResult<()> {
+    let ours = &PostgresUpdateRowsNode.manifest().placeholders_are_inputs;
+    let query = &PostgresExecuteQueryNode.manifest().placeholders_are_inputs;
+    assert_eq!(ours.as_ref().map(|p| p.pattern.as_str()), query.as_ref().map(|p| p.pattern.as_str()));
+    assert_eq!(ours.as_ref().map(|p| p.setting.as_str()), Some("where"));
+    Ok(())
 }
 
 fn builds() -> WeftResult<()> {

@@ -141,7 +141,7 @@ pub struct Woken {
     pub now_ms: i64,
     /// The signal's durable state as read just now.
     pub stored: RowState,
-    /// True when the signal is a parked run's wait (`await_signal`)
+    /// True when the signal is a parked run's wait (`state.wait`)
     /// rather than an entry trigger, read off the row like the state.
     pub is_resume: bool,
 }
@@ -281,7 +281,7 @@ pub trait KindHandler: Send + Sync {
     /// after the registration finds the version moved and loses.
     ///
     /// `asked_at_unix_ms` is when the registration was asked for (the
-    /// node's `await_signal`, or the activation), for a kind whose state
+    /// node's wait, or the activation), for a kind whose state
     /// counts from that moment. `is_resume` says which of the two it is,
     /// for a kind that behaves differently while a run waits on it.
     fn compute_initial_state(&self, _spec: &SignalSpec, _asked_at_unix_ms: i64, _is_resume: bool) -> Result<Value> {
@@ -308,7 +308,7 @@ pub trait KindHandler: Send + Sync {
     }
 
     /// Refuse a spec this kind cannot serve as a parked run's wait
-    /// (`await_signal`), naming why. Called at registration, only for a
+    /// (`state.wait`), naming why. Called at registration, only for a
     /// resume. Default: every spec the kind validates can be awaited.
     fn check_resume(&self, _spec: &SignalSpec) -> Result<()> {
         Ok(())
@@ -513,7 +513,7 @@ pub async fn prepare_signal(
     if !is_resume && spec.on_cancel.is_some() {
         anyhow::bail!(
             "a '{}' entry trigger carries a last call on cancel, which only a run's wait can send; \
-             wait with `ctx.await_signal_with_cancel` instead",
+             wait with `state.wait(field, kind.cancel_with(call))` instead",
             spec.kind,
         );
     }
@@ -525,7 +525,7 @@ pub async fn prepare_signal(
     // Settling may look at the signal's connection, through the broker,
     // as the signal itself would once up; its slot shows nothing, and it
     // has no registration yet to give up on, nor to keep what it fetched for.
-    let ctx = spawn_ctx(state, &token, crate::reach::UNREGISTERED, &tenant_id, for_instance, &spec, true, Arc::default());
+    let ctx = spawn_ctx(state, &token, crate::reach::UNREGISTERED, &tenant_id, for_instance, spec.match_predicates.clone(), true, Arc::default());
     let kind_state = handler.settle(&spec, computed, &ctx).await?;
     let holds = handler.between_fires(&spec, &kind_state)? == BetweenFires::Holds;
     let signal = RegisteredSignal {
@@ -562,7 +562,7 @@ pub async fn check_signal(
     let handler = handler_or_err(&identity.spec.kind)?;
     let (token, tenant_id, spec) = (identity.token.clone(), identity.tenant_id.clone(), identity.spec.clone());
     let prepared = prepare_signal(state, identity, for_instance.clone(), None, asked_at_unix_ms).await?;
-    let ctx = spawn_ctx(state, &token, crate::reach::UNREGISTERED, &tenant_id, for_instance, &spec, true, Arc::default());
+    let ctx = spawn_ctx(state, &token, crate::reach::UNREGISTERED, &tenant_id, for_instance, spec.match_predicates.clone(), true, Arc::default());
     handler.check_coming_up(&spec, &prepared.kind_state, &ctx).await
 }
 
@@ -659,7 +659,7 @@ pub async fn bring_up(state: &crate::ListenerState, row: weft_broker_client::pro
             // ([`crate::registry::hold`] leaves a newer one be).
             stop_held(state, &row.token, Registrations::UpTo(row.generation)).await;
             let serving = Arc::new(Mutex::new(ServingState::default()));
-            let mut ctx = spawn_ctx(state, &row.token, row.generation, &row.tenant_id, row.for_instance.clone(), &spec, fresh, serving.clone());
+            let mut ctx = spawn_ctx(state, &row.token, row.generation, &row.tenant_id, row.for_instance.clone(), spec.match_predicates.clone(), fresh, serving.clone());
             // Its fires go out under this holder's claim, so a copy that
             // lost the row (to another holder, or to a registration that no
             // longer holds) delivers nothing from then on.
@@ -1003,7 +1003,7 @@ fn spawn_ctx(
     generation: i64,
     tenant_id: &str,
     for_instance: Option<weft_core::instance::InstanceScope>,
-    spec: &SignalSpec,
+    predicates: Vec<weft_core::signal::Predicate>,
     fresh: bool,
     serving: Arc<Mutex<ServingState>>,
 ) -> SpawnCtx {
@@ -1014,7 +1014,7 @@ fn spawn_ctx(
             generation,
             tenant_id.to_string(),
             for_instance,
-            spec.match_predicates.clone(),
+            predicates,
         ),
         config: state.config.clone(),
         events_broker: state.events_broker.clone(),
@@ -1355,7 +1355,7 @@ pub async fn wake(state: &crate::ListenerState, body: WakeBody) -> Result<Option
     // A `Wakes` kind keeps nothing in this process between calls (see
     // `bring_up`), so its serving slot lives for this one wake.
     let serving = Arc::new(Mutex::new(ServingState::default()));
-    let ctx = spawn_ctx(state, &row.token, row.generation, &row.tenant_id, row.for_instance.clone(), &spec, false, serving);
+    let ctx = spawn_ctx(state, &row.token, row.generation, &row.tenant_id, row.for_instance.clone(), spec.match_predicates.clone(), false, serving);
     let woken = Woken { aimed_at_ms, now_ms, stored: RowState { state: row.kind_state.clone(), seq: row.kind_state_seq }, is_resume: row.is_resume };
     let after = match handler.on_wake(&spec, woken, ctx).await {
         Ok(Some(after)) => after,
@@ -1543,20 +1543,21 @@ pub fn last_answer(sig: &RegisteredSignal) -> Option<weft_core::signal::listener
     lookup(&sig.spec.kind).and_then(|handler| handler.last_answer(sig))
 }
 
-/// Send the last call of a wait whose run was cancelled
-/// (`weft_core::signal::cancel_call`), once, as the wait's connection, to
-/// the address it names.
-/// The wait's row is gone: everything comes with the request, and nothing
-/// fetched for it is kept past the call. An error says why the call did
-/// not go through, a refusal naming the status and what the service said.
+/// Send a call weft owes for a run nobody drives any more
+/// (`weft_core::signal::cancel_call`): a cancelled wait's last call, or
+/// one a node owed when its run ended without a worker. Once, as its
+/// connection, to the address it names. What it was recorded with is
+/// gone: everything comes with the request, and nothing fetched for it is
+/// kept past the call. A `404` counts as done (the thing is gone already);
+/// an error says why the call did not go through, a refusal naming the
+/// status and what the service said.
 pub async fn cancel_call(state: &crate::ListenerState, req: weft_core::signal::listener_protocol::CancelCallRequest) -> Result<()> {
-    let call = req.spec.on_cancel.clone().ok_or_else(|| anyhow::anyhow!("the wait {} carries no last call", req.token))?;
-    call.validate().map_err(|e| anyhow::anyhow!(e))?;
-    let ctx = spawn_ctx(state, &req.token, crate::reach::UNREGISTERED, &req.tenant_id, req.for_instance.clone(), &req.spec, false, Arc::default());
+    req.call.validate().map_err(|e| anyhow::anyhow!(e))?;
+    let ctx = spawn_ctx(state, &req.token, crate::reach::UNREGISTERED, &req.tenant_id, req.for_instance.clone(), Vec::new(), false, Arc::default());
     // Nothing it fetched is kept (`UNREGISTERED`), so there is nothing to
     // forget after it: dropping what is kept under the token would only
     // drop a newer registration's.
-    send_cancel_call(&call, &req.spec.access, &ctx).await
+    send_cancel_call(&req.call, &req.access, &ctx).await
 }
 
 /// How long a last call may take before it counts as not having gone
@@ -1589,11 +1590,11 @@ async fn send_cancel_call(
     let what = format!("{} {}", call.method.as_http(), call.url);
     let resp = request.send().await.with_context(|| format!("the last call {what} did not reach the service"))?;
     let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_else(|e| format!("<body read failed: {e}>"));
-        anyhow::bail!("the service refused the last call {what}: {status}: {body}");
+    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
     }
-    Ok(())
+    let body = resp.text().await.unwrap_or_else(|e| format!("<body read failed: {e}>"));
+    anyhow::bail!("the service refused the last call {what}: {status}: {}", weft_core::access::client::error_detail(&body));
 }
 
 pub fn compute_live(ctx: &LiveCtx<'_>) -> LiveFeed {
@@ -1663,15 +1664,19 @@ pub fn address_items(ctx: &LiveCtx<'_>) -> Vec<LiveItem> {
         // "open" is about the door, not about who knows the address.
         SignalAuth::None => LiveItem::text("Auth", "open (anyone with the URL)"),
         SignalAuth::Connection => {
-            // `compute_routing` writes `service` alongside `access_id` on
-            // every gated route, so a missing one is a broken
-            // registration. Say that instead of inventing a name for it.
-            match sig.routing.auth_config.get("service").and_then(Value::as_str) {
-                Some(service) => LiveItem::text(
-                    "Auth",
-                    format!("checked against the wired {service} connection"),
-                ),
-                None => LiveItem::text(
+            // `compute_routing` writes `service` and the check alongside
+            // `access_id` on every gated route, so a missing service is a
+            // broken registration. Say that instead of inventing a name for
+            // it. A missing check is a gate whose check an older weft did
+            // not keep, which the door refuses.
+            let config = &sig.routing.auth_config;
+            let scheme = config.get("verify").and_then(|v| v.get("kind")).and_then(Value::as_str);
+            match (config.get("service").and_then(Value::as_str), scheme) {
+                (Some(service), Some(scheme)) => {
+                    LiveItem::text("Auth", format!("checked with {scheme} against its {service} connection"))
+                }
+                (Some(service), None) => LiveItem::text("Auth", weft_core::signal::auth::uncarried_gate(service)),
+                (None, _) => LiveItem::text(
                     "Auth",
                     "gated, but this registration names no connection to check against",
                 ),
@@ -1919,12 +1924,12 @@ mod tests {
     fn a_gated_route_names_the_connection_and_nothing_secret() {
         let sig = signal(
             public("chat", &[]),
-            serde_json::json!({ "access_id": "acc-1", "service": "api_key_auth" }),
+            serde_json::json!({ "access_id": "acc-1", "service": "api_key_auth", "verify": { "kind": "api_keys" } }),
         );
         let items = address_items(&ctx(&sig, Some("https://w.example/local/chat")));
         assert_eq!(
             items[1],
-            LiveItem::text("Auth", "checked against the wired api_key_auth connection")
+            LiveItem::text("Auth", "checked with api_keys against its api_key_auth connection")
         );
         // The material lives on the connection; the listener has none
         // of it and the display must not imply otherwise.

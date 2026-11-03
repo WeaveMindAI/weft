@@ -53,7 +53,7 @@ pub enum VersionCall {
 }
 
 impl VersionCall {
-    pub const JOURNAL_NAMES: &'static [&'static str] = &[
+    pub const NAMES: &'static [&'static str] = &[
         "weft.working_copies.list",
         "weft.working_copies.read",
         "weft.working_copies.change",
@@ -70,7 +70,7 @@ impl VersionCall {
         "weft.builds.state",
     ];
 
-    pub fn journal_name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             VersionCall::WorkingCopies => "weft.working_copies.list",
             VersionCall::WorkingState { .. } => "weft.working_copies.read",
@@ -123,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn every_call_has_its_journal_name_listed() {
+    fn every_call_has_its_name_listed() {
         let calls = [
             VersionCall::WorkingCopies,
             VersionCall::WorkingState { copy: WorkingCopyRef::default() },
@@ -140,7 +140,7 @@ mod tests {
             VersionCall::Build { request: Default::default() },
             VersionCall::BuildState { build: uuid::Uuid::nil() },
         ];
-        let names: Vec<&str> = calls.iter().map(VersionCall::journal_name).collect();
-        assert_eq!(names, VersionCall::JOURNAL_NAMES, "one name per call, in the listed order");
+        let names: Vec<&str> = calls.iter().map(VersionCall::name).collect();
+        assert_eq!(names, VersionCall::NAMES, "one name per call, in the listed order");
     }
 }

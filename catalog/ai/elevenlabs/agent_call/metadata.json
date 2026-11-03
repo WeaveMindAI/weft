@@ -14,7 +14,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[elevenlabs]", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "agents"
@@ -193,15 +193,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "toNumber"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "toNumber",
-              "regex": "^\\+[1-9][0-9]{1,14}$"
+              "matches": "^\\+[1-9][0-9]{1,14}$"
             }
           }
         ]

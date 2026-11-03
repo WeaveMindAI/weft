@@ -19,6 +19,7 @@
     {
       "name": "run",
       "type": "String",
+      "keepsBlank": true,
       "description": "Only this run's costs, by the id GetRunId gave it."
     },
     {

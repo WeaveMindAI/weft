@@ -71,15 +71,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "feedUrl"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "feedUrl",
-              "regex": "(?i)^https?://"
+              "matches": "(?i)^https?://"
             }
           }
         ]

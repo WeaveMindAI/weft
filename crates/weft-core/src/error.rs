@@ -24,12 +24,13 @@ pub enum WeftError {
     #[error("the machine this worker runs on lacks {0}, which this node needs")]
     NeedMissing(String),
 
-    /// The node called a suspension primitive; the worker should
-    /// record the suspension (already done via the ContextHandle)
-    /// and exit. On wake, a new worker picks up from the resume
-    /// payload.
-    #[error("suspended: token {token}")]
-    Suspended { token: String },
+    /// The firing paused, its state saved (`crate::context::Kept`): on
+    /// the wait `token` registered, which its answer resumes, or, with
+    /// no token, inside the run (a bus read, a stream pull, a yield)
+    /// while the whole run paused, which it resumes with. Returned by
+    /// the call the body paused in; the body hands it back with `?`.
+    #[error("{}", match token { Some(token) => format!("suspended: token {token}"), None => "paused with its run".to_string() })]
+    Suspended { token: Option<String> },
 
     #[error("suspension setup failed: {0}")]
     Suspension(String),
@@ -54,6 +55,16 @@ pub enum WeftError {
 
     #[error("runtime error: {0}")]
     Runtime(#[from] anyhow::Error),
+}
+
+impl WeftError {
+    /// The run's own control flow, never a failure of the node's: a pause,
+    /// a cancel, a person skipping the wait, a wait given up (which the run
+    /// reads by its variant, to say it gave up). Whatever wraps errors
+    /// passes these through unchanged.
+    pub fn is_run_control(&self) -> bool {
+        matches!(self, Self::Suspended { .. } | Self::Cancelled | Self::WaitSkipped(_) | Self::WaitGaveUp(_))
+    }
 }
 
 pub type WeftResult<T> = Result<T, WeftError>;
@@ -92,6 +103,19 @@ macro_rules! node_bail {
     };
 }
 
+/// Fail the node now with an input error carrying this message: the
+/// statement door for a mistake in the program the node spotted (a value
+/// of the wrong shape, SQL that does not parse). Expands to
+/// `return Err(WeftError::Input(format!(...)))`. Unlike [`node_bail!`],
+/// a wired `_error` does not catch it: the run fails, because the fix is
+/// in the program.
+#[macro_export]
+macro_rules! input_bail {
+    ($($arg:tt)*) => {
+        return Err($crate::error::WeftError::Input(format!($($arg)*)))
+    };
+}
+
 /// The one door for wrapping an OUTSIDE error (an HTTP library, a JSON
 /// parser, any non-weft `Result` or absent `Option`) into a node
 /// failure with context.
@@ -100,9 +124,24 @@ pub trait NodeErrExt<T> {
     fn node_err(self, context: impl std::fmt::Display) -> WeftResult<T>;
 }
 
-impl<T, E: std::fmt::Display> NodeErrExt<T> for Result<T, E> {
+impl<T, E: std::fmt::Display + 'static> NodeErrExt<T> for Result<T, E> {
+    /// A weft error that is the run's own control flow
+    /// ([`WeftError::is_run_control`]) passes through unchanged: wrapped as
+    /// a failure, a pause inside a bus read or a wait would fail the node
+    /// instead of pausing it, and a skipped wait would fail it instead of
+    /// skipping it.
     fn node_err(self, context: impl std::fmt::Display) -> WeftResult<T> {
-        self.map_err(|e| WeftError::NodeFailed(format!("{context}: {e}")))
+        self.map_err(|e| {
+            let e: Box<dyn std::any::Any> = Box::new(e);
+            match e.downcast::<WeftError>() {
+                Ok(weft) if weft.is_run_control() => *weft,
+                Ok(weft) => WeftError::NodeFailed(format!("{context}: {weft}")),
+                Err(other) => {
+                    let other = other.downcast::<E>().expect("the boxed error is the one just boxed");
+                    WeftError::NodeFailed(format!("{context}: {other}"))
+                }
+            }
+        })
     }
 }
 
@@ -160,6 +199,36 @@ mod node_err_tests {
             "{e}"
         );
         assert!(matches!(node_error("boom"), WeftError::NodeFailed(m) if m == "boom"));
+    }
+
+    #[test]
+    fn input_bail_fails_with_an_input_error_carrying_the_message() {
+        fn bails() -> WeftResult<()> {
+            crate::input_bail!("`count` is {}, and it takes at most 10", 12);
+        }
+        let e = bails().unwrap_err();
+        assert!(matches!(&e, WeftError::Input(m) if m == "`count` is 12, and it takes at most 10"), "{e}");
+    }
+
+    /// The run's own control flow passes through a `node_err` unchanged:
+    /// a pause still pauses, a skip still skips.
+    #[test]
+    fn node_err_passes_the_runs_control_flow_through() {
+        let controls = || {
+            [
+                WeftError::Suspended { token: None },
+                WeftError::Cancelled,
+                WeftError::WaitSkipped("skipped".into()),
+                WeftError::WaitGaveUp("gave up".into()),
+            ]
+        };
+        for (control, same) in controls().into_iter().zip(controls()) {
+            let passed = Err::<(), _>(control).node_err("waiting").unwrap_err();
+            assert_eq!(passed.to_string(), same.to_string(), "{same:?}");
+            assert!(passed.is_run_control());
+        }
+        let failure = Err::<(), _>(WeftError::NodeFailed("boom".into())).node_err("waiting").unwrap_err();
+        assert!(matches!(&failure, WeftError::NodeFailed(m) if m.starts_with("waiting: ")), "{failure}");
     }
 
     #[test]

@@ -50,5 +50,15 @@
       "type": "List[JsonDict]",
       "description": "Each entry: the original index and its relevance score, best first."
     }
+  ],
+  "validate": [
+    {
+      "when": { "kind": "not", "of": { "kind": "value", "field": "documents", "count": { "min": 1 } } },
+      "then": {
+        "message": "LlmRerank '{id}' has no documents in `documents`: give it at least one to rank.",
+        "level": "structural",
+        "field": "documents"
+      }
+    }
   ]
 }

@@ -474,18 +474,40 @@ fn check_bag(node: &NodeDefinition, frames: &LoopFrames, wired: &HashSet<&str>, 
     errors
 }
 
-/// Why the port's widget refuses a value its type accepts (a number
-/// outside its range or off its step). One rule, [`Widget::check_value`],
-/// shared with the compiler: the compiler refuses the written constant
-/// at build time and this refuses the wired or replayed one at run
-/// time, both loudly, so the same number is never legal on one path and
-/// quietly replaced on the other.
-fn widget_refusal(port: &crate::project::InputDefinition, value: &Value) -> Option<String> {
-    port.widget
-        .as_ref()?
-        .check_value(value)
-        .err()
-        .map(|why| format!("'{}': {why}", port.name))
+/// Why the port refuses a value its type accepts: its widget (a number
+/// outside its range or off its step, [`Widget::check_value`]). The same
+/// rule the compiler holds the written constant to at build time, holding
+/// the wired or replayed one at run time, both loudly, so the same value
+/// is never legal on one path and quietly replaced on the other.
+fn domain_refusal(port: &crate::project::InputDefinition, value: &Value) -> Option<String> {
+    let widget = port.widget.as_ref().and_then(|widget| widget.check_value(value).err());
+    widget.map(|why| format!("'{}': {why}", port.name))
+}
+
+/// Whether a blank text on `input` would be no value: one of the node
+/// type's own optional inputs that takes text (`String`, or a union with
+/// it) and does not declare
+/// `keepsBlank`. A port the program added keeps what arrives on it, a
+/// blank included: it is the program's data.
+pub fn blank_can_be_absent(input: &crate::project::InputDefinition) -> bool {
+    input.from_spec && crate::node::blank_is_no_value(input.required, input.keeps_blank, input.port_type.port_value_type())
+}
+
+/// Take out of a firing's `delivered` values every blank text on an input
+/// `absent_when_blank` names (one where [`blank_can_be_absent`]), so the
+/// node reads it absent and a declared default fills it like any absent
+/// input. Only a blank text asks, so a firing with none pays a glance at
+/// each value.
+pub fn drop_blank_texts(delivered: &mut serde_json::Map<String, Value>, absent_when_blank: impl Fn(&str) -> bool) {
+    delivered.retain(|name, value| !(value.as_str().is_some_and(|text| text.trim().is_empty()) && absent_when_blank(name)));
+}
+
+/// Whether `value` on `input` is a blank text that counts as no value
+/// ([`blank_can_be_absent`]): the node reads it absent, `oneOfRequired`
+/// counts it not given, and a rule sees it not set. The one reading for
+/// all three, so a node never has to filter a blank out itself.
+pub fn blank_is_absent(input: &crate::project::InputDefinition, value: &Value) -> bool {
+    value.as_str().is_some_and(|text| text.trim().is_empty()) && blank_can_be_absent(input)
 }
 
 /// Outcome of checking one incoming value against an input port type.
@@ -575,11 +597,19 @@ pub fn filled_ports<'a>(
 /// Does a written constant carry a value for the port? A `null` is data
 /// only on a port whose type admits Null (`String | Null`): there it
 /// fills the port like any value. Anywhere else a written `null` is the
-/// absence of a value, which leaves the port to its default or unmet.
+/// absence of a value, which leaves the port to its default or unmet. A
+/// blank text on an input where a blank is no value ([`blank_is_absent`])
+/// is the absence of one too.
 /// The compiler's `required-port-unmet` / `@require_one_of` rules read
 /// the same line, so a source that compiles is a source that fills.
 pub fn literal_is_data(node: &NodeDefinition, port: &str, value: &Value) -> bool {
-    !value.is_null() || port_admits_null(node, port)
+    // Only a blank text looks its input up, so every other constant
+    // costs what it did.
+    let blank = || {
+        value.as_str().is_some_and(|text| text.trim().is_empty())
+            && node.inputs.iter().find(|p| p.name == port).is_some_and(blank_can_be_absent)
+    };
+    (!value.is_null() || port_admits_null(node, port)) && !blank()
 }
 
 /// Whether the port's declared type admits Null as a value.
@@ -647,10 +677,14 @@ fn check_input(port: &crate::project::InputDefinition, value: &Value, wired: boo
     // `Widget::check_handle_shape` where the rewrite happens, by the
     // same rule the compiler applies to the written value. Judging it
     // against the port's type here refused every connection a program
-    // picks in its own source.
+    // picks in its own source. A connection itself (an access marker,
+    // which only a wire or a group port delivers) is no stored handle: it
+    // is held to the port's type below like any value, so one to another
+    // service than `Access[x]` names is refused on this input.
     if port.widget.as_ref().is_some_and(|w| {
         matches!(w, crate::node::Widget::Access { .. } | crate::node::Widget::RemoteSelect { .. })
     }) && value.is_object()
+        && value.get(crate::access::ACCESS_MARKER_KEY).is_none()
     {
         return InputCheck::Ok;
     }
@@ -662,7 +696,7 @@ fn check_input(port: &crate::project::InputDefinition, value: &Value, wired: boo
         // node the port's default in place of the number the author
         // wrote, which is the silent substitution this check exists to
         // stop: a poll interval of 0 would quietly become 30.
-        return match widget_refusal(port, value) {
+        return match domain_refusal(port, value) {
             Some(why) => InputCheck::Fail(why),
             None => InputCheck::Ok,
         };
@@ -890,6 +924,52 @@ mod tests {
         }
     }
 
+    /// A datetime binds a wired moment.
+    #[test]
+    fn a_datetime_binds_a_wired_value() {
+        let at: InputDefinition = serde_json::from_value(json!({
+            "name": "at", "portType": "String", "required": true, "widget": { "kind": "datetime" }
+        })).unwrap();
+        assert_eq!(check_input(&at, &json!("2026-09-03T11:00:00+02:00"), false), InputCheck::Ok);
+        assert!(matches!(check_input(&at, &json!("next tuesday"), false), InputCheck::Fail(msg) if msg.starts_with("'at': ")));
+    }
+
+    /// A blank text is no value on the node type's own optional String
+    /// inputs, and only there: never on a required one, one that keeps
+    /// blanks, one the program added, or one of another type. A blank
+    /// written constant then fills nothing, and a blank delivered value
+    /// is taken out of the bag so a default fills it.
+    #[test]
+    fn a_blank_text_is_no_value_on_an_optional_text_of_the_node() {
+        let input = |ty: &str, required: bool, from_spec: bool, keeps: bool| -> InputDefinition {
+            serde_json::from_value(json!({
+                "name": "title", "portType": ty, "required": required, "fromSpec": from_spec, "keepsBlank": keeps
+            })).unwrap()
+        };
+        let optional = input("String", false, true, false);
+        for blank in [json!(""), json!("  \n\t")] {
+            assert!(super::blank_is_absent(&optional, &blank), "{blank}");
+        }
+        assert!(!super::blank_is_absent(&optional, &json!(" x ")));
+        assert!(super::blank_is_absent(&input("String | Null", false, true, false), &json!("")));
+        assert!(!super::blank_is_absent(&input("String", true, true, false), &json!("")), "required");
+        assert!(!super::blank_is_absent(&input("String", false, true, true), &json!("")), "keepsBlank");
+        assert!(!super::blank_is_absent(&input("String", false, false, false), &json!("")), "added by the program");
+        assert!(super::blank_is_absent(&input("String | List[String]", false, true, false), &json!("")), "a union that takes text");
+        assert!(super::blank_is_absent(&input("JsonDict | String", false, true, false), &json!("")), "a union that takes text");
+        assert!(!super::blank_is_absent(&input("String | List[String]", false, true, false), &json!(["", ""])), "a list is a value");
+
+        let node = kicked_node("X", vec![optional.clone()], json!({ "title": " " }));
+        assert!(!super::literal_is_data(&node, "title", &json!(" ")));
+        assert!(super::literal_is_data(&node, "title", &json!("t")));
+        let (kicked, _) = build_kicked_input(&node, &vec![], None);
+        assert!(!kicked.contains_key("title"), "a blank constant fills nothing");
+
+        let mut delivered = json!({ "title": "", "other": "", "kept": "x" }).as_object().unwrap().clone();
+        super::drop_blank_texts(&mut delivered, |name| name == "title");
+        assert_eq!(serde_json::Value::Object(delivered), json!({ "other": "", "kept": "x" }));
+    }
+
     /// A whole-number step means the input takes whole numbers. A
     /// fractional one is the arrow key's increment and holds a typed
     /// value to nothing: a temperature box stepping by 0.1 takes 0.85.
@@ -977,6 +1057,24 @@ mod tests {
         assert_eq!(input.get("account").map(|v| &**v), Some(&handle), "the handle reaches the bag intact");
     }
 
+    /// A connection itself (an access marker) arriving on a connection
+    /// picker is no stored handle: it is held to the port's type, so a
+    /// connection to another service than `Access[x]` names is refused on
+    /// that input when the node fires, and one to that service passes.
+    #[test]
+    fn a_connection_to_another_service_is_refused_on_a_connection_picker() {
+        let account: InputDefinition = serde_json::from_value(json!({
+            "name": "account", "portType": "Access[fal]", "required": true,
+            "widget": { "kind": "access", "service": "fal" }
+        })).unwrap();
+        let to = |service: &str| crate::access::Access::new("11111111-1111-1111-1111-111111111111", service, None).to_value();
+        assert_eq!(check_input(&account, &to("fal"), true), InputCheck::Ok);
+        match check_input(&account, &to("slack"), true) {
+            InputCheck::Fail(why) => assert!(why.contains("Access[fal]") && why.contains("Access[slack]"), "{why}"),
+            other => panic!("a slack connection on a fal picker was {other:?}"),
+        }
+    }
+
     /// An `@instance_filled` field reaches the bag only once the engine swaps
     /// in the instance's value: the marker itself is never judged against
     /// the port (a String port would refuse the marker's object).
@@ -1028,6 +1126,7 @@ mod tests {
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None,
             header_span: None,
             config_spans: Default::default(),

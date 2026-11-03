@@ -138,8 +138,8 @@ fn a_provider_trigger_declares_every_field_its_topic_can_send() {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
         {
-            // An `await_signal` on a provider topic is a resume, not a
-            // firing, and wakes through its own await rather than here.
+            // A wait on a provider topic is a resume, not a firing, and
+            // wakes through its own wait rather than here.
             continue;
         }
         let node_type = raw.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();

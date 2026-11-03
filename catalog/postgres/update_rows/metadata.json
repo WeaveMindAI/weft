@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[postgres]", "accepts": ["wire"],
       "required": true,
       "requiresValues": [
         "host",
@@ -64,5 +64,9 @@
   "features": {
     "canAddInputPorts": true,
     "addedPortsAreDataKeys": true
+  },
+  "placeholdersAreInputs": {
+    "in": "where",
+    "pattern": "(?s)--[^\\n]*|/\\*.*?\\*/|[Ee](?:'(?:[^'\\\\]|\\\\.)*')+|(?:'[^']*')+|(?:\"[^\"]*\")+|\\$(?<tag>(?:[A-Za-z_][[:word:]]*)?)\\$.*?\\$\\k<tag>\\$|[[:word:]]+(?:\\$[[:word:]]+)*\\$?|\\$(?<name>[A-Za-z_][[:word:]]*)"
   }
 }

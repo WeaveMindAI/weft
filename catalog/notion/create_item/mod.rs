@@ -4,11 +4,10 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use weft::access::client::post_json;
-use weft::node::NodeOutput;
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::access::client::{post_json, url};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::notion::{data_source_id, API};
+use super::notion::{data_source_id, page_output, API};
 
 #[derive(NodeManifest)]
 pub struct NotionCreateItemNode;
@@ -33,7 +32,7 @@ impl Node for NotionCreateItemNode {
         let source = data_source_id(&http, &database, source.as_deref()).await?;
         let page = post_json(
             &http,
-            &format!("{API}/pages"),
+            url(API, &["pages"])?.as_str(),
             &json!({
                 "parent": { "type": "data_source_id", "data_source_id": source },
                 "properties": properties,
@@ -41,10 +40,6 @@ impl Node for NotionCreateItemNode {
             "notion: create the item",
         )
         .await?;
-        let id = page["id"].as_str().node_err("notion: the item answered no id")?;
-        ctx.pulse_downstream(
-            NodeOutput::new().set("pageId", id).set("url", page["url"].clone()),
-        )
-        .await
+        ctx.pulse_downstream(page_output(&page, "notion: create the item")?).await
     }
 }

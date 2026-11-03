@@ -5,11 +5,11 @@
 
 use async_trait::async_trait;
 
-use weft::access::client::Multipart;
+use weft::access::client::{checked_send, url, Multipart, StoredBodyExt};
 use weft::node::NodeOutput;
 use weft::reqwest::header::CONTENT_TYPE;
 use weft::storage::{normalize_content_type, FileHandle, StorageScope};
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::elevenlabs::{audio_file_type, input_file_format, store_audio, API};
 
@@ -60,28 +60,22 @@ impl Node for ElevenLabsIsolateVoiceNode {
         let account: Access = ctx.inputs.get("account")?;
         let audio: FileHandle = ctx.inputs.get("audio")?;
 
-        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&audio).await?;
-        let file_format = input_file_format(&ctx, &meta.mime_type)?;
-        let mut form = Multipart::form_data().file("audio", &meta.filename, &meta.mime_type, bytes);
-        if let Some(file_format) = file_format {
+        let recording = ctx.storage(StorageScope::Run).body(&audio).await?;
+        let recording_name = recording.filename().to_string();
+        let mut form = Multipart::form_data();
+        if let Some(file_format) = input_file_format(&ctx, recording.mime_type())? {
             form = form.text("file_format", file_format);
         }
-        let (content_type, body) = form.build();
+        let form = form.stored("audio", recording);
 
         let http = ctx.client(&account).await?;
-        let resp = http
-            .post(format!("{API}/audio-isolation"))
-            .header("content-type", content_type)
-            .body(body)
-            .send()
-            .await
-            .node_err(WHAT)?;
+        let resp = checked_send(http.post(url(API, &["audio-isolation"])?.as_str()).multipart(form), WHAT).await?;
         // The route takes no output format, and ElevenLabs's reference
         // declares its answer as audio/mpeg whatever was sent, so the
         // answer's own type is the truth about the bytes, never the
         // recording's.
         let mime = normalize_content_type(resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()));
-        let stored = store_audio(&ctx, resp, WHAT, &isolated_name(&meta.filename, &mime), &mime).await?;
+        let stored = store_audio(&ctx, resp, WHAT, &isolated_name(&recording_name, &mime), &mime).await?;
         ctx.pulse_downstream(NodeOutput::stored_file(stored)).await
     }
 }

@@ -6,11 +6,11 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use weft::{Access, RunContext, Node, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::elevenlabs::{audio_file_type, emit_audio_with_id, API};
+use super::elevenlabs::{audio_file_type, emit_audio_with_id};
 use super::flows::set_some;
-use super::speech::{query, shared_settings};
+use super::speech::{shared_settings, speech_url};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsDialogueNode;
@@ -42,9 +42,6 @@ impl Node for ElevenLabsDialogueNode {
         let previous: Option<String> = ctx.inputs.opt("previousText")?;
         let next: Option<String> = ctx.inputs.opt("nextText")?;
 
-        if lines.is_empty() {
-            return Err(WeftError::Input("`lines` is empty: a dialogue needs at least one line".into()));
-        }
         let inputs: Vec<_> = lines.iter().map(|l| json!({ "text": l.text, "voice_id": l.voice })).collect();
         let mut body = json!({ "inputs": inputs, "model_id": model });
         let mut settings = serde_json::Map::new();
@@ -59,14 +56,14 @@ impl Node for ElevenLabsDialogueNode {
         }
         set_some(&mut body, "previous_text", previous);
         set_some(&mut body, "future_text", next);
-        shared_settings(&ctx, &mut body, &output_format)?;
+        shared_settings(&ctx, &mut body)?;
 
         let http = ctx.client(&account).await?;
-        let url = format!("{API}/text-to-dialogue?{}", query(&ctx, &output_format)?);
+        let url = speech_url(&ctx, &["text-to-dialogue"], &output_format)?;
         let (extension, mime) = audio_file_type(&output_format)?;
         emit_audio_with_id(
             &ctx,
-            http.post(url).json(&body),
+            http.post(url.as_str()).json(&body),
             "turn the script into dialogue on ElevenLabs",
             &format!("dialogue.{extension}"),
             mime,

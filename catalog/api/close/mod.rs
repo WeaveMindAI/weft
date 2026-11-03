@@ -2,7 +2,7 @@
 //! say why. WebSocket: the close frame with `code` and `reason`. HTTP:
 //! the end of the response; with nothing sent yet and a `reason`, the
 //! reason IS the body under `status` (sent the way Reply sends a
-//! String, through the package's `wire`), with no reason a bodiless
+//! String, through weft's `OutboundChunk::of_input`), with no reason a bodiless
 //! answer under `status`; after a Stream the head already went out and
 //! only the stream ends (the connection says which: `wire_started`).
 //!
@@ -20,11 +20,11 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft::caller::{CallerHandle, CloseReason};
+use weft::caller::{CallerHandle, CloseReason, OutboundChunk, ResponseHead};
 use weft::node::NodeOutput;
 use weft::{RunContext, Node, NodeManifest, WeftResult};
 
-use super::wire;
+use super::api;
 
 #[derive(NodeManifest)]
 pub struct CloseNode;
@@ -43,7 +43,7 @@ impl Node for CloseNode {
         let code: Option<u16> = ctx.inputs.opt("code")?;
         let status: Option<u16> = ctx.inputs.opt("status")?;
         let reason: Option<String> = ctx.inputs.opt("reason")?;
-        let headers = wire::headers(&ctx).await?;
+        let headers = api::headers(&ctx).await?;
         match ctx.live_caller().await? {
             CallerHandle::Http(http) => {
                 if let Some(code) = code {
@@ -57,7 +57,7 @@ impl Node for CloseNode {
                     // carrying these went out with the stream's first
                     // chunk, so a header set here would silently never
                     // reach the caller.
-                    if wire::has_headers(headers.as_ref()) {
+                    if !headers.is_empty() {
                         weft::node_bail!(
                             "`headers` cannot reach this caller: a Stream already sent the \
                              response head, so only its end is left. Set them on the Stream, \
@@ -79,20 +79,13 @@ impl Node for CloseNode {
                 } else if let Some(reason) = reason {
                     // The reason IS the answer's body, so one node both
                     // ends the exchange and says why.
-                    let status = match status {
-                        None => 200,
-                        Some(204) => weft::node_bail!(
-                            "`status` is 204 and there is a `reason`: a 204 carries no body, so \
-                             the message would never reach the caller. Pick a status that \
-                             carries one (400, 403, 404, 409...), or drop `reason`"
-                        ),
-                        Some(status) => status,
-                    };
+                    // A 204 carries no body: the metadata refuses a 204
+                    // with a reason, wired or written.
                     let data_type = ctx.caller_data_type().unwrap_or_default();
-                    let chunk = wire::chunk_for(&ctx, data_type, Value::String(reason)).await?;
-                    http.respond_with(wire::head_for(status, headers.as_ref())?, chunk).await?;
+                    let chunk = OutboundChunk::of_input(&ctx, "reason", Value::String(reason), data_type).await?;
+                    http.respond_with(ResponseHead::new(status.unwrap_or(200)).with_headers(headers), chunk).await?;
                 } else {
-                    http.close_with(wire::head_for(status.unwrap_or(204), headers.as_ref())?).await?;
+                    http.close_with(ResponseHead::new(status.unwrap_or(204)).with_headers(headers)).await?;
                 }
             }
             CallerHandle::Websocket(ws) => {
@@ -102,7 +95,7 @@ impl Node for CloseNode {
                          close frame carries `code` and `reason` instead"
                     );
                 }
-                wire::refuse_head_on_socket("Close", 200, headers.as_ref())?;
+                api::refuse_head_on_socket("Close", 200, &headers)?;
                 ws.close_with(CloseReason { code: code.unwrap_or(1000), reason: reason.unwrap_or_default() }).await?;
             }
         }

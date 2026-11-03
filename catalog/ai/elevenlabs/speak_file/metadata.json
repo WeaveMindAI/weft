@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[elevenlabs]", "accepts": ["wire"],
       "required": true,
       "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
     },
@@ -406,15 +406,15 @@
           {
             "kind": "not",
             "of": {
-              "kind": "config_equals",
+              "kind": "value",
               "field": "sendLevel",
               "equals": 0
             }
           },
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "outputFormat",
-            "regex": "^(pcm|ulaw|alaw)_"
+            "matches": "^(pcm|ulaw|alaw)_"
           }
         ]
       },
@@ -434,15 +434,15 @@
           {
             "kind": "not",
             "of": {
-              "kind": "config_equals",
+              "kind": "value",
               "field": "pan",
               "equals": 0
             }
           },
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "outputFormat",
-            "regex": "^(pcm|ulaw|alaw)_"
+            "matches": "^(pcm|ulaw|alaw)_"
           }
         ]
       },
@@ -456,7 +456,7 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_equals",
+            "kind": "value",
             "field": "enableLogging",
             "equals": false
           },
@@ -464,12 +464,14 @@
             "kind": "any",
             "of": [
               {
-                "kind": "input_satisfied",
-                "port": "previousRequestIds"
+                "kind": "value",
+                "field": "previousRequestIds",
+                "nonempty": true
               },
               {
-                "kind": "input_satisfied",
-                "port": "nextRequestIds"
+                "kind": "value",
+                "field": "nextRequestIds",
+                "nonempty": true
               }
             ]
           }
@@ -492,7 +494,7 @@
             "kind": "any",
             "of": [
               {
-                "kind": "config_equals",
+                "kind": "value",
                 "field": "model",
                 "equals": "eleven_multilingual_v2"
               },
@@ -502,7 +504,7 @@
                   {
                     "kind": "not",
                     "of": {
-                      "kind": "config_present",
+                      "kind": "value",
                       "field": "model"
                     }
                   },
@@ -529,7 +531,7 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_equals",
+            "kind": "value",
             "field": "model",
             "equals": "eleven_v3"
           },
@@ -537,12 +539,14 @@
             "kind": "any",
             "of": [
               {
-                "kind": "input_satisfied",
-                "port": "previousRequestIds"
+                "kind": "value",
+                "field": "previousRequestIds",
+                "nonempty": true
               },
               {
-                "kind": "input_satisfied",
-                "port": "nextRequestIds"
+                "kind": "value",
+                "field": "nextRequestIds",
+                "nonempty": true
               }
             ]
           }
@@ -562,8 +566,9 @@
             "port": "previousText"
           },
           {
-            "kind": "input_satisfied",
-            "port": "previousRequestIds"
+            "kind": "value",
+            "field": "previousRequestIds",
+            "nonempty": true
           }
         ]
       },
@@ -581,14 +586,48 @@
             "port": "nextText"
           },
           {
-            "kind": "input_satisfied",
-            "port": "nextRequestIds"
+            "kind": "value",
+            "field": "nextRequestIds",
+            "nonempty": true
           }
         ]
       },
       "then": {
         "message": "ElevenLabsSpeakFile '{id}' sets both `nextText` and `nextRequestIds`, and ElevenLabs ignores the text when it has the ids: keep one of them.",
         "port": "nextText"
+      }
+    },
+    {
+      "when": {
+        "kind": "value",
+        "field": "pronunciationDictionaries",
+        "count": { "min": 4 }
+      },
+      "then": {
+        "message": "ElevenLabsSpeakFile '{id}' lists more than 3 `pronunciationDictionaries`, and ElevenLabs applies at most 3 to one request: keep 3 or fewer.",
+        "port": "pronunciationDictionaries"
+      }
+    },
+    {
+      "when": {
+        "kind": "value",
+        "field": "previousRequestIds",
+        "count": { "min": 4 }
+      },
+      "then": {
+        "message": "ElevenLabsSpeakFile '{id}' lists more than 3 `previousRequestIds`, and ElevenLabs takes at most 3: keep the 3 closest to this request.",
+        "port": "previousRequestIds"
+      }
+    },
+    {
+      "when": {
+        "kind": "value",
+        "field": "nextRequestIds",
+        "count": { "min": 4 }
+      },
+      "then": {
+        "message": "ElevenLabsSpeakFile '{id}' lists more than 3 `nextRequestIds`, and ElevenLabs takes at most 3: keep the 3 closest to this request.",
+        "port": "nextRequestIds"
       }
     }
   ],

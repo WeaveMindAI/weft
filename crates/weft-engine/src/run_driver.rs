@@ -6,28 +6,36 @@
 //! - Boot: fold what the run starts from (its record as the worker's
 //!   claim read it, or the birth this worker just handed its record) to
 //!   recover pulses, firings, kicked roots, and pending deliveries.
-//! - Dispatch: ready nodes go into a `JoinSet` as tokio tasks.
-//!   Each task runs the node's async `execute` and reports back
+//! - Dispatch: ready nodes run as bodies (`Bodies`: the first on the
+//!   drive's own task, the ones beside it spawned). Each reports back
 //!   through an mpsc channel; the main loop applies results to
 //!   `pulses` and `firings` (single-writer invariant).
-//! - Suspend: a node calling `ctx.await_signal(...)` returns
-//!   `WeftError::Suspended { token }` from the spawned task; the
-//!   loop marks its firing `WaitingForInput` with the token. The
-//!   fold at boot seeds any already-resolved suspensions in
-//!   `awaited_sequences`; bodies pop entries in call_index order.
-//!   When nothing is making progress and at least one firing is
-//!   waiting, the loop returns `Stalled`. A run that cannot pause
-//!   right now holds the wait in the node's call instead
-//!   (`crate::held_waits`), and the loop ends it: with its answer, by
-//!   giving it up once nothing moved for the run's `holdSecs`, or by
-//!   suspending it once the run can pause again.
+//! - Pause: a node waiting (`state.wait`) holds the wait in its call
+//!   (`crate::held_waits`), and the loop ends it: with its answer, which
+//!   carries the body on where it is, or by pausing it. A run pauses in
+//!   one way only: every node still running waits (a held wait, a bus
+//!   read, a stream pull, a yield), something outside the run moves it
+//!   next, and the run stayed that quiet for its `pauseAfterSecs` (at
+//!   once for a hand-back, [`pause_decision`]); then the loop tells them
+//!   all to pause. Each saves its state and returns a suspension, a held
+//!   wait with its token (the loop marks its firing `WaitingForInput` on
+//!   it) and any other wait with none. Once nothing runs and at least
+//!   one firing is waiting, the loop returns `Stalled`. A worker that
+//!   picks the run up opens its buses again, and runs every paused
+//!   firing again from the top with what it saved ([`Carried`]): the
+//!   ones paused inside the run, and the ones whose wait was answered.
+//!   A run that cannot pause right now (a caller on the line,
+//!   `recorded: false`) never pauses: its held wait ends with its answer,
+//!   given up once nothing moved for the run's `holdSecs`, or paused once
+//!   the run can pause again and the same rule pauses it.
 //! - Answers: only the worker driving a run writes its record, so an
 //!   answer to a wait of a run being driven waits at the broker for its
 //!   worker to take it (`RunClient::answers`), which records it as the
-//!   run's own `SuspensionResolved`. A run that holds a wait, or holds
-//!   its worker with a bus while a node is suspended, asks for them; any
-//!   other stalled run lets go, and an answer that came meanwhile is
-//!   handed to it as it does.
+//!   run's own `SuspensionResolved`. A run that holds a wait, or keeps
+//!   running while a firing an earlier drive paused waits, asks for them
+//!   (an answer to that firing resumes it in place); any other stalled
+//!   run lets go, and an answer that came meanwhile is handed to it as it
+//!   does.
 //! - Ending: whatever the run ends with, its buses' last rows, its spend
 //!   and its caller's last words go on its record first, then its ending
 //!   (`run_one_observed`).
@@ -55,7 +63,8 @@ use weft_core::run::{
 use weft_core::generator::{StreamEnd, DEFAULT_MAX_BUFFERED_ITEMS};
 use weft_core::liveness::FiringLocation;
 use weft_core::node::NodeOutput;
-use weft_core::primitive::{KickedNode, RunSnapshot};
+use weft_core::primitive::{KickedNode, RecordedWait, RunSnapshot};
+use weft_core::run::saved::SavedState;
 use weft_core::project::ProgramIndex;
 use weft_core::pulse::{PulseStatus, PulseTable};
 use weft_core::cancellation::CancellationFlag;
@@ -82,7 +91,8 @@ pub struct HandBack {
     /// running.
     pub asked: tokio_util::sync::CancellationToken,
     /// Stop the nodes still running where they are and hand the run back
-    /// now: the next worker fails each of them as cut short.
+    /// now: the next worker runs each of them again from its saved state,
+    /// or fails it as cut short when it keeps none.
     pub overdue: tokio_util::sync::CancellationToken,
 }
 
@@ -117,9 +127,10 @@ pub enum RunOutcome {
     /// stops a worker no call holds open): it started no node since, and
     /// every node that was running ended or, once the hand-back was
     /// overdue, was stopped where it was. Its record holds all of it, so
-    /// the next worker carries it on from there, failing a node that was
-    /// stopped as cut short. No ending is written; the worker asks for
-    /// its resume.
+    /// the next worker carries it on from there, running a node that was
+    /// stopped again from its saved state, or failing it as cut short
+    /// when it keeps none. No ending is written; the worker asks for its
+    /// resume.
     HandedBack,
     /// Scheduler ran to quiescence but pulses remain pending and
     /// nothing is waiting. Treat as a graph-shape bug. The report
@@ -205,6 +216,8 @@ pub(crate) struct ClaimedRecord {
     pub(crate) firing_payload: Option<serde_json::Value>,
     /// The charges it leaves open.
     pub(crate) charges: weft_journal::ChargeBook,
+    /// The calls its firings owe when they end.
+    pub(crate) owed: weft_journal::OwedCalls,
     /// What the run inherits (`weft run --seed`).
     pub(crate) chain: weft_journal::SeedChain,
     /// Its fold, the whole record taken.
@@ -250,11 +263,11 @@ impl ClaimedRecord {
         let fold = weft_journal::LiveFold::new(weft_journal::Fold::new(run_id, project).driving(), &chain, &page).await?;
         // The first page is taken here, the rest walked after it.
         let last = weft_journal::record::RecordPage::last_seq(&first).expect("the first page holds the birth");
-        let mut read = Reading { fold, charges: weft_journal::ChargeBook::default(), firing_payload: None, last_seq: last };
+        let mut read = Reading { fold, charges: weft_journal::ChargeBook::default(), owed: weft_journal::OwedCalls::default(), firing_payload: None, last_seq: last };
         read = weft_journal::on_blocking_pool(move || read.take(first).map(|()| read)).await?;
         let read = weft_journal::record::fold_pages(|after| page(run_id, after), Some(last), read, |read: &mut Reading, rows| read.take(rows)).await?;
-        let Reading { fold, charges, firing_payload, last_seq } = read;
-        Ok(Self { birth, firing_payload, charges, chain, fold, last_seq, lost_full })
+        let Reading { fold, charges, owed, firing_payload, last_seq } = read;
+        Ok(Self { birth, firing_payload, charges, owed, chain, fold, last_seq, lost_full })
     }
 }
 
@@ -262,6 +275,7 @@ impl ClaimedRecord {
 struct Reading {
     fold: weft_journal::LiveFold,
     charges: weft_journal::ChargeBook,
+    owed: weft_journal::OwedCalls,
     firing_payload: Option<serde_json::Value>,
     /// The last row taken.
     last_seq: i32,
@@ -274,6 +288,7 @@ impl Reading {
         }
         for row in &page {
             self.charges.apply(&row.event);
+            self.owed.apply(&row.event);
             if let (None, RunEvent::NodeKicked { firing: true, payload, .. }) = (&self.firing_payload, &row.event) {
                 self.firing_payload = Some(payload.clone().unwrap_or_default());
             }
@@ -345,7 +360,7 @@ pub(crate) async fn run_one_observed(
     let RunDrive { run_id, journal, program, starts_from, cancellation, exchange, hand_back, hold } = run;
     // The run's spend still being worked out, which goes on its record
     // before its ending (`crate::metering`).
-    let record = RunRecord { journal: journal.clone(), costs: crate::metering::PendingCostRecords::new() };
+    let record = RunRecord::new(journal.clone());
     // The run owns its shared wait tracker; the bus coordinator,
     // the stream runtime and every firing's handle are its clients.
     //
@@ -397,7 +412,7 @@ pub(crate) async fn run_one_observed(
     // Everything the run says goes on its record before its ending, in
     // this order. Its buses' last rows: close every live bus and wait for
     // the pump to hand them over.
-    bus_coordinator.shutdown().await;
+    bus_coordinator.shutdown(drove.as_ref().is_ok_and(|drove| matches!(drove.outcome, RunOutcome::Stalled | RunOutcome::HandedBack))).await;
     drop(bus_coordinator);
     // A durable run whose record stopped being written (a write got no
     // answer, `DriveJournal::must_hand_back`) after the drive's last look
@@ -510,7 +525,12 @@ async fn finish_exchange<'e>(
             Ok(RunOutcome::Cancelled { cause }) => conn.surface_error(&format!("run cancelled: {cause}"), Ending::of_cancel(cause)).await,
             Ok(RunOutcome::Stuck { report }) => conn.surface_error(&report.to_string(), Ending::ProgramFailed).await,
             Ok(RunOutcome::Completed) => conn.run_ended().await,
-            Ok(RunOutcome::Stalled) => conn.run_carries_on(crate::caller_conn::PARKED).await,
+            // A run pauses with its caller still on the line only when the
+            // caller is being let go at the platform's limit on one
+            // connection: it hears why. Otherwise the caller is gone (a
+            // connected caller keeps the run on its worker), and nobody is
+            // left to tell.
+            Ok(RunOutcome::Stalled) => conn.let_go().await,
             Ok(RunOutcome::HandedBack) => conn.run_carries_on(crate::caller_conn::HANDED_BACK).await,
         }
         if conn.holds_answer() {
@@ -758,13 +778,13 @@ async fn resume_answered(
     firings: &NodeFiringTable,
     pulses: &mut PulseTable,
     kicked: &mut weft_core::primitive::KickTable,
-    awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
+    carried: &mut Carried,
 ) -> anyhow::Result<()> {
     if answers.is_empty() {
         return Ok(());
     }
     let snap = take_answers(journal, fold, run_id, replica, answers).await?;
-    let resumed = resume_resolved_suspensions_in_place(snap, firings, pulses, kicked, awaited_sequences)?;
+    let resumed = resume_resolved_suspensions_in_place(snap, firings, pulses, kicked, carried)?;
     if resumed > 0 {
         tracing::info!(
             target: "weft_engine::resume",
@@ -820,10 +840,9 @@ async fn drive_run_id(
     // What the run decided about its scopes (`weft_core::run::scope`):
     // no row of its own, the fold decides the same from the same rows.
     let mut scopes = ScopeTable::default();
-    // Per-(node, frames) ordered list of past `await_signal` calls.
-    // Pre-loaded from the journal fold; consumed by the body's
-    // `await_signal` calls in call_index order.
-    let mut awaited_sequences: HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>> = HashMap::new();
+    // What each firing carries on from, out of the journal fold: the
+    // waits it made and the state it saved last.
+    let mut carried = Carried::default();
     let mut loop_runtime = LoopRuntime::new();
     // What the run's tables are done with goes as the drive goes
     // (`weft_core::run::forget`): a run carried on from its record takes
@@ -844,14 +863,26 @@ async fn drive_run_id(
             (born_with, RunFold::unborn(run_id, project_arc.clone()))
         }
         StartsFrom::Record(claimed) => {
-            let ClaimedRecord { birth, charges, chain, fold, lost_full, .. } = *claimed;
+            let ClaimedRecord { birth, charges, owed, chain, fold, lost_full, .. } = *claimed;
             reopen_charges(clients, record, replica, run_id, cancellation, charges);
+            // What its firings owed when the drive before went away, still
+            // owed here.
+            *record.owed.lock().expect("owed calls poisoned") = owed;
             let born_with = BornWith::of_birth(run_id, &birth)?;
-            let (fold, snap) = RunFold::of_live(run_id, project_arc.clone(), chain, fold).await?;
+            let (fold, mut snap) = RunFold::of_live(run_id, project_arc.clone(), chain, fold).await?;
+            let open_buses = std::mem::take(&mut snap.open_buses);
             let crashed = apply_snapshot(
-                &program, snap, &mut pulses, &mut firings, &mut kicked, &mut scopes, &mut awaited_sequences,
+                &program, snap, &mut pulses, &mut firings, &mut kicked, &mut scopes, &mut carried,
                 &mut loop_runtime, &mut forgetting,
             )?;
+            // A node left running (whether it runs again from its saved
+            // state or is failed) means the worker before went away
+            // mid-drive, as a crash or an overdue hand-back does.
+            let left_running = firings
+                .open()
+                .any(|e| e.status() == NodeFiringStatus::Running && !program.boundaries.contains(&e.node_id));
+            reopen_buses(&bus_coordinator, &open_buses, &firings, &carried, left_running)
+                .map_err(|why| anyhow::anyhow!("run {run_id} cannot carry on: {why}"))?;
             // A run claimed with its cancel waiting ends every open firing
             // Cancelled below, a body a dead drive left behind included.
             if !cancellation.is_cancelled() {
@@ -879,9 +910,10 @@ async fn drive_run_id(
         )
         .await;
         forget_what_ended(
-            &program, run_id, &mut forgetting, &mut pulses, &mut firings, &mut kicked, &mut scopes, &mut awaited_sequences,
+            &program, run_id, &mut forgetting, &mut pulses, &mut firings, &mut kicked, &mut scopes, &mut carried,
             &mut loop_runtime, |_| false,
         );
+        crate::end_calls::settle_run(&end_call_sender(clients, record, replica, run_id, instance.as_ref()), record, project, true).await;
         return Ok(Drove { outcome: RunOutcome::Cancelled { cause }, pulses, firings, loop_runtime, kicked, scopes });
     }
 
@@ -903,7 +935,7 @@ async fn drive_run_id(
         &mut firings,
         &mut kicked,
         &mut scopes,
-        awaited_sequences,
+        carried,
         &mut loop_runtime,
         phase,
         instance.as_ref(),
@@ -921,6 +953,7 @@ async fn drive_run_id(
     // when the failed write surfaced as an error from inside a turn (a
     // write the turn waited on) rather than at its top: its record is a
     // prefix of what it did either way (`DriveJournal::must_hand_back`).
+    let sender = end_call_sender(clients, record, replica, run_id, instance.as_ref());
     let mut outcome = match outcome {
         Err(e) if drive_journal.must_hand_back() => {
             tracing::info!(
@@ -930,7 +963,13 @@ async fn drive_run_id(
             );
             RunOutcome::HandedBack
         }
-        outcome => outcome?,
+        Err(e) => {
+            // The run fails on this: what its firings still owe goes out
+            // as at any end that is not a cancel.
+            crate::end_calls::settle_run(&sender, record, project, false).await;
+            return Err(e);
+        }
+        Ok(outcome) => outcome,
     };
 
     // A route's caller is still waiting and nothing was ever sent: the
@@ -943,10 +982,27 @@ async fn drive_run_id(
     // The drive is over and every body with it: what its last turn ended
     // goes too.
     forget_what_ended(
-        &program, run_id, &mut forgetting, &mut pulses, &mut firings, &mut kicked, &mut scopes, &mut HashMap::new(),
+        &program, run_id, &mut forgetting, &mut pulses, &mut firings, &mut kicked, &mut scopes, &mut Carried::default(),
         &mut loop_runtime, |_| false,
     );
+    // A run that ends for good sends what its firings still owe; one that
+    // pauses keeps it on its record for the drive that picks it up.
+    if !outcome.pauses() {
+        crate::end_calls::settle_run(&sender, record, project, matches!(outcome, RunOutcome::Cancelled { .. })).await;
+    }
     Ok(Drove { outcome, pulses, firings, loop_runtime, kicked, scopes })
+}
+
+/// What sends the calls run `run_id`'s firings owe as its drive ends
+/// (`crate::end_calls`).
+fn end_call_sender<'a>(
+    clients: &'a EngineClients,
+    record: &'a RunRecord,
+    replica: &'a str,
+    run_id: RunId,
+    instance: Option<&'a weft_core::instance::InstanceId>,
+) -> crate::end_calls::Sender<'a> {
+    crate::end_calls::Sender { clients, journal: &record.journal, replica, run_id, instance }
 }
 
 /// Hold again, before anything of the run runs, every charge its record
@@ -1052,7 +1108,8 @@ async fn hand_back_overdue(hand_back: Option<&HandBack>) {
 /// could not be written, `why`): the nodes still running stop where they
 /// are, what they said before that is applied (and goes on record when it
 /// still can), and the run is handed back. Their records stay open, so
-/// the next worker fails each one as cut short.
+/// the next worker runs each one again from its saved state, or fails it
+/// as cut short when it keeps none.
 #[allow(clippy::too_many_arguments)]
 async fn cut_short(
     bodies: &mut Bodies,
@@ -1275,36 +1332,107 @@ fn body_ended(ended: Ended, task_tx: &mpsc::UnboundedSender<TaskMsg>, run_id: Ru
 // use, so the driver never grows a second name for one concept.
 
 /// The set of parked nodes whose CURRENT suspension is now resolved. A
-/// `WaitingForInput` firing resumes ONLY if the token it is parked on (its
-/// `callback_id`) appears as a resolved `Await` in its folded sequence.
+/// `WaitingForInput` firing resumes ONLY if the wait it is parked on (its
+/// `callback_id`) has an ending among its recorded waits; one paused
+/// inside the run (no wait) carries on whenever the run does.
 ///
-/// Checking "ANY resolved entry" instead of the current token would
-/// livelock a multi-await body: after the first await resolves, the
-/// sequence permanently contains a resolved entry, so every re-fold would
-/// re-dispatch the node, the body would replay and re-suspend on the next
-/// await, shipping fresh NodeResumed + NodeSuspended rows that the
-/// refetch loop treats as progress, spinning until its deadline. Scoping
+/// Checking "ANY ended wait" instead of the current token would livelock
+/// a body that waits twice: after the first wait ends, the firing
+/// permanently holds an ended wait, so every re-fold would re-dispatch
+/// the node, the body would run again and pause on its next wait,
+/// shipping fresh NodeResumed + NodeSuspended rows that the refetch loop
+/// treats as progress, spinning until its deadline. Scoping
 /// to the current token is what both resume paths (boot-time
 /// `apply_snapshot` and mid-drive `resume_resolved_suspensions_in_place`)
 /// depend on, so it lives here once.
-fn resolved_waiting_locations(
-    firings: &NodeFiringTable,
-    awaited_sequences: &HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
-) -> std::collections::HashSet<FiringLocation> {
+fn resolved_waiting_locations(firings: &NodeFiringTable, waits: &HashMap<FiringLocation, Vec<RecordedWait>>) -> std::collections::HashSet<FiringLocation> {
     firings
         .waiting()
-        .filter_map(|e| {
-            let token = e.callback_id.as_deref()?;
-            let seq = awaited_sequences.get(&FiringLocation::new(e.node_id.clone(), e.frames.clone()))?;
-            seq.iter()
-                .any(|entry| matches!(
-                    &entry.kind,
-                    weft_core::primitive::AwaitedEntryKind::Await { token: t, ended: Some(_) }
-                        if t.as_str() == token
-                ))
-                .then(|| FiringLocation::new(e.node_id.clone(), e.frames.clone()))
+        .filter(|e| match e.callback_id.as_deref() {
+            Some(token) => waits
+                .get(&FiringLocation::new(e.node_id.clone(), e.frames.clone()))
+                .is_some_and(|recorded| recorded.iter().any(|wait| wait.token == token && wait.ended.is_some())),
+            // Paused inside the run: it carries on whenever the run does.
+            None => true,
         })
+        .map(|e| FiringLocation::new(e.node_id.clone(), e.frames.clone()))
         .collect()
+}
+
+/// What a run's firings carry on from, by firing, out of its fold: the
+/// waits each made (`RunSnapshot::recorded_waits`) and the state each saved
+/// last (`RunSnapshot::saved_states`). A firing dispatched again takes its
+/// own out ([`Carried::resume_of`]).
+#[derive(Default)]
+struct Carried {
+    waits: HashMap<FiringLocation, Vec<RecordedWait>>,
+    saved: HashMap<FiringLocation, SavedState>,
+}
+
+impl Carried {
+    /// What the firing at `at` carries on from: its saved state and its
+    /// waits.
+    fn resume_of(&mut self, at: &FiringLocation, record: Option<&NodeFiring>) -> crate::context::FiringResume {
+        crate::context::FiringResume {
+            saved: self.saved.remove(at),
+            waits: self.waits.remove(at).unwrap_or_default(),
+            items_on_record: record.map_or(0, |record| record.stream_items),
+        }
+    }
+}
+
+/// Open again, before any body runs, every bus a run that paused left open
+/// (`open`, from its record), with the names its paused firings hold on
+/// each (their saved positions). A drive that ended with nodes still
+/// running (`left_running`: its worker died, or a hand-back went overdue)
+/// may have left a bus's last messages off the record, so each such bus
+/// is opened only to end it failed, whether those nodes run again from
+/// their saved states or are failed: a reader carrying on from it would
+/// otherwise read on past messages it never got. So is a bus a saved place
+/// is ahead of (the record lost its last entries before the pause).
+fn reopen_buses(
+    coordinator: &Arc<crate::context::BusCoordinator>,
+    open: &BTreeMap<uuid::Uuid, weft_core::primitive::OpenBus>,
+    firings: &NodeFiringTable,
+    carried: &Carried,
+    left_running: bool,
+) -> Result<(), String> {
+    let mut held: HashMap<uuid::Uuid, Vec<(String, FiringLocation, u64)>> = HashMap::new();
+    for (at, saved) in &carried.saved {
+        if firings.at(&at.node_id, &at.frames).is_none_or(|record| record.status().is_terminal()) {
+            continue;
+        }
+        for (bus, position) in &saved.positions.buses {
+            let (Ok(id), Some(registered)) = (uuid::Uuid::parse_str(bus), &position.registered) else { continue };
+            held.entry(id).or_default().push((registered.name.clone(), at.clone(), registered.joined_offset));
+        }
+    }
+    // A saved place ahead of what the record holds of a bus (its last
+    // rows never landed: a write that failed before the pause, a worker
+    // gone before its buses were written) would have the reopened bus hand
+    // out those offsets again under the readers' feet.
+    let behind_the_record: Vec<uuid::Uuid> = open
+        .iter()
+        .filter(|(id, bus)| {
+            carried.saved.values().filter_map(|saved| saved.positions.buses.get(&id.to_string())).any(|position| {
+                position.cursor.is_some_and(|cursor| cursor > bus.next_offset)
+                    || position.registered.as_ref().is_some_and(|registered| registered.joined_offset >= bus.next_offset)
+            })
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    coordinator.reopen(open, held)?;
+    if left_running {
+        coordinator.close_all(StreamEnd::Failed {
+            error: "the worker holding this bus went away, so messages it carried may be lost".into(),
+        });
+    }
+    for id in behind_the_record {
+        coordinator.close_bus(id, StreamEnd::Failed {
+            error: "the run's record lost this bus's last entries before the pause, so messages it carried may be lost".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Mark a set of firing locations for re-dispatch as resumes. For each
@@ -1368,7 +1496,7 @@ fn apply_snapshot(
     firings: &mut NodeFiringTable,
     kicked: &mut weft_core::primitive::KickTable,
     scopes: &mut ScopeTable,
-    awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
+    carried: &mut Carried,
     loop_runtime: &mut LoopRuntime,
     forgetting: &mut Forgetting,
 ) -> anyhow::Result<Vec<CrashedFiring>> {
@@ -1383,7 +1511,8 @@ fn apply_snapshot(
     *firings = snap.firings;
     *kicked = snap.kicked;
     *scopes = snap.scopes;
-    *awaited_sequences = snap.awaited_sequences;
+    carried.waits = snap.recorded_waits;
+    carried.saved = snap.saved_states;
     // The fold drove every loop instance from the loop rows; the
     // resumed worker takes them over as its own runtime. Buffered
     // stream items are not in it: their pulses refolded Pending and
@@ -1392,14 +1521,15 @@ fn apply_snapshot(
     // `snap.corruptions` is empty here: `checked_snapshot` refused the
     // snapshot otherwise.
 
-    // A WaitingForInput firing re-dispatches ONLY if the suspension it
-    // is CURRENTLY parked on has been resolved by a fire AND the firing
-    // is still non-terminal (`resolved_waiting_locations`). Without
-    // this scoping, every fresh worker spawn would re-dispatch every
-    // still-suspended sibling, re-run the body, hit the first await,
-    // find no delivery yet, re-suspend, churning the journal with
-    // spurious NodeStarted/Suspended cycles per fresh worker.
-    let resume_locations = resolved_waiting_locations(firings, awaited_sequences);
+    // A WaitingForInput firing re-dispatches when the wait it is
+    // CURRENTLY parked on has an ending, or when it paused inside the run
+    // (no wait: it carries on with the run), and is still non-terminal
+    // (`resolved_waiting_locations`). Without this scoping, every fresh
+    // worker spawn would re-dispatch every still-suspended sibling, run
+    // its body, reach its wait, find no answer yet, re-suspend, churning
+    // the journal with spurious NodeStarted/Suspended cycles per fresh
+    // worker.
+    let resume_locations = resolved_waiting_locations(firings, &carried.waits);
 
     // A worker that died mid-firing: a `Running` firing with no terminal
     // in the journal belonged to a worker that went away while the
@@ -1410,11 +1540,16 @@ fn apply_snapshot(
     // catchable on its `_error` output like any failure. A retry is
     // only ever something the program asks for.
     //
-    // Except a pure node (`features.pure`) that had not emitted yet: it
-    // did nothing outside its run and nothing inside it either, so it
-    // runs again, exactly as if its start had never been written. One
-    // that emitted already, or read a stream (it took items off it for
-    // good), is failed like any other node.
+    // Except a node that saved a state (`ctx.keep`): it said where it is,
+    // so it runs again from there, as a resumed firing does (a `once`
+    // whose result never got saved runs again, which is the gap its docs
+    // name; a stream it read hands it again what it took since that save,
+    // since a firing's takes go on record with its saves). And except a
+    // pure node (`features.pure`) that had not emitted yet: it did nothing
+    // outside its run and nothing inside it either, so it runs again,
+    // exactly as if its start had never been written. One that emitted
+    // already, or read a stream, with no state saved, is failed like any
+    // other node.
     //
     // A firing being Running here means its worker is gone because at
     // most ONE worker drives a run at a time: its execute or
@@ -1444,7 +1579,7 @@ fn apply_snapshot(
         let pure_and_untouched = program.node(&e.node_id).is_some_and(|node| node.features.pure)
             && e.mentioned_ports.is_empty()
             && !consumed_a_stream;
-        if program.boundaries.contains(&e.node_id) || pure_and_untouched {
+        if program.boundaries.contains(&e.node_id) || pure_and_untouched || carried.saved.contains_key(&loc) {
             run_again.insert(loc);
         } else {
             crashed.push(CrashedFiring { consumed_a_stream, loc });
@@ -1461,8 +1596,9 @@ fn apply_snapshot(
 /// A firing a dead worker left running (see `apply_snapshot`).
 struct CrashedFiring {
     loc: FiringLocation,
-    /// The node was reading a stream: what it already pulled was taken
-    /// off the stream for good, which its message says.
+    /// The node was reading a stream: having saved no state, it put none
+    /// of its takes on record, so the items it pulled are back on the
+    /// stream and go with its failure, which its message says.
     consumed_a_stream: bool,
 }
 
@@ -1484,9 +1620,9 @@ fn crashed_firing_message(firing: &CrashedFiring, lost_full: Option<&weft_broker
     };
     if firing.consumed_a_stream {
         format!(
-            "{cause}; it was not run again, because the items it had already read are gone from \
-             the stream and it may have partly acted on them. Re-run the run to start the stream \
-             over once you have checked what it did."
+            "{cause}; it was not run again, because it saved no state to carry on from and may \
+             have partly acted on the items it had read. The rest of its stream goes with it. \
+             Re-run the run to start the stream over once you have checked what it did."
         )
     } else {
         format!(
@@ -1589,12 +1725,12 @@ async fn fail_crashed_firings(
 /// genuinely Running in-flight, so a full `apply_snapshot` would read
 /// them as firings a dead worker left running and fail them (a
 /// `NodeFailed` journaled over a live task). This touches ONLY the resolved
-/// waiters: it reads the run's fold solely to recover the resolved
-/// `awaited_sequences` entries, then for each WaitingForInput firing
-/// whose `callback_id` token is now resolved it (a) installs that
-/// node's fresh await sequence into the live map and (b) un-absorbs the
-/// pulses the original dispatch consumed, so the next drain re-fires it
-/// as a resume (NodeResumed). Returns how many nodes it resumed.
+/// waiters: it reads the run's fold solely to recover their recorded waits
+/// and saved states, then for each WaitingForInput firing whose
+/// `callback_id` token is now resolved it (a) installs what that firing
+/// carries on from into the live map and (b) un-absorbs the pulses the
+/// original dispatch consumed, so the next drain re-fires it as a resume
+/// (NodeResumed). Returns how many nodes it resumed.
 ///
 /// Mirrors the `resume_locations` half of `apply_snapshot` (the half
 /// about firings a dead worker left Running is deliberately omitted:
@@ -1604,25 +1740,28 @@ fn resume_resolved_suspensions_in_place(
     firings: &NodeFiringTable,
     pulses: &mut PulseTable,
     kicked: &mut weft_core::primitive::KickTable,
-    awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
+    carried: &mut Carried,
 ) -> anyhow::Result<usize> {
     // Which parked nodes have their CURRENT suspension resolved now?
-    // Computed against the FRESHLY-FOLDED sequences (the live map is
-    // stale mid-drive, which is exactly why this path exists), NOT the
-    // firings a dead worker left Running that apply_snapshot also
-    // handles: mid-flight a Running firing is a live in-flight task, not a
-    // dead one.
-    let resume_locations = resolved_waiting_locations(firings, &snap.awaited_sequences);
+    // Computed against the FRESHLY-FOLDED waits (the live map is stale
+    // mid-drive, which is exactly why this path exists), NOT the firings
+    // a dead worker left Running that apply_snapshot also handles:
+    // mid-flight a Running firing is a live in-flight task, not a dead
+    // one.
+    let resume_locations = resolved_waiting_locations(firings, &snap.recorded_waits);
 
     if resume_locations.is_empty() {
         return Ok(0);
     }
 
-    // Install the resolved await sequences for exactly those nodes so the
-    // body's replay pops the resolved value.
+    // Install what exactly those firings carry on from, so the body gets
+    // its saved state back and its wait the answer.
     for key in &resume_locations {
-        if let Some(seq) = snap.awaited_sequences.get(key) {
-            awaited_sequences.insert(key.clone(), seq.clone());
+        if let Some(waits) = snap.recorded_waits.get(key) {
+            carried.waits.insert(key.clone(), waits.clone());
+        }
+        if let Some(saved) = snap.saved_states.get(key) {
+            carried.saved.insert(key.clone(), saved.clone());
         }
     }
 
@@ -1655,7 +1794,7 @@ async fn drive(
     firings: &mut NodeFiringTable,
     kicked: &mut weft_core::primitive::KickTable,
     scopes: &mut ScopeTable,
-    mut awaited_sequences: HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
+    mut carried: Carried,
     loop_runtime: &mut LoopRuntime,
     phase: weft_core::context::Phase,
     // Which instance the run is for, from its `RunStarted`; every
@@ -1741,6 +1880,17 @@ async fn drive(
     // How long the run has been quiet: every running node waiting, and one
     // of those waits ended only from outside (see the stuck-check below).
     let mut hold_clock = crate::outside_waits::HoldClock::new(clients.clock.as_ref(), run_id, settings.hold_secs());
+    // When the run went quiet (every running node waiting): one that can
+    // pause stays on its worker its `pauseAfterSecs` from then before it
+    // pauses ([`pause_decision`]), and anything moving in it starts the
+    // count over.
+    let mut quiet_since: Option<std::time::Instant> = None;
+    // Set once the drive told every waiting body to pause
+    // ([`pause_decision`]): from then on nothing starts and no answer is
+    // taken, and once the last body is gone the run lets go, `Stalled`
+    // (an answer from outside picks it up again) or, paused for a
+    // hand-back, `HandedBack` (the next worker does).
+    let mut paused: Option<RunOutcome> = None;
     'turn: loop {
         // Poison checkpoint: a journal write failed somewhere since
         // the last iteration. The journal is now a strict prefix of
@@ -1851,37 +2001,19 @@ async fn drive(
 
         // Asked to let go of this worker. A run that can be suspended
         // starts no node from here on, the ones running go on to their
-        // end, and the run is handed back once none is left (below). What
-        // waits to run stays in the table and on record, for the worker
-        // that carries the run on. A run that cannot be suspended carries
-        // on here as if nothing was asked, getting as far as it can: the
-        // process going away ends it the way a crash would. It drains
-        // from the turn it can be suspended (its last bus closed).
+        // end or pause where they wait (`pause_decision`), and the run is
+        // handed back once none is left (below). What waits to run stays
+        // in the table and on record, for the worker that carries the run
+        // on. A run that cannot be suspended carries on here as if nothing
+        // was asked, getting as far as it can: the process going away ends
+        // it the way a crash would. It drains from the turn it can be
+        // suspended (its caller gone).
         let (asked, overdue) = hand_back.map_or((false, false), |hand_back| {
             let overdue = hand_back.overdue.is_cancelled();
             (overdue || hand_back.asked.is_cancelled(), overdue)
         });
-        let draining = asked && unsuspendable(caller, bus_coordinator, settings).is_none();
-        // A run that can pause again (the last bus between its nodes
-        // closed) suspends the waits it was holding, as if it could have
-        // from the start.
-        if waits.held().pending() && unsuspendable(caller, bus_coordinator, settings).is_none() {
-            waits.held().pause();
-        }
-        // An answer that came before its node suspended (see the answers
-        // arm below) resumes it once it reads as suspended.
-        if waiting_count(firings) > 0 {
-            let early: Vec<_> = waits
-                .held()
-                .early_for(&suspended_tokens(firings))
-                .into_iter()
-                .map(|(token, answer)| weft_broker_client::protocol::RunAnswer { token, answer })
-                .collect();
-            resume_answered(
-                drive_journal, fold, run_id, replica, early, firings, pulses, kicked, &mut awaited_sequences,
-            )
-            .await?;
-        }
+        let can_pause = unsuspendable(caller, settings).is_none();
+        let draining = asked && can_pause;
         // Past the hand-back's deadline every node still running is
         // stopped where it is, a wait held in a node's call included, also
         // in a run that could only be suspended once the deadline was gone
@@ -1895,8 +2027,22 @@ async fn drive(
         }
 
         let mut ready = program.ready(pulses, given);
+        // What tells a resume from a firing that already took its inputs
+        // (see the dispatch below): the parked firings whose current wait
+        // is answered, or that paused inside the run.
+        let resolved_waiters = resolved_waiting_locations(firings, &carried.waits);
         ready.retain_mut(|(id, group)| {
             let node = program.node(id).expect("ready node belongs to project");
+            // Items keep coming down a stream while the firing reading it
+            // is parked on a wait: they wait on their wire for its resumed
+            // body, and dispatch nothing.
+            let at = FiringLocation::new(id.clone(), group.frames.clone());
+            if firing_at(firings, id, group.run_id, &group.frames).is_some_and(|record| record.status() == NodeFiringStatus::WaitingForInput)
+                && !resolved_waiters.contains(&at)
+                && only_stream_items(pulses, program_idx, id, &group.pulse_ids)
+            {
+                return false;
+            }
             match scope_permission(program_idx, node, &group.frames, scopes) {
                 ScopePermission::Pending => false,
                 ScopePermission::Allowed => true,
@@ -1909,7 +2055,7 @@ async fn drive(
         // Work this worker leaves for the next one: what is ready, and a
         // kick not dispatched yet.
         let held_back = draining && (!ready.is_empty() || kicked.any_undispatched());
-        if draining {
+        if draining || paused.is_some() {
             ready.clear();
         }
         // A kick not dispatched yet that has no pulse-driven ReadyGroup at
@@ -1921,7 +2067,8 @@ async fn drive(
         // of each body root behind it. (What a kicked node's body reads
         // as its wake is read off its kick at the dispatch below, a
         // resume's included.)
-        let to_dispatch: Vec<FiringLocation> = if draining { Vec::new() } else { kicked.undispatched().cloned().collect() };
+        let to_dispatch: Vec<FiringLocation> =
+            if draining || paused.is_some() { Vec::new() } else { kicked.undispatched().cloned().collect() };
         for loc in to_dispatch {
             let node = program.node(&loc.node_id)
                 .ok_or_else(|| anyhow::anyhow!("kick names unknown node '{}'", loc.node_id))?;
@@ -1996,10 +2143,6 @@ async fn drive(
         if !ready.is_empty() {
             let_answer_go(answering);
         }
-        // What tells a resume from a firing that already took its
-        // inputs (see the dispatch below): the parked firings whose
-        // current wait is answered, and the bodies still running.
-        let resolved_waiters = resolved_waiting_locations(firings, &awaited_sequences);
         for (node_id, mut group) in ready {
             tracing::debug!(
                 target: "weft_engine::run_driver",
@@ -2020,10 +2163,11 @@ async fn drive(
                 ));
             };
             // A record already at this location makes the dispatch a
-            // resume, and only two kinds are: a firing parked on a wait
-            // whose answer is in, and one left Running with no body (a
-            // loop boundary or a pure node a dead worker left, run again
-            // after a refold).
+            // resume, and only two kinds are: a firing parked (on a wait
+            // whose answer is in, or paused inside the run), and one left
+            // Running with no body (a loop boundary, a pure node that sent
+            // nothing, or a node that saved a state, which a dead worker
+            // left, run again after a refold).
             // One run fires a node once per frames, so a group over
             // any other record (a terminal one, a body still running, a
             // wait still unanswered) is a pulse that reached a firing
@@ -2060,13 +2204,30 @@ async fn drive(
                     Some(record)
                 }
             };
-            // For the NodeResumed row: the token of the await this
+            // For the NodeResumed row: the token of the wait this
             // dispatch is actually resuming on, the record's CURRENT
-            // parked token (`callback_id`); `None` for a node run again
-            // after a refold, which ships a re-fire, not a delivery. And
-            // what the firing already sent, with its values: the replayed
-            // body sends those ports again as no-ops.
+            // parked token (`callback_id`); `None` for a firing paused
+            // inside the run, and for one a dead worker left running (run
+            // again from its saved state after a refold). What
+            // the firing carries on from (its saved state, its waits, the
+            // wait it paused in), read while its record still says where
+            // it was parked. And what the firing already sent, with its
+            // values: the body run again sends those ports as no-ops.
             let parked_token: Option<String> = resuming.and_then(|record| record.callback_id.clone());
+            let resume = carried.resume_of(&loc, resuming);
+            // A firing parked on a wait carries on from the state it saved
+            // before it waited. One with none paused before weft kept node
+            // states (it resumed by running its body over its record), and
+            // its node's code, moved to a saved state since, cannot carry on
+            // from that record.
+            let paused_before_states = (parked_token.is_some() && resume.saved.is_none()).then(|| {
+                format!(
+                    "this run paused before this version of weft, which picks a paused node up from the state it \
+                     saved (`ctx.keep`), and '{}' saved none: it cannot carry on. Start the run again \
+                     (`weft run --seed={run_id}` reuses what it already did).",
+                    place_of(project, &loc),
+                )
+            });
             let sent_before_pause = match resuming {
                 Some(record) => fold.sent_before_pause(record)?,
                 None => Default::default(),
@@ -2284,8 +2445,19 @@ async fn drive(
                         // absent; a read answers None honestly.
                         continue;
                     }
-                    match stream_rt.create_feed(&loc, port, task_tx.clone()) {
+                    // A resumed firing's feed starts past what it took,
+                    // with what a drain of it held, ended when its end
+                    // had reached it.
+                    let positions = resume.saved.as_ref().map(|saved| &saved.positions);
+                    let taken = positions.and_then(|at| at.taken.get(port).copied()).unwrap_or(0);
+                    let drained = positions.and_then(|at| at.drained.get(port).cloned()).unwrap_or_default();
+                    let ended = positions.and_then(|at| at.ended.get(port).cloned());
+                    let starts_ended = ended.is_some();
+                    match stream_rt.create_feed(&loc, port, task_tx.clone(), taken, drained, ended) {
                         Ok(marker) => {
+                            if starts_ended {
+                                hand_over_untaken(stream_rt.feed_for(&loc, port), &loc, port, group.run_id, pulses);
+                            }
                             // An ENDED generator port (an empty
                             // stream, or a closure racing dispatch)
                             // is a live feed, never a closed port;
@@ -2351,11 +2523,16 @@ async fn drive(
             let delivered = with_instance_values(node_def, &place, instance, instance_values, bag);
             let inputs = match delivered.and_then(|delivered| {
                 weft_core::context::node_input_bag(node_def, &group.frames, delivered, &group.received.closed_ports)
+            }).and_then(|bag| {
+                // The node's rules the compile could not decide, asked on
+                // what arrived; a node with none pays nothing.
+                weft_core::rules::recheck(node_def, project, &bag).map(|()| bag).map_err(|e| e.to_string())
             }) {
                 Ok(bag) => bag,
                 // A broken spec or malformed widget handle: the node
                 // fails loud instead of running on a bag it can never
-                // read correctly. Feeds created for this dispatch are
+                // read correctly; a rule that fires on what arrived fails
+                // it with the rule's message. Feeds created for this dispatch are
                 // retired FIRST, so its terminal record (checked ahead
                 // of any feed by the routing scan) is never shadowed by
                 // an orphan feed that would swallow the stream.
@@ -2376,16 +2553,6 @@ async fn drive(
                     continue;
                 }
             };
-            // Hand the per-(node, frames) await sequence to the
-            // handle. The body's `await_signal` calls pop entries
-            // in call_index order: resolved entries replay
-            // instantly, the pending tail re-suspends, and an
-            // exhausted sequence (or fresh node) registers a new
-            // await with the next call_index.
-            let sequence = awaited_sequences
-                .remove(&FiringLocation::new(node_id.clone(), group.frames.clone()))
-                .unwrap_or_default();
-
             let declared_outputs = node_ports.outputs.clone();
             let declared_inputs = node_ports.inputs.clone();
             // What reads each output in THIS run: the wires out of the
@@ -2398,9 +2565,9 @@ async fn drive(
                 .collect();
             // Every dispatch of a kicked node sees the wake it was kicked
             // with, a resume's too: a kicked node that parked on a wait
-            // and runs again once it is answered replays its body, and
-            // the body's `ctx.wake` must still hold what the listener
-            // delivered.
+            // and runs again once it is answered runs its body from the
+            // top, and the body's `ctx.wake` must still hold what the
+            // listener delivered.
             let wake_payload = kicked.get(&FiringLocation::new(node_id.clone(), group.frames.clone())).and_then(KickedNode::wake_payload);
             let mut runner = RunnerHandle::new(
                 project.id,
@@ -2420,9 +2587,9 @@ async fn drive(
                 declared_outputs,
                 declared_inputs,
                 wired_outputs,
-                !generator_ports.is_empty(),
             )
-            .with_awaited_sequence(sequence)
+            .with_resume(resume)
+            .with_feeds(stream_rt.feeds_of(&loc))
             .with_sent_before_pause(sent_before_pause)
             .with_emit_channel(task_tx.clone())
             .with_caller_connection(caller.cloned())
@@ -2487,8 +2654,9 @@ async fn drive(
             )
             .marked_pure(node_def.features.pure);
             // A firing cannot start when the payload that woke it is not
-            // what the trigger declared.
-            if let Some(err) = fire_payload_refusal {
+            // what the trigger declared, nor carry on from a pause it has
+            // no state for.
+            if let Some(err) = fire_payload_refusal.or(paused_before_states) {
                 if !generator_ports.is_empty() {
                     let loc = FiringLocation::new(node_id.clone(), group.frames.clone());
                     retire_consumer_streams(
@@ -2780,7 +2948,7 @@ async fn drive(
         // reaped, and every message it sent drained just above), and an
         // iteration nothing inside is alive in any more. A body still
         // running keeps its firing's record: its late messages read it.
-        forget_what_ended(program, run_id, forgetting, pulses, firings, kicked, scopes, &mut awaited_sequences, loop_runtime, |at| bodies.runs(at));
+        forget_what_ended(program, run_id, forgetting, pulses, firings, kicked, scopes, &mut carried, loop_runtime, |at| bodies.runs(at));
 
         if progress {
             idled_since_progress = false;
@@ -2811,8 +2979,9 @@ async fn drive(
         // No progress from draining. Check: is anything still in flight?
         if bodies.is_empty() {
             // A run handed back with work left reads as unfinished here,
-            // which it is not: the next worker runs that work.
-            if held_back {
+            // which it is not: the next worker runs that work. A run that
+            // paused for a hand-back is the same.
+            if held_back || matches!(paused, Some(RunOutcome::HandedBack)) {
                 return Ok(RunOutcome::HandedBack);
             }
             return terminate(project, program_idx, pulses, firings, kicked, scopes).await;
@@ -2916,28 +3085,55 @@ async fn drive(
             continue;
         }
         // Every running node waits, and nothing new can come from inside
-        // the run. While draining, a node waiting on one that was never
-        // started is waiting on the next worker, not on anything here.
-        let all_waiting = !draining && waits.deadlock_provable(bodies.firings()) && task_rx.is_empty();
-        // Something outside may still end one of those waits: a wait held
-        // in a node's call, the answer of a suspended node, which resumes
-        // it in place (it may be what the waiting tasks wait on), or the
-        // caller's next message. The run is then quiet rather than stuck,
-        // and the hold clock runs (`hold_clock`), from the last time
-        // anything moved in it; only when it runs out does the run unwind
-        // (the hold-out arm below). With nothing outside, the run unwinds
-        // at once.
+        // the run (a run already pausing only waits for its bodies to
+        // go). What happens then is `pause_decision`'s: pause them all, hold
+        // quiet for something outside, or unwind a deadlock.
+        let all_waiting = paused.is_none() && waits.deadlock_provable(bodies.firings()) && task_rx.is_empty();
         let on_caller = all_waiting && answering.is_some_and(|conn| conn.waited_on(waits));
-        let waits_outside = waits.held().pending() || waiting_count(firings) > 0 || on_caller;
-        hold_clock.quiet(all_waiting && waits_outside);
-        if all_waiting && !waits_outside {
-            unwind(run_id, bus_coordinator, &mut stream_rt, waits, bodies.len());
-            // Don't `continue`: the waiting tasks wake in other tokio
-            // tasks; their results arrive on `result_rx` shortly.
-            // Falling through to the idle-wait yields to the runtime and
-            // wakes on the first real event. The select below re-sets
-            // `idled_since_progress = true` on return; the next
-            // iteration drains the unwound state.
+        // The clock is read only once the run is quiet, so a run that never
+        // goes quiet pays nothing for its stay before a pause.
+        let decision = all_waiting.then(|| {
+            let now = clients.clock.now();
+            let since = *quiet_since.get_or_insert(now);
+            pause_decision(AllWaiting {
+                pausable: waits.all_pausable(bodies.firings()),
+                can_pause,
+                suspended: waiting_count(firings) > 0,
+                held: waits.held().pending(),
+                on_caller,
+                draining,
+                quiet_for: now.saturating_duration_since(since),
+                pause_after_secs: settings.pause_after_secs(),
+                cap_left: hold.and_then(|hold| hold.cap_left(now_unix())),
+            })
+        });
+        hold_clock.quiet(decision == Some(WhenAllWait::Hold));
+        // How long the run stays quiet on its worker before it pauses.
+        let mut pause_in = None;
+        match decision {
+            Some(WhenAllWait::StayQuiet(left)) => pause_in = Some(left),
+            Some(WhenAllWait::Pause) => {
+                tracing::info!(
+                    target: "weft_engine::run_driver",
+                    %run_id, waiting = bodies.len(), draining,
+                    "every running node waits, and what moves the run next is outside it: pausing them all"
+                );
+                paused = Some(if draining { RunOutcome::HandedBack } else { RunOutcome::Stalled });
+                waits.pause();
+            }
+            Some(WhenAllWait::Unwind) => {
+                unwind(run_id, bus_coordinator, &mut stream_rt, waits, bodies.len());
+                // Don't `continue`: the waiting tasks wake in other tokio
+                // tasks; their results arrive on `result_rx` shortly.
+                // Falling through to the idle-wait yields to the runtime
+                // and wakes on the first real event. The select below
+                // re-sets `idled_since_progress = true` on return; the
+                // next iteration drains the unwound state.
+            }
+            Some(WhenAllWait::Hold) | None => {}
+        }
+        if decision.is_none() {
+            quiet_since = None;
         }
 
         // At least one in-flight task. Block until something happens:
@@ -2957,29 +3153,38 @@ async fn drive(
         // DO NOT poll `result_rx` here: `recv().await` would consume
         // the message and drop it. Same reason we don't drain emit_rx
         // here; we just need the wakeup.
-        // Ask for the run's answers ONLY while a wait is held, or a node is
-        // suspended while others still run. Not armed otherwise, so the
-        // common path never asks.
-        ask.while_needed(waits.held().pending() || waiting_count(firings) > 0);
+        // Ask for the run's answers ONLY while a wait is held, or a firing
+        // an earlier pause parked waits while others run, and never once
+        // the run is pausing. Not armed otherwise, so the common path never
+        // asks.
+        ask.while_needed(paused.is_none() && (waits.held().pending() || waiting_count(firings) > 0));
         // The hold runs out `holdSecs` after the run went quiet, and never
-        // runs while a node waits on its caller: a silent caller is never
-        // cut, nor its run unwound.
-        let quiet_for = hold_clock.quiet_for(!on_caller);
+        // runs while its caller is on the line: a run keeps its caller
+        // for as long as it stays, so neither the caller is cut nor the
+        // run unwound.
+        let caller_connected = caller.is_some_and(|conn| conn.is_connected());
+        let quiet_for = hold_clock.quiet_for(!caller_connected);
         // While quiet, its worker may stop ticking, vouching for itself
-        // until the run's hold gives up, or, waiting on its caller, until
-        // its caps end.
+        // until the run's hold gives up, or, with its caller on the line,
+        // until the caller's caps end.
         if let Some(hold) = hold {
-            let can_pause = unsuspendable(caller, bus_coordinator, settings).is_none();
-            match (on_caller, answering) {
+            match (caller_connected, answering) {
                 (true, Some(conn)) => hold.quiet_on_caller(conn.session_ends(), can_pause),
                 _ => hold.quiet(hold_clock.until().map(|until| crate::run_holds::Quiet { until, can_pause })),
             }
         }
         let held_out = hold_clock.held_out(quiet_for);
         tokio::pin!(held_out);
-        // A caller hanging up while a wait is held: the next turn looks
-        // again at whether the run can pause.
-        let watch_caller = waits.held().pending() && caller.is_some_and(|conn| conn.is_connected());
+        let pause_due = async {
+            match pause_in {
+                Some(left) => clients.clock.sleep(left).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(pause_due);
+        // A caller hanging up: the next turn looks again at whether the
+        // run can pause (a connected caller is what kept it from it).
+        let watch_caller = caller_connected;
         let caller_left = async {
             match caller {
                 Some(conn) => conn.disconnected().await,
@@ -3033,7 +3238,7 @@ async fn drive(
                     waits.held().answer(&answer.token, answer.answer);
                 }
                 resume_answered(
-                    drive_journal, fold, run_id, replica, suspended, firings, pulses, kicked, &mut awaited_sequences,
+                    drive_journal, fold, run_id, replica, suspended, firings, pulses, kicked, &mut carried,
                 )
                 .await?;
             }
@@ -3070,14 +3275,19 @@ async fn drive(
             // Nothing moved in the run for its `holdSecs` while only the
             // outside could end its waits: the waits it holds are given
             // up, each failing its node's call. With none held, what keeps
-            // the worker is nodes waiting on each other beside a suspended
-            // one, and the run unwinds the way a deadlock does (the buses
-            // close, else the stream waits fail), so it can pause.
+            // the worker is nodes that cannot pause waiting on each other
+            // beside a suspended one, and the run unwinds the way a
+            // deadlock does (the buses close, else the stream waits fail).
             () = held_out.as_mut(), if quiet_for.is_some() => {
                 moved = false;
-                if hold_clock.ran_out(waits.held(), unsuspendable(caller, bus_coordinator, settings)) == 0 {
+                if hold_clock.ran_out(waits.held(), unsuspendable(caller, settings)) == 0 {
                     unwind(run_id, bus_coordinator, &mut stream_rt, waits, bodies.len());
                 }
+            }
+            // The run stayed quiet for its `pauseAfterSecs` with nothing
+            // left but to pause: the next turn pauses it.
+            () = pause_due.as_mut(), if pause_in.is_some() => {
+                moved = false;
             }
             () = caller_left.as_mut(), if watch_caller => {}
             // Asked to let go: the next turn starts nothing new, if the
@@ -3118,13 +3328,166 @@ async fn drive(
         // We just unblocked from the idle-wait. The next no-progress
         // drain is allowed to declare stuck.
         idled_since_progress = true;
-        // Moved, or its hold gave up: quiet no longer, before it goes on
-        // (telling a run that is not quiet changes nothing).
+        // Moved: the stay before a pause starts over the next time the run
+        // goes quiet. Moved, or its hold gave up: quiet no longer, before it
+        // goes on (telling a run that is not quiet changes nothing).
+        if moved {
+            quiet_since = None;
+        }
         if hold_clock.turned(moved) {
             if let Some(hold) = hold {
                 hold.quiet(None);
             }
         }
+    }
+}
+
+/// What the drive knows once every running node waits and nothing inside
+/// the run can move it ([`pause_decision`]).
+#[derive(Debug, Clone, Copy)]
+struct AllWaiting {
+    /// Every one of them waits in a call that holds its firing's state
+    /// (`weft_core::liveness::wait_or_pause`), so each can pause.
+    pausable: bool,
+    /// The run can pause (`crate::held_waits::unsuspendable`).
+    can_pause: bool,
+    /// A firing is parked on a wait, whose answer comes from outside: one
+    /// an earlier drive paused, its wait not answered yet.
+    suspended: bool,
+    /// A wait is held in a node's call, whose answer comes from outside.
+    held: bool,
+    /// A node waits on its caller's next message.
+    on_caller: bool,
+    /// The run was asked to let go of its worker.
+    draining: bool,
+    /// How long the run has been this quiet.
+    quiet_for: std::time::Duration,
+    /// How long a run that can pause stays quiet before it pauses
+    /// (`weft_core::run_settings::RunSettings::pause_after_secs`).
+    pause_after_secs: u32,
+    /// What is left of the run's own cap on this worker, which ends the
+    /// run rather than pausing it (`crate::run_holds::RunHold::cap_left`).
+    cap_left: Option<std::time::Duration>,
+}
+
+/// What the drive does with a run whose every running node waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhenAllWait {
+    /// Tell every waiting call to pause: each saves its state and
+    /// suspends, and the run lets go of its worker.
+    Pause,
+    /// Stay on the worker, quiet, this much longer before pausing:
+    /// anything that moves the run meanwhile (an answer reaching a held
+    /// wait, a message) carries it on with no pause.
+    StayQuiet(std::time::Duration),
+    /// Wait, quiet, for something outside to end a wait (an answer, the
+    /// caller's next message), the hold clock running.
+    Hold,
+    /// Nothing outside can end any of the waits: a deadlock, unwound.
+    Unwind,
+}
+
+/// A run pauses in one way: every waiting call can pause, the run can,
+/// and what moves it next comes from outside it (a held wait's answer, a
+/// parked firing's) once it stayed quiet for its `pauseAfterSecs`
+/// (`StayQuiet` until then), so a run fed by frequent messages takes each
+/// one where it is instead of pausing and being picked up again for every
+/// one. A hand-back pauses it now, for the next worker to wait, and the
+/// stay never runs past `cap_left`. A run that cannot pause holds for what
+/// outside can still end a wait (a held wait, a parked firing's answer,
+/// the caller); with nothing outside, it is a deadlock.
+fn pause_decision(at: AllWaiting) -> WhenAllWait {
+    if at.pausable && at.can_pause && (at.held || at.suspended || at.draining) {
+        if at.draining {
+            return WhenAllWait::Pause;
+        }
+        let left = std::time::Duration::from_secs(at.pause_after_secs.into()).saturating_sub(at.quiet_for);
+        let left = at.cap_left.map_or(left, |cap_left| left.min(cap_left));
+        if left.is_zero() {
+            WhenAllWait::Pause
+        } else {
+            WhenAllWait::StayQuiet(left)
+        }
+    } else if at.held || at.suspended || at.on_caller {
+        WhenAllWait::Hold
+    } else {
+        WhenAllWait::Unwind
+    }
+}
+
+/// Whether every pulse of `ids` pending at `node` lands on one of its
+/// stream inputs: items of a stream, which never dispatch a firing that
+/// already took its inputs.
+fn only_stream_items(pulses: &PulseTable, program_idx: &ProgramIndex, node: &str, ids: &[uuid::Uuid]) -> bool {
+    let streams = program_idx.stream_inputs(node);
+    !streams.is_empty()
+        && pulses.get(node).is_some_and(|bucket| {
+            bucket.iter().filter(|pulse| ids.contains(&pulse.id)).all(|pulse| streams.contains(&pulse.target_port))
+        })
+}
+
+// Layer 1: what the drive does once every running node waits.
+#[cfg(test)]
+mod pause_decision_tests {
+    use super::*;
+
+    fn secs(n: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(n)
+    }
+
+    /// A pausable run whose every node waits, one of them on an answer
+    /// from outside held in its call, quiet for `quiet_for` with a window
+    /// of ten seconds.
+    fn waiting(quiet_for: u64) -> AllWaiting {
+        AllWaiting {
+            pausable: true,
+            can_pause: true,
+            suspended: false,
+            held: true,
+            on_caller: false,
+            draining: false,
+            quiet_for: secs(quiet_for),
+            pause_after_secs: 10,
+            cap_left: None,
+        }
+    }
+
+    /// A run stays quiet for its window, then pauses; `0` pauses at once.
+    #[test]
+    fn a_run_stays_quiet_for_its_window_then_pauses() {
+        assert_eq!(pause_decision(waiting(0)), WhenAllWait::StayQuiet(secs(10)));
+        assert_eq!(pause_decision(waiting(4)), WhenAllWait::StayQuiet(secs(6)));
+        assert_eq!(pause_decision(waiting(10)), WhenAllWait::Pause);
+        assert_eq!(pause_decision(waiting(11)), WhenAllWait::Pause);
+        assert_eq!(pause_decision(AllWaiting { pause_after_secs: 0, ..waiting(0) }), WhenAllWait::Pause, "0 pauses at once");
+        let parked = AllWaiting { held: false, suspended: true, ..waiting(3) };
+        assert_eq!(pause_decision(parked), WhenAllWait::StayQuiet(secs(7)), "a firing an earlier drive parked waits on the outside too");
+    }
+
+    /// A hand-back pauses the run now, whatever its window says, and the
+    /// window never outlasts the run's cap on its worker.
+    #[test]
+    fn a_hand_back_or_the_cap_cuts_the_window() {
+        assert_eq!(pause_decision(AllWaiting { draining: true, ..waiting(0) }), WhenAllWait::Pause);
+        assert_eq!(pause_decision(AllWaiting { draining: true, held: false, ..waiting(0) }), WhenAllWait::Pause, "a hand-back pauses it for the next worker");
+        assert_eq!(pause_decision(AllWaiting { cap_left: Some(secs(3)), ..waiting(2) }), WhenAllWait::StayQuiet(secs(3)));
+        assert_eq!(pause_decision(AllWaiting { cap_left: Some(secs(30)), ..waiting(2) }), WhenAllWait::StayQuiet(secs(8)));
+        assert_eq!(pause_decision(AllWaiting { cap_left: Some(secs(0)), ..waiting(0) }), WhenAllWait::Pause, "the cap is here");
+    }
+
+    #[test]
+    fn a_run_that_cannot_pause_holds_for_the_outside() {
+        assert_eq!(pause_decision(AllWaiting { can_pause: false, ..waiting(60) }), WhenAllWait::Hold);
+        let caller = AllWaiting { can_pause: false, held: false, on_caller: true, ..waiting(0) };
+        assert_eq!(pause_decision(caller), WhenAllWait::Hold, "a connected caller keeps the run on its worker");
+        let unpausable_wait = AllWaiting { pausable: false, ..waiting(60) };
+        assert_eq!(pause_decision(unpausable_wait), WhenAllWait::Hold, "a wait that cannot pause keeps it too");
+    }
+
+    #[test]
+    fn nodes_waiting_only_on_each_other_are_a_deadlock() {
+        assert_eq!(pause_decision(AllWaiting { held: false, ..waiting(0) }), WhenAllWait::Unwind);
+        assert_eq!(pause_decision(AllWaiting { held: false, can_pause: false, ..waiting(0) }), WhenAllWait::Unwind);
     }
 }
 
@@ -3949,6 +4312,7 @@ async fn refuse_emission(
     loc: &FiringLocation,
     err: String,
     delivery: Option<&DeliveryGate>,
+    held: &crate::held_waits::HeldWaits,
     is_cancel: bool,
     run_id: weft_core::RunId,
     project: &ProjectDefinition,
@@ -3969,6 +4333,9 @@ async fn refuse_emission(
         );
         return;
     }
+    // The body still runs: what it waits on, or waits on next, ends with
+    // this failure now.
+    held.fail_firing(loc, &err);
     let mentioned = mentioned_ports(firings, &loc.node_id, run_id, &loc.frames);
     handle_node_failure(
         &loc.node_id, &mentioned, run_id, &loc.frames, &err, None, false, project, program_idx, pulses,
@@ -4081,9 +4448,9 @@ impl BodyEnd {
 impl Drop for BodyEnd {
     fn drop(&mut self) {
         if let Some(runner) = self.0.take() {
-            runner.end_body(weft_core::bus::StreamEnd::Failed {
+            runner.end_body(Some(weft_core::bus::StreamEnd::Failed {
                 error: "the node stopped before its body returned (it panicked, or its run was cancelled)".into(),
-            });
+            }));
         }
     }
 }
@@ -4157,6 +4524,15 @@ async fn cancel_cleanup(
     // more reads a phantom success. The feeds die with the
     // StreamRuntime.
     stream_rt.fail_all_gates("the run was cancelled");
+    // What the stopped bodies took off their streams goes on record
+    // before their cancel, as a body that ends puts it there.
+    for at in firings.open().map(|e| FiringLocation::new(e.node_id.clone(), e.frames.clone())).collect::<Vec<_>>() {
+        if let Some(taken) = crate::context::takes_to_record(&stream_rt.feeds_of(&at), run_id, &at) {
+            if let Err(err) = journal.record_event(&taken, Some(replica)).await {
+                tracing::warn!(target: "weft_engine", error = %err, node = %at.node_id, "failed to journal what a cancelled firing took off its streams");
+            }
+        }
+    }
     // 3. The cancel walk.
     cancel_open_firings(
         firings, pulses, kicked, scopes, loop_runtime, run_id, project, program_idx, journal, replica,
@@ -4356,7 +4732,12 @@ async fn route_stream_pulses(
                 // it Pending.
                 if firing_already_terminal(firings, forgetting, project, program_idx, &node.id, run_id, &p.frames) {
                     actions.push(RouteAction::Drop { loc, pulse: p.id, closed: p.closed });
-                } else if stream_rt.feed_for(&loc, &p.target_port).is_some() {
+                } else if let Some(feed) = stream_rt.feed_for(&loc, &p.target_port) {
+                    // A pausing feed takes no end: the close waits on its
+                    // wire for the feed of the resumed body.
+                    if p.closed && feed.is_paused() {
+                        continue;
+                    }
                     if p.closed {
                         actions.push(RouteAction::FeedClose {
                             loc,
@@ -4428,6 +4809,9 @@ async fn route_stream_pulses(
                             project, &loc, run_id, pulses, journal, replica, stream_rt,
                         )
                         .await;
+                        // The body still runs: what it waits on, or waits
+                        // on next, ends with this failure now.
+                        stream_rt.held_waits().fail_firing(&loc, &err);
                         let mentioned = mentioned_ports(firings, &loc.node_id, run_id, &loc.frames);
                         handle_node_failure(
                             &loc.node_id, &mentioned, run_id, &loc.frames, &err, None, false,
@@ -4438,17 +4822,27 @@ async fn route_stream_pulses(
                 }
             }
             RouteAction::FeedClose { loc, port, pulse, end } => {
-                if let Some(feed) = stream_rt.feed_for(&loc, &port).cloned() {
-                    feed.close(end);
+                match stream_rt.feed_for(&loc, &port).cloned() {
+                    // The firing takes the end as it is routed: off its
+                    // wire now, on record with the firing's next save or
+                    // its end, like the items it took.
+                    // A pausing feed refuses it: the close stays on its wire
+                    // for the feed the resumed body gets.
+                    Some(feed) => {
+                        if feed.close_taken(pulse, end) {
+                            apply_stream_item_taken(&loc, pulse, pulses, stream_rt);
+                        }
+                    }
+                    // Its consumer is gone since the scan: absorbed
+                    // durably now.
+                    None => {
+                        consume_stream_pulses(
+                            &[pulse], &loc, run_id, pulses, journal, replica, stream_rt,
+                            AbsorbKind::Taken,
+                        )
+                        .await;
+                    }
                 }
-                // The end is consumed by the routing itself (nothing
-                // "takes" a close), whether or not the feed was still
-                // live; absorb it durably now.
-                consume_stream_pulses(
-                    &[pulse], &loc, run_id, pulses, journal, replica, stream_rt,
-                    AbsorbKind::Taken,
-                )
-                .await;
             }
             RouteAction::LoopItem { key, loop_in, pulse, value } => {
                 // Staleness guard: the instance can have terminated
@@ -4625,6 +5019,25 @@ fn place_of(project: &ProjectDefinition, loc: &FiringLocation) -> String {
     weft_core::project::address_of(project, &loc.node_id, &call_path)
 }
 
+/// A feed that starts ended gets the items its firing had not taken
+/// before its body starts: its body reads them before that end, never the
+/// end first because the routing pass had not come round yet.
+fn hand_over_untaken(
+    feed: Option<&Arc<weft_core::generator::GeneratorFeed>>,
+    loc: &FiringLocation,
+    port: &str,
+    run_id: RunId,
+    pulses: &mut PulseTable,
+) {
+    let (Some(feed), Some(bucket)) = (feed, pulses.get_mut(&loc.node_id)) else { return };
+    for p in bucket.iter_mut() {
+        if p.run_id == run_id && p.frames == loc.frames && p.target_port == port && p.status == PulseStatus::Pending && !p.closed {
+            feed.push(p.id, p.value.clone()).expect("a feed that starts ended takes every item it is handed");
+            p.status = PulseStatus::Routed;
+        }
+    }
+}
+
 fn set_pulse_status(
     pulses: &mut PulseTable,
     node_id: &str,
@@ -4656,9 +5069,10 @@ fn set_pulse_status(
 /// every scheduler pass and routing pass walks that bucket. Keeping a
 /// spent item as a tombstone would grow the bucket without bound and
 /// turn the per-iteration scans quadratic. Consumed items are also
-/// never un-absorb targets (no firing is ever re-run, a stream consumer
-/// included: `apply_snapshot` fails one a dead worker left running), and the journal fold removes them identically,
-/// so live and refolded tables agree byte for byte.
+/// never un-absorb targets: a consumer run again from its saved state
+/// gets back only the takes its record does not hold, which were never
+/// removed from the table. The journal fold removes them identically, so
+/// live and refolded tables agree byte for byte.
 #[allow(clippy::too_many_arguments)]
 async fn consume_stream_pulses(
     ids: &[uuid::Uuid],
@@ -4708,21 +5122,14 @@ fn drop_consumed_pulses(pulses: &mut PulseTable, node_id: &str, ids: &[uuid::Uui
     }
 }
 
-/// A running consumer's pull took one item (`TaskMsg::StreamItemTaken`).
-#[allow(clippy::too_many_arguments)]
-async fn apply_stream_item_taken(
-    loc: &FiringLocation,
-    pulse_id: uuid::Uuid,
-    run_id: RunId,
-    pulses: &mut PulseTable,
-    journal: &dyn JournalClient,
-    replica: &str,
-    stream_rt: &mut StreamRuntime,
-) {
-    consume_stream_pulses(
-        &[pulse_id], loc, run_id, pulses, journal, replica, stream_rt, AbsorbKind::Taken,
-    )
-    .await;
+/// A running consumer's pull took one item (`TaskMsg::StreamItemTaken`):
+/// off its wire, and its producer's delivery settled. The take goes on
+/// record with the consuming firing's next save, or its end
+/// (`RunnerHandle::record_takes`), so a firing run again from its last
+/// save after a crash is handed again what it took since.
+fn apply_stream_item_taken(loc: &FiringLocation, pulse_id: uuid::Uuid, pulses: &mut PulseTable, stream_rt: &mut StreamRuntime) {
+    drop_consumed_pulses(pulses, &loc.node_id, &[pulse_id]);
+    stream_rt.on_pulses_absorbed(&[pulse_id], AbsorbKind::Taken);
 }
 
 /// A stream consumer's firing ended (any outcome): tear its feeds
@@ -5071,6 +5478,17 @@ async fn apply_one_emission(
     // pulses on the same wires.
     let emission_id = msg.id;
     let just_mentioned: std::collections::HashSet<String> = match msg.kind {
+        // A stream item the firing yielded before its pause, yielded
+        // again: nothing goes on a wire, and the gate waits on that
+        // item's pulses still waiting to be taken (none: taken already,
+        // delivered).
+        crate::context::EmitKind::Again { ports } => {
+            if let Some(gate) = &delivery {
+                let waiting = pulses_of_emission(project, program_idx, pulses, &msg.loc, &ports, emission_id);
+                stream_rt.register_gate(gate, &waiting);
+            }
+            return;
+        }
         crate::context::EmitKind::Values(output) => {
             // Generator buffer bound: an emission that would push a
             // generator edge past its un-taken cap fails the producer
@@ -5080,7 +5498,7 @@ async fn apply_one_emission(
                 &msg.loc.frames, pulses,
             ) {
                 refuse_emission(
-                    &msg.loc, err, delivery.as_deref(), is_cancel, run_id, project, program_idx,
+                    &msg.loc, err, delivery.as_deref(), stream_rt.held_waits(), is_cancel, run_id, project, program_idx,
                     pulses, firings, journal, replica,
                 )
                 .await;
@@ -5131,7 +5549,7 @@ async fn apply_one_emission(
                     // emission gets the same error back instead of
                     // hanging on pulses that were never created.
                     refuse_emission(
-                        &msg.loc, err.to_string(), delivery.as_deref(), is_cancel, run_id, project,
+                        &msg.loc, err.to_string(), delivery.as_deref(), stream_rt.held_waits(), is_cancel, run_id, project,
                         program_idx, pulses, firings, journal, replica,
                     )
                     .await;
@@ -5156,7 +5574,7 @@ async fn apply_one_emission(
                 None,
             ) {
                 refuse_emission(
-                    &msg.loc, err.to_string(), delivery.as_deref(), is_cancel, run_id, project,
+                    &msg.loc, err.to_string(), delivery.as_deref(), stream_rt.held_waits(), is_cancel, run_id, project,
                     program_idx, pulses, firings, journal, replica,
                 )
                 .await;
@@ -5176,11 +5594,12 @@ async fn apply_one_emission(
 
     // Union into the firing's mentioned set (on its record, as the
     // fold keeps it) so termination knows which ports were already
-    // touched, whether by value or by closure.
-    firing_at_mut(firings, &msg.loc.node_id, run_id, &msg.loc.frames)
-        .expect("an emission comes from a firing with a record (checked non-terminal above)")
-        .mentioned_ports
-        .extend(just_mentioned);
+    // touched, whether by value or by closure, and count a stream item
+    // the way the fold counts it.
+    let record = firing_at_mut(firings, &msg.loc.node_id, run_id, &msg.loc.frames)
+        .expect("an emission comes from a firing with a record (checked non-terminal above)");
+    record.mentioned_ports.extend(just_mentioned);
+    record.count_stream_item(emission_id);
 
     // A delivery-waiting emission: arm its gate with exactly the
     // pulses this apply created. They resolve at the absorb sites; an
@@ -5195,6 +5614,30 @@ async fn apply_one_emission(
     // readiness pass dispatches that node as a skip (reason: outside
     // this run), which absorbs the pulse and settles any delivery gate
     // tracking it through the ordinary skip-absorb path.
+}
+
+/// The pulses of the emission `emission` the firing at `loc` put on the
+/// wires out of its `ports` that are still waiting to be taken: the ids its
+/// place derives (`weft_core::run::emission::pulse_id`, a value or a
+/// projected closure on each wire), the ones the table holds pending.
+fn pulses_of_emission(
+    project: &ProjectDefinition,
+    program_idx: &ProgramIndex,
+    pulses: &PulseTable,
+    loc: &FiringLocation,
+    ports: &[String],
+    emission: uuid::Uuid,
+) -> Vec<uuid::Uuid> {
+    program_idx
+        .get_outgoing(project, &loc.node_id, &loc.frames)
+        .into_iter()
+        .filter(|edge| ports.iter().any(|port| edge.source_handle.as_deref().unwrap_or("default") == port))
+        .flat_map(|edge| {
+            [true, false].map(|closed| (edge.target.clone(), weft_core::run::emission::pulse_id(emission, &edge.id, closed)))
+        })
+        .filter(|(target, id)| pulses.get(target).is_some_and(|bucket| bucket.iter().any(|pulse| pulse.id == *id)))
+        .map(|(_, id)| id)
+        .collect()
 }
 
 /// Drain the task channel in FIFO order, applying each `Emission`
@@ -5284,10 +5727,19 @@ async fn apply_one_task_msg(
             .await;
         }
         TaskMsg::StreamItemTaken { loc, pulse_id } => {
-            apply_stream_item_taken(&loc, pulse_id, run_id, pulses, journal, replica, stream_rt)
-                .await;
+            apply_stream_item_taken(&loc, pulse_id, pulses, stream_rt);
         }
-        TaskMsg::Terminal { loc, run_id: task_run_id, outcome, runner } => match withdrawn_at_end(outcome, runner.as_deref(), &loc, task_run_id).await {
+        TaskMsg::Terminal { loc, run_id: task_run_id, outcome, runner } => {
+            // What the firing took off its streams goes on record before
+            // its ending (a pause already put it there with its save).
+            record_takes_at_end(runner.as_deref(), task_run_id, &loc).await;
+            let outcome = withdrawn_at_end(outcome, runner.as_deref(), &loc, task_run_id).await;
+            // A firing that ended (in any way but a pause) sends the calls
+            // it owed before its ending is written.
+            if let (Some(runner), false) = (runner.as_deref(), matches!(outcome, NodeTaskOutcome::Waiting(_))) {
+                runner.settle_end_calls().await;
+            }
+            match outcome {
             NodeTaskOutcome::Completed { saved } => {
                 retire_consumer_streams(project, &loc, task_run_id, pulses, journal, replica, stream_rt)
                     .await;
@@ -5371,23 +5823,49 @@ async fn apply_one_task_msg(
             NodeTaskOutcome::Waiting(token) => {
                 // Same stale-terminal guard as the Completed arm: a body
                 // the engine failed mid-flight that then paused on a wait
-                // stays failed. Back to waiting, its answer would replay
-                // the body onto ports the failure already closed, and
+                // stays failed. Back to waiting, its answer would run the
+                // body again onto ports the failure already closed, and
                 // their consumers would fire a second time. The wait it
-                // registered answers nothing and goes with the run.
+                // registered answers nothing and goes with the run. Its
+                // body paused (so ended none of its buses), but the firing
+                // is over: its buses end failed and the names it held over
+                // an earlier pause leave with it, as for any failed body.
                 if firing_already_terminal(firings, forgetting, project, program_idx, &loc.node_id, task_run_id, &loc.frames) {
                     tracing::warn!(
                         target: "weft_engine::run_driver",
-                        run_id = %task_run_id, node = %loc.node_id, frames = ?loc.frames, %token,
-                        "a firing the engine already failed paused on a wait; it stays failed"
+                        run_id = %task_run_id, node = %loc.node_id, frames = ?loc.frames, ?token,
+                        "a firing the engine already failed paused; it stays failed"
                     );
+                    if let Some(runner) = runner.as_deref() {
+                        runner.end_body(Some(weft_core::bus::StreamEnd::Failed {
+                            error: format!("node '{}' had already failed when its body paused", loc.node_id),
+                        }));
+                        runner.settle_end_calls().await;
+                    }
+                    retire_consumer_streams(project, &loc, task_run_id, pulses, journal, replica, stream_rt).await;
                     return;
                 }
-                mark_waiting(firings, &loc.node_id, task_run_id, &loc.frames, &token);
-                ship_node_suspended(journal, replica, task_run_id, &loc.node_id, &loc.frames, &token)
+                // Its feeds go, and what was routed into them untaken goes
+                // back on its wire for the feed its resumed body gets.
+                for pulse in stream_rt.set_aside(&loc) {
+                    set_pulse_status(pulses, &loc.node_id, pulse, PulseStatus::Pending);
+                }
+                mark_waiting(firings, &loc.node_id, task_run_id, &loc.frames, token.as_deref());
+                ship_node_suspended(journal, replica, task_run_id, &loc.node_id, &loc.frames, token.as_deref())
                     .await;
             }
-        },
+            }
+        }
+    }
+}
+
+/// Put on record what a firing that ended took off its streams and did
+/// not record yet (`RunnerHandle::record_takes`). A write that fails
+/// poisons the drive, which stops on it; the line says which firing.
+async fn record_takes_at_end(runner: Option<&RunnerHandle>, run_id: RunId, loc: &FiringLocation) {
+    let Some(runner) = runner else { return };
+    if let Err(e) = runner.record_takes().await {
+        tracing::error!(target: "weft_engine::stream", %run_id, node = %loc.node_id, frames = ?loc.frames, error = %e, "recording a firing's stream takes failed");
     }
 }
 
@@ -5427,10 +5905,7 @@ async fn drain_task_msgs_for_cancel(
             // pulse-level write, not a node-status write, so it cannot
             // race the dispatcher's NodeCancelled).
             TaskMsg::StreamItemTaken { loc, pulse_id } => {
-                apply_stream_item_taken(
-                    &loc, pulse_id, run_id, pulses, journal, replica, stream_rt,
-                )
-                .await;
+                apply_stream_item_taken(&loc, pulse_id, pulses, stream_rt);
             }
             TaskMsg::Terminal { loc, run_id: task_run_id, outcome, .. } => match outcome {
                 NodeTaskOutcome::Completed { .. } | NodeTaskOutcome::Failed { .. } | NodeTaskOutcome::Skipped(_) => {
@@ -5445,7 +5920,7 @@ async fn drain_task_msgs_for_cancel(
                 NodeTaskOutcome::Waiting(token)
                     if !firing_already_terminal(firings, forgetting, project, program_idx, &loc.node_id, task_run_id, &loc.frames) =>
                 {
-                    mark_waiting(firings, &loc.node_id, task_run_id, &loc.frames, &token);
+                    mark_waiting(firings, &loc.node_id, task_run_id, &loc.frames, token.as_deref());
                 }
                 NodeTaskOutcome::Waiting(_) => {}
             },
@@ -5475,15 +5950,16 @@ fn firing_already_terminal(
     }
 }
 
+/// The firing paused: on the wait `token`, or inside the run (`None`).
 fn mark_waiting(
     firings: &mut NodeFiringTable,
     node_id: &str,
     run_id: RunId,
     frames: &weft_core::frames::LoopFrames,
-    token: &str,
+    token: Option<&str>,
 ) {
     if let Some(e) = set_firing_status(firings, node_id, run_id, frames, NodeFiringStatus::WaitingForInput) {
-        e.callback_id = Some(token.to_string());
+        e.callback_id = token.map(str::to_string);
     }
 }
 
@@ -5561,12 +6037,20 @@ fn forget_what_ended(
     firings: &mut NodeFiringTable,
     kicked: &mut weft_core::primitive::KickTable,
     scopes: &mut ScopeTable,
-    awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
+    carried: &mut Carried,
     loop_runtime: &mut LoopRuntime,
     busy: impl Fn(&FiringLocation) -> bool,
 ) {
     let places = Places { project: &program.project, index: &program.index, run_id };
-    let mut tables = Tables { pulses, firings, kicked, scopes, awaited_sequences, loop_runtime };
+    let mut tables = Tables {
+        pulses,
+        firings,
+        kicked,
+        scopes,
+        recorded_waits: &mut carried.waits,
+        saved_states: &mut carried.saved,
+        loop_runtime,
+    };
     forgetting.forget_ended(&places, &mut tables, &busy);
     forgetting.forget_finished_iterations(&places, &mut tables, &busy);
 }
@@ -5757,6 +6241,12 @@ mod branching_tests;
 #[path = "run_driver_tests/error_port.rs"]
 mod error_port_tests;
 
+// Layer 3: a call a node registers with `ctx.after_node` is sent once
+// when it ends, whether its body returned or failed.
+#[cfg(test)]
+#[path = "run_driver_tests/end_calls.rs"]
+mod end_calls_tests;
+
 // Layer 3: a baked output falls back on what its copy saved.
 #[cfg(test)]
 #[path = "run_driver_tests/baked.rs"]
@@ -5774,7 +6264,7 @@ mod wire_values_tests;
 mod born_tests;
 
 // Layer 3: a node that emits, pauses on a wait and emits more; a port
-// sent before the pause sends nothing on the replay.
+// sent before the pause sends nothing when the body runs again.
 #[cfg(test)]
 #[path = "run_driver_tests/pause_emissions.rs"]
 mod pause_emissions_tests;
@@ -5784,6 +6274,12 @@ mod pause_emissions_tests;
 #[cfg(test)]
 #[path = "run_driver_tests/hand_back.rs"]
 mod hand_back_tests;
+
+// Layer 3: a run that would pause stays quiet on its worker for its
+// `pauseAfterSecs` first; an answer inside that time carries it on there.
+#[cfg(test)]
+#[path = "run_driver_tests/pause_window.rs"]
+mod pause_window_tests;
 
 // Layer 3: a run's secrets: only their markers on record, their values
 // riding its batches, revealed from memory, from the record, and never
@@ -5839,6 +6335,14 @@ mod include_calls_tests;
 #[cfg(test)]
 #[path = "run_driver_tests/stream.rs"]
 mod stream_tests;
+
+// Layer 3: a firing that keeps its state, across drives: waits around
+// work done once, a wait in a loop, a stream paused from either end, a
+// consumer crashing between saves, a bus conversation paused and picked
+// up again, and a run paused before saved states existed.
+#[cfg(test)]
+#[path = "run_driver_tests/saved_state.rs"]
+mod saved_state_tests;
 
 // Layer 3: LoopRuntime integration rig tests. These exercise the engine's
 // loop boundary handlers (`handle_loop_boundary_firing`, `launch_iteration`,

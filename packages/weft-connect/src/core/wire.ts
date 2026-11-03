@@ -117,11 +117,6 @@ export interface AccessSpecWire {
    *  reads inside; the blob rides to the server verbatim (the door
    *  probe records it so the events receiver can verify pushes). */
   events?: Record<string, unknown>;
-  /** How a CALLER presenting a connection of this service is checked
-   *  when a live route is gated by it (an auth access node's recipe).
-   *  The editor never reads inside; the blob rides to the server
-   *  verbatim and the broker runs it. */
-  verify?: Record<string, unknown>;
   /** All-or-nothing groups of optional fields, at least one of which a
    *  connect must fill (a mailbox's receiving vs sending servers). The
    *  connect refuses a half-filled or empty choice, naming the fix. */
@@ -503,6 +498,10 @@ export interface InputDefinition extends PortDefinition {
   /// permissions a shortfall is never "unknown", so it always marks.
   // SYNC: InputDefinition.requiresValues <-> crates/weft-core/src/project.rs InputDefinition.requires_values
   requiresValues?: string[];
+  /// A blank text on this optional String input is a value (mirrored
+  /// from the metadata's `keepsBlank`); without it a blank is absent.
+  // SYNC: InputDefinition.keepsBlank <-> crates/weft-core/src/project.rs InputDefinition.keeps_blank
+  keepsBlank?: boolean;
 }
 
 // The editor control an input renders. Every key a widget object may

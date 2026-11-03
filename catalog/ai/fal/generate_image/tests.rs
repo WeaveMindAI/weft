@@ -1,5 +1,6 @@
 //! FalGenerateImage self-tests: the queue dance (submit, the parked
-//! wait on the status, result) and the internalized image outputs.
+//! wait on the status, result), a resumed run picking up from its
+//! state, and the internalized image outputs.
 
 use serde_json::json;
 
@@ -13,7 +14,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_resumed_run_never_submits_twice", resumed),
         NodeTest::fake("an_unknown_status_fails_loud", unknown_status),
         NodeTest::fake("a_failed_generation_surfaces_fals_words", failed_generation),
-        NodeTest::fake("a_traversal_model_id_fails_the_run_even_when_error_is_wired", bad_model),
         NodeTest::fake("a_refused_submit_fails_the_run_when_error_is_unwired", refused_unwired),
         NodeTest::fake("a_refused_submit_comes_out_on_error_when_it_is_wired", refused_wired),
         NodeTest::live("one_real_small_generation", "fal", live_generate),
@@ -119,9 +119,10 @@ fn fox(rig: &FakeRig) -> serde_json::Value {
     })
 }
 
-/// The body replays from the top when the wait resumes. The paid
-/// submit is journaled, so the second pass reads the request id back
-/// instead of queueing a second generation.
+/// A resumed body runs from its top with the state it saved: the
+/// request id from the paid submit and the status the wait ended on. The
+/// second pass sends no second submit and asks fal nothing about the
+/// status again; it only reads the result.
 async fn resumed(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/fal-ai/flux/dev", json!({ "request_id": "req-7" }));
     rig.signal(json!({ "status": "COMPLETED" }));
@@ -131,9 +132,15 @@ async fn resumed(rig: FakeRig) -> WeftResult<()> {
         json!({ "images": [{ "url": "data:image/png;base64,aWpn" }] }),
     );
     rig.run(&FalGenerateImageNode, fox(&rig)).await.ok()?;
+    assert_eq!(
+        rig.saved_state(&FalGenerateImageNode),
+        Some(json!({ "request_id": "req-7", "status": { "status": "COMPLETED" } })),
+        "the state says the request was submitted and left the queue"
+    );
     rig.run(&FalGenerateImageNode, fox(&rig)).await.ok()?;
     let submits = rig.requests().iter().filter(|r| r.method == "POST").count();
-    assert_eq!(submits, 1, "the replay reads the journaled submit back");
+    assert_eq!(submits, 1, "the resumed body reads the request id back from its state");
+    assert_eq!(rig.awaited_signals().len(), 1, "the answered wait is not made again");
     Ok(())
 }
 
@@ -174,28 +181,6 @@ async fn failed_generation(rig: FakeRig) -> WeftResult<()> {
         .await;
     let err = outcome.result.expect_err("a failed generation must refuse").to_string();
     assert!(err.contains("content policy violation"), "{err}");
-    Ok(())
-}
-
-/// A malformed model id is a mistake in the program, not fal's answer:
-/// a wired `_error` must not swallow it.
-async fn bad_model(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    let err = rig
-        .run(
-            &FalGenerateImageNode,
-            json!({
-                "account": rig.access("fal"),
-                "prompt": "x",
-                "model": "../../etc",
-                "imageSize": "square",
-                "count": 1,
-            }),
-        )
-        .await
-        .failure()?;
-    assert!(err.starts_with("input error"), "{err}");
-    assert!(err.contains("not a fal model id"), "{err}");
     Ok(())
 }
 

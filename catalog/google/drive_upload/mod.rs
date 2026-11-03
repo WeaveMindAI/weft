@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 
-use weft::access::client::Multipart;
+use weft::access::client::{url, Multipart, StoredBodyExt};
 use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
@@ -29,27 +29,25 @@ impl Node for GoogleDriveUploadNode {
         let name: Option<String> = ctx.inputs.opt("name")?;
         let folder: Option<String> = ctx.inputs.opt("folder")?;
 
-        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&file).await?;
-        let file_meta = drive::file_metadata(
-            Some(name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| meta.filename.clone())),
-            folder,
-        );
+        let body = ctx.storage(StorageScope::Run).body(&file).await?;
+        let file_meta =
+            drive::file_metadata(Some(name.unwrap_or_else(|| body.filename().to_string())), folder);
 
         // The related-multipart body Drive's one-shot upload expects:
-        // the JSON metadata part, then the bytes.
-        let (content_type, body) = Multipart::related()
+        // the JSON metadata part, then the file, streamed out of storage.
+        let form = Multipart::related()
             .part("application/json; charset=UTF-8", file_meta.to_string())
-            .part(&meta.mime_type, bytes)
-            .build();
+            .stored_part(body);
 
         let http = ctx.client(&account).await?;
         let answer = weft::access::client::json_call(
-            http.post(format!(
-                "{}/files?uploadType=multipart&fields=id,webViewLink",
-                drive::UPLOAD_API
-            ))
-            .header("content-type", content_type)
-            .body(body),
+            http.post(
+                url(drive::UPLOAD_API, &["files"])?
+                    .query("uploadType", "multipart")
+                    .query("fields", "id,webViewLink")
+                    .as_str(),
+            )
+            .multipart(form),
             "upload the file",
         )
         .await?;

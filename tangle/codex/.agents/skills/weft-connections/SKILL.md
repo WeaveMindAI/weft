@@ -35,8 +35,8 @@ one yourself, stop and write: "Wait. The key never passes through me."
 Then hand them the `weft connect` command below, with `--set-env` when the
 value is in their environment.
 
-For a key from another service, the user always runs `weft connect` with
-`--node <node>` (plus `--label`, `--on <target>` when they apply) and types
+For a key from another service, the user always runs `weft connect
+<node>` (plus `--label`, `--on <target>` when they apply) and types
 the key at its hidden prompt. You never offer them the form that puts the
 key on the command line (`--set`), or any other place to keep it (a secrets
 script of their own, an env file).
@@ -46,7 +46,7 @@ script of their own, an env file).
 Every Connect panel action exists as a CLI verb, so a user without VS
 Code is never stuck. `weft connect` with no arguments opens
 interactive menus: first the project's [access node]s (including nodes
-inside `@include`d files; each file is one target, and `--node` takes a
+inside `@include`d files; each file is one target, and the node is a
 bare id or `file.weft:node` when the id is ambiguous), then the [door]s: paste a key (hidden input), browser
 sign-in (URL printed, polled), the one-click shared app, `--mint` for a
 created own app. A pick is kept by the install, per place of the node (a
@@ -63,7 +63,7 @@ The flags you run:
   [access node]s with their stored connections (the picked one marked);
   outside a project, or in one with no [access node], every stored
   [connection] across all services.
-- `--node <id> --grant <grant>` picks a stored [connection] on this
+- `<node> --grant <grant>` picks a stored [connection] on this
   install; no secrets travel and no file changes. A live trigger that
   reads the node is set up again with it, and the answer names it.
   `--disconnect` forgets the pick.

@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use weft::access::client::url;
 use weft::node::NodeOutput;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
@@ -23,23 +24,27 @@ impl Node for GoogleDriveListFilesNode {
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
-        let query: String = ctx.inputs.get_or("query", String::new())?;
-        let page_size = super::api::page_size(&ctx.inputs, "pageSize")?;
-        let page_token: String = ctx.inputs.get_or("pageToken", String::new())?;
+        let query: Option<String> = ctx.inputs.opt("query")?;
+        let page_size: u64 = ctx.inputs.get("pageSize")?;
+        let page_token: Option<String> = ctx.inputs.opt("pageToken")?;
 
         let drive = ctx.client(&access).await?;
         // One Drive page per call. Drive may answer fewer than
         // `pageSize` even when more match; `hasMore` says so either way.
-        let mut base = format!(
-            "{}/files?pageSize={page_size}&fields=nextPageToken,files(id,name,mimeType)",
-            super::drive::API,
-        );
-        if !query.trim().is_empty() {
-            base.push_str(&format!("&q={}", urlencoding::encode(query.trim())));
-        }
-        let page =
-            super::api::list_page(&drive, &base, "files", &page_token, Value::clone, "list the files", "pageSize")
-                .await?;
+        let base = url(super::drive::API, &["files"])?
+            .query("pageSize", page_size)
+            .query("fields", "nextPageToken,files(id,name,mimeType)")
+            .query_opt("q", query.as_deref().map(str::trim));
+        let page = super::api::list_page(
+            &drive,
+            base,
+            "files",
+            page_token.as_deref(),
+            Value::clone,
+            "list the files",
+            "pageSize",
+        )
+        .await?;
         ctx.pulse_downstream(
             NodeOutput::new()
                 .set("files", Value::Array(page.items))

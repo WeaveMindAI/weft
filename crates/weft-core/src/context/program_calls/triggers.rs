@@ -9,7 +9,12 @@ use crate::builds::BuildHashes;
 use crate::deactivation::{DeactivateRequest, ResyncAnswer, ResyncRequest, ResyncResponse};
 use crate::instance::{InstanceId, InstanceTarget};
 use crate::program::triggers::{BakeAnswer, TriggerCall};
+use crate::context::kept::Step;
+use crate::context::Kept;
+use crate::signal::to_spec;
 use crate::take_down::{ReleaseHeld, TakeDownChoice};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{WeftError, WeftResult};
@@ -39,22 +44,45 @@ impl<'a> ProjectCalls<'a> {
     /// began with, and return once it ends, the way
     /// [`TriggerCalls::resync`] does (`weft resync --resume`). Refused
     /// when the project holds no resync, and on this run's own project.
-    pub async fn resume_resync(self) -> WeftResult<ResyncResponse> {
-        let answer: ResyncAnswer = self.call(ProgramCall::Triggers(TriggerCall::ResumeResync), StopSelf::Keep).await?;
-        self.resynced(answer).await
+    /// Following it pauses the run on a timer between looks, where
+    /// `state` comes in.
+    pub async fn resume_resync<S: Serialize + DeserializeOwned + Send>(self, state: &mut Kept<S>) -> WeftResult<ResyncResponse> {
+        self.resync_followed("triggers.resume_resync", TriggerCall::ResumeResync, state).await
     }
 
-    /// A resync's answer once it ended: at once when it was done, else
-    /// after following its task.
-    async fn resynced(self, answer: ResyncAnswer) -> WeftResult<ResyncResponse> {
-        match answer {
-            ResyncAnswer::Done(response) => Ok(response),
-            ResyncAnswer::UnderWay { task, brought_back } => {
-                let followed: ResyncResponse = self.follow(task).await?;
-                Ok(ResyncResponse { brought_back, ..followed })
-            }
-        }
+    /// Ask for the resync `call` once (the task it hands back is kept with
+    /// a pause), and its answer once it ended: at once when it was done,
+    /// else after following its task.
+    async fn resync_followed<S: Serialize + DeserializeOwned + Send>(
+        self,
+        helper: &'static str,
+        call: TriggerCall,
+        state: &mut Kept<S>,
+    ) -> WeftResult<ResyncResponse> {
+        let call = &call;
+        state
+            .follow(helper, &(self.project, call), to_spec(super::project::FOLLOW_LOOK_AGAIN), None::<Resyncing>, move |place| async move {
+                let place = match place {
+                    Some(place) => place,
+                    None => match self.call::<ResyncAnswer>(ProgramCall::Triggers(call.clone()), StopSelf::Keep).await? {
+                        ResyncAnswer::Done(response) => return Ok(Step::Done(response)),
+                        ResyncAnswer::UnderWay { task, brought_back } => Resyncing { task, brought_back },
+                    },
+                };
+                Ok(match self.task_ended::<ResyncResponse>(place.task).await? {
+                    Some(followed) => Step::Done(ResyncResponse { brought_back: place.brought_back, ..followed }),
+                    None => Step::LookAgain(Some(place)),
+                })
+            })
+            .await
     }
+}
+
+/// A resync under way, between the looks that follow it.
+#[derive(Clone, Serialize, Deserialize)]
+struct Resyncing {
+    task: uuid::Uuid,
+    brought_back: Option<crate::maintenance::ProjectLifted>,
 }
 
 /// Whose activations, beside the instances named: what `.all_instances()`
@@ -157,10 +185,11 @@ impl<'a> TriggerCalls<'a> {
     /// build. One that is off is never turned on; the answer names it.
     /// Chain `.on_build(..)` before awaiting it. It returns once the
     /// resync ended, however long the old version's runs take: between
-    /// looks the run parks on a timer and holds no worker. Refused on this
-    /// run's own project, whose runs on the old version include this one.
-    pub fn resync(self, take_down: TakeDownChoice) -> Resync<'a> {
-        Resync { calls: self, take_down, build: BuildHashes::default() }
+    /// looks the run pauses on a timer (where `state` comes in) and holds
+    /// no worker. Refused on this run's own project, whose runs on the old
+    /// version include this one.
+    pub fn resync<'k, S>(self, take_down: TakeDownChoice, state: &'k mut Kept<S>) -> Resync<'a, 'k, S> {
+        Resync { calls: self, take_down, build: BuildHashes::default(), state }
     }
 }
 
@@ -202,13 +231,14 @@ impl<'a> IntoFuture for Activate<'a> {
 }
 
 /// [`TriggerCalls::resync`], awaited to carry it out.
-pub struct Resync<'a> {
+pub struct Resync<'a, 'k, S> {
     calls: TriggerCalls<'a>,
     take_down: TakeDownChoice,
     build: BuildHashes,
+    state: &'k mut Kept<S>,
 }
 
-impl Resync<'_> {
+impl<S> Resync<'_, '_, S> {
     /// The build to bring the triggers onto (what a build call answered):
     /// the resync is refused when another build registered since.
     pub fn on_build(mut self, build: BuildHashes) -> Self {
@@ -217,16 +247,17 @@ impl Resync<'_> {
     }
 }
 
-impl<'a> IntoFuture for Resync<'a> {
+impl<'a, 'k, S: Serialize + DeserializeOwned + Send> IntoFuture for Resync<'a, 'k, S>
+where
+    'a: 'k,
+{
     type Output = WeftResult<ResyncResponse>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'k>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             let request = ResyncRequest { build: self.build, choice: self.take_down, scope: self.calls.scope()? };
-            let at = self.calls.at;
-            let answer: ResyncAnswer = at.call(ProgramCall::Triggers(TriggerCall::Resync { request }), StopSelf::Keep).await?;
-            at.resynced(answer).await
+            self.calls.at.resync_followed("triggers.resync", TriggerCall::Resync { request }, self.state).await
         })
     }
 }

@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::access::client::{get_json, required_str};
+use weft::access::client::{get_json, required_str, url};
 use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
@@ -41,27 +41,20 @@ impl Node for GmailSendNode {
         let subject: String = ctx.inputs.get_or("subject", String::new())?;
         let text: Option<String> = ctx.inputs.opt("text")?;
         let html: Option<String> = ctx.inputs.opt("html")?;
-        let reply_to = ctx.inputs.opt::<String>("replyTo")?.filter(|r| !r.trim().is_empty());
+        let reply_to: Option<String> = ctx.inputs.opt("replyTo")?;
         // `from` is an address, with or without a display name
         // ("Name <address>"); only the address decides who may send.
         let wanted = ctx
             .inputs
             .opt::<String>("from")?
             .map(|a| a.trim().to_string())
-            .filter(|a| !a.is_empty())
             .map(|a| {
                 a.parse::<Mailbox>().map_err(|e| {
                     weft::WeftError::Input(format!("gmail: from ('{a}') is not an email address, or a name and an address like 'Name <name@example.com>': {e}"))
                 })
             })
             .transpose()?;
-        let handles: Vec<Value> = ctx.inputs.list("attachments")?;
-
-        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
-            return Err(weft::WeftError::Input(
-                "no recipient: provide to, cc, or bcc".to_string(),
-            ));
-        }
+        let files: Vec<FileHandle> = ctx.inputs.list("attachments")?;
         // Gmail sends as the signed-in account; its address is the
         // connection's recorded identity, and the message must name it.
         let Some(own) = account.identity().map(str::to_string) else {
@@ -89,10 +82,10 @@ impl Node for GmailSendNode {
         if let Some(orig_id) = reply_to {
             let orig: Value = get_json(
                 &http,
-                &format!(
-                    "{API}/messages/{}?format=metadata&metadataHeaders=Message-ID",
-                    super::api::segment(&orig_id)
-                ),
+                url(API, &["messages", &orig_id])?
+                    .query("format", "metadata")
+                    .query("metadataHeaders", "Message-ID")
+                    .as_str(),
                 "gmail: read the replied-to message (replying needs 'Read mail', \
                  'Organize mail' or 'Read mail headers' ticked on the Google access node)",
             )
@@ -110,12 +103,12 @@ impl Node for GmailSendNode {
             thread_id = orig["threadId"].as_str().map(str::to_string);
         }
 
-        // Attachments: one File or a list of Files, read from storage.
+        // Attachments: one File or a list of Files, read from storage
+        // whole, since each is base64-encoded into the message itself.
         let mut attachments = Vec::new();
         let storage = ctx.storage(StorageScope::Run);
-        for h in handles {
-            let handle = FileHandle::from_value(&h)?;
-            let (meta, bytes) = storage.get_bytes(&handle).await?;
+        for file in files {
+            let (meta, bytes) = storage.get_bytes(&file).await?;
             attachments.push(OutAttachment {
                 filename: meta.filename,
                 mime_type: meta.mime_type,
@@ -140,7 +133,7 @@ impl Node for GmailSendNode {
             body["threadId"] = json!(t);
         }
         let answer =
-            weft::access::client::json_call(http.post(format!("{API}/messages/send")).json(&body), "send the mail")
+            weft::access::client::json_call(http.post(url(API, &["messages", "send"])?.as_str()).json(&body), "send the mail")
                 .await?;
         ctx.pulse_downstream(
             NodeOutput::new()
@@ -188,7 +181,7 @@ async fn send_as(
     // which permission to tick so that refusal reads as its own fix.
     let answer = get_json(
         http,
-        &format!("{API}/settings/sendAs"),
+        url(API, &["settings", "sendAs"])?.as_str(),
         "list the account's Send mail as addresses (sending from an alias needs \
          'Read mail' or 'Organize mail' ticked on the Google access node)",
     )
@@ -219,10 +212,10 @@ fn send_as_in(answer: &Value, own: &str, address: &str) -> WeftResult<SendAs> {
         return Ok(SendAs { name: text("displayName"), reply_to: text("replyToAddress").and_then(|r| r.parse().ok()) });
     }
     let allowed: Vec<&str> = usable.iter().filter_map(address_of).collect();
-    Err(weft::WeftError::Input(format!(
+    weft::input_bail!(
         "gmail: '{address}' is not one of this account's Send mail as addresses, so Gmail \
          would send from {own} instead. Allowed: {}. Add the address under Gmail's \
          Settings > Accounts > Send mail as, or pick one of these.",
         if allowed.is_empty() { own.to_string() } else { allowed.join(", ") }
-    )))
+    )
 }

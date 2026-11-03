@@ -32,7 +32,6 @@ pub fn tests() -> Vec<NodeTest> {
         }),
         NodeTest::fake("lists_one_page_and_says_where_the_next_starts", paged_listing),
         NodeTest::fake("a_page_stops_early_at_what_a_wire_carries", heavy_page),
-        NodeTest::fake("a_page_size_below_one_is_refused", zero_max_keys),
     ]
 }
 
@@ -131,16 +130,5 @@ async fn heavy_page(rig: FakeRig) -> WeftResult<()> {
     assert!(weft::storage::wire_weight(objects) <= weft::storage::MAX_WIRE_VALUE_BYTES);
     assert_eq!(outcome.outputs["lastKey"], json!(keys[listed - 1]), "the next page starts right after it");
     assert_eq!(outcome.outputs["hasMore"], json!(true));
-    Ok(())
-}
-
-/// A page of 0 keys would hand back the same `lastKey` forever.
-async fn zero_max_keys(rig: FakeRig) -> WeftResult<()> {
-    let err = rig
-        .run(&S3ListObjectsNode, json!({ "account": rig.access("s3"), "bucket": "pics", "maxKeys": 0 }))
-        .await
-        .failure()?;
-    assert!(err.starts_with("config error") && err.contains("`maxKeys`"), "{err}");
-    assert!(rig.requests().is_empty(), "nothing is listed");
     Ok(())
 }

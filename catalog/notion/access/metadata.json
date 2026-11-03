@@ -87,7 +87,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[notion]",
       "widget": {
         "kind": "access"
       },
@@ -97,7 +97,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[notion]",
       "description": "Wire into the Notion nodes."
     }
   ]

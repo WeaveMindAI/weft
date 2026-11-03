@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use axum::http::StatusCode;
 
 use weft_core::frames::{loop_indices, FiringLocation, Located, LoopFrames};
-use weft_core::primitive::{AwaitedEntryKind, LoopInstanceKey, LoopTerminationReason, RunSnapshot};
+use weft_core::primitive::{LoopInstanceKey, LoopTerminationReason, RunSnapshot};
 use weft_core::program::{NodeState, NodeStatus};
 use weft_core::project::graph::ProjectGraph;
 use weft_core::project::places::{enclosing_loops, every_place, members_in, named, scopes_around, state_place, Named, StatePlace};
@@ -85,15 +85,10 @@ pub(crate) fn in_run(cut: &ProjectDefinition, snapshot: &RunSnapshot, place: &St
 /// (`snapshot`): what tells two iterations waiting at one node apart.
 pub(crate) fn wait_iterations(snapshot: &RunSnapshot, place: &Located) -> HashMap<String, Vec<u32>> {
     snapshot
-        .awaited_sequences
+        .recorded_waits
         .iter()
         .filter(|(at, _)| Located::at(at.node_id.clone(), &at.frames) == *place)
-        .flat_map(|(at, entries)| {
-            entries.iter().filter_map(move |entry| match &entry.kind {
-                AwaitedEntryKind::Await { token, .. } => Some((token.clone(), loop_indices(&at.frames))),
-                _ => None,
-            })
-        })
+        .flat_map(|(at, waits)| waits.iter().map(move |wait| (wait.token.clone(), loop_indices(&at.frames))))
         .collect()
 }
 
@@ -130,6 +125,7 @@ pub(crate) fn seen_at(project: &ProjectDefinition, cut: &ProjectDefinition, snap
 
 /// What the record says of the node at `place`, which fires at `frames`;
 /// `copy_of` is the copy of a scope around it the run would decide.
+// SYNC: node_seen <-> extension-vscode/src/runFollower.ts firingStatus
 fn node_seen(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Located, frames: LoopFrames, copy_of: impl Fn(&Located) -> ScopeCopy) -> Seen {
     // A node outside every loop fires once in a run; a seeded run holds the
     // firing it took over under its own id too.
@@ -144,10 +140,7 @@ fn node_seen(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Locate
         return Seen::of(if skipped { NodeStatus::Skipped } else { NodeStatus::Pending });
     };
     let pending_wait = || {
-        snapshot.awaited_sequences.get(&FiringLocation::new(place.id.clone(), frames.clone()))?.iter().rev().find_map(|entry| match &entry.kind {
-            AwaitedEntryKind::Await { token, ended: None } => Some(token.clone()),
-            _ => None,
-        })
+        snapshot.recorded_waits.get(&FiringLocation::new(place.id.clone(), frames.clone()))?.iter().rev().find(|wait| wait.ended.is_none()).map(|wait| wait.token.clone())
     };
     match firing.status() {
         // A wait the worker holds leaves its firing running: the wait on
@@ -156,9 +149,13 @@ fn node_seen(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Locate
             Some(token) => Seen { status: NodeStatus::Waiting, waiting_on: Some(token), error: None },
             None => Seen::of(NodeStatus::Running),
         },
-        NodeFiringStatus::WaitingForInput => {
-            Seen { status: NodeStatus::Waiting, waiting_on: firing.callback_id.clone().or_else(pending_wait), error: None }
-        }
+        // Parked: on a wait of its own (the record's, or one still on
+        // record with no ending), else only because its run paused with
+        // it inside, which names nothing to wait on.
+        NodeFiringStatus::WaitingForInput => match firing.callback_id.clone().or_else(pending_wait) {
+            Some(token) => Seen { status: NodeStatus::Waiting, waiting_on: Some(token), error: None },
+            None => Seen::of(NodeStatus::Paused),
+        },
         NodeFiringStatus::Completed => Seen::of(NodeStatus::Completed),
         NodeFiringStatus::Failed => Seen { status: NodeStatus::Failed, waiting_on: None, error: firing.error.clone() },
         NodeFiringStatus::Skipped => Seen::of(NodeStatus::Skipped),
@@ -261,7 +258,7 @@ mod tests {
             frames: vec![],
             token: token.into(),
             spec: SignalSpec::of_kind("poll_endpoint", json!({ "url": "https://x/status" })),
-            call_index: 0,
+            wait_index: 0,
             at_unix: 2,
         }
     }
@@ -294,9 +291,21 @@ mod tests {
     fn a_node_with_a_wait_on_record_and_no_ending_waits() {
         let held = seen(&[started("a"), registered("a", "t1")], "a");
         assert_eq!((held.status, held.waiting_on.as_deref()), (NodeStatus::Waiting, Some("t1")));
-        let suspended = RunEvent::NodeSuspended { run_id: RUN, node_id: "a".into(), frames: vec![], token: "t1".into(), at_unix: 3 };
+        let suspended = RunEvent::NodeSuspended { run_id: RUN, node_id: "a".into(), frames: vec![], token: Some("t1".into()), at_unix: 3 };
         let paused = seen(&[started("a"), registered("a", "t1"), suspended], "a");
         assert_eq!((paused.status, paused.waiting_on.as_deref()), (NodeStatus::Waiting, Some("t1")));
+    }
+
+    /// A firing parked only because its run paused with it inside (a bus
+    /// read, a stream pull) has no wait of its own to name: it reads
+    /// paused. One whose own wait is still on record with no ending when
+    /// the run pauses waits on that wait all the same.
+    #[test]
+    fn a_node_parked_only_by_its_run_pausing_reads_paused() {
+        let with_run = |node: &str| RunEvent::NodeSuspended { run_id: RUN, node_id: node.into(), frames: vec![], token: None, at_unix: 3 };
+        assert_eq!(seen(&[started("a"), with_run("a")], "a"), Seen::of(NodeStatus::Paused));
+        let holding = seen(&[started("a"), registered("a", "t1"), with_run("a")], "a");
+        assert_eq!((holding.status, holding.waiting_on.as_deref()), (NodeStatus::Waiting, Some("t1")));
     }
 
     /// Each wait a node registered is read off the record with the loop
@@ -309,7 +318,7 @@ mod tests {
             frames: vec![weft_core::frames::Frame::Loop { index }],
             token: token.into(),
             spec: SignalSpec::of_kind("poll_endpoint", json!({ "url": "https://x/status" })),
-            call_index: 0,
+            wait_index: 0,
             at_unix: 2,
         };
         let project = program();

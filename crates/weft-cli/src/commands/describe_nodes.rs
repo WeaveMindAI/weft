@@ -215,7 +215,7 @@ pub async fn run(
         let printed = if compact {
             serde_json::to_string(&metadata.compact_json())
         } else {
-            serde_json::to_string_pretty(metadata)
+            serde_json::to_string_pretty(&editor_entry(metadata)?)
         };
         println!("{}", printed.context("serialize describe response")?);
         return Ok(());
@@ -229,10 +229,38 @@ pub async fn run(
             .collect();
         serde_json::to_string(&NodesResponse { catalog, warnings })
     } else {
+        let catalog = catalog
+            .iter()
+            .map(|(node_type, metadata)| Ok((node_type.clone(), editor_entry(metadata)?)))
+            .collect::<Result<BTreeMap<String, serde_json::Value>>>()?;
         serde_json::to_string(&NodesResponse { catalog, warnings })
     };
     println!("{}", printed.context("serialize describe response")?);
     Ok(())
+}
+
+/// One node's full entry, as the editor reads it: its resolved metadata,
+/// and on a node checking its callers the recipe of the connection its
+/// `auth` reads (`callerRecipes`), keyed by each word the value is read
+/// by: a name `auth` takes, or the `kind` of a check written as a record.
+/// No catalog node carries these; its Connect panel follows `auth`.
+// SYNC: callerRecipes <-> packages/weft-graph/src/protocol.ts CatalogEntry.callerRecipes
+fn editor_entry(metadata: &weft_core::node::NodeMetadata) -> Result<serde_json::Value> {
+    let mut entry = serde_json::to_value(metadata).context("serialize a node's metadata")?;
+    if metadata.features.checks_callers {
+        use weft_core::access::callers::{CallerScheme, NAMED_CHECKS};
+        let named = NAMED_CHECKS.iter().map(|named| {
+            (named.name, CallerScheme::of(&named.verify()).expect("a named check checks callers"))
+        });
+        let kinds = CallerScheme::ALL.into_iter().map(|scheme| (scheme.name(), scheme));
+        let recipes: serde_json::Map<String, serde_json::Value> = named
+            .chain(kinds)
+            .map(|(word, scheme)| Ok((word.to_string(), serde_json::to_value(scheme.recipe())?)))
+            .collect::<Result<_, serde_json::Error>>()
+            .context("serialize the caller checks' recipes")?;
+        entry["callerRecipes"] = serde_json::Value::Object(recipes);
+    }
+    Ok(entry)
 }
 
 /// What `--node <name>` answers for a name the language owns rather
@@ -264,7 +292,30 @@ fn language_construct(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_sentence, language_construct};
+    use super::{editor_entry, first_sentence, language_construct};
+
+    /// A Route's `auth` choices are in its wiring view, and its editor
+    /// entry carries each scheme's recipe for the Connect panel.
+    #[test]
+    fn a_route_shows_its_auth_choices_and_carries_their_recipes() {
+        let cat = weft_catalog::FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
+        let route = weft_core::node::MetadataCatalog::lookup(&cat, "Route").expect("Route is in the catalog").resolved();
+        let compact = route.compact_json();
+        let auth = compact["inputs"].as_array().unwrap().iter().find(|i| i["name"] == "auth").expect("an auth input");
+        assert_eq!(
+            auth["widget"]["options"],
+            serde_json::json!(["none", "api_keys", "hmac_sha256", "hmac_sha1", "hmac_sha512", "ed25519", "ecdsa_p256", "oidc"])
+        );
+        let entry = editor_entry(&route).unwrap();
+        assert_eq!(entry["callerRecipes"]["api_keys"]["service"], "api_key_auth");
+        assert_eq!(entry["callerRecipes"]["oidc"]["service"], "oidc_auth");
+        assert_eq!(entry["callerRecipes"]["hmac_sha512"]["service"], "hmac_auth");
+        assert_eq!(entry["callerRecipes"]["ecdsa_p256"]["service"], "signature_auth");
+        // A check written as a record finds its recipe by its `kind`.
+        assert_eq!(entry["callerRecipes"]["hmac"]["service"], "hmac_auth");
+        let reply = weft_core::node::MetadataCatalog::lookup(&cat, "Reply").unwrap().resolved();
+        assert!(editor_entry(&reply).unwrap().get("callerRecipes").is_none());
+    }
 
     /// Every type name the language reserves answers with what it is,
     /// never "unknown node type".

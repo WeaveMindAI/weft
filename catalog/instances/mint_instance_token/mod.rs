@@ -5,10 +5,10 @@
 
 use async_trait::async_trait;
 
+use weft::instance::InstanceId;
 use weft::node::NodeOutput;
-use weft::{node_bail, RunContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
-use super::lifecycle::instance;
 
 #[derive(NodeManifest)]
 pub struct MintInstanceTokenNode;
@@ -27,15 +27,12 @@ impl Node for MintInstanceTokenNode {
         let hours: f64 = ctx.inputs.get("expiresInHours")?;
         // The token's life is counted in whole seconds, so the hours
         // round to the nearest one (1.1 hours is 3960.0000000000005
-        // seconds in floating point, and means 3960). The bounds (at
-        // least a second, at most a year) are the core's, checked at the
-        // mint, so anything rounding to 0 is refused there.
-        let secs = (hours * 3600.0).round();
-        if !(secs.is_finite() && secs >= 0.0) {
-            node_bail!("expiresInHours must be a finite, non-negative number of hours, got {hours}");
-        }
-        let expires_in = std::time::Duration::from_secs(secs as u64);
-        let minted = ctx.tokens().mint_for_instance(instance(&ctx)?, expires_in).await?;
+        // seconds in floating point, and means 3960). The widget keeps it
+        // from 0 up; the bounds (at least a second, at most a year) are the
+        // core's, checked at the mint, so anything rounding to 0 is refused
+        // there.
+        let expires_in = std::time::Duration::from_secs_f64((hours * 3600.0).round());
+        let minted = ctx.tokens().mint_for_instance(ctx.inputs.get::<InstanceId>("instance")?, expires_in).await?;
         let token = ctx.secret(&minted.token)?;
         ctx.pulse_downstream(NodeOutput::new().set("token", token).set("expiresAt", minted.expires_at_unix)).await
     }

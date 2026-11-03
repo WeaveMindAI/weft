@@ -42,7 +42,7 @@ impl Node for TelegramSendMessageNode {
         let reply_to: Option<i64> = ctx.inputs.opt("replyTo")?;
 
         let mut body = serde_json::json!({ "chat_id": chat_id, "text": text });
-        if let Some(m) = parse_mode.filter(|m| !m.trim().is_empty() && m != "plain") {
+        if let Some(m) = parse_mode.filter(|m| m != "plain") {
             body["parse_mode"] = serde_json::json!(m);
         }
         if let Some(r) = reply_to {

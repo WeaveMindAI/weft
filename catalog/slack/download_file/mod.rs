@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use weft::access::client::checked_send;
 use weft::node::NodeOutput;
 use weft::storage::StorageScope;
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
@@ -51,7 +52,7 @@ impl Node for SlackDownloadFileNode {
         // url_private only answers with the workspace bearer, so this
         // fetch runs on the connection's client and streams into
         // storage (bounded memory, whatever the file size).
-        let resp = client.get(&url).send().await.node_err("slack: fetch file bytes")?;
+        let resp = checked_send(client.get(&url), "slack: fetch file bytes").await?;
         let stored = ctx
             .storage(StorageScope::Run)
             .put_response(

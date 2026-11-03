@@ -2800,3 +2800,74 @@ fn a_record_holding_a_secret_narrows_an_object_output() {
     assert!(WeftType::fits_within(&record, &WeftType::JsonDict));
     assert!(!WeftType::is_compatible(&record, &WeftType::JsonDict));
 }
+
+/// `Access[service]` parses like `List[T]` and prints back the same; a
+/// service is named the way a recipe names it, and anything else is
+/// refused at parse.
+#[test]
+fn access_names_its_service_and_round_trips() {
+    for text in ["Access", "Access[fal]", "Access[google_drive]", "Access[openai] | Access[anthropic]", "List[Access[s3]]"] {
+        assert_eq!(WeftType::parse(text).expect(text).to_string(), text);
+    }
+    assert_eq!(WeftType::parse("Access[fal]").unwrap(), WeftType::Access(Some("fal".into())));
+    assert_eq!(WeftType::parse("Access").unwrap(), WeftType::Access(None));
+    assert_ne!(WeftType::parse("Access[fal]").unwrap(), WeftType::Access(None));
+    for bad in ["Access[]", "Access[Fal]", "Access[String]", "Access[a-b]", "Access[a, b]"] {
+        let e = WeftType::try_parse(bad).unwrap_err();
+        assert!(e.contains("takes a service's name"), "{bad}: {e}");
+    }
+}
+
+/// `Access[fal]` fits `Access[fal]` and bare `Access`; bare `Access`
+/// fits only bare `Access`; a union of services fits only a port taking
+/// each of them.
+#[test]
+fn an_access_fits_only_a_port_naming_its_service() {
+    let fits = |source: &str, target: &str| {
+        WeftType::is_compatible(&WeftType::parse(source).unwrap(), &WeftType::parse(target).unwrap())
+    };
+    let table = [
+        ("Access[fal]", "Access[fal]", true),
+        ("Access[fal]", "Access", true),
+        ("Access", "Access", true),
+        ("Access", "Access[fal]", false),
+        ("Access[slack]", "Access[fal]", false),
+        ("Access[a]", "Access[a] | Access[b]", true),
+        ("Access", "Access[a] | Access[b]", false),
+        ("Access[a] | Access[b]", "Access[a] | Access[b]", true),
+        ("Access[a] | Access[b]", "Access", true),
+        ("Access[a] | Access[b]", "Access[a]", false),
+        ("Access[a]", "JsonDict", false),
+        ("Access[a]", "Json", false),
+    ];
+    for (source, target, want) in table {
+        assert_eq!(fits(source, target), want, "{source} into {target}");
+    }
+}
+
+/// A value's type reads the service off its marker, and a value is held
+/// to the service its type names.
+#[test]
+fn an_access_value_is_typed_and_held_by_its_service() {
+    let fal = crate::access::Access::new("conn-1", "fal", None).to_value();
+    assert_eq!(WeftType::infer(&fal), WeftType::Access(Some("fal".into())));
+    assert_eq!(WeftType::infer(&serde_json::json!({ "__weft_access__": {} })), WeftType::Access(None));
+    assert!(WeftType::parse("Access[fal]").unwrap().validate_value(&fal).is_ok());
+    assert!(WeftType::parse("Access").unwrap().validate_value(&fal).is_ok());
+    assert!(WeftType::parse("Access[openai] | Access[fal]").unwrap().validate_value(&fal).is_ok());
+    let e = WeftType::parse("Access[slack]").unwrap().validate_value(&fal).unwrap_err();
+    assert!(e.contains("expected Access[slack], got Access[fal]"), "{e}");
+    assert!(WeftType::parse("Access[slack]").unwrap().validate_value(&serde_json::json!({ "a": 1 })).is_err());
+}
+
+/// A node's connection inputs: an `Access`, an `Access[x]`, or a union of
+/// those, and nothing else.
+#[test]
+fn is_access_reads_bare_named_and_unions() {
+    for yes in ["Access", "Access[fal]", "Access[a] | Access[b]"] {
+        assert!(WeftType::parse(yes).unwrap().is_access(), "{yes}");
+    }
+    for no in ["String", "Access[a] | String", "List[Access]"] {
+        assert!(!WeftType::parse(no).unwrap().is_access(), "{no}");
+    }
+}

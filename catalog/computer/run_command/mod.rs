@@ -5,16 +5,20 @@
 //! command to the next. A quick command answers in the same call. A
 //! longer one answers with its id at once, and the node parks on the
 //! command's status route (`PollEndpoint`), so no worker is held while
-//! it runs; the start is inside `ctx.run`, so the replay after the wait
-//! does not run the command a second time. Once it ended, its output is
+//! it runs. The node's state holds the computer's answer to the start
+//! and, once it ended, the command's end, so the body run again after
+//! the wait does not run the command a second time and comes straight
+//! back to the wait on the same command. Once it ended, its output is
 //! read off the computer in pieces, straight into storage, so an output
 //! of any size never sits whole in memory. Cutting it down for a reader
 //! (a model) is a later node's job (`TextPreview`), never this one's.
 
 use async_trait::async_trait;
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use weft::access::client;
 use weft::node::NodeOutput;
 use weft::signal::poll_endpoint::MIN_POLL_INTERVAL_SECS;
 use weft::signal::{PollEndpoint, Predicate};
@@ -25,6 +29,15 @@ use super::actions;
 
 #[derive(NodeManifest)]
 pub struct RunCommandNode;
+
+/// Where the command stands: the computer's answer to the start (a
+/// finished command, or a running one with its id), then, for one that
+/// was still running, the answer that ended the wait on it.
+#[derive(Default, Serialize, Deserialize)]
+struct Command {
+    started: Option<Value>,
+    ended: Option<Value>,
+}
 
 #[cfg(feature = "node-tests")]
 mod tests;
@@ -102,7 +115,10 @@ impl Node for RunCommandNode {
         if let Some(session) = ctx.inputs.opt::<String>("session")? {
             payload.insert("session".into(), json!(session));
         }
-        let started = ctx.run("start the command", || actions::act(&ctx, actions::EXEC, Value::Object(payload))).await?;
+        let mut state = ctx.keep(Command::default()).await?;
+        let started = state
+            .once(|s| &mut s.started, async |_| actions::act(&ctx, actions::EXEC, Value::Object(payload)).await)
+            .await?;
         let storage = ctx.storage(StorageScope::Run);
         if started["restarted"] == true {
             let output = storage.put(RESTARTED.as_bytes().to_vec(), "text/plain", "output.txt", None).await?;
@@ -113,25 +129,19 @@ impl Node for RunCommandNode {
             let id = started["id"].as_str().node_err(format!("the computer answered a running command with no id: {started}"))?;
             // As often as a wait may look: a model waiting on the command
             // should get it back as soon as it ends.
-            ctx.await_signal(PollEndpoint {
-                url: format!("{}{}{id}", computer.url(), actions::JOBS_PATH),
+            let status = PollEndpoint {
+                url: client::url(computer.url(), &[actions::JOBS, id])?.into(),
                 interval_secs: MIN_POLL_INTERVAL_SECS,
                 filters: vec![Predicate::neq("status", RUNNING)],
                 ..Default::default()
-            })
-            .await?
+            };
+            state.wait(|s| &mut s.ended, status).await?
         } else {
             started
         };
         let (exit_code, size) = finished(&answer)?;
         let id = answer["id"].as_str().node_err(format!("the computer answered a finished command with no id: {answer}"))?;
-        // A big output is many reads off the computer: a press of stop
-        // ends them, wherever they are.
-        let cancel = ctx.cancellation();
-        let output = tokio::select! {
-            stored = storage.put_stream(output_stream(computer, id.to_string(), size), "text/plain", "output.txt", None) => stored?,
-            err = cancel.cancelled_err() => return Err(err),
-        };
+        let output = storage.put_stream(output_stream(computer, id.to_string(), size), "text/plain", "output.txt", None).await?;
         ctx.pulse_downstream(NodeOutput::new().set("output", output).set("exitCode", exit_code)).await
     }
 }

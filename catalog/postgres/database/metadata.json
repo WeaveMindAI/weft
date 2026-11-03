@@ -1,7 +1,7 @@
 {
   "type": "PostgresDatabase",
   "label": "Postgres: Database",
-  "description": "Run a Postgres database inside the project, with a disk that survives restarts; wire its access output into the query and write nodes. Its generated password is handed out exactly ONCE, to whoever takes it first (the program's run, `weft infra env`, or the card's copy button): until then the node's card shows it masked with a copy button (how an outside client, such as a frontend with its own tables, gets in); afterwards the card's Reset password button mints and shows a new one. `weft infra env <node> --into .env --set DATABASE_USER=User --set DATABASE_PASSWORD=Password` writes both into an env file without anyone reading the password; once handed over, `weft infra press <node> reset_password` then `weft infra env` writes a fresh one (`weft infra show <node>` lists the buttons). Every client (the program's workers, a frontend) signs in as `app`, which owns the database and is no superuser, through the node's pooler: Postgres serves a fixed number of connections (see `memory`), and a client past them waits its turn instead of being refused, however many workers run. A connection that sits idle for a minute is closed by the database, so an outside client's own pool must expect an idle connection to be gone (most close theirs sooner). Watching queries (PostgresWatchQuery) have their own share of the connections, a quarter of them. Through the pooler a client reaches this one database only, never Postgres's own `postgres` database or another one made beside it. An extension the program needs, trusted by Postgres or not, goes in `extensions`: the superuser `weft` makes it on every start, and `app` uses it. Roles the program needs go in `roles`, made the same way. To keep tenants apart with row-level security: list a role per kind of tenant, have the program grant it what it may touch, turn on (and `FORCE`) the tables' policies naming it, and `set role` to it before a tenant's queries; a client outside the program (a site) signs in as a `login` role of its own. `app` owns the tables, and a `FORCE` policy binds their owner too, so a setup step that must write past the policies (seeding every tenant's rows) does `set role` to a role marked `bypassRowLevelSecurity`, granted what it writes. The superuser signs in only over the unix socket inside the database's own container. Postgres note: a function called in a `cross join lateral (select f(x) as v)` subquery and read several times through `v` can run once per read, because Postgres folds the subquery into the outer query; `offset 0` inside the subquery keeps it to one call. Terminating its infra deletes the disk and all data.",
+  "description": "Run a Postgres database inside the project, with a disk that survives restarts; wire its access output into the query and write nodes. Its generated password is handed out exactly ONCE, to whoever takes it first (the program's run, `weft infra env`, or the card's copy button): until then the node's card shows it masked with a copy button (how an outside client, such as a frontend with its own tables, gets in); afterwards the card's Reset password button mints and shows a new one. `weft infra env <node> --into .env --set DATABASE_USER=User --set DATABASE_PASSWORD=Password` writes both into an env file without anyone reading the password; once handed over, `weft infra press <node> reset_password` then `weft infra env` writes a fresh one (`weft infra show <node>` lists the buttons). Every client (the program's workers, a frontend) signs in as `app`, which owns the database and is no superuser, through the node's pooler: Postgres serves a fixed number of connections, set by `memory`, and a client past them waits its turn instead of being refused, however many workers run. `memory` takes at least 565Mi. Postgres is set up for it: 352Mi stays with the machine (the pooler and the helper beside Postgres included) and the rest is Postgres's, so at 1Gi it serves 23 connections, at 2Gi 59, at 4Gi 131 (200 at most). Three of them are kept for the superuser and two spare; of the rest a quarter is for watching queries and the others for every other query. If runs often wait for the database, or it is killed for running out of memory, raise `memory`. A local install uses the same settings and caps Postgres's container at its share the same way. The default size, a quarter CPU with 1Gi, is Compute Engine's `e2-micro` on a cloud install, about $6 a month. A connection that sits idle for a minute is closed by the database, so an outside client's own pool must expect an idle connection to be gone (most close theirs sooner). Through the pooler a client reaches this one database only, never Postgres's own `postgres` database or another one made beside it. An extension the program needs, trusted by Postgres or not, goes in `extensions`: the superuser `weft` makes it on every start, and `app` uses it. Roles the program needs go in `roles`, made the same way. To keep tenants apart with row-level security: list a role per kind of tenant, have the program grant it what it may touch, turn on (and `FORCE`) the tables' policies naming it, and `set role` to it before a tenant's queries; a client outside the program (a site) signs in as a `login` role of its own. `app` owns the tables, and a `FORCE` policy binds their owner too, so a setup step that must write past the policies (seeding every tenant's rows) does `set role` to a role marked `bypassRowLevelSecurity`, granted what it writes. The superuser signs in only over the unix socket inside the database's own container. Postgres note: a function called in a `cross join lateral (select f(x) as v)` subquery and read several times through `v` can run once per read, because Postgres folds the subquery into the outer query; `offset 0` inside the subquery keeps it to one call. Terminating its infra deletes the disk and all data.",
   "tags": [
     "postgres",
     "database",
@@ -12,7 +12,11 @@
   "color": "#336791",
   "requiresInfra": true,
   "features": {
-    "liveEndpoint": "credential"
+    "liveEndpoint": "credential",
+    "machineInputs": {
+      "cpu": "0.25",
+      "memory": "1Gi"
+    }
   },
   "images": [
     "images/credential",
@@ -61,33 +65,12 @@
       "default": false,
       "label": "Reachable from this machine",
       "description": "On: clients outside the program (a frontend, `psql`) may connect, at an address on the runtime's machine that `weft infra list-doors` prints (loopback only on a local install, never the internet; the password is still required). Off (default): reachable only inside the project."
-    },
-    {
-      "name": "cpu",
-      "type": "String",
-      "default": "0.25",
-      "label": "CPUs",
-      "description": "CPUs the machine sustains (`0.25`, `1`, `250m`). A cloud install picks its cheapest machine holding this and `memory`: a quarter CPU with 1Gi is Compute Engine's `e2-micro`, about $6 a month. A local install does not cap the container."
-    },
-    {
-      "name": "memory",
-      "type": "String",
-      "default": "1Gi",
-      "label": "Memory",
-      "description": "Memory, a number followed by Gi, Mi, G or M (`1Gi`). It takes at least 565Mi. Sized with `cpu`. Postgres is set up for it: 352Mi stays with the machine (the pooler and the helper beside Postgres included) and the rest is Postgres's, so at 1Gi it serves 23 connections, at 2Gi 59, at 4Gi 131 (200 at most). Three of them are kept for the superuser and two spare; of the rest a quarter is for watching queries and the others for every other query. When every connection is busy, a client waits for one rather than being refused. If runs often wait for the database, or it is killed for running out of memory, raise `memory`. A local install uses the same settings and caps the container the same way."
-    },
-    {
-      "name": "machineType",
-      "type": "String",
-      "label": "Machine type",
-      "placeholder": "picked from CPUs and memory",
-      "description": "Last resort: a cloud's own machine type, used as is instead of the one picked from `cpu` and `memory` (`n2-standard-4` on Compute Engine). A local install ignores it."
     }
   ],
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[postgres]",
       "description": "Wire into the Postgres query and write nodes, like a PostgresAccess node's. Baked: made when the database's infra is applied, so a run that reads only this output uses the saved connection and does not run this node.",
       "baked": true
     }
@@ -98,13 +81,13 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "database"
           },
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "database",
-            "regex": "^$|\\p{Cc}"
+            "matches": "^$|\\p{Cc}"
           }
         ]
       },
@@ -120,15 +103,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "version"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "version",
-              "regex": "^[1-9][0-9]{0,3}(\\.(0|[1-9][0-9]*))?$"
+              "matches": "^[1-9][0-9]{0,3}(\\.(0|[1-9][0-9]*))?$"
             }
           }
         ]
@@ -142,9 +125,9 @@
     },
     {
       "when": {
-        "kind": "config_matches",
+        "kind": "value",
         "field": "version",
-        "regex": "^([1-9]|1[0-3])(\\.(0|[1-9][0-9]*))?$"
+        "matches": "^([1-9]|1[0-3])(\\.(0|[1-9][0-9]*))?$"
       },
       "then": {
         "message": "PostgresDatabase '{id}' runs a Postgres older than 14, which does not close connections a client left idle: an existing database keeps running without that, and a new one is refused when it starts. To move to 14 or later: Postgres cannot open an older version's data, so the data moves by dump and restore while the old database still runs. Dump it: `weft infra press {id} reset_password`, then `weft infra env {id} --into old.env --set PGUSER=User --set PGDATABASE=Database --set PGPASSWORD=Password`, and with those exported, `pg_dump -Fc -h <host> -p <port> -f data.dump` at the address `weft infra list-doors` prints for it (turn `reachable` on first if it is off). Restore it: add a PostgresDatabase on 17 with `reachable` on, wire it where the old one was, start it (its setup takes the password), then press its reset_password and write its env the same way, and `pg_restore --no-owner -h <host> -p <port> -d \"$PGDATABASE\" data.dump`.",
@@ -158,15 +141,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "storage"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "storage",
-              "regex": "^[0-9]+(\\.[0-9]+)?(Gi|Mi|G|M)$"
+              "matches": "^[0-9]+(\\.[0-9]+)?(Gi|Mi|G|M)$"
             }
           }
         ]
@@ -183,49 +166,24 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
-            "field": "cpu"
+            "kind": "value",
+            "field": "roles"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
-              "field": "cpu",
-              "regex": "^[0-9]+(\\.[0-9]+)?m?$"
+              "kind": "value",
+              "field": "roles",
+              "unique": "name"
             }
           }
         ]
       },
       "then": {
-        "message": "PostgresDatabase '{id}' has a `cpu` it cannot read. Write a number, or thousandths with m (0.25, 250m).",
+        "message": "PostgresDatabase '{id}' lists a role twice in `roles`; list each role once, with all its settings.",
         "level": "structural",
         "severity": "error",
-        "port": "cpu"
-      }
-    },
-    {
-      "when": {
-        "kind": "all",
-        "of": [
-          {
-            "kind": "config_present",
-            "field": "memory"
-          },
-          {
-            "kind": "not",
-            "of": {
-              "kind": "config_matches",
-              "field": "memory",
-              "regex": "^[0-9]+(\\.[0-9]+)?(Gi|Mi|G|M)$"
-            }
-          }
-        ]
-      },
-      "then": {
-        "message": "PostgresDatabase '{id}' has a `memory` it cannot read. Write a number followed by Gi, Mi, G or M (1Gi).",
-        "level": "structural",
-        "severity": "error",
-        "port": "memory"
+        "port": "roles"
       }
     }
   ]

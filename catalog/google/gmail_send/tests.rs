@@ -1,5 +1,5 @@
-//! GmailSend self-tests: the assembled raw message and the recipient
-//! rule. The MIME builder itself (CRLF sanitizing, multipart shapes)
+//! GmailSend self-tests: the assembled raw message and the sender
+//! rules. The MIME builder itself (CRLF sanitizing, multipart shapes)
 //! is tested where it lives, in the package's `gmail.rs`.
 
 use base64::Engine as _;
@@ -24,10 +24,9 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_named_from_keeps_its_name_and_is_checked_by_its_address", from_named_alias),
         NodeTest::fake("a_named_own_address_needs_no_send_as_read", from_named_own),
         NodeTest::fake("from_an_address_off_the_send_as_list_fails_naming_the_allowed_ones", from_unknown),
-        NodeTest::fake("no_recipient_refuses_before_any_call", no_recipient),
         NodeTest::fake("a_refused_send_fails_the_run_when_error_is_unwired", refused_unwired),
         NodeTest::fake("a_refused_send_comes_out_on_error_when_it_is_wired", refused_wired),
-        NodeTest::fake("a_missing_recipient_is_never_caught_by_error", mistake_not_caught),
+        NodeTest::fake("a_malformed_from_is_never_caught_by_error", mistake_not_caught),
         NodeTest::fake("a_plain_send_asks_only_for_send_mail", plain_send_permissions),
         NodeTest::fake("a_reply_on_send_mail_alone_fails_naming_read_mail", reply_needs_read_mail),
         NodeTest::fake(
@@ -230,19 +229,6 @@ async fn from_unknown(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn no_recipient(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig
-        .run(
-            &GmailSendNode,
-            json!({ "account": google_account(), "subject": "s", "text": "t" }),
-        )
-        .await;
-    let err = outcome.result.expect_err("no recipient must refuse").to_string();
-    assert!(err.contains("no recipient"), "{err}");
-    assert!(rig.requests().is_empty(), "nothing was sent");
-    Ok(())
-}
-
 /// Gmail refuses the send, the way it does past the daily quota.
 fn refuse_the_send(rig: &FakeRig) {
     rig.respond_status(
@@ -283,15 +269,11 @@ async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
 
 async fn mistake_not_caught(rig: FakeRig) -> WeftResult<()> {
     rig.wire_output("_error");
-    let err = rig
-        .run(
-            &GmailSendNode,
-            json!({ "account": google_account(), "subject": "s", "text": "t" }),
-        )
-        .await
-        .failure()?;
+    let mut mail = a_mail();
+    mail["from"] = json!("not an address");
+    let err = rig.run(&GmailSendNode, mail).await.failure()?;
     assert!(err.starts_with("input error"), "a program mistake fails the run: {err}");
-    assert!(err.contains("no recipient"), "{err}");
+    assert!(err.contains("not an address"), "{err}");
     assert!(rig.requests().is_empty(), "nothing was sent");
     Ok(())
 }

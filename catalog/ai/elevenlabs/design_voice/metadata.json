@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[elevenlabs]", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "voice_lab"
@@ -168,9 +168,9 @@
   "validate": [
     {
       "when": {
-        "kind": "config_matches",
+        "kind": "value",
         "field": "description",
-        "regex": "(?s)^.{0,19}$"
+        "matches": "(?s)^.{0,19}$"
       },
       "then": {
         "message": "ElevenLabsDesignVoice '{id}' has a `description` under 20 characters, and ElevenLabs takes 20 to 1000: describe the voice in more detail.",
@@ -179,9 +179,9 @@
     },
     {
       "when": {
-        "kind": "config_matches",
+        "kind": "value",
         "field": "description",
-        "regex": "(?s)^.{1001}"
+        "matches": "(?s)^.{1001}"
       },
       "then": {
         "message": "ElevenLabsDesignVoice '{id}' has a `description` over 1000 characters, and ElevenLabs takes 20 to 1000: shorten it.",
@@ -193,14 +193,14 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "text",
-            "regex": "\\S"
+            "matches": "\\S"
           },
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "text",
-            "regex": "(?s)^.{1,99}$"
+            "matches": "(?s)^.{1,99}$"
           }
         ]
       },
@@ -214,14 +214,14 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "text",
-            "regex": "\\S"
+            "matches": "\\S"
           },
           {
-            "kind": "config_matches",
+            "kind": "value",
             "field": "text",
-            "regex": "(?s)^.{1001}"
+            "matches": "(?s)^.{1001}"
           }
         ]
       },
@@ -241,14 +241,7 @@
           {
             "kind": "not",
             "of": {
-              "kind": "input_wired",
-              "port": "model"
-            }
-          },
-          {
-            "kind": "not",
-            "of": {
-              "kind": "config_equals",
+              "kind": "value",
               "field": "model",
               "equals": "eleven_ttv_v3"
             }

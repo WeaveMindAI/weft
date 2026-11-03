@@ -1,5 +1,6 @@
-//! The connections a program's own access nodes use, picked on each
-//! install rather than written in the source.
+//! The connections a program's own access nodes (and the nodes checking
+//! their callers, `crate::access::callers`) use, picked on each install
+//! rather than written in the source.
 //!
 //! A connection lives in one install's store, so a connection's id means
 //! nothing on another install: a pick written into the source worked on
@@ -123,11 +124,7 @@ pub fn run_picks(program: &ProjectDefinition, stored: &Picks) -> Result<Picks, R
                     kept.insert(field.to_string(), handle.clone());
                 }
                 None if optional(node, field) => {}
-                None => refusal.errors.push(format!(
-                    "'{spelled}' has no {} connection picked on this install; pick one with \
-                     `weft connect --node {spelled}` (add `--on <target>` for another install)",
-                    service_of(node, field).unwrap_or("service")
-                )),
+                None => refusal.errors.push(missing_pick(node, field, &spelled)),
             }
         }
         if !kept.is_empty() {
@@ -135,6 +132,26 @@ pub fn run_picks(program: &ProjectDefinition, stored: &Picks) -> Result<Picks, R
         }
     }
     if refusal.is_empty() { Ok(picks) } else { Err(refusal) }
+}
+
+/// What a person reads when the required connection `field` of `node`,
+/// at the place `spelled`, has no pick: a node checking its callers names
+/// its scheme (`crate::access::callers::no_connection`), any other the
+/// service.
+fn missing_pick(node: &NodeDefinition, field: &str, spelled: &str) -> String {
+    let scheme = node
+        .features
+        .checks_callers
+        .then(|| crate::access::callers::parse_auth(node.port_literals.get(crate::access::callers::AUTH_FIELD)).ok().flatten())
+        .flatten();
+    match scheme {
+        Some(verify) => crate::access::callers::no_connection(spelled, &verify),
+        None => format!(
+            "'{spelled}' has no {} connection picked on this install; pick one with \
+             `weft connect {spelled}` (add `--on <target>` for another install)",
+            service_of(node, field).unwrap_or("service")
+        ),
+    }
 }
 
 /// One pick the author asks the install to keep: the connection `connection`
@@ -380,7 +397,7 @@ pub fn check_move(project: &ProjectDefinition, stored: &[StoredField], request: 
     if stored.iter().any(|s| &s.node == to) {
         return Err(format!(
             "'{to}' already has connections or values stored; a move never merges, so clear them first \
-             (`weft connect --node {to} --disconnect`, and `--instance <id>` for an instance's)"
+             (`weft connect {to} --disconnect`, and `--instance <id>` for an instance's)"
         ));
     }
     let misfits: BTreeSet<&str> = moving.iter().filter(|s| !holds(node, s)).map(|s| s.field.as_str()).collect();
@@ -437,7 +454,21 @@ mod tests {
         let refused = run_picks(&p, &Picks::new()).unwrap_err();
         assert_eq!(refused.errors.len(), 1, "the optional one is not required: {refused:?}");
         assert!(refused.errors[0].contains("no slack connection picked on this install")
-            && refused.errors[0].contains("weft connect --node slack"), "{refused:?}");
+            && refused.errors[0].contains("weft connect slack"), "{refused:?}");
+    }
+
+    /// A node checking its callers with no connection names its scheme.
+    #[test]
+    fn a_route_with_no_pick_names_the_scheme_it_checks_with() {
+        let mut route = access_node("secure", false);
+        route.node_type = "Route".into();
+        route.features.checks_callers = true;
+        route.port_literals.insert("auth".into(), json!("api_keys"));
+        let refused = run_picks(&project(vec![route]), &Picks::new()).unwrap_err();
+        assert_eq!(
+            refused.errors,
+            vec!["'secure' checks callers with api_keys but has no connection; run `weft connect secure`".to_string()]
+        );
     }
 
     #[test]
@@ -519,7 +550,7 @@ mod tests {
         let p = project(vec![access_node("studio_agent", false)]);
         let refused = activation_picks(&p, &Picks::new(), &[kept("agent", Some("slack"), None)]).unwrap_err();
         assert_eq!(refused.errors.len(), 2, "{refused:?}");
-        assert!(refused.errors[0].contains("weft connect --node studio_agent"), "{refused:?}");
+        assert!(refused.errors[0].contains("weft connect studio_agent"), "{refused:?}");
         assert!(refused.errors[1].contains("weft connect --move agent studio_agent"), "{refused:?}");
         let handle = json!({ "id": uuid::Uuid::nil() });
         let picks: Picks = BTreeMap::from([("studio_agent".into(), BTreeMap::from([("access".into(), handle)]))]);

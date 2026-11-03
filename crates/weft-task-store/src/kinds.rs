@@ -23,12 +23,15 @@ weft_core::wire_enum! {
         /// goes, and the listener lets go of it, so nobody is still asked to
         /// answer it. Producer = worker (via broker).
         WithdrawSignal = "withdraw_signal",
-        /// Send the last call of a wait whose run was cancelled
+        /// Send a call weft owes for a run nobody drives any more
         /// (`weft_core::signal::listener_protocol::CancelCallRequest`, the
-        /// payload as it is), through the listener. Producer = the
-        /// dispatcher's cancel, in the transaction that takes the wait
-        /// down, so a cancel never loses its call to a crash; no caller of
-        /// the broker may enqueue it. Deduplicated on [`cancel_call_key`].
+        /// payload as it is), through the listener: the last call of a
+        /// wait whose run was cancelled, or a call a node of a run that
+        /// ended with no worker owed when it ends (`ctx.after_node`).
+        /// Producer = the dispatcher, in the transaction that takes the
+        /// wait or the run down, so neither loses its call to a crash; no
+        /// caller of the broker may enqueue it. Deduplicated on
+        /// [`cancel_call_key`].
         CancelCall = "cancel_call",
         /// An answer to a waiting run that a listener picked up (a timer's
         /// tick, an event on a connection it holds), already processed by its
@@ -105,8 +108,10 @@ weft_core::wire_enum! {
 /// so a second `weft maintenance off` while one goes follows that one.
 pub const MAINTENANCE_LIFT_KEY: &str = "maintenance_lift";
 
-/// The dedup key of the [`TaskKind::CancelCall`] of the wait `token`: one
-/// per wait, so a cancel that runs twice queues its call once.
+/// The dedup key of the [`TaskKind::CancelCall`] named `token`
+/// (`CancelCallRequest::token`: the wait's token, or the node's call's
+/// name, `node_call_name`): one per call, so a cancel that runs twice
+/// queues each call once.
 pub fn cancel_call_key(token: &str) -> String {
     format!("cancel_call:{token}")
 }
@@ -148,14 +153,14 @@ pub struct RegisterSignalPayload {
     pub frames: weft_core::frames::LoopFrames,
     pub spec: weft_core::primitive::SignalSpec,
     pub is_resume: bool,
-    /// 0-based ordinal of the `await_signal` call within this
-    /// (run, node_id, frames). Set by the worker, which stamps it on
-    /// the `SuspensionRegistered` it records, so replay can rebuild the
-    /// per-(node, frames) sequence in order. Must not vary across replays
-    /// of the same body, so the dedup key and the resume token include it.
-    /// Required: a missing field would silently default to 0 and collide
-    /// every await on the same frame stack.
-    pub call_index: u32,
+    /// The wait's number within its firing
+    /// (`weft_core::run::saved::Counters::waits`), 0 for an entry
+    /// registration. Set by the worker, which stamps it on the
+    /// `SuspensionRegistered` it records. A resumed body makes the same
+    /// wait under the same number, so the dedup key and the resume token
+    /// include it. Required: a missing field would silently default to 0
+    /// and collide every wait on the same frame stack.
+    pub wait_index: u32,
     /// The trigger's delivered port values at registration time (an
     /// entry registration only; `None` on resumes). Stored on the
     /// signal row and replayed onto the trigger's ports at every fire.

@@ -2,15 +2,16 @@
 //! transcript it builds, with the file it stores (the node's pure
 //! decision core), the session URL with every setting under
 //! ElevenLabs's names, the audio formats a bus
-//! can declare, the refusals said before the session opens, plus one real
-//! realtime session. The socket session has no fake form yet, so the
+//! can declare, plus one real realtime session. What ElevenLabs would
+//! refuse in the settings is the metadata rules', which this rig does not
+//! run. The socket session has no fake form yet, so the
 //! streaming path's free coverage is the mechanism e2es.
 
 use serde_json::{json, Value};
 
 use weft::bus::{BusOptions, BusPayloadKind};
 use weft::storage::StoredFile;
-use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
+use weft::{LiveRig, NodeTest, WeftResult};
 
 use super::{audio_chunk, audio_format, classify_server_frame, ServerWord, Session, Transcript};
 
@@ -67,7 +68,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::basic("only_the_model_format_and_commit_ride_by_default", default_query),
         NodeTest::basic("the_bus_metadata_picks_the_audio_format", formats),
         NodeTest::basic("the_context_rides_the_chunk_it_is_given", chunks),
-        NodeTest::fake("settings_elevenlabs_would_refuse_are_refused_before_the_session_opens", refused),
     ]
 }
 
@@ -195,10 +195,10 @@ fn session() -> Session {
 
 fn default_query() -> WeftResult<()> {
     assert_eq!(
-        session().query("pcm_16000"),
-        "model_id=scribe_v2_realtime&audio_format=pcm_16000&commit_strategy=vad"
+        session().url("pcm_16000")?.as_str(),
+        "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&audio_format=pcm_16000\
+         &commit_strategy=vad"
     );
-    assert!(session().refusal().is_none());
     Ok(())
 }
 
@@ -219,10 +219,9 @@ fn every_setting() -> WeftResult<()> {
         enable_logging: false,
         ..session()
     };
-    assert!(s.refusal().is_none(), "{:?}", s.refusal());
     assert_eq!(
-        s.query("ulaw_8000"),
-        "model_id=scribe_v2_realtime&audio_format=ulaw_8000&commit_strategy=turn_prediction&language_code=en\
+        s.url("ulaw_8000")?.as_str(),
+        "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&audio_format=ulaw_8000&commit_strategy=turn_prediction&language_code=en\
          &secondary_languages=fr&secondary_languages=de&vad_silence_threshold_secs=0.8&vad_threshold=0.35\
          &min_speech_duration_ms=120&min_silence_duration_ms=300&include_timestamps=true\
          &include_language_detection=true&no_verbatim=true&keyterms=Weavemind&keyterms=weft%20node\
@@ -233,13 +232,12 @@ fn every_setting() -> WeftResult<()> {
         filter_background_audio: true,
         ..session()
     };
-    assert!(rewrite.refusal().is_none());
     assert!(
-        rewrite.query("pcm_16000").ends_with(
+        rewrite.url("pcm_16000")?.as_str().ends_with(
             "&filter_background_audio=true&transcript_edit=Write%20dates%20as%20YYYY-MM-DD%20%26%20times%20as%20HH%3AMM"
         ),
         "{}",
-        rewrite.query("pcm_16000")
+        rewrite.url("pcm_16000")?
     );
     Ok(())
 }
@@ -281,42 +279,6 @@ fn chunks() -> WeftResult<()> {
         flush,
         json!({ "message_type": "input_audio_chunk", "audio_base_64": "", "commit": true, "sample_rate": 8000 })
     );
-    Ok(())
-}
-
-/// A 16 kHz PCM bus with one frame, already closed: what the node reads
-/// its format from before it would open the session.
-fn audio_bus(rig: &FakeRig) -> WeftResult<Value> {
-    let (mut audio, marker) = rig.seed_bus(BusOptions {
-        payload: BusPayloadKind::Bytes,
-        meta: json!({ "sample_rate": 16_000, "encoding": "pcm_s16le" }),
-        ..BusOptions::default()
-    })?;
-    audio.register("mic").expect("a fresh bus accepts its first name");
-    audio.send_bytes("audio", vec![0u8; 320]).expect("an open bytes bus accepts a frame");
-    audio.close();
-    Ok(marker)
-}
-
-async fn refused(rig: FakeRig) -> WeftResult<()> {
-    for (extra, says) in [
-        (json!({ "commitStrategy": "manual", "vadThreshold": 0.5 }), "`commitStrategy` manual"),
-        (json!({ "commitStrategy": "manual", "minSilenceDurationMs": 200 }), "`commitStrategy` manual"),
-        (json!({ "filterBackgroundAudio": true, "includeTimestamps": true }), "does not combine `filterBackgroundAudio`"),
-        (json!({ "transcriptEdit": "Spell numbers out.", "entityDetection": ["pii"] }), "both `transcriptEdit` and `entityDetection`"),
-        (json!({ "transcriptEdit": "x".repeat(2001) }), "2001 characters"),
-        (json!({ "keyterms": vec!["term"; 51] }), "at most 50"),
-        (json!({ "keyterms": ["a".repeat(21)] }), "at most 20"),
-    ] {
-        let mut given = json!({ "account": rig.access("elevenlabs"), "audio": audio_bus(&rig)? });
-        for (k, v) in extra.as_object().expect("extra inputs are an object") {
-            given[k] = v.clone();
-        }
-        let err = rig.run(&super::ElevenLabsTranscribeNode, given).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program is an input error: {extra}: {err}");
-        assert!(err.contains(says), "{extra}: {err}");
-    }
-    assert!(rig.requests().is_empty(), "no session opens, so nothing is paid for");
     Ok(())
 }
 

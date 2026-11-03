@@ -1,6 +1,7 @@
 //! CrawlSite self-tests: submit, park until the crawl ends, accumulate
-//! pages across `next` links into one stored JSON lines file, and the
-//! loud failed-crawl path.
+//! pages across `next` links into one stored JSON lines file, the body
+//! run again after the wait starting no second crawl, and the loud
+//! failed-crawl path.
 
 use serde_json::{json, Value};
 
@@ -22,6 +23,7 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("crawls_and_accumulates_pages_across_links", crawl_accumulates),
         NodeTest::fake("a_crawl_heavier_than_a_wire_is_stored_whole", heavy_crawl),
+        NodeTest::fake("a_resumed_body_starts_no_second_crawl", resumed),
         NodeTest::fake("a_next_link_that_brings_no_pages_ends_the_reading", empty_next),
         NodeTest::fake("a_read_failing_mid_crawl_fails_and_keeps_no_half_file", failed_mid_read),
         NodeTest::fake("a_failed_crawl_fails_loud", failed_crawl),
@@ -130,6 +132,35 @@ async fn crawl_accumulates(rig: FakeRig) -> WeftResult<()> {
         Some(weft::signal::CancelCall::delete("https://api.firecrawl.dev/v2/crawl/job-1")),
         "cancelling the run cancels the crawl"
     );
+    Ok(())
+}
+
+/// The first run pauses in its wait (the crawl still going): the state
+/// holds the job. The run again comes back to the wait on that job and
+/// never pays for a second crawl.
+async fn resumed(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("POST", "/v2/crawl", json!({ "success": true, "id": "job-8" }));
+    rig.respond(
+        "GET",
+        "/v2/crawl/job-8",
+        json!({ "status": "completed", "data": [{ "markdown": "one", "metadata": {} }] }),
+    );
+    let inputs = json!({ "account": rig.access("firecrawl"), "url": "https://ex.com", "limit": 5 });
+
+    rig.signal_paused();
+    let paused = rig.run(&CrawlSiteNode, inputs.clone()).await;
+    assert!(paused.paused(), "the first run pauses in its wait: {:?}", paused.result);
+    assert_eq!(rig.saved_state(&CrawlSiteNode), Some(json!({ "job": "job-8", "ended": null })));
+
+    rig.signal(json!({ "status": "completed" }));
+    let outcome = rig.run(&CrawlSiteNode, inputs).await.ok()?;
+    assert_eq!(outcome.outputs["count"], json!(1.0));
+    let starts = rig.requests().iter().filter(|r| r.method == "POST").count();
+    assert_eq!(starts, 1, "one crawl across the two runs");
+    let awaited = rig.awaited_signals();
+    assert_eq!(awaited.len(), 2, "the paused wait, then the same wait answered");
+    assert_eq!(awaited[0].config, awaited[1].config, "both on the one job");
+    assert_eq!(awaited[1].on_cancel, awaited[0].on_cancel, "the resumed wait still cancels the crawl");
     Ok(())
 }
 

@@ -260,11 +260,16 @@ fn remove_run_waits(g: &mut FakeState, run_id: RunId, cancelled: bool) -> (Vec<S
 /// End `run_id`, a run nobody drives, cancelled for `cause`, with
 /// the real cancel's rows (`cancel_terminal_events`: its open charges
 /// booked unknown, then its ending), less the per-node ones (the fake
-/// folds no nodes).
+/// folds no nodes), and queue what its firings owed
+/// (`owed_call_requests`).
 fn end_unowned(g: &mut FakeState, run_id: RunId, cause: &weft_core::run::CancelCause) -> anyhow::Result<()> {
     let record: Vec<RunEvent> = g.events.iter().filter(|e| e.run_id() == run_id).cloned().collect();
     let writes = crate::api::run::cancel_terminal_events(run_id, &record, None, cause, 0)?;
-    note(g.runs.get_mut(&run_id).expect("the run's row"), &writes);
+    let row = g.runs.get_mut(&run_id).expect("the run's row");
+    note(row, &writes);
+    let (tenant_id, project_id) = (row.tenant_id.clone(), row.project_id);
+    let owed = weft_journal::OwedCalls::of_record(&record);
+    g.cancel_calls.extend(crate::api::run::owed_call_requests(run_id, owed, &tenant_id, project_id));
     g.events.extend(writes);
     Ok(())
 }

@@ -38,7 +38,7 @@ fn canned_tab(rig: &FakeRig) {
     );
     rig.respond(
         "GET",
-        &path(&values_url("s1", "People", None)),
+        &path(values_url("s1", "People", None).unwrap().as_str()),
         json!({ "values": [
             ["name", "city"],
             ["ada", "london"],

@@ -1,13 +1,16 @@
     //! Layer 3: a node that emits, pauses on a wait, and emits more. On
-    //! resume its body replays from the top, and a port the firing sent
+    //! resume its body runs again from the top, and a port the firing sent
     //! before the pause sends nothing the second time: the node on that
     //! port fires once, the node on the later port fires when the body
-    //! gets there, and the record folds back the same. A firing that is
+    //! gets there, and the record folds back the same. An answer that
+    //! comes while the run goes on reaches the waiting call itself, and the
+    //! body never runs again. A firing that is
     //! no longer running owns nothing done through its ctx, and one the
-    //! engine already failed never goes back to waiting.
+    //! engine already failed waits on nothing: a wait it reaches, or one
+    //! it holds, ends at once with its failure.
 
     use super::*;
-    use super::engine_test_rig::{catalog, clients, run_checked, test_manifest, Answers, AwaitTasks, MemJournal};
+    use super::engine_test_rig::{catalog, clients, human_form as form, node_json as node, run_checked, test_manifest, Answers, AwaitTasks, MemJournal};
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -16,16 +19,6 @@
     use weft_core::node::{Node, NodeOutput};
     use weft_core::{RunContext, ProjectDefinition};
     use weft_journal::RunEvent;
-
-    fn form() -> weft_core::signal::Form {
-        weft_core::signal::Form {
-            form_type: "human_query".into(),
-            schema: weft_core::signal::FormSchema { fields: Vec::new() },
-            title: None,
-            description: None,
-            consumer_kind: None,
-        }
-    }
 
     /// Emits `stats` at once, waits for the picture, then emits `image`
     /// with the answer. Counts how often its body starts.
@@ -38,7 +31,7 @@
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             self.bodies.fetch_add(1, Ordering::SeqCst);
             ctx.pulse_downstream(NodeOutput::new().set("stats", json!({"queued": true}))).await?;
-            let image = ctx.await_signal(form()).await?;
+            let image = crate::run_driver::engine_test_rig::wait_once(&ctx, form()).await?;
             ctx.pulse_downstream(NodeOutput::new().set("image", image)).await
         }
     }
@@ -69,16 +62,6 @@
             self.stop.notified().await;
             Ok(())
         }
-    }
-
-    fn node(id: &str, ty: &str, inputs: &[(&str, &str)], outputs: &[(&str, &str)]) -> serde_json::Value {
-        json!({
-            "id": id, "nodeType": ty, "label": null, "config": null,
-            "position": { "x": 0.0, "y": 0.0 },
-            "inputs": inputs.iter().map(|(name, ty)| json!({ "name": name, "portType": ty, "required": true })).collect::<Vec<_>>(),
-            "outputs": outputs.iter().map(|(name, ty)| json!({ "name": name, "portType": ty, "required": false })).collect::<Vec<_>>(),
-            "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
-        })
     }
 
     /// `imager.stats -> on_stats.value`, `imager.image -> on_image.value`,
@@ -157,23 +140,7 @@
 
     /// The run's birth, its listed nodes kicked.
     fn birth(project: &ProjectDefinition, run_id: RunId, kicks: &[&str]) -> Vec<RunEvent> {
-        let mut rows = vec![RunEvent::RunStarted { given: Default::default(),
-            run_id,
-            project_id: project.id,
-            entry_node: kicks[0].to_string(),
-            phase: weft_core::context::Phase::Fire,
-            definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),
-            binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-            cut_from: None, seed: None, instance: None, fired_trigger: None, stand_in: None,
-            instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-            settings: Default::default(),
-        }];
-        for kick in kicks {
-            rows.push(RunEvent::NodeKicked {
-                run_id, node_id: kick.to_string(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
-            });
-        }
-        rows
+        super::engine_test_rig::birth_kicking(project, run_id, kicks, super::engine_test_rig::pausing_at_once())
     }
 
     fn rows_of<'a>(events: &'a [RunEvent], matches: impl Fn(&RunEvent) -> bool + 'a) -> usize {
@@ -189,7 +156,7 @@
     }
 
     /// The worker that drove the pause is gone; the next one folds the
-    /// record, the answer among it, and replays the body: `stats` sends
+    /// record, the answer among it, and runs the body again: `stats` sends
     /// nothing again, `image` goes out, and each sink fired once.
     #[tokio::test]
     async fn a_port_sent_before_a_pause_is_not_sent_again_after_a_refold() {
@@ -224,18 +191,18 @@
             .expect("the second drive runs");
         assert!(matches!(resumed, RunOutcome::Completed), "{resumed:?}");
 
-        assert_eq!(rig.bodies.load(Ordering::SeqCst), 2, "the body ran, paused, and replayed");
+        assert_eq!(rig.bodies.load(Ordering::SeqCst), 2, "the body ran, paused, and ran again");
         assert_eq!(*rig.stats.lock().unwrap(), vec![json!({"queued": true})], "`stats` reached its node once");
         assert_eq!(*rig.images.lock().unwrap(), vec![json!("cat.png")]);
         let events = journal.events_of(run_id);
-        assert_eq!(emitted(&events, "imager", "stats"), 1, "the replay sent nothing on `stats`: {events:?}");
+        assert_eq!(emitted(&events, "imager", "stats"), 1, "the body run again sent nothing on `stats`: {events:?}");
         assert_eq!(emitted(&events, "imager", "image"), 1);
         assert_eq!(started(&events, "on_stats"), 1);
         assert_eq!(started(&events, "on_image"), 1);
     }
 
     weft_core::stress_test! {
-        name: a_port_sent_before_a_pause_is_not_sent_again_when_resumed_in_place,
+        name: an_answer_while_the_run_goes_on_reaches_the_waiting_call,
         runs: 8,
         worker_threads: 4,
         async fn body() {
@@ -255,7 +222,7 @@
                 async move { run_checked(project, catalog, run_id, journal, c, CancellationFlag::new_arc(), None).await }
             });
 
-            // The node paused (its wait registered) while `holder` keeps
+            // The node holds its wait (registered) while `holder` keeps
             // the drive going, and the run read its answers once.
             let token = tasks.await_token().await;
             for _ in 0..2000 {
@@ -271,11 +238,12 @@
 
             let outcome = drive.await.expect("join").expect("the drive runs");
             assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
-            assert_eq!(rig.bodies.load(Ordering::SeqCst), 2, "the body ran, paused, and replayed");
+            assert_eq!(rig.bodies.load(Ordering::SeqCst), 1, "the answer went into the waiting call: the body never ran again");
             assert_eq!(*rig.stats.lock().unwrap(), vec![json!({"queued": true})], "`stats` reached its node once");
             assert_eq!(*rig.images.lock().unwrap(), vec![json!("cat.png")]);
             let events = journal.events_of(run_id);
-            assert_eq!(emitted(&events, "imager", "stats"), 1, "the replay sent nothing on `stats`");
+            assert_eq!(rows_of(&events, |e| matches!(e, RunEvent::NodeSuspended { .. } | RunEvent::NodeResumed { .. })), 0, "nothing paused: {events:?}");
+            assert_eq!(emitted(&events, "imager", "stats"), 1);
             assert_eq!(started(&events, "on_stats"), 1);
             assert_eq!(started(&events, "on_image"), 1);
         }
@@ -299,7 +267,7 @@
                 *result.lock().unwrap() = Some(sent.map_err(|e| e.to_string()));
                 done.notify_one();
             });
-            ctx.await_signal(form()).await?;
+            crate::run_driver::engine_test_rig::wait_once(&ctx, form()).await?;
             Ok(())
         }
     }
@@ -342,28 +310,83 @@
         assert_eq!(started(&events, "on_image"), 0);
     }
 
-    /// The engine fails the firing over an emission it cannot deliver
-    /// (its wire reads a key off a value that has none) while the body
-    /// sails on into a wait: the firing stays failed, never waiting, and
-    /// the run ends failed instead of parking a body whose ports are
-    /// already closed.
-    #[tokio::test]
-    async fn a_firing_the_engine_failed_never_goes_back_to_waiting() {
-        let rig = rig();
-        let project = Arc::new(project(&["speed"]));
+    /// Sends `stats` and waits for it to be taken (refused: its wire reads
+    /// a key off a value that has none, which fails the firing), carries on
+    /// past the refusal, and waits on a person.
+    struct FailsThenWaits;
+    test_manifest!(FailsThenWaits, "FailsThenWaits");
+    #[async_trait]
+    impl Node for FailsThenWaits {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(Option::<serde_json::Value>::None).await?;
+            let _refused = ctx.yield_downstream(NodeOutput::new().set("stats", json!({"queued": true})), &mut state).await;
+            state.wait(|s| s, form()).await?;
+            Ok(())
+        }
+    }
+
+    /// Waits on a person while a task it spawned sends `stats` a moment
+    /// later (refused the same way, failing the firing while its wait is
+    /// held in the quiet window).
+    struct WaitsThenFails;
+    test_manifest!(WaitsThenFails, "WaitsThenFails");
+    #[async_trait]
+    impl Node for WaitsThenFails {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let late = ctx.clone();
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                let _refused = late.pulse_downstream(NodeOutput::new().set("stats", json!({"queued": true}))).await;
+            });
+            let mut state = ctx.keep(Option::<serde_json::Value>::None).await?;
+            let waited = state.wait(|s| s, form()).await;
+            let _ = task.await;
+            waited.map(|_| ())
+        }
+    }
+
+    /// The firing of node type `imager` (its `stats` wire reading `speed`,
+    /// which the value has not) driven under the default quiet window, on
+    /// the paused clock: how it ended, the run's record, and how long it
+    /// took.
+    async fn failing_firing(imager: Box<dyn Node>) -> (RunOutcome, Vec<RunEvent>, std::time::Duration) {
+        let cat = sinks(catalog(vec![("Imager", imager)]), Arc::new(StdMutex::new(Vec::new())), Arc::new(StdMutex::new(Vec::new())));
+        let mut project = project(&["speed"]);
+        project.nodes.retain(|n| n.id != "holder");
+        let project = Arc::new(project);
         let run_id = weft_core::new_run_id();
         let journal = Arc::new(MemJournal::default());
-        journal.seed(&birth(&project, run_id, &["imager"]));
-        let mut c = clients(journal.clone());
+        journal.seed(&super::engine_test_rig::birth_kicking(&project, run_id, &["imager"], Default::default()));
+        let mut c = super::engine_test_rig::clients_on_paused_clock(journal.clone());
         c.tasks = AwaitTasks::new();
-        let outcome = run_checked(project, rig.catalog.clone(), run_id, journal.clone(), c, CancellationFlag::new_arc(), None)
+        let started_at = tokio::time::Instant::now();
+        let outcome = run_checked(project, cat, run_id, journal.clone(), c, CancellationFlag::new_arc(), None)
             .await
             .expect("the drive runs");
+        (outcome, journal.events_of(run_id), started_at.elapsed())
+    }
+
+    /// A firing the engine failed before its body reaches a wait waits on
+    /// nothing: the wait ends at once with the failure, inside no window.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_reached_after_its_firing_failed_ends_at_once() {
+        let (outcome, events, took) = failing_firing(Box::new(FailsThenWaits)).await;
         assert!(matches!(outcome, RunOutcome::Failed { .. }), "{outcome:?}");
-        let events = journal.events_of(run_id);
+        assert!(took < std::time::Duration::from_secs(1), "no window waited out, only the record's writes: {took:?}");
         assert_eq!(rows_of(&events, |e| matches!(e, RunEvent::NodeFailed { node_id, .. } if node_id == "imager")), 1, "{events:?}");
         assert_eq!(rows_of(&events, |e| matches!(e, RunEvent::NodeSuspended { node_id, .. } if node_id == "imager")), 0, "{events:?}");
-        assert!(rig.stats.lock().unwrap().is_empty() && rig.images.lock().unwrap().is_empty(), "both sinks were skipped");
-        assert_eq!(started(&events, "on_stats"), 1);
-        assert_eq!(started(&events, "on_image"), 1);
+        assert_eq!(rows_of(&events, |e| matches!(e, RunEvent::SuspensionRegistered { .. })), 0, "no wait was registered: {events:?}");
+    }
+
+    /// A wait held open in the quiet window ends the moment its firing
+    /// fails, with the failure: the run ends failed without waiting out
+    /// the window.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_held_in_the_window_ends_when_its_firing_fails() {
+        let (outcome, events, took) = failing_firing(Box::new(WaitsThenFails)).await;
+        assert!(matches!(outcome, RunOutcome::Failed { .. }), "{outcome:?}");
+        assert!(took < std::time::Duration::from_secs(1), "no window waited out, only the task's moment and the record's writes: {took:?}");
+        assert_eq!(rows_of(&events, |e| matches!(e, RunEvent::SuspensionRegistered { .. })), 1, "the wait was held: {events:?}");
+        assert_eq!(rows_of(&events, |e| matches!(e, RunEvent::NodeSuspended { node_id, .. } if node_id == "imager")), 0, "{events:?}");
+        assert_eq!(rows_of(&events, |e| matches!(e, RunEvent::NodeFailed { node_id, .. } if node_id == "imager")), 1, "{events:?}");
     }

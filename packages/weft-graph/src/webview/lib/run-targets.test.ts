@@ -45,9 +45,10 @@ describe('runProgress', () => {
       a: [{ status: 'completed' as const }],
       b: [{ status: 'completed' as const }, { status: 'running' as const }],
       c: [{ status: 'skipped' as const }],
-      d: [{ status: 'waiting_for_input' as const }],
+      d: [{ status: 'waiting' as const }],
+      e: [{ status: 'paused' as const }],
     };
-    expect(runProgress(firings, ['a', 'b', 'c', 'd', 'e'])).toEqual({ done: 2, total: 5 });
+    expect(runProgress(firings, ['a', 'b', 'c', 'd', 'e', 'f'])).toEqual({ done: 2, total: 6 });
   });
 
   it('has no total when the run\'s program could not be read', () => {

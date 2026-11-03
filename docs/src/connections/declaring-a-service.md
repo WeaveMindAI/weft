@@ -28,7 +28,6 @@ weft::access_node!(SlackAccessNode);
 | `callback` | `any` | What address the provider accepts for its OAuth callback: `any`, `https` (it refuses plain http, like Slack), or `domain` (https on a domain name, never an IP address, like Google) |
 | `ownPage` | none | What the "your own" door shows beyond its paste fields |
 | `events` | `{}` | How this service reports events, by topic |
-| `verify` | none | How weft checks the callers of a route gated by this service's connections. For every key, go and read [checking a signed request](verifying-requests.md) |
 | `capabilities` | `[]` | Named groups of optional fields, each unlocking one thing |
 | `grants` | `coexisting` | Whether two grants of this service can coexist |
 

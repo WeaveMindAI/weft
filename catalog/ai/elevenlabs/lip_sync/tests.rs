@@ -4,6 +4,7 @@
 
 use serde_json::{json, Value};
 
+use weft::signal::SendWhen;
 use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
 use crate::testing::{completes, create_body, emitted_file, fails, inline};
@@ -81,17 +82,15 @@ async fn every_setting(rig: FakeRig) -> WeftResult<()> {
 async fn ogg_asset(rig: FakeRig) -> WeftResult<()> {
     completes(&rig, "video", "l3", "video/mp4", b"mp4");
     rig.respond("POST", "/v1/assets", json!({ "asset_id": "a1" }));
-    rig.respond_status("DELETE", "/v1/assets/a1", 204, Value::Null);
     let note = rig.store_file("note.ogg", "audio/ogg", b"OggS".to_vec());
     rig.run(&ElevenLabsLipSyncNode, inputs(&rig, json!({ "audio": note }))).await.ok()?;
 
     assert_eq!(create_body(&rig)["audio"], json!({ "type": "asset", "asset_id": "a1" }));
     assert_eq!(create_body(&rig)["image"], inline("image/png", b"face"), "the png still goes inline");
-    let sent = rig.requests();
-    let order: Vec<(&str, &str)> = sent.iter().map(|r| (r.method.as_str(), r.path.as_str())).collect();
-    let create = order.iter().position(|r| *r == ("POST", "/v1/flows/video")).expect("a create");
-    let delete = order.iter().position(|r| *r == ("DELETE", "/v1/assets/a1")).expect("the asset is deleted");
-    assert!(delete > create, "the asset outlives the create it was uploaded for: {order:?}");
+    let owed = rig.owed_calls();
+    assert_eq!(owed.len(), 1, "{owed:?}");
+    assert!(owed[0].0.url.ends_with("/v1/assets/a1"), "{}", owed[0].0.url);
+    assert_eq!(owed[0].0.when, SendWhen::Always, "weft deletes the asset however the node ends");
     Ok(())
 }
 

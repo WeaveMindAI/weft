@@ -11,6 +11,7 @@ pub mod costs;
 pub mod events;
 pub mod fold;
 pub mod frame;
+pub mod owed;
 pub mod record;
 pub mod search;
 pub mod seed;
@@ -21,6 +22,7 @@ pub mod unrecorded;
 
 pub use events::{RunEvent, Seed};
 pub use fold::{fold_to_snapshot, unpriced_charges_closed, unpriced_cost, ChargeBook, EndedWait, FiringView, Fold, FoldEffects, OpenedCharge};
+pub use owed::{OwedCall, OwedCalls};
 pub use seed::{seed_chain, LiveFold, SeedChain};
 pub use traits::{decoded_page, rows_after, secret_gone, BatchError, JournalClient, JournalRow, Position, RecordClient};
 

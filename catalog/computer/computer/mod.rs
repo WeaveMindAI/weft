@@ -48,27 +48,20 @@ impl Node for ComputerNode {
         let packages: Option<String> = input.opt("packages")?;
         let ssh_keys: Option<String> = input.opt("sshKeys")?;
         let disk: String = input.get("disk")?;
-        let machine = MachineShape {
-            cpu: input.opt("cpu")?,
-            memory: input.opt("memory")?,
-            kind: input.opt::<String>("machineType")?.filter(|t| !t.trim().is_empty()),
-            gpu: None,
-        };
+        let machine = MachineShape::from_inputs(&input)?;
         let mut env = vec![
             EnvEntry::new("WEFT_COMPUTER_PORT", PORT.to_string()),
             EnvEntry::new("WEFT_COMPUTER_SCREEN", screen),
         ];
         // One spelling per package list, so the same packages written
         // with other spacing are the same spec and re-apply nothing.
-        let packages = packages.map(|p| p.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|p| !p.is_empty());
+        let packages = packages.map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "));
         if let Some(packages) = packages {
             env.push(EnvEntry::new("WEFT_COMPUTER_PACKAGES", packages));
         }
         // One key per line, blank lines and stray spaces dropped, for the
         // same reason.
-        let ssh_keys = ssh_keys
-            .map(|keys| keys.lines().map(str::trim).filter(|key| !key.is_empty()).collect::<Vec<_>>().join("\n"))
-            .filter(|keys| !keys.is_empty());
+        let ssh_keys = ssh_keys.map(|keys| keys.lines().map(str::trim).filter(|key| !key.is_empty()).collect::<Vec<_>>().join("\n"));
         let mut ports = vec![ContainerPort { name: "http".into(), port: PORT, protocol: Protocol::Tcp }];
         let mut endpoints = vec![Endpoint {
             name: "api".into(),

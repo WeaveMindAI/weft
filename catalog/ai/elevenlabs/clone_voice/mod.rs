@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use serde_json::json;
 
-use weft::access::client::{json_call, Multipart};
+use weft::access::client::{json_call, url, Multipart, StoredBodyExt};
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
@@ -36,38 +36,14 @@ impl Node for ElevenLabsCloneVoiceNode {
         let remove_noise: bool = ctx.inputs.get("removeBackgroundNoise")?;
         let labels: Option<BTreeMap<String, String>> = ctx.inputs.opt("labels")?;
 
-        if samples.is_empty() {
-            return Err(weft::WeftError::Input(
-                "cloning a voice needs at least one sample recording".into(),
-            ));
-        }
-
         let storage = ctx.storage(StorageScope::Run);
-        let mut form = Multipart::form_data().text("name", &name);
+        let mut form = fields(&name, description.as_deref(), remove_noise, labels);
         for sample in &samples {
-            let (meta, bytes) = storage.get_bytes(sample).await?;
-            form = form.file("files", &meta.filename, &meta.mime_type, bytes);
+            form = form.stored("files", storage.body(sample).await?);
         }
-        if let Some(d) = description.as_deref().filter(|d| !d.trim().is_empty()) {
-            form = form.text("description", d);
-        }
-        if remove_noise {
-            form = form.text("remove_background_noise", "true");
-        }
-        // A form field carries text, so the labels go as their JSON.
-        if let Some(labels) = labels.filter(|l| !l.is_empty()) {
-            form = form.text("labels", &json!(labels).to_string());
-        }
-        let (content_type, body) = form.build();
-
         let http = ctx.client(&account).await?;
-        let answer = json_call(
-            http.post(format!("{API}/voices/add"))
-                .header("content-type", content_type)
-                .body(body),
-            "clone the voice on ElevenLabs",
-        )
-        .await?;
+        let answer =
+            json_call(http.post(url(API, &["voices", "add"])?.as_str()).multipart(form), "clone the voice on ElevenLabs").await?;
         let voice_id = answer["voice_id"]
             .as_str()
             .node_err("ElevenLabs cloned the voice but its answer has no voice_id")?;
@@ -80,4 +56,21 @@ impl Node for ElevenLabsCloneVoiceNode {
         }
         ctx.pulse_downstream(out).await
     }
+}
+
+/// The clone's text fields: its name, and every setting that was given.
+/// The samples go after them, streamed out of storage.
+pub fn fields(name: &str, description: Option<&str>, remove_noise: bool, labels: Option<BTreeMap<String, String>>) -> Multipart {
+    let mut form = Multipart::form_data().text("name", name);
+    if let Some(d) = description {
+        form = form.text("description", d);
+    }
+    if remove_noise {
+        form = form.text("remove_background_noise", "true");
+    }
+    // A form field carries text, so the labels go as their JSON.
+    if let Some(labels) = labels.filter(|l| !l.is_empty()) {
+        form = form.text("labels", &json!(labels).to_string());
+    }
+    form
 }

@@ -63,6 +63,7 @@ pub mod edit;
 pub mod file_reader;
 pub mod file_ref;
 pub mod enrich;
+mod connection_field;
 pub mod validate;
 // Project source / drift hashing. `compute_definition_hash` (weft-core's,
 // re-exported here) is pure (no filesystem) and always available
@@ -361,6 +362,9 @@ pub fn compile_program_with_contents(
         }
         diagnostics.extend(validate::validate_with_mode(&project, catalog, validate::ValidationMode::Structural));
         settle(&mut project, catalog, diagnostics, root.as_deref())?;
+        // Read while the `@file` contents are still in, as every check
+        // above read them.
+        validate::record_rechecks(&mut project, catalog);
         // Every check has read the `@file` contents; the program the
         // build keeps names each by its content.
         let contents = file_ref::name_contents(&mut project, reads);

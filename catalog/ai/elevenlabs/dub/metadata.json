@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[elevenlabs]",
       "accepts": [
         "wire"
       ],
@@ -101,7 +101,7 @@
     {
       "name": "projectId",
       "type": "String",
-      "description": "The dub's project, on the ElevenLabs account whose key the node used. If it is your own account and you want to keep the project (to edit the dub or add languages to it in ElevenLabs), wire this. When nothing reads it, the node deletes the project once the dub is stored."
+      "description": "The dub's project, on the ElevenLabs account whose key the node used. If it is your own account and you want to keep the project (to edit the dub or add languages to it in ElevenLabs), wire this. When nothing reads it, the project is deleted once the node ends, whether the dub was stored, failed, was cancelled or gave up."
     },
     {
       "name": "filename",
@@ -136,16 +136,9 @@
           {
             "kind": "not",
             "of": {
-              "kind": "config_equals",
+              "kind": "value",
               "field": "model",
               "equals": "dubbing_v2"
-            }
-          },
-          {
-            "kind": "not",
-            "of": {
-              "kind": "input_wired",
-              "port": "model"
             }
           }
         ]

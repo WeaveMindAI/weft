@@ -20,6 +20,7 @@ pub fn tests() -> Vec<NodeTest> {
     // to pick up.
     vec![
         NodeTest::fake("waits_then_reads_and_shapes_a_done_conversation", reads),
+        NodeTest::fake("a_resumed_run_has_the_conversation_its_wait_ended_on", resumed),
         NodeTest::fake("without_waiting_reads_the_call_as_it_stands", reads_now),
         NodeTest::fake("the_whole_conversation_is_stored_only_when_something_reads_it", conversation_only_when_read),
         NodeTest::fake("the_trace_is_read_only_when_something_reads_it", trace),
@@ -39,7 +40,8 @@ fn json_file(rig: &FakeRig, outputs: &Map<String, Value>, port: &str) -> WeftRes
 
 async fn reads(rig: FakeRig) -> WeftResult<()> {
     rig.wire_output("conversation");
-    rig.signal(json!({
+    rig.signal(json!({ "status": "done" }));
+    rig.respond("GET", "/v1/convai/conversations/conv-1", json!({
         "status": "done",
         "transcript": [
             { "role": "agent", "message": "Hello!", "extra": "dropped" },
@@ -122,7 +124,27 @@ async fn reads(rig: FakeRig) -> WeftResult<()> {
         json!("https://api.elevenlabs.io/v1/convai/conversations/conv-1")
     );
     assert!(awaited[0].access.is_some(), "each poll is signed by the elevenlabs connection");
-    assert_eq!(rig.requests().len(), 1, "only the audio was downloaded besides the wait");
+    assert_eq!(rig.requests().len(), 2, "the finished conversation read after the wait, and its audio");
+    Ok(())
+}
+
+/// A resumed body runs from its top with the status its wait ended on in
+/// its state: the wait is not made again, and the finished conversation,
+/// read again, gives the same outputs.
+async fn resumed(rig: FakeRig) -> WeftResult<()> {
+    rig.signal(json!({ "status": "done" }));
+    rig.respond("GET", "/v1/convai/conversations/conv-1", json!({ "status": "done", "transcript": [{ "role": "agent", "message": "Hello!" }] }));
+    let given = json!({
+        "account": rig.access("elevenlabs"),
+        "conversationId": "conv-1",
+        "waitUntilDone": true,
+        "includeAudio": false,
+    });
+    rig.run(&ElevenLabsGetConversationNode, given.clone()).await.ok()?;
+    let again = rig.run(&ElevenLabsGetConversationNode, given).await.ok()?;
+    assert_eq!(again.outputs["status"], json!("done"));
+    assert_eq!(rig.awaited_signals().len(), 1, "the answered wait is not made again");
+    assert_eq!(rig.requests().len(), 2, "the finished conversation is read once per run");
     Ok(())
 }
 
@@ -250,7 +272,8 @@ async fn trace_missing(rig: FakeRig) -> WeftResult<()> {
 /// A status the node does not know ends the wait (it is not in flight)
 /// and fails loud, instead of being emitted as though the call ended.
 async fn unexpected_status(rig: FakeRig) -> WeftResult<()> {
-    rig.signal(json!({ "status": "archived", "transcript": [] }));
+    rig.signal(json!({ "status": "archived" }));
+    rig.respond("GET", "/v1/convai/conversations/conv-5", json!({ "status": "archived", "transcript": [] }));
     let err = rig
         .run(
             &ElevenLabsGetConversationNode,

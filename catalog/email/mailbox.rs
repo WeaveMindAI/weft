@@ -8,7 +8,7 @@
 //! parse exist once.
 
 use weft::access::OpenedConnection;
-use weft::{WeftError, WeftResult};
+use weft::WeftResult;
 
 /// The SMTP submission half: server, port, credentials, and the
 /// address the message says it is FROM (the connection's `sendAs`
@@ -25,14 +25,12 @@ pub fn smtp(conn: &OpenedConnection) -> WeftResult<Smtp> {
     let user = conn.value("user")?.to_string();
     let sender = conn.opt_value("sendAs").map(str::trim).unwrap_or("");
     let sender = if sender.is_empty() { user.clone() } else { sender.to_string() };
+    let Ok(port) = conn.value("smtpPort")?.trim().parse::<u16>() else {
+        weft::input_bail!("the connection's SMTP port is not a number; reconnect it with a numeric port");
+    };
     Ok(Smtp {
         host: conn.value("smtpHost")?.to_string(),
-        port: conn.value("smtpPort")?.trim().parse().map_err(|_| {
-            WeftError::Input(
-                "the connection's SMTP port is not a number; reconnect it with a numeric port"
-                    .to_string(),
-            )
-        })?,
+        port,
         user,
         password: conn.value("password")?.to_string(),
         sender,

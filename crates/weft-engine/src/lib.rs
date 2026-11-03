@@ -1,7 +1,7 @@
 //! Weft run engine, linked into each compiled project binary. The
 //! binary serves HTTP (`worker`): weft calls it per run, and it folds
 //! the journal, drives the run to its end, and writes journal events
-//! through the broker. Its control-plane round-trips (`await_signal`,
+//! through the broker. Its control-plane round-trips (a wait,
 //! `register_signal`) flow through the dispatcher's task queue (also via
 //! the broker).
 
@@ -9,6 +9,7 @@ pub(crate) mod caller_conn;
 pub(crate) mod busy;
 pub(crate) mod context;
 pub(crate) mod contents;
+pub(crate) mod end_calls;
 pub mod door;
 pub(crate) mod run_driver;
 pub(crate) mod fired_caller;

@@ -16,7 +16,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[elevenlabs]", "accepts": ["wire"],
       "required": true,
       "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
     },
@@ -295,8 +295,7 @@
         "kind": "all",
         "of": [
           { "kind": "input_satisfied", "port": "diarizationThreshold" },
-          { "kind": "not", "of": { "kind": "config_equals", "field": "diarize", "equals": true } },
-          { "kind": "not", "of": { "kind": "input_wired", "port": "diarize" } }
+          { "kind": "not", "of": { "kind": "value", "field": "diarize", "equals": true } }
         ]
       },
       "then": {
@@ -321,9 +320,8 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "detectSpeakerRoles", "equals": true },
-          { "kind": "not", "of": { "kind": "config_equals", "field": "diarize", "equals": true } },
-          { "kind": "not", "of": { "kind": "input_wired", "port": "diarize" } }
+          { "kind": "value", "field": "detectSpeakerRoles", "equals": true },
+          { "kind": "not", "of": { "kind": "value", "field": "diarize", "equals": true } }
         ]
       },
       "then": {
@@ -335,8 +333,8 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "detectSpeakerRoles", "equals": true },
-          { "kind": "config_equals", "field": "useMultiChannel", "equals": true }
+          { "kind": "value", "field": "detectSpeakerRoles", "equals": true },
+          { "kind": "value", "field": "useMultiChannel", "equals": true }
         ]
       },
       "then": {
@@ -348,9 +346,8 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "useSpeakerLibrary", "equals": true },
-          { "kind": "not", "of": { "kind": "config_equals", "field": "diarize", "equals": true } },
-          { "kind": "not", "of": { "kind": "input_wired", "port": "diarize" } }
+          { "kind": "value", "field": "useSpeakerLibrary", "equals": true },
+          { "kind": "not", "of": { "kind": "value", "field": "diarize", "equals": true } }
         ]
       },
       "then": {
@@ -362,8 +359,8 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "useMultiChannel", "equals": true },
-          { "kind": "config_equals", "field": "diarize", "equals": true }
+          { "kind": "value", "field": "useMultiChannel", "equals": true },
+          { "kind": "value", "field": "diarize", "equals": true }
         ]
       },
       "then": {
@@ -375,7 +372,7 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "useMultiChannel", "equals": true },
+          { "kind": "value", "field": "useMultiChannel", "equals": true },
           { "kind": "input_satisfied", "port": "numSpeakers" }
         ]
       },
@@ -389,8 +386,7 @@
         "kind": "all",
         "of": [
           { "kind": "input_satisfied", "port": "multichannelOutputStyle" },
-          { "kind": "not", "of": { "kind": "config_equals", "field": "useMultiChannel", "equals": true } },
-          { "kind": "not", "of": { "kind": "input_wired", "port": "useMultiChannel" } }
+          { "kind": "not", "of": { "kind": "value", "field": "useMultiChannel", "equals": true } }
         ]
       },
       "then": {
@@ -402,8 +398,8 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "multichannelOutputStyle", "equals": "combined" },
-          { "kind": "config_equals", "field": "timestampsGranularity", "equals": "none" }
+          { "kind": "value", "field": "multichannelOutputStyle", "equals": "combined" },
+          { "kind": "value", "field": "timestampsGranularity", "equals": "none" }
         ]
       },
       "then": {
@@ -415,12 +411,12 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "multichannelOutputStyle", "equals": "combined" },
+          { "kind": "value", "field": "multichannelOutputStyle", "equals": "combined" },
           {
             "kind": "any",
             "of": [
-              { "kind": "input_satisfied", "port": "entityDetection" },
-              { "kind": "input_satisfied", "port": "entityRedaction" }
+              { "kind": "value", "field": "entityDetection", "nonempty": true },
+              { "kind": "value", "field": "entityRedaction", "nonempty": true }
             ]
           }
         ]
@@ -438,9 +434,9 @@
           {
             "kind": "any",
             "of": [
-              { "kind": "input_satisfied", "port": "entityDetection" },
-              { "kind": "input_satisfied", "port": "entityRedaction" },
-              { "kind": "config_equals", "field": "useMultiChannel", "equals": true }
+              { "kind": "value", "field": "entityDetection", "nonempty": true },
+              { "kind": "value", "field": "entityRedaction", "nonempty": true },
+              { "kind": "value", "field": "useMultiChannel", "equals": true }
             ]
           }
         ]
@@ -454,8 +450,8 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "input_satisfied", "port": "entityRedaction" },
-          { "kind": "not", "of": { "kind": "input_satisfied", "port": "entityDetection" } }
+          { "kind": "value", "field": "entityRedaction", "nonempty": true },
+          { "kind": "not", "of": { "kind": "value", "field": "entityDetection", "nonempty": true } }
         ]
       },
       "then": {
@@ -468,7 +464,7 @@
         "kind": "all",
         "of": [
           { "kind": "input_satisfied", "port": "entityRedactionMode" },
-          { "kind": "not", "of": { "kind": "input_satisfied", "port": "entityRedaction" } }
+          { "kind": "not", "of": { "kind": "value", "field": "entityRedaction", "nonempty": true } }
         ]
       },
       "then": {
@@ -480,8 +476,8 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "noVerbatim", "equals": true },
-          { "kind": "config_matches", "field": "model", "regex": "^scribe_v1" }
+          { "kind": "value", "field": "noVerbatim", "equals": true },
+          { "kind": "value", "field": "model", "matches": "^scribe_v1" }
         ]
       },
       "then": {
@@ -493,13 +489,107 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "input_satisfied", "port": "keyterms" },
-          { "kind": "config_matches", "field": "model", "regex": "^scribe_v1" }
+          { "kind": "value", "field": "keyterms", "nonempty": true },
+          { "kind": "value", "field": "model", "matches": "^scribe_v1" }
         ]
       },
       "then": {
         "message": "ElevenLabsTranscribeFile '{id}' gives `keyterms` to a scribe_v1 model, and ElevenLabs offers keyterms on scribe_v2 and scribe_v2_medical only: pick one of those, or leave `keyterms` empty.",
         "port": "keyterms"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "value", "field": "transcriptEdit" },
+          {
+            "kind": "not",
+            "of": { "kind": "value", "field": "transcriptEdit", "length": { "max": 2000 } }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' has a `transcriptEdit` over 2000 characters, and ElevenLabs takes at most 2000: shorten it.",
+        "port": "transcriptEdit"
+      }
+    },
+    {
+      "when": { "kind": "value", "field": "keyterms", "count": { "min": 1001 } },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' lists more than 1000 `keyterms`, and ElevenLabs takes at most 1000: keep 1000 or fewer.",
+        "port": "keyterms"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "value", "field": "keyterms" },
+          {
+            "kind": "not",
+            "of": { "kind": "value", "field": "keyterms", "each": { "length": { "max": 49 } } }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' has a keyterm of 50 characters or more, and ElevenLabs takes terms under 50: shorten it.",
+        "port": "keyterms"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "value", "field": "keyterms" },
+          {
+            "kind": "not",
+            "of": { "kind": "value", "field": "keyterms", "each": { "matches": "^[^<>{}\\[\\]\\\\]*$" } }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' has a keyterm holding one of the characters `<>{}[]\\`, which ElevenLabs does not take: remove it.",
+        "port": "keyterms"
+      }
+    },
+    {
+      "when": { "kind": "value", "field": "additionalFormats", "count": { "min": 11 } },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' lists more than 10 `additionalFormats`, and ElevenLabs exports at most 10 per request: keep 10 or fewer.",
+        "port": "additionalFormats"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "value", "field": "additionalFormats" },
+          {
+            "kind": "not",
+            "of": { "kind": "value", "field": "additionalFormats", "each": { "matches": "^(segmented_json|docx|pdf|txt|html|srt)$" } }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' lists an `additionalFormats` entry ElevenLabs does not export to: pick from segmented_json, docx, pdf, txt, html, srt.",
+        "port": "additionalFormats"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "value", "field": "additionalFormats" },
+          {
+            "kind": "not",
+            "of": { "kind": "value", "field": "additionalFormats", "each": { "key": "format", "oneOf": ["segmented_json", "docx", "pdf", "txt", "html", "srt"] } }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' lists an `additionalFormats` entry whose `format` ElevenLabs does not export to: pick from segmented_json, docx, pdf, txt, html, srt.",
+        "port": "additionalFormats"
       }
     }
   ]

@@ -35,25 +35,14 @@ impl Node for FirstInOrderNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        if ctx.declared_inputs().is_empty() {
-            return Err(weft::node_error(
-                "this FirstInOrder joins no branches: wire one input per branch, in the order \
-                 they take precedence",
-            ));
-        }
         // `in_order` walks the node's ports in the order they were
-        // written and yields only the ones that DELIVERED: a branch
-        // that closed is absent, so the first pair is the winner. A join
-        // none of whose branches delivered is skipped before it runs (its
-        // skip closes `value`, carrying a branch's failure), so a run
-        // that finds none here is the engine breaking that promise, and
-        // says so rather than closing `value` with the failure dropped.
-        let Some((_, first)) = ctx.inputs.in_order()?.next() else {
-            return Err(weft::node_error(
-                "this FirstInOrder ran with no branch delivered, which the engine skips before \
-                 running; this is a weft bug",
-            ));
-        };
-        ctx.pulse_downstream(NodeOutput::new().set("value", first.clone())).await
+        // written and yields only the ones that DELIVERED: a branch that
+        // closed is absent, so the first pair is the winner. The node's
+        // rule refuses a FirstInOrder joining no branch before it runs.
+        let mut output = NodeOutput::new();
+        if let Some((_, first)) = ctx.inputs.in_order()?.next() {
+            output = output.set("value", first.clone());
+        }
+        ctx.pulse_downstream(output).await
     }
 }

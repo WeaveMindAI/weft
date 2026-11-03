@@ -10,16 +10,19 @@ import type { NodeFiringStatus } from '../types';
 /// and its members carry the same skip, so the card says skipped rather
 /// than "completed" for a set of rows that are all terminal.
 ///
-/// A member parked on a human (or any suspension) holds the container
-/// with it: nothing inside is progressing, so the card says waiting,
-/// in the same cyan the parked node wears, rather than running. Only
-/// when some other member is actually running does running win.
+/// A member parked on a human (or any wait of its own) holds the
+/// container with it: nothing inside is progressing, so the card says
+/// waiting, in the same cyan the parked node wears, rather than running.
+/// Only when some other member is actually running does running win. A
+/// member that only paused with its run says paused, unless another
+/// waits on something of its own, which names more.
 export function containerStatus(
 	inStatus: NodeFiringStatus,
 	related: ReadonlyArray<{ status: NodeFiringStatus }>,
 ): NodeFiringStatus {
 	if (related.some((e) => e.status === 'running')) return 'running';
-	if (related.some((e) => e.status === 'waiting_for_input')) return 'waiting_for_input';
+	if (related.some((e) => e.status === 'waiting')) return 'waiting';
+	if (related.some((e) => e.status === 'paused')) return 'paused';
 	if (related.some((e) => e.status === 'failed')) return 'failed';
 	if (inStatus === 'skipped') return 'skipped';
 	const allTerminal =

@@ -81,6 +81,10 @@ pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Po
                     disks: weft_platform_local::DiskBacking::Volumes,
                     publish: weft_platform_local::Publish::Loopback,
                     install: config.install.clone(),
+                    // Every install on this machine shares its Docker.
+                    names: weft_platform_local::infra_names::Names::PerInstall {
+                        claims: weft_platform_local::MachineLayout::here().disk_claims(),
+                    },
                     // A unit's agent is a container, so it reaches the
                     // broker where containers do.
                     agent_broker: weft_platform_local::AgentBroker {

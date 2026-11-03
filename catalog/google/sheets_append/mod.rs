@@ -6,10 +6,11 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use weft::access::client::url;
 use weft::node::NodeOutput;
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::sheets::{header_for_row, row_to_cells, tab_title, values_url};
+use super::sheets::{header_for_row, row_to_cells, tab_title, values_url, Row};
 
 #[derive(NodeManifest)]
 pub struct GoogleSheetsAppendNode;
@@ -28,7 +29,7 @@ impl Node for GoogleSheetsAppendNode {
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
         let gid: Option<String> = ctx.inputs.opt("tab")?;
-        let row: Value = ctx.inputs.get("row")?;
+        let row: Row = ctx.inputs.get("row")?;
         let has_header: bool = ctx.inputs.get("hasHeader")?;
 
         let http = ctx.client(&account).await?;
@@ -36,13 +37,14 @@ impl Node for GoogleSheetsAppendNode {
         let headers = header_for_row(&http, &id, &title, &row, has_header).await?;
         let cells = row_to_cells(&row, headers.as_deref())?;
 
-        let url = format!(
-            "{}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS",
-            values_url(&id, &title, None)
-        );
+        // `:append` is a method suffix on the range's own path segment,
+        // so it follows the encoded range unencoded.
+        let url = url(&format!("{}:append", values_url(&id, &title, None)?), &[])?
+            .query("valueInputOption", "USER_ENTERED")
+            .query("insertDataOption", "INSERT_ROWS");
         let body = weft::access::client::post_json(
             &http,
-            &url,
+            url.as_str(),
             &json!({ "values": [cells] }),
             "append the row",
         )

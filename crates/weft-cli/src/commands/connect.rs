@@ -33,10 +33,10 @@ use crate::prompt::{confirm, is_interactive, prompt_line};
 
 #[derive(clap::Args, Debug)]
 pub struct ConnectOpts {
-    /// The access node to manage: its id, or `path/to/file.weft:id`
-    /// when the same id exists in more than one included file. Optional
-    /// when the project has exactly one access node.
-    #[arg(long)]
+    /// The node to manage (an access node, or a Route or Socket checking
+    /// its callers): its id, or `path/to/file.weft:id` when the same id
+    /// exists in more than one included file. Optional when the project
+    /// has exactly one node that takes a connection.
     pub node: Option<String>,
     /// Only list the node's stored connections, change nothing.
     #[arg(long, group = "action")]
@@ -136,7 +136,7 @@ impl ConnectOpts {
 /// it is named by ([`AccessTarget::spelling`]).
 pub(crate) struct AccessTarget {
     /// The file the node is written in, relative to the project root, the
-    /// name `--node file:id` qualification and every message use.
+    /// name a `file:id` qualification and every message use.
     rel_file: String,
     /// The node's id, as the compiler keys it: for a node inside an
     /// included file that carries the file's path (`@src:sweep.key`).
@@ -305,12 +305,12 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
             return print_all_grants(&client, json).await;
         }
         bail!(
-            "this project has no access node (no node whose type declares a service \
-             recipe), so there is nothing to connect"
+            "this project has no node that takes a connection (an access node, or a Route or \
+             Socket whose `auth` checks its callers), so there is nothing to connect"
         );
     }
-    // `--list` never prompts: with several access nodes and no
-    // `--node`, every node's connections are listed in turn.
+    // `--list` never prompts: with several access nodes and no node
+    // named, every node's connections are listed in turn.
     if opts.list && opts.node.is_none() && targets.len() > 1 {
         let mut all: Vec<serde_json::Value> = Vec::new();
         for (i, target) in targets.iter().enumerate() {
@@ -381,16 +381,18 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
     if opts.list {
         if json {
             // One JSON OBJECT per line, per the global --json contract.
-            // It names the node it listed for: a caller that passed
-            // `--node` still has to see which one answered, spelled the
+            // It names the node it listed for: a caller that named one
+            // still has to see which one answered, spelled the
             // way the program spells it, and every other name the node
-            // has (a file included twice gives it two).
+            // has (a file included twice gives it two), and which
+            // connection this install has picked for it, if any.
             println!(
                 "{}",
                 serde_json::json!({
                     "node": target.spelling(),
                     "spellings": target.spellings(),
                     "file": target.rel_file,
+                    "picked": target.picked.handle().map(|h| h.id),
                     "connections": grants,
                 })
             );
@@ -611,7 +613,7 @@ impl Place<'_> {
     /// `weft connect` for `target`, here, followed by `rest`.
     fn connect(&self, target: &AccessTarget, rest: &str) -> String {
         let instance = self.instance.map(|i| format!("--instance {i} ")).unwrap_or_default();
-        super::weft_on(self.on, &format!("connect {instance}--node {} {rest}", target.spelling()))
+        super::weft_on(self.on, &format!("connect {} {instance}{rest}", target.spelling()))
     }
 }
 
@@ -748,7 +750,7 @@ pub(crate) fn written_in_source(target: &AccessTarget) -> String {
     format!(
         "'{node}.{field}' holds a connection written in the source ({file}). That was the old way of \
          connecting a node: a connection lives in one install, so its id means nothing on any other. \
-         Erase that line, then run `weft connect --node {node}` again; the pick is kept by the \
+         Erase that line, then run `weft connect {node}` again; the pick is kept by the \
          install. See {doc}",
         node = target.spelling(),
         field = target.input,
@@ -765,6 +767,8 @@ pub(crate) fn written_in_source(target: &AccessTarget) -> String {
 struct OtherNode {
     node: String,
     node_type: String,
+    /// A node that would check its callers but whose `auth` is "none".
+    checks_no_caller: bool,
 }
 
 /// Walk main.weft and every `@include`d file (recursively) and pair
@@ -879,28 +883,23 @@ fn collect_targets(
             continue;
         }
         let spellings = spellings_of(program, &node.id)?;
-        let mut note_other = || {
-            others.push(OtherNode { node: node.id.clone(), node_type: node.node_type.clone() })
+        let mut note_other = |checks_no_caller: bool| {
+            others.push(OtherNode { node: node.id.clone(), node_type: node.node_type.clone(), checks_no_caller })
         };
         let Some(meta) = weft_core::node::MetadataCatalog::lookup(catalog, &node.node_type) else {
-            note_other();
+            note_other(false);
             continue;
         };
-        let Some(spec) = meta.service.clone() else {
-            note_other();
+        // The one answer to which field takes a connection and to which
+        // recipe: an access node's own, or the scheme a Route's `auth`
+        // names.
+        let auth = node.written_value(weft_core::access::callers::AUTH_FIELD);
+        let field = weft_core::access::callers::connection_field(meta, auth)
+            .map_err(|why| anyhow::anyhow!("'{}': {why}", weft_core::project::plain_id(&node.id)))?;
+        let Some(weft_core::access::callers::ConnectionField { input, spec }) = field else {
+            note_other(meta.features.checks_callers);
             continue;
         };
-        let input = meta
-            .access_input()
-            .map(|i| i.name.clone())
-            .with_context(|| {
-                format!(
-                    "node type '{}' declares the '{}' service but no input carries the \
-                     access widget; metadata load is supposed to refuse that, so the \
-                     installed catalog is broken",
-                    node.node_type, spec.service
-                )
-            })?;
         // Through `written_value`, never `config`: a constant written for
         // an INPUT PORT has two homes in source and enrich moves it from
         // one to the other (`normalize_port_literals`).
@@ -1019,7 +1018,7 @@ fn describe_target(t: &AccessTarget) -> String {
 }
 
 /// Any node of the project, found by the name a person types, the same
-/// way `weft connect --node` finds an access node.
+/// way `weft connect <node>` finds an access node.
 pub(crate) struct ResolvedNode {
     /// The compiled id, the key into `program`.
     pub(crate) node: String,
@@ -1068,6 +1067,13 @@ fn choose_target(
         // as "you typed it wrong" when the real answer is "that one
         // needs nothing from you".
         if let Some(other) = others.iter().find(|o| o.node == id) {
+            if other.checks_no_caller {
+                bail!(
+                    "'{name}' checks no caller (its `auth` is \"none\"), so it takes no connection; set \
+                     its `auth` to the scheme its callers use ({}) first",
+                    weft_core::access::callers::auth_options()[1..].join(", ")
+                );
+            }
             bail!(
                 "'{name}' is a {} and takes no connection: nothing about it is yours to \
                  pick, so there is nothing to connect here. `weft connect --list` shows the \
@@ -1101,7 +1107,7 @@ fn choose_target(
         };
         eprintln!("  [{}] {} - {}", i + 1, describe_target(t), status);
     }
-    let choice = prompt_line("Which node? ", "--node <id>")?;
+    let choice = prompt_line("Which node? ", "weft connect <node>")?;
     let idx: usize = choice
         .trim()
         .parse()
@@ -2121,8 +2127,18 @@ pub(crate) fn collect_field_values(
             None if !interactive && optional => continue,
             None if !interactive => bail!(
                 "'{label}' has no value; pass {flag_hint} (for '{}') to fill it \
-                 non-interactively",
-                f.name
+                 non-interactively. The fields this connection asks for: {}",
+                f.name,
+                fields
+                    .iter()
+                    .map(|f| match (&f.label, f.optional) {
+                        (Some(label), false) => format!("{} ({label})", f.name),
+                        (Some(label), true) => format!("{} ({label}, optional)", f.name),
+                        (None, false) => f.name.clone(),
+                        (None, true) => format!("{} (optional)", f.name),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             None => {
                 let suffix = if optional {
@@ -2266,7 +2282,7 @@ mod tests {
         assert!(listing.contains("Instance 'ada''s Fake connections:"), "{listing}");
         assert!(listing.contains("ada@example.com (named \"Fake\")"), "{listing}");
         let empty = grants_listing(&target, &Pick::None, place, "Fake", &[]);
-        assert!(empty.contains("`weft connect --instance ada --node mail --door own`"), "{empty}");
+        assert!(empty.contains("`weft connect mail --instance ada --door own`"), "{empty}");
     }
 
     #[test]
@@ -2342,10 +2358,11 @@ mod tests {
 
     #[test]
     fn required_field_with_no_terminal_names_the_flag() {
-        let fields = vec![field("key", false, true)];
+        let fields = vec![field("key", false, true), field("region", true, false)];
         let mut set = BTreeMap::new();
         let err = collect_field_values(&fields, &mut set, "--set", false, false).unwrap_err();
         assert!(err.to_string().contains("--set (for 'key')"), "{err}");
+        assert!(err.to_string().ends_with("The fields this connection asks for: key, region (optional)"), "{err}");
     }
 
     #[test]
@@ -2471,7 +2488,7 @@ mod tests {
         assert_eq!(spellings_of(&p, "db").unwrap(), vec!["db".to_string()]);
     }
 
-    /// `weft connect --node` over a real project whose access node lives
+    /// `weft connect <node>` over a real project whose access node lives
     /// in a file included at two sites: each site's name picks it and is
     /// the name it answers in, the compiler's own key and the bare name
     /// are refused with both names that work, and a pick written for one
@@ -2485,7 +2502,7 @@ mod tests {
         std::fs::create_dir_all(project.src_dir().join("lib")).unwrap();
         std::fs::write(
             project.src_dir().join("lib/part.weft"),
-            "Group(text: String) -> (access: Access) {\n  key = ApiKeyAuth\n  self.access = key.access\n}\n",
+            "Group(text: String) -> (access: Access) {\n  key = PostgresAccess\n  self.access = key.access\n}\n",
         )
         .unwrap();
         std::fs::write(
@@ -2521,6 +2538,32 @@ mod tests {
         assert!(listed.contains(&format!("'one.key' is connected as {id}")), "{listed}");
         let listed = grants_listing(&two, &two.picked, place, "Key", &[]);
         assert!(listed.contains("'two.key' has no connection picked"), "{listed}");
+    }
+
+    /// A Route checking its callers is a node to connect, to the recipe
+    /// of the scheme its `auth` names; one checking nobody is refused,
+    /// saying to set its `auth` first.
+    #[test]
+    fn a_route_checking_its_callers_connects_to_its_schemes_recipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = weft_compiler::project::Project::init(dir.path(), "gated").unwrap();
+        let catalog = weft_compiler::build::build_project_catalog(&project.root).unwrap();
+        std::fs::write(
+            project.main_weft(),
+            "secure = Route { path: \"secure\", auth: \"api_keys\" }\nsigned = Route { path: \"signed\", auth: \"hmac_sha256\" }\n\
+             open = Route { path: \"open\" }\n",
+        )
+        .unwrap();
+        let choose = |name: &str| {
+            let mut others = Vec::new();
+            let (targets, program) = discover(&project, &catalog, &mut others).unwrap();
+            choose_target(&project, &program, targets, &others, Some(name), true)
+        };
+        let secure = choose("secure").unwrap();
+        assert_eq!((secure.input(), secure.spec.service.as_str()), ("connection", "api_key_auth"));
+        assert_eq!(choose("signed").unwrap().spec.service, "hmac_auth");
+        let why = format!("{:#}", choose("open").err().expect("refused"));
+        assert!(why.contains("checks no caller") && why.contains("api_keys"), "{why}");
     }
 
     /// A node at no place in the program is refused, never given a

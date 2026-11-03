@@ -34,6 +34,15 @@ can read.
 failed, skipped, suspended, resumed or cancelled. A skip carries its reason in
 plain words.
 
+**Where a node is.** Each time a node saves the state it keeps
+(`state.save()`, the end of a `once` or a `wait`, or a pause), a
+`NodeStateSaved` row holds it whole, with what weft keeps beside it: how far
+the node read each bus and stream, how many items it yielded, and the numbers
+its next wait and its next program call will take. The latest row is what the
+node gets back when it runs again after a pause or a crash. Each wait it
+registers carries its number in the node (`wait_index`), which is how a body
+that runs again finds the wait it already made.
+
 **Values on wires.** `PortEmitted` is the only event that carries a value, and
 it carries it once. When a run is rebuilt, weft puts the value on every
 outgoing wire itself, which is why a replay lands on exactly the same picture
@@ -43,7 +52,10 @@ as the live run did.
 that close because a body returned are worked out again on replay.
 
 **Loops, streams and buses** get their own events: an iteration launching, a
-gather assembling, a bus participant joining, a window of messages.
+gather assembling, a bus being made, a participant joining, a window of
+messages. The row for a bus being made (`BusCreated`) holds what a worker
+needs to open it again after a pause: its id, the port its marker went out
+on, its options.
 
 **A live caller's exchange** does too: the caller arriving, a window of what
 the caller and the program said, an error, the caller leaving. A window also
@@ -149,8 +161,8 @@ hole in it would rebuild a different run: a node whose start was lost but whose
 values landed would run again and spend twice. So what landed is always the
 run's first rows, in order, which is the record a worker that died leaves
 behind, and a durable run carries on from it the same way. A node whose start
-landed and whose end did not is failed rather than run again (for that, go and
-read [when the worker dies mid-run](../nodes/durable-execution.md#when-the-worker-dies-mid-run)).
+landed and whose end did not is failed rather than run again, unless it saved
+a state (for that, go and read [when the worker dies mid-run](../nodes/durable-execution.md#when-the-worker-dies-mid-run)).
 
 ## How long a run is kept
 

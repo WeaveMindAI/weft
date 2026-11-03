@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[s3]", "accepts": ["wire"],
       "required": true,
       "description": "The object store access (wire an S3Access node)."
     },
@@ -72,6 +72,21 @@
       "name": "hasMore",
       "type": "Boolean",
       "description": "True when keys past this page match the prefix."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "value",
+        "field": "bucket",
+        "matches": "^\\.{0,2}$"
+      },
+      "then": {
+        "message": "S3ListObjects '{id}': `bucket` is empty, `.` or `..`, which no URL can address; name a real bucket.",
+        "level": "structural",
+        "severity": "error",
+        "field": "bucket"
+      }
     }
   ]
 }

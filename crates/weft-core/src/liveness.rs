@@ -16,14 +16,18 @@
 //! - [`WaitLiveness`] is the engine-side tracker every wait reports to.
 //! - [`wait_on`] is THE wait loop; it holds a private RAII guard so
 //!   entry and exit can never unbalance, even across cancellation.
+//!   [`wait_or_pause`] is the same loop for a wait inside a call that
+//!   holds the firing's saved state (`crate::context::Kept`): when the
+//!   run pauses, it ends with [`Paused`] instead, and the call saves the
+//!   state and suspends the firing.
 //!
-//! ## "wait" vs "park" vocabulary
+//! ## "wait" vs "pause" vocabulary
 //!
-//! The word "park" in this codebase already names `ctx.await_signal`
-//! (journal-replay workflow suspension, worker swap). The waits here
-//! are plain in-process tokio awaits; the worker stays alive. The
-//! engine only needs the hooks so its stuck-check can prove a deadlock
-//! instead of hanging forever.
+//! The waits here are plain in-process tokio awaits; the worker stays
+//! alive. The engine needs the hooks so its stuck-check can prove a
+//! deadlock instead of hanging forever, and so that, when every running
+//! node waits and something outside the run is what moves it next, it
+//! can tell every waiting call to pause and let the worker go.
 
 use std::sync::{Arc, Weak};
 
@@ -93,19 +97,62 @@ pub async fn wait_on<T>(
     liveness: &Weak<dyn WaitLiveness>,
     node: &Option<FiringLocation>,
     source: &Arc<dyn WaitSource>,
-    mut evaluate: impl FnMut() -> Option<T>,
+    evaluate: impl FnMut() -> Option<T>,
 ) -> T {
-    if let Some(v) = evaluate() {
-        return v;
+    match wait_loop(liveness, node, source, false, evaluate).await {
+        Ok(v) => v,
+        Err(Paused) => unreachable!("a wait that cannot pause is never told to"),
     }
-    let guard = WaitGuard::new(liveness, node, source);
+}
+
+/// The run paused while a call waited in [`wait_or_pause`]: the call
+/// saves the firing's state and suspends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Paused;
+
+/// [`wait_on`] for a wait at a place the run can pause
+/// (`crate::context::PausePoint`): `pausable`, it also ends, with
+/// [`Paused`], once the run pauses ([`WaitLiveness::pausing`]), and
+/// otherwise (the firing holds the run, `crate::context::Holding`) it
+/// keeps the run from pausing while it waits. The pause is looked at
+/// before every evaluation, so a call woken by a peer pausing (its handle
+/// dropping) pauses too instead of reading what that peer left behind.
+pub async fn wait_or_pause<T>(
+    liveness: &Weak<dyn WaitLiveness>,
+    node: &Option<FiringLocation>,
+    source: &Arc<dyn WaitSource>,
+    pausable: bool,
+    evaluate: impl FnMut() -> Option<T>,
+) -> Result<T, Paused> {
+    wait_loop(liveness, node, source, pausable, evaluate).await
+}
+
+/// The one wait loop behind [`wait_on`] and [`wait_or_pause`].
+async fn wait_loop<T>(
+    liveness: &Weak<dyn WaitLiveness>,
+    node: &Option<FiringLocation>,
+    source: &Arc<dyn WaitSource>,
+    pausable: bool,
+    mut evaluate: impl FnMut() -> Option<T>,
+) -> Result<T, Paused> {
+    let pausing = || pausable && liveness.upgrade().is_some_and(|w| w.pausing());
+    if pausing() {
+        return Err(Paused);
+    }
+    if let Some(v) = evaluate() {
+        return Ok(v);
+    }
+    let guard = WaitGuard::new(liveness, node, source, pausable);
     loop {
         let notified = source.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
         guard.record_observed();
+        if pausing() {
+            return Err(Paused);
+        }
         if let Some(v) = evaluate() {
-            return v;
+            return Ok(v);
         }
         guard.record_parked();
         notified.await;
@@ -134,8 +181,13 @@ pub trait WaitLiveness: Send + Sync {
     /// A node entered a wait on `source`. Mints and returns a `WaitId`
     /// the other per-wait hooks key on. The engine stores a `Weak` on
     /// the source (so the stuck-check can read its generation) and
-    /// marks this wait actively waiting but NOT yet parked.
-    fn enter_wait(&self, node: &FiringLocation, source: &Arc<dyn WaitSource>) -> WaitId;
+    /// marks this wait actively waiting but NOT yet parked. `pausable`:
+    /// the wait ends when the run pauses ([`wait_or_pause`]), so the
+    /// run may pause while it waits.
+    fn enter_wait(&self, node: &FiringLocation, source: &Arc<dyn WaitSource>, pausable: bool) -> WaitId;
+    /// Whether the run is pausing: every pausable wait ends with
+    /// [`Paused`] from here on. Once set, it stays set for the drive.
+    fn pausing(&self) -> bool;
     /// The wait `id` under `node` ended (resolved or cancelled). Removes
     /// its slot; the node entry is dropped once it holds no more waits.
     fn exit_wait(&self, node: &FiringLocation, id: WaitId);
@@ -187,7 +239,10 @@ pub trait WaitLiveness: Send + Sync {
 /// the unsize coercion.
 struct NoLiveness;
 impl WaitLiveness for NoLiveness {
-    fn enter_wait(&self, _node: &FiringLocation, _source: &Arc<dyn WaitSource>) -> WaitId {
+    fn enter_wait(&self, _node: &FiringLocation, _source: &Arc<dyn WaitSource>, _pausable: bool) -> WaitId {
+        unreachable!("NoLiveness is never constructed")
+    }
+    fn pausing(&self) -> bool {
         unreachable!("NoLiveness is never constructed")
     }
     fn exit_wait(&self, _node: &FiringLocation, _id: WaitId) {
@@ -230,10 +285,11 @@ impl WaitGuard {
         liveness_weak: &Weak<dyn WaitLiveness>,
         node: &Option<FiringLocation>,
         source: &Arc<dyn WaitSource>,
+        pausable: bool,
     ) -> Self {
         let liveness = match (liveness_weak.upgrade(), node) {
             (Some(w), Some(node)) => {
-                let id = w.enter_wait(node, source);
+                let id = w.enter_wait(node, source, pausable);
                 Some((w, node.clone(), id))
             }
             _ => None,

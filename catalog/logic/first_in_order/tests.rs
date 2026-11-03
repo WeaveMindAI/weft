@@ -1,7 +1,7 @@
-//! FirstInOrder self-tests: the first input that spoke is the answer,
-//! an all-quiet firing is refused as the engine bug it would be (in a
-//! run the engine skips the join before it runs; `skip.rs` proves that),
-//! and a FirstInOrder joining nothing is refused.
+//! FirstInOrder self-tests: the first input that spoke is the answer.
+//! A join none of whose branches delivered is skipped before it runs
+//! (`skip.rs` proves that), and a FirstInOrder joining nothing is
+//! refused by the node's rule, at compile time.
 //!
 //! A case hands its inputs as a JSON object, so the rig cannot express
 //! "this port was written first" (object keys arrive sorted). The
@@ -21,8 +21,6 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("the_first_input_that_spoke_is_emitted", first_delivered_wins),
         NodeTest::fake("a_single_branch_passes_through", single_branch),
-        NodeTest::fake("all_quiet_is_refused", all_quiet),
-        NodeTest::fake("no_branches_is_refused", no_branches),
     ]
 }
 
@@ -49,23 +47,5 @@ async fn single_branch(rig: FakeRig) -> WeftResult<()> {
     branches(&rig, &["checked", "quick"]);
     let outcome = rig.run(&FirstInOrderNode, json!({ "quick": "automatic" })).await.ok()?;
     assert_eq!(outcome.outputs["value"], json!("automatic"));
-    Ok(())
-}
-
-/// The engine skips a join none of whose branches delivered, so a body
-/// that runs with none says so instead of closing `value` silently.
-async fn all_quiet(rig: FakeRig) -> WeftResult<()> {
-    branches(&rig, &["checked", "quick"]);
-    let error = rig.run(&FirstInOrderNode, json!({})).await.failure()?;
-    assert!(error.contains("no branch delivered"), "{error}");
-    Ok(())
-}
-
-/// A FirstInOrder joining nothing is a node somebody added and never
-/// wired; it says so rather than closing `value` as if every branch had
-/// been cut.
-async fn no_branches(rig: FakeRig) -> WeftResult<()> {
-    let error = rig.run(&FirstInOrderNode, json!({})).await.failure()?;
-    assert!(error.contains("joins no branches"), "{error}");
     Ok(())
 }

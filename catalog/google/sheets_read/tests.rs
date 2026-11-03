@@ -36,7 +36,6 @@ pub fn tests() -> Vec<NodeTest> {
         }),
         NodeTest::fake("signed_in_read_emits_header_keyed_rows", signed_in_read),
         NodeTest::fake("a_tab_comes_a_page_at_a_time", paged_read),
-        NodeTest::fake("a_page_size_below_one_is_refused", zero_max_rows),
         NodeTest::fake("a_page_stops_early_at_what_a_wire_carries", heavy_rows_read),
         NodeTest::fake("no_tab_reads_the_first_tab_whatever_its_id", first_tab),
         NodeTest::live("one_real_signed_in_read", "google", live_read).with_fixture(
@@ -116,21 +115,6 @@ async fn paged_read(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(second.outputs["hasMore"], json!(false));
     Ok(())
 }
-
-/// A page of 0 rows would hand back the same `nextOffset` forever.
-async fn zero_max_rows(rig: FakeRig) -> WeftResult<()> {
-    let err = rig
-        .run(
-            &GoogleSheetsReadNode,
-            json!({ "account": rig.access("google"), "spreadsheet": "sheet-1", "maxRows": 0 }),
-        )
-        .await
-        .failure()?;
-    assert!(err.starts_with("config error") && err.contains("`maxRows`"), "{err}");
-    assert!(rig.requests().is_empty(), "nothing is read");
-    Ok(())
-}
-
 async fn heavy_rows_read(rig: FakeRig) -> WeftResult<()> {
     three_rows(&rig, &"x".repeat(40 * 1024));
     let outcome = rig

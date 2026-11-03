@@ -117,15 +117,17 @@ message sent within one window lands in the same row of the record. A shorter
 window shows messages in the inspector sooner and gives a row per message on a
 slow stream. A longer one writes fewer rows for a fast stream (audio frames,
 tokens), and the inspector trails the live stream by up to that long. A row
-also closes early once it holds 2 MB. `Route` and `Socket` have both settings,
+also closes early once it holds 2 MB, and at once when the bus ends or the run
+pauses. `Route` and `Socket` have both settings,
 and so do `LlmStream`, `ElevenLabsTranscribe` and `PostgresWatchQuery`. Other
 nodes have them only if their author turned them on.
 
 The window is 64 messages either way. What is always kept, in both modes, is
 who joined and who left, so nothing a reader needs can disappear into a gap.
 
-The record exists so you can read the conversation in the inspector afterwards.
-It is not what rebuilds a bus, because nothing rebuilds a bus.
+The record exists so you can read the conversation in the inspector
+afterwards, and so a paused run gets its buses back: the worker that picks the
+run up opens each one again from it (below).
 
 ### How a bus ends
 
@@ -136,9 +138,9 @@ ways:
 
 - **finished**, when that node's work completed, or when the node closed the
   bus early on purpose;
-- **failed**, with the reason, when that node failed, was cancelled, or paused
-  on a wait before it was done. weft also ends a bus failed when the run got
-  stuck, or ended while the bus was still open.
+- **failed**, with the reason, when that node failed or was cancelled. weft
+  also ends a bus failed when the run got stuck, when it ended while the bus
+  was still open, and when a node was still running as its worker died.
 
 Each reader decides what a failed end means for it. `Stream` fails the answer
 to its caller ([what the caller
@@ -152,18 +154,35 @@ If a producer fails before its first piece, it may not have opened its bus
 yet. For what the program can do then, go and read [when a node
 fails](how-a-program-runs.md#when-a-node-fails).
 
-### A bus lives exactly as long as its worker
+### A bus pauses with its run
 
-It is memory in a process. If that worker goes away, the bus goes with it, and
-a marker resolved afterwards fails saying the bus is unknown.
+A bus is memory in the worker running the run, and it does not stop the run
+from pausing. A node can wait a week on a question while a bus between two
+other nodes stays open: once every node still running waits, the run pauses,
+buses and all, and the worker lets go. Nobody on the bus sees anybody leave.
 
-That is fine for what it is for, which is nodes that are alive together right
-now. It is why a run that used a bus cannot be partly reused by a seeded run:
-weft leaves the producer and its readers out rather than handing you a marker
-pointing at nothing.
+When the run picks up, the new worker opens every bus that was open again,
+with the same id, so every marker still names it, and its messages carry on
+numbering from where they stopped. A journaled bus comes back with its last
+JSON messages, as many as its window holds, so a reader can still reach back;
+the record keeps a message over 100 KB trimmed, so that message and every one
+before it are left out. An
+ephemeral bus, or one that carries bytes, comes back empty. A reader that was
+waiting for the next message had read everything and loses nothing. One that
+stopped to wait on something else carries on where it stopped, and if the
+messages it had not read did not come back, its first read fails, saying
+so. A node that must not stop reading at all holds the run
+instead (`ctx.hold()`), which keeps the run from pausing while it reads.
 
-A durable wait is a different thing and the two coexist. A node can park on a
-question for a week while a bus somewhere else stays up.
+A worker that dies is different, because the last messages it carried may
+never have reached the record. If a durable run carries on in another worker
+and any node was still running when the first one went, each bus that was
+open ends failed, with `the worker holding this bus went away, so messages it
+carried may be lost`.
+
+A seeded run cannot reuse a node that emitted a bus, since that bus belonged
+to the earlier run: weft leaves the producer and its readers out rather than
+handing you a marker pointing at nothing.
 
 ### What a bus does not check
 
@@ -179,7 +198,7 @@ but what is inside is between the nodes talking.
 | Several live nodes talking to each other | A bus |
 | To fan one thing out to several readers | A bus |
 | Ordering and type checking on every item | A stream |
-| To survive the worker restarting | Neither. Use storage, or a node that ends |
+| To survive its worker dying | Neither. Use storage, or a node that ends |
 
 For the Rust on both sides, go and read
 [streams and buses in Rust](../nodes/streams-and-buses.md).

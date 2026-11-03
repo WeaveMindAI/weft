@@ -13,7 +13,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::basic("the_most_likely_level_takes_the_lower_on_a_tie", most_likely_level),
         NodeTest::basic("probabilities_come_in_level_order", in_level_order),
         NodeTest::fake("scores_on_the_written_levels", scores),
-        NodeTest::fake("fewer_than_two_levels_are_refused", one_level),
         NodeTest::fake("a_level_with_no_probability_fails", level_missing),
         NodeTest::fake("a_score_past_the_levels_fails", score_past_levels),
         NodeTest::live("one_real_score", "openrouter", live_score),
@@ -72,20 +71,6 @@ async fn scores(rig: FakeRig) -> WeftResult<()> {
             "criteria": ["Can wait", "This week", "Blocking revenue now"],
         })
     );
-    Ok(())
-}
-
-async fn one_level(rig: FakeRig) -> WeftResult<()> {
-    rig.input_type("ticket", ty("String"));
-    let err = rig
-        .run(
-            &DecisionScoreNode,
-            json!({ "provider": provider(&rig), "instructions": "Urgent?", "levels": ["Yes"], "ticket": "x" }),
-        )
-        .await
-        .failure()?;
-    assert!(err.contains("at least two"), "{err}");
-    assert!(rig.requests().is_empty(), "nothing was sent");
     Ok(())
 }
 

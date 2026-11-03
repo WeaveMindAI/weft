@@ -72,7 +72,7 @@ pub enum InfraCall {
 }
 
 impl InfraCall {
-    pub const JOURNAL_NAMES: &'static [&'static str] = &[
+    pub const NAMES: &'static [&'static str] = &[
         "weft.infra.start",
         "weft.infra.stop",
         "weft.infra.terminate",
@@ -90,7 +90,7 @@ impl InfraCall {
         "weft.infra.setup",
     ];
 
-    pub fn journal_name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             InfraCall::Start { .. } => "weft.infra.start",
             InfraCall::Stop { .. } => "weft.infra.stop",

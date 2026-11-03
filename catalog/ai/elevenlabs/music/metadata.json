@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[elevenlabs]", "accepts": ["wire"],
       "required": true,
       "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
     },
@@ -266,7 +266,7 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "forceInstrumental", "equals": true },
+          { "kind": "value", "field": "forceInstrumental", "equals": true },
           { "kind": "input_satisfied", "port": "compositionPlan" }
         ]
       },
@@ -293,7 +293,7 @@
         "kind": "all",
         "of": [
           { "kind": "input_satisfied", "port": "lyrics" },
-          { "kind": "config_equals", "field": "forceInstrumental", "equals": true }
+          { "kind": "value", "field": "forceInstrumental", "equals": true }
         ]
       },
       "then": {
@@ -318,8 +318,8 @@
       "when": {
         "kind": "any",
         "of": [
-          { "kind": "config_equals", "field": "finetuneStrength", "equals": 0 },
-          { "kind": "config_equals", "field": "finetuneStrength", "equals": 0.0 }
+          { "kind": "value", "field": "finetuneStrength", "equals": 0 },
+          { "kind": "value", "field": "finetuneStrength", "equals": 0.0 }
         ]
       },
       "then": {
@@ -331,8 +331,8 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "signWithC2pa", "equals": true },
-          { "kind": "config_matches", "field": "outputFormat", "regex": "^(pcm|ulaw|alaw|opus)_" }
+          { "kind": "value", "field": "signWithC2pa", "equals": true },
+          { "kind": "value", "field": "outputFormat", "matches": "^(pcm|ulaw|alaw|opus)_" }
         ]
       },
       "then": {
@@ -345,7 +345,7 @@
         "kind": "all",
         "of": [
           { "kind": "output_wired", "port": "songId" },
-          { "kind": "not", "of": { "kind": "config_equals", "field": "storeForInpainting", "equals": true } },
+          { "kind": "not", "of": { "kind": "value", "field": "storeForInpainting", "equals": true } },
           { "kind": "not", "of": { "kind": "input_wired", "port": "storeForInpainting" } }
         ]
       },
@@ -353,6 +353,38 @@
         "message": "ElevenLabsMusic '{id}' hands its `songId` on with `storeForInpainting` off, and a later `compositionPlan` can only build on a song ElevenLabs stored: turn `storeForInpainting` on if that is what the id is for.",
         "severity": "warning",
         "port": "storeForInpainting"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "value", "field": "prompt" },
+          {
+            "kind": "not",
+            "of": { "kind": "value", "field": "prompt", "length": { "max": 4100 } }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsMusic '{id}' has a `prompt` over 4100 characters, and ElevenLabs takes at most 4100: shorten it, or lay the song out in a `compositionPlan`.",
+        "port": "prompt"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "value", "field": "lyrics" },
+          {
+            "kind": "not",
+            "of": { "kind": "value", "field": "lyrics", "length": { "max": 4000 } }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsMusic '{id}' has `lyrics` over 4000 characters, and ElevenLabs takes at most 4000: shorten them.",
+        "port": "lyrics"
       }
     }
   ],

@@ -52,7 +52,7 @@ impl Node for BaileySendMediaNode {
             // bridge applies it to audio only.
             "ptt": voice_note,
         });
-        if let Some(caption) = caption.filter(|c| !c.is_empty()) {
+        if let Some(caption) = caption {
             payload["caption"] = serde_json::json!(caption);
         }
 

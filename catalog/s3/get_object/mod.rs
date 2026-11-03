@@ -5,9 +5,10 @@
 
 use async_trait::async_trait;
 
+use weft::access::client::checked_send;
 use weft::node::NodeOutput;
 use weft::storage::StorageScope;
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::s3;
 
@@ -30,11 +31,7 @@ impl Node for S3GetObjectNode {
         let key: String = ctx.inputs.get("key")?;
 
         let s3 = ctx.client(&access).await?;
-        let resp = s3
-            .get(s3::object_url(&bucket, &key)?)
-            .send()
-            .await
-            .node_err("s3: get object")?;
+        let resp = checked_send(s3.get(s3::object_url(&bucket, &key)?.as_str()), "s3: get object").await?;
         // The one genuinely local bit: an object key has no served
         // filename, so the last path segment stands in.
         let filename = key.rsplit('/').next().unwrap_or(&key).to_string();

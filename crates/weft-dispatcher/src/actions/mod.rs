@@ -88,8 +88,8 @@ impl Actor {
     }
 }
 
-/// Every action, by the name a program call is journaled under
-/// (`weft_core::program::ProgramCall::journal_name`), and whether a
+/// Every action, by the name of the program call carried to it
+/// (`weft_core::program::ProgramCall::name`), and whether a
 /// program may ask for it: each area's list (`<area>::NAMES`). The test
 /// below holds this list and the program calls to each other, so an action
 /// a program may ask for cannot lack its call, and one it may not is said
@@ -201,7 +201,7 @@ mod tests {
     /// program call is an action here: the two lists cannot drift.
     #[test]
     fn every_action_a_program_may_ask_for_has_its_call() {
-        let calls: std::collections::BTreeSet<&str> = weft_core::program::ProgramCall::journal_names().into_iter().collect();
+        let calls: std::collections::BTreeSet<&str> = weft_core::program::ProgramCall::names().into_iter().collect();
         let everyone: std::collections::BTreeSet<&str> =
             names().into_iter().filter(|(_, reach)| *reach == Reach::Everyone).map(|(name, _)| name).collect();
         assert_eq!(calls, everyone, "a program call with no action, or an action a program may ask for with no call");

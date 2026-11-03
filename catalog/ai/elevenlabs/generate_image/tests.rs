@@ -1,9 +1,11 @@
 //! ElevenLabsGenerateImage self-tests: the request each setting makes,
-//! how files become references (inline, or a temporary asset that is
-//! deleted again), the parked wait, and the stored image.
+//! how files become references (inline, or a temporary asset whose
+//! delete weft owes once the node ends), the parked wait, and the stored
+//! image.
 
 use serde_json::{json, Value};
 
+use weft::signal::{CancelMethod, SendWhen};
 use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
 use crate::flows::{inline_mime, output_filename};
@@ -18,8 +20,8 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_prompt_alone_sends_only_the_model_and_the_prompt", prompt_alone),
         NodeTest::fake("every_setting_and_file_reaches_the_request", every_setting),
         NodeTest::fake("a_single_wired_image_goes_as_a_one_item_list", single_image),
-        NodeTest::fake("a_file_that_cannot_go_inline_is_a_temporary_asset_deleted_after", temporary_asset),
-        NodeTest::fake("a_refused_create_deletes_its_temporary_asset", refused_create_cleans_up),
+        NodeTest::fake("a_file_that_cannot_go_inline_is_a_temporary_asset_weft_deletes_after", temporary_asset),
+        NodeTest::fake("a_refused_create_still_owes_its_temporary_asset_delete", refused_create_cleans_up),
         NodeTest::fake("a_resumed_run_never_starts_a_second_generation", resumed),
         NodeTest::fake("a_failed_generation_fails_with_elevenlabs_reason", failed),
         NodeTest::fake("a_failed_generation_comes_out_on_error_when_it_is_wired", failed_caught),
@@ -27,9 +29,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("an_unknown_status_fails_loud", unknown_status),
         NodeTest::fake("the_image_is_stored_as_the_type_elevenlabs_reported", reported_type_wins),
         NodeTest::fake("an_output_reported_as_no_image_is_refused_before_any_download", reported_non_image_refused),
-        NodeTest::fake("a_temporary_asset_already_gone_counts_as_removed", asset_already_gone),
-        NodeTest::fake("an_asset_that_cannot_be_removed_is_logged_and_the_image_still_lands", asset_left_behind),
-        NodeTest::fake("a_wait_given_up_removes_its_temporary_asset", given_up_wait_cleans_up),
+        NodeTest::fake("a_wait_given_up_still_owes_its_temporary_asset_delete", given_up_wait_cleans_up),
         NodeTest::live("one_real_image_then_an_edit_of_it", "elevenlabs", live_generate_then_edit),
     ]
 }
@@ -153,26 +153,32 @@ async fn single_image(rig: FakeRig) -> WeftResult<()> {
 async fn temporary_asset(rig: FakeRig) -> WeftResult<()> {
     completes(&rig, "image", "g4", "image/png", b"edited");
     rig.respond("POST", "/v1/assets", json!({ "asset_id": "a1", "name": "spin.gif", "mime_type": "image/gif" }));
-    rig.respond_status("DELETE", "/v1/assets/a1", 204, Value::Null);
     let gif = rig.store_file("spin.gif", "image/gif", b"GIF89a".to_vec());
     rig.run(&ElevenLabsGenerateImageNode, inputs(&rig, json!({ "images": [gif] }))).await.ok()?;
 
     assert_eq!(create_body(&rig)["images"], json!([{ "type": "asset", "asset_id": "a1" }]));
     let sent = rig.requests();
     let upload = sent.iter().find(|r| r.path == "/v1/assets").expect("the gif went up as an asset");
-    let form = upload.body_text.as_deref().expect("a buffered multipart body");
-    assert!(form.contains("name=\"asset\"; filename=\"spin.gif\""), "{form}");
-    assert!(form.contains("GIF89a"), "the file's bytes are in the upload");
-    let order: Vec<(&str, &str)> = sent.iter().map(|r| (r.method.as_str(), r.path.as_str())).collect();
-    let create = order.iter().position(|r| *r == ("POST", "/v1/flows/image")).expect("a create");
-    let delete = order.iter().position(|r| *r == ("DELETE", "/v1/assets/a1")).expect("the asset is deleted");
-    assert!(delete > create, "the asset outlives the create it was uploaded for: {order:?}");
+    assert!(upload.body_streamed, "the asset streams out of storage, never held whole");
+    assert!(!sent.iter().any(|r| r.method == "DELETE"), "the node deletes nothing itself");
+    owes_asset_delete(&rig, "a1");
     Ok(())
+}
+
+/// The node left weft the delete of the temporary asset `id`, sent
+/// however the node ends.
+fn owes_asset_delete(rig: &FakeRig, id: &str) {
+    let owed = rig.owed_calls();
+    assert_eq!(owed.len(), 1, "{owed:?}");
+    let (call, access) = &owed[0];
+    assert!(call.url.ends_with(&format!("/v1/assets/{id}")), "{}", call.url);
+    assert!(matches!(call.method, CancelMethod::Delete));
+    assert_eq!(call.when, SendWhen::Always);
+    assert!(access.is_some(), "the delete goes through the node's own access");
 }
 
 async fn refused_create_cleans_up(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/v1/assets", json!({ "asset_id": "a2" }));
-    rig.respond_status("DELETE", "/v1/assets/a2", 204, Value::Null);
     rig.respond_status(
         "POST",
         "/v1/flows/image",
@@ -182,7 +188,7 @@ async fn refused_create_cleans_up(rig: FakeRig) -> WeftResult<()> {
     let gif = rig.store_file("spin.gif", "image/gif", b"GIF89a".to_vec());
     let err = rig.run(&ElevenLabsGenerateImageNode, inputs(&rig, json!({ "images": [gif] }))).await.failure()?;
     assert!(err.contains("Unsupported image type"), "{err}");
-    rig.assert_sent("DELETE", "/v1/assets/a2");
+    owes_asset_delete(&rig, "a2");
     Ok(())
 }
 
@@ -191,7 +197,9 @@ async fn resumed(rig: FakeRig) -> WeftResult<()> {
     rig.run(&ElevenLabsGenerateImageNode, inputs(&rig, json!({}))).await.ok()?;
     rig.run(&ElevenLabsGenerateImageNode, inputs(&rig, json!({}))).await.ok()?;
     let creates = rig.requests().iter().filter(|r| r.method == "POST" && r.path == "/v1/flows/image").count();
-    assert_eq!(creates, 1, "the replay reads the journaled create back instead of paying twice");
+    assert_eq!(creates, 1, "the resumed body finds the job in its state instead of paying twice");
+    assert_eq!(rig.awaited_signals().len(), 1, "and the wait it already got an answer to is not made again");
+    assert_eq!(rig.saved_state(&ElevenLabsGenerateImageNode).expect("a saved state")["submitted"], json!("g5"));
     Ok(())
 }
 
@@ -278,44 +286,14 @@ async fn reported_non_image_refused(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// A gif goes up as a temporary asset; the canned answers for its
-/// upload and its delete (answering `delete_status`), and the inputs
-/// that send it.
-fn gif_through_an_asset(rig: &FakeRig, delete_status: u16) -> Value {
-    rig.respond("POST", "/v1/assets", json!({ "asset_id": "a3" }));
-    rig.respond_status("DELETE", "/v1/assets/a3", delete_status, json!({ "detail": { "message": "storage hiccup" } }));
-    let gif = rig.store_file("spin.gif", "image/gif", b"GIF89a".to_vec());
-    inputs(rig, json!({ "images": [gif] }))
-}
-
-async fn asset_already_gone(rig: FakeRig) -> WeftResult<()> {
-    completes(&rig, "image", "g11", "image/png", b"png");
-    let given = gif_through_an_asset(&rig, 404);
-    rig.run(&ElevenLabsGenerateImageNode, given).await.ok()?;
-    assert!(rig.logs().is_empty(), "an asset already gone is removed, nothing to say: {:?}", rig.logs());
-    Ok(())
-}
-
-async fn asset_left_behind(rig: FakeRig) -> WeftResult<()> {
-    completes(&rig, "image", "g12", "image/png", b"png");
-    let given = gif_through_an_asset(&rig, 500);
-    let outcome = rig.run(&ElevenLabsGenerateImageNode, given).await.ok()?;
-    let (bytes, _, _) = emitted_file(&rig, &outcome.outputs, "image")?;
-    assert_eq!(bytes, b"png", "the paid image still lands");
-    let logs = rig.logs();
-    assert_eq!(logs.len(), 1, "{logs:?}");
-    assert_eq!(logs[0].0, weft::context::LogLevel::Warn);
-    assert!(logs[0].1.contains("a3") && logs[0].1.contains("Assets section"), "{}", logs[0].1);
-    Ok(())
-}
-
 async fn given_up_wait_cleans_up(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/v1/flows/image", json!({ "id": "g13", "status": "pending" }));
     rig.signal_given_up();
-    let given = gif_through_an_asset(&rig, 204);
-    let err = rig.run(&ElevenLabsGenerateImageNode, given).await.failure()?;
+    rig.respond("POST", "/v1/assets", json!({ "asset_id": "a3" }));
+    let gif = rig.store_file("spin.gif", "image/gif", b"GIF89a".to_vec());
+    let err = rig.run(&ElevenLabsGenerateImageNode, inputs(&rig, json!({ "images": [gif] }))).await.failure()?;
     assert!(err.contains("given up"), "{err}");
-    rig.assert_sent("DELETE", "/v1/assets/a3");
+    owes_asset_delete(&rig, "a3");
     Ok(())
 }
 

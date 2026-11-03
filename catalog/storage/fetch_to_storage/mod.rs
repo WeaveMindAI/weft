@@ -32,8 +32,8 @@ impl Node for FetchToStorageNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let url: String = ctx.inputs.get("url")?;
         let filename: Option<String> = ctx.inputs.opt("filename")?;
-        let scope = lifetime::scope_named(&ctx.inputs.get::<String>("scope")?)?;
-        let identity: Option<String> = ctx.inputs.opt("identity")?.filter(|s: &String| !s.is_empty());
+        let scope = ctx.inputs.get::<lifetime::Scope>("scope")?;
+        let identity: Option<String> = ctx.inputs.opt("identity")?;
         // No default on purpose, as on every storage node: absent is the
         // scope's own lifetime (a run file goes with its run, a
         // project file stays).
@@ -44,11 +44,11 @@ impl Node for FetchToStorageNode {
         // capability: ctx GETs the URL, derives the mime, streams the
         // body in (bounded memory), and returns the stored-file
         // reference. An identity makes it ask the store first.
-        let mut storage = ctx.storage(scope);
+        let mut storage = ctx.storage(scope.into());
         if let Some(identity) = identity {
             storage = storage.identified(identity);
         }
-        let file = storage.put_from_url(&url, filename.as_deref(), keep_ttl).await?;
+        let file = storage.put_from_url(&url, None, filename.as_deref(), keep_ttl).await?;
 
         ctx.pulse_downstream(NodeOutput::stored_file(StoredFile::from_value(&file)?)).await
     }

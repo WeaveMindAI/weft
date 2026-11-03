@@ -2,8 +2,10 @@
 //! (recurring events appear as their instances) and ordered by start.
 
 use async_trait::async_trait;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 
+use weft::access::client::url;
 use weft::node::NodeOutput;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
@@ -23,21 +25,19 @@ impl Node for GoogleCalendarListEventsNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let calendar: String = ctx.inputs.get("calendar")?;
-        let time_min: String = ctx.inputs.get("timeMin")?;
-        let time_max: String = ctx.inputs.get("timeMax")?;
+        let time_min: DateTime<Utc> = ctx.inputs.get("timeMin")?;
+        let time_max: DateTime<Utc> = ctx.inputs.get("timeMax")?;
         let query: Option<String> = ctx.inputs.opt("query")?;
-        let max_results = super::api::page_size(&ctx.inputs, "maxResults")?;
+        let max_results: u64 = ctx.inputs.get("maxResults")?;
+        let page_token: Option<String> = ctx.inputs.opt("pageToken")?;
 
-        let mut base = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events?singleEvents=true&orderBy=startTime&maxResults={max_results}&timeMin={}&timeMax={}",
-            super::api::segment(&calendar),
-            urlencoding::encode(&time_min),
-            urlencoding::encode(&time_max),
-        );
-        if let Some(q) = query.filter(|q| !q.trim().is_empty()) {
-            base.push_str(&format!("&q={}", urlencoding::encode(&q)));
-        }
-        let page_token: String = ctx.inputs.get_or("pageToken", String::new())?;
+        let base = url(super::api::CALENDAR_API, &["calendars", &calendar, "events"])?
+            .query("singleEvents", true)
+            .query("orderBy", "startTime")
+            .query("maxResults", max_results)
+            .query("timeMin", time_min.to_rfc3339_opts(SecondsFormat::AutoSi, true))
+            .query("timeMax", time_max.to_rfc3339_opts(SecondsFormat::AutoSi, true))
+            .query_opt("q", query);
         let http = ctx.client(&account).await?;
 
         // One Google page per call: a window can hold more events than
@@ -45,9 +45,9 @@ impl Node for GoogleCalendarListEventsNode {
         // `nextPageToken` until `hasMore` is false.
         let page = super::api::list_page(
             &http,
-            &base,
+            base,
             "items",
-            &page_token,
+            page_token.as_deref(),
             event,
             "google calendar: list events",
             "maxResults",

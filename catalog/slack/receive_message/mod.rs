@@ -10,12 +10,22 @@
 //!     output ports.
 
 use async_trait::async_trait;
+use serde::Deserialize;
 
 use weft::signal::{Predicate, ProviderEvents};
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct SlackReceiveMessageNode;
+
+/// The `replies` select: which messages of a channel fire.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Replies {
+    All,
+    TopLevel,
+    ThreadReplies,
+}
 
 #[cfg(feature = "node-tests")]
 mod tests;
@@ -34,29 +44,28 @@ impl Node for SlackReceiveMessageNode {
         let pattern: Option<String> = ctx.inputs.opt("pattern")?;
         let from_user: Option<String> = ctx.inputs.opt("fromUser")?;
         let include_bots: bool = ctx.inputs.get("includeBots")?;
-        let replies: String = ctx.inputs.get("replies")?;
+        let replies: Replies = ctx.inputs.get("replies")?;
 
         let mut filters = vec![Predicate::eq("type", "message"), Predicate::eq("channel", channel)];
-        if let Some(k) = keyword.filter(|k| !k.trim().is_empty()) {
+        if let Some(k) = keyword {
             filters.push(Predicate::contains("text", k));
         }
-        if let Some(p) = pattern.filter(|p| !p.trim().is_empty()) {
+        if let Some(p) = pattern {
             filters.push(Predicate::regex("text", p));
         }
-        if let Some(u) = from_user.filter(|u| !u.trim().is_empty()) {
+        if let Some(u) = from_user {
             filters.push(Predicate::eq("user", u));
         }
         if !include_bots {
             // A bot message carries the `bot` field; a human's does not.
             filters.push(Predicate::not_exists("bot"));
         }
-        match replies.as_str() {
+        match replies {
             // A thread reply carries the `thread` field; a top-level
             // message does not.
-            "top_level" => filters.push(Predicate::not_exists("thread")),
-            "thread_replies" => filters.push(Predicate::exists("thread")),
-            "all" => {}
-            other => weft::node_bail!("replies must be top_level, thread_replies or all, got {other:?}"),
+            Replies::TopLevel => filters.push(Predicate::not_exists("thread")),
+            Replies::ThreadReplies => filters.push(Predicate::exists("thread")),
+            Replies::All => {}
         }
 
         ctx.register_signal(ProviderEvents::new(&account, "messages", filters)).await

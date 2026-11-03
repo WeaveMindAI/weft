@@ -8,18 +8,17 @@
 use std::path::Path;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use weft::access::client::{get_json, json_call, post_json, send_error, Multipart};
+use weft::access::client::{get_json, json_call, post_json, url, Multipart, StoredBodyExt, Url};
 use weft::context::LogLevel;
 use weft::node::NodeOutput;
-use weft::reqwest::StatusCode;
-use weft::signal::{PollEndpoint, Predicate};
-use weft::storage::{FileHandle, StorageScope, StoredFile};
+use weft::signal::{CancelCall, PollEndpoint, Predicate};
+use weft::storage::{name_in_url, FileHandle, StorageScope, StoredFile};
 use weft::{node_error, Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
-use super::elevenlabs::{link_filename, API};
-use super::flows::store_download;
+use super::elevenlabs::API;
 
 type Client = weft::reqwest_middleware::ClientWithMiddleware;
 
@@ -52,91 +51,74 @@ impl Node for ElevenLabsDubNode {
         // The project is the program's only when it reads `projectId`.
         // Otherwise nothing would ever use it again, and it would sit on
         // the account (the install's own, on the built-in connection)
-        // until somebody deleted it, so the node deletes it once done.
+        // until somebody deleted it, so weft deletes it once the node
+        // ends, however it ends.
         let keep = ctx.is_output_wired("projectId");
-        // Everything ElevenLabs would refuse once the project has taken
-        // its up-front charge, refused here before anything is sent (the
-        // compiler already refuses the written shapes; this is the floor
-        // for wired ones).
-        let recording = match (file, source_url) {
-            (Some(file), None) => Recording::File(file),
-            (None, Some(url)) => Recording::Url(url),
-            (Some(_), Some(_)) => {
-                return Err(WeftError::Input("both `file` and `sourceUrl` are given: keep one of them".into()))
-            }
-            (None, None) => return Err(WeftError::Input("there is nothing to dub: give a `file` or a `sourceUrl`".into())),
+        // The rules refuse both `file` and `sourceUrl`, and a node given
+        // neither is skipped.
+        let recording = match file {
+            Some(file) => Recording::File(file),
+            None => Recording::Url(source_url.node_err("the dub has neither `file` nor `sourceUrl`")?),
         };
-        if let Some(refusal) = refusal(&model, cloning.is_some(), source.is_some(), transcript.as_ref()) {
-            return Err(WeftError::Input(refusal));
+        if cloning.is_some() && transcript.as_ref().is_some_and(translated) {
+            weft::input_bail!(
+                "the `transcript` carries translations, which ElevenLabs only takes for a language started with the \
+                 project, and `cloningStrength` needs the language added on its own: drop the translations, or leave \
+                 `cloningStrength` empty"
+            );
         }
 
         let http = ctx.client(&account).await?;
-        let projects = format!("{API}/dubbing/project");
+        let projects = url(API, &["dubbing", "project"])?;
 
-        // Creating the project is paid (one language's dub up front), and
-        // the body replays from the top when the wait resumes: journaled,
-        // the replay reads the project back instead of paying for a second
-        // one (and never reads the recording again). The language rides
-        // on the create whenever it can, so a language ElevenLabs does not
-        // dub is refused before anything is charged; a cloning strength
-        // can only be set on a language added on its own.
-        let created = ctx
-            .run("elevenlabs_create_dub_project", || async {
-                let mut form = Multipart::form_data().text("model_id", &model);
-                let filename = match &recording {
-                    Recording::File(file) => {
-                        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(file).await?;
-                        form = form.file("file", &meta.filename, &meta.mime_type, bytes);
-                        meta.filename
-                    }
-                    Recording::Url(url) => {
-                        form = form.text("source_url", url);
-                        link_filename(url, "source")
-                    }
+        let mut state = ctx.keep(Dub::default()).await?;
+
+        // Creating the project is paid (one language's dub up front), so
+        // it runs once: a run resumed after the wait finds the project in
+        // its state instead of paying for a second one (and never reads
+        // the recording again). The language rides on the create whenever
+        // it can, so a language ElevenLabs does not dub is refused before
+        // anything is charged; a cloning strength can only be set on a
+        // language added on its own.
+        let created = state
+            .once(|s| &mut s.created, async |_| {
+                let settings = Settings {
+                    model: &model,
+                    source_language: source.as_deref(),
+                    target_language: cloning.is_none().then_some(target.as_str()),
+                    keyterms: &keyterms,
+                    transcript: transcript.as_ref(),
+                    reference: reference.as_deref(),
                 };
-                if let Some(lang) = &source {
-                    form = form.text("source_language", lang);
-                }
-                if cloning.is_none() {
-                    form = form.text("target_language", &target);
-                }
-                // ElevenLabs reads a list field as the field repeated.
-                for term in &keyterms {
-                    form = form.text("keyterms", term);
-                }
-                if let Some(transcript) = &transcript {
-                    let document = serde_json::to_vec(transcript).node_err("serialize the transcript")?;
-                    form = form.file("transcript", "transcript.json", "application/json", document);
-                }
-                if let Some(reference) = &reference {
-                    form = form.text("reference", reference);
-                }
-                let (content_type, body) = form.build();
-                let answer = json_call(
-                    http.post(&projects).header("content-type", content_type).body(body),
-                    "create the ElevenLabs dub project",
-                )
-                .await?;
+                let (form, filename) = match &recording {
+                    Recording::File(file) => {
+                        let body = ctx.storage(StorageScope::Run).body(file).await?;
+                        let filename = body.filename().to_string();
+                        (settings.form(None)?.stored("file", body), filename)
+                    }
+                    Recording::Url(link) => (settings.form(Some(link))?, name_in_url(link).unwrap_or("source").to_string()),
+                };
+                let answer =
+                    json_call(http.post(projects.as_str()).multipart(form), "create the ElevenLabs dub project").await?;
                 let project = answer["project_id"]
                     .as_str()
-                    .node_err("ElevenLabs created the dub project but its answer has no project_id")?;
-                Ok(json!({ "project": project, "filename": filename, "language": answer["language_ids"][0] }))
+                    .node_err("ElevenLabs created the dub project but its answer has no project_id")?
+                    .to_string();
+                // Owed from now on, so a project nobody keeps goes whether
+                // the node ends done, failed, cancelled or given up.
+                if !keep {
+                    ctx.after_node(CancelCall::delete(projects.clone().segment(&project)?).always(), &account).await?;
+                }
+                let language = answer["language_ids"][0].as_str().map(str::to_string);
+                Ok(Created { project, filename, language })
             })
             .await?;
-        let project =
-            created["project"].as_str().node_err("the dub project this run recorded has no project id")?.to_string();
-        let filename =
-            created["filename"].as_str().node_err("the dub project this run recorded has no filename")?.to_string();
+        let Created { project, filename, language } = created;
 
-        let language = match (created["language"].as_str(), cloning) {
-            (Some(language), None) => language.to_string(),
+        let language = match (language, cloning) {
+            (Some(language), None) => language,
             (None, None) => {
-                let fate = if keep {
-                    "it stays on the account behind this node's key, where the first language you add uses that prepaid dub; or delete it there"
-                } else {
-                    discard(&ctx, &http, &projects, &project).await?;
-                    "it was deleted"
-                };
+                let fate = project_fate(keep);
                 weft::node_bail!(
                     "ElevenLabs created the dub project {project} but did not say it started the dub into \
                      '{target}'. Creating the project already cost one language's dub, and {fate}"
@@ -145,82 +127,75 @@ impl Node for ElevenLabsDubNode {
             // A step of its own: by now the project holds its prepaid
             // language, so a failure here says what became of it.
             (_, Some(strength)) => {
-                let added = ctx
-                    .run("elevenlabs_add_dub_language", || async {
+                state
+                    .once(|s| &mut s.added, async |_| {
                         let body = json!({ "target_language": target, "voice_settings": { "cloning_strength": strength } });
-                        let url = format!("{projects}/{project}/language");
-                        let added =
-                            post_json(&http, &url, &body, &format!("add '{target}' to the ElevenLabs dub project")).await;
+                        let address = projects.clone().segment(&project)?.segment("language")?;
+                        let added = post_json(&http, address.as_str(), &body, &format!("add '{target}' to the ElevenLabs dub project"))
+                            .await;
                         let answer = match added {
                             Ok(answer) => answer,
                             Err(e) => {
-                                let fate = if keep {
-                                    "it stays on the account behind this node's key, where the first language you add uses that prepaid dub; or delete it there"
-                                } else {
-                                    discard(&ctx, &http, &projects, &project).await?;
-                                    "it was deleted"
-                                };
+                                let fate = project_fate(keep);
                                 return Err(node_error(format!(
                                     "adding '{target}' to the dub project {project} failed: {e}. Creating the project \
                                      already cost one language's dub, and {fate}"
                                 )));
                             }
                         };
-                        let language = answer["language_id"]
+                        Ok(answer["language_id"]
                             .as_str()
-                            .node_err("ElevenLabs added the language but its answer has no language_id")?;
-                        Ok(json!({ "language": language }))
+                            .node_err("ElevenLabs added the language but its answer has no language_id")?
+                            .to_string())
                     })
-                    .await?;
-                added["language"].as_str().node_err("the dub language this run recorded has no language id")?.to_string()
+                    .await?
             }
         };
-        let target_url = format!("{projects}/{project}/language/{language}");
+        let target_url = projects.clone().segment(&project)?.segment("language")?.segment(&language)?;
 
         // Resume on any status that is not in flight, so one this node
         // does not know ends the wait and is refused below instead of
         // being waited on for ever. The wait carries only the status; the
         // read after it carries the rest, with the download URL signed
         // now rather than whenever the wait ended (it lasts an hour).
-        let waited = ctx
-            .await_signal(PollEndpoint {
-                url: target_url.clone(),
-                interval_secs: 10,
-                access: Some(weft::primitive::AccessRef::from(&account)),
-                filters: vec![Predicate::neq("status", "queued"), Predicate::neq("status", "processing")],
-                carry: vec!["status".into()],
-                ..Default::default()
-            })
-            .await;
-        match waited {
-            Ok(_) => {}
-            // The run gave the dub up without its answer (the wait ran out
-            // of time, or a person skipped it): nothing will read it.
-            Err(e @ (WeftError::WaitGaveUp(_) | WeftError::WaitSkipped(_))) => {
-                if !keep {
-                    discard(&ctx, &http, &projects, &project).await?;
-                }
-                return Err(e);
-            }
-            // Anything else, the park above all (the body stops here and
-            // replays once the dub has ended), leaves the project alone.
-            Err(e) => return Err(e),
-        }
+        let poll = PollEndpoint {
+            url: target_url.to_string(),
+            interval_secs: 10,
+            access: Some(weft::primitive::AccessRef::from(&account)),
+            filters: vec![Predicate::neq("status", "queued"), Predicate::neq("status", "processing")],
+            carry: vec!["status".into()],
+            ..Default::default()
+        };
+        state.wait(|s| &mut s.ended, poll).await?;
 
-        // Journaled, so a body replaying after a crash that followed the
-        // delete below reads the stored dub back instead of reading a
-        // project that is gone.
-        let dubbed = ctx
-            .run("elevenlabs_store_dub", || async {
-                Ok(finished(&ctx, &http, &projects, &project, &target, &target_url, &filename).await?.to_value())
-            })
-            .await;
-        if !keep {
-            discard(&ctx, &http, &projects, &project).await?;
-        }
-        let stored = StoredFile::from_value(&dubbed?)?;
-        ctx.pulse_downstream(NodeOutput::stored_file(stored).set("projectId", project)).await
+        // Kept, so a body run again after a crash finds the stored dub in
+        // its state instead of downloading it again.
+        let dubbed = state
+            .once(|s| &mut s.dubbed, async |_| finished(&ctx, &http, &projects, &project, &target, &target_url, &filename).await)
+            .await?;
+        ctx.pulse_downstream(NodeOutput::stored_file(dubbed).set("projectId", project)).await
     }
+}
+
+/// Where the dub stands: the project created (and the language it
+/// started), the language added on its own when a cloning strength is
+/// set, the status the wait ended on, and the dubbed audio stored.
+#[derive(Default, Serialize, Deserialize)]
+struct Dub {
+    created: Option<Created>,
+    added: Option<String>,
+    ended: Option<Value>,
+    dubbed: Option<StoredFile>,
+}
+
+/// The dub project the create made.
+#[derive(Clone, Serialize, Deserialize)]
+struct Created {
+    project: String,
+    /// The recording's name, which names the dubbed file.
+    filename: String,
+    /// The language the create started, when it started one.
+    language: Option<String>,
 }
 
 /// Where the recording to dub comes from.
@@ -231,35 +206,54 @@ enum Recording {
     Url(String),
 }
 
-/// What ElevenLabs would refuse, or what would pay for nothing, said
-/// before the project is created, or `None` when the dub can go.
-fn refusal(model: &str, cloning: bool, source_language: bool, transcript: Option<&Value>) -> Option<String> {
-    // ElevenLabs offers a cloning strength on Dubbing v2 only, and it
-    // goes on a language added after the project has taken its charge.
-    if cloning && model != "dubbing_v2" {
-        return Some(format!(
-            "`cloningStrength` is a dubbing_v2 setting, and this dub uses '{model}': set `model` to dubbing_v2, \
-             or leave `cloningStrength` empty"
-        ));
+/// The create's settings, as the node was given them.
+pub struct Settings<'a> {
+    pub model: &'a str,
+    pub source_language: Option<&'a str>,
+    /// The language the create starts, unless a cloning strength makes
+    /// the node add it on its own.
+    pub target_language: Option<&'a str>,
+    pub keyterms: &'a [String],
+    pub transcript: Option<&'a Value>,
+    pub reference: Option<&'a str>,
+}
+
+impl Settings<'_> {
+    /// The create's form, all but a stored recording, which goes after
+    /// it streamed out of storage: every setting given, and the public
+    /// `source_url` ElevenLabs fetches the recording from when there is
+    /// one.
+    pub fn form(&self, source_url: Option<&str>) -> WeftResult<Multipart> {
+        let mut form = Multipart::form_data().text("model_id", self.model);
+        if let Some(link) = source_url {
+            form = form.text("source_url", link);
+        }
+        if let Some(lang) = self.source_language {
+            form = form.text("source_language", lang);
+        }
+        if let Some(target) = self.target_language {
+            form = form.text("target_language", target);
+        }
+        // ElevenLabs reads a list field as the field repeated.
+        for term in self.keyterms {
+            form = form.text("keyterms", term);
+        }
+        if let Some(transcript) = self.transcript {
+            let document = serde_json::to_vec(transcript).node_err("serialize the transcript")?;
+            form = form.file("transcript", "transcript.json", "application/json", document);
+        }
+        if let Some(reference) = self.reference {
+            form = form.text("reference", reference);
+        }
+        Ok(form)
     }
-    let Some(transcript) = transcript else { return None };
-    if !source_language {
-        return Some("ElevenLabs needs `sourceLang` with a `transcript`: say which language the transcript is in".into());
-    }
-    // A transcript's translations seed the language the create starts,
-    // and a cloning strength makes the node add that language on its own.
-    let translated = transcript["segments"]
-        .as_array()
-        .is_some_and(|segments| segments.iter().any(|s| s.get("translation").is_some()));
-    if cloning && translated {
-        return Some(
-            "the `transcript` carries translations, which ElevenLabs only takes for a language started with the \
-             project, and `cloningStrength` needs the language added on its own: drop the translations, or leave \
-             `cloningStrength` empty"
-                .into(),
-        );
-    }
-    None
+}
+
+/// Whether a `transcript` carries translations, which seed the language
+/// the create starts (a cloning strength makes the node add that
+/// language on its own instead, so the two cannot go together).
+fn translated(transcript: &Value) -> bool {
+    transcript["segments"].as_array().is_some_and(|segments| segments.iter().any(|s| s.get("translation").is_some()))
 }
 
 /// Read the dub target that just ended and store its audio, or fail with
@@ -267,20 +261,20 @@ fn refusal(model: &str, cloning: bool, source_language: bool, transcript: Option
 async fn finished(
     ctx: &RunContext,
     http: &Client,
-    projects: &str,
+    projects: &Url,
     project: &str,
     target: &str,
-    target_url: &str,
+    target_url: &Url,
     filename: &str,
 ) -> WeftResult<StoredFile> {
-    let dub = get_json(http, target_url, "read the finished ElevenLabs dub").await?;
+    let dub = get_json(http, target_url.as_str(), "read the finished ElevenLabs dub").await?;
+    let project_url = projects.clone().segment(project)?;
     match dub["status"].as_str().unwrap_or_default() {
         "completed" => {}
         // The target only says its project failed; the project carries
         // the cause.
         "failed" if dub["error"]["code"] == "project_failed" => {
-            let parent =
-                get_json(http, &format!("{projects}/{project}"), "read the failed ElevenLabs dub project").await?;
+            let parent = get_json(http, project_url.as_str(), "read the failed ElevenLabs dub project").await?;
             return Err(failure(&format!("the dub project {project}"), &parent["error"]));
         }
         "failed" => return Err(failure(&format!("the dub into '{target}' of project {project}"), &dub["error"])),
@@ -290,7 +284,7 @@ async fn finished(
     }
     // The target carries its own warnings; what came up while the source
     // was prepared is reported on the project.
-    let parent = get_json(http, &format!("{projects}/{project}"), "read the finished ElevenLabs dub project").await?;
+    let parent = get_json(http, project_url.as_str(), "read the finished ElevenLabs dub project").await?;
     let lines: Vec<String> = [&parent["warnings"], &dub["warnings"]]
         .into_iter()
         .filter_map(Value::as_array)
@@ -304,28 +298,25 @@ async fn finished(
         .as_str()
         .node_err("ElevenLabs reports the dub finished but gives no outputs.lossless_audio to download")?;
     let stem = Path::new(filename).file_stem().and_then(|s| s.to_str()).unwrap_or(filename);
-    store_download(ctx, url, "audio/flac", &format!("dubbed_{target}_{stem}.flac")).await
+    // Stored as the lossless FLAC ElevenLabs names it, whatever type the
+    // signed download is served under.
+    let stored = ctx
+        .storage(StorageScope::Run)
+        .put_from_url(url, Some("audio/flac"), Some(&format!("dubbed_{target}_{stem}.flac")), None)
+        .await?;
+    StoredFile::from_value(&stored)
 }
 
-/// Delete a dub project nobody keeps. One already gone counts as
-/// deleted (the body can replay after a crash that followed the delete);
-/// one that cannot be deleted never fails the node, since the dub it
-/// served is already paid for: it is named on the node's log instead.
-async fn discard(ctx: &RunContext, http: &Client, projects: &str, project: &str) -> WeftResult<()> {
-    let refused = match http.delete(format!("{projects}/{project}")).send().await {
-        Ok(resp) if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND => return Ok(()),
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            format!("ElevenLabs answered {status}: {}", body.chars().take(300).collect::<String>())
-        }
-        Err(e) => send_error(e),
-    };
-    ctx.log(
-        LogLevel::Warn,
-        format!("the dub project {project} is still on the ElevenLabs account ({refused}); delete it from that account"),
-    )
-    .await
+/// What becomes of a project whose dub could not start: kept on the
+/// account (`keep`), where its prepaid dub serves the first language
+/// added, or deleted when the node ends. Its words finish the failure's
+/// sentence.
+fn project_fate(keep: bool) -> &'static str {
+    if keep {
+        "it stays on the account behind this node's key, where the first language you add uses that prepaid dub; or delete it there"
+    } else {
+        "it is deleted"
+    }
 }
 
 /// The failure ElevenLabs reported in an `error` object (a dub target's

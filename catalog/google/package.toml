@@ -5,7 +5,7 @@ name = "google"
 async-trait = "0.1"
 serde_json = "1"
 csv = "1"
-urlencoding = "2"
+chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.23"
 uuid = { version = "1", features = ["v4"] }
 # Gmail's send takes a whole RFC 5322 message; lettre's builder

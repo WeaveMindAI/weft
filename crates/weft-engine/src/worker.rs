@@ -27,9 +27,9 @@
 //! no new node and, once the nodes it runs have ended, is handed back
 //! whole for another worker to carry on from its record (a node still
 //! running `HAND_BACK_GRACE` later is stopped where it is, and the next
-//! worker fails it as cut short); one that cannot (unrecorded, tied to
-//! the caller on the line, or with a bus open) carries on as if nothing
-//! was asked, getting as far as it can before the platform stops the
+//! worker runs it again from its saved state, or fails it as cut short
+//! when it keeps none); one that cannot (unrecorded, or with its caller
+//! on the line) carries on as if nothing was asked, getting as far as it can before the platform stops the
 //! process, which ends it the way a crash would. The worker writes what
 //! is left of their records as each one ends. On a
 //! platform that stops a worker no call holds open, a run that outlives
@@ -154,7 +154,8 @@ struct Worker {
     /// drives has to leave (see the module doc), and no run is born here.
     stopping: tokio_util::sync::CancellationToken,
     /// Fired [`HAND_BACK_GRACE`] after [`Self::stopping`]: the nodes still
-    /// running are stopped where they are and their runs handed back.
+    /// running are stopped where they are and their runs handed back. Each
+    /// run's own overdue token is a child of it ([`Self::hand_back`]).
     stopping_overdue: tokio_util::sync::CancellationToken,
     run_cap: Option<std::time::Duration>,
     /// See [`WorkerConfig::resume_when_caller_leaves`].
@@ -475,7 +476,7 @@ impl Worker {
         // by the next worker, and carries on here if it cannot, until the
         // process goes (the driver decides both). The ask ends with the
         // drive.
-        let hand_back = crate::run_driver::HandBack { asked: self.stopping.child_token(), overdue: self.stopping_overdue.clone() };
+        let hand_back = self.hand_back();
         let _asked_ends = hand_back.asked.clone().drop_guard();
         // On a platform that stops a worker no call holds open, a run has to
         // leave this worker once its caller is gone (hung up, or answered):
@@ -505,7 +506,7 @@ impl Worker {
             &self.replica,
             &self.tenant_id,
         );
-        let outcome = self.while_driving(run, run_id, &cancellation, caller.is_some(), leaves_with, &hand_back).await;
+        let outcome = self.while_driving(run, run_id, &cancellation, caller, leaves_with, &hand_back).await;
         // The run's own work is over: its place at the door (its entry's
         // runs at once, its run permit) is free once the slot goes, and a
         // failure is counted for `weft status`.
@@ -530,6 +531,14 @@ impl Worker {
             }
         }
         outcome.map(|_| ())
+    }
+
+    /// One run's hand-back: asked when the worker is told to stop and
+    /// overdue when the worker's stop is, either also on its own when the
+    /// run alone has to leave (its caller left, or the platform's cap on
+    /// its connection came, see [`Self::while_driving`]).
+    fn hand_back(&self) -> crate::run_driver::HandBack {
+        crate::run_driver::HandBack { asked: self.stopping.child_token(), overdue: self.stopping_overdue.child_token() }
     }
 
     /// Let go of a run whose record is written (whole, or for a durable
@@ -615,12 +624,29 @@ impl Worker {
     /// leaving (`leaves_with`), which asks the run to let go of this
     /// worker. The cap's timer is only set once the run outlives the poll
     /// that started it, and never on a platform without a cap.
+    ///
+    /// A run whose caller (`live`) is still on the line when the cap comes
+    /// and whose route outlives its caller keeps going without it, with
+    /// the window a worker being stopped gives: its hand-back is asked
+    /// (it starts no new node, and the ones running go on to their end),
+    /// and the caller stops keeping it on this worker
+    /// (`LiveCallerConnection::letting_go`), so it can hand itself back.
+    /// It is overdue [`HAND_BACK_GRACE`] later if it has not
+    /// ([`overdue_after_grace`]): the nodes still running stop where they
+    /// are, and a fresh worker runs each of them again from its saved
+    /// state. The caller's connection stays open through the window (it is
+    /// the request keeping this worker up) and is let go, told to
+    /// reconnect, when the window ends or the run hands itself back,
+    /// whichever comes first. A run that ends within the window ends its
+    /// exchange the way any run does. Such a run is always recorded (the
+    /// compiler refuses `outlivesCaller` without it), so it can always be
+    /// handed back. Every other run ends at the cap.
     async fn while_driving(
         &self,
         run: impl std::future::Future<Output = Result<RunOutcome>>,
         run_id: RunId,
         cancellation: &CancellationFlag,
-        live: bool,
+        live: Option<Arc<crate::caller_conn::LiveCallerConnection>>,
         leaves_with: Option<Arc<crate::caller_conn::LiveCallerConnection>>,
         hand_back: &crate::run_driver::HandBack,
     ) -> Result<RunOutcome> {
@@ -641,13 +667,51 @@ impl Worker {
         };
         tokio::pin!(caller_left);
         let (mut cap_fired, mut left) = (false, false);
+        // The window a caller being let go at the cap keeps the line open
+        // through (its clock starts on its first poll, once the cap came),
+        // and that caller.
+        let window = overdue_after_grace(&hand_back.overdue);
+        tokio::pin!(window);
+        let mut window_open = false;
+        let mut leaving: Option<&Arc<crate::caller_conn::LiveCallerConnection>> = None;
         loop {
             tokio::select! {
                 biased;
+                // A run that hands itself back (or pauses) within the window
+                // lets its caller go as it ends its exchange
+                // (`LiveCallerConnection::run_carries_on`).
                 outcome = &mut run => return outcome,
+                () = &mut window, if window_open => {
+                    window_open = false;
+                    if let Some(conn) = leaving {
+                        conn.let_go().await;
+                    }
+                }
                 () = &mut capped, if !cap_fired => {
                     cap_fired = true;
-                    Limit::RunCap { cap: cap.expect("armed only with a cap"), live }.end(cancellation, run_id);
+                    let cap = cap.expect("armed only with a cap");
+                    match live.as_ref().filter(|conn| weft_core::caller::CallerConnection::config(conn.as_ref()).outlives_caller) {
+                        Some(conn) => {
+                            tracing::info!(target: "weft_engine::worker", %run_id, ?cap, "the caller reached the platform's limit on one connection; the run outlives it, so its running nodes get the hand-back's window to end before it carries on in a fresh worker");
+                            let why = format!(
+                                "this connection ended {} before the {} minute limit this platform puts on one connection; \
+                                 run {run_id} goes on without it (its route outlives its caller), so reconnect to talk to the \
+                                 program again",
+                                seconds(RUN_CAP_MARGIN),
+                                cap.as_secs() / 60,
+                            );
+                            // A caller that already hung up is told nothing:
+                            // nobody is left to tell. The run still gets the
+                            // window to hand itself back.
+                            if weft_core::caller::CallerConnection::is_connected(conn.as_ref()) {
+                                conn.letting_go(why);
+                                leaving = Some(conn);
+                            }
+                            hand_back.asked.cancel();
+                            window_open = true;
+                        }
+                        None => Limit::RunCap { cap, live: live.is_some() }.end(cancellation, run_id),
+                    }
                 }
                 () = &mut caller_left, if !left => {
                     left = true;
@@ -1051,8 +1115,8 @@ impl Limit {
                 "run {run_id} stopped {} before the {} minute limit this platform puts on the line \
                  between its worker and weft, counted from when that line opened, not from the run's start: every \
                  run on the worker only waited, and a worker whose runs only wait opens no new line, which would \
-                 wake the database. A run that can pause (recorded, not tied to its caller, no bus open) lets go of \
-                 its worker while it waits, and may wait as long as it needs",
+                 wake the database. A run that can pause (recorded, its caller gone) lets go of its worker while \
+                 it waits, and may wait as long as it needs",
                 seconds(left),
                 cut.as_secs() / 60,
             ),
@@ -1322,13 +1386,14 @@ enum CutLook {
     RecordsPending,
 }
 
-/// Once [`Worker::stopping`] fired, which takes no new run and hands back
-/// every run that can be suspended once its running nodes end: fire
-/// [`Worker::stopping_overdue`] [`HAND_BACK_GRACE`] later, which stops
-/// the nodes still running.
-async fn overdue_after_grace(worker: &Worker) {
+/// Once a hand-back was asked (a run starts no new node, and is handed
+/// back once its running nodes end): fire `overdue` [`HAND_BACK_GRACE`]
+/// later, which stops the nodes still running. For the worker's stop,
+/// [`Worker::stopping_overdue`] (every run's); at the platform's limit on
+/// one connection, that run's own ([`Worker::while_driving`]).
+async fn overdue_after_grace(overdue: &tokio_util::sync::CancellationToken) {
     tokio::time::sleep(HAND_BACK_GRACE).await;
-    worker.stopping_overdue.cancel();
+    overdue.cancel();
 }
 
 /// Stop the worker once the platform says to. A run that cannot be
@@ -1339,7 +1404,7 @@ fn stop_on_signal(worker: &Worker) {
         shutdown_signal().await;
         tracing::info!(target: "weft_engine::worker", "told to stop: every run that can be suspended is handed back once its running nodes end; the others carry on until the process goes");
         worker.stopping.cancel();
-        overdue_after_grace(&worker).await;
+        overdue_after_grace(&worker.stopping_overdue).await;
     });
 }
 
@@ -1404,7 +1469,7 @@ fn keep_ahead_of_line_cut(worker: &Worker) {
                 let looked = margin_reached.then(|| worker.stopped_for_cut(told));
                 if looked == Some(CutLook::Stopped) {
                     tracing::info!(target: "weft_engine::worker", line_cut_secs = told.max_age.as_secs(), "every run only waits and weft cuts this worker's line soon, on which they hear their answers: the ones that can pause are handed back, the others end, and the next request starts a fresh worker");
-                    overdue_after_grace(&worker).await;
+                    overdue_after_grace(&worker.stopping_overdue).await;
                     return;
                 }
                 // `written` answers at once if the records went out since
@@ -2814,5 +2879,154 @@ mod tests {
             matches!(worker.door.arrive(call(), axum::body::Body::empty()).await, crate::door::Arrived::Run(..)),
             "the run ended, so its room is free again"
         );
+    }
+
+    /// A live caller for the cap tests, its route outliving it or not.
+    fn capped_caller(outlives_caller: bool) -> Arc<crate::caller_conn::LiveCallerConnection> {
+        let config = weft_core::caller::CallerRuntimeConfig {
+            protocol: weft_core::signal::Protocol::Websocket,
+            data_type: weft_core::signal::DataType::Json,
+            backpressure: weft_core::signal::Backpressure::Block,
+            error_mode: weft_core::signal::ErrorMode::Surface,
+            max_inbound_bytes: 1024,
+            caller_silence_secs: weft_core::signal::DEFAULT_CALLER_SILENCE_SECS,
+            max_session_secs: 0,
+            outlives_caller,
+            inbound_window: 4,
+            journal: weft_core::stream_journal::JournalPolicy::default(),
+        };
+        let unkept = Arc::new(crate::run_driver::engine_test_rig::Unkept);
+        crate::caller_conn::new_connection(config, RunId::nil(), Arc::default(), None, unkept).0
+    }
+
+    /// A worker whose platform caps one stretch of a run just past its
+    /// margin, so the cap comes a second in.
+    fn capped_worker() -> Worker {
+        let config = WorkerConfig { run_cap: Some(RUN_CAP_MARGIN + std::time::Duration::from_secs(1)), ..config() };
+        worker_configured(Arc::new(NoCatalog), clients(Arc::new(MemJournal::default())), &config)
+    }
+
+    /// What a capped run saw once its hand-back was asked: whether its
+    /// caller was still on the line, still kept it on this worker, and
+    /// whether the hand-back was overdue yet.
+    #[derive(Debug, PartialEq)]
+    struct AtTheAsk {
+        caller_on_the_line: bool,
+        caller_holds_it: bool,
+        overdue: bool,
+        /// Whether the caller was still on the line when the hand-back
+        /// went overdue (`None`: it never did).
+        on_the_line_when_overdue: Option<bool>,
+    }
+
+    /// A run that, once its hand-back is asked, notes what it saw, then
+    /// hands itself back after `finishing` (its running node ending), ending
+    /// its caller's exchange as the drive does, or, when its hand-back goes
+    /// overdue first, notes whether the window already let the caller go
+    /// and leaves the exchange alone.
+    fn capped_run(
+        hand_back: &crate::run_driver::HandBack,
+        caller: &Arc<crate::caller_conn::LiveCallerConnection>,
+        finishing: Option<std::time::Duration>,
+    ) -> (impl std::future::Future<Output = Result<RunOutcome>>, Arc<std::sync::Mutex<Option<AtTheAsk>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let (watched, caller, noted) = (hand_back.clone(), caller.clone(), seen.clone());
+        let run = async move {
+            watched.asked.cancelled().await;
+            let mut at_the_ask = AtTheAsk {
+                caller_on_the_line: weft_core::caller::CallerConnection::is_connected(caller.as_ref()),
+                caller_holds_it: weft_core::caller::CallerConnection::holds_the_run(caller.as_ref()),
+                overdue: watched.overdue.is_cancelled(),
+                on_the_line_when_overdue: None,
+            };
+            let finished = async {
+                match finishing {
+                    Some(after) => tokio::time::sleep(after).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                // How the drive ends the exchange of a run it hands back.
+                () = finished => caller.run_carries_on(crate::caller_conn::HANDED_BACK).await,
+                () = watched.overdue.cancelled() => {
+                    at_the_ask.on_the_line_when_overdue = Some(weft_core::caller::CallerConnection::is_connected(caller.as_ref()));
+                }
+            }
+            *noted.lock().unwrap() = Some(at_the_ask);
+            Ok(RunOutcome::HandedBack)
+        };
+        (run, seen)
+    }
+
+    /// At the cap, a run whose route outlives its caller gets the window a
+    /// stopping worker gives: its hand-back is asked while the caller stays
+    /// on the line (no longer keeping it here), and goes overdue
+    /// [`HAND_BACK_GRACE`] later when its node is still running. Only then
+    /// is the caller let go, told why, so it reconnects. The run is not
+    /// ended, and another run on the same worker stays where it is.
+    #[tokio::test(start_paused = true)]
+    async fn at_the_cap_a_run_outliving_its_caller_lets_the_caller_go_and_is_handed_back() {
+        let worker = capped_worker();
+        let caller = capped_caller(true);
+        let flag = CancellationFlag::new_arc();
+        let hand_back = worker.hand_back();
+        let beside = worker.hand_back();
+        let (run, seen) = capped_run(&hand_back, &caller, None);
+        let asked_at = tokio::time::Instant::now();
+        let outcome = worker.while_driving(run, RunId::nil(), &flag, Some(caller.clone()), None, &hand_back).await.expect("drove");
+        assert!(matches!(outcome, RunOutcome::HandedBack), "the run was handed back: {outcome:?}");
+        assert_eq!(
+            seen.lock().unwrap().take(),
+            Some(AtTheAsk { caller_on_the_line: true, caller_holds_it: false, overdue: false, on_the_line_when_overdue: Some(false) }),
+            "asked first with the caller still on the line, which the window's end let go"
+        );
+        assert!(hand_back.overdue.is_cancelled(), "a node still running is stopped once the window ends");
+        assert!(asked_at.elapsed() >= std::time::Duration::from_secs(1) + HAND_BACK_GRACE, "the window was given in full");
+        assert!(!flag.is_cancelled(), "the cap did not end the run: {:?}", flag.cause());
+        assert!(!weft_core::caller::CallerConnection::is_connected(caller.as_ref()), "the caller was let go");
+        assert!(
+            !beside.asked.is_cancelled() && !beside.overdue.is_cancelled() && !worker.stopping_overdue.is_cancelled(),
+            "only the capped run leaves the worker"
+        );
+        worker.stopping_overdue.cancel();
+        assert!(beside.overdue.is_cancelled(), "the worker's own stop still reaches every run");
+    }
+
+    /// At the cap, a run whose node ends within the window hands itself
+    /// back whole: its hand-back never goes overdue, so nothing is stopped
+    /// where it is, and its caller is let go then, before the window ends.
+    #[tokio::test(start_paused = true)]
+    async fn at_the_cap_a_node_ending_within_the_window_is_not_stopped() {
+        let worker = capped_worker();
+        let caller = capped_caller(true);
+        let flag = CancellationFlag::new_arc();
+        let hand_back = worker.hand_back();
+        let (run, seen) = capped_run(&hand_back, &caller, Some(HAND_BACK_GRACE / 2));
+        let outcome = worker.while_driving(run, RunId::nil(), &flag, Some(caller.clone()), None, &hand_back).await.expect("drove");
+        assert!(matches!(outcome, RunOutcome::HandedBack), "the run handed itself back: {outcome:?}");
+        assert!(seen.lock().unwrap().is_some(), "its hand-back was asked");
+        assert!(!hand_back.overdue.is_cancelled(), "its node ended in time, so nothing was stopped");
+        assert!(!weft_core::caller::CallerConnection::is_connected(caller.as_ref()), "the caller was let go once the run handed itself back");
+    }
+
+    /// At the cap, a run whose caller cannot be left behind is ended as a
+    /// time limit telling the caller to reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn at_the_cap_a_run_tied_to_its_caller_is_ended() {
+        let worker = capped_worker();
+        let caller = capped_caller(false);
+        let flag = CancellationFlag::new_arc();
+        let watched = flag.clone();
+        let run = async move {
+            watched.cancelled().await;
+            Ok(RunOutcome::Cancelled { cause: watched.cause().expect("a cause") })
+        };
+        let hand_back = worker.hand_back();
+        let outcome = worker.while_driving(run, RunId::nil(), &flag, Some(caller), None, &hand_back).await.expect("drove");
+        assert!(
+            matches!(&outcome, RunOutcome::Cancelled { cause: weft_core::run::CancelCause::Limit { detail } } if detail.contains("reconnect")),
+            "{outcome:?}"
+        );
+        assert!(!hand_back.asked.is_cancelled() && !hand_back.overdue.is_cancelled(), "an ended run is not handed back");
     }
 }

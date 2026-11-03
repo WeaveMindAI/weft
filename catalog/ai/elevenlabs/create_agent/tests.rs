@@ -366,19 +366,15 @@ async fn json_inputs_merge(rig: FakeRig) -> WeftResult<()> {
 
 async fn refused(rig: FakeRig) -> WeftResult<()> {
     rig.wire_output("_error");
-    let servers: Vec<String> = (0..11).map(|i| format!("mcp-{i}")).collect();
+    // What the rules cannot see: a dict's values, and what the JSON
+    // inputs set. The MCP server count and the knowledge base's closed
+    // values are metadata rules, which this rig does not run.
     for (extra, says) in [
-        (json!({ "mcpServerIds": servers }), "at most 10"),
-        (json!({ "knowledgeBase": [{ "id": "doc-1", "name": "Menu", "type": "pdf" }] }), "has type 'pdf'"),
-        (
-            json!({ "knowledgeBase": [{ "id": "doc-1", "name": "Menu", "type": "file", "usageMode": "always" }] }),
-            "usageMode 'always'",
-        ),
         (
             json!({ "dataCollection": { "party_size": { "type": "integer", "description": "How many", "enum": ["2"] } } }),
             "only on a `string` item",
         ),
-        (json!({ "dataCollection": { "day": { "type": "date", "description": "Which day" } } }), "has type \"date\""),
+        (json!({ "dataCollection": { "day": { "type": "date", "description": "Which day" } } }), "has type 'date'"),
         (json!({ "evaluationCriteria": { "long": "a".repeat(2001) } }), "2001 characters"),
         (json!({ "llm": "custom-llm" }), "needs that model's definition"),
         (

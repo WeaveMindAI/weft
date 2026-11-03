@@ -2084,7 +2084,8 @@
 					// it gained instead (`node-inherited`) is defined nowhere.
 					const nodeClass = notInRun ? 'run-dimmed'
 						: firingStatus === 'running' ? 'node-running'
-						: firingStatus === 'waiting_for_input' ? 'node-waiting'
+						: firingStatus === 'waiting' ? 'node-waiting'
+						: firingStatus === 'paused' ? 'node-paused'
 						: firingStatus === 'failed' ? 'node-failed'
 						: firingStatus === 'completed' || firingStatus === 'skipped' ? 'node-completed'
 						: '';

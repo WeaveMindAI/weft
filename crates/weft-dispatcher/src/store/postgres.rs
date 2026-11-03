@@ -236,12 +236,17 @@ async fn cancel_unowned_in(
         Ok(())
     })
     .await?;
-    let writes = read.into_events(cause, now);
+    let (writes, owed) = read.into_ending(cause, now);
     let node_cancellations = writes.iter().filter(|write| matches!(write, RunEvent::NodeCancelled { .. })).count();
     match weft_journal::record::append_locked_in(tx, run_id, locked, &writes, weft_journal::record::DISPATCHER, Then::Stays).await? {
-        Appended::At(_) => Ok(node_cancellations),
+        Appended::At(_) => {}
         other => anyhow::bail!("run {run_id} was locked with no owner, yet its cancel was not written: {other:?}"),
     }
+    // What its firings owed goes out now that they ended with no worker,
+    // queued in the same commit so a crash cannot lose it.
+    let calls = crate::api::run::owed_call_requests(run_id, owed, &locked.tenant_id, locked.project_id);
+    queue_call_requests_in(tx, Some(run_id), locked.project_id, &calls).await?;
+    Ok(node_cancellations)
 }
 
 /// The schema of the stores' tables. Early in `app::DISPATCHER_GROUPS` (other
@@ -269,6 +274,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // The full identity travels inside `bake_json`. A setup of some
         // triggers merges its captures into the bake it shares a key with.
         r#"CREATE TABLE IF NOT EXISTS trigger_bake (
+            -- The key the boot walks `bake_json`'s rows by when it carries
+            -- them to a newer shape: the natural key below holds a
+            -- nullable `instance_id`, so it cannot be the primary key.
+            id BIGSERIAL PRIMARY KEY,
             project_id UUID NOT NULL,
             instance_id TEXT,
             program_hash TEXT NOT NULL,
@@ -914,7 +923,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // tied, which is what the last-one-wins rule compares (unix
         // seconds would tie two runs of the same user inside one
         // second). The (run, tag) uniqueness is what makes a body
-        // replayed after a durable wait land on the same row instead of moving
+        // run again after a pause or a crash land on the same row instead of moving
         // the run's place in the order. Rows go with the run.
         r#"CREATE TABLE IF NOT EXISTS run_tag (
             seq BIGSERIAL PRIMARY KEY,
@@ -1077,21 +1086,28 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                     WHERE v.fate = 'continue' AND r.run_id = v.id;
                 -- Each cost is named by its run's ordinal, which names the
                 -- run only when the run went in now: any other's costs go
-                -- nowhere.
-                PERFORM weft_record_costs(
-                    ARRAY(SELECT CASE WHEN v_fates[c.run] IN ('insert', 'continue') THEN p_ids[c.run] END
-                          FROM unnest(p_cost_run) WITH ORDINALITY AS c(run, n) ORDER BY c.n),
-                    p_cost_seq, p_cost_id, p_cost_idx, p_cost_node, p_cost_service, p_cost_model, p_cost_amount,
-                    p_cost_paid_by, p_cost_paid_by_instance, p_cost_at, p_cost_path_cost, p_cost_path_site);
+                -- nowhere. Called only when the batch carries costs: the
+                -- SQL function plans its query on every call, which a
+                -- durable run (one run per batch) paid on every write.
+                IF cardinality(p_cost_run) > 0 THEN
+                    PERFORM weft_record_costs(
+                        ARRAY(SELECT CASE WHEN v_fates[c.run] IN ('insert', 'continue') THEN p_ids[c.run] END
+                              FROM unnest(p_cost_run) WITH ORDINALITY AS c(run, n) ORDER BY c.n),
+                        p_cost_seq, p_cost_id, p_cost_idx, p_cost_node, p_cost_service, p_cost_model, p_cost_amount,
+                        p_cost_paid_by, p_cost_paid_by_instance, p_cost_at, p_cost_path_cost, p_cost_path_site);
+                END IF;
                 -- A run's secrets go in only when the run did, each once:
-                -- a batch sent again finds them there.
-                INSERT INTO run_secret (secret_id, project_id, run_id, sealed)
-                    SELECT s.id, r.project_id, r.run_id, s.sealed
-                    FROM unnest(p_secret_run, p_secret_id, p_secret_sealed) AS s(run, id, sealed)
-                        JOIN run r ON r.run_id = p_ids[s.run]
-                    WHERE v_fates[s.run] IN ('insert', 'continue')
-                    ORDER BY s.id
-                    ON CONFLICT (secret_id) DO NOTHING;
+                -- a batch sent again finds them there. Only when the batch
+                -- carries secrets, so a batch without any runs no statement.
+                IF cardinality(p_secret_run) > 0 THEN
+                    INSERT INTO run_secret (secret_id, project_id, run_id, sealed)
+                        SELECT s.id, r.project_id, r.run_id, s.sealed
+                        FROM unnest(p_secret_run, p_secret_id, p_secret_sealed) AS s(run, id, sealed)
+                            JOIN run r ON r.run_id = p_ids[s.run]
+                        WHERE v_fates[s.run] IN ('insert', 'continue')
+                        ORDER BY s.id
+                        ON CONFLICT (secret_id) DO NOTHING;
+                END IF;
                 INSERT INTO run_log (run_id, seq, events, events_version, writer, written_at)
                     SELECT p_ids[w.run], w.seq, w.events, p_events_version, p_writer, p_now
                     FROM unnest(p_row_run, p_row_seq, p_row_events) AS w(run, seq, events)
@@ -1976,13 +1992,30 @@ async fn queue_cancel_calls_in(tx: &impl Client, waits: &[SignalRegistration]) -
                 continue;
             }
         };
+        queued += queue_call_requests_in(tx, wait.run_id, wait.project_id, std::slice::from_ref(&call)).await?;
+    }
+    Ok(queued)
+}
+
+/// Queue `calls` of `project_id`'s run `run_id` for the listener to send
+/// (`weft_task_store::TaskKind::CancelCall`), in the caller's transaction,
+/// each keyed by its name so it is queued once. Answers how many it
+/// queued.
+async fn queue_call_requests_in(
+    tx: &impl Client,
+    run_id: Option<RunId>,
+    project_id: uuid::Uuid,
+    calls: &[weft_core::signal::listener_protocol::CancelCallRequest],
+) -> anyhow::Result<usize> {
+    let mut queued = 0;
+    for call in calls {
         let task = weft_task_store::tasks::NewTask {
             kind: weft_task_store::TaskKind::CancelCall,
-            project_id: Some(wait.project_id),
-            dedup_key: Some(weft_task_store::kinds::cancel_call_key(&wait.token)),
-            run_id: wait.run_id,
-            tenant_id: wait.tenant_id.clone(),
-            payload: serde_json::to_value(&call).context("a last call's payload")?,
+            project_id: Some(project_id),
+            dedup_key: Some(weft_task_store::kinds::cancel_call_key(&call.token)),
+            run_id,
+            tenant_id: call.tenant_id.clone(),
+            payload: serde_json::to_value(call).context("a last call's payload")?,
         };
         let outcome = weft_task_store::tasks::enqueue_dedup_in(tx, task).await.context("queue a last call")?;
         if matches!(outcome, weft_task_store::tasks::DedupOutcome::Inserted(_)) {
@@ -2075,10 +2108,33 @@ pub(crate) async fn erase_project_runs(tx: &impl Client, project_id: uuid::Uuid)
         .await?
         .into_iter()
         .collect();
+    // What the firings of a run it ends owed goes out too, read off its
+    // record before the record goes (an ended run's firings settled
+    // theirs as they ended).
+    let unended: Vec<(RunId, String)> = tx
+        .all("SELECT run_id, tenant_id FROM run WHERE project_id = $1 AND state <> 'ended'", &[&project_id])
+        .await?;
+    let mut owed_calls = Vec::new();
+    for (run_id, tenant_id) in unended {
+        let owed = weft_journal::record::fold_pages(
+            |after| weft_journal::record::read_page(tx, run_id, after),
+            None,
+            weft_journal::OwedCalls::default(),
+            move |owed: &mut weft_journal::OwedCalls, page| {
+                page.decode(run_id).map_err(anyhow::Error::msg)?.iter().for_each(|row| owed.apply(&row.event));
+                Ok(())
+            },
+        )
+        .await?;
+        owed_calls.push((run_id, crate::api::run::owed_call_requests(run_id, owed, &tenant_id, project_id)));
+    }
     let removed = erase_run_ids(tx, &run_ids).await?;
     let cut_short_waits: Vec<SignalRegistration> =
         removed.iter().filter(|wait| wait.run_id.is_some_and(|run| cut_short.contains(&run))).cloned().collect();
     queue_cancel_calls_in(tx, &cut_short_waits).await?;
+    for (run_id, calls) in owed_calls {
+        queue_call_requests_in(tx, Some(run_id), project_id, &calls).await?;
+    }
     Ok((run_ids.len(), removed))
 }
 

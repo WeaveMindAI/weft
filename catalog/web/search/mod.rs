@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, RunContext, Node, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use weft::storage::MAX_WIRE_VALUE_BYTES;
 
@@ -28,15 +28,15 @@ impl Node for WebSearchNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let query: String = ctx.inputs.get("query")?;
-        let num_results: f64 = ctx.inputs.get("numResults")?;
+        let num_results: u64 = ctx.inputs.get("numResults")?;
         let include_text: bool = ctx.inputs.get("includeText")?;
-        let max_text_chars: f64 = ctx.inputs.get("maxTextChars")?;
+        let max_text_chars: u64 = ctx.inputs.get("maxTextChars")?;
         let domains: Vec<String> = ctx.inputs.list("includeDomains")?;
 
         let mut body = json!({
             "query": query,
             "type": "auto",
-            "numResults": num_results as u64,
+            "numResults": num_results,
         });
         if include_text {
             // Exa cuts each page's text at `maxCharacters`, so the
@@ -46,15 +46,15 @@ impl Node for WebSearchNode {
             // news happened to be long. Settings whose texts could not
             // fit even one byte a character are refused before the paid
             // search.
-            if num_results * max_text_chars > MAX_WIRE_VALUE_BYTES as f64 {
-                return Err(WeftError::Input(format!(
+            if num_results * max_text_chars > MAX_WIRE_VALUE_BYTES as u64 {
+                weft::input_bail!(
                     "`numResults` {num_results} times `maxTextChars` {max_text_chars} is more text than the {} KB \
                      a wire carries; lower one of them so the two multiplied are at most {}",
                     MAX_WIRE_VALUE_BYTES / 1024,
                     MAX_WIRE_VALUE_BYTES
-                )));
+                );
             }
-            body["contents"] = json!({ "text": { "maxCharacters": max_text_chars as u64 } });
+            body["contents"] = json!({ "text": { "maxCharacters": max_text_chars } });
         }
         if !domains.is_empty() {
             body["includeDomains"] = json!(domains);

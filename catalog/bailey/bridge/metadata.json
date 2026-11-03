@@ -1,7 +1,7 @@
 {
   "type": "BaileyBridge",
   "label": "WhatsApp Bridge (Baileys)",
-  "description": "WhatsApp bridge (Baileys over WhatsApp Web) that every other WhatsApp node talks to through its `bridge` output. Pair a phone by QR code on first start; the session is kept on disk, so later starts reuse it.",
+  "description": "WhatsApp bridge (Baileys over WhatsApp Web) that every other WhatsApp node talks to through its `bridge` output. Pair a phone by QR code on first start; the session is kept on disk, so later starts reuse it. Its default size, a quarter CPU with 1Gi, is Compute Engine's `e2-micro` on a cloud install, about $6 a month.",
   "tags": [
     "whatsapp",
     "baileys",
@@ -10,29 +10,7 @@
   ],
   "icon": "MessageCircle",
   "color": "#25D366",
-  "inputs": [
-    {
-      "name": "cpu",
-      "type": "String",
-      "default": "0.25",
-      "label": "CPUs",
-      "description": "CPUs the machine sustains (`0.25`, `1`, `250m`). A cloud install picks its cheapest machine holding this and `memory`: a quarter CPU with 1Gi is Compute Engine's `e2-micro`, about $6 a month. A local install does not cap the container."
-    },
-    {
-      "name": "memory",
-      "type": "String",
-      "default": "1Gi",
-      "label": "Memory",
-      "description": "Memory, a number followed by Gi, Mi, G or M (`1Gi`). Sized with `cpu`; a local install does not cap the container."
-    },
-    {
-      "name": "machineType",
-      "type": "String",
-      "label": "Machine type",
-      "placeholder": "picked from CPUs and memory",
-      "description": "Last resort: a cloud's own machine type, used as is instead of the one picked from `cpu` and `memory` (`n2-standard-4` on Compute Engine). A local install ignores it."
-    }
-  ],
+  "inputs": [],
   "outputs": [
     {
       "name": "bridge",
@@ -62,58 +40,10 @@
     "images/bridge"
   ],
   "features": {
-    "liveEndpoint": "api"
-  },
-  "validate": [
-    {
-      "when": {
-        "kind": "all",
-        "of": [
-          {
-            "kind": "config_present",
-            "field": "cpu"
-          },
-          {
-            "kind": "not",
-            "of": {
-              "kind": "config_matches",
-              "field": "cpu",
-              "regex": "^[0-9]+(\\.[0-9]+)?m?$"
-            }
-          }
-        ]
-      },
-      "then": {
-        "message": "BaileyBridge '{id}' has a `cpu` it cannot read. Write a number, or thousandths with m (0.25, 250m).",
-        "level": "structural",
-        "severity": "error",
-        "port": "cpu"
-      }
-    },
-    {
-      "when": {
-        "kind": "all",
-        "of": [
-          {
-            "kind": "config_present",
-            "field": "memory"
-          },
-          {
-            "kind": "not",
-            "of": {
-              "kind": "config_matches",
-              "field": "memory",
-              "regex": "^[0-9]+(\\.[0-9]+)?(Gi|Mi|G|M)$"
-            }
-          }
-        ]
-      },
-      "then": {
-        "message": "BaileyBridge '{id}' has a `memory` it cannot read. Write a number followed by Gi, Mi, G or M (1Gi).",
-        "level": "structural",
-        "severity": "error",
-        "port": "memory"
-      }
+    "liveEndpoint": "api",
+    "machineInputs": {
+      "cpu": "0.25",
+      "memory": "1Gi"
     }
-  ]
+  }
 }

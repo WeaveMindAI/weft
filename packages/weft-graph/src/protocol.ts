@@ -114,10 +114,12 @@ export type WeftType =
   // A Bus output connects only to a Bus input; the payloads are not
   // type-checked. Wires only (a live runtime handle takes no literal).
   | { kind: 'bus' }
-  // An access handle (a stored credential grant). Access connects only
-  // to Access; the grant itself is opaque to the type system.
-  // SYNC: access <-> crates/weft-core/src/weft_type.rs WeftType::Access
-  | { kind: 'access' }
+  // A connection (a stored credential grant). `Access[fal]` (`service`
+  // set) is a connection to one service, bare `Access` to any.
+  // `Access[fal]` fits `Access[fal]` and bare `Access`; bare `Access`
+  // fits only bare `Access`.
+  // SYNC: WeftType 'access' <-> crates/weft-core/src/weft_type.rs WeftType::Access
+  | { kind: 'access'; service?: string }
   // A handle on one endpoint of an infra node, the value an infra node
   // emits so other nodes reach it. Infra connects only to Infra. Wires
   // only (minted by an infra node, never typed as a literal).
@@ -378,7 +380,8 @@ function parseSingleType(s: string): WeftType {
   if (s === 'Access') return { kind: 'access' };
   if (s === 'Infra') return { kind: 'infra' };
 
-  // Parameterized: List[T], Generator[T], Secret[T], Dict[String, V]
+  // Parameterized: List[T], Generator[T], Secret[T], Dict[String, V],
+  // and Access[service], which takes a service's name rather than a type.
   const bracketPos = s.indexOf('[');
   if (bracketPos !== -1) {
     if (!s.endsWith(']')) refuse(`\`${s}\` opens a \`[\` it never closes at its end`);
@@ -388,6 +391,17 @@ function parseSingleType(s: string): WeftType {
     if (name === 'List') return { kind: 'list', inner: parseTypeOrThrow(inner) };
     if (name === 'Generator') return { kind: 'generator', inner: parseTypeOrThrow(inner) };
     if (name === 'Secret') return { kind: 'secret', inner: parseTypeOrThrow(inner) };
+    // SYNC: parseSingleType (Access arm) <-> crates/weft-core/src/weft_type.rs parse_single_type (Access arm)
+    if (name === 'Access') {
+      const service = inner.trim();
+      if (!/^[a-z0-9_]+$/.test(service)) {
+        refuse(
+          `\`${s}\`: \`Access[...]\` takes a service's name (lowercase letters, digits and `
+          + `underscores, like \`Access[google_drive]\`), and \`${service}\` is not one`,
+        );
+      }
+      return { kind: 'access', service };
+    }
     if (name === 'Dict') {
       const parts = splitTopLevel(inner, ',');
       if (parts.length !== 2) refuse(`\`${s}\`: a dict takes two types, \`Dict[String, V]\``);
@@ -405,7 +419,7 @@ function parseSingleType(s: string): WeftType {
       }
       return { kind: 'dict', value };
     }
-    refuse(`\`${name}[...]\` is not a type; the types that take one are List, Generator, Secret and Dict`);
+    refuse(`\`${name}[...]\` is not a type; the types that take one are List, Generator, Secret, Dict and Access`);
   }
 
   // Primitive
@@ -528,8 +542,10 @@ export function weftTypesEqual(a: WeftType, b: WeftType): boolean {
       return b.kind === 'named' && a.name === (b as Extract<WeftType, { kind: 'named' }>).name;
     case 'typevar':
       return b.kind === 'typevar' && a.name === (b as Extract<WeftType, { kind: 'typevar' }>).name;
+    case 'access':
+      return b.kind === 'access' && (a.service ?? null) === ((b as Extract<WeftType, { kind: 'access' }>).service ?? null);
     default:
-      // json_dict / json / bus / access / infra carry no payload.
+      // json_dict / json / bus / infra carry no payload.
       return true;
   }
 }
@@ -579,7 +595,7 @@ function renderType(t: WeftType, wire: boolean): string {
     case 'json_dict': return 'JsonDict';
     case 'json': return 'Json';
     case 'bus': return 'Bus';
-    case 'access': return 'Access';
+    case 'access': return t.service ? `Access[${t.service}]` : 'Access';
     case 'infra': return 'Infra';
     case 'generator': return `Generator[${renderType(t.inner, wire)}]`;
     case 'secret': return `Secret[${renderType(t.inner, wire)}]`;
@@ -674,6 +690,10 @@ export interface NodeFeaturesWire {
   /// input and the output follows.
   pairsAddedPorts?: boolean;
   isTrigger?: boolean;
+  /// The node checks its callers: its `auth` names a scheme, and its
+  /// `connection` field, picked on the install, holds what it checks.
+  // SYNC: checksCallers <-> crates/weft-core/src/node.rs NodeFeatures.checks_callers
+  checksCallers?: boolean;
   showDebugPreview?: boolean;
   /// Names the endpoint serving the node's `/live` HTTP route the
   /// body panel polls. Unset for a node that speaks only TCP
@@ -1018,6 +1038,10 @@ export interface InputSpec {
   /// (Access-typed inputs only); checked the same three places.
   // SYNC: InputSpec.requiresValues <-> crates/weft-core/src/node.rs InputSpec.requires_values
   requiresValues?: string[];
+  /// On an optional String input, a blank text is a value the node uses;
+  /// without it a blank text is no value at all.
+  // SYNC: InputSpec.keepsBlank <-> crates/weft-core/src/node.rs InputSpec.keeps_blank
+  keepsBlank?: boolean;
 }
 
 // SYNC: OutputSpec <-> crates/weft-core/src/node.rs OutputSpec
@@ -1105,6 +1129,13 @@ export interface CatalogEntry {
    *  is the app's credentials. Empty in the shipped catalog. */
   // SYNC: accessApps <-> crates/weft-core/src/node.rs NodeMetadata.access_apps
   accessApps?: Record<string, AppRegistration>;
+  /** On a node that checks its callers (`features.checksCallers`): the
+   *  recipe of the connection its `auth` reads, keyed by each word the
+   *  value is read by: a name `auth` takes (`api_keys`, `hmac_sha256`,
+   *  ...) or the `kind` of a check written as a record (`hmac`). Its
+   *  Connect panel follows `auth`. */
+  // SYNC: CatalogEntry.callerRecipes <-> crates/weft-cli/src/commands/describe_nodes.rs editor_entry
+  callerRecipes?: Record<string, AccessSpecWire>;
   /** The bound on each type variable the node's ports use, keyed by
    *  the variable (`{ "T": "Media" }`): what the variable may resolve to. */
   // SYNC: CatalogEntry.typeParams <-> crates/weft-core/src/node.rs NodeMetadata.type_params
@@ -1353,16 +1384,20 @@ export function isLanguagePort(name: string): boolean {
   return isGatePort(name) || name === ERROR_PORT;
 }
 
-// SYNC: NodeFiringStatus <-> crates/weft-core/src/run/firing.rs NodeFiringStatus
-/// Adding a state requires adding it on both sides; the UI lookup
-/// tables in `webview/lib/utils/status.ts` exhaust this union so
-/// drift compiles as an error. The earlier shape had ghost variants
-/// (`pending` / `suspended` / `accumulating`) the dispatcher never
-/// emitted; they painted states the engine could not produce and
-/// `suspended` doubled-up with the real `waiting_for_input` event.
+// SYNC: NodeFiringStatus <-> crates/weft-core/src/program.rs NodeStatus, catalog/logic/get_node_state/metadata.json (the `state` output's description)
+/// Where one firing stands, in the words `weft node-state` and
+/// `GetNodeState` use (`NodeStatus`), less `pending`: a firing the graph
+/// paints has started. A firing is `waiting` while a wait of its own is
+/// open, whether its worker holds the wait (a `wait_started` with no
+/// ending yet) or the run parked on it (its suspension names a token),
+/// and `paused` when it only paused with its run. Adding a state
+/// requires adding it on every side; the UI lookup tables in
+/// `webview/lib/utils/status.ts` exhaust this union so drift compiles as
+/// an error.
 export type NodeFiringStatus =
   | 'running'
-  | 'waiting_for_input'
+  | 'waiting'
+  | 'paused'
   | 'completed'
   | 'skipped'
   | 'failed'
@@ -2095,6 +2130,8 @@ export type CorruptionSite =
   /// The run's birth gives values where its program says nothing is
   /// given, or misses one it says.
   | 'RunGiven'
+  /// A bus row names its bus by an id that is no bus id.
+  | 'Bus'
   | 'UndecodableRow'
   /// Not one row: the whole run. The code it ran is no longer
   /// recorded, so no value can be worked out from the journal. Shown

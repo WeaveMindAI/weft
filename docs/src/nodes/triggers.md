@@ -85,7 +85,7 @@ run --fire` cannot tell you what to send.
 
 | Kind | What it is |
 |---|---|
-| `Timer` | A delay, a date, or a cron schedule. A delay counts from when it was asked for: the activation for a trigger, the `await_signal` call for a node that waits |
+| `Timer` | A delay, a date, or a cron schedule. A delay counts from when it was asked for: the activation for a trigger, the `state.wait` call for a node that waits |
 | `Form` | A person filling something in |
 | `Route` | An inbound HTTP request |
 | `Socket` | An inbound WebSocket |
@@ -107,6 +107,63 @@ refused rather than sent as a second command.
 `ProviderEvents` is the one to reach for when the service has a recipe, because
 it takes care of both roads: a provider that pushes to you, and one you have to
 dial. Go and read [events from a service](../connections/events.md).
+
+## A trigger that polls a list
+
+If the service only offers "list the latest items" (a mailbox, a database
+query), register a `PollEndpoint` with a `delta`, and weft fires one run per
+new item instead of one per poll:
+
+```rust
+use weft::access::client::url;
+use weft::signal::{DeltaMode, PollDelta, PollEndpoint, PollPaging};
+
+ctx.register_signal(PollEndpoint {
+    url: url(API, &["messages"])?.query("maxResults", 500).into(),
+    interval_secs: interval,
+    delta: Some(PollDelta {
+        items: "messages".into(),
+        cursor_field: Some("id".into()),
+        mode: DeltaMode::Set,
+        cursor_param: None,
+        paging: Some(PollPaging::query("nextPageToken", "pageToken")),
+    }),
+    access: Some(weft::primitive::AccessRef::from(&account)),
+    ..Default::default()
+})
+.await
+```
+
+`items` is the dotted path to the list in the answer. `cursor_field` is the
+field that tells items apart: with `DeltaMode::Max` an item is new when that
+field is above the highest one seen so far, which needs a field that only
+grows in the order items show up; with `DeltaMode::Set` it is new when weft
+has not seen its id recently, for a list whose ids are opaque. The first poll
+after activation only records what is there and fires nothing, so activation
+means "from now on". Each run gets the item on `ctx.wake` as `item`.
+
+If the list comes in pages, newest first, say how to ask for the next one in
+`paging`, so a burst bigger than one page is not cut to its newest page:
+
+- `PollPaging::query(next, param)`: the answer says the next page's cursor at
+  the dotted path `next`, and the next request sends it as the query
+  parameter `param`;
+- `PollPaging::body(next, field)`: the next request sends it as the field
+  `field` of the JSON body, for a `PollMethod::Post` poll whose `body` is an
+  object.
+
+Each poll then follows the pages until one holds an item it has already
+seen, or the answer names no next page (a cursor that is missing, empty or
+not a string), and fires every new item it read. The first poll after
+activation reads the first page alone. If more than 50 pages of new items
+arrived since the last poll, the poll fails and fires nothing, rather than
+firing only part of the burst: the log says `paged poll ran past its page
+limit`, and the fix is polling more often (`interval_secs`) or asking for
+bigger pages. Set `paging: None` for a list that fits one answer.
+
+`paging` needs a `cursor_field`, a JSON answer (not `PollFormat::Feed`), and
+no `cursor_param` beside it, since that already says where the next request
+starts. Activation refuses each of those, saying which.
 
 ## Two things a trigger cannot do
 

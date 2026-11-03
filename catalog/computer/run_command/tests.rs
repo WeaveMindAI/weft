@@ -1,5 +1,6 @@
 //! RunCommand self-tests: a quick command answered in the call, a long
-//! one parked on its status route and not run again on the replay, the
+//! one parked on its status route and not run again when the body runs
+//! again after the wait, the
 //! whole output read off the computer piece by piece into a stored file,
 //! the session passed along, and the ways a command fails to come back.
 
@@ -21,7 +22,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_quick_command_hands_back_its_whole_output_as_a_file", quick),
         NodeTest::fake("a_long_output_is_read_in_pieces", in_pieces),
         NodeTest::fake("pieces_out_of_order_fail_loud", out_of_order),
-        NodeTest::fake("a_long_command_parks_and_is_not_run_again_on_the_replay", long),
+        NodeTest::fake("a_long_command_parks_and_is_not_run_again_on_resume", long),
         NodeTest::fake("a_restart_alone_says_so_in_the_output", restart_alone),
         NodeTest::fake("a_command_lost_while_parked_reaches_error", lost_while_parked),
         NodeTest::fake("a_busy_session_reaches_error", busy),
@@ -112,24 +113,30 @@ async fn out_of_order(rig: FakeRig) -> WeftResult<()> {
 async fn long(rig: FakeRig) -> WeftResult<()> {
     let computer = computer(&rig);
     answers(&rig, json!({ "status": "running", "id": "j7" }));
-    rig.signal(json!({ "status": "done", "id": "j7", "exitCode": 0, "size": 6 }));
-    answers(&rig, json!({ "data": b64(b"built\n"), "next": 6, "end": true }));
     answers(&rig, json!({ "data": b64(b"built\n"), "next": 6, "end": true }));
     let input = json!({ "computer": computer, "args": { "command": "make", "timeoutSecs": 600 } });
-    let outcome = rig.run(&RunCommandNode, input.clone()).await.ok()?;
+    // The first run pauses in its wait (no status yet): the state holds
+    // the started command.
+    rig.signal_paused();
+    let paused = rig.run(&RunCommandNode, input.clone()).await;
+    assert!(paused.paused(), "the first run pauses in its wait: {:?}", paused.result);
+    assert_eq!(rig.saved_state(&RunCommandNode), Some(json!({ "started": { "status": "running", "id": "j7" }, "ended": null })));
+    // The body runs again from its top: the start is in its state, so
+    // the command is not sent to the computer again, and the run comes
+    // back to the wait on the same command.
+    rig.signal(json!({ "status": "done", "id": "j7", "exitCode": 0, "size": 6 }));
+    let outcome = rig.run(&RunCommandNode, input).await.ok()?;
     assert_eq!(output_of(&rig, &outcome.outputs["output"])?, b"built\n");
-    let awaited = rig.awaited_signals();
-    assert_eq!(awaited.len(), 1, "one wait");
-    assert_eq!(awaited[0].kind, "poll_endpoint");
-    assert_eq!(awaited[0].config["url"], json!("http://computer.example:8000/jobs/j7"));
-    assert_eq!(awaited[0].config["interval_secs"], json!(5));
-    assert_eq!(awaited[0].match_predicates, vec![Predicate::neq("status", "running")]);
-    // The run resumes after the wait by replaying the body: the start is
-    // recorded, so the command is not sent to the computer again.
-    let again = rig.run(&RunCommandNode, input).await.ok()?;
-    assert_eq!(again.outputs["exitCode"], json!(0));
+    assert_eq!(outcome.outputs["exitCode"], json!(0));
     let starts = asked(&rig).into_iter().filter(|(action, _)| action == "exec").count();
     assert_eq!(starts, 1, "the command ran once: {:?}", asked(&rig));
+    let awaited = rig.awaited_signals();
+    assert_eq!(awaited.len(), 2, "the paused wait, then the same wait answered");
+    assert_eq!(awaited[0].config, awaited[1].config, "both on the one command's status");
+    assert_eq!(awaited[1].kind, "poll_endpoint");
+    assert_eq!(awaited[1].config["url"], json!("http://computer.example:8000/jobs/j7"));
+    assert_eq!(awaited[1].config["interval_secs"], json!(5));
+    assert_eq!(awaited[1].match_predicates, vec![Predicate::neq("status", "running")]);
     Ok(())
 }
 

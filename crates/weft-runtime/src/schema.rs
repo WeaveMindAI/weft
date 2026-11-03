@@ -262,6 +262,30 @@ mod tests {
         }
     }
 
+    /// The boot carries a document column to a newer shape by walking its
+    /// table's primary key, so every table holding one declares a key; a
+    /// table without one would stop the boot the first time its document's
+    /// version moved.
+    #[test]
+    fn every_table_holding_documents_has_a_primary_key() {
+        let groups = groups();
+        for document in documents() {
+            let opening = format!("CREATE TABLE IF NOT EXISTS {} (", document.table);
+            let created = groups
+                .iter()
+                .flat_map(|g| g.ddl.iter())
+                .find_map(|ddl| ddl.find(&opening).map(|at| &ddl[at + opening.len()..]))
+                .unwrap_or_else(|| panic!("document '{}': no CREATE TABLE for '{}'", document.name(), document.table));
+            let statement = created.split("CREATE ").next().unwrap_or(created);
+            assert!(
+                statement.contains("PRIMARY KEY"),
+                "table '{}' holds document '{}' and declares no primary key",
+                document.table,
+                document.name()
+            );
+        }
+    }
+
     /// Every registered column's committed samples, one file per version
     /// (`documents/<table>.<column>/v<N>.json`, each a list of documents,
     /// the same documents in every version): today's holds exactly what

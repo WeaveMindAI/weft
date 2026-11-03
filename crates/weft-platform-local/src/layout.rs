@@ -113,6 +113,16 @@ impl MachineLayout {
         self.root.join("worker-crates")
     }
 
+    /// Which install takes each disk volume named before infra names
+    /// carried the install (`infra_names::plan_disk`): one file per such
+    /// volume, named after it and holding the install's label, written by
+    /// `weft infra take-disk` and removed once the volume is carried over.
+    /// On the machine, never in an install's folder, so two installs can
+    /// never both take one.
+    pub fn disk_claims(&self) -> PathBuf {
+        self.root.join("disk-claims")
+    }
+
     /// What a program compiled on this machine is packaged as: a process
     /// the machine runs, its build sharing the machine's crates.
     pub fn host_packaging(&self) -> weft_core::builds::WorkerPackaging {

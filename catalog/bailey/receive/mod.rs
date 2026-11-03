@@ -12,11 +12,11 @@
 //!     payload. Map the WhatsApp-specific fields to output ports.
 
 use async_trait::async_trait;
-use serde_json::Value;
 
+use weft::access::client;
 use weft::infra::InfraHandle;
 use weft::signal::{Predicate, SseSubscribe};
-use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BaileyReceiveNode;
@@ -59,7 +59,7 @@ impl Node for BaileyReceiveNode {
 
         let bridge = ctx.endpoint_of(&bridge).await?;
         ctx.register_signal(SseSubscribe {
-            url: format!("{}/events", bridge.url().trim_end_matches('/')),
+            url: client::url(bridge.url(), &["events"])?.into(),
             event_name: "message.received".into(),
             filters,
         })
@@ -76,17 +76,11 @@ impl Node for BaileyReceiveNode {
         // user values). A field the payload sends as null is skipped when
         // its port's type has no Null, so that port closes the same way.
         //
-        // `file` is a port THIS node computes (a stored-file reference, only
-        // on the media path below); it is never a payload field, and the
-        // trigger's declared payload does not name it, so an event
-        // smuggling one is refused before this body runs at all. Stripping
-        // it here is the second line: it costs one statement and it holds
-        // whatever the declaration says, so the port can only ever carry a
-        // reference this node made.
-        let mut data = ctx.wake.object()?.clone();
-        data.remove("file");
-        let data = Value::Object(data);
-        let mut out = ctx.fan_declared(&data);
+        // `file` is a port THIS node computes (a stored-file reference,
+        // only on the media path below): the trigger's declared payload
+        // does not name it, so an event carrying one is refused before
+        // this body runs.
+        let mut out = ctx.fan_declared(&ctx.wake.record()?);
 
         // Media messages: stream the bytes from the bridge's media
         // endpoint straight into PROJECT storage under the message's
@@ -94,18 +88,12 @@ impl Node for BaileyReceiveNode {
         // self-describing stored-file reference on `file`. Bytes never ride
         // the pulse path; downstream nodes get/stream/presign via the
         // reference.
-        let message_type = data
-            .get("messageType")
-            .and_then(|v| v.as_str())
-            .node_err("message event without a messageType; the bridge always sends one")?;
-        if MEDIA_TYPES.contains(&message_type) {
+        let message_type: String = ctx.wake.get("messageType")?;
+        if MEDIA_TYPES.contains(&message_type.as_str()) {
             let bridge: InfraHandle = ctx.inputs.get("bridge")?;
-            let message_id = data
-                .get("messageId")
-                .and_then(|v| v.as_str())
-                .node_err("media message without a messageId; cannot fetch its bytes")?;
+            let message_id: String = ctx.wake.get("messageId")?;
             let bridge = ctx.endpoint_of(&bridge).await?;
-            let file = super::media::fetch_media(&ctx, &bridge, message_id).await?;
+            let file = super::media::fetch_media(&ctx, &bridge, &message_id).await?;
             out = out.set("file", file);
         }
         ctx.pulse_downstream(out).await

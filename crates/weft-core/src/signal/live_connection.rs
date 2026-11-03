@@ -286,15 +286,17 @@ pub struct LiveConnectionConfig {
 impl LiveConnectionConfig {
     /// Build the shared body from a catalog node's config field map (the
     /// common authoring fields both live-caller nodes expose: `path`,
-    /// `method`, `dataType`, `auth`, `outlivesCaller`, `maxSessionSecs`,
-    /// `callerSilenceSecs`, `maxInboundMb`, `whenChunkFails`,
-    /// `whenCallerIsSlow`, and the journal settings the language gives a
-    /// live-connection trigger, `journalEphemeral` and `journalWindowMs`).
-    /// Centralized here so the two nodes (`Route`, `Socket`) do NOT each
-    /// re-implement field parsing; every non-exposed knob keeps its
-    /// default. `fields` is the node's `ctx.inputs.object()` map.
+    /// `method`, `dataType`, `auth` and `connection`, `outlivesCaller`,
+    /// `maxSessionSecs`, `callerSilenceSecs`, `maxInboundMb`,
+    /// `whenChunkFails`, `whenCallerIsSlow`, and the journal settings the
+    /// language gives a live-connection trigger, `journalEphemeral` and
+    /// `journalWindowMs`). Centralized here so the two nodes (`Route`,
+    /// `Socket`) do NOT each re-implement field parsing; every non-exposed
+    /// knob keeps its default. `fields` is the node's `ctx.inputs.object()`
+    /// map; `place` names the node in a refusal (`weft connect <place>`).
     pub fn from_node_fields(
         fields: &serde_json::Map<String, serde_json::Value>,
+        place: &str,
     ) -> Result<Self, String> {
         let path = fields.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
         // One method on the node (`method: "POST"`), stored as the
@@ -322,19 +324,34 @@ impl LiveConnectionConfig {
         let data_type = choice(fields, "dataType", DataType::parse_field)?;
         let error_mode = choice(fields, "whenChunkFails", ErrorMode::parse_field)?;
         let backpressure = choice(fields, "whenCallerIsSlow", Backpressure::parse_field)?;
-        // The `auth` input carries an `Access` marker (an auth access
-        // node's output); the routing keeps only what the gate needs to
-        // find the connection again.
-        let auth = match fields.get("auth") {
-            None | Some(serde_json::Value::Null) => super::PublicEntryAuth::None,
-            Some(value) => {
-                let access = crate::access::Access::from_value(value)
-                    .map_err(|e| format!("auth must be a connection (wire an auth access node): {e}"))?;
-                super::PublicEntryAuth::Connection {
-                    access_id: access.access_id().to_string(),
-                    service: access.service().to_string(),
+        // `auth` names the check, `connection` (the install's pick, put
+        // in where the compiler marked it) holds what it checks against;
+        // the routing keeps the check and what finds the connection again.
+        use crate::access::callers;
+        let auth = match callers::parse_auth(fields.get(callers::AUTH_FIELD))? {
+            None => super::PublicEntryAuth::None,
+            Some(verify) => match fields.get(callers::CONNECTION_FIELD) {
+                None | Some(serde_json::Value::Null) => return Err(callers::no_connection(place, &verify)),
+                Some(value) => {
+                    let access = crate::access::Access::from_value(value)
+                        .map_err(|e| format!("{} must be a connection: {e}", callers::CONNECTION_FIELD))?;
+                    let scheme = callers::CallerScheme::of(&verify).expect("parse_auth answers caller schemes only");
+                    if access.service() != scheme.service() {
+                        return Err(format!(
+                            "'{place}' checks callers with {} against a '{}' connection, but that check \
+                             reads a '{}' connection; run `weft connect {place}`",
+                            verify.tag(),
+                            access.service(),
+                            scheme.service()
+                        ));
+                    }
+                    super::PublicEntryAuth::Connection {
+                        access_id: access.access_id().to_string(),
+                        service: access.service().to_string(),
+                        verify: Box::new(verify),
+                    }
                 }
-            }
+            },
         };
         // Read the way the run's settings read it (refused rather than read
         // as off: "may outlive the caller" decides what a disconnect does).
@@ -419,6 +436,15 @@ impl LiveConnectionConfig {
             ));
         }
         self.journal.check().map_err(|why| format!("{kind_tag}: {why}"))?;
+        match &self.auth {
+            super::PublicEntryAuth::None => {}
+            super::PublicEntryAuth::Connection { service, verify, .. } => {
+                verify.validate(service, crate::access::events::VerifySide::Caller).map_err(|e| format!("{kind_tag} auth: {e}"))?;
+            }
+            super::PublicEntryAuth::CheckNotKept { service, .. } => {
+                return Err(format!("{kind_tag}: {}", super::auth::uncarried_gate(service)));
+            }
+        }
         if let Some(w) = self.window {
             if w == 0 {
                 return Err(format!(
@@ -539,6 +565,7 @@ mod tests {
                 auth: PublicEntryAuth::Connection {
                     access_id: "acc-1".into(),
                     service: "api_key_auth".into(),
+                    verify: Box::new(crate::access::callers::named_check("api_keys").unwrap().verify()),
                 },
                 outlives_caller: true,
                 heartbeat_interval_secs: 15,
@@ -562,7 +589,7 @@ mod tests {
         assert_eq!(back.common.path, "tangle/{room}");
         assert!(matches!(
             back.common.auth,
-            PublicEntryAuth::Connection { ref access_id, ref service }
+            PublicEntryAuth::Connection { ref access_id, ref service, .. }
                 if access_id == "acc-1" && service == "api_key_auth"
         ));
         assert!(back.common.outlives_caller);
@@ -584,7 +611,7 @@ mod tests {
             let mut fields = serde_json::Map::new();
             fields.insert("path".to_string(), serde_json::json!("chat"));
             fields.extend(extra.as_object().unwrap().clone());
-            LiveConnectionConfig::from_node_fields(&fields)
+            LiveConnectionConfig::from_node_fields(&fields, "chat")
         };
         let set = with(serde_json::json!({ "journalEphemeral": true, "journalWindowMs": 250 })).unwrap();
         assert!(set.journal.is_ephemeral());
@@ -632,25 +659,26 @@ mod tests {
 
     #[test]
     fn node_fields_build_the_body() {
-        let access = crate::access::Access::new("acc-9", "jwt_auth", None).to_value();
+        let access = crate::access::Access::new("acc-9", "hmac_auth", None).to_value();
         let fields = serde_json::json!({
             "path": "users/{id}",
             "method": "get",
             "dataType": "text",
-            "auth": access,
+            "auth": "hmac_sha256",
+            "connection": access,
             "outlivesCaller": true,
             "maxSessionSecs": 900,
             "callerSilenceSecs": 90,
             "maxInboundMb": 64,
         });
-        let cfg = LiveConnectionConfig::from_node_fields(fields.as_object().unwrap()).expect("builds");
+        let cfg = LiveConnectionConfig::from_node_fields(fields.as_object().unwrap(), "users").expect("builds");
         assert_eq!(cfg.path, "users/{id}");
         assert_eq!(cfg.methods, vec!["GET".to_string()]);
         assert_eq!(cfg.data_type, DataType::Text);
         assert!(matches!(
             cfg.auth,
-            PublicEntryAuth::Connection { ref access_id, ref service }
-                if access_id == "acc-9" && service == "jwt_auth"
+            PublicEntryAuth::Connection { ref access_id, ref service, ref verify }
+                if access_id == "acc-9" && service == "hmac_auth" && verify.tag() == "hmac"
         ));
         assert!(cfg.outlives_caller);
         assert_eq!(cfg.max_session_secs, 900, "the ceiling the author asked for");
@@ -661,7 +689,7 @@ mod tests {
         );
 
         let empty = serde_json::json!({ "path": "x", "method": "", "dataType": "" });
-        let cfg = LiveConnectionConfig::from_node_fields(empty.as_object().unwrap()).expect("builds");
+        let cfg = LiveConnectionConfig::from_node_fields(empty.as_object().unwrap(), "x").expect("builds");
         assert!(cfg.methods.is_empty(), "an empty method is any method");
         assert_eq!(cfg.data_type, DataType::Json);
         assert_eq!(cfg.error_mode, ErrorMode::Surface, "a route that says nothing tells its caller");
@@ -678,7 +706,8 @@ mod tests {
             ("method", serde_json::json!("GTE")),
             ("method", serde_json::json!(3)),
             ("dataType", serde_json::json!("xml")),
-            ("auth", serde_json::json!("not-a-connection")),
+            ("auth", serde_json::json!("not-a-scheme")),
+            ("auth", serde_json::json!({ "kind": "token_echo" })),
             ("outlivesCaller", serde_json::json!("yes")),
             ("maxSessionSecs", serde_json::json!(1.5)),
             ("maxSessionSecs", serde_json::json!("forever")),
@@ -692,10 +721,37 @@ mod tests {
         ] {
             let bad = serde_json::json!({ "path": "x", field: value });
             assert!(
-                LiveConnectionConfig::from_node_fields(bad.as_object().unwrap()).is_err(),
+                LiveConnectionConfig::from_node_fields(bad.as_object().unwrap(), "x").is_err(),
                 "{field} must be refused"
             );
         }
+    }
+
+    /// `auth` names the check and `connection` what it reads: a scheme
+    /// with no connection, or one of another service, is refused naming
+    /// the node's place and `weft connect`, never served open.
+    #[test]
+    fn a_scheme_needs_a_connection_of_its_service() {
+        let with = |fields: serde_json::Value| LiveConnectionConfig::from_node_fields(fields.as_object().unwrap(), "secure");
+        let missing = with(serde_json::json!({ "path": "x", "auth": "api_keys" })).unwrap_err();
+        assert_eq!(missing, "'secure' checks callers with api_keys but has no connection; run `weft connect secure`");
+        let other = crate::access::Access::new("acc-1", "hmac_auth", None).to_value();
+        let wrong = with(serde_json::json!({ "path": "x", "auth": "api_keys", "connection": other })).unwrap_err();
+        assert!(wrong.contains("'hmac_auth'") && wrong.contains("'api_key_auth'"), "{wrong}");
+        let record = serde_json::json!({ "kind": "hmac", "signature": { "in": "header:X-Hub-Signature-256" }, "concat": "{body}" });
+        let cfg = with(serde_json::json!({ "path": "x", "auth": record, "connection": other })).unwrap();
+        assert!(matches!(cfg.auth, PublicEntryAuth::Connection { ref verify, .. } if verify.credential_headers() == ["X-Hub-Signature-256"]));
+        let open = with(serde_json::json!({ "path": "x", "auth": "none" })).unwrap();
+        assert_eq!(open.auth, PublicEntryAuth::None);
+    }
+
+    /// A gate whose check an older weft did not keep is never served:
+    /// registering it again is refused, naming the fix.
+    #[test]
+    fn a_gate_whose_check_was_not_kept_is_refused() {
+        let auth = PublicEntryAuth::CheckNotKept { access_id: "a".into(), service: "jwt_auth".into() };
+        let err = Route { common: LiveConnectionConfig { auth, ..bare() } }.validate().unwrap_err();
+        assert!(err.contains("weft resync") && err.contains("jwt_auth"), "{err}");
     }
 
     /// The two settings that say what gives on a live exchange reach the
@@ -705,7 +761,7 @@ mod tests {
     fn node_fields_pick_what_gives_on_a_live_exchange() {
         let with = |field: &str, value: &str| {
             let fields = serde_json::json!({ "path": "feed", field: value });
-            LiveConnectionConfig::from_node_fields(fields.as_object().unwrap()).expect("builds")
+            LiveConnectionConfig::from_node_fields(fields.as_object().unwrap(), "feed").expect("builds")
         };
         assert_eq!(with("whenChunkFails", "surface").error_mode, ErrorMode::Surface);
         assert_eq!(with("whenChunkFails", "drop_chunk").error_mode, ErrorMode::DropChunk);
@@ -728,6 +784,7 @@ mod tests {
 
         let refusal = LiveConnectionConfig::from_node_fields(
             serde_json::json!({ "path": "feed", "whenCallerIsSlow": "skip" }).as_object().unwrap(),
+            "feed",
         )
         .expect_err("not one of the modes");
         assert!(refusal.contains("block, drop_oldest or drop_newest"), "{refusal}");

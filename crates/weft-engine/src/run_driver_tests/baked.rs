@@ -140,7 +140,8 @@
                 cut_from: None,
                 seed: None, instance: None, stand_in: None, fired_trigger: None,
                 instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-                settings: Default::default(),
+                // A test here that waits checks a pause, not the quiet window.
+                settings: super::engine_test_rig::pausing_at_once(),
             },
             RunEvent::NodeKicked { run_id, node_id: "db".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
         ]
@@ -207,7 +208,7 @@
         );
     }
 
-    /// Emits `addr` (what it sends tells its first body from the replay),
+    /// Emits `addr` (what it sends tells its first body from the second),
     /// then waits for an answer and returns.
     struct PausingDb {
         bodies: std::sync::atomic::AtomicU32,
@@ -221,10 +222,10 @@
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let life = match self.bodies.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
                 0 => "first-life",
-                _ => "replayed",
+                _ => "run-again",
             };
             ctx.pulse_downstream(NodeOutput::new().set("addr", json!(life))).await?;
-            ctx.await_signal(weft_core::signal::Form {
+            crate::run_driver::engine_test_rig::wait_once(&ctx, weft_core::signal::Form {
                 form_type: "human_query".into(),
                 schema: weft_core::signal::FormSchema { fields: Vec::new() },
                 title: None,
@@ -237,7 +238,7 @@
     }
 
     /// An infra setup sends a baked output, pauses, and resumes on a
-    /// later worker: the replay sends nothing on that output, and the
+    /// later worker: the body run again sends nothing on that output, and the
     /// bake saves the value downstream received, the first body's.
     #[tokio::test]
     async fn an_infra_setup_that_paused_bakes_what_went_out_before_the_pause() {
@@ -279,7 +280,7 @@
         assert_eq!(
             events.iter().filter(|e| matches!(e, RunEvent::PortEmitted { node_id, port, .. } if node_id == "db" && port == "addr")).count(),
             1,
-            "the replay sent nothing on `addr`"
+            "the body run again sent nothing on `addr`"
         );
         assert_eq!(
             *copy.saves.lock().unwrap(),

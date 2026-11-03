@@ -55,7 +55,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[fal]",
       "widget": {
         "kind": "access"
       },
@@ -65,7 +65,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[fal]",
       "description": "Wire into the fal media nodes' account input."
     }
   ]

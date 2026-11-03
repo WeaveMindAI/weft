@@ -22,7 +22,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("after_a_stream_the_close_just_ends_the_response", http_after_stream),
         NodeTest::fake("a_reason_behind_a_route_is_the_body_under_the_status", http_reason_body),
         NodeTest::fake("a_reason_with_no_status_answers_200", http_reason_default_status),
-        NodeTest::fake("a_reason_with_a_204_is_refused", http_reason_on_204),
         NodeTest::fake("a_reason_after_a_stream_is_refused", http_reason_after_stream),
         NodeTest::fake("a_close_code_behind_a_route_is_refused", code_on_route),
         NodeTest::fake("a_status_behind_a_socket_is_refused", status_on_socket),
@@ -82,15 +81,6 @@ async fn http_reason_default_status(rig: FakeRig) -> WeftResult<()> {
     rig.run(&CloseNode, json!({ "reason": "all done" })).await.ok()?;
     assert_eq!(conn.heads(), vec![ResponseHead::new(200)]);
     assert!(matches!(conn.calls().last(), Some(CallerCall::Terminate { final_chunk: Some(OutboundChunk::Text(t)), .. }) if t == "all done"));
-    Ok(())
-}
-
-async fn http_reason_on_204(rig: FakeRig) -> WeftResult<()> {
-    let conn = http_caller_without_body(DataType::Json, LiveRequest::default());
-    rig.attach_caller(conn.clone());
-    let err = rig.run(&CloseNode, json!({ "status": 204, "reason": "gone" })).await.result.expect_err("a 204 carries no body").to_string();
-    assert!(err.contains("204") && err.contains("reason"), "{err}");
-    assert!(conn.heads().is_empty(), "nothing went out");
     Ok(())
 }
 

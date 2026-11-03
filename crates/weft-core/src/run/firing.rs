@@ -13,7 +13,6 @@ use serde_json::Value;
 use crate::frames::{FiringLocation, LoopFrames};
 use crate::RunId;
 
-// SYNC: NodeFiringStatus <-> packages/weft-graph/src/protocol.ts NodeFiringStatus
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeFiringStatus {
@@ -92,6 +91,11 @@ pub struct NodeFiring {
     /// Explicit output closures, including generator ends already delivered.
     #[serde(default)]
     pub closed_output_ports: HashSet<String>,
+    /// How many items the firing yielded on its stream outputs
+    /// ([`Self::count_stream_item`]): a body run again after a pause
+    /// or a crash yields the ones below it again as nothing new.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stream_items: u64,
     pub run_id: RunId,
     pub frames: LoopFrames,
     /// The run this record was inherited from, when a seeded run reused
@@ -107,7 +111,21 @@ pub struct NodeFiring {
     start: u64,
 }
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 impl NodeFiring {
+    /// Count the emission `emission` when it is the firing's next stream
+    /// item (`crate::run::emission::stream_emission`): an item's id is
+    /// derived from its number, so the live engine and the fold, each
+    /// seeing the emission's rows, count it once and alike.
+    pub fn count_stream_item(&mut self, emission: uuid::Uuid) {
+        if emission == crate::run::emission::stream_emission(&self.node_id, &self.frames, self.stream_items) {
+            self.stream_items += 1;
+        }
+    }
+
     /// The record of a firing that starts now, `Running`, having taken
     /// `pulses_absorbed`.
     pub fn started(
@@ -134,6 +152,7 @@ impl NodeFiring {
             logs: Vec::new(),
             mentioned_ports: HashSet::new(),
             closed_output_ports: HashSet::new(),
+            stream_items: 0,
             run_id,
             frames,
             inherited_from: None,

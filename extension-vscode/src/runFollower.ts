@@ -43,6 +43,7 @@ import type {
   Frame,
   LoopTerminationReason,
   NodeFiringEvent,
+  NodeFiringStatus,
   Seed,
   ScopeDecidedEvent,
   ScopeState,
@@ -84,8 +85,13 @@ export type DispatcherEvent = { eventId: string } & (
   // outputs, a wait's answer) comes as where the run's record keeps it;
   // the graph reads a value when it shows it (`POST /runs/{id}/values`).
   | { kind: 'node_started'; runId: string; node: string; frames: Frame[]; input: Record<string, ValueRef>; closedPorts: string[]; providedPorts?: string[]; inheritedPorts?: Record<string, string>; inheritedFrom?: string; projectId: string; atUnix: number }
-  | { kind: 'node_suspended'; runId: string; node: string; frames: Frame[]; token: string; inheritedFrom?: string; projectId: string; atUnix: number }
+  | { kind: 'node_suspended'; runId: string; node: string; frames: Frame[]; token: string | null; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_resumed'; runId: string; node: string; frames: Frame[]; token: string | null; inheritedFrom?: string; projectId: string; atUnix: number }
+  // The firing registered a wait that had not ended yet: it waits on
+  // `token` from here, whether its worker holds the wait (the firing stays
+  // running) or the run pauses on it. A wait answered before it was
+  // registered sends only its `wait_ended`.
+  | { kind: 'wait_started'; runId: string; node: string; frames: Frame[]; token: string; inheritedFrom?: string; projectId: string; atUnix: number }
   // A wait of the firing ended, the first ending on record. A wait the run
   // holds in its worker never suspends or resumes the firing, so this is
   // the one event that sees every wait's ending.
@@ -203,6 +209,12 @@ export function recordedAt(eventId: string): string | undefined {
   return eventId.startsWith('journal:') ? eventId.slice('journal:'.length) : undefined;
 }
 
+/** One firing of a run: its node and frame stack, the way the graph keys
+ *  its row. */
+function firingKey(node: string, frames: Frame[]): string {
+  return `${node}\u0000${JSON.stringify(frames)}`;
+}
+
 function identifiedEvent(value: unknown): DispatcherEvent {
   if (!value || typeof value !== 'object' || !('eventId' in value)
       || typeof value.eventId !== 'string' || value.eventId.length === 0) {
@@ -212,6 +224,25 @@ function identifiedEvent(value: unknown): DispatcherEvent {
 }
 
 export type PostFn = (msg: HostMessage) => void;
+
+/** What the follower knows of one firing's waits: the token it is parked
+ *  on (`null` when it only paused with its run, absent while it is not
+ *  parked), and the waits it registered that have not ended. */
+interface FiringWaits {
+  parkedOn?: string | null;
+  open: Set<string>;
+}
+
+/** Where a firing stands from its waits, the way `weft node-state` reads
+ *  it: parked on a wait of its own, or with one still open, it waits;
+ *  parked on nothing it is paused; not parked, an open wait (one its
+ *  worker holds) makes it wait, and none leaves it running. */
+// SYNC: firingStatus <-> crates/weft-dispatcher/src/node_state.rs node_seen
+function firingStatus(waits: FiringWaits | undefined): NodeFiringStatus {
+  if (!waits) return 'running';
+  if (waits.parkedOn !== undefined) return waits.parkedOn !== null || waits.open.size > 0 ? 'waiting' : 'paused';
+  return waits.open.size > 0 ? 'waiting' : 'running';
+}
 
 /** A followed run that has not ended, with the project it belongs to:
  *  a display stream asks for its waits only on that project's stream. */
@@ -252,6 +283,10 @@ export class RunFollower implements vscode.Disposable {
   /// The tries at opening it again that failed since it last opened.
   private failedReopens = 0;
   private readonly liveRunListeners: Array<(run: LiveRun | undefined) => void> = [];
+  /// The waits of each firing of the followed run that has not ended, by
+  /// node and frame stack (the graph's row for it), so a wait starting or
+  /// ending repaints the firing as `weft node-state` reads it.
+  private readonly waits = new Map<string, FiringWaits>();
 
   constructor(
     private readonly client: DispatcherClient,
@@ -304,6 +339,7 @@ export class RunFollower implements vscode.Disposable {
     this.after = undefined;
     this.opened = false;
     this.failedReopens = 0;
+    this.waits.clear();
     this.setLiveRun(undefined);
     this.post({ kind: 'runReset', runId });
     // Coming back opens it.
@@ -419,10 +455,34 @@ export class RunFollower implements vscode.Disposable {
     this.stop();
   }
 
+  /** The waits on record of the firing at `node` and `frames`, made
+   *  empty when it has none yet. */
+  private waitsOf(node: string, frames: Frame[]): FiringWaits {
+    const key = firingKey(node, frames);
+    let waits = this.waits.get(key);
+    if (!waits) {
+      waits = { open: new Set() };
+      this.waits.set(key, waits);
+    }
+    return waits;
+  }
+
+  /** Repaint the firing a wait started or ended at, when that changed
+   *  where it stands. */
+  private repaintWaits(e: { node: string; frames: Frame[]; inheritedFrom?: string; atUnix: number }, waits: FiringWaits, before: NodeFiringStatus): void {
+    const state = firingStatus(waits);
+    if (state === before) return;
+    // A held wait ending puts the same firing back to running: a resume,
+    // so the graph keeps what the firing gathered so far.
+    const firingEvent: NodeFiringEvent = { nodeId: e.node, atUnix: e.atUnix, state, resumed: state === 'running', frames: e.frames, inheritedFrom: e.inheritedFrom };
+    this.post({ kind: 'firingEvent', event: firingEvent });
+  }
+
   private apply(e: DispatcherEvent): void {
     this.runProject ??= e.projectId;
     switch (e.kind) {
       case 'node_started': {
+        this.waits.delete(firingKey(e.node, e.frames));
         const firingEvent: NodeFiringEvent = {
           nodeId: e.node,
           atUnix: e.atUnix,
@@ -438,14 +498,16 @@ export class RunFollower implements vscode.Disposable {
         break;
       }
       case 'node_suspended': {
-        // SSE 'node_suspended' = engine 'WaitingForInput'. Use the
-        // Rust-side label directly so the inspector renders one
-        // canonical state instead of two names (suspended-via-SSE
-        // vs waiting_for_input-via-fold).
+        // The same words `weft node-state` answers (`NodeStatus`): a
+        // suspension naming a token waits on a wait of its own, one
+        // naming none only paused with its run, unless a wait of its own
+        // is still open.
+        const waits = this.waitsOf(e.node, e.frames);
+        waits.parkedOn = e.token;
         const firingEvent: NodeFiringEvent = {
           nodeId: e.node,
           atUnix: e.atUnix,
-          state: 'waiting_for_input',
+          state: firingStatus(waits),
           frames: e.frames,
           inheritedFrom: e.inheritedFrom,
         };
@@ -458,11 +520,14 @@ export class RunFollower implements vscode.Disposable {
         // firing's accumulated per-attempt state (port warnings)
         // instead of resetting it like a fresh start. The delivered
         // value shows up in the run replay itself, so the event
-        // carries no resume payload.
+        // carries no resume payload. A firing that resumes with a wait of
+        // its own still open waits on it again, held in its worker.
+        const waits = this.waitsOf(e.node, e.frames);
+        delete waits.parkedOn;
         const firingEvent: NodeFiringEvent = {
           nodeId: e.node,
           atUnix: e.atUnix,
-          state: 'running',
+          state: firingStatus(waits),
           resumed: true,
           frames: e.frames,
           inheritedFrom: e.inheritedFrom,
@@ -471,6 +536,7 @@ export class RunFollower implements vscode.Disposable {
         break;
       }
       case 'node_cancelled': {
+        this.waits.delete(firingKey(e.node, e.frames));
         const firingEvent: NodeFiringEvent = {
           nodeId: e.node,
           atUnix: e.atUnix,
@@ -483,6 +549,7 @@ export class RunFollower implements vscode.Disposable {
         break;
       }
       case 'node_completed': {
+        this.waits.delete(firingKey(e.node, e.frames));
         const firingEvent: NodeFiringEvent = {
           nodeId: e.node,
           atUnix: e.atUnix,
@@ -495,6 +562,7 @@ export class RunFollower implements vscode.Disposable {
         break;
       }
       case 'node_failed': {
+        this.waits.delete(firingKey(e.node, e.frames));
         const firingEvent: NodeFiringEvent = {
           nodeId: e.node,
           atUnix: e.atUnix,
@@ -507,6 +575,7 @@ export class RunFollower implements vscode.Disposable {
         break;
       }
       case 'node_skipped': {
+        this.waits.delete(firingKey(e.node, e.frames));
         const firingEvent: NodeFiringEvent = {
           nodeId: e.node,
           atUnix: e.atUnix,
@@ -782,10 +851,23 @@ export class RunFollower implements vscode.Disposable {
       case 'trigger_url_changed':
       case 'working_copy_changed':
         break;
-      // How a wait ended is what `weft freeze` records; the graph paints
-      // the firing's own lifecycle, which the node events already carry.
-      case 'wait_ended':
+      case 'wait_started': {
+        const waits = this.waitsOf(e.node, e.frames);
+        const before = firingStatus(waits);
+        waits.open.add(e.token);
+        this.repaintWaits(e, waits, before);
         break;
+      }
+      // A firing that already ended has nothing to repaint: how its wait
+      // ended is what `weft freeze` records.
+      case 'wait_ended': {
+        const waits = this.waits.get(firingKey(e.node, e.frames));
+        if (!waits) break;
+        const before = firingStatus(waits);
+        waits.open.delete(e.token);
+        this.repaintWaits(e, waits, before);
+        break;
+      }
       default: {
         // Exhaustiveness: if a new DispatcherEvent variant is
         // added to the union without a route here, TypeScript

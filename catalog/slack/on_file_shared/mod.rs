@@ -25,7 +25,7 @@ impl Node for SlackOnFileSharedNode {
         let channel: Option<String> = ctx.inputs.opt("channel")?;
 
         let mut filters = vec![Predicate::eq("type", "file_shared")];
-        if let Some(c) = channel.filter(|c| !c.trim().is_empty()) {
+        if let Some(c) = channel {
             filters.push(Predicate::eq("channel", c));
         }
 

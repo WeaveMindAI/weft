@@ -496,9 +496,9 @@
         // the Stop button. Close EVERY non-terminal row (in case a
         // NodeCompleted slipped through SSE, a parallel-loop iteration
         // left several rows open, or a node was still
-        // `waiting_for_input` when the run was cancelled): only
+        // `waiting` when the run was cancelled): only
         // completed/failed/skipped/cancelled are terminal, so anything
-        // else (running, waiting_for_input) must be force-closed to the
+        // else (running, waiting, paused) must be force-closed to the
         // run's terminal state, not just the last `running` row.
         runState.isRunning = false;
         // Keep how it ended: a cancel's cause is what tells a run a
@@ -605,7 +605,7 @@
         const e = msg.event;
         const state = e.state;
         // One run row per (nodeId, framesKey). The dispatcher
-        // produces state events (running/waiting_for_input/completed/
+        // produces state events (running/waiting/paused/completed/
         // failed/skipped/cancelled) on the same record; we mutate
         // the existing row, not append. A fresh dispatch after a
         // terminal row goes into the same row's history (one pulse

@@ -160,6 +160,99 @@ pub struct MachineShape {
     pub kind: Option<String>,
 }
 
+/// A node's own sizes for the machine inputs the language gives it
+/// (`"features": { "machineInputs": { "cpu": "1", "memory": "2Gi" } }`):
+/// what its `cpu` and `memory` hold when the program writes neither.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineDefaults {
+    pub cpu: String,
+    pub memory: String,
+}
+
+impl MachineShape {
+    /// The inputs `features.machineInputs` adds, in this order: the CPUs,
+    /// the memory, and the platform's own machine type.
+    pub const NODE_FIELDS: [&'static str; 3] = ["cpu", "memory", "machineType"];
+    /// What a `cpu` reads as: a number, or thousandths with `m`.
+    const CPU_PATTERN: &'static str = r"^[0-9]+(\.[0-9]+)?m?$";
+    /// What a `memory` reads as: a number followed by Gi, Mi, G or M.
+    const MEMORY_PATTERN: &'static str = r"^[0-9]+(\.[0-9]+)?(Gi|Mi|G|M)$";
+
+    /// The three inputs `features.machineInputs` gives an infra node,
+    /// `cpu` and `memory` defaulting to the node's own `defaults`. A
+    /// default that does not read as its size is refused, naming it.
+    pub fn node_inputs(defaults: &MachineDefaults) -> Result<Vec<crate::node::InputSpec>, String> {
+        let [cpu, memory, machine_type] = Self::NODE_FIELDS;
+        for (name, value, pattern) in [(cpu, &defaults.cpu, Self::CPU_PATTERN), (memory, &defaults.memory, Self::MEMORY_PATTERN)] {
+            if !regex::Regex::new(pattern).expect("a valid pattern").is_match(value) {
+                return Err(format!("features.machineInputs: its `{name}` of '{value}' is no size a machine reads"));
+            }
+        }
+        let input = |spec: serde_json::Value| -> crate::node::InputSpec {
+            serde_json::from_value(spec).expect("a machine input is a valid InputSpec")
+        };
+        Ok(vec![
+            input(serde_json::json!({
+                "name": cpu,
+                "type": "String",
+                "default": defaults.cpu,
+                "label": "CPUs",
+                "description": "CPUs the machine sustains (`1`, `0.25`, `500m`). A cloud install picks its cheapest machine holding this and `memory`: a quarter CPU with 1Gi is Compute Engine's `e2-micro`. A local install does not cap the container.",
+            })),
+            input(serde_json::json!({
+                "name": memory,
+                "type": "String",
+                "default": defaults.memory,
+                "label": "Memory",
+                "description": "Memory, a number followed by Gi, Mi, G or M (`2Gi`). Sized with `cpu`; a local install does not cap the container.",
+            })),
+            input(serde_json::json!({
+                "name": machine_type,
+                "type": "String",
+                "label": "Machine type",
+                "placeholder": "picked from CPUs and memory",
+                "description": "Last resort: a cloud's own machine type, used as is instead of the one picked from `cpu` and `memory` (`n2-standard-4` on Compute Engine). A local install ignores it.",
+            })),
+        ])
+    }
+
+    /// The checks on [`Self::node_inputs`], one per size, for a node of
+    /// type `node_type`: a `cpu` or a `memory` that does not read as one
+    /// is refused, written or wired.
+    pub fn node_rules(node_type: &str) -> Vec<crate::node::ValidationRule> {
+        let [cpu, memory, _] = Self::NODE_FIELDS;
+        let rule = |field: &str, pattern: &str, write: &str| -> crate::node::ValidationRule {
+            serde_json::from_value(serde_json::json!({
+                "when": { "kind": "all", "of": [
+                    { "kind": "value", "field": field },
+                    { "kind": "not", "of": { "kind": "value", "field": field, "matches": pattern } }
+                ] },
+                "then": {
+                    "message": format!("{node_type} '{{id}}' has a `{field}` it cannot read. {write}"),
+                    "level": "structural",
+                    "severity": "error",
+                    "port": field
+                }
+            }))
+            .expect("a machine rule is a valid ValidationRule")
+        };
+        vec![
+            rule(cpu, Self::CPU_PATTERN, "Write a number, or thousandths with m (1, 500m)."),
+            rule(memory, Self::MEMORY_PATTERN, "Write a number followed by Gi, Mi, G or M (2Gi)."),
+        ]
+    }
+
+    /// The machine a node with `features.machineInputs` asked for, read
+    /// off its inputs: its `cpu` and `memory` (which the language checked),
+    /// and its `machineType` when one is written (a blank one is absent).
+    #[cfg(feature = "runtime")]
+    pub fn from_inputs(inputs: &crate::context::ValueBag) -> crate::error::WeftResult<Self> {
+        let [cpu, memory, machine_type] = Self::NODE_FIELDS;
+        Ok(Self { cpu: inputs.opt(cpu)?, memory: inputs.opt(memory)?, gpu: None, kind: inputs.opt(machine_type)? })
+    }
+}
+
 /// GPUs for a unit: which kind and how many. The kind is the platform's
 /// accelerator name (`nvidia-l4`, `nvidia-tesla-t4`); a local install
 /// ignores the kind and hands every GPU the host has.
@@ -617,6 +710,37 @@ pub fn env_map(env: &[EnvEntry]) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The checks `machineInputs` adds refuse a size a machine cannot
+    /// read and take one it can.
+    #[test]
+    fn the_machine_checks_hold_each_size_to_its_shape() {
+        let cpu = &MachineShape::node_rules("Box")[0];
+        let reads = |value: &str| regex::Regex::new(MachineShape::CPU_PATTERN).unwrap().is_match(value);
+        assert!(reads("1") && reads("0.25") && reads("500m"));
+        assert!(!reads("one") && !reads("1 cpu"));
+        assert_eq!(cpu.then.port.as_deref(), Some("cpu"));
+        let memory = regex::Regex::new(MachineShape::MEMORY_PATTERN).unwrap();
+        assert!(memory.is_match("2Gi") && memory.is_match("512Mi") && memory.is_match("1.5G"));
+        assert!(!memory.is_match("2GB") && !memory.is_match("2"));
+    }
+
+    /// A node reads its machine off its inputs in one call, a blank
+    /// machine type (taken out of the bag as no value) left to the
+    /// platform's pick.
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn a_machine_is_read_off_the_inputs() {
+        let bag = |values: serde_json::Value| {
+            let mut delivered = values.as_object().unwrap().clone();
+            crate::run::ready::drop_blank_texts(&mut delivered, |name| name == "machineType");
+            crate::context::ValueBag::inputs(delivered, Default::default(), Vec::new())
+        };
+        let machine = MachineShape::from_inputs(&bag(serde_json::json!({ "cpu": "1", "memory": "2Gi", "machineType": " " }))).unwrap();
+        assert_eq!(machine, MachineShape { cpu: Some("1".into()), memory: Some("2Gi".into()), gpu: None, kind: None });
+        let typed = MachineShape::from_inputs(&bag(serde_json::json!({ "cpu": "1", "memory": "2Gi", "machineType": "e2-micro" }))).unwrap();
+        assert_eq!(typed.kind.as_deref(), Some("e2-micro"));
+    }
 
     /// The kind a unit's row stores is the one serde writes.
     #[test]

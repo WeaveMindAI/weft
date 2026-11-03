@@ -20,16 +20,7 @@
     use weft_journal::RunEvent;
     use crate::context::EngineClients;
 
-    /// A minimal wait-for-input signal for the bus + await_signal tests.
-    fn human_form() -> weft_core::signal::Form {
-        weft_core::signal::Form {
-            form_type: "human_query".into(),
-            schema: weft_core::signal::FormSchema { fields: Vec::new() },
-            title: None,
-            description: None,
-            consumer_kind: None,
-        }
-    }
+    use super::engine_test_rig::human_form;
 
     /// Producer: create a bus on output port "channel", emit it, then
     /// send three messages and close. Stays alive (its execute does not
@@ -39,7 +30,8 @@
     #[async_trait]
     impl Node for Producer {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-            let (mut bus, marker) = ctx.create_bus(Default::default())?;
+            let mut state = ctx.keep(()).await?;
+            let (mut bus, marker) = ctx.create_bus("channel", Default::default())?;
             bus.register("producer").expect("register producer");
             // Put the marker on the bus output port; downstream resolves
             // it through the per-run `BusRegistry`.
@@ -49,7 +41,7 @@
             // register under "llm" before streaming: the bus only delivers
             // messages sent AFTER a participant is live. `wait_for` returns
             // an error (never hangs) if "llm" can never register.
-            bus.wait_for("llm").await.expect("consumer 'llm' should register");
+            bus.wait_for("llm", &mut state).await.expect("consumer 'llm' should register");
             for i in 0..3 {
                 bus.send("tick", json!({ "i": i })).expect("send to live consumer");
             }
@@ -70,22 +62,22 @@
     #[async_trait]
     impl Node for Consumer {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
             let mut bus = ctx.bus_from_input("channel")?;
             // Claim our identity: this is what releases the producer's
             // `wait_for("llm")` and stamps our sends.
             bus.register("llm").expect("register llm");
-            let mut cursor = bus.cursor().with_filter(|entry| {
+            let mut cursor = bus.cursor()?.with_filter(|entry| {
                 matches!(
                     &entry.kind,
                     weft_core::bus::BusEntryKind::Message { msg_kind, .. } if msg_kind == "tick"
                 )
             });
-            while let Some(entry) = cursor.next().await {
-                if let weft_core::bus::BusEntryKind::Message { from, payload, .. } = entry.kind {
-                    let payload =
-                        payload.expect("journaled payload").into_json().expect("json bus");
+            while let Some(entry) = cursor.next(&mut state).await? {
+                if let weft_core::bus::BusEntryKind::Message { from, .. } = &entry.kind {
+                    let (_, payload) = entry.as_json().expect("a json message");
                     let i = payload["i"].as_i64().unwrap_or(-1);
-                    self.seen.lock().unwrap().push((from, i));
+                    self.seen.lock().unwrap().push((from.clone(), i));
                 }
             }
             Ok(())
@@ -262,18 +254,20 @@
     /// when the run is cancelled, the loop wakes, returns
     /// Failed(cancelled), and the waiting task is aborted (its bus
     /// handle drops). This is what makes a user "Stop" tear down a
-    /// live-bus run.
-    struct Waiter;
+    /// live-bus run. It rings its bell as it reaches its cursor wait.
+    struct Waiter(tokio::sync::Notify);
     test_manifest!(Waiter, "Waiter");
     #[async_trait]
     impl Node for Waiter {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-            let (mut bus, _marker) = ctx.create_bus(Default::default())?;
+            let mut state = ctx.keep(()).await?;
+            let (mut bus, _marker) = ctx.create_bus("channel", Default::default())?;
             bus.register("waiter").expect("register");
             // Wait forever: no peer ever sends or closes. Only
             // cancellation (task abort) can end this.
-            let mut cursor = bus.cursor();
-            while cursor.next().await.is_some() {}
+            let mut cursor = bus.cursor()?;
+            self.0.notify_one();
+            while cursor.next(&mut state).await?.is_some() {}
             Ok(())
         }
     }
@@ -288,7 +282,8 @@
 
     #[tokio::test]
     async fn cancellation_unblocks_a_node_waiting_on_cursor() {
-        let catalog: Arc<dyn NodeCatalog> = Arc::new(WaiterCatalog(Box::leak(Box::new(Waiter))));
+        let waiter: &'static Waiter = Box::leak(Box::new(Waiter(tokio::sync::Notify::new())));
+        let catalog: Arc<dyn NodeCatalog> = Arc::new(WaiterCatalog(waiter));
         let project: ProjectDefinition = serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(), "name": "waiter", "description": null,
             "nodes": [{
@@ -318,8 +313,8 @@
         let run = tokio::spawn(run_checked(
             Arc::new(project), catalog, run_id, journal, clients, cancel.clone(), None,
         ));
-        // Let the waiter reach its cursor wait, then cancel.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Once the waiter reached its cursor wait, cancel.
+        waiter.0.notified().await;
         cancel.cancel_because(weft_core::run::CancelCause::User);
 
         // Must finish (not hang). Bound it so a regression fails the
@@ -336,8 +331,10 @@
             .expect("run ok");
         match outcome {
             RunOutcome::Cancelled { .. } => {} // cancel won the race
-            RunOutcome::Completed => {} // dead-end closed the bus, Waiter exited cleanly
-            other => panic!("expected Cancelled or Completed via dead-end, got {other:?}"),
+            // The dead-end detector closed the bus failed first, and the
+            // Waiter's read handed that failure on.
+            RunOutcome::Failed { error, .. } if error.contains("stuck") => {}
+            other => panic!("expected Cancelled, or Failed via the dead-end, got {other:?}"),
         }
     }
 
@@ -436,13 +433,12 @@
         .expect("project")
     }
 
-    /// Topology for the bus + await_signal matrix: a bus `creator` wired
-    /// to a `peer` (the pair holds the worker alive), PLUS an independent
-    /// `waiter` entry node that does the `await_signal`. The waiter does
-    /// NOT touch the bus and emits nothing. All three are
+    /// Topology for the bus + wait matrix: a bus `creator` wired to a
+    /// `peer`, PLUS an independent `waiter` entry node that waits. The
+    /// waiter does NOT touch the bus and emits nothing. All three are
     /// kicked as entry roots. This mirrors reality: a HumanQuery-style
     /// node waits for input while OTHER nodes keep a bus conversation
-    /// alive; the bus only prevents the worker dying.
+    /// going.
     fn bus_plus_waiter_topology() -> ProjectDefinition {
         serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(), "name": "bus-plus-waiter", "description": null,
@@ -483,8 +479,8 @@
     /// `pulses_absorbed` un-absorb path (not the kicked `dispatched=false`
     /// reset). Two required ports means a re-dispatch only forms when BOTH
     /// ports carry a pending pulse again, which the un-absorb has to put
-    /// back. The creator+peer bus keeps the worker alive across the awaits
-    /// exactly as in the kicked variant.
+    /// back. The creator, working, keeps the run on its worker across the
+    /// waits exactly as in the kicked variant.
     fn bus_plus_pulse_fed_waiter_topology() -> ProjectDefinition {
         serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(), "name": "bus-plus-pulse-fed-waiter", "description": null,
@@ -616,23 +612,25 @@
         let project = bus_topology("creator", &["peer"], "ch");
         let pid = project.id;
         install_body(pid, "creator", std::sync::Arc::new(|ctx| Box::pin(async move {
-            let (mut bus, marker) = ctx.create_bus(Default::default())?;
+            let mut state = ctx.keep(()).await?;
+            let (mut bus, marker) = ctx.create_bus("ch", Default::default())?;
             bus.register("creator").expect("register");
             emit_bus_marker(&ctx, "ch", marker).await?;
             // Wait for the peer to register. The peer is dispatched on the
             // next loop iteration after the emit lands; the engine must
             // not panic / dead-end while it gets there.
-            bus.wait_for("peer").await.expect("peer should register");
+            bus.wait_for("peer", &mut state).await.expect("peer should register");
             bus.send("ping", json!(null)).expect("send to live peer");
             bus.close();
             Ok(())
         })));
         install_body(pid, "peer", std::sync::Arc::new(|ctx| Box::pin(async move {
+            let mut state = ctx.keep(()).await?;
             let mut bus = ctx.bus_from_input("ch")?;
             bus.register("peer").expect("register");
             // Drain until close.
-            let mut cursor = bus.cursor();
-            while cursor.next().await.is_some() {}
+            let mut cursor = bus.cursor()?;
+            while cursor.next(&mut state).await?.is_some() {}
             Ok(())
         })));
         let outcome = run_test(project, "creator").await;
@@ -652,20 +650,22 @@
         let project = bus_topology("a", &["b", "c"], "ch");
         let pid = project.id;
         install_body(pid, "a", std::sync::Arc::new(|ctx| Box::pin(async move {
-            let (mut bus, marker) = ctx.create_bus(Default::default())?;
+            let mut state = ctx.keep(()).await?;
+            let (mut bus, marker) = ctx.create_bus("ch", Default::default())?;
             bus.register("a").expect("register a");
             emit_bus_marker(&ctx, "ch", marker).await?;
             // A waits for B. When the engine closes the bus, this errors.
-            bus.wait_for("b").await.map_err(|e| weft_core::error::WeftError::Runtime(
+            bus.wait_for("b", &mut state).await.map_err(|e| weft_core::error::WeftError::Runtime(
                 anyhow::anyhow!("a: wait_for(b) failed: {e}"),
             ))?;
             Ok(())
         })));
         install_body(pid, "b", std::sync::Arc::new(|ctx| Box::pin(async move {
+            let mut state = ctx.keep(()).await?;
             let mut bus = ctx.bus_from_input("ch")?;
             bus.register("b").expect("register b");
             // B waits for C. When the engine closes the bus, this errors.
-            bus.wait_for("c").await.map_err(|e| weft_core::error::WeftError::Runtime(
+            bus.wait_for("c", &mut state).await.map_err(|e| weft_core::error::WeftError::Runtime(
                 anyhow::anyhow!("b: wait_for(c) failed: {e}"),
             ))?;
             Ok(())
@@ -695,14 +695,15 @@
         let project = bus_topology("producer", &["inspector", "consumer"], "ch");
         let pid = project.id;
         install_body(pid, "producer", std::sync::Arc::new(|ctx| Box::pin(async move {
-            let (mut bus, marker) = ctx.create_bus(Default::default())?;
+            let mut state = ctx.keep(()).await?;
+            let (mut bus, marker) = ctx.create_bus("ch", Default::default())?;
             bus.register("producer").expect("register");
             emit_bus_marker(&ctx, "ch", marker).await?;
             // The producer waits for the real consumer. The holder
             // (`inspector`) also has the bus but never registered; if the
             // engine miscounted holders as participants, this would
             // dead-end with the inspector still alive.
-            bus.wait_for("consumer").await.expect("real consumer should register");
+            bus.wait_for("consumer", &mut state).await.expect("real consumer should register");
             bus.send("ping", json!(null)).expect("send");
             bus.close();
             Ok(())
@@ -717,10 +718,11 @@
             Ok(())
         })));
         install_body(pid, "consumer", std::sync::Arc::new(|ctx| Box::pin(async move {
+            let mut state = ctx.keep(()).await?;
             let mut bus = ctx.bus_from_input("ch")?;
             bus.register("consumer").expect("register");
-            let mut cursor = bus.cursor();
-            while cursor.next().await.is_some() {}
+            let mut cursor = bus.cursor()?;
+            while cursor.next(&mut state).await?.is_some() {}
             Ok(())
         })));
         let outcome = run_test(project, "producer").await;
@@ -754,18 +756,20 @@
             let project = bus_topology("a", &["b"], "ch");
             let pid = project.id;
             install_body(pid, "a", std::sync::Arc::new(|ctx| Box::pin(async move {
-                let (mut bus, marker) = ctx.create_bus(Default::default())?;
+                let mut state = ctx.keep(()).await?;
+                let (mut bus, marker) = ctx.create_bus("ch", Default::default())?;
                 bus.register("a").expect("register");
                 emit_bus_marker(&ctx, "ch", marker).await?;
-                bus.wait_for("x").await.map_err(|e| weft_core::error::WeftError::Runtime(
+                bus.wait_for("x", &mut state).await.map_err(|e| weft_core::error::WeftError::Runtime(
                     anyhow::anyhow!("a: {e}"),
                 ))?;
                 Ok(())
             })));
             install_body(pid, "b", std::sync::Arc::new(|ctx| Box::pin(async move {
+                let mut state = ctx.keep(()).await?;
                 let mut bus = ctx.bus_from_input("ch")?;
                 bus.register("b").expect("register");
-                bus.wait_for("y").await.map_err(|e| weft_core::error::WeftError::Runtime(
+                bus.wait_for("y", &mut state).await.map_err(|e| weft_core::error::WeftError::Runtime(
                     anyhow::anyhow!("b: {e}"),
                 ))?;
                 Ok(())
@@ -805,30 +809,31 @@
             install_body(pid, "a", std::sync::Arc::new(move |ctx| {
                 let a_ex = a_ex.clone();
                 Box::pin(async move {
-                    let (mut bus, marker) = ctx.create_bus(Default::default())?;
+                    let mut state = ctx.keep(()).await?;
+                    let (mut bus, marker) = ctx.create_bus("ch", Default::default())?;
                     bus.register("a").expect("register");
                     emit_bus_marker(&ctx, "ch", marker).await?;
                     // Wait for B to be live, then send it a message and
                     // immediately park reading for B's reply. The park
                     // right after the send is the false-positive window.
-                    bus.wait_for("b").await.map_err(|e| weft_core::error::WeftError::Runtime(
+                    bus.wait_for("b", &mut state).await.map_err(|e| weft_core::error::WeftError::Runtime(
                         anyhow::anyhow!("a: wait_for(b): {e}"),
                     ))?;
                     // Position the pong-cursor BEFORE sending ping, so B's
                     // reply (which may land before A is re-scheduled)
                     // cannot slip behind the cursor's start offset.
-                    let mut cursor = bus.cursor().with_filter(|e| matches!(
+                    let mut cursor = bus.cursor()?.with_filter(|e| matches!(
                         &e.kind,
                         weft_core::bus::BusEntryKind::Message { msg_kind, .. } if msg_kind == "pong"
                     ));
                     bus.send("ping", serde_json::json!({"v": 1})).expect("a sends ping");
                     // The close may legitimately race the deadlock tail;
                     // a closed bus here surfaces as None, not a panic.
-                    if cursor.next().await.is_some() {
+                    if cursor.next(&mut state).await?.is_some() {
                         a_ex.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     // Now deadlock: wait for a name that never comes.
-                    bus.wait_for("never").await.map_err(|e| weft_core::error::WeftError::Runtime(
+                    bus.wait_for("never", &mut state).await.map_err(|e| weft_core::error::WeftError::Runtime(
                         anyhow::anyhow!("a: {e}"),
                     ))?;
                     Ok(())
@@ -838,19 +843,20 @@
             install_body(pid, "b", std::sync::Arc::new(move |ctx| {
                 let b_ex = b_ex.clone();
                 Box::pin(async move {
+                    let mut state = ctx.keep(()).await?;
                     let mut bus = ctx.bus_from_input("ch")?;
                     bus.register("b").expect("register");
                     // Drain A's ping, reply with pong, then deadlock.
-                    let mut cursor = bus.cursor().with_filter(|e| matches!(
+                    let mut cursor = bus.cursor()?.with_filter(|e| matches!(
                         &e.kind,
                         weft_core::bus::BusEntryKind::Message { msg_kind, .. } if msg_kind == "ping"
                     ));
-                    if cursor.next().await.is_some() {
+                    if cursor.next(&mut state).await?.is_some() {
                         b_ex.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         // The reply can race the close; ignore a closed bus.
                         let _ = bus.send("pong", serde_json::json!({"v": 2}));
                     }
-                    bus.wait_for("never").await.map_err(|e| weft_core::error::WeftError::Runtime(
+                    bus.wait_for("never", &mut state).await.map_err(|e| weft_core::error::WeftError::Runtime(
                         anyhow::anyhow!("b: {e}"),
                     ))?;
                     Ok(())
@@ -908,15 +914,16 @@
             install_body(pid, "a", std::sync::Arc::new(move |ctx| {
                 let a_ex = a_ex.clone();
                 Box::pin(async move {
-                    let (mut bus, marker) = ctx.create_bus(Default::default())?;
+                    let mut state = ctx.keep(()).await?;
+                    let (mut bus, marker) = ctx.create_bus("ch", Default::default())?;
                     bus.register("a").expect("register");
                     emit_bus_marker(&ctx, "ch", marker).await?;
-                    bus.wait_for("b").await.map_err(|e| weft_core::error::WeftError::Runtime(
+                    bus.wait_for("b", &mut state).await.map_err(|e| weft_core::error::WeftError::Runtime(
                         anyhow::anyhow!("a: wait_for(b): {e}"),
                     ))?;
                     // Cursor positioned BEFORE the ping send so B's pong
                     // cannot slip behind the start offset.
-                    let mut cursor = bus.cursor().with_filter(|e| matches!(
+                    let mut cursor = bus.cursor()?.with_filter(|e| matches!(
                         &e.kind,
                         weft_core::bus::BusEntryKind::Message { msg_kind, .. } if msg_kind == "pong"
                     ));
@@ -924,10 +931,10 @@
                     // parked caught-up half of the false-positive pair
                     // while B is mid-search on the ping.
                     bus.send("ping", serde_json::json!({"v": 1})).expect("a sends ping");
-                    if cursor.next().await.is_some() {
+                    if cursor.next(&mut state).await?.is_some() {
                         a_ex.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
-                    bus.wait_for("never").await.map_err(|e| weft_core::error::WeftError::Runtime(
+                    bus.wait_for("never", &mut state).await.map_err(|e| weft_core::error::WeftError::Runtime(
                         anyhow::anyhow!("a: {e}"),
                     ))?;
                     Ok(())
@@ -937,12 +944,13 @@
             install_body(pid, "b", std::sync::Arc::new(move |ctx| {
                 let b_ex = b_ex.clone();
                 Box::pin(async move {
+                    let mut state = ctx.keep(()).await?;
                     let mut bus = ctx.bus_from_input("ch")?;
                     bus.register("b").expect("register");
                     // The sleep runs inside the search, between B's
                     // record_observed and the message being returned:
                     // exactly the window the parked flag must cover.
-                    let mut cursor = bus.cursor().with_filter(|e| {
+                    let mut cursor = bus.cursor()?.with_filter(|e| {
                         let hit = matches!(
                             &e.kind,
                             weft_core::bus::BusEntryKind::Message { msg_kind, .. } if msg_kind == "ping"
@@ -952,7 +960,7 @@
                         }
                         hit
                     });
-                    if cursor.next().await.is_some() {
+                    if cursor.next(&mut state).await?.is_some() {
                         b_ex.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         // The reply MUST succeed: a Closed here is the
                         // false positive this test exists to catch. The
@@ -962,7 +970,7 @@
                         bus.send("pong", serde_json::json!({"v": 2}))
                             .expect("pong send failed: bus closed under a succeeding evaluation");
                     }
-                    bus.wait_for("never").await.map_err(|e| weft_core::error::WeftError::Runtime(
+                    bus.wait_for("never", &mut state).await.map_err(|e| weft_core::error::WeftError::Runtime(
                         anyhow::anyhow!("b: {e}"),
                     ))?;
                     Ok(())
@@ -1065,107 +1073,39 @@
                 "cancelled run reports Cancelled; got {outcome:?}"
             );
             // The close is drop-spawned on abort, so it may land a beat
-            // after the run returns: poll briefly rather than sleep blind.
-            for _ in 0..100 {
-                if !fake_access_broker.released.lock().unwrap().is_empty() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+            // after the run returns: wait for it to land.
+            fake_access_broker.released_at_least(1).await;
             let released = fake_access_broker.released.lock().unwrap().clone();
             assert_eq!(released.len(), 1, "the aborted body's connection must be released by the runtime");
             assert_eq!(released[0].get("token").map(String::as_str), Some("sk-platform"));
         }
     );
 
-    weft_core::stress_test!(
-        // END-TO-END concurrent waits in ONE node task, through the real
-        // WaitGuard/cursor wiring (not the coordinator hooks directly).
-        // Node A holds TWO concurrent bus waits at once: a `tokio::select!`
-        // over two cursors on its bus (one filtering "ping", one a
-        // membership wait). This is the exact shape the per-node single-
-        // wait slot got wrong: two WaitGuards under one (node, frames),
-        // where the old code clobbered the first wait's state and panicked
-        // the worker when the second guard dropped. Here B sends "ping",
-        // resolving A's select; A then deadlocks waiting for a name that
-        // never comes while B also deadlocks. The run must reach Failed
-        // (clean unwind) and NOT panic: if the select's two guards
-        // corrupted the liveness map, the worker would abort instead.
-        name: concurrent_waits_in_one_task_unwind_cleanly,
-        runs: 64,
-        worker_threads: 4,
-        async fn body() {
-            let got_ping = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let project = bus_topology("a", &["b"], "ch");
-            let pid = project.id;
-            let a_got = got_ping.clone();
-            install_body(pid, "a", std::sync::Arc::new(move |ctx| {
-                let a_got = a_got.clone();
-                Box::pin(async move {
-                    let (mut bus, marker) = ctx.create_bus(Default::default())?;
-                    bus.register("a").expect("register");
-                    emit_bus_marker(&ctx, "ch", marker).await?;
-                    bus.wait_for("b").await.map_err(|e| weft_core::error::WeftError::Runtime(
-                        anyhow::anyhow!("a: wait_for(b): {e}"),
-                    ))?;
-                    // TWO concurrent waits in one task: a cursor for "ping"
-                    // and a membership wait for a name that never comes.
-                    // select! polls BOTH futures, so both hold a live
-                    // WaitGuard under (a, root frames) at once.
-                    let mut ping_cursor = bus.cursor().with_filter(|e| matches!(
-                        &e.kind,
-                        weft_core::bus::BusEntryKind::Message { msg_kind, .. } if msg_kind == "ping"
-                    ));
-                    let never_handle = bus.new_handle();
-                    tokio::select! {
-                        r = ping_cursor.next() => {
-                            if r.is_some() {
-                                a_got.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            }
-                        }
-                        r = never_handle.wait_for("never-x") => {
-                            // The bus close can race this; a Closed here is
-                            // fine (the select's other branch or the
-                            // deadlock won).
-                            let _ = r;
-                        }
-                    }
-                    // Now deadlock on a name that never arrives.
-                    bus.wait_for("never-y").await.map_err(|e| weft_core::error::WeftError::Runtime(
-                        anyhow::anyhow!("a: {e}"),
-                    ))?;
-                    Ok(())
-                })
-            }));
-            install_body(pid, "b", std::sync::Arc::new(|ctx| Box::pin(async move {
-                let mut bus = ctx.bus_from_input("ch")?;
-                bus.register("b").expect("register");
-                let _ = bus.send("ping", serde_json::json!({"v": 1}));
-                bus.wait_for("never-z").await.map_err(|e| weft_core::error::WeftError::Runtime(
-                    anyhow::anyhow!("b: {e}"),
-                ))?;
-                Ok(())
-            })));
-            let outcome = run_test(project, "a").await;
-            assert!(
-                matches!(outcome, RunOutcome::Failed { .. }),
-                "concurrent waits then mutual deadlock unwinds to Failed (no worker abort); \
-                 got {outcome:?}"
-            );
-        }
-    );
-
     // ─────────────────────────────────────────────────────────────────
-    // Bus + wait-for-input (await_signal). A live bus keeps the worker
-    // alive but must be TRANSPARENT to the signal machinery: a node can
-    // await_signal while a bus is open; the worker stays alive (bus
-    // holds it) and the resume is delivered IN PROCESS the moment the
-    // fire's answer comes. When no bus holds the worker, a
-    // parked await falls through to the normal stall -> die -> respawn
-    // path. These tests pin the whole matrix.
+    // Bus + a wait (`state.wait`). A wait holds in its node's call; while
+    // another node still runs (a bus conversation going on beside it), the
+    // worker stays and an answer that comes goes straight into the waiting
+    // call, the body never running again. Once every running node waits
+    // (and the run stayed quiet for its `pauseAfterSecs`, 0 here), the run
+    // pauses (Stalled) and a fresh worker picks it up. These tests pin
+    // that matrix.
     // ─────────────────────────────────────────────────────────────────
 
-    use super::engine_test_rig::AwaitTasks;
+    use super::engine_test_rig::{wait_once, AwaitTasks};
+
+    /// What a test node waiting twice keeps: both answers, so a firing
+    /// resumed after its first wait goes straight on to the second.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct TwoAnswers {
+        first: Option<Value>,
+        second: Option<Value>,
+    }
+
+    /// Until the run, waiting, read its answers once: an answer given from
+    /// then on is told to it.
+    async fn reads_its_answers(answers: &super::engine_test_rig::Answers) {
+        answers.read_past(0).await;
+    }
 
     /// Spawn `run_one` with the given tasks fake, journal and
     /// answers, so a test can give an answer to a wait while the worker
@@ -1191,6 +1131,21 @@
         answers: Arc<super::engine_test_rig::Answers>,
         hold_secs: u32,
     ) -> (tokio::task::JoinHandle<anyhow::Result<RunOutcome>>, RunId) {
+        let settings = super::engine_test_rig::pausing_at_once().holding_for(hold_secs).unwrap();
+        let base = clients(journal.clone());
+        spawn_run_with(project, kicked, journal, base, tasks, answers, settings)
+    }
+
+    /// [`spawn_run`], the run under `settings`, its other clients `base`'s.
+    fn spawn_run_with(
+        project: ProjectDefinition,
+        kicked: &[&str],
+        journal: Arc<MemJournal>,
+        base: EngineClients,
+        tasks: Arc<dyn weft_task_store::TaskStoreClient>,
+        answers: Arc<super::engine_test_rig::Answers>,
+        settings: weft_core::run_settings::RunSettings,
+    ) -> (tokio::task::JoinHandle<anyhow::Result<RunOutcome>>, RunId) {
         let run_id = weft_core::new_run_id();
         let entry = kicked[0].to_string();
         let kicked: Vec<String> = kicked.iter().map(|s| s.to_string()).collect();
@@ -1208,7 +1163,7 @@
                     cut_from: None,
                     seed: None,
                     instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-                    settings: weft_core::run_settings::RunSettings::default().holding_for(hold_secs).unwrap(),
+                    settings,
                 },
                 None,
             )
@@ -1229,17 +1184,16 @@
                 .await
                 .unwrap();
             }
-            let clients = EngineClients { tasks, told: answers.told.clone(), runs: answers, ..clients(j.clone()) };
+            let clients = EngineClients { tasks, told: answers.told.clone(), runs: answers, ..base };
             run_checked(Arc::new(project), configurable_catalog(), run_id, j, clients, CancellationFlag::new_arc(), None)
                 .await
         });
         (handle, run_id)
     }
 
-    /// BASELINE (no bus): a lone node awaits. With no bus holding it, the
-    /// worker stalls and EXITS (Stalled) so the dispatcher can respawn it
-    /// on the fire. This is the unchanged normal path; the bus work must
-    /// not have altered it.
+    /// BASELINE (no bus): a lone node waits. Nothing else runs, so the
+    /// worker pauses the run and EXITS (Stalled) so the dispatcher can
+    /// respawn it on the fire.
     #[tokio::test]
     async fn await_without_bus_stalls_and_exits() {
         let project = bus_topology("waiter", &[], "ch");
@@ -1250,7 +1204,7 @@
             "waiter",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
-                    let _ = ctx.await_signal(human_form()).await?;
+                    wait_once(&ctx, human_form()).await?;
                     Ok(())
                 })
             }),
@@ -1271,21 +1225,21 @@
         );
     }
 
-    /// IN-FLIGHT RESUME (bus opened after the wait suspended): an
-    /// independent `waiter` node suspends on `await_signal` while nothing
-    /// keeps the worker, then `creator`+`peer` open a bus conversation
-    /// (holding the worker alive). The test answers the wait mid-flight;
-    /// the suspended waiter resumes IN PROCESS on the live worker (no
-    /// respawn), and once it resumes it tells the creator to wrap up so
-    /// the bus closes and the run completes.
+    /// IN-FLIGHT ANSWER: an independent `waiter` node holds its wait,
+    /// then `creator`+`peer` open a bus conversation (the creator keeps
+    /// working, so the run does not pause). The test answers the wait
+    /// mid-flight; the answer goes straight into the waiter's call on the
+    /// live worker (no pause, no respawn), and the waiter then tells the
+    /// creator to wrap up so the bus closes and the run completes.
     #[tokio::test]
     async fn await_with_live_bus_resumes_in_process() {
         let project = bus_plus_waiter_topology();
         let pid = project.id;
-        // Shared flag: the waiter flips it on resume; the creator polls it
-        // on the bus and closes once set. (A plain Arc<AtomicBool> is the
-        // cross-node signal; the bus just keeps the worker warm.)
-        let resumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Shared bell: the waiter rings it on resume; the creator waits
+        // on it and closes its bus once rung. (Waiting on it is not a
+        // wait the run knows of: the creator, working, keeps the run on
+        // its worker.)
+        let resumed = Arc::new(tokio::sync::Notify::new());
         // The creator opens its bus only once the waiter has suspended.
         let open = Arc::new(tokio::sync::Notify::new());
 
@@ -1298,17 +1252,16 @@
                 let resumed = r_creator.clone();
                 let open = o_creator.clone();
                 Box::pin(async move {
+                    let mut state = ctx.keep(()).await?;
                     open.notified().await;
-                    let (mut bus, marker) = ctx.create_bus(Default::default())?;
+                    let (mut bus, marker) = ctx.create_bus("ch", Default::default())?;
                     bus.register("creator").expect("register creator");
                     emit_bus_marker(&ctx, "ch", marker).await?;
-                    bus.wait_for("peer").await.expect("peer joins");
-                    // Hold the bus open until the waiter has resumed, then
-                    // close so the run can complete. This keeps the
-                    // worker alive across the await + resume.
-                    while !resumed.load(std::sync::atomic::Ordering::Acquire) {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
+                    bus.wait_for("peer", &mut state).await.expect("peer joins");
+                    // Keep working until the waiter has resumed, then close
+                    // so the run can complete: a node working keeps the
+                    // run from pausing across the wait and its resume.
+                    resumed.notified().await;
                     bus.close();
                     Ok(())
                 })
@@ -1319,11 +1272,12 @@
             "peer",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
+                    let mut state = ctx.keep(()).await?;
                     let mut bus = ctx.bus_from_input("ch")?;
                     bus.register("peer").expect("register peer");
-                    let mut cursor = bus.cursor();
+                    let mut cursor = bus.cursor()?;
                     // Stay co-alive until the creator closes the bus.
-                    while cursor.next().await.is_some() {}
+                    while cursor.next(&mut state).await?.is_some() {}
                     Ok(())
                 })
             }),
@@ -1335,10 +1289,10 @@
             std::sync::Arc::new(move |ctx| {
                 let resumed = r_waiter.clone();
                 Box::pin(async move {
-                    // Park on a signal WHILE the bus holds the worker.
-                    let _ = ctx.await_signal(human_form()).await?;
+                    // Suspend on a wait while the creator keeps working.
+                    wait_once(&ctx, human_form()).await?;
                     // Resumed in-process: tell the creator to wrap up.
-                    resumed.store(true, std::sync::atomic::Ordering::Release);
+                    resumed.notify_one();
                     Ok(())
                 })
             }),
@@ -1350,15 +1304,14 @@
         let (handle, _) =
             spawn_run(project, &["creator", "waiter"], journal.clone(), tasks.clone(), answers.clone());
 
-        // Wait until the waiter's await registered (token minted), give it
-        // a beat to reach the suspended state, have the bus open, then
-        // answer its wait the way the install does on a real fire. It lands
-        // while the worker is alive (bus open); the in-loop ask takes it
-        // and resumes the waiter in process.
+        // Wait until the waiter's wait registered (token minted) and the run
+        // read its answers, have the bus open, then answer its wait the way
+        // the install does on a real fire. It lands
+        // while the worker is alive (the creator working); the in-loop ask
+        // takes it and resumes the waiter in process.
         let token = tasks.await_token().await;
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        reads_its_answers(&answers).await;
         open.notify_one();
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         answers.answer(token, serde_json::json!({ "answer": 42 }));
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
@@ -1370,29 +1323,28 @@
             matches!(outcome, RunOutcome::Completed),
             "the resume must happen in process on the bus-held worker and complete; got {outcome:?}"
         );
-        // The journal must show the WAITER resumed (NodeResumed), proving
-        // the resume happened on this live worker, not via a respawn.
+        // The waiter never paused: its answer is on record, and it was
+        // neither suspended nor resumed.
         let events = journal.events.lock().unwrap().clone();
+        assert!(events.iter().any(|e| matches!(e, RunEvent::SuspensionResolved { .. })), "the answer is on record: {events:?}");
         assert!(
-            events.iter().any(|e| matches!(e, RunEvent::NodeResumed { node_id, .. } if node_id == "waiter")),
-            "waiter must have a NodeResumed event (in-process resume); got {events:?}"
+            !events.iter().any(|e| matches!(e, RunEvent::NodeSuspended { .. } | RunEvent::NodeResumed { .. })),
+            "the waiter took its answer in its call, with no pause: {events:?}"
         );
     }
 
-    /// TWO awaits on a live bus where the waiter is a KICKED entry node
-    /// (no inbound pulses): it parks, resumes, parks again, resumes again,
-    /// all in process on the bus-held worker. A kicked node re-fires via
-    /// the `dispatched=false` reset (not the pulse un-absorb path), so
-    /// this pins the multi-await-on-bus path for entry nodes. The pulse-
-    /// fed variant that exercises the `pulses_absorbed` un-absorb across
-    /// two resumes is `two_awaits_pulse_fed_waiter_both_resume`.
+    /// TWO waits beside a live bus where the waiter is a KICKED entry
+    /// node (no inbound pulses): each answer goes into the waiting call
+    /// while the creator keeps working, and the body goes on to its second
+    /// wait and its end without ever pausing. The pulse-fed variant is
+    /// `two_awaits_pulse_fed_waiter_both_resume`.
     #[tokio::test]
     async fn two_awaits_on_live_bus_both_resume_in_process() {
         let project = bus_plus_waiter_topology();
         let pid = project.id;
         // Counts how many times the waiter has resumed (0 -> 1 -> 2). The
         // creator holds the bus open until BOTH resumes have landed.
-        let resumes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let resumes = Arc::new(tokio::sync::watch::Sender::new(0u32));
 
         let c_resumes = resumes.clone();
         install_body(
@@ -1401,14 +1353,13 @@
             std::sync::Arc::new(move |ctx| {
                 let resumes = c_resumes.clone();
                 Box::pin(async move {
-                    let (mut bus, marker) = ctx.create_bus(Default::default())?;
+                    let mut state = ctx.keep(()).await?;
+                    let (mut bus, marker) = ctx.create_bus("ch", Default::default())?;
                     bus.register("creator").expect("register creator");
                     emit_bus_marker(&ctx, "ch", marker).await?;
-                    bus.wait_for("peer").await.expect("peer joins");
+                    bus.wait_for("peer", &mut state).await.expect("peer joins");
                     // Hold the bus open until BOTH awaits have resumed.
-                    while resumes.load(std::sync::atomic::Ordering::Acquire) < 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
+                    resumes.subscribe().wait_for(|n| *n >= 2).await.expect("the count outlives the creator");
                     bus.close();
                     Ok(())
                 })
@@ -1419,10 +1370,11 @@
             "peer",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
+                    let mut state = ctx.keep(()).await?;
                     let mut bus = ctx.bus_from_input("ch")?;
                     bus.register("peer").expect("register peer");
-                    let mut cursor = bus.cursor();
-                    while cursor.next().await.is_some() {}
+                    let mut cursor = bus.cursor()?;
+                    while cursor.next(&mut state).await?.is_some() {}
                     Ok(())
                 })
             }),
@@ -1434,12 +1386,13 @@
             std::sync::Arc::new(move |ctx| {
                 let resumes = w_resumes.clone();
                 Box::pin(async move {
-                    // First park + resume.
-                    let _ = ctx.await_signal(human_form()).await?;
-                    resumes.fetch_add(1, std::sync::atomic::Ordering::Release);
-                    // Second park + resume on the same live worker.
-                    let _ = ctx.await_signal(human_form()).await?;
-                    resumes.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    // Each run of the body goes as far as its state lets
+                    // it: a resumed run passes the wait already answered.
+                    let mut state = ctx.keep(TwoAnswers::default()).await?;
+                    state.wait(|s| &mut s.first, human_form()).await?;
+                    resumes.send_modify(|n| *n = (*n).max(1));
+                    state.wait(|s| &mut s.second, human_form()).await?;
+                    resumes.send_modify(|n| *n = (*n).max(2));
                     Ok(())
                 })
             }),
@@ -1451,21 +1404,14 @@
         let (handle, _) =
             spawn_run(project, &["creator", "waiter"], journal.clone(), tasks.clone(), answers.clone());
 
-        // Resolve the FIRST await (call_index 0).
+        // Resolve the FIRST wait (wait 0).
         let token0 = tasks.await_token().await;
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        reads_its_answers(&answers).await;
         answers.answer(token0.clone(), serde_json::json!({ "answer": 1 }));
 
-        // Wait for the SECOND await to register a NEW token (distinct from
-        // the first), then resolve it (call_index 1). `await_token` returns
-        // the most-recently-minted token, so poll until it changes.
-        let token1 = loop {
-            let t = tasks.await_token().await;
-            if t != token0 {
-                break t;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        };
+        // Wait for the SECOND wait to register a NEW token (distinct from
+        // the first), then resolve it (wait 1).
+        let token1 = tasks.await_token_after(&token0).await;
         answers.answer(token1, serde_json::json!({ "answer": 2 }));
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
@@ -1478,27 +1424,23 @@
             "both resumes must land in process and the run complete; got {outcome:?}"
         );
         let events = journal.events.lock().unwrap().clone();
-        // Both answers reached the waiter in process: each is on the
-        // record, whether its wait had suspended (no bus open yet) or was
-        // held in the call (a bus open).
+        // Both answers reached the waiter's calls in process.
         let answered = events.iter().filter(|e| matches!(e, RunEvent::SuspensionResolved { .. })).count();
-        assert_eq!(answered, 2, "one answer per await, both taken in process: {events:?}");
+        assert_eq!(answered, 2, "one answer per wait, both taken in process: {events:?}");
+        let paused = events.iter().filter(|e| matches!(e, RunEvent::NodeSuspended { node_id, .. } | RunEvent::NodeResumed { node_id, .. } if node_id == "waiter")).count();
+        assert_eq!(paused, 0, "each answer went into the waiting call, with no pause: {events:?}");
     }
 
-    /// PULSE-FED waiter, resumed in place. The waiter has two required
-    /// inbound ports (`in1`, `in2`), each fed once. Its first await
-    /// suspends while nothing keeps the worker; then the bus opens, and its
-    /// answer re-fires the waiter IN PROCESS through the `pulses_absorbed`
-    /// UN-ABSORB path (it has inbound edges, so its resume cannot use the
-    /// kicked `dispatched=false` reset). Its second await, made while the
-    /// bus is open, holds in the call and takes its answer there.
+    /// PULSE-FED waiter. The waiter has two required inbound ports (`in1`,
+    /// `in2`), each fed once. Each of its waits holds in its call, and
+    /// each answer carries the body on in process, its inputs taken once.
     #[tokio::test]
     async fn two_awaits_pulse_fed_waiter_both_resume() {
         let project = bus_plus_pulse_fed_waiter_topology();
         let pid = project.id;
         // 0 -> first await parked, 1 -> first resume done, 2 -> second
         // answer taken.
-        let resumes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let resumes = Arc::new(tokio::sync::watch::Sender::new(0u32));
         // The creator opens its bus only once the waiter has suspended.
         let open = Arc::new(tokio::sync::Notify::new());
 
@@ -1511,14 +1453,13 @@
                 let resumes = c_resumes.clone();
                 let open = o_creator.clone();
                 Box::pin(async move {
+                    let mut state = ctx.keep(()).await?;
                     open.notified().await;
-                    let (mut bus, marker) = ctx.create_bus(Default::default())?;
+                    let (mut bus, marker) = ctx.create_bus("ch", Default::default())?;
                     bus.register("creator").expect("register creator");
                     emit_bus_marker(&ctx, "ch", marker).await?;
-                    bus.wait_for("peer").await.expect("peer joins");
-                    while resumes.load(std::sync::atomic::Ordering::Acquire) < 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
+                    bus.wait_for("peer", &mut state).await.expect("peer joins");
+                    resumes.subscribe().wait_for(|n| *n >= 2).await.expect("the count outlives the creator");
                     bus.close();
                     Ok(())
                 })
@@ -1529,10 +1470,11 @@
             "peer",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
+                    let mut state = ctx.keep(()).await?;
                     let mut bus = ctx.bus_from_input("ch")?;
                     bus.register("peer").expect("register peer");
-                    let mut cursor = bus.cursor();
-                    while cursor.next().await.is_some() {}
+                    let mut cursor = bus.cursor()?;
+                    while cursor.next(&mut state).await?.is_some() {}
                     Ok(())
                 })
             }),
@@ -1566,10 +1508,13 @@
             std::sync::Arc::new(move |ctx| {
                 let resumes = w_resumes.clone();
                 Box::pin(async move {
-                    let _ = ctx.await_signal(human_form()).await?;
-                    resumes.fetch_add(1, std::sync::atomic::Ordering::Release);
-                    let _ = ctx.await_signal(human_form()).await?;
-                    resumes.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    // Each run of the body goes as far as its state lets
+                    // it: a resumed run passes the wait already answered.
+                    let mut state = ctx.keep(TwoAnswers::default()).await?;
+                    state.wait(|s| &mut s.first, human_form()).await?;
+                    resumes.send_modify(|n| *n = (*n).max(1));
+                    state.wait(|s| &mut s.second, human_form()).await?;
+                    resumes.send_modify(|n| *n = (*n).max(2));
                     Ok(())
                 })
             }),
@@ -1588,22 +1533,15 @@
             answers.clone(),
         );
 
-        // Resolve the FIRST await (call_index 0) once it suspended and the
-        // bus is open.
+        // Resolve the FIRST wait (wait 0) once it suspended and the bus is
+        // open.
         let token0 = tasks.await_token().await;
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        reads_its_answers(&answers).await;
         open.notify_one();
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         answers.answer(token0.clone(), serde_json::json!({ "answer": 1 }));
 
-        // Resolve the SECOND await (call_index 1) once its token appears.
-        let token1 = loop {
-            let t = tasks.await_token().await;
-            if t != token0 {
-                break t;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        };
+        // Resolve the SECOND wait (wait 1) once its token appears.
+        let token1 = tasks.await_token_after(&token0).await;
         answers.answer(token1, serde_json::json!({ "answer": 2 }));
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
@@ -1616,22 +1554,18 @@
             "both resumes must land in process and the run complete; got {outcome:?}"
         );
         let events = journal.events.lock().unwrap().clone();
-        // Both answers reached the waiter in process: each is on the
-        // record, whether its wait had suspended (no bus open yet) or was
-        // held in the call (a bus open).
         let answered = events.iter().filter(|e| matches!(e, RunEvent::SuspensionResolved { .. })).count();
-        assert_eq!(answered, 2, "one answer per await, both taken in process: {events:?}");
-        let resumed = events.iter().filter(|e| matches!(e, RunEvent::NodeResumed { node_id, .. } if node_id == "waiter")).count();
-        assert_eq!(resumed, 1, "the suspended first await resumed in place, the second held: {events:?}");
+        assert_eq!(answered, 2, "one answer per wait, both taken in process: {events:?}");
+        let paused = events.iter().filter(|e| matches!(e, RunEvent::NodeSuspended { node_id, .. } | RunEvent::NodeResumed { node_id, .. } if node_id == "waiter")).count();
+        assert_eq!(paused, 0, "each answer went into the waiting call, with no pause: {events:?}");
     }
 
     /// BUS CLOSES BEFORE THE FIRE: the `creator`+`peer` bus conversation
-    /// ends (bus closes) while the independent `waiter` is parked on
-    /// `await_signal` and the fire has NOT arrived. Once the bus is gone
-    /// nothing holds the worker, so the await must fall through to the
-    /// normal stall -> exit path (the dispatcher respawns on the eventual
-    /// fire). No answer is given, proving the worker
-    /// exits rather than waiting forever on the dead bus.
+    /// ends (bus closes) while the independent `waiter` holds
+    /// its wait and the fire has NOT arrived. Once the others are done,
+    /// the run pauses (the dispatcher respawns on the eventual fire). No
+    /// answer is given, proving the worker exits rather than waiting
+    /// forever on the dead bus.
     #[tokio::test]
     async fn bus_closes_before_fire_then_worker_exits_normally() {
         let project = bus_plus_waiter_topology();
@@ -1641,13 +1575,14 @@
             "creator",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
-                    let (mut bus, marker) = ctx.create_bus(Default::default())?;
+                    let mut state = ctx.keep(()).await?;
+                    let (mut bus, marker) = ctx.create_bus("ch", Default::default())?;
                     bus.register("creator").expect("register creator");
                     emit_bus_marker(&ctx, "ch", marker).await?;
-                    bus.wait_for("peer").await.expect("peer joins");
+                    bus.wait_for("peer", &mut state).await.expect("peer joins");
                     // The conversation is over: close the bus. After this,
-                    // nothing holds the worker, so the parked waiter must
-                    // stall+exit (not hang on the dead bus).
+                    // only the waiting waiter is left, so the run must
+                    // pause (not hang on the dead bus).
                     bus.close();
                     Ok(())
                 })
@@ -1670,7 +1605,7 @@
             "waiter",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
-                    let _ = ctx.await_signal(human_form()).await?;
+                    wait_once(&ctx, human_form()).await?;
                     Ok(())
                 })
             }),
@@ -1682,9 +1617,8 @@
         let (handle, _run_id) =
             spawn_run(project, &["creator", "waiter"], journal.clone(), tasks.clone(), answers.clone());
 
-        // No answer is given. The worker must exit Stalled
-        // (bus closed, nothing holds it, await unresolved) rather than
-        // hang.
+        // No answer is given. The worker must exit Stalled (bus closed,
+        // the wait unanswered) rather than hang.
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
             .await
             .expect("must not hang: a closed bus must not hold the worker for an unresolved await")
@@ -1692,7 +1626,7 @@
             .expect("run ok");
         assert!(
             matches!(outcome, RunOutcome::Stalled),
-            "once the bus closed, the unresolved await must stall+exit for a respawn; got {outcome:?}"
+            "once the bus closed, the unanswered wait must pause the run for a respawn; got {outcome:?}"
         );
     }
 
@@ -1831,6 +1765,25 @@
 
     /// [`seed`], the run holding a wait it cannot pause on `hold_secs`.
     async fn seed_holding(journal: &MemJournal, run_id: RunId, project: &ProjectDefinition, entry: &str, hold_secs: u32) {
+        let settings = super::engine_test_rig::pausing_at_once().holding_for(hold_secs).unwrap();
+        seed_with(journal, run_id, project, entry, settings).await
+    }
+
+    /// [`seed`], an unrecorded run (which cannot pause) holding its waits
+    /// `hold_secs`.
+    async fn seed_unrecorded(journal: &MemJournal, run_id: RunId, project: &ProjectDefinition, entry: &str, hold_secs: u32) {
+        seed_with(journal, run_id, project, entry, unrecorded_holding(hold_secs)).await
+    }
+
+    /// The settings of an unrecorded run holding its waits `hold_secs`.
+    fn unrecorded_holding(hold_secs: u32) -> weft_core::run_settings::RunSettings {
+        weft_core::run_settings::RunSettings::new(weft_core::run_settings::Keeping::Fast, false)
+            .and_then(|settings| settings.holding_for(hold_secs))
+            .unwrap()
+    }
+
+    /// [`seed`], the run under `settings`.
+    async fn seed_with(journal: &MemJournal, run_id: RunId, project: &ProjectDefinition, entry: &str, settings: weft_core::run_settings::RunSettings) {
         journal
             .record_event(
                 &RunEvent::RunStarted { given: Default::default(),
@@ -1843,7 +1796,7 @@
                     cut_from: None,
                     seed: None,
                     instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-                    settings: weft_core::run_settings::RunSettings::default().holding_for(hold_secs).unwrap(),
+                    settings,
                 },
                 None,
             )
@@ -1868,12 +1821,14 @@
         run_id: RunId,
         caller: Option<Arc<dyn CallerConnection>>,
     ) -> RunOutcome {
-        run_with_caller_tasks(project, catalog, journal, run_id, caller, Arc::new(NoopTasks)).await
+        let clients = EngineClients { tasks: Arc::new(NoopTasks), ..clients(journal.clone()) };
+        run_with_caller_on(project, catalog, journal, run_id, caller, clients).await
     }
 
-    /// As `run_with_caller` but with an explicit tasks client (await_signal
-    /// nodes enqueue a RegisterSignal task, which `NoopTasks` rejects; those
-    /// tests pass `AwaitTasks`).
+    /// As `run_with_caller` but with an explicit tasks client (a waiting
+    /// node enqueues a RegisterSignal task, which `NoopTasks` rejects; those
+    /// tests pass `AwaitTasks`), on tokio's paused clock: these tests wait
+    /// out a hold, which the paused clock skips through.
     async fn run_with_caller_tasks(
         project: ProjectDefinition,
         catalog: Arc<dyn NodeCatalog>,
@@ -1882,7 +1837,18 @@
         caller: Option<Arc<dyn CallerConnection>>,
         tasks: Arc<dyn weft_task_store::TaskStoreClient>,
     ) -> RunOutcome {
-        let clients = EngineClients { tasks, ..clients(journal.clone()) };
+        let clients = EngineClients { tasks, ..super::engine_test_rig::clients_on_paused_clock(journal.clone()) };
+        run_with_caller_on(project, catalog, journal, run_id, caller, clients).await
+    }
+
+    async fn run_with_caller_on(
+        project: ProjectDefinition,
+        catalog: Arc<dyn NodeCatalog>,
+        journal: Arc<MemJournal>,
+        run_id: RunId,
+        caller: Option<Arc<dyn CallerConnection>>,
+        clients: EngineClients,
+    ) -> RunOutcome {
         run_checked(Arc::new(project), catalog, run_id, journal, clients, CancellationFlag::new_arc(), caller)
             .await
             .expect("run_one ok")
@@ -1919,15 +1885,16 @@
     #[async_trait]
     impl Node for CallerToBus {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
             let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
                 return Err(weft_core::error::WeftError::NodeFailed("no ws caller".into()));
             };
-            let (mut bus, marker) = ctx.create_bus(weft_core::bus::BusOptions::default())?;
+            let (mut bus, marker) = ctx.create_bus("channel", weft_core::bus::BusOptions::default())?;
             bus.register("caller_to_bus").expect("register");
             // Pulse the bus marker downstream FIRST so the consumer node
             // fires and registers, THEN wait for it (mirrors Producer).
             ctx.pulse_downstream(NodeOutput::new().set("channel", marker)).await?;
-            bus.wait_for("drain").await.expect("consumer registers");
+            bus.wait_for("drain", &mut state).await.expect("consumer registers");
             // The test scripts inbound before the run, so read history from
             // the retained window start (a forward `ws.receive()` would only
             // see messages arriving after attach).
@@ -2075,10 +2042,11 @@
         #[async_trait]
         impl Node for Drainer {
             async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+                let mut state = ctx.keep(()).await?;
                 let mut bus = ctx.bus_from_input("channel")?;
                 bus.register("drain").expect("register drain");
-                let mut cursor = bus.cursor();
-                while cursor.next().await.is_some() {}
+                let mut cursor = bus.cursor()?;
+                while cursor.next(&mut state).await?.is_some() {}
                 Ok(())
             }
         }
@@ -2382,17 +2350,17 @@
         );
     }
 
-    // ----- await_signal × caller (hold-then-kill) + non-durability -------
+    // ----- a wait × caller, and a run that cannot pause ---------------
 
-    /// A node that parks on `await_signal` (a human form), the durable-wait
-    /// primitive. Its interaction with a live caller is the whole point: a
-    /// caller-tied run cannot durably suspend here, so the wait holds.
+    /// A node that waits on a human form. Its interaction with a live
+    /// caller is the whole point: a run whose caller is on the line cannot
+    /// pause, so the wait holds in its call.
     struct AwaiterNode;
     test_manifest!(AwaiterNode, "Awaiter");
     #[async_trait]
     impl Node for AwaiterNode {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-            let _ = ctx.await_signal(human_form()).await?;
+            wait_once(&ctx, human_form()).await?;
             ctx.pulse_downstream(NodeOutput::new().set("done", Value::Bool(true))).await
         }
     }
@@ -2404,7 +2372,7 @@
     #[async_trait]
     impl Node for RecoversNode {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-            let answered = match ctx.await_signal(human_form()).await {
+            let answered = match wait_once(&ctx, human_form()).await {
                 Ok(_) => true,
                 Err(weft_core::error::WeftError::WaitGaveUp(_)) => false,
                 Err(other) => return Err(other),
@@ -2413,56 +2381,18 @@
         }
     }
 
-    /// Caller-tied run hits a wait no answer comes to: the wait holds in
-    /// its call while the run is quiet, then is given up, failing the call
-    /// (the run with it, as the node does not handle it), and is
-    /// withdrawn. It never becomes a resumable suspension.
-    #[tokio::test]
-    async fn caller_tied_run_gives_up_a_wait_nothing_answers() {
-        let catalog: Arc<dyn NodeCatalog> =
-            Arc::new(OneNodeCatalog { node: Box::leak(Box::new(AwaiterNode)) });
-        let project = single_node_project("Awaiter");
-        let run_id = uuid::Uuid::new_v4();
-        let journal = Arc::new(MemJournal::default());
-        seed_holding(&journal, run_id, &project, "entry", 1).await;
-        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
-        let tasks = AwaitTasks::new();
-
-        let outcome = run_with_caller_tasks(
-            project, catalog, journal.clone(), run_id,
-            Some(fake.clone() as Arc<dyn CallerConnection>), tasks.clone(),
-        ).await;
-        assert!(
-            matches!(&outcome, RunOutcome::Failed { error, held_too_long: true } if error.contains("gave up its wait") && error.contains("`outlivesCaller`")),
-            "a caller-tied run gives up a wait nothing answers, a time limit for its caller; got {outcome:?}"
-        );
-        let token = tasks.minted().expect("the wait was registered");
-        assert_eq!(*tasks.withdrawn.lock().unwrap(), vec![token.clone()], "the wait given up is withdrawn");
-        let events = journal.events.lock().unwrap().clone();
-        assert!(events.iter().any(|e| matches!(e, RunEvent::SuspensionGaveUp { token: t, .. } if *t == token)), "{events:?}");
-        assert!(!events.iter().any(|e| matches!(e, RunEvent::NodeSuspended { .. })), "nothing parked: {events:?}");
-        assert!(
-            events.iter().any(|e| matches!(e, RunEvent::NodeFailed { gave_up_wait: true, .. })),
-            "the failure's row says it gave up a wait, so any worker ending the run reads it: {events:?}"
-        );
-    }
-
     /// The node may handle a wait given up like any outcome of its firing,
-    /// and the run goes on.
-    #[tokio::test]
+    /// and the run goes on. On the paused clock, the hold runs out at once.
+    #[tokio::test(start_paused = true)]
     async fn a_node_handles_a_wait_given_up() {
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(RecoversNode)) });
         let project = single_node_project("Recovers");
         let run_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed_holding(&journal, run_id, &project, "entry", 1).await;
-        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
+        seed_unrecorded(&journal, run_id, &project, "entry", 1).await;
 
-        let outcome = run_with_caller_tasks(
-            project, catalog, journal, run_id,
-            Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
-        ).await;
+        let outcome = run_with_caller_tasks(project, catalog, journal, run_id, None, AwaitTasks::new()).await;
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
     }
 
@@ -2472,7 +2402,7 @@
     #[async_trait]
     impl Node for RecoversThenFailsNode {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-            match ctx.await_signal(human_form()).await {
+            match wait_once(&ctx, human_form()).await {
                 Err(weft_core::error::WeftError::WaitGaveUp(_)) => {}
                 other => panic!("the wait is given up: {other:?}"),
             }
@@ -2482,31 +2412,29 @@
 
     /// A wait given up earlier in the run does not make a later, unrelated
     /// failure a time limit: what the caller hears is decided by the error
-    /// of the node that failed the run.
-    #[tokio::test]
+    /// of the node that failed the run. On the paused clock, the hold runs
+    /// out at once.
+    #[tokio::test(start_paused = true)]
     async fn a_failure_after_a_wait_given_up_and_handled_is_the_programs() {
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(RecoversThenFailsNode)) });
         let project = single_node_project("RecoversThenFails");
         let run_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed_holding(&journal, run_id, &project, "entry", 1).await;
-        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
+        seed_unrecorded(&journal, run_id, &project, "entry", 1).await;
 
-        let outcome = run_with_caller_tasks(
-            project, catalog, journal, run_id,
-            Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
-        ).await;
+        let outcome = run_with_caller_tasks(project, catalog, journal, run_id, None, AwaitTasks::new()).await;
         assert!(
             matches!(&outcome, RunOutcome::Failed { error, held_too_long: false } if error.contains("the provider refused")),
             "{outcome:?}"
         );
     }
 
-    /// The hold clock runs only while the run is quiet: a run whose other
-    /// node keeps talking holds its wait past `holdSecs`, and the answer
-    /// that comes then is taken.
-    #[tokio::test]
+    /// The hold clock runs only while the run is quiet: an unrecorded run
+    /// (which cannot pause) whose other node keeps talking holds its wait
+    /// past `holdSecs`, and the answer that comes then is taken. On the
+    /// paused clock, its three seconds take none.
+    #[tokio::test(start_paused = true)]
     async fn a_wait_holds_while_the_run_is_busy() {
         let project = bus_plus_waiter_topology();
         let pid = project.id;
@@ -2518,10 +2446,11 @@
             std::sync::Arc::new(move |ctx| {
                 let answered = a_creator.clone();
                 Box::pin(async move {
-                    let (mut bus, marker) = ctx.create_bus(Default::default())?;
+                    let mut state = ctx.keep(()).await?;
+                    let (mut bus, marker) = ctx.create_bus("ch", Default::default())?;
                     bus.register("creator").expect("register creator");
                     emit_bus_marker(&ctx, "ch", marker).await?;
-                    bus.wait_for("peer").await.expect("peer joins");
+                    bus.wait_for("peer", &mut state).await.expect("peer joins");
                     // Talk every 200 ms until the waiter has its answer.
                     while !answered.load(std::sync::atomic::Ordering::Acquire) {
                         bus.send("tick", json!(null)).expect("send");
@@ -2537,10 +2466,11 @@
             "peer",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
+                    let mut state = ctx.keep(()).await?;
                     let mut bus = ctx.bus_from_input("ch")?;
                     bus.register("peer").expect("register peer");
-                    let mut cursor = bus.cursor();
-                    while cursor.next().await.is_some() {}
+                    let mut cursor = bus.cursor()?;
+                    while cursor.next(&mut state).await?.is_some() {}
                     Ok(())
                 })
             }),
@@ -2552,7 +2482,7 @@
             std::sync::Arc::new(move |ctx| {
                 let answered = a_waiter.clone();
                 Box::pin(async move {
-                    let _ = ctx.await_signal(human_form()).await?;
+                    wait_once(&ctx, human_form()).await?;
                     answered.store(true, std::sync::atomic::Ordering::Release);
                     Ok(())
                 })
@@ -2562,7 +2492,8 @@
         let journal = Arc::new(MemJournal::default());
         let tasks = AwaitTasks::new();
         let answers = Arc::new(super::engine_test_rig::Answers::default());
-        let (handle, _) = spawn_run_holding(project, &["creator", "waiter"], journal, tasks.clone(), answers.clone(), 1);
+        let base = super::engine_test_rig::clients_on_paused_clock(journal.clone());
+        let (handle, _) = spawn_run_with(project, &["creator", "waiter"], journal, base, tasks.clone(), answers.clone(), unrecorded_holding(1));
         // Three seconds of a busy run: three times its hold.
         let token = tasks.await_token().await;
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -2579,8 +2510,10 @@
     /// A caller hanging up mid-hold ends the hold at once: the run is no
     /// longer tied, so the wait it held suspends after all (the real
     /// connection also cancels a tied run whose caller left; the fake
-    /// leaves that to the run).
-    #[tokio::test]
+    /// leaves that to the run). On the paused clock, the caller hangs up
+    /// once the run has sat 300 ms in its hold, and the ten seconds the
+    /// run is given are ten seconds of that clock, a sliver of the hold.
+    #[tokio::test(start_paused = true)]
     async fn caller_hang_up_ends_the_hold_promptly() {
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(AwaiterNode)) });
@@ -2606,16 +2539,18 @@
         .expect("a hang-up must end the hold, not wait out the 600s hold");
         assert!(
             matches!(outcome, RunOutcome::Stalled),
-            "with the caller gone the held wait suspends; got {outcome:?}"
+            "with the caller gone the run pauses, its held wait with it; got {outcome:?}"
         );
     }
 
-    /// A run that outlives its caller hits the SAME wait and cleanly
-    /// STALLS (suspends): the worker exits, a later fire resumes it
-    /// caller-less. The contrast with the tied case above is the lifetime
-    /// axis doing its job.
-    #[tokio::test]
-    async fn survivable_run_at_await_signal_suspends_cleanly() {
+    /// A run that may outlive its caller hits the SAME wait while its
+    /// caller is on the line: the wait holds in its call, past `holdSecs`
+    /// (the clock does not run while a caller is connected, so the caller
+    /// is never cut off), and once the caller leaves the run pauses: the
+    /// worker exits, and a later fire resumes it caller-less. On the
+    /// paused clock, its 2.5 seconds take none.
+    #[tokio::test(start_paused = true)]
+    async fn a_connected_caller_keeps_the_wait_past_its_hold_and_leaving_pauses_the_run() {
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(AwaiterNode)) });
         let project = single_node_project("Awaiter");
@@ -2623,15 +2558,32 @@
         let journal = Arc::new(MemJournal::default());
         seed_holding(&journal, run_id, &project, "entry", 1).await;
         let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, true));
+        let hang_up = fake.clone();
+        let started = tokio::time::Instant::now();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+            hang_up.set_connected(false);
+        });
 
-        let outcome = run_with_caller_tasks(
-            project, catalog, journal, run_id,
-            Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
-        ).await;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_with_caller_tasks(
+                project, catalog, journal.clone(), run_id,
+                Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
+            ),
+        )
+        .await
+        .expect("the caller leaving must end the hold");
         assert!(
             matches!(outcome, RunOutcome::Stalled),
-            "a survivable run durably suspends at await_signal; got {outcome:?}"
+            "with the caller gone the held wait pauses the run; got {outcome:?}"
         );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(2_500),
+            "the wait held until the caller left, past its 1s hold"
+        );
+        let events = journal.events.lock().unwrap().clone();
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::SuspensionGaveUp { .. })), "nothing was given up: {events:?}");
     }
 
     // ----- infra × caller ------------------------------------------------

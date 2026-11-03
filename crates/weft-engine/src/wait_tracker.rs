@@ -6,10 +6,11 @@
 //! A second private tracker would let the detector see half the waits
 //! and either hang the run or close it under live work.
 //!
-//! Vocabulary: this code uses "wait" everywhere, not "park". The word
-//! "park" already names `ctx.await_signal` (journal-replay workflow
-//! suspension, worker swap). These waits are plain in-process tokio
-//! awaits; the worker stays alive; no swap.
+//! The tracker is also how the drive pauses a run whose every running
+//! node waits: each wait inside a call that holds its firing's saved
+//! state is pausable (`weft_core::liveness::wait_or_pause`), and
+//! [`WaitTracker::pause`] ends them all, so each call saves its state
+//! and suspends its firing.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +20,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use weft_core::error::{WeftError, WeftResult};
-use weft_core::liveness::{wait_on, FiringLocation, WaitId, WaitLiveness, WaitSource};
+use weft_core::liveness::{wait_or_pause, FiringLocation, Paused, WaitId, WaitLiveness, WaitSource};
 
 /// One firing's wait state in the tracker's liveness map: the
 /// set of waits this node is currently inside, keyed by `WaitId`. A
@@ -47,6 +48,8 @@ struct WaitState {
     source: Weak<dyn WaitSource>,
     observed: u64,
     parked: bool,
+    /// The wait ends when the run pauses (`wait_or_pause`).
+    pausable: bool,
 }
 
 /// Per-run wait tracker, owned by the run's drive and
@@ -81,6 +84,8 @@ pub struct WaitTracker {
     /// The signal waits the run holds in this worker because it cannot
     /// pause (`crate::held_waits`).
     held: Arc<crate::held_waits::HeldWaits>,
+    /// Set once the drive pauses the run ([`Self::pause`]); never unset.
+    pausing: std::sync::atomic::AtomicBool,
 }
 
 impl WaitTracker {
@@ -90,7 +95,38 @@ impl WaitTracker {
             nodes: Mutex::new(HashMap::new()),
             next_wait_id: AtomicU64::new(0),
             held: crate::held_waits::HeldWaits::new(),
+            pausing: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Pause the run: every pausable wait ends (its call saves its
+    /// firing's state and suspends it), the ones parked now and any that
+    /// starts later, and so does every wait it holds in its worker
+    /// (`crate::held_waits`). The flag is set BEFORE the parked waits are
+    /// woken, and a wait registers before it first looks at the flag, so
+    /// none can park past the pause unseen.
+    pub(crate) fn pause(&self) {
+        self.pausing.store(true, Ordering::SeqCst);
+        self.held.pause();
+        let sources: Vec<Arc<dyn WaitSource>> = self
+            .lock_nodes()
+            .values()
+            .flat_map(|node| node.waits.values())
+            .filter_map(|wait| wait.source.upgrade())
+            .collect();
+        for source in sources {
+            source.wake_waiters();
+        }
+        self.wait_notify.notify_one();
+    }
+
+    /// Whether every one of the `in_flight` firings waits ONLY in waits
+    /// that end when the run pauses: the run can then pause around them.
+    /// Read beside [`Self::deadlock_provable`], which proves they all
+    /// wait; a firing with no wait at all is not pausable (it computes).
+    pub fn all_pausable<'a>(&self, in_flight: impl IntoIterator<Item = &'a FiringLocation>) -> bool {
+        let nodes = self.lock_nodes();
+        in_flight.into_iter().all(|loc| nodes.get(loc).is_some_and(|node| node.waits.values().all(|wait| wait.pausable)))
     }
 
     /// The signal waits the run holds in this worker.
@@ -238,7 +274,10 @@ impl WaitTracker {
 }
 
 impl WaitLiveness for WaitTracker {
-    fn enter_wait(&self, node: &FiringLocation, source: &Arc<dyn WaitSource>) -> WaitId {
+    fn pausing(&self) -> bool {
+        self.pausing.load(Ordering::SeqCst)
+    }
+    fn enter_wait(&self, node: &FiringLocation, source: &Arc<dyn WaitSource>, pausable: bool) -> WaitId {
         let id = self.next_wait_id.fetch_add(1, Ordering::AcqRel) + 1;
         // `observed: 0` registers the wait as conservatively BEHIND and
         // `parked: false` as conservatively MID-EVALUATION (both
@@ -254,6 +293,7 @@ impl WaitLiveness for WaitTracker {
                     source: Arc::downgrade(source),
                     observed: 0,
                     parked: false,
+                    pausable,
                 },
             );
         // Use `notify_one` (NOT `notify_waiters`) so a wait-start that
@@ -538,17 +578,21 @@ impl DeliveryGate {
     /// with the shared wait tracker so the drive loop's stuck-check
     /// sees the wait (and can fail it on a proven deadlock instead of
     /// hanging). Runs the same shared wait protocol
-    /// (`liveness::wait_on`) as the bus and generator wait loops.
+    /// (`liveness::wait_or_pause`) as the bus and generator wait loops:
+    /// a yield is a place the run can pause, and a pause here ends the
+    /// wait with a suspension (no token), which the yield's caller turns
+    /// into its firing's saved state.
     pub async fn wait_delivered(
         self: &Arc<Self>,
         liveness: &Weak<dyn WaitLiveness>,
         node: FiringLocation,
+        pausable: bool,
     ) -> WeftResult<()> {
         let source = self.clone() as Arc<dyn WaitSource>;
-        let outcome = wait_on(liveness, &Some(node), &source, || self.outcome()).await;
-        outcome.map_err(|e| {
-            WeftError::NodeFailed(format!("the emission was not delivered: {e}"))
-        })
+        match wait_or_pause(liveness, &Some(node), &source, pausable, || self.outcome()).await {
+            Ok(outcome) => outcome.map_err(|e| WeftError::NodeFailed(format!("the emission was not delivered: {e}"))),
+            Err(Paused) => Err(WeftError::Suspended { token: None }),
+        }
     }
 }
 
@@ -615,7 +659,7 @@ mod tests {
         let src = FakeSource::new();
         let source = src.clone() as Arc<dyn WaitSource>;
         let a = loc("a");
-        let id = tracker.enter_wait(&a, &source);
+        let id = tracker.enter_wait(&a, &source, false);
 
         // Registered but neither observed nor parked: alive.
         assert!(!tracker.deadlock_provable(&in_flight(&["a"])));
@@ -642,13 +686,13 @@ mod tests {
         let source = src.clone() as Arc<dyn WaitSource>;
 
         let zombie = loc("zombie");
-        let zid = tracker.enter_wait(&zombie, &source);
+        let zid = tracker.enter_wait(&zombie, &source, false);
         tracker.observed(&zombie, zid);
         // The zombie never parks (it is mid-evaluation forever, the
         // worst case for a count-based check).
 
         let a = loc("a");
-        let id = tracker.enter_wait(&a, &source);
+        let id = tracker.enter_wait(&a, &source, false);
         tracker.observed(&a, id);
         tracker.parked(&a, id);
         assert!(
@@ -665,7 +709,7 @@ mod tests {
         let src = FakeSource::new();
         let source = src.clone() as Arc<dyn WaitSource>;
         let a = loc("a");
-        let id = tracker.enter_wait(&a, &source);
+        let id = tracker.enter_wait(&a, &source, false);
         tracker.observed(&a, id);
         tracker.parked(&a, id);
         // An event lands AFTER the last observation: the wait is
@@ -684,8 +728,8 @@ mod tests {
         let src = FakeSource::new();
         let source = src.clone() as Arc<dyn WaitSource>;
         let a = loc("a");
-        let w1 = tracker.enter_wait(&a, &source);
-        let w2 = tracker.enter_wait(&a, &source);
+        let w1 = tracker.enter_wait(&a, &source, false);
+        let w2 = tracker.enter_wait(&a, &source, false);
         assert_eq!(tracker.nodes_len(), 1, "two waits collapse under one node entry");
         tracker.observed(&a, w1);
         tracker.parked(&a, w1);
@@ -698,6 +742,21 @@ mod tests {
         tracker.exit_wait(&a, w2);
         assert!(!tracker.deadlock_provable(&in_flight(&["a"])));
         tracker.exit_wait(&a, w1);
+    }
+
+    /// A firing holding the run (`ctx.hold()`) waits with a wait that
+    /// cannot pause, which keeps the whole run from pausing.
+    #[test]
+    fn a_holding_wait_keeps_the_run_from_pausing() {
+        let tracker = WaitTracker::new();
+        let source = FakeSource::new() as Arc<dyn WaitSource>;
+        let (a, b) = (loc("a"), loc("b"));
+        let wa = tracker.enter_wait(&a, &source, true);
+        assert!(tracker.all_pausable(&in_flight(&["a"])));
+        let wb = tracker.enter_wait(&b, &source, false);
+        assert!(!tracker.all_pausable(&in_flight(&["a", "b"])), "b holds the run");
+        tracker.exit_wait(&b, wb);
+        tracker.exit_wait(&a, wa);
     }
 
     #[test]
@@ -773,7 +832,7 @@ mod tests {
                 let gate = gate.clone();
                 tokio::spawn(async move {
                     gate.wait_delivered(&weft_core::liveness::no_liveness(),
-                        FiringLocation::new("p", Vec::new())).await
+                        FiringLocation::new("p", Vec::new()), true).await
                 })
             };
             // Resolution lands before, during, or after the park under

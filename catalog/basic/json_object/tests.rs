@@ -1,7 +1,7 @@
 //! JsonObject self-tests: the wired keys are the object, written order
 //! survives, a value of any shape goes in whole, keys that all stayed
-//! silent make `{}`, and a node with no keys at all is refused rather
-//! than emitting `{}`.
+//! silent make `{}`. A node with no keys at all is refused by its
+//! metadata rule, at compile time, which the rig does not run.
 //!
 //! Whether an absent input skips the node or arrives absent is the
 //! engine's decision, taken before this body runs, and it is proved in
@@ -20,7 +20,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("keys_keep_the_order_they_were_written", written_order),
         NodeTest::fake("a_value_of_any_shape_goes_in_whole", nested_value),
         NodeTest::fake("keys_that_all_stayed_silent_make_an_empty_object", all_silent),
-        NodeTest::fake("no_keys_at_all_is_refused", no_keys),
     ]
 }
 
@@ -85,14 +84,5 @@ async fn all_silent(rig: FakeRig) -> WeftResult<()> {
     keys(&rig, &["title", "note"]);
     let outcome = rig.run(&JsonObjectNode, json!({})).await.ok()?;
     assert_eq!(outcome.outputs["object"], json!({}));
-    Ok(())
-}
-
-/// A JsonObject with no keys at all would hand on `{}` with nothing on
-/// screen saying why, and a caller reading that body sees a successful
-/// empty answer.
-async fn no_keys(rig: FakeRig) -> WeftResult<()> {
-    let error = rig.run(&JsonObjectNode, json!({})).await.failure()?;
-    assert!(error.contains("has no keys"), "{error}");
     Ok(())
 }

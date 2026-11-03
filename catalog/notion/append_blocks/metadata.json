@@ -1,7 +1,7 @@
 {
   "type": "NotionAppendBlocks",
   "label": "Notion: Append to Page",
-  "description": "Append plain text (one paragraph per line) or raw Notion blocks to the end of a page.",
+  "description": "Append plain text (one paragraph per line) or raw Notion blocks to the end of a page. With neither given, the node is skipped.",
   "tags": [
     "notion",
     "page",
@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[notion]", "accepts": ["wire"],
       "required": true,
       "description": "The Notion access (wire a NotionAccess node)."
     },
@@ -60,5 +60,15 @@
         "blocks"
       ]
     ]
-  }
+  },
+  "validate": [
+    {
+      "when": { "kind": "all", "of": [{ "kind": "value", "field": "blocks" }, { "kind": "not", "of": { "kind": "value", "field": "blocks", "count": { "min": 1 } } }, { "kind": "not", "of": { "kind": "value", "field": "content", "nonempty": true } }] },
+      "then": {
+        "message": "NotionAppendBlocks '{id}' has an empty `blocks` list: give it at least one block, or leave it unset and write `content`.",
+        "level": "structural",
+        "field": "blocks"
+      }
+    }
+  ]
 }

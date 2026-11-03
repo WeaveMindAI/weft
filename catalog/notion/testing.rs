@@ -5,7 +5,7 @@
 #![cfg(feature = "node-tests")]
 
 use weft::access::OpenedConnection;
-use weft::{NodeErrExt, WeftResult};
+use weft::WeftResult;
 
 use super::notion::API;
 
@@ -28,19 +28,13 @@ pub const DATABASE_LABEL: (&str, &str) = (
 /// Archive one page/row the test created (Notion's delete). A failed
 /// archive is a loud test failure: leftovers would skew later runs.
 pub async fn archive_page(conn: &OpenedConnection, page_id: &str) -> WeftResult<()> {
-    let resp = conn
-        .client()
-        .patch(format!("{API}/pages/{page_id}"))
-        .json(&serde_json::json!({ "archived": true }))
-        .send()
-        .await
-        .node_err("notion: archive the test page")?;
-    if !resp.status().is_success() {
-        weft::node_bail!(
-            "notion refused to archive test page {page_id} ({}); archive it by hand",
-            resp.status()
-        );
-    }
+    weft::access::client::checked_send(
+        conn.client()
+            .patch(weft::access::client::url(API, &["pages", page_id])?.as_str())
+            .json(&serde_json::json!({ "archived": true })),
+        &format!("archive test page {page_id} (archive it by hand)"),
+    )
+    .await?;
     Ok(())
 }
 

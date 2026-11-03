@@ -8,6 +8,9 @@
 //! - `runner`: a project's workers, one process per project and program.
 //! - `registry`: the worker processes each life of the runtime started.
 //! - `infra_host`: infra units, each a group of containers.
+//! - `infra_names`: what those containers and their volumes are called,
+//!   and what happens to a disk named before the names carried the install
+//!   (`disk_claims`: which install a person said takes one).
 //! - `images`: workers compiled on the machine (`host_build`, in the
 //!   machine's compile `lanes`), infra images with `docker build` into the
 //!   daemon's own store.
@@ -20,6 +23,7 @@
 
 pub mod alarm;
 pub mod cargo_cache;
+pub mod disk_claims;
 pub mod docker;
 pub mod domains;
 pub mod folders;
@@ -29,6 +33,7 @@ pub mod host_build;
 pub mod identity;
 pub mod images;
 pub mod infra_host;
+pub mod infra_names;
 pub mod lanes;
 pub mod layout;
 pub mod needs;

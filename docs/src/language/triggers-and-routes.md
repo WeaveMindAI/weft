@@ -86,6 +86,10 @@ The caller is held open while your program works, and `Reply` is what answers
 them. For streaming an answer as it is produced, and for the Rust side, go and
 read [talking to a live caller](../nodes/live-callers.md).
 
+If only some callers may call it, set its `auth` (`auth: "api_keys"`, say)
+and pick the connection holding the keys with `weft connect post`. For every
+scheme, go and read [checking a signed request](../connections/verifying-requests.md#on-a-route).
+
 The request's body comes out whole on `body`. Left undeclared, it is a
 `JsonDict`. If you declare a type on it, as `Card` above, a call whose body
 does not fit is answered `400` naming what is wrong, and no node after `post`
@@ -120,7 +124,7 @@ asking you to rename the capture.
 **A caller's credentials come out on `credentials`, never on `headers`.** The
 headers that carry one (`authorization`, `proxy-authorization`, `cookie`,
 `weft-instance-token`, and any header the route's `auth` reads, like the
-`X-Api-Key` an `ApiKeyAuth` checks) are
+`X-Api-Key` that `auth: "api_keys"` checks) are
 each made a secret the moment the call arrives, before anything of the run is
 written, so the run's record, the inspector, `weft events` and search hold a
 marker in their place and never the value. The value is still there for the
@@ -208,6 +212,7 @@ pay = Route -> (body: JsonDict) {
 | `journalEphemeral` | off | what streams through the route should not be written to the run's record, only counted. For what that keeps, go and read [two modes](streams-and-buses.md#two-modes) |
 | `journalWindowMs` | 1000 | you want the record's rows to cover less or more time, from 100 to 60000 ms. Same page |
 | `holdSecs` | 60 | a run that cannot pause should wait longer for an answer (up to 30 days), or not at all (`0`). See [when a run cannot pause](#when-a-run-cannot-pause) |
+| `pauseAfterSecs` | 10 | a run fed by frequent messages from outside should stay on its worker longer before it pauses (up to an hour), or pause at once (`0`). See [when a run pauses](#when-a-run-pauses) |
 
 **By default (`durable` off), a run is fast: it only waits for the database
 when it has to.** That is when it pauses (a timer, a form), and in a few
@@ -231,13 +236,15 @@ waiting.
 If the worker dies mid-run, another worker picks the run up where it stopped:
 every finished node stays finished, and a node that was in the middle of its
 work is failed with a message saying it may have partly happened, so you know
-which node to check. The exception is a pure node that takes no
-stream and had not passed anything on yet: it simply runs again. If a caller
+which node to check. Two kinds of node run again instead: one that saved a
+state (`ctx.keep`), from its last save, and a pure node that takes no stream
+and had not passed anything on yet. If a caller
 started the run, its connection was on the old worker and is gone: the run
 carries on in the new worker with nobody on the line, so a node that answers
 the caller fails, saying no live caller is attached. If the platform stops the
 worker instead, a run that can pause gets 5 seconds for the nodes already
-running to finish, and only a node still running after that is failed. A run
+running to finish, and a node still running after that runs again from its
+last save if it saved a state, or is failed if it did not. A run
 that cannot pause ([below](#when-a-run-cannot-pause)) keeps running on the
 stopping worker for as long as the platform lets it, and if the worker goes
 before the run ends, that is the same as the worker dying. If you want to know
@@ -245,22 +252,43 @@ what a wired `_error` does with that failure, or what happens to a node that was
 waiting on an answer or reading a stream, go and read [surviving a
 restart](../nodes/durable-execution.md#when-the-worker-dies-mid-run).
 
-Even with `durable` off, a run waiting on a timer or a form, with nothing else
-of it running, survives its worker, because its whole record is written before
-it pauses. A run that cannot pause is the exception, below.
+Even with `durable` off, a paused run survives its worker. A run that cannot
+pause is the exception, below.
+
+### When a run pauses
+
+A run pauses in one way: every node running in it waits (on a timer, a form, a
+message, a bus or a stream), at least one of those waits needs an answer from
+outside, and the run has stayed like that for the trigger's `pauseAfterSecs`
+(10 seconds unless it says otherwise). Then every node saves where it is, all
+together, the record is written, and the worker lets go.
+
+During those seconds each wait stays open in its node. If its answer arrives,
+it goes straight into the node, which carries on from that very line: nothing
+pauses and nothing starts again. So a run fed by a steady trickle of messages
+is not paused and picked up again for every one of them. Each time it goes
+quiet again, the count starts over. With `pauseAfterSecs: 0` it pauses as soon
+as everything waits.
+
+The run does not stay when weft needs it off its worker: if the worker is
+stopping, or the run has to move to a fresh one, it pauses straight away and
+the next worker picks it up. On a cloud install it also never stays past its
+hour on the worker, since reaching that would end it.
 
 ### When a run cannot pause
 
-Three kinds of run cannot pause: one whose caller is still on the line while
-its trigger leaves `outlivesCaller` off (the caller cannot follow it), one with
-`recorded` off (there is no record to pick it back up from), and one with a
-bus between its nodes open (a bus lives in its worker's memory alone).
+Two kinds of run cannot pause: one whose caller is still on the line (the
+caller cannot follow it to another worker, whatever `outlivesCaller` says),
+and one with `recorded` off (there is no record to pick it back up from). A
+node test cannot pause either, since it has no program for another worker to
+pick up.
 
 **When such a run reaches a timer or a form, the wait holds in the node's call
-instead.** The wait is registered as usual, the run stays on its worker, and
-the answer carries it on right there. The hold clock only runs while the run
+for as long as it needs.** The wait is registered as usual, the run stays on
+its worker, and the answer carries it on right there. The hold clock only runs while the run
 is quiet, meaning every node still running is waiting, on an answer or on a
-bus. Anything that moves (a bus message, a node finishing) starts it over. If
+bus, and never while a caller is on the line. Anything that moves (a bus
+message, a node finishing) starts it over. If
 the run stays quiet for `holdSecs` (60 seconds unless the trigger says
 otherwise), the call that was waiting fails, saying it gave up, and the wait is
 withdrawn, so a form is no longer offered. The node's code can handle that
@@ -269,9 +297,17 @@ node's `_error` when that is wired ([when a node
 fails](how-a-program-runs.md#when-a-node-fails)). With `holdSecs: 0`, such a
 wait fails at once.
 
-If the run becomes able to pause while a wait holds (the last bus between its
-nodes closes), the wait pauses after all, the way it would have from the
-start. A run whose caller leaves while `outlivesCaller` is off is cancelled,
+A node that holds the run (its code called `ctx.hold()`, because its work
+cannot be picked up from the middle) works differently. While it holds, none
+of its waits pauses, a timer or a form as much as a read, and the run keeps
+its worker as a run that cannot pause does: for as long as a caller is on the
+line, otherwise until nothing has moved in it for `holdSecs`, when the waiting
+call gives up with `WaitGaveUp`, saying the node holds its run. The other
+nodes' waits stay open in their calls meanwhile.
+
+If the run becomes able to pause while a wait holds (its caller hangs up, on
+a route with `outlivesCaller` on), it pauses the way any other run does, once
+it has been quiet for its `pauseAfterSecs`. A run whose caller leaves while `outlivesCaller` is off is cancelled,
 as always. And a fast run holding a wait still ends with its worker.
 
 **If a page asks a route for a status every few seconds, turn `recorded`
@@ -302,20 +338,33 @@ refuses `durable: true` with `recorded: false`.
 cuts a request at 60 minutes, so a run stops itself 59 minutes after it
 started on its worker. It ends cancelled with a message saying so, instead
 of being cut off while a node is still running, with no ending written. A run
-that pauses whole (every branch
-waiting on a timer or a form) starts a fresh hour when it picks back up; one
-branch waiting while another runs does not. So if a job can take longer than
+that pauses starts a fresh hour when it picks back up; one branch waiting
+while another runs does not. So if a job can take longer than
 an hour, split it with a pause. On your machine no run is cut.
 
-A run that answers a caller lives on the worker the caller reached. While the
-caller is on the line, the run stops at 59 minutes too, with a message telling
-you to have the client reconnect. Once the caller has gone, a route with
-`outlivesCaller` on keeps its run going, and on a cloud install the run moves:
-it starts no new node on that worker, and once the nodes it was running end, it
-carries on under a call weft holds open for it, with a fresh hour. Moving works
-from the run's record, so the compiler refuses `outlivesCaller: true` with
-`recorded: false`. A run with a bus open cannot move, since a bus lives in its worker's memory
-alone, so it keeps running on that worker for as long as the worker stays up.
+A run that answers a caller lives on the worker the caller reached, and stays
+there while the caller is on the line. If the caller is still there at 59
+minutes, the route's `outlivesCaller` decides. Off, the run stops, with a
+message telling you to have the client reconnect. On, the run moves to a fresh
+worker, with a fresh hour. It starts no new node, and the nodes it is running
+get 5 seconds to end, while the caller's connection stays open for what they
+still send. Once they have ended, or the 5 seconds are up, the caller gets a
+`504` with the usual failure (`Something went wrong` and the run id; a socket
+closes with `1011`), and the run carries on in the fresh worker. Why goes on
+the run's record, where `weft logs <run id>` shows it: `this connection ended
+60 seconds before the 60 minute limit this platform puts on one connection;
+run <id> goes on without it (its route outlives its caller), so reconnect to
+talk to the program again`. A node still running after the 5 seconds stops
+where it is, and the worker that picks the run up runs it again from its saved
+state, or fails it as cut short if it keeps none.
+
+Once the caller has gone, a route with `outlivesCaller` on keeps its run
+going. It pauses if everything in it is waiting, and otherwise, on a cloud
+install, it moves: it starts no new node on that worker, and once the nodes it
+was running end or settle into a wait, it carries on under a call weft holds
+open for it, with a fresh hour. Buses between its nodes come along: the worker
+that picks it up opens them again where they stopped. Moving works from the run's record, so the compiler
+refuses `outlivesCaller: true` with `recorded: false`.
 
 ### When a run ends before it answers
 
@@ -333,7 +382,7 @@ one of these statuses instead, and this JSON body:
 |---|---|
 | `500` | the program failed, got stuck, or ended without answering |
 | `504` | a time limit ran out (the four limits are listed below the table) |
-| `503` | weft, a person, or another run (`ctx.stop_tagged`) stopped the run, weft could not keep it going, or it carries on without this caller (it paused on a wait, or moved to another worker) |
+| `503` | weft, a person, or another run (`ctx.stop_tagged`) stopped the run, weft could not keep it going, or it carries on in another worker without this caller |
 
 A `504` means one of four limits ran out: on a cloud install, the run's
 hour; the route's or socket's `maxSessionSecs` (the longest one connection

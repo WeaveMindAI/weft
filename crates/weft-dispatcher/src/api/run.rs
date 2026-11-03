@@ -358,7 +358,32 @@ pub fn cancel_terminal_events(
 ) -> anyhow::Result<Vec<weft_journal::RunEvent>> {
     let mut read = CancelRead::new(run_id, program.map(|program| Arc::new(program.clone())));
     events.iter().for_each(|event| read.apply(event));
-    Ok(read.into_events(cause, now))
+    Ok(read.into_ending(cause, now).0)
+}
+
+/// What a run nobody drives owed when it ended (`owed`, its record's
+/// `weft_journal::OwedCalls`), as the listener sends it
+/// (`weft_task_store::TaskKind::CancelCall`): every call, since its
+/// firings end without their worker. One request per call, named by the
+/// run, the node and its number, so each is queued once.
+pub fn owed_call_requests(
+    run_id: RunId,
+    mut owed: weft_journal::OwedCalls,
+    tenant_id: &str,
+    project_id: uuid::Uuid,
+) -> Vec<weft_core::signal::listener_protocol::CancelCallRequest> {
+    let for_instance = owed.instance().cloned().map(|instance| weft_core::instance::InstanceScope { project_id, instance });
+    owed.take_all()
+        .into_iter()
+        .enumerate()
+        .map(|(index, owed)| weft_core::signal::listener_protocol::CancelCallRequest {
+            token: weft_core::signal::listener_protocol::node_call_name(run_id, &owed.node_id, &owed.frames, index),
+            tenant_id: tenant_id.to_string(),
+            for_instance: for_instance.clone(),
+            call: owed.call,
+            access: owed.access,
+        })
+        .collect()
 }
 
 /// What a dispatcher-side cancel reads off a run's record, fed its events
@@ -373,6 +398,9 @@ pub struct CancelRead {
     /// still ends, on the terminal alone.
     fold: Option<weft_journal::Fold>,
     charges: weft_journal::ChargeBook,
+    /// The calls its firings owe when they end, which they now do with no
+    /// worker to send them.
+    owed: weft_journal::OwedCalls,
     started_a_node: bool,
 }
 
@@ -382,6 +410,7 @@ impl CancelRead {
             run_id,
             fold: program.map(|program| weft_journal::Fold::new(run_id, program).showing()),
             charges: weft_journal::ChargeBook::default(),
+            owed: weft_journal::OwedCalls::default(),
             started_a_node: false,
         }
     }
@@ -394,11 +423,13 @@ impl CancelRead {
             fold.apply(event);
         }
         self.charges.apply(event);
+        self.owed.apply(event);
         self.started_a_node |= matches!(event, weft_journal::RunEvent::NodeStarted { .. });
     }
 
-    /// The events that end the run, cancelled for `cause` at `now`.
-    pub fn into_events(self, cause: &CancelCause, now: u64) -> Vec<weft_journal::RunEvent> {
+    /// The events that end the run, cancelled for `cause` at `now`, and
+    /// the calls its firings owed ([`owed_call_requests`] queues them).
+    pub fn into_ending(self, cause: &CancelCause, now: u64) -> (Vec<weft_journal::RunEvent>, weft_journal::OwedCalls) {
         use weft_journal::RunEvent;
         let run_id = self.run_id;
         let reason = cause.to_string();
@@ -433,8 +464,13 @@ impl CancelRead {
         // price: booked unknown before the ending.
         let why = format!("the run was cancelled before the job was read back: {reason}");
         writes.extend(weft_journal::unpriced_charges_closed(run_id, self.charges, &why, now));
+        // What its firings owed is queued with this ending
+        // ([`owed_call_requests`]): owed no more.
+        writes.extend(
+            self.owed.owing().into_iter().map(|(node_id, frames)| RunEvent::EndCallsSettled { run_id, node_id, frames, at_unix: now }),
+        );
         writes.push(RunEvent::RunCancelled { run_id, reason, cause: Some(cause.clone()), at_unix: now });
-        writes
+        (writes, self.owed)
     }
 }
 
@@ -626,6 +662,34 @@ mod cancel_tests {
             RunEvent::NodeKicked { run_id, node_id: "wait".into(), frames: vec![], firing: true, payload: None, port_snapshot: None, at_unix: 0 },
             RunEvent::NodeStarted { run_id, node_id: "wait".into(), frames: vec![], at_unix: 1 },
         ]
+    }
+
+    /// A run cancelled with nobody driving it queues every call its
+    /// firings owed, as their connection, named one by one, and puts each
+    /// firing's settlement on the record before the terminal; with or
+    /// without its program.
+    #[test]
+    fn a_cancel_queues_what_the_firings_owed() {
+        let run_id = RunId::new_v4();
+        let mut record = open_firing(run_id);
+        let access = Some(weft_core::primitive::AccessRef { id: "conn".into(), service: "provider".into(), required_values: Vec::new() });
+        for call in [weft_core::signal::CancelCall::delete("https://x/uploads/1").always(), weft_core::signal::CancelCall::put("https://x/jobs/2/cancel")] {
+            record.push(RunEvent::EndCallOwed { run_id, node_id: "wait".into(), frames: vec![], call, access: access.clone(), at_unix: 2 });
+        }
+        for program in [Some(program()), None] {
+            let mut read = CancelRead::new(run_id, program.map(Arc::new));
+            record.iter().for_each(|event| read.apply(event));
+            let (writes, owed) = read.into_ending(&CancelCause::User, 9);
+            let kinds: Vec<&str> = writes.iter().map(RunEvent::kind_str).collect();
+            assert_eq!(&kinds[kinds.len() - 2..], ["end_calls_settled", "run_cancelled"]);
+            let project = uuid::Uuid::new_v4();
+            let calls = owed_call_requests(run_id, owed, "acme", project);
+            assert_eq!(calls.len(), 2, "both go: the cancel ends the firing");
+            assert_eq!(calls[0].call, weft_core::signal::CancelCall::delete("https://x/uploads/1").always());
+            assert_eq!(calls[1].access, access);
+            assert_eq!(calls[0].tenant_id, "acme");
+            assert_ne!(calls[0].token, calls[1].token);
+        }
     }
 
     /// With the program, every open firing gets its `NodeCancelled`

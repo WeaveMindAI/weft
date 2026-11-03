@@ -790,11 +790,19 @@ pub enum WeftType {
     Bus,
     /// Authorized ability to call a third party: the value an access
     /// node emits (`{"__weft_access__": {...}}`, see
-    /// `crate::access::Access`). One general type for both kinds
-    /// (metered + personal); never parameterized per service (wrong-
-    /// service wiring fails loud at runtime). Wired-only: the marker is
-    /// minted by an access node, never typed as a literal.
-    Access,
+    /// `crate::access::Access`), metered and personal alike. `Access[fal]`
+    /// (`Some("fal")`) is a connection to one service, named the way a
+    /// recipe names it; bare `Access` (`None`) is a connection to any
+    /// service. `Access[fal]` fits `Access[fal]` and bare `Access`, and
+    /// bare `Access` fits only bare `Access`, so a wire from one service
+    /// into a node taking another is refused at compile time. A node
+    /// taking several services writes a union
+    /// (`Access[openai] | Access[anthropic]`). The run-time floor is
+    /// `open_connection`, which holds the marker's service to the port's
+    /// type. Wired-only: the marker is minted by an access node, never
+    /// typed as a literal.
+    // SYNC: WeftType::Access <-> packages/weft-graph/src/protocol.ts WeftType 'access'
+    Access(Option<std::string::String>),
     /// A handle on one endpoint of an infra node: the value an infra
     /// node emits (`{"__weft_infra__": {...}}`, see
     /// `crate::infra::InfraHandle`) so other nodes reach that endpoint.
@@ -870,7 +878,7 @@ impl PartialEq for WeftType {
             (WeftType::JsonDict, WeftType::JsonDict) => true,
             (WeftType::Json, WeftType::Json) => true,
             (WeftType::Bus, WeftType::Bus) => true,
-            (WeftType::Access, WeftType::Access) => true,
+            (WeftType::Access(a), WeftType::Access(b)) => a == b,
             (WeftType::Infra, WeftType::Infra) => true,
             (WeftType::Generator(a), WeftType::Generator(b)) => a == b,
             (WeftType::Secret(a), WeftType::Secret(b)) => a == b,
@@ -1147,6 +1155,16 @@ impl WeftType {
         matches!(self.structural(), WeftType::Bus | WeftType::Generator(_))
     }
 
+    /// Whether every value of this type is a connection: `Access`,
+    /// `Access[x]`, or a union of those (`Access[openai] | Access[anthropic]`).
+    pub fn is_access(&self) -> bool {
+        match self.structural() {
+            WeftType::Access(_) => true,
+            WeftType::Union(members) => members.iter().all(WeftType::is_access),
+            _ => false,
+        }
+    }
+
     // SYNC: structural <-> packages/weft-graph/src/webview/lib/types/index.ts structural
     pub fn structural(&self) -> &WeftType {
         match self {
@@ -1178,7 +1196,7 @@ impl WeftType {
             WeftType::JsonDict
             | WeftType::Json
             | WeftType::Bus
-            | WeftType::Access
+            | WeftType::Access(_)
             | WeftType::Infra
             | WeftType::Generator(_)
             | WeftType::Secret(_)
@@ -1297,7 +1315,7 @@ impl WeftType {
             // Any JSON value is one, and none is more neutral than null.
             WeftType::Json
             | WeftType::Bus
-            | WeftType::Access
+            | WeftType::Access(_)
             | WeftType::Infra
             | WeftType::Generator(_)
             | WeftType::Secret(_)
@@ -1341,9 +1359,11 @@ impl WeftType {
             (src, WeftType::Json) => src.fits_json(),
             // A bus connects only to a bus; payloads are not type-checked.
             (WeftType::Bus, WeftType::Bus) => true,
-            // An access connects only to an access; the KIND/service is
-            // checked at runtime resolution, not by the type system.
-            (WeftType::Access, WeftType::Access) => true,
+            // An access connects only to an access: one of a service into
+            // that service or into any, and one of any service only into
+            // any (the open_connection floor holds what arrives to it).
+            // SYNC: access compatibility <-> packages/weft-graph/src/webview/lib/types/index.ts isCompatible
+            (WeftType::Access(source), WeftType::Access(target)) => target.is_none() || source == target,
             // An infra handle connects only to an infra handle; which
             // node it names is checked when it resolves.
             (WeftType::Infra, WeftType::Infra) => true,
@@ -1445,7 +1465,7 @@ impl WeftType {
             WeftType::Record { fields, .. } => fields.iter().all(|f| f.ty.fits_json()),
             WeftType::Named { body, .. } => body.fits_json(),
             WeftType::JsonDict | WeftType::Json | WeftType::TypeVar(_) => true,
-            WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_) | WeftType::Secret(_) => false,
+            WeftType::Bus | WeftType::Access(_) | WeftType::Infra | WeftType::Generator(_) | WeftType::Secret(_) => false,
         }
     }
 
@@ -1463,7 +1483,7 @@ impl WeftType {
             | WeftType::JsonDict
             | WeftType::Json
             | WeftType::Bus
-            | WeftType::Access
+            | WeftType::Access(_)
             | WeftType::Infra
             | WeftType::TypeVar(_) => false,
         }
@@ -1632,8 +1652,11 @@ impl WeftType {
                 if Self::detect_bus_type(obj).is_some() {
                     return WeftType::Bus;
                 }
-                if obj.contains_key(crate::access::ACCESS_MARKER_KEY) {
-                    return WeftType::Access;
+                // An access marker names its service, so the value is a
+                // connection to that one (one naming none is to any).
+                if let Some(payload) = obj.get(crate::access::ACCESS_MARKER_KEY) {
+                    let service = payload.get("service").and_then(serde_json::Value::as_str);
+                    return WeftType::Access(service.map(str::to_string));
                 }
                 if obj.contains_key(crate::infra::INFRA_MARKER_KEY) {
                     return WeftType::Infra;
@@ -1825,7 +1848,7 @@ impl WeftType {
             return refuse(crate::secret::MADE_BY_A_NODE.to_string());
         }
         if self.is_unresolved()
-            || matches!(self, WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_))
+            || matches!(self, WeftType::Bus | WeftType::Access(_) | WeftType::Infra | WeftType::Generator(_))
         {
             return refuse(format!("no cast into {self}"));
         }
@@ -2050,7 +2073,7 @@ impl WeftType {
         }
         let text_serializable = |t: &WeftType| {
             !t.references_file()
-                && !matches!(t, WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_) | WeftType::Secret(_))
+                && !matches!(t, WeftType::Bus | WeftType::Access(_) | WeftType::Infra | WeftType::Generator(_) | WeftType::Secret(_))
         };
         let object_shaped = |t: &WeftType| {
             matches!(
@@ -2328,11 +2351,12 @@ impl WeftType {
                     mismatch(path)
                 }
             }
-            WeftType::Access => {
-                if value
-                    .as_object()
-                    .is_some_and(|o| o.contains_key(crate::access::ACCESS_MARKER_KEY))
-                {
+            // A marker, and when the type names a service, a marker of
+            // that service: a connection to another one is no `Access[x]`.
+            WeftType::Access(wanted) => {
+                let marker = value.as_object().and_then(|o| o.get(crate::access::ACCESS_MARKER_KEY));
+                let service = marker.and_then(|m| m.get("service")).and_then(serde_json::Value::as_str);
+                if marker.is_some() && wanted.as_deref().is_none_or(|wanted| service == Some(wanted)) {
                     Ok(())
                 } else {
                     mismatch(path)
@@ -2591,7 +2615,7 @@ impl WeftType {
             | WeftType::JsonDict
             | WeftType::Record { .. }
             | WeftType::Bus
-            | WeftType::Access
+            | WeftType::Access(_)
             | WeftType::Infra
             | WeftType::Generator(_)
             | WeftType::Secret(_) => value.is_object(),
@@ -2825,12 +2849,13 @@ fn parse_single_type(s: &str) -> Result<WeftType, std::string::String> {
         "JsonDict" => return Ok(WeftType::JsonDict),
         "Json" => return Ok(WeftType::Json),
         "Bus" => return Ok(WeftType::Bus),
-        "Access" => return Ok(WeftType::Access),
+        "Access" => return Ok(WeftType::Access(None)),
         "Infra" => return Ok(WeftType::Infra),
         _ => {}
     }
 
-    // Parameterized: List[T], Generator[T], Secret[T], Dict[String, V]
+    // Parameterized: List[T], Generator[T], Secret[T], Dict[String, V],
+    // and Access[service], which takes a service's name rather than a type.
     if let Some(bracket_pos) = s.find('[') {
         if !s.ends_with(']') {
             return Err(format!("`{s}` opens a `[` it never closes at its end"));
@@ -2842,6 +2867,17 @@ fn parse_single_type(s: &str) -> Result<WeftType, std::string::String> {
             "List" => Ok(WeftType::List(Box::new(WeftType::try_parse(inner)?))),
             "Generator" => Ok(WeftType::Generator(Box::new(WeftType::try_parse(inner)?))),
             "Secret" => Ok(WeftType::Secret(Box::new(WeftType::try_parse(inner)?))),
+            // SYNC: parse_single_type (Access arm) <-> packages/weft-graph/src/protocol.ts parseSingleType (Access arm)
+            "Access" => {
+                let service = inner.trim();
+                if !crate::node::is_valid_provider_name(service) {
+                    return Err(format!(
+                        "`{s}`: `Access[...]` takes a service's name (lowercase letters, digits and \
+                         underscores, like `Access[google_drive]`), and `{service}` is not one"
+                    ));
+                }
+                Ok(WeftType::Access(Some(service.to_string())))
+            }
             "Dict" => {
                 let parts = split_top_level(inner, ',');
                 let [key, value] = parts.as_slice() else {
@@ -2861,7 +2897,7 @@ fn parse_single_type(s: &str) -> Result<WeftType, std::string::String> {
                 }
                 Ok(WeftType::Dict(Box::new(value)))
             }
-            _ => Err(format!("`{name}[...]` is not a type; the types that take one are List, Generator, Secret and Dict")),
+            _ => Err(format!("`{name}[...]` is not a type; the types that take one are List, Generator, Secret, Dict and Access")),
         };
     }
 
@@ -3028,7 +3064,10 @@ impl WeftType {
             WeftType::JsonDict => out.push_str("JsonDict"),
             WeftType::Json => out.push_str("Json"),
             WeftType::Bus => out.push_str("Bus"),
-            WeftType::Access => out.push_str("Access"),
+            WeftType::Access(None) => out.push_str("Access"),
+            WeftType::Access(Some(service)) => {
+                let _ = write!(out, "Access[{service}]");
+            }
             WeftType::Infra => out.push_str("Infra"),
             WeftType::Generator(inner) => {
                 out.push_str("Generator[");

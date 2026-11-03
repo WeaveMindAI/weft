@@ -8,9 +8,14 @@ use crate::live::{LiveFeed, LivePress};
 use crate::program::infra::{InfraCall, InfraCancelAnswer, InfraLogsRequest, RebakeAnswer, SetupEnd};
 use crate::program::{InfraCopy, InfraDownAnswer, InfraStartAnswer};
 use crate::signal::timer::{Timer, TimerSpec};
+use crate::signal::to_spec;
 use crate::take_down::TakeDownChoice;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::context::kept::Step;
+use crate::context::Kept;
 use crate::error::{WeftError, WeftResult};
 use crate::program::ProgramCall;
 use crate::tag::StopSelf;
@@ -62,42 +67,48 @@ impl InfraCalls<'_> {
     ///
     /// The wait has no deadline (a copy pulling a large image takes as
     /// long as it takes) and holds no worker: between looks the run
-    /// parks on a timer, so a start that moves the project's workers
-    /// next to their infra never waits on the run that asked for it.
-    pub async fn start(self) -> WeftResult<()> {
+    /// pauses on a timer (where `state` comes in, `Kept::follow`), so
+    /// a start that moves the project's workers next to their infra never
+    /// waits on the run that asked for it.
+    pub async fn start<S: Serialize + DeserializeOwned + Send>(self, state: &mut Kept<S>) -> WeftResult<()> {
         let instance = instance_id(&self.instance)?;
-        self.ask_until_accepted(&instance).await?;
-        let node = self.node;
-        loop {
-            // An accepted start reads `provisioning` from the moment the
-            // runtime accepted it (the runtime counts the start under way,
-            // not only what the copy's row says), so every other answer is
-            // where the copy really stands.
-            let status = ProgramCall::Infra(InfraCall::Status { node: node.clone(), instance: instance.clone() });
-            let copy: Option<InfraCopy> = self.at.call(status, StopSelf::Keep).await?;
-            match copy.as_ref().map(|c| c.status) {
-                Some(InfraNodeStatus::Running) => return Ok(()),
-                Some(InfraNodeStatus::Failed) => {
-                    let why = copy.and_then(|c| c.failure).unwrap_or_else(|| "no reason recorded".into());
-                    return Err(WeftError::NodeFailed(format!(
-                        "infra '{node}' failed to start: {why}; `weft infra status` shows the copy"
-                    )));
+        let (this, instance) = (&self, &instance);
+        // The start is asked again until accepted (a copy running or
+        // starting is not started twice), then the copy is read until it
+        // runs.
+        state
+            .follow("infra.start", &this.target(instance), to_spec(LOOK_AGAIN), Starting::Asking, move |place| async move {
+                if place == Starting::Asking && !this.start_accepted(instance).await? {
+                    return Ok(Step::LookAgain(Starting::Asking));
                 }
-                None => {
-                    return Err(WeftError::NodeFailed(format!(
+                // An accepted start reads `provisioning` from the moment the
+                // runtime accepted it (the runtime counts the start under
+                // way, not only what the copy's row says), so every other
+                // answer is where the copy really stands.
+                let node = &this.node;
+                let status = ProgramCall::Infra(InfraCall::Status { node: node.clone(), instance: instance.clone() });
+                let copy: Option<InfraCopy> = this.at.call(status, StopSelf::Keep).await?;
+                match copy.as_ref().map(|c| c.status) {
+                    Some(InfraNodeStatus::Running) => Ok(Step::Done(())),
+                    Some(InfraNodeStatus::Failed) => {
+                        let why = copy.and_then(|c| c.failure).unwrap_or_else(|| "no reason recorded".into());
+                        Err(WeftError::NodeFailed(format!(
+                            "infra '{node}' failed to start: {why}; `weft infra status` shows the copy"
+                        )))
+                    }
+                    None => Err(WeftError::NodeFailed(format!(
                         "infra '{node}' did not come up: its start ended without a copy (the setup run failed \
                          or was cancelled, or somebody terminated it); `weft runs` shows the setup run"
-                    )));
+                    ))),
+                    Some(stopped @ (InfraNodeStatus::Stopped | InfraNodeStatus::Stopping | InfraNodeStatus::Terminating)) => {
+                        Err(WeftError::NodeFailed(format!(
+                            "infra '{node}' is {stopped}: somebody took it down while this start waited for it"
+                        )))
+                    }
+                    Some(InfraNodeStatus::Provisioning | InfraNodeStatus::Flaky) => Ok(Step::LookAgain(Starting::Accepted)),
                 }
-                Some(stopped @ (InfraNodeStatus::Stopped | InfraNodeStatus::Stopping | InfraNodeStatus::Terminating)) => {
-                    return Err(WeftError::NodeFailed(format!(
-                        "infra '{node}' is {stopped}: somebody took it down while this start waited for it"
-                    )));
-                }
-                Some(InfraNodeStatus::Provisioning | InfraNodeStatus::Flaky) => {}
-            }
-            self.at.ctx.await_signal(LOOK_AGAIN).await?;
-        }
+            })
+            .await
     }
 
     /// Ask for the copy to come up, and return once weft accepted the
@@ -109,23 +120,30 @@ impl InfraCalls<'_> {
     /// progress, a trigger of the copy mid-activation) is asked again
     /// every few seconds until it is accepted; a copy already running or
     /// starting is not started twice. Whether the copy then comes up is
-    /// for a later `status` read to tell: nothing here waits for it.
-    pub async fn request_start(self) -> WeftResult<()> {
+    /// for a later `status` read to tell: nothing here waits for the copy.
+    pub async fn request_start<S: Serialize + DeserializeOwned + Send>(self, state: &mut Kept<S>) -> WeftResult<()> {
         let instance = instance_id(&self.instance)?;
-        self.ask_until_accepted(&instance).await
+        let (this, instance) = (&self, &instance);
+        state
+            .follow("infra.request_start", &this.target(instance), to_spec(LOOK_AGAIN), (), move |()| async move {
+                Ok(if this.start_accepted(instance).await? { Step::Done(()) } else { Step::LookAgain(()) })
+            })
+            .await
     }
 
-    /// Ask for the start until weft accepts it, parking on a timer
-    /// between refusals for a passing reason.
-    async fn ask_until_accepted(&self, instance: &Option<InstanceId>) -> WeftResult<()> {
-        loop {
-            let call = ProgramCall::Infra(InfraCall::Start { node: self.node.clone(), instance: instance.clone() });
-            let answer: InfraStartAnswer = self.at.call(call, StopSelf::Keep).await?;
-            if answer.accepted() {
-                return Ok(());
-            }
-            self.at.ctx.await_signal(LOOK_AGAIN).await?;
-        }
+    /// What a helper on this copy asks for (`Kept::follow`): the project,
+    /// the node and the instance.
+    fn target<'i>(&'i self, instance: &'i Option<InstanceId>) -> (Option<uuid::Uuid>, &'i str, &'i Option<InstanceId>) {
+        (self.at.project, &self.node, instance)
+    }
+
+    /// Ask for the start once: whether weft accepted it (a refusal for a
+    /// passing reason, a build in progress or a trigger of the copy
+    /// mid-activation, is asked again by the caller after a look).
+    async fn start_accepted(&self, instance: &Option<InstanceId>) -> WeftResult<bool> {
+        let call = ProgramCall::Infra(InfraCall::Start { node: self.node.clone(), instance: instance.clone() });
+        let answer: InfraStartAnswer = self.at.call(call, StopSelf::Keep).await?;
+        Ok(answer.accepted())
     }
 
     /// Scale the copy down, keeping its disk, the way `weft infra stop
@@ -238,30 +256,31 @@ impl InfraCalls<'_> {
     /// infra setup again, which saves the new values, for a copy whose
     /// values changed in a way weft did not see. Returns once the setup
     /// ended; a setup of the same copies already under way is waited out
-    /// first. Like [`Self::start`], every wait parks the run on a timer.
-    pub async fn rebake(self) -> WeftResult<()> {
+    /// first. Like [`Self::start`], every wait pauses the run on a timer.
+    pub async fn rebake<S: Serialize + DeserializeOwned + Send>(self, state: &mut Kept<S>) -> WeftResult<()> {
         let instance = instance_id(&self.instance)?;
-        let run = loop {
-            let call = ProgramCall::Infra(InfraCall::Rebake { node: self.node.clone(), instance: instance.clone() });
-            match self.at.call::<RebakeAnswer>(call, StopSelf::Keep).await? {
-                RebakeAnswer::Started { run } => break run,
-                RebakeAnswer::NothingToSetUp => return Ok(()),
-                RebakeAnswer::Waiting { .. } => {
-                    self.at.ctx.await_signal(LOOK_AGAIN).await?;
+        let (this, instance) = (&self, &instance);
+        state
+            .follow("infra.rebake", &this.target(instance), to_spec(LOOK_AGAIN), Rebaking::Asking, move |place| async move {
+                let run = match place {
+                    Rebaking::Asking => {
+                        let call = ProgramCall::Infra(InfraCall::Rebake { node: this.node.clone(), instance: instance.clone() });
+                        match this.at.call::<RebakeAnswer>(call, StopSelf::Keep).await? {
+                            RebakeAnswer::Started { run } => run,
+                            RebakeAnswer::NothingToSetUp => return Ok(Step::Done(())),
+                            RebakeAnswer::Waiting { .. } => return Ok(Step::LookAgain(Rebaking::Asking)),
+                        }
+                    }
+                    Rebaking::SettingUp { run } => run,
+                };
+                match this.at.call::<SetupEnd>(ProgramCall::Infra(InfraCall::Setup { run }), StopSelf::Keep).await? {
+                    SetupEnd::Completed => Ok(Step::Done(())),
+                    SetupEnd::Going => Ok(Step::LookAgain(Rebaking::SettingUp { run })),
+                    SetupEnd::Failed { reason } => Err(rebake_ended(&this.node, "failed", run, reason)),
+                    SetupEnd::Cancelled { reason } => Err(rebake_ended(&this.node, "cancelled", run, reason)),
                 }
-            }
-        };
-        loop {
-            let end: SetupEnd = self.at.call(ProgramCall::Infra(InfraCall::Setup { run }), StopSelf::Keep).await?;
-            match end {
-                SetupEnd::Completed => return Ok(()),
-                SetupEnd::Going => {
-                    self.at.ctx.await_signal(LOOK_AGAIN).await?;
-                }
-                SetupEnd::Failed { reason } => return Err(rebake_ended(&self.node, "failed", run, reason)),
-                SetupEnd::Cancelled { reason } => return Err(rebake_ended(&self.node, "cancelled", run, reason)),
-            }
-        }
+            })
+            .await
     }
 
     /// A call that reads every copy of the node, refused when an instance
@@ -339,17 +358,38 @@ impl AllInfraCalls<'_> {
 
     /// Lifecycle command `id`'s end, once it has one. The wait has no
     /// deadline (a stop waits for the runs reaching its copies when it
-    /// was asked to) and holds no worker: between looks the run parks on
-    /// a timer.
-    pub async fn follow_command(self, id: i64) -> WeftResult<CommandStatus> {
-        loop {
-            let status: CommandStatus = self.at.call(ProgramCall::Infra(InfraCall::Command { id }), StopSelf::Keep).await?;
-            if status.done {
-                return Ok(status);
-            }
-            self.at.ctx.await_signal(LOOK_AGAIN).await?;
-        }
+    /// was asked to) and holds no worker: between looks the run pauses
+    /// on a timer.
+    pub async fn follow_command<S: Serialize + DeserializeOwned + Send>(self, id: i64, state: &mut Kept<S>) -> WeftResult<CommandStatus> {
+        let this = &self;
+        state
+            .follow("infra.follow_command", &(this.at.project, id), to_spec(LOOK_AGAIN), (), move |()| async move {
+                let status: CommandStatus = this.at.call(ProgramCall::Infra(InfraCall::Command { id }), StopSelf::Keep).await?;
+                Ok(if status.done { Step::Done(status) } else { Step::LookAgain(()) })
+            })
+            .await
     }
+}
+
+/// Where [`InfraCalls::start`] stands between its looks.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Starting {
+    /// The start is asked until weft accepts it.
+    Asking,
+    /// Accepted: the copy is read until it runs.
+    Accepted,
+}
+
+/// Where [`InfraCalls::rebake`] stands between its looks.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Rebaking {
+    /// The rebake is asked until a setup of the same copies already under
+    /// way ended.
+    Asking,
+    /// The setup run it started is followed until it ends.
+    SettingUp { run: crate::RunId },
 }
 
 #[cfg(test)]

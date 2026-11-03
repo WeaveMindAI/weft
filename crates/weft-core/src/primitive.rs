@@ -1,6 +1,5 @@
 #[cfg(feature = "runtime")]
 use std::collections::HashMap;
-use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,7 +11,7 @@ use crate::RunId;
 // A wake signal is "something the listener listens for on behalf of
 // a node." When it fires, the dispatcher either spawns a fresh run
 // (entry path: `register_signal`) or resumes a paused firing (resume
-// path: `await_signal`). The kind doesn't know which; the
+// path: a wait, `state.wait`). The kind doesn't know which; the
 // dispatcher's `PrepareRequest` and the journal's signal row carry
 // that lifecycle metadata.
 //
@@ -20,7 +19,7 @@ use crate::RunId;
 // `config` is an opaque JSON blob owned by that kind. Per-kind data
 // types and the `Signal` trait live in `crate::signal`; node code
 // constructs kinds there and passes them straight to
-// `ctx.register_signal(kind)` / `ctx.await_signal(kind)`. The
+// `ctx.register_signal(kind)` / `state.wait(field, kind)`. The
 // framework projects the typed kind onto this wire shape via
 // `signal::to_spec`. Authors never see `SignalSpec` directly.
 //
@@ -93,9 +92,21 @@ pub enum RegisterSignalResult {
     Registered { token: String },
 }
 
+/// The steps a stored [`SignalSpec`] takes from the shape an older weft
+/// wrote; `crate::stored` says how they run. A document holding specs
+/// elsewhere (a trigger's bake, a run's record) applies
+/// [`SIGNAL_SPEC_V2`] where each sits.
+pub const SIGNAL_SPEC_UPGRADES: &[&[crate::stored::Op]] = &[SIGNAL_SPEC_V2];
+
+/// Version 2: a live caller's gate names its check
+/// (`crate::signal::auth::auth_to_v2`); only a live-caller kind's config
+/// has an `auth`.
+pub const SIGNAL_SPEC_V2: &[crate::stored::Op] =
+    &[crate::stored::Op::Within { at: "config", ops: crate::signal::auth::AUTH_V2 }];
+
 impl SignalSpec {
     /// A registered signal's spec, as its row stores it (`signal.spec_json`).
-    pub const STORED: crate::stored::Kind<SignalSpec> = crate::stored::Kind::new("signal spec", &[]);
+    pub const STORED: crate::stored::Kind<SignalSpec> = crate::stored::Kind::new("signal spec", SIGNAL_SPEC_UPGRADES);
 
     /// A spec carrying only a kind tag and its config: no connection,
     /// no filter, no consumer label. The shape most callers building a
@@ -202,9 +213,10 @@ pub enum SignalAuth {
     /// Open. Anyone with the URL can fire. Suitable for raw
     /// webhooks where the URL itself is the secret.
     None,
-    /// The caller is verified against a stored connection (the
-    /// service recipe's `verify` block says how). `auth_config`
-    /// shape: `{ access_id, service }`. No secret is ever on the
+    /// The caller is checked against a stored connection with the
+    /// trigger's own scheme. `auth_config` shape:
+    /// `{ access_id, service, verify }` (no `verify`: a gate whose check
+    /// was not kept, refused at the door). No secret is ever on the
     /// row: the broker holds the connection and answers the check.
     Connection,
 }
@@ -236,7 +248,7 @@ impl SignalSurface {
 ///
 /// `auth_config` is a kind-specific JSON blob the dispatcher's
 /// auth gate parses according to `auth.kind_tag()`. For
-/// `Connection` the blob is `{access_id, service}`.
+/// `Connection` the blob is `{access_id, service, verify}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalRouting {
     pub surface: SignalSurface,
@@ -263,7 +275,17 @@ impl SignalRouting {
                 auth: SignalAuth::None,
                 auth_config: Value::Null,
             },
-            crate::signal::PublicEntryAuth::Connection { access_id, service } => Self {
+            crate::signal::PublicEntryAuth::Connection { access_id, service, verify } => Self {
+                surface,
+                auth: SignalAuth::Connection,
+                auth_config: serde_json::json!({
+                    "access_id": access_id,
+                    "service": service,
+                    "verify": verify,
+                }),
+            },
+            // No `verify`: the door refuses every caller, naming the fix.
+            crate::signal::PublicEntryAuth::CheckNotKept { access_id, service } => Self {
                 surface,
                 auth: SignalAuth::Connection,
                 auth_config: serde_json::json!({
@@ -331,18 +353,15 @@ pub struct RunSnapshot {
     /// registration takes its ending from here, so the two rows fold the
     /// same in either order.
     pub pending_deliveries: HashMap<String, AwaitEnd>,
-    /// Per-(node, frames) ordered sequence of past `await_signal`
-    /// calls. Each entry has the call_index (0-based ordinal of
-    /// the call within the body), the token, and either the
-    /// resolved value (if the corresponding fire arrived) or None
-    /// (still pending; this is the live suspension).
-    ///
-    /// On replay, the runtime pre-loads this sequence per
-    /// (node, frames); each `await_signal` call within the body
-    /// pops the next entry and either returns its resolved value
-    /// instantly OR re-suspends if pending. This is what makes
-    /// multiple sequential awaits within one node body work.
-    pub awaited_sequences: HashMap<crate::frames::FiringLocation, Vec<AwaitedEntry>>,
+    /// Per firing, every wait it registered, by number
+    /// ([`RecordedWait`]).
+    pub recorded_waits: HashMap<crate::frames::FiringLocation, Vec<RecordedWait>>,
+    /// Per firing, the last state it saved (`RunEvent::NodeStateSaved`):
+    /// what its body gets back when it runs again.
+    pub saved_states: HashMap<crate::frames::FiringLocation, crate::run::saved::SavedState>,
+    /// Every bus created and not closed, by id: what a worker that picks
+    /// the run up after a pause opens again before any body runs.
+    pub open_buses: std::collections::BTreeMap<uuid::Uuid, OpenBus>,
     /// Journal rows the fold could not apply because they were
     /// corrupted (unparseable UUID, broken invariants, a row the
     /// program cannot make sense of). Empty in the normal case.
@@ -366,6 +385,37 @@ pub struct JournalCorruption {
     /// "absorbed_pulse_ids[0]") and the parse error or invariant
     /// violation.
     pub reason: String,
+}
+
+/// A bus the run created and has not closed, as its record tells it
+/// (`RunEvent::BusCreated` and the bus rows after it): everything a
+/// worker needs to open it again where it stood, with the same id, so
+/// the markers already handed out keep naming it.
+#[cfg(feature = "runtime")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenBus {
+    /// The firing that created it, and the output port its marker goes
+    /// out on: a resumed body creating its bus on that port gets this one.
+    pub creator: crate::frames::FiringLocation,
+    pub port: String,
+    pub payload: crate::bus::BusPayloadKind,
+    pub meta: Value,
+    pub window: usize,
+    pub journal: crate::stream_journal::JournalPolicy,
+    /// The offset its next entry lands at.
+    pub next_offset: u64,
+    /// Every name that ever joined it.
+    pub joined: std::collections::BTreeSet<String>,
+    /// The last messages a journaled bus kept whole on its record (at
+    /// most `window`), oldest first, every one after `lost_through`: what
+    /// a reader reaching back finds again. Empty for an ephemeral bus,
+    /// whose record keeps no content.
+    pub retained: std::collections::VecDeque<crate::bus::WindowedBusMessage>,
+    /// One past the newest message its record cannot hand back whole
+    /// (every message of an ephemeral bus; one a journaled bus cut short,
+    /// kept without its bytes, or let fall out of `window`): a reader that
+    /// had not read it cannot read on as if it had.
+    pub lost_through: u64,
 }
 
 /// Closed enum over the places a journal row can be rejected: every
@@ -411,6 +461,9 @@ pub enum CorruptionSite {
     /// does not say it is given something, or misses one it says
     /// (`weft_core::project::Given::check_against`).
     RunGiven,
+    /// A bus row (`RunEvent::BusCreated` and the rows after it) names its
+    /// bus by an id that is no bus id.
+    Bus,
     /// A journal row whose JSON no longer decodes to any `RunEvent`
     /// at all (the display read surfaces it; state-rebuilding reads
     /// refuse the whole log instead).
@@ -422,42 +475,42 @@ pub enum CorruptionSite {
     MissingProgram,
 }
 
-/// One entry in the per-(node, frames) replay sequence rebuilt by
-/// `fold_to_snapshot`. The runtime consumes these in call_index
-/// order on every dispatch. Two kinds of observable points within
-/// a node body produce entries:
-///
-/// - `Await { token, ended }`: a past `ctx.await_signal` call, and how
-///   it ended: `None` for the still-pending tail.
-///
-/// - `Run { name, value }`: a past `ctx.run("name", fn)` call.
-///   The closure's output was journaled and replays here without
-///   re-running the closure (handles non-determinism between
-///   awaits without forcing replay-from-top to recompute).
+/// One wait a firing registered, by its number: the wait's token and
+/// how it ended (`None` while it is open). Rebuilt by the fold from
+/// `SuspensionRegistered` and the rows that end a wait. A resumed firing
+/// reads the ending of the wait it paused in here
+/// (`crate::context::Kept::wait`), a seeded firing the answers its seed
+/// was given ([`answered_waits`]), and the node-status view the wait a
+/// firing is parked on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AwaitedEntry {
-    pub call_index: u32,
-    pub kind: AwaitedEntryKind,
+pub struct RecordedWait {
+    /// The wait's number within its firing (`crate::run::saved::Counters::waits`).
+    pub wait_index: u32,
+    pub token: String,
+    /// The signal kind it waited on (`SignalSpec::kind`).
+    pub kind: String,
+    /// `None` while the wait is open.
+    pub ended: Option<AwaitEnd>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AwaitedEntryKind {
-    Await {
-        token: String,
-        /// `None` for the still-pending tail.
-        ended: Option<AwaitEnd>,
-    },
-    Run {
-        /// Author-supplied identifier for the call site. Used for
-        /// debugging + journal traceability; the runtime keys on
-        /// `call_index` only.
-        name: String,
-        value: Value,
-    },
+/// Refuse a body that asks, under a wait number its record already holds,
+/// a wait of another kind than the one recorded there: it did not come
+/// back to where it was, so its state does not say where the node is.
+pub fn check_wait_kind(recorded: &RecordedWait, asked: &SignalSpec, node: &str) -> crate::error::WeftResult<()> {
+    if recorded.kind == asked.kind {
+        return Ok(());
+    }
+    Err(crate::error::WeftError::NodeFailed(format!(
+        "node '{node}' waited for a '{}' signal as its wait #{n}, but its record holds wait #{n} as a '{}' signal: \
+         a node's saved state must say where it was, so that its body, run again from the top, comes back to the \
+         waits it made in the same order (keep what each step decided in the state, and skip what it says is done)",
+        asked.kind,
+        recorded.kind,
+        n = recorded.wait_index,
+    )))
 }
 
-/// How a past `ctx.await_signal` ended. The first ending on record
+/// How a past wait (`state.wait`) ended. The first ending on record
 /// stands: an answer that comes after a wait was given up is ignored.
 /// `V` is how the answer is held: the value itself, or, in an event that
 /// names it, where the record keeps it (`crate::live_event::DispatcherEvent`).
@@ -511,103 +564,21 @@ pub fn wait_skipped() -> crate::error::WeftError {
     crate::error::WeftError::WaitSkipped("a person skipped what this node was waiting for".into())
 }
 
-/// What a body's `ctx.await_signal` finds in its journal at its call
-/// index: the answer that already arrived, or the token of the wait
-/// it is still parked on. A wait given up is the call's error instead
-/// ([`replay_await`]).
-#[derive(Debug, Clone, PartialEq)]
-pub enum ReplayedAwait {
-    Resolved(Value),
-    Pending { token: String },
-}
-
-/// The steps of a firing's journal a new firing of the same code may
-/// replay (a seeded run re-running a node, `weft run --seed`): in call
-/// order from the first, every `ctx.run` and every wait somebody
-/// answered, up to the first wait that was not (still open, given up,
-/// skipped) or a gap in the order. The new firing asks that one again.
-pub fn answered_steps(entries: &[AwaitedEntry]) -> Vec<AwaitedEntry> {
-    let mut ordered: Vec<&AwaitedEntry> = entries.iter().collect();
-    ordered.sort_by_key(|entry| entry.call_index);
-    let mut steps = Vec::new();
-    for (at, entry) in ordered.into_iter().enumerate() {
-        let settled = match &entry.kind {
-            AwaitedEntryKind::Run { .. } => true,
-            AwaitedEntryKind::Await { ended, .. } => matches!(ended, Some(AwaitEnd::Answered { .. })),
-        };
-        if !settled || entry.call_index as usize != at { break; }
-        steps.push(entry.clone());
-    }
-    steps
-}
-
-/// The replay decision for a `ctx.await_signal` at `call_index`: pops
-/// the next journal entry of the (node, frames) sequence. `None` when
-/// the sequence is exhausted (a fresh await, to be registered). The
-/// ONE reading of the journal for both the run engine and the
-/// node-test rig, so a body a test replays green replays the same in
-/// production: a mismatched index or a `ctx.run` where an await was
-/// journaled means the body's call order changed, which is refused.
-pub fn replay_await(
-    sequence: &mut VecDeque<AwaitedEntry>,
-    call_index: u32,
-) -> crate::error::WeftResult<Option<ReplayedAwait>> {
-    let Some(entry) = sequence.pop_front() else {
-        return Ok(None);
-    };
-    if entry.call_index != call_index {
-        return Err(crate::error::WeftError::NodeFailed(format!(
-            "await_signal call_index mismatch (counter={call_index}, journal={}). \
-             This means the node body's call order changed between replays. \
-             Wrap any non-deterministic logic between awaits in `ctx.run`.",
-            entry.call_index
-        )));
-    }
-    match entry.kind {
-        AwaitedEntryKind::Await { token, ended } => match ended {
-            Some(AwaitEnd::Answered { value }) => Ok(Some(ReplayedAwait::Resolved(value))),
-            Some(AwaitEnd::GaveUp { error }) => Err(crate::error::WeftError::WaitGaveUp(error)),
-            Some(AwaitEnd::Skipped) => Err(wait_skipped()),
-            None => Ok(Some(ReplayedAwait::Pending { token })),
-        },
-        AwaitedEntryKind::Run { name, .. } => Err(crate::error::WeftError::NodeFailed(format!(
-            "await_signal at call_index={call_index} but journal has Run('{name}'). \
-             This means the node body called `ctx.run` here on a previous run \
-             and `ctx.await_signal` now; non-deterministic bodies are not safe \
-             to replay. Use `ctx.run` to wrap non-deterministic work."
-        ))),
-    }
-}
-
-/// The replay decision for a `ctx.run(name)` at `call_index`: the
-/// journaled value when the step already ran, `None` when the sequence
-/// is exhausted (the fresh path: the closure runs and its value is
-/// recorded). Same rule and same refusals as [`replay_await`].
-pub fn replay_run(
-    sequence: &mut VecDeque<AwaitedEntry>,
-    name: &str,
-    call_index: u32,
-) -> crate::error::WeftResult<Option<Value>> {
-    let Some(entry) = sequence.pop_front() else {
-        return Ok(None);
-    };
-    if entry.call_index != call_index {
-        return Err(crate::error::WeftError::NodeFailed(format!(
-            "ctx.run('{name}') call_index mismatch (counter={call_index}, journal={}). \
-             This means the node body's call order changed between replays. \
-             Wrap any non-deterministic logic in `ctx.run`.",
-            entry.call_index
-        )));
-    }
-    match entry.kind {
-        AwaitedEntryKind::Run { value, .. } => Ok(Some(value)),
-        AwaitedEntryKind::Await { .. } => Err(crate::error::WeftError::NodeFailed(format!(
-            "ctx.run('{name}') at call_index={call_index} but journal has Await. \
-             This means the node body called `ctx.await_signal` here on a previous \
-             run and `ctx.run` now; non-deterministic bodies are not safe to \
-             replay."
-        ))),
-    }
+/// The waits of a firing a new firing of the same code may take the
+/// answers of (a seeded run re-running a node, `weft run --seed`): in
+/// number order from the first, every wait somebody answered, up to the
+/// first that was not (still open, given up, skipped) or a gap in the
+/// numbers. The new firing's wait of the same number takes that answer
+/// at once; the first one past them asks again.
+pub fn answered_waits(waits: &[RecordedWait]) -> Vec<RecordedWait> {
+    let mut ordered: Vec<&RecordedWait> = waits.iter().collect();
+    ordered.sort_by_key(|wait| wait.wait_index);
+    ordered
+        .into_iter()
+        .enumerate()
+        .take_while(|(at, wait)| wait.wait_index as usize == *at && matches!(wait.ended, Some(AwaitEnd::Answered { .. })))
+        .map(|(_, wait)| wait.clone())
+        .collect()
 }
 
 /// Per-paused-(node, frames) info stored in the snapshot. `token` is
@@ -621,11 +592,9 @@ pub struct SuspensionInfo {
     pub frames: crate::frames::LoopFrames,
     pub spec: SignalSpec,
     pub created_at_unix: u64,
-    /// 0-based ordinal of the `await_signal` call within this
-    /// (node_id, frames). The runtime uses this on replay to put
-    /// resolved values back in the right order.
-    #[serde(default)]
-    pub call_index: u32,
+    /// The wait's number within its firing
+    /// (`crate::run::saved::Counters::waits`).
+    pub wait_index: u32,
 }
 
 /// One kicked root node in a folded snapshot. A kicked node is an
@@ -854,24 +823,34 @@ impl Phase {
 mod tests {
     use super::*;
 
-    fn run(call_index: u32) -> AwaitedEntry {
-        AwaitedEntry { call_index, kind: AwaitedEntryKind::Run { name: format!("step{call_index}"), value: Value::from(call_index) } }
+    fn wait(wait_index: u32, ended: Option<AwaitEnd>) -> RecordedWait {
+        RecordedWait { wait_index, token: format!("t{wait_index}"), kind: "timer".into(), ended }
     }
 
-    fn wait(call_index: u32, ended: Option<AwaitEnd>) -> AwaitedEntry {
-        AwaitedEntry { call_index, kind: AwaitedEntryKind::Await { token: format!("t{call_index}"), ended } }
+    fn answered(wait_index: u32) -> RecordedWait {
+        wait(wait_index, Some(AwaitEnd::Answered { value: Value::from(wait_index) }))
     }
 
-    /// A new firing replays, in call order, every step up to the first
+    /// A wait under a recorded number is that wait only when it is of the
+    /// kind recorded there; another kind is refused, naming both.
+    #[test]
+    fn a_wait_of_another_kind_under_a_recorded_number_is_refused() {
+        let recorded = RecordedWait { wait_index: 2, token: "t".into(), kind: "timer".into(), ended: None };
+        let asked = |kind: &str| SignalSpec { kind: kind.into(), ..crate::signal::to_spec(crate::signal::timer::Timer { spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 } }) };
+        assert!(check_wait_kind(&recorded, &asked("timer"), "n").is_ok());
+        let refused = check_wait_kind(&recorded, &asked("form"), "n").unwrap_err().to_string();
+        assert!(refused.contains("'form' signal as its wait #2") && refused.contains("holds wait #2 as a 'timer' signal"), "{refused}");
+    }
+
+    /// A new firing takes, in number order, every answer up to the first
     /// wait nobody answered, and asks that one again.
     #[test]
-    fn answered_steps_stop_at_the_first_wait_nobody_answered() {
-        let answered = wait(1, Some(AwaitEnd::Answered { value: Value::from("yes") }));
-        let entries = vec![wait(2, None), answered.clone(), run(0), run(3)];
-        assert_eq!(answered_steps(&entries), vec![run(0), answered.clone()]);
-        let gave_up = vec![run(0), wait(1, Some(AwaitEnd::GaveUp { error: "gone".into() })), run(2)];
-        assert_eq!(answered_steps(&gave_up), vec![run(0)]);
-        assert_eq!(answered_steps(&[wait(0, Some(AwaitEnd::Skipped))]), Vec::new());
-        assert_eq!(answered_steps(&[run(0), run(2)]), vec![run(0)], "a gap in the order ends the replay");
+    fn answered_waits_stop_at_the_first_wait_nobody_answered() {
+        let waits = vec![wait(2, None), answered(1), answered(0), answered(3)];
+        assert_eq!(answered_waits(&waits), vec![answered(0), answered(1)]);
+        let gave_up = vec![answered(0), wait(1, Some(AwaitEnd::GaveUp { error: "gone".into() })), answered(2)];
+        assert_eq!(answered_waits(&gave_up), vec![answered(0)]);
+        assert_eq!(answered_waits(&[wait(0, Some(AwaitEnd::Skipped))]), Vec::new());
+        assert_eq!(answered_waits(&[answered(0), answered(2)]), vec![answered(0)], "a gap in the numbers ends them");
     }
 }

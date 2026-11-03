@@ -64,8 +64,8 @@ into that group through the group's inputs.
    instance's trigger reads a value filled per instance (a schedule, a
    sheet), give that field a fallback if one makes sense, so the trigger can
    be turned on the moment the instance is created.
-2. **An admin route** the frontend's server calls, gated by `ApiKeyAuth` on
-   the `Route`'s `auth`, its key only in that server's environment. It
+2. **An admin route** the frontend's server calls, gated by `auth: "api_keys"`
+   on the `Route`, its key only in that server's environment. It
    onboards a person: writes the row, `MintInstanceToken`, then, if there is
    a per-instance infra node, `StartInfra` with `waitUntilRunning` off,
    then `Reply` with the token so the request ends at once, then a second
@@ -98,7 +98,7 @@ user picked on the install, on the user's bill. Ask the user which they want
 for each paid service before you write it.
 
 To try a person's path before any website exists, give a test instance the
-values a person would: `weft connect --instance alice --node <node>` and
+values a person would: `weft connect <node> --instance alice` and
 `weft instance-values --instance alice --set <node>.<field>=<value>`, then run with
 `--instance alice`.
 

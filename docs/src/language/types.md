@@ -32,7 +32,7 @@ Generator[String]
 | `{ a: String, b?: Number }` | A record, with `?` marking a field that may be missing |
 | `{ a: String, .. }` | An open record: a record that also takes keys it does not name, and drops them |
 | `A \| B` | Either one |
-| `Access` | A connection to a service. Go and read [how connections work](../connections/how-they-work.md) |
+| `Access[service]` | A connection to one service, named the way its access node names it (`Access[slack]`, `Access[google_drive]`). A bare `Access` is a connection to any service. Go and read [how connections work](../connections/how-they-work.md) |
 | `Generator[T]` | A stream of `T`. Go and read [streams and buses](streams-and-buses.md) |
 | `Bus` | A live channel. Same page |
 | `Secret[T]` | A `T` the run's record never holds. See [secrets](#secrets) below |
@@ -56,6 +56,8 @@ the file is, which is why a `String` holding a URL is not an `Image`.
 | A file, `Bus`, `Access`, `Infra`, `Generator[T]`, or a type holding one | `Json` | **No** |
 | `Json` | anything but `Json` | **No.** Use a `Cast`, which checks the value |
 | `Record` | `Record` | Every field you have must be declared on the target (unless the target ends with `..`), every required field it wants must be required on yours, and the types must match |
+| `Access[slack]` | `Access[slack]` or `Access` | Yes |
+| `Access` | `Access[slack]` | **No.** Type the port with its service |
 | `A` | `A \| B` | Yes |
 | `A \| B` | `A` | Only if **both** `A` and `B` fit `A` |
 | `Generator[A]` | `Generator[B]` | Only if they fit both ways. A stream is invariant |

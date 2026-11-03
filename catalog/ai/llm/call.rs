@@ -29,6 +29,7 @@ use weft::storage::{FileHandle, StorageScope};
 use weft::{RunContext, NodeErrExt, WeftError, WeftResult};
 
 use super::chat;
+use super::provider::{self, Provider};
 
 /// One assembled call: the generator (riding the opened connection's
 /// client), the per-call parameters, the conversation in stored form
@@ -82,6 +83,10 @@ impl LlmCall {
     /// change. Every other failure (a timeout, an overload, a 5xx whose
     /// text happens to say "reason") stays a catchable node failure.
     pub fn call_error(&self, err: MiniLLMError) -> WeftError {
+        // The ctx's client ended the call because the run was cancelled.
+        if weft::cancellation::is_cancel(&err) {
+            return WeftError::Cancelled;
+        }
         if self.reasoning_off && refuses_reasoning_off(&err) {
             return WeftError::Config(format!(
                 "llm: {err}. This model always reasons; set `reasoning: true` on its params \
@@ -113,25 +118,35 @@ fn refuses_reasoning_off(err: &MiniLLMError) -> bool {
 /// `prompt`, `media`, `tools`, `toolChoice`) into one ready-to-send
 /// call. Fails loudly on a provider object no provider node built.
 pub async fn assemble(ctx: &RunContext) -> WeftResult<LlmCall> {
-    // The `provider` input carries ONE `LlmProvider` object (the wired
+    // The `provider` input carries ONE `LlmProvider` record (the wired
     // provider node's output: which service, which model, and the
-    // connection to spend). THIS node interprets it.
-    let provider = ctx.inputs.nested("provider")?;
-    let kind: String = provider.get("kind")?;
-    let model: String = provider.get("model")?;
-
-    let mut generator = match kind.as_str() {
-        "openrouter" => GeneratorInfo::openrouter(&model)
-            .with_app_attribution("https://weavemind.ai", "WeaveMind"),
-        "anthropic" => GeneratorInfo::anthropic(&model),
-        "openai" => GeneratorInfo::openai(&model),
-        "custom" => {
-            let base_url: String = provider.get("baseUrl")?;
-            let name: String = provider.get_or("name", "Custom".to_string())?;
-            GeneratorInfo::custom(name, base_url, &model)
+    // connection to spend). THIS node interprets it. The named services
+    // always stamp a finish reason on a whole reply (`announces_finish`);
+    // a bare OpenAI-compatible server may end one by just closing.
+    let (mut generator, account, routing, announces_finish) = match provider::read(ctx)? {
+        Provider::Openrouter { model, account, serving_provider, provider_fallbacks } => {
+            // OpenRouter routing rides the provider record (it is a fact
+            // of WHERE the call is served, not of how the model samples);
+            // the lib attaches it under the request's `provider` key.
+            let routing = (serving_provider.is_some() || provider_fallbacks.is_some()).then(|| {
+                let mut routing = OpenRouterRouting::new();
+                if let Some(pin) = serving_provider {
+                    routing = routing.with_order(vec![pin]);
+                }
+                if let Some(fallbacks) = provider_fallbacks {
+                    routing = routing.with_fallbacks(fallbacks);
+                }
+                routing
+            });
+            let generator = GeneratorInfo::openrouter(&model)
+                .with_app_attribution("https://weavemind.ai", "WeaveMind");
+            (generator, Some(account), routing, true)
         }
-        other => {
-            return Err(WeftError::Input(format!("unknown LLM provider kind '{other}'")))
+        Provider::Anthropic { model, account } => (GeneratorInfo::anthropic(&model), Some(account), None, true),
+        Provider::Openai { model, account } => (GeneratorInfo::openai(&model), Some(account), None, true),
+        Provider::Custom { model, account, base_url, name } => {
+            let name = name.unwrap_or_else(|| "Custom".to_string());
+            (GeneratorInfo::custom(name, base_url, &model), account, None, false)
         }
     };
 
@@ -140,29 +155,17 @@ pub async fn assemble(ctx: &RunContext) -> WeftResult<LlmCall> {
     // cleared explicitly rather than relied on to be overridden.
     generator = generator.with_auth(minillmlib::Auth::None);
 
-    // The connection: every provider node embeds the picked Access
-    // marker in the object it emits; only a custom endpoint may run
-    // without one (a local or unauthenticated OpenAI-compatible
-    // server). The generator gets the connection's signed, measured
-    // client and NO key of its own: the client signs every request
-    // (which also covers services whose sign-in is more than one
-    // header), and with the auth cleared the lib sends none. The
-    // opened connection is not kept: its lease is the runtime's,
-    // released when the firing's body finishes.
-    match provider.opt::<weft::Access>("account")? {
-        Some(account) => {
-            let conn = ctx.open(&account).await?;
-            generator = generator.with_http_client(conn.client().clone());
-        }
-        None if kind == "custom" => {
-            generator = generator.with_http_client(ctx.http().clone());
-        }
-        None => {
-            return Err(WeftError::Input(
-                "the wired LlmProvider object carries no connection; wire the service's Access node into its Model node"
-                    .to_string(),
-            ))
-        }
+    // The connection: the generator gets the connection's signed,
+    // measured client and NO key of its own: the client signs every
+    // request (which also covers services whose sign-in is more than one
+    // header), and with the auth cleared the lib sends none. Only a
+    // custom endpoint may run without one (a local or unauthenticated
+    // OpenAI-compatible server), on the plain client. The opened
+    // connection is not kept: its lease is the runtime's, released when
+    // the firing's body finishes.
+    generator = match &account {
+        Some(account) => generator.with_http_client(ctx.open(account).await?.client().clone()),
+        None => generator.with_http_client(ctx.http().clone()),
     };
 
     // The `params` input carries ONE plain object (the wired LlmParams
@@ -187,18 +190,7 @@ pub async fn assemble(ctx: &RunContext) -> WeftResult<LlmCall> {
     }
     let reasoning_off = reasoning == Some(false);
 
-    // OpenRouter routing rides the provider object (it is a fact of
-    // WHERE the call is served, not of how the model samples); the lib
-    // attaches it under the request's `provider` key and other wires
-    // ignore it.
-    let mut routing = OpenRouterRouting::new();
-    if let Some(pin) = provider.opt::<String>("servingProvider")? {
-        routing = routing.with_order(vec![pin]);
-    }
-    if let Some(fallbacks) = provider.opt::<bool>("providerFallbacks")? {
-        routing = routing.with_fallbacks(fallbacks);
-    }
-    if routing.order.is_some() || routing.allow_fallbacks.is_some() {
+    if let Some(routing) = routing {
         cp = cp.with_openrouter_routing(routing);
     }
 
@@ -207,7 +199,7 @@ pub async fn assemble(ctx: &RunContext) -> WeftResult<LlmCall> {
     // field, so it decodes straight into one.
     // SYNC: types.LlmTool (catalog/ai/llm/metadata.json) <->
     //       MiniLLMLibRS/src/tools/mod.rs ToolDefinition
-    let tools: Vec<ToolDefinition> = ctx.inputs.opt("tools")?.unwrap_or_default();
+    let tools: Vec<ToolDefinition> = ctx.inputs.list("tools")?;
     let has_tools = !tools.is_empty();
     for tool in tools {
         cp = cp.with_tool(tool);
@@ -250,9 +242,7 @@ pub async fn assemble(ctx: &RunContext) -> WeftResult<LlmCall> {
         new_turn = 1;
     }
     if stored.is_empty() {
-        return Err(WeftError::Input(
-            "nothing to send: no prompt, no media, and no conversation on historyFile".to_string(),
-        ));
+        weft::input_bail!("nothing to send: no prompt, no media, and no conversation on historyFile");
     }
     Ok(LlmCall {
         generator,
@@ -263,7 +253,7 @@ pub async fn assemble(ctx: &RunContext) -> WeftResult<LlmCall> {
         auto_cache: ctx.inputs.get_or("autoCache", true)?,
         new_turn,
         history_ty,
-        announces_finish: kind != "custom",
+        announces_finish,
         reasoning_off,
     })
 }
@@ -338,9 +328,9 @@ pub async fn to_wire(ctx: &RunContext, llm: &LlmCall) -> WeftResult<ChatNode> {
 
 /// The buffered call: assemble it, send it, and hand back the call with
 /// the model's whole reply. It streams internally so a Stop lands
-/// mid-generation instead of after it; on cancel, dropping the stream
-/// is all the wrap-up there is (the metered client resolves the
-/// interrupted call's real cost on its own).
+/// mid-generation instead of after it: the call rides the ctx's client,
+/// whose body read ends the moment the run is cancelled, and the metered
+/// client resolves the interrupted call's real cost on its own.
 pub async fn complete(ctx: &RunContext) -> WeftResult<(LlmCall, CompletionResponse)> {
     let llm = assemble(ctx).await?;
     let leaf = to_wire(ctx, &llm).await?;
@@ -348,11 +338,7 @@ pub async fn complete(ctx: &RunContext) -> WeftResult<(LlmCall, CompletionRespon
         .complete_streaming(&llm.generator, Some(&llm.params))
         .await
         .map_err(|e| llm.call_error(e))?;
-    let cancelled = ctx.cancellation();
-    let response = tokio::select! {
-        collected = stream.collect() => collected.map_err(|e| llm.call_error(e))?,
-        err = cancelled.cancelled_err() => return Err(err),
-    };
+    let response = stream.collect().await.map_err(|e| llm.call_error(e))?;
     Ok((llm, response))
 }
 

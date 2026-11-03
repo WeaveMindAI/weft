@@ -40,7 +40,7 @@ impl Node for SlackAppMessagesNode {
         let include_bots: bool = ctx.inputs.get("includeBots")?;
 
         let mut filters = vec![Predicate::eq("type", "message")];
-        if let Some(k) = keyword.filter(|k| !k.trim().is_empty()) {
+        if let Some(k) = keyword {
             filters.push(Predicate::contains("text", k));
         }
         if !include_bots {

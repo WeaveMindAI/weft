@@ -41,8 +41,8 @@ use weft_core::run::{
 };
 use weft_core::frames::{FiringLocation, Located, LoopFrames};
 use weft_core::primitive::{
-    AwaitEnd, AwaitedEntry, AwaitedEntryKind, CorruptionSite, RunSnapshot, JournalCorruption, KickedNode,
-    LoopInstanceKey, LoopTerminationReason, SuspensionInfo,
+    AwaitEnd, CorruptionSite, RunSnapshot, JournalCorruption, KickedNode,
+    LoopInstanceKey, LoopTerminationReason, OpenBus, RecordedWait, SuspensionInfo,
 };
 use weft_core::project::scopes::ScopeCopy;
 use weft_core::project::{loop_in_id, loop_out_id, GivenOrigin, GivenPort, ProgramIndex, NodeDefinition, ProjectDefinition};
@@ -191,7 +191,9 @@ impl Fold {
                 loop_runtime: loop_runtime::LoopRuntime::new(),
                 kicked: Default::default(),
                 pending_deliveries: HashMap::new(),
-                awaited_sequences: HashMap::new(),
+                recorded_waits: HashMap::new(),
+                saved_states: HashMap::new(),
+                open_buses: Default::default(),
                 corruptions: Vec::new(),
             },
             outputs: HashMap::new(),
@@ -374,9 +376,9 @@ impl Fold {
                 self.snap.firings.insert(record);
             }
         }
-        for (location, entries) in &source.snap.awaited_sequences {
+        for (location, waits) in &source.snap.recorded_waits {
             if places.contains(&Located::at(&location.node_id, &location.frames)) {
-                self.snap.awaited_sequences.insert(location.clone(), entries.clone());
+                self.snap.recorded_waits.insert(location.clone(), waits.clone());
                 self.index_awaits(location);
             }
         }
@@ -387,26 +389,25 @@ impl Fold {
     }
 
     /// Take the answers `places` were given in `source`, for the firings
-    /// this run runs again there: at each of their frames, the steps its
-    /// body went through in `source` up to the first wait nobody answered
-    /// (`weft_core::primitive::answered_steps`), so the body replays them
-    /// and carries on from there instead of asking again.
+    /// this run runs again there: at each of their frames, the waits its
+    /// body made in `source`, in number order, up to the first nobody
+    /// answered (`weft_core::primitive::answered_waits`), so the body's
+    /// waits of those numbers take those answers at once and it asks
+    /// again from there.
     pub fn take_answers(&mut self, source: &Fold, places: &BTreeSet<Located>) {
-        for (location, entries) in &source.snap.awaited_sequences {
+        for (location, waits) in &source.snap.recorded_waits {
             if !places.contains(&Located::at(&location.node_id, &location.frames)) { continue; }
-            let answered = weft_core::primitive::answered_steps(entries);
-            if answered.is_empty() || self.snap.awaited_sequences.contains_key(location) { continue; }
-            self.snap.awaited_sequences.insert(location.clone(), answered);
+            let answered = weft_core::primitive::answered_waits(waits);
+            if answered.is_empty() || self.snap.recorded_waits.contains_key(location) { continue; }
+            self.snap.recorded_waits.insert(location.clone(), answered);
             self.index_awaits(location);
         }
     }
 
-    /// Know where each wait of the entries at `at` is ([`Self::awaits`]).
+    /// Know where each wait recorded at `at` is ([`Self::awaits`]).
     fn index_awaits(&mut self, at: &FiringLocation) {
-        for entry in self.snap.awaited_sequences.get(at).into_iter().flatten() {
-            if let AwaitedEntryKind::Await { token, .. } = &entry.kind {
-                self.awaits.entry(token.clone()).or_insert_with(|| at.clone());
-            }
+        for wait in self.snap.recorded_waits.get(at).into_iter().flatten() {
+            self.awaits.entry(wait.token.clone()).or_insert_with(|| at.clone());
         }
     }
 
@@ -418,20 +419,20 @@ impl Fold {
         effects
     }
 
-    /// The snapshot, with every awaited sequence in call order.
+    /// The snapshot, with every firing's waits in number order.
     pub fn into_snapshot(mut self) -> RunSnapshot {
-        for entries in self.snap.awaited_sequences.values_mut() {
-            entries.sort_by_key(|e| e.call_index);
+        for waits in self.snap.recorded_waits.values_mut() {
+            waits.sort_by_key(|wait| wait.wait_index);
         }
         self.snap
     }
 
-    /// The snapshot as it stands, with every awaited sequence in call
+    /// The snapshot as it stands, with every firing's waits in number
     /// order, leaving the fold to take more rows.
     pub fn current_snapshot(&self) -> RunSnapshot {
         let mut snap = self.snap.clone();
-        for entries in snap.awaited_sequences.values_mut() {
-            entries.sort_by_key(|e| e.call_index);
+        for waits in snap.recorded_waits.values_mut() {
+            waits.sort_by_key(|wait| wait.wait_index);
         }
         snap
     }
@@ -530,7 +531,8 @@ impl Fold {
             firings: &mut snap.firings,
             kicked: &mut snap.kicked,
             scopes: &mut snap.scopes,
-            awaited_sequences: &mut snap.awaited_sequences,
+            recorded_waits: &mut snap.recorded_waits,
+            saved_states: &mut snap.saved_states,
             loop_runtime: &mut snap.loop_runtime,
         };
         for forgotten in forgetting.forget_firing(&places, &mut tables, at) {
@@ -550,7 +552,8 @@ impl Fold {
             firings: &mut snap.firings,
             kicked: &mut snap.kicked,
             scopes: &mut snap.scopes,
-            awaited_sequences: &mut snap.awaited_sequences,
+            recorded_waits: &mut snap.recorded_waits,
+            saved_states: &mut snap.saved_states,
             loop_runtime: &mut snap.loop_runtime,
         };
         let forgot = forgetting.forget_finished_iterations(&places, &mut tables, |_| false);
@@ -566,7 +569,7 @@ impl Fold {
     /// Let go of what the fold holds of a firing its tables forgot,
     /// whichever way it went: its outputs, unless it is its place's last
     /// completed one (the run's outputs read it), and its waits.
-    fn let_go(&mut self, Forgotten { record, answers }: Forgotten) {
+    fn let_go(&mut self, Forgotten { record, waits }: Forgotten) {
         let boundary = self.program_idx.node(&self.project, &record.node_id)
             .is_some_and(|def| weft_core::project::boundary_types::is_boundary(&def.node_type));
         if record.status() == NodeFiringStatus::Completed && !boundary {
@@ -583,11 +586,9 @@ impl Fold {
             self.outputs.remove(&record.id);
             self.output_kept.remove(&record.id);
         }
-        for entry in answers {
-            if let AwaitedEntryKind::Await { token, .. } = entry.kind {
-                self.awaits.remove(&token);
-                self.snap.suspensions.remove(&token);
-            }
+        for wait in waits {
+            self.awaits.remove(&wait.token);
+            self.snap.suspensions.remove(&wait.token);
         }
     }
 
@@ -646,10 +647,12 @@ impl Fold {
                         });
                         // An output is mentioned even without a wire;
                         // a later seeded run can connect a consumer to it.
-                        self.record_at_mut(node_id, frames)
-                            .expect("`firing_record_id` found this record and nothing removes records")
-                            .mentioned_ports
-                            .extend(mentioned);
+                        // A stream item is counted as the live engine
+                        // counts it.
+                        let record = self.record_at_mut(node_id, frames)
+                            .expect("`firing_record_id` found this record and nothing removes records");
+                        record.mentioned_ports.extend(mentioned);
+                        record.count_stream_item(*emission_id);
                         // A firing's emissions merge into one output
                         // bag, later wins per port: an ordinary port is
                         // mentioned once per firing (the runner refuses
@@ -680,7 +683,8 @@ impl Fold {
                 // every per-pass scan of a REFOLDED worker quadratic
                 // where the live worker's is not). Safe because
                 // consumed stream pulses are never un-absorb targets
-                // (a stream consumer is never re-run). Deliberately
+                // (a consumer run again from its saved state gets back
+                // only the takes this record does not hold). Deliberately
                 // NOT recorded on the consuming record's
                 // `pulses_absorbed`: that list exists for the
                 // resume-time un-absorb, which never applies here, and
@@ -763,8 +767,17 @@ impl Fold {
                     return effects;
                 }
                 if let Some(e) = self.snap.firings.set_status(node_id, frames, NodeFiringStatus::WaitingForInput) {
-                    e.callback_id = Some(token.clone());
+                    e.callback_id = token.clone();
                 }
+            }
+            RunEvent::NodeStateSaved { node_id, frames, saved, .. } => {
+                // A save of a firing the journal never opened is
+                // corruption like every other lifecycle row: a state
+                // with no firing could only be handed to the wrong one.
+                if self.firing_record_id(node_id, frames, CorruptionSite::NodeLifecycle, ev).is_none() {
+                    return effects;
+                }
+                self.snap.saved_states.insert(FiringLocation::new(node_id.clone(), frames.clone()), saved.clone());
             }
             RunEvent::NodeResumed { node_id, frames, token, .. } => {
                 // Absorb the pending pulses at the location, exactly as
@@ -965,7 +978,7 @@ impl Fold {
                     }
                 }
             }
-            RunEvent::SuspensionRegistered { node_id, frames, token, spec, call_index, at_unix, .. } => {
+            RunEvent::SuspensionRegistered { node_id, frames, token, spec, wait_index, at_unix, .. } => {
                 self.snap.suspensions.insert(
                     token.clone(),
                     SuspensionInfo {
@@ -973,7 +986,7 @@ impl Fold {
                         frames: frames.clone(),
                         spec: spec.clone(),
                         created_at_unix: *at_unix,
-                        call_index: *call_index,
+                        wait_index: *wait_index,
                     },
                 );
                 // Close the out-of-order window: the wait's registration is
@@ -995,24 +1008,12 @@ impl Fold {
                 if let Some(end) = &ended {
                     effects.wait_ended = Some(EndedWait { at: at.clone(), token: token.clone(), end: end.clone(), answer_kept });
                 }
-                self.snap
-                    .awaited_sequences
-                    .entry(at)
-                    .or_default()
-                    .push(AwaitedEntry {
-                        call_index: *call_index,
-                        kind: AwaitedEntryKind::Await { token: token.clone(), ended },
-                    });
-            }
-            RunEvent::RunOutput { node_id, frames, call_index, name, value, .. } => {
-                self.snap
-                    .awaited_sequences
-                    .entry(FiringLocation::new(node_id.clone(), frames.clone()))
-                    .or_default()
-                    .push(AwaitedEntry {
-                        call_index: *call_index,
-                        kind: AwaitedEntryKind::Run { name: name.clone(), value: value.clone() },
-                    });
+                self.snap.recorded_waits.entry(at).or_default().push(RecordedWait {
+                    wait_index: *wait_index,
+                    token: token.clone(),
+                    kind: spec.kind.clone(),
+                    ended,
+                });
             }
             RunEvent::SuspensionResolved { token, value, .. } => {
                 let kept = self.kept_at(at);
@@ -1038,14 +1039,84 @@ impl Fold {
                     }
                 }
             }
+            // The run's buses, as far as a worker opening them again after
+            // a pause needs them (`RunSnapshot::open_buses`): how each was
+            // made, where its next entry lands, who ever joined, and the
+            // messages a journaled one's record kept whole.
+            RunEvent::BusCreated { bus_id, node_id, frames, port, payload, meta, window, journal, .. } => {
+                let Some(id) = self.bus_id(bus_id, ev) else { return effects };
+                self.snap.open_buses.insert(
+                    id,
+                    OpenBus {
+                        creator: FiringLocation::new(node_id.clone(), frames.clone()),
+                        port: port.clone(),
+                        payload: *payload,
+                        meta: meta.clone(),
+                        window: *window,
+                        journal: *journal,
+                        next_offset: 0,
+                        joined: Default::default(),
+                        retained: Default::default(),
+                        lost_through: 0,
+                    },
+                );
+            }
+            RunEvent::BusJoined { bus_id, offset, name, .. } => {
+                if let Some(bus) = self.open_bus(bus_id, ev) {
+                    bus.next_offset = bus.next_offset.max(offset + 1);
+                    bus.joined.insert(name.clone());
+                }
+            }
+            RunEvent::BusLeft { bus_id, offset, .. } => {
+                if let Some(bus) = self.open_bus(bus_id, ev) {
+                    bus.next_offset = bus.next_offset.max(offset + 1);
+                }
+            }
+            RunEvent::BusWindow { bus_id, last_offset, messages, .. } => {
+                if let Some(bus) = self.open_bus(bus_id, ev) {
+                    bus.next_offset = bus.next_offset.max(last_offset + 1);
+                    // Only a message kept whole can be read again; one cut
+                    // short or kept without its bytes (every message of an
+                    // ephemeral bus, whose window carries none) is lost,
+                    // and so is every one before it: the retained window
+                    // is the unbroken run of whole messages after the
+                    // newest one lost, so a reader behind it is told, never
+                    // carried over a hole.
+                    if bus.journal.is_ephemeral() {
+                        bus.lost_through = bus.lost_through.max(last_offset + 1);
+                    }
+                    for message in messages {
+                        if message.payload.is_some() && !message.trimmed {
+                            bus.retained.push_back(message.clone());
+                        } else {
+                            bus.lost_through = bus.lost_through.max(message.offset + 1);
+                        }
+                    }
+                    while bus.retained.len() > bus.window {
+                        if let Some(dropped) = bus.retained.pop_front() {
+                            bus.lost_through = bus.lost_through.max(dropped.offset + 1);
+                        }
+                    }
+                    let lost_through = bus.lost_through;
+                    bus.retained.retain(|message| message.offset >= lost_through);
+                }
+            }
+            RunEvent::BusClosed { bus_id, .. } => {
+                if let Some(id) = self.bus_id(bus_id, ev) {
+                    self.snap.open_buses.remove(&id);
+                }
+            }
             // Observability-only events: they carry no state the resume
-            // fold needs. Bus replay and caller-exchange replay are read
-            // straight from the row stream by the inspector, not from the
-            // snapshot. Caller events are additionally non-durable by
-            // design (a live connection dies with its worker), so they
-            // never contribute to a resumed run's state. A charge's
-            // opening is read by [`ChargeBook`], which the drive reads.
+            // fold needs. Caller-exchange replay is read straight from the
+            // row stream by the inspector, not from the snapshot. Caller
+            // events are additionally non-durable by design (a live
+            // connection dies with its worker), so they never contribute
+            // to a resumed run's state. A charge's opening is read by
+            // [`ChargeBook`], which the drive reads; a call a node owes by
+            // [`crate::OwedCalls`].
             RunEvent::ChargeOpened { .. }
+            | RunEvent::EndCallOwed { .. }
+            | RunEvent::EndCallsSettled { .. }
             | RunEvent::LogLine { .. }
             | RunEvent::FileEdited { .. }
             | RunEvent::TriggerCaptured { .. }
@@ -1053,10 +1124,6 @@ impl Fold {
             | RunEvent::RunCompleted { .. }
             | RunEvent::RunFailed { .. }
             | RunEvent::RunCancelled { .. }
-            | RunEvent::BusJoined { .. }
-            | RunEvent::BusLeft { .. }
-            | RunEvent::BusWindow { .. }
-            | RunEvent::BusClosed { .. }
             | RunEvent::CallerConnected { .. }
             | RunEvent::CallerWindow { .. }
             | RunEvent::CallerErrored { .. }
@@ -1454,6 +1521,27 @@ impl Fold {
     /// The id of the record at `(node, frames)`, or a
     /// corruption at `site` when there is none (a row about a firing
     /// the journal never opened).
+    /// The bus a bus row names, or a corruption report when its id is no
+    /// bus id.
+    fn bus_id(&mut self, bus_id: &str, ev: &RunEvent) -> Option<Uuid> {
+        match Uuid::parse_str(bus_id) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                self.report(CorruptionSite::Bus, format!("{}: bus id '{bus_id}': {e}", describe(ev)));
+                None
+            }
+        }
+    }
+
+    /// The open bus a bus row is about. `None` for a bus the run never
+    /// recorded creating, which is a run recorded before buses were
+    /// (`RunEvent::BusCreated`): such a bus is never opened again, so its
+    /// rows are only for the inspector.
+    fn open_bus(&mut self, bus_id: &str, ev: &RunEvent) -> Option<&mut OpenBus> {
+        let id = self.bus_id(bus_id, ev)?;
+        self.snap.open_buses.get_mut(&id)
+    }
+
     fn firing_record_id(&mut self, node_id: &str, frames: &LoopFrames, site: CorruptionSite, ev: &RunEvent) -> Option<Uuid> {
         match self.record_at(node_id, frames).map(|e| e.id) {
             Some(id) => Some(id),
@@ -1475,10 +1563,7 @@ impl Fold {
     /// `answer_kept` is where the record keeps an answer.
     fn end_await(&mut self, token: &str, end: AwaitEnd, answer_kept: Option<Arc<ValueRef>>) -> Option<EndedWait> {
         if let Some(at) = self.awaits.get(token) {
-            let entry = self.snap.awaited_sequences.get_mut(at).into_iter().flatten().find_map(|entry| match &mut entry.kind {
-                AwaitedEntryKind::Await { token: t, ended } if t == token => Some(ended),
-                _ => None,
-            });
+            let entry = self.snap.recorded_waits.get_mut(at).into_iter().flatten().find(|wait| wait.token == token).map(|wait| &mut wait.ended);
             let Some(ended) = entry else {
                 // Every registration lands its entry beside its token; a
                 // token whose entry is gone is a fold that lost track.
@@ -1540,6 +1625,7 @@ fn describe(ev: &RunEvent) -> String {
         }
         RunEvent::NodeStarted { node_id, frames, .. }
         | RunEvent::NodeSuspended { node_id, frames, .. }
+        | RunEvent::NodeStateSaved { node_id, frames, .. }
         | RunEvent::NodeResumed { node_id, frames, .. }
         | RunEvent::NodeCompleted { node_id, frames, .. }
         | RunEvent::NodeFailed { node_id, frames, .. }
@@ -2091,30 +2177,134 @@ mod tests {
         assert_eq!(fold.output_of("src", &vec![]).map(|output| shown(&output)), Some(json!({ "out": 1 })));
     }
 
-    /// The awaited sequence of a firing reads in call order whatever
-    /// order its rows landed in (a register and a run output are
-    /// written by independent dispatcher paths).
+    /// A firing's waits read in number order whatever order their rows
+    /// landed in, each with its signal's kind.
     #[test]
-    fn an_awaited_sequence_reads_in_call_order() {
-        let register = |call_index: u32| RunEvent::SuspensionRegistered {
+    fn a_firings_waits_read_in_number_order() {
+        let register = |wait_index: u32| RunEvent::SuspensionRegistered {
             run_id: run_id(),
             node_id: "a".into(),
             frames: vec![],
-            token: format!("t{call_index}"),
+            token: format!("t{wait_index}"),
             spec: make_spec(),
-            call_index,
+            wait_index,
             at_unix: 0,
         };
+        let events = vec![register(2), register(0), register(1)];
+        let snap = fold_to_snapshot(run_id(), fan_out_project(), &events);
+        let waits = &snap.recorded_waits[&FiringLocation::new("a", vec![])];
+        assert_eq!(waits.iter().map(|w| w.wait_index).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(waits[1].token, "t1");
+        assert_eq!(waits[1].kind, make_spec().kind);
+    }
+
+    /// The latest state a firing saved is the one a resume reads; a save
+    /// of a firing the record never opened is corruption.
+    #[test]
+    fn the_latest_saved_state_of_a_firing_is_kept() {
+        let saved = |n: u64| weft_core::run::saved::SavedState {
+            state: json!({ "step": n }),
+            positions: Default::default(),
+            counters: weft_core::run::saved::Counters { waits: n as u32, program_calls: 0 },
+            helper: None,
+        };
+        let row = |n: u64| RunEvent::NodeStateSaved { run_id: run_id(), node_id: "a".into(), frames: vec![], saved: saved(n), at_unix: n };
         let events = vec![
-            register(2),
-            RunEvent::RunOutput { run_id: run_id(), node_id: "a".into(), frames: vec![], call_index: 0, name: "decide".into(), value: json!("left"), at_unix: 0 },
-            register(1),
+            RunEvent::NodeStarted { run_id: run_id(), node_id: "a".into(), frames: vec![], at_unix: 0 },
+            row(1),
+            row(2),
         ];
         let snap = fold_to_snapshot(run_id(), fan_out_project(), &events);
-        let seq = &snap.awaited_sequences[&FiringLocation::new("a", vec![])];
-        assert_eq!(seq.iter().map(|e| e.call_index).collect::<Vec<_>>(), vec![0, 1, 2]);
-        assert!(matches!(&seq[0].kind, AwaitedEntryKind::Run { name, .. } if name == "decide"));
-        assert!(matches!(&seq[1].kind, AwaitedEntryKind::Await { token, .. } if token == "t1"));
+        assert_eq!(snap.saved_states[&FiringLocation::new("a", vec![])], saved(2));
+
+        let orphan = fold_to_snapshot(run_id(), fan_out_project(), &[row(1)]);
+        assert!(orphan.saved_states.is_empty());
+        assert_eq!(orphan.corruptions.len(), 1, "{:?}", orphan.corruptions);
+    }
+
+    /// The record tells a resume which buses are open, as they stand:
+    /// where each was created, the offset its next entry lands at, who
+    /// joined, and the messages a journaled one kept whole (at most its
+    /// window); a closed one is gone, an ephemeral one keeps no content.
+    #[test]
+    fn open_buses_are_folded_from_their_rows() {
+        let bus = uuid::Uuid::from_u128(9);
+        let created = |id: uuid::Uuid, journal: weft_core::stream_journal::JournalPolicy| RunEvent::BusCreated {
+            run_id: run_id(),
+            bus_id: id.to_string(),
+            node_id: "a".into(),
+            frames: vec![],
+            port: "out".into(),
+            payload: weft_core::bus::BusPayloadKind::Json,
+            meta: Value::Null,
+            window: 2,
+            journal,
+            at_unix: 0,
+        };
+        let message = |offset: u64, trimmed: bool| weft_core::bus::WindowedBusMessage {
+            offset,
+            from: "host".into(),
+            msg_kind: "msg".into(),
+            payload: Some(weft_core::bus::WirePayload::Json(json!(offset))),
+            payload_byte_size: 1,
+            trimmed,
+            at_unix: 0,
+        };
+        let window = |id: uuid::Uuid, messages: Vec<weft_core::bus::WindowedBusMessage>| RunEvent::BusWindow {
+            run_id: run_id(),
+            bus_id: id.to_string(),
+            first_offset: messages.first().map_or(0, |m| m.offset),
+            last_offset: messages.last().map_or(0, |m| m.offset),
+            messages,
+            totals: vec![],
+            at_unix: 0,
+        };
+        let closed = uuid::Uuid::from_u128(10);
+        let events = vec![
+            created(bus, Default::default()),
+            RunEvent::BusJoined { run_id: run_id(), bus_id: bus.to_string(), offset: 0, name: "host".into(), at_unix: 0 },
+            window(bus, vec![message(1, false), message(2, true), message(3, false), message(4, false)]),
+            RunEvent::BusLeft { run_id: run_id(), bus_id: bus.to_string(), offset: 5, name: "guest".into(), at_unix: 0 },
+            created(closed, weft_core::stream_journal::JournalPolicy::ephemeral()),
+            RunEvent::BusClosed { run_id: run_id(), bus_id: closed.to_string(), offset: 0, end: weft_core::bus::StreamEnd::Finished, at_unix: 0 },
+            // A bus the record never created (a run from before buses
+            // were recorded) is only for the inspector.
+            RunEvent::BusJoined { run_id: run_id(), bus_id: uuid::Uuid::from_u128(11).to_string(), offset: 0, name: "x".into(), at_unix: 0 },
+        ];
+        let snap = fold_to_snapshot(run_id(), fan_out_project(), &events);
+        assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
+        assert_eq!(snap.open_buses.keys().collect::<Vec<_>>(), vec![&bus]);
+        let open = &snap.open_buses[&bus];
+        assert_eq!(open.creator, FiringLocation::new("a", vec![]));
+        assert_eq!(open.port, "out");
+        assert_eq!(open.next_offset, 6);
+        assert_eq!(open.joined.iter().collect::<Vec<_>>(), vec!["host"]);
+        assert_eq!(open.retained.iter().map(|m| m.offset).collect::<Vec<_>>(), vec![3, 4], "the whole ones after the newest one lost");
+        assert_eq!(open.lost_through, 3, "message 2 was cut short, so a reader behind it cannot read on");
+        let held_whole = fold_to_snapshot(run_id(), fan_out_project(), &[
+            created(bus, Default::default()),
+            window(bus, vec![message(1, false), message(2, false), message(3, false)]),
+        ]);
+        let open = &held_whole.open_buses[&bus];
+        assert_eq!(open.retained.iter().map(|m| m.offset).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(open.lost_through, 2, "the message that fell out of the window is lost");
+        let ephemeral = fold_to_snapshot(run_id(), fan_out_project(), &[
+            created(bus, weft_core::stream_journal::JournalPolicy::ephemeral()),
+            window(bus, Vec::new()),
+            RunEvent::BusWindow { run_id: run_id(), bus_id: bus.to_string(), first_offset: 1, last_offset: 4, messages: vec![], totals: vec![], at_unix: 0 },
+        ]);
+        let open = &ephemeral.open_buses[&bus];
+        assert!(open.retained.is_empty());
+        assert_eq!(open.lost_through, 5, "an ephemeral bus brings back none of its messages");
+
+        let bad = fold_to_snapshot(run_id(), fan_out_project(), &[RunEvent::BusClosed {
+            run_id: run_id(),
+            bus_id: "not-a-bus".into(),
+            offset: 0,
+            end: weft_core::bus::StreamEnd::Finished,
+            at_unix: 0,
+        }]);
+        assert_eq!(bad.corruptions[0].site, CorruptionSite::Bus);
     }
 
     /// `gen.rows` streams into loop `lp` over its `rows` port; the body
@@ -2845,14 +3035,14 @@ mod tests {
             emitted(Uuid::new_v4(), "src", vec![], "out", json!(42)),
             completed("src", vec![], 0),
             started("a", vec![], 0),
-            RunEvent::NodeSuspended { run_id: run_id(), node_id: "a".into(), frames: vec![], token: token.clone(), at_unix: 0 },
+            RunEvent::NodeSuspended { run_id: run_id(), node_id: "a".into(), frames: vec![], token: Some(token.clone()), at_unix: 0 },
             RunEvent::SuspensionRegistered {
                 run_id: run_id(),
                 node_id: "a".into(),
                 frames: vec![],
                 token: token.clone(),
                 spec: make_spec(),
-                call_index: 0,
+                wait_index: 0,
                 at_unix: 0,
             },
             RunEvent::SuspensionResolved { run_id: run_id(), token: token.clone(), value: json!("approved"), at_unix: 0 },
@@ -2872,8 +3062,8 @@ mod tests {
         assert!(snap.suspensions.is_empty(), "suspensions cleared after resume+complete");
         assert!(snap.pending_deliveries.is_empty());
         assert_eq!(ended, vec![EndedWait { at: FiringLocation::new("a", vec![]), token, end: AwaitEnd::Answered { value: json!("approved") }, answer_kept: None }], "the answer ends the wait, once");
-        let seq = &snap.awaited_sequences[&FiringLocation::new("a", vec![])];
-        assert!(matches!(&seq[0].kind, AwaitedEntryKind::Await { ended: Some(AwaitEnd::Answered { value }), .. } if value == &json!("approved")));
+        let waits = &snap.recorded_waits[&FiringLocation::new("a", vec![])];
+        assert!(matches!(&waits[0].ended, Some(AwaitEnd::Answered { value }) if value == &json!("approved")));
     }
 
     /// A resume absorbs the pulses that arrived while the node waited,
@@ -2882,7 +3072,7 @@ mod tests {
     fn node_resumed_absorbs_pulses() {
         let events = vec![
             started("a", vec![], 0),
-            RunEvent::NodeSuspended { run_id: run_id(), node_id: "a".into(), frames: vec![], token: "t".into(), at_unix: 0 },
+            RunEvent::NodeSuspended { run_id: run_id(), node_id: "a".into(), frames: vec![], token: Some("t".into()), at_unix: 0 },
             started("src", vec![], 0),
             emitted(Uuid::new_v4(), "src", vec![], "out", json!(1)),
             RunEvent::NodeResumed { run_id: run_id(), node_id: "a".into(), frames: vec![], token: None, at_unix: 0 },
@@ -2981,7 +3171,7 @@ mod tests {
                 frames: vec![],
                 token: "t".into(),
                 spec: make_spec(),
-                call_index: 0,
+                wait_index: 0,
                 at_unix: 0,
             },
         ];
@@ -2990,8 +3180,8 @@ mod tests {
         assert_eq!(ended, vec![None, Some(EndedWait { at: FiringLocation::new("a", vec![]), token: "t".into(), end: AwaitEnd::Answered { value: json!(5) }, answer_kept: None })],
             "an answer on record before its wait ends the wait at the registration");
         let snap = fold.into_snapshot();
-        let seq = &snap.awaited_sequences[&FiringLocation::new("a", vec![])];
-        assert!(matches!(&seq[0].kind, AwaitedEntryKind::Await { ended: Some(AwaitEnd::Answered { value }), .. } if value == &json!(5)));
+        let waits = &snap.recorded_waits[&FiringLocation::new("a", vec![])];
+        assert!(matches!(&waits[0].ended, Some(AwaitEnd::Answered { value }) if value == &json!(5)));
         assert!(snap.pending_deliveries.is_empty(), "the registration took the answer");
     }
 
@@ -3006,7 +3196,7 @@ mod tests {
                 frames: vec![],
                 token: "t".into(),
                 spec: make_spec(),
-                call_index: 0,
+                wait_index: 0,
                 at_unix: 0,
             },
             RunEvent::SuspensionGaveUp { run_id: run_id(), token: "t".into(), error: "gave up".into(), at_unix: 0 },
@@ -3017,8 +3207,8 @@ mod tests {
         assert_eq!(ended, vec![None, Some(EndedWait { at: FiringLocation::new("a", vec![]), token: "t".into(), end: AwaitEnd::GaveUp { error: "gave up".into() }, answer_kept: None }), None],
             "the give-up ends the wait; the late answer ends nothing");
         let snap = fold.into_snapshot();
-        let seq = &snap.awaited_sequences[&FiringLocation::new("a", vec![])];
-        assert!(matches!(&seq[0].kind, AwaitedEntryKind::Await { ended: Some(AwaitEnd::GaveUp { error }), .. } if error == "gave up"));
+        let waits = &snap.recorded_waits[&FiringLocation::new("a", vec![])];
+        assert!(matches!(&waits[0].ended, Some(AwaitEnd::GaveUp { error }) if error == "gave up"));
         assert!(snap.pending_deliveries.is_empty(), "nothing is left to deliver");
     }
 
@@ -3072,7 +3262,7 @@ mod tests {
         let events = vec![
             // A resume, and a suspension, of a firing that never opened.
             RunEvent::NodeResumed { run_id: run_id(), node_id: "add".into(), frames: vec![], token: None, at_unix: 0 },
-            RunEvent::NodeSuspended { run_id: run_id(), node_id: "add".into(), frames: vec![], token: "t".into(), at_unix: 0 },
+            RunEvent::NodeSuspended { run_id: run_id(), node_id: "add".into(), frames: vec![], token: Some("t".into()), at_unix: 0 },
             started("feed", vec![], 0),
             // A second start over a firing still open.
             started("feed", vec![], 0),
@@ -3191,24 +3381,24 @@ mod tests {
         assert_eq!(view.inherited_ports.get("in"), Some(&original.run_id()));
     }
 
-    /// A node run again replays the answers the seed run's firing was
-    /// given, up to its first wait nobody answered.
+    /// A node run again takes the answers the seed run's firing was
+    /// given, by wait number, up to its first wait nobody answered.
     #[test]
     fn a_node_run_again_takes_the_answers_its_seed_gave() {
         let project = fan_out_project();
         let mut original = Fold::new(run_id(), project.clone());
         for row in [
             started_run(), kicked("src"), started("src", vec![], 0),
-            RunEvent::SuspensionRegistered { run_id: run_id(), node_id: "src".into(), frames: vec![], token: "t0".into(), spec: make_spec(), call_index: 0, at_unix: 1 },
+            RunEvent::SuspensionRegistered { run_id: run_id(), node_id: "src".into(), frames: vec![], token: "t0".into(), spec: make_spec(), wait_index: 0, at_unix: 1 },
             RunEvent::SuspensionResolved { run_id: run_id(), token: "t0".into(), value: json!("yes"), at_unix: 2 },
-            RunEvent::SuspensionRegistered { run_id: run_id(), node_id: "src".into(), frames: vec![], token: "t1".into(), spec: make_spec(), call_index: 1, at_unix: 3 },
+            RunEvent::SuspensionRegistered { run_id: run_id(), node_id: "src".into(), frames: vec![], token: "t1".into(), spec: make_spec(), wait_index: 1, at_unix: 3 },
         ] { assert!(!original.apply(&row).rejected()); }
         let mut child = Fold::new(Uuid::new_v4(), project);
         child.apply(&started_run());
         child.take_answers(&original, &BTreeSet::from([Located::top("src")]));
-        let replayed = &child.snapshot().awaited_sequences[&FiringLocation::new("src", vec![])];
+        let replayed = &child.snapshot().recorded_waits[&FiringLocation::new("src", vec![])];
         assert_eq!(replayed.len(), 1, "the unanswered wait is asked again");
-        assert!(matches!(&replayed[0].kind, AwaitedEntryKind::Await { ended: Some(AwaitEnd::Answered { value }), .. } if *value == json!("yes")));
+        assert!(matches!(&replayed[0].ended, Some(AwaitEnd::Answered { value }) if *value == json!("yes")));
     }
 
     /// A LoopOut row is a vote only once its writes landed: the same
@@ -3576,7 +3766,7 @@ mod tests {
 
         let token = "t".to_string();
         let registered = |token: &str| RunEvent::SuspensionRegistered {
-            run_id: run_id(), node_id: "a".into(), frames: vec![], token: token.into(), spec: make_spec(), call_index: 0, at_unix: 0,
+            run_id: run_id(), node_id: "a".into(), frames: vec![], token: token.into(), spec: make_spec(), wait_index: 0, at_unix: 0,
         };
         let waits = vec![
             started_run(),
@@ -3584,7 +3774,7 @@ mod tests {
             emitted(Uuid::new_v4(), "src", vec![], "out", json!(42)),
             completed("src", vec![], 0),
             started("a", vec![], 0),
-            RunEvent::NodeSuspended { run_id: run_id(), node_id: "a".into(), frames: vec![], token: token.clone(), at_unix: 0 },
+            RunEvent::NodeSuspended { run_id: run_id(), node_id: "a".into(), frames: vec![], token: Some(token.clone()), at_unix: 0 },
             registered(&token),
             RunEvent::SuspensionResolved { run_id: run_id(), token: token.clone(), value: json!("approved"), at_unix: 0 },
             RunEvent::NodeResumed { run_id: run_id(), node_id: "a".into(), frames: vec![], token: Some(token), at_unix: 0 },
@@ -3671,7 +3861,7 @@ mod tests {
             emitted(Uuid::new_v4(), "src", vec![], "out", json!(1)),
             completed("src", vec![], 0),
             started("a", vec![], 1),
-            RunEvent::SuspensionRegistered { run_id: run_id(), node_id: "a".into(), frames: vec![], token: "t".into(), spec: make_spec(), call_index: 0, at_unix: 1 },
+            RunEvent::SuspensionRegistered { run_id: run_id(), node_id: "a".into(), frames: vec![], token: "t".into(), spec: make_spec(), wait_index: 0, at_unix: 1 },
             failed("a", 9),
             started("b", vec![], 2),
             failed("b", 5),
@@ -3740,7 +3930,7 @@ mod tests {
             completed("src", vec![], 0),
             started("a", vec![], 1),
             RunEvent::SuspensionResolved { run_id: run_id(), token: "t".into(), value: json!("yes"), at_unix: 1 },
-            RunEvent::SuspensionRegistered { run_id: run_id(), node_id: "a".into(), frames: vec![], token: "t".into(), spec: make_spec(), call_index: 0, at_unix: 1 },
+            RunEvent::SuspensionRegistered { run_id: run_id(), node_id: "a".into(), frames: vec![], token: "t".into(), spec: make_spec(), wait_index: 0, at_unix: 1 },
         ];
         let mut ended = None;
         for (seq, ev) in rows.iter().enumerate() {

@@ -37,7 +37,7 @@ async fn fetches(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(outcome.outputs["messages"][0]["content"], json!("hi"));
     let body = rig.endpoint_calls()[0].body.clone().expect("action body");
     assert_eq!(body["action"], json!("fetchMessages"));
-    assert_eq!(body["payload"]["count"], json!(2.0));
+    assert_eq!(body["payload"]["count"], json!(2));
     Ok(())
 }
 

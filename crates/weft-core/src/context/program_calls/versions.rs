@@ -11,15 +11,20 @@
 //! person's folder follows what the program writes for it, written to disk
 //! by their runtime), else the copy programs write into.
 
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::Value;
 
-use crate::builds::{BuildAnswer, BuildRequest, BuiltProgram, NodeSet, RunPreview, VersionBuildState, VersionBuildStatus};
+use crate::builds::{BuildAnswer, BuildRequest, BuildsUnderway, BuiltProgram, NodeSet, RunPreview, VersionBuildState, VersionBuildStatus};
 use crate::error::{WeftError, WeftResult};
 use crate::program::runs::RunCall;
 use crate::program::versions::VersionCall;
 use crate::program::ProgramCall;
 use crate::run_flags::RunFlags;
+use crate::context::kept::Step;
+use crate::context::Kept;
 use crate::signal::timer::{Timer, TimerSpec};
+use crate::signal::to_spec;
 use crate::storage::StoredFile;
 use crate::tag::StopSelf;
 use crate::versions::{CheckpointRequest, PruneResponse, RunShape, RunStarted, RunningSource, VersionRunRequest, VersionTree, VersionUpsert};
@@ -269,37 +274,61 @@ impl BuildCalls<'_> {
     }
 
     /// Build, and return once the build registered, following its image
-    /// builds for as long as they take: between looks the run parks on a
+    /// builds for as long as they take: between looks the run pauses on a
     /// timer, holding no worker. A build that failed or was cancelled fails
     /// this call with why.
-    pub async fn start(self) -> WeftResult<BuiltProgram> {
-        build_and_follow(self.code.at, self.request).await
+    pub async fn start<S: Serialize + DeserializeOwned + Send>(self, state: &mut Kept<S>) -> WeftResult<BuiltProgram> {
+        let request = &self.request;
+        let (built, _) = build_and_follow(self.code.at, state, "versions.build", request, || async { Ok(request.clone()) }).await?;
+        Ok(built)
     }
 }
 
-/// Ask for `request` and follow it until it registers.
-async fn build_and_follow(at: ProjectCalls<'_>, request: BuildRequest) -> WeftResult<BuiltProgram> {
-    let answer: BuildAnswer = at.call(ProgramCall::Versions(VersionCall::Build { request: Box::new(request) }), StopSelf::Keep).await?;
-    let underway = match answer {
-        BuildAnswer::Registered { program } => return Ok(*program),
-        BuildAnswer::Underway { underway } => underway,
-    };
-    loop {
-        at.ctx.await_signal(BUILD_LOOK_AGAIN).await?;
+/// Ask for the build `request` makes, once (the build it starts, and the
+/// working copy it is of, are kept with a pause), and follow that build
+/// until it registers, pausing on a timer between looks. `helper` and
+/// `call` say which helper asks and for what (`Kept::follow`). Answers the
+/// program and the working copy it was built from.
+async fn build_and_follow<S, F, Fut>(
+    at: ProjectCalls<'_>,
+    kept: &mut Kept<S>,
+    helper: &'static str,
+    call: &impl Serialize,
+    request: F,
+) -> WeftResult<(BuiltProgram, WorkingCopyRef)>
+where
+    S: Serialize + DeserializeOwned + Send,
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = WeftResult<BuildRequest>>,
+{
+    let request = &request;
+    kept.follow(helper, &(at.project, call), to_spec(BUILD_LOOK_AGAIN), None::<(WorkingCopyRef, BuildsUnderway)>, move |underway| async move {
+        let Some((copy, underway)) = underway else {
+            let request = request().await?;
+            let copy = request.working_copy;
+            let build = VersionCall::Build { request: Box::new(request) };
+            return Ok(match at.call::<BuildAnswer>(ProgramCall::Versions(build), StopSelf::Keep).await? {
+                BuildAnswer::Registered { program } => Step::Done((*program, copy)),
+                BuildAnswer::Underway { underway } => Step::LookAgain(Some((copy, underway))),
+            });
+        };
         let state: VersionBuildState = at.call(ProgramCall::Versions(VersionCall::BuildState { build: underway.build }), StopSelf::Keep).await?;
         let why = || state.reason.clone().unwrap_or_else(|| "the install gave no reason".into());
         match state.state {
-            VersionBuildStatus::Waiting => {}
-            VersionBuildStatus::Registered => {
-                return state.program.clone().ok_or_else(|| WeftError::NodeFailed("the build registered, and its answer names no program".into()))
-            }
-            VersionBuildStatus::Failed => return Err(WeftError::NodeFailed(format!("the build of version {} failed: {}", underway.version, why()))),
-            VersionBuildStatus::Cancelled => return Err(WeftError::NodeFailed(format!("the build of version {} was cancelled", underway.version))),
+            VersionBuildStatus::Waiting => Ok(Step::LookAgain(Some((copy, underway)))),
+            VersionBuildStatus::Registered => state
+                .program
+                .clone()
+                .map(|program| Step::Done((program, copy)))
+                .ok_or_else(|| WeftError::NodeFailed("the build registered, and its answer names no program".into())),
+            VersionBuildStatus::Failed => Err(WeftError::NodeFailed(format!("the build of version {} failed: {}", underway.version, why()))),
+            VersionBuildStatus::Cancelled => Err(WeftError::NodeFailed(format!("the build of version {} was cancelled", underway.version))),
             VersionBuildStatus::Superseded => {
-                return Err(WeftError::NodeFailed(format!("the build of version {} will not be registered: {}", underway.version, why())))
+                Err(WeftError::NodeFailed(format!("the build of version {} will not be registered: {}", underway.version, why())))
             }
         }
-    }
+    })
+    .await
 }
 
 /// A run being asked for. See [`CodeCalls::run`]. Each setter is the
@@ -432,16 +461,26 @@ impl RunCalls<'_> {
     /// before any image builds, so a run that could not start is refused
     /// at once), follow the build, then start the run on it. Answers once
     /// the run started; read how it goes with `ctx.runs()` and the run's
-    /// own calls.
-    pub async fn start(self) -> WeftResult<RunStarted> {
-        let code = self.code.resolved().await?;
+    /// own calls. Following the build pauses the run on a timer between
+    /// looks, where `state` comes in.
+    pub async fn start<S: Serialize + DeserializeOwned + Send>(self, state: &mut Kept<S>) -> WeftResult<RunStarted> {
+        let code = self.code;
         let shape = RunShape { example: self.example, flags: self.flags };
         let seeded = self.seed || self.seed_run.is_some();
         let preview = RunPreview { shape: shape.clone(), seeded, seed_until: self.seed_until.clone(), seed_before: self.seed_before.clone() };
-        let build = BuildRequest { working_copy: code.copy, version: None, node_set: self.node_set, root: self.root, run: Some(preview) };
-        let built = build_and_follow(code.at, build).await?;
+        let (node_set, root) = (self.node_set, self.root);
+        // The working copy is resolved in the build's first look, so a
+        // body resumed while the build goes on runs on the copy it built,
+        // never one read again.
+        let preview = &preview;
+        let asked = (code.copy, node_set, root, preview);
+        let (built, copy) = build_and_follow(code.at, state, "versions.run", &asked, || async move {
+            let copy = code.resolved().await?.copy;
+            Ok(BuildRequest { working_copy: copy, version: None, node_set, root, run: Some(preview.clone()) })
+        })
+        .await?;
         let request = VersionRunRequest {
-            working_copy: code.copy,
+            working_copy: copy,
             version: built.version,
             definition_hash: built.definition_hash,
             binary_hash: built.binary_hash,

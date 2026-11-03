@@ -35,8 +35,9 @@
 //! (`weft_core::infra::VALUES_URL_ENV`), which writes it into the
 //! connection this node published: no run of this node is involved.
 //!
-//! Nothing here is memoized with `ctx.run`, and it does not need to
-//! be: the body never waits, so it is never replayed, and every call
+//! Nothing here is kept in a saved state (`state.once`), and it does not
+//! need to be: the body never waits, so it never runs again after a
+//! pause, and every call
 //! it makes is safe to repeat when somebody runs the node again. Reading the password is a
 //! read; publishing REPLACES one row keyed by this node; retiring is
 //! the same request with the same password, which the credential
@@ -55,7 +56,7 @@ use weft::{
     WeftResult,
 };
 
-use super::postgres::{mistake, IDLE_CLOSE};
+use super::postgres::IDLE_CLOSE;
 
 /// The port clients connect to: the pooler's. Postgres's own default, so
 /// a connection string reads like any other Postgres one.
@@ -418,7 +419,7 @@ impl Tuning {
         let Split { share, shared_buffers_mib, maintenance_work_mem_mib, connections_mib, max_connections, query_pool, watch_pool } =
             split(memory_mib(memory)?);
         if query_pool == 0 || watch_pool == 0 {
-            mistake!(
+            weft::input_bail!(
                 "memory {memory} leaves Postgres room for {max_connections} connections, too few to keep \
                  {SUPERUSER_RESERVED} for the superuser and still give queries and watchers one each; raise \
                  `memory` to {LEAST_MEMORY_MIB}Mi or more"
@@ -490,8 +491,7 @@ const fn split(machine_mib: u64) -> Split {
 /// The least `memory` the node takes, in MiB: the smallest machine whose
 /// share gives the pooler a connection for queries and one for
 /// watchers. Read off [`split`], so it moves with the formula; the
-/// `memory` input's description states it too, and a test holds the two
-/// together.
+/// node's description states it too, and a test holds the two together.
 pub const LEAST_MEMORY_MIB: u64 = {
     let mut mib = BESIDE_POSTGRES_MIB;
     while split(mib).query_pool == 0 || split(mib).watch_pool == 0 {
@@ -499,22 +499,6 @@ pub const LEAST_MEMORY_MIB: u64 = {
     }
     mib
 };
-
-/// The `database` input as Postgres has the database: exactly as
-/// written, whatever it holds, because a database made under a name is
-/// found only under that name again, and a node pointing at another
-/// name points at a new, empty database. Refused only when nothing
-/// could carry it: empty, or with a line break or another control
-/// character, which no container's settings can hold.
-pub fn database_name(raw: &str) -> WeftResult<String> {
-    if raw.is_empty() {
-        mistake!("the `database` input is empty; name the database (app)");
-    }
-    if raw.chars().any(char::is_control) {
-        mistake!("database {raw:?} has a line break or another control character in it; name it without (app)");
-    }
-    Ok(raw.to_string())
-}
 
 /// The longest name the pooler can let clients in by as written: its
 /// watching door ([`watch_database`]) adds `_watch`, and Postgres and
@@ -568,7 +552,7 @@ fn name_hash(name: &str) -> u64 {
 pub fn extension_names(raw: Vec<String>) -> WeftResult<Vec<String>> {
     for name in &raw {
         if name.is_empty() || name.chars().any(char::is_control) {
-            mistake!("extension {name:?} in `extensions` is not a name; write each as Postgres names it (pg_trgm)");
+            weft::input_bail!("extension {name:?} in `extensions` is not a name; write each as Postgres names it (pg_trgm)");
         }
     }
     Ok(raw)
@@ -620,35 +604,32 @@ const RESERVED_WORDS: [&str; 78] = [
 /// program's role and the superuser, which this node makes itself), the
 /// names Postgres keeps (`public`, `none`, `pg_`, and its reserved words,
 /// among them `all`, every user to the pooler, and the ones that mean the
-/// current user), and a name listed twice.
+/// current user). A name listed twice is the metadata's `unique` rule.
 pub fn role_list(raw: Vec<Role>) -> WeftResult<Vec<Role>> {
     const KEPT: [&str; 4] = [APP_USER, ADMIN_USER, "public", "none"];
-    for (i, role) in raw.iter().enumerate() {
+    for role in &raw {
         let name = role.name.as_str();
         let plain = name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
             && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
             && name.len() <= MOST_ROLE_CHARS;
         if !plain {
-            mistake!(
+            weft::input_bail!(
                 "role {name:?} in `roles` is not a name a program can write as it is; use lowercase letters, digits \
                  and `_`, not starting with a digit, at most {MOST_ROLE_CHARS} characters (tenant_app)"
             );
         }
         if KEPT.contains(&name) || name.starts_with("pg_") {
-            mistake!(
+            weft::input_bail!(
                 "role {name:?} in `roles` is a name this node or Postgres keeps for itself (`{APP_USER}` is the \
                  program's own role, `{ADMIN_USER}` the superuser, `pg_` names and `public` and `none` are \
                  Postgres's); name it something else"
             );
         }
         if RESERVED_WORDS.contains(&name) {
-            mistake!(
+            weft::input_bail!(
                 "role {name:?} in `roles` is a word Postgres reserves, so `set role {name}` written as it is would be \
                  a syntax error; name it something else (tenant_{name})"
             );
-        }
-        if raw[..i].iter().any(|other| other.name == name) {
-            mistake!("role {name:?} is listed twice in `roles`; list each role once, with all its settings");
         }
     }
     Ok(raw)
@@ -704,11 +685,11 @@ pub fn postgres_version(raw: &str) -> WeftResult<PostgresVersion> {
     let number = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) && (part == "0" || !part.starts_with('0'));
     let (major, minor) = raw.split_once('.').map_or((raw, None), |(major, minor)| (major, Some(minor)));
     if !number(major) || major == "0" || major.len() > 4 || minor.is_some_and(|minor| !number(minor)) {
-        mistake!("version '{raw}' is not a Postgres version; write its major version (17)");
+        weft::input_bail!("version '{raw}' is not a Postgres version; write its major version (17)");
     }
     match major.parse::<u32>() {
         Ok(major) => Ok(PostgresVersion { tag: raw.to_string(), major }),
-        Err(_) => mistake!("version '{raw}' is not a Postgres version; write its major version (17)"),
+        Err(_) => weft::input_bail!("version '{raw}' is not a Postgres version; write its major version (17)"),
     }
 }
 
@@ -718,7 +699,7 @@ pub fn postgres_version(raw: &str) -> WeftResult<PostgresVersion> {
 pub fn memory_mib(raw: &str) -> WeftResult<u64> {
     match weft::infra::memory_mib(raw) {
         Some(mib) => Ok(mib.floor() as u64),
-        None => mistake!("memory '{}' is not a size this node reads; write a number followed by Gi, Mi, G or M (1Gi)", raw.trim()),
+        None => weft::input_bail!("memory '{}' is not a size this node reads; write a number followed by Gi, Mi, G or M (1Gi)", raw.trim()),
     }
 }
 
@@ -734,7 +715,7 @@ impl Node for PostgresDatabaseNode {
         _ctx: InfraProvisionContext,
         input: ValueBag,
     ) -> WeftResult<InfraSpec> {
-        let database = database_name(&input.get::<String>("database")?)?;
+        let database = input.get::<String>("database")?;
         let storage: String = input.get("storage")?;
         let version = postgres_version(&input.get::<String>("version")?)?;
         // Whether anything outside this program may connect. The
@@ -744,8 +725,8 @@ impl Node for PostgresDatabaseNode {
         let reachable: bool = input.get("reachable")?;
         // The machine, as the node's settings size it; the cloud picks
         // its cheapest that holds it.
+        let machine = MachineShape::from_inputs(&input)?;
         let memory: String = input.get("memory")?;
-        let machine = MachineShape { cpu: input.opt("cpu")?, memory: Some(memory.clone()), kind: input.opt::<String>("machineType")?.filter(|t| !t.trim().is_empty()), gpu: None };
         let tuning = Tuning::for_machine(&memory)?;
         let extensions = extension_names(input.opt::<Vec<String>>("extensions")?.unwrap_or_default())?;
         let roles = role_list(input.opt::<Vec<Role>>("roles")?.unwrap_or_default())?;
@@ -894,7 +875,7 @@ impl Node for PostgresDatabaseNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let database = database_name(&ctx.inputs.get::<String>("database")?)?;
+        let database = ctx.inputs.get::<String>("database")?;
         // Three asks that need nothing from each other, so they go out
         // together.
         let (sql, credential, published) =

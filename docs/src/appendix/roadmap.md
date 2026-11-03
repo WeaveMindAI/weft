@@ -11,13 +11,15 @@ primitive, `ctx.hold_signal`, where the await happens in place and the worker
 stays alive. Die-and-resume stays the default, and the language makes the cost
 visible, because holding keeps a worker up for the whole wait.
 
-**Suspendable live channels.** A bus is pinned to one worker, both ends have to
-stay alive, and the run cannot pause while it is open: an `await_signal` there
-waits in place on the same worker. The plan is to
-journal enough channel state that a fresh worker resumes both ends mid-stream.
-That needs a replay story for a partially-consumed stream, which items were
-delivered and which pulls answered, so it comes after the rest of the durable
-work.
+**Should a `recorded: false` run be able to pause?** Today it cannot, so its
+waits hold in its worker. It could: such a run writes nothing while it works,
+but at a pause everything it holds in memory is plain data, so it could write
+that once, as one snapshot, and nothing else. That needs the snapshot's
+format, a place to keep it, a resume that starts from it and then reads what
+was written after it (the answer that woke the run), the run's secrets and
+the costs it has not settled carried inside it, and cancelling and
+`weft node-state` taught to read it. Whether that is
+worth it is still open.
 
 **Type rules in metadata.** `FirstInOrder` wants an output whose type metadata
 cannot write down as one type: the union of its created inputs. Today every

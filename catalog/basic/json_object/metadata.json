@@ -26,5 +26,14 @@
     "pure": true,
     "canAddInputPorts": true,
     "addedPortsAreDataKeys": true
-  }
+  },
+  "validate": [
+    {
+      "when": { "kind": "not", "of": { "kind": "custom_inputs_declared" } },
+      "then": {
+        "message": "JsonObject '{id}' has no keys, so there is nothing to build. Wire a value onto it for each key you want, naming the key.",
+        "level": "structural"
+      }
+    }
+  ]
 }

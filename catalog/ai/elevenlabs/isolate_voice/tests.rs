@@ -67,11 +67,6 @@ fn inputs(rig: &FakeRig, audio: Value, extra: Value) -> Value {
     base
 }
 
-/// The multipart body of the one request the node sent.
-fn form(rig: &FakeRig) -> String {
-    rig.requests()[0].body_text.clone().expect("the form is a buffered body the rig can read")
-}
-
 async fn isolates(rig: FakeRig) -> WeftResult<()> {
     rig.respond_raw("POST", "/v1/audio-isolation", 200, "audio/mpeg", b"clean".to_vec());
     let audio = rig.store_file("noisy.mp3", "audio/mpeg", b"noisy-bytes".to_vec());
@@ -79,8 +74,8 @@ async fn isolates(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(outcome.outputs["filename"], json!("isolated_noisy.mp3"));
     assert_eq!(outcome.outputs["mimeType"], json!("audio/mpeg"));
     let sent = &rig.requests()[0];
-    assert!(sent.body.is_none(), "a multipart upload is not a JSON body");
-    let form = form(&rig);
+    assert!(sent.body_streamed, "the recording streams out of storage, never held whole");
+    let form = sent.body_text.clone().expect("the rig reads a streamed body whole");
     assert!(form.contains("name=\"audio\"; filename=\"noisy.mp3\"") && form.contains("noisy-bytes"), "{form}");
     assert!(!form.contains("name=\"file_format\""), "ElevenLabs's own default needs no field: {form}");
     Ok(())
@@ -101,7 +96,7 @@ async fn raw_pcm(rig: FakeRig) -> WeftResult<()> {
     rig.respond_raw("POST", "/v1/audio-isolation", 200, "audio/mpeg", b"clean".to_vec());
     let audio = rig.store_file("noisy.pcm", "audio/pcm", b"raw".to_vec());
     rig.run(&ElevenLabsIsolateVoiceNode, inputs(&rig, audio, json!({ "fileFormat": "pcm_s16le_16" }))).await.ok()?;
-    let form = form(&rig);
+    let form = rig.requests()[0].body_text.clone().expect("the rig reads a streamed body whole");
     assert!(form.contains("name=\"file_format\"\r\n\r\npcm_s16le_16\r\n"), "{form}");
     Ok(())
 }

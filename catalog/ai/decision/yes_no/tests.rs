@@ -20,12 +20,10 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("asks_a_noul_about_the_ports_in_written_order", asks_in_written_order),
         NodeTest::fake("yes_follows_the_threshold", yes_follows_threshold),
         NodeTest::fake("both_criteria_ride_the_question", both_criteria),
-        NodeTest::fake("one_criterion_alone_is_refused", one_criterion),
         NodeTest::fake("a_probability_at_the_threshold_is_yes", at_threshold),
         NodeTest::fake("the_routing_block_rides_the_request", routing_knobs),
         NodeTest::fake("an_image_port_is_sent_after_a_label", image_sent),
         NodeTest::fake("a_record_is_sent_as_it_is", record_sent_whole),
-        NodeTest::fake("a_file_inside_a_record_is_refused", file_inside_a_record),
         NodeTest::fake("a_list_of_images_is_sent_item_by_item", list_of_images),
         NodeTest::fake("a_list_of_text_files_is_a_list_of_contents", list_of_text_files),
         NodeTest::fake("an_audio_port_rides_as_base64_with_its_format", audio_sent),
@@ -204,28 +202,6 @@ async fn both_criteria(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn one_criterion(rig: FakeRig) -> WeftResult<()> {
-    rig.input_type("text", ty("String"));
-    let err = rig
-        .run(
-            &DecisionYesNoNode,
-            json!({ "provider": provider(&rig), "instructions": "Bug?", "whenTrue": "Broken.", "text": "x" }),
-        )
-        .await
-        .failure()?;
-    assert!(err.contains("whenTrue and whenFalse go together"), "{err}");
-    let err = rig
-        .run(
-            &DecisionYesNoNode,
-            json!({ "provider": provider(&rig), "instructions": "Bug?", "whenFalse": "Fine.", "text": "x" }),
-        )
-        .await
-        .failure()?;
-    assert!(err.contains("whenTrue and whenFalse go together"), "whenFalse alone too: {err}");
-    assert!(rig.requests().is_empty(), "nothing was sent");
-    Ok(())
-}
-
 async fn at_threshold(rig: FakeRig) -> WeftResult<()> {
     answer_decision(&rig, noul(0.7));
     rig.input_type("text", ty("String"));
@@ -299,27 +275,6 @@ async fn record_sent_whole(rig: FakeRig) -> WeftResult<()> {
     .ok()?;
     let body = decision_request(&rig);
     assert_eq!(body["state"], json!({ "listing": { "title": "Red square sticker", "tags": ["red"] } }));
-    Ok(())
-}
-
-/// The compiler refuses this port's type (`custom_inputs_fit`); run as it
-/// stands, the node refuses it too, before anything is read or paid.
-async fn file_inside_a_record(rig: FakeRig) -> WeftResult<()> {
-    rig.input_type("listing", ty("{ title: String, photo: Image }"));
-    let photo = rig.store_file("front.jpg", "image/jpeg", b"front".to_vec());
-    let err = rig
-        .run(
-            &DecisionYesNoNode,
-            json!({
-                "provider": provider(&rig),
-                "instructions": "Does `listing.photo` match `listing.title`?",
-                "listing": { "title": "Red square sticker", "photo": photo },
-            }),
-        )
-        .await
-        .failure()?;
-    assert!(err.contains("a value made of JSON, a file, or a list of files"), "{err}");
-    assert!(rig.requests().is_empty(), "nothing was sent");
     Ok(())
 }
 

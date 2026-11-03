@@ -4,6 +4,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use weft::access::client::url;
 use weft::node::NodeOutput;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
@@ -39,23 +40,15 @@ impl Node for GoogleDriveMoveNode {
             .filter_map(Value::as_str)
             .collect();
 
-        let mut url = format!(
-            "{}/files/{}?addParents={}&fields=id",
-            drive::API,
-            super::api::segment(&file_id),
-            urlencoding::encode(&folder),
-        );
-        if !old_parents.is_empty() {
-            url.push_str(&format!(
-                "&removeParents={}",
-                urlencoding::encode(&old_parents.join(","))
-            ));
-        }
+        let url = url(drive::API, &["files", &file_id])?
+            .query("addParents", &folder)
+            .query("fields", "id")
+            .query_opt("removeParents", (!old_parents.is_empty()).then(|| old_parents.join(",")));
         let mut body = json!({});
-        if let Some(n) = rename.filter(|n| !n.trim().is_empty()) {
+        if let Some(n) = rename {
             body["name"] = json!(n);
         }
-        weft::access::client::json_call(http.patch(&url).json(&body), "move the file").await?;
+        weft::access::client::json_call(http.patch(url.as_str()).json(&body), "move the file").await?;
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
     }
 }

@@ -29,19 +29,12 @@ impl Node for KeenableSearchNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Option<Access> = ctx.inputs.opt("account")?;
         let query: String = ctx.inputs.get("query")?;
-        let num_results: f64 = ctx.inputs.get("numResults")?;
-        let max_text_chars: f64 = ctx.inputs.get("maxTextChars")?;
+        let num_results: u64 = ctx.inputs.get("numResults")?;
+        let max_text_chars: usize = ctx.inputs.get("maxTextChars")?;
         let site: Option<String> = ctx.inputs.opt("site")?;
 
         let keenable = Keenable::open(&ctx, account.as_ref()).await?;
-        let results = search(
-            &keenable,
-            &query,
-            num_results as u64,
-            site.as_deref(),
-            max_text_chars as usize,
-        )
-        .await?;
+        let results = search(&keenable, &query, num_results, site.as_deref(), max_text_chars).await?;
         let count = results.len() as f64;
         ctx.pulse_downstream(
             NodeOutput::new().set("results", json!(results)).set("count", count),
@@ -75,11 +68,11 @@ pub async fn search(
     Ok(results)
 }
 
-/// The search request. `site` rides only when it names a domain, so an
-/// emptied field searches the whole web.
+/// The search request. `site` rides only when it is set, so without it
+/// the search covers the whole web.
 pub fn search_body(query: &str, num_results: u64, site: Option<&str>) -> Value {
     let mut body = json!({ "query": query, "max_results": num_results });
-    if let Some(site) = site.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(site) = site {
         body["site"] = json!(site);
     }
     body

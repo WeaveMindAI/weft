@@ -13,6 +13,7 @@
     {
       "name": "instance",
       "type": "String",
+      "keepsBlank": true,
       "description": "Whose triggers: an instance id your program gives it (`user-42`), for that instance's per-instance triggers. Unwired: the program's own triggers, the ones shared by every instance. Wired, and no id arrives (the node feeding it did not run): this node skips."
     },
     {

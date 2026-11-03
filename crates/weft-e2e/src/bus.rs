@@ -32,7 +32,7 @@ pub struct BusMessage {
 
 impl SettledRun {
     /// The distinct bus ids that had a join in this run.
-    fn bus_ids(&self) -> Vec<String> {
+    pub fn bus_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self
             .replay
             .by_kind("bus_joined")

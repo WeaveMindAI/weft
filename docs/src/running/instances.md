@@ -171,21 +171,21 @@ and nothing changes it afterwards:
 | A call to a gated `Route` with `Weft-Instance: user-42` | `user-42` |
 | A timer, a webhook, an open `Route`, anything else | None |
 
-A gated route is one whose `auth` input is wired from an auth node such as
-`ApiKeyAuth` (weft's messages call it a route gated by a connection), so the
-caller must present a key or a signature before a run starts. If your own backend calls your
+A gated route is one whose `auth` setting is not `"none"`, `"api_keys"` say
+(weft's messages call it a route gated by a connection), so the caller must
+present a key or a signature before a run starts. If your own backend calls your
 program for an instance, this is the route it uses. It is also the only place
 weft honours the `Weft-Instance` header: on an open route anybody could claim
 any instance, so weft refuses the header there and says why. A browser presents
 an instance token instead.
 
-If a provider signs the webhooks it sends to your route, `HmacAuth` checks a
-hex HMAC-SHA256 of `<timestamp>.<body>` sent in `X-Signature`, with the
-unix-seconds timestamp in `X-Timestamp`, refused when it is more than five
+If a provider signs the webhooks it sends to your route, `auth: "hmac_sha256"`
+checks a hex HMAC-SHA256 of `<timestamp>.<body>` sent in `X-Signature`, with
+the unix-seconds timestamp in `X-Timestamp`, refused when it is more than five
 minutes off. For any other scheme (Standard Webhooks, Stripe, signed identity
-tokens from your sign-in provider), you write a small access node of your own,
+tokens from your sign-in provider), you write the scheme's block in `auth`,
 and for how, go and read
-[checking a signed request](../connections/verifying-requests.md).
+[checking a signed request](../connections/verifying-requests.md#on-a-route).
 
 If you call a route and want the run to be for an instance, call it at one of
 its route addresses: `/connect/local/<project id>/<path>` on the install, the project's own
@@ -245,7 +245,7 @@ moment it is asked for, before the container itself moves.
 From your program, `ctx.infra` names the node and the instance:
 
 ```rust
-ctx.infra("bridge").instance("user-42").start().await?;
+ctx.infra("bridge").instance("user-42").start(&mut state).await?;
 let copy = ctx.infra("bridge").instance("user-42").status().await?; // None: no copy
 let every = ctx.infra("bridge").copies().await?;                     // shared + each instance's
 ```
@@ -349,7 +349,7 @@ If you want to test that page from the terminal, two commands do what it does
 (each mints its own instance token that lasts one hour and revokes it when
 done, so the instance's own tokens are untouched):
 
-- `weft connect --instance user-42 --node openrouter --door own --set-env
+- `weft connect openrouter --instance user-42 --door own --set-env
   key=OPENROUTER_KEY` connects an account as that instance's from a key in
   your environment, and `--grant <id>` picks one it already has; `--list` and
   `--disconnect` work the same way;
@@ -398,11 +398,13 @@ let minted = ctx.tokens().mint_for_instance("user-42", Duration::from_secs(7 * 8
 ctx.tokens().instance("user-42").revoke().await?;
 ```
 
-The token comes out once, because weft keeps only a hash of it. So when a run is
-replayed after a restart, weft cannot hand back the token it minted the first
-time: it mints a fresh value for the same token, and the old value stops
-working. If your program already handed the first value to a browser, that
-browser needs the new one.
+The token comes out once, because weft keeps only a hash of it. So if a node's
+body makes this call again after a crash, from a state saved before the mint,
+weft cannot hand back the value it minted the first time: it mints a fresh
+value for the same token, and the old value stops working. If your program
+already handed the first value to a browser, that browser needs the new one.
+After a pause, a body that runs the mint again makes a second token beside
+the first, so make the mint after the last place your node can pause.
 
 ## An instance's files
 
@@ -464,9 +466,10 @@ argument decides what happens to it:
 - `StopSelf::Include`: it is cancelled with the rest, once the take-down is
   queued; the call never returns.
 
-If a run is replayed after a restart, a copy it terminated is never terminated
-twice (for why, go and read [your project beyond this
-run](../nodes/ctx.md#your-project-beyond-this-run)).
+If a node's body runs again after a pause and terminates the copy again, the
+second call finds it already gone and answers `NoCopy`, so nothing is
+terminated twice (for the answers, go and read [the project's
+infra](../nodes/ctx.md#the-projects-infra-triggers-instances-and-settings)).
 
 ## Cleaning up after instances
 

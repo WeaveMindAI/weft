@@ -21,7 +21,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_stored_file_object_in_a_response_is_refused", file_marker_body),
         NodeTest::fake("a_refusal_status_still_emits", refusal_status),
         NodeTest::fake("method_headers_and_body_ride_the_request", request_shape),
-        NodeTest::fake("a_bad_method_fails_the_run_even_with_error_wired", bad_method_wired),
         NodeTest::fake("a_binary_body_is_stored_whole_as_a_file", binary_body),
         NodeTest::fake("a_text_body_too_big_for_a_wire_is_stored_whole_as_a_file", oversize_text_body),
         NodeTest::fake("a_text_body_too_big_for_a_wire_fails_when_only_body_is_wired", oversize_text_body_unwired_file),
@@ -96,20 +95,6 @@ async fn secret_header(rig: FakeRig) -> WeftResult<()> {
     let sent = rig.requests();
     assert_eq!(sent[0].header("authorization"), Some("Bearer tok-1"));
     assert_eq!(sent[0].header("x-trace"), Some("t-9"));
-    Ok(())
-}
-
-async fn bad_method_wired(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    let err = rig
-        .run(
-            &HttpRequestNode,
-            json!({ "url": "https://api.example/api/items", "method": "NOT A METHOD" }),
-        )
-        .await
-        .failure()?;
-    assert!(err.starts_with("input error") && err.contains("bad method"), "{err}");
-    assert!(rig.requests().is_empty(), "a program mistake refuses before anything is sent");
     Ok(())
 }
 

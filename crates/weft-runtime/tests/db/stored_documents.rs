@@ -91,8 +91,10 @@ async fn a_database_an_older_weft_filled_boots_and_every_row_reads(pool: Pool) {
         }
     };
     let slack_spec = read_spec(slack_id).await;
+    // Its gate's check is gone from the recipe (a Route names its own);
+    // the connection still reads, its service the one plain `hmac` reads.
     let hmac_spec = read_spec(hmac_id).await;
-    assert!(matches!(hmac_spec.verify, Some(weft_core::access::events::VerifyKind::Hmac { .. })));
+    assert_eq!(hmac_spec.service, weft_core::access::callers::CallerScheme::Hmac.service());
 
     // The recorded recipe is kept under the hash of its new JSON, and the
     // Slack connection names that hash, so a verified push finds it.

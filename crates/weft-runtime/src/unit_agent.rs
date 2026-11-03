@@ -380,6 +380,8 @@ pub async fn host() -> anyhow::Result<()> {
             publish: Publish::AllPorts,
             // A machine runs one unit of one install.
             install: weft_core::infra::Install::default_install(),
+            // Its agent's name is the machine's own.
+            names: weft_platform_local::infra_names::Names::Machine,
             // The machine's own identity names the copy it runs.
             agent_broker: weft_platform_local::AgentBroker {
                 url: broker_url.clone(),

@@ -4,12 +4,12 @@
 //! addressings.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use weft::node::NodeOutput;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::sheets::{header_for_row, row_to_cells, tab_title, values_url};
+use super::sheets::{header_for_row, row_to_cells, tab_title, values_url, Row};
 
 #[derive(NodeManifest)]
 pub struct GoogleSheetsUpdateNode;
@@ -25,17 +25,21 @@ impl Node for GoogleSheetsUpdateNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        /// Google Sheets tops out at ten million cells per spreadsheet,
-        /// so no addressable row is anywhere near this.
-        const MAX_SHEET_ROW: f64 = 10_000_000.0;
-
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
         let gid: Option<String> = ctx.inputs.opt("tab")?;
-        let row: Value = ctx.inputs.get("row")?;
-        let row_number: Option<f64> = ctx.inputs.opt("rowNumber")?;
-        let range: Option<String> = ctx.inputs.opt("range")?;
+        let row: Row = ctx.inputs.get("row")?;
+        let row_number: Option<u64> = ctx.inputs.opt("rowNumber")?;
         let has_header: bool = ctx.inputs.get("hasHeader")?;
+
+        // The metadata makes the addressing exactly one of the two:
+        // `oneOfRequired` skips the node with neither, and a rule refuses
+        // both, written or wired. The widget holds `rowNumber` to a
+        // sheet's rows.
+        let addr = match row_number {
+            Some(n) => format!("A{n}"),
+            None => ctx.inputs.get("range")?,
+        };
 
         let http = ctx.client(&account).await?;
         let title = tab_title(&http, &id, gid.as_deref()).await?;
@@ -43,33 +47,8 @@ impl Node for GoogleSheetsUpdateNode {
         let headers = header_for_row(&http, &id, &title, &row, has_header).await?;
         let cells = row_to_cells(&row, headers.as_deref())?;
 
-        let addr = match (row_number, range) {
-            // The widget holds `rowNumber` to a whole number from 1,
-            // wired or written, and a value outside that fails the node
-            // before this runs. What it does not bound is the top end,
-            // and a sheet has nothing like a billion rows, so an
-            // absurd one is caught here rather than saturating the
-            // cast into a nonsense address.
-            (Some(n), None) if n <= MAX_SHEET_ROW => format!("A{}", n as u64),
-            (Some(n), None) => {
-                return Err(weft::WeftError::Input(format!(
-                    "rowNumber {n} is past the last row a sheet can have"
-                )))
-            }
-            (None, Some(r)) => r,
-            // Neither one never reaches here: `oneOfRequired` skips the node.
-            _ => {
-                return Err(weft::WeftError::Input(
-                    "pick ONE addressing: rowNumber or range, not both".to_string(),
-                ))
-            }
-        };
-
-        let url = format!(
-            "{}?valueInputOption=USER_ENTERED",
-            values_url(&id, &title, Some(&addr))
-        );
-        weft::access::client::json_call(http.put(&url).json(&json!({ "values": [cells] })), "update the row")
+        let url = values_url(&id, &title, Some(&addr))?.query("valueInputOption", "USER_ENTERED");
+        weft::access::client::json_call(http.put(url.as_str()).json(&json!({ "values": [cells] })), "update the row")
             .await?;
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
     }

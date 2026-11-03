@@ -162,7 +162,12 @@ impl<'a> HoldClock<'a> {
     /// The clock starts over. Answers how many were given up.
     pub(crate) fn ran_out(&mut self, held: &HeldWaits, why: Option<Unsuspendable>) -> usize {
         self.quiet_since = None;
-        let given_up = why.map_or(0, |why| held.give_up(&crate::held_waits::gave_up_because(why, self.hold_secs)));
+        // A run that could pause holds only for its firings that hold their
+        // run: those are the waits that give up.
+        let given_up = match why {
+            Some(why) => held.give_up(&crate::held_waits::gave_up_because(why, self.hold_secs), false),
+            None => held.give_up(&crate::held_waits::gave_up_because(Unsuspendable::Holding, self.hold_secs), true),
+        };
         tracing::info!(
             target: "weft_engine::outside_waits",
             run_id = %self.run_id,
@@ -225,7 +230,7 @@ pub(crate) async fn keep_held(
         tokio::pin!(on_wait_change);
         on_wait_change.as_mut().enable();
         if let Some(cause) = cancellation.cause() {
-            held.give_up(&format!("its run was cancelled ({cause})"));
+            held.give_up(&format!("its run was cancelled ({cause})"), false);
         }
         let holding = held.pending();
         clock.quiet(holding && waits.deadlock_provable(&firing));
@@ -243,7 +248,7 @@ pub(crate) async fn keep_held(
                     }
                 }
                 Err(e) => {
-                    held.give_up(&format!("its answers could not be read: {e:#}"));
+                    held.give_up(&format!("its answers could not be read: {e:#}"), false);
                 }
             },
             () = held_out.as_mut(), if quiet_for.is_some() => {
@@ -266,7 +271,6 @@ mod tests {
 
     use serde_json::json;
     use weft_core::cancellation::CancellationFlag;
-    use weft_core::context::ContextHandle;
     use weft_core::error::WeftResult;
     use weft_core::liveness::FiringLocation;
 
@@ -292,7 +296,7 @@ mod tests {
         let (tasks, answers) = (AwaitTasks::new(), Arc::new(Answers::default()));
         let clients = EngineClients { tasks: tasks.clone(), told: answers.told.clone(), runs: answers.clone(), ..clients(Arc::new(MemJournal::default())) };
         let run_id = weft_core::new_run_id();
-        let record = RunRecord { journal: handle(&clients, run_id, &[], 0, Vec::new()), costs: crate::metering::PendingCostRecords::new() };
+        let record = RunRecord::new(handle(&clients, run_id, &[], 0, Vec::new()));
         let waits = crate::wait_tracker::WaitTracker::new();
         let cancellation = CancellationFlag::new_arc();
         let settings = weft_core::run_settings::RunSettings::bookkeeping().holding_for(hold_secs).unwrap();
@@ -314,13 +318,12 @@ mod tests {
             Default::default(),
             Default::default(),
             Default::default(),
-            false,
         )
         .with_settings(settings)
         .without_program();
         let call = tokio::spawn(async move {
             let timer = weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 600_000 } };
-            node.await_signal(weft_core::signal::to_spec(timer)).await
+            weft_core::context::ContextHandle::wait(&node, weft_core::signal::to_spec(timer)).await
         });
         let keeper = tokio::spawn({
             let cancellation = cancellation.clone();

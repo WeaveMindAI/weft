@@ -14,8 +14,8 @@ and one call is one fresh run carrying the request on its ports. An
 caller's connection to every node in the run, so a node of your own is one
 as readily as a catalog node. The `api` package ships three: `Reply` sends
 a body, `Stream` sends a bus as it flows, `Close` ends the exchange. A
-[gate] is an auth access node wired into a [route]'s `auth`; the package
-ships one per way of proving who is calling, and the listing names them. A
+[gate] is a [route]'s `auth` setting: how its callers prove who they are,
+checked against a connection of the route's own. A
 [stored-file value] is a few hundred bytes saying where a file sits in
 storage, the only way bytes travel a wire.
 
@@ -235,10 +235,10 @@ it started (a small row that goes when its trigger's `keepRunsFor`
 ends), so a stop by that tag still reaches it while it runs.
 
 A run that cannot pause (an unrecorded one, or one whose caller is still on
-the line with `outlivesCaller` off) still waits on a timer or a form: the wait
-holds the worker and the call open, and the answer carries the run on. If
-nothing moves in the run for the route's `holdSecs` (60 by default, `0` to
-never wait), the waiting node fails saying it gave up, and the caller gets a 504 with the plain failure body and the run id (the reason stays on the run, for you).
+the line, whatever `outlivesCaller` says) still waits on a timer or a form: the wait
+holds the worker and the call open, and the answer carries the run on. While the caller stays on the line, the wait holds for as long as it stays. Once no caller is connected, if
+nothing moves in the run for the route's `holdSecs` (60 by default; `0` refuses
+every such wait at once, caller or not), the waiting node fails saying it gave up, and the caller gets a 504 with the plain failure body and the run id (the reason stays on the run, for you).
 
 A route also has two settings for what a streamed answer leaves on the run's record: `journalEphemeral` (on keeps only counts and sizes, never what was said; off by default) and `journalWindowMs` (messages sent within one window share one record row; 100 to 60000, 1000 by default; shorter shows them in the inspector sooner, longer writes fewer rows for a fast stream).
 
@@ -594,13 +594,12 @@ same as under Streaming, for every message a `Reply` or a `Stream` sends;
 under `surface` the socket closes with `1011`, and a `Reply` whose message was
 skipped leaves its `done` absent.
 
-**One connection is one run, so a socket whose gate names the person is not finished until it carries a `TagRun` and a `StopTagged`, wired as under Streaming above.** What a socket can tag on is who the [gate] let in. A path capture like `{room}` names a room shared by everyone in it, not one person, so it is the wrong tag here. The `caller` port takes the type you declare: declare it on the arrow as an open record holding the claim that names the person, and wire that claim into both nodes. Here `UserTokens` is an access node of the project's own whose `verify` is `oidc` (weft ships no identity-token gate: its service declares the fields `issuer`, `jwksUrl` and `audience`, and `"verify": { "kind": "oidc", "issuers": ["{issuer}"], "jwksUrl": "{jwksUrl}" }`).
+**One connection is one run, so a socket whose gate names the person is not finished until it carries a `TagRun` and a `StopTagged`, wired as under Streaming above.** What a socket can tag on is who the [gate] let in. A path capture like `{room}` names a room shared by everyone in it, not one person, so it is the wrong tag here. The `caller` port takes the type you declare: declare it on the arrow as an open record holding the claim that names the person, and wire that claim into both nodes. Here the [gate] checks identity tokens (`oidc`), and the socket's connection holds `issuer`, `jwksUrl` and `audience`.
 
 ```weft
-gate = UserTokens
 sock = Socket -> (inbound: Generator[Said], caller: { sub: String, .. }) {
   path: "chat/{room}"
-  auth: gate.access
+  auth: { "kind": "oidc", "issuers": ["{issuer}"], "jwksUrl": "{jwksUrl}" }
 }
 claim = TagRun { person: sock.caller.sub }
 stop = StopTagged {
@@ -641,23 +640,24 @@ the route's own address.
 
 ## Auth
 
-A [route] is open unless a [gate] is wired into its `auth`. The user stores
-the [gate]'s connection through its connect flow, like any other; the
-gateway checks every caller before a run starts, and what the check
-established comes out on the trigger's `caller` port.
+A [route] is open while its `auth` is `"none"`, the default. Set it and
+the gateway checks every caller before a run starts, and what the check
+established comes out on the trigger's `caller` port. Which you want depends
+on who calls: `"api_keys"` (a key in `X-Api-Key`, or `Authorization: Bearer`)
+suits a service you control, `"hmac_sha256"` (`X-Signature` over
+`<timestamp>.<body>`, with `X-Timestamp`; `"hmac_sha1"`, `"hmac_sha512"`,
+`"ed25519"` and `"ecdsa_p256"` sign the same bytes) a webhook whose sender
+signs that way, and a whole verify block (`{ "kind": "oidc", ... }`, GitHub's signature)
+anything else, from identity tokens for a frontend (anything publishing a
+JWKS) to a provider's own signing scheme
+(https://weavemindai.github.io/weft/connections/verifying-requests.html).
 
-The `api` package ships one [gate] per way of proving who is calling: a
-shared key, a signed token from an identity provider, and a signature over
-the request body. Which you want depends on who calls: a token from an
-identity provider is the frontend door (anything publishing a JWKS), a
-shared key suits a service you control, a body signature suits a webhook
-whose sender signs it.
-
-Each [gate]'s own metadata names the exact header a caller must present and
-the shape it puts on `caller`, in its description; the fields its connection
-holds are in its `service` block, which `--compact` strips, so you read the
-file itself. Both before wiring one, and before telling a caller how to
-authenticate.
+The keys or the secret live in the route's own connection, picked on the
+install: `weft connect <route>` (the field is `keys` for `api_keys`,
+`signingSecret` for the `hmac_*` names, `publicKey` for `ed25519` and
+`ecdsa_p256`; a missing one is named), or `--grant <id>` for
+one already stored. A gated route with no connection fails to turn on,
+naming the command.
 
 Finer rules (this key may only read, this user owns that room) are never the
 [gate]'s job: they are a branch in the graph on `caller`.
@@ -684,9 +684,9 @@ the header), or with an instance token in `Weft-Instance-Token`.
 
 Two readers of one socket (inbound is broadcast to `ctx` readers), a reply
 assembled from many chunks with logic between them, a response mixing writes
-and a computed head: a node of your own reaching `ctx.http_caller()` /
-`ctx.ws_caller()`, described in the docs page "Talking to a live caller".
-You reach for `ctx` only when the graph cannot say it.
+and a computed head: a node of your own on `ctx.http_caller()` / `ctx.ws_caller()`,
+whose `body_as`, `recv_as`, `refuse`, `stream_bus` and `OutboundChunk::of_input`
+do the typing, file links and framing (docs page "Talking to a live caller").
 
 ## Trying it
 

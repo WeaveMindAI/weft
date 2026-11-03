@@ -23,6 +23,8 @@
 //! does that before the body runs) and nothing half-built escapes. With
 //! every key optional and none arriving, the object is `{}`: the node
 //! ran because its gate said so, and an empty object is the true answer.
+//! A JsonObject with no keys at all is refused by the compiler (its
+//! metadata rule).
 
 use async_trait::async_trait;
 
@@ -51,16 +53,6 @@ impl Node for JsonObjectNode {
         // no settings of its own, so every port here is a wired key.)
         for (key, value) in ctx.inputs.in_order()? {
             object.insert(key.clone(), value.clone());
-        }
-        // A JsonObject with no keys at all is a node somebody added and
-        // never wired, and `{}` from it would say nothing about why.
-        // Every optional key staying silent is different: the keys
-        // exist, and `{}` is the true answer.
-        if ctx.declared_inputs().is_empty() {
-            return Err(weft::node_error(
-                "this JsonObject has no keys, so there is nothing to build. Wire a value onto \
-                 it for each key you want, naming the key",
-            ));
         }
         ctx.pulse_downstream(NodeOutput::new().set("object", serde_json::Value::Object(object)))
             .await

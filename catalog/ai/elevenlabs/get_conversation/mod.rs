@@ -8,15 +8,16 @@
 //! the call audio.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use weft::access::client::get_json;
+use weft::access::client::{checked_send, get_json, url};
 use weft::node::NodeOutput;
 use weft::signal::{PollEndpoint, Predicate};
 use weft::storage::{StorageScope};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::elevenlabs::{store_json, API};
+use super::elevenlabs::API;
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsGetConversationNode;
@@ -38,16 +39,19 @@ impl Node for ElevenLabsGetConversationNode {
         let include_audio: bool = ctx.inputs.get("includeAudio")?;
 
         let http = ctx.client(&account).await?;
-        // The id is typed text that becomes a path segment: encoded, it
-        // can only ever name a conversation.
-        let url = format!("{API}/convai/conversations/{}", urlencoding::encode(&conversation));
+        let address = url(API, &["convai", "conversations", &conversation])?;
         // Waiting parks on the conversation and resumes on any status
         // that is not in flight (still ringing, talking, or
         // post-processing), so a status this node does not know ends the
         // wait and is refused below instead of being waited on forever.
+        // The wait carries only the status, which the state keeps, so a
+        // run resumed after it waits no more; the conversation itself
+        // (its transcript can run past 100 KB) is read after the wait,
+        // and a finished conversation reads the same however often.
+        let mut state = ctx.keep(Waited::default()).await?;
         let answer = if wait {
-            ctx.await_signal(PollEndpoint {
-                url: url.clone(),
+            let poll = PollEndpoint {
+                url: address.to_string(),
                 interval_secs: 5,
                 access: Some(weft::primitive::AccessRef::from(&account)),
                 filters: vec![
@@ -55,11 +59,13 @@ impl Node for ElevenLabsGetConversationNode {
                     Predicate::neq("status", "in-progress"),
                     Predicate::neq("status", "processing"),
                 ],
+                carry: vec!["status".into()],
                 ..Default::default()
-            })
-            .await?
+            };
+            state.wait(|s| &mut s.ended, poll).await?;
+            get_json(&http, address.as_str(), "read the finished ElevenLabs conversation").await?
         } else {
-            get_json(&http, &url, "read the ElevenLabs conversation").await?
+            get_json(&http, address.as_str(), "read the ElevenLabs conversation").await?
         };
         let status = answer["status"]
             .as_str()
@@ -90,12 +96,10 @@ impl Node for ElevenLabsGetConversationNode {
             .join("\n");
         // The transcript grows with the call, past the 100 KB a wire
         // carries, so it always travels as a file.
-        let transcript = store_json(
-            &ctx,
-            &json!({ "text": text, "turns": turns }),
-            &format!("conversation_{conversation}_transcript.json"),
-        )
-        .await?;
+        let storage = ctx.storage(StorageScope::Run);
+        let transcript = storage
+            .put_json(&json!({ "text": text, "turns": turns }), &format!("conversation_{conversation}_transcript.json"), None)
+            .await?;
 
         let mut out = NodeOutput::new().set("status", status).set("transcript", transcript);
         // The analysis only exists once elevenlabs has processed the
@@ -132,42 +136,40 @@ impl Node for ElevenLabsGetConversationNode {
         // The whole object holds everything the ports above carry and
         // more, so it is stored only for a program that reads it.
         if ctx.is_output_wired("conversation") {
-            let stored = store_json(&ctx, &answer, &format!("conversation_{conversation}.json")).await?;
+            let stored = storage.put_json(&answer, &format!("conversation_{conversation}.json"), None).await?;
             out = out.set("conversation", stored);
         }
 
         // The trace is asked for on its own read, after the wait, so the
         // looks while the call runs never carry it.
         if ctx.is_output_wired("otlpTrace") {
-            let traced = get_json(&http, &format!("{url}?format=opentelemetry"), "read the ElevenLabs conversation's trace")
-                .await?;
+            let traced = get_json(
+                &http,
+                address.clone().query("format", "opentelemetry").as_str(),
+                "read the ElevenLabs conversation's trace",
+            )
+            .await?;
             let trace = traced
                 .get("otlp_traces")
                 .filter(|trace| trace.is_object())
                 .node_err(format!("elevenlabs answered no otlp_traces for conversation {conversation}"))?;
-            let stored = store_json(&ctx, trace, &format!("conversation_{conversation}_otlp.json")).await?;
+            let stored = storage.put_json(trace, &format!("conversation_{conversation}_otlp.json"), None).await?;
             out = out.set("otlpTrace", stored);
         }
         if include_audio {
-            let resp = http
-                .get(format!("{url}/audio"))
-                .send()
-                .await
-                .node_err("download the call audio from ElevenLabs")?;
-            let stored = ctx
-                .storage(StorageScope::Run)
-                .put_response(
-                    resp,
-                    "download the call audio from ElevenLabs",
-                    None,
-                    &format!("call_{conversation}.mp3"),
-                    None,
-                )
-                .await?;
+            let what = "download the call audio from ElevenLabs";
+            let resp = checked_send(http.get(address.segment("audio")?.as_str()), what).await?;
+            let stored = storage.put_response(resp, what, None, &format!("call_{conversation}.mp3"), None).await?;
             out = out.set("audio", stored.to_value());
         }
         ctx.pulse_downstream(out).await
     }
+}
+
+/// What the node keeps: the status its wait ended on, when it waits.
+#[derive(Default, Serialize, Deserialize)]
+struct Waited {
+    ended: Option<Value>,
 }
 
 /// The number ElevenLabs answered, as it answered it, or `None` when it

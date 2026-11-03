@@ -31,6 +31,76 @@
     }
     pub(super) use test_manifest;
 
+    /// What a test node that waits once keeps: the answer.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    pub(crate) struct Answered {
+        pub(crate) answer: Option<serde_json::Value>,
+    }
+
+    /// A test node's one wait, on `kind`: its state kept (`ctx.keep`),
+    /// so a firing resumed after the pause gets the answer back at once.
+    /// The node's one `keep` of its firing.
+    pub(crate) async fn wait_once(ctx: &RunContext, kind: impl weft_core::signal::WaitOn) -> weft_core::error::WeftResult<serde_json::Value> {
+        let mut state = ctx.keep(Answered::default()).await?;
+        state.wait(|s| &mut s.answer, kind).await
+    }
+
+    /// A human form with no fields: the wait the engine tests park on.
+    pub(crate) fn human_form() -> weft_core::signal::Form {
+        weft_core::signal::Form {
+            form_type: "human_query".into(),
+            schema: weft_core::signal::FormSchema { fields: Vec::new() },
+            title: None,
+            description: None,
+            consumer_kind: None,
+        }
+    }
+
+    /// A node `id` of type `ty`, its inputs required and its outputs not.
+    pub(crate) fn node_json(id: &str, ty: &str, inputs: &[(&str, &str)], outputs: &[(&str, &str)]) -> serde_json::Value {
+        json!({
+            "id": id, "nodeType": ty, "label": null, "config": null,
+            "position": { "x": 0.0, "y": 0.0 },
+            "inputs": inputs.iter().map(|(name, ty)| json!({ "name": name, "portType": ty, "required": true })).collect::<Vec<_>>(),
+            "outputs": outputs.iter().map(|(name, ty)| json!({ "name": name, "portType": ty, "required": false })).collect::<Vec<_>>(),
+            "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+        })
+    }
+
+    /// The settings of a run that pauses as soon as every node it runs
+    /// waits, with no quiet window first (`pauseAfterSecs: 0`): what a test
+    /// that checks a pause, rather than the window, runs under.
+    pub(crate) fn pausing_at_once() -> weft_core::run_settings::RunSettings {
+        weft_core::run_settings::RunSettings::default().pausing_after(0).expect("0 is a stay")
+    }
+
+    /// The birth of run `run_id` of `project` under `settings`, its
+    /// listed nodes kicked.
+    pub(crate) fn birth_kicking(
+        project: &ProjectDefinition,
+        run_id: RunId,
+        kicks: &[&str],
+        settings: weft_core::run_settings::RunSettings,
+    ) -> Vec<RunEvent> {
+        let mut rows = vec![RunEvent::RunStarted { given: Default::default(),
+            run_id,
+            project_id: project.id,
+            entry_node: kicks[0].to_string(),
+            phase: weft_core::context::Phase::Fire,
+            definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),
+            binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
+            cut_from: None, seed: None, instance: None, fired_trigger: None, stand_in: None,
+            instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            settings,
+        }];
+        for kick in kicks {
+            rows.push(RunEvent::NodeKicked {
+                run_id, node_id: kick.to_string(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
+            });
+        }
+        rows
+    }
+
     /// Lookup-by-type catalog over a plain list, the shape every suite
     /// that hands its own node set to `drive` needs.
     pub(super) struct VecCatalog {
@@ -144,7 +214,7 @@
             unreachable!()
         }
     }
-    /// Tasks fake for await_signal tests. `enqueue_dedup` of a
+    /// Tasks fake for tests whose nodes wait. `enqueue_dedup` of a
     /// RegisterSignal mints a deterministic token (recording it so the
     /// test can give the matching answer) and `wait_for_terminal` hands
     /// back a registered signal result; a WithdrawSignal is recorded.
@@ -153,30 +223,38 @@
         // (task_id -> token) so wait_for_terminal returns the same token
         // enqueue minted, and the test can read the token to resolve it.
         tokens: StdMutex<std::collections::HashMap<uuid::Uuid, String>>,
-        // The most-recently-minted token, for the test to resolve.
-        last_token: StdMutex<Option<String>>,
+        // The most-recently-minted token, for the test to resolve; a
+        // test waits on it changing.
+        last_token: tokio::sync::watch::Sender<Option<String>>,
         /// The waits withdrawn, by token.
         pub(crate) withdrawn: StdMutex<Vec<String>>,
     }
     impl AwaitTasks {
         pub(crate) fn new() -> Arc<Self> {
-            Arc::new(Self { tokens: Default::default(), last_token: Default::default(), withdrawn: Default::default() })
+            Arc::new(Self { tokens: Default::default(), last_token: tokio::sync::watch::Sender::new(None), withdrawn: Default::default() })
         }
         /// Block (test-side) until a token has been minted, then return
         /// it. Buses race the worker; the await may not have registered
         /// the instant the test wants to resolve it.
         pub(crate) async fn await_token(&self) -> String {
-            for _ in 0..2000 {
-                if let Some(t) = self.last_token.lock().unwrap().clone() {
-                    return t;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            }
-            panic!("no register_signal token minted within timeout");
+            self.await_token_where(|_| true).await
+        }
+        /// [`Self::await_token`], for a token other than `earlier`: the
+        /// wait a node registers after the one it was answered on.
+        pub(crate) async fn await_token_after(&self, earlier: &str) -> String {
+            self.await_token_where(|token| token != earlier).await
+        }
+        async fn await_token_where(&self, wanted: impl Fn(&str) -> bool) -> String {
+            let mut minted = self.last_token.subscribe();
+            let token = tokio::time::timeout(std::time::Duration::from_secs(4), minted.wait_for(|t| t.as_deref().is_some_and(&wanted)))
+                .await
+                .expect("no register_signal token minted within timeout")
+                .expect("the tasks fake outlives its waiters");
+            token.clone().expect("a minted token")
         }
         /// The token minted last, if any.
         pub(crate) fn minted(&self) -> Option<String> {
-            self.last_token.lock().unwrap().clone()
+            self.last_token.borrow().clone()
         }
     }
     #[async_trait]
@@ -191,12 +269,12 @@
             assert_eq!(t.kind, weft_task_store::TaskKind::RegisterSignal, "await tests only register and withdraw waits");
             // The token derives from the wait's identity, as the
             // dispatcher's resume token does (`task_kinds::register_signal`):
-            // two registrations of one (run, node, frames, call
-            // index) get the same token.
-            let identity = ["run_id", "node_id", "frames", "is_resume", "call_index"].map(|field| t.payload[field].to_string());
+            // two registrations of one (run, node, frames, wait number)
+            // get the same token.
+            let identity = ["run_id", "node_id", "frames", "is_resume", "wait_index"].map(|field| t.payload[field].to_string());
             let token = format!("tok-{}", uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, identity.join("/").as_bytes()));
             self.tokens.lock().unwrap().insert(id, token.clone());
-            *self.last_token.lock().unwrap() = Some(token);
+            self.last_token.send_replace(Some(token));
             Ok(weft_task_store::tasks::DedupOutcome::Inserted(id))
         }
         async fn wait_for_terminal(&self, t: uuid::Uuid, _to: std::time::Duration) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
@@ -228,8 +306,8 @@
         pub(crate) told: tokio::sync::broadcast::Sender<crate::context::RunTold>,
         /// The run that reads, as its first read names it.
         run: StdMutex<Option<RunId>>,
-        /// How many times the answers were read.
-        pub(crate) reads: std::sync::atomic::AtomicUsize,
+        /// How many times the answers were read; a test waits on it.
+        reads: tokio::sync::watch::Sender<usize>,
         pub(crate) let_go: StdMutex<Vec<(RunId, weft_broker_client::protocol::LetGo)>>,
     }
     impl Default for Answers {
@@ -238,7 +316,7 @@
                 waiting: StdMutex::default(),
                 told: crate::context::run_told(),
                 run: StdMutex::default(),
-                reads: std::sync::atomic::AtomicUsize::new(0),
+                reads: tokio::sync::watch::Sender::new(0),
                 let_go: StdMutex::default(),
             }
         }
@@ -262,7 +340,16 @@
         }
 
         pub(crate) fn reads(&self) -> usize {
-            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+            *self.reads.borrow()
+        }
+
+        /// Until the answers were read more than `reads` times.
+        pub(crate) async fn read_past(&self, reads: usize) {
+            let mut read = self.reads.subscribe();
+            tokio::time::timeout(std::time::Duration::from_secs(10), read.wait_for(|n| *n > reads))
+                .await
+                .expect("the run reads its answers")
+                .expect("the answers fake outlives its waiters");
         }
     }
     #[async_trait]
@@ -275,9 +362,10 @@
             Ok(())
         }
         async fn answers(&self, run_id: RunId, _taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
-            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.run.lock().unwrap() = Some(run_id);
-            Ok(std::mem::take(&mut *self.waiting.lock().unwrap()))
+            let waiting = std::mem::take(&mut *self.waiting.lock().unwrap());
+            self.reads.send_modify(|n| *n += 1);
+            Ok(waiting)
         }
         async fn rechecked(&self) -> anyhow::Result<weft_broker_client::protocol::RunRecheckedResponse> {
             unreachable!("a rig has no line watch")
@@ -721,8 +809,42 @@
     /// [`clients`], their writer batching as `settings` say, its lanes on
     /// the process's own io runtime as a worker's are (`EngineClients::io`).
     pub(crate) fn clients_writing(journal: Arc<MemJournal>, settings: crate::journal_writer::WriterSettings) -> EngineClients {
-        let answers = Arc::new(Answers::default());
         let io = crate::context::io_runtime().expect("the io runtime starts");
+        clients_on(journal, settings, io, Arc::new(weft_platform_traits::clock::SystemClock))
+    }
+
+    /// [`clients`] for a test on tokio's paused clock (`start_paused`):
+    /// the run's hold reads the time the test's runtime keeps
+    /// ([`TokioClock`]), and its writer lanes run on the test's runtime,
+    /// so a write under way keeps that runtime from skipping ahead.
+    pub(crate) fn clients_on_paused_clock(journal: Arc<MemJournal>) -> EngineClients {
+        clients_on(journal, Default::default(), tokio::runtime::Handle::current(), Arc::new(TokioClock))
+    }
+
+    /// A clock that reads tokio's, so a run's hold follows a paused
+    /// runtime as it skips ahead. `SystemClock::now` reads the machine's
+    /// clock, which a paused runtime does not move.
+    pub(crate) struct TokioClock;
+    #[async_trait]
+    impl weft_platform_traits::Clock for TokioClock {
+        fn now(&self) -> std::time::Instant {
+            tokio::time::Instant::now().into_std()
+        }
+        fn now_unix(&self) -> i64 {
+            weft_platform_traits::Clock::now_unix(&weft_platform_traits::clock::SystemClock)
+        }
+        async fn sleep(&self, d: std::time::Duration) {
+            tokio::time::sleep(d).await;
+        }
+    }
+
+    fn clients_on(
+        journal: Arc<MemJournal>,
+        settings: crate::journal_writer::WriterSettings,
+        io: tokio::runtime::Handle,
+        clock: Arc<dyn weft_platform_traits::Clock>,
+    ) -> EngineClients {
+        let answers = Arc::new(Answers::default());
         EngineClients {
             writer: crate::journal_writer::WorkerJournal::start(journal, settings, &io),
             io,
@@ -732,7 +854,7 @@
             infra: Arc::new(NoopInfra),
             infra_state: Arc::new(NoopInfraState),
             project: Arc::new(NoopProject),
-            clock: Arc::new(weft_platform_traits::clock::SystemClock),
+            clock,
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: crate::context::FakeAccessBroker::new(),
             open_charges: crate::metering::OpenCharges::new(),
@@ -939,6 +1061,11 @@
         // The run's own rows, folded over what it inherits (the journal
         // may hold the seed's rows under another run).
         let events = journal.events_of(run_id);
+        // An unrecorded run writes no record to fold back: nothing to check.
+        let recorded = events.iter().any(|e| matches!(e, RunEvent::RunStarted { settings, .. } if settings.recorded()));
+        if !recorded {
+            return Ok(drove);
+        }
         let page = |c: RunId, after: Option<i32>| {
             let events = journal.events_of(c);
             async move { Ok(crate::test_record::rows_of(c, &events, after)) }

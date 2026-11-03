@@ -37,7 +37,7 @@ async fn appends(rig: FakeRig) -> WeftResult<()> {
         "POST",
         &format!(
             "{}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS",
-            path(&values_url("s1", "Log", None))
+            path(values_url("s1", "Log", None)?.as_str())
         ),
         json!({ "updates": { "updatedRange": "'Log'!A5:B5" } }),
     );

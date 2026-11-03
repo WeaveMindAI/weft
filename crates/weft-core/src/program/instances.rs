@@ -38,7 +38,7 @@ pub enum InstanceCall {
 }
 
 impl InstanceCall {
-    pub const JOURNAL_NAMES: &'static [&'static str] = &[
+    pub const NAMES: &'static [&'static str] = &[
         "weft.connections.list",
         "weft.connections.forget",
         "weft.values.get",
@@ -48,7 +48,7 @@ impl InstanceCall {
         "weft.tokens.revoke",
     ];
 
-    pub fn journal_name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             InstanceCall::ConnectionsList { .. } => "weft.connections.list",
             InstanceCall::ConnectionsForget { .. } => "weft.connections.forget",

@@ -23,6 +23,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_waiting_node_whose_answer_was_too_large_says_its_size", |rig| {
             passes_on(rig, json!({ "status": "waiting", "liveTooLarge": 70000 }))
         }),
+        NodeTest::fake("a_paused_node_reads_paused", |rig| passes_on(rig, json!({ "status": "paused" }))),
         NodeTest::fake("a_completed_node_reads_completed", |rig| passes_on(rig, json!({ "status": "completed" }))),
         NodeTest::fake("a_failed_node_hands_on_its_error_raw", |rig| {
             passes_on(rig, json!({ "status": "failed", "error": "render: the service answered 500" }))
@@ -51,7 +52,7 @@ async fn passes_on(rig: FakeRig, answer: Value) -> WeftResult<()> {
 
 async fn bad_run_id(rig: FakeRig) -> WeftResult<()> {
     let err = rig.run(&GetNodeStateNode, json!({ "runId": "run-7", "node": "render" })).await.failure()?;
-    assert!(err.contains("runId") && err.contains("'run-7'"), "{err}");
+    assert!(err.contains("'runId'"), "{err}");
     assert!(rig.program_calls().is_empty());
     Ok(())
 }

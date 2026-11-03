@@ -10,18 +10,15 @@
 //! start a job: the create itself answers 422, before anything is paid.
 
 use std::future::Future;
-use std::sync::Mutex;
 
 use base64::Engine as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use weft::access::client::{get_json, json_call, post_json, send_error, Multipart};
-use weft::context::LogLevel;
-use weft::reqwest::StatusCode;
-use weft::signal::{PollEndpoint, Predicate};
-use weft::storage::{FileHandle, StorageScope, StoredFile};
-use weft::{node_error, Access, RunContext, NodeErrExt, WeftError, WeftResult};
+use weft::access::client::{get_json, json_call, post_json, url, Multipart, StoredBodyExt};
+use weft::signal::{CancelCall, PollEndpoint, Predicate};
+use weft::storage::{FileHandle, StorageScope};
+use weft::{node_error, Access, Kept, RunContext, NodeErrExt, WeftResult};
 
 use super::elevenlabs::API;
 
@@ -29,7 +26,7 @@ type Client = weft::reqwest_middleware::ClientWithMiddleware;
 
 /// The largest file ElevenLabs takes inline in a request (25 MB once
 /// decoded). A bigger one goes up as a temporary asset instead.
-const INLINE_MAX_BYTES: usize = 25_000_000;
+const INLINE_MAX_BYTES: u64 = 25_000_000;
 
 /// What a generation route makes.
 #[derive(Clone, Copy)]
@@ -62,7 +59,7 @@ impl Media {
 /// bytes, spelled the way the API spells it, or `None` when the file
 /// has to go up as an asset (a type outside the inline list, or more
 /// than 25 MB).
-pub fn inline_mime(mime: &str, len: usize) -> Option<&'static str> {
+pub fn inline_mime(mime: &str, len: u64) -> Option<&'static str> {
     if len > INLINE_MAX_BYTES {
         return None;
     }
@@ -112,45 +109,47 @@ pub fn set_some<T: Serialize>(body: &mut Value, key: &str, value: Option<T>) {
 }
 
 /// Turns the graph's files into the media references one request
-/// carries, and remembers every temporary asset it had to upload, so
-/// the node removes them once the job no longer needs them.
+/// carries. A file ElevenLabs does not take inline goes up as a
+/// temporary asset, whose delete weft owes from then on, however the node
+/// ends (`ctx.after_node`): a job reads its assets until it ends, and the
+/// node ends after the job.
 pub struct References<'a> {
     ctx: &'a RunContext,
     http: &'a Client,
-    uploads: Mutex<Vec<String>>,
+    account: &'a Access,
 }
 
 impl<'a> References<'a> {
-    pub fn new(ctx: &'a RunContext, http: &'a Client) -> Self {
-        Self { ctx, http, uploads: Mutex::new(Vec::new()) }
+    pub fn new(ctx: &'a RunContext, http: &'a Client, account: &'a Access) -> Self {
+        Self { ctx, http, account }
     }
 
     /// The reference for one file: its bytes inline when ElevenLabs
     /// takes it that way, otherwise an asset uploaded to the workspace
     /// for this job and named by its id.
     pub async fn of(&self, file: &FileHandle) -> WeftResult<Value> {
-        let (meta, bytes) = self.ctx.storage(StorageScope::Run).get_bytes(file).await?;
-        if let Some(mime) = inline_mime(&meta.mime_type, bytes.len()) {
+        let storage = self.ctx.storage(StorageScope::Run);
+        let body = storage.body(file).await?;
+        if let Some(mime) = inline_mime(body.mime_type(), body.len()) {
+            // Inline, the bytes go base64 inside the JSON, so they are read
+            // whole (25 MB at most).
+            drop(body);
+            let (_, bytes) = storage.get_bytes(file).await?;
             return Ok(json!({
                 "type": "inline_base64",
                 "mime_type": mime,
                 "content_base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
             }));
         }
-        let (content_type, body) = Multipart::form_data()
-            .text("name", &meta.filename)
-            .file("asset", &meta.filename, &meta.mime_type, bytes.to_vec())
-            .build();
+        let name = body.filename().to_string();
+        let form = Multipart::form_data().text("name", &name).stored("asset", body);
         let answer = json_call(
-            self.http.post(format!("{API}/assets")).header("content-type", content_type).body(body),
-            &format!("upload '{}' to ElevenLabs as a temporary asset", meta.filename),
+            self.http.post(url(API, &["assets"])?.as_str()).multipart(form),
+            &format!("upload '{name}' to ElevenLabs as a temporary asset"),
         )
         .await?;
-        let id = answer["asset_id"]
-            .as_str()
-            .node_err("ElevenLabs answered no asset_id for the uploaded asset")?
-            .to_string();
-        self.uploads.lock().expect("no holder of this lock panics").push(id.clone());
+        let id = answer["asset_id"].as_str().node_err("ElevenLabs answered no asset_id for the uploaded asset")?;
+        self.ctx.after_node(CancelCall::delete(url(API, &["assets", id])?).always(), self.account).await?;
         Ok(json!({ "type": "asset", "asset_id": id }))
     }
 
@@ -162,136 +161,55 @@ impl<'a> References<'a> {
         }
         Ok(refs)
     }
-
-    fn uploads(&self) -> Vec<String> {
-        self.uploads.lock().expect("no holder of this lock panics").clone()
-    }
 }
 
-/// A job ElevenLabs accepted: its create answer, and the temporary
-/// assets it reads.
-pub struct Submitted {
-    pub answer: Value,
-    uploads: Vec<String>,
+/// Where a job stands, the state of a node that runs one: nothing yet,
+/// accepted (its id), or ended (the status the wait ended on). A run
+/// that pauses while ElevenLabs works comes back with the job, so the
+/// paid create is never sent twice.
+#[derive(Default, Serialize, Deserialize)]
+pub struct Job {
+    submitted: Option<String>,
+    ended: Option<Value>,
 }
 
-/// Build a request with `build` (which turns files into references
-/// through `refs`) and POST it to `url`, once: the step is journaled,
-/// so the body replaying after the wait reads the answer back instead
-/// of paying for a second job. A request that fails takes its
-/// temporary uploads with it.
-pub async fn submit<F, Fut>(
-    ctx: &RunContext,
-    http: &Client,
-    refs: &References<'_>,
-    url: &str,
-    what: &str,
-    build: F,
-) -> WeftResult<Submitted>
+/// Build a request with `build` (which turns files into references)
+/// and POST it to `url`, once: a resumed body finds the job's id in its
+/// state instead of paying for a second one. `no_id` is the refusal when
+/// the answer names no job.
+pub async fn submit<F, Fut>(state: &mut Kept<Job>, http: &Client, url: &str, what: &str, no_id: &str, build: F) -> WeftResult<String>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = WeftResult<Value>>,
 {
-    let journaled = ctx
-        .run("elevenlabs_submit", || async {
-            let sent = async {
-                let body = build().await?;
-                post_json(http, url, &body, what).await
-            }
-            .await;
-            match sent {
-                Ok(answer) => Ok(json!({ "answer": answer, "uploads": refs.uploads() })),
-                Err(e) => {
-                    remove_uploads(ctx, http, &refs.uploads()).await?;
-                    Err(e)
-                }
-            }
+    state
+        .once(|s| &mut s.submitted, async |_| {
+            let body = build().await?;
+            let answer = post_json(http, url, &body, what).await?;
+            Ok(answer["id"].as_str().node_err(no_id)?.to_string())
         })
-        .await?;
-    let uploads = journaled["uploads"]
-        .as_array()
-        .node_err("the journaled submit has no uploads")?
-        .iter()
-        .filter_map(|id| id.as_str().map(str::to_string))
-        .collect();
-    Ok(Submitted { answer: journaled["answer"].clone(), uploads })
+        .await
 }
 
 /// Park until the job at `url` leaves `pending` and `generating`,
-/// without holding a worker, then remove the job's temporary uploads
-/// (it no longer reads them, whatever its outcome) and answer the job
-/// read again now.
+/// without holding a worker, and answer the job read again now.
 ///
 /// The wait carries only `status`; the read after it carries the rest,
 /// with content URLs signed now rather than whenever the wait ended,
-/// and none of them lands in the journal. Any status that is not in
+/// and none of them lands in the state. Any status that is not in
 /// flight ends the wait, so one this package does not know is refused
-/// by the caller instead of waited on for ever. A run stopped while it
-/// waits runs none of this, so its temporary uploads stay in the
-/// workspace's assets.
-pub async fn finish(
-    ctx: &RunContext,
-    account: &Access,
-    http: &Client,
-    url: &str,
-    poll_secs: u64,
-    submitted: &Submitted,
-) -> WeftResult<Value> {
-    let ended = ctx
-        .await_signal(PollEndpoint {
-            url: url.to_string(),
-            interval_secs: poll_secs,
-            access: Some(weft::primitive::AccessRef::from(account)),
-            filters: vec![Predicate::neq("status", "pending"), Predicate::neq("status", "generating")],
-            carry: vec!["status".into()],
-            ..Default::default()
-        })
-        .await;
-    match ended {
-        Ok(_) => {}
-        // The run gave the job up without its answer (the wait ran out
-        // of time, or a person skipped it): nothing will read the job
-        // again, so its uploads go now.
-        Err(e @ (WeftError::WaitGaveUp(_) | WeftError::WaitSkipped(_))) => {
-            remove_uploads(ctx, http, &submitted.uploads).await?;
-            return Err(e);
-        }
-        // Anything else leaves the job its files, the park above all:
-        // the body stops here while ElevenLabs works and replays from
-        // the top once the job has ended.
-        Err(e) => return Err(e),
-    }
-    remove_uploads(ctx, http, &submitted.uploads).await?;
+/// by the caller instead of waited on for ever.
+pub async fn finish(state: &mut Kept<Job>, account: &Access, http: &Client, url: &str, poll_secs: u64) -> WeftResult<Value> {
+    let poll = PollEndpoint {
+        url: url.to_string(),
+        interval_secs: poll_secs,
+        access: Some(weft::primitive::AccessRef::from(account)),
+        filters: vec![Predicate::neq("status", "pending"), Predicate::neq("status", "generating")],
+        carry: vec!["status".into()],
+        ..Default::default()
+    };
+    state.wait(|s| &mut s.ended, poll).await?;
     get_json(http, url, "read the finished ElevenLabs job").await
-}
-
-/// Delete the temporary assets a job read. One already gone counts as
-/// removed (the body can replay after a crash that followed the
-/// delete). One that cannot be removed never fails the node, since the
-/// job it served is already paid for: it is named on the node's log,
-/// with where to delete it, because it stays in the workspace and
-/// counts against its storage.
-async fn remove_uploads(ctx: &RunContext, http: &Client, uploads: &[String]) -> WeftResult<()> {
-    for id in uploads {
-        let refused = match http.delete(format!("{API}/assets/{id}")).send().await {
-            Ok(resp) if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND => continue,
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                format!("ElevenLabs answered {status}: {}", body.chars().take(300).collect::<String>())
-            }
-            Err(e) => send_error(e),
-        };
-        ctx.log(
-            LogLevel::Warn,
-            format!(
-                "the temporary asset {id} is still in the ElevenLabs workspace ({refused}); delete it in the \
-                 Assets section of ElevenLabs, where it counts against the workspace's storage"
-            ),
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 /// The failure ElevenLabs reported on a finished job or output.
@@ -304,11 +222,11 @@ pub fn failure(what: &str, job: &Value) -> weft::WeftError {
 }
 
 /// Download a completed output of `kind` (`image`, `video`, `audio`)
-/// into the run's storage, and answer the stored
-/// file to emit. The file is stored as the type ElevenLabs reported on
-/// the job, not whatever the download's header says: everything
-/// downstream reads the stored type as the truth about the bytes, and
-/// it decides which kind of file the graph sees.
+/// from the signed URL ElevenLabs handed back into the run's storage,
+/// and answer the stored file to emit. The file is stored as the type
+/// ElevenLabs reported on the job, not whatever the download's header
+/// says: everything downstream reads the stored type as the truth about
+/// the bytes, and it decides which kind of file the graph sees.
 pub async fn store_output(ctx: &RunContext, kind: &str, output: &Value) -> WeftResult<Value> {
     let url = output["content_url"].as_str().node_err("ElevenLabs answered a finished output with no content_url")?;
     let mime = output["content_mime_type"]
@@ -317,31 +235,16 @@ pub async fn store_output(ctx: &RunContext, kind: &str, output: &Value) -> WeftR
     if mime.split('/').next() != Some(kind) {
         weft::node_bail!("elevenlabs reported the finished {kind} as {mime}, which is no {kind}");
     }
-    let stored = store_download(ctx, url, mime, &output_filename(kind, mime)).await?;
-    Ok(stored.to_value())
-}
-
-/// Download a finished output from the signed `url` ElevenLabs handed
-/// back into the run's storage, as `mime` (the type
-/// ElevenLabs stated, never the download's header: everything
-/// downstream reads the stored type as the truth about the bytes) under
-/// `filename`.
-pub async fn store_download(ctx: &RunContext, url: &str, mime: &str, filename: &str) -> WeftResult<StoredFile> {
-    let what = format!("download {filename} from ElevenLabs");
-    // The URL is signed by ElevenLabs and served by a storage host: it
-    // goes out on the plain client, so the account's key never travels
-    // with it.
-    let resp = ctx.http().get(url).send().await.map_err(|e| node_error(format!("{what}: {}", send_error(e))))?;
-    ctx.storage(StorageScope::Run).put_response(resp, &what, Some(mime), filename, None).await
+    ctx.storage(StorageScope::Run).put_from_url(url, Some(mime), Some(&output_filename(kind, mime)), None).await
 }
 
 /// Make one generation: POST what `build` returns to the route for
 /// `media`, wait for the job, and answer the stored output.
 pub async fn generate<F, Fut>(
     ctx: &RunContext,
+    state: &mut Kept<Job>,
     account: &Access,
     http: &Client,
-    refs: &References<'_>,
     media: Media,
     build: F,
 ) -> WeftResult<Value>
@@ -350,14 +253,16 @@ where
     Fut: Future<Output = WeftResult<Value>>,
 {
     let noun = media.noun();
-    let route = format!("{API}/flows/{noun}");
-    let submitted =
-        submit(ctx, http, refs, &route, &format!("start the ElevenLabs {noun} generation"), build).await?;
-    let id = submitted.answer["id"]
-        .as_str()
-        .node_err("ElevenLabs answered no generation id when the generation was started")?
-        .to_string();
-    let job = finish(ctx, account, http, &format!("{route}/{id}"), media.poll_secs(), &submitted).await?;
+    let id = submit(
+        state,
+        http,
+        url(API, &["flows", noun])?.as_str(),
+        &format!("start the ElevenLabs {noun} generation"),
+        "ElevenLabs answered no generation id when the generation was started",
+        build,
+    )
+    .await?;
+    let job = finish(state, account, http, url(API, &["flows", noun, &id])?.as_str(), media.poll_secs()).await?;
     match job["status"].as_str().unwrap_or_default() {
         "completed" => store_output(ctx, noun, &job).await,
         "failed" => Err(failure(&format!("the {noun} generation {id}"), &job)),
@@ -381,25 +286,22 @@ pub fn video_request(ctx: &RunContext) -> WeftResult<Value> {
     let prompt: String = ctx.inputs.get("prompt")?;
     let generate_audio: bool = ctx.inputs.get("generateAudio")?;
     let as_written: bool = ctx.inputs.get("promptAsWritten")?;
-    let duration: Option<f64> = ctx.inputs.opt("durationSecs")?;
+    let duration: Option<u64> = ctx.inputs.opt("durationSecs")?;
     let aspect: Option<String> = ctx.inputs.opt("aspectRatio")?;
     let resolution: Option<String> = ctx.inputs.opt("resolution")?;
     let negative: Option<String> = ctx.inputs.opt("negativePrompt")?;
-    let seed: Option<f64> = ctx.inputs.opt("seed")?;
+    let seed: Option<u64> = ctx.inputs.opt("seed")?;
 
     let resolution = resolution.map(|r| video_resolution(&model, &r));
     let mut body = json!({ "model_id": model, "prompt": prompt, "generate_audio": generate_audio });
-    // `durationSecs` and `seed` take whole numbers only (their widgets'
-    // step, which the runtime holds a wired value to as well), so both
-    // casts are exact.
-    set_some(&mut body, "duration_secs", duration.map(|d| d as u64));
+    set_some(&mut body, "duration_secs", duration);
     set_some(&mut body, "aspect_ratio", aspect);
     set_some(&mut body, "resolution", resolution);
     set_some(&mut body, "negative_prompt", negative);
     // Veo rewrites the prompt unless told not to, and only Veo takes the
     // field, so it travels only when the person ticked the box.
     set_some(&mut body, "enhance_prompt", as_written.then_some(false));
-    set_some(&mut body, "seed", seed.map(|s| s as u64));
+    set_some(&mut body, "seed", seed);
     Ok(body)
 }
 

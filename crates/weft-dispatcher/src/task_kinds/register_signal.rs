@@ -8,7 +8,7 @@
 //! (`start`), so whatever the signal starts always finds its row.
 //!
 //! Idempotency: dedup keyed on `(run, node_id, frames, is_resume,
-//! call_index)` so a process-crash retry converges on the same task. The
+//! wait_index)` so a process-crash retry converges on the same task. The
 //! task's body is itself idempotent: entry rows reuse a stable token
 //! per `(project_id, node_id)`, resume rows mint per-suspension.
 
@@ -82,13 +82,13 @@ pub(crate) fn captured_trigger_address(
     project: &weft_core::ProjectDefinition,
     node_id: &str,
     frames: &LoopFrames,
-    call_index: u32,
+    wait_index: u32,
 ) -> Result<String> {
     anyhow::ensure!(
         frames.iter().all(|frame| frame.loop_index().is_none()),
         "entry capture cannot occur inside a loop"
     );
-    anyhow::ensure!(call_index == 0, "entry capture cannot register more than once");
+    anyhow::ensure!(wait_index == 0, "entry capture cannot register more than once");
     anyhow::ensure!(
         project.nodes.iter().any(|node| node.id == node_id && node.features.is_trigger),
         "entry capture must come from a trigger in its original program"
@@ -234,7 +234,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             );
             let found = crate::projection::program_of_owner(state, run_id, &owner).await?;
             let project = found.program().context("entry capture has no original program")?;
-            let node_id = captured_trigger_address(&project, &payload.node_id, &payload.frames, payload.call_index)?;
+            let node_id = captured_trigger_address(&project, &payload.node_id, &payload.frames, payload.wait_index)?;
             let ports = payload.port_snapshot.as_ref().context("entry capture requires its input port snapshot")?;
             anyhow::ensure!(ports.is_object(), "entry capture ports must be an object");
             // The worker writes the capture into its run's record: nobody
@@ -300,10 +300,9 @@ impl RegisterSignalExecutor {
             payload.spec.settings = payload.spec.settings.keeping_for(Some(payload.spec.settings.kept_for(defaults.keep_for())));
         }
 
-        // Resume tokens derive from the suspension identity so a retry of
-        // this task converges on the same token. The identity (run,
-        // node_id, frames, call_index) is what the engine's fold uses to
-        // match resumes. Entry tokens are reused across reactivates and
+        // Resume tokens derive from the wait's identity so a retry of
+        // this task converges on the same token: (run, node_id, frames,
+        // wait number), which a resumed body reaches again. Entry tokens are reused across reactivates and
         // read off the existing row below.
         let resume_token = payload.is_resume.then(|| {
             let mut hasher = Sha256::new();
@@ -316,7 +315,7 @@ impl RegisterSignalExecutor {
                 hasher.update(b"/");
             }
             hasher.update(b":");
-            hasher.update(payload.call_index.to_le_bytes());
+            hasher.update(payload.wait_index.to_le_bytes());
             let bytes = hasher.finalize();
             let mut buf = [0u8; 16];
             buf.copy_from_slice(&bytes[..16]);

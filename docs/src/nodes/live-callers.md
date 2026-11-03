@@ -18,7 +18,7 @@ caller.respond(OutboundChunk::json(json!({ "ok": true }))).await?;
 | `ctx.is_websocket()` | Whether a WebSocket one is |
 | `ctx.caller()` | The caller as a handle, or `None` |
 | `ctx.caller_request()` | What they sent to open the exchange |
-| `ctx.caller_data_type()` | Whether this connection speaks bytes or JSON |
+| `ctx.caller_data_type()` | Whether this connection speaks `json`, `text` or `bytes` (the trigger's `dataType`) |
 
 Those are two separate questions rather than one enum, because a node can
 branch three ways: HTTP, WebSocket, or nobody.
@@ -43,6 +43,56 @@ so if your node also runs without one, check `ctx.caller()` first.
 Each of those folds together "is anybody there", "is it the right protocol" and
 "wait for the connection" into one call. Use the specific one when your node
 only makes sense behind a route, and `live_caller` when it works either way.
+
+## Reading what the caller sent
+
+If you want the request's body as the value your program declared for it,
+ask for it by type and weft does the rest:
+
+```rust
+let http = ctx.http_caller().await?;
+let taken = http.body_as(&ctx, &declared, "body", None).await?;
+let body = match taken {
+    Ok(body) => body,                        // Option<Value>: None when no body came (every GET)
+    Err(why) => return http.refuse(why).await, // a 400 telling the caller what was wrong
+};
+```
+
+`body_as` reads the body in the trigger's `dataType` and holds it to
+`declared`. A picture the caller sent in a file-typed place, as a `data:` URL
+or bare base64, is stored (run scope) and the stored file takes its place; an
+upload slot (`weft-upload:...`) in such a place is received. A stored-file or
+secret marker the caller wrote in themselves is refused, since only weft makes
+those. The last argument stands in when the connection carries no body: pass
+the body a fired run carries (one started without a request), or `None`.
+
+There are two kinds of failure, kept apart. The inner `Err(why)` is the
+caller's mistake, worded for the caller: a body in the wrong shape, a field
+that does not fit, a picture that is not one. `refuse(why)` answers it with a
+`400`, `{"error": why}` on a `json` route and the text itself on the others.
+The outer `?` is your node's own failure, like storage refusing a write.
+
+On a WebSocket, `recv_as(&ctx, &declared, name)` does the same for each
+message, and gives `None` once the caller has gone. There `refuse(why)` sends
+the reason back and the session goes on:
+
+```rust
+let ws = ctx.ws_caller().await?;
+let mut turn = 0;
+while let Some(taken) = ws.recv_as(&ctx, &item, &format!("message-{turn}")).await? {
+    turn += 1;
+    match taken {
+        Ok(msg) => handle(msg).await?,
+        Err(why) => ws.refuse(why).await?,
+    }
+}
+```
+
+`name` is what a refusal and a stored file are called.
+
+If you want the fields of what you took on your node's same-named output
+ports, `ctx.fan_declared(&value)` builds that output (go and read
+[values and emission](values-and-emission.md)).
 
 ## Answering over HTTP
 
@@ -92,18 +142,98 @@ answers](../language/triggers-and-routes.md#when-a-run-ends-before-it-answers).
 The head can only be sent once, and sending a body after the exchange ended is
 an error rather than a silent nothing.
 
-If you want the caller to receive a secret's value while the run's record keeps
-its marker, send an `OutboundChunk::Revealed`. `sent` is what the caller gets,
-and `kept` is what the record holds:
+### Sending one of your node's inputs
+
+If what you answer with is the value of one of your node's inputs, let weft
+turn it into the chunk:
+
+```rust
+let chunk = OutboundChunk::of_input(&ctx, "body", value, data_type).await?;
+http.respond_with(ResponseHead::new(status).with_headers(headers), chunk).await?;
+```
+
+`of_input` reads the input's declared type and, per `data_type`: on `json`
+every file the type places goes out as a link (see [files going
+out](#files-going-out)); on `text` the value must be a string; on `bytes` it
+must be a stored file, and its content is what gets sent. Every secret the
+type places is revealed for the caller while the run's record keeps its
+marker. A secret where the type declares none fails the node, since the caller
+would receive the marker instead of the value.
+
+The head has a few builders:
+
+| Call | What it gives you |
+|---|---|
+| `ResponseHead::new(status)` | A status and no headers yet |
+| `.with_header(name, value)` / `.with_headers(map)` | Headers added, one at a time or a whole `BTreeMap<String, String>` (a `headers` input, say, once `ctx.reveal_input` has revealed it) |
+| `.with_file(&stored)` | For a stored file answered as bytes: its type as `content-type`, its name as an inline `content-disposition`, unless the head already set them |
+| `ResponseHead::redirect(status, location)?` | A redirect: `301`, `302`, `303`, `307` or `308`, and `200` becomes `302`. Any other status is refused |
+
+If you hold a value that is not one of your inputs and want a secret in it
+revealed, send an `OutboundChunk::Revealed` yourself. `sent` is what the
+caller gets, and `kept` is what the record holds:
 
 ```rust
 let revealed = ctx.reveal_in(value.clone(), &ty).await?;
 caller.respond(OutboundChunk::Revealed { sent: Box::new(OutboundChunk::json(revealed)), kept: value }).await?;
 ```
 
-`Reply` and `Stream` do this for you wherever their input's type says a secret
-is, and fail on a secret anywhere else, since their caller would receive the
-marker.
+### Streaming a bus
+
+If you want every message of a bus sent to the caller as it comes, hand the
+bus over:
+
+```rust
+let head = ResponseHead::new(200);
+let whole = http.stream_bus(&ctx, &bus, head, Format::Sse, data_type, Some(("first", first))).await?;
+```
+
+It reads from the earliest message the bus still holds, so a producer that
+started before your node, or already finished, loses nothing. The head goes
+out with the first chunk, and the response ends when the bus closes. A bus
+that ended failed is never ended as a whole answer: the response fails, as
+with `fail`, and `stream_bus` answers `false` (your node does not fail;
+`true` means the whole bus went out). Each message goes through `drop_or_fail`. `first` is one value
+sent ahead of the bus and framed like its messages, the value of the input
+it names, whose type says where its files and secrets are. The run is held
+while it streams, since an answer cannot be picked up from the middle.
+
+`Format` says how messages are framed. It reads straight from an input that
+holds `"raw"`, `"ndjson"` or `"sse"` (`ctx.inputs.get::<Format>("format")?`):
+
+| `Format` | The caller gets | Content type | While the bus is quiet |
+|---|---|---|---|
+| `Raw` | Each payload as it is, per `data_type`, no separator | None added | Nothing |
+| `Ndjson` | One JSON value per line | `application/x-ndjson` | An empty line |
+| `Sse` | `data:` lines per event, a blank line after each | `text/event-stream` | `: keepalive` |
+
+The filler written while the bus is quiet is ignored by every reader of the
+format, and it is how a caller who hung up without a word is found. A head
+that already names a content type keeps it.
+
+### Files going out
+
+A file can never go to a caller as bytes inside JSON, so it goes as a link:
+`{ "url", "mimeType", "filename", "sizeBytes" }`. A browser can put that `url`
+straight into an `<img>` or a `<video>`. Asked again soon, the same file gets
+the same link, and the link lives as long as the file's `linkSecs` says, else
+fifteen minutes. A file the install cannot link fails the node.
+
+What counts as a file is decided by the value's **declared type**, never by
+finding a marker in raw JSON. `of_input` and `stream_bus` do this for you.
+If you build a JSON answer
+yourself, `caller::link_files(&ctx, &value, &ty)` gives you the value with
+every file linked. For the walk underneath, go and read [whole values full of
+files](storage.md#whole-values-full-of-files).
+
+A bus declares no type for its messages, so `stream_bus` reads each message's
+type off the message itself (`WeftType::infer`): a stored file in it is a file,
+a secret is a `Secret`. From there a message goes out exactly like an input of
+that type: every file as a link, every secret revealed, with the run's record
+keeping the secret's marker. If your own node reads a bus and hands its
+messages outside weft, read them with `next_message` and
+`WirePayload::into_typed_json`, which gives you the same type to link and
+reveal by.
 
 ## Talking over a WebSocket
 
@@ -122,6 +252,9 @@ while let Some(msg) = ws.recv_next().await? {
 | `drop_or_fail(made)` | The same as on HTTP, per the socket's `whenChunkFails` |
 | `receive()` | Wait for the next one |
 | `recv_next()` | The same, with `None` when the caller has gone |
+| `recv_as(&ctx, &declared, name)` | The next one as the value you declared (see [reading what the caller sent](#reading-what-the-caller-sent)) |
+| `refuse(why)` | Tell the caller what was wrong with a message; the session goes on |
+| `stream_bus(&ctx, &bus, data_type, first)` | One socket message per bus message until the bus closes, the socket staying open. A bus that ended failed ends the session as failed, and the call answers `false` |
 | `request(msg)` | Send, and wait for the reply to that |
 | `close()` / `close_with(reason)` | End it |
 | `fail(message)` | End it as failed, with a `1011` close |
@@ -135,14 +268,16 @@ rather than only from now: `cursor()`, `cursor_from_start()`,
 A caller is a socket in one worker. It is not written down and it cannot be
 rebuilt.
 
-So while the caller is on the line, on a `Route` or `Socket` that leaves its
-`outlivesCaller` setting off, the run keeps its worker, and `ctx.await_signal`
-waits inside your call instead of pausing the run (go and read [when the run
-cannot pause](durable-execution.md#when-the-run-cannot-pause)). With
-`outlivesCaller` on, the run can pause. If it pauses before your node has
-answered, weft ends the caller's request with an error saying no answer will
-come (on a socket, a `1013` close), and the run carries on without them. For that setting, go and read [how a run is
-kept](../language/triggers-and-routes.md#how-a-run-is-kept).
+So while the caller is on the line, the run keeps its worker, whatever the
+route's `outlivesCaller` setting says, and `state.wait` waits inside your call
+instead of pausing the run (go and read [when the run cannot
+pause](durable-execution.md#when-the-run-cannot-pause)). The trigger's
+`holdSecs` does not count down meanwhile, so a wait does not cut a caller who
+is still there, unless `holdSecs` is `0`, which fails the wait at once. `outlivesCaller` only decides what the caller leaving does: off, the
+run is cancelled; on, it carries on without them, and pauses once everything
+in it waits on something from outside. For that setting, and for what happens
+when a connection reaches a cloud install's one-hour limit, go and read [how a
+run is kept](../language/triggers-and-routes.md#how-a-run-is-kept).
 
 If the caller goes away, that is not your node failing. It reads as the run
 being cancelled, which your node can notice with `ctx.is_cancelled()` and stop

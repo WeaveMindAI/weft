@@ -11,7 +11,6 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("flags_and_extracts_the_flagged_categories", flags),
         NodeTest::fake("the_model_setting_names_the_moderation_model", model_setting),
-        NodeTest::fake("a_connection_of_another_service_is_refused", wrong_service),
         NodeTest::fake("a_result_without_a_verdict_never_passes_as_safe", missing_verdict),
         NodeTest::live("one_real_moderation_verdict", "openai", live_moderation),
     ]
@@ -96,15 +95,5 @@ async fn missing_verdict(rig: FakeRig) -> WeftResult<()> {
         .await;
     let err = outcome.result.expect_err("a missing verdict must refuse").to_string();
     assert!(err.contains("flagged"), "{err}");
-    Ok(())
-}
-
-async fn wrong_service(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig
-        .run(&LlmModerateNode, json!({ "access": rig.access("openrouter"), "text": "hi" }))
-        .await;
-    let err = outcome.result.expect_err("an openrouter connection must refuse").to_string();
-    assert!(err.contains("OpenAIAccess") && err.contains("openrouter"), "{err}");
-    assert!(rig.requests().is_empty(), "refused before anything is sent");
     Ok(())
 }

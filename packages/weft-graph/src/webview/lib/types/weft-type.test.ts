@@ -76,8 +76,27 @@ describe('parseWeftType', () => {
 		expect(tryParseWeftType('MustOverride')).toEqual({ ok: false, error: '`MustOverride` is not a type', unknownName: true });
 	});
 
-	it('parses Access', () => {
-		expect(parseWeftType('Access')?.kind).toBe('access');
+	it('parses Access, bare and naming its service', () => {
+		expect(parseWeftType('Access')).toEqual({ kind: 'access' });
+		expect(parseWeftType('Access[google_drive]')).toEqual({ kind: 'access', service: 'google_drive' });
+		expect(weftTypeToString(parseWeftType('Access[fal]')!)).toBe('Access[fal]');
+		expect(weftTypeToString(parseWeftType('Access[openai] | Access[anthropic]')!)).toBe('Access[openai] | Access[anthropic]');
+		expect(tryParseWeftType('Access[Fal]').ok).toBe(false);
+		expect(tryParseWeftType('Access[]').ok).toBe(false);
+		expect(tryParseWeftType('Access[String]').ok).toBe(false);
+	});
+
+	it('holds a connection to the service its type names', () => {
+		const t = (s: string) => parseWeftType(s)!;
+		expect(isCompatible(t('Access[fal]'), t('Access[fal]'))).toBe(true);
+		expect(isCompatible(t('Access[fal]'), t('Access'))).toBe(true);
+		expect(isCompatible(t('Access'), t('Access[fal]'))).toBe(false);
+		expect(isCompatible(t('Access[slack]'), t('Access[fal]'))).toBe(false);
+		expect(isCompatible(t('Access[a]'), t('Access[a] | Access[b]'))).toBe(true);
+		expect(isCompatible(t('Access[a] | Access[b]'), t('Access[a]'))).toBe(false);
+		expect(weftTypesEqual(t('Access[a]'), t('Access[a]'))).toBe(true);
+		expect(weftTypesEqual(t('Access[a]'), t('Access'))).toBe(false);
+		expect(weftTypesEqual(t('Access[a]'), t('Access[b]'))).toBe(false);
 	});
 
 	it('parses Infra, and only an Infra handle connects to it', () => {
@@ -793,6 +812,7 @@ describe('runtime handle inference', () => {
 	it('infers Bus and Access from their sentinel markers', () => {
 		expect(inferTypeFromValue({ __weft_bus__: { id: 'a', mode: 'journaled' } })).toEqual({ kind: 'bus' });
 		expect(inferTypeFromValue({ __weft_access__: {} })).toEqual({ kind: 'access' });
+		expect(inferTypeFromValue({ __weft_access__: { accessId: 'x', service: 'fal' } })).toEqual({ kind: 'access', service: 'fal' });
 		expect(inferTypeFromValue({ __weft_infra__: { place: 'bridge', endpoint: 'api' } })).toEqual({ kind: 'infra' });
 	});
 });

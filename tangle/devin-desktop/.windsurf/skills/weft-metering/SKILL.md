@@ -28,7 +28,7 @@ All three carry one string, the [service name], and a [meter] whose [service nam
     { "name": "prompt", "type": "String", "required": true },
     {
       "name": "connection",
-      "type": "Access",
+      "type": "Access[acme]",
       "widget": { "kind": "access" },
       "label": "Connection"
     }

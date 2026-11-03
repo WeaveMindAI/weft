@@ -5,15 +5,16 @@
 //!
 //! Airtable's list API can only sort by a real column, so the trigger
 //! asks which Created-time column to sort on: newest-first is what
-//! keeps a new record on the first page however big the table grows.
+//! lets the poll stop paging at the first record it has already seen.
 
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::signal::{DeltaMode, PollDelta, PollEndpoint};
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::access::client::url;
+use weft::signal::{DeltaMode, PollDelta, PollEndpoint, PollPaging};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::airtable::{checked_id, API};
+use super::airtable::API;
 
 #[derive(NodeManifest)]
 pub struct AirtableNewRecordNode;
@@ -33,24 +34,22 @@ impl Node for AirtableNewRecordNode {
         let base: String = ctx.inputs.get("base")?;
         let table: String = ctx.inputs.get("table")?;
         let created_field: String = ctx.inputs.get("createdField")?;
-        let interval: f64 = ctx.inputs.get("intervalSecs")?;
+        let interval: u64 = ctx.inputs.get("intervalSecs")?;
 
-        let base = checked_id(&base, "base id")?;
-        let table = checked_id(&table, "table")?;
-        let url = format!(
-            "{API}/{base}/{}?pageSize=100&sort%5B0%5D%5Bfield%5D={}&sort%5B0%5D%5Bdirection%5D=desc",
-            urlencoding::encode(table),
-            urlencoding::encode(&created_field),
-        );
+        let url = url(API, &[&base, &table])?
+            .query("pageSize", 100)
+            .query("sort[0][field]", &created_field)
+            .query("sort[0][direction]", "desc");
 
         ctx.register_signal(PollEndpoint {
-            url,
-            interval_secs: interval as u64,
+            url: url.into(),
+            interval_secs: interval,
             delta: Some(PollDelta {
                 items: "records".into(),
                 cursor_field: Some("id".into()),
                 mode: DeltaMode::Set,
                 cursor_param: None,
+                paging: Some(PollPaging::query("offset", "offset")),
             }),
             access: Some(weft::primitive::AccessRef::from(&account)),
             ..Default::default()
@@ -59,12 +58,9 @@ impl Node for AirtableNewRecordNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let wake = ctx.wake.record()?;
-        let record = wake["item"].clone();
-        let id = record["id"]
-            .as_str()
-            .node_err("the poll wake carries no record id")?
-            .to_string();
+        let item = ctx.wake.nested("item")?;
+        let id: String = item.get("id")?;
+        let record = item.record()?;
         ctx.pulse_downstream(
             NodeOutput::new()
                 .set("record", record.clone())

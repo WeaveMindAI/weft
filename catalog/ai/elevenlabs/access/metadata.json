@@ -106,7 +106,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[elevenlabs]",
       "widget": {
         "kind": "access"
       },
@@ -116,7 +116,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[elevenlabs]",
       "description": "Wire into an ElevenLabs node's account input."
     }
   ]

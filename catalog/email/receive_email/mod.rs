@@ -10,10 +10,13 @@
 //!     body opens its own short IMAP session, reads every unseen
 //!     message (which also marks them seen, the natural cursor),
 //!     applies the from/subject filters, and fans the newest match
-//!     (plus the full list on `messages` for bursts).
+//!     (plus the full list on `messages` for bursts). The fetched
+//!     messages are the node's state: marked seen on the server, they
+//!     could not be read a second time.
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use weft::signal::{Framing, SocketFrame, StreamListen};
@@ -21,6 +24,12 @@ use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct ReceiveEmailNode;
+
+/// The unseen messages this firing fetched, parsed, once it fetched them.
+#[derive(Default, Serialize, Deserialize)]
+struct Fetched {
+    messages: Option<Vec<Value>>,
+}
 
 #[cfg(feature = "node-tests")]
 mod tests;
@@ -61,38 +70,33 @@ impl Node for ReceiveEmailNode {
         let account: Access = ctx.inputs.get("account")?;
         let from_contains: Option<String> = ctx.inputs.opt("fromContains")?;
         let subject_contains: Option<String> = ctx.inputs.opt("subjectContains")?;
-        // Fetching marks the messages seen on the server, so it is
-        // journaled: a replay after a resume reads the same parsed
-        // messages back (opening nothing) instead of asking the server
-        // again, where they are no longer unseen and would be lost.
-        let fetched = {
-            let ctx = &ctx;
-            let account = &account;
-            ctx.run("fetch_unseen", move || async move {
-                let conn = ctx.open(account).await?;
+        // Fetching marks the messages seen on the server, so it is a
+        // step of its own: a body run again after a crash takes the
+        // parsed messages from its state (opening nothing) instead of
+        // asking the server again, where they are no longer unseen and
+        // would be lost.
+        let mut state = ctx.keep(Fetched::default()).await?;
+        let parsed_messages = state
+            .once(|s| &mut s.messages, async |_| {
+                let conn = ctx.open(&account).await?;
                 let imap = super::mailbox::imap(&conn)?;
-                let raw = fetch_unseen(&imap.address, &imap.user, &imap.password)
-                    .await
+                let raw = ctx
+                    .cancellation()
+                    .race(fetch_unseen(&imap.address, &imap.user, &imap.password))
+                    .await?
                     .map_err(|e| weft::WeftError::NodeFailed(format!("reading the inbox over IMAP: {e}")))?;
-                Ok(Value::Array(raw.iter().map(|m| parse_message(m)).collect()))
+                Ok(raw.iter().map(|m| parse_message(m)).collect::<Vec<_>>())
             })
-            .await?
-        };
-        let parsed_messages = match fetched {
-            Value::Array(messages) => messages,
-            other => weft::node_bail!("the journaled inbox fetch is not a list of messages: {other}"),
-        };
+            .await?;
 
         // Keep the ones passing the filters, oldest first.
         let mut messages: Vec<Value> = Vec::new();
         for parsed in parsed_messages {
             let from_ok = from_contains
                 .as_deref()
-                .filter(|f| !f.trim().is_empty())
                 .map_or(true, |f| text_of(&parsed, "from").contains(f));
             let subject_ok = subject_contains
                 .as_deref()
-                .filter(|f| !f.trim().is_empty())
                 .map_or(true, |f| text_of(&parsed, "subject").contains(f));
             if from_ok && subject_ok {
                 messages.push(parsed);

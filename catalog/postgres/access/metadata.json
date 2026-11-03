@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[postgres]",
       "widget": {
         "kind": "access"
       },
@@ -23,7 +23,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[postgres]",
       "description": "Wire into the Postgres query and write nodes."
     }
   ],

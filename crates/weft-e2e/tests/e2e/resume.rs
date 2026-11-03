@@ -52,6 +52,9 @@ async fn worker_crash_resumes_on_fresh_worker() -> anyhow::Result<()> {
     // least one was live so this test exercises the abrupt-crash path on
     // purpose, not by accident.
     let review = human::wait_for_form_by_node(&disp, &pid, "review").await?;
+    // Its trigger pauses it at once (`pauseAfterSecs: 0`); the form shows
+    // as the wait registers, a moment before the pause is on record.
+    run::wait_for_status(&disp, run_id, "waiting_for_input").await?;
     let killed = platform.kill_workers(&pid).await?;
     assert!(
         !killed.is_empty(),

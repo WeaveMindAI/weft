@@ -35,11 +35,35 @@
     },
     {
       "name": "auth",
-      "type": "Access",
+      "type": "String | JsonDict",
+      "default": "none",
       "accepts": [
-        "wire"
+        "literal"
       ],
-      "description": "Auth access node (ApiKeyAuth, HmacAuth, or one of your own), checked on the opening request. Unwired, anyone with the URL may connect. The identity comes out on `caller`."
+      "widget": {
+        "kind": "select",
+        "options": [
+          "none",
+          "api_keys",
+          "hmac_sha256",
+          "hmac_sha1",
+          "hmac_sha512",
+          "ed25519",
+          "ecdsa_p256",
+          "oidc"
+        ]
+      },
+      "label": "Check callers with",
+      "description": "How a caller is checked on the opening request, before the conversation starts. `none` (the default): anyone with the URL may connect. `api_keys`: one of the connection's keys in `X-Api-Key` or `Authorization: Bearer`; `caller` says which matched (`{\"key\": 0}` for the first). `hmac_sha256`: `X-Signature` holds the hex HMAC-SHA256 of `<X-Timestamp>.<raw body>` under the connection's secret, a timestamp more than five minutes off refused; `caller` is `{}`. `hmac_sha1` and `hmac_sha512`: the same with that hash. `ed25519`: the same layout, signed with the Ed25519 key whose public half the connection holds; `ecdsa_p256`: signed with ECDSA P-256, the signature in base64 DER. `oidc`: a bearer identity token from the connection's issuer, for its audience; `caller` is the token's claims. A provider's own layout is written as the scheme itself (`{\"kind\": \"api_keys\", \"header\": \"X-Team-Key\"}`). The secret goes on `connection`."
+    },
+    {
+      "name": "connection",
+      "type": "Access",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Connection",
+      "description": "What `auth` checks callers against: the accepted keys, the signing secret, the public key, or the issuer and audience. Picked on each install (`weft connect <node>`, or the Connect button), never written in the source. Not used when `auth` is `none`."
     },
     {
       "name": "maxSessionSecs",
@@ -135,13 +159,13 @@
     {
       "name": "credentials",
       "type": "Dict[String, Secret[String]]",
-      "description": "The headers carrying a credential (`authorization`, `proxy-authorization`, `cookie`, `weft-instance-token`, and those the `auth` connection reads), lowercase names, each a secret: the run's record holds its marker, never its value. Wire one to a node that takes a secret (an HttpRequest's `headers`), or reveal it in your own node."
+      "description": "The headers carrying a credential (`authorization`, `proxy-authorization`, `cookie`, `weft-instance-token`, and those `auth` reads a credential from), lowercase names, each a secret: the run's record holds its marker, never its value. Wire one to a node that takes a secret (an HttpRequest's `headers`), or reveal it in your own node."
     },
     {
       "name": "caller",
       "type": "JsonDict | Null",
       "narrowable": true,
-      "description": "What the auth gate established: JWT claims, `{\"key\": <index>}` for an API key, `{}` for HMAC. Null with no `auth`."
+      "description": "Who `auth` found the caller to be: an identity token's claims for `oidc`, `{\"key\": <index>}` for `api_keys`, `{}` for `hmac` and `signature`. Null when `auth` is `none`."
     },
     {
       "name": "inbound",
@@ -165,14 +189,15 @@
   },
   "features": {
     "isTrigger": true,
-    "liveConnection": "websocket"
+    "liveConnection": "websocket",
+    "checksCallers": true
   },
   "validate": [
     {
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "not", "of": { "kind": "config_in_set", "field": "dataType", "values": ["text", "bytes"] } },
+          { "kind": "not", "of": { "kind": "value", "field": "dataType", "oneOf": ["text", "bytes"] } },
           { "kind": "not", "of": { "kind": "output_type_fits", "port": "inbound", "within": "Generator[JsonDict | Json | File]" } }
         ]
       },
@@ -187,7 +212,7 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "dataType", "equals": "text" },
+          { "kind": "value", "field": "dataType", "equals": "text" },
           { "kind": "not", "of": { "kind": "output_type_fits", "port": "inbound", "within": "Generator[String]" } }
         ]
       },
@@ -202,7 +227,7 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_equals", "field": "dataType", "equals": "bytes" },
+          { "kind": "value", "field": "dataType", "equals": "bytes" },
           { "kind": "not", "of": { "kind": "output_type_fits", "port": "inbound", "within": "Generator[File]" } }
         ]
       },
@@ -215,9 +240,9 @@
     },
     {
       "when": {
-        "kind": "config_matches",
+        "kind": "value",
         "field": "path",
-        "regex": "^/"
+        "matches": "^/"
       },
       "then": {
         "message": "Socket '{id}' path starts with '/'. The gateway prefixes the route automatically; drop the leading slash.",

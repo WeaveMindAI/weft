@@ -10,7 +10,6 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("embeds_texts_and_reports_dimensions", embeds),
         NodeTest::fake("a_non_openrouter_provider_is_refused", wrong_kind),
-        NodeTest::fake("empty_texts_are_refused", empty_texts),
         NodeTest::fake("out_of_order_embeddings_land_by_their_index", out_of_order),
         NodeTest::live("one_real_embedding", "openrouter", live_embedding),
     ]
@@ -87,25 +86,6 @@ async fn wrong_kind(rig: FakeRig) -> WeftResult<()> {
         .await;
     let err = outcome.result.expect_err("openai kind must refuse").to_string();
     assert!(err.contains("OpenRouterModel"), "{err}");
-    Ok(())
-}
-
-async fn empty_texts(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig
-        .run(
-            &LlmEmbedNode,
-            json!({
-                "provider": {
-                    "kind": "openrouter",
-                    "model": "x",
-                    "account": rig.access("openrouter"),
-                },
-                "texts": [],
-            }),
-        )
-        .await;
-    let err = outcome.result.expect_err("empty texts must refuse").to_string();
-    assert!(err.contains("empty"), "{err}");
     Ok(())
 }
 

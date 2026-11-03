@@ -23,24 +23,21 @@ impl Node for LlmEmbedNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let (model, account) = super::provider::read_for(&ctx, "openrouter", "embeddings")?;
+        let (model, account) = super::provider::openrouter(&ctx, "embeddings")?;
+        // At least one text, by the node's `texts` rule.
         let inputs: Vec<String> = ctx.inputs.list("texts")?;
-        let dimensions: Option<f64> = ctx.inputs.opt("dimensions")?;
-
-        if inputs.is_empty() {
-            weft::node_bail!("texts is empty; nothing to embed");
-        }
+        let dimensions: Option<u64> = ctx.inputs.opt("dimensions")?;
 
         let count = inputs.len();
         let mut body = json!({ "model": model, "input": inputs });
         if let Some(d) = dimensions {
-            body["dimensions"] = json!(d as u64);
+            body["dimensions"] = json!(d);
         }
 
         let http = ctx.client(&account).await?;
         let answer = weft::access::client::post_json(
             &http,
-            &format!("{}/embeddings", super::provider::OPENROUTER_API),
+            weft::access::client::url(super::provider::OPENROUTER_API, &["embeddings"])?.as_str(),
             &body,
             "openrouter: embeddings",
         )

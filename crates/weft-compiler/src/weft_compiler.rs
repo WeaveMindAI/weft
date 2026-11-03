@@ -4282,6 +4282,7 @@ fn push_loop_boundaries(group: &ParsedGroup, nodes: &mut Vec<NodeDefinition>) {
         published_service: None,
         instance_service: None,
         instance_rules: None,
+        recheck: Vec::new(),
         span: None,
         // The loop's header is where a diagnostic about either
         // boundary points: the boundaries are the header's two
@@ -4375,6 +4376,7 @@ fn push_loop_boundaries(group: &ParsedGroup, nodes: &mut Vec<NodeDefinition>) {
         published_service: None,
         instance_service: None,
         instance_rules: None,
+        recheck: Vec::new(),
         span: None,
         header_span: group.header_span,
         config_spans: Default::default(),
@@ -4454,6 +4456,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         published_service: None,
         instance_service: None,
         instance_rules: None,
+        recheck: Vec::new(),
         span: pn.span,
         header_span: pn.header_span,
         config_spans: pn.config_spans.clone(),

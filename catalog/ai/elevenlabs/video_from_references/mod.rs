@@ -9,7 +9,7 @@ use weft::node::NodeOutput;
 use weft::storage::FileHandle;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::flows::{generate, is_veo, video_request, Media, References};
+use super::flows::{generate, is_veo, video_request, Job, Media, References};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsVideoFromReferencesNode;
@@ -31,21 +31,15 @@ impl Node for ElevenLabsVideoFromReferencesNode {
         let styles: Vec<FileHandle> = ctx.inputs.list("styles")?;
         let videos: Vec<FileHandle> = ctx.inputs.list("videos")?;
         let audios: Vec<FileHandle> = ctx.inputs.list("audios")?;
-        // Only Veo gives a reference image a role. Every other model takes
-        // all its images the same way, so a style image would quietly lose
-        // what made it a style: refused before anything is sent.
+        // Only Veo gives a reference image a role; `styles` on any other
+        // model is refused by the metadata rule before the body runs.
         let veo = is_veo(&model);
-        if !veo && !styles.is_empty() {
-            return Err(weft::WeftError::Input(format!(
-                "`styles` is a Veo setting: '{model}' takes its reference images without a role, \
-                 so put these images in `subjects`, or pick a veo model."
-            )));
-        }
         let mut body = video_request(&ctx)?;
 
         let http = ctx.client(&account).await?;
-        let refs = References::new(&ctx, &http);
-        let video = generate(&ctx, &account, &http, &refs, Media::Video, || async {
+        let refs = References::new(&ctx, &http, &account);
+        let mut job = ctx.keep(Job::default()).await?;
+        let video = generate(&ctx, &mut job, &account, &http, Media::Video, || async {
             let images = if veo {
                 let mut images = Vec::with_capacity(subjects.len() + styles.len());
                 for (files, role) in [(&subjects, "subject"), (&styles, "style")] {

@@ -27,12 +27,12 @@ impl Node for TextToFileNode {
         // Both declare metadata defaults, so the bag always holds them.
         let filename: String = ctx.inputs.get("filename")?;
         let mime_type: String = ctx.inputs.get("mimeType")?;
-        let scope = lifetime::scope_named(&ctx.inputs.get::<String>("scope")?)?;
+        let scope = ctx.inputs.get::<lifetime::Scope>("scope")?;
         // No default on purpose: absent is the scope's own lifetime (a
         // run file goes with its run, a project file stays).
         let ttl_days: Option<u64> = ctx.inputs.opt("ttlDays")?;
         let file = ctx
-            .storage(scope)
+            .storage(scope.into())
             .put(text.into_bytes(), &mime_type, &filename, ttl_days.map(lifetime::ttl_of_days))
             .await?;
         ctx.pulse_downstream(NodeOutput::stored_file(StoredFile::from_value(&file)?)).await

@@ -283,6 +283,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
             from_spec: true,
             requires_scopes: None,
             requires_values: None,
+            keeps_blank: false,
         },
         InputDefinition {
             port: PortDefinition {
@@ -307,6 +308,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
             from_spec: true,
             requires_scopes: None,
             requires_values: None,
+            keeps_blank: false,
         },
     ]
 }
@@ -452,6 +454,7 @@ pub fn enrich_collecting(
                 from_spec: true,
                 requires_scopes: spec.requires_scopes.clone(),
                 requires_values: spec.requires_values.clone(),
+                keeps_blank: spec.keeps_blank,
             })
             .collect();
         let mut catalog_outputs: Vec<PortDefinition> = meta
@@ -486,17 +489,19 @@ pub fn enrich_collecting(
 
         catalog_inputs.extend(gate_inputs());
 
-        // An ACCESS NODE (metadata carries the `service` recipe):
-        // stamp the service name onto its `access` widget, so the
-        // runtime bag and the editor read it off the node. The
-        // permissions are NOT materialized as an input: they are ticked
-        // once at connect time and live on the stored connection, never
-        // in source. The stamp itself is `AccessSpec::stamp_onto`, the
-        // one definition the compact wiring view shares.
-        if let Some(service_spec) = &meta.service {
-            for input in catalog_inputs.iter_mut() {
+        // A node taking a connection (an access node, or one checking its
+        // callers, whose recipe follows its `auth`): stamp the service
+        // name onto its `access` widget, so the runtime bag and the
+        // editor read it off the node. The permissions are NOT
+        // materialized as an input: they are ticked once at connect time
+        // and live on the stored connection, never in source. The stamp
+        // itself is `AccessSpec::stamp_onto`, the one definition the
+        // compact wiring view shares.
+        let connection = crate::connection_field::resolve(meta, node, node_span, &mut errors);
+        if let Some(field) = &connection {
+            for input in catalog_inputs.iter_mut().filter(|i| i.name == field.input) {
                 if let Some(widget) = &mut input.widget {
-                    service_spec.stamp_onto(widget);
+                    field.spec.stamp_onto(widget);
                 }
             }
         }
@@ -750,13 +755,13 @@ pub fn enrich_collecting(
             }
         }
         normalize_port_literals(node);
-        // An access node's connection is picked on each install, never
-        // written in the source (`weft_core::picks`): a field neither
-        // wired nor `@instance_filled` is marked picked on the install, and
-        // a connection written there (an instance's fallback included) is
+        // A node's connection is picked on each install, never written in
+        // the source (`weft_core::picks`): a field neither wired nor
+        // `@instance_filled` is marked picked on the install, and a
+        // connection written there (an instance's fallback included) is
         // the old way, refused naming the fix, since its id means nothing
-        // on any other install.
-        if let Some(input) = meta.access_input() {
+        // on any other install. A node checking no caller takes none.
+        if let Some(input) = connection.as_ref().and_then(|field| meta.inputs.iter().find(|i| i.name == field.input)) {
             let wired = incoming_wires
                 .get(&node.id)
                 .is_some_and(|wires| wires.iter().any(|w| w.target_port == input.name));
@@ -797,7 +802,7 @@ pub fn enrich_collecting(
                             "'{id}.{field}' holds a connection written in the source. That was the old way \
                              of connecting a node: a connection lives in one install, so its id means \
                              nothing on any other. Erase this line and connect again with `weft connect \
-                             --node {id}` (or the node's Connect button); the pick is kept by the install. \
+                             {id}` (or the node's Connect button); the pick is kept by the install. \
                              See {doc}",
                             id = node.id,
                             field = input.name,
@@ -818,8 +823,8 @@ pub fn enrich_collecting(
             rules: crate::validate::node_rules(meta, node),
             custom: weft_core::rules::CustomPorts::of(node, meta),
         });
-        node.instance_service = match (meta.access_input(), &meta.service) {
-            (Some(input), Some(spec)) if filled.contains(&input.name) => Some(spec.clone()),
+        node.instance_service = match connection {
+            Some(field) if filled.contains(&field.input) => Some(field.spec),
             _ => None,
         };
     }

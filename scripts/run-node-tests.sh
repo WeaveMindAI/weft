@@ -35,7 +35,7 @@
 # branch's own). Each `weft test-node` compiles its packages first, so it
 # takes its turn in the machine's build slot (one heavy cargo build at a
 # time, shared with setup.sh and the e2e runner): sequentially one
-# package at a time, with --parallel one batch at a time.
+# package at a time, with --parallel the one call that tests them all.
 #
 # Live-tier credentials come from the environment / the repo-root .env
 # (uncommitted; the weft CLI loads it itself). For a pasted-key
@@ -101,16 +101,17 @@ TIERS=()
 TARGETS=()
 FROM=""
 TEST_NAME=""
-PARALLEL=""   # ""=sequential, 0=all at once, N=batches of N
+PARALLEL=""   # ""=sequential, 0=all at once, N=up to N side by side
 RETEST=0      # 1 = ignore the live-pass cache (still records fresh passes)
 usage() {
   echo "usage: run-node-tests.sh [--tier basic|fake|live]... [--from <name>] [--test <name>] [--parallel [N]] [<package|node> ...]" >&2
   echo "  no --tier      basic + fake" >&2
   echo "  no targets     every package with tests, in order" >&2
   echo "  --from <n>     the ordered suite starting at the first package containing <n>" >&2
-  echo "  --parallel     every package at once; --parallel N runs batches of N." >&2
-  echo "                 A failure stops after its batch (parallel outputs are" >&2
-  echo "                 buffered per package and printed in order)." >&2
+  echo "  --parallel     one weft test-node for every package: one build, then every" >&2
+  echo "                 package side by side; --parallel N runs up to N at once." >&2
+  echo "                 Every package runs, failing or not; each one's output is" >&2
+  echo "                 printed as one block when it finishes." >&2
   echo "  --retest       live: re-run packages whose exact code already passed" >&2
 }
 while [ $# -gt 0 ]; do
@@ -125,8 +126,8 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "--test needs a test name" >&2; exit 1; }
       TEST_NAME="$2"; shift 2 ;;
     --parallel)
-      # Bare --parallel = everything at once (batch size 0 = "all");
-      # --parallel N = batches of N packages.
+      # Bare --parallel = everything at once (0 = "all");
+      # --parallel N = up to N packages side by side.
       if [ $# -ge 2 ] && [[ "$2" =~ ^[0-9]+$ ]]; then
         PARALLEL="$2"; shift 2
       else
@@ -143,8 +144,8 @@ if [ -n "$FROM" ] && [ ${#TARGETS[@]} -gt 0 ]; then
   exit 1
 fi
 
-# Ctrl+C / TERM aborts the WHOLE run, including backgrounded batch
-# invocations. The terminal's SIGINT already reaches every child (they
+# Ctrl+C / TERM aborts the WHOLE run, including the weft invocation
+# in flight. The terminal's SIGINT already reaches every child (they
 # share the process group); a TERM only reaches the script, so it is
 # forwarded. Either way the script then WAITS: each weft invocation
 # needs its moment to delete the ephemeral grants it created.
@@ -289,24 +290,21 @@ cache_record() {
 }
 
 # ---------- Run ----------
-# One package's whole invocation. In parallel mode the caller redirects
-# this to a per-package log; sequentially it writes straight through.
-run_pkg() {
-  local pkg="$1"
-  local CMD=(weft test-node "$pkg")
+# One `weft test-node` over the given packages, with the run's scope.
+# Under --parallel the CLI runs the packages side by side, and inside
+# each package the tests too, under the same cap (0 = all at once).
+run_pkgs() {
+  local CMD=(weft test-node "$@")
   CMD+=(${TIER_FLAGS[@]+"${TIER_FLAGS[@]}"})
   [ -n "$TEST_NAME" ] && CMD+=(--test "$TEST_NAME")
   [ "$LIVE" = 1 ] && CMD+=(--yes)
-  # Package-level parallelism composes with test-level parallelism:
-  # inside each package the tests also run concurrently, under the
-  # same cap (0 = all at once).
   [ -n "$PARALLEL" ] && CMD+=(--parallel "$PARALLEL")
   (cd "$PROJECT_DIR" && "${CMD[@]}")
 }
 
 # One package in the build slot, for the sequential run.
 run_pkg_in_slot() {
-  with_build_slot run_pkg "$1"
+  with_build_slot run_pkgs "$1"
 }
 
 fail_banner() {
@@ -350,65 +348,44 @@ if [ -z "$PARALLEL" ]; then
     cache_record "$pkg"
   done
 else
-  # Batched: launch a batch of packages together, buffer each package's
-  # output to its own log, and print one status line the moment each
-  # finishes so a long batch is never silent. The full logs print in
-  # suite order once the batch settles; the run stops AFTER the batch
-  # that contains a failure (so every failure in that batch is visible,
-  # not just the first).
-  BATCH_SIZE="$PARALLEL"
-  [ "$BATCH_SIZE" = 0 ] && BATCH_SIZE=$TOTAL
-  LOG_DIR="$(mktemp -d)"
-  trap 'rm -rf "$LOG_DIR"; machine_lock_release_mine' EXIT
-  i=0
-  done_count=0
-  while [ "$i" -lt "$TOTAL" ]; do
-    BATCH=("${RUN_LIST[@]:$i:$BATCH_SIZE}")
-    # The whole batch compiles at once, so it holds the build slot until
-    # its last package is done.
-    build_slot_take || exit 1
-    declare -A PID_PKG=()
-    for pkg in "${BATCH[@]}"; do
-      # A package name may contain '/', which would nest the log path;
-      # the log file uses a flattened name, display keeps the real one.
-      # Its own subshell drops the build slot's descriptor: the slot is
-      # this script's to hand back, whatever the package leaves running.
-      ( close_machine_locks_here; run_pkg "$pkg" ) >"$LOG_DIR/${pkg//\//_}.log" 2>&1 &
-      PID_PKG["$!"]="$pkg"
-      echo "→ $pkg started"
-    done
-    BATCH_FAILED=()
-    remaining=${#BATCH[@]}
-    while [ "$remaining" -gt 0 ]; do
-      st=0
-      wait -n -p FIN_PID || st=$?
-      pkg="${PID_PKG[$FIN_PID]}"
-      remaining=$((remaining - 1))
-      done_count=$((done_count + 1))
-      if [ "$st" = 0 ]; then
-        echo "✓ $pkg passed  ($done_count/$TOTAL)"
-        cache_record "$pkg"
-      else
-        echo "✗ $pkg FAILED  ($done_count/$TOTAL)"
-        BATCH_FAILED+=("$pkg")
-      fi
-    done
-    build_slot_release
-    for pkg in "${BATCH[@]}"; do
-      echo ""
-      echo "========================================================================"
-      echo "  node tests: $pkg"
-      echo "========================================================================"
-      cat "$LOG_DIR/${pkg//\//_}.log"
-    done
-    if [ ${#BATCH_FAILED[@]} -gt 0 ]; then
-      for pkg in "${BATCH_FAILED[@]}"; do
+  # One weft test-node for every package: one workspace, one build, then
+  # the packages side by side. Its stdout (the per-test lines and, with
+  # several packages, one line per package) is kept to learn which
+  # packages passed; their output blocks go to stderr, straight through.
+  OUT_FILE="$(mktemp)"
+  trap 'rm -f "$OUT_FILE"; machine_lock_release_mine' EXIT
+  run_all() {
+    run_pkgs "${RUN_LIST[@]}" | tee "$OUT_FILE"
+    return "${PIPESTATUS[0]}"
+  }
+  st=0
+  with_build_slot run_all || st=$?
+  if [ "$st" = 0 ]; then
+    for pkg in "${RUN_LIST[@]}"; do cache_record "$pkg"; done
+  else
+    # With several packages the CLI ends on one line per package:
+    # `✓ package <name>: ...` or `✗ package <name>: ...`.
+    # SYNC: the `✓ package` lines <-> crates/weft-cli/src/commands/test_node/mod.rs (package_line)
+    mapfile -t PASSED < <(sed -n 's/^✓ package \([^:]*\):.*/\1/p' "$OUT_FILE")
+    mapfile -t FAILED < <(sed -n 's/^✗ package \([^:]*\):.*/\1/p' "$OUT_FILE")
+    for pkg in ${PASSED[@]+"${PASSED[@]}"}; do cache_record "$pkg"; done
+    if [ ${#FAILED[@]} -gt 0 ]; then
+      for pkg in "${FAILED[@]}"; do
         fail_banner "$pkg"
       done
-      exit 1
+    elif [ "$TOTAL" = 1 ]; then
+      fail_banner "${RUN_LIST[0]}"
+    else
+      # No package line: the targets were one package in the end (node
+      # types of it), or it stopped before any package ran (the build, a
+      # target that did not resolve). Either way the error is above.
+      echo ""
+      echo "########################################################################"
+      echo "  FAILED (see above)  -- stopping."
+      echo "########################################################################"
     fi
-    i=$((i + BATCH_SIZE))
-  done
+    exit 1
+  fi
 fi
 
 echo ""

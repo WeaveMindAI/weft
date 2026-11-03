@@ -4,6 +4,235 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-11-03 (0.2.290)
+
+**What breaks after this update:**
+
+**A node picks up after a pause from a state it saves, instead of running
+its body again over a record of what it did.** `ctx.run` and
+`ctx.await_signal` are gone. A node that waits now keeps a state and waits
+through it:
+
+```rust
+#[derive(Default, Serialize, Deserialize)]
+struct Approval { posted: Option<Posted>, manager: Option<Value> }
+
+let mut state = ctx.keep(Approval::default()).await?;
+let posted = state.once(|s| &mut s.posted, async |_| post_buttons(&ctx).await).await?;
+let manager = state.wait(|s| &mut s.manager, form).await?;
+```
+
+`once` runs its work only while its field is empty, `wait` waits only while
+its field is empty, and both save the state. A wait with a call to make if
+the run is cancelled is `state.wait(field, kind.cancel_with(call))`. Your own
+nodes need this change before they build again.
+
+**Every call where a run can pause takes the state.** Bus reads
+(`cursor.next(&mut state)`, `next_json`, `next_message`, `next_bytes`),
+`bus.wait_for(name, &mut state)`, stream pulls (`gen.next(&mut state)`,
+`try_next(&state)`, `drain(&mut state)`) and `ctx.yield_downstream(output, &mut
+state)`, and the program-call helpers that wait in a loop (`infra.start`,
+`request_start`, `rebake`, `follow_command`, a build or run that follows,
+`resync`, `resume_resync`, `remove`). A node whose work cannot be picked up
+from the middle (a provider session, an answer to a caller) passes
+`&mut ctx.hold()` instead: while a `ctx.hold()` value of the firing exists,
+no wait of that firing pauses (its `state.wait` and helpers' waits included);
+each waits open in its call, as in a run that cannot pause, up to the
+trigger's `holdSecs` with nobody on the line, then gives up. `ctx.create_bus` now takes the output port its marker goes out on.
+
+**A node reads a bus through one reader, and reads directly only where a
+pause cannot catch it out.** `bus.cursor()`, `cursor_at(offset)` and
+`cursor_from_start()` return a `Result`, and opening a second reader on a bus
+the body already opened one on fails the node, naming both lines. The first
+time a run of the body reaches a place it can pause (a bus read, a stream
+pull, `state.read`, `state.wait`, a yield; a place is its line and the bus,
+stream or state field it reads, so buses read in turn at one line are a place
+each), no direct read (a bus reader's
+`next`, `next_json`, `next_message` or `next_bytes`, a stream's `next`,
+`try_next` or `drain`) may have happened before it in that run, except inside
+a `state.once` that finished; otherwise the node fails there, naming both
+lines (`read directly (not through its state) at ... before it ...`). The
+check runs on every run, so a body that takes another path on its resume
+fails where the paths split. Reads made while the firing holds its run
+(`ctx.hold()`) are exempt while it holds; once the hold is dropped, its last
+held read counts as a direct read for every place after. `bus.wait_for` is not
+a read. If you need a
+message again after a pause, read it with the new
+`state.read(|s| &mut s.field, &mut reader)`, which hands back the item in the
+field when it is filled and reads into it otherwise, saving it with the rest
+of the state at the next save (a pause, `save()`, or the end of a `once` or
+`wait`). `state.once`'s work now gets the state,
+`state.once(|s| &mut s.f, async |st| { .. })`, so a finished phase of reads
+can go inside it. A message's kind and JSON value come from the new
+`BusEntry::as_json()`. For the rule and the shapes it allows, go and read
+"Reading a bus or a stream across a pause" in the node docs.
+
+**A run paused before this update fails when it picks up**, naming the node
+and saying to start it again with `weft run --seed=<run>`, which reuses what
+it already did. Runs that are not paused are not affected.
+
+**Local infra is named after its install, so two installs on one machine
+running the same project no longer share a container or a database.**
+Before, they shared one name, so the second could not start, or started its
+database on the first one's data. Your local databases keep their data: the
+first time an install starts an infra node after this update, it copies each
+disk from its old volume into one under the new name, then removes the old
+volume. Infra still running from before keeps running, but weft can no longer
+reach its doors: a node calling it fails, saying to run `weft infra stop`
+then `weft infra start`, which moves it over. If two installs on the machine
+ran the same infra on one old volume, weft cannot tell whose data it holds, so
+the start refuses and names the command to settle it: `weft infra take-disk
+<volume>`, run under the install whose data it is. A start also refuses a
+volume that has this install's name but belongs to another install.
+
+**A connection now carries its service in its type.** Before, wiring a
+Mistral connection into a fal node compiled, and the node sent the Mistral key
+to fal. A connection is now typed with its service, `Access[fal]`: each access
+node takes and puts out its own service's (a node of yours that declares a
+`service` types its connection input with it), every catalog node's connection
+input names the service it takes (a union like `Access[openai] | Access[anthropic]` when
+it takes several), and the compiler refuses any other. A bare `Access` takes
+any service, but a bare `Access` no longer fits an `Access[fal]` input, so if a
+group or included file of yours passes a connection through a port typed
+`Access`, write the service on it (`db: Access[postgres]`). A connection of
+another service arriving at a node's input when it runs fails the node, naming
+both.
+
+**Route and Socket check their callers themselves; ApiKeyAuth and HmacAuth
+are gone.** `auth` on a `Route` or `Socket` is now a setting: `"none"` (the
+default), `"api_keys"` (what ApiKeyAuth did: `X-Api-Key`, or a Bearer
+token), `"hmac_sha256"` (what HmacAuth did: `X-Signature` over
+`<timestamp>.<body>`), `"hmac_sha1"`, `"hmac_sha512"`, `"ed25519"` or
+`"ecdsa_p256"` (the same layout, with that algorithm), `"oidc"`, or a whole
+verify block for any other scheme. The
+keys or the secret live in a connection of the route's own, picked on each
+install, so each gated route needs it once after this update: `weft connect
+<route> --grant <id>` picks the connection the old auth node used (`weft
+connect --list` shows its id), or `weft connect <route>` stores a new one. A
+route whose `auth` names a scheme and has no connection fails to activate,
+saying so. `weft connect` now takes the node as its argument
+(`weft connect <node>`), and `--node` is gone.
+
+**A node's rules on values are written with one kind, `value`.** A node
+`metadata.json` using `config_present`, `config_nonempty`, `config_equals`,
+`config_in_set`, `config_matches`, `config_item_count`, `config_items_fit`,
+`config_in_range` or `config_field_in_set`, or an input's `minItems`, now
+fails to load, naming `value`. Write `{ "kind": "value", "field": "x" }`
+with the checks you need (`nonempty`, `equals`, `oneOf`, `matches`, `count`,
+`range`, `length`, `unique`, `each`); `minItems: 2` becomes a rule refusing
+`not { "kind": "value", "field": "x", "count": { "min": 2 } }`. A node's own
+rule `input_source_type` fails to load too: type the input with its service
+instead (`"type": "Access[slack]"`).
+
+**A node's rules now hold for values that arrive on a wire.** A rule in a
+node's `metadata.json` that the compiler could not decide, because its value
+comes from another node, is now checked before the node runs, with the value
+that arrived. A program that compiled and ran with a wired value breaking a
+rule now fails at that node with the rule's own message, and a wired `_error`
+does not catch it. Fix the value upstream.
+
+**A blank optional text counts as not given.** An optional input that takes
+text (`String`, or a union with `String` in it, like `String | List[String]`)
+that arrives empty or only spaces is treated as absent: the node gets no value
+(or the input's default), and a node needing one of several inputs counts it
+as missing. So these nodes now skip instead of failing: GmailSend when `to`,
+`cc` and `bcc` are all blank or missing, or `text` and `html` both are;
+GmailLabel when `add` and `remove` both are; NotionAppendBlocks when `content`
+is blank and `blocks` is missing.
+If your program relied on that failure, check for the skip instead.
+
+**A `datetime` setting must be a moment with its zone**, like
+`2026-09-03T11:00:00+02:00`. WaitUntil's and GoogleCalendarListEvents' dates are
+held to it: a written one at compile time, a wired one before the node runs.
+
+**A bus that ended failed now fails the node reading it**, with `the bus
+ended failed: <why>`, instead of reading as a clean end.
+
+**A message on a bus goes out to a caller with its files as links and its
+secrets revealed.** A bus carries no type, so `Stream` reads each message's
+markers instead: a stored file in it goes out as a link, and a secret as its
+value. Before, either one was refused.
+
+**For your own nodes:**
+
+- `storage.put_from_url(url, mime, filename, keep)` takes the file's type
+  second (`None` takes the server's).
+- A `PollDelta` takes `paging` (`None` for a list that fits one answer).
+- `client::cursor_paged` hands its request closure the cursor
+  (`|cursor| ..`), and `CursorPaging.param` is an `Option` (`None` when the
+  cursor goes in the body).
+
+**The rest:**
+
+**`weft test-node` takes several packages or nodes at once**
+(`weft test-node slack telegram`) and builds them together.
+
+**Poll triggers no longer lose a burst.** A trigger polling a list that
+comes in pages (Gmail's, Notion's, Airtable's new-item triggers) follows the
+pages until it meets an item it has seen, and fires every new one, instead
+of firing only the first page. More than 50 pages of new items between two
+polls fails the poll, firing nothing, and the log says so.
+
+**A cancelled run stops waiting on a slow server.** Every request a node
+sends through weft's clients, an infra endpoint's call, a storage read or a
+write of bytes or a stream, a provider socket and a bus read now end the moment the run is
+cancelled, so nodes that did not watch for a cancel themselves (an HTTP
+request, a text-to-speech call, an embedding) no longer keep a cancelled run
+alive.
+
+**A node can clean up what it made at a provider, however it ends.**
+`ctx.after_node(CancelCall::delete(url).always(), &access)` puts the call
+on the run's record and sends it once when the node ends, even after a
+crash. The ElevenLabs nodes use it for the files they upload for a job, so
+a cancelled or crashed run no longer leaves them in your account.
+
+**A durable run's record is written faster again.** Since costs and secrets
+got tables of their own, every write of a run's record paid for saving them
+even when it had none; it now does that work only when the run reported a
+cost or holds a secret.
+
+**A bus or a stream no longer keeps a run from pausing.** When every node
+waits and one of them waits on something outside the run (a timer, a form),
+the run pauses with its buses open; the next worker opens them again with the
+same members, and every node carries on where it stopped. A node that paused
+behind messages the bus no longer holds when it comes back (an ephemeral bus
+keeps none over a pause, and any bus drops what falls out of its window) fails
+saying so, instead of skipping them. A node holds one name per bus. A node
+reading a whole stream with `drain` can pause too: weft saves the items it
+was holding with the node's state, and the resumed `drain` starts from them
+and takes the rest, so a node draining a stream fed by a node waiting on a
+person no longer keeps the worker up for as long as that person takes. A
+pausing run writes its buses' open journal windows at once, instead of
+waiting for each window to run out (a second by default) before it lets go
+of its worker.
+
+**A node that saves a state runs again from it when its worker dies**,
+instead of being failed, in a durable run.
+
+**A run stays on its worker a while before it pauses.** A trigger's new
+`pauseAfterSecs` (default 10, `0` pauses at once as before, at most 3600, and
+`weft run --pause-after-secs` for one run) is how long a run that can pause
+stays on its worker, quiet, once every node it is running waits, before it
+pauses: a wait's answer that arrives in that time goes straight into the
+waiting call, so a run fed by frequent messages no longer pauses and resumes
+for each one. A run now pauses in one way only: every node it runs waits,
+the window runs out, and every waiting call pauses together. A hand-back (the
+cloud's 59-minute limit, a worker stopping, maintenance) pauses at once.
+
+**A caller on the line is never cut off by a wait.** While a route's caller
+is connected, a wait holds the run on its worker for as long as the caller
+stays (`holdSecs` only counts once nobody is on the line, or with `0`, which
+still refuses such a wait at once). At a cloud install's 59-minute limit on
+one connection, a route with `outlivesCaller` on gives the nodes its run is
+running 5 seconds to end, then ends its caller's connection with a `504`
+(the reason, saying to reconnect, is on the run's record for `weft logs`) and
+the run goes on in a fresh worker (a node still running then runs again from its saved
+state, or fails as cut short if it keeps none); with it off, the run is
+cancelled as before.
+
+**`ctx.projects().declare` without an id** takes one from the call, so a call
+carried again after a lost answer finds the project the first one made.
+
 ## 2026-11-02 (0.2.289)
 
 **A group's or a loop's `@file` value now shows and edits in the editor.** A

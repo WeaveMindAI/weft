@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[elevenlabs]",
       "accepts": [
         "wire"
       ],
@@ -398,7 +398,7 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_equals",
+            "kind": "value",
             "field": "llm",
             "equals": "custom-llm"
           },
@@ -421,9 +421,9 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_in_set",
+            "kind": "value",
             "field": "ttsModel",
-            "values": [
+            "oneOf": [
               "eleven_v4",
               "eleven_v3_conversational",
               "eleven_flash_v2_5",
@@ -434,7 +434,7 @@
             "kind": "any",
             "of": [
               {
-                "kind": "config_equals",
+                "kind": "value",
                 "field": "language",
                 "equals": "en"
               },
@@ -444,15 +444,8 @@
                   {
                     "kind": "not",
                     "of": {
-                      "kind": "config_present",
+                      "kind": "value",
                       "field": "language"
-                    }
-                  },
-                  {
-                    "kind": "not",
-                    "of": {
-                      "kind": "input_wired",
-                      "port": "language"
                     }
                   }
                 ]
@@ -464,6 +457,77 @@
       "then": {
         "message": "ElevenLabsCreateAgent '{id}' makes an English agent with that `ttsModel`, and ElevenLabs takes an English agent only on eleven_v4_turbo or eleven_flash_v2: pick one of those, or leave `ttsModel` empty.",
         "port": "ttsModel"
+      }
+    },
+    {
+      "when": {
+        "kind": "value",
+        "field": "mcpServerIds",
+        "count": { "min": 11 }
+      },
+      "then": {
+        "message": "ElevenLabsCreateAgent '{id}' lists more than 10 `mcpServerIds`, and ElevenLabs gives one agent at most 10: keep 10 or fewer.",
+        "port": "mcpServerIds"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "knowledgeBase"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "knowledgeBase",
+              "each": {
+                "key": "type",
+                "oneOf": [
+                  "file",
+                  "url",
+                  "text",
+                  "folder"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsCreateAgent '{id}' has a `knowledgeBase` document whose `type` ElevenLabs does not take: use file, url, text or folder.",
+        "port": "knowledgeBase"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "knowledgeBase"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "knowledgeBase",
+              "each": {
+                "key": "usageMode",
+                "oneOf": [
+                  "auto",
+                  "prompt"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsCreateAgent '{id}' has a `knowledgeBase` document whose `usageMode` ElevenLabs does not take: use auto or prompt, or leave it out.",
+        "port": "knowledgeBase"
       }
     }
   ]

@@ -25,7 +25,8 @@ pub const KEY: &str = "key";
 pub const EXEC: &str = "exec";
 pub const OUTPUT: &str = "output";
 pub const END_SESSION: &str = "end_session";
-pub const JOBS_PATH: &str = "/jobs/";
+/// The path segment a command's status sits under (`/jobs/<id>`).
+pub const JOBS: &str = "jobs";
 
 /// The computer on the node's `computer` input, reached.
 pub async fn endpoint(ctx: &RunContext) -> WeftResult<EndpointHandle> {
@@ -37,14 +38,9 @@ pub async fn endpoint(ctx: &RunContext) -> WeftResult<EndpointHandle> {
 /// hand back what it answered. An action that did not fully happen on
 /// the computer (a key name it does not know, a point off the screen)
 /// fails the node with the computer's own words. A press of stop ends
-/// the call: an action can take a while (a key held down for minutes).
+/// the call (an action can take a while: a key held down for minutes).
 pub async fn act(ctx: &RunContext, action: &str, payload: Value) -> WeftResult<Value> {
-    let computer = endpoint(ctx).await?;
-    let cancel = ctx.cancellation();
-    tokio::select! {
-        answer = computer.action(action, payload) => answer,
-        err = cancel.cancelled_err() => Err(err),
-    }
+    endpoint(ctx).await?.action(action, payload).await
 }
 
 /// Do `action`, then send `result` on the node's `result` output: the

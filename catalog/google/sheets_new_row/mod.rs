@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
 use weft::signal::{PollDelta, PollEndpoint};
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::sheets::{header_row, row_object, row_to_strings, tab_title, values_url};
 
@@ -36,19 +36,22 @@ impl Node for GoogleSheetsNewRowNode {
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
         let gid: Option<String> = ctx.inputs.opt("tab")?;
-        let interval: f64 = ctx.inputs.get("intervalSecs")?;
+        let interval: u64 = ctx.inputs.get("intervalSecs")?;
 
         let http = ctx.client(&account).await?;
         let title = tab_title(&http, &id, gid.as_deref()).await?;
 
+        // The values answer is the whole tab in one answer, never paged,
+        // and a positional delta reads one answer anyway.
         ctx.register_signal(PollEndpoint {
-            url: values_url(&id, &title, None),
-            interval_secs: interval as u64,
+            url: values_url(&id, &title, None)?.into(),
+            interval_secs: interval,
             delta: Some(PollDelta {
                 items: "values".into(),
                 cursor_field: None,
                 mode: Default::default(),
                 cursor_param: None,
+                paging: None,
             }),
             access: Some(weft::primitive::AccessRef::from(&account)),
             ..Default::default()
@@ -62,11 +65,8 @@ impl Node for GoogleSheetsNewRowNode {
         let gid: Option<String> = ctx.inputs.opt("tab")?;
         let has_header: bool = ctx.inputs.get("hasHeader")?;
 
-        let wake = ctx.wake.record()?;
-        let cells = row_to_strings(&wake["item"]);
-        let index = wake["index"]
-            .as_u64()
-            .node_err("the poll wake carries no index")?;
+        let cells = row_to_strings(&ctx.wake.get::<Value>("item")?);
+        let index: u64 = ctx.wake.get("index")?;
 
         let mut out = NodeOutput::new()
             .set("cells", json!(cells.clone()))

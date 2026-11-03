@@ -7,34 +7,29 @@ use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
 use crate::testing::emitted_file;
 
-use super::ElevenLabsDubNode;
-use crate::elevenlabs::link_filename;
+use super::{ElevenLabsDubNode, Settings};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
-        NodeTest::fake("creates_the_project_with_its_language_waits_stores_the_dub_and_deletes_the_project", dubs),
+        NodeTest::fake("creates_the_project_with_its_language_waits_stores_the_dub_and_owes_the_project_delete", dubs),
         NodeTest::fake("a_project_the_program_reads_is_kept", kept),
         NodeTest::fake("every_term_and_the_cloning_strength_reach_the_requests", every_setting),
-        NodeTest::fake("a_cloning_strength_on_dubbing_v1_is_refused_before_anything_is_sent", cloning_needs_v2),
         NodeTest::fake("a_failed_dub_fails_with_elevenlabs_message", failed),
         NodeTest::fake("a_failed_project_is_named_with_its_own_cause", failed_project),
         NodeTest::fake("a_failed_dub_comes_out_on_error_when_it_is_wired", failed_caught),
-        NodeTest::fake("a_language_that_cannot_be_added_deletes_the_paid_project", language_refused),
+        NodeTest::fake("a_language_that_cannot_be_added_owes_the_paid_project_delete", language_refused),
         NodeTest::fake("a_language_that_cannot_be_added_leaves_a_kept_project_named", language_refused_kept),
-        NodeTest::fake("a_project_that_cannot_be_deleted_is_logged_and_the_dub_still_lands", undeletable),
-        NodeTest::fake("a_create_that_names_no_language_deletes_the_paid_project", no_language_named),
-        NodeTest::fake("a_wait_given_up_deletes_the_project", given_up),
+        NodeTest::fake("a_create_that_names_no_language_owes_the_paid_project_delete", no_language_named),
+        NodeTest::fake("a_wait_given_up_owes_the_project_delete", given_up),
         NodeTest::fake("a_kept_project_survives_a_wait_given_up", given_up_kept),
         NodeTest::fake("a_replacement_voice_is_logged_and_the_dub_still_lands", replacement_voice),
         NodeTest::fake("a_warning_from_preparing_the_source_is_logged_too", preparation_warning),
         NodeTest::fake("a_resumed_run_never_creates_a_second_project", resumed),
         NodeTest::fake("an_unknown_status_fails_loud", unknown_status),
         NodeTest::fake("a_link_goes_instead_of_a_file_and_names_the_dub", source_url),
-        NodeTest::fake("a_file_and_a_link_together_or_neither_are_refused_before_anything_is_sent", one_recording),
-        NodeTest::fake("a_transcript_goes_as_a_json_file_and_a_reference_as_text", transcript_and_reference),
-        NodeTest::fake("a_transcript_without_its_language_is_refused_before_anything_is_sent", transcript_needs_language),
+        NodeTest::fake("a_transcript_with_translations_starts_its_language_on_the_create", transcript_and_reference),
+        NodeTest::basic("every_setting_rides_the_create_and_nothing_nobody_gave", create_fields),
         NodeTest::fake("translations_with_a_cloning_strength_are_refused_before_anything_is_sent", translations_with_cloning),
-        NodeTest::basic("a_link_names_the_dub_after_its_last_path_segment", link_names),
         NodeTest::live("one_real_short_dub_to_spanish", "elevenlabs", live_dub),
     ]
 }
@@ -57,9 +52,8 @@ fn inputs(rig: &FakeRig, extra: Value) -> Value {
 
 /// Canned answers up to the wait: the create answers project `p1` with
 /// its target `l1` (the language rides on the create), adding a language
-/// on its own also answers `l1`, the wait ends on `status`, and deleting
-/// the project answers `delete_status`.
-fn starts_deleting(rig: &FakeRig, status: &str, delete_status: u16) {
+/// on its own also answers `l1`, and the wait ends on `status`.
+fn starts(rig: &FakeRig, status: &str) {
     rig.respond(
         "POST",
         "/v1/dubbing/project",
@@ -71,27 +65,30 @@ fn starts_deleting(rig: &FakeRig, status: &str, delete_status: u16) {
         json!({ "language_id": "l1", "project_id": "p1", "target_language": "es", "status": "queued" }),
     );
     rig.signal(json!({ "status": status }));
-    rig.respond_status("DELETE", PROJECT_PATH, delete_status, json!({ "detail": { "message": "try again later" } }));
 }
 
-fn starts(rig: &FakeRig, status: &str) {
-    starts_deleting(rig, status, 204);
-}
-
-fn deleted(rig: &FakeRig) -> bool {
-    rig.requests().iter().any(|r| r.method == "DELETE" && r.path == PROJECT_PATH)
+/// Whether weft owes the project's delete when the node ends, however it
+/// ends, through the node's own access.
+fn owes_delete(rig: &FakeRig) -> bool {
+    let project = format!("https://api.elevenlabs.io{PROJECT_PATH}");
+    rig.owed_calls().iter().any(|(call, access)| {
+        call.url == project
+            && call.method == weft::signal::CancelMethod::Delete
+            && call.when == weft::signal::SendWhen::Always
+            && access.is_some()
+    })
 }
 
 /// Canned answers for a dub that completes with `warnings`, its FLAC
 /// served at a signed storage URL with a generic content type.
 fn completes(rig: &FakeRig, warnings: Value) {
-    completes_deleting(rig, warnings, json!([]), 204);
+    completes_with(rig, warnings, json!([]));
 }
 
 /// A completed dub whose target carries `warnings` and whose project
 /// carries `project_warnings` (what came up preparing the source).
-fn completes_deleting(rig: &FakeRig, warnings: Value, project_warnings: Value, delete_status: u16) {
-    starts_deleting(rig, "completed", delete_status);
+fn completes_with(rig: &FakeRig, warnings: Value, project_warnings: Value) {
+    starts(rig, "completed");
     rig.respond(
         "GET",
         TARGET_PATH,
@@ -123,13 +120,32 @@ fn fails(rig: &FakeRig, error: Value) {
     );
 }
 
-/// The multipart body of the project create.
-fn create_form(rig: &FakeRig) -> String {
+/// The create the node sent. Its form streams (the recording goes out
+/// of storage as it is sent), so the rig cannot read it: the fields are
+/// checked on [`Settings::form`] instead.
+fn create(rig: &FakeRig) -> weft::SentRequest {
     rig.requests()
         .into_iter()
         .find(|r| r.method == "POST" && r.path == "/v1/dubbing/project")
-        .and_then(|r| r.body_text)
         .expect("the node sent a multipart create")
+}
+
+/// The fields `settings` puts on the create, with `source_url` when given.
+fn fields(settings: &Settings<'_>, source_url: Option<&str>) -> WeftResult<String> {
+    let (_, body) = settings.form(source_url)?.build();
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// A create of a Spanish dub on weft's default model, with nothing else.
+fn plain() -> Settings<'static> {
+    Settings {
+        model: "dubbing_v1",
+        source_language: None,
+        target_language: Some("es"),
+        keyterms: &[],
+        transcript: None,
+        reference: None,
+    }
 }
 
 /// The JSON body of the language POST.
@@ -154,16 +170,7 @@ async fn dubs(rig: FakeRig) -> WeftResult<()> {
     completes(&rig, json!([]));
     let outcome = rig.run(&ElevenLabsDubNode, inputs(&rig, json!({ "sourceLang": "en" }))).await.ok()?;
 
-    let form = create_form(&rig);
-    assert!(form.contains("name=\"file\"; filename=\"talk.mp3\""), "{form}");
-    assert!(form.contains("english speech"), "the recording's bytes are in the create: {form}");
-    assert!(has_field(&form, "model_id", "dubbing_v1"), "weft's default model: {form}");
-    assert!(has_field(&form, "source_language", "en"), "{form}");
-    assert!(
-        has_field(&form, "target_language", "es"),
-        "the language rides on the create, so one ElevenLabs does not dub is refused before any charge: {form}"
-    );
-    assert!(!form.contains("name=\"keyterms\""), "no term nobody gave: {form}");
+    assert!(create(&rig).body_streamed, "the recording streams out of storage, never held whole");
     assert_eq!(language_posts(&rig), 0, "no language added on its own");
 
     // The wait parks on the language target, signed by the connection,
@@ -187,12 +194,47 @@ async fn dubs(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(bytes, b"fLaC spanish");
     assert_eq!(filename, "dubbed_es_talk.flac");
     assert_eq!(mime, "audio/flac", "stored as FLAC, never as the download's generic header");
-    let order: Vec<(String, String)> = rig.requests().into_iter().map(|r| (r.method, r.path)).collect();
-    let download = order.iter().position(|(_, p)| p == "/dubs/l1.flac").expect("a download");
-    let delete = order.iter().position(|(m, p)| m == "DELETE" && p == PROJECT_PATH).expect(
-        "nothing reads `projectId`, so the project goes once the dub is stored",
+    assert!(owes_delete(&rig), "nothing reads `projectId`, so the project goes once the node ends");
+    assert!(!rig.requests().iter().any(|r| r.method == "DELETE"), "the node deletes nothing itself");
+    Ok(())
+}
+
+/// The create's fields: the model, the languages, each term as its own
+/// field, the transcript as a JSON file, the reference and the link, and
+/// nothing nobody gave.
+fn create_fields() -> WeftResult<()> {
+    let form = fields(&Settings { source_language: Some("en"), ..plain() }, None)?;
+    assert!(has_field(&form, "model_id", "dubbing_v1"), "weft's default model: {form}");
+    assert!(has_field(&form, "source_language", "en"), "{form}");
+    assert!(
+        has_field(&form, "target_language", "es"),
+        "the language rides on the create, so one ElevenLabs does not dub is refused before any charge: {form}"
     );
-    assert!(delete > download, "the project outlives the download of its dub: {order:?}");
+    assert!(!form.contains("name=\"keyterms\""), "no term nobody gave: {form}");
+    assert!(!form.contains("name=\"source_url\""), "{form}");
+
+    let terms = ["Weavemind".to_string(), "weft".to_string()];
+    let form = fields(&Settings { model: "dubbing_v2", target_language: None, keyterms: &terms, ..plain() }, None)?;
+    assert!(has_field(&form, "model_id", "dubbing_v2"), "{form}");
+    assert_eq!(form.matches("name=\"keyterms\"").count(), 2, "one field per term: {form}");
+    assert!(has_field(&form, "keyterms", "Weavemind") && has_field(&form, "keyterms", "weft"), "{form}");
+    assert!(!form.contains("name=\"source_language\""), "no language given is detected: {form}");
+    assert!(
+        !form.contains("name=\"target_language\""),
+        "a cloning strength can only ride on a language added on its own: {form}"
+    );
+
+    let transcript = json!({ "segments": [{ "start": 0.0, "end": 1.5, "text": "Hello.", "translation": "Hola." }] });
+    let link = "https://example.com/media/talk.mp4?sig=abc";
+    let form = fields(&Settings { transcript: Some(&transcript), reference: Some("episode-12"), ..plain() }, Some(link))?;
+    assert!(
+        form.contains("name=\"transcript\"; filename=\"transcript.json\"\r\nContent-Type: application/json"),
+        "ElevenLabs takes the transcript as a JSON file: {form}"
+    );
+    let document = form.split("filename=\"transcript.json\"").nth(1).expect("a transcript part");
+    assert!(document.contains(r#""translation":"Hola.""#), "the document goes as given: {form}");
+    assert!(has_field(&form, "reference", "episode-12"), "{form}");
+    assert!(has_field(&form, "source_url", link), "ElevenLabs fetches the link itself: {form}");
     Ok(())
 }
 
@@ -201,7 +243,7 @@ async fn kept(rig: FakeRig) -> WeftResult<()> {
     rig.wire_output("projectId");
     let outcome = rig.run(&ElevenLabsDubNode, inputs(&rig, json!({}))).await.ok()?;
     assert_eq!(outcome.outputs["projectId"], json!("p1"));
-    assert!(!deleted(&rig), "a project the program reads is the program's to keep");
+    assert!(!owes_delete(&rig), "a project the program reads is the program's to keep");
     Ok(())
 }
 
@@ -221,17 +263,6 @@ async fn every_setting(rig: FakeRig) -> WeftResult<()> {
     )
     .await
     .ok()?;
-    assert!(has_field(&create_form(&rig), "model_id", "dubbing_v2"));
-
-    let form = create_form(&rig);
-    assert_eq!(form.matches("name=\"keyterms\"").count(), 2, "one field per term: {form}");
-    assert!(has_field(&form, "keyterms", "Weavemind"), "{form}");
-    assert!(has_field(&form, "keyterms", "weft"), "{form}");
-    assert!(!form.contains("name=\"source_language\""), "no language given is detected: {form}");
-    assert!(
-        !form.contains("name=\"target_language\""),
-        "a cloning strength can only ride on a language added on its own: {form}"
-    );
     assert_eq!(
         language_body(&rig),
         json!({ "target_language": "es", "voice_settings": { "cloning_strength": 3 } }),
@@ -288,17 +319,7 @@ fn refuse_the_language(rig: &FakeRig) -> Value {
         422,
         json!({ "detail": { "message": "Unsupported target language: xx" } }),
     );
-    rig.respond_status("DELETE", PROJECT_PATH, 204, Value::Null);
     inputs(rig, json!({ "targetLang": "xx", "model": "dubbing_v2", "cloningStrength": 5 }))
-}
-
-async fn cloning_needs_v2(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    let err = rig.run(&ElevenLabsDubNode, inputs(&rig, json!({ "cloningStrength": 5 }))).await.failure()?;
-    assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {err}");
-    assert!(err.contains("dubbing_v2 setting") && err.contains("dubbing_v1"), "{err}");
-    assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");
-    Ok(())
 }
 
 async fn language_refused(rig: FakeRig) -> WeftResult<()> {
@@ -306,8 +327,8 @@ async fn language_refused(rig: FakeRig) -> WeftResult<()> {
     let err = rig.run(&ElevenLabsDubNode, given).await.failure()?;
     assert!(err.contains("422"), "{err}");
     assert!(err.contains("Unsupported target language: xx"), "{err}");
-    assert!(err.contains("p1") && err.contains("it was deleted"), "the paid project is named: {err}");
-    assert!(deleted(&rig), "nothing reads `projectId`, so the project goes");
+    assert!(err.contains("p1") && err.contains("it is deleted"), "the paid project is named: {err}");
+    assert!(owes_delete(&rig), "nothing reads `projectId`, so the project goes");
     assert!(rig.awaited_signals().is_empty(), "a target that was never added is never waited on");
     Ok(())
 }
@@ -317,17 +338,16 @@ async fn language_refused_kept(rig: FakeRig) -> WeftResult<()> {
     rig.wire_output("projectId");
     let err = rig.run(&ElevenLabsDubNode, given).await.failure()?;
     assert!(err.contains("p1") && err.contains("stays on the account"), "{err}");
-    assert!(!deleted(&rig), "a project the program reads is the program's to keep");
+    assert!(!owes_delete(&rig), "a project the program reads is the program's to keep");
     Ok(())
 }
 
 async fn no_language_named(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/v1/dubbing/project", json!({ "project_id": "p1", "status": "queued", "language_ids": [] }));
-    rig.respond_status("DELETE", PROJECT_PATH, 204, Value::Null);
     let err = rig.run(&ElevenLabsDubNode, inputs(&rig, json!({}))).await.failure()?;
     assert!(err.contains("did not say it started the dub into 'es'"), "{err}");
-    assert!(err.contains("p1") && err.contains("it was deleted"), "{err}");
-    assert!(deleted(&rig), "nothing reads `projectId`, so the paid project goes");
+    assert!(err.contains("p1") && err.contains("it is deleted"), "{err}");
+    assert!(owes_delete(&rig), "nothing reads `projectId`, so the paid project goes");
     assert!(rig.awaited_signals().is_empty(), "nothing to wait on");
     Ok(())
 }
@@ -340,14 +360,13 @@ fn gives_up(rig: &FakeRig) {
         json!({ "project_id": "p1", "status": "queued", "model_id": "dubbing_v1", "language_ids": ["l1"] }),
     );
     rig.signal_given_up();
-    rig.respond_status("DELETE", PROJECT_PATH, 204, Value::Null);
 }
 
 async fn given_up(rig: FakeRig) -> WeftResult<()> {
     gives_up(&rig);
     let err = rig.run(&ElevenLabsDubNode, inputs(&rig, json!({}))).await.failure()?;
     assert!(err.contains("given up"), "{err}");
-    assert!(deleted(&rig), "nothing will read the dub, so its project goes");
+    assert!(owes_delete(&rig), "nothing will read the dub, so its project goes");
     Ok(())
 }
 
@@ -356,19 +375,7 @@ async fn given_up_kept(rig: FakeRig) -> WeftResult<()> {
     rig.wire_output("projectId");
     let err = rig.run(&ElevenLabsDubNode, inputs(&rig, json!({}))).await.failure()?;
     assert!(err.contains("given up"), "{err}");
-    assert!(!deleted(&rig), "a project the program reads is the program's to keep");
-    Ok(())
-}
-
-async fn undeletable(rig: FakeRig) -> WeftResult<()> {
-    completes_deleting(&rig, json!([]), json!([]), 500);
-    let outcome = rig.run(&ElevenLabsDubNode, inputs(&rig, json!({}))).await.ok()?;
-    let (bytes, _, _) = emitted_file(&rig, &outcome.outputs, "file")?;
-    assert_eq!(bytes, b"fLaC spanish", "the paid dub still lands");
-    let logs = rig.logs();
-    assert_eq!(logs.len(), 1, "{logs:?}");
-    assert_eq!(logs[0].0, weft::context::LogLevel::Warn);
-    assert!(logs[0].1.contains("p1") && logs[0].1.contains("still on the ElevenLabs account"), "{}", logs[0].1);
+    assert!(!owes_delete(&rig), "a project the program reads is the program's to keep");
     Ok(())
 }
 
@@ -393,11 +400,10 @@ async fn replacement_voice(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn preparation_warning(rig: FakeRig) -> WeftResult<()> {
-    completes_deleting(
+    completes_with(
         &rig,
         json!([]),
         json!([{ "type": "voices_not_permitted", "speaker_ids": ["speaker_1"], "message": "Not permitted." }]),
-        204,
     );
     rig.run(&ElevenLabsDubNode, inputs(&rig, json!({}))).await.ok()?;
     let logs = rig.logs();
@@ -412,7 +418,12 @@ async fn resumed(rig: FakeRig) -> WeftResult<()> {
     rig.run(&ElevenLabsDubNode, given.clone()).await.ok()?;
     rig.run(&ElevenLabsDubNode, given).await.ok()?;
     let posts = |path: &str| rig.requests().iter().filter(|r| r.method == "POST" && r.path == path).count();
-    assert_eq!(posts("/v1/dubbing/project"), 1, "the replay reads the journaled project back instead of paying twice");
+    assert_eq!(posts("/v1/dubbing/project"), 1, "the resumed body finds the project in its state instead of paying twice");
+    assert_eq!(rig.awaited_signals().len(), 1, "and does not wait again on a dub whose end it already has");
+    let saved = rig.saved_state(&ElevenLabsDubNode).expect("a saved state");
+    assert!(saved["dubbed"].is_object(), "the stored dub is in the state, so the project is never read again: {saved}");
+    let reads = rig.requests().iter().filter(|r| r.method == "GET" && r.path == TARGET_PATH).count();
+    assert_eq!(reads, 1, "the finished dub was read once");
     Ok(())
 }
 
@@ -430,26 +441,13 @@ async fn source_url(rig: FakeRig) -> WeftResult<()> {
     let mut given = inputs(&rig, json!({ "sourceUrl": "https://example.com/media/talk.mp4?sig=abc" }));
     given.as_object_mut().expect("inputs are an object").remove("file");
     let outcome = rig.run(&ElevenLabsDubNode, given).await.ok()?;
-    let form = create_form(&rig);
-    assert!(has_field(&form, "source_url", "https://example.com/media/talk.mp4?sig=abc"), "{form}");
-    assert!(!form.contains("name=\"file\""), "ElevenLabs fetches the link itself: {form}");
     let (_, filename, _) = emitted_file(&rig, &outcome.outputs, "file")?;
     assert_eq!(filename, "dubbed_es_talk.flac", "named after the link's last path segment");
     Ok(())
 }
 
-async fn one_recording(rig: FakeRig) -> WeftResult<()> {
-    let both = inputs(&rig, json!({ "sourceUrl": "https://example.com/talk.mp4" }));
-    let err = rig.run(&ElevenLabsDubNode, both).await.failure()?;
-    assert!(err.starts_with("input error") && err.contains("both `file` and `sourceUrl`"), "{err}");
-    let mut neither = inputs(&rig, json!({}));
-    neither.as_object_mut().expect("inputs are an object").remove("file");
-    let err = rig.run(&ElevenLabsDubNode, neither).await.failure()?;
-    assert!(err.contains("nothing to dub"), "{err}");
-    assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");
-    Ok(())
-}
-
+/// A transcript with translations seeds the language the create starts,
+/// so a dub that carries one runs without adding a language on its own.
 async fn transcript_and_reference(rig: FakeRig) -> WeftResult<()> {
     completes(&rig, json!([]));
     rig.wire_output("projectId");
@@ -460,23 +458,7 @@ async fn transcript_and_reference(rig: FakeRig) -> WeftResult<()> {
     )
     .await
     .ok()?;
-    let form = create_form(&rig);
-    assert!(
-        form.contains("name=\"transcript\"; filename=\"transcript.json\"\r\nContent-Type: application/json"),
-        "ElevenLabs takes the transcript as a JSON file: {form}"
-    );
-    let document = form.split("filename=\"transcript.json\"").nth(1).expect("a transcript part");
-    assert!(document.contains(r#""translation":"Hola.""#), "the document goes as given: {form}");
-    assert!(has_field(&form, "reference", "episode-12"), "{form}");
-    assert!(has_field(&form, "target_language", "es"), "the translations seed the language the create starts: {form}");
-    Ok(())
-}
-
-async fn transcript_needs_language(rig: FakeRig) -> WeftResult<()> {
-    let given = inputs(&rig, json!({ "transcript": { "segments": [] } }));
-    let err = rig.run(&ElevenLabsDubNode, given).await.failure()?;
-    assert!(err.starts_with("input error") && err.contains("`sourceLang`"), "{err}");
-    assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");
+    assert_eq!(language_posts(&rig), 0, "the translations seed the language the create starts");
     Ok(())
 }
 
@@ -492,19 +474,11 @@ async fn translations_with_cloning(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-fn link_names() -> WeftResult<()> {
-    assert_eq!(link_filename("https://example.com/a/b/talk.mp4", "source"), "talk.mp4");
-    assert_eq!(link_filename("https://example.com/talk.mp4?sig=x#t=3", "source"), "talk.mp4");
-    assert_eq!(link_filename("https://example.com/", "source"), "source");
-    assert_eq!(link_filename("https://example.com", "source"), "source");
-    Ok(())
-}
-
 /// The cheapest real dub: a couple of seconds of English speech into
 /// Spanish on Dubbing v1 (expect a few minutes of processing). Nothing
-/// reads `projectId`, so the node deletes its project itself; the test
-/// checks it is gone, and deletes it if it is not, so repeated runs
-/// never pile projects up.
+/// reads `projectId`, so weft owes its delete when the node ends; the
+/// rig records that call rather than sending it, so the test deletes the
+/// project itself, and repeated runs never pile projects up.
 async fn live_dub(rig: LiveRig) -> WeftResult<()> {
     let conn = rig.connect().await?;
     let voice = crate::testing::first_voice_id(&conn).await?;
@@ -525,18 +499,7 @@ async fn live_dub(rig: LiveRig) -> WeftResult<()> {
         .ok()?;
     let project = outcome.output("projectId")?.as_str().expect("project id").to_string();
     let url = format!("{}/dubbing/project/{project}", crate::elevenlabs::API);
-    let still_there = conn
-        .client()
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| weft::node_error(format!("read the test dub project: {e}")))?
-        .status()
-        .is_success();
-    if still_there {
-        crate::testing::delete(&conn, &url, "delete the dub project the node left behind").await?;
-    }
-    assert!(!still_there, "nothing read `projectId`, so the node deletes its project");
+    crate::testing::delete(&conn, &url, "delete the test dub project").await?;
     assert_eq!(outcome.output("mimeType")?, &json!("audio/flac"));
     let filename = outcome.output("filename")?.as_str().unwrap_or_default().to_string();
     assert_eq!(filename, "dubbed_es_english.flac");

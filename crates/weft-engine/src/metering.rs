@@ -646,7 +646,7 @@ impl CostSink {
     }
 
     /// Write the figure down: a `CostReported` on the run's record, one per
-    /// physical call (a replayed body that calls again spends again), and
+    /// physical call (a body run again that calls again spends again), and
     /// on record at once whatever the run is kept as, since it is money:
     /// an unrecorded run leaves a note of itself for it
     /// (`weft_journal::unrecorded`). A figure that cannot be written is
@@ -1028,41 +1028,27 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
         // cost and records it, detached from the caller's future.
         let mut observer = meter.observe(route, &request_query, &request_bytes);
         observer.on_status(response.status().as_u16());
-        let status = response.status();
-        let version = response.version();
-        let headers = response.headers().clone();
         // The headers reach the observer BEFORE any chunk, because a
         // provider that states the charge out of band states it here
         // (fal's `X-Fal-Billable-Units`), and a meter that has the
         // provider's own figure never has to re-derive one.
-        observer.on_headers(&headers);
-        let tapped = TapStream {
-            inner: Some(response.bytes_stream().boxed()),
+        observer.on_headers(response.headers());
+        let finalizer = Finalizer {
+            observer,
+            meter,
+            route: route.to_string(),
+            class,
+            open_charges: self.sink.open_charges.clone(),
+            follow_up: self.follow_up.clone(),
+            sink: self.sink.clone(),
+            held,
+        };
+        Ok(weft_core::net::with_body_stream(response, |chunks| TapStream {
+            inner: Some(chunks),
             host,
             watch: None,
-            finalizer: Some(Finalizer {
-                observer,
-                meter,
-                route: route.to_string(),
-                class,
-                open_charges: self.sink.open_charges.clone(),
-                follow_up: self.follow_up.clone(),
-                sink: self.sink.clone(),
-                held,
-            }),
-        };
-        // The rebuild carries the wire-visible surface only (status,
-        // version, headers); response extensions are process-local
-        // bookkeeping and nothing downstream of a metered call reads them.
-        let mut rebuilt = http::Response::builder().status(status).version(version);
-        match rebuilt.headers_mut() {
-            Some(h) => *h = headers,
-            None => return Err(middleware_err("rebuild tapped response".into())),
-        }
-        let rebuilt = rebuilt
-            .body(reqwest::Body::wrap_stream(tapped))
-            .map_err(|e| middleware_err(format!("rebuild tapped response: {e}")))?;
-        Ok(reqwest::Response::from(rebuilt))
+            finalizer: Some(finalizer),
+        }))
     }
 }
 
@@ -1927,6 +1913,30 @@ pub(crate) mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("no meter is registered"), "{err}");
+    }
+
+    /// L3: a metered answer still states its size to the caller, and an
+    /// answer that named none still states none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_metered_answer_keeps_its_size() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base: &'static str = Box::leak(format!("http://{}/api/v1", listener.local_addr().unwrap()).into_boxed_str());
+        let app = axum::Router::new().route("/api/v1/chat/completions", axum::routing::post(|| async { "data: [DONE]\n\n" }));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (client, _tasks, pending) = rig_owned(base, None, weft_core::CredentialOwner::Author, Some(0.001), weft_core::cancellation::CancellationFlag::new_arc());
+        let response = client.post(format!("{base}/chat/completions")).json(&serde_json::json!({})).send().await.expect("send");
+        assert_eq!(response.content_length(), Some(14));
+        assert_eq!(response.bytes().await.expect("body").len(), 14);
+        pending.wait_zero().await;
+
+        let (base, chunk_tx, _received) = spawn_sse_server().await;
+        let base: &'static str = Box::leak(base.into_boxed_str());
+        let (client, _tasks, pending) = rig_owned(base, None, weft_core::CredentialOwner::Author, Some(0.001), weft_core::cancellation::CancellationFlag::new_arc());
+        drop(chunk_tx);
+        let response = client.post(format!("{base}/chat/completions")).json(&serde_json::json!({})).send().await.expect("send");
+        assert_eq!(response.content_length(), None);
+        response.bytes().await.expect("body");
+        pending.wait_zero().await;
     }
 
     /// L3, the streaming tap: the caller receives chunk N in REAL TIME

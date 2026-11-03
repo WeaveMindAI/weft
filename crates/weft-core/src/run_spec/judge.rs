@@ -1,7 +1,8 @@
 //! Whether a run could start: everything the dispatcher refuses a run for
 //! before it starts, judged from the program and the spec alone, so
 //! whoever builds a run (`weft run`, `weft run --check`, a program's
-//! `ctx.run()`, a run from a saved example) refuses it the same way.
+//! run call, `ctx.project(..).code().run()`, a run from a saved example)
+//! refuses it the same way.
 
 use crate::project::cut::{self, SelectionBounds};
 use crate::project::graph::ProjectGraph;

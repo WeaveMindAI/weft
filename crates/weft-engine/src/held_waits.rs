@@ -1,24 +1,34 @@
-//! The waits a run keeps in its worker because it cannot pause.
+//! The waits a run keeps in its worker: every `state.wait`
+//! (`weft_core::context::Kept`) of a run being driven.
 //!
-//! A run pauses on a wait (`ctx.await_signal`) by letting go of its
-//! worker: its record holds the wait, and the answer has a worker pick it
-//! up again. A run that cannot pause right now ([`Unsuspendable`]) keeps
-//! the wait inside the node's own call instead. The call registers the
-//! wait as any wait does, then waits here for one of three endings, which
-//! the drive hands it:
+//! A wait never pauses its run on its own. Its call registers the wait as
+//! any wait does, then waits here for one of four endings, which the
+//! drive hands it:
 //! - the answer, which the drive takes from the broker (the call records
 //!   it, as it recorded the wait and records a wait given up: a wait's
-//!   whole story is written by the call that waits);
-//! - giving up, once nothing moved in the run for its `holdSecs`
+//!   whole story is written by the call that waits), and the body goes on
+//!   where it is;
+//! - pausing: the run pauses once every node it runs waits and it stayed
+//!   that quiet for its `pauseAfterSecs`
+//!   (`weft_core::run_settings::RunSettings::pause_after_secs`), or at
+//!   once for a hand-back, and every waiting call saves its state and
+//!   suspends together; the firing goes on record as suspended on its
+//!   wait, so a later answer resumes it;
+//! - giving up, in a run that cannot pause ([`Unsuspendable`]), once
+//!   nothing moved in the run for its `holdSecs`
 //!   (`weft_core::run_settings::RunSettings::hold_secs`): the call fails,
-//!   and the node may handle that like any outcome of its firing;
-//! - pausing after all, once the run can (the last bus between its nodes
-//!   closed): the call suspends the way it would have from the start.
+//!   and the node may handle that like any outcome of its firing. Such a
+//!   run pauses its held waits once it can (its caller left, on a route
+//!   that outlives its caller), by the same rule;
+//! - its firing failing: the engine failed it while its body still ran
+//!   (an emission it refused, a stream into it gone corrupt,
+//!   [`HeldWaits::fail_firing`]), so the call ends with that failure, and
+//!   a wait the firing reaches after ends the same way at once.
 //!
 //! A held wait is one more in-process wait of the run, so it reports to
 //! the run's [`crate::wait_tracker::WaitTracker`] like a bus read does:
-//! the drive sees when every running node waits, which is when the hold
-//! clock runs.
+//! the drive sees when every running node waits, which is when the run is
+//! quiet.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,23 +37,26 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use weft_core::primitive::WaitAnswer;
 use tokio::sync::Notify;
 
-use weft_core::liveness::{wait_on, FiringLocation, WaitLiveness, WaitSource};
+use weft_core::liveness::{wait_or_pause, FiringLocation, WaitLiveness, WaitSource};
 
-/// Why a run cannot be suspended right now: what makes a wait hold in its
-/// worker, and what keeps a run that was asked to leave its worker on it
-/// until the process goes.
+/// Why a run cannot be suspended right now: what makes a held wait give
+/// up after its `holdSecs` rather than pause, and what keeps a run that was
+/// asked to leave its worker on it until the process goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unsuspendable {
     /// It keeps no record to be picked back up from.
     Unrecorded,
     /// Its caller (or the stand-in a fired run serves) is still on the
-    /// line, and its route does not outlive its caller.
+    /// line: a run never pauses under a connected caller, whatever its
+    /// route's `outlivesCaller` says (that only decides what the caller
+    /// leaving does).
     TiedCaller,
-    /// A bus is open, and a bus lives in this worker's memory alone.
-    LiveBus,
     /// It runs no program a worker could pick it back up with: a node
     /// test's run, whose handles say so (`RunnerHandle::without_program`).
     NoProgram,
+    /// The firing waiting holds its run (a `ctx.hold()` value of it
+    /// exists): its waits do not pause until it lets go.
+    Holding,
 }
 
 impl Unsuspendable {
@@ -51,27 +64,26 @@ impl Unsuspendable {
         match self {
             Self::NoProgram => "it is a node test, which has no program to be picked back up with",
             Self::Unrecorded => "it keeps no record to be picked back up from (its trigger has `recorded: false`)",
-            Self::TiedCaller => "it is tied to its caller, which cannot follow it (its route does not have `outlivesCaller`)",
-            Self::LiveBus => "a bus between its nodes is open, and a bus lives in its worker's memory alone",
+            Self::TiedCaller => "its caller is still on the line, and a caller cannot follow a run to another worker",
+            Self::Holding => "the node holds its run (`ctx.hold()`)",
         }
     }
 }
 
 /// Whether a run driven over its program can be suspended right now: the
-/// one check behind a wait that holds, a held wait that pauses after all,
-/// and a run asked to leave its worker that drains or stays. A run with no
-/// program never can ([`Unsuspendable::NoProgram`]).
+/// one check behind a held wait that gives up, a run whose every node
+/// waits that pauses, and a run asked to leave its
+/// worker that drains or stays. A run with no program never can either,
+/// which the handles of a node test's run say themselves
+/// ([`Unsuspendable::NoProgram`]); a drive always has one.
 pub(crate) fn unsuspendable(
     caller: Option<&Arc<dyn weft_core::caller::CallerConnection>>,
-    bus_coordinator: &crate::context::BusCoordinator,
     settings: weft_core::run_settings::RunSettings,
 ) -> Option<Unsuspendable> {
-    if caller.is_some_and(|conn| !conn.config().outlives_caller && conn.is_connected()) {
+    if caller.is_some_and(|conn| conn.holds_the_run()) {
         Some(Unsuspendable::TiedCaller)
     } else if !settings.recorded() {
         Some(Unsuspendable::Unrecorded)
-    } else if bus_coordinator.has_live_buses() {
-        Some(Unsuspendable::LiveBus)
     } else {
         None
     }
@@ -96,8 +108,12 @@ pub(crate) enum HeldEnd {
     Answered(WaitAnswer),
     /// Given up, and why.
     GaveUp(String),
-    /// The run can pause now: the wait suspends.
+    /// The run pauses: the wait suspends.
     Pause,
+    /// The engine failed the firing holding it while its body still ran
+    /// (an emission it refused, a stream into it gone corrupt), with this
+    /// failure: the wait ends with it.
+    FiringFailed(String),
 }
 
 /// The waits a run holds in its worker, by token. One per run, owned by
@@ -114,13 +130,21 @@ struct HeldState {
     /// Every wait held, `None` until it ends.
     waits: HashMap<String, Option<HeldEnd>>,
     /// Answers the drive took for waits nobody holds right now: one whose
-    /// node registered it and holds it next, or one whose node suspended
-    /// on it and is about to read as suspended (`Self::early_for` hands
-    /// those to the drive's resume). Kept by token until one of those
-    /// takes it.
+    /// node registered it and holds it next, or one whose call is pausing
+    /// (that one stays unrecorded, so the broker hands it to the run's
+    /// next worker). Kept by token until a hold takes it.
     early: HashMap<String, WaitAnswer>,
     /// Waits given up: an answer that comes for one after is dropped.
     given_up: HashSet<String>,
+    /// The firing holding each wait.
+    holders: HashMap<String, FiringLocation>,
+    /// The waits held that must not pause: their firing holds its run
+    /// ([`Unsuspendable::Holding`]). The run pausing leaves them open.
+    unpausable: HashSet<String>,
+    /// The firings the engine failed while their bodies still ran, with
+    /// their failure ([`HeldWaits::fail_firing`]): a wait one of them
+    /// holds or reaches after ends at once with it.
+    failed: HashMap<FiringLocation, String>,
     /// Monotone generation of endings, for [`WaitSource`].
     gen: u64,
 }
@@ -140,25 +164,44 @@ impl HeldWaits {
     }
 
     /// Hold the wait `token` for the node at `node` until it ends. A wait
-    /// dropped mid-hold (its run cancelled) leaves nothing behind.
-    pub(crate) async fn hold(self: &Arc<Self>, liveness: &Weak<dyn WaitLiveness>, node: FiringLocation, token: &str) -> HeldEnd {
+    /// dropped mid-hold (its run cancelled) leaves nothing behind. The
+    /// hold is inside the node's `state.wait`, so the run pausing ends it
+    /// like any pausable wait: it pauses.
+    /// `pausable`: whether the run pausing may end it (`false` while its
+    /// firing holds its run: it waits until answered or given up).
+    pub(crate) async fn hold(self: &Arc<Self>, liveness: &Weak<dyn WaitLiveness>, node: FiringLocation, token: &str, pausable: bool) -> HeldEnd {
         {
             let mut state = self.lock();
+            if let Some(failure) = state.failed.get(&node) {
+                let failure = failure.clone();
+                state.early.remove(token);
+                state.given_up.insert(token.to_string());
+                return HeldEnd::FiringFailed(failure);
+            }
             if let Some(value) = state.early.remove(token) {
                 return HeldEnd::Answered(value);
             }
             state.waits.entry(token.to_string()).or_insert(None);
+            state.holders.insert(token.to_string(), node.clone());
+            if !pausable {
+                state.unpausable.insert(token.to_string());
+            }
         }
         let forget = Forget { held: self, token };
         let source = self.clone() as Arc<dyn WaitSource>;
-        let end = wait_on(liveness, &Some(node), &source, || {
+        let end = wait_or_pause(liveness, &Some(node), &source, pausable, || {
             let mut state = self.lock();
             match state.waits.get(token) {
-                Some(Some(_)) => state.waits.remove(token).flatten(),
+                Some(Some(_)) => {
+                    state.holders.remove(token);
+                    state.unpausable.remove(token);
+                    state.waits.remove(token).flatten()
+                }
                 _ => None,
             }
         })
-        .await;
+        .await
+        .unwrap_or(HeldEnd::Pause);
         drop(forget);
         end
     }
@@ -186,14 +229,6 @@ impl HeldWaits {
         }
     }
 
-    /// The answers kept for waits that turned out to be suspended nodes
-    /// (their tokens in `suspended`), for the drive to resume them with.
-    pub(crate) fn early_for(&self, suspended: &HashSet<&str>) -> Vec<(String, WaitAnswer)> {
-        let mut state = self.lock();
-        let tokens: Vec<String> = state.early.keys().filter(|token| suspended.contains(token.as_str())).cloned().collect();
-        tokens.into_iter().filter_map(|token| state.early.remove(&token).map(|value| (token, value))).collect()
-    }
-
     /// The wait `token` was given up without being held (a hold of no
     /// time): an answer that comes for it after is dropped.
     pub(crate) fn gave_up(&self, token: &str) {
@@ -202,10 +237,16 @@ impl HeldWaits {
         state.given_up.insert(token.to_string());
     }
 
-    /// Give up every wait still held, for `why`. Answers how many.
-    pub(crate) fn give_up(&self, why: &str) -> usize {
+    /// Give up every wait still held, for `why`; `only_unpausable`: only
+    /// those whose firing holds its run. Answers how many.
+    pub(crate) fn give_up(&self, why: &str, only_unpausable: bool) -> usize {
         let mut state = self.lock();
-        let tokens: Vec<String> = state.waits.iter().filter(|(_, end)| end.is_none()).map(|(token, _)| token.clone()).collect();
+        let tokens: Vec<String> = state
+            .waits
+            .iter()
+            .filter(|(token, end)| end.is_none() && (!only_unpausable || state.unpausable.contains(*token)))
+            .map(|(token, _)| token.clone())
+            .collect();
         for token in &tokens {
             state.waits.insert(token.clone(), Some(HeldEnd::GaveUp(why.to_string())));
             state.given_up.insert(token.clone());
@@ -216,11 +257,41 @@ impl HeldWaits {
         tokens.len()
     }
 
-    /// The run can pause now: every wait still held suspends.
+    /// The engine failed the firing at `at` while its body still runs,
+    /// with `failure`: every wait it holds ends with it now, an answer
+    /// that comes for one after is dropped, and a wait it reaches later
+    /// ends at once the same way ([`Self::failure_of`]).
+    pub(crate) fn fail_firing(&self, at: &FiringLocation, failure: &str) {
+        let mut state = self.lock();
+        state.failed.insert(at.clone(), failure.to_string());
+        let tokens: Vec<String> = state
+            .holders
+            .iter()
+            .filter(|(token, holder)| *holder == at && state.waits.get(*token).is_some_and(Option::is_none))
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in &tokens {
+            state.waits.insert(token.clone(), Some(HeldEnd::FiringFailed(failure.to_string())));
+            state.given_up.insert(token.clone());
+        }
+        if !tokens.is_empty() {
+            self.ended(&mut state);
+        }
+    }
+
+    /// The failure the engine failed the firing at `at` with while its
+    /// body ran, if it did ([`Self::fail_firing`]).
+    pub(crate) fn failure_of(&self, at: &FiringLocation) -> Option<String> {
+        self.lock().failed.get(at).cloned()
+    }
+
+    /// The run pauses: every wait still held suspends, but one whose
+    /// firing holds its run.
     pub(crate) fn pause(&self) {
         let mut state = self.lock();
         let mut paused = false;
-        for end in state.waits.values_mut().filter(|end| end.is_none()) {
+        let HeldState { waits, unpausable, .. } = &mut *state;
+        for (_, end) in waits.iter_mut().filter(|(token, end)| end.is_none() && !unpausable.contains(*token)) {
             *end = Some(HeldEnd::Pause);
             paused = true;
         }
@@ -250,6 +321,8 @@ impl Drop for Forget<'_> {
         let mut state = self.held.lock();
         if state.waits.get(self.token).is_some_and(Option::is_none) {
             state.waits.remove(self.token);
+            state.holders.remove(self.token);
+            state.unpausable.remove(self.token);
         }
     }
 }
@@ -293,10 +366,10 @@ mod tests {
         let (_tracker, weak) = liveness();
         let held = HeldWaits::new();
         held.answer("early", given(serde_json::json!(1)));
-        assert_eq!(held.hold(&weak, here(), "early").await, HeldEnd::Answered(given(serde_json::json!(1))));
+        assert_eq!(held.hold(&weak, here(), "early", true).await, HeldEnd::Answered(given(serde_json::json!(1))));
         let waiting = tokio::spawn({
             let held = held.clone();
-            async move { held.hold(&weak, here(), "late").await }
+            async move { held.hold(&weak, here(), "late", true).await }
         });
         while !held.pending() {
             tokio::task::yield_now().await;
@@ -314,45 +387,40 @@ mod tests {
         let held = HeldWaits::new();
         let waiting = tokio::spawn({
             let held = held.clone();
-            async move { held.hold(&weak, here(), "t").await }
+            async move { held.hold(&weak, here(), "t", true).await }
         });
         while !held.pending() {
             tokio::task::yield_now().await;
         }
-        assert_eq!(held.give_up("nothing moved"), 1);
+        assert_eq!(held.give_up("nothing moved", false), 1);
         held.answer("t", given(serde_json::json!("late")));
         assert_eq!(waiting.await.unwrap(), HeldEnd::GaveUp("nothing moved".into()));
         {
             let state = held.lock();
             assert!(state.waits.is_empty() && state.early.is_empty(), "the late answer is not kept");
         }
-        assert_eq!(held.give_up("again"), 0);
+        assert_eq!(held.give_up("again", false), 0);
     }
 
-    /// An answer kept for a wait nobody held goes to the node that
-    /// suspended on it, and one for a wait given up without a hold is
-    /// dropped.
+    /// An answer for a wait given up without a hold is dropped.
     #[test]
-    fn an_early_answer_waits_for_its_node() {
+    fn a_wait_given_up_takes_no_answer() {
         let held = HeldWaits::new();
-        held.answer("suspends", given(serde_json::json!(1)));
         held.answer("zero", given(serde_json::json!(2)));
         held.gave_up("zero");
-        assert!(held.early_for(&HashSet::from(["other"])).is_empty());
-        assert_eq!(held.early_for(&HashSet::from(["suspends", "zero"])), vec![("suspends".to_string(), given(serde_json::json!(1)))]);
         held.answer("zero", given(serde_json::json!(3)));
         assert!(held.lock().early.is_empty(), "a wait given up takes no answer");
     }
 
-    /// Once the run can pause, every held wait suspends, and an answer
-    /// that comes before its call saw the pause is kept for the node.
+    /// The run pausing suspends every held wait, and an answer that comes
+    /// before its call saw the pause is kept, never handed to it.
     #[tokio::test]
-    async fn a_run_that_can_pause_again_pauses_its_held_waits() {
+    async fn a_run_pausing_pauses_its_held_waits() {
         let (_tracker, weak) = liveness();
         let held = HeldWaits::new();
         let waiting = tokio::spawn({
             let held = held.clone();
-            async move { held.hold(&weak, here(), "t").await }
+            async move { held.hold(&weak, here(), "t", true).await }
         });
         while !held.pending() {
             tokio::task::yield_now().await;
@@ -360,7 +428,36 @@ mod tests {
         held.pause();
         held.answer("t", given(serde_json::json!("yes")));
         assert_eq!(waiting.await.unwrap(), HeldEnd::Pause);
-        assert_eq!(held.early_for(&HashSet::from(["t"])), vec![("t".to_string(), given(serde_json::json!("yes")))]);
+        assert_eq!(held.lock().early.get("t"), Some(&given(serde_json::json!("yes"))));
+    }
+
+    /// A firing the engine fails ends the waits it holds with its failure,
+    /// drops an answer that comes for one after, and ends a wait it holds
+    /// later at once; another firing's wait is left alone.
+    #[tokio::test]
+    async fn a_failed_firing_ends_its_held_waits_now_and_later() {
+        let (_tracker, weak) = liveness();
+        let held = HeldWaits::new();
+        let other = FiringLocation::new("other", Vec::new());
+        let waiting = tokio::spawn({
+            let (held, weak) = (held.clone(), weak.clone());
+            async move { held.hold(&weak, here(), "t", true).await }
+        });
+        let beside = tokio::spawn({
+            let (held, weak, other) = (held.clone(), weak.clone(), other.clone());
+            async move { held.hold(&weak, other, "u", true).await }
+        });
+        while held.lock().holders.len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        held.fail_firing(&here(), "boom");
+        assert_eq!(waiting.await.unwrap(), HeldEnd::FiringFailed("boom".into()));
+        held.answer("t", given(serde_json::json!("late")));
+        assert!(held.lock().early.is_empty(), "an answer for a failed firing's wait is dropped");
+        assert_eq!(held.hold(&weak, here(), "v", true).await, HeldEnd::FiringFailed("boom".into()), "a later wait ends at once");
+        assert_eq!(held.failure_of(&here()).as_deref(), Some("boom"));
+        held.answer("u", given(serde_json::json!("yes")));
+        assert_eq!(beside.await.unwrap(), HeldEnd::Answered(given(serde_json::json!("yes"))), "another firing's wait is left alone");
     }
 
     /// A held wait is parked to the run's tracker: a run whose only running node
@@ -371,7 +468,7 @@ mod tests {
         let held = HeldWaits::new();
         let waiting = tokio::spawn({
             let held = held.clone();
-            async move { held.hold(&weak, here(), "t").await }
+            async move { held.hold(&weak, here(), "t", true).await }
         });
         let in_flight: HashSet<FiringLocation> = [here()].into_iter().collect();
         while !tracker.deadlock_provable(&in_flight) {

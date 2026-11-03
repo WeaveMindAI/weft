@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{RunContext, RunId, Node, NodeManifest, WeftError, WeftResult};
+use weft::{RunContext, RunId, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct GetNodeStateNode;
@@ -25,10 +25,7 @@ impl Node for GetNodeStateNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let given: String = ctx.inputs.get("runId")?;
-        let run: RunId = given.trim().parse().map_err(|_| {
-            WeftError::Input(format!("runId takes a run id (the one GetRunId gives), so it cannot be '{given}'"))
-        })?;
+        let run: RunId = ctx.inputs.get("runId")?;
         let node: String = ctx.inputs.get("node")?;
         let state = ctx.run_by_id(run).node_state(node).await?;
         ctx.pulse_downstream(NodeOutput::new().set_serialized("state", &state)?).await

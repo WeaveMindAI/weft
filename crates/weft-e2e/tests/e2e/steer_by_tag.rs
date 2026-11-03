@@ -92,6 +92,7 @@ async fn later_run_stops_earlier_runs_for_the_same_sender() -> anyhow::Result<()
     let first = rig.fire("go", "user_7").await?;
     let first_form = human::wait_for_form_by_node(&rig.disp, &rig.pid, "review").await?;
     let first_token = first_form.token().expect("the parked run's form has a token").to_string();
+    rig.parked(first).await?;
 
     // Both tags are on the run while it is alive, in the order they were
     // written (the created port first, then the `tags` list), and the

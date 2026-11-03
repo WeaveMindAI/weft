@@ -2,18 +2,18 @@
 //! and emit the inserted row (RETURNING *).
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use weft::node::NodeOutput;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::postgres::{connect, mistake, quote_ident, WrittenBy};
+use super::postgres::{connect, quote_ident, WrittenBy};
 
 /// The INSERT for a table and its column names: quoted identifiers,
 /// one placeholder per column, RETURNING *.
 pub fn insert_sql(table: &str, columns: &[String]) -> WeftResult<String> {
     if columns.is_empty() {
-        mistake!("values holds no columns; nothing to insert");
+        weft::input_bail!("values holds no columns; nothing to insert");
     }
     let cols: Vec<String> =
         columns.iter().map(|c| quote_ident(c)).collect::<WeftResult<_>>()?;
@@ -42,11 +42,7 @@ impl Node for PostgresInsertRowNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let table: String = ctx.inputs.get("table")?;
-        let values: Value = ctx.inputs.get("values")?;
-
-        let Some(obj) = values.as_object() else {
-            mistake!("values must be an object of column: value pairs");
-        };
+        let obj: Map<String, Value> = ctx.inputs.get("values")?;
         let columns: Vec<String> = obj.keys().cloned().collect();
         let params: Vec<Value> = obj.values().cloned().collect();
         let sql = insert_sql(&table, &columns)?;

@@ -30,6 +30,8 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod pool;
+
 use crate::access::{Access, OpenedConnection};
 use crate::context::RunContext;
 use crate::error::WeftResult;
@@ -59,7 +61,10 @@ impl SharedKey for &Access {
     type From = OpenedConnection;
 
     async fn resolve(self, ctx: &RunContext) -> WeftResult<Resolved<OpenedConnection>> {
-        let opened = ctx.open(self).await?;
+        // Opened apart from the run's cancellation: what it builds is
+        // shared with every run of the worker, and must not end with the
+        // run that happened to build it.
+        let opened = ctx.handle.open_connection(self, crate::context::DEFAULT_PROVIDER_WINDOW).await?;
         Ok(Resolved {
             slot: format!("connection:{}", self.access_id()),
             fingerprint: fingerprint_of(opened.values()),

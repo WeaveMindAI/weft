@@ -15,6 +15,7 @@
 //! (`weft-providers`), run by the runtime around the call; a node never
 //! states a cost and has no way to.
 
+pub mod callers;
 #[cfg(feature = "runtime")]
 pub mod client;
 pub mod events;
@@ -140,6 +141,17 @@ impl OpenedConnection {
 
     pub fn service(&self) -> &str {
         &self.service
+    }
+
+    /// This connection as a run is handed it (`RunContext::open`): its
+    /// client's requests and answers, its sockets, and its dial all end
+    /// with the cancelled error the moment `flag`, the run's, is set.
+    pub(crate) fn ends_with_run(self, flag: std::sync::Arc<crate::cancellation::CancellationFlag>) -> Self {
+        Self {
+            client: crate::cancellation::ends_with_run(self.client, flag.clone()),
+            socket: std::sync::Arc::new(socket::EndsWithRunDial { inner: self.socket, flag }),
+            ..self
+        }
     }
 
     /// Display identity of the connected account, if recorded.

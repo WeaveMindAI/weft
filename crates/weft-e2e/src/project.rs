@@ -128,6 +128,11 @@ impl Project {
         cli_ok(&self.disp, &self.dir, args).await
     }
 
+    /// [`Project::weft`] with `env` set on the `weft` process alone.
+    pub async fn weft_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
+        crate::client::cli_ok_with_env(&self.disp, &self.dir, args, env).await
+    }
+
     /// Run `weft <args>` EXPECTING a refusal: errors if it succeeds,
     /// otherwise returns stdout and stderr together so the test asserts
     /// on the refusal's message.

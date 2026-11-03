@@ -200,7 +200,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[google]",
       "widget": {
         "kind": "access"
       },
@@ -210,7 +210,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[google]",
       "description": "Wire into Google nodes."
     }
   ]

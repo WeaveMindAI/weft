@@ -1,5 +1,6 @@
 //! What a run's tables forget once nothing can need it any more: a firing
-//! once it ended (with the pulses it took and the answers it got), and a
+//! once it ended (with the pulses it took, its waits and the state it
+//! saved), and a
 //! loop's iteration once nothing inside it is alive (what it decided,
 //! kicked, sent and ran inside). The same forgetting runs wherever a run's
 //! tables are held for long: the worker driving the run, its fold, and a
@@ -13,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::frames::{Frame, FiringLocation, LoopFrames};
-use crate::primitive::{AwaitedEntry, KickTable, LoopInstanceKey};
+use crate::primitive::{KickTable, LoopInstanceKey, RecordedWait};
 use crate::project::scopes::{ScopeCopy, ScopeKind};
 use crate::project::{loop_in_id, ProgramIndex, ProjectDefinition};
 use crate::pulse::PulseTable;
@@ -27,15 +28,16 @@ pub struct Tables<'a> {
     pub firings: &'a mut NodeFiringTable,
     pub kicked: &'a mut KickTable,
     pub scopes: &'a mut ScopeTable,
-    pub awaited_sequences: &'a mut HashMap<FiringLocation, Vec<AwaitedEntry>>,
+    pub recorded_waits: &'a mut HashMap<FiringLocation, Vec<RecordedWait>>,
+    pub saved_states: &'a mut HashMap<FiringLocation, crate::run::saved::SavedState>,
     pub loop_runtime: &'a mut LoopRuntime,
 }
 
 /// A firing forgotten ([`Forgetting::forget_firing`]): its record and the
-/// answers it was given.
+/// waits it registered.
 pub struct Forgotten {
     pub record: NodeFiring,
-    pub answers: Vec<AwaitedEntry>,
+    pub waits: Vec<RecordedWait>,
 }
 
 /// What a run forgot, and what it still has to look at to forget more.
@@ -153,7 +155,7 @@ impl Forgetting {
     }
 
     /// Take the ended record at `at` out of `tables`, with the pulses it
-    /// took, the answers it was given and its kick, and mark where it
+    /// took, the waits it registered, the state it saved and its kick, and mark where it
     /// ended. Answers what was forgotten, to let go of what else belongs to
     /// it: nothing when there is no record, it is not to be forgotten on
     /// its own ([`forgettable`]) or it is the run's first failure, kept;
@@ -193,10 +195,11 @@ impl Forgetting {
     fn take_out(&mut self, tables: &mut Tables, at: &FiringLocation) -> Option<Forgotten> {
         let record = tables.firings.remove(&at.node_id, &at.frames)?;
         tables.pulses.forget_absorbed(&record.pulses_absorbed);
-        let answers = tables.awaited_sequences.remove(at).unwrap_or_default();
+        let waits = tables.recorded_waits.remove(at).unwrap_or_default();
+        tables.saved_states.remove(at);
         tables.kicked.forget(|kicked| kicked == at);
         self.ended.insert(at.clone());
-        Some(Forgotten { record, answers })
+        Some(Forgotten { record, waits })
     }
 
     /// Forget every ended firing `busy` does not hold (a body still
@@ -257,7 +260,8 @@ impl Forgetting {
             });
             let loop_inside = |key: &LoopInstanceKey| places.location_in(&loop_in_id(&key.group_id), &key.parent_frames, iteration);
             tables.loop_runtime.forget(loop_inside);
-            tables.awaited_sequences.retain(|at, _| !inside(at));
+            tables.recorded_waits.retain(|at, _| !inside(at));
+            tables.saved_states.retain(|at, _| !inside(at));
             // What ended inside is covered by the iteration's index now,
             // and so is any loop that ran inside it.
             self.ended.retain(|at| !inside(at));

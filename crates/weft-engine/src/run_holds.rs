@@ -107,6 +107,13 @@ impl RunHold {
         self.quiet(until.map(|until| Quiet { until, can_pause }));
     }
 
+    /// What is left of the run's own cap on this worker at `now_unix`,
+    /// never without one: a run still on its worker then is ended, so one
+    /// that could pause has paused by then.
+    pub(crate) fn cap_left(&self, now_unix: u64) -> Option<std::time::Duration> {
+        self.cap_ends.map(|ends| std::time::Duration::from_secs(u64::try_from(ends).unwrap_or(0).saturating_sub(now_unix)))
+    }
+
     /// The run only waits outside, as `how` says, or it moves again
     /// (`None`). Saying the same again changes nothing.
     pub(crate) fn quiet(&self, how: Option<Quiet>) {

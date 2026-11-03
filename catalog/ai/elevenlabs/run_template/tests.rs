@@ -13,7 +13,7 @@ use weft::{fixture_spec, FakeRig, LiveRig, NodeTest, WeftResult, WeftType};
 use crate::testing::{emitted_file, inline};
 
 use super::{
-    input_mismatches, input_value, output_mismatches, output_type, pick_version, template_id, weft_type,
+    input_mismatches, input_value, output_mismatches, output_type, pick_version, weft_type,
     ElevenLabsRunTemplateNode,
 };
 
@@ -28,14 +28,13 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::basic("each_template_kind_maps_to_the_weft_type_that_carries_it", kinds),
         NodeTest::basic("each_value_goes_the_way_its_template_kind_takes_it", values),
-        NodeTest::basic("a_value_its_template_kind_cannot_take_is_refused", bad_values),
         NodeTest::basic("every_mismatch_is_named_in_one_list", every_mismatch),
         NodeTest::basic("the_version_flagged_latest_runs_when_none_is_pinned", latest),
-        NodeTest::basic("only_a_clean_template_id_reaches_the_route", template_ids),
         NodeTest::fake(
             "every_input_goes_as_its_template_type_and_every_output_lands_on_its_port",
             every_kind,
         ),
+        NodeTest::fake("a_fraction_on_a_whole_number_input_is_refused_before_anything_runs", fraction_refused),
         NodeTest::fake("an_array_of_images_sends_each_as_a_reference", array_of_images),
         NodeTest::fake("a_pinned_version_is_checked_against_its_own_ports_and_sent", pinned),
         NodeTest::fake("a_template_input_with_no_port_is_refused_before_anything_runs", missing_port),
@@ -104,7 +103,7 @@ fn values() -> WeftResult<()> {
             other => panic!("a key-backed file: {other:?}"),
         }
     };
-    let mut sent = |schema: Value, value: Value| input_value("port", &schema, &value, &mut reference);
+    let mut sent = |schema: Value, value: Value| input_value(&schema, &value, &mut reference);
 
     assert_eq!(sent(json!({ "type": "string" }), json!("a corgi"))?, json!("a corgi"));
     assert_eq!(
@@ -112,11 +111,7 @@ fn values() -> WeftResult<()> {
         json!({ "type": "voice", "voice_id": "v1" })
     );
     assert_eq!(sent(json!({ "type": "number" }), json!(0.5))?, json!(0.5));
-    assert_eq!(
-        sent(json!({ "type": "integer" }), json!(3.0))?,
-        json!(3),
-        "a whole number a wire carried as 3.0 goes as 3"
-    );
+    assert_eq!(sent(json!({ "type": "integer" }), json!(3))?, json!(3));
     assert_eq!(sent(json!({ "type": "boolean" }), json!(true))?, json!(true));
     assert_eq!(sent(json!({ "type": "image" }), photo.clone())?, json!({ "type": "asset", "asset_id": "k1" }));
     assert_eq!(
@@ -127,24 +122,11 @@ fn values() -> WeftResult<()> {
         sent(json!({ "type": "array", "items": { "type": "string" } }), json!(["a", "b"]))?,
         json!(["a", "b"])
     );
-    Ok(())
-}
-
-fn bad_values() -> WeftResult<()> {
-    let mut no_file = |_: FileHandle| -> WeftResult<Value> { panic!("no file goes out") };
-    let half = input_value("count", &json!({ "type": "integer" }), &json!(2.5), &mut no_file)
-        .unwrap_err()
-        .to_string();
-    assert!(half.contains("`count` takes a whole number, and got 2.5"), "{half}");
-    let item = input_value(
-        "tags",
-        &json!({ "type": "array", "items": { "type": "string" } }),
-        &json!(["a", 1]),
-        &mut no_file,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(item.contains("`tags[1]` takes text"), "the item is named by its place: {item}");
+    assert_eq!(
+        sent(json!({ "type": "array", "items": { "type": "string" } }), json!("a"))?,
+        json!(["a"]),
+        "a list port carrying one item sends a one-item list"
+    );
     Ok(())
 }
 
@@ -200,16 +182,6 @@ fn latest() -> WeftResult<()> {
         { "version_id": "ver_2", "is_latest": false },
     ] });
     assert_eq!(pick_version("tmpl_1", &unflagged, None)?["version_id"], "ver_3", "else the newest listed");
-    Ok(())
-}
-
-fn template_ids() -> WeftResult<()> {
-    assert_eq!(template_id("tmpl_abc-1.2".to_string())?, "tmpl_abc-1.2");
-    for bad in ["", "x/../../text-to-speech/v1?", "tmpl 1", ".hidden", "a/b"] {
-        let err = template_id(bad.to_string()).unwrap_err().to_string();
-        assert!(err.starts_with("input error"), "{bad}: {err}");
-        assert!(err.contains("not an ElevenLabs template id"), "{bad}: {err}");
-    }
     Ok(())
 }
 
@@ -312,6 +284,16 @@ fn started(rig: &FakeRig) -> bool {
     rig.requests().iter().any(|r| r.method == "POST" && r.path == RUNS)
 }
 
+async fn fraction_refused(rig: FakeRig) -> WeftResult<()> {
+    template_has(&rig, vec![version("ver_1", true, vec![port("count", json!({ "type": "integer" }))], vec![])]);
+    rig.input_type("count", ty("Number"));
+    let err = rig.run(&ElevenLabsRunTemplateNode, inputs(&rig, json!({ "count": 2.5 }))).await.failure()?;
+    assert!(err.starts_with("input error"), "{err}");
+    assert!(err.contains("`count` takes whole numbers, and got 2.5"), "{err}");
+    assert!(!started(&rig), "nothing runs");
+    Ok(())
+}
+
 async fn every_kind(rig: FakeRig) -> WeftResult<()> {
     template_has(
         &rig,
@@ -358,7 +340,8 @@ async fn every_kind(rig: FakeRig) -> WeftResult<()> {
                     "prompt": "a corgi on a surfboard",
                     "reference": photo,
                     "narrator": "v1",
-                    "count": 3,
+                    // A wire carries a whole number as a float.
+                    "count": 3.0,
                     "tags": ["a", "b"],
                 }),
             ),
@@ -587,8 +570,9 @@ async fn resumed(rig: FakeRig) -> WeftResult<()> {
     let sent = rig.requests();
     let reads = sent.iter().filter(|r| r.method == "GET" && r.path == TEMPLATE).count();
     let runs = sent.iter().filter(|r| r.method == "POST" && r.path == RUNS).count();
-    assert_eq!(reads, 1, "the replay reads the journaled submit back, template read included");
+    assert_eq!(reads, 1, "the resumed body finds the job in its state, so it never reads the template again");
     assert_eq!(runs, 1, "and never pays for a second run");
+    assert_eq!(rig.awaited_signals().len(), 1, "nor waits again on a job whose end it already has");
     Ok(())
 }
 

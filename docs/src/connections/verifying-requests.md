@@ -6,20 +6,12 @@ it claims to. You write it in one of two places:
 - in a topic's `webhook`, to check a provider's pushes. The secret or public
   key comes from the receiving app's `events` entry in
   [the apps file](the-apps-file.md);
-- at the top level of a service, so that a `Route` or `Socket` whose `auth` is
-  wired from that service's access node checks its callers (a gated route).
-  The secret or key comes from the connection's stored values: `signingSecret`
-  for `hmac`, `publicKey` for `signature`, `keys` for `api_keys`, and for
-  `oidc`, `audience` plus whatever stored values its `issuers` and `jwksUrl`
-  name as `{...}` placeholders. Each of these has to be a field the service
-  declares (its `acquisition` `fields`, or `registrationFields` for an
-  `oauth2` service), and not an `optional` one, or loading the metadata
-  fails.
+- in a `Route`'s or `Socket`'s `auth` setting, so that it checks its callers
+  (a gated route). The secret or key comes from a connection of the route's
+  own (see [on a route](#on-a-route) below).
 
 The block only describes the request: where each part sits, what gets signed,
-which issuer to trust. If no shipped access node checks your sender's scheme,
-you write your own and put the block in its service; for how, go and read
-[declaring a service](declaring-a-service.md).
+which issuer to trust.
 
 ## The shortest one
 
@@ -38,6 +30,54 @@ weft computes the HMAC-SHA256 of the exact bytes it received, keyed by the
 stored secret, decodes the hex after `sha256=`, and compares the two as bytes,
 in constant time.
 
+## On a route
+
+A `Route` or a `Socket` answers anybody who has its address until you set its
+`auth`:
+
+| `auth` | What the caller sends |
+|---|---|
+| `"none"` (the default) | Nothing |
+| `"api_keys"` | One of the keys you hand out, in `X-Api-Key` or as `Authorization: Bearer <key>` |
+| `"hmac_sha256"` | A hex HMAC-SHA256 of `<timestamp>.<body>` in `X-Signature`, with the unix-seconds timestamp in `X-Timestamp`, refused when it is more than five minutes off |
+| `"hmac_sha1"`, `"hmac_sha512"` | The same layout, with HMAC-SHA1 or HMAC-SHA512 |
+| `"ed25519"` | The same layout, signed with Ed25519 instead of an HMAC |
+| `"ecdsa_p256"` | The same layout, signed with ECDSA P-256, the signature in base64 DER |
+| `"oidc"` | A signed identity token in `Authorization: Bearer`, from the issuer the connection names |
+| a block | Whatever the block says, written the way the rest of this page describes |
+
+If your sender uses another scheme (GitHub's signature, signed identity
+tokens from your sign-in provider), write the whole block:
+
+```weft
+hook = Route {
+  path: "github"
+  method: "POST"
+  auth: { "kind": "hmac", "signature": { "in": "header:X-Hub-Signature-256", "pair": "=", "key": "sha256" }, "concat": "{body}" }
+}
+```
+
+Then give the route its connection, which holds the keys or the secret: the
+editor shows a Connect panel under `auth`, and in the terminal it is
+`weft connect hook`. Each scheme's connection has its own fields:
+
+| `auth` | Its connection's service | Fields |
+|---|---|---|
+| `api_keys` | `api_key_auth` | `keys` |
+| `hmac_sha256`, `hmac_sha1`, `hmac_sha512` | `hmac_auth` | `signingSecret` |
+| `ed25519`, `ecdsa_p256` | `signature_auth` | `publicKey`: hex for `ed25519`, base64 DER for `ecdsa_p256` |
+| `oidc` | `oidc_auth` | `issuer`, `jwksUrl`, `audience` |
+
+If you are scripting it, `weft connect hook --door own --set-env
+signingSecret=HOOK_SECRET --label "github hook"` stores a new one, and `weft
+connect hook --grant <id>` picks one already stored. When a field is missing,
+the command prints the fields the scheme wants.
+
+If you turn on a route whose `auth` names a scheme and no connection is
+picked, preparing it fails with ``'hook' checks callers with hmac but has no
+connection; run `weft connect hook` ``. `token_echo` cannot check a caller, so
+`auth` refuses it.
+
 ## The schemes
 
 | `kind` | Checks | Secret or key |
@@ -45,7 +85,7 @@ in constant time.
 | `hmac` | An HMAC over parts of the request | `signingSecret` |
 | `signature` | An Ed25519 or ECDSA P-256 signature over parts of the request | `publicKey` |
 | `oidc` | A signed identity token in `Authorization: Bearer`, against an issuer's published keys | the issuer's keys; see below for the audience |
-| `api_keys` | A key from a list. Gated routes only | `keys` |
+| `api_keys` | A key from a list. Routes only | `keys` |
 | `token_echo` | The token weft minted when it subscribed, sent back on every push. Pushes only | the subscription |
 
 If you use `oidc`, write `issuers` (the `iss` values the token may carry) and
@@ -65,24 +105,11 @@ values, like `"{jwksUrl}"`, and every token must name the connection's
 `audience`. One issuer usually signs tokens for every app it serves, so
 without the audience a token meant for another of those apps would get in.
 If you want a route that admits the users of your own sign-in provider
-(BetterAuth, Clerk, Auth0, Firebase, any OIDC issuer), this is the whole
-service of the access node you write for it:
+(BetterAuth, Clerk, Auth0, Firebase, any OIDC issuer), this `auth` does it,
+and the route's connection then holds `issuer`, `jwksUrl` and `audience`:
 
 ```json
-"service": {
-  "service": "my_users",
-  "label": "My sign-in provider",
-  "acquisition": {
-    "kind": "static",
-    "fields": [
-      { "name": "issuer", "label": "Issuer", "secret": false },
-      { "name": "jwksUrl", "label": "JWKS URL", "secret": false },
-      { "name": "audience", "label": "Audience", "secret": false }
-    ]
-  },
-  "identity": "{issuer}",
-  "verify": { "kind": "oidc", "issuers": ["{issuer}"], "jwksUrl": "{jwksUrl}" }
-}
+{ "kind": "oidc", "issuers": ["{issuer}"], "jwksUrl": "{jwksUrl}" }
 ```
 
 The caller sends `Authorization: Bearer <token>`, and the run's `caller`

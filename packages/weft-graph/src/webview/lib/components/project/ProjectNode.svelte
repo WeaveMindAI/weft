@@ -163,6 +163,19 @@
 		},
 	);
 
+	/** The recipe this node's connection field connects to: an access
+	 *  node's own, or on a node checking its callers the recipe of the
+	 *  scheme its `auth` names (a plain name, or a record's `kind`), and
+	 *  none while `auth` checks nobody. */
+	// SYNC: connectionSpec <-> crates/weft-core/src/access/callers.rs connection_field
+	const connectionSpec = $derived.by((): import('../../../../protocol').AccessSpecWire | undefined => {
+		if (typeConfig.service) return typeConfig.service;
+		if (!typeConfig.features?.checksCallers) return undefined;
+		const auth = ownValue(portLiterals, 'auth');
+		const scheme = typeof auth === 'string' ? auth : (auth as { kind?: unknown } | null | undefined)?.kind;
+		return typeof scheme === 'string' ? typeConfig.callerRecipes?.[scheme] : undefined;
+	});
+
 	// Opaque `@include` block: carries a file path, navigates into the file
 	// on Open. Renders ports + an Open affordance, no config/body.
 	const isInclude = $derived(isIncludeNodeType(data.nodeType));
@@ -203,15 +216,17 @@
 	const glowClass = $derived(
 		displayedStatus === 'running'
 			? 'node-running-glow'
-			: displayedStatus === 'waiting_for_input'
+			: displayedStatus === 'waiting'
 				? 'node-waiting-glow'
-				: displayedStatus === 'failed'
-					? 'node-failed-glow'
-					: latestFiring?.inheritedFrom
-						? 'node-inherited-glow'
-						: displayedStatus === 'completed'
-							? 'node-completed-glow'
-							: '',
+				: displayedStatus === 'paused'
+					? 'node-paused-glow'
+					: displayedStatus === 'failed'
+						? 'node-failed-glow'
+						: latestFiring?.inheritedFrom
+							? 'node-inherited-glow'
+							: displayedStatus === 'completed'
+								? 'node-completed-glow'
+								: '',
 	);
 	// Per-bus IRC log this node took part in. Empty `[]` for nodes
 	// that never touched a bus.
@@ -896,7 +911,7 @@
 	 *  (the pin lives on node data, never in config, so `expanded: true`
 	 *  travels the ordinary layout path and sticks). */
 	async function pickConnection(key: string, v: { id: string; identity?: string } | null | undefined): Promise<void> {
-		const service = typeConfig.service?.service;
+		const service = connectionSpec?.service;
 		if (!service) return;
 		if (v != null && !(data.config?.expanded as boolean)) {
 			data.onUpdate?.({ config: { ...data.config, expanded: true } });
@@ -917,7 +932,7 @@
 
 	function traceAccessRef(accessInput: string): { accessId: string; service: string } | null {
 		if (accessInputIsOwnWidget(accessInput)) {
-			const service = typeConfig.service?.service;
+			const service = connectionSpec?.service;
 			if (!service) return null;
 			const handle = effectiveAccessValue(ownValue(portLiterals, accessInput), data.placeOf?.(id) ?? id, accessInput);
 			const grantId =
@@ -2236,18 +2251,24 @@
 								/>
 							</div>
 						{:else if field.type === "access"}
-							<!-- The connect control on a personal ACCESS NODE. The
-							     config value is only the small {id, identity} handle;
-							     pasted secrets go editor -> store through the host's
-							     access channel and never touch node config. -->
-							{#if typeConfig.service}
+							<!-- The connect control on a personal ACCESS NODE, and on a
+							     node checking its callers (under its `auth`, following
+							     the scheme it names). The config value is only the small
+							     {id, identity} handle; pasted secrets go editor -> store
+							     through the host's access channel and never touch node
+							     config. -->
+							{#if connectionSpec}
 								<AccessField
-									spec={typeConfig.service}
-									projectApp={typeConfig.accessApps?.[typeConfig.service.service]}
+									spec={connectionSpec}
+									projectApp={typeConfig.accessApps?.[connectionSpec.service]}
 									nodeType={data.nodeType}
 									value={effectiveAccessValue(declaredValue(field), data.placeOf?.(id) ?? id, field.key) as { id: string; identity?: string } | undefined}
 									onUpdate={(v) => pickConnection(field.key, v)}
 								/>
+							{:else if typeConfig.features?.checksCallers}
+								<div class="text-[10px] text-muted-foreground">
+									Anyone with the address may call. Pick how callers are checked in `auth` to connect what they are checked against.
+								</div>
 							{:else}
 								<div class="text-[10px] text-red-500">
 									This node's metadata declares no `service` recipe; the access widget has nothing to connect.
@@ -2381,10 +2402,14 @@
 								|| 'Cancelled'}
 						</span>
 					</div>
-				{:else if displayedStatus === 'running' || displayedStatus === 'waiting_for_input'}
+				{:else if displayedStatus === 'running' || displayedStatus === 'waiting'}
 					<div class="debug-placeholder running">
 						<span class="debug-spinner"></span>
-						<span>{displayedStatus === 'waiting_for_input' ? 'Suspended' : 'Processing...'}</span>
+						<span>{displayedStatus === 'waiting' ? 'Suspended' : 'Processing...'}</span>
+					</div>
+				{:else if displayedStatus === 'paused'}
+					<div class="debug-placeholder waiting">
+						<span>Paused with its run</span>
 					</div>
 				{:else}
 					<div class="debug-placeholder waiting">
@@ -2411,10 +2436,10 @@
 						<span>✓</span>
 						<span>No file received</span>
 					</div>
-				{:else if displayedStatus === 'running' || displayedStatus === 'waiting_for_input'}
+				{:else if displayedStatus === 'running' || displayedStatus === 'waiting' || displayedStatus === 'paused'}
 					<div class="debug-placeholder running">
 						<span class="debug-spinner"></span>
-						<span>Processing...</span>
+						<span>{displayedStatus === 'paused' ? 'Paused with its run' : 'Processing...'}</span>
 					</div>
 				{:else}
 					<div class="debug-placeholder waiting">

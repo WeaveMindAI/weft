@@ -646,8 +646,8 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_nonempty", "field": "cron" },
-          { "kind": "not", "of": { "kind": "config_matches", "field": "cron", "regex": "^\\s*\\S+(\\s+\\S+){5,6}\\s*$" } }
+          { "kind": "value", "field": "cron", "nonempty": true },
+          { "kind": "not", "of": { "kind": "value", "field": "cron", "matches": "^\\s*\\S+(\\s+\\S+){5,6}\\s*$" } }
         ]
       },
       "then": {

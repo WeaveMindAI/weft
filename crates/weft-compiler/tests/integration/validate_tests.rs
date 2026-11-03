@@ -395,6 +395,7 @@ t = Text
         from_spec: false,
         requires_scopes: None,
         requires_values: None,
+        keeps_blank: false,
     });
     t.port_literals.insert("value".into(), serde_json::json!({"not": "a string"}));
     let d = validate(&project, &catalog());
@@ -429,6 +430,7 @@ t = Text { value: "ok" }
         from_spec: false,
         requires_scopes: None,
         requires_values: None,
+        keeps_blank: false,
     });
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"required-port-unmet"), "{d:?}");
@@ -473,21 +475,21 @@ fn top_level_include_does_not_make_project_look_like_a_component() {
     assert!(d.is_empty(), "the include compiles clean: {d:?}");
 }
 
-// ── declarative-rule engine (ConfigMatches) ──────────────────────────────────
+// ── declarative-rule engine (a `value` rule's `matches`) ─────────────────────
 
-/// The Route node carries a declarative rule:
-/// `when config_matches(path, "^/") then warn`. These tests exercise the
-/// declarative-rule engine + the `ConfigMatches` condition end-to-end, including
-/// the fail-closed behavior on an absent field (the rule must NOT fire when the
-/// field is missing, like every sibling ConfigX condition).
+/// The Route node carries a declarative rule: a `value` rule whose
+/// `matches` asks whether `path` starts with `/`. These tests exercise the
+/// declarative-rule engine end to end, including an absent field (the rule
+/// must NOT fire when the field is missing: absent is false whenever a
+/// check is given).
 #[test]
-fn config_matches_rule_fires_only_when_pattern_matches() {
+fn a_value_matches_rule_fires_only_when_the_pattern_matches() {
     // path starts with `/` -> the rule fires (warning).
     let with_slash = parse_enrich("t = Route { path: \"/hook\" }\n");
     let d = validate(&with_slash, &catalog());
     assert!(
         d.iter().any(|x| x.message.contains("path starts with '/'")),
-        "config_matches must fire for a leading slash: {d:?}"
+        "the `matches` rule must fire for a leading slash: {d:?}"
     );
 
     // path without a leading slash -> no rule.
@@ -495,7 +497,7 @@ fn config_matches_rule_fires_only_when_pattern_matches() {
     let d2 = validate(&no_slash, &catalog());
     assert!(
         !d2.iter().any(|x| x.message.contains("path starts with '/'")),
-        "config_matches must NOT fire without a leading slash: {d2:?}"
+        "the `matches` rule must NOT fire without a leading slash: {d2:?}"
     );
 
     // path absent entirely -> no rule (fail-closed: an absent field is not a
@@ -505,7 +507,7 @@ fn config_matches_rule_fires_only_when_pattern_matches() {
     let d3 = validate(&absent, &catalog());
     assert!(
         !d3.iter().any(|x| x.message.contains("path starts with '/'")),
-        "config_matches must NOT fire when the field is absent: {d3:?}"
+        "the `matches` rule must NOT fire when the field is absent: {d3:?}"
     );
 }
 
@@ -2662,7 +2664,7 @@ fn a_connection_written_in_the_source_is_refused() {
     )
     .unwrap();
     let e = enrich(&mut project, &catalog()).unwrap_err().to_string();
-    assert!(e.contains("old way") && e.contains("weft connect --node ws"), "{e}");
+    assert!(e.contains("old way") && e.contains("weft connect ws"), "{e}");
     assert!(e.contains(weft_core::picks::PICKS_DOC), "{e}");
 }
 
@@ -2702,12 +2704,12 @@ fn declared_picker_rule_suppresses_the_synthesized_twin() {
   "service": { "service": "legacy",
                "acquisition": { "kind": "static", "fields": [{ "name": "key" }] } },
   "inputs": [
-    { "name": "account", "type": "Access",
+    { "name": "account", "type": "Access[legacy]",
       "widget": { "kind": "access" } }
   ],
-  "outputs": [{ "name": "access", "type": "Access" }],
+  "outputs": [{ "name": "access", "type": "Access[legacy]" }],
   "validate": [
-    { "when": { "kind": "not", "of": { "kind": "config_nonempty", "field": "account" } },
+    { "when": { "kind": "not", "of": { "kind": "value", "field": "account", "nonempty": true } },
       "then": { "message": "the old boilerplate wording",
                 "level": "runtime", "field": "account" } }
   ]
@@ -2745,12 +2747,12 @@ fn unrelated_picker_rule_does_not_suppress_the_synthesized_one() {
   "service": { "service": "legacy",
                "acquisition": { "kind": "static", "fields": [{ "name": "key" }] } },
   "inputs": [
-    { "name": "account", "type": "Access",
+    { "name": "account", "type": "Access[legacy]",
       "widget": { "kind": "access" } }
   ],
-  "outputs": [{ "name": "access", "type": "Access" }],
+  "outputs": [{ "name": "access", "type": "Access[legacy]" }],
   "validate": [
-    { "when": { "kind": "config_nonempty", "field": "account" },
+    { "when": { "kind": "value", "field": "account", "nonempty": true },
       "then": { "message": "an unrelated declared rule",
                 "level": "runtime", "field": "account" } }
   ]
@@ -3962,11 +3964,11 @@ fn a_decision_input_holding_a_file_inside_a_value_is_refused() {
 /// fine.
 #[test]
 fn a_route_that_ended_up_per_instance_is_refused_naming_why() {
-    let per_instance = "gate = ApiKeyAuth { account: @instance_filled }\nt = Route { path: \"hook\" }\nt.auth = gate.access\nr = Reply { body: \"x\" }\nr._should_flow = t.method\n";
+    let per_instance = "gate = PostgresAccess { account: @instance_filled }\nt = Route { path: \"hook\" }\nt._should_flow = gate.access\nr = Reply { body: \"x\" }\nr._should_flow = t.method\n";
     let found = messages(per_instance);
     let hit = found.iter().find(|m| m.contains("would exist once per instance"));
     assert!(hit.is_some_and(|m| m.contains("because it reads 'gate'") && m.contains("Weft-Instance")), "{found:?}");
-    let shared = "gate = ApiKeyAuth {}\nt = Route { path: \"hook\" }\nt.auth = gate.access\nr = Reply { body: \"x\" }\nr._should_flow = t.method\n";
+    let shared = "gate = PostgresAccess {}\nt = Route { path: \"hook\" }\nt._should_flow = gate.access\nr = Reply { body: \"x\" }\nr._should_flow = t.method\n";
     assert!(!messages(shared).iter().any(|m| m.contains("would exist once per instance")));
 }
 
@@ -3982,15 +3984,15 @@ fn the_per_instance_refusal_names_the_path_through_a_group() {
         let found = messages(source);
         found.into_iter().find(|m| m.contains("would exist once per instance")).expect("the route is refused")
     };
-    let through_port = "gate = ApiKeyAuth { account: @instance_filled }\nwork = Group(k: Access) {\n  t = Route { path: \"hook\" }\n  t.auth = self.k\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\nwork.k = gate.access\n";
+    let through_port = "gate = PostgresAccess { account: @instance_filled }\nwork = Group(k: Access) {\n  t = Route { path: \"hook\" }\n  t._should_flow = self.k\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\nwork.k = gate.access\n";
     let m = refusal(through_port);
     assert!(m.contains("because it reads 'gate', but"), "{m}");
 
-    let beside = "gate = ApiKeyAuth { account: @instance_filled }\nshared = ApiKeyAuth {}\nwork = Group(k: Access, o: Access) {\n  t = Route { path: \"hook\" }\n  t.auth = self.o\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n  d = Debug\n  d.data = self.k\n}\nwork.k = gate.access\nwork.o = shared.access\n";
+    let beside = "gate = PostgresAccess { account: @instance_filled }\nshared = PostgresAccess {}\nwork = Group(k: Access, o: Access) {\n  t = Route { path: \"hook\" }\n  t._should_flow = self.o\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n  d = Debug\n  d.data = self.k\n}\nwork.k = gate.access\nwork.o = shared.access\n";
     let found = messages(beside);
     assert!(!found.iter().any(|m| m.contains("would exist once per instance")), "{found:?}");
 
-    let gated = "gate = ApiKeyAuth { account: @instance_filled }\nshared = ApiKeyAuth {}\nwork = Group(o: Access) {\n  t = Route { path: \"hook\" }\n  t.auth = self.o\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\nwork.o = shared.access\nwork._should_flow = gate.access\n";
+    let gated = "gate = PostgresAccess { account: @instance_filled }\nshared = PostgresAccess {}\nwork = Group(o: Access) {\n  t = Route { path: \"hook\" }\n  t._should_flow = self.o\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\nwork.o = shared.access\nwork._should_flow = gate.access\n";
     let m = refusal(gated);
     assert!(m.contains("because it sits inside group 'work', whose gate reads 'gate', but"), "{m}");
     assert!(!m.contains("it reads"), "{m}");
@@ -4006,7 +4008,7 @@ fn the_per_instance_refusal_names_the_call_site_whose_gate_reads_it() {
         dir.path().join("hook.weft"),
         "Group() {\n  t = Route { path: \"hook\" }\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\n",
     ).unwrap();
-    let src = "gate = ApiKeyAuth { account: @instance_filled }\none = @include(\"hook.weft\")\none._should_flow = gate.access\n";
+    let src = "gate = PostgresAccess { account: @instance_filled }\none = @include(\"hook.weft\")\none._should_flow = gate.access\n";
     let found: Vec<String> = entry_program(src, dir.path()).into_iter().map(|d| d.message).collect();
     let m = found.iter().find(|m| m.contains("would exist once per instance")).unwrap_or_else(|| panic!("the route is refused: {found:?}"));
     assert!(m.contains("because it sits inside group 'one', whose gate reads 'gate', but"), "{m}");
@@ -4017,7 +4019,7 @@ fn the_per_instance_refusal_names_the_call_site_whose_gate_reads_it() {
 /// instance, and the refusal names the loop.
 #[test]
 fn the_per_instance_refusal_names_the_loop_whose_list_reads_it() {
-    let src = "gate = ApiKeyAuth { account: @instance_filled }\nlist = ExecPython(a: Access) -> (items: List[String]) { code: \"x\" }\nlist.a = gate.access\neach = Loop(items: List[String]) -> (seen: List[String | Null]) {\n  parallel: false\n  over: [\"items\"]\n  t = Route { path: \"hook\" }\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n  self.seen = self.items\n}\neach.items = list.items\n";
+    let src = "gate = PostgresAccess { account: @instance_filled }\nlist = ExecPython(a: Access) -> (items: List[String]) { code: \"x\" }\nlist.a = gate.access\neach = Loop(items: List[String]) -> (seen: List[String | Null]) {\n  parallel: false\n  over: [\"items\"]\n  t = Route { path: \"hook\" }\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n  self.seen = self.items\n}\neach.items = list.items\n";
     let found = messages(src);
     let m = found.iter().find(|m| m.contains("would exist once per instance")).unwrap_or_else(|| panic!("the route is refused: {found:?}"));
     assert!(m.contains("because it sits inside loop 'each', which runs on what 'gate' gives it, but"), "{m}");
@@ -4115,15 +4117,15 @@ fn set_instance_values_names_fields_an_instance_fills() {
 }
 
 /// A trigger fires on its event, never on its inputs, so the gate rule
-/// never applies to one: a route with only its auth wired is a correct
+/// never applies to one: a route with only its gate wired is a correct
 /// program.
 #[test]
 fn a_trigger_is_never_asked_when_it_runs() {
     let project = parse_enrich(
         r#"
-gate = ApiKeyAuth {}
+gate = PostgresAccess {}
 t = Route { path: "hook" }
-t.auth = gate.access
+t._should_flow = gate.access
 "#,
     );
     let d = validate(&project, &catalog());
@@ -5014,17 +5016,17 @@ fn a_one_of_member_fed_by_the_loop_index_is_fed() {
     assert!(unmet_is_empty(&entry_program(src, dir.path())));
 }
 
-/// A key set gating two chains links them too: eight and seven plus the
-/// key set is one part of sixteen, and warns.
+/// A connection gating two chains links them too: eight and seven plus the
+/// connection node is one part of sixteen, and warns.
 #[test]
 fn a_connection_node_links_the_chains_it_gates() {
     let src = format!(
-        "\ngate = ApiKeyAuth\n{}{}",
+        "\ngate = PostgresAccess\n{}{}",
         chain("a", 8, Some("gate.access")).trim_start_matches('\n'),
         chain("b", 7, Some("gate.access")).trim_start_matches('\n')
     );
     let d = validate(&parse_enrich(&src), &catalog());
-    assert_eq!(level_warnings(&d).len(), 1, "one part of 16 with the key set: {d:?}");
+    assert_eq!(level_warnings(&d).len(), 1, "one part of 16 with the connection node: {d:?}");
 }
 
 /// A provider's model counts as given whether it is written on the node

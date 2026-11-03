@@ -41,7 +41,9 @@ async fn held_work_carries_on_across_a_runtime_restart() -> anyhow::Result<()> {
     // only after the runtime that registered them is gone.
     let mut parked = Project::prepare("wait_format", disp.clone()).await?;
     parked.set_node_config("hold", "seconds", "30")?;
-    let parked_run = run::start(&mut parked).await?;
+    // Paused at once, not after the quiet window a run first stays on its
+    // worker for (`pauseAfterSecs`).
+    let parked_run = run::start_with(&mut parked, &["--pause-after-secs", "0"]).await?;
     run::wait_for_status(&disp, parked_run, "waiting_for_input").await?;
     cell.restart().await?;
 

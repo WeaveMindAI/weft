@@ -6,10 +6,10 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft::access::client::required_str;
+use weft::access::client::{checked_send, required_str, url};
 use weft::node::NodeOutput;
 use weft::storage::StorageScope;
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::drive;
 
@@ -54,8 +54,8 @@ impl Node for GoogleDriveDownloadNode {
 
         let (url, stored_mime, filename) = if native_mime.starts_with("application/vnd.google-apps.")
         {
-            let (mime, ext) = match export_mime.as_deref().filter(|m| !m.trim().is_empty()) {
-                Some(m) => (m.to_string(), "bin"),
+            let (mime, ext) = match export_mime {
+                Some(m) => (m, "bin"),
                 None => match default_export(&native_mime) {
                     Some((m, e)) => (m.to_string(), e),
                     None => weft::node_bail!(
@@ -63,21 +63,12 @@ impl Node for GoogleDriveDownloadNode {
                     ),
                 },
             };
-            (
-                format!(
-                    "{}/files/{}/export?mimeType={}",
-                    drive::API,
-                    super::api::segment(&file_id),
-                    urlencoding::encode(&mime)
-                ),
-                mime,
-                format!("{name}.{ext}"),
-            )
+            (url(drive::API, &["files", &file_id, "export"])?.query("mimeType", &mime), mime, format!("{name}.{ext}"))
         } else {
-            (format!("{}/files/{}?alt=media", drive::API, super::api::segment(&file_id)), native_mime, name)
+            (url(drive::API, &["files", &file_id])?.query("alt", "media"), native_mime, name)
         };
 
-        let resp = http.get(&url).send().await.node_err("google drive: download")?;
+        let resp = checked_send(http.get(url.as_str()), "google drive: download the file").await?;
         let stored = ctx
             .storage(StorageScope::Run)
             .put_response(

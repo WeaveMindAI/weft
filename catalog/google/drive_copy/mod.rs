@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 
+use weft::access::client::url;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::drive;
@@ -30,11 +31,7 @@ impl Node for GoogleDriveCopyNode {
         let body = drive::file_metadata(name, folder);
         let http = ctx.client(&account).await?;
         let answer = weft::access::client::json_call(
-            http.post(format!(
-                "{}/files/{}/copy?fields=id,webViewLink",
-                drive::API,
-                super::api::segment(&file_id)
-            ))
+            http.post(url(drive::API, &["files", &file_id, "copy"])?.query("fields", "id,webViewLink").as_str())
             .json(&body),
             "copy the file",
         )

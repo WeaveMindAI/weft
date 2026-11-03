@@ -4896,6 +4896,8 @@ dependencies = [
  "futures",
  "hmac",
  "http",
+ "http-body",
+ "http-body-util",
  "indexmap",
  "inventory",
  "jsonwebtoken",

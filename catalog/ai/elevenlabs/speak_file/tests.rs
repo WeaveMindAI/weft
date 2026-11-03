@@ -6,8 +6,7 @@ use serde_json::{json, Value};
 use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
 use super::super::elevenlabs::audio_file_type;
-use super::super::speech::stereo_refusal;
-use super::{refusal, ElevenLabsSpeakFileNode};
+use super::ElevenLabsSpeakFileNode;
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -18,9 +17,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("every_elevenlabs_setting_reaches_the_request", every_setting),
         NodeTest::fake("the_request_id_comes_out_for_stitching", request_id),
         NodeTest::fake("zero_retention_rides_the_query", zero_retention),
-        NodeTest::fake("settings_elevenlabs_would_refuse_together_are_refused_before_anything_is_sent", refused_pairs),
-        NodeTest::basic("the_text_to_speech_pairs_that_cannot_go_together", pairs),
-        NodeTest::basic("stereo_effects_need_a_format_that_carries_stereo", stereo),
         NodeTest::live("one_real_short_speech", "elevenlabs", live_speech),
         NodeTest::live("one_real_short_speech_on_v4", "elevenlabs", live_speech_v4),
         NodeTest::live("two_real_stitched_takes_with_a_filter", "elevenlabs", live_stitched),
@@ -79,7 +75,7 @@ async fn live_speech_v4(rig: LiveRig) -> WeftResult<()> {
 
 /// Every format the metadata offers stores under a real extension and
 /// mime, the opus family as the Ogg Opus a WhatsApp voice note wants;
-/// a family the nodes never declared is refused, never guessed.
+/// a family the nodes never declared fails, never guessed.
 fn file_types() -> WeftResult<()> {
     assert_eq!(audio_file_type("mp3_44100_128")?, ("mp3", "audio/mpeg"));
     assert_eq!(audio_file_type("pcm_16000")?, ("pcm", "audio/pcm"));
@@ -288,47 +284,6 @@ async fn zero_retention(rig: FakeRig) -> WeftResult<()> {
     answers(&rig, "output_format=mp3_44100_128&enable_logging=false");
     rig.run(&ElevenLabsSpeakFileNode, inputs(&rig, json!({ "enableLogging": false }))).await.ok()?;
     assert_eq!(rig.requests()[0].query.as_deref(), Some("output_format=mp3_44100_128&enable_logging=false"));
-    Ok(())
-}
-
-async fn refused_pairs(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    for (extra, says) in [
-        (json!({ "model": "eleven_multilingual_v2", "languageCode": "fr" }), "takes no `languageCode`"),
-        (json!({ "model": "eleven_v3", "previousRequestIds": ["r"] }), "`nextRequestIds` on eleven_v3"),
-        (json!({ "nextText": "Later.", "nextRequestIds": ["r"] }), "`nextText` and `nextRequestIds`"),
-        (json!({ "enableLogging": false, "nextRequestIds": ["r"] }), "keeps no history"),
-        (json!({ "pronunciationDictionaries": ["a", "b", "c", "d"] }), "at most 3"),
-        (json!({ "previousRequestIds": ["a", "b", "c", "d"] }), "at most 3"),
-        (json!({ "sendLevel": 0.5 }), "no `environment`"),
-        (json!({ "outputFormat": "pcm_16000", "environment": "hall" }), "refuses stereo audio in 'pcm_16000'"),
-        (json!({ "outputFormat": "ulaw_8000", "pan": 0.5 }), "`pan` makes the audio stereo"),
-    ] {
-        let err = rig.run(&ElevenLabsSpeakFileNode, inputs(&rig, extra.clone())).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {extra}: {err}");
-        assert!(err.contains(says), "{extra}: {err}");
-    }
-    assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");
-    Ok(())
-}
-
-fn pairs() -> WeftResult<()> {
-    assert!(refusal("eleven_multilingual_v2", true, false, false, false, false).is_some());
-    assert!(refusal("eleven_v4", true, false, false, false, false).is_none(), "v4 takes a language code");
-    assert!(refusal("eleven_v3", false, false, false, true, false).is_some());
-    assert!(refusal("eleven_v3", false, true, true, false, false).is_none(), "v3 still takes the texts");
-    assert!(refusal("eleven_v4", false, true, false, true, false).is_some());
-    assert!(refusal("eleven_v4", false, true, false, false, true).is_none(), "text before and ids after go together");
-    Ok(())
-}
-
-fn stereo() -> WeftResult<()> {
-    assert!(stereo_refusal("pcm_16000", true, None, None).is_some(), "reverb is on at the default send level");
-    assert!(stereo_refusal("pcm_16000", true, Some(0.0), None).is_none(), "a send level of 0 turns the reverb off");
-    assert!(stereo_refusal("alaw_8000", false, None, Some(0.2)).is_some());
-    assert!(stereo_refusal("ulaw_8000", false, None, Some(0.0)).is_none(), "a centred voice stays mono");
-    assert!(stereo_refusal("wav_16000", true, None, Some(1.0)).is_none(), "wav carries stereo");
-    assert!(stereo_refusal("mp3_44100_128", true, None, Some(1.0)).is_none());
     Ok(())
 }
 

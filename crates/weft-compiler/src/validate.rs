@@ -6,7 +6,7 @@
 
 use weft_core::rules::{has_incoming_edge, literal_fills};
 use weft_core::node::{
-    Condition, MetadataCatalog, RuleDiagnostic, RuleSeverity, ValidationLevel, ValidationRule,
+    Condition, MetadataCatalog, RuleDiagnostic, RuleSeverity, ValidationLevel, ValidationRule, ValueChecks,
 };
 
 use weft_core::project::{NodeDefinition, Span};
@@ -1210,6 +1210,30 @@ fn check_declarative_rules(
     }
 }
 
+/// Record on each node the rules the compile could not decide
+/// (`NodeDefinition::recheck`): their answer leans on a value that
+/// arrives on a wire, so the runtime asks them again, with the same
+/// evaluator, on the values that arrived, before the node's body runs
+/// (`weft_core::rules::recheck`). Every rule a node answers to, at both
+/// levels: a run is a run. A node whose rules were all decided records
+/// nothing and pays nothing when it fires.
+pub(crate) fn record_rechecks(project: &mut ProjectDefinition, catalog: &dyn MetadataCatalog) {
+    let rechecks: Vec<Vec<weft_core::rules::Recheck>> = {
+        let rules = weft_core::rules::RuleContext::new(project);
+        project
+            .nodes
+            .iter()
+            .map(|node| match catalog.lookup(&node.node_type) {
+                Some(meta) => weft_core::rules::undecided(&node_rules(meta, node), node, &rules, &weft_core::rules::CustomPorts::of(node, meta)),
+                None => Vec::new(),
+            })
+            .collect()
+    };
+    for (node, recheck) in project.nodes.iter_mut().zip(rechecks) {
+        node.recheck = recheck;
+    }
+}
+
 /// Every rule a node of this type answers to: the ones its metadata
 /// declares, and the one the language adds. Every access node requires a
 /// connection BY DEFAULT: declaring a `service` recipe is what makes a
@@ -1246,7 +1270,7 @@ fn implicit_connection_rule(
     }
     Some(ValidationRule {
         when: Condition::Not {
-            of: Box::new(Condition::ConfigNonempty { field: input.name.clone() }),
+            of: Box::new(Condition::Value { field: input.name.clone(), checks: Box::new(ValueChecks { nonempty: true, ..Default::default() }) }),
         },
         then: RuleDiagnostic {
             message: format!(
@@ -1271,7 +1295,8 @@ fn is_the_connection_rule(meta: &weft_core::node::NodeMetadata, rule: &Validatio
         && matches!(
             &rule.when,
             Condition::Not { of }
-                if matches!(of.as_ref(), Condition::ConfigNonempty { field } if field == &input.name)
+                if matches!(of.as_ref(), Condition::Value { field, checks }
+                    if field == &input.name && **checks == ValueChecks { nonempty: true, ..Default::default() })
         )
 }
 

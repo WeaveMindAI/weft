@@ -1,7 +1,7 @@
 {
   "type": "Stream",
   "label": "Stream",
-  "description": "Stream a bus to the caller of this run, one chunk per message, until the bus closes: an LLM's reply as it is generated, a watched query keeping a page live. Behind a Route the response body streams; behind a Socket each message is one frame and the socket stays open. Stored files inside messages go out as `{ url, mimeType, filename, sizeBytes }`. A bus that ended failed ends the answer as a failure: an error status before anything was sent, the format's error marker after, a 1011 close on a socket. A message that cannot be sent in the caller's data type fails the answer the same way, unless the trigger's `whenChunkFails` is `drop_chunk`, which skips it and goes on.",
+  "description": "Stream a bus to the caller of this run, one chunk per message, until the bus closes: an LLM's reply as it is generated, a watched query keeping a page live. Behind a Route the response body streams; behind a Socket each message is one frame and the socket stays open. A stored file in a message goes out as a link, `{ url, mimeType, filename, sizeBytes }`, and a secret goes out revealed, the run's record keeping its marker. A bus that ended failed ends the answer as a failure: an error status before anything was sent, the format's error marker after, a 1011 close on a socket. A message that cannot be sent in the caller's data type fails the answer the same way, unless the trigger's `whenChunkFails` is `drop_chunk`, which skips it and goes on.",
   "tags": [
     "api",
     "http",
@@ -24,7 +24,7 @@
     {
       "name": "first",
       "type": "T",
-      "description": "One value sent ahead of the bus, framed like the messages (an id, a created row, a session token). A secret in it goes out revealed where its type declares one, and the run's record keeps its marker. A secret anywhere its type does not declare one fails the node, and so does a secret in a bus message, since a bus carries no type."
+      "description": "One value sent ahead of the bus, framed like the messages (an id, a created row, a session token). A secret in it goes out revealed where its type declares one, and the run's record keeps its marker. A secret anywhere its type does not declare one fails the node."
     },
     {
       "name": "format",
@@ -47,14 +47,13 @@
       "widget": {
         "kind": "select",
         "options": [
-          "",
           "json",
           "text",
           "bytes"
         ]
       },
       "label": "Answer as",
-      "description": "Shape of each `raw` message and of socket frames; empty follows the trigger's `dataType`."
+      "description": "Shape of each `raw` message and of socket frames; unset follows the trigger's `dataType`."
     },
     {
       "name": "status",

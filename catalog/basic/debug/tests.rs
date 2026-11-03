@@ -11,7 +11,7 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("logs_the_value_under_the_node_label", logs_value),
         NodeTest::fake("an_absent_input_logs_null", absent_logs_null),
-        NodeTest::fake("a_bus_that_broke_off_is_logged_as_failed", failed_bus),
+        NodeTest::fake("a_bus_that_broke_off_fails_the_node_after_logging_its_messages", failed_bus),
     ]
 }
 
@@ -32,16 +32,17 @@ async fn absent_logs_null(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// A bus whose producer broke off is followed to its end like any bus, and
-/// the closing line says it failed and why.
+/// A bus whose producer broke off is followed to its end like any bus,
+/// each message logged as it lands, and the read past its end fails the
+/// node naming why.
 async fn failed_bus(rig: FakeRig) -> WeftResult<()> {
     let (mut bus, marker) = rig.seed_bus(BusOptions::default())?;
     bus.register("llm").expect("a fresh bus accepts its first name");
     bus.send("delta", json!("hel")).expect("an open bus accepts a send");
     bus.inner_arc().close(StreamEnd::Failed { error: "the model went away".into() });
-    rig.run(&DebugNode, json!({ "data": marker })).await.ok()?;
+    let err = rig.run(&DebugNode, json!({ "data": marker })).await.failure()?;
+    assert!(err.contains("the model went away"), "{err}");
     let logs = rig.logs();
-    let last = &logs.last().expect("the closing line").1;
-    assert!(last.contains("bus failed after 1 message(s)") && last.contains("the model went away"), "{last}");
+    assert!(logs.iter().any(|(_, line)| line.contains(r#""hel""#)), "the message was logged as it landed: {logs:?}");
     Ok(())
 }

@@ -1,6 +1,6 @@
 {
   "types": {
-    "DecisionProvider": "JsonDict",
+    "DecisionProvider": "{ kind: String, model: String, account: Access, routing?: JsonDict }",
     "BoundingBox": "{ top: Number, bottom: Number, left: Number, right: Number }"
   }
 }

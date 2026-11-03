@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[google]", "accepts": ["wire"],
       "required": true,
       "description": "Needs the read-all-of-Drive permission. Google classes it restricted, so it usually takes your own Google app rather than the shared one.",
       "requiresScopes": [

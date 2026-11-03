@@ -22,7 +22,7 @@
 //! mirror, no inventory.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
@@ -35,7 +35,8 @@ use crate::context::{ContextHandle, EndpointMethod, RunContext, LogLevel, ValueB
 use crate::error::{WeftError, WeftResult};
 use crate::frames::LoopFrames;
 use crate::node::{InputSpec, Node, NodeMetadata, NodeOutput};
-use crate::primitive::{replay_await, replay_run, AwaitEnd, AwaitedEntry, AwaitedEntryKind, ReplayedAwait, SignalSpec};
+use crate::primitive::{AwaitEnd, SignalSpec};
+use crate::run::saved::{Counters, Positions, SavedState};
 use crate::weft_type::WeftType;
 
 // ----- The test declaration ------------------------------------------
@@ -412,6 +413,7 @@ pub fn fixture_spec(name: &str, label: &str, description: &str) -> InputSpec {
         description: Some(description.to_string()),
         requires_scopes: None,
         requires_values: None,
+        keeps_blank: false,
     }
 }
 
@@ -544,6 +546,12 @@ impl RigOutcome {
         }
     }
 
+    /// Whether the run paused in the body ([`FakeRig::signal_paused`]): a
+    /// next `rig.run` of the node carries the firing on.
+    pub fn paused(&self) -> bool {
+        matches!(self.result, Err(WeftError::Suspended { .. }))
+    }
+
     /// The message the body refused with: the mirror of [`Self::ok`],
     /// for a test whose whole point is that the node says no. A run
     /// that SUCCEEDED here is the failure, and says so.
@@ -592,14 +600,13 @@ pub struct SentRequest {
     pub path: String,
     /// Raw query string, if any.
     pub query: Option<String>,
-    /// The request body as text, if the request carried a buffered body.
+    /// The request body as text (lossily decoded), if the request
+    /// carried one, buffered or streamed: a streamed body is read whole.
     pub body_text: Option<String>,
     /// The body parsed as JSON, when it parses.
     pub body: Option<Value>,
-    /// True when the request carried a STREAMED body the rig cannot
-    /// read (`body_text`/`body` are `None` then, which is not "no
-    /// body"); an assertion on the body of a streamed request should
-    /// check this first and say so.
+    /// True when the body was streamed (an upload from storage) rather
+    /// than buffered; `body_text` holds it either way.
     pub body_streamed: bool,
     /// The request's headers, names lowercased (`("content-type",
     /// "application/json")`). Non-UTF-8 values are lossily decoded.
@@ -840,9 +847,9 @@ struct FakeState {
     routes: Mutex<HashMap<RouteKey, CannedRoute>>,
     /// Every request sent through the rig's HTTP surface, in order.
     requests: Mutex<Vec<SentRequest>>,
-    /// Canned `await_signal` endings (an answer, or a wait given up),
-    /// popped in order.
-    signals: Mutex<VecDeque<AwaitEnd>>,
+    /// Canned wait endings (an answer, a wait given up or skipped, or a
+    /// pause there), popped in order.
+    signals: Mutex<VecDeque<CannedWait>>,
     /// The wake payload for the NEXT `run` (a firing trigger's
     /// `ctx.wake`). Taken (consumed) when a run starts.
     wake: Mutex<Option<Value>>,
@@ -856,9 +863,9 @@ struct FakeState {
     caller: Mutex<Option<Arc<dyn crate::caller::CallerConnection>>>,
     /// Every `register_signal` call: (spec, port snapshot).
     registered_signals: Mutex<Vec<(SignalSpec, Value)>>,
-    /// Every `await_signal` the node made, in order. What a node parks
-    /// ON is as much of its behaviour as what it emits (a form is the
-    /// thing a person reads), so a test can look at it.
+    /// Every signal the node waited on (`state.wait`), in order. What a
+    /// node waits ON is as much of its behaviour as what it emits (a
+    /// form is the thing a person reads), so a test can look at it.
     awaited_signals: Mutex<Vec<SignalSpec>>,
     /// Stored values the fake's opened connections answer
     /// (`conn.value(name)`), keyed by service then value name.
@@ -895,6 +902,10 @@ struct FakeState {
     /// marker, so the marker resolves back (in the node and in the
     /// test's post-run read).
     buses: Mutex<HashMap<String, crate::bus::BusHandle>>,
+    /// The bus each node body created on each output port, by its body's
+    /// key and the port: a run of that body again creating its bus there
+    /// gets the same bus, as production keys it by firing and port.
+    created_buses: Mutex<HashMap<(String, String), String>>,
     /// In-memory storage, keyed by minted key. A key carries its scope
     /// (`node-test/<scope>/..`) and the entry its resolved scope, so a
     /// list sees only its own wall.
@@ -921,6 +932,11 @@ struct FakeState {
     /// Every tag the node put on its run, in call order, one
     /// entry per `ctx.tag_run` call.
     run_tags: Mutex<Vec<Vec<String>>>,
+    /// Every call the node owes when it ends (`ctx.after_node`), in the
+    /// order it first registered each, with the connection it goes
+    /// through. The fake sends none; a test reads them to see the node
+    /// registered its clean-up.
+    owed_calls: Mutex<Vec<(crate::signal::CancelCall, Option<crate::primitive::AccessRef>)>>,
     /// Every `ctx.stop_tagged` the node asked for, in order. The fake
     /// stops nothing (there are no sibling runs here); it records the
     /// ask so a test can assert the node steered the right tag the
@@ -960,25 +976,39 @@ struct FakeState {
     endpoint_answers: Mutex<BTreeMap<(EndpointKey, EndpointMethod, String), VecDeque<CannedAnswer>>>,
     /// Every endpoint call the node made, in order.
     endpoint_calls: Mutex<Vec<EndpointCall>>,
-    /// The fake's journal of each body's replayable calls: every
-    /// `ctx.run` step and every `ctx.await_signal`, in one sequence
-    /// with one counter, exactly as production journals them (a body
-    /// that awaits then runs journals the run at index 1). Keyed the
-    /// way production keys its journal, per node body (a node's run
-    /// and its trigger setup are two runs there, and two node
-    /// types never share one), and it lives on the RIG, not on one
-    /// run's handle, so a second `rig.run(..)` of the same node on the
-    /// same rig is a resume: it replays what the first recorded, a
-    /// step's value and a signal's payload alike, and refuses (through
-    /// the same reading production uses) when the body's call order
-    /// changed between the two. That is what lets a test prove a node's
-    /// exactly-once step: a post that must not go out twice.
-    journal: Mutex<BTreeMap<String, Vec<AwaitedEntry>>>,
+    /// Per node body, the state it last saved (`ctx.keep`), keyed the way
+    /// production keys a firing (a node's run and its trigger setup are
+    /// two firings there, and two node types never share one). It lives on
+    /// the RIG, not on one run's handle, so a second `rig.run(..)` of the
+    /// same node on the same rig picks the firing up as production does
+    /// after a pause ([`FakeRig::signal_paused`]) or a crash: the body gets
+    /// its saved state back, its counters start where they were saved, its
+    /// bus cursors where they stood, and a stream input skips what it took.
+    /// That is what lets a test prove a node's exactly-once step: a post
+    /// that must not go out twice.
+    kept: Mutex<BTreeMap<String, KeptBody>>,
     cancellation: Arc<CancellationFlag>,
     /// [`FakeRig::stop_after_calls`]: the number of outbound calls
     /// (HTTP requests and endpoint calls together) after which the
     /// rig presses stop. `None` until a test asks.
     stop_after_calls: Mutex<Option<usize>>,
+}
+
+/// What one node body keeps across `rig.run`s ([`FakeState::kept`]):
+/// the state it last saved, with the line its run paused at
+/// ([`FakeRig::signal_paused`]), which its next run comes back to.
+#[derive(Default, Clone)]
+struct KeptBody {
+    saved: Option<SavedState>,
+}
+
+/// How the node's next wait ends on the rig ([`FakeRig::signal`] and its
+/// siblings).
+enum CannedWait {
+    Ends(AwaitEnd),
+    /// The run pauses there, as production pauses it when every node
+    /// waits ([`FakeRig::signal_paused`]).
+    Pauses,
 }
 
 /// An infra endpoint in the fake: the infra node's place, and the
@@ -1071,6 +1101,7 @@ impl FakeState {
             shared: crate::shared::Shared::new(std::time::Duration::MAX),
             input_types: Mutex::new(Vec::new()),
             buses: Mutex::new(HashMap::new()),
+            created_buses: Mutex::new(HashMap::new()),
             storage: Mutex::new(HashMap::new()),
             identities: Mutex::new(Vec::new()),
             public_links: std::sync::atomic::AtomicBool::new(false),
@@ -1080,6 +1111,7 @@ impl FakeState {
             next_storage_key: AtomicU64::new(0),
             logs: Mutex::new(Vec::new()),
             run_tags: Mutex::new(Vec::new()),
+            owed_calls: Mutex::new(Vec::new()),
             stops: Mutex::new(Vec::new()),
             program_calls: Mutex::new(Vec::new()),
             program_answers: Mutex::new(HashMap::new()),
@@ -1089,7 +1121,7 @@ impl FakeState {
             public_urls: Mutex::new(BTreeMap::new()),
             endpoint_answers: Mutex::new(BTreeMap::new()),
             endpoint_calls: Mutex::new(Vec::new()),
-            journal: Mutex::new(BTreeMap::new()),
+            kept: Mutex::new(BTreeMap::new()),
             cancellation: Arc::new(CancellationFlag::new()),
             stop_after_calls: Mutex::new(None),
         })
@@ -1278,28 +1310,39 @@ impl FakeRig {
         self.state.routes.lock().unwrap().insert(key, route);
     }
 
-    /// Queue a canned payload for the node's next `ctx.await_signal`.
-    /// Multiple calls queue in order; an `await_signal` on an empty
-    /// queue fails loud ("the test declared no signal").
+    /// Queue a canned answer for the node's next wait (`state.wait`).
+    /// Multiple calls queue in order; a wait on an empty queue fails
+    /// loud ("the test declared no signal").
     pub fn signal(&self, payload: Value) {
-        self.state.signals.lock().unwrap().push_back(AwaitEnd::Answered { value: payload });
+        self.state.signals.lock().unwrap().push_back(CannedWait::Ends(AwaitEnd::Answered { value: payload }));
     }
 
-    /// Make the node's next `ctx.await_signal` fail the way a wait the
+    /// Make the node's next wait fail the way a wait the
     /// run could not pause on fails once its hold runs out
     /// (`WeftError::WaitGaveUp`), queued in order with [`Self::signal`]:
     /// how a test checks what the node does with a wait given up.
     pub fn signal_given_up(&self) {
         let error = "the wait was given up (`rig.signal_given_up()`)".to_string();
-        self.state.signals.lock().unwrap().push_back(AwaitEnd::GaveUp { error });
+        self.state.signals.lock().unwrap().push_back(CannedWait::Ends(AwaitEnd::GaveUp { error }));
     }
 
-    /// Make the node's next `ctx.await_signal` end the way a person
+    /// Make the node's next wait end the way a person
     /// skipping it does (the `/skip` door, `WeftError::WaitSkipped`),
     /// queued in order with [`Self::signal`]: in production the node's
     /// firing then ends skipped with every output closed.
     pub fn signal_skipped(&self) {
-        self.state.signals.lock().unwrap().push_back(AwaitEnd::Skipped);
+        self.state.signals.lock().unwrap().push_back(CannedWait::Ends(AwaitEnd::Skipped));
+    }
+
+    /// Make the node's next wait pause the run there, the way production
+    /// pauses it when every node waits, queued in order with
+    /// [`Self::signal`]: the body saves its state as the pause leaves it
+    /// and stops ([`RigOutcome::paused`]), and a next `rig.run` of the node
+    /// picks the firing up at that wait, where it takes the next answer
+    /// queued. How a test proves that a node carries on across a pause
+    /// without doing again what it did before it.
+    pub fn signal_paused(&self) {
+        self.state.signals.lock().unwrap().push_back(CannedWait::Pauses);
     }
 
     /// Make every run on this rig a run for this instance, what
@@ -1547,9 +1590,10 @@ impl FakeRig {
     /// Press stop, the way a person does with `weft stop` or the
     /// editor's Stop button, once the node has made `calls` outbound
     /// calls (HTTP requests and endpoint calls, counted together). The
-    /// call that reaches the count still gets its answer; the node sees
-    /// the stop at its next `ctx.is_cancelled()` or `cancelled_err()`
-    /// arm. `0` presses it before the run starts. The stop stays
+    /// call that reaches the count still gets its answer; the next call
+    /// through ctx ends with the cancelled error, as a node's own wait
+    /// raced with `ctx.cancellation().race(..)` does. `0` presses it
+    /// before the run starts. The stop stays
     /// pressed for every later run on this rig, as a cancelled run's
     /// flag does.
     pub fn stop_after_calls(&self, calls: usize) {
@@ -1621,7 +1665,7 @@ impl FakeRig {
             run_id: None,
         };
         // Keeps the run's generator feeds registered (see `run`).
-        let (bag, _feeds_alive) = match manifest_input_bag(node.manifest(), &self.state.input_types.lock().unwrap(), inputs) {
+        let (bag, _feeds_alive) = match manifest_input_bag(node.manifest(), &self.state.input_types.lock().unwrap(), inputs, &Default::default()) {
             Ok(pair) => pair,
             Err(e) => return RigOutcome { result: Err(e), ..empty() },
         };
@@ -1651,12 +1695,12 @@ impl FakeRig {
         RigOutcome { run_id: Some(run_id), ..handle.into_outcome(result) }
     }
 
-    /// The journal a body of `node` replays and records: what
-    /// production keys by (run, node, frames), here one sequence per
-    /// node TYPE and body kind, because a rig runs one instance of a
-    /// type at a time (`NODE_UNDER_TEST_ID` is every node's id here).
-    /// Two structs returning one manifest are one node to the rig.
-    fn journal_key(node: &dyn Node, body: &str) -> String {
+    /// The firing a body of `node` is to the rig ([`FakeState::kept`]):
+    /// what production keys by (run, node, frames), here one per node
+    /// TYPE and body kind, because a rig runs one instance of a type at a
+    /// time (`NODE_UNDER_TEST_ID` is every node's id here). Two structs
+    /// returning one manifest are one node to the rig.
+    fn body_key(node: &dyn Node, body: &str) -> String {
         format!("{}/{body}", node.manifest().node_type)
     }
 
@@ -1668,7 +1712,16 @@ impl FakeRig {
     ) -> WeftResult<(CaptureBox, RunContext, RegisteredFeeds)> {
         let manifest = node.manifest();
         let custom = self.state.input_types.lock().unwrap().clone();
-        let (bag, feeds) = manifest_input_bag(manifest, &custom, inputs)?;
+        // A body run again picks up where it saved, as production's
+        // firing does: its state, its counters, the waits it made, and
+        // its stream inputs past what it took.
+        let body_key = Self::body_key(node, body);
+        let kept = self.state.kept.lock().unwrap().get(&body_key).cloned().unwrap_or_default();
+        let (positions, counters) = match &kept.saved {
+            Some(saved) => (saved.positions.clone(), saved.counters),
+            None => Default::default(),
+        };
+        let (bag, feeds) = manifest_input_bag(manifest, &custom, inputs, &positions)?;
         let wake = self.state.wake.lock().unwrap().take();
         // The same gate production applies before a trigger's body
         // runs: a firing payload has to be exactly what the node
@@ -1692,30 +1745,32 @@ impl FakeRig {
         let config = Value::Object(bag.object()?.clone());
         let mut outputs = declared_output_map(manifest, &config);
         declare_output_types(manifest, &config, &mut outputs, &self.state.output_types.lock().unwrap())?;
-        // A resume loads the body's journal, exactly as the run
-        // driver seeds a firing's awaited sequence from the fold: in
-        // call-index order, whatever order the records landed in (two
-        // steps started together record in completion order, and the
-        // fold sorts them the same way).
-        let journal_key = Self::journal_key(node, body);
-        let mut awaited_sequence =
-            self.state.journal.lock().unwrap().get(&journal_key).cloned().unwrap_or_default();
-        awaited_sequence.sort_by_key(|entry| entry.call_index);
         let run_id = crate::RunId::new_v4();
         let handle = Arc::new(TestHandle {
             state: self.state.clone(),
             run_id,
-            capture: Capture::new(
-                outputs,
-                self.state.wired_outputs.lock().unwrap().clone(),
-            ),
+            capture: Capture {
+                buses: Arc::new(
+                    match &kept.saved {
+                        Some(_) => crate::bus::FiringBuses::resumed(positions.buses.clone()),
+                        None => crate::bus::FiringBuses::default(),
+                    }
+                    .cancelled_by(self.state.cancellation.clone()),
+                ),
+                ..Capture::new(outputs, self.state.wired_outputs.lock().unwrap().clone())
+            },
             declared_inputs: declared_input_map(manifest, &custom),
             wake,
             publishes: manifest.publishes.clone(),
-            has_generator_input: manifest.has_generator_input(),
-            journal_key,
-            awaited_sequence: Mutex::new(awaited_sequence.into()),
-            next_call_index: AtomicU32::new(0),
+            feeds: feeds.0.iter().map(|(_, feed)| feed.clone()).collect(),
+            yielded_before: positions.yielded,
+            resumed_helper: Mutex::new(kept.saved.as_ref().and_then(|saved| saved.helper.clone())),
+            places: crate::context::Places::new(NODE_UNDER_TEST_ID),
+            saved: kept.saved,
+            kept_once: AtomicBool::new(false),
+            counters: Mutex::new(counters),
+            wait_in_flight: Mutex::new(None),
+            body_key,
         });
         let instance = self.state.instance.lock().unwrap().clone();
         let ctx = test_context(manifest, bag, instance, run_id, handle.clone());
@@ -1818,15 +1873,15 @@ impl FakeRig {
     }
 
     /// The live bus behind an emitted marker (`outcome.outputs["stream"]`),
-    /// for reading what the run sent. Loud when the run opened no bus
-    /// behind that marker.
+    /// for reading what the run sent, from outside the node (read it with
+    /// `HarnessRead`). Loud when the run opened no bus behind that marker.
     pub fn bus(&self, marker: &Value) -> WeftResult<crate::bus::BusHandle> {
         self.state
             .buses
             .lock()
             .unwrap()
             .get(&marker.to_string())
-            .map(|h| h.new_handle())
+            .map(|h| crate::bus::BusHandle::from_inner(h.inner_arc(), None, None))
             .ok_or_else(|| {
                 WeftError::NodeFailed(
                     "no bus behind this marker (the run never opened one)".to_string(),
@@ -1875,23 +1930,34 @@ impl FakeRig {
         self.state.logs.lock().unwrap().clone()
     }
 
-    /// Every replayable call recorded on this rig, in call order: each
-    /// `ctx.run` step with its value and each `ctx.await_signal` with the
-    /// payload it got, in call order with the call index each landed
-    /// at, for `node`'s run body. A second `rig.run(..)` of the node on
-    /// the same rig replays them instead of running the step's work or
-    /// popping a new signal, the way a resumed run replays its
-    /// journal: run the node twice and this list still holds one entry
-    /// per call, and the request log shows the provider was called
-    /// once.
-    pub fn recorded_steps(&self, node: &dyn Node) -> Vec<AwaitedEntry> {
-        self.state.journal.lock().unwrap().get(&Self::journal_key(node, RUN_BODY)).cloned().unwrap_or_default()
+    /// Hand `node`'s run body `state` as the state it saved before (with
+    /// its counters at zero), as a firing picked up after a pause or a
+    /// crash gets it: for a test of a resume whose first run the rig
+    /// cannot play (a step it cannot fake).
+    pub fn seed_state(&self, node: &dyn Node, state: Value) {
+        self.state.kept.lock().unwrap().entry(Self::body_key(node, RUN_BODY)).or_default().saved =
+            Some(SavedState { state, positions: Positions::default(), counters: Counters::default(), helper: None });
+    }
+
+    /// The state `node`'s run body last saved (`ctx.keep`), as JSON:
+    /// what a second `rig.run(..)` of the node on this rig hands back to
+    /// its body. `None` before it saved anything.
+    pub fn saved_state(&self, node: &dyn Node) -> Option<Value> {
+        self.state.kept.lock().unwrap().get(&Self::body_key(node, RUN_BODY)).and_then(|kept| kept.saved.as_ref()).map(|saved| saved.state.clone())
     }
 
     /// Every tag the node put on its run, one list per
     /// `ctx.tag_run` call, in call order.
     pub fn run_tags(&self) -> Vec<Vec<String>> {
         self.state.run_tags.lock().unwrap().clone()
+    }
+
+    /// Every call the node owes when it ends (`ctx.after_node`), each
+    /// once, in the order it was first registered, with the connection
+    /// it goes through (`None`: plain). Nothing was sent: this is the
+    /// record of what production would send when the node ends.
+    pub fn owed_calls(&self) -> Vec<(crate::signal::CancelCall, Option<crate::primitive::AccessRef>)> {
+        self.state.owed_calls.lock().unwrap().clone()
     }
 
     /// Every `ctx.stop_tagged` the node asked for, in order: the tag
@@ -1956,10 +2022,14 @@ impl Default for FakeRig {
 /// inputs, and the manifest's input names become the spec-name set so
 /// `ctx.inputs.custom()` behaves. Tests hand values in engine shape
 /// (an access input carries a marker built by `rig.access(..)`).
+/// `positions` is where a body run again on the same rig saved: each
+/// stream input's feed starts past what it took, with what a drain of it
+/// held, as a resumed firing's feed does.
 fn manifest_input_bag(
     manifest: &NodeMetadata,
     custom: &[(String, WeftType)],
     inputs: Value,
+    positions: &crate::run::saved::Positions,
 ) -> WeftResult<(ValueBag, RegisteredFeeds)> {
     let Value::Object(mut delivered) = inputs else {
         return Err(WeftError::Input(format!(
@@ -1967,6 +2037,7 @@ fn manifest_input_bag(
         )));
     };
     let mut feeds = RegisteredFeeds(Vec::new());
+    crate::run::ready::drop_blank_texts(&mut delivered, |name| manifest.inputs.iter().any(|i| i.name == name && crate::node::blank_is_no_value(i.required, i.keeps_blank, &i.input_type)));
     for input in &manifest.inputs {
         if let Some(default) = &input.default {
             delivered
@@ -1987,13 +2058,17 @@ fn manifest_input_bag(
                         input.name
                     )));
                 };
+                let taken = positions.taken.get(&input.name).copied().unwrap_or(0);
                 let feed = crate::generator::GeneratorFeed::new(
                     input.name.clone(),
                     crate::liveness::no_liveness(),
                     None,
                     Box::new(|_| {}),
+                    taken,
+                    positions.drained.get(&input.name).cloned().unwrap_or_default(),
+                    None,
                 );
-                for item in items {
+                for item in items.into_iter().skip(usize::try_from(taken).unwrap_or(usize::MAX)) {
                     feed.push(uuid::Uuid::new_v4(), std::sync::Arc::new(item))?;
                 }
                 feed.close(crate::generator::StreamEnd::Finished);
@@ -2160,9 +2235,10 @@ struct Capture {
     declared: HashMap<String, WeftType>,
     /// The output ports the case wired downstream.
     wired: HashSet<String>,
-    /// The buses the body creates or joins, ended with how it returned
-    /// as the engine ends them.
-    buses: crate::bus::FiringBuses,
+    /// The body's side of every bus it creates or joins: ended with how it
+    /// returned as the engine ends them, and where it stands on each
+    /// (from where it saved, on a run of it again).
+    buses: Arc<crate::bus::FiringBuses>,
     outputs: Mutex<serde_json::Map<String, Value>>,
     /// Items emitted on `Generator[T]` ports, in order. Folded into
     /// `outputs` as one JSON array per port at outcome time, so a test
@@ -2177,7 +2253,7 @@ impl Capture {
         Self {
             declared,
             wired,
-            buses: crate::bus::FiringBuses::default(),
+            buses: Arc::default(),
             outputs: Mutex::new(Default::default()),
             stream_outputs: Mutex::new(HashMap::new()),
             closed_ports: Mutex::new(Vec::new()),
@@ -2292,13 +2368,9 @@ impl Capture {
         Ok(())
     }
 
-    /// Whether the body has yielded on or closed a stream output yet,
-    /// mirroring production's `await_signal` guard (a stream's items
-    /// went out live, so a pause after one cannot be replayed; an
-    /// ordinary port sent before a pause replays as a no-op).
-    fn has_touched_a_stream(&self) -> bool {
-        !self.stream_outputs.lock().unwrap().is_empty()
-            || self.closed_ports.lock().unwrap().iter().any(|port| self.declared[port].as_generator().is_some())
+    /// How many items the body yielded on its stream outputs this run.
+    fn yielded(&self) -> u64 {
+        self.stream_outputs.lock().unwrap().values().map(|items| items.len() as u64).sum()
     }
 
     /// Same ARGUMENT validation production applies (a declared
@@ -2325,7 +2397,9 @@ impl Capture {
     fn into_outcome(self, result: WeftResult<()>) -> RigOutcome {
         // The body is done: its buses end with how it returned, as the
         // engine ends them, so a reader under test reads the same end.
-        self.buses.end(crate::bus::body_end(&result));
+        if let Some(end) = crate::bus::body_end(&result) {
+            self.buses.end(end);
+        }
         let mut outputs = self.outputs.into_inner().unwrap();
         let mut streams = self.stream_outputs.into_inner().unwrap();
         let closed_ports = self.closed_ports.into_inner().unwrap();
@@ -2393,7 +2467,9 @@ impl CaptureBox {
             }
         }
         match self {
-            Self::Fake(handle) => unwrap_capture(handle, |h| h.capture).into_outcome(result),
+            Self::Fake(handle) => {
+                unwrap_capture(handle, |h| h.capture).into_outcome(result)
+            }
             Self::Live(handle) => unwrap_capture(handle, |h| h.capture).into_outcome(result),
         }
     }
@@ -2424,24 +2500,34 @@ struct TestHandle {
     /// production does: the service comes from the declaration, never
     /// from the body.
     publishes: Option<String>,
-    /// Whether the node under test declares a Generator input, so the
-    /// rig refuses `await_signal` exactly where a run would.
-    has_generator_input: bool,
-    /// Which of the rig's journals this body records into.
-    journal_key: String,
-    /// What the body has left to replay: the journal it started from,
-    /// popped in call order by the same reading production uses.
-    awaited_sequence: Mutex<VecDeque<AwaitedEntry>>,
-    /// The call counter for THIS run, advanced by `ctx.run` and
-    /// `ctx.await_signal` alike, as production numbers them: one
-    /// sequence across both, never keyed on a step's name.
-    next_call_index: AtomicU32,
+    /// Which firing this body is to the rig ([`FakeState::kept`]).
+    body_key: String,
+    /// The state the body saved on an earlier run of it, what `ctx.keep`
+    /// hands back.
+    saved: Option<SavedState>,
+    /// `ctx.keep` was called: a second call is refused, as in a run.
+    kept_once: AtomicBool,
+    /// The wait and program-call numbers, from where the body saved them.
+    counters: Mutex<Counters>,
+    /// Where the body is among its pause points, from the line its last
+    /// run paused at (`crate::context::Places`).
+    places: crate::context::Places,
+    /// The number of the wait the body is pausing in
+    /// ([`FakeRig::signal_paused`]): its save keeps that number for the
+    /// run again to wait under.
+    wait_in_flight: Mutex<Option<u32>>,
+    /// The waiting helper the last run paused in, handed once to the helper
+    /// this run comes back into (`crate::context::Kept::follow`).
+    resumed_helper: Mutex<Option<crate::run::saved::PausedHelper>>,
+    /// The body's stream inputs, whose takes its saved positions carry.
+    feeds: Vec<Arc<crate::generator::GeneratorFeed>>,
+    /// How many items it yielded on an earlier run, before this one's.
+    yielded_before: u64,
 }
 
 impl TestHandle {
-    /// Append one replayable call to this body's journal on the rig.
-    fn record(&self, entry: AwaitedEntry) {
-        self.state.journal.lock().unwrap().entry(self.journal_key.clone()).or_default().push(entry);
+    fn kept(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, KeptBody>> {
+        self.state.kept.lock().unwrap()
     }
 
     /// The service the node under test declares it publishes, or the
@@ -2466,55 +2552,85 @@ impl ContextHandle for TestHandle {
         self.state.canned_client()
     }
 
-    async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value> {
-        // Same refusals as the production handle, in production's
-        // order: a green node test on a body a run would refuse
-        // is the costly divergence.
-        if self.capture.has_touched_a_stream() {
-            return Err(WeftError::NodeFailed(
-                crate::context::streamed_then_await_signal_error(NODE_UNDER_TEST_ID),
-            ));
+    async fn keep_state(&self, initial: Value) -> WeftResult<Value> {
+        if self.kept_once.swap(true, Ordering::SeqCst) {
+            return Err(crate::context::kept_twice());
         }
-        if self.has_generator_input {
-            return Err(WeftError::NodeFailed(
-                crate::context::stream_consumer_await_signal_error(NODE_UNDER_TEST_ID),
-            ));
-        }
-        // One counter with `ctx.run` and the one replay reading, as
-        // production: a resume (a second run of this node on this rig)
-        // replays the payload this index got the first time, and a
-        // drifted body is refused with production's own words.
-        let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
-        match replay_await(&mut self.awaited_sequence.lock().unwrap(), call_index)? {
-            Some(ReplayedAwait::Resolved(payload)) => return Ok(payload),
-            Some(ReplayedAwait::Pending { token }) => {
-                return Err(WeftError::NodeFailed(format!(
-                    "the rig's journal holds an unanswered await ({token}) at call_index={call_index}, \
-                     which it never records: every await it journals was answered when it was made"
-                )));
+        Ok(self.saved.as_ref().map_or(initial, |saved| saved.state.clone()))
+    }
+
+    /// A save is where the body stands, except the one a pause makes
+    /// ([`FakeRig::signal_paused`]): its wait takes the same number again.
+    async fn save_state(&self, state: Value, at: crate::context::SaveAt) -> WeftResult<()> {
+        let mut counters = *self.counters.lock().unwrap();
+        let helper = match at {
+            crate::context::SaveAt::Pausing { helper } => {
+                // As production pauses a firing: its names held over, its
+                // streams taking no end, its wait numbered again.
+                self.capture.buses.pause();
+                self.feeds.iter().for_each(|feed| feed.pause());
+                if let Some(number) = *self.wait_in_flight.lock().unwrap() {
+                    counters.waits = number;
+                }
+                helper
             }
-            None => {}
-        }
-        // Record the ATTEMPT before popping, so a test can see a park
-        // that found no queued payload (otherwise "parked on nothing"
-        // and "never awaited" would look the same).
+            crate::context::SaveAt::Here => None,
+        };
+        let streams = crate::generator::GeneratorFeed::saved_of(&self.feeds);
+        let saved = SavedState {
+            state,
+            positions: Positions {
+                buses: self.capture.buses.positions(),
+                taken: streams.taken,
+                ended: streams.ended,
+                drained: streams.drained,
+                yielded: self.yielded_before + self.capture.yielded(),
+            },
+            counters,
+            helper,
+        };
+        self.kept().entry(self.body_key.clone()).or_default().saved = Some(saved);
+        Ok(())
+    }
+
+    fn resumed_helper(&self) -> Option<crate::run::saved::PausedHelper> {
+        self.resumed_helper.lock().unwrap().take()
+    }
+
+    /// A wait, numbered on from the firing's saved counters as production
+    /// numbers it, taking the next answer the test queued: an ending, or a
+    /// pause there ([`FakeRig::signal_paused`]), whose save keeps this
+    /// wait's number for the run again to wait under.
+    async fn wait(&self, spec: SignalSpec) -> WeftResult<Value> {
+        let number = {
+            let mut counters = self.counters.lock().unwrap();
+            counters.waits += 1;
+            counters.waits - 1
+        };
+        // Record the ATTEMPT before popping, so a test can see a wait that
+        // found no queued answer (otherwise "waited on nothing" and "never
+        // waited" would look the same).
         self.state.awaited_signals.lock().unwrap().push(spec.clone());
         let ended = self.state.signals.lock().unwrap().pop_front().ok_or_else(|| {
             WeftError::Config(format!(
-                "the node awaited a '{}' signal but the test declared no payload for it; \
+                "the node waited on a '{}' signal but the test declared no answer for it; \
                  queue one with rig.signal(json!(..)) before rig.run(..)",
                 spec.kind
             ))
         })?;
-        self.record(AwaitedEntry {
-            call_index,
-            kind: AwaitedEntryKind::Await { token: format!("rig-{}-{call_index}", spec.kind), ended: Some(ended.clone()) },
-        });
         match ended {
-            AwaitEnd::Answered { value } => Ok(value),
-            AwaitEnd::GaveUp { error } => Err(WeftError::WaitGaveUp(error)),
-            AwaitEnd::Skipped => Err(crate::primitive::wait_skipped()),
+            CannedWait::Ends(AwaitEnd::Answered { value }) => Ok(value),
+            CannedWait::Ends(AwaitEnd::GaveUp { error }) => Err(WeftError::WaitGaveUp(error)),
+            CannedWait::Ends(AwaitEnd::Skipped) => Err(crate::primitive::wait_skipped()),
+            CannedWait::Pauses => {
+                *self.wait_in_flight.lock().unwrap() = Some(number);
+                Err(WeftError::Suspended { token: Some(format!("rig-{}-{number}", spec.kind)) })
+            }
         }
+    }
+
+    fn places(&self) -> &crate::context::Places {
+        &self.places
     }
 
     async fn register_signal(&self, spec: SignalSpec, port_snapshot: Value) -> WeftResult<()> {
@@ -2621,26 +2737,6 @@ impl ContextHandle for TestHandle {
         }
     }
 
-    async fn run_step(&self, name: &str) -> WeftResult<(u32, Option<Value>)> {
-        // The rig's journal replayed by the one reading production
-        // uses: a step an earlier run of this node recorded is replayed
-        // by call index, name unread; an await there, or another index,
-        // is the drift production refuses.
-        let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
-        let replayed = replay_run(&mut self.awaited_sequence.lock().unwrap(), name, call_index)?;
-        Ok((call_index, replayed))
-    }
-
-    async fn run_record(&self, name: &str, call_index: u32, value: &Value) -> WeftResult<()> {
-        // Appended in the order the records land, as production's
-        // journal rows are; the index travels on the entry.
-        self.record(AwaitedEntry {
-            call_index,
-            kind: AwaitedEntryKind::Run { name: name.to_string(), value: value.clone() },
-        });
-        Ok(())
-    }
-
     /// Publishing in the fake rig writes the values into the same map
     /// `open_connection` reads, so a node that publishes and then opens
     /// what it published behaves as it does in production. The service
@@ -2665,6 +2761,17 @@ impl ContextHandle for TestHandle {
         self.state.secrets.lock().unwrap().get(&id).cloned().ok_or_else(|| {
             WeftError::Type(format!("secret {id} is no secret of this run: hand the node one made with `rig.secret(..)`"))
         })
+    }
+
+    /// Checked like production, and owed once however often the body
+    /// registers it.
+    async fn after_node(&self, call: crate::signal::CancelCall, access: Option<crate::primitive::AccessRef>) -> WeftResult<()> {
+        call.validate().map_err(|why| WeftError::Input(format!("node '{NODE_UNDER_TEST_ID}': {why}")))?;
+        let mut owed = self.state.owed_calls.lock().unwrap();
+        if !owed.iter().any(|(c, a)| *c == call && *a == access) {
+            owed.push((call, access));
+        }
+        Ok(())
     }
 
     async fn published_access(&self) -> WeftResult<Option<Access>> {
@@ -2743,11 +2850,11 @@ impl ContextHandle for TestHandle {
         &self,
         call: crate::program::ProgramCall,
         stop_self: crate::tag::StopSelf,
-        _call_index: u32,
         _project: Option<uuid::Uuid>,
     ) -> WeftResult<Value> {
         use crate::program::{infra::InfraCall, instances::InstanceCall, triggers::TriggerCall, ProgramCall};
-        let name = call.journal_name();
+        self.counters.lock().unwrap().program_calls += 1;
+        let name = call.name();
         // A call that only acts, left unanswered by the test, answers the
         // way the runtime answers one it carried out: a start is queued, a
         // copy taken down, a change of values set nothing up again.
@@ -2786,9 +2893,17 @@ impl ContextHandle for TestHandle {
         instance: &crate::instance::InstanceId,
         expires_in_secs: u64,
         _displays: bool,
-        id: uuid::Uuid,
         project: Option<uuid::Uuid>,
     ) -> WeftResult<crate::program::MintedInstanceToken> {
+        // Derived from where the mint is made, as production derives it:
+        // a body minting again under the same number mints the same id.
+        let number = {
+            let mut counters = self.counters.lock().unwrap();
+            let n = counters.program_calls;
+            counters.program_calls += 1;
+            n
+        };
+        let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, format!("node-test/{}/{number}", self.body_key).as_bytes());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before unix epoch")
@@ -2819,7 +2934,7 @@ impl ContextHandle for TestHandle {
         &self.capture.buses
     }
 
-    async fn pulse_downstream(&self, output: NodeOutput, _wait_delivered: bool) -> WeftResult<()> {
+    async fn pulse_downstream(&self, output: NodeOutput, _delivery: crate::context::Delivery) -> WeftResult<()> {
         // No downstream graph in a rig run: the harness is the
         // consumer and takes every yield instantly, so a delivery-
         // waiting emission resolves immediately and a plain one leaves
@@ -2837,29 +2952,53 @@ impl ContextHandle for TestHandle {
 
     fn create_bus(
         &self,
+        port: &str,
         opts: crate::bus::BusOptions,
     ) -> WeftResult<(crate::bus::BusHandle, Value)> {
+        // A run of the body again creating its bus on a port while the
+        // one it created there is still open (its last run paused) gets
+        // that bus, as production does after a pause; one that closed went
+        // with its run, so a new run of the body opens a new one.
+        let key = (self.body_key.clone(), port.to_string());
+        let kept = self.state.created_buses.lock().unwrap().get(&key).cloned();
+        if let Some(marker) = kept {
+            let existing = self.bus(&serde_json::from_str(&marker).expect("a kept marker reads back"))?;
+            if !existing.is_closed() {
+                let marker = existing.marker();
+                return Ok((existing, marker));
+            }
+        }
         // The REAL in-process bus, held in the rig's registry so the
         // marker resolves back (`ctx.bus`, and the test's own
-        // `rig.bus` read after the run).
-        let handle = crate::bus::BusHandle::create_with_options(opts)
-            .map_err(|e| WeftError::NodeFailed(format!("create bus: {e}")))?;
+        // `rig.bus` read after the run), the body's own handle carrying
+        // where the body stands on it.
+        let handle = crate::bus::BusHandle::create_with_engine(
+            opts,
+            crate::liveness::no_liveness(),
+            std::sync::Weak::new(),
+            Some(node_under_test()),
+            Some(self.capture.buses.clone()),
+        )
+        .map_err(|e| WeftError::NodeFailed(format!("create bus: {e}")))?;
         let marker = handle.marker();
         self.state
             .buses
             .lock()
             .unwrap()
             .insert(marker.to_string(), handle.new_handle());
+        self.state.created_buses.lock().unwrap().insert(key, marker.to_string());
         Ok((handle, marker))
     }
 
+    /// The body's handle on the bus behind `marker`, carrying where it
+    /// stands on it (so a run of it again reads on from where it saved).
     fn bus(&self, marker: &Value) -> WeftResult<crate::bus::BusHandle> {
         self.state
             .buses
             .lock()
             .unwrap()
             .get(&marker.to_string())
-            .map(|h| h.new_handle())
+            .map(|h| crate::bus::BusHandle::from_inner(h.inner_arc(), Some(node_under_test()), Some(self.capture.buses.clone())))
             .ok_or_else(|| {
                 WeftError::NodeFailed(
                     "no bus behind this marker (the run never opened one)".to_string(),
@@ -2919,6 +3058,7 @@ impl ContextHandle for TestHandle {
         scope: &crate::storage::StorageScope,
         identity: Option<&str>,
         url: &str,
+        mime: Option<&str>,
         filename: Option<&str>,
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
@@ -2947,10 +3087,14 @@ impl ContextHandle for TestHandle {
         }
         // Mime and filename derive through the same core helpers
         // production funnels a fetched URL through, so a fake-passing
-        // node stores the same metadata production would.
-        let mime = crate::storage::normalize_content_type(
-            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
-        );
+        // node stores the same metadata production would: the caller's
+        // stated type wins over the canned route's.
+        let mime = match mime {
+            Some(mime) => mime.to_string(),
+            None => crate::storage::normalize_content_type(
+                resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            ),
+        };
         // The caller's name, then the one the canned route serves in
         // its Content-Disposition, then the URL: the same order as
         // production, so a test sees the name a node would.
@@ -3222,16 +3366,37 @@ struct CannedAnswerMiddleware {
 impl reqwest_middleware::Middleware for CannedAnswerMiddleware {
     async fn handle(
         &self,
-        req: reqwest::Request,
+        mut req: reqwest::Request,
         _extensions: &mut http::Extensions,
         _next: reqwest_middleware::Next<'_>,
     ) -> reqwest_middleware::Result<reqwest::Response> {
+        // The run's cancel layer sits inside this one and is never
+        // reached (this answers itself), so a stopped run's request ends
+        // here the way it would there: with the cancelled error, nothing
+        // sent.
+        if self.state.cancellation.is_cancelled() {
+            return Err(reqwest_middleware::Error::Middleware(anyhow::Error::new(crate::error::WeftError::Cancelled)));
+        }
         let method = req.method().as_str().to_ascii_uppercase();
         let path = req.url().path().to_string();
         let query = req.url().query().map(str::to_string);
-        let body_bytes = req.body().and_then(|b| b.as_bytes());
-        let body_streamed = req.body().is_some() && body_bytes.is_none();
-        let body_text = body_bytes.map(|b| String::from_utf8_lossy(b).into_owned());
+        let body_streamed = req.body().is_some_and(|b| b.as_bytes().is_none());
+        // The fake answers itself and never forwards, so a streamed body
+        // (an upload from storage) is read whole for the test to see.
+        let body_bytes = match req.body_mut().take() {
+            None => None,
+            Some(body) => match body.as_bytes() {
+                Some(bytes) => Some(bytes.to_vec()),
+                None => Some(
+                    http_body_util::BodyExt::collect(body)
+                        .await
+                        .map_err(|e| reqwest_middleware::Error::Middleware(anyhow::anyhow!("the node-test rig could not read a streamed request body: {e}")))?
+                        .to_bytes()
+                        .to_vec(),
+                ),
+            },
+        };
+        let body_text = body_bytes.as_deref().map(|b| String::from_utf8_lossy(b).into_owned());
         let body = body_text.as_deref().and_then(|t| serde_json::from_str(t).ok());
         let headers = req
             .headers()
@@ -3347,6 +3512,15 @@ const SETUP_TRIGGER_BODY: &str = "setup_trigger";
 /// it, so a drifted copy would silently blind the watchdog.
 pub const NODE_UNDER_TEST_ID: &str = "node-under-test";
 
+/// What a test reads a bus or a stream with from outside the node's body
+/// (`weft_core::context::HarnessRead`).
+pub use crate::context::HarnessRead;
+
+/// The firing every rig body runs as.
+fn node_under_test() -> crate::liveness::FiringLocation {
+    crate::liveness::FiringLocation::new(NODE_UNDER_TEST_ID, Vec::new())
+}
+
 /// The base the fake rig's external links go under
 /// (`StorageHandle::external_link`): a stable address a test asserts
 /// against.
@@ -3365,15 +3539,13 @@ pub const FAKE_CONTAINER_BASE: &str = "http://fake-containers.test";
 pub const NODE_TEST_HARNESS_ID: &str = "node-test-harness";
 
 /// Builds the production `ContextHandle` for one live-rig actor, from
-/// its role, its declared output map, and whether it declares a
-/// Generator input (so the production `await_signal` guard applies in
-/// a live test exactly as in a run). The runtime composes it
+/// its role and its declared output map. The runtime composes it
 /// (broker clients, throwaway run identity, no-op journal) and
 /// hands it to the runner; weft-core only names the seam so
 /// [`NodeTest`] can be declared without depending on the runtime
 /// crate.
 pub type LiveHandleFactory = Arc<
-    dyn Fn(HandleRole<'_>, HashMap<String, WeftType>, bool) -> WeftResult<Arc<dyn ContextHandle>>
+    dyn Fn(HandleRole<'_>, HashMap<String, WeftType>) -> WeftResult<Arc<dyn ContextHandle>>
         + Send
         + Sync,
 >;
@@ -3393,6 +3565,8 @@ pub struct LiveRig {
     input_types: Mutex<Vec<(String, WeftType)>>,
     /// Output port types the case declared, as [`FakeRig::output_type`].
     output_types: Mutex<HashMap<String, WeftType>>,
+    /// How many buses the test seeded ([`Self::bus`]): each one's port.
+    bus_seeds: AtomicU64,
 }
 
 impl LiveRig {
@@ -3405,6 +3579,7 @@ impl LiveRig {
             wired_outputs: Mutex::new(HashSet::new()),
             input_types: Mutex::new(Vec::new()),
             output_types: Mutex::new(HashMap::new()),
+            bus_seeds: AtomicU64::new(0),
         }
     }
 
@@ -3478,11 +3653,7 @@ impl LiveRig {
         bytes: impl Into<Vec<u8>>,
     ) -> WeftResult<Value> {
         // A storage seed emits nothing, so it declares no outputs.
-        let handle = (self.factory)(
-            HandleRole::Harness { node_type: "NodeTestStorageSeed" },
-            HashMap::new(),
-            false,
-        )?;
+        let handle = (self.factory)(HandleRole::Harness { node_type: "NodeTestStorageSeed" }, HashMap::new())?;
         handle
             .storage_put(
                 &crate::storage::StorageScope::Run,
@@ -3503,11 +3674,7 @@ impl LiveRig {
     pub async fn stored_bytes(&self, file: &Value) -> WeftResult<bytes::Bytes> {
         let key = crate::storage::StoredFile::from_value(file)?.key;
         // A storage read emits nothing, so it declares no outputs.
-        let handle = (self.factory)(
-            HandleRole::Harness { node_type: "NodeTestStorageRead" },
-            HashMap::new(),
-            false,
-        )?;
+        let handle = (self.factory)(HandleRole::Harness { node_type: "NodeTestStorageRead" }, HashMap::new())?;
         let (_, stream) = handle.storage_get(&key, None).await?;
         crate::storage::collect_stream(stream)
             .await
@@ -3526,11 +3693,7 @@ impl LiveRig {
     pub async fn connect(&self) -> WeftResult<OpenedConnection> {
         // A setup/teardown connection emits nothing, so its handle
         // declares no outputs.
-        let handle = (self.factory)(
-            HandleRole::Harness { node_type: "NodeTestConnect" },
-            HashMap::new(),
-            false,
-        )?;
+        let handle = (self.factory)(HandleRole::Harness { node_type: "NodeTestConnect" }, HashMap::new())?;
         handle
             .open_connection(&self.access, crate::context::DEFAULT_PROVIDER_WINDOW)
             .await
@@ -3547,13 +3710,12 @@ impl LiveRig {
         &self,
         opts: crate::bus::BusOptions,
     ) -> WeftResult<(crate::bus::BusHandle, Value)> {
-        // A bus seed emits nothing, so its handle declares no outputs.
-        let handle = (self.factory)(
-            HandleRole::Harness { node_type: "NodeTestBusSeed" },
-            HashMap::new(),
-            false,
-        )?;
-        handle.create_bus(opts)
+        // A bus seed emits nothing, so its handle declares no outputs. A
+        // firing creates one bus per port, and every seed of the rig runs
+        // as the one harness firing, so each takes a port of its own.
+        let handle = (self.factory)(HandleRole::Harness { node_type: "NodeTestBusSeed" }, HashMap::new())?;
+        let seed = self.bus_seeds.fetch_add(1, Ordering::SeqCst);
+        handle.create_bus(&format!("seed{seed}"), opts)
     }
 
     /// Run the node's `run` body against the production handle,
@@ -3564,13 +3726,12 @@ impl LiveRig {
         let custom = self.input_types.lock().unwrap().clone();
         // Keeps the run's generator feeds registered (see the fake
         // rig's `run` for why this binding must outlive the body).
-        let (bag, _feeds_alive) = match manifest_input_bag(manifest, &custom, inputs) {
+        let (bag, _feeds_alive) = match manifest_input_bag(manifest, &custom, inputs, &Default::default()) {
             Ok(pair) => pair,
             Err(e) => {
                 return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None }
             }
         };
-        let has_generator_input = manifest.has_generator_input();
         // From the BAG, not the raw case inputs, for the same reason as
         // the fake rig: the node reads the defaulted bag, so the output
         // map must be derived from it too.
@@ -3584,11 +3745,7 @@ impl LiveRig {
         if let Err(e) = declare_output_types(manifest, &config, &mut outputs_by_name, &self.output_types.lock().unwrap()) {
             return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None };
         }
-        let inner = match (self.factory)(
-            HandleRole::NodeUnderTest { node_type: &manifest.node_type },
-            outputs_by_name.clone(),
-            has_generator_input,
-        ) {
+        let inner = match (self.factory)(HandleRole::NodeUnderTest { node_type: &manifest.node_type }, outputs_by_name.clone()) {
             Ok(handle) => handle,
             Err(e) => {
                 return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None }
@@ -3622,16 +3779,24 @@ struct CapturingHandle {
 
 #[async_trait::async_trait]
 impl ContextHandle for CapturingHandle {
-    async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value> {
-        // Emissions are captured HERE, so the inner production
-        // handle's own streamed-then-suspend guard never sees them;
-        // apply it at the capture layer where the truth lives.
-        if self.capture.has_touched_a_stream() {
-            return Err(WeftError::NodeFailed(
-                crate::context::streamed_then_await_signal_error(NODE_UNDER_TEST_ID),
-            ));
-        }
-        self.inner.await_signal(spec).await
+    async fn keep_state(&self, initial: Value) -> WeftResult<Value> {
+        self.inner.keep_state(initial).await
+    }
+
+    async fn save_state(&self, state: Value, at: crate::context::SaveAt) -> WeftResult<()> {
+        self.inner.save_state(state, at).await
+    }
+
+    fn resumed_helper(&self) -> Option<crate::run::saved::PausedHelper> {
+        self.inner.resumed_helper()
+    }
+
+    async fn wait(&self, spec: SignalSpec) -> WeftResult<Value> {
+        self.inner.wait(spec).await
+    }
+
+    fn places(&self) -> &crate::context::Places {
+        self.inner.places()
     }
 
     async fn register_signal(&self, spec: SignalSpec, port_snapshot: Value) -> WeftResult<()> {
@@ -3667,14 +3832,6 @@ impl ContextHandle for CapturingHandle {
         self.inner.endpoint_call(url, method, path, body).await
     }
 
-    async fn run_step(&self, name: &str) -> WeftResult<(u32, Option<Value>)> {
-        self.inner.run_step(name).await
-    }
-
-    async fn run_record(&self, name: &str, call_index: u32, value: &Value) -> WeftResult<()> {
-        self.inner.run_record(name, call_index, value).await
-    }
-
     async fn open_connection(
         &self,
         access: &Access,
@@ -3689,6 +3846,10 @@ impl ContextHandle for CapturingHandle {
 
     async fn published_access(&self) -> WeftResult<Option<Access>> {
         self.inner.published_access().await
+    }
+
+    async fn after_node(&self, call: crate::signal::CancelCall, access: Option<crate::primitive::AccessRef>) -> WeftResult<()> {
+        self.inner.after_node(call, access).await
     }
 
     fn keep_secret(&self, value: Value) -> WeftResult<crate::secret::SecretId> {
@@ -3723,10 +3884,9 @@ impl ContextHandle for CapturingHandle {
         &self,
         call: crate::program::ProgramCall,
         stop_self: crate::tag::StopSelf,
-        call_index: u32,
         project: Option<uuid::Uuid>,
     ) -> WeftResult<Value> {
-        self.inner.program_call(call, stop_self, call_index, project).await
+        self.inner.program_call(call, stop_self, project).await
     }
 
     async fn mint_instance_token(
@@ -3734,10 +3894,9 @@ impl ContextHandle for CapturingHandle {
         instance: &crate::instance::InstanceId,
         expires_in_secs: u64,
         displays: bool,
-        id: uuid::Uuid,
         project: Option<uuid::Uuid>,
     ) -> WeftResult<crate::program::MintedInstanceToken> {
-        self.inner.mint_instance_token(instance, expires_in_secs, displays, id, project).await
+        self.inner.mint_instance_token(instance, expires_in_secs, displays, project).await
     }
 
     fn cancellation(&self) -> Arc<CancellationFlag> {
@@ -3760,7 +3919,7 @@ impl ContextHandle for CapturingHandle {
         &self.capture.buses
     }
 
-    async fn pulse_downstream(&self, output: NodeOutput, _wait_delivered: bool) -> WeftResult<()> {
+    async fn pulse_downstream(&self, output: NodeOutput, _delivery: crate::context::Delivery) -> WeftResult<()> {
         // Same stance as the fake handle: the harness takes every
         // yield instantly, so a delivery wait resolves immediately.
         self.capture.pulse(output)
@@ -3776,9 +3935,10 @@ impl ContextHandle for CapturingHandle {
 
     fn create_bus(
         &self,
+        port: &str,
         opts: crate::bus::BusOptions,
     ) -> WeftResult<(crate::bus::BusHandle, Value)> {
-        self.inner.create_bus(opts)
+        self.inner.create_bus(port, opts)
     }
 
     fn bus(&self, marker: &Value) -> WeftResult<crate::bus::BusHandle> {
@@ -3805,10 +3965,11 @@ impl ContextHandle for CapturingHandle {
         scope: &crate::storage::StorageScope,
         identity: Option<&str>,
         url: &str,
+        mime: Option<&str>,
         filename: Option<&str>,
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
-        self.inner.storage_put_from_url(scope, identity, url, filename, keep).await
+        self.inner.storage_put_from_url(scope, identity, url, mime, filename, keep).await
     }
 
     async fn storage_get(
@@ -4191,7 +4352,7 @@ mod tests {
 
     /// A stop pressed mid-poll ends the run cancelled after exactly the
     /// calls made before it; a stop pressed up front ends it before the
-    /// first poll is answered past its select.
+    /// first poll goes out, as the run's cancel layer does in a real run.
     #[tokio::test]
     async fn stop_after_calls_cancels_a_polling_node() {
         let rig = FakeRig::new();
@@ -4211,7 +4372,7 @@ mod tests {
         rig.stop_after_calls(0);
         let outcome = rig.run(&PollingNode, json!({})).await;
         assert!(matches!(outcome.result, Err(crate::error::WeftError::Cancelled)));
-        assert_eq!(rig.requests().len(), 1, "one poll went out before the select saw the stop");
+        assert!(rig.requests().is_empty(), "a run stopped up front sends nothing");
     }
 
     /// A node that steers its siblings: the fake records the tags it put
@@ -4439,7 +4600,7 @@ mod tests {
                 "label": "Rig publisher",
                 "description": "test-only node",
                 "inputs": [],
-                "outputs": [{"name": "access", "type": "Access"}],
+                "outputs": [{"name": "access", "type": "Access[probedb]"}],
                 "publishes": "probedb"
             }))
             .expect("publisher manifest")
@@ -4453,7 +4614,7 @@ mod tests {
                 "label": "Rig probe database access",
                 "description": "test-only node",
                 "inputs": [],
-                "outputs": [{"name": "access", "type": "Access"}],
+                "outputs": [{"name": "access", "type": "Access[probedb]"}],
                 "service": {
                     "service": "probedb",
                     "acquisition": { "kind": "static", "fields": [
@@ -4572,9 +4733,17 @@ mod tests {
         );
     }
 
-    /// A node that publishes through `ctx.run`, the exactly-once step:
-    /// the provider call is the step's work, and the emitted id is
-    /// whatever the step answered.
+    /// What the publishing nodes below keep: the post they published, and
+    /// (for the one that asks first) the answer it was given.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct Publish {
+        answer: Option<Value>,
+        published: Option<Value>,
+    }
+
+    /// A node that publishes in a `once`, the exactly-once step: the
+    /// provider call is the step's work, and the emitted id is whatever
+    /// the step answered.
     struct PublishingNode;
     impl crate::node::NodeManifest for PublishingNode {
         fn manifest(&self) -> &'static NodeMetadata {
@@ -4586,8 +4755,9 @@ mod tests {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let access: Access = ctx.inputs.get("account")?;
             let client = ctx.client(&access).await?;
-            let published = ctx
-                .run("publish", || async {
+            let mut state = ctx.keep(Publish::default()).await?;
+            let published = state
+                .once(|s| &mut s.published, async |_| {
                     crate::access::client::post_json(
                         &client,
                         "https://provider.example/api/send",
@@ -4602,12 +4772,11 @@ mod tests {
         }
     }
 
-    /// The rig's recorded steps are the journal: a second run on the
-    /// same rig is a resume, and the provider is not called again. This
-    /// is the property a node that posts on somebody's behalf exists to
-    /// keep, and the one its tests could not prove before.
+    /// A second run on the same rig picks the firing up from the state it
+    /// saved, and the provider is not called again. This is the property a
+    /// node that posts on somebody's behalf exists to keep.
     #[tokio::test]
-    async fn a_recorded_step_is_replayed_by_the_next_run_on_the_same_rig() {
+    async fn a_saved_once_is_not_done_again_by_the_next_run_on_the_same_rig() {
         let rig = FakeRig::new();
         rig.respond("POST", "/api/send", json!({"id": "post-1"}));
         let first = rig
@@ -4619,51 +4788,38 @@ mod tests {
             .run(&PublishingNode, json!({"account": rig.access("probe")}))
             .await
             .ok()
-            .expect("second run replays");
+            .expect("second run carries on from the saved state");
 
         assert_eq!(first.outputs["reply"], json!({"id": "post-1"}));
-        assert_eq!(second.outputs["reply"], first.outputs["reply"], "the replay answers the same");
+        assert_eq!(second.outputs["reply"], first.outputs["reply"], "the saved result stands");
         assert_eq!(rig.requests().len(), 1, "the provider was called once across two runs");
-        assert_eq!(
-            rig.recorded_steps(&PublishingNode),
-            vec![AwaitedEntry {
-                call_index: 0,
-                kind: AwaitedEntryKind::Run { name: "publish".into(), value: json!({"id": "post-1"}) },
-            }]
-        );
+        assert_eq!(rig.saved_state(&PublishingNode), Some(json!({"answer": null, "published": {"id": "post-1"}})));
     }
 
-    /// Two node types on one rig are two runs in production, with
-    /// a journal each: the second never replays the first's steps.
+    /// Two node types on one rig are two firings in production, with a
+    /// saved state each: the second never picks up the first's.
     #[tokio::test]
-    async fn another_node_on_the_same_rig_has_its_own_journal() {
+    async fn another_node_on_the_same_rig_has_its_own_state() {
         let rig = FakeRig::new();
         rig.respond("POST", "/api/send", json!({"id": "post-1"}));
         rig.signal(json!({"ok": true}));
-        rig.run(&AskThenPublishNode { ask: true }, json!({"account": rig.access("probe")}))
+        rig.run(&AskThenPublishNode, json!({"account": rig.access("probe")}))
             .await
             .ok()
-            .expect("the asking node parks, is answered, publishes");
+            .expect("the asking node waits, is answered, publishes");
         let other = rig
             .run(&PublishingNode, json!({"account": rig.access("probe")}))
             .await
             .ok()
-            .expect("a different node runs its own body, replaying nothing");
+            .expect("a different node runs its own body from its own state");
         assert_eq!(other.outputs["reply"], json!({"id": "post-1"}));
         assert_eq!(rig.requests().len(), 2, "each node made its own call");
-        assert!(rig.recorded_steps(&PublishingNode).iter().all(|entry| matches!(entry.kind, AwaitedEntryKind::Run { .. })));
     }
 
-    /// A body that parks on a signal and then publishes: production
-    /// numbers the await and the run on one counter, and a resume
-    /// replays both. The rig does the same, so the second run needs no
-    /// second signal, calls the provider once, and a body whose call
-    /// order changed is refused where production would refuse it.
-    struct AskThenPublishNode {
-        /// `false` is the same node with its await edited out: the
-        /// drifted body a resume must refuse.
-        ask: bool,
-    }
+    /// A body that waits on a signal and then publishes: a second run on
+    /// the same rig gets its saved state back, so it needs no second
+    /// signal and calls the provider once.
+    struct AskThenPublishNode;
     impl crate::node::NodeManifest for AskThenPublishNode {
         fn manifest(&self) -> &'static NodeMetadata {
             asking_manifest()
@@ -4682,16 +4838,12 @@ mod tests {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let access: Access = ctx.inputs.get("account")?;
             let client = ctx.client(&access).await?;
-            let answer = if self.ask {
-                ctx.await_signal(crate::signal::timer::Timer {
-                    spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 },
-                })
-                .await?
-            } else {
-                json!(true)
-            };
-            let published = ctx
-                .run("publish", || async {
+            let mut state = ctx.keep(Publish::default()).await?;
+            let answer = state
+                .wait(|s| &mut s.answer, crate::signal::timer::Timer { spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 } })
+                .await?;
+            let published = state
+                .once(|s| &mut s.published, async |_| {
                     crate::access::client::post_json(
                         &client,
                         "https://provider.example/api/send",
@@ -4707,47 +4859,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_await_and_a_run_share_one_index_and_both_replay() {
+    async fn a_wait_and_a_once_both_carry_over_to_the_next_run() {
         let rig = FakeRig::new();
         rig.respond("POST", "/api/send", json!({"id": "post-1"}));
         rig.signal(json!({"ok": true}));
-        rig.run(&AskThenPublishNode { ask: true }, json!({"account": rig.access("probe")}))
+        rig.run(&AskThenPublishNode, json!({"account": rig.access("probe")}))
             .await
             .ok()
-            .expect("first run parks, is answered, publishes");
-        // No second signal queued: the resume replays the first answer.
+            .expect("first run waits, is answered, publishes");
+        // No second signal queued: the saved answer stands.
         let second = rig
-            .run(&AskThenPublishNode { ask: true }, json!({"account": rig.access("probe")}))
+            .run(&AskThenPublishNode, json!({"account": rig.access("probe")}))
             .await
             .ok()
-            .expect("second run replays the answer and the publish");
+            .expect("second run carries on from the saved answer and post");
         assert_eq!(second.outputs["reply"], json!({"id": "post-1"}));
         assert_eq!(rig.requests().len(), 1, "one provider call across the two runs");
-        let steps = rig.recorded_steps(&AskThenPublishNode { ask: true });
-        assert_eq!(steps.len(), 2, "one entry per call, replays add none: {steps:?}");
-        assert!(
-            matches!(&steps[0].kind, AwaitedEntryKind::Await { ended: Some(AwaitEnd::Answered { value }), .. } if value == &json!({"ok": true}))
-                && steps[0].call_index == 0,
-            "the await is index 0, as production numbers it: {steps:?}"
-        );
-        assert_eq!(
-            steps[1],
-            AwaitedEntry {
-                call_index: 1,
-                kind: AwaitedEntryKind::Run { name: "publish".into(), value: json!({"id": "post-1"}) },
-            },
-            "and the run index 1"
-        );
+        assert_eq!(rig.awaited_signals().len(), 1, "the wait was asked once");
+    }
 
-        // The same node with its await edited out runs where it awaited:
-        // a drifted body, refused with production's own words.
-        let err = rig
-            .run(&AskThenPublishNode { ask: false }, json!({"account": rig.access("probe")}))
-            .await
-            .result
-            .expect_err("a run where an await was journaled is a drifted body")
-            .to_string();
-        assert!(err.contains("journal has Await"), "{err}");
+    /// What `TimerWaiter` keeps: the answer to its wait.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct Waited {
+        answer: Option<Value>,
+    }
+
+    /// A node that waits on a timer and sends what it answered.
+    struct TimerWaiter;
+    impl crate::node::NodeManifest for TimerWaiter {
+        fn manifest(&self) -> &'static NodeMetadata {
+            manifest()
+        }
+    }
+    #[async_trait::async_trait]
+    impl Node for TimerWaiter {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(Waited::default()).await?;
+            let timer = crate::signal::timer::Timer { spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 } };
+            let answer = state.wait(|s| &mut s.answer, timer).await?;
+            ctx.pulse_downstream(NodeOutput::new().set("reply", answer)).await
+        }
+    }
+
+    /// A wait the rig pauses at stops the run there, saving the state as
+    /// the pause leaves it, and a run of the node again carries on at that
+    /// wait, taking the next answer queued.
+    #[tokio::test]
+    async fn a_wait_paused_on_the_rig_carries_on_when_the_node_runs_again() {
+        let rig = FakeRig::new();
+        rig.signal_paused();
+        let paused = rig.run(&TimerWaiter, json!({})).await;
+        assert!(paused.paused(), "{:?}", paused.result);
+        assert!(paused.outputs.get("reply").is_none(), "nothing went out before the wait");
+        rig.signal(json!({"answer": 1}));
+        let resumed = rig.run(&TimerWaiter, json!({})).await.ok().expect("its wait is answered");
+        assert_eq!(resumed.outputs["reply"], json!({"answer": 1}));
+        assert_eq!(rig.awaited_signals().len(), 2, "the wait it paused in, then the same wait again");
     }
 
     #[test]
@@ -4926,26 +5093,25 @@ mod tests {
     #[async_trait::async_trait]
     impl Node for AwaitingNode {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-            let answer = ctx
-                .await_signal(crate::signal::timer::Timer {
-                    spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 },
-                })
+            let mut state = ctx.keep(Waited::default()).await?;
+            let answer = state
+                .wait(|s| &mut s.answer, crate::signal::timer::Timer { spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 } })
                 .await?;
             ctx.pulse_downstream(NodeOutput::new().set("reply", answer)).await
         }
     }
 
-    /// A canned signal resumes an awaiting node; an empty queue is a
-    /// loud error naming the missing declaration.
+    /// A canned signal answers a waiting node; an empty queue is a loud
+    /// error naming the missing declaration.
     #[tokio::test]
-    async fn canned_signals_resume_an_awaiting_node() {
+    async fn canned_signals_answer_a_waiting_node() {
         let rig = FakeRig::new();
         rig.signal(json!({"answer": 42}));
         let outcome = rig
             .run(&AwaitingNode, json!({}))
             .await
             .ok()
-            .expect("resumes with the canned payload");
+            .expect("answered with the canned payload");
         assert_eq!(outcome.outputs["reply"], json!({"answer": 42}));
 
         let rig = FakeRig::new();
@@ -4955,14 +5121,24 @@ mod tests {
             .result
             .expect_err("empty queue is loud")
             .to_string();
-        assert!(err.contains("declared no payload"), "{err}");
+        assert!(err.contains("declared no answer"), "{err}");
     }
 
-    /// A stream-consuming test node: drains its `rows` stream and
-    /// emits the gathered items, or (when `awaits`) calls
-    /// `await_signal` instead, which the rig must refuse.
+    /// What `StreamConsumerNode` keeps: what it took so far, and (when it
+    /// waits) the answer its wait got.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct Taking {
+        next: Option<f64>,
+        taken: Vec<f64>,
+        answer: Option<Value>,
+    }
+
+    /// A stream-consuming test node: takes its `rows` stream item by item,
+    /// keeping each in its state, and emits the gathered items; with
+    /// `waits`, it waits on a signal after its first item (a stream
+    /// consumer may wait like any node).
     struct StreamConsumerNode {
-        awaits: bool,
+        waits: bool,
     }
     impl crate::node::NodeManifest for StreamConsumerNode {
         fn manifest(&self) -> &'static NodeMetadata {
@@ -4984,19 +5160,20 @@ mod tests {
     #[async_trait::async_trait]
     impl Node for StreamConsumerNode {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-            if self.awaits {
-                ctx.await_signal(crate::signal::timer::Timer {
-                    spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 },
-                })
-                .await?;
-                return Ok(());
+            let mut state = ctx.keep(Taking::default()).await?;
+            let mut rows = ctx.inputs.get::<crate::generator::Generator<f64>>("rows")?;
+            // Through the state: a direct pull before the wait would be read
+            // again, and lost, when the body runs again.
+            while let Some(n) = state.read(|s| &mut s.next, &mut rows).await? {
+                state.taken.push(n);
+                state.next = None;
+                state.save().await?;
+                if self.waits && state.taken.len() == 1 {
+                    state.wait(|s| &mut s.answer, crate::signal::timer::Timer { spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 } }).await?;
+                }
             }
-            let rows = ctx.inputs.get::<crate::generator::Generator<f64>>("rows")?;
-            let mut taken = Vec::new();
-            while let Some(n) = rows.next().await? {
-                taken.push(n);
-            }
-            ctx.pulse_downstream(NodeOutput::new().set("reply", json!({ "taken": taken })))
+            let taken = state.taken.clone();
+            ctx.pulse_downstream(NodeOutput::new().set("reply", json!({ "taken": taken, "answer": state.answer })))
                 .await
         }
     }
@@ -5008,36 +5185,36 @@ mod tests {
     async fn a_generator_input_feeds_the_bodys_pull_loop() {
         let rig = FakeRig::new();
         let outcome = rig
-            .run(&StreamConsumerNode { awaits: false }, json!({"rows": [1, 2, 3]}))
+            .run(&StreamConsumerNode { waits: false }, json!({"rows": [1, 2, 3]}))
             .await
             .ok()
             .expect("the consumer drains the seeded stream");
-        assert_eq!(outcome.outputs["reply"], json!({"taken": [1.0, 2.0, 3.0]}));
+        assert_eq!(outcome.outputs["reply"], json!({"taken": [1.0, 2.0, 3.0], "answer": null}));
     }
 
-    /// A stream consumer's `await_signal` is refused with the exact
-    /// production error, whatever the signal queue holds.
+    /// A stream consumer waits like any node, and a run again on the same
+    /// rig carries on past what it took: its state holds the items, and
+    /// its feed starts after them.
     #[tokio::test]
-    async fn a_stream_consumers_await_signal_is_refused() {
+    async fn a_stream_consumer_waits_and_carries_on_past_what_it_took() {
         let rig = FakeRig::new();
         rig.signal(json!({"answer": 42}));
-        let err = rig
-            .run(&StreamConsumerNode { awaits: true }, json!({"rows": [1]}))
+        let outcome = rig
+            .run(&StreamConsumerNode { waits: true }, json!({"rows": [1, 2, 3]}))
             .await
-            .result
-            .expect_err("a stream consumer cannot durably suspend")
-            .to_string();
-        assert!(
-            err.contains(&crate::context::stream_consumer_await_signal_error(
-                NODE_UNDER_TEST_ID
-            )),
-            "{err}"
-        );
+            .ok()
+            .expect("a stream consumer may wait");
+        assert_eq!(outcome.outputs["reply"], json!({"taken": [1.0, 2.0, 3.0], "answer": {"answer": 42}}));
+        let again = rig
+            .run(&StreamConsumerNode { waits: true }, json!({"rows": [1, 2, 3]}))
+            .await
+            .ok()
+            .expect("a run again carries on from the saved state");
+        assert_eq!(again.outputs["reply"], json!({"taken": [1.0, 2.0, 3.0], "answer": {"answer": 42}}), "nothing taken twice");
     }
 
-    /// A body that emits on an ordinary port, waits, then emits more:
-    /// production replays the first emission as a no-op on resume, so
-    /// the rig lets it through and both values land.
+    /// A body that emits on an ordinary port, waits, then emits more: both
+    /// values land.
     struct EmitThenAwaitNode;
     impl crate::node::NodeManifest for EmitThenAwaitNode {
         fn manifest(&self) -> &'static NodeMetadata {
@@ -5047,18 +5224,17 @@ mod tests {
     #[async_trait::async_trait]
     impl Node for EmitThenAwaitNode {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(Waited::default()).await?;
             ctx.pulse_downstream(NodeOutput::new().set("done", json!(true))).await?;
-            let answer = ctx
-                .await_signal(crate::signal::timer::Timer {
-                    spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 },
-                })
+            let answer = state
+                .wait(|s| &mut s.answer, crate::signal::timer::Timer { spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 } })
                 .await?;
             ctx.pulse_downstream(NodeOutput::new().set("reply", answer)).await
         }
     }
 
     #[tokio::test]
-    async fn an_emit_then_await_then_emit_lands_both_values() {
+    async fn an_emit_then_wait_then_emit_lands_both_values() {
         let rig = FakeRig::new();
         rig.signal(json!({"answer": 42}));
         let outcome = rig.run(&EmitThenAwaitNode, json!({})).await;
@@ -5067,9 +5243,8 @@ mod tests {
         assert_eq!(outcome.outputs["reply"], json!({"answer": 42}));
     }
 
-    /// A body that yields on a stream then awaits is refused with the
-    /// exact production error: the stream's items went out live and a
-    /// replay could not tell which it already sent.
+    /// A body that yields on a stream then waits: a stream producer may
+    /// wait like any node now, its items numbered across a pause.
     struct YieldThenAwaitNode;
     impl crate::node::NodeManifest for YieldThenAwaitNode {
         fn manifest(&self) -> &'static NodeMetadata {
@@ -5089,31 +5264,20 @@ mod tests {
     #[async_trait::async_trait]
     impl Node for YieldThenAwaitNode {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-            ctx.pulse_downstream(NodeOutput::new().set("rows", json!(1))).await?;
-            ctx.await_signal(crate::signal::timer::Timer {
-                spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 },
-            })
-            .await?;
-            Ok(())
+            let mut state = ctx.keep(Waited::default()).await?;
+            ctx.yield_downstream(NodeOutput::new().set("rows", json!(1)), &mut state).await?;
+            state.wait(|s| &mut s.answer, crate::signal::timer::Timer { spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 } }).await?;
+            ctx.yield_downstream(NodeOutput::new().set("rows", json!(2)), &mut state).await
         }
     }
 
     #[tokio::test]
-    async fn a_yield_then_await_is_refused_like_production() {
+    async fn a_yield_then_wait_then_yield_lands_every_item() {
         let rig = FakeRig::new();
         rig.signal(json!({"answer": 42}));
-        let err = rig
-            .run(&YieldThenAwaitNode, json!({}))
-            .await
-            .result
-            .expect_err("a stream's items cannot be replayed")
-            .to_string();
-        assert!(
-            err.contains(&crate::context::streamed_then_await_signal_error(
-                NODE_UNDER_TEST_ID
-            )),
-            "{err}"
-        );
+        let outcome = rig.run(&YieldThenAwaitNode, json!({})).await;
+        outcome.result.as_ref().expect("a stream producer may wait");
+        assert_eq!(outcome.outputs["rows"], json!([1, 2]));
     }
 
     struct WakeEchoNode;
@@ -5239,7 +5403,7 @@ mod tests {
         assert!(err.contains("basic-tier, not fake"), "{err}");
         let err = basic
             .run_live(LiveRig::new(
-                Arc::new(|_, _, _| Err(WeftError::Config("unused".into()))),
+                Arc::new(|_, _| Err(WeftError::Config("unused".into()))),
                 Access::new("c", "svc", None),
                 Default::default(),
             ))

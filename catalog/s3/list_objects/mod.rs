@@ -10,10 +10,10 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use weft::access::client::checked_send;
+use weft::access::client::{body_error, checked_send};
 use weft::node::NodeOutput;
 use weft::storage::wire_page;
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct S3ListObjectsNode;
@@ -28,31 +28,21 @@ impl Node for S3ListObjectsNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let bucket: String = ctx.inputs.get("bucket")?;
-        let prefix: String = ctx.inputs.get_or("prefix", String::new())?;
-        let start_after: String = ctx.inputs.get_or("startAfter", String::new())?;
-        // `maxKeys` declares a metadata default, so the bag holds it. A
-        // wired or written value skips the widget's minimum, and a page
-        // of 0 keys would never move `startAfter` on.
-        let max_keys: f64 = ctx.inputs.get("maxKeys")?;
-        if max_keys < 1.0 {
-            return Err(WeftError::Config(format!("`maxKeys` is {max_keys}; a page holds at least 1 key")));
-        }
-        let max_keys = (max_keys as u64).to_string();
+        let prefix: Option<String> = ctx.inputs.opt("prefix")?;
+        let start_after: Option<String> = ctx.inputs.opt("startAfter")?;
+        let max_keys: u64 = ctx.inputs.get("maxKeys")?;
 
         let s3 = ctx.client(&access).await?;
-        let mut query: Vec<(&str, &str)> = vec![("list-type", "2"), ("max-keys", max_keys.as_str())];
-        if !prefix.is_empty() {
-            query.push(("prefix", prefix.as_str()));
-        }
-        if !start_after.is_empty() {
-            query.push(("start-after", start_after.as_str()));
-        }
-        let url = super::s3::bucket_url(&bucket, &query)?;
-        let body = checked_send(s3.get(&url), "list the bucket's objects")
+        let url = super::s3::bucket_url(&bucket)?
+            .query("list-type", 2)
+            .query("max-keys", max_keys)
+            .query_opt("prefix", prefix.as_deref())
+            .query_opt("start-after", start_after.as_deref());
+        let body = checked_send(s3.get(url.as_str()), "list the bucket's objects")
             .await?
             .text()
             .await
-            .node_err("s3: read list response")?;
+            .map_err(|e| body_error("s3: read list response", e))?;
         let listed = listing_objects(&body)?;
         let truncated = first_tag(&body, "IsTruncated").as_deref() == Some("true");
 
@@ -67,7 +57,7 @@ impl Node for S3ListObjectsNode {
         // With nothing listed, the next page still starts where this
         // one was asked to.
         let last_key =
-            objects.last().and_then(|o| o["key"].as_str()).unwrap_or(start_after.as_str()).to_string();
+            objects.last().and_then(|o| o["key"].as_str()).or(start_after.as_deref()).unwrap_or_default().to_string();
         let count = objects.len() as f64;
         let keys: Vec<Value> = objects.iter().map(|o| o["key"].clone()).collect();
         ctx.pulse_downstream(

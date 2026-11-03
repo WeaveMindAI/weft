@@ -441,6 +441,7 @@ async fn a_resync_moves_a_run_waiting_on_a_person_onto_the_new_build() -> anyhow
     let run_id =
         run::wait_for_triggered_run(&disp, &pid, &before, Duration::from_secs(60)).await?;
     let review = human::wait_for_form_by_node(&disp, &pid, "review").await?;
+    run::wait_for_status(&disp, run_id, "waiting_for_input").await?;
 
     // One more node reads the answer, so the trigger's cut moves and it is
     // behind the build the resync makes.

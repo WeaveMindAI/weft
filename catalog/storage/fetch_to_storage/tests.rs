@@ -56,7 +56,7 @@ async fn mistake_wired(rig: FakeRig) -> WeftResult<()> {
         )
         .await
         .failure()?;
-    assert!(err.starts_with("input error") && err.contains("`scope`"), "{err}");
+    assert!(err.starts_with("input error") && err.contains("'scope'"), "{err}");
     Ok(())
 }
 

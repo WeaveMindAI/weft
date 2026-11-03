@@ -17,7 +17,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_user_destination_opens_the_dm_first", dm_destination),
         NodeTest::fake("blocks_and_thread_ts_ride_the_post", blocks_and_thread),
         NodeTest::fake("a_post_at_schedules_instead_of_posting", scheduled_post),
-        NodeTest::fake("refuses_two_destinations", refuses_two_destinations),
         NodeTest::fake("a_refused_post_fails_the_run_when_error_is_unwired", refused_unwired),
         NodeTest::fake("a_refused_post_comes_out_on_error_when_it_is_wired", refused_wired),
         NodeTest::live("one_real_send_then_delete", "slack", live_send_then_delete).with_fixture(
@@ -258,24 +257,6 @@ async fn permalink_failure(rig: FakeRig) -> WeftResult<()> {
                 && message.contains("message_not_found")),
         "the permalink failure lands in the log: {logged:?}"
     );
-    Ok(())
-}
-
-async fn refuses_two_destinations(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig
-        .run(
-            &SlackSendMessageNode,
-            json!({
-                "account": rig.access("slack"),
-                "channel": "C42",
-                "user": "U7",
-                "text": "hello",
-            }),
-        )
-        .await;
-    let err = outcome.result.expect_err("both destinations must refuse").to_string();
-    assert!(err.contains("ONE destination"), "{err}");
-    assert!(rig.requests().is_empty(), "refused before any call");
     Ok(())
 }
 

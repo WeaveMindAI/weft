@@ -1,6 +1,5 @@
 //! LinkOptions self-tests: the lifetime lands on the value and on every
-//! link made from it, nothing is stored, and a lifetime no link can have
-//! is refused.
+//! link made from it, and nothing is stored.
 
 use serde_json::json;
 
@@ -13,7 +12,6 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("the_lifetime_rides_the_value_and_stores_nothing", sets),
         NodeTest::fake("empty_minutes_is_the_default_lifetime", default),
-        NodeTest::fake("a_lifetime_no_link_can_have_is_refused", refused),
         NodeTest::fake("a_video_stays_a_video", video_stays_video),
         NodeTest::fake("a_blob_holding_a_picture_stays_a_blob", blob_stays_blob),
     ]
@@ -40,15 +38,6 @@ async fn default(rig: FakeRig) -> WeftResult<()> {
     file["__weft_blob__"]["linkSecs"] = json!(60);
     let outcome = rig.run(&LinkOptionsNode, json!({ "file": file })).await.ok()?;
     assert!(outcome.outputs["file"]["__weft_blob__"].get("linkSecs").is_none(), "back to the default");
-    Ok(())
-}
-
-async fn refused(rig: FakeRig) -> WeftResult<()> {
-    let file = rig.store_file("a.txt", "text/plain", b"x".to_vec());
-    for minutes in [0, 10081] {
-        let err = rig.run(&LinkOptionsNode, json!({ "file": file.clone(), "minutes": minutes })).await.failure()?;
-        assert!(err.contains("7 days"), "{minutes}: {err}");
-    }
     Ok(())
 }
 

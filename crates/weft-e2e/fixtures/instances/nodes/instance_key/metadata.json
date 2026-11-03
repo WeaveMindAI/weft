@@ -1,0 +1,43 @@
+{
+  "type": "InstanceKey",
+  "label": "Instance Key",
+  "description": "A key set each instance pastes for itself, handed on as a connection. Used by the e2e rig to prove an instance's own connection reaches its runs.",
+  "tags": [
+    "instances",
+    "e2e"
+  ],
+  "icon": "KeyRound",
+  "color": "#0ea5e9",
+  "service": {
+    "service": "instance_key",
+    "label": "Instance key",
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "keys",
+          "label": "Keys",
+          "secret": true
+        }
+      ]
+    },
+    "identity": "Instance key"
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[instance_key]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Keys"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[instance_key]"
+    }
+  ],
+  "requiresInfra": false
+}

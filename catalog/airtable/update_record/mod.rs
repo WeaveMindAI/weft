@@ -4,11 +4,11 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use weft::access::client::json_call;
+use weft::access::client::{json_call, required_str, url};
 use weft::node::NodeOutput;
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::airtable::{checked_id, API};
+use super::airtable::API;
 
 #[derive(NodeManifest)]
 pub struct AirtableUpdateRecordNode;
@@ -31,9 +31,6 @@ impl Node for AirtableUpdateRecordNode {
         let fields: Value = ctx.inputs.get("fields")?;
         let typecast: bool = ctx.inputs.get("typecast")?;
 
-        let base = checked_id(&base, "base id")?;
-        let table = checked_id(&table, "table")?;
-        let record = checked_id(&record, "record id")?;
         let mut body = json!({ "fields": fields });
         if typecast {
             body["typecast"] = json!(true);
@@ -41,12 +38,12 @@ impl Node for AirtableUpdateRecordNode {
 
         let http = ctx.client(&account).await?;
         let updated = json_call(
-            http.patch(format!("{API}/{base}/{}/{record}", urlencoding::encode(table)))
+            http.patch(url(API, &[&base, &table, &record])?.as_str())
                 .json(&body),
             "airtable: update the record",
         )
         .await?;
-        let id = updated["id"].as_str().node_err("airtable: the update answered no id")?;
+        let id = required_str(&updated, "airtable: update the record", "id")?;
         ctx.pulse_downstream(
             NodeOutput::new().set("recordId", id).set("record", updated.clone()),
         )

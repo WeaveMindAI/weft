@@ -56,7 +56,7 @@ pub enum SettingsCall {
 }
 
 impl SettingsCall {
-    pub const JOURNAL_NAMES: &'static [&'static str] = &[
+    pub const NAMES: &'static [&'static str] = &[
         "weft.frontends.list",
         "weft.frontends.add",
         "weft.frontends.remove",
@@ -72,7 +72,7 @@ impl SettingsCall {
         "weft.signal_tokens.revoke",
     ];
 
-    pub fn journal_name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             SettingsCall::FrontendsList => "weft.frontends.list",
             SettingsCall::FrontendAdd { .. } => "weft.frontends.add",

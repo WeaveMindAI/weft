@@ -38,7 +38,7 @@
     impl Node for Waits {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let timer = weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 5_000 } };
-            ctx.await_signal(timer).await?;
+            crate::run_driver::engine_test_rig::wait_once(&ctx, timer).await?;
             ctx.pulse_downstream(NodeOutput::new().set("value", json!("late"))).await
         }
     }
@@ -51,7 +51,7 @@
     impl Node for Abandons {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let timer = weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 5_000 } };
-            let waiting = ctx.await_signal(timer);
+            let waiting = crate::run_driver::engine_test_rig::wait_once(&ctx, timer);
             tokio::pin!(waiting);
             // Polled until it holds (registered, and waiting in its call),
             // then dropped.
@@ -73,7 +73,7 @@
     impl Node for PanicsWaiting {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let timer = weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 5_000 } };
-            let waiting = ctx.await_signal(timer);
+            let waiting = crate::run_driver::engine_test_rig::wait_once(&ctx, timer);
             tokio::pin!(waiting);
             for _ in 0..50 {
                 if futures::poll!(waiting.as_mut()).is_ready() {
@@ -371,16 +371,18 @@
         assert!(!written.iter().any(|e| matches!(e, RunEvent::NodeSuspended { .. })), "nothing parked");
     }
 
-    /// A wait given up after its hold is a time limit to the caller still
-    /// waiting on the run: with nothing sent yet, the exchange ends as one
-    /// (`504`), the plain failure its caller is told carrying no more than
-    /// that the run failed and which run it was.
+    /// A wait given up is a time limit to the caller still waiting on the
+    /// run: with nothing sent yet, the exchange ends as one (`504`), the
+    /// plain failure its caller is told carrying no more than that the run
+    /// failed and which run it was. With its caller on the line the hold
+    /// clock does not run, so the one wait given up under a caller is one
+    /// whose `holdSecs` is 0, given up at once.
     #[tokio::test]
     async fn a_wait_given_up_ends_its_callers_exchange_as_a_time_limit() {
         use crate::caller_conn::{Ending, Outbound};
         let run_id = weft_core::new_run_id();
         let project = project();
-        let birth = birth(run_id, &project, 1);
+        let birth = birth(run_id, &project, 0);
         let run_clients = EngineClients { tasks: AwaitTasks::new(), ..clients(Arc::new(MemJournal::default())) };
         let run = born(&run_clients, run_id, &birth).await;
         let cfg = weft_core::caller::CallerRuntimeConfig {

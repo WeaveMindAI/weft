@@ -3,11 +3,12 @@ name = "api"
 
 # Making a program an API: the two live triggers (`Route` for HTTP,
 # `Socket` for WebSocket), the three nodes that answer whichever caller
-# the run has (`Reply` once, `Stream` a bus, `Close` the exchange), and
-# the two auth access nodes a route can be gated by (`ApiKeyAuth`,
-# `HmacAuth`). The shared `wire.rs` turns port values into
-# outbound chunks and inbound messages into port values per the trigger's
-# declared data type; `framing.rs` is the pure SSE / ndjson framing.
+# the run has (`Reply` once, `Stream` a bus, `Close` the exchange). A
+# trigger checks its own callers (its `auth`, `weft::access::callers`).
+# Turning values into what a caller receives and back is
+# weft's (`weft::caller`); the shared `api.rs` holds what is left to
+# these nodes: the request fields a trigger fans out, the revealed
+# `headers`, and the refusal of a head behind a socket.
 [dependencies]
 async-trait = "0.1"
 serde_json = "1"

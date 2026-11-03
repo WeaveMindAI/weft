@@ -22,7 +22,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[google]", "accepts": ["wire"],
       "required": true,
       "description": "Needs at least read access to the watched file."
     },

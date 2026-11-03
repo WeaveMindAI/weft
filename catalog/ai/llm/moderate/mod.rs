@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct LlmModerateNode;
@@ -24,13 +24,8 @@ impl Node for LlmModerateNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+        // An OpenAI connection, by the input's type (`Access[openai]`).
         let account: Access = ctx.inputs.get("access")?;
-        if account.service() != "openai" {
-            return Err(WeftError::Input(format!(
-                "moderation speaks the OpenAI API; wire an OpenAIAccess (got a {} connection)",
-                account.service()
-            )));
-        }
         let model: String = ctx.inputs.get("model")?;
         let text: String = ctx.inputs.get("text")?;
 

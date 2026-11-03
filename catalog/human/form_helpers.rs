@@ -50,8 +50,8 @@ pub fn build_form(
     form_type: &str,
     prefill: &Value,
 ) -> WeftResult<Form> {
-    let raw_fields = parse_form_fields(inputs.object()?)?;
-    let title: String = inputs.get_or("title", String::new())?;
+    let raw_fields = parse_form_fields(inputs)?;
+    let title: Option<String> = inputs.opt("title")?;
     let description: Option<String> = inputs.opt("description")?;
     let schema = FormSchema {
         fields: build_form_fields(&raw_fields, specs, prefill)?,
@@ -59,7 +59,7 @@ pub fn build_form(
     Ok(Form {
         form_type: form_type.to_string(),
         schema,
-        title: if title.is_empty() { None } else { Some(title) },
+        title,
         description,
         // Browser extension / human-in-the-loop processors enumerate
         // this consumer kind.
@@ -67,18 +67,10 @@ pub fn build_form(
     })
 }
 
-/// Pull the `fields` array off a node's config. The canonical shape is a
-/// JSON array (what the compiler produces). An absent `fields` is a form
-/// with no fields; any other shape is a broken config and fails loudly
-/// instead of silently becoming an empty form.
-pub fn parse_form_fields(config: &serde_json::Map<String, Value>) -> WeftResult<Vec<Value>> {
-    match config.get("fields") {
-        Some(Value::Array(arr)) => Ok(arr.clone()),
-        None => Ok(Vec::new()),
-        Some(other) => weft::node_bail!(
-            "the form's `fields` must be a list of field entries, and it is {other}"
-        ),
-    }
+/// The form's `fields` entries, as the node's `fields` input
+/// (`List[JsonDict]`) holds them.
+pub fn parse_form_fields(inputs: &ValueBag) -> WeftResult<Vec<Value>> {
+    inputs.list("fields")
 }
 
 /// Read the `kind` off one entry of `config.fields`, the key every

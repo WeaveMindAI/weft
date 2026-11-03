@@ -5,9 +5,9 @@
 
 use serde_json::json;
 
-use weft::bus::{BusEntryKind, StreamEnd};
+use weft::bus::StreamEnd;
 use weft::stream_journal::JournalPolicy;
-use weft::context::ERROR_PORT;
+use weft::context::{HarnessRead, ERROR_PORT};
 use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
 use super::super::testing::sse;
@@ -81,12 +81,20 @@ async fn truncated(rig: FakeRig) -> WeftResult<()> {
     // The bus ends with the body, the failure path included, and says
     // so: the marker pulsed before the error, so a reader may be parked
     // on it, and the failed end both releases it and tells it the reply
-    // is cut. Draining to the end proves termination; the metadata names
-    // the model, as on the happy path.
+    // is cut: the read past the last message is that failure. Draining
+    // to it proves termination; the metadata names the model, as on the
+    // happy path.
     let bus = rig.bus(&outcome.outputs["stream"])?;
     assert_eq!(bus.meta()["model"], json!("test/model"));
-    let mut cursor = bus.cursor_from_start();
-    while cursor.next().await.is_some() {}
+    let mut cursor = bus.cursor_from_start().unwrap();
+    let ended = loop {
+        match cursor.next(&mut HarnessRead).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("a cut reply must not read as a clean end"),
+            Err(e) => break e.to_string(),
+        }
+    };
+    assert!(ended.contains("truncated"), "{ended}");
     assert!(
         matches!(bus.end(), Some(StreamEnd::Failed { error }) if error.contains("truncated")),
         "{:?}",
@@ -154,14 +162,12 @@ async fn streams(rig: FakeRig) -> WeftResult<()> {
 
     // The bus behind the emitted marker: both deltas, then the close.
     let bus = rig.bus(&outcome.outputs["stream"])?;
-    let mut cursor = bus.cursor_from_start();
+    let mut cursor = bus.cursor_from_start().unwrap();
     let mut deltas: Vec<String> = Vec::new();
-    while let Some(entry) = cursor.next().await {
-        if let BusEntryKind::Message { msg_kind, payload, .. } = &entry.kind {
+    while let Some(entry) = cursor.next(&mut HarnessRead).await? {
+        if let Some((msg_kind, v)) = entry.as_json() {
             assert_eq!(msg_kind, "delta");
-            if let Some(weft::bus::WirePayload::Json(v)) = payload {
-                deltas.push(v.as_str().expect("delta text").to_string());
-            }
+            deltas.push(v.as_str().expect("delta text").to_string());
         }
     }
     assert_eq!(deltas, vec!["Hel".to_string(), "lo".to_string()]);

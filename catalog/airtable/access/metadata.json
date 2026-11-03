@@ -92,7 +92,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[airtable]",
       "widget": {
         "kind": "access"
       },
@@ -102,7 +102,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[airtable]",
       "description": "Wire into the Airtable nodes."
     }
   ]

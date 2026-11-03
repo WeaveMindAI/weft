@@ -7,6 +7,9 @@
 //! A broken `main.weft` never blocks this, and neither does a broken
 //! package nobody targeted: only what you asked to test joins the
 //! build. Target a package and it is the only one that has to compile.
+//! However many packages are targeted, they build in ONE cargo
+//! invocation, then their binaries run one at a time or, under
+//! `--parallel`, side by side.
 //!
 //! The live tier runs the PRODUCTION credential path (connection
 //! resolution, relaying, metering, billing), which only exists next to
@@ -20,7 +23,7 @@
 //! attribute to something) and a grant for each test's declared
 //! service.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -41,9 +44,9 @@ mod progress;
 use progress::LiveProgress;
 
 pub struct TestNodeArgs {
-    /// A package name or a node type; absent = every package.
-    pub target: Option<String>,
-    /// Run only the test with this name (needs a node/package target).
+    /// Package names or node types; empty = every package.
+    pub targets: Vec<String>,
+    /// Run only the test with this name.
     pub test: Option<String>,
     /// Tiers to run; empty = basic and fake (never live implicitly).
     pub tiers: Vec<TierArg>,
@@ -58,10 +61,10 @@ pub struct TestNodeArgs {
     pub connection: Vec<String>,
     /// Skip the live-run confirmation for this invocation.
     pub yes: bool,
-    /// Concurrency: `None` = one test at a time, `Some(0)` = all at
-    /// once (bare `--parallel`), `Some(n)` = at most n in flight.
-    /// Applies to the local tiers (forwarded to the package binary)
-    /// and to live runs alike.
+    /// Concurrency: `None` = one at a time, `Some(0)` = all at once
+    /// (bare `--parallel`), `Some(n)` = at most n in flight. Caps the
+    /// package binaries running side by side, the tests in flight
+    /// inside each (forwarded to the binary), and the live runs.
     pub parallel: Option<usize>,
 }
 
@@ -84,12 +87,40 @@ impl TierArg {
     }
 }
 
-/// One package to test, with an optional single-node filter (set when
-/// the target named a node type rather than a package).
-#[derive(Debug)]
+/// One package to test, with the node types to keep when the targets
+/// named node types of it rather than the package itself.
+#[derive(Debug, PartialEq)]
 struct TargetPackage {
     name: String,
-    node_filter: Option<String>,
+    /// `None` = every node of the package.
+    nodes: Option<BTreeSet<String>>,
+}
+
+impl TargetPackage {
+    fn tests_node(&self, node_type: &str) -> bool {
+        self.nodes.as_ref().is_none_or(|nodes| nodes.contains(node_type))
+    }
+
+    /// Fold one more target resolving to this package in: the whole
+    /// package wins over any node of it.
+    fn widen(&mut self, node: Option<String>) {
+        match (&mut self.nodes, node) {
+            (Some(nodes), Some(node)) => {
+                nodes.insert(node);
+            }
+            (nodes, None) => *nodes = None,
+            (None, Some(_)) => {}
+        }
+    }
+}
+
+/// One test's report, with the package it belongs to (the unit a
+/// scripted sweep records and resumes by).
+#[derive(Debug, serde::Serialize)]
+struct PackageReport {
+    package: String,
+    #[serde(flatten)]
+    report: TestReport,
 }
 
 pub async fn run(ctx: Ctx, args: TestNodeArgs) -> Result<()> {
@@ -97,7 +128,7 @@ pub async fn run(ctx: Ctx, args: TestNodeArgs) -> Result<()> {
     let catalog = weft_compiler::build::build_project_catalog(&project.root)
         .map_err(|e| anyhow::anyhow!("discover nodes: {e}"))?;
 
-    let targets = resolve_targets(&catalog, args.target.as_deref())?;
+    let targets = resolve_targets(&catalog, &args.targets)?;
     if targets.is_empty() {
         eprintln!(
             "no package in this project (nodes/ or src/) declares tests (a node declares tests in a \
@@ -132,7 +163,13 @@ pub async fn run(ctx: Ctx, args: TestNodeArgs) -> Result<()> {
     // `cached_listing` answers without a build when the package's
     // content hash has not moved.
     let cache_root = node_test_cache_root();
-    bound_build_cache(&cache_root, cache_cap_bytes()?)?;
+    let cache_lock = node_test_cache_lock();
+    bound_build_cache(&cache_root, &cache_lock, cache_cap_bytes()?)?;
+    // Held, shared with every other run, until this one returns: its
+    // build and its tests use the cache, and no wipe may take the folder
+    // away meanwhile.
+    let _using_cache = weft_core::file_lock::hold_shared(&cache_lock)
+        .with_context(|| format!("lock {}", cache_lock.display()))?;
     let build_dirs =
         weft_compiler::build::TestBuildDirs::shared(&project.root, &cache_root);
     // Every package this run will test is emitted BEFORE any of them
@@ -142,32 +179,41 @@ pub async fn run(ctx: Ctx, args: TestNodeArgs) -> Result<()> {
     let workspace =
         weft_compiler::build::prepare_test_workspace(&catalog, &package_names, &build_dirs)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut reports: Vec<TestReport> = Vec::new();
+    let mut reports: Vec<PackageReport> = Vec::new();
+    // Packages whose binary could not be run at all (not a failing
+    // test: a broken invocation), each with why.
+    let mut broken: Vec<(String, anyhow::Error)> = Vec::new();
     if !local.is_empty() {
         // Every package compiles before any test runs: nothing to run
         // until the code builds, and cargo's own diagnostics have
         // already named whatever broke.
         let binaries = weft_compiler::build::build_node_test_binaries(&workspace)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        for target in &targets {
-            let binary = binaries.get(&target.name).with_context(|| {
-                format!("no test binary was built for package '{}'", target.name)
-            })?;
-            let run = run_local(binary, target, args.test.as_deref(), &local, args.parallel);
-            // The binary has served its purpose. It is ~110MB (mostly
-            // the line tables), it relinks in seconds from the
-            // dependency cache that stays, and keeping one per package
-            // held 3.2GB of the cache between runs for nothing.
-            weft_compiler::build::drop_built_binary(binary);
-            reports.extend(run?);
+        let local_run = LocalRun { test_filter: args.test.as_deref(), tiers: &local, parallel: args.parallel };
+        for (target, outcome) in targets.iter().zip(run_local_packages(&targets, &binaries, &local_run)) {
+            match outcome {
+                Ok(run) => reports.extend(run.into_iter().map(|report| PackageReport { package: target.name.clone(), report })),
+                Err(e) => broken.push((target.name.clone(), e)),
+            }
         }
     }
-    if live {
+    // When a package's binary could not even run, the run has already
+    // failed, so nothing goes on to spend money live.
+    if live && broken.is_empty() {
         run_live(&ctx, &catalog, &targets, &workspace, &build_dirs, &args, &mut reports).await?;
     }
 
-    render(&ctx, &reports)?;
-    let failed = reports.iter().filter(|r| !r.passed).count();
+    render(&ctx, &targets, &reports, &broken)?;
+    let failed = reports.iter().filter(|r| !r.report.passed).count();
+    if !broken.is_empty() {
+        let why: Vec<String> = broken.iter().map(|(package, e)| format!("  {package}: {e:#}")).collect();
+        bail!(
+            "the tests of {} package(s) could not run{}:\n{}",
+            broken.len(),
+            if failed > 0 { format!(", and {failed} of {} node tests failed", reports.len()) } else { String::new() },
+            why.join("\n")
+        );
+    }
     if failed > 0 {
         bail!("{failed} of {} node tests failed", reports.len());
     }
@@ -184,9 +230,14 @@ pub async fn run(ctx: Ctx, args: TestNodeArgs) -> Result<()> {
                 tier_names.join(", ")
             );
         }
-        match args.target.as_deref() {
-            Some(t) => eprintln!("'{t}' declares no tests in tier(s) {}: nothing to run", tier_names.join(", ")),
-            None => eprintln!("no matching node tests declared (a node declares tests in its tests.rs)"),
+        if args.targets.is_empty() {
+            eprintln!("no matching node tests declared (a node declares tests in its tests.rs)");
+        } else {
+            eprintln!(
+                "{} declare(s) no tests in tier(s) {}: nothing to run",
+                args.targets.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", "),
+                tier_names.join(", ")
+            );
         }
     }
     Ok(())
@@ -208,14 +259,14 @@ pub fn hash(ctx: Ctx, target: Option<String>) -> Result<()> {
         Some(t) => {
             // Accept a node type too, resolved to its package, so the
             // argument surface matches `weft test-node`.
-            let targets = resolve_targets(&catalog, Some(&t))?;
+            let targets = resolve_targets(&catalog, std::slice::from_ref(&t))?;
             let package = &targets.first().expect("resolve_targets errors instead of empty").name;
             let hash = weft_compiler::build::node_test_cache_hash(&catalog, package)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{hash}");
         }
         None => {
-            for target in resolve_targets(&catalog, None)? {
+            for target in resolve_targets(&catalog, &[])? {
                 let hash =
                     weft_compiler::build::node_test_cache_hash(&catalog, &target.name)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -231,6 +282,14 @@ pub fn hash(ctx: Ctx, target: Option<String>) -> Result<()> {
 /// than inside anybody's project.
 fn node_test_cache_root() -> PathBuf {
     super::daemon::data_dir().join("node-test-cache")
+}
+
+/// The lock every user of the node-test cache holds shared while it
+/// builds and runs there, and a wipe holds alone. Beside the cache
+/// rather than in it: a lock file inside would go with the wipe, and the
+/// next run would lock a new file nobody else holds.
+fn node_test_cache_lock() -> PathBuf {
+    super::daemon::data_dir().join("node-test-cache.lock")
 }
 
 /// This project's own slice of the shared node-test cache (its emitted
@@ -253,13 +312,20 @@ pub fn cache_size_bytes() -> Result<Option<u64>> {
 
 /// Throw the whole node-test cache away (`weft clean --build-cache`):
 /// every project's emitted crates and the shared compiled engine. The
-/// next `weft test-node` builds cold and re-makes all of it.
+/// next `weft test-node` builds cold and re-makes all of it. Waits for
+/// every `weft test-node` using the cache to finish first.
 pub fn wipe_cache() -> Result<()> {
     let root = node_test_cache_root();
     if !root.exists() {
         return Ok(());
     }
-    std::fs::remove_dir_all(&root).with_context(|| format!("remove {}", root.display()))
+    let lock = node_test_cache_lock();
+    let _alone = weft_core::file_lock::hold(&lock, || println!("waiting for the weft test-node runs using it to end…"))
+        .with_context(|| format!("lock {}", lock.display()))?;
+    match std::fs::remove_dir_all(&root) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).with_context(|| format!("remove {}", root.display())),
+        _ => Ok(()),
+    }
 }
 
 /// The cap on the node-test cache, in bytes. Override with
@@ -290,35 +356,93 @@ fn cache_cap_bytes() -> Result<u64> {
 /// was shared and bounded). Under the cap the cache is untouched and
 /// reruns stay fast; over it, one cold rebuild buys the space back.
 /// `cap_bytes` of 0 disables the bound.
-fn bound_build_cache(root: &std::path::Path, cap_bytes: u64) -> Result<()> {
+///
+/// Another run building or testing in the cache holds `lock` shared,
+/// so the wipe only tries for it alone and never waits: while anyone
+/// uses the cache it is left over the cap this time, and a later run
+/// that finds it free wipes it.
+fn bound_build_cache(root: &std::path::Path, lock: &std::path::Path, cap_bytes: u64) -> Result<()> {
     if cap_bytes == 0 || !root.exists() {
         return Ok(());
     }
-    let size = dir_size_bytes(root)
-        .with_context(|| format!("measure the node-test build cache at {}", root.display()))?;
-    if size <= cap_bytes {
-        return Ok(());
+    // `weft clean --build-cache` may remove the whole cache between the
+    // check above and the walk: nothing is left, so nothing is over the cap.
+    let size = match dir_size_bytes(root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !root.exists() => 0,
+        measured => measured.with_context(|| format!("measure the node-test build cache at {}", root.display()))?,
+    };
+    let alone = if size > cap_bytes {
+        weft_core::file_lock::try_hold(lock).with_context(|| format!("lock {}", lock.display()))?
+    } else {
+        None
+    };
+    let gb = |bytes: u64| bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+    match bound_decision(size, cap_bytes, alone.is_some()) {
+        BoundDecision::Keep => {}
+        BoundDecision::Busy => println!(
+            "node-test build cache is {:.1}GB (cap {:.0}GB), but another weft test-node is using it; \
+             leaving it for a later run to clear. The cap is WEFT_TEST_CACHE_CAP_GB.",
+            gb(size),
+            gb(cap_bytes),
+        ),
+        BoundDecision::Wipe => {
+            println!(
+                "node-test build cache is {:.1}GB (cap {:.0}GB); clearing it, so this run builds cold. \
+                 The cap is WEFT_TEST_CACHE_CAP_GB.",
+                gb(size),
+                gb(cap_bytes),
+            );
+            std::fs::remove_dir_all(root).with_context(|| format!("remove {}", root.display()))?;
+        }
     }
-    println!(
-        "node-test build cache is {:.1}GB (cap {:.0}GB); clearing it, so this run builds cold. \
-         The cap is WEFT_TEST_CACHE_CAP_GB.",
-        size as f64 / 1024.0 / 1024.0 / 1024.0,
-        cap_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
-    );
-    std::fs::remove_dir_all(root).with_context(|| format!("remove {}", root.display()))?;
     Ok(())
+}
+
+/// What [`bound_build_cache`] does with the cache.
+#[derive(Debug, PartialEq)]
+enum BoundDecision {
+    /// Under the cap (or no cap): leave it.
+    Keep,
+    /// Over the cap and nobody else is using it: wipe it.
+    Wipe,
+    /// Over the cap, but another run is using it: leave it this time.
+    Busy,
+}
+
+/// `alone` says whether this run got the cache's lock to itself; it only
+/// matters over the cap.
+fn bound_decision(size: u64, cap_bytes: u64, alone: bool) -> BoundDecision {
+    if cap_bytes == 0 || size <= cap_bytes {
+        BoundDecision::Keep
+    } else if alone {
+        BoundDecision::Wipe
+    } else {
+        BoundDecision::Busy
+    }
 }
 
 /// Total bytes of every file under `root`, following no symlinks (a
 /// target dir symlinked onto another disk is still that disk's
-/// problem, and following one could wander out of the tree).
+/// problem, and following one could wander out of the tree). A file or
+/// folder that vanishes mid-walk counts as nothing: another run's cargo
+/// may be building in the tree, and it removes its temporary files.
 pub(crate) fn dir_size_bytes(root: &std::path::Path) -> std::io::Result<u64> {
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
     let mut total = 0;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir)? {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if gone(&e) && dir != root => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
             let entry = entry?;
-            let meta = entry.metadata()?;
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(e) if gone(&e) => continue,
+                Err(e) => return Err(e),
+            };
             if meta.is_dir() {
                 stack.push(entry.path());
             } else if meta.is_file() {
@@ -329,9 +453,11 @@ pub(crate) fn dir_size_bytes(root: &std::path::Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-/// Resolve the positional target to packages. A package name wins over
-/// a node type on the (unlikely) collision, since the package is the
-/// build unit.
+/// Resolve the positional targets to packages, in the order first
+/// named. A package name wins over a node type on the (unlikely)
+/// collision, since the package is the build unit. Several targets in
+/// one package fold into one entry: the package once, testing the named
+/// node types, or all of it when the package itself was named.
 ///
 /// A node that failed to load is left out of the catalog, and so out of
 /// its package's test binary: its tests would never run while the rest
@@ -341,7 +467,7 @@ pub(crate) fn dir_size_bytes(root: &std::path::Path) -> std::io::Result<u64> {
 /// package's folder when one is named, anywhere in the project for the
 /// whole-project sweep, and listed beside "no such package" when the
 /// name matches nothing (it may be one of them).
-fn resolve_targets(catalog: &FsCatalog, target: Option<&str>) -> Result<Vec<TargetPackage>> {
+fn resolve_targets(catalog: &FsCatalog, targets: &[String]) -> Result<Vec<TargetPackage>> {
     let left_out = |within: Option<&std::path::Path>| -> Vec<String> {
         catalog
             .problems()
@@ -350,104 +476,210 @@ fn resolve_targets(catalog: &FsCatalog, target: Option<&str>) -> Result<Vec<Targ
             .map(|problem| format!("  {}", problem.error))
             .collect()
     };
-    match target {
-        None => {
+    if targets.is_empty() {
+        let broken = left_out(None);
+        if !broken.is_empty() {
+            bail!("some nodes of this project did not load, so their tests cannot run:\n{}", broken.join("\n"));
+        }
+        // The whole-project sweep covers exactly the packages that
+        // declare tests (the catalog's own predicate, shared with
+        // every other consumer): building a test binary for a
+        // test-less package would be wasted compilation.
+        let mut names: Vec<String> = Vec::new();
+        for package in catalog.packages() {
+            if catalog.package_declares_tests(package)? {
+                names.push(package.name.clone());
+            }
+        }
+        names.sort();
+        return Ok(names.into_iter().map(|name| TargetPackage { name, nodes: None }).collect());
+    }
+    let mut resolved: Vec<TargetPackage> = Vec::new();
+    for t in targets {
+        let found = match catalog.packages().find(|p| p.name == *t) {
+            Some(package) => Some((package, None)),
+            None => catalog.package_of(t).map(|package| (package, Some(t.clone()))),
+        };
+        let Some((package, node)) = found else {
+            let mut known: Vec<&str> = catalog.packages().map(|p| p.name.as_str()).collect();
+            known.sort();
             let broken = left_out(None);
-            if !broken.is_empty() {
-                bail!("some nodes of this project did not load, so their tests cannot run:\n{}", broken.join("\n"));
-            }
-            // The whole-project sweep covers exactly the packages that
-            // declare tests (the catalog's own predicate, shared with
-            // every other consumer): building a test binary for a
-            // test-less package would be wasted compilation.
-            let mut names: Vec<String> = Vec::new();
-            for package in catalog.packages() {
-                if catalog.package_declares_tests(package)? {
-                    names.push(package.name.clone());
+            let broken = if broken.is_empty() {
+                String::new()
+            } else {
+                format!("; these did not load, and it may be one of them:\n{}", broken.join("\n"))
+            };
+            bail!(
+                "'{t}' is neither a package nor a node type in this project (nodes/ or src/) \
+                 (packages: {}){broken}",
+                known.join(", ")
+            );
+        };
+        let broken = left_out(Some(&package.root));
+        if !broken.is_empty() {
+            bail!(
+                "some nodes of package '{}' did not load, so its tests cannot run (a package is \
+                 built and tested whole):\n{}",
+                package.name,
+                broken.join("\n")
+            );
+        }
+        match resolved.iter_mut().find(|r| r.name == package.name) {
+            Some(existing) => existing.widen(node),
+            None => resolved.push(TargetPackage { name: package.name.clone(), nodes: node.map(|n| BTreeSet::from([n])) }),
+        }
+    }
+    Ok(resolved)
+}
+
+/// What every package's local run shares: the test filter, the tiers,
+/// and the concurrency cap.
+struct LocalRun<'a> {
+    test_filter: Option<&'a str>,
+    tiers: &'a [TestTier],
+    parallel: Option<usize>,
+}
+
+/// Run every target package's local tiers through its built binary,
+/// up to `--parallel` packages side by side, and give back each
+/// package's outcome in `targets`' order.
+///
+/// Side by side, a package's own output (its binary's stderr: node
+/// logs, tracing) is held until it finishes and printed as one block
+/// under its name with its outcome line, so two packages never
+/// interleave; one at a time, it streams straight through under its
+/// name. Each binary is deleted once its package has run.
+fn run_local_packages(
+    targets: &[TargetPackage],
+    binaries: &BTreeMap<String, PathBuf>,
+    run: &LocalRun<'_>,
+) -> Vec<Result<Vec<TestReport>>> {
+    let lanes = concurrency_limit(run.parallel, targets.len()).min(targets.len());
+    let side_by_side = lanes > 1;
+    let several = targets.len() > 1;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let outcomes: std::sync::Mutex<Vec<Option<Result<Vec<TestReport>>>>> =
+        std::sync::Mutex::new(targets.iter().map(|_| None).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..lanes {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(target) = targets.get(i) else { break };
+                if several && !side_by_side {
+                    eprintln!("\n──── node tests: {} ────", target.name);
                 }
-            }
-            names.sort();
-            Ok(names
-                .into_iter()
-                .map(|name| TargetPackage { name, node_filter: None })
-                .collect())
+                let mut log = side_by_side.then(Vec::new);
+                let outcome = binaries
+                    .get(&target.name)
+                    .with_context(|| format!("no test binary was built for package '{}'", target.name))
+                    .and_then(|binary| {
+                        let tested = run_local(binary, target, run, log.as_mut());
+                        // The binary has served its purpose. It is ~110MB
+                        // (mostly the line tables), it relinks in seconds
+                        // from the dependency cache that stays, and keeping
+                        // one per package held 3.2GB of the cache between
+                        // runs for nothing.
+                        weft_compiler::build::drop_built_binary(binary);
+                        tested
+                    });
+                if let Some(log) = log {
+                    use std::io::Write as _;
+                    let mut err = std::io::stderr().lock();
+                    let _ = writeln!(err, "\n──── node tests: {} ────", target.name);
+                    let _ = err.write_all(&log);
+                    let _ = writeln!(err, "{}", package_line(&target.name, &outcome_view(&outcome)));
+                }
+                outcomes.lock().expect("no lane panics while holding the outcomes")[i] = Some(outcome);
+            });
         }
-        Some(t) => {
-            let found = match catalog.packages().find(|p| p.name == t) {
-                Some(package) => Some((package, None)),
-                None => catalog.package_of(t).map(|package| (package, Some(t.to_string()))),
-            };
-            let Some((package, node_filter)) = found else {
-                let mut known: Vec<&str> = catalog.packages().map(|p| p.name.as_str()).collect();
-                known.sort();
-                let broken = left_out(None);
-                let broken = if broken.is_empty() {
-                    String::new()
-                } else {
-                    format!("; these did not load, and it may be one of them:\n{}", broken.join("\n"))
-                };
-                bail!(
-                    "'{t}' is neither a package nor a node type in this project (nodes/ or src/) \
-                     (packages: {}){broken}",
-                    known.join(", ")
-                );
-            };
-            let broken = left_out(Some(&package.root));
-            if !broken.is_empty() {
-                bail!(
-                    "some nodes of package '{}' did not load, so its tests cannot run (a package is \
-                     built and tested whole):\n{}",
-                    package.name,
-                    broken.join("\n")
-                );
-            }
-            Ok(vec![TargetPackage { name: package.name.clone(), node_filter }])
-        }
+    });
+    outcomes
+        .into_inner()
+        .expect("every lane has finished")
+        .into_iter()
+        .map(|outcome| outcome.expect("every package was taken by a lane"))
+        .collect()
+}
+
+/// How one package's run went, as its outcome line tells it.
+enum PackageOutcome {
+    /// It ran: how many tests, how many failed.
+    Ran { tests: usize, failed: usize },
+    /// Its binary could not run at all.
+    Broken,
+}
+
+impl PackageOutcome {
+    fn of<'a>(reports: impl Iterator<Item = &'a TestReport>) -> Self {
+        let (tests, failed) = reports.fold((0, 0), |(tests, failed), r| (tests + 1, failed + usize::from(!r.passed)));
+        Self::Ran { tests, failed }
+    }
+}
+
+fn outcome_view(outcome: &Result<Vec<TestReport>>) -> PackageOutcome {
+    match outcome {
+        Ok(reports) => PackageOutcome::of(reports.iter()),
+        Err(_) => PackageOutcome::Broken,
+    }
+}
+
+/// One package's outcome line. A passing package's line starts with
+/// `✓ package <name>:`, which a scripted sweep reads to learn which
+/// packages passed.
+// SYNC: package_line <-> scripts/run-node-tests.sh (the `✓ package` lines)
+fn package_line(package: &str, outcome: &PackageOutcome) -> String {
+    match outcome {
+        PackageOutcome::Ran { tests: 0, .. } => format!("✓ package {package}: no test in the selected tiers"),
+        PackageOutcome::Ran { tests, failed: 0 } => format!("✓ package {package}: {tests} passed"),
+        PackageOutcome::Ran { tests, failed } => format!("✗ package {package}: {failed} of {tests} failed"),
+        PackageOutcome::Broken => format!("✗ package {package}: could not run (why is at the end)"),
     }
 }
 
 /// Run one package's local-tier (basic/fake) tests through its built
 /// binary. The caller decides whether an empty result is an error.
+/// `log`, when given, takes the binary's stderr instead of the
+/// terminal.
 fn run_local(
     binary: &PathBuf,
     target: &TargetPackage,
-    test_filter: Option<&str>,
-    tiers: &[TestTier],
-    parallel: Option<usize>,
+    run: &LocalRun<'_>,
+    mut log: Option<&mut Vec<u8>>,
 ) -> Result<Vec<TestReport>> {
     // Unfiltered: one `run-all` invocation covers the package.
-    if target.node_filter.is_none() && test_filter.is_none() {
+    if target.nodes.is_none() && run.test_filter.is_none() {
         let mut cmd: Vec<&str> = vec!["run-all"];
-        for t in tiers {
+        for t in run.tiers {
             cmd.extend(["--tier", t.as_str()]);
         }
-        let parallel_arg = parallel.map(|n| n.to_string());
+        let parallel_arg = run.parallel.map(|n| n.to_string());
         if let Some(n) = parallel_arg.as_deref() {
             cmd.extend(["--parallel", n]);
         }
-        let out = run_binary(binary, &cmd)?;
+        let out = run_binary(binary, &cmd, log)?;
         let parsed: RunAllReport =
             serde_json::from_str(&out.report).context("parse run-all report")?;
         return Ok(parsed.tests);
     }
 
     // Filtered: list, select, run each individually.
-    let listing = list_tests(binary)?;
+    let listing = list_tests(binary, log.as_deref_mut())?;
     let mut reports = Vec::new();
     for node in &listing {
-        if target.node_filter.as_deref().is_some_and(|f| f != node.node_type) {
+        if !target.tests_node(&node.node_type) {
             continue;
         }
         for t in &node.tests {
-            if test_filter.is_some_and(|f| f != t.name) {
+            if run.test_filter.is_some_and(|f| f != t.name) {
                 continue;
             }
-            if !tiers.contains(&t.tier) {
+            if !run.tiers.contains(&t.tier) {
                 continue;
             }
             let out = run_binary(
                 binary,
                 &["run", "--node", &node.node_type, "--test", &t.name],
+                log.as_deref_mut(),
             )?;
             reports.push(
                 serde_json::from_str(&out.report).context("parse test report")?,
@@ -457,8 +689,8 @@ fn run_local(
     Ok(reports)
 }
 
-fn list_tests(binary: &PathBuf) -> Result<Vec<NodeTestsListing>> {
-    let out = run_binary(binary, &["list"])?;
+fn list_tests(binary: &PathBuf, log: Option<&mut Vec<u8>>) -> Result<Vec<NodeTestsListing>> {
+    let out = run_binary(binary, &["list"], log)?;
     let parsed: TestListing =
         serde_json::from_str(&out.report).context("parse test listing")?;
     Ok(parsed.nodes)
@@ -521,7 +753,7 @@ fn cached_listings(
         let binary = binaries
             .get(&package)
             .with_context(|| format!("no test binary was built for package '{package}'"))?;
-        let nodes = list_tests(binary)?;
+        let nodes = list_tests(binary, None)?;
         weft_compiler::build::drop_built_binary(binary);
         std::fs::create_dir_all(path.parent().expect("the listings path has a parent"))?;
         std::fs::write(
@@ -541,16 +773,21 @@ struct BinaryOutput {
     report: String,
 }
 
-/// Run the test binary; stderr (node logs, tracing) streams through to
-/// the terminal, stdout is the JSON channel. A non-zero exit with
-/// parseable stdout is NOT an error here (a failing test reports
-/// through the JSON); a broken invocation surfaces via empty stdout.
-fn run_binary(binary: &PathBuf, args: &[&str]) -> Result<BinaryOutput> {
+/// Run the test binary; stdout is the JSON channel, and stderr (node
+/// logs, tracing) streams through to the terminal, or is appended to
+/// `log` when one is given. A non-zero exit with parseable stdout is NOT
+/// an error here (a failing test reports through the JSON); a broken
+/// invocation surfaces via empty stdout.
+fn run_binary(binary: &PathBuf, args: &[&str], log: Option<&mut Vec<u8>>) -> Result<BinaryOutput> {
+    let stderr = if log.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::inherit() };
     let out = std::process::Command::new(binary)
         .args(args)
-        .stderr(std::process::Stdio::inherit())
+        .stderr(stderr)
         .output()
         .with_context(|| format!("run {}", binary.display()))?;
+    if let Some(log) = log {
+        log.extend_from_slice(&out.stderr);
+    }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let Some(report) = report_line(&stdout) else {
         bail!(
@@ -563,20 +800,20 @@ fn run_binary(binary: &PathBuf, args: &[&str]) -> Result<BinaryOutput> {
     Ok(BinaryOutput { report: report.to_string() })
 }
 
-fn render(ctx: &Ctx, reports: &[TestReport]) -> Result<()> {
+fn render(ctx: &Ctx, targets: &[TargetPackage], reports: &[PackageReport], broken: &[(String, anyhow::Error)]) -> Result<()> {
     if ctx.json_out(&reports)? {
         return Ok(());
     }
     // Per-test lines for the LOCAL tiers only: a live test already
     // printed its line the moment it finished (the progress block), so
     // repeating it here would double every result in the scrollback.
-    for r in reports.iter().filter(|r| r.tier != TestTier::Live) {
+    for r in reports.iter().map(|r| &r.report).filter(|r| r.tier != TestTier::Live) {
         let mark = if r.passed { "✓" } else { "✗" };
         println!("{mark} {} / {} ({})", r.node, r.test, r.tier.as_str());
     }
     // Then every failure in full, so a red run ends with the errors on
     // screen instead of scrolled away behind other tests' output.
-    let failed: Vec<&TestReport> = reports.iter().filter(|r| !r.passed).collect();
+    let failed: Vec<&TestReport> = reports.iter().map(|r| &r.report).filter(|r| !r.passed).collect();
     if !failed.is_empty() {
         println!("\n──── failures ────");
         for r in &failed {
@@ -595,9 +832,22 @@ fn render(ctx: &Ctx, reports: &[TestReport]) -> Result<()> {
             }
         }
     }
+    // With several packages, one line each, every tier counted, so a
+    // red run says which packages to look at.
+    if targets.len() > 1 {
+        println!();
+        for target in targets {
+            let outcome = if broken.iter().any(|(package, _)| *package == target.name) {
+                PackageOutcome::Broken
+            } else {
+                PackageOutcome::of(reports.iter().filter(|r| r.package == target.name).map(|r| &r.report))
+            };
+            println!("{}", package_line(&target.name, &outcome));
+        }
+    }
     // The failure count line is the caller's bail (the process error),
     // so it prints exactly once.
-    if !reports.is_empty() && failed.is_empty() {
+    if !reports.is_empty() && failed.is_empty() && broken.is_empty() {
         println!("\nall {} node tests passed", reports.len());
     }
     Ok(())
@@ -620,7 +870,7 @@ async fn run_live(
     workspace: &weft_compiler::build::TestWorkspace,
     build_dirs: &weft_compiler::build::TestBuildDirs,
     args: &TestNodeArgs,
-    reports: &mut Vec<TestReport>,
+    reports: &mut Vec<PackageReport>,
 ) -> Result<()> {
     // Discover the live tests per target package (through each
     // package's listing: the registry is the single source, read via
@@ -634,7 +884,7 @@ async fn run_live(
     let listings = cached_listings(catalog, targets, build_dirs, workspace)?;
     for target in targets {
         for node in &listings[&target.name] {
-            if target.node_filter.as_deref().is_some_and(|f| f != node.node_type) {
+            if !target.tests_node(&node.node_type) {
                 continue;
             }
             for t in &node.tests {
@@ -1118,7 +1368,7 @@ async fn run_live_tests(
     connections: &BTreeMap<String, uuid::Uuid>,
     fixtures: &BTreeMap<String, String>,
     parallel: Option<usize>,
-    reports: &mut Vec<TestReport>,
+    reports: &mut Vec<PackageReport>,
 ) -> Result<()> {
     let client = ctx.client()?;
     let project = ctx.project()?;
@@ -1215,8 +1465,8 @@ async fn run_live_tests(
     drop(session);
     let mut settled = settled;
     settled.sort_by_key(|(i, _)| *i);
-    for (_, outcome) in settled {
-        reports.push(outcome?);
+    for (i, outcome) in settled {
+        reports.push(PackageReport { package: runs[i].package.clone(), report: outcome? });
     }
     Ok(())
 }
@@ -1515,14 +1765,71 @@ mod tests {
         node(&tmp.path().join("gone/only"), &broken("Only"));
         node(&tmp.path().join("other/fine"), &good("Fine"));
         let catalog = FsCatalog::discover(tmp.path()).expect("discover");
-        let refusal = |target: Option<&str>| resolve_targets(&catalog, target).expect_err("refused").to_string();
-        for target in [Some("pkg"), Some("Good"), Some("gone"), None] {
-            let err = refusal(target);
-            assert!(err.contains("no_such_kind"), "{target:?}: {err}");
+        let refusal = |targets: &[&str]| {
+            resolve_targets(&catalog, &targets.iter().map(|t| t.to_string()).collect::<Vec<_>>())
+                .expect_err("refused")
+                .to_string()
+        };
+        let cases: [&[&str]; 5] = [&["pkg"], &["Good"], &["gone"], &[], &["other", "pkg"]];
+        for targets in cases {
+            let err = refusal(targets);
+            assert!(err.contains("no_such_kind"), "{targets:?}: {err}");
         }
-        assert!(refusal(Some("gone")).contains("gone/only"), "the package that vanished is named by its folder");
-        let fine = resolve_targets(&catalog, Some("other")).expect("another package's broken node is not this one's");
+        assert!(refusal(&["gone"]).contains("gone/only"), "the package that vanished is named by its folder");
+        let fine = resolve_targets(&catalog, &["other".to_string()]).expect("another package's broken node is not this one's");
         assert_eq!(fine[0].name, "other");
+    }
+
+    /// Several targets resolve to each package once, in the order first
+    /// named: node types of one package fold into its node set, naming
+    /// the package itself widens it to every node whichever comes first,
+    /// and a name that is neither a package nor a node type refuses the
+    /// whole call.
+    #[test]
+    fn several_targets_fold_into_one_entry_per_package() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for (package, nodes) in [("alpha", &["One", "Two"][..]), ("beta", &["Three"])] {
+            let root = tmp.path().join(package);
+            std::fs::create_dir_all(&root).expect("mkdir");
+            std::fs::write(root.join("package.toml"), format!("[package]\nname = \"{package}\"\n")).expect("write");
+            for node in nodes {
+                let dir = root.join(node.to_lowercase());
+                std::fs::create_dir_all(&dir).expect("mkdir");
+                std::fs::write(dir.join("metadata.json"), format!(r#"{{ "type": "{node}", "label": "{node}", "description": "" }}"#))
+                    .expect("write");
+                std::fs::write(dir.join("mod.rs"), "// node\n").expect("write");
+            }
+        }
+        let catalog = FsCatalog::discover(tmp.path()).expect("discover");
+        let resolve = |targets: &[&str]| resolve_targets(&catalog, &targets.iter().map(|t| t.to_string()).collect::<Vec<_>>());
+        let nodes = |names: &[&str]| Some(names.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>());
+        let package = |name: &str, nodes: Option<BTreeSet<String>>| TargetPackage { name: name.to_string(), nodes };
+
+        assert_eq!(
+            resolve(&["Three", "One", "Two"]).expect("resolves"),
+            vec![package("beta", nodes(&["Three"])), package("alpha", nodes(&["One", "Two"]))]
+        );
+        assert_eq!(resolve(&["One", "alpha"]).expect("resolves"), vec![package("alpha", None)]);
+        assert_eq!(resolve(&["alpha", "One"]).expect("resolves"), vec![package("alpha", None)]);
+        assert_eq!(resolve(&["beta", "beta"]).expect("resolves"), vec![package("beta", None)]);
+        let err = resolve(&["alpha", "Nope"]).expect_err("refused").to_string();
+        assert!(err.contains("'Nope' is neither a package nor a node type"), "{err}");
+
+        let one = package("alpha", nodes(&["One"]));
+        assert!(one.tests_node("One") && !one.tests_node("Two"));
+        assert!(package("alpha", None).tests_node("Two"));
+    }
+
+    /// A passing package's outcome line starts `✓ package <name>:`, the
+    /// prefix scripts/run-node-tests.sh reads to record which packages
+    /// passed; every other outcome does not.
+    #[test]
+    fn only_a_passing_package_line_reads_as_passed() {
+        let passed = |outcome: PackageOutcome| package_line("web", &outcome).starts_with("✓ package web:");
+        assert!(passed(PackageOutcome::Ran { tests: 3, failed: 0 }));
+        assert!(passed(PackageOutcome::Ran { tests: 0, failed: 0 }));
+        assert!(!passed(PackageOutcome::Ran { tests: 3, failed: 1 }));
+        assert!(!passed(PackageOutcome::Broken));
     }
 
     /// Write `bytes` bytes at `path`, creating parents.
@@ -1545,7 +1852,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("test");
         file_of(&root.join("deps/a"), 100);
-        bound_build_cache(&root, 1000).unwrap();
+        bound_build_cache(&root, &dir.path().join("test.lock"), 1000).unwrap();
         assert!(root.join("deps/a").exists());
     }
 
@@ -1554,8 +1861,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("test");
         file_of(&root.join("deps/a"), 2000);
-        bound_build_cache(&root, 1000).unwrap();
+        bound_build_cache(&root, &dir.path().join("test.lock"), 1000).unwrap();
         assert!(!root.exists());
+    }
+
+    /// Over the cap, a cache another run holds is left where it is; once
+    /// nobody holds it, the next run wipes it.
+    #[test]
+    fn a_cache_in_use_is_never_wiped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("test");
+        let lock = dir.path().join("test.lock");
+        file_of(&root.join("deps/a"), 2000);
+        let other_run = weft_core::file_lock::hold_shared(&lock).unwrap();
+        bound_build_cache(&root, &lock, 1000).unwrap();
+        assert!(root.join("deps/a").exists(), "another run is building in it");
+        drop(other_run);
+        bound_build_cache(&root, &lock, 1000).unwrap();
+        assert!(!root.exists(), "free again, it goes");
+    }
+
+    #[test]
+    fn the_wipe_happens_only_over_the_cap_and_alone() {
+        assert_eq!(bound_decision(500, 1000, false), BoundDecision::Keep);
+        assert_eq!(bound_decision(1000, 1000, true), BoundDecision::Keep);
+        assert_eq!(bound_decision(2000, 0, true), BoundDecision::Keep);
+        assert_eq!(bound_decision(2000, 1000, true), BoundDecision::Wipe);
+        assert_eq!(bound_decision(2000, 1000, false), BoundDecision::Busy);
     }
 
     #[test]
@@ -1563,7 +1895,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("test");
         file_of(&root.join("deps/a"), 2000);
-        bound_build_cache(&root, 0).unwrap();
+        bound_build_cache(&root, &dir.path().join("test.lock"), 0).unwrap();
         assert!(root.join("deps/a").exists());
     }
 
@@ -1646,6 +1978,6 @@ mod tests {
     #[test]
     fn a_missing_cache_is_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        bound_build_cache(&dir.path().join("absent"), 1).unwrap();
+        bound_build_cache(&dir.path().join("absent"), &dir.path().join("absent.lock"), 1).unwrap();
     }
 }

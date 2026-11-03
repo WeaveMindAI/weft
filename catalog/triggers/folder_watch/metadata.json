@@ -67,8 +67,8 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "config_nonempty", "field": "folder" },
-          { "kind": "not", "of": { "kind": "config_matches", "field": "folder", "regex": "^/" } }
+          { "kind": "value", "field": "folder", "nonempty": true },
+          { "kind": "not", "of": { "kind": "value", "field": "folder", "matches": "^/" } }
         ]
       },
       "then": {
@@ -77,7 +77,7 @@
       }
     },
     {
-      "when": { "kind": "config_matches", "field": "pattern", "regex": "/" },
+      "when": { "kind": "value", "field": "pattern", "matches": "/" },
       "then": {
         "message": "FolderWatch '{id}' has a `pattern` with a `/`, but it matches a file's name only. Turn on `recursive` to look in the folders under it.",
         "field": "pattern"

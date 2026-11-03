@@ -24,5 +24,20 @@
     "canAddInputPorts": true,
     "join": true,
     "customInputType": "T"
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "custom_inputs_declared"
+        }
+      },
+      "then": {
+        "message": "FirstInOrder '{id}' joins no branches. Wire one input per branch, in the order they take precedence.",
+        "level": "structural",
+        "severity": "error"
+      }
+    }
+  ]
 }

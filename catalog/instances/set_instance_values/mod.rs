@@ -4,10 +4,10 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use weft::instance::InstanceId;
 use weft::node::NodeOutput;
 use weft::{node_bail, RunContext, Node, NodeManifest, WeftResult};
 
-use super::lifecycle::instance;
 
 #[derive(NodeManifest)]
 pub struct SetInstanceValuesNode;
@@ -37,7 +37,7 @@ impl Node for SetInstanceValuesNode {
         if values.is_empty() && clear.is_empty() {
             node_bail!("nothing to change: give `values`, `clear`, or both");
         }
-        let mut change = ctx.values().instance(instance(&ctx)?);
+        let mut change = ctx.values().instance(ctx.inputs.get::<InstanceId>("instance")?);
         for (target, value) in values {
             let (node, field) = field_of(&target)?;
             change = change.set(node, field, value);

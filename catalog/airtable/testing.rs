@@ -6,7 +6,8 @@
 #![cfg(feature = "node-tests")]
 
 use weft::access::OpenedConnection;
-use weft::{NodeErrExt, WeftResult};
+use weft::access::client::{checked_send, required_str, url};
+use weft::WeftResult;
 
 use super::airtable::API;
 
@@ -32,15 +33,12 @@ pub async fn seed_record(
 ) -> WeftResult<String> {
     let created = weft::access::client::post_json(
         conn.client(),
-        &format!("{API}/{base}/{table}"),
+        url(API, &[base, table])?.as_str(),
         &serde_json::json!({ "fields": { "Name": name } }),
         "airtable: seed the test record",
     )
     .await?;
-    created["id"]
-        .as_str()
-        .map(str::to_string)
-        .node_err("airtable answered no id for the seeded record")
+    Ok(required_str(&created, "airtable: seed the test record", "id")?.to_string())
 }
 
 /// A name no earlier run could have left behind, so a search matches
@@ -62,17 +60,10 @@ pub async fn delete_record(
     table: &str,
     record_id: &str,
 ) -> WeftResult<()> {
-    let resp = conn
-        .client()
-        .delete(format!("{API}/{base}/{table}/{record_id}"))
-        .send()
-        .await
-        .node_err("airtable: delete the test record")?;
-    if !resp.status().is_success() {
-        weft::node_bail!(
-            "airtable refused to delete test record {record_id} ({}); remove it by hand",
-            resp.status()
-        );
-    }
+    checked_send(
+        conn.client().delete(url(API, &[base, table, record_id])?.as_str()),
+        &format!("delete test record {record_id} (remove it by hand)"),
+    )
+    .await?;
     Ok(())
 }

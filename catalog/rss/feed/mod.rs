@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 use weft::node::NodeOutput;
 use weft::signal::{DeltaMode, PollDelta, PollEndpoint, PollFormat};
-use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct RssFeedNode;
@@ -25,17 +25,19 @@ impl Node for RssFeedNode {
 
     async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let url: String = ctx.inputs.get("feedUrl")?;
-        let interval: f64 = ctx.inputs.get("intervalSecs")?;
+        let interval: u64 = ctx.inputs.get("intervalSecs")?;
 
         ctx.register_signal(PollEndpoint {
             url,
             format: PollFormat::Feed,
-            interval_secs: interval as u64,
+            interval_secs: interval,
             delta: Some(PollDelta {
                 items: "items".into(),
                 cursor_field: Some("id".into()),
                 mode: DeltaMode::Set,
                 cursor_param: None,
+                // A syndication feed has no next-page cursor to follow.
+                paging: None,
             }),
             ..Default::default()
         })
@@ -43,12 +45,10 @@ impl Node for RssFeedNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let wake = ctx.wake.record()?;
-        let entry = wake["item"].clone();
+        let entry = ctx.wake.get::<weft::serde_json::Value>("item")?;
         // A feed that gives no title or no link says so with a null.
         // Turning either into an empty string sent an empty URL down a
         // wire that then fetched nothing, with nothing to look at.
-        entry["id"].as_str().node_err("the poll wake carries no entry id")?;
         ctx.pulse_downstream(
             NodeOutput::new()
                 .set("title", entry["title"].clone())

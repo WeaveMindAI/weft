@@ -1,11 +1,11 @@
 //! Engine-side `ContextHandle`. Lifecycle events go straight to
-//! the journal via the broker. Control-plane round-trips
-//! (`await_signal`, `register_signal`) go through the dispatcher's
-//! task queue (also via the broker): the worker enqueues a task row
-//! and waits for completion. Resume values are seeded into the
-//! per-(node, frames) await sequence by the loop driver at boot from
-//! the journal fold; the body's `await_signal` calls pop entries in
-//! call_index order.
+//! the journal via the broker. Control-plane round-trips (a wait's
+//! registration, `register_signal`) go through the dispatcher's task
+//! queue (also via the broker): the worker enqueues a task row and waits
+//! for completion. A firing picked up again (after a pause or a crash) is
+//! handed what it carries on from by the loop driver, out of the
+//! journal's fold ([`FiringResume`]): the state it saved, the waits it
+//! made by number, and the wait it paused in.
 //!
 //! Infra-provision (the engine-side counterpart to user code's
 //! `Node::provision_infra` returning an `InfraSpec`) is driven by the loop
@@ -17,7 +17,7 @@
 //! the loop driver runs the node's body with `Phase::InfraSetup`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -32,7 +32,8 @@ use weft_core::liveness::{FiringLocation, WaitLiveness};
 use weft_core::context::{ContextHandle, LogLevel};
 use weft_core::error::{WeftError, WeftResult};
 use weft_core::node::NodeOutput;
-use weft_core::primitive::SignalSpec;
+use weft_core::primitive::{AwaitEnd, RecordedWait, SignalSpec};
+use weft_core::run::saved::{Counters, Positions, SavedState};
 use weft_core::weft_type::WeftType;
 use weft_core::RunId;
 
@@ -46,6 +47,28 @@ use weft_task_store::{InfraReader, TaskKind, TaskStoreClient};
 /// How often a run that `stop_tagged` reached warns while it waits for
 /// its own stop to land.
 const SELF_STOP_BREADCRUMB: Duration = Duration::from_secs(60);
+
+/// Namespace of the digest of a program call's content in its key
+/// (`RunnerHandle::program_call`): generated once and frozen.
+const PROGRAM_CALL_CONTENT_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x2b8f_04d7_6e1c_4a93_b5f2_9d07_3c6a_e481);
+
+/// Namespace of the ids of instance tokens a program mints
+/// (`ctx.tokens().mint_for_instance`): generated once and frozen.
+const MINTED_TOKEN_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x7c3e_51a9_d2b4_4f86_a0e1_6b9d_2c4f_8e13);
+
+/// What the firing at `at` took off its stream inputs (`feeds`) and the
+/// record does not hold yet, as the row that puts it there; `None` when
+/// there is nothing.
+pub(crate) fn takes_to_record(feeds: &[Arc<weft_core::generator::GeneratorFeed>], run_id: RunId, at: &FiringLocation) -> Option<RunEvent> {
+    let taken: Vec<String> = feeds.iter().flat_map(|feed| feed.takes_to_record()).map(|id| id.to_string()).collect();
+    (!taken.is_empty()).then(|| RunEvent::PulsesConsumed {
+        run_id,
+        node_id: at.node_id.clone(),
+        frames: at.frames.clone(),
+        pulse_ids: taken,
+        at_unix: now_unix(),
+    })
+}
 
 /// Serialize a frame stack into the canonical string used in task dedup keys.
 /// One definition so the register-signal and program-call task dedup
@@ -371,12 +394,22 @@ impl RunClient for weft_broker_client::BrokerRunClient {
 
 /// What a firing writes about its run: the run's one handle on its record
 /// (its `crate::journal_writer::DriveJournal` on a worker, nothing around
-/// a node test, which has no run), and the spend still being worked out,
-/// which the run waits for before it ends (`crate::metering`).
+/// a node test, which has no run), the spend still being worked out,
+/// which the run waits for before it ends (`crate::metering`), and the
+/// calls its firings owe when they end (`crate::end_calls`).
 #[derive(Clone)]
 pub struct RunRecord {
     pub journal: Arc<dyn JournalClient>,
     pub costs: Arc<crate::metering::PendingCostRecords>,
+    pub owed: Arc<std::sync::Mutex<weft_journal::OwedCalls>>,
+}
+
+impl RunRecord {
+    /// A run's record written through `journal`, with nothing being worked
+    /// out and nothing owed yet.
+    pub fn new(journal: Arc<dyn JournalClient>) -> Self {
+        Self { journal, costs: crate::metering::PendingCostRecords::new(), owed: Default::default() }
+    }
 }
 
 /// Trait surface over `BrokerSteeringClient` so tests can inject a
@@ -622,6 +655,8 @@ pub struct FakeAccessBroker {
     /// The value maps of every release received, in order.
     pub released:
         std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>,
+    /// How many releases landed, for a test to wait on.
+    releases: tokio::sync::watch::Sender<usize>,
     /// Every publish received, in order.
     pub published: std::sync::Mutex<Vec<weft_broker_client::protocol::PublishAccessRequest>>,
 }
@@ -634,8 +669,19 @@ impl FakeAccessBroker {
             connections: std::sync::Mutex::new(HashMap::new()),
             resolved: std::sync::Mutex::new(Vec::new()),
             released: std::sync::Mutex::new(Vec::new()),
+            releases: tokio::sync::watch::Sender::new(0),
             published: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Until at least `count` releases landed, however late (a close
+    /// spawned as a body is dropped lands after the run returns).
+    pub async fn released_at_least(&self, count: usize) {
+        let mut releases = self.releases.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(5), releases.wait_for(|n| *n >= count))
+            .await
+            .expect("the releases land")
+            .expect("the fake outlives its waiters");
     }
 
     pub fn set_connection(
@@ -704,6 +750,7 @@ impl AccessBroker for FakeAccessBroker {
         req: &weft_broker_client::protocol::ReleaseConnectionRequest,
     ) -> anyhow::Result<weft_broker_client::protocol::ReleaseConnectionResponse> {
         self.released.lock().unwrap().push(req.values.clone());
+        self.releases.send_modify(|n| *n += 1);
         Ok(weft_broker_client::protocol::ReleaseConnectionResponse {})
     }
 
@@ -764,18 +811,14 @@ fn published_connection(
 }
 
 /// Per-run bus state: the registry that resolves markers to live
-/// channels, plus the list of buses the engine knows about. The dead-
-/// end policy is one line: if the loop is stuck (drained, no waiters,
-/// tasks still alive) AND any bus is live, close every bus. Each
-/// closed bus wakes its parked cursors and waits with Closed / None;
-/// the node tasks unwind, the loop drains them and terminates.
-///
-/// Vocabulary: this code uses "wait" everywhere, not "park". The word
-/// "park" already names `ctx.await_signal` (journal-replay workflow
-/// suspension, worker swap). A bus cursor's `next().await` is plain
-/// in-process tokio await; the worker stays alive; no swap. The
-/// engine's stuck-detector still needs the wake-up so it can know
-/// "every in-flight task is blocked on a bus right now" and close.
+/// channels, the bus each firing created on each port, and the journal
+/// pump. The dead-end policy is one line: if the loop is stuck (drained,
+/// no waiters, tasks still alive, nothing outside to move it) AND any bus
+/// is live, close every bus. Each closed bus wakes its parked cursors and
+/// waits with Closed / None; the node tasks unwind, the loop drains them
+/// and terminates. A run that pauses keeps its buses: the pump hands
+/// their last rows to the record, and the worker that picks the run up
+/// opens them again from it ([`Self::reopen`]).
 pub struct BusCoordinator {
     /// Single source of truth for every bus minted this run.
     /// Holds the strong `Arc<BusInner>` per bus (so the pump's Weak
@@ -807,9 +850,20 @@ pub struct BusCoordinator {
     /// `drop(coordinator)` race that could leave the pump parked
     /// forever on a multi-thread runtime.
     pump_should_exit: std::sync::atomic::AtomicBool,
+    /// Set as the run pauses ([`Self::shutdown`]): the pump flushes every
+    /// open journal window at once, as a bus closing does, instead of on
+    /// each window's timer, so the pause waits on no window.
+    flush_now: std::sync::atomic::AtomicBool,
     /// Where a recorded run's bus rows go ([`Self::recorded`]); `None` for
     /// a coordinator whose pump, if any, its owner runs.
     pump: Option<BusPump>,
+    /// The bus each firing created on each output port: what a resumed
+    /// body creating its bus there again gets ([`Self::bus_on`]).
+    created: Mutex<HashMap<(FiringLocation, String), uuid::Uuid>>,
+    /// The buses the pump has to tell the record were created
+    /// (`RunEvent::BusCreated`), before any row of their own: each with
+    /// its creator and port.
+    unannounced: Mutex<Vec<(std::sync::Weak<BusInner>, FiringLocation, String)>>,
 }
 
 /// A run's bus pump ([`run_bus_journal_task`]): started by the run's first
@@ -844,7 +898,10 @@ impl BusCoordinator {
             journal_pump_notify: Arc::new(tokio::sync::Notify::new()),
             drain_complete_notify: Arc::new(tokio::sync::Notify::new()),
             pump_should_exit: std::sync::atomic::AtomicBool::new(false),
+            flush_now: std::sync::atomic::AtomicBool::new(false),
             pump,
+            created: Mutex::new(HashMap::new()),
+            unannounced: Mutex::new(Vec::new()),
         })
     }
 
@@ -869,25 +926,122 @@ impl BusCoordinator {
         self.drain_complete_notify.clone()
     }
 
-    /// Mint a fresh bus with the provided options and register it,
-    /// attributed to the minting firing `node` (whose identity
-    /// keys its wait liveness). The registry pins the `Arc<BusInner>`
-    /// (so the pump's `Weak` always upgrades while the run is
-    /// live); the bus's engine hooks (the shared wait tracker + the
-    /// journal-pump notify) are `Weak` on purpose so the coordinator
-    /// drops naturally at run end; once gone, the bus's hooks
-    /// no-op. Errors on an invalid `window`.
-    pub fn new_bus(
+    /// The bus the firing `node` creates on its output `port`: the one
+    /// it created there before (a resumed body creating its bus again),
+    /// else a fresh one with `opts`, registered and announced to the
+    /// record. A handle attributed to `node` and its `firing` buses
+    /// either way. The registry pins the `Arc<BusInner>` (so the pump's
+    /// `Weak` always upgrades while the run is live); the bus's engine
+    /// hooks (the shared wait tracker + the journal-pump notify) are
+    /// `Weak` on purpose so the coordinator drops naturally at run end;
+    /// once gone, the bus's hooks no-op. Errors on an invalid `window`.
+    ///
+    /// `sent_before`: the firing put a marker on `port` before a pause.
+    /// The run holds that bus unless it closed before the pause, and a
+    /// fresh one in its place would reach none of the readers holding the
+    /// marker, so that is refused.
+    pub fn bus_on(
         self: &Arc<Self>,
         opts: BusOptions,
         node: FiringLocation,
+        port: &str,
+        firing: Arc<weft_core::bus::FiringBuses>,
+        sent_before: bool,
     ) -> Result<BusHandle, String> {
+        let mut created = self.created.lock().expect("created buses poisoned");
+        let key = (node.clone(), port.to_string());
+        if let Some(id) = created.get(&key) {
+            return self.registry.handle(*id, Some(node), Some(firing)).ok_or_else(|| {
+                format!("the bus this firing created on '{port}' is no longer held by the run")
+            });
+        }
+        if sent_before {
+            return Err(format!(
+                "this firing sent a bus on '{port}' before it paused, and that bus closed before the pause; a body \
+                 resumed from its saved state must not open its bus again once it closed (keep in the state that it is done)"
+            ));
+        }
         let weak = Arc::downgrade(&self.waits) as std::sync::Weak<dyn WaitLiveness>;
         let pump_notify_weak = Arc::downgrade(&self.journal_pump_notify);
-        let bus = BusHandle::create_with_engine(opts, weak, pump_notify_weak, Some(node))?;
+        let bus = BusHandle::create_with_engine(opts, weak, pump_notify_weak, Some(node.clone()), Some(firing))?;
+        // Queued for its announcement before the pump can see it: the
+        // pump reads the buses it drains before it takes the ones to
+        // announce, so a bus it drains is always announced first.
+        self.unannounced.lock().expect("unannounced buses poisoned").push((Arc::downgrade(&bus.inner_arc()), node, port.to_string()));
         self.registry.insert(&bus);
+        created.insert(key, bus.id());
         self.start_pump();
+        self.journal_pump_notify.notify_waiters();
         Ok(bus)
+    }
+
+    /// Open again every bus `open` (a paused run's, from its record),
+    /// before any body runs, with the names each held-over firing still
+    /// holds on it (`held`, by bus: name, firing, `Joined` offset). Each
+    /// keeps its id, so the markers handed out still name it, and its
+    /// creator's port, so a resumed creator gets it back.
+    pub fn reopen(
+        self: &Arc<Self>,
+        open: &std::collections::BTreeMap<uuid::Uuid, weft_core::primitive::OpenBus>,
+        mut held: HashMap<uuid::Uuid, Vec<(String, FiringLocation, u64)>>,
+    ) -> Result<(), String> {
+        for (id, bus) in open {
+            let reopened = weft_core::bus::ReopenedBus {
+                id: *id,
+                opts: BusOptions {
+                    journal: bus.journal,
+                    window: Some(bus.window),
+                    payload: bus.payload,
+                    meta: bus.meta.clone(),
+                },
+                next_offset: bus.next_offset,
+                joined: bus.joined.iter().cloned().collect(),
+                held_over: held.remove(id).unwrap_or_default(),
+                retained: bus.retained.iter().cloned().collect(),
+                lost_through: bus.lost_through,
+            };
+            let weak = Arc::downgrade(&self.waits) as std::sync::Weak<dyn WaitLiveness>;
+            let handle = BusHandle::reopen(reopened, weak, Arc::downgrade(&self.journal_pump_notify))
+                .map_err(|e| format!("open bus {id} again: {e}"))?;
+            self.registry.insert(&handle);
+            self.created.lock().expect("created buses poisoned").insert((bus.creator.clone(), bus.port.clone()), *id);
+        }
+        if !open.is_empty() {
+            self.start_pump();
+        }
+        Ok(())
+    }
+
+    /// The firing at `at` ended for good: every name it held over a pause
+    /// and did not take back leaves the bus it was on. `buses`: the buses
+    /// the firing holds a name on (`FiringBuses::named_on`), the only ones
+    /// a held-over name of its can be on.
+    pub fn release_held(&self, at: &FiringLocation, buses: &[uuid::Uuid]) {
+        for &id in buses {
+            if let Some(bus) = self.registry.handle(id, None, None) {
+                bus.inner_arc().release_held(at);
+            }
+        }
+    }
+
+    /// End bus `id` as `end`, whoever holds it.
+    pub fn close_bus(&self, id: uuid::Uuid, end: weft_core::bus::StreamEnd) {
+        if let Some(bus) = self.registry.handle(id, None, None) {
+            bus.inner_arc().close(end);
+        }
+        self.journal_pump_notify.notify_waiters();
+    }
+
+    /// The buses created since the pump last looked, to announce before
+    /// their own rows.
+    fn take_unannounced(&self) -> Vec<(std::sync::Weak<BusInner>, FiringLocation, String)> {
+        std::mem::take(&mut *self.unannounced.lock().expect("unannounced buses poisoned"))
+    }
+
+    /// Buses whose creation the record refused: announced again on the
+    /// pump's next pass, before any row of theirs.
+    fn announce_again(&self, buses: Vec<(std::sync::Weak<BusInner>, FiringLocation, String)>) {
+        self.unannounced.lock().expect("unannounced buses poisoned").extend(buses);
     }
 
     /// Handle on the per-run journal-pump wake-up. The pump task
@@ -900,6 +1054,12 @@ impl BusCoordinator {
     /// Whether the pump should exit on its next iteration. Set by
     /// `shutdown()` after every entry has been drained; the pump
     /// reads this every iteration and exits cleanly once true.
+    /// Whether the pump flushes every open window on its next pass
+    /// ([`Self::flush_now`]).
+    fn flush_now(&self) -> bool {
+        self.flush_now.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn pump_should_exit(&self) -> bool {
         self.pump_should_exit.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -913,13 +1073,14 @@ impl BusCoordinator {
 
     /// Look up a Bus marker JSON value in this run's registry,
     /// attributed to the resolving firing `node` (whose identity
-    /// keys its own bus liveness).
+    /// keys its own bus liveness) and its `firing` buses.
     pub fn lookup_bus(
         &self,
         marker: &serde_json::Value,
         node: FiringLocation,
+        firing: Arc<weft_core::bus::FiringBuses>,
     ) -> Result<BusHandle, weft_core::bus::BusLookupError> {
-        self.registry.lookup(marker, Some(node))
+        self.registry.lookup(marker, Some(node), Some(firing))
     }
 
     /// Whether any bus is live AND not yet closed. The loop reads this
@@ -940,14 +1101,14 @@ impl BusCoordinator {
         self.journal_pump_notify.notify_waiters();
     }
 
-    /// True when the pump has handed every entry on every live bus to the
-    /// run's record. A `journal_degraded` bus is treated as drained: the
-    /// pump can't drain it by definition, and the node author already saw
-    /// the failure as `SendError::JournalDegraded`.
+    /// True when the pump has handed every bus's creation and every entry
+    /// on every live bus to the run's record. A `journal_degraded` bus is
+    /// treated as drained: the pump can't drain it by definition, and the
+    /// node author already saw the failure as `SendError::JournalDegraded`.
     fn fully_drained(&self) -> bool {
-        self.registry.live_bus_arcs().iter().all(|b| {
-            b.is_journal_degraded() || b.journaled_through() >= b.log_len()
-        })
+        let degraded_or_gone = |bus: &std::sync::Weak<BusInner>| bus.upgrade().is_none_or(|bus| bus.is_journal_degraded());
+        self.unannounced.lock().expect("unannounced buses poisoned").iter().all(|(bus, _, _)| degraded_or_gone(bus))
+            && self.registry.live_bus_arcs().iter().all(|b| b.is_journal_degraded() || b.journaled_through() >= b.log_len())
     }
 
     /// Run the full bus shutdown sequence:
@@ -967,7 +1128,12 @@ impl BusCoordinator {
     ///      upgrade, finish an empty drain, and re-park on a notify
     ///      no one will fire again.
     ///   5. For a recorded run, wait for its pump to end.
-    pub async fn shutdown(&self) {
+    ///
+    /// A run that `paused` skips the first step: its buses stay open on
+    /// its record, every row they hold handed over (its open journal
+    /// windows flushed at once, [`Self::flush_now`]), for the worker that
+    /// picks the run up to open them again.
+    pub async fn shutdown(&self, paused: bool) {
         let pump = self.pump.as_ref().map(|pump| (pump.run_id, pump.task.lock().expect("bus pump poisoned").take()));
         if let Some((_, None)) = pump {
             // A recorded run whose pump never started minted no bus:
@@ -975,7 +1141,12 @@ impl BusCoordinator {
             self.pump_should_exit.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
-        self.close_all(run_ended_with_bus_open());
+        if paused {
+            self.flush_now.store(true, std::sync::atomic::Ordering::Release);
+            self.journal_pump_notify.notify_waiters();
+        } else {
+            self.close_all(run_ended_with_bus_open());
+        }
         let drain = self.drain_complete_notify.clone();
         loop {
             // Arm the wake BEFORE the predicate check so a drain pass
@@ -1004,7 +1175,7 @@ impl BusCoordinator {
                     target: "weft_engine::run_driver",
                     %run_id,
                     error = %e,
-                    "bus journal task ended abnormally; bus replay for this run is degraded"
+                    "bus journal task ended abnormally; the record of this run's buses is incomplete"
                 );
             }
         }
@@ -1097,23 +1268,52 @@ pub async fn run_bus_journal_task(
         // already true. We still run one final drain pass first so
         // any entries that landed concurrent with the shutdown flag
         // being set are journaled (and every open window flushed).
-        let should_exit = match coordinator.upgrade() {
+        let (should_exit, flush_now, unannounced) = match coordinator.upgrade() {
             Some(coord) => {
                 known_buses = coord.live_bus_inners();
-                coord.pump_should_exit()
+                (coord.pump_should_exit(), coord.flush_now(), coord.take_unannounced())
             }
             // Coordinator dropped before shutdown could set the flag.
             // Treat as "exit": there's nothing live to drain and no
             // one will fire pump_wake again.
-            None => true,
+            None => (true, false, Vec::new()),
         };
+        // A bus's creation goes on record before any row of its own: one
+        // the record refused is degraded, announced again on the next
+        // pass, and none of its rows go this pass.
+        let mut refused = Vec::new();
+        for (weak, creator, port) in unannounced {
+            let Some(bus) = weak.upgrade() else { continue };
+            let created = RunEvent::BusCreated {
+                run_id,
+                bus_id: bus.id().to_string(),
+                node_id: creator.node_id.clone(),
+                frames: creator.frames.clone(),
+                port: port.clone(),
+                payload: bus.payload_kind(),
+                meta: bus.meta().clone(),
+                window: bus.window(),
+                journal: bus.journal(),
+                at_unix: now_unix(),
+            };
+            if let Err(e) = journal.record_event(&created, Some(&replica)).await {
+                tracing::error!(target: "weft_engine::bus", bus = %bus.id(), error = %e, "recording a bus's creation failed; marking it degraded");
+                bus.mark_journal_degraded(format!("journal write failed: {e}"));
+                refused.push((weak, creator, port));
+            }
+        }
+        let not_on_record: Vec<uuid::Uuid> = refused.iter().filter_map(|(weak, _, _)| weak.upgrade().map(|bus| bus.id())).collect();
+        if let Some(coord) = coordinator.upgrade() {
+            coord.announce_again(refused);
+        }
+        known_buses.retain(|weak| weak.upgrade().is_some_and(|bus| !not_on_record.contains(&bus.id())));
         drain_buses(
             &known_buses,
             run_id,
             journal.as_ref(),
             &replica,
             &mut windows,
-            /* flush_all = */ should_exit,
+            /* flush_all = */ should_exit || flush_now,
         )
         .await;
         drain_done.notify_waiters();
@@ -1447,9 +1647,9 @@ pub enum NodeTaskOutcome {
     /// skipped by a person (`WeftError::WaitSkipped`). Every output it
     /// did not emit closes, as for any skip.
     Skipped(weft_core::run::skip::SkipReason),
-    /// The node called `await_signal` and is now waiting on a fired
-    /// wake signal (carries the suspension token).
-    Waiting(String),
+    /// The firing paused, its state saved: on a wait (carries its
+    /// token), or inside the run while the whole run paused (no token).
+    Waiting(Option<String>),
 }
 
 /// What the emission carries. A node either ships values on N output
@@ -1464,6 +1664,12 @@ pub enum EmitKind {
     /// nothing's coming, exactly the same shape as the
     /// termination-time sweep for an unmentioned port.
     Close { port: String },
+    /// No new pulse: a resumed body yielded again on `ports` what it
+    /// already put on the wires before its pause (the emission's id is
+    /// the message's). Only the delivery of those pulses is waited for:
+    /// the driver arms the gate on the ones still waiting to be taken,
+    /// and resolves it at once when none is.
+    Again { ports: Vec<String> },
 }
 
 /// Round-trip timeout for control-plane tasks. Generous because
@@ -1499,18 +1705,54 @@ struct PortClaims {
     /// end-of-stream verb; a yield after the end is a node-author bug
     /// and errors loud).
     ended_streams: HashSet<String>,
-    /// What the firing sent before it paused: the ports its record
-    /// mentions (`NodeFiring::mentioned_ports`), each with the value
-    /// the run's fold holds for it (`None` for a close). The body
-    /// replays from the top on resume, and its emission on one of these
-    /// again sends nothing, the first value standing.
+    /// What the firing sent before it paused: the ordinary ports its
+    /// record mentions (`NodeFiring::mentioned_ports`), each with the
+    /// value the run's fold holds for it (`None` for a close). The body
+    /// runs from the top again on resume, and its emission on one of
+    /// these again sends nothing, the first value standing (see
+    /// [`RunnerHandle::with_sent_before_pause`]).
     sent_before_pause: SentBeforePause,
+    /// The stream outputs the firing closed before it paused.
+    streams_closed_before: HashSet<String>,
     /// How many emissions yielded on a stream output so far: the
-    /// number of the next one's id (`stream_emission`).
+    /// number of the next one's id (`stream_emission`). A resumed body
+    /// starts from the count it saved.
     stream_items: u64,
-    /// The body returned (it ended, or paused on a wait): the firing
-    /// owns nothing done through this handle from here on.
+    /// How many of those items the run's record holds (the firing's
+    /// yields before a pause or a crash): a yield numbered below it
+    /// sends nothing again, the item on record standing.
+    items_on_record: u64,
+    /// The item a delivery-waiting yield is waiting on the take of: a
+    /// pause there saves the count from before it, so the resumed body's
+    /// same yield is that same item.
+    yield_in_flight: Option<u64>,
+    /// The body returned (it ended, or paused): the firing owns nothing
+    /// done through this handle from here on.
     body_returned: bool,
+    /// The body is pausing (its state saved as the pause leaves it):
+    /// nothing it asks from here on is done.
+    paused: bool,
+}
+
+impl PortClaims {
+    /// Whether the firing is past doing anything through its handle.
+    fn done(&self) -> bool {
+        self.body_returned || self.paused
+    }
+}
+
+/// What a firing picked up again carries on from, out of the run's fold
+/// (`RunnerHandle::with_resume`). Empty for a firing's first run.
+#[derive(Default)]
+pub struct FiringResume {
+    /// The state it saved last (`RunEvent::NodeStateSaved`): what
+    /// `ctx.keep` hands back, its positions and its counters.
+    pub saved: Option<SavedState>,
+    /// Every wait it made, by number: its own, or, for a firing a seeded
+    /// run runs again, the answers its seed was given.
+    pub waits: Vec<RecordedWait>,
+    /// How many items it yielded on its stream outputs on record.
+    pub items_on_record: u64,
 }
 
 pub struct RunnerHandle {
@@ -1532,9 +1774,11 @@ pub struct RunnerHandle {
     /// Which copies of its infra the run's program declares: an `Infra`
     /// handle another node shared resolves only to one of these.
     declared_infra: Arc<weft_core::project::DeclaredInfra>,
-    /// The buses this firing ends when its body does
-    /// (`weft_core::bus::FiringBuses`, ended by [`Self::end_body`]).
-    buses: weft_core::bus::FiringBuses,
+    /// This firing's side of every bus it touches
+    /// (`weft_core::bus::FiringBuses`): the buses it ends when its body
+    /// does ([`Self::end_body`]), and where it stands on each, saved
+    /// with its state. Shared with every bus handle it gets.
+    buses: Arc<weft_core::bus::FiringBuses>,
     /// The node's baked outputs (`weft_core::infra::bake`), and what the
     /// body emitted on them this firing: what an infra setup saves.
     baked_outputs: std::collections::BTreeSet<String>,
@@ -1576,43 +1820,43 @@ pub struct RunnerHandle {
     /// Tenant id stamped on every task this handle enqueues.
     tenant_id: String,
     cancellation: Arc<CancellationFlag>,
-    /// Pre-loaded sequence of past `await_signal` calls for this
-    /// (node, frames), seeded by the loop driver from the journal
-    /// fold on every dispatch. Each `await_signal` call inside the
-    /// node body pops the next entry:
-    ///   - ended: return its value instantly, or fail the way it
-    ///     failed when given up (replay path).
-    ///   - not ended (the still-pending tail): wait on this token
-    ///     (we're being re-dispatched but our fire hasn't arrived for
-    ///     THIS call yet).
-    ///   - exhausted: this is a fresh await; enqueue register_signal
-    ///     with the next call_index.
-    /// The `Mutex` is just for interior mutability across the
-    /// `&self` of the trait method; calls are serialized by the
-    /// node body (single Future polling).
-    awaited_sequence: Mutex<std::collections::VecDeque<weft_core::primitive::AwaitedEntry>>,
+    /// The state the firing saved before, until `ctx.keep` takes it.
+    saved: Mutex<Option<SavedState>>,
+    /// The waiting helper the firing paused in and where it stood, from
+    /// its saved state, handed once to the helper it comes back into
+    /// (`weft_core::context::Kept::follow`).
+    resumed_helper: Mutex<Option<weft_core::run::saved::PausedHelper>>,
+    /// `ctx.keep` was called: a second call in the firing is refused.
+    kept: AtomicBool,
+    /// Every wait the firing made before, by number ([`FiringResume::waits`]).
+    recorded_waits: Vec<RecordedWait>,
+    /// What this run of the body reached among the places it can pause
+    /// (`weft_core::context::Places`).
+    places: weft_core::context::Places,
+    /// The number of the wait the body is inside right now: a pause in
+    /// it saves the counters from before it, so the resumed body's same
+    /// wait takes the same number.
+    wait_in_flight: Mutex<Option<u32>>,
     /// The waits this firing's calls are inside, by token: from the call's
     /// wait until it is answered or given up. One left when the firing
     /// ends for good was abandoned (a call dropped, a body that went on
     /// without it, or one that panicked) and is withdrawn
     /// ([`Self::withdraw_abandoned_waits`]).
     open_waits: Mutex<std::collections::HashSet<String>>,
-    /// 0-based ordinal of the NEXT `await_signal` or `ctx.run` call
-    /// within this (node, frames) run. Increments on every call.
-    /// Combined with the per-(node, frames) sequence above, it
-    /// determines whether the call replays or registers fresh, and it
-    /// is the last part of a wait's identity (run, node, frames,
-    /// call index), so two calls that share the rest must never share
-    /// it. A firing starts its own at 0, because one run fires a
-    /// node once per frames; a live node test, which fires its node
-    /// once per `rig.run` under one run and one node id, hands
-    /// every handle it mints the same one
-    /// ([`Self::with_call_numbering`]).
-    next_call_index: Arc<AtomicU32>,
+    /// The numbers the firing's next wait and next program call take
+    /// (`weft_core::run::saved::Counters`): from where the firing saved
+    /// them, else 0. They are the last part of a wait's identity (run,
+    /// node, frames, wait number) and of a program call's key, so two
+    /// waits (or calls) that share the rest never share them. A live
+    /// node test, which fires its node once per `rig.run` under one run
+    /// and one node id, hands every handle it mints the same counters
+    /// ([`Self::with_counters`]).
+    counters: Arc<Mutex<Counters>>,
+    /// The firing's stream inputs: how many items each took is saved
+    /// with its state.
+    feeds: Vec<Arc<weft_core::generator::GeneratorFeed>>,
     /// 0-based ordinal of the NEXT log line within this (node, frames):
     /// its place among its firing's lines (`RunEvent::LogLine::seq`).
-    /// Separate counter from `next_call_index` so log lines don't shift
-    /// the replay alignment of `await_signal` / `run_step`.
     next_side_effect_index: AtomicU32,
     /// Number of `register_signal` (entry trigger) calls this node
     /// has made on this invocation. Entry triggers are a one-shot
@@ -1632,11 +1876,10 @@ pub struct RunnerHandle {
     /// firing) and errors loud. Multiple `pulse_downstream` calls on
     /// DISJOINT ports are fine: that's the "release early then
     /// finalize" pattern (bus marker out, then `done` at the end), and
-    /// it holds across a pause: a port sent before it replays as a
-    /// no-op. `Generator[T]` ports are EXEMPT from the once-only claim
+    /// it holds across a pause: a port sent before it sends nothing
+    /// again. `Generator[T]` ports are EXEMPT from the once-only claim
     /// (each emission is one item of the stream) but still recorded
-    /// here, so the no-wait-after-a-stream-started guard sees yields.
-    /// The once-only rule is not weakened by the exemption: it
+    /// here. The once-only rule is not weakened by the exemption: it
     /// exists because a second pulse at one `(run_id, frames)` key has
     /// no identity a waiting consumer could reconcile, and a generator
     /// consumer never reconciles: it fires once and pulls items in
@@ -1660,11 +1903,6 @@ pub struct RunnerHandle {
     /// ctx has no ordering guarantee (the snapshot is
     /// construction-time, not channel-time).
     stream_caps: Mutex<Arc<HashMap<String, usize>>>,
-    /// Whether this node declares any `Generator[T]` INPUT. A stream
-    /// consumer must not `await_signal`: a durable suspension replays
-    /// the body from the top, and the already-pulled stream cannot be
-    /// replayed (the producer's items were consumed live).
-    has_generator_input: bool,
     /// The run's shared wait tracker: this firing's delivery
     /// waits register here (its bus waits and generator pulls reach
     /// the same tracker through their own sources).
@@ -1735,8 +1973,8 @@ impl RunnerHandle {
         declared_outputs: Arc<HashMap<String, WeftType>>,
         declared_inputs: Arc<HashMap<String, WeftType>>,
         wired_outputs: std::collections::HashSet<String>,
-        has_generator_input: bool,
     ) -> Self {
+        let places = weft_core::context::Places::new(place.clone());
         Self {
             project_id,
             run_id,
@@ -1745,7 +1983,7 @@ impl RunnerHandle {
             per_instance: None,
             run_instance: None,
             declared_infra: Arc::new(weft_core::project::DeclaredInfra::default()),
-            buses: Default::default(),
+            buses: Arc::new(weft_core::bus::FiringBuses::default().cancelled_by(cancellation.clone())),
             baked_outputs: Default::default(),
             baked_emitted: Default::default(),
             infra_made: Default::default(),
@@ -1759,15 +1997,20 @@ impl RunnerHandle {
             worker_replica,
             tenant_id,
             cancellation,
-            awaited_sequence: Mutex::new(std::collections::VecDeque::new()),
+            saved: Mutex::new(None),
+            resumed_helper: Mutex::new(None),
+            kept: AtomicBool::new(false),
+            recorded_waits: Vec::new(),
+            places,
+            wait_in_flight: Mutex::new(None),
             open_waits: Mutex::new(std::collections::HashSet::new()),
-            next_call_index: Arc::new(AtomicU32::new(0)),
+            counters: Arc::new(Mutex::new(Counters::default())),
+            feeds: Vec::new(),
             next_side_effect_index: AtomicU32::new(0),
             entry_register_count: AtomicU32::new(0),
             emit_tx: None,
             port_claims: Mutex::new(PortClaims::default()),
             stream_caps: Mutex::new(Arc::new(HashMap::new())),
-            has_generator_input,
             waits,
             bus_coordinator,
             declared_outputs,
@@ -1815,6 +2058,57 @@ impl RunnerHandle {
                     .to_string(),
             )
         })
+    }
+
+    /// `ctx.after_node(call, access)`: the node owes `call` when it
+    /// ends, sent through `access` (`None`: plain) as the call's `when`
+    /// says (`weft_core::signal::cancel_call`). On the run's record before
+    /// it answers, so a worker that picks the run up after a crash still
+    /// owes it. A body run again that registers the same call again owes
+    /// it once.
+    pub async fn after_node(
+        &self,
+        call: weft_core::signal::CancelCall,
+        access: Option<weft_core::primitive::AccessRef>,
+    ) -> WeftResult<()> {
+        call.validate().map_err(|why| WeftError::Input(format!("node '{}': {why}", self.place)))?;
+        let owes = |owed: &weft_journal::OwedCalls| owed.owes(&self.node_id, &self.node_frames, &call, &access);
+        if owes(&self.record.owed.lock().expect("owed calls poisoned")) {
+            return Ok(());
+        }
+        let event = RunEvent::EndCallOwed {
+            run_id: self.run_id,
+            node_id: self.node_id.clone(),
+            frames: self.node_frames.clone(),
+            call: call.clone(),
+            access: access.clone(),
+            at_unix: now_unix(),
+        };
+        self.record
+            .journal
+            .record_event(&event, Some(&self.worker_replica))
+            .await
+            .map_err(|e| WeftError::NodeFailed(format!("put the call this node owes when it ends on the run's record: {e:#}")))?;
+        self.record.owed.lock().expect("owed calls poisoned").owe(&self.node_id, &self.node_frames, &call, &access);
+        Ok(())
+    }
+
+    /// The firing ended: send the calls it owed that go out for how it
+    /// ended (a cancel when the run's cancel is tripped, any other end
+    /// otherwise), before its ending is written (`crate::end_calls`).
+    pub(crate) async fn settle_end_calls(&self) {
+        let owed = self.record.owed.lock().expect("owed calls poisoned").take(&self.node_id, &self.node_frames);
+        if owed.is_empty() {
+            return;
+        }
+        let sender = crate::end_calls::Sender {
+            clients: &self.clients,
+            journal: &self.record.journal,
+            replica: &self.worker_replica,
+            run_id: self.run_id,
+            instance: self.run_instance.as_ref(),
+        };
+        sender.send(owed, self.cancellation.is_cancelled(), |_| self.node_type.clone()).await;
     }
 
     /// Release every runtime-owned connection this firing opened (the
@@ -1889,15 +2183,15 @@ impl RunnerHandle {
         self
     }
 
-    /// Number this handle's `await_signal` and `ctx.run` calls on
-    /// `numbering`, shared with the other handles of a live node test
-    /// (see `next_call_index`): each `rig.run` is a firing of the same
-    /// node under the same run, so a second run's first wait
-    /// carries on from the first run's numbering instead of taking its
-    /// identity, and with it its answer.
+    /// Number this handle's waits and program calls on `counters`,
+    /// shared with the other handles of a live node test (see
+    /// `counters`): each `rig.run` is a firing of the same node under the
+    /// same run, so a second run's first wait carries on from the first
+    /// run's numbering instead of taking its identity, and with it its
+    /// answer.
     #[cfg(feature = "node-tests")]
-    pub fn with_call_numbering(mut self, numbering: Arc<AtomicU32>) -> Self {
-        self.next_call_index = numbering;
+    pub fn with_counters(mut self, counters: Arc<Mutex<Counters>>) -> Self {
+        self.counters = counters;
         self
     }
 
@@ -1929,7 +2223,7 @@ impl RunnerHandle {
 
     /// What the firing emitted on its baked outputs: in this run of the
     /// body, and before it paused (the value downstream received, which
-    /// a replay never sends again).
+    /// the body run again never sends again).
     pub fn baked_emitted(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
         let mut baked = self.baked_emitted.lock().expect("baked emissions poisoned").clone();
         for (port, value) in &self.lock_port_claims().sent_before_pause {
@@ -1986,45 +2280,95 @@ impl RunnerHandle {
         self.next_side_effect_index.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Seed the per-(node, frames) await-call sequence the loop
-    /// driver pulled from the journal fold. Replaces
-    /// `with_expected_token` from the single-await world: now we
-    /// have an ordered sequence, not just one token.
-    pub fn with_awaited_sequence(
-        mut self,
-        sequence: Vec<weft_core::primitive::AwaitedEntry>,
-    ) -> Self {
-        self.awaited_sequence = Mutex::new(sequence.into());
+    /// What the firing carries on from ([`FiringResume`]): its saved
+    /// state (and with it its counters, its yield count and where it
+    /// stands on its buses), and the waits it made.
+    pub fn with_resume(mut self, resume: FiringResume) -> Self {
+        if let Some(saved) = &resume.saved {
+            *self.counters.lock().expect("counters poisoned") = saved.counters;
+            *self.resumed_helper.lock().expect("resumed helper poisoned") = saved.helper.clone();
+            self.buses = Arc::new(weft_core::bus::FiringBuses::resumed(saved.positions.buses.clone()).cancelled_by(self.cancellation.clone()));
+            self.lock_port_claims().stream_items = saved.positions.yielded;
+        }
+        self.lock_port_claims().items_on_record = resume.items_on_record;
+        *self.saved.lock().expect("saved state poisoned") = resume.saved;
+        self.recorded_waits = resume.waits;
+        self
+    }
+
+    /// Put on record what the firing took off its streams since it last
+    /// did (`weft_core::generator::GeneratorFeed::takes_to_record`): with
+    /// each save of its state, and at its end. A firing run again after a
+    /// crash from its last save is then handed again what it took since.
+    pub async fn record_takes(&self) -> WeftResult<()> {
+        let at = FiringLocation::new(self.node_id.clone(), self.node_frames.clone());
+        let Some(taken) = takes_to_record(&self.feeds, self.run_id, &at) else {
+            return Ok(());
+        };
+        self.record
+            .journal
+            .record_event(&taken, Some(&self.worker_replica))
+            .await
+            .map_err(|e| WeftError::NodeFailed(format!("node '{}' could not record what it took off its streams: {e:#}", self.place)))
+    }
+
+    /// The firing's stream inputs, whose takes its saved state carries.
+    pub fn with_feeds(mut self, feeds: Vec<Arc<weft_core::generator::GeneratorFeed>>) -> Self {
+        self.feeds = feeds;
         self
     }
 
     /// What the firing being resumed sent or closed before it paused:
-    /// the replayed body's emissions on those ports send nothing, and
+    /// the body run again sends nothing on those ports, and
     /// the values stand for them (an infra setup bakes them).
+    ///
+    /// A stream output is not one of those: its items are numbered
+    /// ([`FiringResume::items_on_record`]), and only a stream it closed
+    /// before the pause is kept, which a close again leaves closed and a
+    /// yield after is refused.
     pub fn with_sent_before_pause(self, sent: SentBeforePause) -> Self {
-        self.lock_port_claims().sent_before_pause = sent;
+        {
+            let mut claims = self.lock_port_claims();
+            for (port, value) in sent {
+                match (self.is_generator_output(&port), value) {
+                    (true, None) => {
+                        claims.streams_closed_before.insert(port);
+                    }
+                    (true, Some(_)) => {}
+                    (false, value) => {
+                        claims.sent_before_pause.insert(port, value);
+                    }
+                }
+            }
+        }
         self
     }
 
     /// The body returned (ended or paused): from here on an emission, a
-    /// wait or a step through this handle (from a task the body spawned
+    /// wait or a save through this handle (from a task the body spawned
     /// with a clone of its ctx) is refused, because the firing it would
     /// belong to is no longer running. Taken under the claims lock every
     /// emission sends under, so an emission is either on the channel
     /// before the firing's terminal or refused. The buses the body held
-    /// end with `end`, how it returned (`weft_core::bus::body_end`).
-    pub fn end_body(&self, end: weft_core::bus::StreamEnd) {
+    /// end with `end`, how it returned (`weft_core::bus::body_end`), and
+    /// the names it held over an earlier pause and did not take back
+    /// leave with it; a body that paused (`None`) ends nothing, and
+    /// carries on from its state.
+    pub fn end_body(&self, end: Option<weft_core::bus::StreamEnd>) {
         self.lock_port_claims().body_returned = true;
-        self.buses.end(end);
+        if let Some(end) = end {
+            self.buses.end(end);
+            self.bus_coordinator.release_held(&self.firing_location(), &self.buses.named_on());
+        }
     }
 
     /// The refusal for anything done through this handle after its body
-    /// returned (see [`Self::end_body`]).
+    /// returned or paused (see [`Self::end_body`]).
     fn outlived(&self, what: &str) -> WeftError {
         WeftError::NodeFailed(format!(
-            "node '{}' {what} after its body returned or paused on a wait; a firing owns only \
-             what is done while its body runs, so a task spawned with a clone of ctx has to \
-             finish before the body returns or waits",
+            "node '{}' {what} after its body returned or paused; a firing owns only what is done \
+             while its body runs, so a task spawned with a clone of ctx has to finish before the \
+             body returns, and a body that paused hands the pause back with `?` rather than going on",
             self.place
         ))
     }
@@ -2070,7 +2414,7 @@ impl RunnerHandle {
     /// would poison later legitimate emissions.
     fn claim(&self, claims: &mut PortClaims, ports: &[String]) -> WeftResult<()> {
         for port_name in ports {
-            if claims.ended_streams.contains(port_name) {
+            if claims.ended_streams.contains(port_name) || claims.streams_closed_before.contains(port_name) {
                 return Err(WeftError::NodeFailed(format!(
                     "node '{}' yielded on stream port '{}' after closing it; a close \
                      ends the stream, nothing can follow it.",
@@ -2096,7 +2440,8 @@ impl RunnerHandle {
     /// Claim what `kind` touches and send it to the loop driver, in ONE
     /// hold of the claims lock: refused once the body returned (see
     /// [`Self::end_body`]); a port the firing sent before it paused is
-    /// claimed for this run of the body and sends nothing (a replay);
+    /// claimed for this run of the body and sends nothing (it went out
+    /// before the pause);
     /// the rest goes out under the id its place derives. Answers whether
     /// anything was sent.
     fn claim_and_send(&self, kind: EmitKind, delivery: Option<Arc<DeliveryGate>>) -> WeftResult<bool> {
@@ -2104,10 +2449,24 @@ impl RunnerHandle {
         let kind = match kind {
             EmitKind::Values(mut output) => {
                 let ports: Vec<String> = output.outputs.keys().cloned().collect();
-                if claims.body_returned {
+                if claims.done() {
                     return Err(self.outlived(&format!("emitted on '{}'", ports.join("', '"))));
                 }
                 self.claim(&mut claims, &ports)?;
+                // A stream item numbered below what the record holds was
+                // yielded before a pause: it stands, and this yield sends
+                // nothing, waiting (when asked) for that item's take.
+                if output.outputs.keys().any(|port| self.is_generator_output(port)) && claims.stream_items < claims.items_on_record {
+                    let item = claims.stream_items;
+                    claims.stream_items += 1;
+                    if delivery.is_none() {
+                        return Ok(false);
+                    }
+                    claims.yield_in_flight = Some(item);
+                    let id = weft_core::run::emission::stream_emission(&self.node_id, &self.node_frames, item);
+                    self.send_emission(id, EmitKind::Again { ports }, delivery)?;
+                    return Ok(true);
+                }
                 output.outputs.retain(|port, _| !claims.sent_before_pause.contains_key(port));
                 if output.outputs.is_empty() {
                     return Ok(false);
@@ -2121,7 +2480,7 @@ impl RunnerHandle {
                 EmitKind::Values(output)
             }
             EmitKind::Close { port } => {
-                if claims.body_returned {
+                if claims.done() {
                     return Err(self.outlived(&format!("closed '{port}'")));
                 }
                 if self.is_generator_output(&port) {
@@ -2131,9 +2490,11 @@ impl RunnerHandle {
                             self.place, port
                         )));
                     }
-                    // Also recorded as a mention, so the no-wait-after-a-
-                    // stream-started guard sees the explicit end too.
                     claims.mentioned.insert(port.clone());
+                    // Closed before the pause already: it stays closed.
+                    if claims.streams_closed_before.contains(&port) {
+                        return Ok(false);
+                    }
                 } else {
                     self.claim(&mut claims, std::slice::from_ref(&port))?;
                 }
@@ -2142,14 +2503,18 @@ impl RunnerHandle {
                 }
                 EmitKind::Close { port }
             }
+            EmitKind::Again { .. } => unreachable!("a body's emission is never an `Again`: the claim makes one"),
         };
         // One id per firing for its ordinary ports, one per item for a
-        // yield: what the fold re-derives from the row, and what a replay
-        // that sent a port again would land on.
+        // yield: what the fold re-derives from the row, and what a body
+        // run again that sent a port again would land on.
         let id = match &kind {
             EmitKind::Values(output) if output.outputs.keys().any(|port| self.is_generator_output(port)) => {
                 let item = claims.stream_items;
                 claims.stream_items += 1;
+                if delivery.is_some() {
+                    claims.yield_in_flight = Some(item);
+                }
                 weft_core::run::emission::stream_emission(&self.node_id, &self.node_frames, item)
             }
             _ => weft_core::run::emission::body_emission(&self.node_id, &self.node_frames),
@@ -2164,21 +2529,71 @@ impl RunnerHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn lock_awaited_sequence(
-        &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<weft_core::primitive::AwaitedEntry>>
-    {
-        self.awaited_sequence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// Why the run cannot pause right now, if it cannot.
     fn unsuspendable(&self) -> Option<crate::held_waits::Unsuspendable> {
         if self.without_program {
             return Some(crate::held_waits::Unsuspendable::NoProgram);
         }
-        crate::held_waits::unsuspendable(self.caller_connection.as_ref(), &self.bus_coordinator, self.settings)
+        if self.places.holding() {
+            return Some(crate::held_waits::Unsuspendable::Holding);
+        }
+        crate::held_waits::unsuspendable(self.caller_connection.as_ref(), self.settings)
+    }
+
+    /// Take the firing's next wait number.
+    fn next_wait(&self) -> u32 {
+        let mut counters = self.counters.lock().expect("counters poisoned");
+        let n = counters.waits;
+        counters.waits += 1;
+        n
+    }
+
+    /// Take the firing's next program-call number.
+    fn next_program_call(&self) -> u32 {
+        let mut counters = self.counters.lock().expect("counters poisoned");
+        let n = counters.program_calls;
+        counters.program_calls += 1;
+        n
+    }
+
+    /// [`Self::wait_in_call`] for the wait numbered `n`: a pause in it
+    /// saves the counters from before it.
+    async fn wait_numbered(&self, n: u32, token: String) -> WeftResult<Value> {
+        *self.wait_in_flight.lock().expect("wait in flight poisoned") = Some(n);
+        let ended = self.wait_in_call(token).await;
+        if !matches!(ended, Err(WeftError::Suspended { .. })) {
+            *self.wait_in_flight.lock().expect("wait in flight poisoned") = None;
+        }
+        ended
+    }
+
+    /// Where the firing stands, for its saved state: its positions and
+    /// counters now, or, `pausing` inside a call, from before that call
+    /// (the wait it pauses in takes the same number again, the item it
+    /// pauses yielding is the same item). `streams`: where it stands on its
+    /// streams, read for this save
+    /// (`weft_core::generator::GeneratorFeed::saved_of`).
+    fn standing(&self, pausing: bool, streams: weft_core::generator::StreamsSaved) -> (Positions, Counters) {
+        let claims = self.lock_port_claims();
+        let yielded = match (pausing, claims.yield_in_flight) {
+            (true, Some(item)) => item,
+            _ => claims.stream_items,
+        };
+        drop(claims);
+        let positions = Positions {
+            buses: self.buses.positions(),
+            taken: streams.taken,
+            ended: streams.ended,
+            drained: streams.drained,
+            yielded,
+        };
+        let mut counters = *self.counters.lock().expect("counters poisoned");
+        if pausing {
+            if let Some(n) = *self.wait_in_flight.lock().expect("wait in flight poisoned") {
+                counters.waits = n;
+            }
+        }
+        (positions, counters)
     }
 
     /// The error a wait of this node given up for `why` fails its call with.
@@ -2236,28 +2651,29 @@ impl RunnerHandle {
         Ok(())
     }
 
-    /// Suspend on the wait `token`, or, while the run cannot pause, hold it
-    /// in this call until the drive ends it (`crate::held_waits`): its
-    /// answer goes on the run's record and is the call's value, the run
-    /// able to pause again suspends
-    /// it after all, and a wait given up fails the call. A wait given up
-    /// goes on the run's record, so a replay of this body fails the same
-    /// call the same way, and is withdrawn, so nobody is still asked to
-    /// answer it.
+    /// Hold the wait `token` in this call until the drive ends it
+    /// (`crate::held_waits`): its answer goes on the run's record and is
+    /// the call's value, the run pausing (every node it runs waits, and
+    /// its `pauseAfterSecs` ran out, or a hand-back) suspends it, and a
+    /// wait given up fails the call. A wait never suspends on its own, so
+    /// a run pauses in one way only: all its waits together. A run that
+    /// cannot pause and holds for no time (`holdSecs: 0`) gives the wait
+    /// up at once. A wait given up goes on the run's record, so this body
+    /// run again fails the same wait the same way, and is withdrawn, so
+    /// nobody is still asked to answer it.
     async fn hold_or_suspend(&self, token: String) -> WeftResult<Value> {
         use crate::held_waits::HeldEnd;
-        let Some(why) = self.unsuspendable() else {
-            return Err(WeftError::Suspended { token });
-        };
-        let end = match self.settings.hold_secs() {
-            0 => {
+        let unsuspendable = self.unsuspendable();
+        let end = match (unsuspendable, self.settings.hold_secs()) {
+            (Some(why), 0) => {
                 self.waits.held().gave_up(&token);
                 HeldEnd::GaveUp(crate::held_waits::gave_up_because(why, 0))
             }
             _ => {
                 let liveness = Arc::downgrade(&self.waits) as std::sync::Weak<dyn WaitLiveness>;
-                let here = FiringLocation::new(self.node_id.clone(), self.node_frames.clone());
-                self.waits.held().hold(&liveness, here, &token).await
+                // A firing holding its run waits until answered or given up.
+                let pausable = unsuspendable != Some(crate::held_waits::Unsuspendable::Holding);
+                self.waits.held().hold(&liveness, self.firing_location(), &token, pausable).await
             }
         };
         let why = match end {
@@ -2275,7 +2691,13 @@ impl RunnerHandle {
                     weft_core::primitive::WaitAnswer::Skipped => Err(weft_core::primitive::wait_skipped()),
                 };
             }
-            HeldEnd::Pause => return Err(WeftError::Suspended { token }),
+            HeldEnd::Pause => return Err(WeftError::Suspended { token: Some(token) }),
+            // Over already: the wait is withdrawn, and the body gets the
+            // firing's failure.
+            HeldEnd::FiringFailed(failure) => {
+                self.withdraw(token).await.map_err(|e| WeftError::NodeFailed(format!("{failure}; and {e}")))?;
+                return Err(WeftError::NodeFailed(failure));
+            }
             HeldEnd::GaveUp(why) => why,
         };
         let error = self.gave_up(&why);
@@ -2377,13 +2799,14 @@ pub async fn ship_node_lifecycle(
     record_from_replica(journal, event, replica).await;
 }
 
+/// Ship a firing's pause: on the wait `token`, or inside the run (`None`).
 pub async fn ship_node_suspended(
     journal: &dyn JournalClient,
     replica: &str,
     run_id: RunId,
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
-    token: &str,
+    token: Option<&str>,
 ) {
     record_from_replica(
         journal,
@@ -2391,7 +2814,7 @@ pub async fn ship_node_suspended(
             run_id,
             node_id: node_id.to_string(),
             frames: frames.clone(),
-            token: token.to_string(),
+            token: token.map(str::to_string),
             at_unix: now_unix(),
         },
         replica,
@@ -2524,66 +2947,95 @@ pub async fn ship_port_closed(
 
 #[async_trait]
 impl ContextHandle for RunnerHandle {
-    /// Wait-and-resume primitive. Generalized to N awaits per body:
-    /// each call has a 0-based call_index keyed on (node, frames).
-    /// On every dispatch, the runtime pre-loads the per-(node, frames)
-    /// awaited sequence from the journal fold:
-    ///
-    /// 1. **Replay path** (the entry ended): the call's answer arrived
-    ///    in a prior cycle; return the stored value instantly, or fail
-    ///    the way the call failed when its wait was given up.
-    /// 2. **Wait path** (the entry has not ended): the call's wait is
-    ///    the still-pending tail of the sequence.
-    /// 3. **Fresh path** (sequence exhausted): no past entry for this
-    ///    call_index; this is the first time this await runs. Enqueue
-    ///    `register_signal` with is_resume=true and the current
-    ///    call_index, and record the wait.
-    ///
-    /// A wait then suspends (`WeftError::Suspended`, the worker lets go
-    /// and the answer has the run carried on), or, while the run cannot
-    /// pause, holds in this call ([`Self::hold_or_suspend`]).
-    ///
-    /// The author writes `let x = ctx.await_signal(...).await?;` N
-    /// times in a row; each call is replay-instant on resume.
-    async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value> {
-        // A durable suspension replays the whole node body on resume.
-        // An ordinary port sent before the wait replays as a no-op (the
-        // firing's record remembers it, see `sent_before_pause`), but a
-        // stream's items went out live, one pulse each, so a wait after
-        // a yield or a stream's close is refused.
+    async fn keep_state(&self, initial: Value) -> WeftResult<Value> {
+        if self.kept.swap(true, Ordering::SeqCst) {
+            return Err(weft_core::context::kept_twice());
+        }
+        let saved = self.saved.lock().expect("saved state poisoned").take();
+        Ok(saved.map_or(initial, |saved| saved.state))
+    }
+
+    /// The row goes to the run's record in the firing's own order, so a
+    /// pause's save is on record before the firing's suspension row.
+    async fn save_state(&self, state: Value, at: weft_core::context::SaveAt) -> WeftResult<()> {
+        let pausing = match at {
+            weft_core::context::SaveAt::Here => None,
+            weft_core::context::SaveAt::Pausing { helper } => Some(helper),
+        };
         {
-            let claims = self.lock_port_claims();
-            if claims.body_returned {
-                return Err(self.outlived("waited"));
+            let mut claims = self.lock_port_claims();
+            if claims.done() {
+                return Err(self.outlived("saved its state"));
             }
-            if claims.mentioned.iter().chain(claims.sent_before_pause.keys()).any(|port| self.is_generator_output(port)) {
-                return Err(WeftError::NodeFailed(
-                    weft_core::context::streamed_then_await_signal_error(&self.place),
-                ));
+            if pausing.is_some() {
+                claims.paused = true;
             }
         }
-        // A stream CONSUMER cannot durably suspend either: the resume
-        // replays the body from the top, and the items its earlier
-        // pulls consumed were delivered live and cannot be replayed.
-        if self.has_generator_input {
-            return Err(WeftError::NodeFailed(
-                weft_core::context::stream_consumer_await_signal_error(&self.place),
-            ));
+        // A pausing feed takes no stream end from here on: one the driver
+        // routes meanwhile stays on its wire for the resumed feed, instead
+        // of going on record without this save to account for it.
+        if pausing.is_some() {
+            self.feeds.iter().for_each(|feed| feed.pause());
         }
-        let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
-
-        // Pop the next pre-loaded entry (if any) through the ONE replay
-        // reading (shared with the node-test rig).
-        let replayed = weft_core::primitive::replay_await(&mut self.lock_awaited_sequence(), call_index)?;
-        match replayed {
-            Some(weft_core::primitive::ReplayedAwait::Resolved(value)) => return Ok(value),
-            Some(weft_core::primitive::ReplayedAwait::Pending { token }) => return self.wait_in_call(token).await,
-            None => {}
+        // What it took goes on record in the same write as the state that
+        // accounts for it, read together with where it stands on each
+        // stream, so the record never holds one without the other.
+        let mut streams = weft_core::generator::GeneratorFeed::saved_of(&self.feeds);
+        let taken = (!streams.takes.is_empty()).then(|| RunEvent::PulsesConsumed {
+            run_id: self.run_id,
+            node_id: self.node_id.clone(),
+            frames: self.node_frames.clone(),
+            pulse_ids: std::mem::take(&mut streams.takes).iter().map(|id| id.to_string()).collect(),
+            at_unix: now_unix(),
+        });
+        let (positions, counters) = self.standing(pausing.is_some(), streams);
+        if pausing.is_some() {
+            self.buses.pause();
         }
+        let saved = RunEvent::NodeStateSaved {
+            run_id: self.run_id,
+            node_id: self.node_id.clone(),
+            frames: self.node_frames.clone(),
+            saved: SavedState { state, positions, counters, helper: pausing.flatten() },
+            at_unix: now_unix(),
+        };
+        let rows: Vec<RunEvent> = taken.into_iter().chain(std::iter::once(saved)).collect();
+        self.record
+            .journal
+            .record_events(&rows, Some(&self.worker_replica))
+            .await
+            .map_err(|e| WeftError::NodeFailed(format!("node '{}' could not save its state: {e:#}", self.place)))
+    }
 
-        // Sequence exhausted: this is a fresh await. Enqueue the
-        // register_signal task that arms the wait; this call records its
-        // own SuspensionRegistered, with the right ordinal, below.
+    fn resumed_helper(&self) -> Option<weft_core::run::saved::PausedHelper> {
+        self.resumed_helper.lock().expect("resumed helper poisoned").take()
+    }
+
+    /// A wait, under the firing's next number. One the record holds under
+    /// that number (made before a pause or a crash, or answered in the run
+    /// this one was seeded from) is that wait: its ending, or, still open,
+    /// a wait on it again. A new one is registered (a `register_signal`
+    /// task with `is_resume` and the number, then its
+    /// `SuspensionRegistered`), and then pauses the run, or holds in this
+    /// call while the run cannot pause ([`Self::hold_or_suspend`]).
+    async fn wait(&self, spec: SignalSpec) -> WeftResult<Value> {
+        if self.lock_port_claims().done() {
+            return Err(self.outlived("waited"));
+        }
+        // A firing the engine failed while its body ran waits on nothing.
+        if let Some(failure) = self.waits.held().failure_of(&self.firing_location()) {
+            return Err(WeftError::NodeFailed(failure));
+        }
+        let n = self.next_wait();
+        if let Some(recorded) = self.recorded_waits.iter().find(|recorded| recorded.wait_index == n) {
+            weft_core::primitive::check_wait_kind(recorded, &spec, &self.place)?;
+            return match &recorded.ended {
+                Some(AwaitEnd::Answered { value }) => Ok(value.clone()),
+                Some(AwaitEnd::GaveUp { error }) => Err(WeftError::WaitGaveUp(error.clone())),
+                Some(AwaitEnd::Skipped) => Err(weft_core::primitive::wait_skipped()),
+                None => self.wait_numbered(n, recorded.token.clone()).await,
+            };
+        }
         let reply = enqueue_register_signal_task(
             self.clients.tasks.as_ref(),
             self.run_id,
@@ -2592,18 +3044,18 @@ impl ContextHandle for RunnerHandle {
             &spec,
             true,
             &self.tenant_id,
-            call_index,
-            // A resume registration wakes THIS parked firing; ports are
-            // live in the body, nothing to replay later.
+            n,
+            // A resume registration wakes THIS paused firing; ports are
+            // live in the body, nothing to hand over at a fire.
             None,
         )
         .await
         .map_err(|e| WeftError::Suspension(format!("request token: {e}")))?;
         let weft_core::primitive::RegisterSignalResult::Registered { token } = reply else {
-            return Err(WeftError::Suspension("await_signal was captured instead of registered".into()));
+            return Err(WeftError::Suspension("a wait was captured instead of registered".into()));
         };
         // The wait is the run's to record: a fold rebuilds the firing's
-        // await sequence from it.
+        // waits from it.
         self.record
             .journal
             .record_event(
@@ -2613,7 +3065,7 @@ impl ContextHandle for RunnerHandle {
                     frames: self.node_frames.clone(),
                     token: token.clone(),
                     spec,
-                    call_index,
+                    wait_index: n,
                     at_unix: now_unix(),
                 },
                 Some(&self.worker_replica),
@@ -2624,50 +3076,15 @@ impl ContextHandle for RunnerHandle {
             target: "weft_engine::suspend",
             node = %self.node_id,
             run_id = %self.run_id,
-            call_index = call_index,
+            wait = n,
             token = %token,
-            "await_signal: registered",
+            "wait registered",
         );
-        self.wait_in_call(token).await
+        self.wait_numbered(n, token).await
     }
 
-    /// Replay-side of `ctx.run`. Pops the next entry in the
-    /// (node, frames) sequence through the ONE replay reading (shared
-    /// with the node-test rig): a Run at our call_index replays its
-    /// journaled value; an Await there, or another index, is a drifted
-    /// body and fails loudly; an exhausted sequence is the fresh path,
-    /// `None`, so the wrapper invokes the closure.
-    async fn run_step(&self, name: &str) -> WeftResult<(u32, Option<Value>)> {
-        if self.lock_port_claims().body_returned {
-            return Err(self.outlived(&format!("ran step '{name}'")));
-        }
-        let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
-        let replayed = weft_core::primitive::replay_run(&mut self.lock_awaited_sequence(), name, call_index)?;
-        Ok((call_index, replayed))
-    }
-
-    async fn run_record(&self, name: &str, call_index: u32, value: &Value) -> WeftResult<()> {
-        // call_index is the value run_step returned, passed in so
-        // run_step and run_record agree on the index explicitly
-        // rather than via a shared counter both sides read.
-        self.record.journal.record_event(
-            &RunEvent::RunOutput {
-                run_id: self.run_id,
-                node_id: self.node_id.clone(),
-                frames: self.node_frames.clone(),
-                call_index,
-                name: name.to_string(),
-                value: value.clone(),
-                at_unix: now_unix(),
-            },
-            Some(&self.worker_replica),
-        )
-        .await
-        .map_err(|error| WeftError::NodeFailed(format!(
-            "could not save result of '{name}' for node '{}': {error}. \
-             The action may already have happened; inspect this run before repeating it.",
-            self.place,
-        )))
+    fn places(&self) -> &weft_core::context::Places {
+        &self.places
     }
 
     async fn storage_put(
@@ -2691,6 +3108,7 @@ impl ContextHandle for RunnerHandle {
         scope: &weft_core::storage::StorageScope,
         identity: Option<&str>,
         url: &str,
+        mime: Option<&str>,
         filename: Option<&str>,
         keep: Option<weft_core::storage::KeepTtl>,
     ) -> WeftResult<Value> {
@@ -2719,9 +3137,13 @@ impl ContextHandle for RunnerHandle {
                 weft_core::truncate_user_string(&body, 512)
             )));
         }
-        let mime = weft_core::storage::normalize_content_type(
-            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
-        );
+        // The caller's stated type wins over what the server says.
+        let mime = match mime {
+            Some(mime) => mime.to_string(),
+            None => weft_core::storage::normalize_content_type(
+                resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            ),
+        };
         // The caller's name wins; then whatever the server calls the
         // file (a media route serving `/media/<id>` still says
         // `voice.ogg` in its Content-Disposition); the URL last.
@@ -3075,11 +3497,11 @@ impl ContextHandle for RunnerHandle {
     /// persistent until the project is deactivated. Each external
     /// fire spawns a fresh run at the worker's door instead of
     /// resuming this firing.
-    /// Distinct from await_signal: no suspend-then-resume cycle.
+    /// Distinct from a wait (`state.wait`): no pause-then-resume cycle.
     async fn register_signal(&self, spec: SignalSpec, port_snapshot: Value) -> WeftResult<()> {
         // Entry triggers are one-shot per node per TriggerSetup.
         // The dedup key for this enqueue is `(run, node, frames,
-        // is_resume=false, call_index=0)`; a second call from the
+        // is_resume=false, wait_index=0)`; a second call from the
         // same node body would collide and silently drop the
         // second trigger. Catch that loudly here so the offending
         // node fails instead of a trigger going missing.
@@ -3160,6 +3582,14 @@ impl ContextHandle for RunnerHandle {
 
     async fn reveal_secret(&self, id: weft_core::secret::SecretId) -> WeftResult<serde_json::Value> {
         self.record.journal.reveal_secret(id).await.map_err(|e| WeftError::NodeFailed(format!("{e:#}")))
+    }
+
+    async fn after_node(
+        &self,
+        call: weft_core::signal::CancelCall,
+        access: Option<weft_core::primitive::AccessRef>,
+    ) -> WeftResult<()> {
+        RunnerHandle::after_node(self, call, access).await
     }
 
     async fn published_access(&self) -> WeftResult<Option<weft_core::access::Access>> {
@@ -3294,8 +3724,8 @@ impl ContextHandle for RunnerHandle {
 
     /// Synchronous through the broker (the tag rows exist on return),
     /// and safe to re-run: the broker's insert keeps an existing
-    /// (run, tag) row, so a body replayed after a durable wait
-    /// re-tags onto the same state. Not journaled through `ctx.run` for that reason.
+    /// (run, tag) row, so a body run again after a pause or a crash
+    /// re-tags onto the same state.
     async fn tag_run(&self, tags: Vec<String>) -> WeftResult<()> {
         // The act goes on the run's record first: the broker's call below
         // names the run, so the record so far (this row with it) is
@@ -3320,7 +3750,7 @@ impl ContextHandle for RunnerHandle {
     }
 
     /// Queues the stop through the broker, which anchors the ordering
-    /// at this instant. Replaying it after a durable wait asks again for
+    /// at this instant. A body run again after a pause asks again for
     /// the same set (anything it already stopped is terminal and skipped).
     /// A stop that reaches this run too never returns: the body waits
     /// for its own cancel, which the dispatcher carries out a moment
@@ -3341,9 +3771,10 @@ impl ContextHandle for RunnerHandle {
     }
 
     /// Carried as a durable `program_call` task for the dispatcher, keyed
-    /// to the call's journal step (`call_index`, which a replay reaches
-    /// at the same index) so a retried or replayed enqueue while the task
-    /// lives is one task; the install names the call after that key
+    /// to the call's number in the firing (which a body run again from
+    /// its saved counters reaches again) and its content, so a retried
+    /// enqueue while the task lives is one task; the install names the
+    /// call after that key
     /// (`weft_core::program::program_call_id`), so a call issued again
     /// once that task ended finds what the first made. The answer is waited for with no
     /// deadline (an infra start can wait out a drain the person chose),
@@ -3354,14 +3785,25 @@ impl ContextHandle for RunnerHandle {
         &self,
         call: weft_core::program::ProgramCall,
         stop_self: weft_core::StopSelf,
-        call_index: u32,
         project: Option<uuid::Uuid>,
     ) -> WeftResult<Value> {
-        let name = call.journal_name();
+        let name = call.name();
+        if self.lock_port_claims().done() {
+            return Err(self.outlived(&format!("called {name}")));
+        }
+        let number = self.next_program_call();
         let frames = frames_dedup_key(&self.node_frames)
             .map_err(|e| WeftError::NodeFailed(format!("{name}: frames: {e}")))?;
+        // The call's own content is part of its key: a call carried again
+        // under its number while its task lives (its answer lost on the
+        // way) is the same call and gets its first answer, and a different
+        // call that lands on the same number (a body run again after a
+        // crash that went another way) is a call of its own, never handed
+        // another's answer.
+        let content = serde_json::to_vec(&call).map_err(|e| WeftError::NodeFailed(format!("{name}: {e}")))?;
+        let digest = uuid::Uuid::new_v5(&PROGRAM_CALL_CONTENT_NAMESPACE, &content).simple();
         // SYNC: the step's spelling <-> crates/weft-broker/src/handlers.rs (the program call's key check)
-        let step = format!("program_call/{}/{}/{frames}/{call_index}", self.run_id, self.node_id);
+        let step = format!("program_call/{}/{}/{frames}/{number}/{digest}", self.run_id, self.node_id);
         let payload = weft_core::program::ProgramCallPayload { by: self.run_id, stop_self, project, call };
         let id = self
             .clients
@@ -3419,9 +3861,15 @@ impl ContextHandle for RunnerHandle {
         instance: &weft_core::instance::InstanceId,
         expires_in_secs: u64,
         displays: bool,
-        id: uuid::Uuid,
         project: Option<uuid::Uuid>,
     ) -> WeftResult<weft_core::program::MintedInstanceToken> {
+        if self.lock_port_claims().done() {
+            return Err(self.outlived("minted an instance token"));
+        }
+        let number = self.next_program_call();
+        let frames = frames_dedup_key(&self.node_frames)
+            .map_err(|e| WeftError::NodeFailed(format!("mint an instance token: frames: {e}")))?;
+        let id = uuid::Uuid::new_v5(&MINTED_TOKEN_NAMESPACE, format!("{}/{}/{frames}/{number}", self.run_id, self.node_id).as_bytes());
         self.clients
             .access_broker
             .mint_instance_token(&weft_broker_client::protocol::ProgramMintInstanceTokenRequest {
@@ -3454,7 +3902,7 @@ impl ContextHandle for RunnerHandle {
     }
 
     fn firing_buses(&self) -> &weft_core::bus::FiringBuses {
-        &self.buses
+        self.buses.as_ref()
     }
 
     /// Fire downstream. Each output port the node mentions in
@@ -3464,10 +3912,11 @@ impl ContextHandle for RunnerHandle {
     /// Calling `pulse_downstream` multiple times with DISJOINT ports
     /// is fine (release early then finalize); calling it twice with
     /// OVERLAPPING non-generator ports is a node-author bug.
-    /// `wait_delivered` parks this body until every pulse the call
-    /// created has been absorbed (the consumer dispatched / the item
-    /// pulled), failing loudly when that can never happen.
-    async fn pulse_downstream(&self, output: NodeOutput, wait_delivered: bool) -> WeftResult<()> {
+    /// [`weft_core::context::Delivery::Taken`] parks this body until
+    /// every pulse the call created has been absorbed (the consumer
+    /// dispatched / the item pulled), failing loudly when that can never
+    /// happen.
+    async fn pulse_downstream(&self, output: NodeOutput, delivery: weft_core::context::Delivery) -> WeftResult<()> {
         let ports: Vec<String> = output.outputs.keys().cloned().collect();
         self.check_declared_outputs(&ports)?;
 
@@ -3522,12 +3971,12 @@ impl ContextHandle for RunnerHandle {
 
         // The call is now known to proceed: claim every touched port
         // (the one-emission-per-port rule) and send.
-        if !wait_delivered {
+        let weft_core::context::Delivery::Taken { pausable } = delivery else {
             if !kept.outputs.is_empty() {
                 self.claim_and_send(EmitKind::Values(kept), None)?;
             }
             return Ok(());
-        }
+        };
         // Delivery-waiting emission that keeps no ports: NOTHING was
         // emitted (an empty output). The caller's contract is "block
         // until this was taken"; reporting success over a handoff that
@@ -3540,13 +3989,17 @@ impl ContextHandle for RunnerHandle {
             )));
         }
         let gate = DeliveryGate::new();
-        // Everything it carries was sent before a pause (a replay): its
-        // delivery is that earlier emission's, already behind the body.
+        // An ordinary port sent before a pause carries nothing again, and
+        // its delivery is that earlier emission's, behind the body.
         if !self.claim_and_send(EmitKind::Values(kept), Some(gate.clone()))? {
             return Ok(());
         }
         let liveness = Arc::downgrade(&self.waits) as std::sync::Weak<dyn WaitLiveness>;
-        gate.wait_delivered(&liveness, self.firing_location()).await
+        let delivered = gate.wait_delivered(&liveness, self.firing_location(), pausable).await;
+        if !matches!(delivered, Err(WeftError::Suspended { .. })) {
+            self.lock_port_claims().yield_in_flight = None;
+        }
+        delivered
     }
 
     fn set_max_buffered_items(&self, port: &str, items: usize) -> WeftResult<()> {
@@ -3589,10 +4042,16 @@ impl ContextHandle for RunnerHandle {
         self.claim_and_send(EmitKind::Close { port }, None).map(|_| ())
     }
 
-    fn create_bus(&self, opts: BusOptions) -> WeftResult<(BusHandle, Value)> {
+    /// The firing's bus on `port`: the one it created there before a
+    /// pause, open still or opened again, else a new one.
+    fn create_bus(&self, port: &str, opts: BusOptions) -> WeftResult<(BusHandle, Value)> {
+        if self.lock_port_claims().done() {
+            return Err(self.outlived(&format!("created a bus on '{port}'")));
+        }
+        let sent_before = self.lock_port_claims().sent_before_pause.contains_key(port);
         let handle = self
             .bus_coordinator
-            .new_bus(opts, self.firing_location())
+            .bus_on(opts, self.firing_location(), port, self.buses.clone(), sent_before)
             .map_err(|e| WeftError::Input(format!("ctx.create_bus on node '{}': {e}", self.place)))?;
         let marker = handle.marker();
         Ok((handle, marker))
@@ -3600,7 +4059,7 @@ impl ContextHandle for RunnerHandle {
 
     fn bus(&self, marker: &Value) -> WeftResult<BusHandle> {
         self.bus_coordinator
-            .lookup_bus(marker, self.firing_location())
+            .lookup_bus(marker, self.firing_location(), self.buses.clone())
             .map_err(|e| {
                 WeftError::Input(format!(
                     "ctx.bus on node '{}': {e}",
@@ -3630,12 +4089,12 @@ async fn enqueue_register_signal_task(
     spec: &SignalSpec,
     is_resume: bool,
     tenant_id: &str,
-    call_index: u32,
+    wait_index: u32,
     port_snapshot: Option<Value>,
 ) -> anyhow::Result<weft_core::primitive::RegisterSignalResult> {
     // Task-level dedup so retries (network blip, supervisor
     // reconnect) converge on the same token. `is_resume` is in the
-    // key because the same (run, node, frames, call_index) tuple can
+    // key because the same (run, node, frames, wait number) tuple can
     // be reused across a resume + an entry-trigger registration on
     // the same node body (e.g. a node that awaits its own webhook).
     // Separate from the journal-level dedup the dispatcher's
@@ -3645,7 +4104,7 @@ async fn enqueue_register_signal_task(
     let frames_key = frames_dedup_key(frames)?;
     let dedup_key = format!(
         "{}/{}/{}/{}/{}",
-        run_id, node_id, frames_key, is_resume, call_index,
+        run_id, node_id, frames_key, is_resume, wait_index,
     );
     let payload = serde_json::to_value(weft_task_store::RegisterSignalPayload {
         run_id,
@@ -3653,7 +4112,7 @@ async fn enqueue_register_signal_task(
         frames: frames.clone(),
         spec: spec.clone(),
         is_resume,
-        call_index,
+        wait_index,
         port_snapshot,
         // Stamped here, where the node asked: a relative wait counts
         // from this moment, not from whenever the listener hears of it.
@@ -3964,16 +4423,14 @@ mod type_check_tests {
 }
 
 #[cfg(test)]
-mod replay_tests {
+mod runner_tests {
     use super::*;
     use super::test_journal::{test_clients, test_record, CaptureJournal};
     use weft_core::context::ContextHandle;
-    use weft_core::primitive::{AwaitedEntry, AwaitedEntryKind};
 
-    fn handle_with_sequence(seq: Vec<AwaitedEntry>) -> RunnerHandle {
-        // These tests only exercise run_step which never touches the
-        // store. The no-op clients below let the trait objects exist
-        // without any IO.
+    /// A handle for `node-x` carrying on from `resume`. The no-op clients
+    /// let the trait objects exist without any IO.
+    fn handle_with(resume: FiringResume) -> RunnerHandle {
         let clients = test_clients(FakeAccessBroker::new());
         RunnerHandle::new(
             uuid::Uuid::nil(),
@@ -3993,44 +4450,128 @@ mod replay_tests {
             Default::default(),
             Default::default(),
             std::collections::HashSet::new(),
-            false,
         )
-        .with_awaited_sequence(seq)
+        .with_resume(resume)
     }
 
+    fn fresh() -> RunnerHandle {
+        handle_with(FiringResume::default())
+    }
+
+    /// A recorded wait #`n` on a timer, ended as `ended`.
+    fn recorded(n: u32, ended: Option<AwaitEnd>) -> RecordedWait {
+        RecordedWait { wait_index: n, token: format!("tok-{n}"), kind: "timer".into(), ended }
+    }
+
+    fn answered(n: u32, value: serde_json::Value) -> RecordedWait {
+        recorded(n, Some(AwaitEnd::Answered { value }))
+    }
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+    struct Step {
+        id: Option<serde_json::Value>,
+        answer: Option<serde_json::Value>,
+    }
+
+    /// The saved states a capture journal holds, in order.
+    fn saves(journal: &CaptureJournal) -> Vec<SavedState> {
+        journal
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::NodeStateSaved { saved, .. } => Some(saved.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A `once` whose save does not land fails before the body can act on
+    /// its result.
     #[tokio::test]
-    async fn run_refuses_to_return_an_unsaved_result() {
+    async fn a_once_refuses_to_return_an_unsaved_result() {
         let journal = Arc::new(CaptureJournal::default());
         *journal.fail_count.lock().unwrap() = 1;
-        let mut handle = handle_with_sequence(Vec::new());
+        let mut handle = fresh();
         handle.record = test_record(journal.clone());
         let ctx = ctx_over(handle);
         let mut reached_followup = false;
         let result: WeftResult<()> = async {
-            ctx.run("request-id", || async { Ok(serde_json::json!("saved-id")) }).await?;
+            let mut state = ctx.keep(Step::default()).await?;
+            state.once(|s| &mut s.id, async |_| { Ok(serde_json::json!("saved-id")) }).await?;
             reached_followup = true;
             Ok(())
-        }.await;
+        }
+        .await;
         assert!(!reached_followup, "a caller must not act on an unsaved result");
         let error = result.unwrap_err().to_string();
-        assert!(error.contains("request-id"), "{error}");
+        assert!(error.contains("could not save its state"), "{error}");
         assert!(error.contains("simulated journal failure"), "{error}");
-        assert!(journal.events.lock().unwrap().is_empty());
     }
 
+    /// A `once` puts its result in the state and saves it, with the
+    /// counters as they stand.
     #[tokio::test]
-    async fn run_returns_a_result_after_recording_it() {
+    async fn a_once_saves_its_result() {
         let journal = Arc::new(CaptureJournal::default());
-        let mut handle = handle_with_sequence(Vec::new());
+        let mut handle = fresh();
         handle.record = test_record(journal.clone());
         let ctx = ctx_over(handle);
-        let result = ctx.run("request-id", || async { Ok(serde_json::json!("saved-id")) }).await.unwrap();
-        let events = journal.events.lock().unwrap();
-        assert!(matches!(events.as_slice(), [RunEvent::RunOutput { name, value, call_index: 0, .. }]
-            if name == "request-id" && *value == result));
+        let mut state = ctx.keep(Step::default()).await.unwrap();
+        let id = state.once(|s| &mut s.id, async |_| { Ok(serde_json::json!("saved-id")) }).await.unwrap();
+        assert_eq!(id, serde_json::json!("saved-id"));
+        let again = state.once(|s| &mut s.id, async |_| { panic!("a filled field runs nothing") }).await.unwrap();
+        assert_eq!(again, id);
+        assert_eq!(
+            saves(&journal),
+            vec![SavedState { state: serde_json::json!({"id": "saved-id", "answer": null}), positions: Default::default(), counters: Counters::default(), helper: None }]
+        );
     }
 
-    /// Same rig as `handle_with_sequence` but with a caller-supplied
+    /// `keep` hands back what the firing saved before, its counters with
+    /// it, and refuses a second call.
+    #[tokio::test]
+    async fn keep_hands_back_the_saved_state_once() {
+        let saved = SavedState {
+            state: serde_json::json!({"id": "earlier", "answer": null}),
+            positions: Default::default(),
+            counters: Counters { waits: 3, program_calls: 2 },
+            helper: None,
+        };
+        let ctx = ctx_over(handle_with(FiringResume { saved: Some(saved), ..Default::default() }));
+        let state = ctx.keep(Step::default()).await.unwrap();
+        assert_eq!(state.id, Some(serde_json::json!("earlier")));
+        assert_eq!(ctx.keep(Step::default()).await.err().map(|e| e.to_string()), Some(weft_core::context::kept_twice().to_string()));
+    }
+
+    /// A wait under a number the record holds is that wait: its answer,
+    /// or the way it was given up, comes back at once, and one of another
+    /// kind there is a body that lost its place.
+    #[tokio::test]
+    async fn a_wait_under_a_recorded_number_is_that_wait() {
+        let given_up = recorded(1, Some(AwaitEnd::GaveUp { error: "node 'node-x' gave up its wait: quiet".into() }));
+        let handle = handle_with(FiringResume { waits: vec![answered(0, serde_json::json!("yes")), given_up], ..Default::default() });
+        assert_eq!(handle.wait(timer()).await.expect("answered"), serde_json::json!("yes"));
+        let err = handle.wait(timer()).await.expect_err("given up");
+        assert!(matches!(&err, WeftError::WaitGaveUp(error) if error.contains("quiet")), "{err:?}");
+        assert!(weft_core::context::catchable_message(&err).is_some(), "a node may catch it");
+
+        let drifted = handle_with(FiringResume { waits: vec![answered(0, serde_json::json!("yes"))], ..Default::default() });
+        let err = drifted.wait(form()).await.expect_err("a form where a timer was waited on").to_string();
+        assert!(err.contains("its record holds wait #0 as a 'timer' signal"), "{err}");
+    }
+
+    fn timer() -> SignalSpec {
+        weft_core::signal::to_spec(weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 1000 } })
+    }
+
+    fn form() -> SignalSpec {
+        use weft_core::signal::{to_spec, Form, FormSchema};
+        to_spec(Form { form_type: "human-query".into(), schema: FormSchema { fields: Vec::new() }, title: None, description: None, consumer_kind: None })
+    }
+
+    /// Same rig as `handle_with` but with a caller-supplied
     /// `PaidCallClient` fake, for the access/provision/settle tests.
     fn handle_with_access_broker(access_broker: Arc<FakeAccessBroker>) -> RunnerHandle {
         let clients = test_clients(access_broker);
@@ -4052,8 +4593,87 @@ mod replay_tests {
             Default::default(),
             Default::default(),
             std::collections::HashSet::new(),
-            false,
         )
+    }
+
+    /// Program calls answered with `answer`, each call's payload kept.
+    struct ProgramTasks {
+        answer: serde_json::Value,
+        calls: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+    #[async_trait]
+    impl weft_task_store::TaskStoreClient for ProgramTasks {
+        async fn enqueue_dedup(&self, t: task_store::NewTask) -> anyhow::Result<task_store::DedupOutcome> {
+            assert_eq!(t.kind, TaskKind::ProgramCall, "only program calls here");
+            self.calls.lock().unwrap().push(t.payload);
+            Ok(task_store::DedupOutcome::Inserted(uuid::Uuid::new_v4()))
+        }
+        async fn wait_for_terminal(&self, _: uuid::Uuid, _: std::time::Duration) -> anyhow::Result<task_store::TaskOutcome> {
+            Ok(task_store::TaskOutcome {
+                status: task_store::TaskStatus::Complete,
+                result: Some(serde_json::json!({ "value": self.answer })),
+                error: None,
+            })
+        }
+    }
+
+    /// A firing resumed in the look-again wait of `helper` following
+    /// command `command` of its own project (wait #0, a timer, answered),
+    /// its program calls answered `done`.
+    fn resumed_in_helper(helper: &str, command: i64) -> (RunnerHandle, Arc<ProgramTasks>) {
+        let call = weft_core::run::saved::PausedHelper::digest(&(None::<uuid::Uuid>, command)).unwrap();
+        let tasks = Arc::new(ProgramTasks { answer: serde_json::json!({ "done": true }), calls: std::sync::Mutex::new(Vec::new()) });
+        let mut handle = handle_with(FiringResume {
+            saved: Some(SavedState {
+                state: serde_json::json!(null),
+                positions: Default::default(),
+                counters: Counters { waits: 0, program_calls: 1 },
+                helper: Some(weft_core::run::saved::PausedHelper { helper: helper.into(), call, place: serde_json::json!(null) }),
+                }),
+            waits: vec![answered(0, serde_json::json!({}))],
+            ..Default::default()
+        });
+        handle.clients.tasks = tasks.clone();
+        (handle, tasks)
+    }
+
+    /// A body resumed in a helper's look-again wait comes back to that
+    /// wait from where the helper stood, making none of the calls it made
+    /// before again (a read made again would answer what stands now), and
+    /// looks on from there.
+    #[tokio::test]
+    async fn a_helper_resumed_in_its_wait_makes_none_of_its_calls_again() {
+        let (handle, tasks) = resumed_in_helper("infra.follow_command", 7);
+        let ctx = ctx_over(handle);
+        let mut state = ctx.keep(()).await.unwrap();
+        let status = ctx.all_infra().follow_command(7, &mut state).await.expect("the command ended");
+        assert!(status.done);
+        assert_eq!(tasks.calls.lock().unwrap().len(), 1, "one look after the wait, none before it");
+    }
+
+    /// A body that paused inside one helper and comes to another first did
+    /// not come back to where it was: refused before any call.
+    #[tokio::test]
+    async fn a_body_coming_back_into_another_helper_is_refused() {
+        let (handle, tasks) = resumed_in_helper("infra.rebake", 7);
+        let ctx = ctx_over(handle);
+        let mut state = ctx.keep(()).await.unwrap();
+        let refused = ctx.all_infra().follow_command(7, &mut state).await.unwrap_err().to_string();
+        assert!(refused.contains("paused inside 'infra.rebake'"), "{refused}");
+        assert!(tasks.calls.lock().unwrap().is_empty());
+    }
+
+    /// The same helper asking for something else (a loop that did not
+    /// keep where it was, following another command first) did not come
+    /// back to where it was: refused before any call.
+    #[tokio::test]
+    async fn the_same_helper_asking_for_something_else_is_refused() {
+        let (handle, tasks) = resumed_in_helper("infra.follow_command", 7);
+        let ctx = ctx_over(handle);
+        let mut state = ctx.keep(()).await.unwrap();
+        let refused = ctx.all_infra().follow_command(8, &mut state).await.unwrap_err().to_string();
+        assert!(refused.contains("asking for something else"), "{refused}");
+        assert!(tasks.calls.lock().unwrap().is_empty());
     }
 
     fn ctx_over(handle: RunnerHandle) -> weft_core::RunContext {
@@ -4307,7 +4927,6 @@ mod replay_tests {
             Default::default(),
             Default::default(),
             std::collections::HashSet::new(),
-            false,
         ));
         ctx_over_arc(worker_handle).client(&scoped_access()).await.expect("worker opens");
 
@@ -4359,7 +4978,7 @@ mod replay_tests {
     #[tokio::test]
     async fn storage_methods_round_trip_and_enforce_the_wall() {
         use weft_core::storage::{KeepTtl, StorageScope, StoredFile};
-        let handle = handle_with_sequence(vec![]);
+        let handle = fresh();
 
         let file = handle
             .storage_put(
@@ -4416,7 +5035,7 @@ mod replay_tests {
     #[tokio::test]
     async fn an_identified_put_answers_the_file_already_stored() {
         use weft_core::storage::{StorageScope, StoredFile};
-        let handle = handle_with_sequence(vec![]);
+        let handle = fresh();
         async fn put(
             handle: &RunnerHandle,
             scope: StorageScope,
@@ -4454,7 +5073,7 @@ mod replay_tests {
     #[tokio::test]
     async fn url_backed_values_route_by_handle_in_storage_verbs() {
         use weft_core::storage::{KeepTtl, StorageScope};
-        let ctx = ctx_over(handle_with_sequence(vec![]));
+        let ctx = ctx_over(fresh());
         let url_value = weft_core::storage::url_file_value("https://x/pic.png", weft_core::weft_type::FileKind::Image);
         let url_file = weft_core::storage::FileHandle::from_value(&url_value).unwrap();
         let storage = ctx.storage(StorageScope::Run);
@@ -4474,7 +5093,7 @@ mod replay_tests {
     #[tokio::test]
     async fn a_copy_puts_a_run_file_into_the_project_scope() {
         use weft_core::storage::{FileHandle, StorageScope, StoredFile};
-        let ctx = ctx_over(handle_with_sequence(vec![]));
+        let ctx = ctx_over(fresh());
         let original = ctx
             .storage(StorageScope::Run)
             .put(bytes::Bytes::from_static(b"PNG!"), "image/png", "upload.png", None)
@@ -4518,143 +5137,6 @@ mod replay_tests {
         &Empty
     }
 
-    /// Replay path: a Run entry at the next call_index returns
-    /// its journaled value without invoking the closure.
-    #[tokio::test]
-    async fn run_step_replay_returns_journaled_value() {
-        let seq = vec![AwaitedEntry {
-            call_index: 0,
-            kind: AwaitedEntryKind::Run {
-                name: "decide".into(),
-                value: serde_json::json!("go-left"),
-            },
-        }];
-        let handle = handle_with_sequence(seq);
-        let (idx, got) = handle
-            .run_step("decide")
-            .await
-            .expect("run_step ok");
-        assert_eq!(idx, 0);
-        assert_eq!(got, Some(serde_json::json!("go-left")));
-    }
-
-    /// Fresh path: sequence is empty, run_step returns None so
-    /// the wrapper invokes the closure.
-    #[tokio::test]
-    async fn run_step_fresh_returns_none() {
-        let handle = handle_with_sequence(Vec::new());
-        let (idx, got) = handle.run_step("decide").await.expect("run_step ok");
-        assert_eq!(idx, 0);
-        assert!(got.is_none(), "no journaled output yet");
-    }
-
-    /// Mismatched kind at the same call_index: body called
-    /// `ctx.run` but the journal has an `Await` at this index.
-    /// Surfaces as Suspension error so the body fails loudly
-    /// instead of silently desyncing.
-    #[tokio::test]
-    async fn run_step_mismatch_kind_errors() {
-        let seq = vec![AwaitedEntry {
-            call_index: 0,
-            kind: AwaitedEntryKind::Await {
-                token: "tok-0".into(),
-                ended: Some(weft_core::primitive::AwaitEnd::Answered { value: serde_json::json!("from-fire") }),
-            },
-        }];
-        let handle = handle_with_sequence(seq);
-        let err = handle
-            .run_step("decide")
-            .await
-            .expect_err("should fail on kind mismatch");
-        let msg = format!("{err}");
-        assert!(
-            matches!(err, WeftError::NodeFailed(_)),
-            "expected NodeFiring variant, got: {err:?}"
-        );
-        assert!(
-            msg.contains("non-deterministic bodies are not safe to replay"),
-            "unexpected: {msg}"
-        );
-    }
-
-    /// Multi-call replay: two Run entries in sequence pop in order.
-    #[tokio::test]
-    async fn run_step_replay_sequential() {
-        let seq = vec![
-            AwaitedEntry {
-                call_index: 0,
-                kind: AwaitedEntryKind::Run {
-                    name: "first".into(),
-                    value: serde_json::json!("v0"),
-                },
-            },
-            AwaitedEntry {
-                call_index: 1,
-                kind: AwaitedEntryKind::Run {
-                    name: "second".into(),
-                    value: serde_json::json!("v1"),
-                },
-            },
-        ];
-        let handle = handle_with_sequence(seq);
-        assert_eq!(
-            handle.run_step("first").await.expect("first"),
-            (0, Some(serde_json::json!("v0")))
-        );
-        assert_eq!(
-            handle.run_step("second").await.expect("second"),
-            (1, Some(serde_json::json!("v1")))
-        );
-        // Third call: sequence exhausted, returns None.
-        let (idx, val) = handle.run_step("third").await.expect("third");
-        assert_eq!(idx, 2);
-        assert!(val.is_none());
-    }
-
-    /// Mixed sequence: Await then Run. Verifies the counter and
-    /// pop work across kinds.
-    #[tokio::test]
-    async fn await_then_run_replay_in_order() {
-        let seq = vec![
-            AwaitedEntry {
-                call_index: 0,
-                kind: AwaitedEntryKind::Await {
-                    token: "tok-0".into(),
-                    ended: Some(weft_core::primitive::AwaitEnd::Answered { value: serde_json::json!("answer") }),
-                },
-            },
-            AwaitedEntry {
-                call_index: 1,
-                kind: AwaitedEntryKind::Run {
-                    name: "process".into(),
-                    value: serde_json::json!({"shape": "pre-baked"}),
-                },
-            },
-        ];
-        let handle = handle_with_sequence(seq);
-        use weft_core::signal::{to_spec, Form, FormSchema};
-        let spec = to_spec(Form {
-            form_type: "human-query".into(),
-            schema: FormSchema { fields: Vec::new() },
-            title: None,
-            description: None,
-            consumer_kind: None,
-        });
-        let answer = handle
-            .await_signal(spec)
-            .await
-            .expect("await replay ok");
-        assert_eq!(answer, serde_json::json!("answer"));
-        let processed = handle
-            .run_step("process")
-            .await
-            .expect("run replay ok");
-        assert_eq!(
-            processed,
-            (1, Some(serde_json::json!({"shape": "pre-baked"})))
-        );
-    }
-
     // ----- Live caller surface on the ContextHandle ------------------
 
     use weft_core::caller::{CallerRuntimeConfig, FakeCallerConnection};
@@ -4677,79 +5159,79 @@ mod replay_tests {
     #[test]
     fn queries_report_protocol_and_none_without_caller() {
         // No caller wired: both queries false, caller() None.
-        let bare = handle_with_sequence(vec![]);
+        let bare = fresh();
         assert!(bare.caller_connection().is_none());
 
         // HTTP caller wired: protocol is Http.
-        let http = handle_with_sequence(vec![]).with_caller_connection(Some(
+        let http = fresh().with_caller_connection(Some(
             FakeCallerConnection::connected(caller_cfg(Protocol::Http, false)),
         ));
         assert!(http.caller_connection().is_some());
         let proto = http.caller_connection().unwrap().config().protocol;
         assert_eq!(proto, Protocol::Http);
 
-        let ws = handle_with_sequence(vec![]).with_caller_connection(Some(
+        let ws = fresh().with_caller_connection(Some(
             FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, true)),
         ));
         assert_eq!(ws.caller_connection().unwrap().config().protocol, Protocol::Websocket);
     }
 
-    fn pending_wait() -> Vec<AwaitedEntry> {
-        vec![AwaitedEntry { call_index: 0, kind: AwaitedEntryKind::Await { token: "tok-pending".into(), ended: None } }]
+    /// The firing waits on a recorded wait #0 that has no answer yet.
+    fn pending_wait() -> FiringResume {
+        FiringResume { waits: vec![recorded(0, None)], ..Default::default() }
     }
 
-    fn timer() -> SignalSpec {
-        weft_core::signal::to_spec(weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 1000 } })
-    }
-
-    /// A wait in a run tied to its caller cannot pause: it holds in the
-    /// call, and its answer is the call's value, on the run's record.
+    /// A wait in a run whose caller is on the line cannot pause, whatever
+    /// its route's `outlivesCaller` says: it holds in the call, and its
+    /// answer is the call's value, on the run's record.
     #[tokio::test]
-    async fn a_wait_holds_in_a_tied_run_and_takes_its_answer() {
+    async fn a_wait_holds_while_its_caller_is_on_the_line() {
+        for outlives_caller in [false, true] {
+            let journal = Arc::new(CaptureJournal::default());
+            let mut handle = handle_with(pending_wait()).with_caller_connection(Some(
+                FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, outlives_caller)),
+            ));
+            handle.record = test_record(journal.clone());
+            let handle = Arc::new(handle);
+            let waiting = tokio::spawn({
+                let handle = handle.clone();
+                async move { handle.wait(timer()).await }
+            });
+            while !handle.waits.held().pending() {
+                tokio::task::yield_now().await;
+            }
+            handle.waits.held().answer("tok-0", weft_core::primitive::WaitAnswer::Given { value: serde_json::json!("approved") });
+            assert_eq!(waiting.await.unwrap().expect("the answer"), serde_json::json!("approved"));
+            let events = journal.events.lock().unwrap();
+            assert!(matches!(events.as_slice(), [RunEvent::SuspensionResolved { token, value, .. }]
+                if token == "tok-0" && *value == serde_json::json!("approved")), "{events:?}");
+        }
+    }
+
+    /// Once its caller is gone the run can pause, and the same wait holds
+    /// until the run does: the run pausing suspends it on its token, and a
+    /// pause there saves the counters from before it, so the resumed
+    /// body's same wait takes the same number.
+    #[tokio::test]
+    async fn a_wait_the_run_pauses_suspends_on_its_token_and_saves_from_before_it() {
         let journal = Arc::new(CaptureJournal::default());
-        let mut handle = handle_with_sequence(pending_wait()).with_caller_connection(Some(
-            FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false)),
+        let mut handle = handle_with(pending_wait()).with_caller_connection(Some(
+            FakeCallerConnection::disconnected(caller_cfg(Protocol::Websocket, true)),
         ));
         handle.record = test_record(journal.clone());
-        let handle = Arc::new(handle);
-        let waiting = tokio::spawn({
-            let handle = handle.clone();
-            async move { handle.await_signal(timer()).await }
+        let waits = handle.waits.clone();
+        let ctx = ctx_over(handle);
+        let waiting = tokio::spawn(async move {
+            let mut state = ctx.keep(Step::default()).await.unwrap();
+            state.wait(|s| &mut s.answer, weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 1000 } }).await
         });
-        while !handle.waits.held().pending() {
+        while !waits.held().pending() {
             tokio::task::yield_now().await;
         }
-        handle.waits.held().answer("tok-pending", weft_core::primitive::WaitAnswer::Given { value: serde_json::json!("approved") });
-        assert_eq!(waiting.await.unwrap().expect("the answer"), serde_json::json!("approved"));
-        let events = journal.events.lock().unwrap();
-        assert!(matches!(events.as_slice(), [RunEvent::SuspensionResolved { token, value, .. }]
-            if token == "tok-pending" && *value == serde_json::json!("approved")), "{events:?}");
-    }
-
-    /// A run that outlives its caller can pause: the same wait suspends.
-    #[tokio::test]
-    async fn a_wait_suspends_in_a_run_that_outlives_its_caller() {
-        let handle = handle_with_sequence(pending_wait()).with_caller_connection(Some(
-            FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, true)),
-        ));
-        let err = handle.await_signal(timer()).await.expect_err("a pending await suspends");
-        assert!(matches!(err, WeftError::Suspended { ref token } if token == "tok-pending"), "{err:?}");
-    }
-
-    /// A wait given up fails its call with the error a node can handle, and
-    /// a replay of the body fails the same call the same way.
-    #[tokio::test]
-    async fn a_wait_given_up_replays_as_the_same_failure() {
-        let given_up = vec![AwaitedEntry {
-            call_index: 0,
-            kind: AwaitedEntryKind::Await {
-                token: "tok".into(),
-                ended: Some(weft_core::primitive::AwaitEnd::GaveUp { error: "node 'node-x' gave up its wait: quiet".into() }),
-            },
-        }];
-        let err = handle_with_sequence(given_up).await_signal(timer()).await.expect_err("given up");
-        assert!(matches!(&err, WeftError::WaitGaveUp(error) if error.contains("quiet")), "{err:?}");
-        assert!(weft_core::context::catchable_message(&err).is_some(), "a node may catch it");
+        waits.pause();
+        let err = waiting.await.unwrap().expect_err("the run paused the wait");
+        assert!(matches!(err, WeftError::Suspended { token: Some(ref token) } if token == "tok-0"), "{err:?}");
+        assert_eq!(saves(&journal).last().map(|saved| saved.counters), Some(Counters::default()), "the wait takes #0 again on resume");
     }
 
     /// A program where `node-x` has infra once per instance.
@@ -4774,7 +5256,7 @@ mod replay_tests {
     /// before any lookup, like a handle another node shared.
     #[tokio::test]
     async fn endpoint_address_refuses_own_place_on_a_side_the_program_does_not_declare() {
-        let handle = handle_with_sequence(Vec::new()).with_declared_infra(declared_per_instance_node_x());
+        let handle = fresh().with_declared_infra(declared_per_instance_node_x());
         let shared = weft_core::infra::InfraHandle::new("node-x", "api", None);
         let err = handle.endpoint_address(&shared).await.expect_err("the shared copy is gone").to_string();
         assert!(err.contains("is not infra this program declares with one shared copy"), "{err}");
@@ -4863,7 +5345,7 @@ mod replay_tests {
     #[tokio::test]
     async fn a_url_file_is_fetched_from_its_url_once_per_read() {
         let (base, seen) = url_file_server().await;
-        let ctx = ctx_over(handle_with_sequence(Vec::new()));
+        let ctx = ctx_over(fresh());
         let storage = ctx.storage(weft_core::storage::StorageScope::Project);
         let file = url_file(format!("{base}/a.bin"));
 
@@ -4887,7 +5369,7 @@ mod replay_tests {
     #[tokio::test]
     async fn a_url_file_range_read_asks_the_server_for_only_that_range() {
         let (base, seen) = url_file_server().await;
-        let ctx = ctx_over(handle_with_sequence(Vec::new()));
+        let ctx = ctx_over(fresh());
         let storage = ctx.storage(weft_core::storage::StorageScope::Project);
         let read = |path: &'static str, start, end| {
             let storage = &storage;
@@ -4945,7 +5427,7 @@ mod replay_tests {
     #[tokio::test]
     async fn a_url_file_answered_with_an_error_status_fails_naming_it() {
         let (base, seen) = url_file_server().await;
-        let ctx = ctx_over(handle_with_sequence(Vec::new()));
+        let ctx = ctx_over(fresh());
         let storage = ctx.storage(weft_core::storage::StorageScope::Project);
         let url = format!("{base}/gone");
 
@@ -5131,7 +5613,7 @@ pub(crate) mod test_journal {
 
     /// A firing's record over `journal`, its spend counted on its own.
     pub(crate) fn test_record(journal: Arc<dyn weft_journal::JournalClient>) -> RunRecord {
-        RunRecord { journal, costs: crate::metering::PendingCostRecords::new() }
+        RunRecord::new(journal)
     }
 
     /// Capturing journal client. Stores every `record_event` payload
@@ -5188,23 +5670,25 @@ mod bus_pump_tests {
         tokio::spawn(run_bus_journal_task(weak, run_id, journal_dyn, "instance".into()))
     }
 
-    /// Test helper: thin wrapper around `coord.new_bus` so tests have
-    /// the same call signature as production. Unwraps the validation
-    /// result; tests pass valid options. These tests exercise the
-    /// journal pump / drain, not the stuck-detector, so a single
-    /// synthetic node identity at root frames is sufficient.
+    /// Test helper: a fresh bus from `coord`, as a firing creates one,
+    /// on a port of its own (a firing creates one bus per port). Unwraps
+    /// the validation result; tests pass valid options. These tests
+    /// exercise the journal pump / drain, not the stuck-detector, so a
+    /// single synthetic node identity at root frames is sufficient.
     fn new_bus(coord: &Arc<BusCoordinator>, opts: BusOptions) -> BusHandle {
-        coord
-            .new_bus(opts, FiringLocation::new("test-node", Vec::new()))
-            .expect("test BusOptions cannot fail")
+        fresh_bus(coord, opts, FiringLocation::new("test-node", Vec::new())).expect("test BusOptions cannot fail")
     }
 
     /// Test helper: mint a bus attributed to a specific firing
     /// at root frames, so liveness tests can drive distinct participants.
     fn new_bus_for(coord: &Arc<BusCoordinator>, node_id: &str) -> BusHandle {
-        coord
-            .new_bus(BusOptions::default(), FiringLocation::new(node_id, Vec::new()))
-            .expect("test BusOptions cannot fail")
+        fresh_bus(coord, BusOptions::default(), FiringLocation::new(node_id, Vec::new())).expect("test BusOptions cannot fail")
+    }
+
+    /// A fresh bus created by the firing `at`, on a port no other call
+    /// used.
+    fn fresh_bus(coord: &Arc<BusCoordinator>, opts: BusOptions, at: FiringLocation) -> Result<BusHandle, String> {
+        coord.bus_on(opts, at, &uuid::Uuid::new_v4().to_string(), Arc::new(weft_core::bus::FiringBuses::default()), false)
     }
 
     fn firing(node_id: &str) -> FiringLocation {
@@ -5222,21 +5706,9 @@ mod bus_pump_tests {
     /// the coordinator and join the pump task. Bounded by 2s so a
     /// regression fails fast instead of hanging the suite.
     async fn shutdown_and_join(coord: Arc<BusCoordinator>, pump: tokio::task::JoinHandle<()>) {
-        coord.shutdown().await;
+        coord.shutdown(false).await;
         drop(coord);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), pump).await;
-    }
-
-    /// Wait until `predicate` returns `true`, polling at 5ms intervals
-    /// with a 2s bound so a regression fails fast instead of hanging.
-    async fn wait_until<F: FnMut() -> bool>(mut predicate: F) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !predicate() {
-            if std::time::Instant::now() > deadline {
-                panic!("wait_until timed out");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
     }
 
     /// Wait until `predicate` is true, re-checking after every pump
@@ -5271,14 +5743,14 @@ mod bus_pump_tests {
     async fn a_recorded_runs_pump_starts_with_its_first_bus() {
         let journal = Arc::new(CaptureJournal::default());
         let quiet = BusCoordinator::recorded(crate::wait_tracker::WaitTracker::new(), uuid::Uuid::new_v4(), journal.clone(), "instance".into());
-        tokio::time::timeout(std::time::Duration::from_secs(2), quiet.shutdown()).await.expect("no bus, nothing to wait for");
+        tokio::time::timeout(std::time::Duration::from_secs(2), quiet.shutdown(false)).await.expect("no bus, nothing to wait for");
         assert!(journal.events.lock().unwrap().is_empty());
 
         let coord = BusCoordinator::recorded(crate::wait_tracker::WaitTracker::new(), uuid::Uuid::new_v4(), journal.clone(), "instance".into());
         let mut bus = new_bus(&coord, BusOptions::default());
         bus.register("alice").unwrap();
         drop(bus);
-        tokio::time::timeout(std::time::Duration::from_secs(2), coord.shutdown()).await.expect("the pump drains and ends");
+        tokio::time::timeout(std::time::Duration::from_secs(2), coord.shutdown(false)).await.expect("the pump drains and ends");
         let events = journal.events.lock().unwrap();
         assert!(events.iter().any(|e| matches!(e, RunEvent::BusJoined { .. })), "{events:?}");
         assert!(events.iter().any(|e| matches!(e, RunEvent::BusClosed { .. })), "{events:?}");
@@ -5306,7 +5778,7 @@ mod bus_pump_tests {
 
         // 3 events: Joined + Message + Closed.
         let j = journal.clone();
-        wait_until(|| j.events.lock().unwrap().len() >= 3).await;
+        wait_for_drained(&coord, || j.events.lock().unwrap().len() >= 3).await;
 
         shutdown_and_join(coord, pump).await;
 
@@ -5338,6 +5810,27 @@ mod bus_pump_tests {
         assert!(joined >= 1, "at least one Joined journaled");
         assert!(messages >= 1, "at least one window journaled");
         assert_eq!(closed, 1, "Closed emitted at shutdown");
+    }
+
+    /// A run pausing with a journal window open flushes it at once, as a
+    /// bus closing does, instead of waiting for its timer: on the paused
+    /// clock, the shutdown takes no time at all and the window is on
+    /// record.
+    #[tokio::test(start_paused = true)]
+    async fn a_pausing_run_flushes_its_open_windows_at_once() {
+        let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
+        let journal = Arc::new(CaptureJournal::default());
+        let pump = spawn_pump(&coord, journal.clone(), uuid::Uuid::new_v4());
+        let mut bus = new_bus(&coord, BusOptions::default());
+        bus.register("mic").unwrap();
+        bus.send("frame", serde_json::json!(1)).unwrap();
+        let paused_at = tokio::time::Instant::now();
+        coord.shutdown(true).await;
+        assert_eq!(paused_at.elapsed(), std::time::Duration::ZERO, "no window timer waited on");
+        assert!(journal.events.lock().unwrap().iter().any(|e| matches!(e, RunEvent::BusWindow { .. })), "the open window is on record");
+        drop(bus);
+        drop(coord);
+        let _ = pump.await;
     }
 
     // A fast stream's window flushes when its TIME is up, without any
@@ -5454,7 +5947,7 @@ mod bus_pump_tests {
             },
             ..Default::default()
         };
-        let why = coord.new_bus(opts, FiringLocation::new("test-node", Vec::new())).expect_err("too short a window");
+        let why = fresh_bus(&coord, opts, FiringLocation::new("test-node", Vec::new())).expect_err("too short a window");
         assert!(why.contains("between 100 and 60000 ms"), "{why}");
     }
 
@@ -5472,7 +5965,8 @@ mod bus_pump_tests {
         let mut bus = new_bus(&coord, BusOptions::default());
         bus.register("alice").unwrap();
         // Inject a failure on the next journal write the pump tries
-        // (which will be the Joined event from the register above).
+        // (which will be the bus's creation): the bus is degraded, and
+        // none of its rows go before its creation does.
         *journal.fail_count.lock().unwrap() = 1;
         // Send something so the pump wakes and processes the tail.
         // The send itself succeeds (it's an in-RAM append); the pump
@@ -5480,7 +5974,7 @@ mod bus_pump_tests {
         let _ = bus.send("warm", serde_json::json!("up"));
         let live_buses = coord.live_bus_inners();
         let bus_inner = live_buses[0].upgrade().unwrap();
-        wait_until(|| bus_inner.is_journal_degraded()).await;
+        wait_for_drained(&coord, || bus_inner.is_journal_degraded()).await;
         // The next send sees the flag and errors loud.
         let err = bus.send("late", serde_json::json!("x"));
         assert!(matches!(err, Err(SendError::JournalDegraded(_))), "got {err:?}");
@@ -5489,9 +5983,9 @@ mod bus_pump_tests {
         // (a rejected send appends nothing, so a second participant's
         // register provides the wake), the buffered tail now writes
         // successfully, the ack clears the flag, and sends resume.
-        let mut bob = bus.new_handle();
+        let mut bob = coord.lookup_bus(&bus.marker(), firing("bob"), Arc::new(weft_core::bus::FiringBuses::default())).unwrap();
         bob.register("bob").unwrap();
-        wait_until(|| !bus_inner.is_journal_degraded()).await;
+        wait_for_drained(&coord, || !bus_inner.is_journal_degraded()).await;
         assert!(bus.send("ok", serde_json::json!("y")).is_ok());
 
         // Shutdown cleanly.
@@ -5583,7 +6077,7 @@ mod bus_pump_tests {
         // Snapshot the weak ref BEFORE shutdown so we can verify
         // post-shutdown collection. shutdown() drains then releases
         // the coordinator's Arc; no other Arc remains.
-        coord.shutdown().await;
+        coord.shutdown(false).await;
         drop(coord);
         assert!(
             weak_after_drop.upgrade().is_none(),
@@ -5660,7 +6154,7 @@ mod bus_pump_tests {
         let mut producer = new_bus_for(&coord, "b");
         let bus = wait_src(&producer);
         let a = firing("a");
-        let w = waits.enter_wait(&a, &bus);
+        let w = waits.enter_wait(&a, &bus, false);
         waits.observed(&a, w); // generation 0
         waits.parked(&a, w);
         // A message lands (generation bumps) but 'a' has not re-observed.
@@ -5692,8 +6186,8 @@ mod bus_pump_tests {
         let mut producer_y = new_bus_for(&coord, "b");
         let bus_y = wait_src(&producer_y);
         let a = firing("a");
-        let wx = waits.enter_wait(&a, &bus_x);
-        let wy = waits.enter_wait(&a, &bus_y);
+        let wx = waits.enter_wait(&a, &bus_x, false);
+        let wy = waits.enter_wait(&a, &bus_y, false);
         // Both waits parked, both caught up at generation 0.
         waits.observed(&a, wx);
         waits.parked(&a, wx);
@@ -5743,11 +6237,11 @@ mod bus_pump_tests {
         // Both lanes share a node id "worker" but differ in frame index.
         let lane0 = FiringLocation::new("worker", vec![Frame::Loop { index: 0 }]);
         let lane1 = FiringLocation::new("worker", vec![Frame::Loop { index: 1 }]);
-        let bus0 = wait_src(&coord.new_bus(BusOptions::default(), lane0.clone()).unwrap());
-        let bus1 = wait_src(&coord.new_bus(BusOptions::default(), lane1.clone()).unwrap());
+        let bus0 = wait_src(&fresh_bus(&coord, BusOptions::default(), lane0.clone()).unwrap());
+        let bus1 = wait_src(&fresh_bus(&coord, BusOptions::default(), lane1.clone()).unwrap());
         // Lane 0 parks (deadlocked). Lane 1 is an in-flight task still
         // computing (no wait yet).
-        let w0 = waits.enter_wait(&lane0, &bus0);
+        let w0 = waits.enter_wait(&lane0, &bus0, false);
         waits.observed(&lane0, w0);
         waits.parked(&lane0, w0);
         assert_eq!(
@@ -5762,7 +6256,7 @@ mod bus_pump_tests {
         // Lane 1 parks too: now both lanes are stuck. If frames were
         // ignored, lane1's enter_wait would land on lane0's entry and
         // parked_nodes_count would read 1, failing this assert.
-        let w1 = waits.enter_wait(&lane1, &bus1);
+        let w1 = waits.enter_wait(&lane1, &bus1, false);
         waits.observed(&lane1, w1);
         waits.parked(&lane1, w1);
         assert_eq!(waits.parked_nodes_count(), 2, "two distinct parked lanes");
@@ -5901,5 +6395,158 @@ mod endpoint_tests {
         assert!(first.contains("endpoint 'sql'"), "it names the endpoint: {first}");
         assert!(first.contains("db.svc:5432"), "and the address: {first}");
         assert!(first.contains("weft stop"), "and the way out: {first}");
+    }
+}
+
+/// The calls a node owes when it ends (`RunnerHandle::after_node`,
+/// `crate::end_calls`), against a provider that records what it is sent.
+#[cfg(test)]
+mod end_call_tests {
+    use super::test_journal::{test_clients, CaptureJournal};
+    use super::*;
+    use weft_core::signal::CancelCall;
+
+    /// A provider answering every call with `status` and `body`, keeping
+    /// each call's verb and path.
+    async fn provider(status: u16, body: &'static str) -> (String, Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+        let calls: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+        let seen = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(move |method: axum::http::Method, uri: axum::http::Uri| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push((method.to_string(), uri.path().to_string()));
+                (axum::http::StatusCode::from_u16(status).unwrap(), body)
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), calls)
+    }
+
+    /// A firing of node `node-x` of a run whose record is `journal` and
+    /// whose owed calls start as `owed`, with the connection `conn`.
+    fn firing(journal: Arc<CaptureJournal>, owed: weft_journal::OwedCalls, cancellation: Arc<CancellationFlag>) -> RunnerHandle {
+        let broker = FakeAccessBroker::new();
+        broker.set_bearer_connection("conn", "secret-key");
+        let record = RunRecord { owed: Arc::new(std::sync::Mutex::new(owed)), ..RunRecord::new(journal) };
+        RunnerHandle::new(
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            "node-x".into(),
+            "node-x".into(),
+            "TestNode".into(),
+            weft_core::frames::LoopFrames::default(),
+            test_clients(broker),
+            record,
+            None,
+            "instance-1".into(),
+            "tenant-1".into(),
+            cancellation,
+            crate::wait_tracker::WaitTracker::new(),
+            BusCoordinator::new(crate::wait_tracker::WaitTracker::new()),
+            Default::default(),
+            Default::default(),
+            std::collections::HashSet::new(),
+        )
+    }
+
+    fn conn() -> Option<weft_core::primitive::AccessRef> {
+        Some(weft_core::primitive::AccessRef { id: "conn".into(), service: "provider".into(), required_values: Vec::new() })
+    }
+
+    fn kinds(journal: &CaptureJournal) -> Vec<&'static str> {
+        journal.events.lock().unwrap().iter().map(RunEvent::kind_str).collect()
+    }
+
+    /// A call sent however the node ends goes once when it ends without a
+    /// cancel (returned, failed, skipped, gave up a wait: the firing's
+    /// end is the same settle), through the node's connection; a
+    /// cancel-only one does not. Registered twice, it is on the record
+    /// once, and the settlement goes on the record after it.
+    #[tokio::test]
+    async fn an_always_call_goes_once_when_the_node_ends() {
+        let (base, calls) = provider(204, "").await;
+        let journal = Arc::new(CaptureJournal::default());
+        let handle = firing(journal.clone(), Default::default(), CancellationFlag::new_arc());
+        let upload = CancelCall::delete(format!("{base}/uploads/1")).always();
+        handle.after_node(upload.clone(), conn()).await.unwrap();
+        handle.after_node(upload, conn()).await.unwrap();
+        handle.after_node(CancelCall::put(format!("{base}/jobs/2/cancel")), conn()).await.unwrap();
+        assert_eq!(kinds(&journal), vec!["end_call_owed", "end_call_owed"], "the same call is owed once");
+
+        handle.settle_end_calls().await;
+        assert_eq!(*calls.lock().unwrap(), vec![("DELETE".to_string(), "/uploads/1".to_string())]);
+        assert_eq!(kinds(&journal).last(), Some(&"end_calls_settled"));
+        handle.settle_end_calls().await;
+        assert_eq!(calls.lock().unwrap().len(), 1, "sent once");
+    }
+
+    /// A firing its run's cancel ends sends both its cancel-only and its
+    /// always calls.
+    #[tokio::test]
+    async fn every_call_goes_when_the_run_is_cancelled() {
+        let (base, calls) = provider(200, "").await;
+        let cancellation = CancellationFlag::new_arc();
+        let handle = firing(Arc::new(CaptureJournal::default()), Default::default(), cancellation.clone());
+        handle.after_node(CancelCall::delete(format!("{base}/uploads/1")).always(), conn()).await.unwrap();
+        handle.after_node(CancelCall::put(format!("{base}/jobs/2/cancel")), None).await.unwrap();
+        cancellation.cancel_because(weft_core::run::CancelCause::User);
+        handle.settle_end_calls().await;
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("DELETE".to_string(), "/uploads/1".to_string()), ("PUT".to_string(), "/jobs/2/cancel".to_string())]
+        );
+    }
+
+    /// A refusal shows on the node's log, quoting what the provider said;
+    /// a 404 is the thing gone already, and done.
+    #[tokio::test]
+    async fn a_refusal_shows_on_the_nodes_log_and_a_404_is_done() {
+        let (refusing, _) = provider(403, r#"{"error": {"message": "the key cannot delete uploads"}}"#).await;
+        let journal = Arc::new(CaptureJournal::default());
+        let handle = firing(journal.clone(), Default::default(), CancellationFlag::new_arc());
+        handle.after_node(CancelCall::delete(format!("{refusing}/uploads/1")).always(), conn()).await.unwrap();
+        handle.settle_end_calls().await;
+        let logged: Vec<String> = journal
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::LogLine { node_id, level, message, .. } if node_id == "node-x" && level == "error" => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(logged[0].contains("403") && logged[0].contains("the key cannot delete uploads"), "{}", logged[0]);
+
+        let (gone, calls) = provider(404, "not found").await;
+        let journal = Arc::new(CaptureJournal::default());
+        let handle = firing(journal.clone(), Default::default(), CancellationFlag::new_arc());
+        handle.after_node(CancelCall::delete(format!("{gone}/uploads/1")).always(), conn()).await.unwrap();
+        handle.settle_end_calls().await;
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(!kinds(&journal).contains(&"log_line"), "a 404 is done");
+    }
+
+    /// A worker that picks the run up after a crash reads what the firing
+    /// owed off its record (the claim fills the run's book from it), and
+    /// sends it when the firing ends there; the body run again that
+    /// registers the same call writes nothing more.
+    #[tokio::test]
+    async fn a_call_owed_before_a_crash_goes_from_the_next_worker() {
+        let (base, calls) = provider(204, "").await;
+        let upload = CancelCall::delete(format!("{base}/uploads/1")).always();
+        let record = [
+            RunEvent::NodeStarted { run_id: uuid::Uuid::nil(), node_id: "node-x".into(), frames: Vec::new(), at_unix: 1 },
+            RunEvent::EndCallOwed { run_id: uuid::Uuid::nil(), node_id: "node-x".into(), frames: Vec::new(), call: upload.clone(), access: conn(), at_unix: 2 },
+        ];
+        let journal = Arc::new(CaptureJournal::default());
+        let resumed = firing(journal.clone(), weft_journal::OwedCalls::of_record(&record), CancellationFlag::new_arc());
+        resumed.after_node(upload, conn()).await.unwrap();
+        assert!(kinds(&journal).is_empty(), "already owed");
+        resumed.settle_end_calls().await;
+        assert_eq!(*calls.lock().unwrap(), vec![("DELETE".to_string(), "/uploads/1".to_string())]);
     }
 }

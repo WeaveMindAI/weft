@@ -115,7 +115,7 @@ frontend ls --on prod` shows that address).
 
 `weft workers` shows a project's worker settings and which come from the install: copies kept warm (`min_instances`), the most copies (`max_instances`), how many calls Cloud Run sends one copy at once (`concurrency`, 80), CPU (unset is one CPU on a cloud install), memory, how long a copy keeps a pool its runs share once nothing uses it (`shared_idle_seconds`), how many runs one copy takes at once (`max_runs_at_once`, unset is one per MiB of memory and never fewer than 64), and how long a call waits for room before it is turned away (`max_queue_wait_seconds`, 30). Before you run `weft workers set --min-instances 1`, tell the user: it keeps
 one copy warm so the first call never waits for a start, and on a cloud
-install that copy is billed all the time. On a cloud install one stretch of a run lasts an hour at most (Cloud Run cuts a request there, and the run stops itself a minute before): a run that pauses whole (every branch waiting on a timer or a form) starts a fresh hour when it picks back up, so split work that can take longer with a pause. A pause does not help while a caller is still on the line (a route with `outlivesCaller` off) or while a bus between its nodes is open: such a run's wait holds its copy, and it stops at 59 minutes, telling the client to reconnect. A route with `outlivesCaller` whose caller has gone moves its run off the caller's copy once the nodes it was running end, and carries it on with a fresh hour; a run with a bus open between its nodes cannot move, so it keeps running on that copy for as long as the copy stays up. A run whose trigger leaves `durable` off (the default) ends cancelled if its copy dies mid-run, and is not run again; if a trigger's runs have to carry on after that (they move money, say), set `durable: true` on it.
+install that copy is billed all the time. On a cloud install one stretch of a run lasts an hour at most (Cloud Run cuts a request there, and the run stops itself a minute before): a run that pauses (every node still running waits, a bus read or a stream pull counting, and at least one waits on a timer, a form or another answer from outside, and no node is reading with `ctx.hold()`) starts a fresh hour when it picks back up, so split work that can take longer with a pause. A pause does not help while a caller is still on the line: such a run's wait holds its copy, and at 59 minutes the client is told to reconnect. With `outlivesCaller` off the run is cancelled then; with it on the caller is dropped and the run goes on, pausing if everything in it waits on a timer or a form, else moving off that copy with a fresh hour. Open buses between its nodes do not stop it pausing either. A run whose trigger leaves `durable` off (the default) ends cancelled if its copy dies mid-run, and is not run again; if a trigger's runs have to carry on after that (they move money, say), set `durable: true` on it.
 
 A trigger that holds a connection open (a stream or a socket it listens to,
 an event subscription that dials out) runs on a holder, which weft starts
@@ -378,7 +378,7 @@ step changes.
 Each install keeps its own connections and its own picks of them: which
 connection each access node uses is picked on the install, never written in
 the source. A node connected on this machine has no pick on prod until one
-is made there: `weft connect --on prod --node <node> --list` shows prod's
+is made there: `weft connect <node> --on prod --list` shows prod's
 stored connections, `--grant <id>` picks one (a live trigger reading it is
 set up again).
 
@@ -393,11 +393,10 @@ A connection prod does not hold yet is added one of three ways:
   deployer stores it without ever reading it, by naming the variable:
   weft loads the project's `.env` into its own environment when it starts,
   so the value goes from the file to the install and never through the
-  chat: `weft connect --on prod --node <node> --door own --set-env <field>=<VARIABLE>`,
+  chat: `weft connect <node> --on prod --door own --set-env <field>=<VARIABLE>`,
   run from the project folder.
 - **A person's own account** (a sign-in, a key a provider gave the user):
-  the user adds it, with the command you hand them (`weft connect --on prod
-  --node <node>`).
+  the user adds it, with the command you hand them (`weft connect <node> --on prod`).
 
 A run on prod that reaches a node with nothing picked there is refused
 before it starts, naming that command.

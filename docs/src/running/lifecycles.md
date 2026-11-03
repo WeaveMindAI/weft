@@ -239,7 +239,7 @@ the infra goes.
 
 The triggers they took down come back on by themselves once that infra runs
 again, after `weft infra start`, the end of an `upgrade`, or a program's own
-`ctx.infra(..).start()`. If you ran `weft deactivate` on one of them while
+`ctx.infra(..).start(&mut state)`. If you ran `weft deactivate` on one of them while
 the infra was down, it stays off. Meanwhile `weft status` says `off, its door set to take, taken down with its
 infra (it comes back once that infra runs again)`.
 
@@ -348,7 +348,7 @@ off, go and read [programs with instances](instances.md).
 | `waiting_for_input` | Parked on a person or a service. No worker is up and nothing is being spent |
 | `completed` | Finished |
 | `failed` | A node failed (a wait the run held past its `holdSecs`, which that node did not handle, counts as one), or the run could get no further |
-| `cancelled` | You or another run stopped it; its live caller hung up; it was a fast run and its worker went away; its worker was stopped while it could not pause (`recorded: false`, a caller still on the line with `outlivesCaller` off, or a bus between its nodes open); it reached the hour a cloud install allows one stretch of a run; its caller's session reached the route's or socket's `maxSessionSecs`; or the runtime stopped it (a newer build replaced its image, its build's worker could not start, or a queued run was refused three times, which names who said the last no: `its worker refused it 3 times: <error>`, `the platform refused weft's calls for it 3 times: <error>`, or `its project's worker settings kept it from any worker 3 times: <error>`) |
+| `cancelled` | You or another run stopped it; its live caller hung up; it was a fast run and its worker went away; its worker was stopped while it could not pause (`recorded: false`, or a caller still on the line); it reached the hour a cloud install allows one stretch of a run; its caller's session reached the route's or socket's `maxSessionSecs`; or the runtime stopped it (a newer build replaced its image, its build's worker could not start, or a queued run was refused three times, which names who said the last no: `its worker refused it 3 times: <error>`, `the platform refused weft's calls for it 3 times: <error>`, or `its project's worker settings kept it from any worker 3 times: <error>`) |
 
 `weft runs --status running` lists both the ones working and the ones
 waiting, and the status column tells them apart.

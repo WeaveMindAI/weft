@@ -4,10 +4,11 @@
 
 use async_trait::async_trait;
 
+use weft::instance::InstanceId;
 use weft::node::NodeOutput;
 use weft::{RunContext, Node, NodeManifest, WeftResult};
 
-use super::lifecycle::{instance_if_given, stop_self, take_down_choice};
+use super::lifecycle::{stop_self, take_down_choice};
 
 #[derive(NodeManifest)]
 pub struct DeactivateTriggersNode;
@@ -23,7 +24,7 @@ impl Node for DeactivateTriggersNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let instance = instance_if_given(&ctx)?;
+        let instance = ctx.inputs.opt::<InstanceId>("instance")?;
         let only: Vec<String> = ctx.inputs.opt("only")?.unwrap_or_default();
         let take_down = take_down_choice(&ctx)?;
         // None named is every trigger of the owner: every shared trigger,

@@ -38,10 +38,10 @@ impl Node for KeenableFetchPageNode {
         let account: Option<Access> = ctx.inputs.opt("account")?;
         let url: String = ctx.inputs.get("url")?;
         // `maxChars` declares a metadata default, so the bag holds it.
-        let max_chars: f64 = ctx.inputs.get("maxChars")?;
+        let max_chars: usize = ctx.inputs.get("maxChars")?;
 
         let keenable = Keenable::open(&ctx, account.as_ref()).await?;
-        let page = fetch(&keenable, &url, max_chars as usize).await?;
+        let page = fetch(&keenable, &url, max_chars).await?;
         ctx.pulse_downstream(
             NodeOutput::new()
                 .set("markdown", page.markdown)

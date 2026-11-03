@@ -21,7 +21,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[slack]", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "files:read"

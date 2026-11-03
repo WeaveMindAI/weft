@@ -66,14 +66,7 @@ impl Node for SlackSendMessageNode {
                     api::call(&client, "conversations.open", json!({ "users": u })).await?;
                 required_str(&opened["channel"], "conversations.open", "id")?.to_string()
             }
-            // The destination is the program's choice, so a wrong pair
-            // is an input mistake, never a caught failure. Neither one
-            // never reaches here: `oneOfRequired` skips the node.
-            _ => {
-                return Err(weft::WeftError::Input(
-                    "pick ONE destination: a channel or a user, not both".to_string(),
-                ));
-            }
+            _ => unreachable!("`oneOfRequired` skips the node with neither destination, and a rule refuses both"),
         };
 
         let mut payload = json!({ "channel": destination });

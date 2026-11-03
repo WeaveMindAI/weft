@@ -321,6 +321,18 @@ impl RunProjector {
                     project_id,
                 }]
             }
+            // A wait starts on its registration, unless its ending was on
+            // record first: then the registration is the row that ended it.
+            RunEvent::SuspensionRegistered { node_id, frames, token, .. } if effects.wait_ended.is_none() => {
+                vec![DispatcherEvent::WaitStarted {
+                    run_id, at_unix,
+                    node: node_id.clone(),
+                    frames: frames.clone(),
+                    token: token.clone(),
+                    inherited_from,
+                    project_id,
+                }]
+            }
             // A wait ends on the row that answers, skips or gives it up,
             // or on its registration when that ending was on record first;
             // the fold says which row ended it, and a row that came after
@@ -547,7 +559,7 @@ impl RunProjector {
                     reason: reason.clone(), dropped: dropped.clone(), at_unix,
                 }]
             }
-            // LogLine / RunOutput / NodeKicked / PulsesConsumed /
+            // LogLine / NodeStateSaved / BusCreated / NodeKicked / PulsesConsumed /
             // LoopStreamEnded / ChargeOpened (its cost is surfaced when
             // a `CostReported` books it), and a port's value or closure
             // (its bus participants are sniffed below):
@@ -682,6 +694,7 @@ impl AncestorPainting {
                 DispatcherEvent::NodeStarted { run_id, node, frames, inherited_from, .. }
                 | DispatcherEvent::NodeSuspended { run_id, node, frames, inherited_from, .. }
                 | DispatcherEvent::NodeResumed { run_id, node, frames, inherited_from, .. }
+                | DispatcherEvent::WaitStarted { run_id, node, frames, inherited_from, .. }
                 | DispatcherEvent::WaitEnded { run_id, node, frames, inherited_from, .. }
                 | DispatcherEvent::NodeCompleted { run_id, node, frames, inherited_from, .. }
                 | DispatcherEvent::NodeSkipped { run_id, node, frames, inherited_from, .. } => {
@@ -1292,10 +1305,10 @@ mod tests {
         rows.splice(3..3, [
             RunEvent::SuspensionRegistered {
                 run_id: run_id(), node_id: "src".into(), frames: vec![], token: "answer".into(),
-                spec: wait_spec(), call_index: 0, at_unix: 1,
+                spec: wait_spec(), wait_index: 0, at_unix: 1,
             },
             RunEvent::NodeSuspended {
-                run_id: run_id(), node_id: "src".into(), frames: vec![], token: "answer".into(), at_unix: 1,
+                run_id: run_id(), node_id: "src".into(), frames: vec![], token: Some("answer".into()), at_unix: 1,
             },
             RunEvent::SuspensionResolved { run_id: run_id(), token: "answer".into(), value: json!("approved"), at_unix: 1 },
             RunEvent::NodeResumed {
@@ -1316,16 +1329,18 @@ mod tests {
         assert_eq!(logs[0].inherited_from, Some(run_id()));
         assert_eq!(kinds(&events), vec![
             ("node_started".into(), "src".into()),
+            ("wait_started".into(), "src".into()),
             ("node_suspended".into(), "src".into()),
             ("wait_ended".into(), "src".into()),
             ("node_resumed".into(), "src".into()),
             ("node_completed".into(), "src".into()),
             ("cost_reported".into(), "".into()),
         ]);
-        assert_eq!(events[2]["ended"], json!({ "type": "answered", "value": "approved" }));
-        assert_eq!(events[4]["output"]["out"], 9);
-        assert_eq!(events[5]["nodeId"], "src");
-        assert_eq!(events[5]["amountUsd"], 0.25);
+        assert_eq!(events[1]["token"], "answer");
+        assert_eq!(events[3]["ended"], json!({ "type": "answered", "value": "approved" }));
+        assert_eq!(events[5]["output"]["out"], 9);
+        assert_eq!(events[6]["nodeId"], "src");
+        assert_eq!(events[6]["amountUsd"], 0.25);
         for event in events {
             assert_eq!(event["runId"], child.to_string());
             assert_eq!(event["inheritedFrom"], run_id().to_string());
@@ -1348,7 +1363,7 @@ mod tests {
         rows.extend([
             RunEvent::SuspensionRegistered {
                 run_id: run_id(), node_id: "src".into(), frames: vec![], token: "t".into(),
-                spec: wait_spec(), call_index: 0, at_unix: 2,
+                spec: wait_spec(), wait_index: 0, at_unix: 2,
             },
             RunEvent::SuspensionGaveUp { run_id: run_id(), token: "t".into(), error: "node 'src' gave up its wait: quiet".into(), at_unix: 3 },
             RunEvent::SuspensionResolved { run_id: run_id(), token: "t".into(), value: json!("late"), at_unix: 4 },
@@ -1358,6 +1373,35 @@ mod tests {
         assert_eq!(ended[0]["node"], "src");
         assert_eq!(ended[0]["token"], "t");
         assert_eq!(ended[0]["ended"], json!({ "type": "gave_up", "error": "node 'src' gave up its wait: quiet" }));
+    }
+
+    /// A wait starts on its registration, so the graph paints the firing
+    /// waiting while its worker holds the wait; a registration whose
+    /// ending was already on record (the answer landed first) paints only
+    /// that ending.
+    #[test]
+    fn a_registration_starts_its_wait_unless_its_ending_came_first() {
+        let head: Vec<RunEvent> = run_rows(false).into_iter().take(3).collect();
+        let registered = |token: &str| RunEvent::SuspensionRegistered {
+            run_id: run_id(), node_id: "src".into(), frames: vec![], token: token.into(),
+            spec: wait_spec(), wait_index: 0, at_unix: 2,
+        };
+        let waits = |rows: &[RunEvent]| -> Vec<(String, String)> {
+            project_all(rows).into_iter()
+                .filter(|e| e["kind"] == "wait_started" || e["kind"] == "wait_ended")
+                .map(|e| (e["kind"].as_str().unwrap().to_string(), e["token"].as_str().unwrap().to_string()))
+                .collect()
+        };
+        let mut held = head.clone();
+        held.extend([registered("t"), RunEvent::SuspensionResolved { run_id: run_id(), token: "t".into(), value: json!("yes"), at_unix: 3 }]);
+        assert_eq!(waits(&held), vec![("wait_started".into(), "t".into()), ("wait_ended".into(), "t".into())]);
+        let started = project_all(&held).into_iter().find(|e| e["kind"] == "wait_started").unwrap();
+        assert_eq!(started["node"], "src");
+        assert_eq!(started["frames"], json!([]));
+        assert_eq!(started["atUnix"], 2);
+        let mut answered_first = head;
+        answered_first.extend([RunEvent::SuspensionResolved { run_id: run_id(), token: "t".into(), value: json!("yes"), at_unix: 2 }, registered("t")]);
+        assert_eq!(waits(&answered_first), vec![("wait_ended".into(), "t".into())]);
     }
 
     /// A copy of a scope whose every node the child reuses was decided in

@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[s3]", "accepts": ["wire"],
       "required": true,
       "description": "The object store access (wire an S3Access node)."
     },
@@ -33,6 +33,34 @@
     {
       "name": "done",
       "type": "Boolean"
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "value",
+        "field": "bucket",
+        "matches": "^\\.{0,2}$"
+      },
+      "then": {
+        "message": "S3DeleteObject '{id}': `bucket` is empty, `.` or `..`, which no URL can address; name a real bucket.",
+        "level": "structural",
+        "severity": "error",
+        "field": "bucket"
+      }
+    },
+    {
+      "when": {
+        "kind": "value",
+        "field": "key",
+        "matches": "(^|/)\\.\\.?(/|$)"
+      },
+      "then": {
+        "message": "S3DeleteObject '{id}': `key` has a `.` or `..` path segment, which URL normalization collapses into a different key; rename the object.",
+        "level": "structural",
+        "severity": "error",
+        "field": "key"
+      }
     }
   ]
 }

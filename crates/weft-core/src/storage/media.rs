@@ -206,6 +206,47 @@ pub fn substitute_media(
         .unwrap_or_else(|| value.clone())
 }
 
+/// One stored file a value holds where its declared type says a file
+/// goes, as [`map_stored_files`] hands it over.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredSlot {
+    /// The file's address, to read it or link it.
+    pub handle: crate::storage::FileHandle,
+    /// The kind its marker names, so a per-kind choice never guesses from
+    /// a mime.
+    pub kind: FileKind,
+    /// The stored-file value itself (the marker), for what its payload
+    /// says beyond the address (name, type, size).
+    pub value: Value,
+}
+
+/// `value` with every stored file its type `ty` places in it replaced by
+/// what `replace` makes of it: the ONE walk of a value's files on their
+/// way out of weft (a link for a caller, an inline `data:` URL for a
+/// provider, a dict for a script). The type decides what is a file,
+/// never a marker key found in raw JSON: a `JsonDict` that happens to
+/// carry one is left whole. Material already outside weft in a file place
+/// (a `data:` URL, an http URL) passes untouched; anything else there is
+/// refused, as [`classify_media_slot`] words it. Each distinct file is
+/// handed over once, however often it appears.
+pub async fn map_stored_files<F, Fut>(value: &Value, ty: &WeftType, mut replace: F) -> crate::error::WeftResult<Value>
+where
+    F: FnMut(StoredSlot) -> Fut,
+    Fut: std::future::Future<Output = crate::error::WeftResult<Value>>,
+{
+    let mut replacements = HashMap::new();
+    for slot in media_slots(value, ty) {
+        let (handle, kind) = match classify_media_slot(&slot).map_err(crate::error::WeftError::Input)? {
+            MediaSlotContent::Stored { handle, kind } => (handle, kind),
+            MediaSlotContent::DataUrl { .. } | MediaSlotContent::ExternalUrl(_) => continue,
+        };
+        let key = slot.to_string();
+        let made = replace(StoredSlot { handle, kind, value: slot }).await?;
+        replacements.insert(key, made);
+    }
+    Ok(substitute_media(value, ty, &replacements))
+}
+
 /// Whether a stored-file value sits anywhere in `value`. Type-free: it
 /// finds markers by their sentinel.
 pub fn holds_file_marker(value: &Value) -> bool {

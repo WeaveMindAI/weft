@@ -24,12 +24,201 @@ pub mod coverage;
 /// weft wrote; `crate::stored` says how they run. A stored program keeps
 /// the hash it was written under through every step
 /// ([`hash::compute_definition_hash`] says why).
-pub const PROJECT_DEFINITION_UPGRADES: &[&[crate::stored::Op]] = &[&[
-    // Version 2: the service recipes a node carries moved with
-    // `AccessSpec`'s own version 2.
-    crate::stored::Op::Within { at: "nodes.*.publishedService", ops: crate::access::spec::ACCESS_SPEC_V2 },
-    crate::stored::Op::Within { at: "nodes.*.instanceService", ops: crate::access::spec::ACCESS_SPEC_V2 },
-]];
+pub const PROJECT_DEFINITION_UPGRADES: &[&[crate::stored::Op]] = &[
+    &[
+        // Version 2: the service recipes a node carries moved with
+        // `AccessSpec`'s own version 2.
+        crate::stored::Op::Within { at: "nodes.*.publishedService", ops: crate::access::spec::ACCESS_SPEC_V2 },
+        crate::stored::Op::Within { at: "nodes.*.instanceService", ops: crate::access::spec::ACCESS_SPEC_V2 },
+    ],
+    &[
+        // Version 3: the recipes moved with `AccessSpec`'s version 3, and
+        // a node's rules are written with the one `value` kind
+        // ([`upgrade::rules_to_value`]).
+        crate::stored::Op::Within { at: "nodes.*.publishedService", ops: crate::access::spec::ACCESS_SPEC_V3 },
+        crate::stored::Op::Within { at: "nodes.*.instanceService", ops: crate::access::spec::ACCESS_SPEC_V3 },
+        crate::stored::Op::Code { at: "nodes.*", run: upgrade::rules_to_value },
+    ],
+];
+
+/// The [`Op::Code`](crate::stored::Op::Code) steps of
+/// [`PROJECT_DEFINITION_UPGRADES`], on a stored node's raw JSON.
+mod upgrade {
+    use serde_json::{json, Map, Value};
+
+    /// Version 3: every rule a node carries (`instanceRules.rules.*.when`,
+    /// `recheck.*.when`) says each `config_*` kind as the `value` kind
+    /// that means the same; a rule asking `input_source_type` (which the
+    /// `Access[service]` type replaced, checked when the program was
+    /// built) is dropped; and an input's `minItems` becomes the rule it
+    /// was, asked again on what arrives (`recheck`), which is the only
+    /// place a built program still needed it.
+    pub(super) fn rules_to_value(node: &mut Value) -> Result<(), String> {
+        let id = node.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        if let Some(rules) = node.pointer_mut("/instanceRules/rules").and_then(Value::as_array_mut) {
+            convert_rules(rules)?;
+        }
+        let mut too_few = Vec::new();
+        for input in node.get_mut("inputs").and_then(Value::as_array_mut).into_iter().flatten() {
+            let Some(min) = input.as_object_mut().and_then(|input| input.remove("minItems")) else { continue };
+            let min = min.as_u64().ok_or_else(|| format!("an input's `minItems` is {min}, no count"))?;
+            let name = input.get("name").and_then(Value::as_str).unwrap_or_default();
+            too_few.push(json!({
+                "when": { "kind": "all", "of": [
+                    { "kind": "value", "field": name },
+                    { "kind": "not", "of": { "kind": "value", "field": name, "count": { "min": min } } }
+                ] },
+                "message": format!("'{id}' takes at least {min} item{} on '{name}'", if min == 1 { "" } else { "s" }),
+            }));
+        }
+        let object = node.as_object_mut().ok_or("a node is no object")?;
+        if let Some(rules) = object.get_mut("recheck").and_then(Value::as_array_mut) {
+            convert_rules(rules)?;
+        }
+        if !too_few.is_empty() {
+            let recheck = object.entry("recheck").or_insert_with(|| Value::Array(Vec::new()));
+            recheck.as_array_mut().ok_or("a node's `recheck` is no list")?.extend(too_few);
+        }
+        if object.get("recheck").and_then(Value::as_array).is_some_and(Vec::is_empty) {
+            object.remove("recheck");
+        }
+        Ok(())
+    }
+
+    /// Each rule's `when` converted, the rules asking `input_source_type`
+    /// left out.
+    fn convert_rules(rules: &mut Vec<Value>) -> Result<(), String> {
+        let mut kept = Vec::with_capacity(rules.len());
+        for mut rule in std::mem::take(rules) {
+            let when = rule.get_mut("when").ok_or("a rule has no `when`")?;
+            if convert(when)? {
+                kept.push(rule);
+            }
+        }
+        *rules = kept;
+        Ok(())
+    }
+
+    /// `cond` with every retired kind said as `value`, at any depth;
+    /// false when it asks `input_source_type`, and the rule goes.
+    fn convert(cond: &mut Value) -> Result<bool, String> {
+        let Some(object) = cond.as_object_mut() else { return Err("a condition is no object".into()) };
+        let kind = object.get("kind").and_then(Value::as_str).ok_or("a condition has no kind")?.to_string();
+        let mut take = |key: &str| object.remove(key);
+        let bounds = |min: Option<Value>, max: Option<Value>| {
+            let mut b = Map::new();
+            for (key, v) in [("min", min), ("max", max)] {
+                if let Some(v) = v.filter(|v| !v.is_null()) {
+                    b.insert(key.into(), v);
+                }
+            }
+            Value::Object(b)
+        };
+        let checks: Map<String, Value> = match kind.as_str() {
+            "all" | "any" => {
+                for part in object.get_mut("of").and_then(Value::as_array_mut).ok_or("`all`/`any` holds no list")? {
+                    if !convert(part)? {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+            "not" => return convert(object.get_mut("of").ok_or("`not` holds nothing")?),
+            "input_source_type" => return Ok(false),
+            "config_present" => Map::new(),
+            "config_nonempty" => [("nonempty".to_string(), Value::Bool(true))].into_iter().collect(),
+            "config_equals" => [("equals".to_string(), take("equals").unwrap_or(Value::Null))].into_iter().collect(),
+            "config_in_set" => [("oneOf".to_string(), take("values").unwrap_or_else(|| json!([])))].into_iter().collect(),
+            "config_matches" => [("matches".to_string(), take("regex").unwrap_or_default())].into_iter().collect(),
+            "config_item_count" => [("count".to_string(), bounds(take("min"), take("max")))].into_iter().collect(),
+            "config_in_range" => [("range".to_string(), bounds(take("min"), take("max")))].into_iter().collect(),
+            "config_items_fit" => {
+                let mut each = Map::new();
+                let length = bounds(take("minLength"), take("maxLength"));
+                if length.as_object().is_some_and(|b| !b.is_empty()) {
+                    each.insert("length".into(), length);
+                }
+                if let Some(regex) = take("regex").filter(|r| !r.is_null()) {
+                    each.insert("matches".into(), regex);
+                }
+                [("each".to_string(), Value::Object(each))].into_iter().collect()
+            }
+            "config_field_in_set" => {
+                let each = json!({ "key": take("key").unwrap_or_default(), "oneOf": take("values").unwrap_or_else(|| json!([])) });
+                [("each".to_string(), each)].into_iter().collect()
+            }
+            _ => return Ok(true),
+        };
+        let field = object.remove("field").ok_or_else(|| format!("a `{kind}` condition has no field"))?;
+        *object = [("kind".to_string(), json!("value")), ("field".to_string(), field)].into_iter().chain(checks).collect();
+        Ok(true)
+    }
+    #[cfg(test)]
+    mod tests {
+        use serde_json::json;
+
+        /// Each retired kind becomes the `value` rule meaning the same, at
+        /// any depth; a rule asking `input_source_type` goes; an input's
+        /// `minItems` becomes the recheck it was; and the node then reads
+        /// as today's.
+        #[test]
+        fn a_stored_nodes_rules_are_said_with_value() {
+            let then = json!({ "message": "m" });
+            let mut node = json!({
+                "id": "n",
+                "inputs": [{ "name": "texts", "portType": "List[String]", "minItems": 2 }, { "name": "mode", "portType": "String" }],
+                "instanceRules": { "rules": [
+                    { "when": { "kind": "all", "of": [
+                        { "kind": "config_present", "field": "mode" },
+                        { "kind": "not", "of": { "kind": "config_matches", "field": "mode", "regex": "^a" } },
+                        { "kind": "any", "of": [
+                            { "kind": "config_in_set", "field": "mode", "values": ["a"] },
+                            { "kind": "config_item_count", "field": "texts", "min": 1, "max": null },
+                            { "kind": "config_items_fit", "field": "texts", "maxLength": 9, "regex": "^x" },
+                            { "kind": "config_in_range", "field": "mode", "min": 0.5 },
+                            { "kind": "config_field_in_set", "field": "texts", "key": "role", "values": ["user"] },
+                            { "kind": "config_equals", "field": "mode", "equals": true },
+                            { "kind": "config_nonempty", "field": "mode" }
+                        ] }
+                    ] }, "then": then },
+                    { "when": { "kind": "not", "of": { "kind": "input_source_type", "port": "account", "equals": "SlackAccess" } }, "then": then }
+                ] },
+                "recheck": [{ "when": { "kind": "input_source_type", "port": "account", "oneOf": ["X"] }, "message": "gone" }]
+            });
+            super::rules_to_value(&mut node).unwrap();
+            assert_eq!(node["instanceRules"]["rules"], json!([
+                { "when": { "kind": "all", "of": [
+                    { "kind": "value", "field": "mode" },
+                    { "kind": "not", "of": { "kind": "value", "field": "mode", "matches": "^a" } },
+                    { "kind": "any", "of": [
+                        { "kind": "value", "field": "mode", "oneOf": ["a"] },
+                        { "kind": "value", "field": "texts", "count": { "min": 1 } },
+                        { "kind": "value", "field": "texts", "each": { "length": { "max": 9 }, "matches": "^x" } },
+                        { "kind": "value", "field": "mode", "range": { "min": 0.5 } },
+                        { "kind": "value", "field": "texts", "each": { "key": "role", "oneOf": ["user"] } },
+                        { "kind": "value", "field": "mode", "equals": true },
+                        { "kind": "value", "field": "mode", "nonempty": true }
+                    ] }
+                ] }, "then": then }
+            ]));
+            assert!(node["inputs"][0].get("minItems").is_none());
+            assert_eq!(node["recheck"], json!([{
+                "when": { "kind": "all", "of": [
+                    { "kind": "value", "field": "texts" },
+                    { "kind": "not", "of": { "kind": "value", "field": "texts", "count": { "min": 2 } } }
+                ] },
+                "message": "'n' takes at least 2 items on 'texts'"
+            }]));
+            let rules: Vec<crate::node::ValidationRule> = serde_json::from_value(node["instanceRules"]["rules"].clone()).expect("today's rules");
+            assert_eq!(rules.len(), 1);
+            let _: Vec<crate::rules::Recheck> = serde_json::from_value(node["recheck"].clone()).expect("today's rechecks");
+
+            let mut plain = json!({ "id": "p", "inputs": [], "recheck": [{ "when": { "kind": "input_source_type", "port": "a", "oneOf": [] }, "message": "x" }] });
+            super::rules_to_value(&mut plain).unwrap();
+            assert!(plain.get("recheck").is_none(), "a recheck left with nothing is dropped, as the type writes it");
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDefinition {
@@ -700,6 +889,13 @@ pub struct NodeDefinition {
     /// is at hand. Resolved at enrich time from the catalog.
     #[serde(default, rename = "instanceRules", skip_serializing_if = "Option::is_none")]
     pub instance_rules: Option<InstanceRules>,
+    /// The node's rules the compiler could not decide, because their
+    /// answer leans on a value that arrives on a wire: each is checked on
+    /// the values that arrived, before the body runs
+    /// ([`crate::rules::recheck`]). Empty for every other node, which
+    /// then pays nothing for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recheck: Vec<crate::rules::Recheck>,
     /// Full source range of the node declaration (including config
     /// block if present). Set by the parser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1152,6 +1348,12 @@ pub struct InputDefinition {
         skip_serializing_if = "Option::is_none"
     )]
     pub requires_values: Option<Vec<String>>,
+    /// A blank text on this optional String input is a value (mirrored
+    /// from the metadata's `keepsBlank`); without it a blank is absent
+    /// ([`crate::run::ready::blank_is_absent`]).
+    // SYNC: InputDefinition.keeps_blank <-> packages/weft-connect/src/core/wire.ts InputDefinition.keepsBlank
+    #[serde(default, rename = "keepsBlank", skip_serializing_if = "std::ops::Not::not")]
+    pub keeps_blank: bool,
 }
 
 /// A node's port types at one place it runs ([`NodeDefinition::place_types`]):
@@ -1251,6 +1453,7 @@ impl InputDefinition {
             from_spec: false,
             requires_scopes: None,
             requires_values: None,
+            keeps_blank: false,
         }
     }
 
@@ -2318,6 +2521,7 @@ mod trigger_dependency_tests {
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -2634,6 +2838,7 @@ mod project_wire_tests {
             from_spec: false,
             requires_scopes: None,
             requires_values: None,
+            keeps_blank: false,
         };
         let node = NodeDefinition {
             id: "g.n".into(),
@@ -2654,6 +2859,7 @@ mod project_wire_tests {
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: Some(Span::single_line(1, 0, 5)),
             header_span: Some(Span::single_line(1, 0, 3)),
             config_spans: Default::default(),
@@ -2793,6 +2999,7 @@ mod project_wire_tests {
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None,
             header_span: None,
             config_spans: Default::default(),

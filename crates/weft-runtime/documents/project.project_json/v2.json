@@ -976,6 +976,73 @@
                 "severity": "error",
                 "field": "account"
               }
+            },
+            {
+              "when": {
+                "kind": "all",
+                "of": [
+                  {
+                    "kind": "config_present",
+                    "field": "account"
+                  },
+                  {
+                    "kind": "not",
+                    "of": {
+                      "kind": "config_matches",
+                      "field": "account",
+                      "regex": "^a"
+                    }
+                  }
+                ]
+              },
+              "then": {
+                "message": "'{id}' account is odd",
+                "level": "structural",
+                "severity": "error",
+                "field": "account"
+              }
+            },
+            {
+              "when": {
+                "kind": "any",
+                "of": [
+                  {
+                    "kind": "config_equals",
+                    "field": "account",
+                    "equals": "x"
+                  },
+                  {
+                    "kind": "config_in_set",
+                    "field": "account",
+                    "values": [
+                      "a",
+                      "b"
+                    ]
+                  }
+                ]
+              },
+              "then": {
+                "message": "'{id}' account is taken",
+                "level": "runtime",
+                "severity": "error",
+                "field": "account"
+              }
+            },
+            {
+              "when": {
+                "kind": "not",
+                "of": {
+                  "kind": "input_source_type",
+                  "port": "account",
+                  "equals": "HmacAccess"
+                }
+              },
+              "then": {
+                "message": "'{id}' account is not an HMAC connection",
+                "level": "structural",
+                "severity": "error",
+                "port": "account"
+              }
             }
           ]
         },

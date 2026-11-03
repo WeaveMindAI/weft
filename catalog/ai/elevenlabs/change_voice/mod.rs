@@ -5,12 +5,12 @@
 
 use async_trait::async_trait;
 
-use weft::access::client::Multipart;
+use weft::access::client::{Multipart, StoredBodyExt};
 use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::elevenlabs::{audio_file_type, emit_audio, input_file_format, API};
-use super::speech::{query, voice_settings};
+use super::elevenlabs::{audio_file_type, emit_audio, input_file_format};
+use super::speech::{speech_url, voice_settings};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsChangeVoiceNode;
@@ -40,11 +40,9 @@ impl Node for ElevenLabsChangeVoiceNode {
         // store must refuse before the paid conversion, not after.
         let (extension, mime) = audio_file_type(&output_format)?;
 
-        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&audio).await?;
-        let file_format = input_file_format(&ctx, &meta.mime_type)?;
-        let mut form = Multipart::form_data()
-            .text("model_id", &model)
-            .file("audio", &meta.filename, &meta.mime_type, bytes);
+        let recording = ctx.storage(StorageScope::Run).body(&audio).await?;
+        let file_format = input_file_format(&ctx, recording.mime_type())?;
+        let mut form = Multipart::form_data().text("model_id", &model).stored("audio", recording);
         // The form carries the settings as one JSON string.
         if let Some(settings) = settings {
             form = form.text("voice_settings", &settings.to_string());
@@ -58,16 +56,15 @@ impl Node for ElevenLabsChangeVoiceNode {
         if let Some(file_format) = file_format {
             form = form.text("file_format", file_format);
         }
-        let (content_type, body) = form.build();
 
         let http = ctx.client(&account).await?;
         // The voice id is typed text that becomes a path segment:
         // encoded, it can only ever name a voice.
-        let url = format!("{API}/speech-to-speech/{}?{}", urlencoding::encode(&voice), query(&ctx, &output_format)?);
+        let url = speech_url(&ctx, &["speech-to-speech", &voice], &output_format)?;
         let filename = format!("revoiced.{extension}");
         emit_audio(
             &ctx,
-            http.post(url).header("content-type", content_type).body(body),
+            http.post(url.as_str()).multipart(form),
             "change the voice on ElevenLabs",
             &filename,
             mime,

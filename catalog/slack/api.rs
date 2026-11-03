@@ -10,15 +10,20 @@
 
 use serde_json::Value;
 
-use weft::access::client::{cursor_paged, json_call, require_ok_flag, CursorPaging};
+use weft::access::client::{cursor_paged, json_call, require_ok_flag, url, CursorPaging};
 use weft::reqwest_middleware::ClientWithMiddleware;
 use weft::WeftResult;
+
+/// The address of a Web API method (`chat.postMessage`).
+fn method_url(method: &str) -> WeftResult<String> {
+    Ok(url("https://slack.com/api", &[method])?.into())
+}
 
 /// POST a Web API method (`chat.postMessage`, ...) with a JSON payload,
 /// on the connection's authenticated client. A node opens that client
 /// once per run (`ctx.client`) and passes it to every call it makes.
 pub async fn call(client: &ClientWithMiddleware, method: &str, payload: Value) -> WeftResult<Value> {
-    let req = client.post(format!("https://slack.com/api/{method}")).json(&payload);
+    let req = client.post(method_url(method)?).json(&payload);
     let what = format!("call {method}");
     require_ok_flag(json_call(req, &what).await?, "ok", "error", &what)
 }
@@ -29,7 +34,7 @@ pub async fn get(
     method: &str,
     query: &[(&str, String)],
 ) -> WeftResult<Value> {
-    let req = client.get(format!("https://slack.com/api/{method}")).query(query);
+    let req = client.get(method_url(method)?).query(query);
     let what = format!("call {method}");
     require_ok_flag(json_call(req, &what).await?, "ok", "error", &what)
 }
@@ -51,18 +56,18 @@ pub async fn paged<T>(
     visit: impl FnMut(&[Value]) -> WeftResult<Option<T>>,
 ) -> WeftResult<Option<T>> {
     let what = format!("call {method}");
-    let url = format!("https://slack.com/api/{method}");
+    let url = method_url(method)?;
     let paging = CursorPaging {
         items,
         next: "/response_metadata/next_cursor",
-        param: "cursor",
+        param: Some("cursor"),
         items_may_be_absent: false,
         past_cap_hint,
     };
     cursor_paged(
         paging,
         &what,
-        || client.get(&url).query(query).query(&[("limit", "200")]),
+        |_| client.get(&url).query(query).query(&[("limit", "200")]),
         |answer| require_ok_flag(answer, "ok", "error", &what),
         visit,
     )

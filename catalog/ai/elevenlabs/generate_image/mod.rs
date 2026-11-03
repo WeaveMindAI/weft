@@ -8,7 +8,7 @@ use weft::node::NodeOutput;
 use weft::storage::FileHandle;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::flows::{generate, set_some, Media, References};
+use super::flows::{generate, set_some, Job, Media, References};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsGenerateImageNode;
@@ -33,11 +33,12 @@ impl Node for ElevenLabsGenerateImageNode {
         let resolution: Option<String> = ctx.inputs.opt("resolution")?;
         let quality: Option<String> = ctx.inputs.opt("quality")?;
         let background: Option<String> = ctx.inputs.opt("background")?;
-        let seed: Option<f64> = ctx.inputs.opt("seed")?;
+        let seed: Option<u64> = ctx.inputs.opt("seed")?;
 
         let http = ctx.client(&account).await?;
-        let refs = References::new(&ctx, &http);
-        let image = generate(&ctx, &account, &http, &refs, Media::Image, || async {
+        let refs = References::new(&ctx, &http, &account);
+        let mut job = ctx.keep(Job::default()).await?;
+        let image = generate(&ctx, &mut job, &account, &http, Media::Image, || async {
             let mut body = json!({ "model_id": model, "prompt": prompt });
             if !images.is_empty() {
                 body["images"] = json!(refs.of_each(&images).await?);
@@ -49,8 +50,7 @@ impl Node for ElevenLabsGenerateImageNode {
             set_some(&mut body, "resolution", resolution);
             set_some(&mut body, "quality", quality);
             set_some(&mut body, "background", background);
-            // `seed` takes whole numbers only (its widget's step).
-            set_some(&mut body, "seed", seed.map(|s| s as u64));
+            set_some(&mut body, "seed", seed);
             Ok(body)
         })
         .await?;

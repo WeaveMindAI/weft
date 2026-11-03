@@ -13,15 +13,16 @@
 
 use async_trait::async_trait;
 use base64::Engine as _;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use weft::access::client::{json_call, Multipart};
+use weft::access::client::{json_call, url, Multipart, StoredBodyExt};
 use weft::context::LogLevel;
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, StorageScope};
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, ValueBag, WeftResult};
 
-use super::elevenlabs::{detected_entity, store_json, text_input, API};
+use super::elevenlabs::{detected_entity, API};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsTranscribeFileNode;
@@ -29,18 +30,7 @@ pub struct ElevenLabsTranscribeFileNode;
 #[cfg(feature = "node-tests")]
 mod tests;
 
-/// ElevenLabs's limits on keyterms: how many one request takes, the
-/// length every term stays under, and the characters none may hold.
-const MAX_KEYTERMS: usize = 1000;
-const KEYTERM_CHARS_UNDER: usize = 50;
-const KEYTERM_FORBIDDEN: [char; 7] = ['<', '>', '{', '}', '[', ']', '\\'];
-/// The longest `transcript_edit` instruction ElevenLabs takes.
-const MAX_EDIT_CHARS: usize = 2000;
-/// The most export formats one request asks for.
-const MAX_FORMATS: usize = 10;
-/// The export formats ElevenLabs writes, and the ones that also take a
-/// line length.
-const FORMATS: [&str; 6] = ["segmented_json", "docx", "pdf", "txt", "html", "srt"];
+/// The export formats that also take a line length.
 const LINE_LENGTH_FORMATS: [&str; 2] = ["srt", "txt"];
 
 /// Every setting the node sends, read from its inputs.
@@ -70,164 +60,43 @@ struct Settings {
 }
 
 impl Settings {
-    fn read(ctx: &RunContext) -> WeftResult<Self> {
+    fn read(inputs: &ValueBag) -> WeftResult<Self> {
         Ok(Self {
-            model: ctx.inputs.get("model")?,
-            language: text_input(ctx, "language")?,
-            diarize: ctx.inputs.get("diarize")?,
+            model: inputs.get("model")?,
+            language: inputs.opt("language")?,
+            diarize: inputs.get("diarize")?,
             // Whole numbers: the widgets' step holds a wired value to
             // whole numbers too.
-            num_speakers: ctx.inputs.opt("numSpeakers")?,
-            diarization_threshold: ctx.inputs.opt("diarizationThreshold")?,
-            detect_speaker_roles: ctx.inputs.get("detectSpeakerRoles")?,
-            use_speaker_library: ctx.inputs.get("useSpeakerLibrary")?,
-            timestamps_granularity: ctx.inputs.opt("timestampsGranularity")?,
-            tag_audio_events: ctx.inputs.get("tagAudioEvents")?,
-            no_verbatim: ctx.inputs.get("noVerbatim")?,
-            keyterms: ctx.inputs.list("keyterms")?,
-            additional_formats: ctx.inputs.list("additionalFormats")?,
-            entity_detection: ctx.inputs.list("entityDetection")?,
-            entity_redaction: ctx.inputs.list("entityRedaction")?,
-            entity_redaction_mode: ctx.inputs.opt("entityRedactionMode")?,
-            transcript_edit: text_input(ctx, "transcriptEdit")?,
-            use_multi_channel: ctx.inputs.get("useMultiChannel")?,
-            multichannel_output_style: ctx.inputs.opt("multichannelOutputStyle")?,
-            temperature: ctx.inputs.opt("temperature")?,
-            seed: ctx.inputs.opt("seed")?,
-            file_format: ctx.inputs.opt("fileFormat")?,
-            enable_logging: ctx.inputs.get("enableLogging")?,
+            num_speakers: inputs.opt("numSpeakers")?,
+            diarization_threshold: inputs.opt("diarizationThreshold")?,
+            detect_speaker_roles: inputs.get("detectSpeakerRoles")?,
+            use_speaker_library: inputs.get("useSpeakerLibrary")?,
+            timestamps_granularity: inputs.opt("timestampsGranularity")?,
+            tag_audio_events: inputs.get("tagAudioEvents")?,
+            no_verbatim: inputs.get("noVerbatim")?,
+            keyterms: inputs.list("keyterms")?,
+            additional_formats: inputs
+                .list::<ExportItem>("additionalFormats")?
+                .into_iter()
+                .map(ExportItem::option)
+                .collect::<WeftResult<_>>()?,
+            entity_detection: inputs.list("entityDetection")?,
+            entity_redaction: inputs.list("entityRedaction")?,
+            entity_redaction_mode: inputs.opt("entityRedactionMode")?,
+            transcript_edit: inputs.opt("transcriptEdit")?,
+            use_multi_channel: inputs.get("useMultiChannel")?,
+            multichannel_output_style: inputs.opt("multichannelOutputStyle")?,
+            temperature: inputs.opt("temperature")?,
+            seed: inputs.opt("seed")?,
+            file_format: inputs.opt("fileFormat")?,
+            enable_logging: inputs.get("enableLogging")?,
         })
-    }
-
-    /// What ElevenLabs would refuse, or what would pay for nothing, said
-    /// before anything is sent (the compiler refuses the same shapes when
-    /// they are written; this is the floor for wired ones), or `None` when
-    /// the request can go.
-    fn refusal(&self) -> Option<String> {
-        let entities = !self.entity_detection.is_empty() || !self.entity_redaction.is_empty();
-        let combined = self.multichannel_output_style.as_deref() == Some("combined");
-        let v1 = self.model.starts_with("scribe_v1");
-        if self.diarization_threshold.is_some() && !self.diarize {
-            return Some(
-                "`diarizationThreshold` tunes the speaker labelling, which only `diarize` turns on: turn `diarize` \
-                 on, or leave `diarizationThreshold` empty"
-                    .into(),
-            );
-        }
-        if self.diarization_threshold.is_some() && self.num_speakers.is_some() {
-            return Some(
-                "ElevenLabs takes `diarizationThreshold` only without `numSpeakers`: keep one of them".into(),
-            );
-        }
-        if self.detect_speaker_roles && !self.diarize {
-            return Some(
-                "`detectSpeakerRoles` names the speakers that `diarize` finds, and `diarize` is off: turn `diarize` \
-                 on, or `detectSpeakerRoles` off"
-                    .into(),
-            );
-        }
-        if self.detect_speaker_roles && self.use_multi_channel {
-            return Some(
-                "ElevenLabs does not detect speaker roles with `useMultiChannel`: turn one of them off".into(),
-            );
-        }
-        if self.use_speaker_library && !self.diarize {
-            return Some(
-                "`useSpeakerLibrary` matches the speakers that `diarize` finds, and `diarize` is off: turn `diarize` \
-                 on, or `useSpeakerLibrary` off"
-                    .into(),
-            );
-        }
-        if self.use_multi_channel && self.diarize {
-            return Some(
-                "with `useMultiChannel` each channel is one speaker, and ElevenLabs needs `diarize` off: turn one \
-                 of them off"
-                    .into(),
-            );
-        }
-        if self.use_multi_channel && self.num_speakers.is_some() {
-            return Some(
-                "with `useMultiChannel` the channels set the number of speakers, and ElevenLabs refuses \
-                 `numSpeakers`: leave `numSpeakers` empty, or turn `useMultiChannel` off"
-                    .into(),
-            );
-        }
-        if self.multichannel_output_style.is_some() && !self.use_multi_channel {
-            return Some(
-                "`multichannelOutputStyle` shapes what `useMultiChannel` answers, and `useMultiChannel` is off: \
-                 turn `useMultiChannel` on, or leave `multichannelOutputStyle` empty"
-                    .into(),
-            );
-        }
-        if combined && self.timestamps_granularity.as_deref() == Some("none") {
-            return Some(
-                "the `combined` style merges the channels by time, and `timestampsGranularity` is none: set it to \
-                 word or character, or pick the `separate` style"
-                    .into(),
-            );
-        }
-        if combined && entities {
-            return Some(
-                "ElevenLabs does not detect or redact entities in the `combined` style: pick the `separate` style, \
-                 or leave `entityDetection` and `entityRedaction` empty"
-                    .into(),
-            );
-        }
-        if let Some(edit) = &self.transcript_edit {
-            if entities || self.use_multi_channel {
-                return Some(
-                    "ElevenLabs does not rewrite a transcript with entity detection, redaction or \
-                     `useMultiChannel`: leave `transcriptEdit` empty, or turn those off"
-                        .into(),
-                );
-            }
-            let chars = edit.chars().count();
-            if chars > MAX_EDIT_CHARS {
-                return Some(format!(
-                    "`transcriptEdit` is {chars} characters, and ElevenLabs takes at most {MAX_EDIT_CHARS}: shorten it"
-                ));
-            }
-        }
-        if !self.entity_redaction.is_empty() && self.entity_detection.is_empty() {
-            return Some(
-                "`entityRedaction` blanks out entities that `entityDetection` finds, and `entityDetection` is \
-                 empty: set `entityDetection` to cover what you redact"
-                    .into(),
-            );
-        }
-        if self.entity_redaction_mode.is_some() && self.entity_redaction.is_empty() {
-            return Some(
-                "`entityRedactionMode` says how redacted entities read, and `entityRedaction` redacts nothing: set \
-                 `entityRedaction`, or leave `entityRedactionMode` empty"
-                    .into(),
-            );
-        }
-        if v1 && self.no_verbatim {
-            return Some(format!(
-                "ElevenLabs offers `noVerbatim` on scribe_v2 and scribe_v2_medical only, and this transcription \
-                 uses '{}': pick one of those, or turn `noVerbatim` off",
-                self.model
-            ));
-        }
-        if !self.keyterms.is_empty() {
-            if v1 {
-                return Some(format!(
-                    "ElevenLabs offers `keyterms` on scribe_v2 and scribe_v2_medical only, and this transcription \
-                     uses '{}': pick one of those, or leave `keyterms` empty",
-                    self.model
-                ));
-            }
-            if let Some(refusal) = keyterms_refusal(&self.keyterms) {
-                return Some(refusal);
-            }
-        }
-        export_options(&self.additional_formats).err()
     }
 
     /// The multipart form ElevenLabs reads, under its own field names:
     /// every setting that was given, nothing that was left at
     /// ElevenLabs's own default.
-    fn form(&self, mut form: Multipart) -> WeftResult<Multipart> {
+    fn form(&self, mut form: Multipart) -> Multipart {
         form = form.text("model_id", &self.model);
         if let Some(language) = &self.language {
             form = form.text("language_code", language);
@@ -255,8 +124,7 @@ impl Settings {
         // The structured fields go as JSON text, the way ElevenLabs's own
         // SDK sends them.
         if !self.additional_formats.is_empty() {
-            let options = export_options(&self.additional_formats).map_err(WeftError::Input)?;
-            form = form.text("additional_formats", &Value::Array(options).to_string());
+            form = form.text("additional_formats", &json!(self.additional_formats).to_string());
         }
         if !self.entity_detection.is_empty() {
             form = form.text("entity_detection", &json!(self.entity_detection).to_string());
@@ -283,7 +151,7 @@ impl Settings {
         if let Some(format) = &self.file_format {
             form = form.text("file_format", format);
         }
-        Ok(form)
+        form
     }
 }
 
@@ -297,99 +165,59 @@ fn flag(form: Multipart, name: &str, set: bool) -> Multipart {
     }
 }
 
-/// What ElevenLabs would refuse in a list of keyterms, or `None`. The
-/// five-word limit is left to ElevenLabs, which counts words after its
-/// own normalisation.
-fn keyterms_refusal(terms: &[String]) -> Option<String> {
-    if terms.len() > MAX_KEYTERMS {
-        return Some(format!(
-            "`keyterms` lists {} terms, and ElevenLabs takes at most {MAX_KEYTERMS}: keep {MAX_KEYTERMS} or fewer",
-            terms.len()
-        ));
-    }
-    if let Some(term) = terms.iter().find(|t| t.chars().count() >= KEYTERM_CHARS_UNDER) {
-        return Some(format!(
-            "the keyterm '{term}' is {} characters, and ElevenLabs takes terms under {KEYTERM_CHARS_UNDER}: shorten it",
-            term.chars().count()
-        ));
-    }
-    if let Some(term) = terms.iter().find(|t| t.chars().any(|c| KEYTERM_FORBIDDEN.contains(&c))) {
-        return Some(format!(
-            "the keyterm '{term}' holds one of the characters `<>{{}}[]\\`, which ElevenLabs does not take: remove it"
-        ));
-    }
-    None
+/// One `additionalFormats` entry, as the port types it: a format's
+/// name, or the format with its layout options.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum ExportItem {
+    Name(String),
+    Options(ExportOptions),
 }
 
-/// The `additional_formats` ElevenLabs reads, from the node's list: a
-/// format's name, or `{ format, ... }` with the layout options under
-/// weft's names. A shape ElevenLabs would refuse is the error, naming
-/// the fix.
-pub fn export_options(items: &[Value]) -> Result<Vec<Value>, String> {
-    if items.len() > MAX_FORMATS {
-        return Err(format!(
-            "`additionalFormats` lists {} formats, and ElevenLabs exports at most {MAX_FORMATS} per request: keep \
-             {MAX_FORMATS} or fewer",
-            items.len()
-        ));
-    }
-    items.iter().map(export_option).collect()
+/// An `additionalFormats` entry with its layout options, under weft's
+/// names.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportOptions {
+    format: String,
+    include_speakers: Option<bool>,
+    include_timestamps: Option<bool>,
+    segment_on_silence_longer_than_s: Option<f64>,
+    max_segment_duration_s: Option<f64>,
+    max_segment_chars: Option<u64>,
+    max_characters_per_line: Option<u64>,
 }
 
-fn export_option(item: &Value) -> Result<Value, String> {
-    let known = |format: &str| -> Result<(), String> {
-        if FORMATS.contains(&format) {
-            Ok(())
-        } else {
-            Err(format!("'{format}' is not a format ElevenLabs exports to; pick one of {}", FORMATS.join(", ")))
+impl ExportItem {
+    /// The entry as ElevenLabs reads it in `additional_formats`, under its
+    /// own names, with only the options that were given.
+    pub fn option(self) -> WeftResult<Value> {
+        let options = match self {
+            ExportItem::Name(format) => return Ok(json!({ "format": format })),
+            ExportItem::Options(options) => options,
+        };
+        if options.max_characters_per_line.is_some() && !LINE_LENGTH_FORMATS.contains(&options.format.as_str()) {
+            weft::input_bail!(
+                "ElevenLabs takes `maxCharactersPerLine` on srt and txt only, and an `additionalFormats` entry is {}: \
+                 leave it out",
+                options.format
+            );
         }
-    };
-    if let Some(format) = item.as_str() {
-        known(format)?;
-        return Ok(json!({ "format": format }));
+        let mut option = json!({ "format": options.format });
+        for (key, value) in [
+            ("include_speakers", options.include_speakers.map(Value::from)),
+            ("include_timestamps", options.include_timestamps.map(Value::from)),
+            ("segment_on_silence_longer_than_s", options.segment_on_silence_longer_than_s.map(Value::from)),
+            ("max_segment_duration_s", options.max_segment_duration_s.map(Value::from)),
+            ("max_segment_chars", options.max_segment_chars.map(Value::from)),
+            ("max_characters_per_line", options.max_characters_per_line.map(Value::from)),
+        ] {
+            if let Some(value) = value {
+                option[key] = value;
+            }
+        }
+        Ok(option)
     }
-    let Some(fields) = item.as_object() else {
-        return Err(format!("an `additionalFormats` entry is a format name or `{{ format, ... }}`, not {item}"));
-    };
-    let format = fields
-        .get("format")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("the `additionalFormats` entry {item} names no `format`"))?;
-    known(format)?;
-    let mut option = Map::new();
-    option.insert("format".into(), json!(format));
-    for (key, value) in fields {
-        let (name, whole) = match key.as_str() {
-            "format" => continue,
-            "includeSpeakers" => ("include_speakers", false),
-            "includeTimestamps" => ("include_timestamps", false),
-            "segmentOnSilenceLongerThanS" => ("segment_on_silence_longer_than_s", false),
-            "maxSegmentDurationS" => ("max_segment_duration_s", false),
-            "maxSegmentChars" => ("max_segment_chars", true),
-            "maxCharactersPerLine" if LINE_LENGTH_FORMATS.contains(&format) => ("max_characters_per_line", true),
-            "maxCharactersPerLine" => {
-                return Err(format!(
-                    "ElevenLabs takes `maxCharactersPerLine` on srt and txt only, and this entry is {format}: \
-                     leave it out"
-                ))
-            }
-            other => {
-                return Err(format!("`{other}` is not a layout option of an `additionalFormats` entry"));
-            }
-        };
-        let value = if whole {
-            // A wire carries `80.0` where a literal held `80`; a count of
-            // characters is a whole number either way.
-            match value.as_f64() {
-                Some(n) if n >= 0.0 && n.fract() == 0.0 => json!(n as u64),
-                _ => return Err(format!("`{key}` in an `additionalFormats` entry is a whole number, not {value}")),
-            }
-        } else {
-            value.clone()
-        };
-        option.insert(name.into(), value);
-    }
-    Ok(Value::Object(option))
 }
 
 /// What a transcript answer carries, read out of ElevenLabs's JSON.
@@ -583,57 +411,24 @@ impl Node for ElevenLabsTranscribeFileNode {
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
-        let audio: Option<FileHandle> = ctx.inputs.opt("audio")?;
-        let source_url = text_input(&ctx, "sourceUrl")?;
-        let settings = Settings::read(&ctx)?;
-        // Everything ElevenLabs would refuse, refused before the recording
-        // is read or anything is sent.
-        let recording = match (audio, source_url) {
-            (Some(file), None) => Recording::File(file),
-            (None, Some(url)) => Recording::Url(url),
-            (Some(_), Some(_)) => {
-                return Err(WeftError::Input(
-                    "both `audio` and `sourceUrl` are given: give the recording one way".into(),
-                ))
-            }
-            (None, None) => {
-                return Err(WeftError::Input("there is nothing to transcribe: give `audio` or a `sourceUrl`".into()))
-            }
+        let settings = Settings::read(&ctx.inputs)?;
+        // One of `audio` and `sourceUrl` arrives: the rules refuse both,
+        // and a run with neither skips this node.
+        let form = match ctx.inputs.opt::<FileHandle>("audio")? {
+            Some(file) => Multipart::form_data().stored("file", ctx.storage(StorageScope::Run).body(&file).await?),
+            None => Multipart::form_data().text("source_url", &ctx.inputs.get::<String>("sourceUrl")?),
         };
-        if let Some(refusal) = settings.refusal() {
-            return Err(WeftError::Input(refusal));
-        }
-
-        let form = match recording {
-            Recording::File(file) => {
-                let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&file).await?;
-                Multipart::form_data().file("file", &meta.filename, &meta.mime_type, bytes)
-            }
-            Recording::Url(url) => Multipart::form_data().text("source_url", &url),
-        };
-        let (content_type, body) = settings.form(form)?.build();
-        let mut url = format!("{API}/speech-to-text");
-        if !settings.enable_logging {
-            url.push_str("?enable_logging=false");
-        }
+        let address = url(API, &["speech-to-text"])?.query_opt("enable_logging", (!settings.enable_logging).then_some("false"));
 
         let http = ctx.client(&account).await?;
         let answer = json_call(
-            http.post(url).header("content-type", content_type).body(body),
+            http.post(address.as_str()).multipart(settings.form(form)),
             "transcribe the recording on ElevenLabs",
         )
         .await?;
         let answer = parse_answer(&answer)?;
         emit(&ctx, answer).await
     }
-}
-
-/// Where the recording to transcribe comes from.
-enum Recording {
-    /// A file in the run's storage, uploaded with the request.
-    File(FileHandle),
-    /// A public link ElevenLabs fetches the recording from itself.
-    Url(String),
 }
 
 /// Emit a parsed answer on the ports: the transcript and the exports as
@@ -684,7 +479,7 @@ async fn emit(ctx: &RunContext, answer: Answer) -> WeftResult<()> {
 
     // Hours of speech are more than a wire carries, so the transcript
     // always travels as a file, like the exports.
-    let file = store_json(ctx, &transcript_document(&answer.transcripts), "transcript.json").await?;
+    let file = storage.put_json(&transcript_document(&answer.transcripts), "transcript.json", None).await?;
     out = out.set("transcript", file);
 
     // Per channel, each channel's language is in its entry of the file.

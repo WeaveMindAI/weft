@@ -14,6 +14,9 @@
 start = TestSseTrigger -> (value: String) {
   url: "__E2E_FAKE_URL__"
   event_name: "go"
+  # Pause at once on the form, rather than after the quiet window a run
+  # first stays on its worker for: the tests act on the run once paused.
+  pauseAfterSecs: 0
 }
 
 review = HumanQuery {

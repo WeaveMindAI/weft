@@ -7,9 +7,10 @@ the failure fails the run. A mistake in the program, like a bad setting, fails
 the run either way. A node that already sent something on a `Bus` or
 `Generator` output fails the run either way.
 
-**Access.** The port type for permission to call a service. One access node
-holds the connection and emits an `Access`; every node that calls that service
-takes one as an input. Nothing secret is in it.
+**Access.** The port type for permission to call a service, written with the
+service it is for: `Access[slack]`. One access node holds the connection and
+emits one; every node that calls that service takes one as an input. Nothing
+secret is in it.
 
 **Access node.** The node that owns the connection for one service. Its body is
 one line; everything it does is declared in its

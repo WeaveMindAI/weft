@@ -81,6 +81,9 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		// keyed by service name. The access node resolves its own app
 		// here and sends it on connect.
 		accessApps: entry.accessApps,
+		// A node checking its callers: the recipe of each scheme its
+		// `auth` can name; its Connect panel follows the one named.
+		callerRecipes: entry.callerRecipes,
 	};
 }
 

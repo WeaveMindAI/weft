@@ -1,6 +1,7 @@
 //! List self-tests: the items come out in written order whatever their
 //! names, a value of any shape goes in whole, a silent optional port is
-//! left out without a gap, and a List with no ports is refused.
+//! left out without a gap. A List with no ports is refused by its
+//! metadata rule, at compile time, which the rig does not run.
 
 use serde_json::json;
 
@@ -13,7 +14,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("items_keep_the_order_they_were_written", written_order),
         NodeTest::fake("a_value_of_any_shape_goes_in_whole", any_shape),
         NodeTest::fake("a_silent_optional_port_is_left_out", silent_optional),
-        NodeTest::fake("no_ports_is_refused", no_ports),
     ]
 }
 
@@ -47,11 +47,5 @@ async fn silent_optional(rig: FakeRig) -> WeftResult<()> {
     declare(&rig, &[("first", "String"), ("middle", "String"), ("last", "String")]);
     let outcome = rig.run(&ListNode, json!({ "first": "a", "last": "c" })).await.ok()?;
     assert_eq!(outcome.outputs["list"], json!(["a", "c"]));
-    Ok(())
-}
-
-async fn no_ports(rig: FakeRig) -> WeftResult<()> {
-    let err = rig.run(&ListNode, json!({})).await.failure()?;
-    assert!(err.contains("declares no input ports"), "{err}");
     Ok(())
 }

@@ -1,25 +1,38 @@
 //! TelegramSendMedia: send a stored file to a chat as a photo,
-//! document, voice note, video, or audio. The bytes go up as
-//! multipart form data.
+//! document, voice note, video, or audio. The bytes stream from
+//! storage as multipart form data.
 
 use async_trait::async_trait;
+use serde::Deserialize;
 
-use weft::access::client::Multipart;
+use weft::access::client::{Multipart, StoredBodyExt};
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::api;
 
-/// The API method + form field per media kind.
-fn method_of(kind: &str) -> Option<(&'static str, &'static str)> {
-    match kind {
-        "photo" => Some(("sendPhoto", "photo")),
-        "document" => Some(("sendDocument", "document")),
-        "voice" => Some(("sendVoice", "voice")),
-        "video" => Some(("sendVideo", "video")),
-        "audio" => Some(("sendAudio", "audio")),
-        _ => None,
+/// The `kind` select: how Telegram shows the file.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MediaKind {
+    Photo,
+    Document,
+    Voice,
+    Video,
+    Audio,
+}
+
+impl MediaKind {
+    /// The API method and its form field.
+    fn method(&self) -> (&'static str, &'static str) {
+        match self {
+            MediaKind::Photo => ("sendPhoto", "photo"),
+            MediaKind::Document => ("sendDocument", "document"),
+            MediaKind::Voice => ("sendVoice", "voice"),
+            MediaKind::Video => ("sendVideo", "video"),
+            MediaKind::Audio => ("sendAudio", "audio"),
+        }
     }
 }
 
@@ -40,30 +53,17 @@ impl Node for TelegramSendMediaNode {
         let access: Access = ctx.inputs.get("account")?;
         let chat_id: String = ctx.inputs.get("chatId")?;
         let file: FileHandle = ctx.inputs.get("file")?;
-        let kind: String = ctx.inputs.get("kind")?;
+        let kind: MediaKind = ctx.inputs.get("kind")?;
         let caption: Option<String> = ctx.inputs.opt("caption")?;
 
-        // The kind is the program's setting: an unknown one is an input
-        // mistake, never a caught failure.
-        let Some((method, field)) = method_of(&kind) else {
-            return Err(weft::WeftError::Input(format!(
-                "unknown media kind '{kind}' (photo, document, voice, video, audio)"
-            )));
-        };
-        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&file).await?;
-
+        let (method, field) = kind.method();
         let mut form = Multipart::form_data().text("chat_id", &chat_id);
         if let Some(c) = &caption {
             form = form.text("caption", c);
         }
-        let (content_type, body) = form
-            .file(field, &meta.filename, &meta.mime_type, bytes)
-            .build();
+        let form = form.stored(field, ctx.storage(StorageScope::Run).body(&file).await?);
 
-        let answer = api::call(&ctx.client(&access).await?, method, |req| {
-            req.header("content-type", content_type).body(body)
-        })
-        .await?;
+        let answer = api::call(&ctx.client(&access).await?, method, |req| req.multipart(form)).await?;
         let message_id = api::result_message_id(&answer, method)?;
         ctx.pulse_downstream(NodeOutput::new().set("messageId", message_id)).await
     }

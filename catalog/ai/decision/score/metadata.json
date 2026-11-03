@@ -76,6 +76,14 @@
         "message": "DecisionScore '{id}' has nothing to decide about: add one input for each piece of what the model should judge, named after it and typed, like `DecisionScore(review: String)`.",
         "level": "structural"
       }
+    },
+    {
+      "when": { "kind": "not", "of": { "kind": "value", "field": "levels", "count": { "min": 2 } } },
+      "then": {
+        "message": "DecisionScore '{id}' has fewer than two `levels`: a scale needs at least two, lowest first.",
+        "level": "structural",
+        "field": "levels"
+      }
     }
   ]
 }

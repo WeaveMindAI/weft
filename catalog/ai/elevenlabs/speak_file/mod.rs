@@ -5,11 +5,11 @@
 use async_trait::async_trait;
 use serde_json::json;
 
-use weft::{Access, RunContext, Node, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::elevenlabs::{audio_file_type, emit_audio_with_id, API};
+use super::elevenlabs::{audio_file_type, emit_audio_with_id};
 use super::flows::set_some;
-use super::speech::{query, shared_settings, voice_settings};
+use super::speech::{shared_settings, speech_url, voice_settings};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsSpeakFileNode;
@@ -34,17 +34,6 @@ impl Node for ElevenLabsSpeakFileNode {
         let next: Option<String> = ctx.inputs.opt("nextText")?;
         let japanese: bool = ctx.inputs.get("languageTextNormalization")?;
 
-        if let Some(refusal) = refusal(
-            &model,
-            ctx.inputs.opt::<String>("languageCode")?.is_some(),
-            previous.is_some(),
-            next.is_some(),
-            !ctx.inputs.list::<String>("previousRequestIds")?.is_empty(),
-            !ctx.inputs.list::<String>("nextRequestIds")?.is_empty(),
-        ) {
-            return Err(WeftError::Input(refusal));
-        }
-
         let mut body = json!({ "text": text, "model_id": model });
         set_some(&mut body, "voice_settings", voice_settings(&ctx)?);
         set_some(&mut body, "previous_text", previous);
@@ -52,51 +41,15 @@ impl Node for ElevenLabsSpeakFileNode {
         if japanese {
             body["apply_language_text_normalization"] = json!(true);
         }
-        shared_settings(&ctx, &mut body, &output_format)?;
+        shared_settings(&ctx, &mut body)?;
 
         let http = ctx.client(&account).await?;
         // The voice id is typed text that becomes a path segment:
         // encoded, it can only ever name a voice.
-        let url = format!("{API}/text-to-speech/{}?{}", urlencoding::encode(&voice), query(&ctx, &output_format)?);
+        let url = speech_url(&ctx, &["text-to-speech", &voice], &output_format)?;
         let (extension, mime) = audio_file_type(&output_format)?;
         let filename = format!("speech.{extension}");
         let what = "turn the text into speech on ElevenLabs";
-        emit_audio_with_id(&ctx, http.post(url).json(&body), what, &filename, mime, ("request-id", "requestId")).await
+        emit_audio_with_id(&ctx, http.post(url.as_str()).json(&body), what, &filename, mime, ("request-id", "requestId")).await
     }
-}
-
-/// The settings ElevenLabs's text to speech route will not take
-/// together, said before anything is paid for (the compiler refuses
-/// the same pairs when they are written; this is the floor for wired
-/// ones), or `None` when the request is fine.
-fn refusal(
-    model: &str,
-    language: bool,
-    previous_text: bool,
-    next_text: bool,
-    previous_ids: bool,
-    next_ids: bool,
-) -> Option<String> {
-    if language && model == "eleven_multilingual_v2" {
-        return Some(
-            "eleven_multilingual_v2 takes no `languageCode`: pick another `model`, or leave `languageCode` empty".into(),
-        );
-    }
-    if model == "eleven_v3" && (previous_ids || next_ids) {
-        return Some(
-            "ElevenLabs does not take `previousRequestIds` or `nextRequestIds` on eleven_v3: pick another \
-             `model`, or leave both empty"
-                .into(),
-        );
-    }
-    // ElevenLabs reads the ids and ignores the text when both are sent.
-    for (text, ids, side) in [(previous_text, previous_ids, "previous"), (next_text, next_ids, "next")] {
-        if text && ids {
-            return Some(format!(
-                "`{side}Text` and `{side}RequestIds` are both set, and ElevenLabs ignores the text when it has \
-                 the ids: keep one of them"
-            ));
-        }
-    }
-    None
 }

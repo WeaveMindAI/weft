@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[elevenlabs]", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "voice_lab"
@@ -64,9 +64,9 @@
   "validate": [
     {
       "when": {
-        "kind": "config_matches",
+        "kind": "value",
         "field": "description",
-        "regex": "(?s)^.{0,19}$"
+        "matches": "(?s)^.{0,19}$"
       },
       "then": {
         "message": "ElevenLabsCreateVoice '{id}' has a `description` under 20 characters, and ElevenLabs takes 20 to 1000: describe the voice in more detail.",
@@ -75,9 +75,9 @@
     },
     {
       "when": {
-        "kind": "config_matches",
+        "kind": "value",
         "field": "description",
-        "regex": "(?s)^.{1001}"
+        "matches": "(?s)^.{1001}"
       },
       "then": {
         "message": "ElevenLabsCreateVoice '{id}' has a `description` over 1000 characters, and ElevenLabs takes 20 to 1000: shorten it.",

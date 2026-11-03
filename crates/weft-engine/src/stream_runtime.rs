@@ -55,6 +55,12 @@ pub struct StreamRuntime {
 }
 
 impl StreamRuntime {
+    /// The run's held waits, which a firing the engine fails while its
+    /// body runs ends ([`crate::held_waits::HeldWaits::fail_firing`]).
+    pub(crate) fn held_waits(&self) -> &Arc<crate::held_waits::HeldWaits> {
+        self.waits.held()
+    }
+
     pub fn new(waits: Arc<WaitTracker>) -> Self {
         Self { waits, feeds: HashMap::new(), gates: HashMap::new() }
     }
@@ -63,16 +69,22 @@ impl StreamRuntime {
     /// firing about to run, returning the bag marker the node's
     /// `ctx.inputs.get::<Generator<T>>` read resolves. `taken_tx` is
     /// the drive loop's task channel; every pull reports its take
-    /// through it so the driver absorbs the pulse (which is also what
-    /// resolves a producer's delivery wait). A second feed for a
-    /// `(firing, port)` that already holds one is an engine dispatch
-    /// bug (the router would keep feeding the orphan while the body
-    /// reads the newcomer): refused loudly.
+    /// through it so the driver takes the pulse off its wire (which is
+    /// also what resolves a producer's delivery wait). `taken`: how many
+    /// items the firing took before, `drained`: those of them a `drain`
+    /// held without handing them yet, and `ended`: the stream's end, when
+    /// it had reached the firing (a resumed one, from its saved state).
+    /// A second feed for a `(firing, port)` that already holds
+    /// one is an engine dispatch bug (the router would keep feeding the
+    /// orphan while the body reads the newcomer): refused loudly.
     pub fn create_feed(
         &mut self,
         loc: &FiringLocation,
         port: &str,
         taken_tx: mpsc::UnboundedSender<TaskMsg>,
+        taken: u64,
+        drained: Vec<serde_json::Value>,
+        ended: Option<StreamEnd>,
     ) -> Result<serde_json::Value, String> {
         let ports = self.feeds.entry(loc.clone()).or_default();
         if ports.contains_key(port) {
@@ -90,7 +102,7 @@ impl StreamRuntime {
             let _ = taken_tx.send(TaskMsg::StreamItemTaken { loc: node.clone(), pulse_id });
         });
         let liveness = Arc::downgrade(&self.waits) as Weak<dyn WaitLiveness>;
-        let feed = GeneratorFeed::new(port, liveness, Some(loc.clone()), on_taken);
+        let feed = GeneratorFeed::new(port, liveness, Some(loc.clone()), on_taken, taken, drained, ended);
         let marker_id = register_feed(&feed);
         ports.insert(port.to_string(), ConsumerFeed { marker_id, feed });
         Ok(generator_marker(marker_id))
@@ -100,6 +112,28 @@ impl StreamRuntime {
     /// running with one.
     pub fn feed_for(&self, loc: &FiringLocation, port: &str) -> Option<&Arc<GeneratorFeed>> {
         self.feeds.get(loc)?.get(port).map(|f| &f.feed)
+    }
+
+    /// The feeds of the firing at `loc`, for its handle (what each took
+    /// goes with its saved state).
+    pub fn feeds_of(&self, loc: &FiringLocation) -> Vec<Arc<GeneratorFeed>> {
+        self.feeds.get(loc).map_or_else(Vec::new, |ports| ports.values().map(|f| f.feed.clone()).collect())
+    }
+
+    /// The firing paused: its feeds go (its resumed body gets fresh ones,
+    /// starting past what it took), returning the pulse ids of the items
+    /// routed into them and not taken, which the CALLER puts back on
+    /// their wires, pending, for those fresh feeds. Nothing is consumed,
+    /// and no producer waiting on one is failed: the item is still to be
+    /// taken.
+    #[must_use = "the returned untaken pulse ids must go back on their wires"]
+    pub fn set_aside(&mut self, loc: &FiringLocation) -> Vec<Uuid> {
+        let mut untaken = Vec::new();
+        for cf in self.feeds.remove(loc).unwrap_or_default().into_values() {
+            untaken.extend(cf.feed.set_aside());
+            unregister_feed(cf.marker_id);
+        }
+        untaken
     }
 
     /// The firing ended (any outcome): tear its feeds down, returning

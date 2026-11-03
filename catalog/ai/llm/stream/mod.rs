@@ -50,13 +50,9 @@ impl Node for LlmStreamNode {
             .complete_streaming(&llm.generator, Some(&llm.params))
             .await
             .map_err(|e| llm.call_error(e))?;
-        let cancelled = ctx.cancellation();
-        loop {
-            let chunk = tokio::select! {
-                chunk = stream.next_chunk() => chunk,
-                err = cancelled.cancelled_err() => return Err(err),
-            };
-            let Some(chunk) = chunk else { break };
+        // The call rides the ctx's client, whose body read ends the moment
+        // the run is cancelled, so a Stop lands mid-generation.
+        while let Some(chunk) = stream.next_chunk().await {
             let chunk = chunk.map_err(|e| llm.call_error(e))?;
             let bus = bus.open().await?;
             if !chunk.delta.is_empty() {

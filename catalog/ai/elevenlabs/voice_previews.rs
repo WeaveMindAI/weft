@@ -1,31 +1,18 @@
 //! What both voice preview nodes share (Design Voice, which designs a
 //! voice from a description, and Remix Voice, which remixes one the
-//! account has): the line the previews speak, the request fields both
-//! routes take, and the ending that stores each preview and hands them
-//! on for Create Voice.
+//! account has): the request fields both routes take, and the ending
+//! that stores each preview and hands them on for Create Voice.
 
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use weft::access::client::post_json;
+use weft::access::client::{post_json, url};
 use weft::node::NodeOutput;
 use weft::storage::{StorageScope};
 use weft::{Access, RunContext, NodeErrExt, WeftResult};
 
 use super::elevenlabs::{audio_file_type, API};
 use super::flows::set_some;
-
-/// What ElevenLabs refuses in the line voice previews speak, or `None`:
-/// both preview routes (design and remix) speak a line of 100 to 1000
-/// characters.
-pub fn line_refusal(text: Option<&str>) -> Option<String> {
-    let spoken = text.map(|t| t.chars().count()).filter(|n| !(100..=1000).contains(n))?;
-    Some(format!(
-        "`text` is {spoken} characters, and ElevenLabs speaks a line of 100 to 1000: {}, or leave `text` empty and \
-         ElevenLabs writes one",
-        if spoken < 100 { "write a longer line" } else { "shorten it" }
-    ))
-}
 
 /// The request fields both voice preview routes (design and remix)
 /// take, read from the inputs of the same names on either node: the
@@ -47,23 +34,23 @@ pub fn preview_request(ctx: &RunContext, description: &str, text: Option<&str>) 
     Ok(body)
 }
 
-/// Ask the voice preview route `route` under `/text-to-voice/` (`design`,
-/// or `{voice_id}/remix`) for previews with `body`, store each one's
-/// audio as `output_format`, and hand on `previews` and the `text` they
-/// speak. A format with no file type is refused before anything is
-/// sent.
+/// Ask the voice preview route under `/text-to-voice/` whose path
+/// segments are `route` (`["design"]`, or `[voice_id, "remix"]`) for
+/// previews with `body`, store each one's audio as `output_format`, and
+/// hand on `previews` and the `text` they speak.
 pub async fn emit_previews(
     ctx: &RunContext,
     account: &Access,
-    route: &str,
+    route: &[&str],
     body: &Value,
     output_format: &str,
     what: &str,
 ) -> WeftResult<()> {
     let (extension, mime) = audio_file_type(output_format)?;
     let http = ctx.client(account).await?;
-    let url = format!("{API}/text-to-voice/{route}?output_format={}", urlencoding::encode(output_format));
-    let answer = post_json(&http, &url, body, what).await?;
+    let segments: Vec<&str> = std::iter::once("text-to-voice").chain(route.iter().copied()).collect();
+    let address = url(API, &segments)?.query("output_format", output_format);
+    let answer = post_json(&http, address.as_str(), body, what).await?;
 
     let storage = ctx.storage(StorageScope::Run);
     let mut previews: Vec<Value> = Vec::new();

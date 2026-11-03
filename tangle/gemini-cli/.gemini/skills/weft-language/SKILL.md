@@ -366,7 +366,7 @@ answer with your own `Reply`.
 To answer some other way when a node failed, gate on it:
 `fallback._should_flow = ask._error`.
 
-A node that could act outside the run is never started again after a crash. If its worker goes away mid-run, a fast run ends cancelled and a durable one fails the node that was running (How a run is kept, below, has both); only a `pure` node that had sent nothing on and read no stream runs again. With `_error` wired, that failure goes there like any other, and the log says `the worker running '<node>' went away while it was running` (or `while it was reading a stream`). A run waiting on a timer or a form, with nothing else of it running, survives its worker dying either way, unless its caller is still on the line with `outlivesCaller` off or a bus between its nodes is open: then its wait holds the worker (up to the trigger's `holdSecs`), and it ends with it.
+A node that could act outside the run is never started again after a crash. If its worker goes away mid-run, a fast run ends cancelled and a durable one fails the node that was running (How a run is kept, below, has both); only a `pure` node that had sent nothing on and read no stream runs again, and, in a durable run, a node that saved its state (`ctx.keep`, the `weft-node-authoring` skill) runs again from its last save. With `_error` wired, that failure goes there like any other, and the log says `the worker running '<node>' went away while it was running` (or `while it was reading a stream`). A run waiting on a timer or a form, with nothing else of it running, survives its worker dying either way, unless a caller is still connected to it: then its wait holds the worker (up to the trigger's `holdSecs`), and it ends with it.
 
 ````weft
 ask = LlmInference { provider: prov.provider, prompt: job.text }
@@ -412,7 +412,7 @@ route's run takes the whole group along, and everything the group needs
 
 ````weft
 live = Route { path: "live/count", method: "GET" }
-work = Group(db: Access) {
+work = Group(db: Access[postgres]) {
   rows = PostgresExecuteQuery { account: self.db, query: "select count(*) from cards" }
   out = Reply { body: rows.rows }
 }
@@ -588,7 +588,7 @@ with instances takes; `weft-members` adds the shape for several people.
 | opaque | `JsonDict`, compatible with any `Dict[String, V]` both ways |
 | any JSON | `Json`: text, a number, a boolean, null, or a list or object of those at any depth, for a value whose shape the program cannot know (what a device answers to an arbitrary command). Every JSON-made type fits into it (`List[List[Number]]`, a record of JSON fields, `JsonDict`); a file, `Bus`, `Generator[..]`, `Access` or `Infra` never does |
 | type variables | `T`, `T2`, unified across a node's ports, pinned by what is wired to the port or by the type the program declares on it (`Cast`'s output is `T2`: `-> (value: Card)` pins it, and so does the port it feeds); one nothing pins is `unresolved-typevar` |
-| live handles | `Bus`, `Generator[T]`, `Access`; never literals |
+| live handles | `Bus`, `Generator[T]`, `Access[service]` (a connection to that service, `Access[slack]`; it fits a bare `Access`, which takes any service, never the other way); never literals |
 
 A record is usable inline in any signature (`p: { wpm: Number, delay: Number
 }`), and a type gets a name either in a node's metadata `types` (e.g.
@@ -919,10 +919,11 @@ pay = Route -> (body: JsonDict) {
 }
 ```
 
-With `durable` off you get a fast run: it waits for its record only where weft has to act on it (a pause, a call to weft that names the run), and if its worker dies the run ends cancelled and is not run again. With it on, everything a run did is on record before a node that could act outside it starts (a pure node does not wait), and an answer to a caller is on record before it leaves. If the worker dies, another worker picks the run up and keeps every finished node; a node that was running is failed rather than run twice, unless it belongs to a `pure` node, read no stream and had sent nothing on: that one simply runs again. If a caller started the run, that caller's connection died with the old worker, so a node that answers it then fails, saying no live caller is attached.
+With `durable` off you get a fast run: it waits for its record only where weft has to act on it (a pause, a call to weft that names the run), and if its worker dies the run ends cancelled and is not run again. With it on, everything a run did is on record before a node that could act outside it starts (a pure node does not wait), and an answer to a caller is on record before it leaves. If the worker dies, another worker picks the run up and keeps every finished node; a node that was running is failed rather than run twice, unless it belongs to a `pure` node, read no stream and had sent nothing on (that one simply runs again), or it saved a state (that one runs again from its last save). If a caller started the run, that caller's connection died with the old worker, so a node that answers it then fails, saying no live caller is attached.
 `durable` or `outlivesCaller` (on any trigger that answers a live caller) with `recorded: false` is the `run-settings` error.
-A run that cannot pause (`recorded: false`, a caller on the line with `outlivesCaller` off, a bus between its nodes open) holds a wait (a timer, a form) in its worker instead of pausing, and the answer carries it on there. Every trigger has `holdSecs` (default 60, `0` to never wait, at most 30 days): when nothing has moved in the run for that long, the waiting node fails saying it gave up, which it may handle itself or send to `_error`. If the run can pause again (its last bus closed), the wait pauses after all.
-A run you start by hand is always recorded. If it fires a trigger (`weft run --fire`), it is kept the way that trigger's `durable` and `keepRunsFor` say, and any other hand-started run is fast. `--durable`, `--fast`, `--keep-for` and `--hold-secs` override that for the one run. For polling routes and answering early, go and read the `weft-api` skill.
+A run that cannot pause (`recorded: false`, or a caller still connected, whatever `outlivesCaller` says; open buses and streams do not stop a pause) holds a wait (a timer, a form) in its worker instead of pausing, and the answer carries it on there. Every trigger has `holdSecs` (default 60, at most 30 days). With a caller on the line, a wait holds for as long as the caller stays; once no caller is connected and nothing has moved in the run for that long, the waiting node fails saying it gave up, which it may handle itself or send to `_error`. `0` refuses every such wait at once, caller or not. If the run can pause again (its caller left), it pauses by the rule below.
+A run that can pause does so in one way: once every node it runs waits (a timer, a form, a message, a bus read) and at least one of those waits needs an answer from outside (if every node waits only on buses or streams, the run is stuck, not paused), it stays on its worker for the trigger's `pauseAfterSecs` (default 10, `0` to pause at once, at most an hour), each wait still open in its node, and an answer in that time goes straight into the waiting call, with no pause and no restart of the body; when the time runs out, every node saves and pauses together. So a run fed by frequent messages is not paused and picked up again for each one. A worker that is stopping pauses it at once.
+A run you start by hand is always recorded. If it fires a trigger (`weft run --fire`), it is kept the way that trigger's `durable` and `keepRunsFor` say, and any other hand-started run is fast. `--durable`, `--fast`, `--keep-for`, `--hold-secs` and `--pause-after-secs` override that for the one run. For polling routes and answering early, go and read the `weft-api` skill.
 
 ## Stopping other runs
 
@@ -1251,7 +1252,7 @@ Inside a loop, `self` is the loop's own boundary, never the group around it.
 A loop nested in a group cannot read the group's `self.db` (that is
 `unknown-source-port`, naming both scopes and the two lines to write); the
 value comes in as a broadcast input of the loop, declared in its signature
-and wired from the group (`run = Loop(db: Access, ...) { ... }` then
+and wired from the group (`run = Loop(db: Access[postgres], ...) { ... }` then
 `run.db = self.db` at the group level).
 
 `parallel` defaults `false`. Five shapes: parallel map (true, over, no

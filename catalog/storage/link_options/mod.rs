@@ -30,15 +30,7 @@ impl Node for LinkOptionsNode {
         // mime: a Blob holding a png stays a Blob, as the output declares.
         let kind = raw.as_object().and_then(FileKind::from_marker_obj).expect("a stored-file value carries its marker");
         let minutes: Option<u64> = ctx.inputs.opt("minutes")?;
-        // A count of minutes too large to be seconds is past the range
-        // anyway, so it saturates into the same refusal.
-        file.link_secs = match minutes {
-            Some(minutes) => Some(
-                weft::storage::checked_link_secs(minutes.saturating_mul(60))
-                    .map_err(|why| weft::node_error(format!("`minutes` is {minutes}: {why}")))?,
-            ),
-            None => None,
-        };
+        file.link_secs = minutes.map(|minutes| minutes * 60);
         let file = WeftType::file_marker(kind, serde_json::to_value(&file).expect("StoredFile serializes"));
         ctx.pulse_downstream(NodeOutput::new().set("file", file)).await
     }

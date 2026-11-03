@@ -443,7 +443,13 @@ impl VerifyKind {
                     RequestValue::BodyField(_) | RequestValue::SignatureKey(_) => Vec::new(),
                 }
             }
-            VerifyKind::ApiKeys { header, .. } => vec![header.clone(), "authorization".to_string()],
+            VerifyKind::ApiKeys { header, bearer } => {
+                let mut headers = vec![header.clone()];
+                if *bearer {
+                    headers.push("authorization".to_string());
+                }
+                headers
+            }
             VerifyKind::Oidc { .. } => vec!["authorization".to_string()],
             VerifyKind::TokenEcho => Vec::new(),
         }
@@ -1698,28 +1704,6 @@ mod tests {
         assert!(spec.named_event(&Value::Null, &[("x-goog-resource-state".into(), "a".into()), ("X-Goog-Resource-State".into(), "b".into())]).is_err());
     }
 
-    /// A route gated by identity tokens reads an audience on every check,
-    /// so its recipe must declare one, and not as optional.
-    #[test]
-    fn an_identity_token_gate_declares_a_required_audience() {
-        let gate = |fields: Value| -> crate::AccessSpec {
-            serde_json::from_value(json!({
-                "service": "jwt",
-                "acquisition": { "kind": "static", "fields": fields },
-                "verify": { "kind": "oidc", "issuers": ["{issuer}"], "jwksUrl": "{jwksUrl}" }
-            }))
-            .unwrap()
-        };
-        gate(json!([{ "name": "issuer" }, { "name": "jwksUrl" }, { "name": "audience" }])).validate().expect("declared");
-        let err = gate(json!([{ "name": "issuer" }, { "name": "jwksUrl" }])).validate().unwrap_err();
-        assert!(err.contains("'audience'"), "{err}");
-        let err = gate(json!([{ "name": "issuer" }, { "name": "jwksUrl" }, { "name": "audience", "optional": true }]))
-            .validate()
-            .unwrap_err();
-        assert!(err.contains("'audience'") && err.contains("optional"), "{err}");
-    }
-
-    /// Signing keys come over TLS only, whatever case the scheme is in.
     #[test]
     fn a_jwks_address_must_be_https() {
         for good in ["https://issuer.example/jwks.json", "HTTPS://issuer.example/jwks.json", "https://localhost:8443/jwks.json"] {

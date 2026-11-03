@@ -21,7 +21,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("answer_as_bytes_answers_a_picture_from_a_json_route", answer_as_bytes),
         NodeTest::fake("a_stored_file_in_a_json_answer_goes_out_as_a_link", file_link),
         NodeTest::fake("a_redirect_sends_the_caller_to_the_files_link", redirect),
-        NodeTest::basic("a_head_carries_status_and_string_headers", head_shape),
         NodeTest::fake("a_secret_reaches_the_caller_revealed_and_the_record_keeps_its_marker", secret_reply),
         NodeTest::fake("a_secret_text_body_goes_out_as_its_text", secret_text),
         NodeTest::fake("a_secret_its_type_does_not_declare_fails_the_reply", undeclared_secret),
@@ -153,8 +152,6 @@ async fn answer_as_bytes(rig: FakeRig) -> WeftResult<()> {
     let headers = json!({ "content-type": "image/x" });
     rig.run(&ReplyNode, json!({ "body": file.clone(), "answerAs": "bytes", "headers": headers })).await.ok()?;
     assert_eq!(set.heads()[0].header("content-type"), Some("image/x"), "the program's header wins");
-    let err = rig.run(&ReplyNode, json!({ "body": file, "answerAs": "xml" })).await.failure()?;
-    assert!(err.contains("answerAs must be json, text, bytes or redirect"), "{err}");
     Ok(())
 }
 
@@ -165,6 +162,9 @@ async fn file_link(rig: FakeRig) -> WeftResult<()> {
     let key = weft::storage::StoredFile::from_value(&file)?.key;
     let away = json!({ "__weft_image__": { "url": "https://example.com/dog.png", "mimeType": "image/png", "filename": "dog.png", "sizeBytes": 9 } });
     let body = json!({ "card": { "photo": file, "caption": "a cat" }, "more": [file], "away": away });
+    // What is a file is the body's declared type's to say, as the
+    // program would carry it.
+    rig.input_type("body", ty("{ card: { photo: Image, caption: String }, more: List[Image], away: Image }"));
     rig.run(&ReplyNode, json!({ "body": body })).await.ok()?;
     let link = json!({
         "url": format!("{}/files/{key}?ttl={}", weft::node_test::FAKE_LINK_BASE, weft::storage::DEFAULT_LINK_SECS),
@@ -216,16 +216,6 @@ async fn redirect(rig: FakeRig) -> WeftResult<()> {
     rig.attach_caller(ws_caller(DataType::Json, LiveRequest::default(), vec![]));
     let err = rig.run(&ReplyNode, json!({ "body": file, "answerAs": "redirect" })).await.failure()?;
     assert!(err.contains("redirect is an HTTP answer"), "{err}");
-    Ok(())
-}
-
-fn head_shape() -> WeftResult<()> {
-    let head = crate::wire::head_for(201, Some(&json!({ "x-run": "r-1" })))?;
-    assert_eq!(head.status, 201);
-    assert_eq!(head.headers, vec![("x-run".to_string(), "r-1".to_string())]);
-    assert!(crate::wire::head_for(200, None)?.headers.is_empty());
-    assert!(crate::wire::head_for(200, Some(&json!(["x"]))).is_err(), "a list is not a header map");
-    assert!(crate::wire::head_for(200, Some(&json!({ "x": 1 }))).is_err(), "a number is not a header value");
     Ok(())
 }
 

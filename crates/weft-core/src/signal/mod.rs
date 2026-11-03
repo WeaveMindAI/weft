@@ -4,7 +4,7 @@
 //! a node." Each kind (timer, form, sse_subscribe, route, socket, ...) is
 //! a plain data struct in this module. Node code constructs one and passes
 //! it directly to `ctx.register_signal(...)` (entry trigger) or
-//! `ctx.await_signal(...)` (mid-run resume). The framework
+//! `state.wait(...)` (a wait mid-run, `crate::context::Kept::wait`). The framework
 //! projects the typed kind onto the internal `SignalSpec` wire
 //! shape via the `Signal` trait.
 //!
@@ -37,13 +37,15 @@ pub use limits::{EntryLimits, Limited, ResolvedLimits};
 
 // Wire-pure like `predicate`: `SignalSpec` carries it.
 pub mod cancel_call;
-pub use cancel_call::{CancelCall, CancelMethod};
+pub use cancel_call::{CancelCall, CancelMethod, SendWhen};
 
 // The dispatcher <-> listener wire, also wire-pure, so the dispatcher
 // speaks it without linking the listener.
 pub mod listener_protocol;
 
-#[cfg(feature = "runtime")]
+// Wire-pure too: a stored signal spec carries its gate, and the spec's
+// upgrade steps (`crate::primitive::SIGNAL_SPEC_V2`) are read wherever
+// the spec is.
 pub mod auth;
 #[cfg(feature = "runtime")]
 pub mod timer;
@@ -77,7 +79,7 @@ pub use sse_subscribe::SseSubscribe;
 #[cfg(feature = "runtime")]
 pub use folder_watch::{FolderChange, FolderEvent, FolderWatch, NamePattern};
 #[cfg(feature = "runtime")]
-pub use poll_endpoint::{CursorParam, DeltaMode, PollDelta, PollEndpoint, PollFormat, PollMethod};
+pub use poll_endpoint::{CursorParam, DeltaMode, PageCursorIn, PollDelta, PollEndpoint, PollFormat, PollMethod, PollPaging};
 #[cfg(feature = "runtime")]
 pub use socket_listen::{SocketFrame, SocketListen};
 #[cfg(feature = "runtime")]
@@ -206,6 +208,53 @@ pub fn to_spec<K: Signal>(kind: K) -> SignalSpec {
     }
 }
 
+/// What a node waits on with `state.wait` (`crate::context::Kept::wait`):
+/// any signal kind, or one that sends its service a cancel if the run is
+/// cancelled while it waits ([`CancelWith::cancel_with`]).
+#[cfg(feature = "runtime")]
+pub trait WaitOn {
+    fn into_spec(self) -> SignalSpec;
+}
+
+#[cfg(feature = "runtime")]
+impl<K: Signal> WaitOn for K {
+    fn into_spec(self) -> SignalSpec {
+        to_spec(self)
+    }
+}
+
+/// A wait on a job running on an outside service that, if the run is
+/// cancelled while it waits, sends the service's own cancel for the job
+/// once, as the connection the signal carries, so the service stops
+/// working and charging ([`cancel_call`]). Never sent when the wait is
+/// answered or the run ends any other way. Made by [`CancelWith::cancel_with`].
+#[cfg(feature = "runtime")]
+pub struct Cancelling<K> {
+    kind: K,
+    on_cancel: CancelCall,
+}
+
+#[cfg(feature = "runtime")]
+impl<K: Signal> WaitOn for Cancelling<K> {
+    fn into_spec(self) -> SignalSpec {
+        let mut spec = to_spec(self.kind);
+        spec.on_cancel = Some(self.on_cancel);
+        spec
+    }
+}
+
+/// `kind.cancel_with(call)`: wait on `kind`, and send `call` if the run
+/// is cancelled meanwhile ([`Cancelling`]).
+#[cfg(feature = "runtime")]
+pub trait CancelWith: Signal {
+    fn cancel_with(self, on_cancel: CancelCall) -> Cancelling<Self> {
+        Cancelling { kind: self, on_cancel }
+    }
+}
+
+#[cfg(feature = "runtime")]
+impl<K: Signal> CancelWith for K {}
+
 /// Inventory entry registering a kind's tag + a JSON-driven validator.
 /// Each `weft-core/src/signal/<name>.rs` file submits one of these.
 /// The framework iterates the registry to validate any `SignalSpec`
@@ -287,7 +336,7 @@ pub fn validate_spec(spec: &SignalSpec) -> Result<(), String> {
     // silent never-fires.
     predicate::validate(&spec.match_predicates)?;
     if let Some(call) = &spec.on_cancel {
-        call.validate()?;
+        call.validate_for_wait()?;
     }
     if entry.requires_access && spec.access.is_none() {
         return Err(format!(

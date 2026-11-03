@@ -1,5 +1,6 @@
 //! HumanQuery self-tests: park on the form, resume on the canned
-//! submission, map to ports.
+//! submission, map to ports, and a body run again after the answer
+//! asking nothing twice.
 
 use serde_json::json;
 
@@ -13,6 +14,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_submission_resumes_and_maps_to_ports", submission_maps),
         NodeTest::fake("a_fields_label_and_placeholder_reach_the_form", label_and_placeholder),
         NodeTest::fake("a_skipped_form_sends_nothing_on", skipped_form),
+        NodeTest::fake("a_resumed_body_takes_the_kept_submission_without_asking_again", resumed),
     ]
 }
 
@@ -116,5 +118,26 @@ async fn submission_maps(rig: FakeRig) -> WeftResult<()> {
         .ok()?;
     assert_eq!(outcome.outputs["decisionRejected"], json!(true));
     assert!(!outcome.outputs.contains_key("decisionApproved"));
+    Ok(())
+}
+
+/// The body runs again from its top after the answer (a pause or a
+/// crash): the submission is in its state, so it maps it again and asks
+/// no second form.
+async fn resumed(rig: FakeRig) -> WeftResult<()> {
+    rig.output_type("decisionApproved", WeftType::parse("Boolean").expect("Boolean parses"));
+    rig.output_type("decisionRejected", WeftType::parse("Boolean").expect("Boolean parses"));
+    rig.signal(json!({ "decision": true }));
+    let inputs = json!({
+        "title": "Ship it?",
+        "fields": [{ "kind": "approve_reject", "key": "decision" }],
+    });
+    rig.run(&HumanQueryNode, inputs.clone()).await.ok()?;
+    assert_eq!(rig.saved_state(&HumanQueryNode), Some(json!({ "submission": { "decision": true } })));
+
+    // No second answer queued: a second form would fail the run.
+    let again = rig.run(&HumanQueryNode, inputs).await.ok()?;
+    assert_eq!(again.outputs["decisionApproved"], json!(true));
+    assert_eq!(rig.awaited_signals().len(), 1, "one form across the two runs");
     Ok(())
 }

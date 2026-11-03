@@ -11,7 +11,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access[exa]", "accepts": ["wire"],
       "required": true,
       "description": "The Exa access (wire an ExaAccess node)."
     },

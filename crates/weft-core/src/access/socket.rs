@@ -191,6 +191,49 @@ impl ProviderSocket {
     pub async fn close(&mut self) -> WeftResult<()> {
         self.inner.close().await
     }
+
+    /// This session, its every send, read and close ending with the
+    /// cancelled error the moment `flag` (its run's) is set.
+    pub(crate) fn ends_with_run(self, flag: std::sync::Arc<crate::cancellation::CancellationFlag>) -> Self {
+        Self::new(Box::new(EndsWithRun { inner: self.inner, flag }))
+    }
+}
+
+/// A transport whose every operation races its run's cancellation
+/// ([`ProviderSocket::ends_with_run`]).
+struct EndsWithRun {
+    inner: Box<dyn SocketTransport>,
+    flag: std::sync::Arc<crate::cancellation::CancellationFlag>,
+}
+
+#[async_trait::async_trait]
+impl SocketTransport for EndsWithRun {
+    async fn send(&mut self, msg: SocketMessage) -> WeftResult<()> {
+        self.flag.race(self.inner.send(msg)).await?
+    }
+
+    async fn recv(&mut self) -> WeftResult<Option<SocketMessage>> {
+        self.flag.race(self.inner.recv()).await?
+    }
+
+    async fn close(&mut self) -> WeftResult<()> {
+        self.flag.race(self.inner.close()).await?
+    }
+}
+
+/// A dialer whose sessions end with their run
+/// ([`ProviderSocket::ends_with_run`]), and whose dial does too.
+pub(crate) struct EndsWithRunDial {
+    pub(crate) inner: std::sync::Arc<dyn SocketDial>,
+    pub(crate) flag: std::sync::Arc<crate::cancellation::CancellationFlag>,
+}
+
+#[async_trait::async_trait]
+impl SocketDial for EndsWithRunDial {
+    async fn dial(&self, url: &str) -> WeftResult<ProviderSocket> {
+        let socket = self.flag.race(self.inner.dial(url)).await??;
+        Ok(socket.ends_with_run(self.flag.clone()))
+    }
 }
 
 /// The runtime's dialer, injected into an [`super::OpenedConnection`] at
@@ -213,6 +256,34 @@ mod tests {
         let err = SocketMessage::binary(vec![0, 1, 2]).into_text().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("3-byte binary frame"), "{msg}");
+    }
+
+    /// A session whose provider never speaks: every read waits.
+    struct Silent;
+    #[async_trait::async_trait]
+    impl SocketTransport for Silent {
+        async fn send(&mut self, _: SocketMessage) -> WeftResult<()> {
+            Ok(())
+        }
+        async fn recv(&mut self) -> WeftResult<Option<SocketMessage>> {
+            std::future::pending().await
+        }
+        async fn close(&mut self) -> WeftResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A read of a session its run handed out ends with the cancelled
+    /// error once the run is cancelled, and so does every call after.
+    #[tokio::test]
+    async fn a_cancelled_run_ends_a_socket_read() {
+        let flag = crate::cancellation::CancellationFlag::new_arc();
+        let mut socket = ProviderSocket::new(Box::new(Silent)).ends_with_run(flag.clone());
+        socket.send(SocketMessage::text("hi")).await.unwrap();
+        let reading = tokio::spawn(async move { socket.recv().await.map(|_| ()) });
+        flag.cancel_because(crate::run::CancelCause::User);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), reading).await.expect("the read ended").unwrap();
+        assert!(matches!(ended, Err(crate::error::WeftError::Cancelled)), "{ended:?}");
     }
 
     /// A node's string or buffer becomes a frame without being copied,

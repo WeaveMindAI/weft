@@ -8,7 +8,7 @@
 //! polls start failing, fail long enough to say so loudly, or work again.
 //!
 //! As an entry trigger every fire starts a fresh run. As a parked
-//! run's wait (`await_signal`, a node waiting for an outside job to
+//! run's wait (`state.wait`, a node waiting for an outside job to
 //! finish) the first poll runs at once, so a job already done resumes
 //! the run without waiting an interval, and the first answer that passes
 //! the signal's filter resumes it; after that the signal polls no more.
@@ -17,6 +17,13 @@
 //! of its state parses (`KindHandler::last_answer`).
 //! Delta mode is refused there: its first poll primes silently, which
 //! would swallow the very answer the run waits for.
+//!
+//! A delta feed that answers in pages, newest first, declares how to ask
+//! for the next one (`PollDelta::paging`): each poll follows the pages
+//! until one holds an item already seen, and fires every new item it
+//! read. Past `MAX_PAGES` pages of new items it fails the poll, naming the
+//! trigger, and fires nothing: a burst is caught up whole or not at all,
+//! never cut to its newest pages.
 
 
 use anyhow::Result;
@@ -336,17 +343,18 @@ async fn poll_once(
         return Ok(Some(Woke { state: kind_state, seq: Some(seq) }));
     }
     let state = before.delta.clone();
+    let token = ctx.fire.token();
     let failed = |what: &str, detail: String| {
         let streak = before.consecutive_failures + 1;
         if streak >= POLL_FAILURE_ESCALATION {
             tracing::error!(
                 target: "weft_listener::poll_endpoint",
-                %url, consecutive_failures = streak, error = %detail,
+                %token, %url, consecutive_failures = streak, error = %detail,
                 "{what}; this trigger has not produced a successful poll in {streak} attempts, \
                  check its endpoint and recipe",
             );
         } else {
-            warn!(target: "weft_listener::poll_endpoint", %url, error = %detail, "{what}; will retry next poll");
+            warn!(target: "weft_listener::poll_endpoint", %token, %url, error = %detail, "{what}; will retry next poll");
         }
         PollState {
             delta: before.delta.clone(),
@@ -376,33 +384,9 @@ async fn poll_once(
             // "discard everything".
             Err(e) => break 'poll failed("cursor unusable", format!("{e:#}")),
         };
-        // The verb and body are part of the registered recipe: a POST
-        // feed (a query endpoint) sends its declared body every poll, a
-        // GET feed sends the bare URL.
-        let request = match poll.method {
-            weft_core::signal::PollMethod::Get => client.get(&poll_url),
-            weft_core::signal::PollMethod::Post => {
-                let req = client.post(&poll_url);
-                match &poll.body {
-                    Some(b) => req.json(b),
-                    None => req,
-                }
-            }
-        };
-        let resp = match request.send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                let status = r.status();
-                if access.is_some() && crate::listener_access::is_refusal(r).await {
-                    crate::listener_access::refused(ctx);
-                }
-                break 'poll failed("non-success poll", status.to_string());
-            }
-            Err(e) => break 'poll failed("poll request failed", e.to_string()),
-        };
-        let body = match resp.text().await {
-            Ok(b) => b,
-            Err(e) => break 'poll failed("poll body read failed", e.to_string()),
+        let body = match fetch(&client, poll, &poll_url, None, access, ctx).await {
+            Ok(body) => body,
+            Err((what, detail)) => break 'poll failed(what, detail),
         };
         let Some(delta) = &poll.delta else {
             // Plain mode: every poll fires the whole response. It has no
@@ -433,7 +417,51 @@ async fn poll_once(
                 Err(e) => break 'poll failed("delta poll needs an RSS/Atom feed", e),
             },
         };
-        let (fires, idle_state) = match delta_advance(delta, &parsed, state.as_ref()) {
+        let mut items = match page_items(delta, &parsed) {
+            Ok(items) => items.clone(),
+            Err(e) => break 'poll failed("delta poll skipped", e.to_string()),
+        };
+        // A paged feed: the next pages, while the last one read holds only
+        // new items. The priming poll reads the first page alone: it pins
+        // the newest items, and activation means "from now on".
+        if let (Some(paging), Some(seen)) = (&delta.paging, state.as_ref()) {
+            let mut page = parsed;
+            let mut last = items.clone();
+            let mut pages = 1;
+            loop {
+                match reaches_seen(delta, &last, seen) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(e) => break 'poll failed("delta poll skipped", e.to_string()),
+                }
+                let Some(cursor) = next_cursor(&page, &paging.next) else { break };
+                if pages == weft_core::access::client::MAX_PAGES {
+                    break 'poll failed(
+                        "paged poll ran past its page limit",
+                        format!(
+                            "more than {} pages of new items since the last poll, and none fired: poll more \
+                             often (`interval_secs`) or ask for bigger pages, so a poll catches up within the limit",
+                            weft_core::access::client::MAX_PAGES
+                        ),
+                    );
+                }
+                let body = match fetch(&client, poll, &poll_url, Some((&paging.sent_in, cursor.as_str())), access, ctx).await {
+                    Ok(body) => body,
+                    Err((what, detail)) => break 'poll failed(what, detail),
+                };
+                page = match serde_json::from_str(&body) {
+                    Ok(v) => v,
+                    Err(e) => break 'poll failed("delta poll needs a JSON response", e.to_string()),
+                };
+                last = match page_items(delta, &page) {
+                    Ok(items) => items.clone(),
+                    Err(e) => break 'poll failed("delta poll skipped", e.to_string()),
+                };
+                items.extend(last.iter().cloned());
+                pages += 1;
+            }
+        }
+        let (fires, idle_state) = match delta_advance(delta, &items, state.as_ref()) {
             Ok(x) => x,
             Err(e) => break 'poll failed("delta poll skipped", e.to_string()),
         };
@@ -474,6 +502,114 @@ async fn poll_once(
         false => Some(seq),
     };
     Ok(Some(Woke { state: next.to_value(), seq }))
+}
+
+/// One answer of the feed, as the registered recipe asks for it: a POST
+/// feed (a query endpoint) sends its declared body, a GET feed the bare
+/// URL. `page` is a paged feed's next page: its cursor, carried where the
+/// feed takes it. A refused, failed or unreadable answer is the failure
+/// to count, as what failed and why.
+async fn fetch(
+    client: &weft_core::reqwest_middleware::ClientWithMiddleware,
+    poll: &PollEndpoint,
+    poll_url: &str,
+    page: Option<(&weft_core::signal::PageCursorIn, &str)>,
+    access: &Option<weft_core::primitive::AccessRef>,
+    ctx: &SpawnCtx,
+) -> Result<String, (&'static str, String)> {
+    let body = match (&poll.body, page) {
+        (body, Some((weft_core::signal::PageCursorIn::Body(field), cursor))) => {
+            let mut body = match body {
+                Some(Value::Object(fields)) => fields.clone(),
+                // Validation refuses a body that is not an object beside a
+                // body cursor; a row past that check fails the poll.
+                Some(other) => return Err(("paged poll cannot carry its cursor", format!("the body is not a JSON object: {other}"))),
+                None => serde_json::Map::new(),
+            };
+            body.insert(field.clone(), Value::String(cursor.to_string()));
+            Some(Value::Object(body))
+        }
+        (body, _) => body.clone(),
+    };
+    let mut request = match poll.method {
+        weft_core::signal::PollMethod::Get => client.get(poll_url),
+        weft_core::signal::PollMethod::Post => {
+            let req = client.post(poll_url);
+            match &body {
+                Some(b) => req.json(b),
+                None => req,
+            }
+        }
+    };
+    if let Some((weft_core::signal::PageCursorIn::Query(name), cursor)) = page {
+        request = request.query(&[(name.as_str(), cursor)]);
+    }
+    let resp = match request.send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            let status = r.status();
+            if access.is_some() && crate::listener_access::is_refusal(r).await {
+                crate::listener_access::refused(ctx);
+            }
+            return Err(("non-success poll", status.to_string()));
+        }
+        Err(e) => return Err(("poll request failed", e.to_string())),
+    };
+    resp.text().await.map_err(|e| ("poll body read failed", e.to_string()))
+}
+
+/// The next page's cursor in a paged feed's answer, at `path`: absent,
+/// not a string, or empty means the answer was the last page.
+fn next_cursor(answer: &Value, path: &str) -> Option<String> {
+    weft_core::access::spec::lookup_path(answer, path)
+        .and_then(Value::as_str)
+        .filter(|cursor| !cursor.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether a page of a paged feed holds an item the stored delta state
+/// `seen` already knows: one whose cursor field is at or below the
+/// stored high-water mark (mode `max`), or whose id is remembered (mode
+/// `set`). Paging stops there. An item without the field is the same
+/// recipe error `delta_advance` names.
+fn reaches_seen(delta: &weft_core::signal::PollDelta, page: &[Value], seen: &Value) -> anyhow::Result<bool> {
+    let Some(field) = &delta.cursor_field else {
+        anyhow::bail!("a paged delta needs a cursor_field to tell an item already seen");
+    };
+    let key = |item: &Value| {
+        weft_core::access::spec::lookup_path(item, field)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("an item carries nothing at cursor_field '{field}'"))
+    };
+    match delta.mode {
+        weft_core::signal::DeltaMode::Max => {
+            let Some(stored) = seen.get("cursor") else { return Ok(true) };
+            for item in page {
+                if cursor_cmp(&key(item)?, stored) != std::cmp::Ordering::Greater {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        weft_core::signal::DeltaMode::Set => {
+            let remembered: Vec<String> = seen.get("seen").and_then(Value::as_array).into_iter().flatten().map(id_of).collect();
+            for item in page {
+                if remembered.contains(&id_of(&key(item)?)) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// An item's id as the set mode remembers it: a string as itself, any
+/// other value as its JSON.
+fn id_of(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// The broker knows the signal no more (it went, or no longer listens):
@@ -561,7 +697,20 @@ fn poll_url(
 /// ascending cursor order, and the state to store for the next poll.
 type DeltaAdvance = (Vec<(Value, Value)>, Option<Value>);
 
-/// The pure delta step. Returns the NEW items past `state` as
+/// The item array of one answer of a delta feed, at `delta.items` (the
+/// answer itself when empty).
+fn page_items<'a>(delta: &weft_core::signal::PollDelta, response: &'a Value) -> anyhow::Result<&'a Vec<Value>> {
+    let items = if delta.items.is_empty() {
+        response
+    } else {
+        weft_core::access::spec::lookup_path(response, &delta.items)
+            .ok_or_else(|| anyhow::anyhow!("the response carries nothing at '{}'", delta.items))?
+    };
+    items.as_array().ok_or_else(|| anyhow::anyhow!("'{}' is not an array in the response", delta.items))
+}
+
+/// The pure delta step over the items one poll read (every page of a
+/// paged feed, in the order read). Returns the NEW items past `state` as
 /// `(payload, state_after)` pairs, each `state_after` being the durable
 /// state that acknowledges exactly that item and everything before it
 /// (so the caller can persist a PREFIX when a fire fails mid-batch),
@@ -591,19 +740,9 @@ type DeltaAdvance = (Vec<(Value, Value)>, Option<Value>);
 /// loudly rather than silently dropping items).
 fn delta_advance(
     delta: &weft_core::signal::PollDelta,
-    response: &Value,
+    items: &[Value],
     state: Option<&Value>,
 ) -> anyhow::Result<DeltaAdvance> {
-    let items = if delta.items.is_empty() {
-        response
-    } else {
-        weft_core::access::spec::lookup_path(response, &delta.items)
-            .ok_or_else(|| anyhow::anyhow!("the response carries nothing at '{}'", delta.items))?
-    };
-    let items = items
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("'{}' is not an array in the response", delta.items))?;
-
     match &delta.cursor_field {
         None => {
             let seen = state.and_then(|s| s.get("count")).and_then(Value::as_u64);
@@ -707,10 +846,6 @@ fn set_advance(
     keyed: Vec<(Value, Value)>,
     state: Option<&Value>,
 ) -> (Vec<(Value, Value)>, Value) {
-    let id_of = |v: &Value| match v {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    };
     let stored: Option<Vec<String>> = state.and_then(|s| s.get("seen")).map(|seen| {
         seen.as_array()
             .into_iter()
@@ -797,12 +932,18 @@ mod tests {
     use serde_json::json;
     use weft_core::signal::PollDelta;
 
+    /// The delta step over one answer of the feed.
+    fn advance(d: &PollDelta, response: &Value, state: Option<&Value>) -> anyhow::Result<DeltaAdvance> {
+        delta_advance(d, page_items(d, response)?, state)
+    }
+
     fn positional() -> PollDelta {
         PollDelta {
             items: "values".into(),
             cursor_field: None,
             mode: Default::default(),
             cursor_param: None,
+            paging: None,
         }
     }
 
@@ -812,6 +953,7 @@ mod tests {
             cursor_field: Some(f.into()),
             mode: Default::default(),
             cursor_param: None,
+            paging: None,
         }
     }
 
@@ -821,6 +963,7 @@ mod tests {
             cursor_field: Some(f.into()),
             mode: weft_core::signal::DeltaMode::Set,
             cursor_param: None,
+            paging: None,
         }
     }
 
@@ -831,12 +974,12 @@ mod tests {
     #[test]
     fn positional_delta_fires_the_tail_only() {
         let d = positional();
-        let (fires, s1) = delta_advance(&d, &json!({ "values": [1, 2] }), None).unwrap();
+        let (fires, s1) = advance(&d, &json!({ "values": [1, 2] }), None).unwrap();
         assert!(fires.is_empty());
         let s1 = s1.unwrap();
         assert_eq!(s1, json!({ "count": 2 }));
 
-        let (fires, s2) = delta_advance(&d, &json!({ "values": [1, 2, 3, 4] }), Some(&s1)).unwrap();
+        let (fires, s2) = advance(&d, &json!({ "values": [1, 2, 3, 4] }), Some(&s1)).unwrap();
         assert_eq!(
             fires,
             vec![
@@ -847,7 +990,7 @@ mod tests {
         let s2 = s2.unwrap();
         assert_eq!(s2, json!({ "count": 4 }), "idle state = whole page acknowledged");
 
-        let (fires, s3) = delta_advance(&d, &json!({ "values": [1] }), Some(&s2)).unwrap();
+        let (fires, s3) = advance(&d, &json!({ "values": [1] }), Some(&s2)).unwrap();
         assert!(fires.is_empty());
         assert_eq!(s3.unwrap(), json!({ "count": 1 }));
     }
@@ -859,7 +1002,7 @@ mod tests {
     fn field_delta_fires_above_the_cursor() {
         let d = by_field("id");
         let two = json!({ "items": [ { "id": "9" }, { "id": "10" } ] });
-        let (fires, s1) = delta_advance(&d, &two, None).unwrap();
+        let (fires, s1) = advance(&d, &two, None).unwrap();
         assert!(fires.is_empty());
         let s1 = s1.unwrap();
         assert_eq!(s1, json!({ "cursor": "10" }));
@@ -867,12 +1010,12 @@ mod tests {
         // A priming poll over an EMPTY page persists NOTHING: there is
         // no cursor to pin, and staying unprimed means the next
         // non-empty page primes for real.
-        let (fires, empty_prime) = delta_advance(&d, &json!({ "items": [] }), None).unwrap();
+        let (fires, empty_prime) = advance(&d, &json!({ "items": [] }), None).unwrap();
         assert!(fires.is_empty());
         assert_eq!(empty_prime, None, "empty priming page stays unprimed");
 
         let three = json!({ "items": [ { "id": "10" }, { "id": "11" }, { "id": "9" } ] });
-        let (fires, s2) = delta_advance(&d, &three, Some(&s1)).unwrap();
+        let (fires, s2) = advance(&d, &three, Some(&s1)).unwrap();
         assert_eq!(
             fires,
             vec![(json!({ "item": { "id": "11" } }), json!({ "cursor": "11" }))]
@@ -885,12 +1028,12 @@ mod tests {
         let s2 = fires_final_state(&d, &three, &s1);
 
         // An empty poll keeps the cursor.
-        let (fires, s3) = delta_advance(&d, &json!({ "items": [] }), Some(&s2)).unwrap();
+        let (fires, s3) = advance(&d, &json!({ "items": [] }), Some(&s2)).unwrap();
         assert!(fires.is_empty());
         let s3 = s3.unwrap();
         assert_eq!(s3, json!({ "cursor": "11" }));
 
-        let err = delta_advance(&d, &json!({ "items": [ { "other": 1 } ] }), Some(&s3))
+        let err = advance(&d, &json!({ "items": [ { "other": 1 } ] }), Some(&s3))
             .unwrap_err()
             .to_string();
         assert!(err.contains("cursor_field"), "{err}");
@@ -899,7 +1042,7 @@ mod tests {
     /// The state after firing every item of a page (what the loop
     /// persists when the whole batch enqueues).
     fn fires_final_state(d: &PollDelta, page: &serde_json::Value, state: &serde_json::Value) -> serde_json::Value {
-        let (fires, idle) = delta_advance(d, page, Some(state)).unwrap();
+        let (fires, idle) = advance(d, page, Some(state)).unwrap();
         fires.into_iter().last().map(|(_, s)| s).or(idle).expect("a primed poll persists")
     }
 
@@ -911,7 +1054,7 @@ mod tests {
         let d = by_field("id");
         let stored = json!({ "cursor": 5 });
         let page = json!({ "items": [ { "id": 8 }, { "id": 6 }, { "id": 7 } ] });
-        let (fires, _) = delta_advance(&d, &page, Some(&stored)).unwrap();
+        let (fires, _) = advance(&d, &page, Some(&stored)).unwrap();
         let states: Vec<_> = fires.iter().map(|(_, s)| s.clone()).collect();
         assert_eq!(
             states,
@@ -926,7 +1069,7 @@ mod tests {
     fn set_delta_fires_unseen_ids_only() {
         let d = by_set("id");
         let first = json!({ "items": [ { "id": "b" }, { "id": "a" } ] });
-        let (fires, s1) = delta_advance(&d, &first, None).unwrap();
+        let (fires, s1) = advance(&d, &first, None).unwrap();
         assert!(fires.is_empty());
         let s1 = s1.unwrap();
         assert_eq!(s1, json!({ "seen": ["b", "a"] }));
@@ -934,7 +1077,7 @@ mod tests {
         // A NEW id lands at the top (newest-first feed); the old ones
         // are still on the page and must not re-fire.
         let second = json!({ "items": [ { "id": "c" }, { "id": "b" }, { "id": "a" } ] });
-        let (fires, idle) = delta_advance(&d, &second, Some(&s1)).unwrap();
+        let (fires, idle) = advance(&d, &second, Some(&s1)).unwrap();
         assert_eq!(fires.len(), 1);
         assert_eq!(fires[0].0, json!({ "item": { "id": "c" } }));
         assert_eq!(fires[0].1, json!({ "seen": ["c", "b", "a"] }));
@@ -945,7 +1088,7 @@ mod tests {
         // re-fire if it reappears within the memory window. And a
         // page that merely reordered writes NOTHING (idle == stored).
         let third = json!({ "items": [ { "id": "a" }, { "id": "c" } ] });
-        let (fires, idle) = delta_advance(&d, &third, Some(&s2)).unwrap();
+        let (fires, idle) = advance(&d, &third, Some(&s2)).unwrap();
         assert!(fires.is_empty());
         assert_eq!(idle.unwrap(), s2, "pure reordering never churns a durable write");
     }
@@ -959,7 +1102,7 @@ mod tests {
         let d = by_set("id");
         let stored = json!({ "seen": ["old1", "pinned", "old2"] });
         let page = json!({ "items": [ { "id": "pinned" }, { "id": "new" } ] });
-        let (fires, _) = delta_advance(&d, &page, Some(&stored)).unwrap();
+        let (fires, _) = advance(&d, &page, Some(&stored)).unwrap();
         assert_eq!(fires.len(), 1);
         assert_eq!(fires[0].0, json!({ "item": { "id": "new" } }));
         // Visible ids lead; off-page ids trail in their stored order.
@@ -1023,10 +1166,37 @@ mod tests {
     }
 
 
+    /// A paged answer's next cursor is a non-empty string at its path;
+    /// anything else is the last page.
+    #[test]
+    fn the_next_cursor_ends_on_anything_but_a_string() {
+        assert_eq!(next_cursor(&json!({ "meta": { "next": "abc" } }), "meta.next").as_deref(), Some("abc"));
+        for last in [json!({}), json!({ "meta": { "next": "" } }), json!({ "meta": { "next": null } }), json!({ "meta": { "next": 3 } })] {
+            assert_eq!(next_cursor(&last, "meta.next"), None, "{last}");
+        }
+    }
+
+    /// Paging stops at a page holding an item at or below the stored mark
+    /// (max) or one remembered (set); a page of only new items reads on,
+    /// and an item without the cursor field is the recipe's error.
+    #[test]
+    fn paging_stops_at_a_page_holding_a_seen_item() {
+        let max = by_field("id");
+        let mark = json!({ "cursor": 10 });
+        assert!(!reaches_seen(&max, &[json!({ "id": 12 }), json!({ "id": 11 })], &mark).unwrap());
+        assert!(reaches_seen(&max, &[json!({ "id": 11 }), json!({ "id": 10 })], &mark).unwrap());
+        assert!(reaches_seen(&max, &[json!({ "id": 9 })], &mark).unwrap());
+        let set = by_set("id");
+        let seen = json!({ "seen": ["a", "b"] });
+        assert!(!reaches_seen(&set, &[json!({ "id": "d" }), json!({ "id": "c" })], &seen).unwrap());
+        assert!(reaches_seen(&set, &[json!({ "id": "c" }), json!({ "id": "b" })], &seen).unwrap());
+        assert!(reaches_seen(&set, &[json!({ "other": 1 })], &seen).unwrap_err().to_string().contains("cursor_field"));
+    }
+
     /// The items path itself failing is loud, not a silent no-fire.
     #[test]
     fn missing_items_path_is_an_error() {
-        let err = delta_advance(&positional(), &json!({ "rows": [] }), None)
+        let err = advance(&positional(), &json!({ "rows": [] }), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("values"), "{err}");

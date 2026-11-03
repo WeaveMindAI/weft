@@ -66,8 +66,9 @@ to the dispatcher at `http://127.0.0.1:14111` (setting `weft.dispatcherUrl`).
   prints.
 - **Debug nodes** render their latest value inline; media nodes render the
   image, an audio/video player, or a download card.
-- **Status glows**: amber running, cyan waiting for input, green completed
-  or skipped, red failed.
+- **Status glows**: amber running, cyan waiting for input, grey paused
+  (no wait of its own: its run paused with it inside, and it carries on
+  when the run does), green completed or skipped, red failed.
 
 ## Toolbar and action bar
 

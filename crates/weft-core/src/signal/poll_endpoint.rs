@@ -9,17 +9,17 @@
 //! Two ways to use it:
 //!   - `ctx.register_signal(PollEndpoint { .. })`: an entry trigger, each
 //!     fire starts a fresh run.
-//!   - `ctx.await_signal(PollEndpoint { .. })`: a node that started an
+//!   - `state.wait(field, PollEndpoint { .. })`: a node that started an
 //!     outside job waits for it without holding a worker. The first poll
 //!     runs at once (a job already done resumes straight away), and the
 //!     first response that passes `filters` resumes the run, as the value
-//!     `await_signal` returns; then the polling stops. With no filters the
+//!     the wait returns; then the polling stops. With no filters the
 //!     first successful response resumes it. A non-2xx answer or a failed
 //!     request is not an answer: it is retried at the next poll and shown
 //!     on the node. `delta` is refused here, since its first poll primes
 //!     silently and would swallow the answer. While it waits, the raw
 //!     last answer it read shows on the waiting node, and
-//!     `ctx.await_signal_with_cancel` names the job's own cancel address,
+//!     `PollEndpoint { .. }.cancel_with(call)` names the job's own cancel address,
 //!     called once if the run is cancelled meanwhile
 //!     ([`super::cancel_call`]).
 //!
@@ -91,7 +91,7 @@ pub struct PollEndpoint {
     /// The pre-fire filter, over the fire payload (a delta fire is
     /// `{ item }`, positional mode also carrying `index`, so item
     /// fields address as `item.<path>`; a plain fire is the response
-    /// itself). For `await_signal` this is what says the job is done.
+    /// itself). For a wait this is what says the job is done.
     /// Lifted onto the spec like `access`; the shared fire plumbing
     /// evaluates it, so a filtered-out item costs no run.
     #[serde(skip)]
@@ -129,6 +129,56 @@ pub struct PollDelta {
     /// mode `max` with a numeric `cursor_field`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_param: Option<CursorParam>,
+    /// For a feed that answers in pages, newest first: where each answer
+    /// says the next page's cursor, and where the next request carries
+    /// it. Each poll follows the pages until one holds an item already
+    /// seen (or there is no next page), and fires every new item it
+    /// read, so a burst bigger than a page is never cut to its newest
+    /// page. The priming poll reads the first page alone. Past
+    /// [`crate::access::client::MAX_PAGES`] pages of new items the poll
+    /// fails loudly and fires nothing, until the trigger polls often
+    /// enough (or asks for pages big enough) to catch up. Absent, a poll
+    /// reads one answer. Needs a `cursor_field` (paging stops at an item
+    /// already seen) and the JSON format, and is refused beside
+    /// `cursor_param`, which already says where the next request starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paging: Option<PollPaging>,
+}
+
+/// How a paged feed's next page is asked for ([`PollDelta::paging`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PollPaging {
+    /// Dotted path to the next page's cursor in an answer
+    /// (`nextPageToken`, `next_cursor`). An answer whose cursor is
+    /// absent, not a string, or empty is the last page.
+    pub next: String,
+    /// Where the next request carries the cursor.
+    pub sent_in: PageCursorIn,
+}
+
+/// Where a paged poll's next request carries the cursor
+/// ([`PollPaging::sent_in`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum PageCursorIn {
+    /// A query parameter of that name, on a `get` or a `post` poll.
+    Query(String),
+    /// A top-level field of that name in a `post` poll's JSON body
+    /// (Notion's `start_cursor`).
+    Body(String),
+}
+
+impl PollPaging {
+    /// The cursor at `next`, sent back as the query parameter `name`.
+    pub fn query(next: impl Into<String>, name: impl Into<String>) -> Self {
+        Self { next: next.into(), sent_in: PageCursorIn::Query(name.into()) }
+    }
+
+    /// The cursor at `next`, sent back as the body field `field`.
+    pub fn body(next: impl Into<String>, field: impl Into<String>) -> Self {
+        Self { next: next.into(), sent_in: PageCursorIn::Body(field.into()) }
+    }
 }
 
 /// The acknowledged-cursor query parameter of [`PollDelta::cursor_param`].
@@ -246,15 +296,16 @@ impl Signal for PollEndpoint {
                             .into(),
                     );
                 }
-                if cp.name.is_empty()
-                    || !cp.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                {
+                if !plain_name(&cp.name) {
                     return Err(format!(
                         "poll_endpoint.delta.cursor_param.name must be a plain query \
                          parameter name (alphanumeric or '_'); got '{}'",
                         cp.name
                     ));
                 }
+            }
+            if let Some(paging) = &delta.paging {
+                self.validate_paging(delta, paging)?;
             }
         }
         Ok(())
@@ -286,6 +337,58 @@ pub fn carried(response: &serde_json::Value, carry: &[String]) -> serde_json::Va
     out
 }
 
+impl PollEndpoint {
+    /// Refuse a paging description that could not be followed
+    /// ([`PollDelta::paging`]).
+    fn validate_paging(&self, delta: &PollDelta, paging: &PollPaging) -> Result<(), String> {
+        if delta.cursor_field.is_none() {
+            return Err("poll_endpoint.delta.paging stops at the first page holding an item already seen, \
+                        which needs a cursor_field to tell; a positional delta reads one answer"
+                .into());
+        }
+        if delta.cursor_param.is_some() {
+            return Err("poll_endpoint.delta.paging and cursor_param both say where the next request \
+                        starts; keep the one the feed answers to"
+                .into());
+        }
+        if self.format != PollFormat::Json {
+            return Err("poll_endpoint.delta.paging reads the next page's cursor out of a JSON answer; \
+                        a syndication feed has none"
+                .into());
+        }
+        if paging.next.trim().is_empty() {
+            return Err("poll_endpoint.delta.paging.next is empty; name where an answer says its next \
+                        page's cursor, like `nextPageToken`"
+                .into());
+        }
+        match &paging.sent_in {
+            PageCursorIn::Query(name) if !plain_name(name) => Err(format!(
+                "poll_endpoint.delta.paging sends the cursor as a query parameter, which must be a \
+                 plain name (alphanumeric or '_'); got '{name}'"
+            )),
+            PageCursorIn::Body(_) if self.method != PollMethod::Post => Err(
+                "poll_endpoint.delta.paging sends the cursor in the body, which only a `post` poll \
+                 sends; set method: Post or send it as a query parameter"
+                    .into(),
+            ),
+            PageCursorIn::Body(field) if field.trim().is_empty() => {
+                Err("poll_endpoint.delta.paging sends the cursor in the body under an empty field name".into())
+            }
+            PageCursorIn::Body(_) if self.body.as_ref().is_some_and(|body| !body.is_object()) => Err(
+                "poll_endpoint.delta.paging sends the cursor as a field of the body, so the body must \
+                 be a JSON object"
+                    .into(),
+            ),
+            PageCursorIn::Query(_) | PageCursorIn::Body(_) => Ok(()),
+        }
+    }
+}
+
+/// A plain query parameter name: alphanumeric or `_`, not empty.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 crate::register_signal_kind!(PollEndpoint);
 
 #[cfg(test)]
@@ -303,7 +406,7 @@ mod tests {
             serde_json::json!({"status": "completed", "error": {"message": "x"}})
         );
         let mut delta = PollEndpoint { url: "https://example.com/x".into(), carry: vec!["status".into()], ..Default::default() };
-        delta.delta = Some(PollDelta { items: String::new(), cursor_field: None, mode: DeltaMode::default(), cursor_param: None });
+        delta.delta = Some(PollDelta { items: String::new(), cursor_field: None, mode: DeltaMode::default(), cursor_param: None, paging: None });
         assert!(delta.validate().unwrap_err().contains("carry"));
     }
 
@@ -352,6 +455,7 @@ mod tests {
                 cursor_field: Some(" ".into()),
                 mode: Default::default(),
                 cursor_param: None,
+                paging: None,
             }),
             ..Default::default()
         };
@@ -392,5 +496,62 @@ mod tests {
             "cursor_param": { "name": "off set" }
         }));
         assert!(bad_name.validate().unwrap_err().contains("name"));
+    }
+
+    /// The paging description rides the spec as JSON, each place the
+    /// cursor goes keeping its wire word, and an unknown key is refused.
+    #[test]
+    fn paging_round_trips() {
+        let p: PollEndpoint = serde_json::from_value(serde_json::json!({
+            "url": "https://x/u",
+            "delta": {
+                "items": "messages", "cursor_field": "id", "mode": "set",
+                "paging": { "next": "nextPageToken", "sent_in": { "query": "pageToken" } }
+            }
+        }))
+        .unwrap();
+        p.validate().unwrap();
+        assert_eq!(p.delta.as_ref().unwrap().paging, Some(PollPaging::query("nextPageToken", "pageToken")));
+        let wire = serde_json::to_value(&p).unwrap();
+        assert_eq!(wire["delta"]["paging"], serde_json::json!({ "next": "nextPageToken", "sent_in": { "query": "pageToken" } }));
+        let in_body = PollPaging::body("next_cursor", "start_cursor");
+        assert_eq!(serde_json::to_value(&in_body).unwrap(), serde_json::json!({ "next": "next_cursor", "sent_in": { "body": "start_cursor" } }));
+        assert_eq!(serde_json::from_value::<PollPaging>(serde_json::to_value(&in_body).unwrap()).unwrap(), in_body);
+        assert!(serde_json::from_value::<PollPaging>(serde_json::json!({ "next": "n", "sent_in": { "query": "p" }, "param": "p" })).is_err());
+        // A delta without paging writes no field.
+        let plain = PollDelta { items: "items".into(), cursor_field: Some("id".into()), mode: DeltaMode::Max, cursor_param: None, paging: None };
+        assert!(serde_json::to_value(&plain).unwrap().get("paging").is_none());
+    }
+
+    /// Paging is refused where it could not be followed: no cursor field
+    /// to stop on, beside an acknowledged cursor, on a syndication feed, a
+    /// body cursor on a `get` poll or beside a body that is not an object,
+    /// and a query parameter that is not a plain name.
+    #[test]
+    fn paging_validates() {
+        let poll = |config: serde_json::Value| -> PollEndpoint { serde_json::from_value(config).unwrap() };
+        let delta = |paging: serde_json::Value| serde_json::json!({ "items": "results", "cursor_field": "id", "mode": "set", "paging": paging });
+        let query = serde_json::json!({ "next": "next", "sent_in": { "query": "offset" } });
+        let body = serde_json::json!({ "next": "next_cursor", "sent_in": { "body": "start_cursor" } });
+        poll(serde_json::json!({ "url": "https://x/u", "delta": delta(query.clone()) })).validate().unwrap();
+        poll(serde_json::json!({ "url": "https://x/u", "method": "post", "body": { "page_size": 100 }, "delta": delta(body.clone()) })).validate().unwrap();
+        poll(serde_json::json!({ "url": "https://x/u", "method": "post", "delta": delta(body.clone()) })).validate().unwrap();
+
+        let positional = poll(serde_json::json!({ "url": "https://x/u", "delta": { "items": "values", "paging": query } }));
+        assert!(positional.validate().unwrap_err().contains("cursor_field"));
+        let acknowledged = poll(serde_json::json!({ "url": "https://x/u", "delta": {
+            "items": "result", "cursor_field": "update_id", "cursor_param": { "name": "offset" }, "paging": query
+        } }));
+        assert!(acknowledged.validate().unwrap_err().contains("cursor_param"));
+        let feed = poll(serde_json::json!({ "url": "https://x/u", "format": "feed", "delta": delta(query.clone()) }));
+        assert!(feed.validate().unwrap_err().contains("JSON"));
+        let on_get = poll(serde_json::json!({ "url": "https://x/u", "delta": delta(body.clone()) }));
+        assert!(on_get.validate().unwrap_err().contains("post"));
+        let listed_body = poll(serde_json::json!({ "url": "https://x/u", "method": "post", "body": [1], "delta": delta(body) }));
+        assert!(listed_body.validate().unwrap_err().contains("object"));
+        let bad_name = poll(serde_json::json!({ "url": "https://x/u", "delta": delta(serde_json::json!({ "next": "next", "sent_in": { "query": "page token" } })) }));
+        assert!(bad_name.validate().unwrap_err().contains("plain name"));
+        let no_next = poll(serde_json::json!({ "url": "https://x/u", "delta": delta(serde_json::json!({ "next": " ", "sent_in": { "query": "offset" } })) }));
+        assert!(no_next.validate().unwrap_err().contains("next"));
     }
 }

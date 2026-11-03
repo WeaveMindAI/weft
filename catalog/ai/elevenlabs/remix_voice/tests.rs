@@ -1,7 +1,6 @@
 //! ElevenLabsRemixVoice self-tests: the request the node builds from
 //! every setting, sent on the picked voice's remix route, the previews
-//! stored as the format asked for, the line ElevenLabs answered, and
-//! what is refused before anything is sent.
+//! stored as the format asked for, and the line ElevenLabs answered.
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -10,7 +9,7 @@ use weft::storage::StoredFile;
 use weft::{FakeRig, NodeTest, WeftResult};
 
 use super::super::elevenlabs::audio_file_type;
-use super::{refusal, ElevenLabsRemixVoiceNode};
+use super::ElevenLabsRemixVoiceNode;
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -19,8 +18,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("every_elevenlabs_setting_reaches_the_request", every_setting),
         NodeTest::fake("a_typed_voice_id_stays_one_path_segment", voice_id_encoded),
         NodeTest::fake("an_answer_without_its_line_still_hands_the_previews_on", no_line),
-        NodeTest::fake("remixes_elevenlabs_would_refuse_are_refused_before_anything_is_sent", refused),
-        NodeTest::basic("the_remix_requests_elevenlabs_refuses", refusals),
     ]
 }
 
@@ -186,35 +183,3 @@ async fn no_line(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    for (extra, says) in [
-        (json!({ "voice": " " }), "`voice` is empty"),
-        (json!({ "description": "Low" }), "`description` is 3 characters"),
-        (json!({ "description": "x".repeat(1001) }), "`description` is 1001 characters"),
-        (json!({ "text": "A short line." }), "`text` is 13 characters"),
-        (json!({ "text": "x".repeat(1001) }), "`text` is 1001 characters"),
-    ] {
-        let err = rig.run(&ElevenLabsRemixVoiceNode, inputs(&rig, extra.clone())).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {extra}: {err}");
-        assert!(err.contains(says), "{extra}: {err}");
-    }
-    assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");
-    Ok(())
-}
-
-fn refusals() -> WeftResult<()> {
-    let fine = "x".repeat(5);
-    assert!(refusal(VOICE, &"x".repeat(4), None).is_some());
-    assert!(refusal(VOICE, &fine, None).is_none(), "5 characters is enough to remix");
-    assert!(refusal(VOICE, &"é".repeat(5), None).is_none(), "characters count, not bytes");
-    assert!(refusal(VOICE, &"x".repeat(1000), None).is_none());
-    assert!(refusal(VOICE, &"x".repeat(1001), None).is_some());
-    assert!(refusal(VOICE, &fine, Some("x".repeat(99).as_str())).is_some());
-    assert!(refusal(VOICE, &fine, Some("x".repeat(100).as_str())).is_none());
-    assert!(refusal(VOICE, &fine, Some("x".repeat(1000).as_str())).is_none());
-    assert!(refusal(VOICE, &fine, Some("x".repeat(1001).as_str())).is_some());
-    assert!(refusal("", &fine, None).is_some(), "an empty voice names no voice");
-    assert!(refusal("  ", &fine, None).is_some(), "nor does a blank one");
-    Ok(())
-}

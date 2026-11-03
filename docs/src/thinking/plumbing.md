@@ -39,8 +39,7 @@ one node's body where nobody can.
 No file on the side, no table of your own, no "I'll just keep this in memory
 between runs" for anything a run has to remember. The journal is the run's
 memory: a durable run whose worker dies is rebuilt from it by another worker,
-and `ctx.run` is how a node that waited reuses its recorded results when it
-picks back up. A connection pool or a process the runs only share for
+and what a node keeps across a pause (`ctx.keep`) is written there too. A connection pool or a process the runs only share for
 speed is different: `ctx.shared` holds one for them, and losing it loses nothing.
 
 **VI. Thou shalt not carry files around.**

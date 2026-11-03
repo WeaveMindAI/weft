@@ -90,8 +90,9 @@
     #[async_trait]
     impl Node for Taker {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
             let stream = ctx.inputs.get::<Generator<i64>>("in")?;
-            while let Some(v) = stream.next().await? {
+            while let Some(v) = stream.next(&mut state).await? {
                 self.took.lock().unwrap().push(v);
             }
             Ok(())
@@ -135,7 +136,8 @@
             binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
             seed,
             instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-            settings: Default::default(),
+            // A test here that waits checks a pause, not the quiet window.
+            settings: super::engine_test_rig::pausing_at_once(),
         }
     }
 
@@ -447,8 +449,7 @@
     impl Node for Asks {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             self.ran.lock().unwrap().push("asks".into());
-            let answer = ctx
-                .await_signal(weft_core::signal::Form {
+            let answer = crate::run_driver::engine_test_rig::wait_once(&ctx, weft_core::signal::Form {
                     form_type: "human_query".into(),
                     schema: weft_core::signal::FormSchema { fields: Vec::new() },
                     title: None,

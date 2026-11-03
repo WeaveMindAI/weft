@@ -62,13 +62,14 @@
     #[async_trait]
     impl Node for Yielder {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
             for i in 0..self.count {
                 if self.fail_after == Some(i) {
                     return Err(weft_core::error::node_error("yielder exploded"));
                 }
                 let out = NodeOutput::new().set("out", json!(i));
                 let result = if self.delivered {
-                    ctx.yield_downstream(out).await
+                    ctx.yield_downstream(out, &mut state).await
                 } else {
                     ctx.pulse_downstream(out).await
                 };
@@ -94,6 +95,7 @@
     #[async_trait]
     impl Node for Taker {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
             log(&self.log, "taker dispatched");
             let stream = ctx.inputs.get::<Generator<i64>>("in")?;
             let mut taken = 0usize;
@@ -106,7 +108,7 @@
                 // the race-free observation point the lock-step test
                 // orders producer sends against.
                 log(&self.log, format!("pulling {taken}"));
-                match stream.next().await {
+                match stream.next(&mut state).await {
                     Ok(Some(v)) => {
                         log(&self.log, format!("took {v}"));
                         taken += 1;
@@ -507,11 +509,12 @@
     #[async_trait]
     impl Node for First {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
             log(&self.log, "first before");
             // `notify_one` stores a permit, so the peer's later
             // `notified()` resolves whichever side gets there first.
             self.first_started.notify_one();
-            ctx.yield_downstream(NodeOutput::new().set("x", json!(1))).await?;
+            ctx.yield_downstream(NodeOutput::new().set("x", json!(1)), &mut state).await?;
             log(&self.log, "first after");
             Ok(())
         }
@@ -533,38 +536,6 @@
             log(&self.log, "second emitted");
             ctx.pulse_downstream(NodeOutput::new().set("y", json!(2))).await
         }
-    }
-
-    /// A stream consumer whose body calls `await_signal`: the engine
-    /// must refuse it (a durable suspension cannot replay the items
-    /// its pulls already consumed).
-    struct AwaitingTaker;
-    test_manifest!(AwaitingTaker, "AwaitingTaker");
-    #[async_trait]
-    impl Node for AwaitingTaker {
-        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-            ctx.await_signal(weft_core::signal::timer::Timer {
-                spec: weft_core::signal::timer::TimerSpec::After { duration_ms: 1 },
-            })
-            .await?;
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn a_stream_consumers_await_signal_fails_the_firing() {
-        let log: Log = Arc::new(StdMutex::new(Vec::new()));
-        let cat = catalog(vec![
-            ("Yielder", Box::new(Yielder { count: 1, delivered: false, fail_after: None, log: log.clone() })),
-            ("Taker", Box::new(AwaitingTaker)),
-        ]);
-        let (outcome, events) = drive(stream_project(), cat, &["producer"]).await;
-        assert!(matches!(outcome, RunOutcome::Failed { .. }), "got {outcome:?}");
-        let err = node_failed_error(&events, "consumer").expect("the consumer fails");
-        assert!(
-            err.contains(&weft_core::context::stream_consumer_await_signal_error("consumer")),
-            "{err}"
-        );
     }
 
     struct Joint {
@@ -724,6 +695,14 @@
         .expect("cycle project")
     }
 
+    /// The state of a body that reads its first item through its state
+    /// and then pulls directly: no direct read may come before a place the
+    /// run can pause that it reaches for the first time.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct FirstItem {
+        first: Option<i64>,
+    }
+
     /// Yield one item, take one, then pull again (which can never
     /// resolve once both sides are here).
     struct PingPong {
@@ -733,13 +712,17 @@
     #[async_trait]
     impl Node for PingPong {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(FirstItem::default()).await?;
             ctx.pulse_downstream(NodeOutput::new().set("out", json!(1))).await?;
-            let stream = ctx.inputs.get::<Generator<i64>>("in")?;
-            let first = stream.next().await?;
+            let mut stream = ctx.inputs.get::<Generator<i64>>("in")?;
+            // The first item is read through the state: read directly, it
+            // would come before the second pull's place, and a resumed body
+            // would read it again.
+            let first = state.read(|s| &mut s.first, &mut stream).await?;
             log(&self.log, format!("got {first:?}"));
             // The second pull can never resolve: the peer is doing the
             // same thing. The engine must fail this loudly.
-            let second = stream.next().await;
+            let second = stream.next(&mut state).await;
             log(&self.log, format!("second: {second:?}"));
             second?;
             Ok(())
@@ -810,10 +793,11 @@
     #[async_trait]
     impl Node for GatedTaker {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
             self.release.notified().await;
             let stream = ctx.inputs.get::<Generator<i64>>("in")?;
             loop {
-                match stream.next().await {
+                match stream.next(&mut state).await {
                     Ok(Some(v)) => log(&self.log, format!("took {v}")),
                     Ok(None) => return Ok(()),
                     Err(e) => {
@@ -1329,8 +1313,9 @@
     #[async_trait]
     impl Node for StringTaker {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
             let stream = ctx.inputs.get::<Generator<String>>("in")?;
-            match stream.next().await {
+            match stream.next(&mut state).await {
                 Ok(v) => log(&self.log, format!("took {v:?}")),
                 Err(e) => {
                     log(&self.log, format!("pull error: {e}"));
@@ -1378,9 +1363,12 @@
     #[async_trait]
     impl Node for TwoTaker {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            // One holding per pull: two pulls at once cannot share one
+            // state.
+            let (mut hold_a, mut hold_b) = (ctx.hold(), ctx.hold());
             let a = ctx.inputs.get::<Generator<i64>>("in_a")?;
             let b = ctx.inputs.get::<Generator<i64>>("in_b")?;
-            let (ra, rb) = tokio::join!(a.drain(), b.drain());
+            let (ra, rb) = tokio::join!(a.drain(&mut hold_a), b.drain(&mut hold_b));
             log(&self.log, format!("a {:?} b {:?}", ra?, rb?));
             Ok(())
         }
@@ -1508,13 +1496,16 @@
     #[async_trait]
     impl Node for CancellingTaker {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-            let stream = ctx.inputs.get::<Generator<i64>>("in")?;
-            let first = stream.next().await?;
+            let mut state = ctx.keep(FirstItem::default()).await?;
+            let mut stream = ctx.inputs.get::<Generator<i64>>("in")?;
+            // Through the state: read directly, it would come before the
+            // pull below, and a resumed body would read it again.
+            let first = state.read(|s| &mut s.first, &mut stream).await?;
             log(&self.log, format!("took {first:?}"));
             self.flag.cancel_because(weft_core::run::CancelCause::User);
             // Keep pulling: the poison/teardown resolves this pull, or
             // the task is aborted by the cancel walk; either is fine.
-            let _ = stream.next().await;
+            let _ = stream.next(&mut state).await;
             Ok(())
         }
     }
@@ -1548,14 +1539,15 @@
     #[async_trait]
     impl Node for BusWaiter {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
             // One item first, so the puller dispatches with a live
             // feed and parks on its SECOND pull (a genuine stream
             // wait), while this body parks on a bus wait.
             ctx.pulse_downstream(NodeOutput::new().set("out", json!(0))).await?;
-            let (bus, _marker) = ctx.create_bus(weft_core::bus::BusOptions::default())?;
+            let (bus, _marker) = ctx.create_bus("channel", weft_core::bus::BusOptions::default())?;
             // Nobody will ever join as "ghost": a bus wait that only
             // deadlock resolution can end.
-            bus.wait_for("ghost")
+            bus.wait_for("ghost", &mut state)
                 .await
                 .map_err(|e| weft_core::error::node_error(format!("bus wait ended: {e}")))?;
             Ok(())
@@ -1570,7 +1562,10 @@
                     "id": "waiter", "nodeType": "BusWaiter", "label": null,
                     "config": null, "position": { "x": 0.0, "y": 0.0 },
                     "inputs": [],
-                    "outputs": [{ "name": "out", "portType": "Generator[Number]", "required": false }],
+                    "outputs": [
+                        { "name": "out", "portType": "Generator[Number]", "required": false },
+                        { "name": "channel", "portType": "Bus", "required": false }
+                    ],
                     "features": {}, "scope": [], "groupBoundary": null,
                     "requiresInfra": false, "images": []
                 },

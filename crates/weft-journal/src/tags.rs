@@ -34,7 +34,7 @@ pub struct TaggedRun {
 
 /// Insert `run_id`'s tag rows, on the caller's connection.
 /// Re-tagging an existing (run, tag) keeps the original row (and its
-/// `seq`): a body replayed after a durable wait lands on the same state,
+/// `seq`): a body run again after a pause or a crash lands on the same state,
 /// and a tag's position in the order is the FIRST time the run claimed it.
 pub async fn tag_run_in(db: &impl Client, run_id: RunId, tags: &[String], at_unix: u64) -> db::Result<()> {
     db.execute(

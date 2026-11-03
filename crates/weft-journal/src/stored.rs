@@ -24,7 +24,37 @@ pub fn encode(events: &[RunEvent]) -> Vec<u8> {
 
 /// A row of a run's record as `run_log.events` holds it, once
 /// decompressed: its events, in order, each without its run.
-pub const STORED_EVENTS: weft_core::stored::Kind<Vec<RunEvent>> = weft_core::stored::Kind::new("run record row", &[]);
+pub const STORED_EVENTS: weft_core::stored::Kind<Vec<RunEvent>> = weft_core::stored::Kind::new("run record row", STEPS);
+
+/// How a row's events changed shape, version N to N+1.
+const STEPS: &[&[weft_core::stored::Op]] = &[
+    // 1 -> 2: a node keeps a saved state instead of replaying its body.
+    // A `ctx.run` step's answer (`run_output`) is no longer recorded, so
+    // its rows go; a wait is numbered among the firing's waits alone
+    // (`wait_index`, which was `call_index`). A run parked before this
+    // cannot resume (its nodes saved no state, and the engine refuses
+    // it, naming the run); what it recorded still reads.
+    &[
+        weft_core::stored::Op::Code { at: "", run: drop_run_outputs },
+        weft_core::stored::Op::RenameKey { at: "*", from: "call_index", to: "wait_index" },
+    ],
+    // 2 -> 3: a live caller's gate names its check
+    // (`weft_core::primitive::SIGNAL_SPEC_V2`), in each spec a row keeps:
+    // a captured trigger's, a wait's, and a fired run's stand-in.
+    &[
+        weft_core::stored::Op::Within { at: "*.spec", ops: weft_core::primitive::SIGNAL_SPEC_V2 },
+        weft_core::stored::Op::Within { at: "*.stand_in", ops: weft_core::primitive::SIGNAL_SPEC_V2 },
+    ],
+];
+
+/// Drop every `run_output` event of a row (version 1 to 2).
+fn drop_run_outputs(row: &mut serde_json::Value) -> Result<(), String> {
+    let serde_json::Value::Array(events) = row else {
+        return Err(format!("a record row should be a list of events, and is {row}"));
+    };
+    events.retain(|event| event.get("kind").and_then(serde_json::Value::as_str) != Some("run_output"));
+    Ok(())
+}
 
 /// The events of one stored row of `run_id`, written at `version`
 /// (`run_log.events_version`), in order, its id set back on each. A row

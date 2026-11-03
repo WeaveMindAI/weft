@@ -1,5 +1,4 @@
-//! TelegramSendMedia self-tests: the multipart framing per media kind
-//! and the unknown-kind refusal.
+//! TelegramSendMedia self-tests: the multipart framing of a photo.
 
 use serde_json::json;
 
@@ -14,7 +13,6 @@ const TINY_PNG: &[u8] = include_bytes!("fixture.png");
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("frames_the_photo_as_multipart", sends_photo),
-        NodeTest::fake("an_unknown_kind_refuses", unknown_kind),
         NodeTest::live("one_real_photo_send", "telegram", live_send).with_fixture(fixture_spec(
             "TELEGRAM_CHAT_ID",
             "Chat id",
@@ -72,20 +70,3 @@ async fn sends_photo(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn unknown_kind(rig: FakeRig) -> WeftResult<()> {
-    let file = rig.store_file("cat.png", "image/png", b"x".to_vec());
-    let outcome = rig
-        .run(
-            &TelegramSendMediaNode,
-            json!({
-                "account": rig.access("telegram"),
-                "chatId": "12345",
-                "file": file,
-                "kind": "hologram",
-            }),
-        )
-        .await;
-    let err = outcome.result.expect_err("unknown kind must refuse").to_string();
-    assert!(err.contains("unknown media kind"), "{err}");
-    Ok(())
-}

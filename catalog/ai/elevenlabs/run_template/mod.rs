@@ -14,15 +14,16 @@
 //! template takes needs a port whose type fits, and every port needs an
 //! input or an output of the template to belong to. Every mismatch is
 //! named in one refusal, as the program mistake it is. The read happens
-//! inside the journaled submit, so the replay after the wait reads the
-//! answer back and never reads the template again.
+//! inside the submit, which runs once: a run resumed after its wait finds
+//! the job in its state and never reads the template again.
 
 use std::collections::{BTreeMap, VecDeque};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use weft::access::client::get_json;
+use weft::access::client::{get_json, url};
 use weft::node::NodeOutput;
 use weft::storage::FileHandle;
 use weft::{
@@ -31,7 +32,7 @@ use weft::{
 };
 
 use super::elevenlabs::API;
-use super::flows::{finish, store_output, submit, References};
+use super::flows::{finish, store_output, submit, Job, References};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsRunTemplateNode;
@@ -64,7 +65,7 @@ impl Node for ElevenLabsRunTemplateNode {
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
-        let template = template_id(ctx.inputs.get("template")?)?;
+        let template: String = ctx.inputs.get("template")?;
         let version: Option<String> = ctx.inputs.opt("version")?;
 
         // The ports the program created, and every data output.
@@ -80,18 +81,19 @@ impl Node for ElevenLabsRunTemplateNode {
         let outputs: BTreeMap<String, WeftType> = ctx.declared_outputs().into_iter().collect();
 
         let http = ctx.client(&account).await?;
-        let refs = References::new(&ctx, &http);
-        let route = format!("{API}/flows/templates/{template}");
-        let submitted = submit(
-            &ctx,
+        let refs = References::new(&ctx, &http, &account);
+        let route = url(API, &["flows", "templates", &template])?;
+        let mut job = ctx.keep(Job::default()).await?;
+        let run_id = submit(
+            &mut job,
             &http,
-            &refs,
-            &format!("{route}/runs"),
+            route.clone().segment("runs")?.as_str(),
             &format!("start a run of the ElevenLabs template {template}"),
+            "ElevenLabs answered no run id when the template run was started",
             || async {
                 let read = get_json(
                     &http,
-                    &format!("{route}?versions_per_template={VERSIONS}"),
+                    route.clone().query("versions_per_template", VERSIONS).as_str(),
                     &format!("read the ElevenLabs template {template}"),
                 )
                 .await?;
@@ -103,12 +105,12 @@ impl Node for ElevenLabsRunTemplateNode {
                 ]
                 .concat();
                 if !problems.is_empty() {
-                    return Err(WeftError::Input(format!(
+                    weft::input_bail!(
                         "the ports of this node do not match version {} of the ElevenLabs template \
                          {template}, so nothing was run: {}",
                         chosen["version_id"].as_str().unwrap_or_default(),
                         problems.join("; ")
-                    )));
+                    );
                 }
                 // The run names the version that was just checked, pinned
                 // or not, so one published between the read and the start
@@ -120,11 +122,7 @@ impl Node for ElevenLabsRunTemplateNode {
             },
         )
         .await?;
-        let run_id = submitted.answer["id"]
-            .as_str()
-            .node_err("ElevenLabs answered no run id when the template run was started")?
-            .to_string();
-        let run = finish(&ctx, &account, &http, &format!("{route}/runs/{run_id}"), POLL_SECS, &submitted).await?;
+        let run = finish(&mut job, &account, &http, route.segment("runs")?.segment(&run_id)?.as_str(), POLL_SECS).await?;
         match run["status"].as_str().unwrap_or_default() {
             "completed" => {
                 let mut emitted = NodeOutput::new();
@@ -145,20 +143,6 @@ impl Node for ElevenLabsRunTemplateNode {
     }
 }
 
-/// `id` when it is one clean URL segment, the shape ElevenLabs gives
-/// template ids (`tmpl_abc123`). It goes into the route, so anything
-/// else could reach another one.
-pub fn template_id(id: String) -> WeftResult<String> {
-    let clean = !id.is_empty()
-        && !id.starts_with('.')
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    if clean {
-        Ok(id)
-    } else {
-        Err(WeftError::Input(format!("'{id}' is not an ElevenLabs template id (they look like tmpl_abc123)")))
-    }
-}
-
 /// The version to check and run: the pinned one when there is one,
 /// else the one ElevenLabs runs when none is (flagged `is_latest`, or
 /// the newest listed when none is flagged). Both refusals are the
@@ -168,11 +152,11 @@ pub fn pick_version<'a>(template_id: &str, template: &'a Value, pinned: Option<&
         .as_array()
         .node_err(format!("elevenlabs answered the template {template_id} with no version list"))?;
     let Some(newest) = versions.first() else {
-        return Err(WeftError::Input(format!(
+        weft::input_bail!(
             "the ElevenLabs template {template_id} has no version the API can run. ElevenLabs leaves out a \
              published version whose graph uses a model it does not serve through the API, or whose saved \
              snapshot is gone; publish a version built on models the API serves"
-        )));
+        );
     };
     let Some(pinned) = pinned else {
         return Ok(versions.iter().find(|v| v["is_latest"] == true).unwrap_or(newest));
@@ -312,75 +296,82 @@ pub fn output_type(schema: &Value) -> Result<WeftType, String> {
     }
 }
 
-/// What the template input `port` takes for the value its port carries,
-/// by its schema's kind: text as itself, a voice id as a voice
-/// reference, a number or a boolean as JSON, a list item by item, and
-/// each file as whatever `file` answers for it (the reference it goes
-/// as).
-pub fn input_value(
-    port: &str,
-    schema: &Value,
-    value: &Value,
-    file: &mut dyn FnMut(FileHandle) -> WeftResult<Value>,
-) -> WeftResult<Value> {
-    let wrong = |takes: &str| WeftError::Input(format!("`{port}` takes {takes}, and got {value}"));
+/// What the template input takes for the value its port carries, by
+/// its schema's kind: a voice id as a voice reference, a list item by
+/// item, each file as whatever `file` answers for it (the reference it
+/// goes as), and every other kind input_mismatches let through (text, a
+/// number, a whole number, a boolean) as itself. The port's declared type
+/// was checked against the template's, so the value is what the kind
+/// says; a list port carries one item as itself, like `ValueBag::list`.
+pub fn input_value(schema: &Value, value: &Value, file: &mut dyn FnMut(FileHandle) -> WeftResult<Value>) -> WeftResult<Value> {
     match kind(schema) {
-        "string" => value.as_str().map(|_| value.clone()).ok_or_else(|| wrong("text")),
-        "voice" => value
-            .as_str()
-            .map(|id| json!({ "type": "voice", "voice_id": id }))
-            .ok_or_else(|| wrong("a voice id")),
-        "number" => value.is_number().then(|| value.clone()).ok_or_else(|| wrong("a number")),
-        "integer" => whole(value).ok_or_else(|| wrong("a whole number")),
-        "boolean" => value.is_boolean().then(|| value.clone()).ok_or_else(|| wrong("true or false")),
+        "voice" => Ok(json!({ "type": "voice", "voice_id": value })),
         "image" | "video" | "audio" => file(FileHandle::from_value(value)?),
         "array" => {
-            let items = value.as_array().ok_or_else(|| wrong("a list"))?;
+            let items = match value {
+                Value::Array(items) => items.as_slice(),
+                single => std::slice::from_ref(single),
+            };
             let mut sent = Vec::with_capacity(items.len());
-            for (i, item) in items.iter().enumerate() {
-                sent.push(input_value(&format!("{port}[{i}]"), &schema["items"], item, &mut *file)?);
+            for item in items {
+                sent.push(input_value(&schema["items"], item, &mut *file)?);
             }
             Ok(Value::Array(sent))
         }
-        other => Err(WeftError::Input(format!(
-            "`{port}` is a template input of a kind this node cannot send ('{other}')"
-        ))),
+        _ => Ok(value.clone()),
     }
 }
 
-/// `value` as the whole number it is: a wire carries `3.0` where a
-/// program wrote `3`, and an integer input takes `3`. `None` for a
-/// fraction, or past what a float holds exactly.
-fn whole(value: &Value) -> Option<Value> {
-    if value.is_i64() || value.is_u64() {
-        return Some(value.clone());
+/// Whether a template input's schema holds whole numbers, at any depth.
+fn holds_integers(schema: &Value) -> bool {
+    match kind(schema) {
+        "integer" => true,
+        "array" => holds_integers(&schema["items"]),
+        _ => false,
     }
-    let f = value.as_f64()?;
-    (f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0).then(|| json!(f as i64))
+}
+
+/// A port value of whole numbers (one, or lists of them): read through
+/// weft's typed read, which takes a `3.0` a wire carried as the 3 it is
+/// and refuses a fraction.
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum Ints {
+    One(i64),
+    Many(Vec<Ints>),
 }
 
 /// The `inputs` a run sends: each template input's port value, the way
 /// its kind takes it. Every value is checked before the first file goes
-/// up, so a bad one leaves nothing behind in the workspace.
+/// up.
 async fn bind_inputs(ctx: &RunContext, refs: &References<'_>, template: &[Value]) -> WeftResult<Value> {
     let mut values = Vec::with_capacity(template.len());
     for input in template {
         let id = port_id(input);
+        let schema = &input["content_schema"];
         let value = ctx.inputs.raw(id).unwrap_or(NOTHING);
         if value.is_null() {
-            return Err(WeftError::Input(format!(
+            weft::input_bail!(
                 "nothing arrived on `{id}`, and the template takes it on every run: drop the `?` on the \
                  port, so a run without it skips this node"
-            )));
+            );
         }
-        values.push((id, &input["content_schema"], value));
+        let value = if holds_integers(schema) {
+            let whole = ctx.inputs.get::<Ints>(id).map_err(|_| {
+                WeftError::Input(format!("`{id}` takes whole numbers, and got {value}"))
+            })?;
+            serde_json::to_value(whole).node_err(format!("`{id}` as JSON"))?
+        } else {
+            value.clone()
+        };
+        values.push((id, schema, value));
     }
-    // The first walk checks every value and gathers its files in order;
-    // the second meets the same files in the same order and sends each
-    // as the reference it became.
+    // The first walk gathers every value's files in order; the second
+    // meets the same files in the same order and sends each as the
+    // reference it became.
     let mut files = Vec::new();
-    for (id, schema, value) in &values {
-        input_value(id, schema, value, &mut |f: FileHandle| -> WeftResult<Value> {
+    for (_, schema, value) in &values {
+        input_value(schema, value, &mut |f: FileHandle| -> WeftResult<Value> {
             files.push(f);
             Ok(Value::Null)
         })?;
@@ -388,7 +379,7 @@ async fn bind_inputs(ctx: &RunContext, refs: &References<'_>, template: &[Value]
     let mut references = VecDeque::from(refs.of_each(&files).await?);
     let mut sent = Map::new();
     for (id, schema, value) in &values {
-        let bound = input_value(id, schema, value, &mut |_: FileHandle| -> WeftResult<Value> {
+        let bound = input_value(schema, value, &mut |_: FileHandle| -> WeftResult<Value> {
             references.pop_front().node_err("a file met on the second walk was not met on the first")
         })?;
         sent.insert(id.to_string(), bound);

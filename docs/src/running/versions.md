@@ -193,8 +193,10 @@ failed. Keep the `=`: `weft run --seed <word>` reads the word as the name of
 a saved example, not as a run. A run that is still going is refused until it
 ends or you `weft stop` it.
 
-If a node that runs again waited for somebody in that run, the answers they
-gave it are replayed, so it carries on instead of asking again. That only
+If a node that runs again waited for somebody in that run, its waits get the
+answers they were given there, matched by order: the node's first wait gets
+the answer its first wait got, and so on. So it carries on instead of asking
+again. That only
 holds while the node's own code is unchanged; if it changed, the node asks
 again and weft says so:
 

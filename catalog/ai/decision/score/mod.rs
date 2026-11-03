@@ -28,10 +28,8 @@ impl Node for DecisionScoreNode {
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let instructions: String = ctx.inputs.get("instructions")?;
+        // At least two, by the node's `levels` rule.
         let levels: Vec<String> = ctx.inputs.get("levels")?;
-        if levels.len() < 2 {
-            weft::node_bail!("levels holds {} level(s), and a scale needs at least two", levels.len());
-        }
         let state = decision::state(&ctx).await?;
         let question = json!({ "type": "score", "instructions": instructions, "criteria": levels });
         let answer = decision::ask(&ctx, state, question).await?;

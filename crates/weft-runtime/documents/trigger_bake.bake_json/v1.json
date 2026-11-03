@@ -12,6 +12,10 @@
       "hook": {
         "spec": { "kind": "route", "config": { "path": "hook", "method": "POST" } },
         "ports": { "text": "hello" }
+      },
+      "secure": {
+        "spec": { "kind": "route", "config": { "path": "secure", "auth": { "kind": "connection", "access_id": "3b8e1f2a-6c4d-4e5f-9a0b-1c2d3e4f5a6b", "service": "api_key_auth" } } },
+        "ports": {}
       }
     },
     "targets": ["hook"],
