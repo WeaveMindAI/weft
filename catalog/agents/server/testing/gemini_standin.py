@@ -19,7 +19,6 @@ result of the call before):
 import http.server
 import json
 import os
-import re
 import sys
 
 KEY_REFUSED = {"error": {"code": 400, "message": "API key not valid. Please pass a valid API key.", "status": "INVALID_ARGUMENT"}}
@@ -29,9 +28,11 @@ def request_text(contents: list) -> str:
     """The turn's message: the last user message's request."""
     for content in reversed(contents):
         for part in content.get("parts") or []:
-            match = re.search(r"<USER_REQUEST>\n(.*?)\n</USER_REQUEST>", part.get("text") or "", re.S)
-            if match:
-                return match.group(1)
+            text = part.get("text") or ""
+            start = text.find("<USER_REQUEST>\n")
+            end = text.find("\n</USER_REQUEST>", start)
+            if start != -1 and end != -1:
+                return text[start + len("<USER_REQUEST>\n"):end]
     return ""
 
 

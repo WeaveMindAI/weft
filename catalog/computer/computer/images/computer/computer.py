@@ -1050,17 +1050,23 @@ def live_items() -> list:
     return items
 
 
-def check_app_name(name: str) -> None:
-    """Refuse a name that is not an app's: it names files in APPS_DIR."""
+def app_file(name: str, suffix: str = "") -> str:
+    """The file of the app `name` in APPS_DIR (its port file, or the one
+    `suffix` names). A name that is not an app's is refused: letters,
+    digits, '-' and '_' only, so its files stay in APPS_DIR."""
     if not name or not all(c.isascii() and (c.isalnum() or c in "-_") for c in name):
         raise Refused(f"{name!r} is not an app name: letters, digits, '-' and '_' only")
+    path = os.path.realpath(os.path.join(APPS_DIR, name + suffix))
+    if not path.startswith(os.path.realpath(APPS_DIR) + os.sep):
+        raise Refused(f"{name!r} is not an app name: its files would leave {APPS_DIR}")
+    return path
 
 
 def app_port(name: str) -> int:
     """The loopback port the app `name` serves on, as it wrote it down."""
-    check_app_name(name)
+    port_file = app_file(name)
     try:
-        with open(os.path.join(APPS_DIR, name), encoding="utf-8") as f:
+        with open(port_file, encoding="utf-8") as f:
             return int(f.read().strip())
     except FileNotFoundError:
         raise Refused(
@@ -1068,7 +1074,7 @@ def app_port(name: str) -> int:
             "again after a restart; the node that starts it starts it on its next run"
         )
     except ValueError:
-        raise Refused(f"the app {name!r} wrote something that is not a port into {os.path.join(APPS_DIR, name)}")
+        raise Refused(f"the app {name!r} wrote something that is not a port into {port_file}")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -1099,8 +1105,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         finally:
             upstream.close()
+        content_type = answer.getheader("Content-Type") or "application/octet-stream"
+        if "\r" in content_type or "\n" in content_type:
+            self._send(502, {"error": f"the app {name!r} answered with a Content-Type that is not one header: {content_type!r}"})
+            return
         self.send_response(answer.status)
-        self.send_header("Content-Type", answer.getheader("Content-Type") or "application/octet-stream")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -1200,12 +1210,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def start_app(name: str) -> None:
     """Run the app `name`'s start script, holding its lock; a failure is logged, never raised:
     one app that does not start leaves the computer and every other app working."""
-    script = os.path.join(APPS_DIR, name + START_SUFFIX)
     try:
-        with open(os.path.join(APPS_DIR, name + LOCK_SUFFIX), "a") as lock:
+        script = app_file(name, START_SUFFIX)
+        with open(app_file(name, LOCK_SUFFIX), "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             done = subprocess.run(["bash", script], cwd=HOME, env=base_env(), stdin=subprocess.DEVNULL, capture_output=True)
-    except OSError as e:
+    except (OSError, Refused) as e:
         log(f"app {name!r} was not started again: {e}")
         return
     if done.returncode != 0:
@@ -1237,8 +1247,7 @@ def remove_app(name: str) -> bool:
     command among them, so asking again runs it again. An app with a port
     or a start file and no remove command was started by something that
     never said how to remove it: refused, naming what is left."""
-    check_app_name(name)
-    port, start, remove, lock = (os.path.join(APPS_DIR, name + suffix) for suffix in ("", START_SUFFIX, REMOVE_SUFFIX, LOCK_SUFFIX))
+    port, start, remove, lock = (app_file(name, suffix) for suffix in ("", START_SUFFIX, REMOVE_SUFFIX, LOCK_SUFFIX))
     if not any(os.path.exists(path) for path in (port, start, remove, lock)):
         return False
     with open(lock, "a") as held:
