@@ -80,6 +80,48 @@ ends every shell session: it stops whatever they run, and whatever their
 commands left running, and each starts over in the home folder. Files on the disk
 survive both.
 
+## A server of your own inside it
+
+If you start a server inside the computer and want a node outside to reach
+it, the computer's own endpoint passes requests on. Have the server listen on
+`127.0.0.1`, pick a name for it (letters, digits, `-` and `_`), and write its
+port number into `~/.weft/apps/<name>`. A `GET` or `POST` to
+`/apps/<name>/<path>` on the computer's endpoint then goes to `/<path>` on
+that port, and the answer comes back once the server has sent all of it. Only
+the `Content-Type` and `Accept` headers are passed on. Until the port file is
+there, the computer answers `502`, saying no app of that name runs yet. Once
+it is there but nothing listens on that port (after a restart, before the
+start script brings the server back), it answers `502` saying the app did not
+answer.
+
+A stop or a restart of the computer ends every program running in it, yours
+included, while the home folder stays. If you want your server back each time
+the computer starts, put
+the bash script that starts it in `~/.weft/apps/<name>.start`, make it start
+the server only when it is not already up, and run it yourself under the
+same lock the computer holds while it runs it at boot (`flock
+~/.weft/apps/<name>.lock bash ~/.weft/apps/<name>.start`), so two starts at
+once start one server. A node can use the names in `computer::apps` for these
+paths. The computer runs every such
+script when it boots, while it already answers, and an app whose script
+fails is left out without stopping the others.
+
+When weft terminates the node that started your server, it sends
+`DELETE /apps/<name>` to the computer, and the computer removes the app. So
+put the bash script that stops your server and deletes what it keeps in
+`~/.weft/apps/<name>.remove`, before anything of the server is there. The
+computer deletes the start script first, so no restart brings the server
+back, then runs the remove script under the same lock, then deletes the port
+file, the remove script and the lock. It answers `{"removed": true}`, or
+`{"removed": false}` when no app of that name is there. If the remove script
+fails, the computer answers `500` with what it printed and keeps the script,
+so asking again runs it again. An app with a port file or a start script and
+no remove script is refused with a `500` naming what is left.
+
+If you are writing a node that starts such a server, its endpoint is declared
+inside the computer's; for that, go and read [a server inside another infra
+node](https://github.com/WeaveMindAI/weft/blob/main/docs/src/nodes/infrastructure.md#a-server-inside-another-infra-node).
+
 ## One node per action
 
 Every action is its own node, and you can use any of them without a model.

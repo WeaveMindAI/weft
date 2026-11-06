@@ -439,6 +439,7 @@ pub enum DispatcherEvent<V = ValueRef> {
     /// multiple buses cleanly. `offset` is the bus-local position used
     /// to tiebreak same-second entries. `at_unix` is the journal's
     /// stamp so replay renders honest timestamps, not "now".
+    // SYNC: BusJoined <-> crates/weft-journal/src/events.rs BusJoined, packages/weft-graph/src/protocol.ts BusInspectorEvent 'joined', extension-vscode/src/runFollower.ts DispatcherEvent 'bus_joined'
     BusJoined {
         run_id: RunId,
         project_id: uuid::Uuid,
@@ -447,14 +448,17 @@ pub enum DispatcherEvent<V = ValueRef> {
         name: String,
         at_unix: u64,
     },
-    /// A bus participant dropped. Pairs with `BusJoined` for the same
-    /// `(bus_id, name)`.
+    /// A bus participant left, and how its body returned (`end`): the
+    /// inspector says it left, or left failed and why. Pairs with
+    /// `BusJoined` for the same `(bus_id, name)`.
+    // SYNC: BusLeft <-> crates/weft-journal/src/events.rs BusLeft, packages/weft-graph/src/protocol.ts BusInspectorEvent 'left', extension-vscode/src/runFollower.ts DispatcherEvent 'bus_left'
     BusLeft {
         run_id: RunId,
         project_id: uuid::Uuid,
         bus_id: String,
         offset: u64,
         name: String,
+        end: crate::bus::StreamEnd,
         at_unix: u64,
     },
     /// One journal-aggregation window of a bus's messages (one row per
@@ -691,7 +695,7 @@ impl<V> DispatcherEvent<V> {
             Self::InfraRecovered { project_id, node_id } => DispatcherEvent::InfraRecovered { project_id, node_id },
             Self::InfraTerminated { project_id, node_id } => DispatcherEvent::InfraTerminated { project_id, node_id },
             Self::BusJoined { run_id, project_id, bus_id, offset, name, at_unix } => DispatcherEvent::BusJoined { run_id, project_id, bus_id, offset, name, at_unix },
-            Self::BusLeft { run_id, project_id, bus_id, offset, name, at_unix } => DispatcherEvent::BusLeft { run_id, project_id, bus_id, offset, name, at_unix },
+            Self::BusLeft { run_id, project_id, bus_id, offset, name, end, at_unix } => DispatcherEvent::BusLeft { run_id, project_id, bus_id, offset, name, end, at_unix },
             Self::BusWindow { run_id, project_id, bus_id, first_offset, last_offset, messages, totals, at_unix } => {
                 DispatcherEvent::BusWindow { run_id, project_id, bus_id, first_offset, last_offset, messages, totals, at_unix }
             }

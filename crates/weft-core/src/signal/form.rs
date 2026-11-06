@@ -7,6 +7,11 @@ use serde_json::Value;
 
 use super::Signal;
 
+mod fields;
+mod from_config;
+pub use fields::{component, config_key, Answer, Answers, ChoiceOption, HUMAN_IN_THE_LOOP};
+pub use from_config::ConfigForm;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Form {
     /// Routes the form to the right UI panel ("human-trigger" vs
@@ -33,8 +38,9 @@ pub struct Form {
 
 // SYNC: FormSchema/FormField wire shape <->
 //       extension-browser/src/lib/api.ts (FormSchema/FormField)
-// (catalog/human/form_helpers.rs constructs these structs directly, so
-// the compiler keeps it in step; only the TS restatement can drift.)
+// (the builders in `fields` and `from_config` construct these structs
+// directly, so the compiler keeps them in step; only the TS restatement
+// can drift.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FormSchema {
     /// Just the fields: the form's `title`/`description` live on
@@ -63,6 +69,19 @@ pub struct FormField {
     /// Per-field config from the source (options, labels, etc).
     #[serde(default)]
     pub config: serde_json::Map<String, Value>,
+    /// The person must answer this field before the form can be sent:
+    /// the consumer keeps its send button off until they have, and
+    /// [`FormSchema::answers`] refuses a submission without it. A field
+    /// [`Self::answers_for`] names counts as answered when that other
+    /// field is. False (absent on the wire) for every field a node's
+    /// settings list, which have no such notion.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub required: bool,
+    /// The key of another field this one is a second way of answering
+    /// (a box for an answer of the person's own beside a list of
+    /// options): an answer here counts as an answer to that field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers_for: Option<String>,
 }
 
 impl FormSchema {
@@ -183,7 +202,7 @@ impl Signal for Form {
         if self.form_type.trim().is_empty() {
             return Err("form.form_type must not be empty".into());
         }
-        Ok(())
+        self.schema.check()
     }
 
     fn consumer_kind(&self) -> Option<&str> {
@@ -214,6 +233,8 @@ mod wire_tests {
             },
             value: None,
             config: serde_json::Map::new(),
+            required: false,
+            answers_for: None,
         }
     }
 
@@ -295,6 +316,8 @@ mod consumer_tests {
             },
             value: Some(value),
             config: Default::default(),
+            required: false,
+            answers_for: None,
         }
     }
 

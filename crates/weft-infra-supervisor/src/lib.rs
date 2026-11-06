@@ -25,6 +25,7 @@ use weft_platform_traits::InfraHost;
 pub mod broker_ops;
 pub mod health;
 pub mod health_engine;
+pub mod inside;
 pub mod lifecycle;
 pub mod ownership;
 
@@ -44,6 +45,9 @@ pub struct SupervisorState {
     pub replica: String,
     /// Where the infrastructure runs.
     pub host: Arc<dyn InfraHost>,
+    /// How a terminate asks a node to remove another node living inside
+    /// its endpoint ([`inside`]).
+    pub inside: Arc<dyn inside::InsideRemover>,
     pub clock: Arc<dyn Clock>,
     /// How often the ownership loop renews this supervisor's project
     /// leases and claims more: a third of `infra_owner_lease_secs`, so one

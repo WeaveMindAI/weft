@@ -1361,6 +1361,19 @@ iteration has to wait for some work (a database write the next iteration
 reads), wire that work's result to the edge, into a carry, a gather or
 `self.done`.
 
+A bus ends once nobody is on it and no node can still join it (its marker is
+on no wire to a node yet to start, in no loop still running, in no node that
+has not used it yet): finished, or failed if its last member failed. A node
+can also end it on purpose: finished while anybody is on it, as its last
+member left when nobody is. If a node holds a bus open for
+a whole loop of senders (an agent node's `stream`, which each turn's
+`AskAgent` sends on), put a `CloseBus` after the loop, its `_should_flow`
+wired to an output that arrives only once the loop is over, as the shipped
+`nodes/base_catalog/agents/conversation.weft` does:
+`close = CloseBus { bus: self.stream, _should_flow: messages.message }`.
+Without it, the run fails with `the bus ended failed: the run was stuck` once
+the last turn is done.
+
 ## Files and reuse
 
 | Marker | Pulls | Writes back |
@@ -1468,6 +1481,11 @@ validate` and the editor's pre-flight gate on Run, Turn on and Resync report
 it; the Problems panel is structural only and never shows it; `weft build`
 skips it, so a half-wired program still compiles, and a run, an activate or
 a resync is refused before it starts while one is open, naming the `weft
-connect` that picks it. [the build tier] is `weft build`:
+connect` that picks it. One kind of rule only a build for an install
+answers: a node's rule asking whether the install is a local one (an agent
+node with nothing on `computer` refuses a cloud install that way). `weft
+validate` and the editor build for no install and never report it; `weft
+run` and `weft status` build for the install they talk to and do, and a run
+that needs the node is refused with the rule's message. [the build tier] is `weft build`:
 structural errors plus the cargo and image build. The slug names the rule,
 the message names the fix.

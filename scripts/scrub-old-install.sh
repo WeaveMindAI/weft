@@ -21,7 +21,9 @@
 #     share;
 #   - ~/.local/share/weft: THE DATABASE (your projects' run history,
 #     versions and stored connections), the install's config and keys,
-#     and every named install under installs/ (the question lists them).
+#     every named install under installs/ (the question lists them), and
+#     the coding agents and other tools weft installed itself under
+#     needs/ (the next run that needs one installs it again).
 #
 # What it keeps: your project folders (the source is the record of your
 # projects; `weft run` registers them again), the `--public-url` choice

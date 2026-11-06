@@ -4,6 +4,164 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-11-06 (0.2.291)
+
+**What breaks after this update:**
+
+**A pasted connection now offers ways to log in.** An access node of your
+own that declares `acquisition: { "kind": "static", "fields": [...] }` no
+longer loads: its fields go into a way, and its guide moves from
+`ownPage.guide` onto the way:
+
+```json
+"acquisition": { "kind": "static", "ways": [
+  { "fields": [{ "name": "key", "label": "API key" }],
+    "guide": { "link": "https://...", "steps": ["Create a key.", "Paste it below."] } }
+] }
+```
+
+A service can offer several ways (a subscription and an API key, say), each
+with its own `id`, `label`, fields and guide, and mark a way `localOnly`: it
+is offered only on a local install, and a cloud install refuses a connection
+made with it. Your connections are carried over by the update, and so is one
+you copy in from an older weft with `weft migrate connections`: each is
+recorded as made with the one way, `default`. `weft connect` asks which way
+when there are several, or takes `--way <id>`, and the connect form in the
+editor and the browser shows the choice. For the whole shape, go and read
+[pasting a key](docs/src/connections/declaring-a-service.md#pasting-a-key).
+
+**If a project keeps its own copy of the standard nodes, run `weft catalog
+update` and then `weft resync` in its folder after `weft maintenance off`.**
+The copy under `nodes/base_catalog/` still has its access nodes in the old
+shape above, so they no longer load, and a project using one stays down after
+`weft maintenance off`. `weft catalog update` replaces the copy with this
+weft's (any edit you made in there is lost), and `weft resync` builds the
+project again.
+
+**A bus now ends once nobody is on it and no node can still join it, not when
+the node that made or joined it returns.** Every node that registered a name
+on a bus (`open_bus`, `pending_bus`, `join_bus`) is a member until its body
+returns, and then its name leaves and nothing else happens, even if it failed.
+A node can still join while the bus's marker is on a wire to a node that has
+not started, in a loop that has not ended, or in the input of a node that is
+still running (or paused on a wait) and has not used the bus yet. When the bus ends, it ends finished, or failed with the
+error of the last member to leave if that one failed. A node
+that makes a bus can return at once, and the nodes it handed the bus to still
+get to join it. Two kinds of node need a change:
+
+- One that relied on its return to end a bus another node is still on (a
+  guest whose exit told the host the conversation was over): call
+  `bus.close()` before it returns, or put a `CloseBus` after it in the graph.
+- One that reads or waits on a bus before joining it: call `join_bus` first.
+  Once your node reads or waits on the bus, it no longer keeps the bus open, so
+  the bus can end before you join, and the join is refused with `bus is closed; cannot
+  register`.
+
+For the whole rule, go and read
+[how a bus ends](docs/src/nodes/streams-and-buses.md#how-a-bus-ends).
+
+**A `package.toml` with a key weft does not know no longer loads.** It holds
+`[package]` with `name` and `uses`, and `[dependencies]`; anything else (a
+misspelled `use`, say) leaves the package's nodes out, and a program using
+one fails naming the key (``unknown field `use` ``).
+
+**For your own nodes:**
+
+- `ctx.open(&access).await?.way()` says which way a connection was made with.
+- `ctx.renew(&access)` renews a connection whose values the service refused:
+  once however many nodes ask, and only while the connection still holds what
+  your firing was handed, so a provider whose refresh token rotates can be
+  shared by many nodes. For how, go and read
+  [when the service refuses the values](docs/src/connections/using-one-in-a-node.md#when-the-service-refuses-the-values).
+- A pasted login that expires (a login file holding a refresh token) can be
+  kept alive by weft: give its way a `renewal`, and weft renews it like a
+  sign-in. Tokens that say their expiry only inside themselves are read with
+  `jwtExpiry`. For both, go and read
+  [a pasted login weft keeps alive](docs/src/connections/declaring-a-service.md#a-pasted-login-weft-keeps-alive).
+- `bus.until_end(&mut state)` waits for a bus to end, pausing like a read,
+  for a node that stays on a bus it has nothing to read on. It is in
+  [how a bus ends](docs/src/nodes/streams-and-buses.md#how-a-bus-ends) too.
+- `ctx.is_setup()` says whether the body runs in a setup (right after its
+  infra is applied) or a real run, and `ctx.firing_key()` is the same every
+  time a firing's body runs again and different on every loop iteration and
+  run: send it to a service that must not see your call twice. For both, go
+  and read [which firing am I](docs/src/nodes/ctx.md#which-firing-am-i).
+- An infra unit can be one process on the machine weft runs on
+  (`Unit.process`, local install only), with the programs it needs checked
+  before it starts. A need of it can carry a `recipe`, and weft then installs
+  the program itself, once, into a folder every install on the machine
+  shares; `weft deps-install` runs those recipes too. For how, go and read
+  [a process on your machine](docs/src/nodes/infrastructure.md#a-process-on-your-machine).
+- An endpoint can live inside another infra node's endpoint
+  (`EndpointTarget::Within`), for a server a node starts inside a Computer.
+  For how, go and read
+  [a server inside another infra node](docs/src/nodes/infrastructure.md#a-server-inside-another-infra-node).
+- A rule can ask whether the program is built for a local install
+  (`{ "kind": "local_install" }`); `weft validate` and the editor leave it
+  unanswered. If a rule mixes that with a value a wire brings, the build
+  settles what it can and the rest is checked again when the node fires. For
+  how, go and read
+  [a rule that asks which install](docs/src/nodes/metadata.md#a-rule-that-asks-which-install).
+- A node can declare named lists (`lists` in its `metadata.json`), and a
+  node it is wired into can refuse a value found in one:
+  `"noneOf": { "list": "reservedToolNames", "ofNodeWiredInto": "agent" }`
+  reads the list off whichever node is wired into its `agent` input, and
+  `noneMatch` refuses a text one of a list's regexes matches (a list marked
+  `"optional": true` may be left out by the node wired in). A value
+  that arrives on a wire is checked when the node fires. For how to write
+  the rule and its message, go and read
+  [a list another node declares](docs/src/nodes/metadata.md#a-list-another-node-declares).
+- A package can call another package's Rust code: name it in `uses = [...]`
+  in `package.toml`. For how, go and read
+  [packaging](docs/src/nodes/packaging.md#using-another-packages-code).
+- If your node builds the form it asks a person at run time, `weft::signal`
+  has it as data (`Form::for_person`, `FormField::choice` with
+  `ChoiceOption`, `.required()`, `.answering_for(key)`), and `ConfigForm`
+  builds one from a node's own settings, as HumanQuery does. For how, go and
+  read [asking a person](docs/src/nodes/triggers.md#asking-a-person).
+- A `[[needs]]` entry can say how to get a program no package manager has
+  (`how = "curl -fsSL ... | bash"`), which the person reads where the need is
+  reported missing, in place of "install it by hand".
+- `state.wait(field, FirstOf::either(a, b))` waits on two signals and ends
+  with whichever answers first, taking the other down (a form withdrawn once
+  what it asks about needs no answer). For how, go and read
+  [waiting on whichever comes first](docs/src/nodes/durable-execution.md#waiting-on-whichever-comes-first).
+
+**The rest:**
+
+**Weft drives coding agents.** `ClaudeCode`, `Codex` and 23 more agent nodes,
+one conversation each, on your machine or inside a Computer: `AskAgent`
+talks to the agent, `AnswerAgent` puts its questions and permission requests
+to a person, `CloseBus` on the agent node's `stream` ends that node's part of the run, and
+`nodes/base_catalog/agents/conversation.weft` is a ready loop of them. In an existing project,
+run `weft catalog update` to get them. For how, go and read
+[Driving a coding agent](docs/src/build/coding-agents.md).
+
+**`CloseBus` ends a bus**, for a bus that outlives the nodes sending on it:
+put it after the last of them. While anybody is on the bus it ends finished;
+if nobody is on it any more, it ends the way its last member left, so a
+producer that failed still reads as failed.
+
+**A bus that ended while its run was paused stays ended after the pause.**
+A node handed its marker afterwards reads it to its end, and the node that
+made it gets it back, instead of failing with "not a live bus".
+
+**The browser extension shows a conversation in a form**, message by
+message, shows a choice's options with their descriptions, and keeps Submit
+off until every required field has an answer.
+
+**A Computer forwards requests to a program started in it**, at
+`/apps/<name>/`, for a node that runs a server inside the computer. If the
+program also wrote down how it starts, the computer starts it again each time
+the computer starts.
+
+**Terminating a node that lives inside another removes it from there.**
+`weft infra terminate` of an agent node deletes its whole conversation, on
+your machine and inside a computer, where weft asks the computer to remove it
+(`DELETE /apps/<name>`); `weft infra stop` keeps everything. For what stays
+and why, go and read
+[stop and terminate](docs/src/build/coding-agents.md#stop-keeps-the-conversation-terminate-deletes-it).
+
 ## 2026-11-03 (0.2.290)
 
 **What breaks after this update:**

@@ -770,6 +770,8 @@ pub fn cut(project: &ProjectDefinition, walked: &Walk, given: &mut Given) -> Res
         defaults: project.defaults,
         given: given.places(),
         broken: Vec::new(),
+        // A cut runs, and a run answers a rule asking the install from it.
+        install: project.install,
         // Only drawn, and a cut is run, never drawn: every value one
         // carried is already on the input it points at.
         metadata_wires: Vec::new(),

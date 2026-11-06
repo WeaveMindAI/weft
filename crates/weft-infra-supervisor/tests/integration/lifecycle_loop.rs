@@ -640,6 +640,156 @@ async fn apply_stamps_every_endpoints_address() {
     assert!(!row.addresses.doors.contains_key("api"));
 }
 
+/// A node with no unit and one endpoint inside another node's: its apply
+/// asks the host for nothing, keeps the endpoint as the other node's
+/// handle and the path (never an address, which the other node's next
+/// start would move), and the row reads Running; applied again it is
+/// skipped; its stop and terminate complete cleanly with nothing to do on
+/// the host but forget the copy.
+#[tokio::test]
+async fn a_node_inside_another_nodes_endpoint_applies_stops_and_terminates_with_no_unit() {
+    let rig = rig();
+    let computer = weft_core::infra::InfraHandle::new("box", "api", None);
+    let spec = serde_json::json!({
+        "endpoints": [{ "name": "api", "target": { "kind": "within", "infra": computer, "path": "/apps/claude" } }]
+    });
+    let mut command = apply_cmd(1);
+    command.spec_json = Some(spec.clone());
+    rig.broker.enqueue_command(command);
+    assert!(rig.tick_lifecycle().await.unwrap());
+    assert_eq!(rig.broker.completed_commands(), vec![(1, None, false)]);
+    assert!(applies(&rig).is_empty(), "no unit to apply");
+    let row = rig.broker.infra_node(PROJECT, NODE).unwrap();
+    assert_eq!(row.status, Status::Running);
+    assert_eq!(
+        row.addresses.urls.get("api"),
+        Some(&weft_core::infra::EndpointRecord::Within(weft_core::infra::WithinRecord { within: computer, path: "/apps/claude".into() }))
+    );
+
+    let mut again = apply_cmd(2);
+    again.spec_json = Some(spec);
+    rig.broker.enqueue_command(again);
+    assert!(rig.tick_lifecycle().await.unwrap());
+    assert_eq!(call_names(&rig).iter().filter(|n| **n == "set_provisioning").count(), 1, "applied as asked already: skipped");
+
+    rig.broker.enqueue_command(cmd(3, Verb::Stop, Some(NODE)));
+    assert!(rig.tick_lifecycle().await.unwrap());
+    assert!(stops(&rig).is_empty());
+    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().status, Status::Stopped);
+
+    let mut back = apply_cmd(5);
+    back.spec_json = Some(serde_json::json!({
+        "endpoints": [{ "name": "api", "target": { "kind": "within", "infra": weft_core::infra::InfraHandle::new("box", "api", None), "path": "/apps/claude" } }]
+    }));
+    rig.broker.enqueue_command(back);
+    assert!(rig.tick_lifecycle().await.unwrap());
+    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().status, Status::Running, "a start after the stop brings it back");
+
+    rig.broker.enqueue_command(cmd(4, Verb::Terminate, Some(NODE)));
+    assert!(rig.tick_lifecycle().await.unwrap());
+    assert!(rig.broker.infra_node(PROJECT, NODE).is_none(), "the row goes");
+    assert!(rig.broker.completed_commands().iter().all(|(_, error, _)| error.is_none()), "{:?}", rig.broker.completed_commands());
+}
+
+/// A computer (`box`, one unit, its endpoint at `http://box:8000`) and an
+/// agent node (`claude`) living inside it at `/apps/agent-claude`, as
+/// their applies leave them.
+fn computer_and_agent(rig: &SupervisorTestRig, computer: Status) {
+    let unit_status = if computer == Status::Running { Status::Running } else { Status::Stopped };
+    rig.broker.add_infra_node_with(
+        PROJECT, "box", "wn-box", computer, Some("h".into()),
+        [("api".to_string(), weft_core::infra::EndpointRecord::Url("http://box:8000".into()))].into(),
+        [("box".to_string(), unit(unit_status, weft_core::StopBehavior::Stop))].into(),
+    );
+    let within = weft_core::infra::WithinRecord { within: weft_core::infra::InfraHandle::new("box", "api", None), path: "/apps/agent-claude".into() };
+    let agent = if computer == Status::Running { Status::Running } else { Status::Stopped };
+    rig.broker.add_infra_node_with(
+        PROJECT, "claude", "wn-claude", agent, Some("h".into()),
+        [("api".to_string(), weft_core::infra::EndpointRecord::Within(within))].into(),
+        Default::default(),
+    );
+}
+
+const AGENT_INSIDE: &str = "http://box:8000/apps/agent-claude";
+
+/// Terminating a node that lives inside a running one asks that one to
+/// remove it, at the node's own path, before its row goes; a stop asks
+/// nothing; the node it lives inside is left running.
+#[tokio::test]
+async fn a_terminate_asks_the_node_it_lives_inside_to_remove_it() {
+    let rig = rig();
+    computer_and_agent(&rig, Status::Running);
+    rig.broker.enqueue_command(cmd(1, Verb::Stop, Some("claude")));
+    assert!(rig.tick_lifecycle().await.unwrap());
+    assert!(rig.inside.asked().is_empty(), "a stop removes nothing");
+    rig.broker.enqueue_command(cmd(2, Verb::Terminate, Some("claude")));
+    assert!(rig.tick_lifecycle().await.unwrap());
+    assert_eq!(rig.inside.asked(), [AGENT_INSIDE]);
+    assert!(rig.broker.infra_node(PROJECT, "claude").is_none(), "the row goes");
+    assert_eq!(rig.broker.infra_node(PROJECT, "box").unwrap().status, Status::Running, "the computer stays");
+    assert!(rig.broker.completed_commands().iter().all(|(_, error, _)| error.is_none()), "{:?}", rig.broker.completed_commands());
+}
+
+/// A node it lives inside that does not answer fails the terminate before
+/// anything is touched, saying how to go on: the row stays as it was.
+#[tokio::test]
+async fn a_terminate_inside_a_stopped_node_fails_naming_it_and_touches_nothing() {
+    let rig = rig();
+    computer_and_agent(&rig, Status::Stopped);
+    rig.broker.enqueue_command(cmd(1, Verb::Terminate, Some("claude")));
+    assert!(rig.tick_lifecycle().await.unwrap());
+    let (_, error, _) = rig.broker.completed_commands().into_iter().find(|(id, _, _)| *id == 1).expect("completed");
+    let error = error.expect("failed");
+    assert!(error.contains("'claude' lives inside 'box'") && error.contains("weft infra start box"), "{error}");
+    assert!(rig.inside.asked().is_empty());
+    assert_eq!(rig.broker.infra_node(PROJECT, "claude").unwrap().status, Status::Stopped, "left as it was");
+}
+
+/// A removal the other node refuses fails the terminate with what it
+/// said and leaves the row Terminating; the next terminate asks again and
+/// completes.
+#[tokio::test]
+async fn a_refused_removal_fails_the_terminate_and_the_next_one_asks_again() {
+    let rig = rig();
+    computer_and_agent(&rig, Status::Running);
+    rig.inside.fail(AGENT_INSIDE, "DELETE answered 500: the folder is busy");
+    rig.broker.enqueue_command(cmd(1, Verb::Terminate, Some("claude")));
+    assert!(rig.tick_lifecycle().await.unwrap());
+    let (_, error, _) = rig.broker.completed_commands().into_iter().find(|(id, _, _)| *id == 1).expect("completed");
+    let error = error.expect("failed");
+    assert!(error.contains("asking 'box' to remove it failed") && error.contains("the folder is busy"), "{error}");
+    assert_eq!(rig.broker.infra_node(PROJECT, "claude").unwrap().status, Status::Terminating);
+    rig.inside.heal(AGENT_INSIDE);
+    rig.broker.enqueue_command(cmd(2, Verb::Terminate, Some("claude")));
+    assert!(rig.tick_lifecycle().await.unwrap());
+    assert_eq!(rig.inside.asked(), [AGENT_INSIDE, AGENT_INSIDE]);
+    assert!(rig.broker.infra_node(PROJECT, "claude").is_none());
+}
+
+/// A terminate of the whole project takes the node living inside a
+/// running one down first, asking it to remove it; inside a stopped one,
+/// it takes that one down first (its disk goes, and what lived in it with
+/// it) and asks nothing.
+#[tokio::test]
+async fn a_project_terminate_orders_a_node_inside_another_by_whether_that_one_answers() {
+    let rig = rig();
+    computer_and_agent(&rig, Status::Running);
+    rig.broker.enqueue_command(cmd(1, Verb::Terminate, None));
+    assert!(rig.tick_lifecycle().await.unwrap());
+    assert_eq!(rig.inside.asked(), [AGENT_INSIDE]);
+    assert_eq!(terminates(&rig).into_iter().map(|(copy, _)| copy).collect::<Vec<_>>(), ["wn-claude", "wn-box"]);
+    assert!(rig.broker.infra_node(PROJECT, "claude").is_none() && rig.broker.infra_node(PROJECT, "box").is_none());
+
+    let rig = self::rig();
+    computer_and_agent(&rig, Status::Stopped);
+    rig.broker.enqueue_command(cmd(1, Verb::Terminate, None));
+    assert!(rig.tick_lifecycle().await.unwrap());
+    assert!(rig.inside.asked().is_empty(), "nothing is left inside a copy gone with its disk");
+    assert_eq!(terminates(&rig).into_iter().map(|(copy, _)| copy).collect::<Vec<_>>(), ["wn-box", "wn-claude"]);
+    assert!(rig.broker.infra_node(PROJECT, "claude").is_none() && rig.broker.infra_node(PROJECT, "box").is_none());
+    assert!(rig.broker.completed_commands().iter().all(|(_, error, _)| error.is_none()), "{:?}", rig.broker.completed_commands());
+}
+
 #[tokio::test]
 async fn apply_reconciles_down_unit_and_skips_up_unit() {
     let rig = rig();

@@ -21,12 +21,12 @@ fn built(template: &str) -> weft_core::ProjectDefinition {
     std::fs::create_dir_all(dir.path().join("prompts")).unwrap();
     std::fs::write(dir.path().join("prompts/t.txt"), template).unwrap();
     let catalog = catalog();
-    let (program, contents) =
-        weft_compiler::compile_program_with_contents(MAIN, uuid::Uuid::nil(), CompileFs::disk(dir.path()), &catalog).expect("compiles");
+    let compiled =
+        weft_compiler::compile_program_with_contents(MAIN, uuid::Uuid::nil(), CompileFs::disk(dir.path()), &catalog, None).expect("compiles");
     // The build's own gate reads the program with its contents put back.
-    let left = weft_compiler::unsettled(&program, &contents, &catalog, CompileFs::disk(dir.path()));
+    let left = weft_compiler::unsettled(&compiled, &catalog, CompileFs::disk(dir.path()));
     assert!(left.is_empty(), "{left:?}");
-    program
+    compiled.definition
 }
 
 /// A check that reads a literal's value reads the file's value at the
@@ -39,14 +39,17 @@ fn the_builds_gate_reads_the_value_a_file_holds() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("on.txt"), "false").unwrap();
     let catalog = catalog();
-    let (program, contents) =
-        weft_compiler::compile_program_with_contents(main, uuid::Uuid::nil(), CompileFs::disk(dir.path()), &catalog).expect("compiles");
+    let compiled =
+        weft_compiler::compile_program_with_contents(main, uuid::Uuid::nil(), CompileFs::disk(dir.path()), &catalog, None).expect("compiles");
+    let program = &compiled.definition;
     assert!(program.broken.is_empty(), "{:?}", program.broken);
     let gate = program.nodes.iter().find(|node| node.id == "off").unwrap().port_literals["_should_flow"].clone();
     assert!(ContentRef::from_value(&gate).is_some(), "the built gate names the file's content: {gate}");
-    let left = weft_compiler::unsettled(&program, &contents, &catalog, CompileFs::disk(dir.path()));
+    let left = weft_compiler::unsettled(&compiled, &catalog, CompileFs::disk(dir.path()));
     assert!(left.is_empty(), "{left:?}");
-    let unread = weft_compiler::unsettled(&program, &Default::default(), &catalog, CompileFs::disk(dir.path()));
+    let mut unread = compiled.clone();
+    unread.contents.clear();
+    let unread = weft_compiler::unsettled(&unread, &catalog, CompileFs::disk(dir.path()));
     assert!(unread.iter().any(|d| d.message.contains("'on.txt'")), "{unread:?}");
 }
 
@@ -154,14 +157,15 @@ each.prefix = @file(\"prefix.txt\")
         assert!(!json.contains("@file("), "no raw `@file` text: {json}");
     };
 
-    let (program, contents) =
-        weft_compiler::compile_program_with_contents(main, uuid::Uuid::nil(), CompileFs::disk(dir.path()), &catalog).expect("compiles");
+    let compiled =
+        weft_compiler::compile_program_with_contents(main, uuid::Uuid::nil(), CompileFs::disk(dir.path()), &catalog, None).expect("compiles");
+    let (program, contents) = (&compiled.definition, &compiled.contents);
     assert!(program.broken.is_empty(), "{:?}", program.broken);
-    let content = ContentRef::from_value(&loop_in(&program).port_literals["prefix"]).expect("the loop's input is named by its content");
+    let content = ContentRef::from_value(&loop_in(program).port_literals["prefix"]).expect("the loop's input is named by its content");
     assert_eq!(content.path(), "prefix.txt");
     assert_eq!(contents.get(&content.id()).map(|value| (**value).clone()), Some(serde_json::json!("hello")));
-    no_copy(&program);
-    let left = weft_compiler::unsettled(&program, &contents, &catalog, CompileFs::disk(dir.path()));
+    no_copy(program);
+    let left = weft_compiler::unsettled(&compiled, &catalog, CompileFs::disk(dir.path()));
     assert!(left.is_empty(), "{left:?}");
 
     let (parsed, _) = weft_compiler::parse_only(main, uuid::Uuid::nil(), CompileFs::disk(dir.path()), &catalog, None);

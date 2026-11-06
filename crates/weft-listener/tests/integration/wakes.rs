@@ -1709,6 +1709,7 @@ fn recording_spec(test: &str, n: u32) -> weft_core::primitive::SignalSpec {
         limits: Default::default(),
         settings: Default::default(),
         on_cancel: None,
+        branch_of: None,
     }
 }
 

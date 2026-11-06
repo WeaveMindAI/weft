@@ -13,6 +13,12 @@
     type PendingTask,
   } from '../../lib/api';
   import { singleFlight } from '../../lib/single-flight';
+  import ChatHistory from './ChatHistory.svelte';
+
+  /// The components that show a value and ask nothing back: no answer
+  /// is kept or sent for them.
+  // SYNC: form components <-> crates/weft-core/src/signal/form/fields.rs (component, SHOWN_ONLY)
+  const SHOWN_ONLY = ['readonly', 'image', 'chat_history'];
 
   // ------------- State -------------
 
@@ -201,17 +207,41 @@
       else if (r.component === 'select' && r.multiple) vals[f.key] = [];
       else if ((r.component === 'textarea' || r.component === 'text') && r.prefilled)
         vals[f.key] = typeof f.value === 'string' ? f.value : '';
-      else if (r.component !== 'readonly') vals[f.key] = '';
+      else if (!SHOWN_ONLY.includes(r.component)) vals[f.key] = '';
     }
     formValues = vals;
     buttonDecisions = decisions;
   }
 
+  /// No answer at all: nothing, a blank text, or an empty pick. The
+  /// rule a `required` field is held to, the same one weft reads the
+  /// submission by.
+  // SYNC: blank answer <-> crates/weft-core/src/signal/form/fields.rs (is_blank)
+  function isBlank(value: unknown): boolean {
+    if (value === undefined || value === null) return true;
+    if (typeof value === 'string') return value.trim() === '';
+    if (Array.isArray(value)) return value.length === 0;
+    return false;
+  }
+
+  /// Whether the person has answered `f`: a decision taken, or a value
+  /// that is not blank.
+  function isAnswered(f: FormField): boolean {
+    if (f.render.component === 'buttons') return buttonDecisions[f.key] === true || buttonDecisions[f.key] === false;
+    return !isBlank(formValues[f.key]);
+  }
+
+  /// Every decision is taken, and every `required` field is answered,
+  /// by itself or by a field answering for it (the box for an answer of
+  /// the person's own beside a question's options).
+  // SYNC: required/answersFor <-> crates/weft-core/src/signal/form/fields.rs (FormSchema::answers)
   function isFormValid(): boolean {
     if (!currentTask?.formSchema) return true;
-    for (const f of currentTask.formSchema.fields) {
+    const fields = currentTask.formSchema.fields;
+    for (const f of fields) {
       if (!f.key) continue;
       if (f.render.component === 'buttons' && buttonDecisions[f.key] === null) return false;
+      if (f.required && !isAnswered(f) && !fields.some((o) => o.answersFor === f.key && isAnswered(o))) return false;
     }
     return true;
   }
@@ -395,10 +425,58 @@
     };
   }
 
-  function getOptions(field: FormField): string[] {
-    if (field.render.source === 'input')
-      return Array.isArray(field.value) ? (field.value as string[]) : [];
-    return (field.config.options as string[]) ?? [];
+  /// One option of a select: what is shown (`label`, with an optional
+  /// line under it) and what is sent when it is picked (`value`). A
+  /// plain string option is both.
+  // SYNC: choice option shape <-> crates/weft-core/src/signal/form/fields.rs (ChoiceOption)
+  interface ChoiceOption {
+    value: string;
+    label: string;
+    description?: string;
+  }
+
+  /// A select's options, from its config (`options`) or, for a field
+  /// fed from an input, its value. Each is a plain string or a
+  /// `{ value, label, description? }`; anything else fails the field,
+  /// naming it, instead of drawing an option the person could not
+  /// answer with.
+  // SYNC: form config keys <-> crates/weft-core/src/signal/form/fields.rs (config_key::OPTIONS, PLACEHOLDER, APPROVE_LABEL, REJECT_LABEL)
+  function readOptions(field: FormField): { options: ChoiceOption[] } | { error: string } {
+    const raw = field.render.source === 'input' ? field.value : field.config.options;
+    if (raw === undefined || raw === null) return { options: [] };
+    if (!Array.isArray(raw)) return { error: `The options of '${field.label || field.key}' are not a list.` };
+    const options: ChoiceOption[] = [];
+    for (const o of raw) {
+      if (typeof o === 'string') {
+        options.push({ value: o, label: o });
+        continue;
+      }
+      const rec = o as Record<string, unknown> | null;
+      if (
+        typeof rec === 'object' && rec !== null &&
+        typeof rec.value === 'string' && typeof rec.label === 'string' &&
+        (rec.description === undefined || typeof rec.description === 'string')
+      ) {
+        options.push({ value: rec.value, label: rec.label, description: rec.description as string | undefined });
+        continue;
+      }
+      return {
+        error: `An option of '${field.label || field.key}' is neither text nor a { value, label, description? }: ${JSON.stringify(o)}`,
+      };
+    }
+    return { options };
+  }
+
+  /// Whether the field's selection holds the option `value`: one value
+  /// for a single choice, a list of values for `multiple`.
+  function isPicked(field: FormField, value: string): boolean {
+    const v = formValues[field.key];
+    return field.render.multiple ? ((v as string[]) ?? []).includes(value) : v === value;
+  }
+
+  function pick(field: FormField, value: string) {
+    if (field.render.multiple) toggleMultiSelect(field.key, value);
+    else formValues = { ...formValues, [field.key]: value };
   }
 
   function fmt(value: unknown): string {
@@ -571,7 +649,7 @@
                   {@const r = field.render}
                   {#if r.component === 'readonly'}
                     <div class="field">
-                      <p class="field-key">{field.label || field.key}</p>
+                      <p class="field-key">{field.label || field.key}{#if field.required}<span class="required-mark" title="Needs an answer before you can send"> *</span>{/if}</p>
                       {#if isComplex(field.value)}
                         <pre class="readonly-pre">{fmt(field.value)}</pre>
                       {:else}
@@ -582,7 +660,7 @@
                     {@const imgSrc = imageSourceOf(field.value)}
                     {@const storedFile = !imgSrc && isStoredFileValue(field.value)}
                     <div class="field">
-                      <p class="field-key">{field.label || field.key}</p>
+                      <p class="field-key">{field.label || field.key}{#if field.required}<span class="required-mark" title="Needs an answer before you can send"> *</span>{/if}</p>
                       {#if imgSrc}
                         <img src={imgSrc} alt={field.label || field.key} class="field-image" />
                       {:else if storedFile}
@@ -608,7 +686,7 @@
                   {:else if r.component === 'buttons'}
                     {@const decision = buttonDecisions[field.key]}
                     <div class="field">
-                      <p class="field-key">{field.label || field.key}</p>
+                      <p class="field-key">{field.label || field.key}{#if field.required}<span class="required-mark" title="Needs an answer before you can send"> *</span>{/if}</p>
                       <div class="btn-row">
                         <button
                           class="decision-btn {decision === false ? 'reject-active' : 'reject-idle'}"
@@ -620,39 +698,55 @@
                         >{(field.config.approveLabel as string) || 'Approve'}</button>
                       </div>
                     </div>
+                  {:else if r.component === 'chat_history'}
+                    <div class="field">
+                      <p class="field-key">{field.label || field.key}{#if field.required}<span class="required-mark" title="Needs an answer before you can send"> *</span>{/if}</p>
+                      <ChatHistory task={currentTask} {field} />
+                    </div>
                   {:else if r.component === 'select'}
-                    {@const options = getOptions(field)}
-                    {#if r.multiple}
-                      {@const selected = (formValues[field.key] as string[]) ?? []}
-                      <div class="field">
-                        <p class="field-key">{field.label || field.key}</p>
-                        <div class="chip-row">
-                          {#each options as option}
+                    {@const read = readOptions(field)}
+                    <div class="field">
+                      <p class="field-key">{field.label || field.key}{#if field.required}<span class="required-mark" title="Needs an answer before you can send"> *</span>{/if}</p>
+                      {#if 'error' in read}
+                        <div class="error-box">{read.error}</div>
+                      {:else if read.options.length === 0}
+                        <p class="field-empty">No options available</p>
+                      {:else if read.options.some((o) => o.description !== undefined)}
+                        <!-- Options that explain themselves: one row each,
+                             the label over its description. -->
+                        <div class="choice-list" role={r.multiple ? 'group' : 'radiogroup'}>
+                          {#each read.options as option}
+                            {@const on = isPicked(field, option.value)}
                             <button
-                              class="chip {selected.includes(option) ? 'chip-active' : 'chip-idle'}"
-                              onclick={() => toggleMultiSelect(field.key, option)}
-                            >{option}</button>
+                              class="choice {on ? 'choice-active' : 'choice-idle'}"
+                              role={r.multiple ? 'checkbox' : 'radio'}
+                              aria-checked={on}
+                              onclick={() => pick(field, option.value)}
+                            >
+                              <span class="choice-mark {r.multiple ? 'mark-box' : 'mark-dot'}"></span>
+                              <span class="choice-text">
+                                <span class="choice-label">{option.label}</span>
+                                {#if option.description}
+                                  <span class="choice-desc">{option.description}</span>
+                                {/if}
+                              </span>
+                            </button>
                           {/each}
-                          {#if options.length === 0}<p class="field-empty">No options available</p>{/if}
                         </div>
-                      </div>
-                    {:else}
-                      <div class="field">
-                        <p class="field-key">{field.label || field.key}</p>
+                      {:else}
                         <div class="chip-row">
-                          {#each options as option}
+                          {#each read.options as option}
                             <button
-                              class="chip {formValues[field.key] === option ? 'chip-active' : 'chip-idle'}"
-                              onclick={() => { formValues = { ...formValues, [field.key]: option }; }}
-                            >{option}</button>
+                              class="chip {isPicked(field, option.value) ? 'chip-active' : 'chip-idle'}"
+                              onclick={() => pick(field, option.value)}
+                            >{option.label}</button>
                           {/each}
-                          {#if options.length === 0}<p class="field-empty">No options available</p>{/if}
                         </div>
-                      </div>
-                    {/if}
+                      {/if}
+                    </div>
                   {:else if r.component === 'text'}
                     <div class="field">
-                      <p class="field-key">{field.label || field.key}</p>
+                      <p class="field-key">{field.label || field.key}{#if field.required}<span class="required-mark" title="Needs an answer before you can send"> *</span>{/if}</p>
                       <input
                         type="text"
                         class="text-input"
@@ -663,7 +757,7 @@
                     </div>
                   {:else if r.component === 'textarea'}
                     <div class="field">
-                      <p class="field-key">{field.label || field.key}</p>
+                      <p class="field-key">{field.label || field.key}{#if field.required}<span class="required-mark" title="Needs an answer before you can send"> *</span>{/if}</p>
                       <textarea
                         class="text-input"
                         rows={r.prefilled ? 6 : 3}
@@ -947,6 +1041,7 @@
     color: #71717a;
     margin: 0 0 6px;
   }
+  .required-mark { color: #dc2626; }
   .readonly-pre {
     font-size: 12px;
     background: #fafafa;
@@ -1033,6 +1128,38 @@
   .chip-idle { background: #f4f4f5; color: #52525b; }
   .chip-idle:hover { background: #e4e4e7; }
   .chip-active { background: #18181b; color: white; }
+  .choice-list { display: flex; flex-direction: column; gap: 6px; }
+  .choice {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    padding: 9px 12px;
+    border: 1px solid #e4e4e7;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .choice-idle { background: #fafafa; }
+  .choice-idle:hover { background: #f4f4f5; }
+  .choice-active { background: white; border-color: #18181b; }
+  .choice-mark {
+    flex-shrink: 0;
+    width: 14px;
+    height: 14px;
+    margin-top: 1px;
+    border: 1.5px solid #a1a1aa;
+    background: white;
+    box-sizing: border-box;
+  }
+  .mark-dot { border-radius: 50%; }
+  .mark-box { border-radius: 3px; }
+  .choice-active .choice-mark { border-color: #18181b; background: #18181b; box-shadow: inset 0 0 0 2px white; }
+  .choice-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .choice-label { font-size: 13px; font-weight: 500; color: #18181b; }
+  .choice-desc { font-size: 12px; color: #71717a; line-height: 1.4; }
 
   .action-row {
     display: flex;

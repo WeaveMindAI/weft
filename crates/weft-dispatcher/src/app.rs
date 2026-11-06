@@ -232,6 +232,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
     let addresses = config.role_addresses(config.roles.of(CoreRole::Dispatcher).vantage());
     let builder = Arc::new(crate::build::VersionBuilder {
         images,
+        install: config.install_kind(),
         pool: pool.clone(),
         prunes: Default::default(),
         blobs: crate::build::blob_cache::BlobCache::in_temp_dir(config.roles.of(CoreRole::Dispatcher).files_take_memory()),

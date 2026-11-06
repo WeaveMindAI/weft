@@ -12,6 +12,8 @@ mod fires_with;
 mod gated_fire;
 mod highlighting_vocabulary;
 mod include_cuts;
+mod install_rules;
+mod none_of_lists;
 mod loop_cuts;
 mod metadata_ports;
 mod infra_image_enum;

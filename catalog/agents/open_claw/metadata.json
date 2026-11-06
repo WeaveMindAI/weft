@@ -1,0 +1,355 @@
+{
+  "type": "OpenClaw",
+  "label": "OpenClaw",
+  "description": "One conversation with OpenClaw, the open source personal assistant that also codes: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, OpenClaw runs on your machine (a local install only), working in `folder`. If `openclaw` is missing, weft installs it into a folder of its own, shared by the whole machine, before the node runs. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs. Either way it logs in with the connection on `access`. It runs on the connection's key, which names no model, so `model` is always required. Each conversation runs an OpenClaw Gateway of its own, in a home of its own, that starts and stops with it, never your machine's own Gateway, which holds its own logins, channels and scheduled jobs. The Gateway's heartbeat, its scheduled jobs and its memory dreaming are off, so it calls no model while nobody talks to it. It works in `folder` and writes none of its own files (AGENTS.md, SOUL.md, ...) there. Only shell commands ask, never file writes or edits. A command made of several (`a; b`) is refused without asking, and the model is told so. A command nobody answers within 30 minutes is denied, a wait OpenClaw fixes in its code, and the model carries on without it. When it needs a decision from you, its own question tool asks it, and the question comes out of AskAgent like a permission does. OpenClaw drops a question nobody answers within an hour, a limit it fixes in its code, and the model then carries on without the answer. Your program's tools reach OpenClaw under their plain names, through a plugin weft writes for it. OpenClaw never lets a plugin's tool take the name of one of its own, so those names (`read`, `exec`, `web_search`, `sessions_spawn` and the rest of this node's list) are refused when the program is built. Its card shows what it is doing and a Start over button. What is exposed: the permission mode, the model and the effort.",
+  "tags": [
+    "agent",
+    "coding",
+    "openclaw",
+    "assistant",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run OpenClaw in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[open_claw]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "An OpenClawAccess's `access`: a model provider's key (Anthropic, OpenAI, Gemini, OpenRouter, or an OpenAI-compatible server). Required, because this agent never runs on a login already on your machine."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder OpenClaw works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`openclaw` on your PATH",
+      "description": "On your machine: the OpenClaw program to run, when it is not the `openclaw` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "auto",
+          "read_only",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What OpenClaw may do without asking. `ask`: every shell command comes out of AskAgent as a question; file writes and edits in `folder` go ahead. `auto`: OpenClaw's own reviewer, one more model call per command, lets each shell command run, refuses it, or asks; file writes and edits in `folder` go ahead. `read_only`: no shell and no file writes or edits: it reads and answers. `bypass`: nothing asks, nothing is refused, and files are written anywhere; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "claude-sonnet-4-5",
+      "description": "The provider's own model id: `claude-sonnet-4-5` with an Anthropic key, `anthropic/claude-sonnet-4.5` on OpenRouter, or the id an OpenAI-compatible server knows. Required."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "off",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultra",
+          "adaptive"
+        ]
+      },
+      "label": "Effort",
+      "description": "How much the model reasons, among the levels that model offers. Left out, `adaptive`, the Gateway's default."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "OpenClaw '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "input_satisfied",
+          "port": "access"
+        }
+      },
+      "then": {
+        "message": "OpenClaw '{id}' runs only on a connection's login: your machine's own OpenClaw Gateway holds its own logins, channels and scheduled jobs; give it an OpenClawAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "OpenClaw '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "value",
+          "field": "model"
+        }
+      },
+      "then": {
+        "message": "OpenClaw '{id}' needs a model; set `model` to the provider's own model id.",
+        "level": "structural",
+        "severity": "error",
+        "port": "model"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "auto",
+                "read_only",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "OpenClaw '{id}' has a `permission` it does not know; pick one of ask, auto, read_only, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "OpenClaw '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "OpenClaw '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs OpenClaw itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "agents_list",
+      "agents_wait",
+      "apply_patch",
+      "ask_user",
+      "automations",
+      "browser",
+      "canvas",
+      "code_execution",
+      "computer",
+      "conversations_list",
+      "conversations_send",
+      "conversations_turn",
+      "create_goal",
+      "dashboard",
+      "decision_evaluate",
+      "dismiss_task",
+      "edit",
+      "exec",
+      "gateway",
+      "get_goal",
+      "github_identity_status",
+      "github_publish",
+      "heartbeat_respond",
+      "image_generate",
+      "intent",
+      "ls",
+      "memory_get",
+      "memory_search",
+      "message",
+      "mobile_ui",
+      "music_generate",
+      "nodes",
+      "openclaw",
+      "pdf",
+      "personal_instructions",
+      "plugins",
+      "portal",
+      "presence",
+      "process",
+      "progress_card",
+      "read",
+      "screen",
+      "secrets",
+      "session_status",
+      "sessions",
+      "sessions_history",
+      "sessions_list",
+      "sessions_search",
+      "sessions_send",
+      "sessions_spawn",
+      "sessions_yield",
+      "show_widget",
+      "skill_workshop",
+      "skills_read",
+      "skills_search",
+      "subagents",
+      "suggest_task",
+      "terminal",
+      "theme",
+      "transcripts",
+      "tts",
+      "update_goal",
+      "video_generate",
+      "view_image",
+      "web_fetch",
+      "web_search",
+      "write",
+      "x_search"
+    ]
+  }
+}

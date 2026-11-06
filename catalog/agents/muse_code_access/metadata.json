@@ -1,0 +1,62 @@
+{
+  "type": "MuseCodeAccess",
+  "label": "Muse Code Access",
+  "description": "A Meta Model API login, for the MuseCode nodes' `access`: an API key, billed pay as you go. One access for however many MuseCode nodes. A Muse Code subscription is not offered here: its credential is for use with Muse Code only, and the shape of its login file is undocumented; on your machine, leaving `access` out uses your own `muse login`.",
+  "tags": [
+    "agent",
+    "muse",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#0866ff",
+  "service": {
+    "service": "muse_code",
+    "label": "Muse Code",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "apiKey",
+          "label": "Meta Model API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "Meta Model API key",
+              "placeholder": "LLM_..."
+            }
+          ],
+          "guide": {
+            "link": "https://dev.meta.ai/docs/authentication",
+            "steps": [
+              "Log in to the Model API dashboard and open the API keys tab.",
+              "Create a key and copy it right away (it is shown once).",
+              "Paste it below and name the connection. Calls are billed pay as you go."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[muse_code]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[muse_code]",
+      "description": "Wire into the MuseCode nodes' `access` input."
+    }
+  ]
+}

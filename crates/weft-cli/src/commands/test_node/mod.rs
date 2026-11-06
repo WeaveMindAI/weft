@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 
 use weft_catalog::FsCatalog;
-use weft_core::access::spec::{AccessSpec, Acquisition, CredentialField, Door};
+use weft_core::access::spec::{AccessSpec, CredentialField, Door, LoginWay};
 use weft_core::access::wire::ConnectDirect;
 use weft_core::node::MetadataCatalog;
 use weft_core::node_test::{
@@ -1138,25 +1138,50 @@ fn key_env_var(service: &str, field: &str) -> String {
     format!("WEFT_NODE_TEST_{}_{}", env_component(service), env_component(field))
 }
 
-/// A spec's static-acquisition credential fields, when it has any.
-fn static_fields(spec: &AccessSpec) -> Option<Vec<CredentialField>> {
-    match &spec.acquisition {
-        Acquisition::Static { fields } => Some(fields.clone()),
-        _ => None,
-    }
+/// Every credential field a `<service>` key can carry: the paste
+/// variant's, plus the fields of every way to sign in the spec itself
+/// offers (either set may be absent).
+fn key_fields(spec: &AccessSpec) -> Vec<CredentialField> {
+    let ways_of = |spec: &AccessSpec| spec.ways().iter().flat_map(|w| w.fields.clone()).collect::<Vec<_>>();
+    let mut fields: Vec<CredentialField> = spec.paste_variant().as_ref().map(ways_of).unwrap_or_default();
+    fields.extend(ways_of(spec));
+    fields
 }
 
-/// Every credential field a `<service>` key can carry: the paste
-/// variant's static fields plus the spec's own static-acquisition
-/// fields (either set may be absent).
-fn key_fields(spec: &AccessSpec) -> Vec<CredentialField> {
-    let mut fields: Vec<CredentialField> = spec
-        .paste_variant()
-        .as_ref()
-        .and_then(static_fields)
-        .unwrap_or_default();
-    fields.extend(static_fields(spec).unwrap_or_default());
-    fields
+/// The way to sign in a `<service>` key fills: the service's only way,
+/// else, for a scripted run, the one way whose fields the environment
+/// sets, else the one the person picks.
+fn key_way<'s>(spec: &'s AccessSpec, service: &str, env_driven: bool) -> Result<&'s LoginWay> {
+    let ways = spec.ways();
+    if let [only] = ways {
+        return Ok(only);
+    }
+    if env_driven {
+        let set: Vec<&LoginWay> = ways
+            .iter()
+            .filter(|w| w.fields.iter().any(|f| std::env::var(key_env_var(service, &f.name)).is_ok_and(|v| !v.is_empty())))
+            .collect();
+        return match set.as_slice() {
+            [one] => Ok(one),
+            [] => bail!("the environment sets no field of any of '{service}'s ways to sign in"),
+            _ => bail!(
+                "the environment sets fields of several of '{service}'s ways to sign in ({}); set only one way's",
+                set.iter().map(|w| w.id.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+        };
+    }
+    let menu: String = ways.iter().enumerate().map(|(i, w)| format!("\n  [{}] {}", i + 1, w.display_label())).collect();
+    let choice = crate::prompt::prompt_line(
+        &format!("How does the '{service}' key sign in?{menu}\nWay [1-{}]: ", ways.len()),
+        &format!("one way's {} variables in the environment", key_env_var(service, "<field>")),
+    )?;
+    choice
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|i| ways.get(i))
+        .with_context(|| format!("'{}' is not one of the ways; answer 1 to {}", choice.trim(), ways.len()))
 }
 
 /// True when any `WEFT_NODE_TEST_<SERVICE>_*` variable is set: the
@@ -1263,6 +1288,9 @@ struct PreparedKey {
     spec: AccessSpec,
     values: BTreeMap<String, String>,
     paste: bool,
+    /// The way to sign in the values fill, for a pasted-credential
+    /// service (`None` for the paste section, whose one way is implied).
+    way: Option<String>,
 }
 
 fn prepare_ephemeral_key(catalog: &FsCatalog, service: &str) -> Result<PreparedKey> {
@@ -1276,26 +1304,22 @@ fn prepare_ephemeral_key(catalog: &FsCatalog, service: &str) -> Result<PreparedK
 
     // The paste surface: a consent service's ownPage.paste fields, or
     // a static (key-paste) service's own declared fields.
-    let (fields, paste_flag) = match spec.paste_variant() {
-        Some(variant) => (
-            static_fields(&variant)
-                .expect("paste_variant always yields a static acquisition"),
-            true,
-        ),
-        None => match static_fields(spec) {
-            Some(fields) => (fields, false),
-            None => bail!(
-                "service '{service}' has no paste flow (it connects through a sign-in); \
-                 connect it in the editor and re-run without --key"
-            ),
-        },
-    };
-
     // Once ANY field for this service comes from the environment the
     // whole grant is env-driven: a required gap fails loud naming the
     // variable and an optional gap is skipped, never prompted (a
     // scripted sweep must not stop on stdin).
     let env_driven = env_key_present(service);
+    let (fields, paste_flag, way) = match spec.paste_variant() {
+        Some(variant) => (variant.ways().iter().flat_map(|w| w.fields.clone()).collect::<Vec<_>>(), true, None),
+        None if !spec.ways().is_empty() => {
+            let way = key_way(spec, service, env_driven)?;
+            (way.fields.clone(), false, Some(way.id.clone()))
+        }
+        None => bail!(
+            "service '{service}' has no paste flow (it connects through a sign-in); \
+             connect it in the editor and re-run without --key"
+        ),
+    };
     let mut values: BTreeMap<String, String> = BTreeMap::new();
     for field in &fields {
         let label = field.label.as_deref().unwrap_or(&field.name);
@@ -1331,7 +1355,7 @@ fn prepare_ephemeral_key(catalog: &FsCatalog, service: &str) -> Result<PreparedK
         }
         values.insert(field.name.clone(), value);
     }
-    Ok(PreparedKey { spec: spec.clone(), values, paste: paste_flag })
+    Ok(PreparedKey { spec: spec.clone(), values, paste: paste_flag, way })
 }
 
 /// The side-effecting half: store the prepared credential as an
@@ -1349,6 +1373,7 @@ async fn create_ephemeral_grant(ctx: &Ctx, key: PreparedKey) -> Result<uuid::Uui
             permissions: Vec::new(),
             registration: None,
             paste: key.paste,
+            way: key.way,
             project_id: None,
             instance: None,
         },
@@ -1967,7 +1992,7 @@ mod tests {
     /// row naming its node type.
     #[test]
     fn only_the_tested_node_types_needs_are_asked() {
-        let need = |name: &str| weft_core::needs::Need { name: name.into(), stage: weft_core::needs::NeedStage::Run, check: vec![name.into()], install: Default::default() };
+        let need = |name: &str| weft_core::needs::Need { name: name.into(), stage: weft_core::needs::NeedStage::Run, check: vec![name.into()], install: Default::default(), how: None, recipe: None };
         let needs: weft_core::needs::NodeNeeds = [("ExecPython".to_string(), vec![need("python3")]), ("Ffmpeg".to_string(), vec![need("ffmpeg")])].into();
         let rows = tested_needs(&needs, ["ExecPython", "ExecPython", "Plain"].into_iter());
         assert_eq!(rows.len(), 1);

@@ -1,0 +1,274 @@
+{
+  "type": "ClineCli",
+  "label": "Cline CLI",
+  "description": "One conversation with Cline CLI, Cline's coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, Cline CLI runs on your machine (a local install only) with your own login, working in `folder`, from your own install of `cline` when there is one on PATH; when there is none, weft installs Cline CLI (with the Node.js 22 it runs on) itself, once, into a folder of its own shared by every program on the machine. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs, and it logs in with the connection on `access`. weft drives Cline through the SDK its npm package carries. It asks before each call of its own tools, and a refusal fails only that tool; your program's tools never ask. When Cline has a question for you, it comes out of AskAgent as a question. Your program's tools reach Cline under their plain names, and one named like a tool of Cline's own (`read_files`, `run_commands`, `spawn_agent`, ...) takes that tool's place. On your machine's own login it is your own Cline: your login, the provider you last used, your plugins, rules and hooks. Its card shows what it is doing and a Start over button. What is exposed: the permission mode, the model and the reasoning effort; the rest of Cline's settings stay its own.",
+  "tags": [
+    "agent",
+    "coding",
+    "cline",
+    "cline-bot",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run Cline CLI in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[cline_cli]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A ClineCliAccess's `access`: a Cline API key, or a key for another provider Cline takes. Required with a `computer`. Left out on your machine, Cline CLI uses the login already on it."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder Cline CLI works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`cline` on your PATH",
+      "description": "On your machine: the Cline CLI program to run, when it is not the `cline` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "plan",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What Cline CLI may do without asking. `ask`: each call of Cline's own tools comes out of AskAgent as a question. `plan`: it reads and plans, and changes nothing. `bypass`: nothing asks, nothing is refused; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "the provider's default",
+      "description": "The model id to use, as its provider names it. Left out, the provider's default."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "label": "Reasoning effort",
+      "description": "How hard the model reasons. Left out, what Cline is set to for the provider, else the model's default."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ClineCli '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ClineCli '{id}' runs in a computer, where no login is waiting for it; give it a ClineCliAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ClineCli '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "plan",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ClineCli '{id}' has a `permission` it does not know; pick one of ask, plan, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ClineCli '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "ClineCli '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs Cline CLI itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": []
+  }
+}

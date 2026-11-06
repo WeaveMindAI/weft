@@ -678,6 +678,7 @@ pub enum RunEvent {
         at_unix: u64,
     },
 
+    // SYNC: BusJoined <-> crates/weft-core/src/live_event.rs BusJoined, packages/weft-graph/src/protocol.ts BusInspectorEvent 'joined', extension-vscode/src/runFollower.ts DispatcherEvent 'bus_joined'
     BusJoined {
         #[serde(skip)]
         run_id: RunId,
@@ -687,12 +688,16 @@ pub enum RunEvent {
         at_unix: u64,
     },
 
+    /// A name left the bus, and how its body returned: how the bus ends
+    /// if nobody joins it after.
+    // SYNC: BusLeft <-> crates/weft-core/src/live_event.rs BusLeft, packages/weft-graph/src/protocol.ts BusInspectorEvent 'left', extension-vscode/src/runFollower.ts DispatcherEvent 'bus_left'
     BusLeft {
         #[serde(skip)]
         run_id: RunId,
         bus_id: String,
         offset: u64,
         name: String,
+        end: weft_core::bus::StreamEnd,
         at_unix: u64,
     },
 
@@ -1510,7 +1515,7 @@ mod wire_tests {
                 at_unix: 1,
             },
             RunEvent::BusJoined { run_id: run_id(), bus_id: "b".into(), offset: 0, name: "a".into(), at_unix: 1 },
-            RunEvent::BusLeft { run_id: run_id(), bus_id: "b".into(), offset: 1, name: "a".into(), at_unix: 1 },
+            RunEvent::BusLeft { run_id: run_id(), bus_id: "b".into(), offset: 1, name: "a".into(), end: weft_core::bus::StreamEnd::Finished, at_unix: 1 },
             RunEvent::BusWindow {
                 run_id: run_id(),
                 bus_id: "b".into(),

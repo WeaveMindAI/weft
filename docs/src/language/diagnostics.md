@@ -190,6 +190,13 @@ For what `@per_instance` and `@instance_filled` do, go and read [Programs with i
 |---|---|---|
 | `rule-structural` | A rule the node's own author wrote, checked on every build | Whatever its message says |
 | `rule-runtime` | The same, but only checked at the moments listed at the top of this page | Fill what the message names. A node with no connection picked is not one of these: the install refuses the run when it starts, and the message gives the command that picks one, `weft connect <node>` |
+| `list-not-declared` | A node's rule reads a list off the node wired into one of its inputs (a `noneOf` naming `ofNodeWiredInto`), and the node wired there declares no list of that name | Wire in the kind of node the rule expects, or, if you wrote the rule, fix the list's name |
+| `list-not-regex` | A node's rule matches against a list of regexes read off the node wired into one of its inputs (a `noneMatch` naming `ofNodeWiredInto`), and an item in that node's list is no regex that compiles | Fix the regex in the `lists` of the node the message names |
+
+A rule that asks whether the install is a local one (`local_install`) is
+never reported by `weft validate` or the editor, which build for no install.
+For which builds answer it and what a cloud install does with it, go and read
+[a rule that asks which install](../nodes/metadata.md#a-rule-that-asks-which-install).
 
 A rule whose answer depends on a value that arrives on a wire cannot be
 decided here, so it is checked again when the node runs, on the value that

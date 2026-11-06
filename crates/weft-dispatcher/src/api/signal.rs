@@ -317,11 +317,11 @@ pub(crate) async fn answer_run(
                 crate::store::Answered::Reached { consumed } => {
                     // The row is gone now, so the listener only learns of
                     // it from here.
-                    state.listener.unregister_many(&[consumed]).await;
+                    state.listener.unregister_many(&consumed).await;
                     Ok(StatusCode::OK)
                 }
                 crate::store::Answered::RunEnded { consumed } => {
-                    state.listener.unregister_many(&[consumed]).await;
+                    state.listener.unregister_many(&consumed).await;
                     Err((StatusCode::GONE, "the run this answers has ended".into()))
                 }
                 crate::store::Answered::Gone => {

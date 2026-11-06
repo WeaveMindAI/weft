@@ -1,0 +1,301 @@
+{
+  "type": "MiniMaxCode",
+  "label": "MiniMax Code",
+  "description": "One conversation with MiniMax Code, MiniMax's coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, MiniMax Code runs on your machine (a local install only) from your own install of `mcode` with your own login, working in `folder`. If `mcode` is missing, weft installs it into a folder of its own, shared by the whole machine, before the node runs. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs, and it logs in with the connection on `access`. When it asks you something with its question tool, it ends its turn to wait, so weft sends your answer on to it as a message of its own, in the same turn. Even in `ask` its own classifier runs plain commands without asking. With a connection, its data contribution is off. Its card shows what it is doing and a Start over button. What is exposed: the permission mode, the model, text added after its system prompt, and a system prompt to replace its own. Your program's tools reach MiniMax Code's model as `mcp__weft__<tool>`, and come back to your program under their plain names. MiniMax Code cannot let a program's tool take one of its own tools' places, so a tool named like one of them (`bash`, `read`, `edit` and the rest of this node's list) is refused when the program is built.",
+  "tags": [
+    "agent",
+    "coding",
+    "minimax",
+    "minimax-ai",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run MiniMax Code in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[mini_max_code]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A MiniMaxCodeAccess's `access`: a MiniMax API key, or a model provider of your own. Required with a `computer`. Left out on your machine, MiniMax Code uses the login already on it (`mcode login`)."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder MiniMax Code works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`mcode` on your PATH",
+      "description": "On your machine: the MiniMax Code program to run, when it is not the `mcode` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "auto",
+          "plan",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What MiniMax Code may do without asking. `ask`: what its classifier finds risky comes out of AskAgent as a question; plain commands run. `auto`: it decides on its own, and asks only what it escalates. `plan`: it researches and plans before making changes. `bypass`: nothing asks, nothing is refused; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "the login's default",
+      "description": "As MiniMax lists it, such as `m:minimax:MiniMax-M3:v:thinking`. Left out, the login's default."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "appendSystemPrompt",
+      "type": "String",
+      "widget": {
+        "kind": "textarea"
+      },
+      "label": "Add to the system prompt",
+      "description": "Text added after its own system prompt, for every turn."
+    },
+    {
+      "name": "systemPrompt",
+      "type": "String",
+      "widget": {
+        "kind": "textarea"
+      },
+      "label": "Replace the system prompt",
+      "description": "A system prompt that replaces its own."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MiniMaxCode '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MiniMaxCode '{id}' runs in a computer, where no login is waiting for it; give it a MiniMaxCodeAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MiniMaxCode '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "auto",
+                "plan",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MiniMaxCode '{id}' has a `permission` it does not know; pick one of ask, auto, plan, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MiniMaxCode '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "MiniMaxCode '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs MiniMax Code itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "ask_user",
+      "bash",
+      "edit",
+      "get_goal",
+      "glob",
+      "grep",
+      "mcp_invoke",
+      "read",
+      "request_feature_enable",
+      "skill",
+      "task",
+      "task_append",
+      "task_output",
+      "task_query",
+      "task_stop",
+      "todowrite",
+      "tool_search",
+      "update_goal",
+      "web_fetch",
+      "web_search",
+      "website_deploy",
+      "write"
+    ]
+  }
+}

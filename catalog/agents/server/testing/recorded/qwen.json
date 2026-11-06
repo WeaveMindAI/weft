@@ -1,0 +1,4588 @@
+{
+ "kind": "qwen",
+ "command": "qwen",
+ "source": "Real, on Qwen Code 0.26.6 with an OpenRouter key through the apiKey login (OPENAI_BASE_URL https://openrouter.ai/api/v1, model deepseek/deepseek-v4-flash), private QWEN_HOME, driven through weft's own agent server and this spec, every line teed (scratchpad acp12/drive.py, acp12/qwen/transcript.jsonl): hello; tool, with the program's tools `lookup` and `web_fetch` (the program's `web_fetch` took the built-in's place; both discovered and called through the commands acp_qwen.py writes, neither asked); permission (`touch made.txt`, allowed, then its `craft/drainMidTurnQueue`, answered method not found). Earlier, against a local scripted OpenAI-compatible model with no account (scratchpad adw/qlive/acp.jsonl, adw/qlive2/acp_a.jsonl): the answers, the session/load replay, ask, reject and connection error (the anthropicKey way pointed at a closed port). Composed: the session/set_config_option answer ({configOptions} as its bundle returns it). available_commands_update and usage lines are left out.",
+ "answers": {
+  "initialize": {
+   "protocolVersion": 1,
+   "agentInfo": {
+    "name": "qwen-code",
+    "title": "Qwen Code",
+    "version": "0.26.6"
+   },
+   "authMethods": [
+    {
+     "id": "openai",
+     "name": "Use OpenAI API key",
+     "description": "Requires setting the `OPENAI_API_KEY` environment variable",
+     "_meta": {
+      "type": "terminal",
+      "args": [
+       "--auth-type=openai"
+      ]
+     }
+    }
+   ],
+   "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {
+     "image": true,
+     "audio": true,
+     "embeddedContext": true
+    },
+    "sessionCapabilities": {
+     "list": {},
+     "resume": {}
+    },
+    "mcpCapabilities": {
+     "sse": true,
+     "http": true
+    },
+    "_meta": {
+     "imageCapability": {
+      "autoHandlesWrongModel": true,
+      "maxBytes": 10380902,
+      "maxImagesPerTurn": 4
+     }
+    }
+   }
+  },
+  "session/new": {
+   "sessionId": "$SESSION",
+   "_meta": {
+    "generatedUi": {
+     "version": 1,
+     "enabled": false,
+     "reason": "unsupported-client"
+    }
+   },
+   "models": {
+    "currentModelId": "$runtime|openai|fake-model(openai)",
+    "availableModels": [
+     {
+      "modelId": "$runtime|openai|fake-model(openai)",
+      "name": "fake-model",
+      "description": null,
+      "_meta": {
+       "contextLimit": 200000
+      }
+     }
+    ]
+   },
+   "modes": {
+    "currentModeId": "auto",
+    "availableModes": [
+     {
+      "id": "plan",
+      "name": "Plan",
+      "description": "Analyze only, do not modify files or execute commands"
+     },
+     {
+      "id": "default",
+      "name": "Default",
+      "description": "Require approval for file edits or shell commands"
+     },
+     {
+      "id": "auto-edit",
+      "name": "Auto Edit",
+      "description": "Automatically approve file edits"
+     },
+     {
+      "id": "auto",
+      "name": "Auto",
+      "description": "LLM classifier auto-approves safe actions, blocks risky ones"
+     },
+     {
+      "id": "yolo",
+      "name": "YOLO",
+      "description": "Automatically approve all tools"
+     }
+    ]
+   },
+   "configOptions": [
+    {
+     "id": "mode",
+     "name": "Mode",
+     "description": "Session permission mode",
+     "category": "mode",
+     "type": "select",
+     "currentValue": "auto",
+     "options": [
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Analyze only, do not modify files or execute commands"
+      },
+      {
+       "value": "default",
+       "name": "Default",
+       "description": "Require approval for file edits or shell commands"
+      },
+      {
+       "value": "auto-edit",
+       "name": "Auto Edit",
+       "description": "Automatically approve file edits"
+      },
+      {
+       "value": "auto",
+       "name": "Auto",
+       "description": "LLM classifier auto-approves safe actions, blocks risky ones"
+      },
+      {
+       "value": "yolo",
+       "name": "YOLO",
+       "description": "Automatically approve all tools"
+      }
+     ]
+    },
+    {
+     "id": "model",
+     "name": "Model",
+     "description": "AI model to use",
+     "category": "model",
+     "type": "select",
+     "currentValue": "$runtime|openai|fake-model(openai)",
+     "options": [
+      {
+       "value": "$runtime|openai|fake-model(openai)",
+       "name": "fake-model",
+       "description": ""
+      }
+     ]
+    },
+    {
+     "id": "workflow_mode",
+     "name": "Workflow mode",
+     "description": "Prefer Workflow orchestration for this session",
+     "type": "select",
+     "currentValue": "off",
+     "options": [
+      {
+       "value": "off",
+       "name": "Off"
+      },
+      {
+       "value": "on",
+       "name": "On"
+      }
+     ],
+     "_meta": {
+      "qwen.workflowMode": {
+       "available": false,
+       "effective": false,
+       "reason": "workflow_unavailable"
+      }
+     }
+    }
+   ]
+  },
+  "session/set_mode": {},
+  "session/load": {
+   "modes": {
+    "currentModeId": "default",
+    "availableModes": [
+     {
+      "id": "plan",
+      "name": "Plan",
+      "description": "Analyze only, do not modify files or execute commands"
+     },
+     {
+      "id": "default",
+      "name": "Default",
+      "description": "Require approval for file edits or shell commands"
+     },
+     {
+      "id": "auto-edit",
+      "name": "Auto Edit",
+      "description": "Automatically approve file edits"
+     },
+     {
+      "id": "auto",
+      "name": "Auto",
+      "description": "LLM classifier auto-approves safe actions, blocks risky ones"
+     },
+     {
+      "id": "yolo",
+      "name": "YOLO",
+      "description": "Automatically approve all tools"
+     }
+    ]
+   },
+   "models": {
+    "currentModelId": "$runtime|openai|fake-model(openai)",
+    "availableModels": [
+     {
+      "modelId": "$runtime|openai|fake-model(openai)",
+      "name": "fake-model",
+      "description": null,
+      "_meta": {
+       "contextLimit": 200000
+      }
+     }
+    ]
+   },
+   "configOptions": [
+    {
+     "id": "mode",
+     "name": "Mode",
+     "description": "Session permission mode",
+     "category": "mode",
+     "type": "select",
+     "currentValue": "default",
+     "options": [
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Analyze only, do not modify files or execute commands"
+      },
+      {
+       "value": "default",
+       "name": "Default",
+       "description": "Require approval for file edits or shell commands"
+      },
+      {
+       "value": "auto-edit",
+       "name": "Auto Edit",
+       "description": "Automatically approve file edits"
+      },
+      {
+       "value": "auto",
+       "name": "Auto",
+       "description": "LLM classifier auto-approves safe actions, blocks risky ones"
+      },
+      {
+       "value": "yolo",
+       "name": "YOLO",
+       "description": "Automatically approve all tools"
+      }
+     ]
+    },
+    {
+     "id": "model",
+     "name": "Model",
+     "description": "AI model to use",
+     "category": "model",
+     "type": "select",
+     "currentValue": "$runtime|openai|fake-model(openai)",
+     "options": [
+      {
+       "value": "$runtime|openai|fake-model(openai)",
+       "name": "fake-model",
+       "description": ""
+      }
+     ]
+    },
+    {
+     "id": "workflow_mode",
+     "name": "Workflow mode",
+     "description": "Prefer Workflow orchestration for this session",
+     "type": "select",
+     "currentValue": "off",
+     "options": [
+      {
+       "value": "off",
+       "name": "Off"
+      },
+      {
+       "value": "on",
+       "name": "On"
+      }
+     ],
+     "_meta": {
+      "qwen.workflowMode": {
+       "available": false,
+       "effective": false,
+       "reason": "workflow_unavailable"
+      }
+     }
+    }
+   ],
+   "_meta": {
+    "generatedUi": {
+     "version": 1,
+     "enabled": false,
+     "reason": "unsupported-client"
+    },
+    "hasRunningBackgroundTasks": false
+   }
+  },
+  "session/set_config_option": {
+   "configOptions": [
+    {
+     "id": "mode",
+     "name": "Mode",
+     "description": "Session permission mode",
+     "category": "mode",
+     "type": "select",
+     "currentValue": "auto",
+     "options": [
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Analyze only, do not modify files or execute commands"
+      },
+      {
+       "value": "default",
+       "name": "Default",
+       "description": "Require approval for file edits or shell commands"
+      },
+      {
+       "value": "auto-edit",
+       "name": "Auto Edit",
+       "description": "Automatically approve file edits"
+      },
+      {
+       "value": "auto",
+       "name": "Auto",
+       "description": "LLM classifier auto-approves safe actions, blocks risky ones"
+      },
+      {
+       "value": "yolo",
+       "name": "YOLO",
+       "description": "Automatically approve all tools"
+      }
+     ]
+    },
+    {
+     "id": "model",
+     "name": "Model",
+     "description": "AI model to use",
+     "category": "model",
+     "type": "select",
+     "currentValue": "$runtime|openai|fake-model(openai)",
+     "options": [
+      {
+       "value": "$runtime|openai|fake-model(openai)",
+       "name": "fake-model",
+       "description": ""
+      }
+     ]
+    },
+    {
+     "id": "workflow_mode",
+     "name": "Workflow mode",
+     "description": "Prefer Workflow orchestration for this session",
+     "type": "select",
+     "currentValue": "off",
+     "options": [
+      {
+       "value": "off",
+       "name": "Off"
+      },
+      {
+       "value": "on",
+       "name": "On"
+      }
+     ],
+     "_meta": {
+      "qwen.workflowMode": {
+       "available": false,
+       "effective": false,
+       "reason": "workflow_unavailable"
+      }
+     }
+    }
+   ]
+  }
+ },
+ "replay": {
+  "before": [
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "SAYHELLO"
+    },
+    "_meta": {
+     "timestamp": 1793744683402,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "7ac259b1-1fce-4c0c-8891-ec6fd7e85f9b"
+      ],
+      "segmentId": "7ac259b1-1fce-4c0c-8891-ec6fd7e85f9b:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "Hello there. "
+    },
+    "_meta": {
+     "timestamp": 1793744683802,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "eca685c6-fd10-41de-b657-0e754d608774"
+      ],
+      "segmentId": "eca685c6-fd10-41de-b657-0e754d608774:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "timestamp": 1793744683802,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "eca685c6-fd10-41de-b657-0e754d608774"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "RUNSHELL"
+    },
+    "_meta": {
+     "timestamp": 1793744684409,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "832f87bc-1c52-44c0-8acb-7677f076f68b"
+      ],
+      "segmentId": "832f87bc-1c52-44c0-8acb-7677f076f68b:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "timestamp": 1793744684437,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "81d3111c-d156-4a00-8ea2-dd0e12cb1ea5"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call_1793744684422",
+    "status": "in_progress",
+    "title": "Shell: touch made.txt && echo created (make a file)",
+    "content": [],
+    "locations": [],
+    "kind": "execute",
+    "rawInput": {
+     "command": "touch made.txt && echo created",
+     "description": "make a file"
+    },
+    "_meta": {
+     "toolName": "run_shell_command",
+     "provenance": "builtin",
+     "timestamp": 1793744684437,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "81d3111c-d156-4a00-8ea2-dd0e12cb1ea5"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call_1793744684422",
+    "status": "completed",
+    "content": [
+     {
+      "type": "content",
+      "content": {
+       "type": "text",
+       "text": "Command: touch made.txt && echo created\nDirectory: (root)\nOutput: created\nError: (none)\nExit Code: 0\nSignal: (none)\nProcess Group PGID: 560678\n\nIf this command created or rewrote a deliverable file (csv, html, sql, py, md, json, notebook, image, pdf, or an office document), call record_artifact for each one. workspacePath is relative to the current execution directory, and title is required. Do not call it for files already recorded by write_file, edit, or notebook_edit."
+      }
+     }
+    ],
+    "_meta": {
+     "toolName": "run_shell_command",
+     "provenance": "builtin",
+     "timestamp": 1793744684543,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "5785d2e9-c512-4983-ac0c-5b5b7f90cf95"
+      ]
+     }
+    },
+    "rawOutput": {
+     "type": "shell_result",
+     "version": 1,
+     "directory": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/adw/qlive/work",
+     "exitCode": 0,
+     "signal": null,
+     "pid": 560678,
+     "outcome": "completed",
+     "outputFiles": [],
+     "output": "created",
+     "text": "created",
+     "error": null,
+     "notices": [],
+     "truncated": false
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "Done. "
+    },
+    "_meta": {
+     "timestamp": 1793744684558,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "b2812456-b8e1-42cd-9a42-2258b277d69e"
+      ],
+      "segmentId": "b2812456-b8e1-42cd-9a42-2258b277d69e:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "timestamp": 1793744684558,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "b2812456-b8e1-42cd-9a42-2258b277d69e"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "ASKUSER"
+    },
+    "_meta": {
+     "timestamp": 1793744684638,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "1614e588-b104-47eb-a62c-103266ff5d60"
+      ],
+      "segmentId": "1614e588-b104-47eb-a62c-103266ff5d60:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "timestamp": 1793744684651,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "bcdea0ca-6937-4901-8cc3-10014d92ac0c"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call_1793744684647",
+    "status": "in_progress",
+    "title": "AskUserQuestion: Ask user 2 questions",
+    "content": [],
+    "locations": [],
+    "kind": "think",
+    "rawInput": {
+     "questions": [
+      {
+       "question": "Which color?",
+       "header": "Color",
+       "options": [
+        {
+         "label": "Red",
+         "description": "warm"
+        },
+        {
+         "label": "Blue",
+         "description": "cool"
+        }
+       ],
+       "multiSelect": false
+      },
+      {
+       "question": "Which sizes?",
+       "header": "Size",
+       "options": [
+        {
+         "label": "S",
+         "description": "small"
+        },
+        {
+         "label": "M",
+         "description": "medium"
+        },
+        {
+         "label": "L",
+         "description": "large"
+        }
+       ],
+       "multiSelect": true
+      }
+     ]
+    },
+    "_meta": {
+     "toolName": "ask_user_question",
+     "provenance": "builtin",
+     "timestamp": 1793744684651,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "bcdea0ca-6937-4901-8cc3-10014d92ac0c"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call_1793744684647",
+    "status": "completed",
+    "content": [
+     {
+      "type": "content",
+      "content": {
+       "type": "text",
+       "text": "User has provided the following answers:\n\n**Color**: Blue\n**Size**: S, L"
+      }
+     }
+    ],
+    "_meta": {
+     "toolName": "ask_user_question",
+     "provenance": "builtin",
+     "timestamp": 1793744684658,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "dec8f754-1fc5-45c5-82b1-24e606a2eede"
+      ]
+     }
+    },
+    "rawOutput": {
+     "type": "ask_user_question_answers",
+     "text": "User has provided the following answers:\n\n**Color**: Blue\n**Size**: S, L",
+     "answers": [
+      {
+       "question": "Which color?",
+       "answer": "Blue"
+      },
+      {
+       "question": "Which sizes?",
+       "answer": "S, L"
+      }
+     ]
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "Done. "
+    },
+    "_meta": {
+     "timestamp": 1793744684669,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "03bbc5b2-a763-4a3b-898d-e944cf797ca0"
+      ],
+      "segmentId": "03bbc5b2-a763-4a3b-898d-e944cf797ca0:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "timestamp": 1793744684669,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "03bbc5b2-a763-4a3b-898d-e944cf797ca0"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "SAYHELLO"
+    },
+    "_meta": {
+     "timestamp": 1793744683402,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "7ac259b1-1fce-4c0c-8891-ec6fd7e85f9b"
+      ],
+      "segmentId": "7ac259b1-1fce-4c0c-8891-ec6fd7e85f9b:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "Hello there. "
+    },
+    "_meta": {
+     "timestamp": 1793744683802,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "eca685c6-fd10-41de-b657-0e754d608774"
+      ],
+      "segmentId": "eca685c6-fd10-41de-b657-0e754d608774:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "timestamp": 1793744683802,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "eca685c6-fd10-41de-b657-0e754d608774"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "RUNSHELL"
+    },
+    "_meta": {
+     "timestamp": 1793744684409,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "832f87bc-1c52-44c0-8acb-7677f076f68b"
+      ],
+      "segmentId": "832f87bc-1c52-44c0-8acb-7677f076f68b:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "timestamp": 1793744684437,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "81d3111c-d156-4a00-8ea2-dd0e12cb1ea5"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call_1793744684422",
+    "status": "in_progress",
+    "title": "Shell: touch made.txt && echo created (make a file)",
+    "content": [],
+    "locations": [],
+    "kind": "execute",
+    "rawInput": {
+     "command": "touch made.txt && echo created",
+     "description": "make a file"
+    },
+    "_meta": {
+     "toolName": "run_shell_command",
+     "provenance": "builtin",
+     "timestamp": 1793744684437,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "81d3111c-d156-4a00-8ea2-dd0e12cb1ea5"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call_1793744684422",
+    "status": "completed",
+    "content": [
+     {
+      "type": "content",
+      "content": {
+       "type": "text",
+       "text": "Command: touch made.txt && echo created\nDirectory: (root)\nOutput: created\nError: (none)\nExit Code: 0\nSignal: (none)\nProcess Group PGID: 560678\n\nIf this command created or rewrote a deliverable file (csv, html, sql, py, md, json, notebook, image, pdf, or an office document), call record_artifact for each one. workspacePath is relative to the current execution directory, and title is required. Do not call it for files already recorded by write_file, edit, or notebook_edit."
+      }
+     }
+    ],
+    "_meta": {
+     "toolName": "run_shell_command",
+     "provenance": "builtin",
+     "timestamp": 1793744684543,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "5785d2e9-c512-4983-ac0c-5b5b7f90cf95"
+      ]
+     }
+    },
+    "rawOutput": {
+     "type": "shell_result",
+     "version": 1,
+     "directory": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/adw/qlive/work",
+     "exitCode": 0,
+     "signal": null,
+     "pid": 560678,
+     "outcome": "completed",
+     "outputFiles": [],
+     "output": "created",
+     "text": "created",
+     "error": null,
+     "notices": [],
+     "truncated": false
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "Done. "
+    },
+    "_meta": {
+     "timestamp": 1793744684558,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "b2812456-b8e1-42cd-9a42-2258b277d69e"
+      ],
+      "segmentId": "b2812456-b8e1-42cd-9a42-2258b277d69e:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "timestamp": 1793744684558,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "b2812456-b8e1-42cd-9a42-2258b277d69e"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "ASKUSER"
+    },
+    "_meta": {
+     "timestamp": 1793744684638,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "1614e588-b104-47eb-a62c-103266ff5d60"
+      ],
+      "segmentId": "1614e588-b104-47eb-a62c-103266ff5d60:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "timestamp": 1793744684651,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "bcdea0ca-6937-4901-8cc3-10014d92ac0c"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call_1793744684647",
+    "status": "in_progress",
+    "title": "AskUserQuestion: Ask user 2 questions",
+    "content": [],
+    "locations": [],
+    "kind": "think",
+    "rawInput": {
+     "questions": [
+      {
+       "question": "Which color?",
+       "header": "Color",
+       "options": [
+        {
+         "label": "Red",
+         "description": "warm"
+        },
+        {
+         "label": "Blue",
+         "description": "cool"
+        }
+       ],
+       "multiSelect": false
+      },
+      {
+       "question": "Which sizes?",
+       "header": "Size",
+       "options": [
+        {
+         "label": "S",
+         "description": "small"
+        },
+        {
+         "label": "M",
+         "description": "medium"
+        },
+        {
+         "label": "L",
+         "description": "large"
+        }
+       ],
+       "multiSelect": true
+      }
+     ]
+    },
+    "_meta": {
+     "toolName": "ask_user_question",
+     "provenance": "builtin",
+     "timestamp": 1793744684651,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "bcdea0ca-6937-4901-8cc3-10014d92ac0c"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call_1793744684647",
+    "status": "completed",
+    "content": [
+     {
+      "type": "content",
+      "content": {
+       "type": "text",
+       "text": "User has provided the following answers:\n\n**Color**: Blue\n**Size**: S, L"
+      }
+     }
+    ],
+    "_meta": {
+     "toolName": "ask_user_question",
+     "provenance": "builtin",
+     "timestamp": 1793744684658,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "dec8f754-1fc5-45c5-82b1-24e606a2eede"
+      ]
+     }
+    },
+    "rawOutput": {
+     "type": "ask_user_question_answers",
+     "text": "User has provided the following answers:\n\n**Color**: Blue\n**Size**: S, L",
+     "answers": [
+      {
+       "question": "Which color?",
+       "answer": "Blue"
+      },
+      {
+       "question": "Which sizes?",
+       "answer": "S, L"
+      }
+     ]
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "Done. "
+    },
+    "_meta": {
+     "timestamp": 1793744684669,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "03bbc5b2-a763-4a3b-898d-e944cf797ca0"
+      ],
+      "segmentId": "03bbc5b2-a763-4a3b-898d-e944cf797ca0:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "timestamp": 1793744684669,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "03bbc5b2-a763-4a3b-898d-e944cf797ca0"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "USEMCP"
+    },
+    "_meta": {
+     "timestamp": 1793744687605,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "554461d5-aeed-4655-870a-2d1b4e695fe0"
+      ],
+      "segmentId": "554461d5-aeed-4655-870a-2d1b4e695fe0:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "timestamp": 1793744687963,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "b77b44aa-224a-4378-ba58-4b0f57355ac6"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call_1793744687950",
+    "status": "in_progress",
+    "title": "mcp__weft__lookup",
+    "content": [],
+    "locations": [],
+    "kind": "other",
+    "rawInput": {},
+    "_meta": {
+     "toolName": "mcp__weft__lookup",
+     "provenance": "mcp",
+     "serverId": "weft",
+     "timestamp": 1793744687963,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "b77b44aa-224a-4378-ba58-4b0f57355ac6"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call_1793744687950",
+    "status": "completed",
+    "content": [
+     {
+      "type": "content",
+      "content": {
+       "type": "text",
+       "text": "42"
+      }
+     }
+    ],
+    "_meta": {
+     "toolName": "mcp__weft__lookup",
+     "provenance": "mcp",
+     "serverId": "weft",
+     "timestamp": 1793744687989,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "292789eb-44e8-46d2-b042-00dc8404578a"
+      ]
+     }
+    },
+    "rawOutput": "42"
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "Done. "
+    },
+    "_meta": {
+     "timestamp": 1793744688003,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "37814933-f78d-4892-90ea-9c83d0d84a26"
+      ],
+      "segmentId": "37814933-f78d-4892-90ea-9c83d0d84a26:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "timestamp": 1793744688003,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "37814933-f78d-4892-90ea-9c83d0d84a26"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "DOREJECT"
+    },
+    "_meta": {
+     "timestamp": 1793744688116,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "e569e3a1-972c-47fd-9f0b-2a3ef8a33d22"
+      ],
+      "segmentId": "e569e3a1-972c-47fd-9f0b-2a3ef8a33d22:0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "timestamp": 1793744688127,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "b4b56d25-f80a-4a20-aebd-c3cf695637b4"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call_1793744688123",
+    "status": "in_progress",
+    "title": "Shell: touch nope.txt (should be refused)",
+    "content": [],
+    "locations": [],
+    "kind": "execute",
+    "rawInput": {
+     "command": "touch nope.txt",
+     "description": "should be refused"
+    },
+    "_meta": {
+     "toolName": "run_shell_command",
+     "provenance": "builtin",
+     "timestamp": 1793744688127,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "b4b56d25-f80a-4a20-aebd-c3cf695637b4"
+      ]
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call_1793744688123",
+    "status": "failed",
+    "content": [
+     {
+      "type": "content",
+      "content": {
+       "type": "text",
+       "text": "Tool \"run_shell_command\" was canceled by the user."
+      }
+     }
+    ],
+    "_meta": {
+     "toolName": "run_shell_command",
+     "provenance": "builtin",
+     "timestamp": 1793744688167,
+     "qwenTranscript": {
+      "sourceRecordIds": [
+       "35b41a2f-4660-459e-a7a4-18c94953bd2f"
+      ]
+     }
+    }
+   }
+  ],
+  "after": [
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "executionLifecycle": {
+      "v": 1,
+      "kind": "request",
+      "executionId": "8178f823-0282-450f-80f3-cf8b268f09d2",
+      "sessionId": "$SESSION",
+      "promptId": "$SESSION########6",
+      "model": "fake-model",
+      "startedAt": 1793744691577,
+      "phase": "started"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "Hello "
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "there. "
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "executionLifecycle": {
+      "v": 1,
+      "kind": "request",
+      "executionId": "8178f823-0282-450f-80f3-cf8b268f09d2",
+      "sessionId": "$SESSION",
+      "promptId": "$SESSION########6",
+      "model": "fake-model",
+      "startedAt": 1793744691577,
+      "phase": "ended",
+      "endedAt": 1793744691932,
+      "durationMs": 355,
+      "outcome": "success"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": ""
+    },
+    "_meta": {
+     "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 15,
+      "thoughtTokens": 0,
+      "cachedReadTokens": 0
+     },
+     "durationMs": 380
+    }
+   }
+  ]
+ },
+ "turns": {
+  "hello": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "f3911e54-b727-4e58-9e58-5d2f55a12e5e",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########1",
+        "model": "deepseek/deepseek-v4-flash",
+        "startedAt": 1793888198205,
+        "phase": "started"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "The"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " user"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " wants"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " me"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " to"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " reply"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " exactly"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " the"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " two"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " words"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "Hello"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " there"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".\""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Hello"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": " there"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "."
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "f3911e54-b727-4e58-9e58-5d2f55a12e5e",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########1",
+        "model": "deepseek/deepseek-v4-flash",
+        "startedAt": 1793888198205,
+        "phase": "ended",
+        "endedAt": 1793888203540,
+        "durationMs": 5335,
+        "outcome": "success"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "usage": {
+        "inputTokens": 22410,
+        "outputTokens": 20,
+        "totalTokens": 22430,
+        "thoughtTokens": 15,
+        "cachedReadTokens": 0
+       },
+       "durationMs": 5346
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "_meta": {
+       "qwen.branchPoint": {
+        "assistantRecordUuid": "5f4f4ebc-21f6-40cb-aadc-170f0475de4f",
+        "checkpointUuid": "67c4ea01-9e5e-4fcb-a9e3-eaeb27aefd4d"
+       }
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "text",
+     "done"
+    ],
+    "reply": "Hello there."
+   }
+  },
+  "permission": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "8a39dd3a-374c-4808-b81d-da9994a7341a",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########3",
+        "model": "deepseek/deepseek-v4-flash",
+        "startedAt": 1793888215278,
+        "phase": "started"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "The"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " user"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " wants"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " me"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " to"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " run"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " `"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "touch"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " made"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".txt"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "`"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " once"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " and"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " then"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " reply"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".\""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_25d9a6ea3edd478984b19e8a",
+      "status": "pending",
+      "title": "Shell",
+      "content": [],
+      "locations": [],
+      "kind": "execute",
+      "rawInput": {},
+      "_meta": {
+       "toolName": "run_shell_command",
+       "provenance": "builtin",
+       "phase": "preparing"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "8a39dd3a-374c-4808-b81d-da9994a7341a",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########3",
+        "model": "deepseek/deepseek-v4-flash",
+        "startedAt": 1793888215278,
+        "phase": "ended",
+        "endedAt": 1793888218046,
+        "durationMs": 2768,
+        "outcome": "success"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "usage": {
+        "inputTokens": 22656,
+        "outputTokens": 88,
+        "totalTokens": 22744,
+        "thoughtTokens": 19,
+        "cachedReadTokens": 22409
+       },
+       "durationMs": 2798
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "options": [
+        {
+         "optionId": "proceed_always_project",
+         "name": "Always Allow in project: touch *",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "proceed_always_user",
+         "name": "Always Allow for user: touch *",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "proceed_once",
+         "name": "Allow",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "cancel",
+         "name": "Reject",
+         "kind": "reject_once"
+        }
+       ],
+       "toolCall": {
+        "toolCallId": "call_25d9a6ea3edd478984b19e8a",
+        "status": "pending",
+        "title": "touch made.txt (Create the made.txt file)",
+        "content": [],
+        "locations": [],
+        "kind": "execute",
+        "rawInput": {
+         "command": "touch made.txt",
+         "description": "Create the made.txt file"
+        },
+        "_meta": {
+         "toolName": "run_shell_command"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_25d9a6ea3edd478984b19e8a",
+      "status": "in_progress",
+      "title": "Shell: touch made.txt (Create the made.txt file)",
+      "content": [],
+      "locations": [],
+      "kind": "execute",
+      "rawInput": {
+       "command": "touch made.txt",
+       "description": "Create the made.txt file"
+      },
+      "_meta": {
+       "toolName": "run_shell_command",
+       "provenance": "builtin",
+       "startedAt": 1793888218053
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_25d9a6ea3edd478984b19e8a",
+      "_meta": {
+       "toolLifecycle": {
+        "v": 1,
+        "kind": "tool",
+        "sessionId": "$SESSION",
+        "executionId": "3c00ca97-3ca1-4989-8058-4e0beca45777",
+        "callId": "call_25d9a6ea3edd478984b19e8a",
+        "toolName": "run_shell_command",
+        "phase": "started",
+        "executionStatus": "running",
+        "startedAt": 1793888218109
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_25d9a6ea3edd478984b19e8a",
+      "_meta": {
+       "toolLifecycle": {
+        "v": 1,
+        "kind": "tool",
+        "sessionId": "$SESSION",
+        "executionId": "3c00ca97-3ca1-4989-8058-4e0beca45777",
+        "callId": "call_25d9a6ea3edd478984b19e8a",
+        "toolName": "run_shell_command",
+        "phase": "ended",
+        "outcome": "success",
+        "endedAt": 1793888218151,
+        "executionStatus": "success",
+        "startedAt": 1793888218109,
+        "executionDurationMs": 41
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_25d9a6ea3edd478984b19e8a",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "Command: touch made.txt\nDirectory: (root)\nOutput: (empty)\nError: (none)\nExit Code: 0\nSignal: (none)\nProcess Group PGID: 94925\n\nIf this command created or rewrote a deliverable file (csv, html, sql, py, md, json, notebook, image, pdf, or an office document), call record_artifact for each one. workspacePath is relative to the current execution directory, and title is required. Do not call it for files already recorded by write_file, edit, or notebook_edit."
+        }
+       }
+      ],
+      "_meta": {
+       "toolName": "run_shell_command",
+       "provenance": "builtin",
+       "startedAt": 1793888218053,
+       "durationMs": 98
+      },
+      "rawOutput": {
+       "type": "shell_result",
+       "version": 1,
+       "text": "",
+       "output": "",
+       "directory": "/home/me/work",
+       "exitCode": 0,
+       "signal": null,
+       "pid": 94925,
+       "error": null,
+       "outcome": "completed",
+       "notices": [],
+       "truncated": false,
+       "outputFiles": []
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "craft/drainMidTurnQueue",
+      "params": {
+       "sessionId": "$SESSION",
+       "todoStopGuardWatchQueuedPrompt": true
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "89ac557c-7b9f-4c12-9a56-37916b4556e1",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########3",
+        "model": "deepseek/deepseek-v4-flash",
+        "startedAt": 1793888218158,
+        "phase": "started"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "The"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " command"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " succeeded"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "."
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " The"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " user"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " just"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " wants"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " me"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " to"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " reply"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".\""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "."
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "89ac557c-7b9f-4c12-9a56-37916b4556e1",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########3",
+        "model": "deepseek/deepseek-v4-flash",
+        "startedAt": 1793888218158,
+        "phase": "ended",
+        "endedAt": 1793888219142,
+        "durationMs": 984,
+        "outcome": "success"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "usage": {
+        "inputTokens": 22872,
+        "outputTokens": 19,
+        "totalTokens": 22891,
+        "thoughtTokens": 15,
+        "cachedReadTokens": 22655
+       },
+       "durationMs": 987
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "_meta": {
+       "qwen.branchPoint": {
+        "assistantRecordUuid": "e5649ae2-2a3a-4fc0-a394-010782724664",
+        "checkpointUuid": "de29789f-c110-413b-8c15-dfd3e1325d98"
+       }
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "tool_use",
+     "question",
+     "tool_result",
+     "thinking",
+     "text",
+     "done"
+    ],
+    "reply": "Done.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "execute",
+        "detail": "touch made.txt"
+       }
+      },
+      "answer": {
+       "choice": "proceed_once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "proceed_once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "ask": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "69558c72-6aa7-4693-a630-797ace7d6403",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########3",
+        "model": "fake-model",
+        "startedAt": 1793744684639,
+        "phase": "started"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_1793744684647",
+      "status": "pending",
+      "title": "AskUserQuestion",
+      "content": [],
+      "locations": [],
+      "kind": "think",
+      "rawInput": {},
+      "_meta": {
+       "toolName": "ask_user_question",
+       "provenance": "builtin",
+       "phase": "preparing"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "69558c72-6aa7-4693-a630-797ace7d6403",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########3",
+        "model": "fake-model",
+        "startedAt": 1793744684639,
+        "phase": "ended",
+        "endedAt": 1793744684650,
+        "durationMs": 11,
+        "outcome": "success"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "usage": {
+        "inputTokens": 10,
+        "outputTokens": 5,
+        "totalTokens": 15,
+        "thoughtTokens": 0,
+        "cachedReadTokens": 0
+       },
+       "durationMs": 13
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "options": [
+        {
+         "optionId": "proceed_once",
+         "name": "Submit",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "cancel",
+         "name": "Cancel",
+         "kind": "reject_once"
+        }
+       ],
+       "toolCall": {
+        "toolCallId": "call_1793744684647",
+        "status": "pending",
+        "title": "Ask user 2 questions",
+        "content": [],
+        "locations": [],
+        "kind": "think",
+        "rawInput": {
+         "questions": [
+          {
+           "question": "Which color?",
+           "header": "Color",
+           "options": [
+            {
+             "label": "Red",
+             "description": "warm"
+            },
+            {
+             "label": "Blue",
+             "description": "cool"
+            }
+           ],
+           "multiSelect": false
+          },
+          {
+           "question": "Which sizes?",
+           "header": "Size",
+           "options": [
+            {
+             "label": "S",
+             "description": "small"
+            },
+            {
+             "label": "M",
+             "description": "medium"
+            },
+            {
+             "label": "L",
+             "description": "large"
+            }
+           ],
+           "multiSelect": true
+          }
+         ]
+        },
+        "_meta": {
+         "toolName": "ask_user_question",
+         "qwenInteractionKind": "user_question",
+         "qwenQuestions": [
+          {
+           "question": "Which color?",
+           "header": "Color",
+           "options": [
+            {
+             "label": "Red",
+             "description": "warm"
+            },
+            {
+             "label": "Blue",
+             "description": "cool"
+            }
+           ],
+           "multiSelect": false
+          },
+          {
+           "question": "Which sizes?",
+           "header": "Size",
+           "options": [
+            {
+             "label": "S",
+             "description": "small"
+            },
+            {
+             "label": "M",
+             "description": "medium"
+            },
+            {
+             "label": "L",
+             "description": "large"
+            }
+           ],
+           "multiSelect": true
+          }
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744684647",
+      "status": "in_progress",
+      "title": "AskUserQuestion: Ask user 2 questions",
+      "content": [],
+      "locations": [],
+      "kind": "think",
+      "rawInput": {
+       "questions": [
+        {
+         "question": "Which color?",
+         "header": "Color",
+         "options": [
+          {
+           "label": "Red",
+           "description": "warm"
+          },
+          {
+           "label": "Blue",
+           "description": "cool"
+          }
+         ],
+         "multiSelect": false
+        },
+        {
+         "question": "Which sizes?",
+         "header": "Size",
+         "options": [
+          {
+           "label": "S",
+           "description": "small"
+          },
+          {
+           "label": "M",
+           "description": "medium"
+          },
+          {
+           "label": "L",
+           "description": "large"
+          }
+         ],
+         "multiSelect": true
+        }
+       ]
+      },
+      "_meta": {
+       "toolName": "ask_user_question",
+       "provenance": "builtin",
+       "startedAt": 1793744684652
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744684647",
+      "_meta": {
+       "toolLifecycle": {
+        "v": 1,
+        "kind": "tool",
+        "sessionId": "$SESSION",
+        "executionId": "4fc1d53a-4a3e-4e5a-896a-a59b33aa9ab8",
+        "callId": "call_1793744684647",
+        "toolName": "ask_user_question",
+        "phase": "started",
+        "executionStatus": "running",
+        "startedAt": 1793744684656
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744684647",
+      "_meta": {
+       "toolLifecycle": {
+        "v": 1,
+        "kind": "tool",
+        "sessionId": "$SESSION",
+        "executionId": "4fc1d53a-4a3e-4e5a-896a-a59b33aa9ab8",
+        "callId": "call_1793744684647",
+        "toolName": "ask_user_question",
+        "phase": "ended",
+        "outcome": "success",
+        "endedAt": 1793744684657,
+        "executionStatus": "success",
+        "startedAt": 1793744684656,
+        "executionDurationMs": 0
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744684647",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "User has provided the following answers:\n\n**Color**: Blue\n**Size**: S, L"
+        }
+       }
+      ],
+      "_meta": {
+       "toolName": "ask_user_question",
+       "provenance": "builtin",
+       "startedAt": 1793744684652,
+       "durationMs": 5
+      },
+      "rawOutput": {
+       "type": "ask_user_question_answers",
+       "text": "User has provided the following answers:\n\n**Color**: Blue\n**Size**: S, L",
+       "answers": [
+        {
+         "question": "Which color?",
+         "answer": "Blue"
+        },
+        {
+         "question": "Which sizes?",
+         "answer": "S, L"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "28de8119-afef-49cf-8cd0-9b1c84340fa1",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########3",
+        "model": "fake-model",
+        "startedAt": 1793744684659,
+        "phase": "started"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done. "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "28de8119-afef-49cf-8cd0-9b1c84340fa1",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########3",
+        "model": "fake-model",
+        "startedAt": 1793744684659,
+        "phase": "ended",
+        "endedAt": 1793744684668,
+        "durationMs": 9,
+        "outcome": "success"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "usage": {
+        "inputTokens": 10,
+        "outputTokens": 5,
+        "totalTokens": 15,
+        "thoughtTokens": 0,
+        "cachedReadTokens": 0
+       },
+       "durationMs": 12
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "_meta": {
+       "qwen.branchPoint": {
+        "assistantRecordUuid": "03bbc5b2-a763-4a3b-898d-e944cf797ca0",
+        "checkpointUuid": "bab6df65-31fd-42c5-8cdd-001fc5db6022"
+       }
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "Done. ",
+    "blocks": [
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "id": "0",
+         "header": "Color",
+         "question": "Which color?",
+         "options": [
+          {
+           "label": "Red",
+           "description": "warm"
+          },
+          {
+           "label": "Blue",
+           "description": "cool"
+          }
+         ],
+         "multiSelect": false,
+         "allowOther": true
+        },
+        {
+         "id": "1",
+         "header": "Size",
+         "question": "Which sizes?",
+         "multiSelect": true,
+         "allowOther": true
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "0": [
+         "Blue"
+        ],
+        "1": [
+         "S",
+         "L"
+        ]
+       }
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "proceed_once"
+       },
+       "answers": {
+        "0": "Blue",
+        "1": "S, L"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "tool": {
+   "tools": [
+    "lookup",
+    "web_fetch"
+   ],
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "9fae1e48-4b32-4845-addf-09e25d9c0004",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########2",
+        "model": "deepseek/deepseek-v4-flash",
+        "startedAt": 1793888205992,
+        "phase": "started"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "The"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " user"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " wants"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " me"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " to"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " call"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " the"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " lookup"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " tool"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " and"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " the"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " web"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "_f"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "etch"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " tool"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ","
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " both"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " no"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " arguments"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ","
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " and"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " then"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " reply"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "It"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " is"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " <"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "the"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " lookup"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " answer"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ">"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".\""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " Let"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " me"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " call"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " both"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " tools"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " in"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " parallel"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " since"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " they"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " are"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " independent"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "."
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_fe4ae089f4124fa2a972ee71",
+      "status": "pending",
+      "title": "lookup: {}",
+      "content": [],
+      "locations": [],
+      "kind": "other",
+      "rawInput": {},
+      "_meta": {
+       "toolName": "lookup",
+       "provenance": "builtin",
+       "phase": "preparing"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_409a1c7a8dd64a3daca4731b",
+      "status": "pending",
+      "title": "web_fetch: {}",
+      "content": [],
+      "locations": [],
+      "kind": "other",
+      "rawInput": {},
+      "_meta": {
+       "toolName": "web_fetch",
+       "provenance": "builtin",
+       "phase": "preparing"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "9fae1e48-4b32-4845-addf-09e25d9c0004",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########2",
+        "model": "deepseek/deepseek-v4-flash",
+        "startedAt": 1793888205992,
+        "phase": "ended",
+        "endedAt": 1793888210858,
+        "durationMs": 4866,
+        "outcome": "success"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "usage": {
+        "inputTokens": 22565,
+        "outputTokens": 91,
+        "totalTokens": 22656,
+        "thoughtTokens": 46,
+        "cachedReadTokens": 6793
+       },
+       "durationMs": 4896
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_fe4ae089f4124fa2a972ee71",
+      "status": "in_progress",
+      "title": "lookup: {}",
+      "content": [],
+      "locations": [],
+      "kind": "other",
+      "rawInput": {},
+      "_meta": {
+       "toolName": "lookup",
+       "provenance": "builtin",
+       "startedAt": 1793888210864
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_fe4ae089f4124fa2a972ee71",
+      "_meta": {
+       "toolLifecycle": {
+        "v": 1,
+        "kind": "tool",
+        "sessionId": "$SESSION",
+        "executionId": "d289cd03-6a91-4d1f-840e-d8bdabd8ba80",
+        "callId": "call_fe4ae089f4124fa2a972ee71",
+        "toolName": "lookup",
+        "phase": "started",
+        "executionStatus": "running",
+        "startedAt": 1793888210868
+       }
+      }
+     }
+    },
+    {
+     "tool": {
+      "name": "lookup",
+      "arguments": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_fe4ae089f4124fa2a972ee71",
+      "_meta": {
+       "toolLifecycle": {
+        "v": 1,
+        "kind": "tool",
+        "sessionId": "$SESSION",
+        "executionId": "d289cd03-6a91-4d1f-840e-d8bdabd8ba80",
+        "callId": "call_fe4ae089f4124fa2a972ee71",
+        "toolName": "lookup",
+        "phase": "ended",
+        "outcome": "success",
+        "endedAt": 1793888210928,
+        "executionStatus": "success",
+        "startedAt": 1793888210868,
+        "executionDurationMs": 59
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_fe4ae089f4124fa2a972ee71",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "42"
+        }
+       }
+      ],
+      "_meta": {
+       "toolName": "lookup",
+       "provenance": "builtin",
+       "startedAt": 1793888210864,
+       "durationMs": 64
+      },
+      "rawOutput": "42"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_409a1c7a8dd64a3daca4731b",
+      "status": "in_progress",
+      "title": "web_fetch: {}",
+      "content": [],
+      "locations": [],
+      "kind": "other",
+      "rawInput": {},
+      "_meta": {
+       "toolName": "web_fetch",
+       "provenance": "builtin",
+       "startedAt": 1793888210930
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_409a1c7a8dd64a3daca4731b",
+      "_meta": {
+       "toolLifecycle": {
+        "v": 1,
+        "kind": "tool",
+        "sessionId": "$SESSION",
+        "executionId": "ce504c3b-afc0-458f-a4ac-264fcc627ffd",
+        "callId": "call_409a1c7a8dd64a3daca4731b",
+        "toolName": "web_fetch",
+        "phase": "started",
+        "executionStatus": "running",
+        "startedAt": 1793888210931
+       }
+      }
+     }
+    },
+    {
+     "tool": {
+      "name": "web_fetch",
+      "arguments": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_409a1c7a8dd64a3daca4731b",
+      "_meta": {
+       "toolLifecycle": {
+        "v": 1,
+        "kind": "tool",
+        "sessionId": "$SESSION",
+        "executionId": "ce504c3b-afc0-458f-a4ac-264fcc627ffd",
+        "callId": "call_409a1c7a8dd64a3daca4731b",
+        "toolName": "web_fetch",
+        "phase": "ended",
+        "outcome": "success",
+        "endedAt": 1793888210988,
+        "executionStatus": "success",
+        "startedAt": 1793888210931,
+        "executionDurationMs": 57
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_409a1c7a8dd64a3daca4731b",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "nothing fetched"
+        }
+       }
+      ],
+      "_meta": {
+       "toolName": "web_fetch",
+       "provenance": "builtin",
+       "startedAt": 1793888210930,
+       "durationMs": 58
+      },
+      "rawOutput": "nothing fetched"
+     }
+    },
+    {
+     "ask": {
+      "method": "craft/drainMidTurnQueue",
+      "params": {
+       "sessionId": "$SESSION",
+       "todoStopGuardWatchQueuedPrompt": true
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "7e4bdc00-3e68-4d16-9d18-9343f9be2232",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########2",
+        "model": "deepseek/deepseek-v4-flash",
+        "startedAt": 1793888210995,
+        "phase": "started"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "The"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " lookup"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " tool"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " returned"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "42"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "\""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " and"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " the"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " web"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "_f"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "etch"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " tool"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " returned"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "nothing"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " fetched"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "\"."
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " The"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " user"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " wants"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " me"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " to"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " reply"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " exactly"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "It"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " is"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " <"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "the"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " lookup"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " answer"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ">"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".\""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " So"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " the"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " lookup"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " answer"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " is"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "42"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "\","
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " so"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " I"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " should"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " reply"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "It"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " is"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "42"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".\""
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "It"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": " is"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": " "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "42"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "."
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "7e4bdc00-3e68-4d16-9d18-9343f9be2232",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########2",
+        "model": "deepseek/deepseek-v4-flash",
+        "startedAt": 1793888210995,
+        "phase": "ended",
+        "endedAt": 1793888212764,
+        "durationMs": 1769,
+        "outcome": "success"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "usage": {
+        "inputTokens": 22677,
+        "outputTokens": 61,
+        "totalTokens": 22738,
+        "thoughtTokens": 54,
+        "cachedReadTokens": 22564
+       },
+       "durationMs": 1773
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "_meta": {
+       "qwen.branchPoint": {
+        "assistantRecordUuid": "1c0d53bd-123b-49df-9ebc-049c23c886a3",
+        "checkpointUuid": "7d98cf7e-6c74-4556-9704-29ffc1b1cfb3"
+       }
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "tool_use",
+     "tool_use",
+     "tool_call",
+     "tool_result",
+     "tool_call",
+     "tool_result",
+     "thinking",
+     "text",
+     "done"
+    ],
+    "reply": "It is 42.",
+    "blocks": [
+     {
+      "tool": "lookup",
+      "result": "42"
+     },
+     {
+      "tool": "web_fetch",
+      "result": "nothing fetched"
+     }
+    ]
+   }
+  },
+  "reject": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "6a2a95ec-ecca-4375-9e34-8803d63bfec9",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########5",
+        "model": "fake-model",
+        "startedAt": 1793744688117,
+        "phase": "started"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_1793744688123",
+      "status": "pending",
+      "title": "Shell",
+      "content": [],
+      "locations": [],
+      "kind": "execute",
+      "rawInput": {},
+      "_meta": {
+       "toolName": "run_shell_command",
+       "provenance": "builtin",
+       "phase": "preparing"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "6a2a95ec-ecca-4375-9e34-8803d63bfec9",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########5",
+        "model": "fake-model",
+        "startedAt": 1793744688117,
+        "phase": "ended",
+        "endedAt": 1793744688126,
+        "durationMs": 9,
+        "outcome": "success"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "usage": {
+        "inputTokens": 10,
+        "outputTokens": 5,
+        "totalTokens": 15,
+        "thoughtTokens": 0,
+        "cachedReadTokens": 0
+       },
+       "durationMs": 11
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "options": [
+        {
+         "optionId": "proceed_always_project",
+         "name": "Always Allow in project: touch *",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "proceed_always_user",
+         "name": "Always Allow for user: touch *",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "proceed_once",
+         "name": "Allow",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "cancel",
+         "name": "Reject",
+         "kind": "reject_once"
+        }
+       ],
+       "toolCall": {
+        "toolCallId": "call_1793744688123",
+        "status": "pending",
+        "title": "touch nope.txt (should be refused)",
+        "content": [],
+        "locations": [],
+        "kind": "execute",
+        "rawInput": {
+         "command": "touch nope.txt",
+         "description": "should be refused"
+        },
+        "_meta": {
+         "toolName": "run_shell_command"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744688123",
+      "_meta": {
+       "toolLifecycle": {
+        "v": 1,
+        "kind": "tool",
+        "sessionId": "$SESSION",
+        "executionId": "64f5fed5-3b51-4f6e-b4b7-45c6b642b988",
+        "callId": "call_1793744688123",
+        "toolName": "run_shell_command",
+        "phase": "ended",
+        "outcome": "cancelled",
+        "endedAt": 1793744688166,
+        "executionStatus": "not_started"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744688123",
+      "status": "failed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "Tool \"run_shell_command\" was canceled by the user."
+        }
+       }
+      ],
+      "_meta": {
+       "toolName": "run_shell_command",
+       "provenance": "builtin",
+       "startedAt": 1793744688127,
+       "durationMs": 39
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "error"
+    ],
+    "status": "failed",
+    "error": "ended the turn when",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission"
+      },
+      "answer": {
+       "choice": "cancel"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "cancel"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "connection error": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "7daa5b18-eb56-4cc4-9e00-d2d93199be20",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########1",
+        "model": "claude-x",
+        "startedAt": 1793744744388,
+        "phase": "started"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": ""
+      },
+      "_meta": {
+       "executionLifecycle": {
+        "v": 1,
+        "kind": "request",
+        "executionId": "7daa5b18-eb56-4cc4-9e00-d2d93199be20",
+        "sessionId": "$SESSION",
+        "promptId": "$SESSION########1",
+        "model": "claude-x",
+        "startedAt": 1793744744388,
+        "phase": "ended",
+        "endedAt": 1793744745802,
+        "durationMs": 1414,
+        "outcome": "error"
+       }
+      }
+     }
+    },
+    {
+     "fail": {
+      "code": -32603,
+      "message": "Internal error",
+      "data": {
+       "details": "Connection error."
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "error"
+    ],
+    "status": "failed",
+    "error": "Connection error."
+   }
+  }
+ },
+ "settings": [
+  {
+   "name": "ask",
+   "given": {
+    "permission": "ask"
+   },
+   "expect": {
+    "args": [
+     [
+      "--acp"
+     ]
+    ],
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "default"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "accept_edits",
+   "given": {
+    "permission": "accept_edits"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "auto-edit"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "auto",
+   "given": {
+    "permission": "auto"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "auto"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "plan",
+   "given": {
+    "permission": "plan"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "plan"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "bypass",
+   "given": {
+    "permission": "bypass"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "yolo"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "model_and_options",
+   "given": {
+    "model": "qwen3-coder-plus",
+    "options": {
+     "effort": "high",
+     "appendSystemPrompt": "Be brief.",
+     "addDirs": [
+      "/a",
+      "/b"
+     ]
+    }
+   },
+   "expect": {
+    "args": [
+     [
+      "--model",
+      "qwen3-coder-plus"
+     ],
+     [
+      "--append-system-prompt",
+      "Be brief."
+     ],
+     [
+      "--include-directories",
+      "/a,/b"
+     ]
+    ],
+    "requests": [
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "reasoning_effort",
+       "value": "high"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "api_key",
+   "given": {
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "sk-test",
+      "baseUrl": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "OPENAI_API_KEY": "sk-test",
+     "OPENAI_BASE_URL": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+     "QWEN_HOME": "$HOME"
+    },
+    "unset": [
+     "ANTHROPIC_API_KEY"
+    ],
+    "files": {
+     "settings.json": [
+      "\"selectedType\": \"openai\"",
+      "\"enableManagedAutoMemory\": false",
+      "\"enableFollowupSuggestions\": false",
+      "\"toolSearch\": {\n      \"enabled\": false"
+     ]
+    }
+   }
+  },
+  {
+   "name": "anthropic_key",
+   "given": {
+    "credentials": {
+     "way": "anthropicKey",
+     "values": {
+      "key": "sk-ant-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "ANTHROPIC_API_KEY": "sk-ant-test",
+     "QWEN_HOME": "$HOME"
+    },
+    "unset": [
+     "OPENAI_API_KEY",
+     "OPENAI_BASE_URL"
+    ],
+    "files": {
+     "settings.json": "\"selectedType\": \"anthropic\""
+    }
+   }
+  },
+  {
+   "name": "bad_option_value",
+   "given": {
+    "options": {
+     "effort": "huge"
+    }
+   },
+   "expect": {
+    "error": "takes low, medium, high, xhigh, max"
+   }
+  }
+ ],
+ "mcpFrom": {
+  "list": {
+   "besideEnv": "QWEN_CODE_SYSTEM_SETTINGS_PATH",
+   "file": "tools.json"
+  }
+ }
+}

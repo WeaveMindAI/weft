@@ -1,0 +1,66 @@
+{
+  "type": "CodexAccess",
+  "label": "Codex Access",
+  "description": "A Codex login, for the Codex nodes' `access`: your ChatGPT login file (on a local install only) or an OpenAI API key (anywhere). One connection serves however many Codex nodes. weft keeps a ChatGPT login alive itself: it renews the login once when it is due and hands every Codex node the same fresh token, and Codex never renews it on its own.",
+  "tags": ["agent", "codex", "openai", "access", "credentials"],
+  "icon": "KeyRound",
+  "color": "#10a37f",
+  "service": {
+    "service": "codex",
+    "label": "Codex",
+    "doors": ["own"],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "subscription",
+          "label": "ChatGPT login",
+          "localOnly": true,
+          "fields": [{ "name": "authJson", "label": "auth.json", "placeholder": "{ \"auth_mode\": \"chatgpt\", ... }" }],
+          "renewal": {
+            "paste": {
+              "field": "authJson",
+              "tokenPath": "tokens.access_token",
+              "refreshTokenPath": "tokens.refresh_token",
+              "jwtExpiry": true,
+              "captures": [{ "name": "accountId", "path": "tokens.account_id" }]
+            },
+            "call": {
+              "url": "https://auth.openai.com/oauth/token",
+              "method": "POST",
+              "body": { "client_id": "app_EMoamEEZ73f0CkXaXp7hrann", "grant_type": "refresh_token", "refresh_token": "{refresh_token}" },
+              "jwtExpiry": true
+            }
+          },
+          "guide": {
+            "link": "https://developers.openai.com/codex/auth",
+            "steps": [
+              "On a machine where Codex is installed, run `codex login` and sign in with your ChatGPT account.",
+              "Open `~/.codex/auth.json` and paste its whole content below.",
+              "Log that machine out afterwards (`codex logout`), or run `codex login` there again to give it a login of its own: from now on weft renews this one, and each renewal stops the copy on that machine from renewing."
+            ]
+          }
+        },
+        {
+          "id": "apiKey",
+          "label": "API key",
+          "fields": [{ "name": "key", "label": "API key", "placeholder": "sk-..." }],
+          "guide": {
+            "link": "https://platform.openai.com/api-keys",
+            "steps": [
+              "Open platform.openai.com, API keys, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that API account."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    { "name": "account", "type": "Access[codex]", "widget": { "kind": "access" }, "label": "Account" }
+  ],
+  "outputs": [
+    { "name": "access", "type": "Access[codex]", "description": "Wire into the Codex nodes' `access` input." }
+  ]
+}

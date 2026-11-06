@@ -1,0 +1,365 @@
+{
+  "type": "Nanobot",
+  "label": "nanobot",
+  "description": "One conversation with nanobot, HKUDS's lightweight agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, nanobot runs on your machine (a local install only), working in `folder`. If `nanobot` is missing, weft installs it into a folder of its own, shared by the whole machine, before the node runs. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs. Either way it logs in with the connection on `access`. It runs on a model provider's key, never on your machine's own nanobot (whose config would start your own channels and jobs), so `access` is always required, and `model` too, since a key names no model. nanobot never asks: what it may do is fixed before the turn by the permission setting, and a refused tool lets it carry on. Its background model calls (heartbeat, memory consolidation, compaction of an idle chat) are off; the one model call it still makes on its own is the chat's title, once, after its first turn. Your program's tools reach the model under their own names. A program tool named like one of nanobot's own takes its place where nanobot can turn that one off by itself (`run_cli_app`, `my`, `generate_image`). nanobot turns its other tools off only a group at a time, and cannot switch its scheduling, messaging, subagent, goal and session tools off at all, so a program tool named like one of those is refused when the program is built: its file tools (`read_file`, `write_file`, `edit_file`, `list_dir`, `apply_patch`, `find_files`, `grep`), its shell's (`exec`, `exec_session`, `list_exec_sessions`, `rg`), its web tools (`web_search`, `web_fetch`), `cron`, `message`, `subagent`, `create_goal`, `update_goal`, `list_sessions`, `send_session_message`, `search_sessions` and `read_session`. Its card shows what it is doing and a Start over button. What is exposed: the permission setting, the model and the effort, token and step limits, fallback models, the shell's limits and patterns, its web tools and text added to its instructions.",
+  "tags": [
+    "agent",
+    "coding",
+    "nanobot",
+    "hkuds",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run nanobot in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[nanobot]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A NanobotAccess's `access`: a model provider's key (Anthropic, OpenAI, OpenRouter, Gemini, DeepSeek, Mistral, or an OpenAI-compatible server). Required, because this agent never runs on a login already on your machine."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder nanobot works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`nanobot` on your PATH",
+      "description": "On your machine: the nanobot program to run, when it is not the `nanobot` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "restricted",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "restricted",
+          "sandboxed",
+          "no_shell",
+          "full"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What nanobot may do; it never asks, and its own shell deny list (`rm -r`, `mkfs`, ...) holds in every setting. `restricted`: its file tools stay in `folder`, and a shell command may not leave it. `sandboxed`: the same, and every shell command runs in the OS sandbox (bubblewrap on Linux, seatbelt on macOS), which must be installed. `no_shell`: files in `folder` only, and no shell at all. `full`: anywhere on the machine; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "claude-sonnet-4-5",
+      "description": "One of the connection's provider's model ids. Required."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "adaptive"
+        ]
+      },
+      "label": "Reasoning effort",
+      "description": "How hard the model reasons; which of these a model takes is the provider's. Left out, the provider's default."
+    },
+    {
+      "name": "maxTokens",
+      "type": "Number",
+      "label": "Most tokens per answer",
+      "description": "A whole number above 0: the most tokens one model answer may take."
+    },
+    {
+      "name": "contextWindowTokens",
+      "type": "Number",
+      "label": "Context window",
+      "description": "A whole number above 0: the model's context window, in tokens."
+    },
+    {
+      "name": "maxToolIterations",
+      "type": "Number",
+      "label": "Most tool steps",
+      "description": "A whole number above 0: the most tool calls one turn may make."
+    },
+    {
+      "name": "fallbackModels",
+      "type": "List[String]",
+      "label": "Fallback models",
+      "description": "Models of the same provider to fall back on, in order."
+    },
+    {
+      "name": "commandMaxSeconds",
+      "type": "Number",
+      "label": "Longest command",
+      "description": "A whole number above 0: the most seconds one shell command may run."
+    },
+    {
+      "name": "denyPatterns",
+      "type": "List[String]",
+      "label": "Refused commands",
+      "description": "Regular expressions: a shell command matching one is refused, on top of its own deny list."
+    },
+    {
+      "name": "allowPatterns",
+      "type": "List[String]",
+      "label": "Allowed commands",
+      "description": "Regular expressions of the shell commands it may run."
+    },
+    {
+      "name": "webTools",
+      "type": "Boolean",
+      "default": true,
+      "label": "Web tools",
+      "description": "Whether it may search and fetch the web."
+    },
+    {
+      "name": "appendSystemPrompt",
+      "type": "String",
+      "widget": {
+        "kind": "textarea"
+      },
+      "label": "Add to its instructions",
+      "description": "Text added to its instructions, for the whole conversation."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Nanobot '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "input_satisfied",
+          "port": "access"
+        }
+      },
+      "then": {
+        "message": "Nanobot '{id}' runs only on a model provider's key; give it a NanobotAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Nanobot '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "value",
+          "field": "model"
+        }
+      },
+      "then": {
+        "message": "Nanobot '{id}' runs on the connection's provider key, which names no model; set `model` to one of that provider's model ids.",
+        "level": "structural",
+        "severity": "error",
+        "port": "model"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "restricted",
+                "sandboxed",
+                "no_shell",
+                "full"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Nanobot '{id}' has a `permission` it does not know; pick one of restricted, sandboxed, no_shell, full.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Nanobot '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "Nanobot '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs nanobot itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "apply_patch",
+      "create_goal",
+      "cron",
+      "edit_file",
+      "exec",
+      "exec_session",
+      "find_files",
+      "grep",
+      "list_dir",
+      "list_exec_sessions",
+      "list_sessions",
+      "message",
+      "read_file",
+      "read_session",
+      "rg",
+      "search_sessions",
+      "send_session_message",
+      "subagent",
+      "update_goal",
+      "web_fetch",
+      "web_search",
+      "write_file"
+    ]
+  }
+}

@@ -41,6 +41,19 @@ export function formatStreamBody(
   return trimmed ? `${body}\n(${byteSize} bytes in all, shown trimmed)` : body;
 }
 
+/// The line a member leaving a bus reads as: that it left, or that it
+/// left failed and why. `failed` tells the panel to draw it as an error.
+/// One definition for the panel and its copy text, so the two say the
+/// same.
+export function busLeftLine(name: string, end: StreamEnd): { text: string; failed: boolean } {
+  switch (end.kind) {
+    case 'finished':
+      return { text: `* ${name} left`, failed: false };
+    case 'failed':
+      return { text: `* ${name} left (failed: ${end.error})`, failed: true };
+  }
+}
+
 /// The line a bus's close reads as: where it closed, or where it failed
 /// and why. `failed` tells the panel to draw it as an error. One
 /// definition for the panel and its copy text, so the two say the same.

@@ -29,6 +29,16 @@ impl MachineLayout {
         &self.root
     }
 
+    /// The folder the needs weft installs itself go under, each in its
+    /// `<group>/<name>` (`weft_core::needs::Recipe::folder`, such as
+    /// `agents/claude`), with its lock and install log beside it
+    /// (`weft_core::needs::setup::Place`): `needs/` in weft's data folder,
+    /// so every install on the machine shares them, and a recipe's folder,
+    /// whatever its node names it, can reach none of weft's own.
+    pub fn needs(&self) -> PathBuf {
+        self.root.join("needs")
+    }
+
     /// The worker programs, one folder per binary hash
     /// (`images::Program::Worker`), with the node-test servers beside them.
     pub fn workers(&self) -> PathBuf {
@@ -162,6 +172,12 @@ impl InstallLayout {
         self.dir.join("workers")
     }
 
+    /// Its process units (`process_units`): their registry, and each
+    /// unit's folder, log and agent's state.
+    pub fn process_units(&self) -> PathBuf {
+        self.dir.join("infra-processes")
+    }
+
     /// The logs of its builds, one per artifact.
     pub fn build_logs(&self) -> PathBuf {
         self.dir.join("build-logs")
@@ -216,6 +232,7 @@ mod tests {
     fn an_installs_folders_sit_under_its_own() {
         let i = InstallLayout::new("/i");
         assert_eq!(i.workers(), Path::new("/i/workers"));
+        assert_eq!(i.process_units(), Path::new("/i/infra-processes"));
         assert_eq!(i.build_log("localhost/weft-cell7/weft-infra-pg:abc"), Path::new("/i/build-logs/localhost_weft-cell7_weft-infra-pg_abc.log"));
     }
 }

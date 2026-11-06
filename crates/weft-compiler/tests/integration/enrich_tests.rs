@@ -586,7 +586,7 @@ out.data = q.rows
         .expect("the database node carries the recipe it publishes against");
     assert_eq!(spec.service, "postgres");
     assert!(
-        spec.own_fields().iter().any(|f| f.name == "password"),
+        spec.chosen_way(None).unwrap().fields.iter().any(|f| f.name == "password"),
         "the recipe is the real one, fields and all"
     );
     let q = project.nodes.iter().find(|n| n.id == "q").unwrap();

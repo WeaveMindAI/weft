@@ -1,0 +1,298 @@
+{
+  "type": "GeminiCli",
+  "label": "Gemini CLI",
+  "description": "One conversation with Gemini CLI, Google's coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, Gemini CLI runs on your machine (a local install only) from your own install of `gemini` with your own login, working in `folder`. If `gemini` is missing, weft installs it into a folder of its own, shared by the whole machine, before the node runs. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs, and it logs in with the connection on `access`. The folder is always trusted (`--skip-trust`): in a folder it was never told to trust, Gemini CLI starts none of your program's tools and refuses `accept_edits` and `bypass`. It has no question tool here, so it asks in plain text, in its reply. Its card shows what it is doing and a Start over button. What is exposed: the permission mode, the model, extra folders and a container to run its tools in; the rest of Gemini CLI's own settings stay in its `settings.json`. Your program's tools reach Gemini CLI's model as `mcp_weft_<tool>`, Gemini CLI's own naming for a tool it did not build, and come back to your program under their plain names; in the `plan` permission setting it gives its model no outside tools at all. Gemini CLI cannot let a program's tool take one of its own tools' places, so a tool named like one of them (`read_file`, `run_shell_command`, `google_web_search` and the rest of this node's list) is refused when the program is built.",
+  "tags": [
+    "agent",
+    "coding",
+    "gemini",
+    "google",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run Gemini CLI in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[gemini_cli]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A GeminiCliAccess's `access`: a Gemini API key or a Vertex AI key. Required with a `computer`. Left out on your machine, Gemini CLI uses the login already on it, your Google account included."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder Gemini CLI works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`gemini` on your PATH",
+      "description": "On your machine: the Gemini CLI program to run, when it is not the `gemini` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "accept_edits",
+          "plan",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What Gemini CLI may do without asking. `ask`: every edit and command it would put to a person comes out of AskAgent as a question. `accept_edits`: file edits go ahead, the rest asks. `plan`: it only reads and plans, and changes nothing. `bypass`: nothing asks, nothing is refused; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "Gemini CLI's default",
+      "description": "The Gemini model to use, by name. Left out, Gemini CLI's own default."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "addDirs",
+      "type": "List[String]",
+      "label": "Extra folders",
+      "description": "Folders besides `folder` Gemini CLI may read and change."
+    },
+    {
+      "name": "sandbox",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "docker",
+          "podman",
+          "runsc",
+          "lxc"
+        ]
+      },
+      "label": "Sandbox",
+      "description": "Run its tools in a container of this kind, which needs that runtime on the machine it runs on. Left out, they run without one."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GeminiCli '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GeminiCli '{id}' runs in a computer, where no login is waiting for it; give it a GeminiCliAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GeminiCli '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "accept_edits",
+                "plan",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GeminiCli '{id}' has a `permission` it does not know; pick one of ask, accept_edits, plan, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GeminiCli '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "GeminiCli '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs Gemini CLI itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "activate_skill",
+      "enter_plan_mode",
+      "exit_plan_mode",
+      "glob",
+      "google_web_search",
+      "grep_search",
+      "invoke_agent",
+      "list_background_processes",
+      "list_directory",
+      "read_background_output",
+      "read_file",
+      "replace",
+      "run_shell_command",
+      "update_topic",
+      "web_fetch",
+      "write_file"
+    ]
+  }
+}

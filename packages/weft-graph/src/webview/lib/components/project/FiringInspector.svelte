@@ -3,7 +3,7 @@
 	import type { RunTerminal, NodeFiring } from '../../types';
 	import { frameText, type FileEditWire, type BusInspectorEvent, type BusMeta, type CorruptionSite, type Frame, type LoopInspectorEvent, type ValueRef } from '../../../../protocol';
 	import { displayStatus, getStatusIcon, skipReasonText } from '../../utils/status';
-	import { busClosedLine, formatClockTime, formatStreamBody } from '../../utils/stream-log';
+	import { busClosedLine, busLeftLine, formatClockTime, formatStreamBody } from '../../utils/stream-log';
 	import PayloadCards from './PayloadCards.svelte';
 	import { runValues } from '../../utils/run-values.svelte';
 	import { refKey } from '../../utils/value-ref';
@@ -105,7 +105,7 @@
 			const lines = events.map((e) => {
 				const ts = formatBusTime(e.atUnix);
 				if (e.kind === 'joined') return `${ts}  * ${e.name} joined`;
-				if (e.kind === 'left') return `${ts}  * ${e.name} left`;
+				if (e.kind === 'left') return `${ts}  ${busLeftLine(e.name, e.end).text}`;
 				if (e.kind === 'closed') return `${ts}  ${busClosedLine(e.end).text}`;
 				if (e.kind === 'window') return `${ts}  * ${formatWindowBody(e)}`;
 				return `${ts}  ${e.from}: ${formatMessageBody(e)}`;
@@ -529,7 +529,8 @@
 											{#if e.kind === 'joined'}
 												<span class="text-emerald-600">* {e.name} joined</span>
 											{:else if e.kind === 'left'}
-												<span class="text-zinc-400">* {e.name} left</span>
+												{@const leftLine = busLeftLine(e.name, e.end)}
+												<span class="{leftLine.failed ? 'text-red-600 break-words' : 'text-zinc-400'}">{leftLine.text}</span>
 											{:else if e.kind === 'closed'}
 												{@const closedLine = busClosedLine(e.end)}
 												<span class="{closedLine.failed ? 'text-red-600 break-words' : 'text-zinc-400'} italic">{closedLine.text}</span>

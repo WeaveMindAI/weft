@@ -1,0 +1,61 @@
+{
+  "type": "GrokBuildAccess",
+  "label": "Grok Build Access",
+  "description": "An xAI login, for the GrokBuild nodes' `access`: an xAI API key. One access for however many GrokBuild nodes.",
+  "tags": [
+    "agent",
+    "grok",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#000000",
+  "service": {
+    "service": "grok_build",
+    "label": "Grok Build",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "apiKey",
+          "label": "API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "xai-..."
+            }
+          ],
+          "guide": {
+            "link": "https://console.x.ai",
+            "steps": [
+              "Open console.x.ai and create an API key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[grok_build]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[grok_build]",
+      "description": "Wire into the GrokBuild nodes' `access` input."
+    }
+  ]
+}

@@ -54,6 +54,37 @@ pub struct LogLine {
     pub text: String,
 }
 
+impl LogLine {
+    /// A line written to `pipe` just now.
+    pub fn now(pipe: Pipe, text: impl Into<String>) -> Self {
+        Self { at: Utc::now(), pipe, text: text.into() }
+    }
+
+    /// The line as a process unit's agent keeps it in the unit's log, the
+    /// way `docker logs --timestamps` prints a container's: its instant
+    /// (RFC 3339, to the nanosecond), its pipe (`out` or `err`), then its
+    /// text. The text is one line already (it was read one line at a time).
+    pub fn stamped(&self) -> String {
+        let pipe = match self.pipe {
+            Pipe::Stdout => "out",
+            Pipe::Stderr => "err",
+        };
+        format!("{} {pipe} {}", self.at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true), self.text)
+    }
+
+    /// The line [`Self::stamped`] wrote as `line`; `None` for anything else.
+    pub fn read_stamped(line: &str) -> Option<LogLine> {
+        let (at, rest) = line.split_once(' ')?;
+        let (pipe, text) = rest.split_once(' ').unwrap_or((rest, ""));
+        let pipe = match pipe {
+            "out" => Pipe::Stdout,
+            "err" => Pipe::Stderr,
+            _ => return None,
+        };
+        Some(LogLine { at: DateTime::parse_from_rfc3339(at).ok()?.to_utc(), pipe, text: text.to_string() })
+    }
+}
+
 /// Which of a container's two outputs a line was written to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -471,6 +502,19 @@ mod tests {
 
     fn texts(lines: &[LogLine]) -> Vec<&str> {
         lines.iter().map(|l| l.text.as_str()).collect()
+    }
+
+    /// A stamped line reads back as the line, spaces in its text and an
+    /// empty text included; a line it did not write reads as none.
+    #[test]
+    fn a_stamped_line_reads_back() {
+        for l in [line(7, "GET /health 200 in 3 ms"), err_line(0, ""), err_line(999_999_999, " indented")] {
+            assert_eq!(LogLine::read_stamped(&l.stamped()), Some(l.clone()), "{}", l.stamped());
+        }
+        assert_eq!(line(7, "hi").stamped(), "2023-11-14T22:13:20.000000007Z out hi");
+        for other in ["", "hi", "2023-11-14T22:13:20Z log hi", "yesterday out hi"] {
+            assert_eq!(LogLine::read_stamped(other), None, "{other}");
+        }
     }
 
     #[test]

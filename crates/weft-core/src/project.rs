@@ -39,6 +39,12 @@ pub const PROJECT_DEFINITION_UPGRADES: &[&[crate::stored::Op]] = &[
         crate::stored::Op::Within { at: "nodes.*.instanceService", ops: crate::access::spec::ACCESS_SPEC_V3 },
         crate::stored::Op::Code { at: "nodes.*", run: upgrade::rules_to_value },
     ],
+    &[
+        // Version 4: the recipes moved with `AccessSpec`'s version 4 (a
+        // pasted credential's fields became its one way to sign in).
+        crate::stored::Op::Within { at: "nodes.*.publishedService", ops: crate::access::spec::ACCESS_SPEC_V4 },
+        crate::stored::Op::Within { at: "nodes.*.instanceService", ops: crate::access::spec::ACCESS_SPEC_V4 },
+    ],
 ];
 
 /// The [`Op::Code`](crate::stored::Op::Code) steps of
@@ -261,6 +267,19 @@ pub struct ProjectDefinition {
     /// that compiles whole, and in every cut.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub broken: Vec<Broken>,
+    /// The install this program was compiled for: set by the install's
+    /// own version build and by a command comparing with it (`weft
+    /// status`), `None` for a compile for no install (`weft validate`,
+    /// the editor). A node's rule may ask which install it is
+    /// (`crate::node::Condition::LocalInstall`), and every reader of the
+    /// rules reads it here: the compile's checks and the rules it records
+    /// for the run ([`NodeDefinition::recheck`]), the build's gate, an
+    /// instance's check. On the program, so nothing hands the kind in
+    /// beside it and nothing can disagree with the compile that decided
+    /// its broken parts. Not hashed ([`hash::compute_definition_hash`]
+    /// says why).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<crate::install::InstallKind>,
     /// The wires that leave a metadata port ([`MetadataPort`]), kept only
     /// so the editor can say where the value written on an input came
     /// from. Enrich has already written
@@ -866,6 +885,12 @@ pub struct NodeDefinition {
     /// other node.
     #[serde(default, rename = "bakedOutputs", skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub baked_outputs: std::collections::BTreeSet<String>,
+    /// The named lists this node declares for other nodes' rules
+    /// (`crate::node::NodeMetadata::lists`), mirrored at enrich time, so
+    /// a rule of a node this one is wired into reads them off the program
+    /// (`crate::node::ValueList::Wired`). Empty on every node declaring none.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub lists: std::collections::BTreeMap<String, Vec<String>>,
     /// The recipe for the service this node publishes a connection to
     /// (`ctx.publish_access`), resolved from the catalog at enrich
     /// time from the node metadata's `publishes` name. Carried on the
@@ -2092,6 +2117,7 @@ mod address_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            install: None,
             metadata_wires: Vec::new(),
         };
         let (node, path) = resolve_address(&project, "");
@@ -2533,7 +2559,7 @@ mod trigger_dependency_tests {
             file_refs: Default::default(),
             include_path: None,
             include_contents: None,
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             source_file: None,
         }
     }
@@ -2563,6 +2589,7 @@ mod trigger_dependency_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            install: None,
             metadata_wires: Vec::new(),
         }
     }
@@ -2797,6 +2824,7 @@ mod project_wire_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            install: None,
             metadata_wires: Vec::new(),
         };
         let v = serde_json::to_value(&p).unwrap();
@@ -2855,7 +2883,7 @@ mod project_wire_tests {
             features: Default::default(),
             requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
             images: vec![],
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
@@ -2924,6 +2952,7 @@ mod project_wire_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            install: None,
             metadata_wires: vec![edge],
         };
         let v = serde_json::to_value(&p).unwrap();
@@ -2995,7 +3024,7 @@ mod project_wire_tests {
             per_instance: None,
             per_instance_paths: Default::default(),
             images: vec![],
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
@@ -3026,6 +3055,7 @@ mod project_wire_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            install: None,
             metadata_wires: Vec::new(),
         }
     }

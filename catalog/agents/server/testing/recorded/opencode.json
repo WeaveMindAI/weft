@@ -1,0 +1,1686 @@
+{
+ "kind": "opencode",
+ "command": "opencode",
+ "source": "OpenCode v2.2.5 run for real (`opencode acp`, isolated HOME) against a local OpenAI-compatible stand-in model (scratchpad oc2/tools/oc_mock.py, scripted tool calls, no network): initialize and session/new from oc2/run3/r3.jsonl lines 2 and 4 (model list cut to three entries), session/set_config_option line 7, session/load answer and replay from oc2/run3/r4.jsonl lines 4-15 (cut to its first turn), hello from oc2/run1/out.jsonl lines 9-11, permission lines 13-21, ask lines 23-30, ask_other lines 32-39, reject from oc2/run3/r3.jsonl lines 18-24, tool from oc2/run8/r7.jsonl lines 17-23 over its HTTP MCP server (the tool's text replaced by $TOOL, the `tool` step inserted where OpenCode called it). The bad key failure is agents/opencode.transcript.jsonl line 170 (research, Anthropic answering 401). Paths are rewritten to /home/me/work and session ids to $SESSION. In ask_other the recorded answer put the typed name in `q1`; weft sends it in `q1_custom`, which OpenCode reads first for a question that takes its own answer. The tool turn was recorded again for real on OpenCode v2.2.5, its tools a plugin of weft's own (the agent server's js_plugin loader, under their plain names) forwarding to a stand-in of the MCP route, against a local fake OpenAI-compatible model (scratchpad fake_model.py, fake_route.py, acp_drive.py, run rec_oc/acp.log); the tool step stands where the plugin's call reached the route. Recorded again for real on OpenCode v2.2.5 (`opencode acp`), driven through weft's agent server on a connection's OpenRouter key (`openrouter/deepseek/deepseek-v4.1-flash`, pinned to Fireworks in the folder's opencode.json), the program's tools through weft's plugin: initialize, session/new, set_config_option and session/load answers (model lists cut to three), the load's replay, hello, ask (its question tool, answered Blue), and tool (the program's `lookup` and a program tool named `read` taking the built-in's place, both called by their plain names; the agent restarts between turns whose tools differ, so each later turn began with a real session/load).",
+ "answers": {
+  "initialize": {
+   "protocolVersion": 1,
+   "agentCapabilities": {
+    "loadSession": true,
+    "mcpCapabilities": {
+     "http": true,
+     "sse": false
+    },
+    "promptCapabilities": {
+     "embeddedContext": true,
+     "image": true
+    },
+    "sessionCapabilities": {
+     "additionalDirectories": {},
+     "close": {},
+     "delete": {},
+     "fork": {},
+     "list": {},
+     "resume": {}
+    },
+    "_meta": {
+     "opencode/child-session-updates": true
+    }
+   },
+   "authMethods": [
+    {
+     "description": "Run `opencode auth login` in the terminal",
+     "name": "Login with opencode",
+     "id": "opencode-login"
+    }
+   ],
+   "agentInfo": {
+    "name": "OpenCode",
+    "version": "2.2.5"
+   }
+  },
+  "session/new": {
+   "sessionId": "$SESSION",
+   "configOptions": [
+    {
+     "id": "model",
+     "name": "Model",
+     "category": "model",
+     "type": "select",
+     "currentValue": "openrouter/particle-ai/particle-1",
+     "options": [
+      {
+       "value": "openrouter/particle-ai/particle-1",
+       "name": "openrouter/Particle-1"
+      },
+      {
+       "value": "deepseek/deepseek-v4-pro",
+       "name": "deepseek/DeepSeek V4 Pro"
+      },
+      {
+       "value": "deepseek/deepseek-flash",
+       "name": "deepseek/DeepSeek V4.1 Flash 1017"
+      }
+     ]
+    },
+    {
+     "id": "effort",
+     "name": "Effort",
+     "description": "Available effort levels for this model",
+     "category": "thought_level",
+     "type": "select",
+     "currentValue": "default",
+     "options": [
+      {
+       "value": "none",
+       "name": "None"
+      },
+      {
+       "value": "minimal",
+       "name": "Minimal"
+      },
+      {
+       "value": "low",
+       "name": "Low"
+      },
+      {
+       "value": "medium",
+       "name": "Medium"
+      },
+      {
+       "value": "high",
+       "name": "High"
+      },
+      {
+       "value": "xhigh",
+       "name": "Xhigh"
+      },
+      {
+       "value": "max",
+       "name": "Max"
+      },
+      {
+       "value": "default",
+       "name": "Default"
+      }
+     ]
+    },
+    {
+     "id": "mode",
+     "name": "Session Mode",
+     "category": "mode",
+     "type": "select",
+     "currentValue": "build",
+     "options": [
+      {
+       "value": "build",
+       "name": "Build",
+       "description": "The default agent. Executes tools based on configured permissions."
+      },
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Read-only agent for exploring the codebase and planning work before implementation."
+      }
+     ]
+    }
+   ]
+  },
+  "session/set_config_option": {
+   "configOptions": [
+    {
+     "id": "model",
+     "name": "Model",
+     "category": "model",
+     "type": "select",
+     "currentValue": "openrouter/deepseek/deepseek-v4.1-flash",
+     "options": [
+      {
+       "value": "openrouter/deepseek/deepseek-v4.1-flash",
+       "name": "openrouter/DeepSeek V4.1 Flash"
+      },
+      {
+       "value": "deepseek/deepseek-v4-pro",
+       "name": "deepseek/DeepSeek V4 Pro"
+      },
+      {
+       "value": "deepseek/deepseek-flash",
+       "name": "deepseek/DeepSeek V4.1 Flash 1017"
+      }
+     ]
+    },
+    {
+     "id": "effort",
+     "name": "Effort",
+     "description": "Available effort levels for this model",
+     "category": "thought_level",
+     "type": "select",
+     "currentValue": "default",
+     "options": [
+      {
+       "value": "none",
+       "name": "None"
+      },
+      {
+       "value": "low",
+       "name": "Low"
+      },
+      {
+       "value": "high",
+       "name": "High"
+      },
+      {
+       "value": "max",
+       "name": "Max"
+      },
+      {
+       "value": "default",
+       "name": "Default"
+      }
+     ]
+    },
+    {
+     "id": "mode",
+     "name": "Session Mode",
+     "category": "mode",
+     "type": "select",
+     "currentValue": "build",
+     "options": [
+      {
+       "value": "build",
+       "name": "Build",
+       "description": "The default agent. Executes tools based on configured permissions."
+      },
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Read-only agent for exploring the codebase and planning work before implementation."
+      }
+     ]
+    }
+   ]
+  },
+  "session/load": {
+   "configOptions": [
+    {
+     "id": "model",
+     "name": "Model",
+     "category": "model",
+     "type": "select",
+     "currentValue": "openrouter/deepseek/deepseek-v4.1-flash",
+     "options": [
+      {
+       "value": "openrouter/deepseek/deepseek-v4.1-flash",
+       "name": "openrouter/DeepSeek V4.1 Flash"
+      },
+      {
+       "value": "deepseek/deepseek-v4-pro",
+       "name": "deepseek/DeepSeek V4 Pro"
+      },
+      {
+       "value": "deepseek/deepseek-flash",
+       "name": "deepseek/DeepSeek V4.1 Flash 1017"
+      }
+     ]
+    },
+    {
+     "id": "effort",
+     "name": "Effort",
+     "description": "Available effort levels for this model",
+     "category": "thought_level",
+     "type": "select",
+     "currentValue": "default",
+     "options": [
+      {
+       "value": "none",
+       "name": "None"
+      },
+      {
+       "value": "low",
+       "name": "Low"
+      },
+      {
+       "value": "high",
+       "name": "High"
+      },
+      {
+       "value": "max",
+       "name": "Max"
+      },
+      {
+       "value": "default",
+       "name": "Default"
+      }
+     ]
+    },
+    {
+     "id": "mode",
+     "name": "Session Mode",
+     "category": "mode",
+     "type": "select",
+     "currentValue": "build",
+     "options": [
+      {
+       "value": "build",
+       "name": "Build",
+       "description": "The default agent. Executes tools based on configured permissions."
+      },
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Read-only agent for exploring the codebase and planning work before implementation."
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "replay": {
+  "before": [
+   {
+    "sessionUpdate": "user_message_chunk",
+    "messageId": "msg_1ac558e2f00108DyHshoj4GrCP",
+    "content": {
+     "type": "text",
+     "text": "Reply with exactly these words and nothing else: hello there"
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "messageId": "msg_1ac558e62001nEB714YvGIRXnR",
+    "content": {
+     "type": "text",
+     "text": "hello there"
+    }
+   },
+   {
+    "sessionUpdate": "user_message_chunk",
+    "messageId": "msg_1ac5599dc0013lQjIwlh7WLS0f",
+    "content": {
+     "type": "text",
+     "text": "Call the lookup tool, then call the read tool with the path notes.txt. Reply with only the number from lookup and the text read returned, separated by a space."
+    }
+   },
+   {
+    "sessionUpdate": "agent_thought_chunk",
+    "messageId": "msg_1ac559a020011OUVVNTcVCXIFT:reasoning:0",
+    "content": {
+     "type": "text",
+     "text": "The lookup tool returns a magic number. Let me call it. Then read notes.txt.\n\nThese are independent? No, read depends on nothing from lookup. But the user wants both. Let me call both in parallel.\n\nActually, lookup tool has no parameters. Let me call both."
+    }
+   },
+   {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call_66d6d6e6f0414e678bb0f69f",
+    "name": "lookup",
+    "title": "lookup",
+    "kind": "other",
+    "status": "pending",
+    "locations": [],
+    "rawInput": {}
+   },
+   {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call_66d6d6e6f0414e678bb0f69f",
+    "status": "completed",
+    "locations": [],
+    "content": [
+     {
+      "type": "content",
+      "content": {
+       "type": "text",
+       "text": "42"
+      }
+     }
+    ],
+    "rawOutput": {
+     "metadata": {
+      "truncated": false
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call_d731fc25361d4911a61460ab",
+    "name": "read",
+    "title": "read",
+    "kind": "read",
+    "status": "pending",
+    "locations": [
+     {
+      "path": "/home/me/work/notes.txt"
+     }
+    ],
+    "rawInput": {
+     "path": "notes.txt"
+    }
+   },
+   {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call_d731fc25361d4911a61460ab",
+    "status": "completed",
+    "locations": [
+     {
+      "path": "/home/me/work/notes.txt"
+     }
+    ],
+    "content": [
+     {
+      "type": "content",
+      "content": {
+       "type": "text",
+       "text": "pineapple"
+      }
+     }
+    ],
+    "rawOutput": {
+     "metadata": {
+      "truncated": false
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "messageId": "msg_1ac55a1db001OejcsxHmhSig9Q",
+    "content": {
+     "type": "text",
+     "text": "42 pineapple"
+    }
+   }
+  ],
+  "after": []
+ },
+ "turns": {
+  "hello": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "msg_1ac558e62001nEB714YvGIRXnR",
+      "content": {
+       "type": "text",
+       "text": "hello there"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 5932,
+      "size": 1048576,
+      "cost": {
+       "amount": 0,
+       "currency": "USD"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 5928,
+       "outputTokens": 4,
+       "totalTokens": 5932
+      },
+      "_meta": {}
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "text",
+     "done"
+    ],
+    "reply": "hello there"
+   }
+  },
+  "permission": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_5e8320d6",
+      "name": "shell",
+      "title": "shell",
+      "kind": "execute",
+      "status": "pending",
+      "locations": [
+       {
+        "path": "/home/me/work"
+       }
+      ],
+      "rawInput": {
+       "cwd": "/home/me/work"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_5e8320d6",
+      "status": "in_progress",
+      "kind": "execute",
+      "title": "echo hi > a.txt",
+      "locations": [
+       {
+        "path": "/home/me/work"
+       }
+      ],
+      "rawInput": {
+       "command": "echo hi > a.txt",
+       "description": "write a.txt",
+       "cwd": "/home/me/work"
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "call_5e8320d6",
+        "name": "shell",
+        "title": "echo hi > a.txt",
+        "kind": "execute",
+        "status": "pending",
+        "locations": [
+         {
+          "path": "/home/me/work"
+         }
+        ],
+        "rawInput": {
+         "command": "echo hi > a.txt",
+         "description": "write a.txt",
+         "cwd": "/home/me/work"
+        }
+       },
+       "options": [
+        {
+         "optionId": "once",
+         "kind": "allow_once",
+         "name": "Allow once"
+        },
+        {
+         "optionId": "always",
+         "kind": "allow_always",
+         "name": "Always allow"
+        },
+        {
+         "optionId": "reject",
+         "kind": "reject_once",
+         "name": "Reject"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_5e8320d6",
+      "status": "in_progress",
+      "kind": "execute",
+      "title": "echo hi > a.txt",
+      "locations": [
+       {
+        "path": "/home/me/work"
+       }
+      ],
+      "rawInput": {
+       "command": "echo hi > a.txt",
+       "description": "write a.txt",
+       "cwd": "/home/me/work"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_5e8320d6",
+      "status": "completed",
+      "locations": [
+       {
+        "path": "/home/me/work"
+       }
+      ],
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "(no output)"
+        }
+       }
+      ],
+      "rawOutput": {
+       "metadata": {
+        "status": "completed",
+        "truncated": false,
+        "exit": 0
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "msg_1a37b42ab001aCr7gmHI8usMT4",
+      "content": {
+       "type": "text",
+       "text": "Tool finished: (no output)"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 20,
+       "outputTokens": 10,
+       "totalTokens": 30
+      },
+      "_meta": {}
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "Tool finished: (no output)",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "execute",
+        "title": "echo hi > a.txt",
+        "detail": "/home/me/work\necho hi > a.txt",
+        "choices": [
+         {
+          "id": "once",
+          "kind": "allow_once"
+         },
+         {
+          "id": "always",
+          "kind": "allow_always"
+         },
+         {
+          "id": "reject",
+          "kind": "reject"
+         }
+        ]
+       }
+      },
+      "answer": {
+       "choice": "once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "ask": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_dda79c0db13f4b17b3983cff",
+      "name": "question",
+      "title": "question",
+      "kind": "other",
+      "status": "pending",
+      "locations": [],
+      "rawInput": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_dda79c0db13f4b17b3983cff",
+      "status": "in_progress",
+      "kind": "other",
+      "title": "question",
+      "locations": [],
+      "rawInput": {
+       "questions": [
+        {
+         "question": "Which color do you prefer?",
+         "header": "Color preference",
+         "options": [
+          {
+           "label": "Red",
+           "description": "You prefer red"
+          },
+          {
+           "label": "Blue",
+           "description": "You prefer blue"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "elicitation/create",
+      "params": {
+       "mode": "form",
+       "sessionId": "$SESSION",
+       "toolCallId": "call_dda79c0db13f4b17b3983cff",
+       "message": "Questions",
+       "requestedSchema": {
+        "type": "object",
+        "properties": {
+         "q0": {
+          "type": "string",
+          "title": "Color preference",
+          "description": "Which color do you prefer?",
+          "oneOf": [
+           {
+            "const": "Red",
+            "title": "Red",
+            "description": "You prefer red"
+           },
+           {
+            "const": "Blue",
+            "title": "Blue",
+            "description": "You prefer blue"
+           }
+          ]
+         },
+         "q0_custom": {
+          "type": "string",
+          "title": "Color preference (other)",
+          "description": "Type your own answer"
+         }
+        },
+        "required": []
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_dda79c0db13f4b17b3983cff",
+      "status": "completed",
+      "locations": [],
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "User has answered your questions: \"Which color do you prefer?\"=\"Blue\". You can now continue with the user's answers in mind."
+        }
+       }
+      ],
+      "rawOutput": {
+       "metadata": {
+        "answers": [
+         [
+          "Blue"
+         ]
+        ],
+        "truncated": false
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "msg_1ac55b132001fEnnrGLrc1SrUj",
+      "content": {
+       "type": "text",
+       "text": "Blue"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 6267,
+      "size": 1048576,
+      "cost": {
+       "amount": 4.72e-05,
+       "currency": "USD"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 595,
+       "outputTokens": 92,
+       "totalTokens": 12493,
+       "cachedReadTokens": 11806
+      },
+      "_meta": {}
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "Blue",
+    "blocks": [
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "id": "q0",
+         "header": "Color preference",
+         "question": "Which color do you prefer?",
+         "options": [
+          {
+           "label": "Red",
+           "description": "You prefer red"
+          },
+          {
+           "label": "Blue",
+           "description": "You prefer blue"
+          }
+         ],
+         "multiSelect": false,
+         "allowOther": true
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "q0": [
+         "Blue"
+        ]
+       }
+      },
+      "agentGot": {
+       "action": "accept",
+       "content": {
+        "q0": "Blue"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "ask_other": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_f5c65a3d",
+      "name": "question",
+      "title": "question",
+      "kind": "other",
+      "status": "pending",
+      "locations": [],
+      "rawInput": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_f5c65a3d",
+      "status": "in_progress",
+      "kind": "other",
+      "title": "question",
+      "locations": [],
+      "rawInput": {
+       "questions": [
+        {
+         "question": "Which fruits?",
+         "header": "Fruits",
+         "multiple": true,
+         "options": [
+          {
+           "label": "Apple",
+           "description": "a"
+          },
+          {
+           "label": "Pear",
+           "description": "p"
+          }
+         ]
+        },
+        {
+         "question": "Your name?",
+         "header": "Name",
+         "options": []
+        }
+       ]
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "elicitation/create",
+      "params": {
+       "mode": "form",
+       "sessionId": "$SESSION",
+       "toolCallId": "call_f5c65a3d",
+       "message": "Questions",
+       "requestedSchema": {
+        "type": "object",
+        "properties": {
+         "q0": {
+          "type": "array",
+          "title": "Fruits",
+          "description": "Which fruits?",
+          "items": {
+           "anyOf": [
+            {
+             "const": "Apple",
+             "title": "Apple",
+             "description": "a"
+            },
+            {
+             "const": "Pear",
+             "title": "Pear",
+             "description": "p"
+            }
+           ]
+          }
+         },
+         "q0_custom": {
+          "type": "string",
+          "title": "Fruits (other)",
+          "description": "Add your own answer"
+         },
+         "q1": {
+          "type": "string",
+          "title": "Name",
+          "description": "Your name?",
+          "oneOf": []
+         },
+         "q1_custom": {
+          "type": "string",
+          "title": "Name (other)",
+          "description": "Type your own answer"
+         }
+        },
+        "required": []
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_f5c65a3d",
+      "status": "completed",
+      "locations": [],
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "User has answered your questions: \"Which fruits?\"=\"Apple, Pear, Kiwi\", \"Your name?\"=\"Quentin\". You can now continue with the user's answers in mind."
+        }
+       }
+      ],
+      "rawOutput": {
+       "metadata": {
+        "answers": [
+         [
+          "Apple",
+          "Pear",
+          "Kiwi"
+         ],
+         [
+          "Quentin"
+         ]
+        ],
+        "truncated": false
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "msg_1a37b435e001QMAabLcXmtyjC4",
+      "content": {
+       "type": "text",
+       "text": "Tool finished: User has answered your questions: \"Which fruits?\"=\"Apple, Pear, Kiwi\", \"Your name?\"=\"Quentin\". You can now continue with the user's answers in mind."
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 20,
+       "outputTokens": 10,
+       "totalTokens": 30
+      },
+      "_meta": {}
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "blocks": [
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "id": "q0",
+         "header": "Fruits",
+         "question": "Which fruits?",
+         "options": [
+          {
+           "label": "Apple",
+           "description": "a"
+          },
+          {
+           "label": "Pear",
+           "description": "p"
+          }
+         ],
+         "multiSelect": true,
+         "allowOther": true
+        },
+        {
+         "id": "q1",
+         "header": "Name",
+         "question": "Your name?",
+         "options": [],
+         "multiSelect": false,
+         "allowOther": true
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "q0": [
+         "Apple",
+         "Pear",
+         "Kiwi"
+        ],
+        "q1": [
+         "Quentin"
+        ]
+       }
+      },
+      "agentGot": {
+       "action": "accept",
+       "content": {
+        "q0": [
+         "Apple",
+         "Pear"
+        ],
+        "q0_custom": "Kiwi",
+        "q1_custom": "Quentin"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "reject": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_fce0f2cc",
+      "name": "shell",
+      "title": "shell",
+      "kind": "execute",
+      "status": "pending",
+      "locations": [
+       {
+        "path": "/home/me/work"
+       }
+      ],
+      "rawInput": {
+       "cwd": "/home/me/work"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_fce0f2cc",
+      "status": "in_progress",
+      "kind": "execute",
+      "title": "echo hi > a.txt",
+      "locations": [
+       {
+        "path": "/home/me/work"
+       }
+      ],
+      "rawInput": {
+       "command": "echo hi > a.txt",
+       "description": "write a.txt",
+       "cwd": "/home/me/work"
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "call_fce0f2cc",
+        "name": "shell",
+        "title": "echo hi > a.txt",
+        "kind": "execute",
+        "status": "pending",
+        "locations": [
+         {
+          "path": "/home/me/work"
+         }
+        ],
+        "rawInput": {
+         "command": "echo hi > a.txt",
+         "description": "write a.txt",
+         "cwd": "/home/me/work"
+        }
+       },
+       "options": [
+        {
+         "optionId": "once",
+         "kind": "allow_once",
+         "name": "Allow once"
+        },
+        {
+         "optionId": "always",
+         "kind": "allow_always",
+         "name": "Always allow"
+        },
+        {
+         "optionId": "reject",
+         "kind": "reject_once",
+         "name": "Reject"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_fce0f2cc",
+      "status": "failed",
+      "kind": "execute",
+      "title": "echo hi > a.txt",
+      "locations": [
+       {
+        "path": "/home/me/work"
+       }
+      ],
+      "rawInput": {
+       "command": "echo hi > a.txt",
+       "description": "write a.txt",
+       "cwd": "/home/me/work"
+      },
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "The user declined this tool call"
+        }
+       }
+      ],
+      "rawOutput": {
+       "metadata": {},
+       "error": "The user declined this tool call"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "cancelled",
+      "usage": {
+       "inputTokens": 10,
+       "outputTokens": 5,
+       "totalTokens": 15
+      },
+      "_meta": {}
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "error"
+    ],
+    "status": "failed",
+    "error": "ended the turn when `echo hi > a.txt` was refused",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission"
+      },
+      "answer": {
+       "choice": "reject"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "reject"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "tool": {
+   "tools": [
+    "lookup",
+    "read"
+   ],
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "messageId": "msg_1ac559a020011OUVVNTcVCXIFT:reasoning:0",
+      "content": {
+       "type": "text",
+       "text": "The"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "messageId": "msg_1ac559a020011OUVVNTcVCXIFT:reasoning:0",
+      "content": {
+       "type": "text",
+       "text": " lookup tool returns a magic number. Let me call it. Then read notes.txt.\n\nThese are independent? No, read depends on nothing from lookup. But the user wants both."
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "messageId": "msg_1ac559a020011OUVVNTcVCXIFT:reasoning:0",
+      "content": {
+       "type": "text",
+       "text": " Let me call both in parallel.\n\nActually, lookup tool has no parameters. Let me"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "messageId": "msg_1ac559a020011OUVVNTcVCXIFT:reasoning:0",
+      "content": {
+       "type": "text",
+       "text": " call both."
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_66d6d6e6f0414e678bb0f69f",
+      "name": "lookup",
+      "title": "lookup",
+      "kind": "other",
+      "status": "pending",
+      "locations": [],
+      "rawInput": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_d731fc25361d4911a61460ab",
+      "name": "read",
+      "title": "read",
+      "kind": "read",
+      "status": "pending",
+      "locations": [],
+      "rawInput": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_66d6d6e6f0414e678bb0f69f",
+      "status": "in_progress",
+      "kind": "other",
+      "title": "lookup",
+      "locations": [],
+      "rawInput": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_d731fc25361d4911a61460ab",
+      "status": "in_progress",
+      "kind": "read",
+      "title": "read",
+      "locations": [
+       {
+        "path": "/home/me/work/notes.txt"
+       }
+      ],
+      "rawInput": {
+       "path": "notes.txt"
+      }
+     }
+    },
+    {
+     "tool": {
+      "name": "lookup",
+      "arguments": {}
+     }
+    },
+    {
+     "tool": {
+      "name": "read",
+      "arguments": {
+       "path": "notes.txt"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_66d6d6e6f0414e678bb0f69f",
+      "status": "completed",
+      "locations": [],
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "42"
+        }
+       }
+      ],
+      "rawOutput": {
+       "metadata": {
+        "truncated": false
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_d731fc25361d4911a61460ab",
+      "status": "completed",
+      "locations": [
+       {
+        "path": "/home/me/work/notes.txt"
+       }
+      ],
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "pineapple"
+        }
+       }
+      ],
+      "rawOutput": {
+       "metadata": {
+        "truncated": false
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "msg_1ac55a1db001OejcsxHmhSig9Q",
+      "content": {
+       "type": "text",
+       "text": "42 pineapple"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 5943,
+      "size": 1048576,
+      "cost": {
+       "amount": 4.72e-05,
+       "currency": "USD"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 2600,
+       "outputTokens": 56,
+       "totalTokens": 11861,
+       "thoughtTokens": 57,
+       "cachedReadTokens": 9148
+      },
+      "_meta": {}
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "tool_use",
+     "tool_use",
+     "tool_call",
+     "tool_call",
+     "tool_result",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "42 pineapple",
+    "blocks": [
+     {
+      "tool": "lookup",
+      "result": "42"
+     },
+     {
+      "tool": "read",
+      "result": "pineapple"
+     }
+    ]
+   }
+  },
+  "bad key": {
+   "steps": [
+    {
+     "fail": {
+      "code": -32000,
+      "message": "Authentication required: provider authentication required",
+      "data": {}
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "error"
+    ],
+    "status": "failed",
+    "error": "Authentication required: provider authentication required"
+   }
+  }
+ },
+ "settings": [
+  {
+   "name": "ask",
+   "given": {
+    "permission": "ask"
+   },
+   "expect": {
+    "args": [
+     [
+      "acp"
+     ]
+    ],
+    "env": {
+     "OPENCODE_CONFIG_CONTENT": "{\"permissions\": [{\"action\": \"shell\", \"resource\": \"*\", \"effect\": \"ask\"}, {\"action\": \"edit\", \"resource\": \"*\", \"effect\": \"ask\"}, {\"action\": \"webfetch\", \"resource\": \"*\", \"effect\": \"ask\"}, {\"action\": \"websearch\", \"resource\": \"*\", \"effect\": \"ask\"}, {\"action\": \"external_directory\", \"resource\": \"*\", \"effect\": \"ask\"}]}",
+     "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+     "OPENCODE_DISABLE_AUTOUPDATE": "1"
+    },
+    "requests": [
+     {
+      "method": "initialize",
+      "params": {
+       "clientCapabilities": {
+        "elicitation": {
+         "form": {}
+        }
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "accept_edits",
+   "given": {
+    "permission": "accept_edits"
+   },
+   "expect": {
+    "env": {
+     "OPENCODE_CONFIG_CONTENT": "{\"permissions\": [{\"action\": \"shell\", \"resource\": \"*\", \"effect\": \"ask\"}, {\"action\": \"edit\", \"resource\": \"*\", \"effect\": \"ask\"}, {\"action\": \"webfetch\", \"resource\": \"*\", \"effect\": \"ask\"}, {\"action\": \"websearch\", \"resource\": \"*\", \"effect\": \"ask\"}, {\"action\": \"external_directory\", \"resource\": \"*\", \"effect\": \"ask\"}, {\"action\": \"edit\", \"resource\": \"*\", \"effect\": \"allow\"}]}"
+    }
+   }
+  },
+  {
+   "name": "plan",
+   "given": {
+    "permission": "plan"
+   },
+   "expect": {
+    "env": {
+     "OPENCODE_CONFIG_CONTENT": "{\"permissions\": [{\"action\": \"shell\", \"resource\": \"*\", \"effect\": \"ask\"}, {\"action\": \"webfetch\", \"resource\": \"*\", \"effect\": \"ask\"}, {\"action\": \"websearch\", \"resource\": \"*\", \"effect\": \"ask\"}, {\"action\": \"external_directory\", \"resource\": \"*\", \"effect\": \"ask\"}]}"
+    },
+    "requests": [
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "mode",
+       "value": "plan"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "bypass",
+   "given": {
+    "permission": "bypass"
+   },
+   "expect": {
+    "env": {
+     "OPENCODE_CONFIG_CONTENT": "{\"permissions\": [{\"action\": \"*\", \"resource\": \"*\", \"effect\": \"allow\"}]}"
+    }
+   }
+  },
+  {
+   "name": "model_and_options",
+   "given": {
+    "model": "anthropic/claude-sonnet-4-6",
+    "options": {
+     "effort": "high",
+     "addDirs": [
+      "/a",
+      "/b"
+     ]
+    }
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/new",
+      "params": {
+       "additionalDirectories": [
+        "/a",
+        "/b"
+       ]
+      }
+     },
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "model",
+       "value": "anthropic/claude-sonnet-4-6"
+      }
+     },
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "effort",
+       "value": "high"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "bad_option_value",
+   "given": {
+    "options": {
+     "effort": "turbo"
+    }
+   },
+   "expect": {
+    "error": "takes minimal, low, medium, high, xhigh, max, default"
+   }
+  },
+  {
+   "name": "anthropicKey",
+   "given": {
+    "credentials": {
+     "way": "anthropicKey",
+     "values": {
+      "key": "anthropicKey-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "ANTHROPIC_API_KEY": "anthropicKey-test",
+     "HOME": "$HOME"
+    },
+    "unset": [
+     "OPENAI_API_KEY",
+     "OPENROUTER_API_KEY",
+     "GEMINI_API_KEY",
+     "OPENCODE_API_KEY"
+    ]
+   }
+  },
+  {
+   "name": "openaiKey",
+   "given": {
+    "credentials": {
+     "way": "openaiKey",
+     "values": {
+      "key": "openaiKey-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "OPENAI_API_KEY": "openaiKey-test",
+     "HOME": "$HOME"
+    },
+    "unset": [
+     "ANTHROPIC_API_KEY",
+     "OPENROUTER_API_KEY",
+     "GEMINI_API_KEY",
+     "OPENCODE_API_KEY"
+    ]
+   }
+  },
+  {
+   "name": "openrouterKey",
+   "given": {
+    "credentials": {
+     "way": "openrouterKey",
+     "values": {
+      "key": "openrouterKey-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "OPENROUTER_API_KEY": "openrouterKey-test",
+     "HOME": "$HOME"
+    },
+    "unset": [
+     "ANTHROPIC_API_KEY",
+     "OPENAI_API_KEY",
+     "GEMINI_API_KEY",
+     "OPENCODE_API_KEY"
+    ]
+   }
+  },
+  {
+   "name": "googleKey",
+   "given": {
+    "credentials": {
+     "way": "googleKey",
+     "values": {
+      "key": "googleKey-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "GEMINI_API_KEY": "googleKey-test",
+     "HOME": "$HOME"
+    },
+    "unset": [
+     "ANTHROPIC_API_KEY",
+     "OPENAI_API_KEY",
+     "OPENROUTER_API_KEY",
+     "OPENCODE_API_KEY"
+    ]
+   }
+  },
+  {
+   "name": "opencodeKey",
+   "given": {
+    "credentials": {
+     "way": "opencodeKey",
+     "values": {
+      "key": "opencodeKey-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "OPENCODE_API_KEY": "opencodeKey-test",
+     "HOME": "$HOME"
+    },
+    "unset": [
+     "ANTHROPIC_API_KEY",
+     "OPENAI_API_KEY",
+     "OPENROUTER_API_KEY",
+     "GEMINI_API_KEY"
+    ]
+   }
+  }
+ ],
+ "mcpFrom": {
+  "loader": {
+   "env": "OPENCODE_CONFIG_CONTENT",
+   "key": [
+    "plugins",
+    0
+   ]
+  }
+ }
+}

@@ -29,6 +29,7 @@ pub use fake::FakeStore;
 use weft_core::signal_token::TokenKind;
 use weft_journal::RunEvent;
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -462,10 +463,12 @@ pub trait SignalStore: Send + Sync {
     async fn signal_remove_registration(&self, token: &str, generation: i64) -> anyhow::Result<Option<SignalRegistration>>;
 
     /// Delete the wait `token` of run `run_id`, given up by its run,
-    /// and return it for the listener to let go of. A token that is no
-    /// wait of that run (an entry trigger, another run's wait, a wait
-    /// already answered) is left alone: `None`.
-    async fn signal_withdraw(&self, run_id: RunId, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
+    /// and return its signals for the listener to let go of: the wait's
+    /// own, or every branch of a wait on the first of several (which has
+    /// no row of its own, `weft_core::signal::first_of`). A token that is
+    /// no wait of that run (an entry trigger, another run's wait, a wait
+    /// already answered) is left alone: nothing comes back.
+    async fn signal_withdraw(&self, run_id: RunId, token: &str) -> anyhow::Result<Vec<SignalRegistration>>;
 
     /// The RESUME registrations of one run: what that run is
     /// parked on.
@@ -804,15 +807,32 @@ impl RunOwner {
     }
 }
 
+/// The wait `sig` is a branch of, when it is one of the branches of a
+/// wait on the first of several (`weft_core::signal::first_of`): read off
+/// its spec, where the dispatcher put it as it armed the branch.
+pub fn branch_of(sig: &SignalRegistration) -> anyhow::Result<Option<weft_core::signal::first_of::BranchOf>> {
+    let spec: weft_core::primitive::SignalSpec =
+        serde_json::from_str(&sig.spec_json).with_context(|| format!("signal {}'s spec does not read", sig.token))?;
+    Ok(spec.branch_of)
+}
+
+/// Whether `sig` is the signal of the wait `token`, or one of its branches.
+pub fn answers_wait(sig: &SignalRegistration, token: &str) -> anyhow::Result<bool> {
+    Ok(sig.token == token || branch_of(sig)?.is_some_and(|of| of.wait == token))
+}
+
 /// What became of an answer to a wait (`SignalStore::answer`).
 #[derive(Debug)]
 pub enum Answered {
     /// It reached its run: written into its record (the run is queued to
     /// carry on), or handed to the worker that drives it. The wait's
     /// signal is gone; the listener still holds it in memory.
-    Reached { consumed: SignalRegistration },
-    /// The run had ended: the wait's signal is gone, nothing was written.
-    RunEnded { consumed: SignalRegistration },
+    ///
+    /// `consumed` is every signal the answer took down: the wait's own, or
+    /// every branch of a wait on the first of several.
+    Reached { consumed: Vec<SignalRegistration> },
+    /// The run had ended: the wait's signals are gone, nothing was written.
+    RunEnded { consumed: Vec<SignalRegistration> },
     /// No such wait: it was answered already, or never existed.
     Gone,
 }

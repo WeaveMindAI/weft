@@ -21,6 +21,7 @@ use weft_core::access::spec::{
 use weft_core::access::wire::{
     BeginOAuth, CompletedConnect, ConnectDirect, GrantSummary, PublishedConnection, StartedOAuth,
 };
+use weft_core::install::InstallKind;
 use weft_core::{AccessSpec, AppRegistration, CredentialOwner};
 
 use crate::{door_of, door_str, owner_of, owner_str, scopes_of, AccessError};
@@ -81,6 +82,7 @@ struct ListedRow {
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     value_names: Vec<String>,
     instance_id: Option<String>,
+    way: Option<String>,
 }
 
 impl FromRow for ListedRow {
@@ -98,6 +100,7 @@ impl FromRow for ListedRow {
             expires_at: row.try_get("expires_at")?,
             value_names: row.try_get("value_names")?,
             instance_id: row.try_get("instance_id")?,
+            way: row.try_get("way")?,
         })
     }
 }
@@ -117,7 +120,7 @@ pub async fn list_grants(
         "SELECT id, service, project_id, identity, label, granted_scopes,
                 permissions_verified, owner, door, expires_at,
                 ARRAY(SELECT jsonb_array_elements_text(value_names)) AS value_names,
-                instance_id
+                instance_id, way
          FROM access_grant
          WHERE tenant_id = $1 AND ($2::text IS NULL OR service = $2) AND {scope}
          ORDER BY created_at",
@@ -138,6 +141,7 @@ pub async fn list_grants(
                     .map_err(anyhow::Error::msg)?,
                 identity: row.identity,
                 label: row.label,
+                way: row.way,
                 scopes: scopes_of(&row.granted_scopes),
                 permissions_verified: row.permissions_verified,
                 // A stored credential is one; a runtime-owned row's
@@ -282,8 +286,12 @@ fn instance_not_shared(instance: &Option<weft_core::instance::InstanceId>, door:
     }
 }
 
+/// `install` is where this connect runs: a way to sign in it does not
+/// offer (a local-only one on a cloud install) is refused, naming the
+/// ways that work here.
 pub async fn connect_direct(
     pool: &Pool,
+    install: InstallKind,
     tenant: &str,
     req: ConnectDirect,
 ) -> anyhow::Result<CompletedConnect> {
@@ -328,6 +336,30 @@ pub async fn connect_direct(
     // the runtime's credential, and resolution asks the credential
     // source per call. (A consent service's shared door goes through
     // begin_oauth with the registered app instead.)
+    // The way to sign in the values were filled for: a pasted
+    // credential's, which this install must offer. Any other connect
+    // names none.
+    let way = match &spec.acquisition {
+        Acquisition::Static { .. } if req.door == Door::Own => {
+            let way = spec.chosen_way(req.way.as_deref()).map_err(AccessError::Invalid)?;
+            if !way.offered_on(install) {
+                return Err(AccessError::Invalid(spec.cloud_refusal(way)).into());
+            }
+            Some(way)
+        }
+        _ => match &req.way {
+            Some(named) => {
+                return Err(AccessError::Invalid(format!(
+                    "this connect names the way to sign in '{named}', but it pastes no credential of \
+                     the '{}' service's (a way is for the own door of a pasted credential)",
+                    spec.service
+                ))
+                .into())
+            }
+            None => None,
+        },
+    };
+
     if req.door == Door::Shared && !spec.is_oauth() {
         let mut stored = spec.clone();
         stored.acquisition = Acquisition::Runtime {};
@@ -345,17 +377,31 @@ pub async fn connect_direct(
             label: Some(connection_name(req.label, &None, spec)),
             identity: None,
             life: None,
+            way: None,
         })
         .await;
     }
 
     let mut values = req.values;
     let mut life: Option<TokenLife> = None;
-    match &spec.acquisition {
-        Acquisition::Static { fields } => {
-            values = storable_values(spec, fields, values).map_err(AccessError::Invalid)?;
+    match (&spec.acquisition, way) {
+        (Acquisition::Static { .. }, Some(way)) => {
+            values = storable_values(spec, &way.fields, values).map_err(AccessError::Invalid)?;
+            // A sign-in weft keeps alive: the pasted document becomes the
+            // token set it renews from, the renewal in `resolve` takes it
+            // from there, and the document (it holds the refresh token) is
+            // stored nowhere.
+            if let Some(renewal) = &way.renewal {
+                let (unpacked, at) =
+                    weft_core::access::spec::unpacked_paste(renewal, values, chrono::Utc::now()).map_err(AccessError::Invalid)?;
+                values = unpacked;
+                life = Some(at);
+            }
         }
-        Acquisition::MintJwt { fields, .. } => {
+        (Acquisition::Static { .. }, None) => {
+            return Err(anyhow::anyhow!("a pasted credential's own-door connect always has its way"));
+        }
+        (Acquisition::MintJwt { fields, .. }, _) => {
             // Held to the same rule as any other pasted set: these are
             // the fields a PERSON filled in, and a missing or blank one
             // would otherwise fail somewhere inside the mint instead of
@@ -367,20 +413,20 @@ pub async fn connect_direct(
             // expiry at resolution time.
             life = crate::resolve::mint_and_exchange(spec, &mut values).await?;
         }
-        Acquisition::OAuth2 { grant: OAuthGrant::ClientCredentials, .. } => {
+        (Acquisition::OAuth2 { grant: OAuthGrant::ClientCredentials, .. }, _) => {
             let reg = require_registration(&req.registration, spec)?;
             let expiry =
                 crate::resolve::client_credentials_token(spec, &reg.to_values(), &mut values, AnswerOf::First)
                     .await?;
             life = connect_expiry(spec, expiry, &values)?;
         }
-        Acquisition::OAuth2 { grant: OAuthGrant::AuthorizationCode { .. }, .. } => {
+        (Acquisition::OAuth2 { grant: OAuthGrant::AuthorizationCode { .. }, .. }, _) => {
             return Err(AccessError::Invalid(
                 "this service connects through a browser consent; use the Connect button".into(),
             )
             .into());
         }
-        Acquisition::Runtime {} => {
+        (Acquisition::Runtime {}, _) => {
             // spec.validate() refused an authored Runtime acquisition
             // above; this arm is unreachable and says so loudly.
             return Err(anyhow::anyhow!("a runtime acquisition never reaches connect_direct"));
@@ -419,6 +465,7 @@ pub async fn connect_direct(
         label,
         identity,
         life,
+        way: way.map(|w| w.id.clone()),
     })
     .await
 }
@@ -514,6 +561,9 @@ pub(crate) struct NewGrant<'a> {
     /// When its token dies and the lifetime it was issued with; `None`
     /// for a credential that does not expire.
     pub(crate) life: Option<TokenLife>,
+    /// The way to sign in a pasted credential was filled for
+    /// (`access_grant.way`): set exactly when `spec` is static.
+    pub(crate) way: Option<String>,
 }
 
 /// The id, birth and token expiry of a connection copied from another
@@ -634,6 +684,7 @@ async fn write_grant(
                  provider_account = EXCLUDED.provider_account,
                  expires_at = EXCLUDED.expires_at,
                  token_lifetime_secs = EXCLUDED.token_lifetime_secs,
+                 way = EXCLUDED.way,
                  renewal_claimed_until = NULL,
                  updated_at = now(),
                  {landing}"
@@ -645,9 +696,9 @@ async fn write_grant(
            (id, tenant_id, service, registration_sealed, client_id, project_id, spec,
             events_recipe_hash, values_sealed, value_names, granted_scopes,
             permissions_verified, owner, door, label, identity, provider_account, expires_at,
-            published_by_node, instance_id, spec_version, token_lifetime_secs, created_at, exclusive)
+            published_by_node, instance_id, spec_version, token_lifetime_secs, created_at, exclusive, way)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                 $18, $19, $20, $21, $22, COALESCE($23, now()), $24){upsert}
+                 $18, $19, $20, $21, $22, COALESCE($23, now()), $24, $25){upsert}
          RETURNING id, granted_scopes"
     );
     let written: Option<(uuid::Uuid, db::Json<Value>)> = db
@@ -678,6 +729,7 @@ async fn write_grant(
                 &lifetime_secs,
                 &moved.map(|m| m.created_at),
                 &(grant.spec.grants == GrantCoexistence::Exclusive),
+                &grant.way,
             ],
         )
         .await?;
@@ -718,7 +770,7 @@ async fn rotate_grant(
              expires_at = $10, spec = $11, registration_sealed = $12,
              client_id = $13, provider_account = $14, events_recipe_hash = $15,
              project_id = $16, spec_version = $17, token_lifetime_secs = $18, owner = $19,
-             exclusive = $22,
+             exclusive = $22, way = $23,
              renewal_claimed_until = NULL, reconnects = reconnects + 1, updated_at = now()
          WHERE id = $1 AND tenant_id = $2 AND service = $21 AND {owned}
          RETURNING granted_scopes",
@@ -755,6 +807,7 @@ async fn rotate_grant(
                 &grant.instance.as_ref().map(|m| m.as_str()),
                 &service,
                 &(grant.spec.grants == GrantCoexistence::Exclusive),
+                &grant.way,
             ],
         )
         .await;
@@ -849,6 +902,7 @@ fn completed(id: uuid::Uuid, grant: NewGrant<'_>, label: Option<String>) -> Comp
             instance: grant.instance,
             identity: grant.identity,
             label,
+            way: grant.way,
             scopes: grant.granted,
             permissions_verified: grant.verified,
             owner,
@@ -1577,6 +1631,7 @@ async fn finish_connect(
         label: label.clone(),
         identity: identity.clone(),
         life,
+        way: None,
     };
     // Where the grant lands: an explicit upgrade rotates that row, and
     // everything else goes through the write a pasted connection and a
@@ -2106,7 +2161,7 @@ mod tests {
         let spec: AccessSpec = serde_json::from_value(serde_json::json!({
             "service": "firecrawl",
             "label": "Firecrawl",
-            "acquisition": { "kind": "static", "fields": [{ "name": "api_key" }] },
+            "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "api_key" }] }] },
         }))
         .expect("a static spec");
         let app = Some(AppRegistration {
@@ -2238,7 +2293,7 @@ async fn publish_grant_in(
     req: PublishAccess,
 ) -> anyhow::Result<PublishedConnection> {
     let PublishAccess { spec, project_id, node_id, instance, values, label } = req;
-    let weft_core::access::spec::PublishableConnection { values, identity } =
+    let weft_core::access::spec::PublishableConnection { values, identity, way } =
         weft_core::access::spec::publishable_connection(&spec, values).map_err(AccessError::Invalid)?;
     let current: Option<Published> = db
         .opt(
@@ -2279,6 +2334,7 @@ async fn publish_grant_in(
             label,
             identity,
             life: None,
+            way: Some(way),
         },
     )
     .await?;

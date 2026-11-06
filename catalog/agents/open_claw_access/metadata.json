@@ -1,0 +1,139 @@
+{
+  "type": "OpenClawAccess",
+  "label": "OpenClaw Access",
+  "description": "A model provider's key, for the OpenClaw nodes' `access`: Anthropic, OpenAI, Gemini, OpenRouter, or any OpenAI-compatible server. OpenClaw always runs on one of these, never on your machine's own OpenClaw login. One access for however many OpenClaw nodes; each node names the model.",
+  "tags": [
+    "agent",
+    "openclaw",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#d9480f",
+  "service": {
+    "service": "open_claw",
+    "label": "OpenClaw",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "anthropicKey",
+          "label": "Anthropic API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-ant-..."
+            }
+          ],
+          "guide": {
+            "link": "https://console.anthropic.com/settings/keys",
+            "steps": [
+              "Open console.anthropic.com, Settings > API Keys, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "openaiKey",
+          "label": "OpenAI API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-..."
+            }
+          ],
+          "guide": {
+            "link": "https://platform.openai.com/api-keys",
+            "steps": [
+              "Open platform.openai.com, API keys, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "geminiKey",
+          "label": "Gemini API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "AIza..."
+            }
+          ],
+          "guide": {
+            "link": "https://aistudio.google.com/apikey",
+            "steps": [
+              "Open aistudio.google.com, Get API key, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "openRouter",
+          "label": "OpenRouter API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-or-..."
+            }
+          ],
+          "guide": {
+            "link": "https://openrouter.ai/keys",
+            "steps": [
+              "Open openrouter.ai, Keys, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "openaiCompatible",
+          "label": "OpenAI-compatible server",
+          "fields": [
+            {
+              "name": "baseUrl",
+              "label": "Server address",
+              "secret": false,
+              "placeholder": "http://127.0.0.1:11434/v1"
+            },
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-..."
+            }
+          ],
+          "guide": {
+            "link": "https://docs.openclaw.ai/gateway/config-tools/custom-providers",
+            "steps": [
+              "For any server that speaks the OpenAI chat API: a gateway, or a model server on your machine.",
+              "Fill in its address and a key for it (any text, for a local server that takes none), and name the connection."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[open_claw]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[open_claw]",
+      "description": "Wire into the OpenClaw nodes' `access` input."
+    }
+  ]
+}

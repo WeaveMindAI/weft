@@ -84,6 +84,7 @@ impl Sender<'_> {
                     required_permissions: Vec::new(),
                     required_values: access.required_values.clone(),
                     expected_duration_secs: CALL_TIMEOUT.as_secs(),
+                    stale: None,
                 };
                 let resp = self
                     .clients

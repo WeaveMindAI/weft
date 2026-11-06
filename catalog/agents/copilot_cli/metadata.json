@@ -1,0 +1,303 @@
+{
+  "type": "CopilotCli",
+  "label": "GitHub Copilot CLI",
+  "description": "One conversation with GitHub Copilot CLI, GitHub's coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, GitHub Copilot CLI runs on your machine (a local install only) with your own login, working in `folder`, from your own install of `copilot` when there is one on PATH; when there is none, weft installs GitHub Copilot CLI itself, once, into a folder of its own shared by every program on the machine. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs, and it logs in with the connection on `access`. With a connection's login it uses that login and nothing else, never your `gh` account. The program's tools reach Copilot under their own names, with no prefix. A tool named like one of Copilot's own (`view`, `bash`, `task`, `ask_user`...) replaces it; only `tool_search_tool` is Copilot's alone. Its questions and permission requests come out of AskAgent; refusing a permission tells Copilot why (your note) and its turn goes on. Its card shows what it is doing and a Start over button. What is exposed: the permission mode, the model, the reasoning effort, extra folders, a cap on the AI credits a conversation spends, and which of its own tools it may use.",
+  "tags": [
+    "agent",
+    "coding",
+    "copilot",
+    "github",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run GitHub Copilot CLI in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[copilot_cli]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A CopilotCliAccess's `access`: a GitHub token, or a model provider of your own. Required with a `computer`. Left out on your machine, Copilot uses the login already on it (`copilot login`, or your `gh` account)."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder GitHub Copilot CLI works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`copilot` on your PATH",
+      "description": "On your machine: the GitHub Copilot CLI program to run, when it is not the `copilot` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "plan",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What GitHub Copilot CLI may do without asking. `ask`: every command, every file change, every read outside the folder and every URL comes out of AskAgent as a question. `plan`: it only plans, and changes nothing outside its own session folder. `bypass`: nothing asks, nothing is refused; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "Copilot's default",
+      "description": "A model id your Copilot plan offers (`auto` lets Copilot pick; a Free plan offers `auto` alone). A model the plan does not offer fails the turn before the model runs, naming the ones it does. With your own provider, it wins over the connection's model. Left out, Copilot's default."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "none",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "label": "Reasoning effort",
+      "description": "How hard the model thinks. Left out, the model's default."
+    },
+    {
+      "name": "addDirs",
+      "type": "List[String]",
+      "label": "Extra folders",
+      "description": "Folders besides `folder` Copilot may read and change."
+    },
+    {
+      "name": "maxAiCredits",
+      "type": "Number",
+      "label": "Most AI credits",
+      "placeholder": "a number, such as 50",
+      "description": "The most AI credits this conversation may spend, on GitHub's models."
+    },
+    {
+      "name": "availableTools",
+      "type": "List[String]",
+      "label": "Only these tools",
+      "description": "The only tools of Copilot's own it may use (`view`, `grep`, `bash`...). The program's tools are always there. Left out, all of them."
+    },
+    {
+      "name": "excludedTools",
+      "type": "List[String]",
+      "label": "Not these tools",
+      "description": "Tools of Copilot's own it may not use. It wins over `availableTools`. A tool the program gives it cannot be named here: to replace one of Copilot's tools, give the program's tool its name."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "lists": {
+    "reservedToolNames": [
+      "tool_search_tool"
+    ]
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "CopilotCli '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "CopilotCli '{id}' runs in a computer, where no login is waiting for it; give it a CopilotCliAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "CopilotCli '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "plan",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "CopilotCli '{id}' has a `permission` it does not know; pick one of ask, plan, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "CopilotCli '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "CopilotCli '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs GitHub Copilot CLI itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ]
+}

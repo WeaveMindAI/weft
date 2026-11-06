@@ -1596,3 +1596,1252 @@
             "{outcome:?}"
         );
     }
+
+    // ----- A bus that outlives the nodes sending on it ------------------
+
+    /// What the owner keeps: every message it read, in order.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct Owning {
+        heard: Vec<Value>,
+    }
+
+    /// Opens a bus on `stream` and reads it through its state until it
+    /// ends, the way a node keeping a session's stream open for its run
+    /// does.
+    struct Owner {
+        heard: Arc<StdMutex<Vec<Value>>>,
+    }
+    test_manifest!(Owner, "Owner");
+    #[async_trait]
+    impl Node for Owner {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(Owning::default()).await?;
+            let bus = ctx.open_bus("stream", Default::default(), "owner").await?;
+            let mut cursor = bus.cursor_from_start()?;
+            while let Some(entry) = cursor.next(&mut state).await? {
+                if let Some((_, value)) = entry.as_json() {
+                    state.heard.push(value.clone());
+                }
+            }
+            *self.heard.lock().unwrap() = state.heard.clone();
+            Ok(())
+        }
+    }
+
+    /// Reads the bus on `stream` through its state until it ends, without
+    /// ever registering: no member, so it keeps nothing open.
+    struct Tap {
+        heard: Arc<StdMutex<Vec<Value>>>,
+    }
+    test_manifest!(Tap, "Tap");
+    #[async_trait]
+    impl Node for Tap {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(Owning::default()).await?;
+            let bus = ctx.bus_from_input("stream")?;
+            let mut cursor = bus.cursor_from_start()?;
+            while let Some(entry) = cursor.next(&mut state).await? {
+                if let Some((_, value)) = entry.as_json() {
+                    state.heard.push(value.clone());
+                }
+            }
+            *self.heard.lock().unwrap() = state.heard.clone();
+            Ok(())
+        }
+    }
+
+    /// What a joiner keeps: how many of its messages went out, and its
+    /// wait.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct Joining {
+        sent: usize,
+        asked: Option<Value>,
+    }
+
+    /// Joins the bus on `stream` as `ask` and sends `says` on it, waiting
+    /// on a person once `pause_after` of them went out, then says it is
+    /// done on `done`, or fails when `fails`.
+    struct Joiner {
+        says: &'static [&'static str],
+        pause_after: Option<usize>,
+        fails: bool,
+    }
+    test_manifest!(Joiner, "Joiner");
+    #[async_trait]
+    impl Node for Joiner {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(Joining::default()).await?;
+            let bus = ctx.join_bus("stream", "ask")?;
+            while let Some(says) = self.says.get(state.sent) {
+                if Some(state.sent) == self.pause_after {
+                    state.wait(|s| &mut s.asked, human_form()).await?;
+                }
+                bus.send("event", json!(says)).map_err(|e| weft_core::error::node_error(e.to_string()))?;
+                state.sent += 1;
+            }
+            if self.fails {
+                return Err(weft_core::error::node_error("the guest broke"));
+            }
+            ctx.pulse_downstream(NodeOutput::new().set("done", json!(true))).await
+        }
+    }
+
+    /// Ends the bus on `bus` as finished once `after` arrives, as the
+    /// catalog's `CloseBus` does.
+    struct Closer;
+    test_manifest!(Closer, "Closer");
+    #[async_trait]
+    impl Node for Closer {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let _: bool = ctx.inputs.get("after")?;
+            ctx.bus_from_input("bus")?.close();
+            Ok(())
+        }
+    }
+
+    struct Outliving {
+        owner: Arc<StdMutex<Vec<Value>>>,
+        tap: Arc<StdMutex<Vec<Value>>>,
+        run: Drives,
+    }
+
+    /// `owner` opens a bus that `tap` reads; `first` (pausing after two
+    /// of its three messages) then `second` join it and send on it, and
+    /// `closer` ends it after `second` when `closes`.
+    fn outliving_bus(closes: bool, first_pauses: bool) -> Outliving {
+        let owner = Arc::new(StdMutex::new(Vec::new()));
+        let tap = Arc::new(StdMutex::new(Vec::new()));
+        let catalog = catalog(vec![
+            ("Owner", Box::new(Owner { heard: owner.clone() })),
+            ("Tap", Box::new(Tap { heard: tap.clone() })),
+            ("Joiner", Box::new(Joiner { says: &["a", "b", "c"], pause_after: first_pauses.then_some(2), fails: false })),
+            ("SecondJoiner", Box::new(Joiner { says: &["d"], pause_after: None, fails: false })),
+            ("Closer", Box::new(Closer)),
+        ]);
+        let wire = |id: &str, source: &str, out: &str, target: &str, port: &str| {
+            json!({ "id": id, "source": source, "sourceHandle": out, "target": target, "targetHandle": port })
+        };
+        let mut nodes = vec![
+            node_json("owner", "Owner", &[], &[("stream", "Bus")]),
+            node_json("tap", "Tap", &[("stream", "Bus")], &[]),
+            node_json("first", "Joiner", &[("stream", "Bus")], &[("done", "Boolean")]),
+            node_json("second", "SecondJoiner", &[("stream", "Bus"), ("after", "Boolean")], &[("done", "Boolean")]),
+        ];
+        let mut edges = vec![
+            wire("e-tap", "owner", "stream", "tap", "stream"),
+            wire("e-first", "owner", "stream", "first", "stream"),
+            wire("e-second", "owner", "stream", "second", "stream"),
+            wire("e-after", "first", "done", "second", "after"),
+        ];
+        if closes {
+            nodes.push(node_json("closer", "Closer", &[("bus", "Bus"), ("after", "Boolean")], &[]));
+            edges.push(wire("e-closer", "owner", "stream", "closer", "bus"));
+            edges.push(wire("e-closer-after", "second", "done", "closer", "after"));
+        }
+        let project: ProjectDefinition =
+            serde_json::from_value(json!({ "id": uuid::Uuid::new_v4(), "nodes": nodes, "edges": edges, "groups": [] })).expect("project");
+        Outliving { owner, tap, run: Drives::new(project, catalog, &["owner"], Default::default()) }
+    }
+
+    /// The messages of `from` on the record's bus rows: offset and value.
+    fn journaled_from(events: &[RunEvent], from: &str) -> Vec<(u64, Value)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::BusWindow { messages, .. } => Some(messages),
+                _ => None,
+            })
+            .flatten()
+            .filter(|message| message.from == from)
+            .map(|message| (message.offset, message.payload.as_ref().and_then(|p| p.as_json()).cloned().expect("a JSON payload kept whole")))
+            .collect()
+    }
+
+    /// Two firings join a bus another node created and send on it, the
+    /// first across a pause, on a fresh drive: the paused member keeps the
+    /// bus open across it and its name comes back to it with nobody reading
+    /// it leave; neither ends the bus when its body returns, since the
+    /// creator is still on it; the creator and a tap read every message
+    /// once and in order, the record holds each once, and a third node
+    /// closing the bus ends it finished, which is what lets the creator's
+    /// body return and the run end.
+    #[tokio::test(start_paused = true)]
+    async fn members_send_on_a_bus_across_a_pause_until_another_node_closes_it() {
+        let outliving = outliving_bus(true, true);
+        let run = &outliving.run;
+        assert_stalled(run.drive().await);
+        run.answer(json!("go on"));
+        assert_completed(run.drive().await);
+
+        let said: Vec<Value> = ["a", "b", "c", "d"].into_iter().map(|s| json!(s)).collect();
+        assert_eq!(*outliving.owner.lock().unwrap(), said, "the owner read each message once, in order");
+        assert_eq!(*outliving.tap.lock().unwrap(), said, "so did another reader");
+        let events = run.events();
+        let journaled = journaled_from(&events, "ask");
+        assert_eq!(journaled.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(), said, "each message is on the record once: {events:?}");
+        assert!(journaled.windows(2).all(|pair| pair[0].0 < pair[1].0), "in the order they went out: {journaled:?}");
+        let joined = |name: &str| count(&events, |e| matches!(e, RunEvent::BusJoined { name: n, .. } if n == name));
+        let left = |name: &str| count(&events, |e| matches!(e, RunEvent::BusLeft { name: n, .. } if n == name));
+        assert_eq!((joined("ask"), left("ask")), (2, 2), "each sender joined once and left as its body returned, none over the pause: {events:?}");
+        let ends: Vec<&weft_core::bus::StreamEnd> = events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::BusClosed { end, .. } => Some(end),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, vec![&weft_core::bus::StreamEnd::Finished], "the closer ended it finished, once: {events:?}");
+        assert_eq!(count(&events, |e| matches!(e, RunEvent::NodeCompleted { node_id, .. } if node_id == "owner")), 1, "{events:?}");
+    }
+
+    /// The same program with nothing closing the bus: once every sender
+    /// is done, the owner is the last member, and it and the tap wait on a
+    /// bus only the owner leaving could end, so the run is stuck. weft ends
+    /// the bus failed, each reader's read fails saying so, and the run
+    /// fails instead of hanging.
+    #[tokio::test(start_paused = true)]
+    async fn a_bus_nothing_closes_ends_failed_and_fails_its_run_once_every_sender_is_done() {
+        let outliving = outliving_bus(false, false);
+        let run = &outliving.run;
+        let outcome = run.drive().await;
+        let error = assert_failed_with(&outcome, "the run was stuck");
+        let events = run.events();
+        let failed = |node: &str| {
+            events.iter().find_map(|e| match e {
+                RunEvent::NodeFailed { node_id, error, .. } if node_id == node => Some(error.clone()),
+                _ => None,
+            })
+        };
+        let stuck = "the bus ended failed: the run was stuck: every node on this bus waited on another, and nothing could end the wait";
+        assert!(failed("owner").is_some_and(|error| error.contains(stuck)), "{events:?}");
+        assert!(failed("tap").is_some_and(|error| error.contains(stuck)), "{events:?}");
+        assert!(error.contains(stuck), "{error}");
+        assert_eq!(count(&events, |e| matches!(e, RunEvent::NodeCompleted { node_id, .. } if node_id == "second")), 1, "every sender ran first: {events:?}");
+    }
+
+    // ----- A bus whose last member is paused ----------------------------
+
+    /// Opens a bus on `stream` as `host`, waits for `ask` to join (so the
+    /// creator leaves while a member is on it), says `hello` and returns.
+    struct GreetsAndGoes;
+    test_manifest!(GreetsAndGoes, "GreetsAndGoes");
+    #[async_trait]
+    impl Node for GreetsAndGoes {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
+            let bus = ctx.open_bus("stream", Default::default(), "host").await?;
+            bus.wait_for("ask", &mut state).await?;
+            bus.send("msg", json!("hello")).map_err(|e| weft_core::error::node_error(e.to_string()))?;
+            Ok(())
+        }
+    }
+
+    /// `opener` opens a bus, says `hello` on it once `joiner` joined, and
+    /// returns; `joiner` joins
+    /// it and waits on a person before saying `bye` (then fails, when
+    /// `fails`); `tap` reads it to its end without ever registering.
+    fn last_member_pauses(fails: bool) -> (Arc<StdMutex<Vec<Value>>>, Drives) {
+        let tap = Arc::new(StdMutex::new(Vec::new()));
+        let catalog = catalog(vec![
+            ("GreetsAndGoes", Box::new(GreetsAndGoes)),
+            ("Joiner", Box::new(Joiner { says: &["bye"], pause_after: Some(0), fails })),
+            ("Tap", Box::new(Tap { heard: tap.clone() })),
+        ]);
+        let wire = |id: &str, source: &str, out: &str, target: &str, port: &str| {
+            json!({ "id": id, "source": source, "sourceHandle": out, "target": target, "targetHandle": port })
+        };
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                node_json("opener", "GreetsAndGoes", &[], &[("stream", "Bus")]),
+                node_json("joiner", "Joiner", &[("stream", "Bus")], &[("done", "Boolean")]),
+                node_json("tap", "Tap", &[("stream", "Bus")], &[]),
+            ],
+            "edges": [wire("e-joiner", "opener", "stream", "joiner", "stream"), wire("e-tap", "opener", "stream", "tap", "stream")],
+            "groups": []
+        }))
+        .expect("project");
+        (tap, Drives::new(project, catalog, &["opener"], Default::default()))
+    }
+
+    /// The bus's creator returns while a member is still on it: its name
+    /// leaves and the bus stays open, through the run's pause with that
+    /// member paused, on a fresh drive, until the member returns last and
+    /// it ends finished. The tap, no member, kept nothing open and read
+    /// both messages to that end.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_member_keeps_a_bus_open_across_a_pause_after_its_creator_left() {
+        let (tap, run) = last_member_pauses(false);
+        assert_stalled(run.drive().await);
+        let events = run.events();
+        assert_eq!(count(&events, |e| matches!(e, RunEvent::BusLeft { name, .. } if name == "host")), 1, "the creator left: {events:?}");
+        assert!(bus_ends(&events).is_empty(), "the paused member keeps it open: {events:?}");
+        run.answer(json!("go on"));
+        assert_completed(run.drive().await);
+        assert_eq!(*tap.lock().unwrap(), vec![json!("hello"), json!("bye")]);
+        let events = run.events();
+        assert_eq!(bus_ends(&events), vec![weft_core::bus::StreamEnd::Finished], "the last member left, finished: {events:?}");
+        let joined = count(&events, |e| matches!(e, RunEvent::BusJoined { name, .. } if name == "ask"));
+        let left = count(&events, |e| matches!(e, RunEvent::BusLeft { name, .. } if name == "ask"));
+        assert_eq!((joined, left), (1, 1), "the member joined once and left as its body returned, never over the pause: {events:?}");
+    }
+
+    /// A record that lost a member's leave (the creator's `BusLeft` never
+    /// landed) names somebody on the bus no paused node holds: nobody would
+    /// ever take that name off, so the bus could never end by its members
+    /// leaving. The worker picking the run up ends it failed, saying so,
+    /// and the tap reading it fails with that.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_that_lost_a_leave_ends_its_bus_failed_on_resume() {
+        let (_tap, run) = last_member_pauses(false);
+        assert_stalled(run.drive().await);
+        let rows: Vec<RunEvent> = run.events().into_iter().filter(|e| !matches!(e, RunEvent::BusLeft { name, .. } if name == "host")).collect();
+        let lost = run.over(rows);
+        lost.answer_open(json!("go on"));
+        let _ = lost.drive().await;
+        let events = lost.events();
+        assert!(
+            matches!(bus_ends(&events).as_slice(), [weft_core::bus::StreamEnd::Failed { error }] if error.contains("held by no paused node: [\"host\"]")),
+            "{events:?}"
+        );
+    }
+
+    /// The same member failing after the pause, last on the bus: it ends
+    /// failed with that member's error, and the tap's read fails with it.
+    #[tokio::test(start_paused = true)]
+    async fn the_last_member_failing_ends_its_bus_failed() {
+        let (tap, run) = last_member_pauses(true);
+        assert_stalled(run.drive().await);
+        run.answer(json!("go on"));
+        let _ = run.drive().await;
+        assert_eq!(*tap.lock().unwrap(), Vec::<Value>::new(), "the tap's body failed before it kept what it read");
+        let events = run.events();
+        assert!(matches!(bus_ends(&events).as_slice(), [weft_core::bus::StreamEnd::Failed { error }] if error.contains("the guest broke")), "{events:?}");
+        let tap_failed = events.iter().find_map(|e| match e {
+            RunEvent::NodeFailed { node_id, error, .. } if node_id == "tap" => Some(error.clone()),
+            _ => None,
+        });
+        assert!(tap_failed.is_some_and(|error| error.contains("the bus ended failed: ") && error.contains("the guest broke")), "{events:?}");
+    }
+
+    // ----- A bus its producer left before the run paused ---------------
+
+    /// Opens a bus on `stream`, says `hello` on it, and returns, finished
+    /// or failed when `fails`: nobody is on the bus after it, which stays
+    /// open while the nodes its marker is on its way to can still join it.
+    struct SaysHello {
+        fails: bool,
+    }
+    test_manifest!(SaysHello, "SaysHello");
+    #[async_trait]
+    impl Node for SaysHello {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let bus = ctx.open_bus("stream", Default::default(), "host").await?;
+            bus.send("msg", json!("hello")).map_err(|e| weft_core::error::node_error(e.to_string()))?;
+            if self.fails {
+                return Err(weft_core::error::node_error("the session went away"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Waits on a person, then says it is done on `done`.
+    struct WaitsThenGoes;
+    test_manifest!(WaitsThenGoes, "WaitsThenGoes");
+    #[async_trait]
+    impl Node for WaitsThenGoes {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            crate::run_driver::engine_test_rig::wait_once(&ctx, human_form()).await?;
+            ctx.pulse_downstream(NodeOutput::new().set("done", json!(true))).await
+        }
+    }
+
+    /// Once `after` arrives, reads the bus on `stream` from the oldest
+    /// message it holds to its end, keeping each message as it reads it.
+    struct LateReader {
+        heard: Arc<StdMutex<Vec<Value>>>,
+    }
+    test_manifest!(LateReader, "LateReader");
+    #[async_trait]
+    impl Node for LateReader {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let _: bool = ctx.inputs.get("after")?;
+            let mut state = ctx.keep(()).await?;
+            let mut cursor = ctx.bus_from_input("stream")?.cursor_from_start()?;
+            while let Some(entry) = cursor.next(&mut state).await? {
+                if let Some((_, value)) = entry.as_json() {
+                    self.heard.lock().unwrap().push(value.clone());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// `opener` makes a bus, says `hello` and leaves it (failed when
+    /// `fails`); `waiter` waits on a person, pausing the run with that bus
+    /// open, its marker waiting on `reader` and `closer`; after the pause
+    /// `reader` reads the bus and `closer` closes it.
+    fn left_before_the_pause(fails: bool) -> (Arc<StdMutex<Vec<Value>>>, Drives) {
+        let heard = Arc::new(StdMutex::new(Vec::new()));
+        let catalog = catalog(vec![
+            ("SaysHello", Box::new(SaysHello { fails })),
+            ("WaitsThenGoes", Box::new(WaitsThenGoes)),
+            ("LateReader", Box::new(LateReader { heard: heard.clone() })),
+            ("Closer", Box::new(Closer)),
+        ]);
+        let wire = |id: &str, source: &str, out: &str, target: &str, port: &str| {
+            json!({ "id": id, "source": source, "sourceHandle": out, "target": target, "targetHandle": port })
+        };
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                node_json("opener", "SaysHello", &[], &[("stream", "Bus")]),
+                node_json("waiter", "WaitsThenGoes", &[], &[("done", "Boolean")]),
+                node_json("reader", "LateReader", &[("stream", "Bus"), ("after", "Boolean")], &[]),
+                node_json("closer", "Closer", &[("bus", "Bus"), ("after", "Boolean")], &[]),
+            ],
+            "edges": [
+                wire("e-reader", "opener", "stream", "reader", "stream"),
+                wire("e-reader-after", "waiter", "done", "reader", "after"),
+                wire("e-closer", "opener", "stream", "closer", "bus"),
+                wire("e-closer-after", "waiter", "done", "closer", "after"),
+            ],
+            "groups": []
+        }))
+        .expect("project");
+        (heard, Drives::new(project, catalog, &["opener", "waiter"], Default::default()))
+    }
+
+    fn bus_ends(events: &[RunEvent]) -> Vec<weft_core::bus::StreamEnd> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::BusClosed { end, .. } => Some(end.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A bus its producer left finished, its marker still on its way to a
+    /// reader and a closer that wait on a person, stays open through the
+    /// run's pause: after it, the reader reads what was said and comes to
+    /// its end, which the closer writes, once, finished.
+    #[tokio::test(start_paused = true)]
+    async fn a_bus_its_producer_left_stays_open_across_a_pause_for_the_nodes_it_goes_to() {
+        let (heard, run) = left_before_the_pause(false);
+        assert_stalled(run.drive().await);
+        assert!(bus_ends(&run.events()).is_empty(), "the nodes it goes to can still join it: {:?}", run.events());
+        run.answer(json!("go on"));
+        assert_completed(run.drive().await);
+        assert_eq!(*heard.lock().unwrap(), vec![json!("hello")], "the reader read the bus to its end");
+        let events = run.events();
+        assert_eq!(bus_ends(&events), vec![weft_core::bus::StreamEnd::Finished], "its end, once: {events:?}");
+        assert!(ran(&events, "closer") && ran(&events, "reader"), "{events:?}");
+    }
+
+    /// The same with a producer that failed: after the pause the reader
+    /// reads what it said, then its read fails with that failure, since
+    /// the closer ends a bus nobody is on as its last member left it.
+    #[tokio::test(start_paused = true)]
+    async fn a_bus_its_producer_left_failed_fails_its_reader_after_a_pause_whoever_closes_it() {
+        let (heard, run) = left_before_the_pause(true);
+        assert_stalled(run.drive().await);
+        run.answer(json!("go on"));
+        let _ = run.drive().await;
+        assert_eq!(*heard.lock().unwrap(), vec![json!("hello")]);
+        let events = run.events();
+        let reader_failed = events.iter().find_map(|e| match e {
+            RunEvent::NodeFailed { node_id, error, .. } if node_id == "reader" => Some(error.clone()),
+            _ => None,
+        });
+        assert!(reader_failed.is_some_and(|error| error.contains("the bus ended failed: ") && error.contains("the session went away")), "{events:?}");
+        assert!(ran(&events, "closer"), "{events:?}");
+        assert_eq!(bus_ends(&events).len(), 1, "its end, once: {events:?}");
+        assert!(matches!(&bus_ends(&events)[0], weft_core::bus::StreamEnd::Failed { error } if error.contains("the session went away")), "{events:?}");
+    }
+
+    fn ran(events: &[RunEvent], node: &str) -> bool {
+        count(events, |e| matches!(e, RunEvent::NodeCompleted { node_id, .. } if node_id == node)) > 0
+    }
+
+    // ----- An owner resumed after its bus ended -------------------------
+
+    /// What the owner keeps: its wait.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct OwnerWaits {
+        asked: Option<Value>,
+    }
+
+    /// Opens a bus on `stream` as `agent`, waits on a person, then reads
+    /// the bus, turning every message down, until it ends, the way a node
+    /// keeping a session open for its run does: whoever ends the bus ends
+    /// its body. Counts its body's starts.
+    struct OwnsUntilEnded {
+        starts: Arc<AtomicU32>,
+    }
+    test_manifest!(OwnsUntilEnded, "OwnsUntilEnded");
+    #[async_trait]
+    impl Node for OwnsUntilEnded {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let mut state = ctx.keep(OwnerWaits::default()).await?;
+            let bus = ctx.open_bus("stream", Default::default(), "agent").await?;
+            state.wait(|s| &mut s.asked, human_form()).await?;
+            let mut cursor = bus.cursor_from_start()?.with_filter(|_| false);
+            while cursor.next(&mut state).await?.is_some() {}
+            Ok(())
+        }
+    }
+
+    /// Once `after` arrives, works until `go` rings: a wait the run does
+    /// not know of, so the run keeps its worker meanwhile.
+    struct WorksUntilRung {
+        go: Arc<tokio::sync::Notify>,
+    }
+    test_manifest!(WorksUntilRung, "WorksUntilRung");
+    #[async_trait]
+    impl Node for WorksUntilRung {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let _: bool = ctx.inputs.get("after")?;
+            self.go.notified().await;
+            Ok(())
+        }
+    }
+
+    /// `owner` opens a bus and waits on a person; `waiter` waits on a
+    /// person too, then `closer` ends the bus and `worker` keeps the run
+    /// on its worker until `go` rings: answered first, the waiter lets the
+    /// closer end the bus while the owner is still parked.
+    fn owner_parked_while_its_bus_ends(starts: Arc<AtomicU32>, go: Arc<tokio::sync::Notify>) -> (ProjectDefinition, Arc<dyn NodeCatalog>) {
+        let catalog = catalog(vec![
+            ("OwnsUntilEnded", Box::new(OwnsUntilEnded { starts })),
+            ("WaitsThenGoes", Box::new(WaitsThenGoes)),
+            ("Closer", Box::new(Closer)),
+            ("WorksUntilRung", Box::new(WorksUntilRung { go })),
+        ]);
+        let wire = |id: &str, source: &str, out: &str, target: &str, port: &str| {
+            json!({ "id": id, "source": source, "sourceHandle": out, "target": target, "targetHandle": port })
+        };
+        let project = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                node_json("owner", "OwnsUntilEnded", &[], &[("stream", "Bus")]),
+                node_json("waiter", "WaitsThenGoes", &[], &[("done", "Boolean")]),
+                node_json("closer", "Closer", &[("bus", "Bus"), ("after", "Boolean")], &[]),
+                node_json("worker", "WorksUntilRung", &[("after", "Boolean")], &[]),
+            ],
+            "edges": [
+                wire("e-bus", "owner", "stream", "closer", "bus"),
+                wire("e-after", "waiter", "done", "closer", "after"),
+                wire("e-worker", "waiter", "done", "worker", "after"),
+            ],
+            "groups": []
+        }))
+        .expect("project");
+        (project, catalog)
+    }
+
+    /// The token `node` last suspended on.
+    fn suspended_on(events: &[RunEvent], node: &str) -> String {
+        events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                RunEvent::NodeSuspended { node_id, token: Some(token), .. } if node_id == node => Some(token.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{node} suspended on a wait: {events:?}"))
+    }
+
+    /// What every run of [`owner_parked_while_its_bus_ends`] ends with:
+    /// the owner got its name back on its ended bus with nothing written
+    /// on it, read to the end and returned, and the run completed.
+    fn assert_the_owner_returned_on_its_ended_bus(events: &[RunEvent], starts: u32) {
+        assert_eq!(starts, 2, "the owner's body ran again once, after its bus ended");
+        assert!(ran(events, "owner") && ran(events, "closer"), "{events:?}");
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::NodeFailed { .. })), "{events:?}");
+        assert_eq!(count(events, |e| matches!(e, RunEvent::BusJoined { name, .. } if name == "agent")), 1, "it joined once: {events:?}");
+        assert_eq!(count(events, |e| matches!(e, RunEvent::BusLeft { .. })), 0, "nobody left: {events:?}");
+        assert_eq!(bus_ends(events), vec![weft_core::bus::StreamEnd::Finished], "the closer's end, once: {events:?}");
+    }
+
+    /// The owner parks, and the bus ends while it is parked; the next
+    /// worker picks the run up with the bus ended and runs the owner
+    /// again from the top: `open_bus` hands it its bus, ended, with its
+    /// name back, its reader comes to the end and it returns.
+    #[tokio::test(start_paused = true)]
+    async fn an_owner_picked_up_after_its_bus_ended_gets_it_back_ended_and_returns() {
+        let starts = Arc::new(AtomicU32::new(0));
+        let go = Arc::new(tokio::sync::Notify::new());
+        // Rung before it waits: the worker does not hold this run up.
+        go.notify_one();
+        let (project, catalog) = owner_parked_while_its_bus_ends(starts.clone(), go);
+        let run = Drives::new(project, catalog, &["owner", "waiter"], Default::default());
+        assert_stalled(run.drive().await);
+        let owner = suspended_on(&run.events(), "owner");
+        run.journal.seed(&[RunEvent::wait_answered(run.run_id, suspended_on(&run.events(), "waiter"), weft_core::primitive::WaitAnswer::Given { value: json!("go") }, 1)]);
+        assert_stalled(run.drive().await);
+        assert_eq!(bus_ends(&run.events()), vec![weft_core::bus::StreamEnd::Finished], "the bus ended while the owner was parked");
+        run.journal.seed(&[RunEvent::wait_answered(run.run_id, owner, weft_core::primitive::WaitAnswer::Given { value: json!("go") }, 1)]);
+        assert_completed(run.drive().await);
+        assert_the_owner_returned_on_its_ended_bus(&run.events(), starts.load(Ordering::SeqCst));
+    }
+
+    /// The same, on one worker: the bus ends while the owner is parked,
+    /// and the owner's answer, coming while the run is still on its worker,
+    /// resumes it in place on the ended bus.
+    #[tokio::test(start_paused = true)]
+    async fn an_owner_resumed_in_place_after_its_bus_ended_gets_it_back_ended_and_returns() {
+        let starts = Arc::new(AtomicU32::new(0));
+        let go = Arc::new(tokio::sync::Notify::new());
+        let (project, catalog) = owner_parked_while_its_bus_ends(starts.clone(), go.clone());
+        let project = Arc::new(project);
+        let run_id = weft_core::new_run_id();
+        let journal = Arc::new(MemJournal::default());
+        journal.seed(&birth_kicking(&project, run_id, &["owner", "waiter"], super::engine_test_rig::pausing_at_once()));
+        let drive = |answers: Arc<super::engine_test_rig::Answers>| {
+            let clients = EngineClients { tasks: AwaitTasks::new(), told: answers.told.clone(), runs: answers, ..clients_on_paused_clock(journal.clone()) };
+            tokio::spawn(run_checked(project.clone(), catalog.clone(), run_id, journal.clone(), clients, CancellationFlag::new_arc(), None))
+        };
+        let paused = drive(Arc::new(Default::default())).await.expect("joins").expect("the first drive runs");
+        assert_stalled(paused);
+        let events = journal.events_of(run_id);
+        let owner = suspended_on(&events, "owner");
+        journal.seed(&[RunEvent::wait_answered(run_id, suspended_on(&events, "waiter"), weft_core::primitive::WaitAnswer::Given { value: json!("go") }, 1)]);
+
+        let answers = Arc::new(super::engine_test_rig::Answers::default());
+        let carried_on = drive(answers.clone());
+        // The worker keeps the run on its worker, asking for the parked
+        // owner's answer; the closer ended the bus meanwhile.
+        answers.read_past(0).await;
+        for _ in 0..2000 {
+            if ran(&journal.events_of(run_id), "closer") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(bus_ends(&journal.events_of(run_id)), vec![weft_core::bus::StreamEnd::Finished], "the bus ended while the owner was parked");
+        answers.answer(owner, json!("go"));
+        for _ in 0..2000 {
+            if ran(&journal.events_of(run_id), "owner") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        go.notify_one();
+        assert_completed(carried_on.await.expect("joins").expect("the second drive runs"));
+        let events = journal.events_of(run_id);
+        assert_eq!(count(&events, |e| matches!(e, RunEvent::NodeResumed { node_id, .. } if node_id == "owner")), 1, "resumed once, in place: {events:?}");
+        assert_the_owner_returned_on_its_ended_bus(&journal.events_of(run_id), starts.load(Ordering::SeqCst));
+    }
+
+    // ----- An owner waiting for its bus's end ---------------------------
+
+    /// Opens a bus on `stream` as `agent` and waits for it to end, reading
+    /// nothing, the way a node keeping a session open for its run does.
+    /// Counts its body's starts.
+    struct WaitsForItsEnd {
+        starts: Arc<AtomicU32>,
+    }
+    test_manifest!(WaitsForItsEnd, "WaitsForItsEnd");
+    #[async_trait]
+    impl Node for WaitsForItsEnd {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let mut state = ctx.keep(()).await?;
+            let bus = ctx.open_bus("stream", Default::default(), "agent").await?;
+            bus.until_end(&mut state).await
+        }
+    }
+
+    /// Once `after` arrives, joins the bus on `stream` as `turn`, sends
+    /// `count` messages on it, then says it is done.
+    struct Floods {
+        count: usize,
+    }
+    test_manifest!(Floods, "Floods");
+    #[async_trait]
+    impl Node for Floods {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let _: bool = ctx.inputs.get("after")?;
+            let bus = ctx.join_bus("stream", "turn")?;
+            for i in 0..self.count {
+                bus.send("event", json!(i)).map_err(|e| weft_core::error::node_error(e.to_string()))?;
+            }
+            ctx.pulse_downstream(NodeOutput::new().set("done", json!(true))).await
+        }
+    }
+
+    /// `owner` waits for its bus's end while `waiter` waits on a person,
+    /// so the run pauses with the owner in its wait. Answered, the waiter
+    /// lets `sender` send far more messages than the bus's window holds,
+    /// then `closer` ends the bus, when `closes`.
+    fn owner_waits_for_the_end(starts: Arc<AtomicU32>, closes: bool) -> Drives {
+        let catalog = catalog(vec![
+            ("WaitsForItsEnd", Box::new(WaitsForItsEnd { starts })),
+            ("WaitsThenGoes", Box::new(WaitsThenGoes)),
+            ("Floods", Box::new(Floods { count: 3 * weft_core::bus::DEFAULT_BUS_WINDOW })),
+            ("Closer", Box::new(Closer)),
+        ]);
+        let wire = |id: &str, source: &str, out: &str, target: &str, port: &str| {
+            json!({ "id": id, "source": source, "sourceHandle": out, "target": target, "targetHandle": port })
+        };
+        let mut nodes = vec![
+            node_json("owner", "WaitsForItsEnd", &[], &[("stream", "Bus")]),
+            node_json("waiter", "WaitsThenGoes", &[], &[("done", "Boolean")]),
+            node_json("sender", "Floods", &[("stream", "Bus"), ("after", "Boolean")], &[("done", "Boolean")]),
+        ];
+        let mut edges = vec![wire("e-sender", "owner", "stream", "sender", "stream"), wire("e-sender-after", "waiter", "done", "sender", "after")];
+        if closes {
+            nodes.push(node_json("closer", "Closer", &[("bus", "Bus"), ("after", "Boolean")], &[]));
+            edges.push(wire("e-closer", "owner", "stream", "closer", "bus"));
+            edges.push(wire("e-closer-after", "sender", "done", "closer", "after"));
+        }
+        let project: ProjectDefinition =
+            serde_json::from_value(json!({ "id": uuid::Uuid::new_v4(), "nodes": nodes, "edges": edges, "groups": [] })).expect("project");
+        Drives::new(project, catalog, &["owner", "waiter"], Default::default())
+    }
+
+    /// The owner pauses in its wait for the end, senders put three windows
+    /// of messages on the bus after the pause, and a closer ends it: the
+    /// owner's wait, kept no place on the bus, comes to the finished end
+    /// and its body returns, however many messages the bus dropped.
+    #[tokio::test(start_paused = true)]
+    async fn an_owner_waiting_for_its_bus_to_end_across_a_pause_returns_when_it_ends() {
+        let starts = Arc::new(AtomicU32::new(0));
+        let run = owner_waits_for_the_end(starts.clone(), true);
+        assert_stalled(run.drive().await);
+        run.answer_open(json!("go"));
+        assert_completed(run.drive().await);
+        let events = run.events();
+        assert_eq!(starts.load(Ordering::SeqCst), 2, "the owner paused in its wait and ran again");
+        assert!(ran(&events, "owner") && ran(&events, "closer"), "{events:?}");
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::NodeFailed { .. })), "{events:?}");
+        assert_eq!(journaled_from(&events, "turn").len(), 3 * weft_core::bus::DEFAULT_BUS_WINDOW, "every message went out");
+        assert_eq!(bus_ends(&events), vec![weft_core::bus::StreamEnd::Finished]);
+    }
+
+    /// With nothing ending the bus, the run is stuck once the sender is
+    /// done: weft ends the bus failed, and the owner's wait fails with that
+    /// failure, so the owner fails and so does the run.
+    #[tokio::test(start_paused = true)]
+    async fn an_owner_waiting_for_a_bus_that_ends_failed_fails_with_its_failure() {
+        let starts = Arc::new(AtomicU32::new(0));
+        let run = owner_waits_for_the_end(starts, false);
+        assert_stalled(run.drive().await);
+        run.answer_open(json!("go"));
+        assert_failed_with(&run.drive().await, "the run was stuck");
+        let events = run.events();
+        let owner_failed = events.iter().find_map(|e| match e {
+            RunEvent::NodeFailed { node_id, error, .. } if node_id == "owner" => Some(error.clone()),
+            _ => None,
+        });
+        assert!(owner_failed.is_some_and(|error| error.contains("the bus ended failed: the run was stuck")), "{events:?}");
+    }
+
+    // ----- A bus a node can still join -------------------------------
+    //
+    // A bus ends once nobody is on it and no node can still join it
+    // (`weft_core::run::bus_reach`): its producer can return at once, and
+    // the bus waits for the nodes its marker is on its way to, through
+    // another node, between the iterations of a loop, carried from one to
+    // the next, gathered out of one, and across a pause.
+
+    /// Hands the bus on `bus` on, untouched, on its `bus`.
+    struct Relay;
+    test_manifest!(Relay, "Relay");
+    #[async_trait]
+    impl Node for Relay {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let marker: Value = ctx.inputs.get("bus")?;
+            ctx.pulse_downstream(NodeOutput::new().set("bus", marker)).await
+        }
+    }
+
+    /// What a `Says` keeps: whether it sent, and its wait.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct Saying {
+        asked: Option<Value>,
+    }
+
+    /// Joins the bus on `stream` under a name of its own firing
+    /// (`says#<frames>`), waiting on a person first when `asks`, or only
+    /// after giving way to the rest of the run `late` times, then says its
+    /// `value` (`"said"` when it has none) and hands the bus on, on
+    /// `stream`, and that it is done, on `done`.
+    struct Says {
+        asks: bool,
+        late: usize,
+    }
+    test_manifest!(Says, "Says");
+    #[async_trait]
+    impl Node for Says {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(Saying::default()).await?;
+            if self.asks {
+                state.wait(|s| &mut s.asked, human_form()).await?;
+            }
+            for _ in 0..self.late {
+                tokio::task::yield_now().await;
+            }
+            let name = format!("says#{}", weft_core::frames::frames_text(&ctx.frames));
+            let bus = ctx.join_bus("stream", &name)?;
+            let value = ctx.inputs.get::<Value>("value").unwrap_or(json!("said"));
+            bus.send("said", value).map_err(|e| weft_core::error::node_error(e.to_string()))?;
+            let marker: Value = ctx.inputs.get("stream")?;
+            ctx.pulse_downstream(NodeOutput::new().set("stream", marker).set("done", json!(true))).await
+        }
+    }
+
+    /// Hands `items` on.
+    struct Items(Value);
+    test_manifest!(Items, "Items");
+    #[async_trait]
+    impl Node for Items {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            ctx.pulse_downstream(NodeOutput::new().set("items", self.0.clone())).await
+        }
+    }
+
+    /// Makes a bus on `stream` and hands it on, joining it never.
+    struct MakesOnly;
+    test_manifest!(MakesOnly, "MakesOnly");
+    #[async_trait]
+    impl Node for MakesOnly {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let (_bus, marker) = ctx.create_bus("stream", Default::default())?;
+            ctx.pulse_downstream(NodeOutput::new().set("stream", marker)).await
+        }
+    }
+
+    /// Says `done` false: what a body votes to stop its loop with, or a
+    /// gate that says no.
+    struct Stops;
+    test_manifest!(Stops, "Stops");
+    #[async_trait]
+    impl Node for Stops {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            ctx.pulse_downstream(NodeOutput::new().set("done", json!(true)).set("no", json!(false))).await
+        }
+    }
+
+    fn wire(id: &str, source: &str, out: &str, target: &str, port: &str) -> Value {
+        json!({ "id": id, "source": source, "sourceHandle": out, "target": target, "targetHandle": port })
+    }
+
+    /// `node` inside the loop `group`.
+    fn inside(mut node: Value, group: &str) -> Value {
+        node["scope"] = json!([group]);
+        node
+    }
+
+    /// Input `port` of `node` is optional: a closed wire into it runs the
+    /// node without it.
+    fn optional(mut node: Value, port: &str) -> Value {
+        for input in node["inputs"].as_array_mut().expect("a node's inputs") {
+            if input["name"] == port {
+                input["required"] = json!(false);
+                input["optional"] = json!(true);
+            }
+        }
+        node
+    }
+
+    /// The two boundary nodes of loop `id` with `config`: what it takes
+    /// from outside (`ins`, each with its outer type and its type inside),
+    /// and what it hands on (`outs`, each with its type inside and its
+    /// outer type).
+    fn loop_boundaries(id: &str, config: Value, ins: &[(&str, &str, &str)], outs: &[(&str, &str, &str)]) -> [Value; 2] {
+        let mut in_config = config.clone();
+        in_config["parentId"] = json!(id);
+        let mut inside_out: Vec<Value> = ins.iter().map(|(name, _, ty)| json!({ "name": name, "portType": ty, "required": false })).collect();
+        inside_out.push(json!({ "name": "index", "portType": "Number", "required": false }));
+        let mut inside_in: Vec<Value> =
+            outs.iter().map(|(name, ty, _)| json!({ "name": name, "portType": ty, "required": false, "optional": true })).collect();
+        if config["parallel"] != json!(true) {
+            inside_in.push(json!({ "name": "done", "portType": "Boolean", "required": false, "optional": true }));
+        }
+        [
+            json!({
+                "id": format!("{id}__in"), "nodeType": "LoopIn", "label": null, "config": in_config,
+                "position": { "x": 0.0, "y": 0.0 },
+                "inputs": ins.iter().map(|(name, ty, _)| json!({ "name": name, "portType": ty, "required": true })).collect::<Vec<_>>(),
+                "outputs": inside_out,
+                "features": {}, "scope": [], "requiresInfra": false, "images": [],
+                "groupBoundary": { "groupId": id, "role": "In" }
+            }),
+            json!({
+                "id": format!("{id}__out"), "nodeType": "LoopOut", "label": null, "config": { "parentId": id },
+                "position": { "x": 0.0, "y": 0.0 },
+                "inputs": inside_in,
+                "outputs": outs.iter().map(|(name, _, ty)| json!({ "name": name, "portType": ty, "required": true })).collect::<Vec<_>>(),
+                "features": {}, "scope": [], "requiresInfra": false, "images": [],
+                "groupBoundary": { "groupId": id, "role": "Out" }
+            }),
+        ]
+    }
+
+    fn program(nodes: Vec<Value>, edges: Vec<Value>, groups: Vec<Value>) -> ProjectDefinition {
+        serde_json::from_value(json!({ "id": uuid::Uuid::new_v4(), "nodes": nodes, "edges": edges, "groups": groups })).expect("project")
+    }
+
+    /// The names that joined a bus on the record.
+    fn joined_names(events: &[RunEvent]) -> Vec<String> {
+        let mut names: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::BusJoined { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn sorted(mut values: Vec<Value>) -> Vec<Value> {
+        values.sort_by_key(Value::to_string);
+        values
+    }
+
+    /// The producer says `hello` and returns before anything else runs;
+    /// the bus reaches its joiner through a relay, and a tap reads it.
+    /// Before, the producer's return ended the bus there and the joiner
+    /// was refused.
+    #[tokio::test(start_paused = true)]
+    async fn a_producer_returns_at_once_and_its_bus_waits_for_the_node_a_relay_hands_it_to() {
+        let tap = Arc::new(StdMutex::new(Vec::new()));
+        let catalog = catalog(vec![
+            ("SaysHello", Box::new(SaysHello { fails: false })),
+            ("Relay", Box::new(Relay)),
+            ("Says", Box::new(Says { asks: false, late: 0 })),
+            ("Tap", Box::new(Tap { heard: tap.clone() })),
+        ]);
+        let project = program(
+            vec![
+                node_json("opener", "SaysHello", &[], &[("stream", "Bus")]),
+                node_json("relay", "Relay", &[("bus", "Bus")], &[("bus", "Bus")]),
+                node_json("says", "Says", &[("stream", "Bus")], &[("stream", "Bus"), ("done", "Boolean")]),
+                node_json("tap", "Tap", &[("stream", "Bus")], &[]),
+            ],
+            vec![
+                wire("e1", "opener", "stream", "relay", "bus"),
+                wire("e2", "relay", "bus", "says", "stream"),
+                wire("e3", "opener", "stream", "tap", "stream"),
+            ],
+            vec![],
+        );
+        let run = Drives::new(project, catalog, &["opener"], Default::default());
+        assert_completed(run.drive().await);
+        let events = run.events();
+        assert_eq!(*tap.lock().unwrap(), vec![json!("hello"), json!("said")], "{events:?}");
+        assert_eq!(joined_names(&events), vec!["host".to_string(), "says#".to_string()], "{events:?}");
+        assert_eq!(bus_ends(&events), vec![weft_core::bus::StreamEnd::Finished], "it ends once, after the joiner: {events:?}");
+    }
+
+    /// `opener`'s bus goes into loop `l` over three items, which every
+    /// iteration gets, each iteration's `says` joining it and saying its
+    /// item; a tap reads it. Nobody is on the bus between two iterations,
+    /// and the loop holding it keeps it open for the next one.
+    async fn every_iteration_joins(parallel: bool) {
+        let tap = Arc::new(StdMutex::new(Vec::new()));
+        let catalog = catalog(vec![
+            ("SaysHello", Box::new(SaysHello { fails: false })),
+            ("Items", Box::new(Items(json!([1, 2, 3])))),
+            ("Says", Box::new(Says { asks: false, late: 0 })),
+            ("Tap", Box::new(Tap { heard: tap.clone() })),
+        ]);
+        let config = json!({ "parallel": parallel, "over": ["items"], "carry": [] });
+        let [loop_in, loop_out] =
+            loop_boundaries("l", config.clone(), &[("items", "List[Number]", "Number"), ("stream", "Bus", "Bus")], &[("said", "Boolean", "List[Boolean | Null]")]);
+        let project = program(
+            vec![
+                node_json("opener", "SaysHello", &[], &[("stream", "Bus")]),
+                node_json("items", "Items", &[], &[("items", "List[Number]")]),
+                loop_in,
+                inside(node_json("says", "Says", &[("stream", "Bus"), ("value", "Number")], &[("stream", "Bus"), ("done", "Boolean")]), "l"),
+                loop_out,
+                node_json("tap", "Tap", &[("stream", "Bus")], &[]),
+            ],
+            vec![
+                wire("e1", "items", "items", "l__in", "items"),
+                wire("e2", "opener", "stream", "l__in", "stream"),
+                wire("e3", "l__in", "stream", "says", "stream"),
+                wire("e4", "l__in", "items", "says", "value"),
+                wire("e5", "says", "done", "l__out", "said"),
+                wire("e6", "opener", "stream", "tap", "stream"),
+            ],
+            vec![json!({ "id": "l", "kind": "loop", "nodeIds": ["says"], "loopConfig": config })],
+        );
+        let run = Drives::new(project, catalog, &["opener", "items"], Default::default());
+        assert_completed(run.drive().await);
+        let events = run.events();
+        assert_eq!(sorted(tap.lock().unwrap().clone()), sorted(vec![json!("hello"), json!(1), json!(2), json!(3)]), "{events:?}");
+        assert_eq!(joined_names(&events), vec!["host", "says#0", "says#1", "says#2"], "every iteration joined: {events:?}");
+        assert_eq!(bus_ends(&events), vec![weft_core::bus::StreamEnd::Finished], "it ends once, after the last iteration: {events:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bus_every_iteration_of_a_sequential_loop_gets_stays_open_between_them() {
+        every_iteration_joins(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bus_every_iteration_of_a_parallel_loop_gets_is_joined_by_each() {
+        every_iteration_joins(true).await;
+    }
+
+    /// The bus is carried through loop `l`: each iteration's `says` joins
+    /// it, says its item and hands it to the next one, and a `says` after
+    /// the loop joins the bus the loop handed on. Each iteration's
+    /// joiner has returned before the next one starts.
+    #[tokio::test(start_paused = true)]
+    async fn a_carried_bus_reaches_every_iteration_and_the_node_after_the_loop() {
+        let tap = Arc::new(StdMutex::new(Vec::new()));
+        let catalog = catalog(vec![
+            ("SaysHello", Box::new(SaysHello { fails: false })),
+            ("Items", Box::new(Items(json!([1, 2, 3])))),
+            ("Says", Box::new(Says { asks: false, late: 0 })),
+            ("Tap", Box::new(Tap { heard: tap.clone() })),
+        ]);
+        let config = json!({ "parallel": false, "over": ["items"], "carry": ["stream"] });
+        let [loop_in, loop_out] =
+            loop_boundaries("l", config.clone(), &[("items", "List[Number]", "Number"), ("stream", "Bus", "Bus")], &[("stream", "Bus", "Bus")]);
+        let project = program(
+            vec![
+                node_json("opener", "SaysHello", &[], &[("stream", "Bus")]),
+                node_json("items", "Items", &[], &[("items", "List[Number]")]),
+                loop_in,
+                inside(node_json("says", "Says", &[("stream", "Bus"), ("value", "Number")], &[("stream", "Bus"), ("done", "Boolean")]), "l"),
+                loop_out,
+                optional(node_json("last", "Says", &[("stream", "Bus"), ("value", "Number")], &[("stream", "Bus"), ("done", "Boolean")]), "value"),
+                node_json("tap", "Tap", &[("stream", "Bus")], &[]),
+            ],
+            vec![
+                wire("e1", "items", "items", "l__in", "items"),
+                wire("e2", "opener", "stream", "l__in", "stream"),
+                wire("e3", "l__in", "stream", "says", "stream"),
+                wire("e4", "l__in", "items", "says", "value"),
+                wire("e5", "says", "stream", "l__out", "stream"),
+                wire("e6", "l__out", "stream", "last", "stream"),
+                wire("e7", "opener", "stream", "tap", "stream"),
+            ],
+            vec![json!({ "id": "l", "kind": "loop", "nodeIds": ["says"], "loopConfig": config })],
+        );
+        let run = Drives::new(project, catalog, &["opener", "items"], Default::default());
+        assert_completed(run.drive().await);
+        let events = run.events();
+        assert_eq!(*tap.lock().unwrap(), vec![json!("hello"), json!(1), json!(2), json!(3), json!("said")], "{events:?}");
+        assert_eq!(joined_names(&events), vec!["host", "says#", "says#0", "says#1", "says#2"], "{events:?}");
+        assert_eq!(bus_ends(&events), vec![weft_core::bus::StreamEnd::Finished], "{events:?}");
+    }
+
+    /// A parallel loop `make` opens a bus in each of three iterations and
+    /// gathers them; a second loop `take` goes over that list, its first
+    /// iteration joining its bus and voting to stop. The buses nobody
+    /// joined end once `take` ended, since it will hand them to no
+    /// iteration, and the run completes.
+    #[tokio::test(start_paused = true)]
+    async fn gathered_buses_a_loop_stopped_before_reaching_end_with_it() {
+        let catalog = catalog(vec![
+            ("SaysHello", Box::new(SaysHello { fails: false })),
+            ("Items", Box::new(Items(json!([1, 2, 3])))),
+            ("Says", Box::new(Says { asks: false, late: 0 })),
+            ("Stops", Box::new(Stops)),
+        ]);
+        let make_config = json!({ "parallel": true, "over": ["items"], "carry": [] });
+        let take_config = json!({ "parallel": false, "over": ["buses"], "carry": [] });
+        let [make_in, make_out] = loop_boundaries("make", make_config.clone(), &[("items", "List[Number]", "Number")], &[("buses", "Bus", "List[Bus | Null]")]);
+        let [take_in, take_out] = loop_boundaries("take", take_config.clone(), &[("buses", "List[Bus | Null]", "Bus | Null")], &[("said", "Boolean", "List[Boolean | Null]")]);
+        let mut opens = inside(node_json("opens", "SaysHello", &[("value", "Number")], &[("stream", "Bus")]), "make");
+        opens["inputs"][0]["required"] = json!(false);
+        let project = program(
+            vec![
+                node_json("items", "Items", &[], &[("items", "List[Number]")]),
+                make_in,
+                opens,
+                make_out,
+                take_in,
+                inside(node_json("says", "Says", &[("stream", "Bus")], &[("stream", "Bus"), ("done", "Boolean")]), "take"),
+                inside(node_json("stops", "Stops", &[("after", "Boolean")], &[("done", "Boolean"), ("no", "Boolean")]), "take"),
+                take_out,
+            ],
+            vec![
+                wire("e1", "items", "items", "make__in", "items"),
+                wire("e2", "make__in", "items", "opens", "value"),
+                wire("e3", "opens", "stream", "make__out", "buses"),
+                wire("e4", "make__out", "buses", "take__in", "buses"),
+                wire("e5", "take__in", "buses", "says", "stream"),
+                wire("e6", "says", "done", "stops", "after"),
+                wire("e7", "says", "done", "take__out", "said"),
+                wire("e8", "stops", "done", "take__out", "done"),
+            ],
+            vec![
+                json!({ "id": "make", "kind": "loop", "nodeIds": ["opens"], "loopConfig": make_config }),
+                json!({ "id": "take", "kind": "loop", "nodeIds": ["says", "stops"], "loopConfig": take_config }),
+            ],
+        );
+        let run = Drives::new(project, catalog, &["items"], Default::default());
+        assert_completed(run.drive().await);
+        let events = run.events();
+        assert_eq!(joined_names(&events), vec!["host", "host", "host", "says#0"], "only the first bus was joined: {events:?}");
+        assert_eq!(bus_ends(&events), vec![weft_core::bus::StreamEnd::Finished; 3], "every bus ended, finished: {events:?}");
+    }
+
+    /// A bus its maker never joins, read by a tap waiting for its end:
+    /// the tap reading it keeps nothing open, so the bus ends finished once
+    /// it reached every node it was going to, and the run completes. A
+    /// joiner behind a gate that says no is skipped, which keeps nothing
+    /// open either.
+    #[tokio::test(start_paused = true)]
+    async fn a_bus_nobody_joins_ends_once_its_marker_went_nowhere_that_could() {
+        let tap = Arc::new(StdMutex::new(Vec::new()));
+        let catalog = catalog(vec![
+            ("MakesOnly", Box::new(MakesOnly)),
+            ("Stops", Box::new(Stops)),
+            ("Says", Box::new(Says { asks: false, late: 0 })),
+            ("Tap", Box::new(Tap { heard: tap.clone() })),
+        ]);
+        let project = program(
+            vec![
+                node_json("maker", "MakesOnly", &[], &[("stream", "Bus")]),
+                node_json("gate", "Stops", &[], &[("done", "Boolean"), ("no", "Boolean")]),
+                node_json("says", "Says", &[("stream", "Bus")], &[("stream", "Bus"), ("done", "Boolean")]),
+                node_json("tap", "Tap", &[("stream", "Bus")], &[]),
+            ],
+            vec![
+                wire("e1", "maker", "stream", "says", "stream"),
+                wire("e2", "gate", "no", "says", "_should_flow"),
+                wire("e3", "maker", "stream", "tap", "stream"),
+            ],
+            vec![],
+        );
+        let run = Drives::new(project, catalog, &["maker", "gate"], Default::default());
+        assert_completed(run.drive().await);
+        let events = run.events();
+        assert!(tap.lock().unwrap().is_empty(), "{events:?}");
+        assert!(joined_names(&events).is_empty(), "{events:?}");
+        assert_eq!(bus_ends(&events), vec![weft_core::bus::StreamEnd::Finished], "{events:?}");
+    }
+
+    /// A node holding the bus joins it only after giving way to the rest
+    /// of the run many times, its producer long gone: holding the marker
+    /// kept the bus open for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_joins_halfway_through_its_body_finds_the_bus_open() {
+        let tap = Arc::new(StdMutex::new(Vec::new()));
+        let catalog = catalog(vec![
+            ("SaysHello", Box::new(SaysHello { fails: false })),
+            ("Says", Box::new(Says { asks: false, late: 50 })),
+            ("Tap", Box::new(Tap { heard: tap.clone() })),
+        ]);
+        let project = program(
+            vec![
+                node_json("opener", "SaysHello", &[], &[("stream", "Bus")]),
+                node_json("says", "Says", &[("stream", "Bus")], &[("stream", "Bus"), ("done", "Boolean")]),
+                node_json("tap", "Tap", &[("stream", "Bus")], &[]),
+            ],
+            vec![wire("e1", "opener", "stream", "says", "stream"), wire("e2", "opener", "stream", "tap", "stream")],
+            vec![],
+        );
+        let run = Drives::new(project, catalog, &["opener"], Default::default());
+        assert_completed(run.drive().await);
+        let events = run.events();
+        assert_eq!(*tap.lock().unwrap(), vec![json!("hello"), json!("said")], "{events:?}");
+        assert_eq!(bus_ends(&events), vec![weft_core::bus::StreamEnd::Finished], "{events:?}");
+    }
+
+    /// Each iteration of a sequential loop over two items waits on a
+    /// person before it joins the bus its producer left: the run pauses
+    /// with nobody on the bus, in the gap before each iteration joins, and
+    /// on each fresh drive the bus is still open for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_paused_between_iterations_keeps_the_bus_open_for_the_next() {
+        let tap = Arc::new(StdMutex::new(Vec::new()));
+        let catalog = catalog(vec![
+            ("SaysHello", Box::new(SaysHello { fails: false })),
+            ("Items", Box::new(Items(json!([1, 2])))),
+            ("Says", Box::new(Says { asks: true, late: 0 })),
+            ("Tap", Box::new(Tap { heard: tap.clone() })),
+        ]);
+        let config = json!({ "parallel": false, "over": ["items"], "carry": [] });
+        let [loop_in, loop_out] =
+            loop_boundaries("l", config.clone(), &[("items", "List[Number]", "Number"), ("stream", "Bus", "Bus")], &[("said", "Boolean", "List[Boolean | Null]")]);
+        let project = program(
+            vec![
+                node_json("opener", "SaysHello", &[], &[("stream", "Bus")]),
+                node_json("items", "Items", &[], &[("items", "List[Number]")]),
+                loop_in,
+                inside(node_json("says", "Says", &[("stream", "Bus"), ("value", "Number")], &[("stream", "Bus"), ("done", "Boolean")]), "l"),
+                loop_out,
+                node_json("tap", "Tap", &[("stream", "Bus")], &[]),
+            ],
+            vec![
+                wire("e1", "items", "items", "l__in", "items"),
+                wire("e2", "opener", "stream", "l__in", "stream"),
+                wire("e3", "l__in", "stream", "says", "stream"),
+                wire("e4", "l__in", "items", "says", "value"),
+                wire("e5", "says", "done", "l__out", "said"),
+                wire("e6", "opener", "stream", "tap", "stream"),
+            ],
+            vec![json!({ "id": "l", "kind": "loop", "nodeIds": ["says"], "loopConfig": config })],
+        );
+        let run = Drives::new(project, catalog, &["opener", "items"], Default::default());
+        for iteration in 0..2 {
+            assert_stalled(run.drive().await);
+            let events = run.events();
+            assert!(bus_ends(&events).is_empty(), "iteration {iteration} can still join it: {events:?}");
+            run.answer(json!("go on"));
+        }
+        assert_completed(run.drive().await);
+        let events = run.events();
+        assert_eq!(*tap.lock().unwrap(), vec![json!("hello"), json!(1), json!(2)], "{events:?}");
+        assert_eq!(joined_names(&events), vec!["host", "says#0", "says#1"], "{events:?}");
+        assert_eq!(bus_ends(&events), vec![weft_core::bus::StreamEnd::Finished], "{events:?}");
+    }
+
+    /// Reads the bus on `stream` to its end, never joining it, then says
+    /// it is done on `done`.
+    struct ReadsThenSays;
+    test_manifest!(ReadsThenSays, "ReadsThenSays");
+    #[async_trait]
+    impl Node for ReadsThenSays {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
+            let mut cursor = ctx.bus_from_input("stream")?.cursor_from_start()?;
+            while cursor.next(&mut state).await?.is_some() {}
+            ctx.pulse_downstream(NodeOutput::new().set("done", json!(true))).await
+        }
+    }
+
+    /// The bus's marker waits at `late`, which also waits on what `reader`
+    /// says once the bus ended: `late` cannot start before the bus ends,
+    /// and the bus would wait for it. With nothing else to move the run,
+    /// the bus nobody is on ends, finished as its producer left it, and the
+    /// run completes instead of being found stuck.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_the_marker_waits_at_behind_a_reader_of_the_bus_does_not_hold_it_open() {
+        let heard = Arc::new(StdMutex::new(Vec::new()));
+        let catalog = catalog(vec![
+            ("SaysHello", Box::new(SaysHello { fails: false })),
+            ("ReadsThenSays", Box::new(ReadsThenSays)),
+            ("LateReader", Box::new(LateReader { heard: heard.clone() })),
+        ]);
+        let project = program(
+            vec![
+                node_json("opener", "SaysHello", &[], &[("stream", "Bus")]),
+                node_json("reader", "ReadsThenSays", &[("stream", "Bus")], &[("done", "Boolean")]),
+                node_json("late", "LateReader", &[("stream", "Bus"), ("after", "Boolean")], &[]),
+            ],
+            vec![
+                wire("e1", "opener", "stream", "reader", "stream"),
+                wire("e2", "opener", "stream", "late", "stream"),
+                wire("e3", "reader", "done", "late", "after"),
+            ],
+            vec![],
+        );
+        let run = Drives::new(project, catalog, &["opener"], Default::default());
+        assert_completed(run.drive().await);
+        let events = run.events();
+        assert_eq!(*heard.lock().unwrap(), vec![json!("hello")], "{events:?}");
+        assert_eq!(bus_ends(&events), vec![weft_core::bus::StreamEnd::Finished], "{events:?}");
+    }

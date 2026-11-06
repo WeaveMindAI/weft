@@ -21,6 +21,7 @@ slack/
 ```toml
 [package]
 name = "slack"
+# uses = ["other"], when you call another package's code (see below)
 
 [dependencies]
 # cargo deps every node here gets
@@ -41,14 +42,62 @@ use super::api;
 That is where the request-building and the error-reading for one service goes,
 written once instead of in every node that talks to it.
 
-Each package compiles as its own crate, so a node sees its own package's shared
-files and nothing else. Another package's code is never on your path.
-
-It also means editing one node recompiles that package and relinks, rather than
-rebuilding the world.
+Each package compiles as its own crate, so editing one node recompiles that
+package and relinks, rather than rebuilding the world.
 
 A shared file whose name is not a valid Rust identifier fails at build time
 naming the file.
+
+## Using another package's code
+
+If your nodes need code another package already has, name that package in
+`uses`, and you can call its shared files as a crate named after it. The agents
+package does this to install its server inside a computer with the same code
+`RunCommand` runs commands with:
+
+```toml
+[package]
+name = "agents"
+uses = ["computer"]
+```
+
+```rust
+use computer::apps;
+use computer::command::{self, Ran};
+```
+
+What you can call is the other package's shared `.rs` files and whatever they
+make `pub`. Don't reach for its nodes' code: a build only compiles the nodes a
+program uses, so that code is missing from most builds.
+
+The used package brings its own `[dependencies]` with it, so you don't repeat
+them. If you change it, every package that uses it rebuilds as well.
+
+If what a package uses can't be found or built, that package is left out with
+a reason naming its `package.toml`, and the rest of the project still loads.
+That happens when:
+
+- The used package isn't in the project, or was itself left out. This is
+  what you'll see if you copied `agents` into a project without `computer`:
+
+  ```text
+  node 'ClaudeCode' failed to load: parse: nodes/agents/package.toml: the
+  package 'agents' uses the package 'computer' (`uses` in this file), and
+  this project has no package of that name that loads; add the 'computer'
+  package to the project's nodes, or take it out of `uses`. `weft
+  describe-nodes` lists every folder left out, and why
+  ```
+
+- Packages that use each other in a ring, or a package that uses itself.
+  The error spells out the ring (`a uses b uses a`).
+- A single node folder with no `package.toml`. It has no shared files, so
+  there is nothing to call.
+- The used package has a name Rust can't take (`type`, `my-tools`), or one
+  of your own `[dependencies]` already takes that name.
+
+`package.toml` takes no keys besides `name`, `uses` and `[dependencies]`, so
+a typo like `use = [...]` fails the same way, naming the key it doesn't
+know.
 
 ## Defaults
 
@@ -147,12 +196,19 @@ on a local install is your own computer. Declare each one with a
 | `check` | Required. A command that exits 0 when the need is met. Its first word is looked up on the `PATH`, and a check still running after ten seconds counts as unmet |
 | `stage` | `"run"` (the default) for what the node starts while it runs, `"build"` for what its package needs to compile, like a C library's headers |
 | `[needs.install.<manager>]` | The packages that meet it. Managers are `apt` (Debian, Ubuntu), `dnf` (Fedora, RHEL), `apk` (Alpine) and `brew` (macOS) |
+| `how` | How a person gets it when no package manager has it, such as a vendor's own installer (`curl -fsSL https://example.com/install.sh \| bash`). Wherever the need is reported missing, this is said in place of "install it by hand" |
 
 Under each manager, `default` names the packages for every system that
 manager serves. A key made of the `ID` and `VERSION_ID` from
 `/etc/os-release`, dots turned to underscores (`debian_12`,
 `ubuntu_24_04`, `fedora_40`), names them for one system whose package names
 differ. weft looks for that exact key first and falls back to `default`.
+
+A need here cannot have a `recipe` (weft installing the program itself): the
+catalog refuses the node, because a node runs in a worker, which never gets the
+folder weft installs into on its `PATH`. Only a program an infra node runs
+as a process can have one (go and read [needs weft installs
+itself](infrastructure.md#needs-weft-installs-itself)).
 
 A local install runs the `run` checks of a program's nodes before the
 program runs, activates or resyncs, and refuses it when one fails. For what

@@ -34,7 +34,7 @@ fn cloud_compile_enumerates_the_infra_nodes_image() {
 
     let project = weft_compiler::project::Project::load(tmp.path()).expect("load project");
     let (definition, catalog) =
-        weft_compiler::hash::load_program(&project).expect("compile + enrich");
+        weft_compiler::hash::load_program(&project, None).expect("compile + enrich");
 
     let svc = definition
         .nodes

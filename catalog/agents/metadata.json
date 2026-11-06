@@ -1,0 +1,13 @@
+{
+  "icon": "Bot",
+  "color": "#7c5cbf",
+  "types": {
+    "AgentQuestion": "{ id: String, kind: String, questions: List[AgentQuestionItem], permission: AgentPermission | Null, statusUrl: String }",
+    "AgentQuestionItem": "{ id: String, header: String, question: String, options: List[AgentOption], multiSelect: Boolean, allowOther: Boolean, secret: Boolean }",
+    "AgentOption": "{ label: String, description: String }",
+    "AgentPermission": "{ tool: String, title: String, detail: String, input: Json, choices: List[AgentChoice] }",
+    "AgentChoice": "{ id: String, label: String, kind: String }",
+    "AgentAnswer": "{ questionId: String, answers?: JsonDict, choice?: String, note?: String, dropped?: Boolean }",
+    "AgentToolResult": "{ callId: String, output: String, isError?: Boolean }"
+  }
+}

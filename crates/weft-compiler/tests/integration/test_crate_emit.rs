@@ -32,6 +32,12 @@ fn package_dir(root: &std::path::Path, ident: &str) -> std::path::PathBuf {
     found.remove(0)
 }
 
+/// A local emission whose package crates sit in `root`, beside the test
+/// crate, as one test crate alone would have them.
+fn local(root: &std::path::Path) -> EmitPaths {
+    EmitPaths::Local { weft_root: weft_catalog::weft_repo_root().expect("weft root"), package_crates: root.to_path_buf() }
+}
+
 fn stdlib() -> FsCatalog {
     FsCatalog::discover(&weft_catalog::stdlib_root().expect("stdlib root"))
         .expect("stdlib discovers")
@@ -43,13 +49,12 @@ fn stdlib() -> FsCatalog {
 #[test]
 fn emitted_test_crate_has_the_expected_shape() {
     let catalog = stdlib();
-    let weft_root = weft_catalog::weft_repo_root().expect("weft root");
     let dir = tempfile::tempdir().expect("temp dir");
     let test_crate = emit_test_crate(
         dir.path(),
         &catalog,
         "slack",
-        &EmitPaths::Local { weft_root: weft_root.clone() },
+        &local(dir.path()),
     )
     .expect("emit");
 
@@ -113,9 +118,8 @@ fn emitted_test_crate_has_the_expected_shape() {
 #[test]
 fn emitted_test_crate_bakes_the_services_its_nodes_publish() {
     let catalog = stdlib();
-    let weft_root = weft_catalog::weft_repo_root().expect("weft root");
     let dir = tempfile::tempdir().expect("temp dir");
-    emit_test_crate(dir.path(), &catalog, "postgres", &EmitPaths::Local { weft_root })
+    emit_test_crate(dir.path(), &catalog, "postgres", &local(dir.path()))
         .expect("emit");
 
     let main_rs = std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
@@ -178,13 +182,11 @@ fn a_test_crate_is_never_emitted_for_an_image() {
 /// source moves it (so an edited copy never passes for the stock one).
 #[test]
 fn a_package_crate_slot_follows_its_content() {
-    let weft_root = weft_catalog::weft_repo_root().expect("weft root");
-    let paths = EmitPaths::Local { weft_root };
     let stock = stdlib();
     let first = tempfile::tempdir().expect("temp dir");
     let second = tempfile::tempdir().expect("temp dir");
-    emit_test_crate(first.path(), &stock, "slack", &paths).expect("emit");
-    emit_test_crate(second.path(), &stock, "slack", &paths).expect("emit");
+    emit_test_crate(first.path(), &stock, "slack", &local(first.path())).expect("emit");
+    emit_test_crate(second.path(), &stock, "slack", &local(second.path())).expect("emit");
     let slot = |root: &std::path::Path| package_dir(root, "pkg_slack").file_name().unwrap().to_owned();
     assert_eq!(slot(first.path()), slot(second.path()), "same content, same slot");
 
@@ -195,7 +197,7 @@ fn a_package_crate_slot_follows_its_content() {
     std::fs::write(&source, code).expect("edit node source");
     let edited = FsCatalog::discover(&project.path().join("nodes")).expect("discover edited copy");
     let third = tempfile::tempdir().expect("temp dir");
-    emit_test_crate(third.path(), &edited, "slack", &paths).expect("emit");
+    emit_test_crate(third.path(), &edited, "slack", &local(third.path())).expect("emit");
     assert_ne!(slot(first.path()), slot(third.path()), "an edited node moves the slot");
 }
 
@@ -204,7 +206,6 @@ fn a_package_crate_slot_follows_its_content() {
 #[test]
 fn re_emission_wipes_stale_files() {
     let catalog = stdlib();
-    let weft_root = weft_catalog::weft_repo_root().expect("weft root");
     let dir = tempfile::tempdir().expect("temp dir");
     let stale = dir.path().join("pkg_oldname");
     std::fs::create_dir_all(&stale).expect("stale dir");
@@ -213,7 +214,7 @@ fn re_emission_wipes_stale_files() {
         dir.path(),
         &catalog,
         "slack",
-        &EmitPaths::Local { weft_root: weft_root.clone() },
+        &local(dir.path()),
     )
     .expect("emit over dirty dir");
     assert!(!stale.exists(), "stale package dirs are wiped on re-emission");
@@ -287,13 +288,12 @@ fn node_test_hash_tracks_sources_not_the_image_recipe() {
 #[test]
 fn unknown_package_is_refused_with_the_known_set() {
     let catalog = stdlib();
-    let weft_root = weft_catalog::weft_repo_root().expect("weft root");
     let dir = tempfile::tempdir().expect("temp dir");
     let err = emit_test_crate(
         dir.path(),
         &catalog,
         "nope",
-        &EmitPaths::Local { weft_root },
+        &local(dir.path()),
     )
     .expect_err("unknown package refused")
     .to_string();
@@ -322,7 +322,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         group_boundary: None,
         requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
         images: Vec::new(),
-        fires_with: Default::default(), baked_outputs: Default::default(),
+        fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
         published_service: None,
         instance_service: None,
         instance_rules: None,
@@ -347,6 +347,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         groups: Vec::new(),
         given: Default::default(),
         broken: Vec::new(),
+        install: None,
         metadata_wires: Vec::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -387,4 +388,23 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         !pkg_toml.contains(r#"features = ["node-tests"]"#),
         "and nothing enables it in a worker build"
     );
+}
+
+/// A package's test crate compiles every package it uses beside it, whole,
+/// so a workspace testing both holds one crate of the used package: the
+/// agents package uses the computer's, under the name `computer`.
+#[test]
+fn a_test_crate_compiles_the_packages_its_package_uses() {
+    let catalog = stdlib();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let test_crate = emit_test_crate(dir.path(), &catalog, "agents", &local(dir.path())).expect("emit");
+    assert_eq!(test_crate.package_crates.keys().map(String::as_str).collect::<Vec<_>>(), ["agents", "computer"]);
+    assert!(test_crate.compiled_node_types.iter().any(|t| t == "RunCommand"), "the used package compiles whole");
+    assert!(!test_crate.node_types.iter().any(|t| t == "RunCommand"), "the registry holds the tested package alone");
+
+    let agents: toml::Value =
+        toml::from_str(&std::fs::read_to_string(test_crate.package_crates["agents"].join("Cargo.toml")).unwrap()).unwrap();
+    let computer = &agents["dependencies"]["computer"];
+    assert_eq!(computer["package"].as_str(), Some("pkg_computer"));
+    assert_eq!(std::path::Path::new(computer["path"].as_str().unwrap()), test_crate.package_crates["computer"]);
 }

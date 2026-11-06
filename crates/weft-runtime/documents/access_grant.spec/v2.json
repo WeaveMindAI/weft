@@ -684,5 +684,38 @@
       },
       "concat": "{timestamp}.{body}"
     }
+  },
+  {
+    "service": "guided_key",
+    "label": "Guided key",
+    "grants": "coexisting",
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "apiKey",
+          "label": "API key",
+          "secret": true,
+          "placeholder": "pk-..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {apiKey}"
+      }
+    ],
+    "identity": "Guided key",
+    "ownPage": {
+      "guide": {
+        "link": "https://example.com/settings/keys",
+        "steps": [
+          "Open example.com/settings/keys and click Create key.",
+          "Copy the key into the field below."
+        ]
+      }
+    }
   }
 ]

@@ -18,11 +18,22 @@
     ],
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "key",
-          "label": "API key",
-          "placeholder": "exa_..."
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "exa_..."
+            }
+          ],
+          "guide": {
+            "link": "https://dashboard.exa.ai/api-keys",
+            "steps": [
+              "Open dashboard.exa.ai and create an API key.",
+              "Paste it below and name the connection."
+            ]
+          }
         }
       ]
     },
@@ -42,15 +53,6 @@
     "verification": {
       "rung": "reports_validity",
       "cost": "free"
-    },
-    "ownPage": {
-      "guide": {
-        "link": "https://dashboard.exa.ai/api-keys",
-        "steps": [
-          "Open dashboard.exa.ai and create an API key.",
-          "Paste it below and name the connection."
-        ]
-      }
     }
   },
   "inputs": [

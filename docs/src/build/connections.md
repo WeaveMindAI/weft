@@ -23,7 +23,11 @@ Click it and you get your existing connections for that service, then, under
   [`access-apps.json`](../connections/the-apps-file.md) before installing.
 - **Your own...**, always. Tick the permissions you want, follow the guide for
   registering an application with that provider, or just paste a key you
-  already have.
+  already have. When a service takes more than one kind of key, like a Claude
+  subscription's token or an API key, you pick which one first, and its own
+  guide and fields follow. On a cloud install, a way kept to local installs is
+  left out of the list. For why, go and read
+  [how connections work](../connections/how-they-work.md#a-way-that-stays-on-your-machine).
 
 Sign-in opens your browser for the provider's consent screen and the panel
 waits, then flips to a green **Connected as *your name*** with **Change** and
@@ -46,7 +50,9 @@ connect --list` prints what is already stored and changes nothing. `weft
 connect account` goes straight to one node: any node that takes a connection
 of its own, an access node or a route that checks its callers. `--disconnect` clears a
 node's pick and leaves the stored account alone, and `--forget <id>` deletes
-the stored account for good.
+the stored account for good. If a service takes more than one kind of key,
+`weft connect` asks which. If you are scripting it, pass `--way <id>` (`--way
+apiKey`); run it once without a terminal and the error lists the ids.
 
 Every project on the install can pick any stored connection, so if you keep
 two keys for one service, their names are how you tell them apart: the list

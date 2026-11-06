@@ -61,11 +61,14 @@ fn take(file: File, on_wait: impl FnOnce()) -> io::Result<File> {
     }
 }
 
+/// Open for reading too: a holder that hands its lock on to a program it
+/// starts as that program's standard input (`needs::setup`) gives it an
+/// empty file that reads as nothing.
 fn open(path: &Path) -> io::Result<File> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)
+    std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)
 }
 
 #[cfg(test)]

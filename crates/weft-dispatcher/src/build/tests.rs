@@ -187,10 +187,10 @@ async fn compile_version(
     tenant: &str,
     manifest: &Manifest,
     root: &std::path::Path,
-) -> Result<(weft_core::ProjectDefinition, weft_core::content::ContentValues, weft_catalog::FsCatalog, weft_compiler::project::Project)> {
+) -> Result<(weft_compiler::Compiled, weft_catalog::FsCatalog, weft_compiler::project::Project)> {
     let files = Arc::new(source::VersionFiles::new(root.to_path_buf(), manifest.clone(), storage, tenant.to_string()));
     let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || source::compile(&root, files)).await.unwrap()
+    tokio::task::spawn_blocking(move || source::compile(&root, files, weft_core::install::InstallKind::Local)).await.unwrap()
 }
 
 const PROGRAM: &[(&str, &[u8])] = &[
@@ -218,7 +218,7 @@ async fn a_version_builds_from_its_own_edited_standard_library() {
     let root = tempfile::tempdir().unwrap();
     source::materialize(storage.as_ref(), &cache, "local", &manifest, root.path()).await.unwrap();
     assert!(!root.path().join("nodes/base_catalog/logic").exists(), "nothing beyond the version is laid out");
-    let (_, _, catalog, _) = compile_version(storage, "local", &manifest, root.path()).await.unwrap();
+    let (_, catalog, _) = compile_version(storage, "local", &manifest, root.path()).await.unwrap();
     let label = &catalog.entry("Text").expect("the version's own Text").metadata.label;
     assert!(label.starts_with("Edited "), "{label}");
 }
@@ -241,7 +241,7 @@ async fn a_version_builds_a_program_that_includes_a_file_from_nodes() {
     let (_blobs, cache) = fresh_cache();
     let root = tempfile::tempdir().unwrap();
     source::materialize(storage.as_ref(), &cache, "local", &manifest, root.path()).await.unwrap();
-    let (definition, _, _, _) = compile_version(storage, "local", &manifest, root.path()).await.unwrap();
+    let definition = compile_version(storage, "local", &manifest, root.path()).await.unwrap().0.definition;
     let hello = definition
         .nodes
         .iter()
@@ -265,7 +265,7 @@ async fn a_version_without_a_standard_library_gets_none() {
     source::materialize(storage.as_ref(), &cache, "local", &manifest, root.path()).await.unwrap();
     assert_eq!(std::fs::read(root.path().join("src/main.weft")).unwrap(), PROGRAM[1].1);
     assert!(!root.path().join("nodes/base_catalog").exists());
-    let (definition, _, _, _) = compile_version(storage, "local", &manifest, root.path()).await.unwrap();
+    let definition = compile_version(storage, "local", &manifest, root.path()).await.unwrap().0.definition;
     assert!(definition.broken.iter().any(|part| part.why.contains("Text")), "{:?}", definition.broken);
 }
 
@@ -319,7 +319,7 @@ async fn a_version_build_finds_its_files_in_the_version() {
     let (_blobs, cache) = fresh_cache();
     let root = tempfile::tempdir().unwrap();
     source::materialize(storage.as_ref(), &cache, "local", &manifest, root.path()).await.unwrap();
-    let (_, _, _, project) = compile_version(storage, "local", &manifest, root.path()).await.unwrap();
+    let (_, _, project) = compile_version(storage, "local", &manifest, root.path()).await.unwrap();
     let fingerprints = weft_compiler::hash::Fingerprints::of_version(project.root.clone(), manifest.clone());
     let main = project.root.join("src/main.weft");
     std::fs::write(&main, b"changed after it was checked").unwrap();
@@ -415,7 +415,7 @@ async fn version_files_fetch_an_asset_only_when_the_compile_reads_it() {
     let (_blobs, cache) = fresh_cache();
     let root = tempfile::tempdir().unwrap();
     source::materialize(storage.as_ref(), &cache, "local", &manifest, root.path()).await.unwrap();
-    let (definition, _, _, _) = compile_version(storage.clone(), "local", &manifest, root.path()).await.unwrap();
+    let definition = compile_version(storage.clone(), "local", &manifest, root.path()).await.unwrap().0.definition;
     let notes = definition.nodes.iter().find(|n| n.id == "notes").expect("the notes node");
     let content = weft_core::content::ContentRef::from_value(notes.written_value("value").unwrap()).expect("named by its content");
     assert_eq!(content.sha256(), manifest["assets/notes.txt"], "the version's own stored blob");

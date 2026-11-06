@@ -153,5 +153,173 @@ class EnvelopeTest(unittest.TestCase):
             self.assertTrue(answer["result"]["error"].startswith("no action 'fly'"), answer)
 
 
+class AppsServer(unittest.TestCase):
+    """The computer's server, and an app it hands requests on to."""
+
+    def setUp(self):
+        self.server = computer.http.server.ThreadingHTTPServer(("127.0.0.1", 0), computer.Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+        class App(computer.http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self._answer({"path": self.path})
+
+            def do_POST(self):  # noqa: N802
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                self._answer({"path": self.path, "body": json.loads(body), "type": self.headers["Content-Type"]})
+
+            def do_DELETE(self):  # noqa: N802
+                self._answer({"path": self.path, "deleted": True})
+
+            def _answer(self, body):
+                payload = json.dumps(body).encode()
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        self.app = computer.http.server.ThreadingHTTPServer(("127.0.0.1", 0), App)
+        threading.Thread(target=self.app.serve_forever, daemon=True).start()
+        self.addCleanup(self.app.server_close)
+        self.addCleanup(self.app.shutdown)
+        os.makedirs(computer.APPS_DIR, exist_ok=True)
+
+    def ask(self, method, path, body=None):
+        url = f"http://127.0.0.1:{self.server.server_address[1]}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as answer:
+                return answer.status, json.loads(answer.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+
+class AppsTest(AppsServer):
+    """`/apps/<name>/`: a request handed on to a program the computer runs."""
+
+    def test_a_request_reaches_the_app_its_path_names_and_its_answer_comes_back(self):
+        with open(os.path.join(computer.APPS_DIR, "agent-one"), "w") as f:
+            f.write(f"{self.app.server_address[1]}\n")
+        self.assertEqual(self.ask("GET", "/apps/agent-one/events?turn=t1&after=3"), (201, {"path": "/events?turn=t1&after=3"}))
+        self.assertEqual(self.ask("POST", "/apps/agent-one/turns", {"message": "hi"}),
+                         (201, {"path": "/turns", "body": {"message": "hi"}, "type": "application/json"}))
+
+    def test_an_app_that_never_started_or_a_bad_name_is_refused_saying_so(self):
+        status, answer = self.ask("GET", "/apps/nobody/health")
+        self.assertEqual(status, 502)
+        self.assertIn("no app 'nobody' runs on this computer", answer["error"])
+        status, answer = self.ask("GET", "/apps/../health")
+        self.assertEqual(status, 502)
+        status, answer = self.ask("GET", "/apps/agent-one.start/health")
+        self.assertEqual(status, 502, "no app is named like an app's start script")
+        self.assertIn("is not an app name", answer["error"])
+
+
+class RemoveAppTest(AppsServer):
+    """`DELETE /apps/<name>`: the app's remove command, then its files, holding its lock."""
+
+    def register(self, name, remove=None):
+        """An app's files as a start leaves them, with `remove` as its remove command."""
+        files = {name: "4000", name + computer.START_SUFFIX: "exit 0\n", name + computer.LOCK_SUFFIX: ""}
+        if remove is not None:
+            files[name + computer.REMOVE_SUFFIX] = remove
+        for file, content in files.items():
+            with open(os.path.join(computer.APPS_DIR, file), "w") as f:
+                f.write(content)
+        os.makedirs(os.path.join(HOME, "kept", name), exist_ok=True)
+
+    def files(self, name):
+        return sorted(f for f in os.listdir(computer.APPS_DIR) if f == name or f.startswith(name + "."))
+
+    def test_a_removal_runs_the_apps_remove_command_then_deletes_its_files_and_leaves_the_others(self):
+        self.register("agent-one", 'rm -rf "$HOME/kept/agent-one"\n')
+        self.register("agent-two", 'rm -rf "$HOME/kept/agent-two"\n')
+        self.assertEqual(self.ask("DELETE", "/apps/agent-one"), (200, {"removed": True}))
+        self.assertEqual(self.files("agent-one"), [])
+        self.assertFalse(os.path.exists(os.path.join(HOME, "kept", "agent-one")))
+        self.assertEqual(len(self.files("agent-two")), 4, "another app is left alone")
+        self.assertTrue(os.path.isdir(os.path.join(HOME, "kept", "agent-two")))
+        self.assertEqual(self.ask("DELETE", "/apps/agent-one"), (200, {"removed": False}), "asked again: nothing left")
+        self.assertEqual(self.ask("DELETE", "/apps/never-started"), (200, {"removed": False}))
+
+    def test_a_failed_remove_command_keeps_what_runs_it_again_and_no_start_brings_the_app_back(self):
+        self.register("agent-one", "echo 'the folder is busy'; exit 4\n")
+        status, answer = self.ask("DELETE", "/apps/agent-one")
+        self.assertEqual(status, 500)
+        self.assertIn("removing the app 'agent-one' failed (exit 4): the folder is busy", answer["error"])
+        self.assertEqual(self.files("agent-one"), ["agent-one", "agent-one.lock", "agent-one.remove"])
+        with open(os.path.join(computer.APPS_DIR, "agent-one" + computer.REMOVE_SUFFIX), "w") as f:
+            f.write('rm -rf "$HOME/kept/agent-one"\n')
+        self.assertEqual(self.ask("DELETE", "/apps/agent-one"), (200, {"removed": True}))
+        self.assertEqual(self.files("agent-one"), [])
+
+    def test_an_app_with_no_remove_command_is_refused_naming_what_is_left(self):
+        self.register("agent-one")
+        status, answer = self.ask("DELETE", "/apps/agent-one")
+        self.assertEqual(status, 500)
+        self.assertIn("registered no remove command", answer["error"])
+        self.assertEqual(len(self.files("agent-one")), 3, "nothing is touched")
+
+    def test_a_bad_name_is_refused_and_a_path_below_the_app_is_the_apps(self):
+        self.assertEqual(self.ask("DELETE", "/apps/agent-one.start")[0], 400)
+        with open(os.path.join(computer.APPS_DIR, "agent-one"), "w") as f:
+            f.write(f"{self.app.server_address[1]}\n")
+        self.assertEqual(self.ask("DELETE", "/apps/agent-one/mcp"), (201, {"path": "/mcp", "deleted": True}))
+
+
+class StartAppsTest(unittest.TestCase):
+    """At boot, the computer runs each registered app's start script, holding the app's lock."""
+
+    def setUp(self):
+        self.addCleanup(setattr, computer, "APPS_DIR", computer.APPS_DIR)
+        computer.APPS_DIR = tempfile.mkdtemp()
+        self.logged = []
+        computer.log = self.logged.append
+        self.addCleanup(setattr, computer, "log", lambda message: None)
+
+    def register(self, name, script):
+        with open(os.path.join(computer.APPS_DIR, name + computer.START_SUFFIX), "w") as f:
+            f.write(script)
+
+    def test_every_registered_app_starts_and_a_failing_one_is_logged_without_stopping_the_rest(self):
+        self.register("broken", "echo 'the server did not start'; exit 3\n")
+        self.register("one", "echo started > \"$HOME/one-started\"\n")
+        with open(os.path.join(computer.APPS_DIR, "one"), "w") as f:
+            f.write("4000")
+        computer.start_apps()
+        with open(os.path.join(HOME, "one-started")) as f:
+            self.assertEqual(f.read(), "started\n")
+        self.assertIn("app 'broken' was not started again (exit 3): the server did not start", self.logged)
+        self.assertIn("app 'one' up", self.logged)
+
+    def test_a_start_waits_for_whoever_holds_the_apps_lock(self):
+        self.register("one", "echo ran >> \"$HOME/one-ran\"\n")
+        lock = open(os.path.join(computer.APPS_DIR, "one" + computer.LOCK_SUFFIX), "a")
+        self.addCleanup(lock.close)
+        computer.fcntl.flock(lock, computer.fcntl.LOCK_EX)
+        started = threading.Thread(target=computer.start_app, args=("one",))
+        started.start()
+        started.join(timeout=0.5)
+        self.assertTrue(started.is_alive(), "the start waits on the lock")
+        self.assertFalse(os.path.exists(os.path.join(HOME, "one-ran")))
+        computer.fcntl.flock(lock, computer.fcntl.LOCK_UN)
+        started.join(timeout=10)
+        self.assertFalse(started.is_alive())
+        with open(os.path.join(HOME, "one-ran")) as f:
+            self.assertEqual(f.read(), "ran\n")
+
+    def test_a_computer_with_no_app_starts_none(self):
+        computer.APPS_DIR = os.path.join(tempfile.mkdtemp(), "none")
+        computer.start_apps()
+        self.assertEqual(self.logged, [])
+
+
 if __name__ == "__main__":
     unittest.main()

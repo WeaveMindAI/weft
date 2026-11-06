@@ -8,6 +8,9 @@
 //! (a unit's `fsGroup`). `host` runs on a cloud machine given one unit: it
 //! runs the unit on the machine's Docker (the laptop's own code,
 //! `weft_platform_local::LocalInfraHost`) and answers weft about it.
+//! `process` is the agent of a unit that runs a process on the machine
+//! (`weft_platform_local::process_units`): it runs the process, stamps
+//! what it prints into the unit's log, and starts it again when it exits.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,8 +18,10 @@ use std::time::Duration;
 use anyhow::Context as _;
 use axum::routing::post;
 use axum::{Json, Router};
-use weft_core::infra::ProbeKind;
-use weft_platform_traits::unit_agent::{ProbeAnswer, ProbeRequest, AGENT_BROKER_URL_ENV, AGENT_IDENTITY_ENV, PROBE_PATH, VALUES_PATH};
+use weft_core::infra::wire::{LogLine, Pipe};
+use weft_platform_traits::unit_agent::{
+    ProbeAnswer, ProbeRequest, ProcessAgentState, ProcessSetup, AGENT_BROKER_URL_ENV, AGENT_IDENTITY_ENV, PROBE_PATH, VALUES_PATH,
+};
 use weft_core::ports::UNIT_AGENT;
 
 /// Serve checks, and pass on what the unit's containers push, until the
@@ -51,77 +56,266 @@ async fn push(
 
 async fn probe(Json(req): Json<ProbeRequest>) -> Json<ProbeAnswer> {
     let timeout = Duration::from_secs(u64::from(req.timeout_seconds.max(1)));
-    Json(run_probe(&req.probe, timeout).await)
+    Json(weft_platform_local::probe::run_probe(&req.probe, timeout).await)
 }
 
-/// Run one network check against the unit's own `127.0.0.1`.
-pub async fn run_probe(probe: &ProbeKind, timeout: Duration) -> ProbeAnswer {
-    let failed = |why: String| ProbeAnswer { ok: false, why: Some(why) };
-    match probe {
-        ProbeKind::Tcp { port } => match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(("127.0.0.1", *port))).await {
-            Ok(Ok(_)) => ProbeAnswer { ok: true, why: None },
-            Ok(Err(e)) => failed(format!("port {port}: {e}")),
-            Err(_) => failed(format!("port {port}: no answer within {}s", timeout.as_secs())),
+/// How big a process unit's log grows before it rolls over to `.1`
+/// (`crate::log_file`): the host reads both back from their end to follow
+/// it, as far as a read needs.
+pub const PROCESS_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Run a process unit's process, `command`, until this agent is told to
+/// stop (`SIGTERM`), the way Docker runs a container with `--restart
+/// unless-stopped`: started in this agent's folder with this agent's
+/// environment (both the host's choice), every line it prints appended to
+/// `log` with the instant it came and the pipe it came out of
+/// (`LogLine::stamped`), and started again whenever it exits on its own,
+/// after [`restart_delay`]. How it is doing is kept at `state`
+/// ([`ProcessAgentState`]) for the host to read.
+///
+/// The process shares this agent's process group, which the host started
+/// as a group of its own: a stop is passed on to the process, which gets
+/// to wind down, and the host kills the whole group once its grace ends,
+/// whatever the process started included.
+///
+/// The process never outlives this agent: on any way out of it (an error,
+/// a panic) the process is killed as the agent lets go of it
+/// (`kill_on_drop`), and on Linux the kernel kills it the moment the agent
+/// dies, even killed outright (`SIGKILL`), which no code of the agent's
+/// runs through ([`dies_with_the_agent`]). Left running, it would hold the
+/// unit's port against the process of the agent the host starts next, and
+/// nothing would ever stop it. On macOS, which has no such signal, the host
+/// kills what a gone agent left before it starts the next one
+/// (`weft_platform_local::processes::kill_leftovers`), as it does on Linux
+/// for what the process itself started.
+///
+/// With `setup` (a `ProcessSetup` file), the needs it names are met first
+/// ([`set_up`]), and the process runs with their program folders first on
+/// its `PATH`.
+pub async fn process(state: &Path, log: &Path, setup: Option<&Path>, command: &[String]) -> anyhow::Result<()> {
+    use weft_platform_traits::unit_agent::{ProcessExit, ProcessRun};
+    let (program, args) = command.split_first().context("a process unit's agent is given the command to run")?;
+    let log = std::sync::Arc::new(crate::log_file::LogFile::open(log, PROCESS_LOG_MAX_BYTES).with_context(|| format!("open {}", log.display()))?);
+    let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).context("listen for the host's stop")?;
+    let path = match setup {
+        None => None,
+        Some(setup) => match set_up(setup, state, &log, &mut stop).await? {
+            Some(path) => Some(path),
+            None => return Ok(()),
         },
-        ProbeKind::Http { path, port } => {
-            let client = weft_core::net::http_client()
-                .timeout(timeout)
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("reqwest client");
-            match client.get(format!("http://127.0.0.1:{port}{path}")).send().await {
-                Ok(r) if r.status().is_success() || r.status().is_redirection() => ProbeAnswer { ok: true, why: None },
-                Ok(r) => {
-                    let status = r.status().as_u16();
-                    // The body rides the same client timeout; one that does
-                    // not arrive is a check that said nothing.
-                    let body = body_start(r).await;
-                    match what_it_said(&body) {
-                        Some(said) => failed(format!("GET {path} on {port} answered {status}: {said}")),
-                        None => failed(format!("GET {path} on {port} answered {status}")),
+    };
+    let mut kept = ProcessAgentState::default();
+    let mut delay = None;
+    loop {
+        let started = std::time::Instant::now();
+        let spawned = process_command(program, args, path.as_deref()).spawn();
+        let code = match spawned {
+            // What a shell answers for a program it cannot run.
+            Err(e) => {
+                say(&log, &format!("could not start `{program}`: {e}"));
+                127
+            }
+            Ok(mut child) => {
+                let pid = child.id().context("the process ended before its pid could be read")?;
+                kept.running = Some(ProcessRun { pid, started_at_unix: now_unix() });
+                kept.write(state)?;
+                stamp(child.stdout.take(), Pipe::Stdout, log.clone());
+                stamp(child.stderr.take(), Pipe::Stderr, log.clone());
+                tokio::select! {
+                    status = child.wait() => exit_code(status?),
+                    _ = stop.recv() => {
+                        // SAFETY: kill(2) takes plain integers and touches no memory of ours.
+                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                        let code = exit_code(child.wait().await?);
+                        kept.running = None;
+                        kept.write(state)?;
+                        say(&log, &format!("stopped; the process exited with code {code}"));
+                        return Ok(());
                     }
                 }
-                Err(e) => failed(format!("GET {path} on {port}: {e}")),
+            }
+        };
+        kept.running = None;
+        kept.restarts += 1;
+        kept.last_exit = Some(ProcessExit { code, at_unix: now_unix() });
+        kept.write(state)?;
+        let wait = restart_delay(delay, started.elapsed());
+        delay = Some(wait);
+        say(&log, &format!("the process exited with code {code}; starting it again in {} ms", wait.as_millis()));
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            _ = stop.recv() => return Ok(()),
+        }
+    }
+}
+
+/// Meet the needs the `ProcessSetup` at `file` names, one after the
+/// other, each step said in the agent's `state` (`setting_up`) and its
+/// log: the `PATH` the process then runs with, their program folders
+/// first. `None` when the host stopped the agent meanwhile, or once it
+/// stopped it after a need could not be met, which the agent keeps in
+/// its `state` (`setup_failed`) and waits there, its process never
+/// started: an agent that exited would be started again, installing
+/// again, for ever.
+///
+/// No deadline: a person waits on the install, as long as it takes. A
+/// stop ends the agent at once; the install it ran is in its process
+/// group, which the host kills with it, and the install left halfway is
+/// one the next setup starts over (`weft_core::needs::setup`).
+async fn set_up(file: &Path, state: &Path, log: &std::sync::Arc<crate::log_file::LogFile>, stop: &mut tokio::signal::unix::Signal) -> anyhow::Result<Option<String>> {
+    let setup: ProcessSetup = serde_json::from_slice(&std::fs::read(file).with_context(|| format!("read {}", file.display()))?)
+        .with_context(|| format!("{} is no process setup this weft reads", file.display()))?;
+    let mut path = std::env::var("PATH").unwrap_or_default();
+    let system = weft_core::needs::System::here();
+    for need in setup.needs {
+        let (root, given, system, state_file, said) = (setup.root.clone(), path.clone(), system.clone(), state.to_path_buf(), log.clone());
+        let meeting = tokio::task::spawn_blocking(move || {
+            need.meet(&root, &given, &system, &mut |step| {
+                let words = step.words(&need.name);
+                say(&said, &words);
+                if let Err(e) = (ProcessAgentState { setting_up: Some(words), ..Default::default() }).write(&state_file) {
+                    tracing::error!(target: "weft_runtime::unit_agent", error = %format!("{e:#}"), "could not say what the setup is doing");
+                }
+            })
+        });
+        let met = tokio::select! {
+            met = meeting => met.context("a need's setup stopped")?,
+            _ = stop.recv() => return Ok(None),
+        };
+        match met {
+            Ok(bins) => path = weft_core::needs::setup::path_with(&bins, &path),
+            Err(why) => {
+                let why = format!(
+                    "{why}\nthen start the infra again (`weft deps-install`, in the project's folder, installs what this \
+                     machine lacks for it, asking for your password where a system package needs it)"
+                );
+                say(log, &why);
+                ProcessAgentState { setup_failed: Some(why), ..Default::default() }.write(state)?;
+                stop.recv().await;
+                return Ok(None);
             }
         }
-        ProbeKind::Exec { .. } => failed("an exec check runs inside its own container, never through the agent".into()),
+    }
+    Ok(Some(path))
+}
+
+/// The command that starts a process unit's process: what it prints piped
+/// to the agent, and killed whenever the agent lets go of it or dies. With
+/// `path`, that is its `PATH`.
+fn process_command(program: &str, args: &[String], path: Option<&str>) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    dies_with_the_agent(command.as_std_mut());
+    command
+}
+
+/// Have the kernel kill what `command` starts the moment the thread that
+/// starts it ends (`PR_SET_PDEATHSIG`, which is about the thread, not the
+/// process). That is the agent's whole life: [`process`] runs on the
+/// agent's main thread (`main` awaits it, and `#[tokio::main]` polls that
+/// on the main thread), which ends only as the agent does.
+#[cfg(target_os = "linux")]
+fn dies_with_the_agent(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: getpid(2) takes nothing and touches no memory of ours.
+    let agent = unsafe { libc::getpid() };
+    // SAFETY: what runs between fork and exec only calls prctl(2),
+    // getppid(2) and _exit(2), all async-signal-safe, and allocates
+    // nothing.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The agent died between the fork and the line above, so the
+            // signal will never come: go now.
+            if libc::getppid() != agent {
+                libc::_exit(137);
+            }
+            Ok(())
+        });
     }
 }
 
-/// The longest stretch of a failing check's body that its reason carries.
-const SAID_MAX_CHARS: usize = 300;
+/// macOS has no signal for a parent's death: the host kills what a gone
+/// agent left before it starts the next one
+/// (`weft_platform_local::processes::kill_leftovers`).
+#[cfg(target_os = "macos")]
+fn dies_with_the_agent(_command: &mut std::process::Command) {}
 
-/// How much of a failing check's body is read: enough for any JSON
-/// `error` a container means to tell, never a whole page a misbehaving one
-/// streams back.
-const BODY_MAX_BYTES: usize = 4096;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("a process unit's agent kills its process when it dies on Linux and macOS only; say how on this system before building it here");
 
-/// The first [`BODY_MAX_BYTES`] of a response's body, read lossily as
-/// text; what arrived before an error when the body breaks off.
-async fn body_start(mut response: reqwest::Response) -> String {
-    let mut body = Vec::new();
-    while body.len() < BODY_MAX_BYTES {
-        match response.chunk().await {
-            Ok(Some(chunk)) => body.extend_from_slice(&chunk[..chunk.len().min(BODY_MAX_BYTES - body.len())]),
-            Ok(None) | Err(_) => break,
+/// The first wait before a process that exited is started again.
+const FIRST_RESTART_DELAY: Duration = Duration::from_millis(100);
+/// The longest one.
+const LONGEST_RESTART_DELAY: Duration = Duration::from_secs(60);
+/// How long a process must have run for its next exit to wait the first
+/// delay again.
+const RAN_LONG_ENOUGH: Duration = Duration::from_secs(10);
+
+/// How long to wait before starting again a process that ran for `ran`,
+/// when the wait before its last start was `previous` (`None`: it had not
+/// exited before): Docker's for a container it restarts, twice the last
+/// one from a tenth of a second up to a minute, back to a tenth once it
+/// ran ten seconds.
+fn restart_delay(previous: Option<Duration>, ran: Duration) -> Duration {
+    match previous {
+        Some(previous) if ran < RAN_LONG_ENOUGH => (previous * 2).min(LONGEST_RESTART_DELAY),
+        _ => FIRST_RESTART_DELAY,
+    }
+}
+
+/// The exit code a shell and Docker say for `status`: its own, or 128
+/// plus the signal that ended it.
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.code().or_else(|| status.signal().map(|signal| 128 + signal)).unwrap_or(-1)
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("system clock past UNIX_EPOCH").as_secs() as i64
+}
+
+/// Append `line` to `log` stamped as one of the agent's own, on stderr.
+fn say(log: &crate::log_file::LogFile, line: &str) {
+    write_line(log, &LogLine::now(Pipe::Stderr, format!("weft: {line}")));
+}
+
+fn write_line(log: &crate::log_file::LogFile, line: &LogLine) {
+    if let Err(e) = log.write_all(format!("{}\n", line.stamped()).as_bytes()) {
+        tracing::error!(target: "weft_runtime::unit_agent", error = %e, "could not write the process's log");
+    }
+}
+
+/// Copy what the process prints on `pipe` into `log`, one stamped line at
+/// a time, until the pipe closes: when the process and every program it
+/// started that kept the pipe are gone.
+fn stamp(from: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>, pipe: Pipe, log: std::sync::Arc<crate::log_file::LogFile>) {
+    use tokio::io::AsyncBufReadExt as _;
+    let Some(from) = from else { return };
+    tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(from);
+        let mut raw = Vec::new();
+        loop {
+            raw.clear();
+            match reader.read_until(b'\n', &mut raw).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let text = String::from_utf8_lossy(&raw);
+                    write_line(&log, &LogLine::now(pipe, text.trim_end_matches(['\n', '\r'])));
+                }
+            }
         }
-    }
-    String::from_utf8_lossy(&body).into_owned()
-}
-
-/// What a failing HTTP check's body says, so a container that knows why
-/// it is not ready can tell it: the string `error` field of a JSON body,
-/// else the body's text, trimmed and cut to [`SAID_MAX_CHARS`]. `None`
-/// when it says nothing.
-fn what_it_said(body: &str) -> Option<String> {
-    let error = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| value.get("error").and_then(serde_json::Value::as_str).map(str::to_owned));
-    let said = error.as_deref().unwrap_or(body).trim();
-    if said.is_empty() {
-        return None;
-    }
-    Some(said.chars().take(SAID_MAX_CHARS).collect())
+    });
 }
 
 /// Give every file under `paths` to group `gid`, readable and writable by
@@ -456,59 +650,6 @@ pub async fn host() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn a_tcp_check_passes_on_a_listening_port_and_fails_on_a_closed_one() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        assert!(run_probe(&ProbeKind::Tcp { port }, Duration::from_secs(1)).await.ok);
-        drop(listener);
-        let answer = run_probe(&ProbeKind::Tcp { port }, Duration::from_secs(1)).await;
-        assert!(!answer.ok);
-        assert!(answer.why.unwrap().contains(&port.to_string()));
-    }
-
-    #[tokio::test]
-    async fn an_http_check_reads_the_status() {
-        let app = Router::new()
-            .route("/ok", axum::routing::get(|| async { "fine" }))
-            .route("/down", axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }))
-            .route(
-                "/broken",
-                axum::routing::get(|| async { (axum::http::StatusCode::SERVICE_UNAVAILABLE, r#"{"error": "no extension"}"#) }),
-            )
-            .route("/long", axum::routing::get(|| async { (axum::http::StatusCode::SERVICE_UNAVAILABLE, "x".repeat(1 << 20)) }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        assert!(run_probe(&ProbeKind::Http { path: "/ok".into(), port }, Duration::from_secs(2)).await.ok);
-        let down = run_probe(&ProbeKind::Http { path: "/down".into(), port }, Duration::from_secs(2)).await;
-        assert_eq!(down.why.as_deref(), Some(format!("GET /down on {port} answered 503").as_str()));
-        let broken = run_probe(&ProbeKind::Http { path: "/broken".into(), port }, Duration::from_secs(2)).await;
-        assert_eq!(broken.why.as_deref(), Some(format!("GET /broken on {port} answered 503: no extension").as_str()));
-        let long = run_probe(&ProbeKind::Http { path: "/long".into(), port }, Duration::from_secs(2)).await;
-        assert_eq!(long.why, Some(format!("GET /long on {port} answered 503: {}", "x".repeat(SAID_MAX_CHARS))));
-    }
-
-    /// A failing check's body is told by its JSON `error`, else by its
-    /// trimmed text, cut on a character boundary, and not at all when
-    /// it is empty.
-    #[test]
-    fn a_failing_check_tells_what_its_body_said() {
-        assert_eq!(
-            what_it_said(r#"{"error": "the database could not create the extension 'foo'", "ready": false}"#).as_deref(),
-            Some("the database could not create the extension 'foo'")
-        );
-        assert_eq!(what_it_said("  still warming up\n").as_deref(), Some("still warming up"));
-        assert_eq!(what_it_said(r#"{"ready": false}"#).as_deref(), Some(r#"{"ready": false}"#));
-        assert_eq!(what_it_said(""), None);
-        assert_eq!(what_it_said(" \n "), None);
-        assert_eq!(what_it_said(r#"{"error": "  "}"#), None);
-        let long = "é".repeat(400);
-        let cut = what_it_said(&long).unwrap();
-        assert_eq!(cut.chars().count(), SAID_MAX_CHARS);
-        assert!(long.starts_with(&cut));
-    }
-
     /// A restart changes what a look compares once, when the container
     /// stops, and not again while it runs back as it was; a new stop does.
     #[test]
@@ -529,6 +670,208 @@ mod tests {
         assert_ne!(before, restarted);
         assert_eq!(restarted, Host::stands(&seen(UnitRunState::Ready, Some(100))), "the same restart is not told again");
         assert_ne!(restarted, Host::stands(&seen(UnitRunState::Ready, Some(160))), "a new stop is");
+    }
+
+    /// The wait before a restart doubles from a tenth of a second while
+    /// the process keeps exiting soon after it starts, stops at a minute,
+    /// and starts over once it ran ten seconds.
+    #[test]
+    fn a_process_that_keeps_exiting_waits_longer_each_time() {
+        let quick = Duration::from_secs(1);
+        assert_eq!(restart_delay(None, quick), Duration::from_millis(100));
+        assert_eq!(restart_delay(Some(Duration::from_millis(100)), quick), Duration::from_millis(200));
+        assert_eq!(restart_delay(Some(Duration::from_secs(40)), quick), Duration::from_secs(60));
+        assert_eq!(restart_delay(Some(Duration::from_secs(60)), quick), Duration::from_secs(60));
+        assert_eq!(restart_delay(Some(Duration::from_secs(60)), Duration::from_secs(10)), Duration::from_millis(100));
+    }
+
+    /// The agent runs its process, stamps what it prints into the log,
+    /// keeps how it exited, starts it again, and on a stop passes the stop
+    /// on and ends. Against a real `sh`, which every machine weft runs on
+    /// has.
+    #[tokio::test]
+    async fn the_agent_runs_its_process_again_and_stops_when_told() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, log) = (dir.path().join("agent.json"), dir.path().join("process.log"));
+        let command: Vec<String> = ["sh", "-c", "echo out; echo err >&2; exit 3"].map(String::from).to_vec();
+        let agent = tokio::spawn({
+            let (state, log) = (state.clone(), log.clone());
+            async move { process(&state, &log, None, &command).await }
+        });
+        let restarted = async {
+            loop {
+                if ProcessAgentState::read(&state).unwrap().is_some_and(|s| s.restarts >= 2) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), restarted).await.expect("the process is started again");
+        let kept = ProcessAgentState::read(&state).unwrap().unwrap();
+        assert_eq!(kept.last_exit.map(|e| e.code), Some(3));
+        let lines: Vec<LogLine> = std::fs::read_to_string(&log).unwrap().lines().map(|l| LogLine::read_stamped(l).unwrap()).collect();
+        assert!(lines.iter().any(|l| l.pipe == Pipe::Stdout && l.text == "out"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.pipe == Pipe::Stderr && l.text == "err"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.text.starts_with("weft: the process exited with code 3; starting it again in")), "{lines:?}");
+        // SAFETY: kill(2) takes plain integers and touches no memory of ours.
+        unsafe { libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM) };
+        tokio::time::timeout(Duration::from_secs(10), agent).await.expect("the agent ends when told").unwrap().unwrap();
+    }
+
+    /// A need for `fakeprog`, which `script` installs under `root`.
+    fn fake_need(script: &str) -> weft_core::needs::Need {
+        weft_core::needs::Need {
+            name: "Fake".into(),
+            stage: weft_core::needs::NeedStage::Run,
+            check: vec!["fakeprog".into(), "--version".into()],
+            install: Default::default(),
+            how: None,
+            recipe: Some(weft_core::needs::Recipe {
+                folder: "tools/fake".into(),
+                script: [(weft_core::needs::Os::here().unwrap(), script.to_string())].into(),
+                bin: vec!["bin".into()],
+                prelude: String::new(),
+            }),
+        }
+    }
+
+    /// The agent waits for its state to satisfy `until`, then answers it.
+    async fn state_when(state: &Path, until: impl Fn(&ProcessAgentState) -> bool) -> ProcessAgentState {
+        let seen = async {
+            loop {
+                if let Some(kept) = ProcessAgentState::read(state).unwrap().filter(|s| until(s)) {
+                    break kept;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(10), seen).await {
+            Ok(kept) => kept,
+            Err(_) => panic!("the agent never got there; its state: {:?}", ProcessAgentState::read(state)),
+        }
+    }
+
+    /// A process whose need weft installs: the agent installs it into its
+    /// folder, says so in its log, and runs the process with the need's
+    /// programs on its PATH. One whose install fails never starts, the
+    /// failure kept in the agent's state until it is stopped.
+    #[tokio::test]
+    async fn the_agent_installs_what_its_process_needs_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, log, setup) = (dir.path().join("agent.json"), dir.path().join("process.log"), dir.path().join("setup.json"));
+        let script = "mkdir -p \"$WEFT_NEED_DIR/bin\"\nprintf '#!/bin/sh\\n[ \"$1\" = --version ] && exit 0\\necho from the installed program; exit 4\\n' > \"$WEFT_NEED_DIR/bin/fakeprog\"\nchmod +x \"$WEFT_NEED_DIR/bin/fakeprog\"";
+        let written = |need| std::fs::write(&setup, serde_json::to_vec(&ProcessSetup { root: dir.path().join("root"), needs: vec![need] }).unwrap()).unwrap();
+        written(fake_need(script));
+        let command: Vec<String> = vec!["fakeprog".into()];
+        let agent = tokio::spawn({
+            let (state, log, setup) = (state.clone(), log.clone(), setup.clone());
+            async move { process(&state, &log, Some(&setup), &command).await }
+        });
+        let kept = state_when(&state, |s| s.last_exit.is_some()).await;
+        assert_eq!(kept.last_exit.map(|e| e.code), Some(4), "the installed program ran");
+        assert_eq!(kept.setting_up, None);
+        let printed = std::fs::read_to_string(&log).unwrap();
+        assert!(printed.contains("weft: installing Fake (its log: "), "{printed}");
+        assert!(printed.contains("from the installed program"), "{printed}");
+        // SAFETY: kill(2) takes plain integers and touches no memory of ours.
+        unsafe { libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM) };
+        tokio::time::timeout(Duration::from_secs(10), agent).await.expect("the agent ends when told").unwrap().unwrap();
+
+        std::fs::remove_file(&state).unwrap();
+        let mut failing = fake_need("echo 'the mirror is down'; exit 2");
+        failing.recipe.as_mut().unwrap().folder = "tools/broken".into();
+        written(failing);
+        let command: Vec<String> = vec!["fakeprog".into()];
+        let agent = tokio::spawn({
+            let (state, log, setup) = (state.clone(), log.clone(), setup.clone());
+            async move { process(&state, &log, Some(&setup), &command).await }
+        });
+        let kept = state_when(&state, |s| s.setup_failed.is_some()).await;
+        let why = kept.setup_failed.unwrap();
+        assert!(why.starts_with("installing Fake into ") && why.contains("the mirror is down"), "{why}");
+        assert!(why.contains("then start the infra again"), "{why}");
+        assert_eq!((kept.running, kept.restarts), (None, 0), "never started");
+        // SAFETY: as above.
+        unsafe { libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM) };
+        tokio::time::timeout(Duration::from_secs(10), agent).await.expect("a failed setup ends when told").unwrap().unwrap();
+    }
+
+    /// Whether the process `pid` has ended: gone, or a zombie its parent
+    /// (this test process) has not reaped yet.
+    #[cfg(target_os = "linux")]
+    fn ended(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+            Err(_) => true,
+        }
+    }
+
+    /// An agent that goes away while its process runs (here its task is
+    /// dropped, as an error or a panic in it would) takes the process
+    /// with it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_process_ends_when_its_agent_lets_go_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, log) = (dir.path().join("agent.json"), dir.path().join("process.log"));
+        let command: Vec<String> = ["sleep", "300"].map(String::from).to_vec();
+        let agent = tokio::spawn({
+            let (state, log) = (state.clone(), log.clone());
+            async move { process(&state, &log, None, &command).await }
+        });
+        let running = async {
+            loop {
+                if let Some(run) = ProcessAgentState::read(&state).unwrap().and_then(|s| s.running) {
+                    break run.pid;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let pid = tokio::time::timeout(Duration::from_secs(10), running).await.expect("the process starts");
+        agent.abort();
+        assert!(agent.await.unwrap_err().is_cancelled());
+        let gone = async {
+            while !ended(pid) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let ended_in_time = tokio::time::timeout(Duration::from_secs(10), gone).await.is_ok();
+        // SAFETY: kill(2) takes plain integers and touches no memory of ours.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        assert!(ended_in_time, "the process {pid} outlived its agent");
+    }
+
+    /// What an agent starts is killed by the kernel the moment the thread
+    /// that started it ends, which no code of the agent's has to run for:
+    /// the agent killed outright (`SIGKILL`) leaves nothing running.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_process_dies_with_what_started_it() {
+        let mut child = std::thread::spawn(|| {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("300");
+            dies_with_the_agent(&mut command);
+            command.spawn().unwrap()
+        })
+        .join()
+        .unwrap();
+        let asked = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if asked.elapsed() > Duration::from_secs(10) {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let Some(status) = status else {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("the process outlived the thread that started it");
+        };
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
     #[cfg(unix)]

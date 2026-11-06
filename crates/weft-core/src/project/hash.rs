@@ -203,12 +203,28 @@ pub fn compute_definition_hash(project: &ProjectDefinition) -> anyhow::Result<So
     // the stored hash with the real project id. If `id` were hashed, those two
     // would NEVER agree and the "out of sync / resync" light would be stuck on.
     // What does not compile (`broken`) follows from the nodes and wires
-    // (a placeholder, a port type), and its wording carries line numbers, so
-    // moving a broken line would otherwise read as a new program. A metadata
+    // (a placeholder, a port type) and from the kind of install it was
+    // compiled for (a node's rule may ask `local_install`, so the same
+    // program is broken on a cloud install and whole on a local one). Its
+    // wording carries line numbers, so moving a broken line would
+    // otherwise read as a new program. Leaving it out is still safe
+    // across kinds: each install keeps its own versions, compiled for its
+    // own kind, and a command comparing with one compiles for its kind,
+    // so one hash never names two broken sets within an install. A metadata
     // wire never runs: its value is already written into the input it
     // points at (`portLiterals`, hashed with the node), and the wire itself
     // is only drawn.
-    let ProjectDefinition { id: _, created_at: _, updated_at: _, broken: _, metadata_wires: _, nodes, edges, groups, defaults, given } =
+    // The install it was compiled for (`install`) is left out with
+    // `broken`, which it decides. What it changes in what runs is the
+    // rules recorded for the run (`crate::rules::undecided` folds them
+    // with it), and those are hashed on the nodes, so the hash already
+    // tells a program compiled for a local install from the same source
+    // compiled for a cloud one whenever a rule asks. Hashing the field
+    // too would only split programs whose rules ask nothing of it. Each
+    // install compiles its own versions, and a command comparing with an
+    // install compiles for that install's kind (`weft status`), so one
+    // hash never names programs compiled for two kinds within an install.
+    let ProjectDefinition { id: _, created_at: _, updated_at: _, broken: _, install: _, metadata_wires: _, nodes, edges, groups, defaults, given } =
         project;
     // The canonical JSON of what is left (every strip made, every object's
     // keys sorted: `defaults`, `edges`, `given`, `groups`, `nodes`, each

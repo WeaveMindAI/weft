@@ -1,0 +1,296 @@
+{
+  "type": "MistralVibe",
+  "label": "Mistral Vibe",
+  "description": "One conversation with Mistral Vibe, Mistral AI's coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, Mistral Vibe runs on your machine (a local install only) with your own login, working in `folder`, from your own install of `vibe-app-server` when there is one on PATH; when there is none, weft installs Mistral Vibe itself, once, into a folder of its own shared by every program on the machine. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs, and it logs in with the connection on `access`. Its model sees your program's tools under their own names. A program tool named `ask_user_question`, `todo`, `cron` or `unified_harness_scratchpad` takes the place of Mistral Vibe's own tool of that name, which is turned off for the conversation; Mistral Vibe keeps `bash`, `read_file`, `write_file`, `edit`, `run_typescript`, `search_tool_functions`, `wait` and `skill` for itself, so a program tool with one of those names is refused. With a connection, `folder` is trusted in its own home, so its `AGENTS.md` and `.vibe/` are read. Its card shows what it is doing and a Start over button. What is exposed: the permission mode, the model, the effort, extra folders and the most model calls a turn makes.",
+  "tags": [
+    "agent",
+    "coding",
+    "vibe",
+    "mistral",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run Mistral Vibe in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[mistral_vibe]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A MistralVibeAccess's `access`: a Mistral API key. Required with a `computer`. Left out on your machine, Mistral Vibe uses the login already on it."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder Mistral Vibe works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`vibe-app-server` on your PATH",
+      "description": "On your machine: the Mistral Vibe program to run, when it is not the `vibe-app-server` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "accept_edits",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What Mistral Vibe may do without asking. `ask`: every request it would put to a person comes out of AskAgent as a question. `accept_edits`: file edits go ahead, the rest asks. `bypass`: nothing asks, nothing is refused; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "Vibe's default",
+      "description": "The model to use, as its `config.toml` names it. Left out, Vibe's default."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "off",
+          "low",
+          "medium",
+          "high",
+          "max"
+        ]
+      },
+      "label": "Effort",
+      "description": "How much the model thinks before it answers. Left out, the model's default."
+    },
+    {
+      "name": "addDirs",
+      "type": "List[String]",
+      "label": "Extra folders",
+      "description": "Folders besides `folder` Mistral Vibe may read and change."
+    },
+    {
+      "name": "maxTurns",
+      "type": "Number",
+      "label": "Most model calls",
+      "placeholder": "a number",
+      "description": "A whole number: the most model calls one turn may make. Left out, Vibe's default."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MistralVibe '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MistralVibe '{id}' runs in a computer, where no login is waiting for it; give it a MistralVibeAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MistralVibe '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "accept_edits",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MistralVibe '{id}' has a `permission` it does not know; pick one of ask, accept_edits, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MistralVibe '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "MistralVibe '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs Mistral Vibe itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "bash",
+      "edit",
+      "read_file",
+      "run_typescript",
+      "search_tool_functions",
+      "skill",
+      "wait",
+      "write_file"
+    ]
+  }
+}

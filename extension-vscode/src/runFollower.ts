@@ -165,8 +165,10 @@ export type DispatcherEvent = { eventId: string } & (
   // only the `totals` rollup.
   // SYNC: DispatcherEvent 'bus_window' messages <-> crates/weft-core/src/bus.rs WindowedBusMessage, packages/weft-graph/src/protocol.ts BusInspectorEvent 'message'
   // SYNC: DispatcherEvent 'bus_window' totals <-> crates/weft-core/src/bus.rs BusWindowTotal, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window' totals
+  // SYNC: DispatcherEvent 'bus_joined' <-> crates/weft-journal/src/events.rs BusJoined, crates/weft-core/src/live_event.rs BusJoined, packages/weft-graph/src/protocol.ts BusInspectorEvent 'joined'
   | { kind: 'bus_joined'; runId: string; projectId: string; busId: string; offset: number; name: string; atUnix: number }
-  | { kind: 'bus_left'; runId: string; projectId: string; busId: string; offset: number; name: string; atUnix: number }
+  // SYNC: DispatcherEvent 'bus_left' <-> crates/weft-journal/src/events.rs BusLeft, crates/weft-core/src/live_event.rs BusLeft, packages/weft-graph/src/protocol.ts BusInspectorEvent 'left'
+  | { kind: 'bus_left'; runId: string; projectId: string; busId: string; offset: number; name: string; end: StreamEnd; atUnix: number }
   // SYNC: DispatcherEvent 'bus_window' <-> crates/weft-journal/src/events.rs BusWindow, crates/weft-core/src/live_event.rs BusWindow, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window'
   | { kind: 'bus_window'; runId: string; projectId: string; busId: string; firstOffset: number; lastOffset: number; messages: Array<{ offset: number; from: string; msgKind: string; payload?: WirePayload; payloadByteSize: number; trimmed?: boolean; atUnix: number }>; totals: Array<{ from: string; msgKind: string; count: number; bytes: number }>; atUnix: number }
   // SYNC: DispatcherEvent 'bus_closed' <-> crates/weft-journal/src/events.rs BusClosed, crates/weft-core/src/live_event.rs BusClosed, packages/weft-graph/src/protocol.ts BusInspectorEvent 'closed'
@@ -648,7 +650,7 @@ export class RunFollower implements vscode.Disposable {
       case 'bus_left':
         this.post({
           kind: 'busEvent',
-          event: { kind: 'left', busId: e.busId, offset: e.offset, name: e.name, atUnix: e.atUnix },
+          event: { kind: 'left', busId: e.busId, offset: e.offset, name: e.name, end: e.end, atUnix: e.atUnix },
         });
         break;
       case 'bus_window':

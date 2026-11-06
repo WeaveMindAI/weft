@@ -8,6 +8,10 @@
 //! - `runner`: a project's workers, one process per project and program.
 //! - `registry`: the worker processes each life of the runtime started.
 //! - `infra_host`: infra units, each a group of containers.
+//! - `process_units`: infra units that run one process on the machine,
+//!   each under an agent of its own; `machine_host` routes a local
+//!   install's units to the one of the two that runs them.
+//! - `probe`: one network check of a unit's port.
 //! - `infra_names`: what those containers and their volumes are called,
 //!   and what happens to a disk named before the names carried the install
 //!   (`disk_claims`: which install a person said takes one).
@@ -36,8 +40,11 @@ pub mod infra_host;
 pub mod infra_names;
 pub mod lanes;
 pub mod layout;
+pub mod machine_host;
 pub mod needs;
 pub mod news;
+pub mod probe;
+pub mod process_units;
 pub mod processes;
 pub mod registry;
 pub mod runner;
@@ -52,6 +59,8 @@ pub use host_build::MachineToolchain;
 pub use images::{bound_build_cache, LocalImageBuilder};
 pub use layout::{InstallLayout, MachineLayout};
 pub use needs::LocalNeeds;
+pub use machine_host::MachineInfraHost;
+pub use process_units::{ProcessUnits, ProcessUnitsConfig};
 pub use processes::MachineProcesses;
 pub use infra_host::{AgentBroker, AgentIdentity, DiskBacking, GpuAccess, LocalInfraHost, LocalInfraHostConfig, Publish};
 pub use news::DatabaseNews;

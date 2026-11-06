@@ -1,0 +1,275 @@
+{
+  "type": "DeepSeekHarness",
+  "label": "DeepSeek Harness",
+  "description": "One conversation with DeepSeek Harness, DeepSeek's coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, DeepSeek Harness runs on your machine (a local install only) with your own login, working in `folder`. If `dsh` is missing, weft installs it into a folder of its own, shared by the whole machine, before the node runs. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs, and it logs in with the connection on `access`. It does not ask before each action: it runs every command in a sandbox the permission setting picks, and asks only when the model wants a command to run outside it. A conversation keeps the permission setting it started with: change it, and the next turn is refused until you set it back or start over from the card. Your program's tools reach the model under their own names. One named like a DeepSeek Harness tool takes that one tool's place and leaves the rest as they are (a program `read` replaces `read`, and `write`, `edit` and `read_image` stay); `run_code` is DeepSeek Harness's own, so a program tool with that name is refused. Its card shows what it is doing and a Start over button. What is exposed: the permission setting, the model and the effort.",
+  "tags": [
+    "agent",
+    "coding",
+    "deepseek",
+    "deepseek-ai",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run DeepSeek Harness in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[deep_seek_harness]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A DeepSeekHarnessAccess's `access`: a DeepSeek API key. Required with a `computer`. Left out on your machine, DeepSeek Harness uses the login already on it."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder DeepSeek Harness works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`dsh` on your PATH",
+      "description": "On your machine: the DeepSeek Harness program to run, when it is not the `dsh` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "read_only",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What DeepSeek Harness may do without asking. `ask`: commands run in a sandbox that may change `folder`, and one that wants out comes out of AskAgent as a question. `read_only`: commands run in a sandbox that changes nothing. `bypass`: commands run with no sandbox; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "deepseek-official/deepseek-v4-flash",
+      "description": "`<route>/<model>`, as its model list names them (`deepseek-official/deepseek-v4-flash`). Left out, its own default."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "off",
+          "low",
+          "high",
+          "max"
+        ]
+      },
+      "label": "Effort",
+      "description": "How much it thinks, on a model that offers it. Left out, the model's default."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "DeepSeekHarness '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "DeepSeekHarness '{id}' runs in a computer, where no login is waiting for it; give it a DeepSeekHarnessAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "DeepSeekHarness '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "read_only",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "DeepSeekHarness '{id}' has a `permission` it does not know; pick one of ask, read_only, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "DeepSeekHarness '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "DeepSeekHarness '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs DeepSeek Harness itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "run_code"
+    ]
+  }
+}

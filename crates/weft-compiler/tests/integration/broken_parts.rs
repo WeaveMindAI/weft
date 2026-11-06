@@ -187,16 +187,16 @@ fn a_broken_part_is_named_the_same_through_a_symlinked_root() {
     let catalog = catalog();
     let compiled: Vec<_> = [&real, &linked]
         .into_iter()
-        .map(|root| weft_compiler::compile_program(&main, uuid::Uuid::nil(), CompileFs::disk(root), &catalog).expect("compiles"))
+        .map(|root| weft_compiler::compile_program_with_contents(&main, uuid::Uuid::nil(), CompileFs::disk(root), &catalog, None).expect("compiles"))
         .collect();
-    let own = compiled[0].broken.iter().find(|part| part.parts == ["draft"]).expect("the file's errors, pinned to its site");
+    let own = compiled[0].definition.broken.iter().find(|part| part.parts == ["draft"]).expect("the file's errors, pinned to its site");
     assert!(own.why.starts_with("lib/draft.weft:"), "{}", own.why);
     let place = dir.path().to_string_lossy().into_owned();
-    assert!(compiled.iter().flat_map(|p| &p.broken).all(|part| !part.why.contains(&place)), "{:?}", compiled[0].broken);
-    assert_eq!(compiled[0].broken, compiled[1].broken);
+    assert!(compiled.iter().flat_map(|p| &p.definition.broken).all(|part| !part.why.contains(&place)), "{:?}", compiled[0].definition.broken);
+    assert_eq!(compiled[0].definition.broken, compiled[1].definition.broken);
     for program in &compiled {
         for root in [&real, &linked] {
-            let left = weft_compiler::unsettled(program, &Default::default(), &catalog, CompileFs::disk(root));
+            let left = weft_compiler::unsettled(program, &catalog, CompileFs::disk(root));
             assert!(left.is_empty(), "{root:?}: {left:?}");
         }
     }
@@ -226,15 +226,15 @@ fn the_gate_places_findings_through_the_reader_that_compiled() {
     let reader = weft_compiler::MapFileReader::new([(root.join("lib/looped.weft"), LOOPED.to_string())].into());
     let fs = CompileFs::with_reader(&reader, Some(root));
     let catalog = catalog();
-    let program = weft_compiler::compile_program(main, uuid::Uuid::nil(), fs, &catalog).expect("compiles");
+    let program = weft_compiler::compile_program_with_contents(main, uuid::Uuid::nil(), fs, &catalog, None).expect("compiles");
     assert!(
-        program.broken.iter().any(|part| part.why.starts_with("lib/looped.weft:") && part.why.contains("inside a Loop")),
+        program.definition.broken.iter().any(|part| part.why.starts_with("lib/looped.weft:") && part.why.contains("inside a Loop")),
         "{:?}",
-        program.broken
+        program.definition.broken
     );
-    let left = weft_compiler::unsettled(&program, &Default::default(), &catalog, fs);
+    let left = weft_compiler::unsettled(&program, &catalog, fs);
     assert!(left.is_empty(), "{left:?}");
-    assert!(!weft_compiler::unsettled(&program, &Default::default(), &catalog, CompileFs::disk(root)).is_empty());
+    assert!(!weft_compiler::unsettled(&program, &catalog, CompileFs::disk(root)).is_empty());
 }
 
 /// A finding about one place of a file included twice breaks that place

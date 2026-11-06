@@ -284,24 +284,26 @@ impl SourceTree for VersionFiles {
     }
 }
 
-/// Compile the materialized project: the definition, the value of each
-/// file content it names (`weft_core::content`), its catalog, and the
-/// project handle the plan reads. Blocking, every file read through
+/// Compile the materialized project: the definition with the value of
+/// each file content it names (`weft_core::content`) and the install it
+/// was compiled for, its catalog, and the project handle the plan reads. Blocking, every file read through
 /// `files` (the `weft.toml` from `root`, where [`materialize`] laid it
 /// out). What does not compile stays in the definition as its broken parts
 /// (`weft_compiler::compile_program`): the version registers, and a run
 /// that needs one is refused when it is cut. A failure of the program as a
 /// whole renders every diagnostic, one per line, the way the CLI prints its
-/// own.
+/// own. Compiled for `install`, the install building it, so a node's rule
+/// asking which kind of install it is (`local_install`) is answered.
 pub fn compile(
     root: &Path,
     files: Arc<VersionFiles>,
-) -> Result<(weft_core::ProjectDefinition, weft_core::content::ContentValues, weft_catalog::FsCatalog, weft_compiler::project::Project)> {
+    install: weft_core::install::InstallKind,
+) -> Result<(weft_compiler::Compiled, weft_catalog::FsCatalog, weft_compiler::project::Project)> {
     let project = weft_compiler::project::Project::load(root).map_err(|e| anyhow!("{e}"))?;
-    let (definition, catalog, contents) = weft_compiler::hash::load_program_in(&project, files)
+    let (compiled, catalog) = weft_compiler::hash::load_program_in(&project, files, Some(install))
         // SYNC: "compile failed:" <-> crates/weft-cli/src/commands/ensure.rs compile_failure
         .map_err(|e| anyhow!("compile failed:\n{e}"))?;
-    Ok((definition, contents, catalog, project))
+    Ok((compiled, catalog, project))
 }
 
 #[cfg(test)]

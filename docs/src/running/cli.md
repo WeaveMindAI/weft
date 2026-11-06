@@ -225,10 +225,14 @@ it through `weft::error::need_missing`.
 apt-get install -y python3`, `brew install python`), runs it once you say
 yes, then checks again and tells you what is still missing. It installs only
 what the machine lacks, with apt (Debian, Ubuntu), dnf (Fedora, RHEL,
-CentOS, Rocky, AlmaLinux), apk (Alpine) or Homebrew (macOS). When a node
-names no package for your system, `weft deps-install` says so, and you
-install that one by hand. On a system none of those four serves, it installs
-nothing, and you install everything by hand.
+CentOS, Rocky, AlmaLinux), apk (Alpine) or Homebrew (macOS). If a need is
+one weft installs itself (it has a
+[recipe](../nodes/infrastructure.md#needs-weft-installs-itself), like the
+coding agents), `weft deps-install` then runs that recipe too, into the same
+folder an infra start would use, without `sudo`. When a node names neither a
+package for your system nor a recipe, `weft deps-install` says so, and you
+install that one by hand. On a system none of those four package managers
+serves, it installs no package, and you install those by hand.
 
 If `weft deps-install` says that what it installed is still missing, it is
 not on the `PATH` of the shell you ran it from: put it there, then run
@@ -240,7 +244,7 @@ holds, go and read [the worker](architecture.md#the-worker).
 
 | Command | What it does |
 |---|---|
-| `weft deps-install` | Installs what the nodes of the program in this folder need and the machine lacks. A node type the program does not use is never asked about |
+| `weft deps-install` | Installs what the nodes of the program in this folder need and the machine lacks, and what the processes its infra runs on this machine need, once that infra has been applied here. A node type the program does not use is never asked about. A need weft installs itself (an infra process's need with a recipe) is installed into weft's own folder, the way starting the infra installs it ([needs weft installs itself](../nodes/infrastructure.md#needs-weft-installs-itself)) |
 | `weft deps-install <NodeType>...` | The same for those node types, whether the program uses them or not |
 | `weft deps-install --all` | The same for every node type of the project's catalog |
 
@@ -366,6 +370,7 @@ naming those flags.
 | `weft connect --instance <id>` | Act inside that instance of the program on an access node whose connection is `@instance_filled`: `--list`, `--grant`, `--disconnect` and connecting a new account all work on its connections and its value, exactly as its settings page would |
 | `weft instance-values --instance <id>` | Lists what the program asks that instance to fill and what it was given; `--set node.field=value` and `--clear node.field` (both repeatable) change it in one go, re-arming its live triggers that read a changed value |
 | `weft connect --door shared\|own` | Which door to connect through, without being asked |
+| `weft connect --way <id>` | Which way to sign in, for a service whose key is pasted and that offers more than one (a subscription's token or an API key). Without it, `weft connect` asks; with no terminal to ask on, the error lists the ids. A way kept to local installs is refused on a cloud install |
 | `weft connect --set NAME=VALUE` | Fill a credential field. The value is visible to other processes, so prefer the prompt or `--set-env NAME=ENV_VAR` |
 | `weft connect --label <name>` | Name the new connection, so two of one service read apart in the list. Without it the connection is named after the service, or after the app it signs in through |
 | `weft token mint` | Mint a signal token. `--name`, `--projects`, `--tags`, `--display <node>`, `--displays`, and `--expires <duration>` (`30m`, `12h`, `7d`; without it the token works until revoked). Printed once and never again. `--operator` mints an operator key instead, which administers the whole install and takes no scope |

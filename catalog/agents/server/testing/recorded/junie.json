@@ -1,0 +1,2124 @@
+{
+ "kind": "junie",
+ "command": "junie",
+ "source": "agents/junie.transcript.jsonl (research): permission turn lines 49-61, ask turn lines 33-39, session/load answer line 68 and its replay lines 65-67 (before) and 73-74 (after). The rest was recorded for this adapter against Junie 26.11.3 with a scripted fake LiteLLM model (scratchpad junie/tools/fake.py, junie/rec/): initialize and session/new (with brave_mode) and the tool turn from rec/http.jsonl (the program's tool over an HTTP MCP server, the filter picking it, permission Yes; the reply's number replaced by $TOOL, and the completed update's text, which Junie fills with a one-sentence summary its model writes rather than the tool's output, replaced by a summary of the same kind since the fake model wrote `x`), set_config_option from rec/safe.jsonl, ask_other from rec/ask_custom.jsonl (two questions, the first answered in its `_custom` field), reject from rec/dirs_off.jsonl (a file creation refused with No; the turn goes on), bad key from rec/anth.jsonl (a real Anthropic call with a fake key: the turn ends cancelled with no reply). Composed: hello (the tool turn's title and final answer chunk with its text changed). Each turn's `available_commands_update` and `config_option_update` notifications are left out (weft reads neither); Junie's own `_auth/status_update` notifications are kept. initialize, session/new (models cut to the first four of the first group) and set_config_option were recorded again for real against Junie 26.11.3 on a Junie token, through weft's agent server (`--model gemini-3.6-flash`, its answer's model currentValue `v1:12:jetbrains-ai:gemini-3.6-flash`); the token's account had no JetBrains AI subscription, so the real prompt ended `cancelled` with 0 tokens and its log said 403 NO_LICENSE, and no real turn could be recorded.",
+ "answers": {
+  "initialize": {
+   "protocolVersion": 1,
+   "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {
+     "audio": false,
+     "image": true,
+     "embeddedContext": true
+    },
+    "mcpCapabilities": {
+     "http": true,
+     "sse": true
+    },
+    "sessionCapabilities": {
+     "fork": {},
+     "list": {},
+     "resume": {},
+     "delete": {},
+     "close": {},
+     "additionalDirectories": {}
+    },
+    "auth": {
+     "logout": {}
+    },
+    "providers": {},
+    "_meta": {
+     "authStatus": {}
+    }
+   },
+   "authMethods": [
+    {
+     "type": "agent",
+     "id": "jetbrains-account",
+     "name": "Junie Account",
+     "description": "Log in via Junie Account in a browser."
+    }
+   ],
+   "agentInfo": {
+    "name": "@jetbrains/junie",
+    "version": "26.11.3 (3959.5)",
+    "title": "Junie"
+   },
+   "_meta": {
+    "requiredPlugins": [],
+    "steering": {
+     "supported": true
+    },
+    "goal": {
+     "version": 1,
+     "controlMethod": "_session/goal",
+     "actions": [
+      "clear"
+     ]
+    },
+    "jetbrains": {
+     "air": {
+      "version": 1,
+      "capabilities": [
+       "nativeSubagentSessions",
+       "agentFileChangeReport",
+       "planFile",
+       "customInstructions",
+       "unattendedInteraction"
+      ],
+      "goal": {
+       "version": 1,
+       "controlMethod": "_session/goal",
+       "actions": [
+        "clear"
+       ]
+      }
+     }
+    }
+   }
+  },
+  "session/new": {
+   "sessionId": "$SESSION",
+   "configOptions": [
+    {
+     "type": "select",
+     "id": "mode",
+     "name": "Mode",
+     "description": "How Junie approaches your request: Default: Junie plans and implements as needed; Plan: Junie prepares a plan and waits for your approval before implementing; Goal: Junie works autonomously toward a configured goal",
+     "currentValue": "default",
+     "options": [
+      {
+       "value": "default",
+       "name": "Default",
+       "description": "Junie plans and implements as needed"
+      },
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Junie prepares a plan and waits for your approval before implementing"
+      },
+      {
+       "value": "goal",
+       "name": "Goal",
+       "description": "Junie works autonomously toward a configured goal"
+      }
+     ]
+    },
+    {
+     "type": "select",
+     "id": "model",
+     "name": "Model",
+     "description": "Select the model Junie uses for responses",
+     "category": "model",
+     "currentValue": "v1:12:jetbrains-ai:gemini-3.6-flash",
+     "options": [
+      {
+       "group": "jetbrains-ai",
+       "name": "JetBrains AI",
+       "options": [
+        {
+         "value": "v1:12:jetbrains-ai:gemini-3.7-flash",
+         "name": "Gemini 3.7 Flash",
+         "description": "",
+         "_meta": {
+          "jetbrains": {
+           "air": {
+            "version": 1,
+            "badge": {
+             "text": "70% off",
+             "color": "green_secondary"
+            }
+           }
+          }
+         }
+        },
+        {
+         "value": "v1:12:jetbrains-ai:claude-fable-5-1",
+         "name": "Claude Fable 5.1",
+         "description": "",
+         "_meta": {
+          "jetbrains": {
+           "air": {
+            "version": 1,
+            "eco": "toggle"
+           }
+          }
+         }
+        },
+        {
+         "value": "v1:12:jetbrains-ai:claude-opus-5-5",
+         "name": "Claude Opus 5.5",
+         "description": "",
+         "_meta": {
+          "jetbrains": {
+           "air": {
+            "version": 1,
+            "eco": "toggle"
+           }
+          }
+         }
+        },
+        {
+         "value": "v1:12:jetbrains-ai:claude-opus-5",
+         "name": "Claude Opus 5",
+         "description": "",
+         "_meta": {
+          "jetbrains": {
+           "air": {
+            "version": 1,
+            "eco": "toggle"
+           }
+          }
+         }
+        }
+       ]
+      }
+     ],
+     "_meta": {
+      "jetbrains": {
+       "air": {
+        "version": 1,
+        "recommendedValue": "v1:12:jetbrains-ai:gemini-3.7-flash"
+       }
+      }
+     }
+    },
+    {
+     "type": "select",
+     "id": "effort",
+     "name": "Effort",
+     "description": "Select how much reasoning effort Junie spends for the selected model",
+     "category": "thought_level",
+     "currentValue": "high",
+     "options": [
+      {
+       "value": "minimal",
+       "name": "◌ Minimal effort"
+      },
+      {
+       "value": "low",
+       "name": "◎ Low effort"
+      },
+      {
+       "value": "medium",
+       "name": "◐ Medium effort"
+      },
+      {
+       "value": "high",
+       "name": "◕ High effort"
+      }
+     ],
+     "_meta": {
+      "jetbrains": {
+       "air": {
+        "version": 1,
+        "recommendedValue": "high"
+       }
+      }
+     }
+    },
+    {
+     "type": "select",
+     "id": "brave_mode",
+     "name": "Brave Mode",
+     "description": "How Junie asks before running commands: Safe asks for everything, Auto auto-approves safe commands and asks for the rest, Brave runs everything without asking",
+     "category": "mode",
+     "currentValue": "brave-auto",
+     "options": [
+      {
+       "value": "brave-auto",
+       "name": "Auto"
+      },
+      {
+       "value": "on",
+       "name": "Brave"
+      },
+      {
+       "value": "off",
+       "name": "Safe"
+      }
+     ]
+    }
+   ]
+  },
+  "session/set_config_option": {
+   "configOptions": [
+    {
+     "type": "select",
+     "id": "mode",
+     "name": "Mode",
+     "description": "How Junie approaches your request: Default: Junie plans and implements as needed; Plan: Junie prepares a plan and waits for your approval before implementing; Goal: Junie works autonomously toward a configured goal",
+     "currentValue": "default",
+     "options": [
+      {
+       "value": "default",
+       "name": "Default",
+       "description": "Junie plans and implements as needed"
+      },
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Junie prepares a plan and waits for your approval before implementing"
+      },
+      {
+       "value": "goal",
+       "name": "Goal",
+       "description": "Junie works autonomously toward a configured goal"
+      }
+     ]
+    },
+    {
+     "type": "select",
+     "id": "model",
+     "name": "Model",
+     "description": "Select the model Junie uses for responses",
+     "category": "model",
+     "currentValue": "v1:12:jetbrains-ai:gemini-3.6-flash",
+     "options": [
+      {
+       "group": "jetbrains-ai",
+       "name": "JetBrains AI",
+       "options": [
+        {
+         "value": "v1:12:jetbrains-ai:gemini-3.7-flash",
+         "name": "Gemini 3.7 Flash",
+         "description": "",
+         "_meta": {
+          "jetbrains": {
+           "air": {
+            "version": 1,
+            "badge": {
+             "text": "70% off",
+             "color": "green_secondary"
+            }
+           }
+          }
+         }
+        },
+        {
+         "value": "v1:12:jetbrains-ai:claude-fable-5-1",
+         "name": "Claude Fable 5.1",
+         "description": "",
+         "_meta": {
+          "jetbrains": {
+           "air": {
+            "version": 1,
+            "eco": "toggle"
+           }
+          }
+         }
+        },
+        {
+         "value": "v1:12:jetbrains-ai:claude-opus-5-5",
+         "name": "Claude Opus 5.5",
+         "description": "",
+         "_meta": {
+          "jetbrains": {
+           "air": {
+            "version": 1,
+            "eco": "toggle"
+           }
+          }
+         }
+        },
+        {
+         "value": "v1:12:jetbrains-ai:claude-opus-5",
+         "name": "Claude Opus 5",
+         "description": "",
+         "_meta": {
+          "jetbrains": {
+           "air": {
+            "version": 1,
+            "eco": "toggle"
+           }
+          }
+         }
+        }
+       ]
+      }
+     ],
+     "_meta": {
+      "jetbrains": {
+       "air": {
+        "version": 1,
+        "recommendedValue": "v1:12:jetbrains-ai:gemini-3.7-flash"
+       }
+      }
+     }
+    },
+    {
+     "type": "select",
+     "id": "effort",
+     "name": "Effort",
+     "description": "Select how much reasoning effort Junie spends for the selected model",
+     "category": "thought_level",
+     "currentValue": "high",
+     "options": [
+      {
+       "value": "minimal",
+       "name": "◌ Minimal effort"
+      },
+      {
+       "value": "low",
+       "name": "◎ Low effort"
+      },
+      {
+       "value": "medium",
+       "name": "◐ Medium effort"
+      },
+      {
+       "value": "high",
+       "name": "◕ High effort"
+      }
+     ],
+     "_meta": {
+      "jetbrains": {
+       "air": {
+        "version": 1,
+        "recommendedValue": "high"
+       }
+      }
+     }
+    },
+    {
+     "type": "select",
+     "id": "brave_mode",
+     "name": "Brave Mode",
+     "description": "How Junie asks before running commands: Safe asks for everything, Auto auto-approves safe commands and asks for the rest, Brave runs everything without asking",
+     "category": "mode",
+     "currentValue": "brave-auto",
+     "options": [
+      {
+       "value": "brave-auto",
+       "name": "Auto"
+      },
+      {
+       "value": "on",
+       "name": "Brave"
+      },
+      {
+       "value": "off",
+       "name": "Safe"
+      }
+     ]
+    }
+   ]
+  },
+  "session/load": {
+   "configOptions": [
+    {
+     "type": "select",
+     "id": "mode",
+     "name": "Mode",
+     "description": "How Junie approaches your request: Default: Junie plans and implements as needed; Plan: Junie prepares a plan and waits for your approval before implementing",
+     "currentValue": "default",
+     "options": [
+      {
+       "value": "default",
+       "name": "Default",
+       "description": "Junie plans and implements as needed"
+      },
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Junie prepares a plan and waits for your approval before implementing"
+      }
+     ]
+    },
+    {
+     "type": "select",
+     "id": "model",
+     "name": "Model",
+     "description": "Select the model Junie uses for responses",
+     "category": "model",
+     "currentValue": "v1:12:byok:litellm:fake-model",
+     "options": [
+      {
+       "group": "byok:litellm",
+       "name": "LiteLLM",
+       "options": [
+        {
+         "value": "v1:12:byok:litellm:fake-model",
+         "name": "fake-model",
+         "description": "LiteLLM proxy → openai"
+        }
+       ]
+      }
+     ],
+     "_meta": {
+      "jetbrains": {
+       "air": {
+        "version": 1,
+        "recommendedValue": "v1:12:byok:litellm:fake-model"
+       }
+      }
+     }
+    },
+    {
+     "type": "select",
+     "id": "effort",
+     "name": "Effort",
+     "description": "Select how much reasoning effort Junie spends for the selected model",
+     "category": "thought_level",
+     "currentValue": "medium",
+     "options": [
+      {
+       "value": "low",
+       "name": "◎ Low effort"
+      },
+      {
+       "value": "medium",
+       "name": "◐ Medium effort"
+      },
+      {
+       "value": "high",
+       "name": "◕ High effort"
+      }
+     ],
+     "_meta": {
+      "jetbrains": {
+       "air": {
+        "version": 1,
+        "recommendedValue": "medium"
+       }
+      }
+     }
+    },
+    {
+     "type": "select",
+     "id": "brave_mode",
+     "name": "Brave Mode",
+     "description": "How Junie asks before running commands: Safe asks for everything, Auto auto-approves safe commands and asks for the rest, Brave runs everything without asking",
+     "category": "mode",
+     "currentValue": "brave-auto",
+     "options": [
+      {
+       "value": "brave-auto",
+       "name": "Auto"
+      },
+      {
+       "value": "on",
+       "name": "Brave"
+      },
+      {
+       "value": "off",
+       "name": "Safe"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "replay": {
+  "before": [
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "ask me"
+    },
+    "messageId": "prompt-261103-220512-778z"
+   },
+   {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "94d1988b-e30c-4dc1-a578-b15f5554e0c5",
+    "title": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+    "kind": "execute",
+    "status": "completed",
+    "content": [],
+    "locations": [],
+    "rawInput": {
+     "command": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+     "cwd": "/home/quent/agentdocs/probe/ws"
+    },
+    "rawOutput": {
+     "output": "",
+     "exitCode": 0
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "ok\n\n"
+    },
+    "messageId": "15629b4b-3700-409f-85cf-f86fdea08f7a",
+    "_meta": {
+     "codex": {
+      "phase": "final_answer"
+     },
+     "jetbrains": {
+      "air": {
+       "phase": "final_answer"
+      }
+     },
+     "junie": {
+      "version": 1,
+      "phase": "final_answer"
+     }
+    }
+   }
+  ],
+  "after": [
+   {
+    "sessionUpdate": "usage_update",
+    "used": 10,
+    "size": 128000
+   },
+   {
+    "sessionUpdate": "session_info_update",
+    "title": "done"
+   }
+  ]
+ },
+ "turns": {
+  "hello": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "title": "x"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Hello there.\n\n"
+      },
+      "messageId": "7d0edb1f-3c49-486e-891c-60c8d40a970f",
+      "_meta": {
+       "codex": {
+        "phase": "final_answer"
+       },
+       "jetbrains": {
+        "air": {
+         "phase": "final_answer"
+        }
+       },
+       "junie": {
+        "version": 1,
+        "phase": "final_answer"
+       }
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 60,
+       "outputTokens": 12,
+       "totalTokens": 72,
+       "cachedReadTokens": 0,
+       "cachedWriteTokens": 0
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "text",
+     "done"
+    ],
+    "reply": "Hello there.\n\n"
+   }
+  },
+  "permission": {
+   "steps": [
+    {
+     "send": {
+      "method": "_auth/status_update",
+      "params": {
+       "authStatus": {
+        "kind": "api_key",
+        "label": "LiteLLM",
+        "detail": "API key"
+       },
+       "sessionId": "$SESSION"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "title": "done"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "94d1988b-e30c-4dc1-a578-b15f5554e0c5",
+      "title": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+      "kind": "execute",
+      "status": "in_progress",
+      "content": [],
+      "locations": [],
+      "rawInput": {
+       "command": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+       "cwd": "/home/quent/agentdocs/probe/ws"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "94d1988b-e30c-4dc1-a578-b15f5554e0c5",
+      "title": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+      "kind": "execute",
+      "status": "in_progress",
+      "content": [],
+      "locations": [],
+      "rawInput": {
+       "command": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+       "cwd": "/home/quent/agentdocs/probe/ws"
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "94d1988b-e30c-4dc1-a578-b15f5554e0c5",
+        "title": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+        "kind": "execute",
+        "status": "pending",
+        "rawInput": {
+         "command": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+         "cwd": "/home/quent/agentdocs/probe/ws"
+        }
+       },
+       "options": [
+        {
+         "optionId": "Yes",
+         "name": "Yes",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "No",
+         "name": "No",
+         "kind": "reject_once"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "94d1988b-e30c-4dc1-a578-b15f5554e0c5",
+      "title": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+      "kind": "execute",
+      "status": "in_progress",
+      "content": [],
+      "locations": [],
+      "rawInput": {
+       "command": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+       "cwd": "/home/quent/agentdocs/probe/ws"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "94d1988b-e30c-4dc1-a578-b15f5554e0c5",
+      "title": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+      "kind": "execute",
+      "status": "in_progress",
+      "content": [],
+      "locations": [],
+      "rawInput": {
+       "command": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+       "cwd": "/home/quent/agentdocs/probe/ws"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "94d1988b-e30c-4dc1-a578-b15f5554e0c5",
+      "title": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+      "kind": "execute",
+      "status": "in_progress",
+      "content": [],
+      "locations": [],
+      "rawInput": {
+       "command": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+       "cwd": "/home/quent/agentdocs/probe/ws"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "94d1988b-e30c-4dc1-a578-b15f5554e0c5",
+      "title": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+      "kind": "execute",
+      "status": "completed",
+      "content": [],
+      "locations": [],
+      "rawInput": {
+       "command": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+       "cwd": "/home/quent/agentdocs/probe/ws"
+      },
+      "rawOutput": {
+       "output": "",
+       "exitCode": 0
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 10,
+      "size": 128000
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "promptSuggestions": {
+        "pending": true
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "ok\n\n"
+      },
+      "messageId": "15629b4b-3700-409f-85cf-f86fdea08f7a",
+      "_meta": {
+       "codex": {
+        "phase": "final_answer"
+       },
+       "jetbrains": {
+        "air": {
+         "phase": "final_answer"
+        }
+       },
+       "junie": {
+        "version": 1,
+        "phase": "final_answer"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "promptSuggestions": null
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 100,
+       "outputTokens": 20,
+       "totalTokens": 120,
+       "cachedReadTokens": 0,
+       "cachedWriteTokens": 0
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "ok\n\n",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "execute",
+        "title": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+        "detail": "rm -f made-by-fake.txt && curl -s https://example.com -o /dev/null",
+        "choices": [
+         {
+          "id": "Yes",
+          "kind": "allow_once"
+         },
+         {
+          "id": "No",
+          "kind": "reject"
+         }
+        ]
+       }
+      },
+      "answer": {
+       "choice": "Yes"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "Yes"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "tool": {
+   "tools": true,
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "title": "x"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "026ea304-f498-4828-8dd2-313192c1e936",
+      "title": "weft/lookup",
+      "kind": "other",
+      "status": "in_progress",
+      "content": [],
+      "locations": [],
+      "_meta": {
+       "is_mcp_tool_call": true
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "026ea304-f498-4828-8dd2-313192c1e936",
+      "title": "weft/lookup",
+      "kind": "other",
+      "status": "in_progress",
+      "content": [],
+      "locations": [],
+      "_meta": {
+       "is_mcp_tool_call": true
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "026ea304-f498-4828-8dd2-313192c1e936",
+        "title": "weft/lookup",
+        "status": "pending",
+        "_meta": {
+         "is_mcp_tool_call": true
+        }
+       },
+       "options": [
+        {
+         "optionId": "Yes",
+         "name": "Yes",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "No",
+         "name": "No",
+         "kind": "reject_once"
+        },
+        {
+         "optionId": "Always allow (\"weft:lookup\")",
+         "name": "Always allow (\"weft:lookup\")",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "Always allow (\"weft:*\")",
+         "name": "Always allow (\"weft:*\")",
+         "kind": "allow_always"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "tool": {
+      "name": "lookup",
+      "arguments": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "026ea304-f498-4828-8dd2-313192c1e936",
+      "title": "weft/lookup",
+      "kind": "other",
+      "status": "in_progress",
+      "content": [],
+      "locations": [],
+      "_meta": {
+       "is_mcp_tool_call": true
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "026ea304-f498-4828-8dd2-313192c1e936",
+      "title": "weft/lookup",
+      "kind": "other",
+      "status": "in_progress",
+      "content": [],
+      "locations": [],
+      "_meta": {
+       "is_mcp_tool_call": true
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "026ea304-f498-4828-8dd2-313192c1e936",
+      "title": "weft/lookup",
+      "kind": "other",
+      "status": "in_progress",
+      "content": [],
+      "locations": [],
+      "_meta": {
+       "is_mcp_tool_call": true
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "026ea304-f498-4828-8dd2-313192c1e936",
+      "title": "weft/lookup",
+      "kind": "other",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "The lookup tool returned the magic number."
+        }
+       }
+      ],
+      "locations": [],
+      "_meta": {
+       "is_mcp_tool_call": true
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 10,
+      "size": 128000
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "promptSuggestions": {
+        "pending": true
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "It is $TOOL.\n\n"
+      },
+      "messageId": "7d0edb1f-3c49-486e-891c-60c8d40a970f",
+      "_meta": {
+       "codex": {
+        "phase": "final_answer"
+       },
+       "jetbrains": {
+        "air": {
+         "phase": "final_answer"
+        }
+       },
+       "junie": {
+        "version": 1,
+        "phase": "final_answer"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "promptSuggestions": {
+        "pending": true
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "promptSuggestions": null
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 60,
+       "outputTokens": 12,
+       "totalTokens": 72,
+       "cachedReadTokens": 0,
+       "cachedWriteTokens": 0
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_call",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "It is 42.\n\n",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "title": "weft/lookup",
+        "choices": [
+         {
+          "id": "Yes",
+          "kind": "allow_once"
+         },
+         {
+          "id": "No",
+          "kind": "reject"
+         },
+         {
+          "id": "Always allow (\"weft:lookup\")",
+          "kind": "allow_always"
+         },
+         {
+          "id": "Always allow (\"weft:*\")",
+          "kind": "allow_always"
+         }
+        ]
+       }
+      },
+      "answer": {
+       "choice": "Always allow (\"weft:*\")"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "Always allow (\"weft:*\")"
+       }
+      }
+     },
+     {
+      "tool": "lookup",
+      "result": "42"
+     }
+    ]
+   }
+  },
+  "ask": {
+   "steps": [
+    {
+     "send": {
+      "method": "_auth/status_update",
+      "params": {
+       "authStatus": {
+        "kind": "api_key",
+        "label": "LiteLLM",
+        "detail": "API key"
+       },
+       "sessionId": "$SESSION"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "title": "done"
+     }
+    },
+    {
+     "ask": {
+      "method": "elicitation/create",
+      "params": {
+       "sessionId": "$SESSION",
+       "mode": "form",
+       "requestedSchema": {
+        "type": "object",
+        "title": "Questions",
+        "properties": {
+         "question_0": {
+          "type": "string",
+          "title": "Database",
+          "oneOf": [
+           {
+            "const": "Postgres",
+            "title": "Postgres",
+            "description": "relational"
+           },
+           {
+            "const": "SQLite",
+            "title": "SQLite",
+            "description": "file"
+           }
+          ]
+         },
+         "question_0_custom": {
+          "type": "string",
+          "title": "Other",
+          "description": "Or type your own answer instead of choosing an option above (optional).",
+          "_meta": {
+           "_askUserQuestionCustomAnswer": true,
+           "jetbrains": {
+            "air": {
+             "customAnswer": true
+            }
+           }
+          }
+         }
+        },
+        "required": []
+       },
+       "message": "Which database should I use?"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 10,
+      "size": 128000
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "promptSuggestions": {
+        "pending": true
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "ok\n\n"
+      },
+      "messageId": "c5ffeadc-2dfe-4553-81f8-4aca4d2d4a15",
+      "_meta": {
+       "codex": {
+        "phase": "final_answer"
+       },
+       "jetbrains": {
+        "air": {
+         "phase": "final_answer"
+        }
+       },
+       "junie": {
+        "version": 1,
+        "phase": "final_answer"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "promptSuggestions": null
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 50,
+       "outputTokens": 10,
+       "totalTokens": 60,
+       "cachedReadTokens": 0,
+       "cachedWriteTokens": 0
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "question",
+     "text",
+     "done"
+    ],
+    "reply": "ok\n\n",
+    "blocks": [
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "id": "question_0",
+         "header": "Database",
+         "question": "Which database should I use?",
+         "options": [
+          {
+           "label": "Postgres",
+           "description": "relational"
+          },
+          {
+           "label": "SQLite",
+           "description": "file"
+          }
+         ],
+         "multiSelect": false,
+         "allowOther": true
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "question_0": [
+         "Postgres"
+        ]
+       }
+      },
+      "agentGot": {
+       "action": "accept",
+       "content": {
+        "question_0": "Postgres"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "ask_other": {
+   "steps": [
+    {
+     "send": {
+      "method": "_auth/status_update",
+      "params": {
+       "authStatus": {
+        "kind": "api_key",
+        "label": "LiteLLM",
+        "detail": "API key"
+       },
+       "sessionId": "$SESSION"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "title": "x"
+     }
+    },
+    {
+     "ask": {
+      "method": "elicitation/create",
+      "params": {
+       "sessionId": "$SESSION",
+       "mode": "form",
+       "requestedSchema": {
+        "type": "object",
+        "title": "Questions",
+        "properties": {
+         "question_0": {
+          "type": "array",
+          "title": "Database",
+          "description": "Which databases should I use?",
+          "minItems": 0,
+          "items": {
+           "anyOf": [
+            {
+             "const": "Postgres",
+             "title": "Postgres",
+             "description": "relational"
+            },
+            {
+             "const": "SQLite",
+             "title": "SQLite",
+             "description": "file"
+            }
+           ]
+          }
+         },
+         "question_0_custom": {
+          "type": "string",
+          "title": "Other",
+          "description": "Or type your own answer instead of choosing an option above (optional).",
+          "_meta": {
+           "_askUserQuestionCustomAnswer": true,
+           "jetbrains": {
+            "air": {
+             "customAnswer": true
+            }
+           }
+          }
+         },
+         "question_1": {
+          "type": "string",
+          "title": "Color",
+          "description": "Which color?"
+         }
+        },
+        "required": []
+       },
+       "message": "Please answer the following questions."
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 10,
+      "size": 128000
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "promptSuggestions": {
+        "pending": true
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "ok\n\n"
+      },
+      "messageId": "6f3946c6-4918-4be8-a266-f9ccabf1e292",
+      "_meta": {
+       "codex": {
+        "phase": "final_answer"
+       },
+       "jetbrains": {
+        "air": {
+         "phase": "final_answer"
+        }
+       },
+       "junie": {
+        "version": 1,
+        "phase": "final_answer"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "promptSuggestions": null
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 50,
+       "outputTokens": 10,
+       "totalTokens": 60,
+       "cachedReadTokens": 0,
+       "cachedWriteTokens": 0
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "question",
+     "text",
+     "done"
+    ],
+    "reply": "ok\n\n",
+    "blocks": [
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "id": "question_0",
+         "header": "Database",
+         "question": "Which databases should I use?",
+         "multiSelect": true,
+         "allowOther": true
+        },
+        {
+         "id": "question_1",
+         "header": "Color",
+         "question": "Which color?",
+         "options": [],
+         "allowOther": true
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "question_0": [
+         "MySQL"
+        ],
+        "question_1": [
+         "blue"
+        ]
+       }
+      },
+      "agentGot": {
+       "action": "accept",
+       "content": {
+        "question_0_custom": "MySQL",
+        "question_1": "blue"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "reject": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "title": "x"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "b0cc7b62-ecb7-44d3-bc50-e52ea0ace7c3",
+      "title": "Create file",
+      "kind": "other",
+      "status": "in_progress",
+      "content": [],
+      "locations": []
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "b0cc7b62-ecb7-44d3-bc50-e52ea0ace7c3",
+      "title": "Create /tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/junie/extra/made.txt",
+      "kind": "edit",
+      "status": "in_progress",
+      "content": [
+       {
+        "type": "diff",
+        "path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/junie/extra/made.txt",
+        "newText": "hi"
+       }
+      ],
+      "locations": [
+       {
+        "path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/junie/extra/made.txt"
+       }
+      ]
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "b0cc7b62-ecb7-44d3-bc50-e52ea0ace7c3",
+        "title": "Allow changes in this file?",
+        "status": "pending"
+       },
+       "options": [
+        {
+         "optionId": "Yes",
+         "name": "Yes",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "No",
+         "name": "No",
+         "kind": "reject_once"
+        },
+        {
+         "optionId": "Always allow (\"/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/junie/extra/made.txt\")",
+         "name": "Always allow (\"/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/junie/extra/made.txt\")",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "Always allow (\"/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/junie/extra/*\")",
+         "name": "Always allow (\"/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/junie/extra/*\")",
+         "kind": "allow_always"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "b0cc7b62-ecb7-44d3-bc50-e52ea0ace7c3",
+      "title": "Create /tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/junie/extra/made.txt",
+      "kind": "edit",
+      "status": "failed",
+      "content": [
+       {
+        "type": "diff",
+        "path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/junie/extra/made.txt",
+        "newText": "hi"
+       }
+      ],
+      "locations": [
+       {
+        "path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/junie/extra/made.txt"
+       }
+      ]
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 10,
+      "size": 128000
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "promptSuggestions": {
+        "pending": true
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "ok\n\n"
+      },
+      "messageId": "645dfc17-3cf4-481a-befd-93c92e663be1",
+      "_meta": {
+       "codex": {
+        "phase": "final_answer"
+       },
+       "jetbrains": {
+        "air": {
+         "phase": "final_answer"
+        }
+       },
+       "junie": {
+        "version": 1,
+        "phase": "final_answer"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "promptSuggestions": null
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 50,
+       "outputTokens": 10,
+       "totalTokens": 60,
+       "cachedReadTokens": 0,
+       "cachedWriteTokens": 0
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "file_change",
+     "text",
+     "done"
+    ],
+    "reply": "ok\n\n",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "title": "Allow changes in this file?"
+       }
+      },
+      "answer": {
+       "choice": "No"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "No"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "bad key": {
+   "steps": [
+    {
+     "send": {
+      "method": "_auth/status_update",
+      "params": {
+       "authStatus": {
+        "kind": "api_key",
+        "label": "Anthropic",
+        "detail": "API key"
+       },
+       "sessionId": "$SESSION"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "cancelled",
+      "usage": {
+       "inputTokens": 0,
+       "outputTokens": 0,
+       "totalTokens": 0,
+       "cachedReadTokens": 0,
+       "cachedWriteTokens": 0
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "error"
+    ],
+    "status": "failed",
+    "error": "stopped the turn: cancelled"
+   }
+  }
+ },
+ "settings": [
+  {
+   "name": "ask",
+   "given": {
+    "permission": "ask"
+   },
+   "expect": {
+    "args": [
+     [
+      "--acp=true",
+      "--skip-update-check"
+     ]
+    ],
+    "unset": [
+     "JUNIE_LLM_PROVIDER",
+     "JUNIE_MODEL",
+     "JUNIE_EFFORT",
+     "JUNIE_SYSTEM_PROMPT"
+    ],
+    "requests": [
+     {
+      "method": "initialize",
+      "params": {
+       "clientCapabilities": {
+        "elicitation": {
+         "form": {}
+        }
+       }
+      }
+     },
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "mode",
+       "value": "default"
+      }
+     },
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "brave_mode",
+       "value": "off"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "auto",
+   "given": {
+    "permission": "auto"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "mode",
+       "value": "default"
+      }
+     },
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "brave_mode",
+       "value": "brave-auto"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "plan",
+   "given": {
+    "permission": "plan"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "mode",
+       "value": "plan"
+      }
+     },
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "brave_mode",
+       "value": "off"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "bypass",
+   "given": {
+    "permission": "bypass"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "mode",
+       "value": "default"
+      }
+     },
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "brave_mode",
+       "value": "on"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "model_and_options",
+   "given": {
+    "model": "gemini-3.6-flash",
+    "options": {
+     "effort": "high",
+     "appendSystemPrompt": "Be brief."
+    }
+   },
+   "expect": {
+    "args": [
+     [
+      "--model",
+      "gemini-3.6-flash"
+     ],
+     [
+      "--system-prompt",
+      "Be brief."
+     ]
+    ],
+    "requests": [
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "effort",
+       "value": "high"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "unoffered_model",
+   "given": {
+    "model": "junie-lite"
+   },
+   "expect": {
+    "error": "Junie does not offer the model 'junie-lite' on this login (it would run 'gemini-3.6-flash' in its place"
+   }
+  },
+  {
+   "name": "bad_effort",
+   "given": {
+    "options": {
+     "effort": "ultra"
+    }
+   },
+   "expect": {
+    "error": "takes none, minimal, low, medium, high, xhigh, max"
+   }
+  },
+  {
+   "name": "junieToken",
+   "given": {
+    "credentials": {
+     "way": "junieToken",
+     "values": {
+      "token": "secret-junieToken"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "JUNIE_API_KEY": "secret-junieToken",
+     "JUNIE_HOME": "$HOME"
+    },
+    "unset": [
+     "JUNIE_ANTHROPIC_API_KEY",
+     "JUNIE_OPENAI_API_KEY",
+     "JUNIE_GOOGLE_API_KEY",
+     "JUNIE_GROK_API_KEY",
+     "JUNIE_META_API_KEY",
+     "JUNIE_OPENROUTER_API_KEY",
+     "JUNIE_LITELLM_URL",
+     "JUNIE_LITELLM_API_KEY"
+    ]
+   }
+  },
+  {
+   "name": "anthropicKey",
+   "given": {
+    "credentials": {
+     "way": "anthropicKey",
+     "values": {
+      "key": "secret-anthropicKey"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "JUNIE_ANTHROPIC_API_KEY": "secret-anthropicKey",
+     "JUNIE_HOME": "$HOME"
+    },
+    "unset": [
+     "JUNIE_API_KEY",
+     "JUNIE_OPENAI_API_KEY",
+     "JUNIE_GOOGLE_API_KEY",
+     "JUNIE_GROK_API_KEY",
+     "JUNIE_META_API_KEY",
+     "JUNIE_OPENROUTER_API_KEY",
+     "JUNIE_LITELLM_URL",
+     "JUNIE_LITELLM_API_KEY"
+    ]
+   }
+  },
+  {
+   "name": "openaiKey",
+   "given": {
+    "credentials": {
+     "way": "openaiKey",
+     "values": {
+      "key": "secret-openaiKey"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "JUNIE_OPENAI_API_KEY": "secret-openaiKey",
+     "JUNIE_HOME": "$HOME"
+    },
+    "unset": [
+     "JUNIE_API_KEY",
+     "JUNIE_ANTHROPIC_API_KEY",
+     "JUNIE_GOOGLE_API_KEY",
+     "JUNIE_GROK_API_KEY",
+     "JUNIE_META_API_KEY",
+     "JUNIE_OPENROUTER_API_KEY",
+     "JUNIE_LITELLM_URL",
+     "JUNIE_LITELLM_API_KEY"
+    ]
+   }
+  },
+  {
+   "name": "googleKey",
+   "given": {
+    "credentials": {
+     "way": "googleKey",
+     "values": {
+      "key": "secret-googleKey"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "JUNIE_GOOGLE_API_KEY": "secret-googleKey",
+     "JUNIE_HOME": "$HOME"
+    },
+    "unset": [
+     "JUNIE_API_KEY",
+     "JUNIE_ANTHROPIC_API_KEY",
+     "JUNIE_OPENAI_API_KEY",
+     "JUNIE_GROK_API_KEY",
+     "JUNIE_META_API_KEY",
+     "JUNIE_OPENROUTER_API_KEY",
+     "JUNIE_LITELLM_URL",
+     "JUNIE_LITELLM_API_KEY"
+    ]
+   }
+  },
+  {
+   "name": "xaiKey",
+   "given": {
+    "credentials": {
+     "way": "xaiKey",
+     "values": {
+      "key": "secret-xaiKey"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "JUNIE_GROK_API_KEY": "secret-xaiKey",
+     "JUNIE_HOME": "$HOME"
+    },
+    "unset": [
+     "JUNIE_API_KEY",
+     "JUNIE_ANTHROPIC_API_KEY",
+     "JUNIE_OPENAI_API_KEY",
+     "JUNIE_GOOGLE_API_KEY",
+     "JUNIE_META_API_KEY",
+     "JUNIE_OPENROUTER_API_KEY",
+     "JUNIE_LITELLM_URL",
+     "JUNIE_LITELLM_API_KEY"
+    ]
+   }
+  },
+  {
+   "name": "metaKey",
+   "given": {
+    "credentials": {
+     "way": "metaKey",
+     "values": {
+      "key": "secret-metaKey"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "JUNIE_META_API_KEY": "secret-metaKey",
+     "JUNIE_HOME": "$HOME"
+    },
+    "unset": [
+     "JUNIE_API_KEY",
+     "JUNIE_ANTHROPIC_API_KEY",
+     "JUNIE_OPENAI_API_KEY",
+     "JUNIE_GOOGLE_API_KEY",
+     "JUNIE_GROK_API_KEY",
+     "JUNIE_OPENROUTER_API_KEY",
+     "JUNIE_LITELLM_URL",
+     "JUNIE_LITELLM_API_KEY"
+    ]
+   }
+  },
+  {
+   "name": "openrouterKey",
+   "given": {
+    "credentials": {
+     "way": "openrouterKey",
+     "values": {
+      "key": "secret-openrouterKey"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "JUNIE_OPENROUTER_API_KEY": "secret-openrouterKey",
+     "JUNIE_HOME": "$HOME"
+    },
+    "unset": [
+     "JUNIE_API_KEY",
+     "JUNIE_ANTHROPIC_API_KEY",
+     "JUNIE_OPENAI_API_KEY",
+     "JUNIE_GOOGLE_API_KEY",
+     "JUNIE_GROK_API_KEY",
+     "JUNIE_META_API_KEY",
+     "JUNIE_LITELLM_URL",
+     "JUNIE_LITELLM_API_KEY"
+    ]
+   }
+  },
+  {
+   "name": "litellm",
+   "given": {
+    "credentials": {
+     "way": "litellm",
+     "values": {
+      "url": "http://127.0.0.1:4000",
+      "key": "sk-litellm"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "JUNIE_LITELLM_URL": "http://127.0.0.1:4000",
+     "JUNIE_LITELLM_API_KEY": "sk-litellm",
+     "JUNIE_HOME": "$HOME"
+    },
+    "unset": [
+     "JUNIE_API_KEY",
+     "JUNIE_ANTHROPIC_API_KEY"
+    ],
+    "files": {
+     "config.json": "\"provider\": \"litellm\""
+    }
+   }
+  }
+ ]
+}

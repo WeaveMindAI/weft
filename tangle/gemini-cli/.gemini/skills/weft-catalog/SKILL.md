@@ -45,7 +45,7 @@ A broken node or package never breaks the catalog: it is left out, and only a pr
 
 ## Reading a metadata file
 
-Top-level keys: `type`, `label`, `description`, `tags`, `icon`, `color`, `inputs`, `outputs`, `metadataPorts` (ports whose value is written in the file; a wire leaving one carries that value into the input it reaches, as if typed there, before any run), `types`, `requiresInfra`, `images`, `publishes`, `service`, `portsFromConfig`, `features`, `display`, `validate`, `firesWith`, `claimsRoute`, `accessApps`. Every key weft defines is camelCase; a snake_case one (`requires_infra`) fails the node's load, and the error names the camelCase spelling. A value from one of weft's own fixed lists stays snake_case (a widget's `kind`, such as `text_list`). A select's `options` belong to the node and keep its spelling (`Africa/Abidjan`).
+Top-level keys: `type`, `label`, `description`, `tags`, `icon`, `color`, `inputs`, `outputs`, `metadataPorts` (ports whose value is written in the file; a wire leaving one carries that value into the input it reaches, as if typed there, before any run), `types`, `requiresInfra`, `images`, `publishes`, `service`, `portsFromConfig`, `features`, `display`, `validate`, `lists` (named lists of text a rule of the node this one is wired into reads, such as an agent node's `reservedToolNames`), `firesWith`, `claimsRoute`, `accessApps`. Every key weft defines is camelCase; a snake_case one (`requires_infra`) fails the node's load, and the error names the camelCase spelling. A value from one of weft's own fixed lists stays snake_case (a widget's `kind`, such as `text_list`). A select's `options` belong to the node and keep its spelling (`Africa/Abidjan`).
 
 An input entry: `name`, `type`, `required`, `accepts`, `widget`, `default`, `label`, `placeholder`, `description`, and for connection inputs (typed `Access[<service>]`) `requiresScopes` and `requiresValues`. An input without `required` is optional: unwired, the node runs without it; wired, the node waits for it and skips if the wire closes. A program can change this where it uses the node (`x: T` requires the input, `x?: T` runs without it even when wired), but it can never make a `required` input optional; the `weft-language` skill has the table. An output entry: `name`, `type`, `description`, `narrowable` (the program may declare a narrower type on it, `-> (response: Verdict)`), and on an [infra node] `baked` (what that means is under the infra node shape below).
 
@@ -94,6 +94,49 @@ and a button for every state it can sit in, so a stuck one always has a way out
 from the editor. The node's own description says which it offers. You never
 tell the user to terminate the infra to get out of a state; a node with no
 button for one of its states is the bug you report.
+
+**A coding agent** (`ClaudeCode`, `Codex` and the other agent nodes; `weft
+describe-nodes --list | grep -i agent` lists them): an [infra node] holding ONE
+conversation, so two nodes are two conversations and every run talks to the
+same one. It emits `agent` and `stream` (a bus of everything the agent does).
+The ready-made loop is an included file shipped beside the nodes:
+
+```weft
+claude = ClaudeCode { folder: "/home/you/projects/app" }
+
+talk = @include("__catalog/base_catalog/agents/conversation.weft")
+talk.agent = claude.agent
+talk.stream = claude.stream
+talk.task = "Add a --verbose flag to the CLI"
+```
+
+It puts each question the agent asks to a person as a form (the browser
+extension), shows each reply, and ends when the person sends an empty next
+message. If you want another loop (your own tools, a check in place of the
+person), copy `nodes/base_catalog/agents/conversation.weft` into `src/` and
+change the copy; it is built from `AskAgent` (one `message`, `answer` or
+`toolResult` per firing, ending on `reply` with `history`, on `question`, or
+on `toolCall`), `AnswerAgent` (a `question` to a form, its `answer` back) and
+a `CloseBus` on `stream` whose `_should_flow` is wired to an output that
+arrives only once the loop is over. Without that `CloseBus` the run fails
+with `the bus ended failed: the run was stuck`. The build refuses an
+`AskAgent` with nothing on `question`, one with nothing on `answer`, one
+given `tools` with nothing on `toolCall`, and one with `toolCall` wired but
+nothing on `toolResult`. A tool named like one the agent keeps for itself (its
+`reservedToolNames`, or a shape under `reservedToolNamePatterns`, such as
+Codex's `^mcp__`) is refused by the build when the list is written straight
+on `tools`, and by the `AskAgent` firing when the tools arrive on a wire, the
+usual case. With nothing on `computer` the agent runs on this machine,
+working in `folder` (weft installs the agent itself, once, when it is missing), and most agents then use the login the machine already
+has. Five never do: `DevinCli`, `HermesAgent`, `Nanobot`, `OpenClaw` and `Pi`
+need their access node on `access` even here, and all but `DevinCli` also
+need `model`. A cloud install needs a `Computer` wired into `computer` and the
+agent's access node (`ClaudeCodeAccess`, ...) on `access`, and building
+without the computer says so; `JunieCli` does not run on a cloud install at
+all, even inside a Computer. So read the agent's own description (`weft
+describe-nodes --node <Type> --compact`) before wiring it: it says how that
+agent installs and logs in. Start the infra (`weft infra start`) before the
+run.
 
 **Ports from a config list** (`portsFromConfig` in its metadata): the entries
 you put in one config field decide which ports appear. The node's metadata

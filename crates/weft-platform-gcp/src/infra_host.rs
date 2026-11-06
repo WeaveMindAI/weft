@@ -379,6 +379,25 @@ pub struct Shape {
 /// GB and 8 GB per CPU). For GPUs it is the family the accelerator
 /// attaches to (N1 for the `nvidia-tesla-*` kinds, G2 for `nvidia-l4`),
 /// at the cheapest type that holds its CPUs and memory.
+/// Refuse a node this platform cannot run, naming what to change: a unit
+/// that runs a process (`weft_core::infra::Process`), which runs on the
+/// machine weft runs on, which only a local install has; a unit no machine
+/// of `zone` holds.
+fn runnable(zone: &str, node: &ResolvedNode) -> Result<(), String> {
+    for u in &node.units {
+        if u.unit.process.is_some() {
+            return Err(format!(
+                "infra node '{}': unit '{}' runs a process, which runs on the machine weft runs on, and only a local \
+                 install has one; this install runs on Google Cloud, so run this node on a local install",
+                weft_core::project::plain_id(&node.node.node),
+                u.unit.name
+            ));
+        }
+        machine_shape(zone, u).map_err(|e| format!("{e:#}"))?;
+    }
+    Ok(())
+}
+
 pub fn machine_shape(_zone: &str, unit: &ResolvedUnit) -> anyhow::Result<Shape> {
     let m = &unit.unit.machine;
     if let Some(kind) = &m.kind {
@@ -656,10 +675,7 @@ fn assignment(machine: &Value) -> anyhow::Result<Option<UnitAssignment>> {
 #[async_trait]
 impl InfraHost for ComputeInfraHost {
     fn check(&self, node: &ResolvedNode) -> Result<(), String> {
-        for u in &node.units {
-            machine_shape(&self.gcp.zone, u).map_err(|e| format!("{e:#}"))?;
-        }
-        Ok(())
+        runnable(&self.gcp.zone, node)
     }
 
     async fn apply_unit(&self, node: &ResolvedNode, unit: &str) -> anyhow::Result<()> {
@@ -854,6 +870,13 @@ impl InfraHost for ComputeInfraHost {
                     same_network: matches!(ep.expose, Expose::SameNetwork).then(|| format!("{ip}:{number}")),
                 })
             }
+            // Never a host's: every lookup follows it to the endpoint it
+            // lives inside (`weft_core::infra::EndpointRecord`).
+            EndpointTarget::Within { .. } => anyhow::bail!("endpoint '{endpoint}' of '{}' lives inside another node's endpoint, which no host serves", node.node.node),
+            // Refused by `check` before anything starts.
+            EndpointTarget::Process { unit, .. } => {
+                anyhow::bail!("endpoint '{endpoint}' of '{}' is a port of the process of unit '{unit}', which a cloud install never runs", node.node.node)
+            }
         }
     }
 
@@ -953,6 +976,21 @@ mod tests {
         assert_eq!(gpu("nvidia-l4", 1, "2", "40Gi").unwrap().machine_type, "g2-standard-12");
         assert_eq!(gpu("nvidia-l4", 1, "20", "1Gi").unwrap().machine_type, "g2-standard-32");
         assert!(gpu("nvidia-l4", 2, "32", "1Gi").is_err());
+    }
+
+    /// A node with a process unit is refused before anything starts,
+    /// naming the node and the unit.
+    #[test]
+    fn a_process_unit_is_refused_naming_it() {
+        let spec = weft_core::infra::InfraSpec {
+            units: vec![Unit { name: "server".into(), process: Some(weft_core::infra::Process::new(vec!["python3".into()])), ..Default::default() }],
+            ..Default::default()
+        };
+        let node = NodeRef { tenant: "t".into(), project: uuid::Uuid::from_u128(1), node: "agent".into(), copy_id: "wn-1".into() };
+        let resolved = weft_core::infra::resolve(&spec, &node, &Default::default()).unwrap();
+        let why = runnable("z", &resolved).unwrap_err();
+        assert!(why.starts_with("infra node 'agent': unit 'server' runs a process"), "{why}");
+        assert!(why.contains("only a local install has one"), "{why}");
     }
 
     #[test]

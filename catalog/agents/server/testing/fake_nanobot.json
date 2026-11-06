@@ -1,0 +1,989 @@
+{
+ "source": "nanobot 0.4.0 (`nanobot --home <instance> gateway --foreground`, its WebSocket channel on a unix socket), every frame verbatim but these placeholders: $CHAT the chat's id, $READY the connection's own chat id, $UPLOAD its upload token, $TURN the turn's id (the `turn_id` sent with `webui: true`; a frame naming another turn keeps that turn's recorded id), $FOLDER the chat's project folder, $TOOL the text the program's tool answered. Recorded by driving the real gateway over its socket against a local fake OpenAI-compatible model (the `custom` provider, no account, no key), with a stdio MCP server standing in for `mcp-bridge`: scratchpad nb/rec/run1..3.out, cut by nb/rec/cut.py. run1: `bogus`, `new_chat`, the turns 'say hi', 'please write a file', 'tool please'; run2 (the gateway restarted): `attach`, `set_workspace_scope`, the turn 'think hard' (the model streamed reasoning); run3 (restarted with a key the model refuses, HTTP 401): `attach`, the turn 'fail please'. The program's tool frames ('tool please') were recorded again for real on nanobot 0.4.0 with its tools weft's plugin (plugin_nanobot.py, a nanobot.tools entry point on the gateway's PYTHONPATH, written by adapter_nanobot.py) against a local scripted OpenAI-compatible model (scratchpad rig/mock_model.py, live.py, nb_frames.jsonl lines 9-10): nanobot names the call `lookup` (its hint's text the bare name too), and the tool step stands where the plugin's call reached the route.",
+ "ready": {
+  "event": "ready",
+  "chat_id": "$READY",
+  "client_id": "weft",
+  "upload": {
+   "path": "/api/attachments",
+   "token": "$UPLOAD"
+  }
+ },
+ "answers": {
+  "bogus": [
+   {
+    "event": "error",
+    "detail": "unknown type: 'bogus'"
+   }
+  ],
+  "new_chat": [
+   {
+    "event": "attached",
+    "chat_id": "$CHAT",
+    "model_preset": null
+   },
+   {
+    "event": "session_updated",
+    "chat_id": "$CHAT",
+    "scope": "metadata",
+    "workspace_scope": {
+     "project_path": "$FOLDER",
+     "access_mode": "restricted",
+     "project_name": "proj",
+     "restrict_to_workspace": true,
+     "sandbox_status": {
+      "restrict_to_workspace": true,
+      "workspace_root": "$FOLDER",
+      "level": "application",
+      "enforced": false,
+      "provider": "none",
+      "provider_label": "None",
+      "summary": "Workspace restriction uses nanobot application-level guards."
+     }
+    }
+   }
+  ],
+  "attach": [
+   {
+    "event": "attached",
+    "chat_id": "$CHAT",
+    "model_preset": null,
+    "usage": {
+     "prompt_tokens": 10,
+     "completion_tokens": 5,
+     "total_tokens": 15,
+     "request_count": 1,
+     "estimated_tokens": 0,
+     "context_tokens": 10,
+     "generation_ms": 8,
+     "measured_completion_tokens": 5,
+     "ttft_ms": 37,
+     "timed_requests": 1
+    }
+   }
+  ],
+  "set_workspace_scope": [
+   {
+    "event": "session_updated",
+    "chat_id": "$CHAT",
+    "scope": "metadata"
+   },
+   {
+    "event": "session_updated",
+    "chat_id": "$CHAT",
+    "scope": "metadata",
+    "workspace_scope": {
+     "project_path": "$FOLDER",
+     "access_mode": "full",
+     "project_name": "proj",
+     "restrict_to_workspace": false,
+     "sandbox_status": {
+      "restrict_to_workspace": false,
+      "workspace_root": "$FOLDER",
+      "level": "off",
+      "enforced": false,
+      "provider": "none",
+      "provider_label": "None",
+      "summary": "Workspace restriction is disabled."
+     }
+    }
+   }
+  ]
+ },
+ "turns": {
+  "say hi": [
+   {
+    "send": {
+     "event": "message_accepted",
+     "chat_id": "$CHAT",
+     "turn_id": "$TURN",
+     "starts_turn": true,
+     "active_turn_id": "$TURN",
+     "started_at": 1793778162.3667018
+    }
+   },
+   {
+    "send": {
+     "event": "turn_model_updated",
+     "chat_id": "$CHAT",
+     "model_name": "stub-model",
+     "context_window_tokens": 200000
+    }
+   },
+   {
+    "send": {
+     "event": "goal_status",
+     "chat_id": "$CHAT",
+     "status": "running",
+     "started_at": 1793778162.7475297,
+     "turn_id": "$TURN"
+    }
+   },
+   {
+    "send": {
+     "event": "retry_status",
+     "chat_id": "$CHAT",
+     "state": "cleared",
+     "attempt": 1,
+     "error_kind": "unknown",
+     "turn_id": "$TURN"
+    }
+   },
+   {
+    "send": {
+     "event": "delta",
+     "chat_id": "$CHAT",
+     "text": "echo: say hi",
+     "stream_id": "websocket:$CHAT:1793778162466720545:0",
+     "response_sources": [],
+     "turn_id": "$TURN",
+     "turn_phase": "answer",
+     "turn_seq": 2
+    }
+   },
+   {
+    "send": {
+     "event": "stream_end",
+     "chat_id": "$CHAT",
+     "stream_id": "websocket:$CHAT:1793778162466720545:0",
+     "response_sources": [],
+     "turn_id": "$TURN",
+     "turn_phase": "answer",
+     "turn_seq": 3
+    }
+   },
+   {
+    "send": {
+     "event": "turn_end",
+     "chat_id": "$CHAT",
+     "turn_id": "$TURN",
+     "latency_ms": 2367,
+     "goal_state": {
+      "active": false
+     },
+     "usage": {
+      "prompt_tokens": 10,
+      "completion_tokens": 5,
+      "total_tokens": 15,
+      "request_count": 1,
+      "estimated_tokens": 0,
+      "context_tokens": 10,
+      "generation_ms": 88,
+      "measured_completion_tokens": 5,
+      "ttft_ms": 1892,
+      "timed_requests": 1
+     },
+     "round_usages": [
+      {
+       "prompt_tokens": 10,
+       "completion_tokens": 5,
+       "total_tokens": 15,
+       "request_count": 1,
+       "estimated_tokens": 0,
+       "context_tokens": 10,
+       "generation_ms": 88,
+       "measured_completion_tokens": 5,
+       "ttft_ms": 1892,
+       "timed_requests": 1
+      }
+     ],
+     "context_window_tokens": 200000,
+     "turn_phase": "complete",
+     "turn_seq": 4
+    }
+   }
+  ],
+  "please write a file": [
+   {
+    "send": {
+     "event": "session_updated",
+     "chat_id": "$CHAT",
+     "scope": "thread"
+    }
+   },
+   {
+    "send": {
+     "event": "goal_status",
+     "chat_id": "$CHAT",
+     "status": "idle",
+     "turn_id": "T-hi"
+    }
+   },
+   {
+    "send": {
+     "event": "message_accepted",
+     "chat_id": "$CHAT",
+     "turn_id": "$TURN",
+     "starts_turn": true,
+     "active_turn_id": "$TURN",
+     "started_at": 1793778164.9157796
+    }
+   },
+   {
+    "send": {
+     "event": "session_updated",
+     "chat_id": "$CHAT",
+     "scope": "metadata"
+    }
+   },
+   {
+    "send": {
+     "event": "turn_model_updated",
+     "chat_id": "$CHAT",
+     "model_name": "stub-model",
+     "context_window_tokens": 200000
+    }
+   },
+   {
+    "send": {
+     "event": "goal_status",
+     "chat_id": "$CHAT",
+     "status": "running",
+     "started_at": 1793778164.9910436,
+     "turn_id": "$TURN"
+    }
+   },
+   {
+    "send": {
+     "event": "retry_status",
+     "chat_id": "$CHAT",
+     "state": "cleared",
+     "attempt": 1,
+     "error_kind": "unknown",
+     "turn_id": "$TURN"
+    }
+   },
+   {
+    "send": {
+     "event": "stream_end",
+     "chat_id": "$CHAT",
+     "stream_id": "websocket:$CHAT:1793778164961226253:0",
+     "resuming": true,
+     "response_sources": [],
+     "turn_id": "$TURN",
+     "turn_phase": "answer",
+     "turn_seq": 2
+    }
+   },
+   {
+    "send": {
+     "event": "message",
+     "chat_id": "$CHAT",
+     "text": "write hello.txt",
+     "turn_id": "$TURN",
+     "tool_events": [
+      {
+       "version": 1,
+       "phase": "start",
+       "call_id": "call_w23",
+       "name": "write_file",
+       "arguments": {
+        "path": "hello.txt",
+        "content": "hi from stub\n"
+       },
+       "result": null,
+       "error": null,
+       "files": [],
+       "embeds": []
+      }
+     ],
+     "kind": "tool_hint",
+     "turn_phase": "activity",
+     "turn_seq": 3
+    }
+   },
+   {
+    "send": {
+     "event": "file_edit",
+     "chat_id": "$CHAT",
+     "edits": [
+      {
+       "version": 1,
+       "call_id": "call_w23",
+       "tool": "write_file",
+       "path": "hello.txt",
+       "absolute_path": "$FOLDER/hello.txt",
+       "phase": "start",
+       "added": 0,
+       "deleted": 0,
+       "approximate": true,
+       "status": "editing"
+      }
+     ],
+     "turn_id": "$TURN",
+     "turn_phase": "activity",
+     "turn_seq": 4
+    }
+   },
+   {
+    "send": {
+     "event": "file_edit",
+     "chat_id": "$CHAT",
+     "edits": [
+      {
+       "version": 1,
+       "call_id": "call_w23",
+       "tool": "write_file",
+       "path": "hello.txt",
+       "absolute_path": "$FOLDER/hello.txt",
+       "phase": "end",
+       "added": 1,
+       "deleted": 0,
+       "approximate": false,
+       "status": "done",
+       "operation": "create",
+       "diff": {
+        "format": "unified",
+        "context": 3,
+        "truncated": false,
+        "text": "--- hello.txt\n+++ hello.txt\n@@ -0,0 +1 @@\n+hi from stub"
+       }
+      }
+     ],
+     "turn_id": "$TURN",
+     "turn_phase": "activity",
+     "turn_seq": 5
+    }
+   },
+   {
+    "send": {
+     "event": "message",
+     "chat_id": "$CHAT",
+     "text": "",
+     "turn_id": "$TURN",
+     "tool_events": [
+      {
+       "version": 1,
+       "phase": "end",
+       "call_id": "call_w23",
+       "name": "write_file",
+       "arguments": {
+        "path": "hello.txt",
+        "content": "hi from stub\n"
+       },
+       "result": "Successfully wrote 13 characters to $FOLDER/hello.txt",
+       "error": null,
+       "files": [],
+       "embeds": []
+      }
+     ],
+     "kind": "progress",
+     "turn_phase": "activity",
+     "turn_seq": 6
+    }
+   },
+   {
+    "send": {
+     "event": "retry_status",
+     "chat_id": "$CHAT",
+     "state": "cleared",
+     "attempt": 1,
+     "error_kind": "unknown",
+     "turn_id": "$TURN"
+    }
+   },
+   {
+    "send": {
+     "event": "stream_end",
+     "chat_id": "$CHAT",
+     "stream_id": "websocket:$CHAT:1793778164961226253:1",
+     "resuming": true,
+     "response_sources": [],
+     "turn_id": "$TURN",
+     "turn_phase": "answer",
+     "turn_seq": 7
+    }
+   },
+   {
+    "send": {
+     "event": "message",
+     "chat_id": "$CHAT",
+     "text": "$ rm -rf ./nothing",
+     "turn_id": "$TURN",
+     "tool_events": [
+      {
+       "version": 1,
+       "phase": "start",
+       "call_id": "call_e24",
+       "name": "exec",
+       "arguments": {
+        "command": "rm -rf ./nothing"
+       },
+       "result": null,
+       "error": null,
+       "files": [],
+       "embeds": []
+      }
+     ],
+     "kind": "tool_hint",
+     "turn_phase": "activity",
+     "turn_seq": 8
+    }
+   },
+   {
+    "send": {
+     "event": "message",
+     "chat_id": "$CHAT",
+     "text": "",
+     "turn_id": "$TURN",
+     "tool_events": [
+      {
+       "version": 1,
+       "phase": "error",
+       "call_id": "call_e24",
+       "name": "exec",
+       "arguments": {
+        "command": "rm -rf ./nothing"
+       },
+       "result": null,
+       "error": "Error: Command blocked by deny pattern filter\n\n[Consider this result in the context of the user's goal and decide whether and how to proceed.]",
+       "files": [],
+       "embeds": []
+      }
+     ],
+     "kind": "progress",
+     "turn_phase": "activity",
+     "turn_seq": 9
+    }
+   },
+   {
+    "send": {
+     "event": "retry_status",
+     "chat_id": "$CHAT",
+     "state": "cleared",
+     "attempt": 1,
+     "error_kind": "unknown",
+     "turn_id": "$TURN"
+    }
+   },
+   {
+    "send": {
+     "event": "delta",
+     "chat_id": "$CHAT",
+     "text": "All done.",
+     "stream_id": "websocket:$CHAT:1793778164961226253:2",
+     "response_sources": [],
+     "turn_id": "$TURN",
+     "turn_phase": "answer",
+     "turn_seq": 10
+    }
+   },
+   {
+    "send": {
+     "event": "stream_end",
+     "chat_id": "$CHAT",
+     "stream_id": "websocket:$CHAT:1793778164961226253:2",
+     "response_sources": [],
+     "turn_id": "$TURN",
+     "turn_phase": "answer",
+     "turn_seq": 11
+    }
+   },
+   {
+    "send": {
+     "event": "turn_end",
+     "chat_id": "$CHAT",
+     "turn_id": "$TURN",
+     "latency_ms": 429,
+     "goal_state": {
+      "active": false
+     },
+     "usage": {
+      "prompt_tokens": 30,
+      "completion_tokens": 15,
+      "total_tokens": 45,
+      "request_count": 3,
+      "estimated_tokens": 0,
+      "context_tokens": 10,
+      "generation_ms": 2,
+      "measured_completion_tokens": 5,
+      "ttft_ms": 45,
+      "timed_requests": 1
+     },
+     "round_usages": [
+      {
+       "prompt_tokens": 10,
+       "completion_tokens": 5,
+       "total_tokens": 15,
+       "request_count": 1,
+       "estimated_tokens": 0,
+       "context_tokens": 10
+      },
+      {
+       "prompt_tokens": 10,
+       "completion_tokens": 5,
+       "total_tokens": 15,
+       "request_count": 1,
+       "estimated_tokens": 0,
+       "context_tokens": 10
+      },
+      {
+       "prompt_tokens": 10,
+       "completion_tokens": 5,
+       "total_tokens": 15,
+       "request_count": 1,
+       "estimated_tokens": 0,
+       "context_tokens": 10,
+       "generation_ms": 2,
+       "measured_completion_tokens": 5,
+       "ttft_ms": 45,
+       "timed_requests": 1
+      }
+     ],
+     "context_window_tokens": 200000,
+     "turn_phase": "complete",
+     "turn_seq": 12
+    }
+   }
+  ],
+  "tool please": [
+   {
+    "send": {
+     "event": "session_updated",
+     "chat_id": "$CHAT",
+     "scope": "thread"
+    }
+   },
+   {
+    "send": {
+     "event": "goal_status",
+     "chat_id": "$CHAT",
+     "status": "idle",
+     "turn_id": "T-write"
+    }
+   },
+   {
+    "send": {
+     "event": "message_accepted",
+     "chat_id": "$CHAT",
+     "turn_id": "$TURN",
+     "starts_turn": true,
+     "active_turn_id": "$TURN",
+     "started_at": 1793778165.4228022
+    }
+   },
+   {
+    "send": {
+     "event": "turn_model_updated",
+     "chat_id": "$CHAT",
+     "model_name": "stub-model",
+     "context_window_tokens": 200000
+    }
+   },
+   {
+    "send": {
+     "event": "goal_status",
+     "chat_id": "$CHAT",
+     "status": "running",
+     "started_at": 1793778165.4672287,
+     "turn_id": "$TURN"
+    }
+   },
+   {
+    "send": {
+     "event": "retry_status",
+     "chat_id": "$CHAT",
+     "state": "cleared",
+     "attempt": 1,
+     "error_kind": "unknown",
+     "turn_id": "$TURN"
+    }
+   },
+   {
+    "send": {
+     "event": "stream_end",
+     "chat_id": "$CHAT",
+     "stream_id": "websocket:$CHAT:1793778165444380096:0",
+     "resuming": true,
+     "response_sources": [],
+     "turn_id": "$TURN",
+     "turn_phase": "answer",
+     "turn_seq": 2
+    }
+   },
+   {
+    "send": {
+     "event": "message",
+     "chat_id": "$CHAT",
+     "text": "lookup",
+     "turn_id": "$TURN",
+     "tool_events": [
+      {
+       "version": 1,
+       "phase": "start",
+       "call_id": "call_t26",
+       "name": "lookup",
+       "arguments": {},
+       "result": null,
+       "error": null,
+       "files": [],
+       "embeds": []
+      }
+     ],
+     "kind": "tool_hint",
+     "turn_phase": "activity",
+     "turn_seq": 3
+    }
+   },
+   {
+    "tool": {
+     "name": "lookup",
+     "arguments": {}
+    }
+   },
+   {
+    "send": {
+     "event": "message",
+     "chat_id": "$CHAT",
+     "text": "",
+     "turn_id": "$TURN",
+     "tool_events": [
+      {
+       "version": 1,
+       "phase": "end",
+       "call_id": "call_t26",
+       "name": "lookup",
+       "arguments": {},
+       "result": "$TOOL",
+       "error": null,
+       "files": [],
+       "embeds": []
+      }
+     ],
+     "kind": "progress",
+     "turn_phase": "activity",
+     "turn_seq": 4
+    }
+   },
+   {
+    "send": {
+     "event": "retry_status",
+     "chat_id": "$CHAT",
+     "state": "cleared",
+     "attempt": 1,
+     "error_kind": "unknown",
+     "turn_id": "$TURN"
+    }
+   },
+   {
+    "send": {
+     "event": "delta",
+     "chat_id": "$CHAT",
+     "text": "The tool said: $TOOL",
+     "stream_id": "websocket:$CHAT:1793778165444380096:1",
+     "response_sources": [],
+     "turn_id": "$TURN",
+     "turn_phase": "answer",
+     "turn_seq": 5
+    }
+   },
+   {
+    "send": {
+     "event": "stream_end",
+     "chat_id": "$CHAT",
+     "stream_id": "websocket:$CHAT:1793778165444380096:1",
+     "response_sources": [],
+     "turn_id": "$TURN",
+     "turn_phase": "answer",
+     "turn_seq": 6
+    }
+   },
+   {
+    "send": {
+     "event": "turn_end",
+     "chat_id": "$CHAT",
+     "turn_id": "$TURN",
+     "latency_ms": 227,
+     "goal_state": {
+      "active": false
+     },
+     "usage": {
+      "prompt_tokens": 20,
+      "completion_tokens": 10,
+      "total_tokens": 30,
+      "request_count": 2,
+      "estimated_tokens": 0,
+      "context_tokens": 10,
+      "generation_ms": 16,
+      "measured_completion_tokens": 5,
+      "ttft_ms": 32,
+      "timed_requests": 1
+     },
+     "round_usages": [
+      {
+       "prompt_tokens": 10,
+       "completion_tokens": 5,
+       "total_tokens": 15,
+       "request_count": 1,
+       "estimated_tokens": 0,
+       "context_tokens": 10
+      },
+      {
+       "prompt_tokens": 10,
+       "completion_tokens": 5,
+       "total_tokens": 15,
+       "request_count": 1,
+       "estimated_tokens": 0,
+       "context_tokens": 10,
+       "generation_ms": 16,
+       "measured_completion_tokens": 5,
+       "ttft_ms": 32,
+       "timed_requests": 1
+      }
+     ],
+     "context_window_tokens": 200000,
+     "turn_phase": "complete",
+     "turn_seq": 7
+    }
+   }
+  ],
+  "think hard": [
+   {
+    "send": {
+     "event": "message_accepted",
+     "chat_id": "$CHAT",
+     "turn_id": "$TURN",
+     "starts_turn": true,
+     "active_turn_id": "$TURN",
+     "started_at": 1793778216.6884432
+    }
+   },
+   {
+    "send": {
+     "event": "turn_model_updated",
+     "chat_id": "$CHAT",
+     "model_name": "stub-model",
+     "context_window_tokens": 200000
+    }
+   },
+   {
+    "send": {
+     "event": "goal_status",
+     "chat_id": "$CHAT",
+     "status": "running",
+     "started_at": 1793778216.7154698,
+     "turn_id": "$TURN"
+    }
+   },
+   {
+    "send": {
+     "event": "retry_status",
+     "chat_id": "$CHAT",
+     "state": "cleared",
+     "attempt": 1,
+     "error_kind": "unknown",
+     "turn_id": "$TURN"
+    }
+   },
+   {
+    "send": {
+     "event": "reasoning_delta",
+     "chat_id": "$CHAT",
+     "text": "Pondering",
+     "turn_id": "$TURN",
+     "turn_phase": "reasoning",
+     "turn_seq": 2
+    }
+   },
+   {
+    "send": {
+     "event": "reasoning_delta",
+     "chat_id": "$CHAT",
+     "text": " the question.",
+     "turn_id": "$TURN",
+     "turn_phase": "reasoning",
+     "turn_seq": 3
+    }
+   },
+   {
+    "send": {
+     "event": "reasoning_end",
+     "chat_id": "$CHAT",
+     "turn_id": "$TURN",
+     "turn_phase": "reasoning",
+     "turn_seq": 4
+    }
+   },
+   {
+    "send": {
+     "event": "delta",
+     "chat_id": "$CHAT",
+     "text": "echo: think hard",
+     "stream_id": "websocket:$CHAT:1793778216701867723:0",
+     "response_sources": [],
+     "turn_id": "$TURN",
+     "turn_phase": "answer",
+     "turn_seq": 5
+    }
+   },
+   {
+    "send": {
+     "event": "stream_end",
+     "chat_id": "$CHAT",
+     "stream_id": "websocket:$CHAT:1793778216701867723:0",
+     "response_sources": [],
+     "turn_id": "$TURN",
+     "turn_phase": "answer",
+     "turn_seq": 6
+    }
+   },
+   {
+    "send": {
+     "event": "turn_end",
+     "chat_id": "$CHAT",
+     "turn_id": "$TURN",
+     "latency_ms": 542,
+     "goal_state": {
+      "active": false
+     },
+     "usage": {
+      "prompt_tokens": 10,
+      "completion_tokens": 5,
+      "total_tokens": 15,
+      "request_count": 1,
+      "estimated_tokens": 0,
+      "context_tokens": 10,
+      "generation_ms": 11,
+      "measured_completion_tokens": 5,
+      "ttft_ms": 482,
+      "timed_requests": 1
+     },
+     "round_usages": [
+      {
+       "prompt_tokens": 10,
+       "completion_tokens": 5,
+       "total_tokens": 15,
+       "request_count": 1,
+       "estimated_tokens": 0,
+       "context_tokens": 10,
+       "generation_ms": 11,
+       "measured_completion_tokens": 5,
+       "ttft_ms": 482,
+       "timed_requests": 1
+      }
+     ],
+     "context_window_tokens": 200000,
+     "turn_phase": "complete",
+     "turn_seq": 7
+    }
+   }
+  ],
+  "fail please": [
+   {
+    "send": {
+     "event": "message_accepted",
+     "chat_id": "$CHAT",
+     "turn_id": "$TURN",
+     "starts_turn": true,
+     "active_turn_id": "$TURN",
+     "started_at": 1793778222.8306293
+    }
+   },
+   {
+    "send": {
+     "event": "turn_model_updated",
+     "chat_id": "$CHAT",
+     "model_name": "stub-model",
+     "context_window_tokens": 200000
+    }
+   },
+   {
+    "send": {
+     "event": "goal_status",
+     "chat_id": "$CHAT",
+     "status": "running",
+     "started_at": 1793778222.9276485,
+     "turn_id": "$TURN"
+    }
+   },
+   {
+    "send": {
+     "event": "retry_status",
+     "chat_id": "$CHAT",
+     "state": "cleared",
+     "attempt": 1,
+     "error_kind": "unknown",
+     "turn_id": "$TURN"
+    }
+   },
+   {
+    "send": {
+     "event": "stream_end",
+     "chat_id": "$CHAT",
+     "stream_id": "websocket:$CHAT:1793778222906773966:0",
+     "response_sources": [],
+     "turn_id": "$TURN",
+     "turn_phase": "answer",
+     "turn_seq": 2
+    }
+   },
+   {
+    "send": {
+     "event": "turn_end",
+     "chat_id": "$CHAT",
+     "turn_id": "$TURN",
+     "latency_ms": 492,
+     "goal_state": {
+      "active": false
+     },
+     "usage": {
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "request_count": 1,
+      "estimated_tokens": 0
+     },
+     "round_usages": [
+      {
+       "prompt_tokens": 0,
+       "completion_tokens": 0,
+       "total_tokens": 0,
+       "request_count": 1,
+       "estimated_tokens": 0
+      }
+     ],
+     "context_window_tokens": 200000,
+     "outcome": "failed",
+     "failure_kind": "model",
+     "failure_error_kind": "authentication",
+     "failure_message": "Model provider request failed. Check the provider configuration or service status, then try again.",
+     "turn_phase": "complete",
+     "turn_seq": 3
+    }
+   },
+   {
+    "send": {
+     "event": "session_updated",
+     "chat_id": "$CHAT",
+     "scope": "thread"
+    }
+   },
+   {
+    "send": {
+     "event": "recovery_state",
+     "chat_id": "$CHAT",
+     "status": "awaiting_user",
+     "recovery_id": "6683072c85184d0cb8adefe8328bad9b",
+     "attempts": 0,
+     "reason": "model_request_failed",
+     "failure_error_kind": "authentication"
+    }
+   },
+   {
+    "send": {
+     "event": "session_updated",
+     "chat_id": "$CHAT",
+     "scope": "thread"
+    }
+   },
+   {
+    "send": {
+     "event": "goal_status",
+     "chat_id": "$CHAT",
+     "status": "idle",
+     "turn_id": "$TURN"
+    }
+   }
+  ]
+ }
+}

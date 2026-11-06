@@ -1,0 +1,85 @@
+{
+  "type": "ClineCliAccess",
+  "label": "Cline CLI Access",
+  "description": "A Cline login, for the ClineCli nodes' `access`: a key for Cline's own provider, or a provider of your own and its key. One access for however many ClineCli nodes. A sign-in (Cline's account, a ChatGPT subscription) and providers that run on another tool's login on your machine (Claude Code, Codex, OpenCode) are not offered: leave `access` out on your machine for those.",
+  "tags": [
+    "agent",
+    "cline",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#5b5bd6",
+  "service": {
+    "service": "cline_cli",
+    "label": "Cline CLI",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "clineKey",
+          "label": "Cline API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "your Cline API key"
+            }
+          ],
+          "guide": {
+            "link": "https://docs.cline.bot/cline-cli/overview",
+            "steps": [
+              "In your Cline account, create an API key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "providerKey",
+          "label": "Another provider",
+          "fields": [
+            {
+              "name": "provider",
+              "label": "Provider",
+              "secret": false,
+              "placeholder": "anthropic, openrouter, ..."
+            },
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-..."
+            }
+          ],
+          "guide": {
+            "link": "https://docs.cline.bot/cli/cli-reference",
+            "steps": [
+              "Name the provider by Cline's id for it (`anthropic`, `openrouter`, ...), as `cline auth -p <provider>` takes it.",
+              "Paste that provider's API key below and name the connection. Calls are billed to that provider's account."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[cline_cli]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[cline_cli]",
+      "description": "Wire into the ClineCli nodes' `access` input."
+    }
+  ]
+}

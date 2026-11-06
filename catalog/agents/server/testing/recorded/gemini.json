@@ -1,0 +1,768 @@
+{
+ "kind": "gemini",
+ "command": "gemini",
+ "source": "Real, on Gemini CLI 0.66.0 with a Gemini API key (gemini-3.5-flash-lite), driven through weft's own agent server and this spec, every line teed (scratchpad acp12/drive.py): hello is acp12/gemini/transcript.jsonl lines 11-14; tool is acp12/gemini2/transcript.jsonl (the program's lookup over the HTTP MCP server, its permission allowed for the server, then `touch made.txt` asked and allowed; the `tool` step stands where the call reached weft's route, which the transcript did not log). Its first run of that turn failed: Gemini parses a text answer with no `structuredContent` into that field itself and refused the bare `42` as no object (fixed in `adapters.mcp_result`). Gemini runs `ls` in `default` mode without asking. From agents/gemini.transcript.jsonl (research): initialize line 23, authenticate line 8, session/new line 10, session/set_mode line 21, session/load replay lines 25-28, the failed prompt (`bad key`) line 17.",
+ "answers": {
+  "initialize": {
+   "protocolVersion": 1,
+   "authMethods": [
+    {
+     "id": "oauth-personal",
+     "name": "Log in with Google",
+     "description": "Log in with your Google account"
+    },
+    {
+     "id": "gemini-api-key",
+     "name": "Gemini API key",
+     "description": "Use an API key with Gemini Developer API",
+     "_meta": {
+      "api-key": {
+       "provider": "google"
+      }
+     }
+    },
+    {
+     "id": "vertex-ai",
+     "name": "Vertex AI",
+     "description": "Use an API key with Vertex AI GenAI API"
+    },
+    {
+     "id": "gateway",
+     "name": "AI API Gateway",
+     "description": "Use a custom AI API Gateway",
+     "_meta": {
+      "gateway": {
+       "protocol": "google",
+       "restartRequired": "false"
+      }
+     }
+    }
+   ],
+   "agentInfo": {
+    "name": "gemini-cli",
+    "title": "Gemini CLI",
+    "version": "0.66.0"
+   },
+   "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {
+     "image": true,
+     "audio": true,
+     "embeddedContext": true
+    },
+    "mcpCapabilities": {
+     "http": true,
+     "sse": true
+    }
+   }
+  },
+  "authenticate": {},
+  "session/new": {
+   "sessionId": "$SESSION",
+   "modes": {
+    "availableModes": [
+     {
+      "id": "default",
+      "name": "Default",
+      "description": "Prompts for approval"
+     },
+     {
+      "id": "autoEdit",
+      "name": "Auto Edit",
+      "description": "Auto-approves edit tools"
+     },
+     {
+      "id": "yolo",
+      "name": "YOLO",
+      "description": "Auto-approves all tools"
+     },
+     {
+      "id": "plan",
+      "name": "Plan",
+      "description": "Read-only mode"
+     }
+    ],
+    "currentModeId": "default"
+   },
+   "models": {
+    "availableModels": [
+     {
+      "modelId": "auto",
+      "name": "Auto",
+      "description": "Let Gemini CLI decide the best model for the task: gemini-3.1-pro-preview, gemini-3.8-flash"
+     },
+     {
+      "modelId": "gemini-3.1-pro-preview-customtools",
+      "name": "gemini-3.1-pro-preview"
+     },
+     {
+      "modelId": "gemini-3-flash-preview",
+      "name": "gemini-3-flash-preview"
+     },
+     {
+      "modelId": "gemini-2.5-pro",
+      "name": "gemini-2.5-pro"
+     },
+     {
+      "modelId": "gemini-3.8-flash",
+      "name": "gemini-3.8-flash"
+     },
+     {
+      "modelId": "gemini-3.5-flash-lite",
+      "name": "gemini-3.5-flash-lite"
+     }
+    ],
+    "currentModelId": "auto"
+   }
+  },
+  "session/load": {
+   "modes": {
+    "availableModes": [
+     {
+      "id": "default",
+      "name": "Default",
+      "description": "Prompts for approval"
+     },
+     {
+      "id": "autoEdit",
+      "name": "Auto Edit",
+      "description": "Auto-approves edit tools"
+     },
+     {
+      "id": "yolo",
+      "name": "YOLO",
+      "description": "Auto-approves all tools"
+     },
+     {
+      "id": "plan",
+      "name": "Plan",
+      "description": "Read-only mode"
+     }
+    ],
+    "currentModeId": "default"
+   },
+   "models": {
+    "availableModels": [
+     {
+      "modelId": "auto",
+      "name": "Auto",
+      "description": "Let Gemini CLI decide the best model for the task: gemini-3.1-pro-preview, gemini-3.8-flash"
+     },
+     {
+      "modelId": "gemini-3.1-pro-preview-customtools",
+      "name": "gemini-3.1-pro-preview"
+     },
+     {
+      "modelId": "gemini-3-flash-preview",
+      "name": "gemini-3-flash-preview"
+     },
+     {
+      "modelId": "gemini-2.5-pro",
+      "name": "gemini-2.5-pro"
+     },
+     {
+      "modelId": "gemini-3.8-flash",
+      "name": "gemini-3.8-flash"
+     },
+     {
+      "modelId": "gemini-3.5-flash-lite",
+      "name": "gemini-3.5-flash-lite"
+     }
+    ],
+    "currentModelId": "auto"
+   }
+  },
+  "session/set_mode": {}
+ },
+ "replay": {
+  "before": [
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "say hi"
+    }
+   }
+  ],
+  "after": [
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "Hi there, crafted reply."
+    }
+   },
+   {
+    "sessionUpdate": "available_commands_update",
+    "availableCommands": [
+     {
+      "name": "memory",
+      "description": "Manage memory."
+     },
+     {
+      "name": "memory show",
+      "description": "Shows the current memory contents."
+     },
+     {
+      "name": "memory refresh",
+      "description": "Refreshes the memory from the source."
+     },
+     {
+      "name": "memory list",
+      "description": "Lists the paths of the GEMINI.md files in use."
+     },
+     {
+      "name": "memory inbox",
+      "description": "Lists memory items extracted from past sessions that are pending review."
+     },
+     {
+      "name": "extensions",
+      "description": "Manage extensions."
+     },
+     {
+      "name": "extensions list",
+      "description": "Lists all installed extensions."
+     },
+     {
+      "name": "extensions explore",
+      "description": "Explore available extensions."
+     },
+     {
+      "name": "extensions enable",
+      "description": "Enable an extension."
+     },
+     {
+      "name": "extensions disable",
+      "description": "Disable an extension."
+     },
+     {
+      "name": "extensions install",
+      "description": "Install an extension from a git repo or local path."
+     },
+     {
+      "name": "extensions link",
+      "description": "Link an extension from a local path."
+     },
+     {
+      "name": "extensions uninstall",
+      "description": "Uninstall an extension."
+     },
+     {
+      "name": "extensions restart",
+      "description": "Restart an extension."
+     },
+     {
+      "name": "extensions update",
+      "description": "Update an extension."
+     },
+     {
+      "name": "init",
+      "description": "Analyzes the project and creates a tailored GEMINI.md file"
+     },
+     {
+      "name": "restore",
+      "description": "Restore to a previous checkpoint, or list available checkpoints to restore. This will reset the conversation and file history to the state it was in when the checkpoint was created"
+     },
+     {
+      "name": "restore list",
+      "description": "Lists all available checkpoints."
+     },
+     {
+      "name": "about",
+      "description": "Show version and environment info"
+     },
+     {
+      "name": "help",
+      "description": "Show available commands"
+     }
+    ]
+   }
+  ]
+ },
+ "turns": {
+  "hello": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Hello there."
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 10348,
+       "outputTokens": 3,
+       "thoughtTokens": 116,
+       "totalTokens": 10351
+      },
+      "_meta": {
+       "quota": {
+        "token_count": {
+         "input_tokens": 10348,
+         "output_tokens": 3
+        },
+        "model_usage": [
+         {
+          "model": "gemini-3.5-flash-lite",
+          "token_count": {
+           "input_tokens": 10348,
+           "output_tokens": 3
+          }
+         }
+        ]
+       }
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "text",
+     "done"
+    ],
+    "reply": "Hello there."
+   }
+  },
+  "tool": {
+   "tools": true,
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "**Analyzing the Tasks**\nI've been reviewing the instructions carefully. My current focus is ensuring I grasp the sequence of operations: the lookup, shell command execution (with the file touch), and the final output format. I'm prioritizing the order and making sure I understand how each element is intended to be used. I'm making sure to consider the constraints on repetition and format."
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "mcp_weft_lookup__call_119536",
+      "status": "pending",
+      "title": "lookup (weft MCP Server)",
+      "content": [],
+      "locations": [],
+      "kind": "other"
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "options": [
+        {
+         "optionId": "proceed_always_server",
+         "name": "Allow all server tools for this session",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "proceed_always_tool",
+         "name": "Allow tool for this session",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "proceed_once",
+         "name": "Allow",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "cancel",
+         "name": "Reject",
+         "kind": "reject_once"
+        }
+       ],
+       "toolCall": {
+        "toolCallId": "mcp_weft_lookup__call_119536",
+        "status": "pending",
+        "title": "lookup (weft MCP Server)",
+        "content": [],
+        "locations": [],
+        "kind": "other"
+       }
+      }
+     }
+    },
+    {
+     "tool": {
+      "name": "lookup",
+      "arguments": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "mcp_weft_lookup__call_119536",
+      "status": "completed",
+      "title": "lookup (weft MCP Server)",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "42"
+        }
+       }
+      ],
+      "locations": [],
+      "kind": "other"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "run_shell_command__call_119542",
+      "status": "pending",
+      "title": "touch made.txt",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "[current working directory /home/me/work] (Create made.txt file)"
+        }
+       }
+      ],
+      "locations": [],
+      "kind": "execute"
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "options": [
+        {
+         "optionId": "proceed_always",
+         "name": "Allow for this session",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "proceed_once",
+         "name": "Allow",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "cancel",
+         "name": "Reject",
+         "kind": "reject_once"
+        }
+       ],
+       "toolCall": {
+        "toolCallId": "run_shell_command__call_119542",
+        "status": "pending",
+        "title": "touch made.txt",
+        "content": [
+         {
+          "type": "content",
+          "content": {
+           "type": "text",
+           "text": "[current working directory /home/me/work] (Create made.txt file)"
+          }
+         }
+        ],
+        "locations": [],
+        "kind": "execute"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "run_shell_command__call_119542",
+      "status": "completed",
+      "title": "touch made.txt",
+      "content": [],
+      "locations": [],
+      "kind": "execute"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "It is 42"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 21400,
+       "outputTokens": 50,
+       "cachedReadTokens": 8104,
+       "thoughtTokens": 434,
+       "totalTokens": 21450
+      },
+      "_meta": {
+       "quota": {
+        "token_count": {
+         "input_tokens": 21400,
+         "output_tokens": 50
+        },
+        "model_usage": [
+         {
+          "model": "gemini-3.5-flash-lite",
+          "token_count": {
+           "input_tokens": 21400,
+           "output_tokens": 50
+          }
+         }
+        ]
+       }
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "tool_use",
+     "question",
+     "tool_call",
+     "tool_result",
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "It is 42",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "title": "lookup (weft MCP Server)"
+       }
+      },
+      "answer": {
+       "choice": "proceed_always_server"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "proceed_always_server"
+       }
+      }
+     },
+     {
+      "tool": "lookup",
+      "result": "42"
+     },
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "execute",
+        "title": "touch made.txt"
+       }
+      },
+      "answer": {
+       "choice": "proceed_once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "proceed_once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "bad key": {
+   "steps": [
+    {
+     "fail": {
+      "code": 400,
+      "message": "{\"error\":{\"message\":\"{\\n  \\\"error\\\": {\\n    \\\"code\\\": 400,\\n    \\\"message\\\": \\\"API key not valid. Please pass a valid API key.\\\",\\n    \\\"status\\\": \\\"INVALID_ARGUMENT\\\",\\n    \\\"details\\\": [\\n      {\\n        \\\"@type\\\": \\\"type.googleapis.com/google.rpc.ErrorInfo\\\",\\n        \\\"reason\\\": \\\"API_KEY_INVALID\\\",\\n        \\\"domain\\\": \\\"googleapis.com\\\",\\n        \\\"metadata\\\": {\\n          \\\"service\\\": \\\"generativelanguage.googleapis.com\\\"\\n        }\\n      },\\n      {\\n        \\\"@type\\\": \\\"type.googleapis.com/google.rpc.LocalizedMessage\\\",\\n        \\\"locale\\\": \\\"en-US\\\",\\n        \\\"message\\\": \\\"API key not valid. Please pass a valid API key.\\\"\\n      }\\n    ]\\n  }\\n}\\n\",\"code\":400,\"status\":\"Bad Request\"}}"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "error"
+    ],
+    "status": "failed",
+    "error": "API key not valid"
+   }
+  }
+ },
+ "settings": [
+  {
+   "name": "ask",
+   "given": {
+    "permission": "ask"
+   },
+   "expect": {
+    "args": [
+     [
+      "--acp",
+      "--skip-trust"
+     ]
+    ],
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "default"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "accept_edits",
+   "given": {
+    "permission": "accept_edits"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "autoEdit"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "plan",
+   "given": {
+    "permission": "plan"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "plan"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "bypass",
+   "given": {
+    "permission": "bypass"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "yolo"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "model_and_options",
+   "given": {
+    "model": "gemini-2.5-pro",
+    "options": {
+     "addDirs": [
+      "/a",
+      "/b"
+     ],
+     "sandbox": "docker"
+    }
+   },
+   "expect": {
+    "args": [
+     [
+      "--model",
+      "gemini-2.5-pro"
+     ],
+     [
+      "--include-directories",
+      "/a,/b"
+     ]
+    ],
+    "env": {
+     "GEMINI_SANDBOX": "docker"
+    }
+   }
+  },
+  {
+   "name": "api_key",
+   "given": {
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "AIza-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "GEMINI_API_KEY": "AIza-test",
+     "GEMINI_CLI_HOME": "$HOME"
+    },
+    "unset": [
+     "GOOGLE_API_KEY"
+    ],
+    "requests": [
+     {
+      "method": "authenticate",
+      "params": {
+       "methodId": "gemini-api-key"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "vertex_key",
+   "given": {
+    "credentials": {
+     "way": "vertexKey",
+     "values": {
+      "key": "vx-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "GOOGLE_API_KEY": "vx-test"
+    },
+    "unset": [
+     "GEMINI_API_KEY"
+    ],
+    "requests": [
+     {
+      "method": "authenticate",
+      "params": {
+       "methodId": "vertex-ai"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "bad_option_value",
+   "given": {
+    "options": {
+     "sandbox": "chroot"
+    }
+   },
+   "expect": {
+    "error": "takes docker, podman, runsc, lxc"
+   }
+  }
+ ]
+}

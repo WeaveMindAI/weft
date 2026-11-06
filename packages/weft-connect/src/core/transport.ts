@@ -44,6 +44,10 @@ export interface DirectConnect {
 	door: Door;
 	paste: boolean;
 	values: Record<string, string>;
+	/** The way to sign in `values` were filled for (`LoginWayWire.id`):
+	 *  set on every own-door connect of a `static` service, `null` for
+	 *  the paste section, the shared door and every other kind. */
+	way: string | null;
 	label: string | null;
 	permissions: string[];
 	// SYNC: sharedApp <-> crates/weft-core/src/access/wire.rs SharedDoorPick

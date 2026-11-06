@@ -343,7 +343,7 @@ async fn export(
             .context("read the project's frontends")?;
     let frontend = hosted_frontend(&frontends, frontend, repo.as_ref())?;
 
-    let picks = check_picks(&client, project).await;
+    let picks = check_picks(&client, project, info.kind()).await;
     let labels = ExportLabels::of(project);
     let (keys, minted) = mint_ci_keys(&client, name, project, &labels, front_env, frontend).await?;
     let prepared = async {
@@ -431,8 +431,13 @@ enum PicksCheck {
 /// connections: the program never travels, so no size of program can
 /// stop the check.
 // SYNC: check_picks <-> crates/weft-core/src/picks.rs Kept, crates/weft-dispatcher/src/api/picks.rs kept
-async fn check_picks(client: &crate::client::DispatcherClient, project: &weft_compiler::project::Project) -> PicksCheck {
-    let definition = match weft_compiler::hash::load_program_with_diagnostics(project) {
+async fn check_picks(
+    client: &crate::client::DispatcherClient,
+    project: &weft_compiler::project::Project,
+    install: weft_core::install::InstallKind,
+) -> PicksCheck {
+    // Compiled for that install, as its own build compiles it.
+    let definition = match weft_compiler::hash::load_program_with_diagnostics(project, Some(install)) {
         Ok((definition, _)) => definition,
         Err(_) => return PicksCheck::Unchecked("the program does not compile here".into()),
     };

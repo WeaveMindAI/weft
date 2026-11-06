@@ -20,7 +20,7 @@ use uuid::Uuid;
 use weft_core::picks::{ChangePicks, PickInput};
 use weft_core::run_spec::InstanceFieldRef;
 use weft_core::access::spec::{
-    percent_encode, AccessSpec, AppRegistration, CredentialField, Door, GrantCoexistence,
+    percent_encode, AccessSpec, AppRegistration, CredentialField, Door, GrantCoexistence, LoginWay,
 };
 use weft_core::access::wire::{
     BeginOAuth, CompletedConnect, ConnectDirect, DoorsAnswer, DoorsRequest, DoorsStatus,
@@ -87,6 +87,11 @@ pub struct ConnectOpts {
     /// token, no app) instead of the app + sign-in path.
     #[arg(long, conflicts_with_all = ["list", "grant", "disconnect", "forget", "upgrade", "mint"])]
     pub paste: bool,
+    /// Which way to sign in to use on the own door (its id), for a
+    /// service that offers several (`subscription`, `apiKey`). Asked for
+    /// when left out on a terminal.
+    #[arg(long, conflicts_with_all = ["list", "grant", "disconnect", "forget", "upgrade", "mint", "paste"])]
+    pub way: Option<String>,
     /// Mint the provider app automatically (services that support it)
     /// and connect through the fresh credentials.
     #[arg(long, conflicts_with_all = ["list", "grant", "disconnect", "forget", "upgrade"])]
@@ -122,6 +127,7 @@ impl ConnectOpts {
             || !self.set.is_empty()
             || !self.set_env.is_empty()
             || self.paste
+            || self.way.is_some()
             || self.mint
             || self.label.is_some()
             || self.permissions.is_some()
@@ -1190,9 +1196,15 @@ fn grant_by_number<'a>(grants: &'a [GrantSummary], raw: &str) -> Result<&'a Gran
 /// node published it) goes by `service_label`.
 fn grant_title(g: &GrantSummary, service_label: &str) -> String {
     let name = g.label.as_deref().unwrap_or(service_label);
-    match &g.identity {
+    let title = match &g.identity {
         Some(who) => format!("{who} (named \"{name}\")"),
         None => format!("\"{name}\""),
+    };
+    // Which way to sign in it was made with, when the service offers a
+    // choice (a service with one way names it the default one).
+    match g.way.as_deref().filter(|way| *way != weft_core::access::spec::DEFAULT_WAY) {
+        Some(way) => format!("{title}, signed in with {way}"),
+        None => title,
     }
 }
 
@@ -1464,8 +1476,8 @@ impl Connecting<'_> {
             // The own-door flags would be silently dropped on this path;
             // dropping a pasted credential on the floor is the worst way
             // to ignore a flag.
-            if !opts.set.is_empty() || !opts.set_env.is_empty() || opts.paste || opts.mint {
-                bail!("--set/--set-env/--paste/--mint fill your own credential; they do nothing with --door shared");
+            if !opts.set.is_empty() || !opts.set_env.is_empty() || opts.paste || opts.mint || opts.way.is_some() {
+                bail!("--set/--set-env/--paste/--mint/--way fill your own credential; they do nothing with --door shared");
             }
             if opts.label.is_some() {
                 bail!("--label names a connection you create yourself; the shared door names it after its app, or after the service");
@@ -1520,6 +1532,7 @@ impl Connecting<'_> {
                     permissions: Vec::new(),
                     registration: None,
                     paste: false,
+                    way: None,
                     project_id: None,
                     instance: None,
                 },
@@ -1692,6 +1705,7 @@ impl Connecting<'_> {
                     permissions: ticked,
                     registration: None,
                     paste: true,
+                    way: None,
                     project_id: None,
                     instance: None,
                 },
@@ -1700,10 +1714,22 @@ impl Connecting<'_> {
             .await;
         }
 
+        // A pasted-credential service's way to sign in, which decides the
+        // guide and the fields below: only one this install offers.
+        let way = match spec.ways() {
+            [] => {
+                if opts.way.is_some() {
+                    bail!("--way picks one of a pasted credential's ways to sign in; {label} signs in another way");
+                }
+                None
+            }
+            _ => Some(chosen_way(spec, &doors.offered_ways, opts.way.as_deref(), label)?),
+        };
+
         // The generated how-to guide, permissions interpolated, exactly as
         // the own page renders it. Terminal-only: in a pipe it is noise a
         // script would have to skip.
-        let steps = spec.guide_steps(&ticked);
+        let steps = spec.guide_steps(way, &ticked);
         if interactive
             && !steps.is_empty()
             && opts.set.is_empty()
@@ -1711,7 +1737,7 @@ impl Connecting<'_> {
             && !opts.mint
         {
             println!("How to create your own {label} credential:");
-            if let Some(link) = spec.guide_link(&ticked) {
+            if let Some(link) = spec.guide_link(way, &ticked) {
                 println!("  {link}");
             }
             for (i, s) in steps.iter().enumerate() {
@@ -1755,7 +1781,7 @@ impl Connecting<'_> {
             minted = answer.values;
         }
 
-        let fields = spec.own_fields();
+        let fields = spec.own_fields(way);
         for f in &fields {
             if let Some(v) = minted.remove(&f.name) {
                 set.entry(f.name.clone()).or_insert(v);
@@ -1861,6 +1887,7 @@ impl Connecting<'_> {
                     permissions: ticked,
                     registration,
                     paste: false,
+                    way: None,
                     project_id: None,
                     instance: None,
                 },
@@ -1885,12 +1912,49 @@ impl Connecting<'_> {
                 permissions: ticked,
                 registration: None,
                 paste: false,
+                way: way.map(|w| w.id.clone()),
                 project_id: None,
                 instance: None,
             },
             None,
         )
         .await
+    }
+}
+
+/// The way to sign in to a pasted-credential service a connect fills: the
+/// one `--way` names, else the only one this install offers (`offered`,
+/// the doors probe's), else the one the person picks. A way this install
+/// does not offer is refused, naming the ones that work here.
+fn chosen_way<'s>(spec: &'s AccessSpec, offered: &[String], flag: Option<&str>, label: &str) -> Result<&'s LoginWay> {
+    let ways = spec.ways();
+    if let Some(id) = flag {
+        let way = spec.chosen_way(Some(id)).map_err(anyhow::Error::msg)?;
+        if !offered.contains(&way.id) {
+            bail!("{}", spec.cloud_refusal(way));
+        }
+        return Ok(way);
+    }
+    let here: Vec<&LoginWay> = ways.iter().filter(|w| offered.contains(&w.id)).collect();
+    match here.as_slice() {
+        [] => bail!("{}", spec.cloud_refusal(&ways[0])),
+        [only] => Ok(only),
+        several => {
+            let menu: String =
+                several.iter().enumerate().map(|(i, w)| format!("\n  [{}] {}", i + 1, w.display_label())).collect();
+            let ids: Vec<&str> = several.iter().map(|w| w.id.as_str()).collect();
+            let choice = prompt_line(
+                &format!("How do you sign in to {label}?{menu}\nWay [1-{}]: ", several.len()),
+                &format!("--way {}", ids.join("|")),
+            )?;
+            choice
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|i| several.get(i).copied())
+                .with_context(|| format!("'{}' is not one of the ways; answer 1 to {} (or pass --way)", choice.trim(), several.len()))
+        }
     }
 }
 
@@ -2055,7 +2119,7 @@ impl Connecting<'_> {
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
 enum ConnectOutcome {
-    Done(CompletedConnect),
+    Done(Box<CompletedConnect>),
     Failed { error: String },
 }
 
@@ -2224,6 +2288,7 @@ mod tests {
             instance: None,
             identity: identity.map(str::to_string),
             label: label.map(str::to_string),
+            way: None,
             scopes: vec![],
             permissions_verified: false,
             owner: weft_core::CredentialOwner::own(None),
@@ -2267,6 +2332,7 @@ mod tests {
             instance: None,
             identity: Some("ada@example.com".into()),
             label: Some("Fake".into()),
+            way: None,
             scopes: vec![],
             permissions_verified: false,
             value_names: vec![],
@@ -2325,6 +2391,7 @@ mod tests {
             instance: None,
             identity: None,
             label: None,
+            way: None,
             scopes: vec![],
             permissions_verified: false,
             value_names: vec![],
@@ -2573,5 +2640,45 @@ mod tests {
         let p = program_including_sweep(&[]);
         let err = spellings_of(&p, "@src:sweep.key").unwrap_err().to_string();
         assert!(err.contains("'sweep.key' is at no place"), "{err}");
+    }
+
+    /// The way a connect fills: the one `--way` names, if this install
+    /// offers it, else the only one it offers; one it does not offer, or
+    /// none at all, is refused naming what works here.
+    #[test]
+    fn the_way_to_sign_in_is_named_or_the_only_one_offered() {
+        let spec: AccessSpec = serde_json::from_value(serde_json::json!({
+            "service": "agent", "label": "Agent",
+            "acquisition": { "kind": "static", "ways": [
+                { "id": "subscription", "label": "Subscription", "localOnly": true, "fields": [{ "name": "token" }] },
+                { "id": "apiKey", "label": "API key", "fields": [{ "name": "key" }] }
+            ] }
+        }))
+        .unwrap();
+        let offered = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let both = offered(&["subscription", "apiKey"]);
+        assert_eq!(chosen_way(&spec, &both, Some("subscription"), "Agent").unwrap().id, "subscription");
+        let cloud = offered(&["apiKey"]);
+        assert_eq!(chosen_way(&spec, &cloud, None, "Agent").unwrap().id, "apiKey", "the only one offered");
+        let why = chosen_way(&spec, &cloud, Some("subscription"), "Agent").unwrap_err().to_string();
+        assert!(why.contains("works only on a local install") && why.ends_with("connect it with 'API key' instead"), "{why}");
+        let why = chosen_way(&spec, &cloud, Some("oauth"), "Agent").unwrap_err().to_string();
+        assert!(why.contains("no way to sign in named 'oauth'"), "{why}");
+        let why = chosen_way(&spec, &[], None, "Agent").unwrap_err().to_string();
+        assert!(why.contains("works only on a local install"), "{why}");
+    }
+
+    /// A connection made with one of several ways says which, in the list.
+    #[test]
+    fn a_connection_lists_the_way_it_was_made_with() {
+        let mut g: GrantSummary = serde_json::from_value(serde_json::json!({
+            "id": Uuid::nil(), "service": "agent", "projectId": null, "identity": null, "label": "mine",
+            "way": "subscription", "scopes": [], "permissionsVerified": false, "owner": "author", "door": "own",
+            "expiresAt": null
+        }))
+        .unwrap();
+        assert_eq!(grant_title(&g, "Agent"), "\"mine\", signed in with subscription");
+        g.way = Some(weft_core::access::spec::DEFAULT_WAY.into());
+        assert_eq!(grant_title(&g, "Agent"), "\"mine\"", "a service with one way names no way");
     }
 }

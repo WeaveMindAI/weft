@@ -33,6 +33,37 @@ export interface CredentialFieldWire {
   placeholder?: string;
 }
 
+/** A how-to-get-it guide: a pre-filled creation link and ordered steps.
+ *  Both may embed `{permissions}` (see `guideSteps` / `guideLink`). */
+// SYNC: GuideWire <-> crates/weft-core/src/access/spec.rs Guide
+export interface GuideWire {
+  link?: string;
+  steps: string[];
+}
+
+/** One way to sign in to a pasted-credential service: what the person
+ *  pastes, how they get it, and where it may be used. A service offers
+ *  one (an API key) or a choice (a subscription's token or an API key). */
+// SYNC: LoginWayWire <-> crates/weft-core/src/access/spec.rs LoginWay
+export interface LoginWayWire {
+  /** What the connection records (`GrantSummary.way`); `DEFAULT_WAY`
+   *  when left out, which only a service offering one way does. */
+  id?: string;
+  /** What the choice shows; set whenever the service offers several. */
+  label?: string;
+  fields: CredentialFieldWire[];
+  guide?: GuideWire;
+  /** Offered only on a local install; default false. */
+  localOnly?: boolean;
+  /** A pasted sign-in weft keeps alive (how the paste is read, and the
+   *  call that renews it). The editor never reads inside: the store does. */
+  renewal?: unknown;
+}
+
+/** The id of a way whose recipe names none. */
+// SYNC: DEFAULT_WAY <-> crates/weft-core/src/access/spec.rs DEFAULT_WAY
+export const DEFAULT_WAY = 'default';
+
 /** One connect door. */
 // SYNC: Door <-> crates/weft-core/src/access/spec.rs Door
 export type Door = 'shared' | 'own';
@@ -55,7 +86,7 @@ export interface Permission {
   ownOnly?: boolean;
   /** The set-up tutorial for this capability, shown as its own
    *  foldable section on the "Your own" page. */
-  guide?: { link?: string; steps: string[] };
+  guide?: GuideWire;
 }
 
 // SYNC: VerificationRung <-> crates/weft-core/src/access/spec.rs VerificationRung
@@ -74,7 +105,9 @@ export type VerificationCost = 'free' | 'ambiguous' | 'paid';
 // SYNC: OwnPage <-> crates/weft-core/src/access/spec.rs OwnPage
 export interface OwnPageWire {
   mint?: { url: string; payload: unknown; captures: unknown[] };
-  guide?: { link?: string; steps: string[] };
+  /** How to create the app, for a consent service; a pasted-credential
+   *  service's guide lives on each of its ways. */
+  guide?: GuideWire;
   /** "I already have a credential": paste it, no app; the server
    *  stores a static-acquisition connection over these fields. */
   paste?: { fields: CredentialFieldWire[] };
@@ -105,6 +138,9 @@ export interface AccessSpecWire {
   acquisition: {
     // SYNC: kind <-> crates/weft-core/src/access/spec.rs Acquisition
     kind: 'static' | 'oauth2' | 'runtime' | 'mint_jwt';
+    /** A `static` service's ways to sign in. */
+    ways?: LoginWayWire[];
+    /** A `mint_jwt` service's key fields. */
     fields?: CredentialFieldWire[];
     registrationFields?: CredentialFieldWire[];
     grant?: { kind: 'authorization_code' | 'client_credentials'; [key: string]: unknown };
@@ -135,6 +171,9 @@ export interface GrantSummary {
   /** The list's middle column: the app's label, or the user's name for
    *  a pasted credential. */
   label?: string | null;
+  /** The way a pasted connection was made with (`LoginWayWire.id`);
+   *  absent for one signed in any other way. */
+  way?: string | null;
   scopes: string[];
   /** Whether `scopes` came from the provider (verified) or the user's
    *  ticks (claimed); only a verified shortfall marks a node. */
@@ -189,6 +228,11 @@ export interface DoorsStatus {
   /** Why no browser consent can run (the provider only accepts https
    *  callbacks and this weft has none); paste connects still work. */
   consentBlocked?: string;
+  /** The ids of the spec's ways to sign in this install offers, in the
+   *  spec's order: a `localOnly` way is left out on a cloud install.
+   *  Empty for a service that takes no pasted credential, and for one
+   *  none of whose ways works here. */
+  offeredWays: string[];
 }
 
 /** A connection a connect finished with. */

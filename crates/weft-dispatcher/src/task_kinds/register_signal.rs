@@ -226,6 +226,13 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
         let payload: RegisterSignalPayload = serde_json::from_value(task.payload.clone())?;
         if !payload.is_resume {
             core_signal::validate_spec(&payload.spec).map_err(anyhow::Error::msg)?;
+            // A trigger fires on its one signal; ending on the first of
+            // several is what a wait does.
+            anyhow::ensure!(
+                payload.spec.kind != core_signal::first_of::TAG,
+                "a trigger cannot listen on the first of several signals ('{}'): only a wait inside a run can",
+                core_signal::first_of::TAG
+            );
             let run_id = payload.run_id;
             let owner = state.runs.run_owner(run_id).await?.context("entry capture has no run")?;
             anyhow::ensure!(
@@ -241,12 +248,46 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             // else writes a run its worker drives.
             return Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Captured { node_id })?);
         }
-        let token = Self::arm(state, payload, false).await?.token;
+        let token = if payload.spec.kind == core_signal::first_of::TAG {
+            Self::arm_branches(state, payload).await?
+        } else {
+            Self::arm(state, payload, false).await?.token
+        };
         Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Registered { token })?)
     }
 }
 
 impl RegisterSignalExecutor {
+    /// Register a wait on the first of several signals
+    /// (`weft_core::signal::first_of`): each branch armed as the signal it
+    /// is, carrying the wait's token and its own position, so the first
+    /// answer to any of them answers the wait and takes the others down
+    /// (`crate::store::postgres::answer_in`). Answers the wait's token,
+    /// which no row has: the worker waits on it, and only a branch's
+    /// answer reaches it. A branch that cannot arm takes back the ones
+    /// before it, so the wait is up whole or not at all; a retry of the
+    /// task arms every branch again under the same tokens.
+    async fn arm_branches(state: &DispatcherState, payload: RegisterSignalPayload) -> Result<String> {
+        core_signal::validate_spec(&payload.spec).map_err(|e| anyhow::anyhow!("invalid signal spec: {e}"))?;
+        let first = core_signal::FirstOf::read(&payload.spec).map_err(anyhow::Error::msg)?;
+        let wait = resume_token(&payload, None);
+        let mut armed = Vec::with_capacity(first.branches.len());
+        for (at, mut spec) in first.branches.into_iter().enumerate() {
+            let branch = u32::try_from(at).context("a wait with more branches than a u32 counts")?;
+            spec.branch_of = Some(core_signal::first_of::BranchOf { wait: wait.clone(), branch });
+            match Self::arm(state, RegisterSignalPayload { spec, ..payload.clone() }, false).await {
+                Ok(one) => armed.push(one),
+                Err(e) => {
+                    if let Err(undo) = disarm(state.registrations.as_ref(), &state.listener, armed).await {
+                        return Err(e.context(format!("branch {at} of the wait could not be registered, and taking back the branches before it failed too: {undo:#}")));
+                    }
+                    return Err(e.context(format!("branch {at} of the wait could not be registered")));
+                }
+            }
+        }
+        Ok(wait)
+    }
+
     /// Arm a captured entry or a live suspension through the same path.
     /// The answer says what the arm did to the row, so a caller whose
     /// later step fails can take it back ([`disarm`]).
@@ -267,6 +308,16 @@ impl RegisterSignalExecutor {
         if let Err(e) = core_signal::validate_spec(&payload.spec) {
             anyhow::bail!("invalid signal spec: {e}");
         }
+        // No listener serves a wait on the first of several: its branches
+        // are what is armed (`Self::arm_branches`).
+        anyhow::ensure!(
+            payload.spec.kind != core_signal::first_of::TAG,
+            "a wait on the first of several signals is armed branch by branch, never as one signal"
+        );
+        anyhow::ensure!(
+            payload.spec.branch_of.is_none() || payload.is_resume,
+            "a branch of a wait on the first of several signals is a run's wait, never a trigger"
+        );
 
         // Resolve tenant + project_id. Token reuse for entry rows keeps the
         // registration stable across reactivates; resume rows always mint
@@ -304,23 +355,7 @@ impl RegisterSignalExecutor {
         // this task converges on the same token: (run, node_id, frames,
         // wait number), which a resumed body reaches again. Entry tokens are reused across reactivates and
         // read off the existing row below.
-        let resume_token = payload.is_resume.then(|| {
-            let mut hasher = Sha256::new();
-            hasher.update(run_id.to_string().as_bytes());
-            hasher.update(b":");
-            hasher.update(payload.node_id.as_bytes());
-            hasher.update(b":");
-            for frame in &payload.frames {
-                hasher.update(frame.text().as_bytes());
-                hasher.update(b"/");
-            }
-            hasher.update(b":");
-            hasher.update(payload.wait_index.to_le_bytes());
-            let bytes = hasher.finalize();
-            let mut buf = [0u8; 16];
-            buf.copy_from_slice(&bytes[..16]);
-            uuid::Uuid::from_bytes(buf).to_string()
-        });
+        let resume_token = payload.is_resume.then(|| resume_token(&payload, payload.spec.branch_of.as_ref().map(|of| of.branch)));
 
         let resume_run_id = payload.is_resume.then_some(run_id);
         let spec_json = serde_json::to_string(&payload.spec)?;
@@ -486,6 +521,32 @@ impl RegisterSignalExecutor {
             (Ok(()), None) => unreachable!("the lease's work ends only after it handed over the bringing-up"),
         }
     }
+}
+
+/// The token of a run's wait, derived from its identity so a retry of
+/// the task converges on it: (run, node_id, frames, wait number), which a
+/// resumed body reaches again, and, for a branch of a wait on the first of
+/// several, its position among the branches.
+fn resume_token(payload: &RegisterSignalPayload, branch: Option<u32>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(payload.run_id.to_string().as_bytes());
+    hasher.update(b":");
+    hasher.update(payload.node_id.as_bytes());
+    hasher.update(b":");
+    for frame in &payload.frames {
+        hasher.update(frame.text().as_bytes());
+        hasher.update(b"/");
+    }
+    hasher.update(b":");
+    hasher.update(payload.wait_index.to_le_bytes());
+    if let Some(branch) = branch {
+        hasher.update(b":branch:");
+        hasher.update(branch.to_le_bytes());
+    }
+    let bytes = hasher.finalize();
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&bytes[..16]);
+    uuid::Uuid::from_bytes(buf).to_string()
 }
 
 /// Bring up the signal [`RegisterSignalExecutor::arm`] just wrote (`token`
@@ -837,6 +898,27 @@ mod tests {
     use weft_core::frames::Frame;
     use weft_core::primitive::SignalSurface;
     use weft_core::route::RoutePattern;
+
+    /// A wait's token is its identity's, the same on every retry, and each
+    /// branch of a wait on the first of several gets one of its own beside
+    /// it, so the wait's token names no row and no two branches share one.
+    #[test]
+    fn each_branch_of_a_wait_has_a_token_of_its_own() {
+        let payload = weft_task_store::RegisterSignalPayload {
+            run_id: weft_core::RunId::from_u128(1),
+            node_id: "answerIt".into(),
+            frames: Default::default(),
+            spec: weft_core::primitive::SignalSpec::of_kind("form", serde_json::json!({})),
+            is_resume: true,
+            wait_index: 0,
+            port_snapshot: None,
+            asked_at_unix_ms: 0,
+        };
+        let wait = super::resume_token(&payload, None);
+        assert_eq!(wait, super::resume_token(&payload, None), "a retry converges on the same token");
+        let (first, second) = (super::resume_token(&payload, Some(0)), super::resume_token(&payload, Some(1)));
+        assert!(wait != first && wait != second && first != second, "{wait} {first} {second}");
+    }
 
     /// A program with a trigger at the top and the same body included
     /// through two sites, each holding a trigger.

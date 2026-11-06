@@ -1,0 +1,61 @@
+{
+  "type": "CodeBuddyCodeAccess",
+  "label": "CodeBuddy Code Access",
+  "description": "A CodeBuddy login, for the CodeBuddyCode nodes' `access`: a CodeBuddy API key. One access for however many CodeBuddyCode nodes. A key from the China site needs the node's `edition` set to `internal`.",
+  "tags": [
+    "agent",
+    "codebuddy",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#006eff",
+  "service": {
+    "service": "code_buddy_code",
+    "label": "CodeBuddy Code",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "apiKey",
+          "label": "API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "your CodeBuddy API key"
+            }
+          ],
+          "guide": {
+            "link": "https://www.codebuddy.ai/profile/keys",
+            "steps": [
+              "Open codebuddy.ai, your profile's API keys, and create a key (a China account: its own console).",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[code_buddy_code]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[code_buddy_code]",
+      "description": "Wire into the CodeBuddyCode nodes' `access` input."
+    }
+  ]
+}

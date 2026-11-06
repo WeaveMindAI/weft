@@ -288,3 +288,148 @@
             "the bake holds what downstream received"
         );
     }
+
+    // ----- A setup and a real run of one body -----------------------------
+
+    /// An infra node keeping a session's stream open for its run: it
+    /// bakes `agent`, and in a real run opens a bus on `stream` and reads
+    /// it until it ends. It records what `ctx.is_setup()` answered.
+    struct Agent {
+        setups: Arc<StdMutex<Vec<bool>>>,
+    }
+    test_manifest!(Agent, "Agent");
+    #[async_trait]
+    impl Node for Agent {
+        async fn provision_infra(&self, _ctx: weft_core::InfraProvisionContext, _input: weft_core::ValueBag) -> WeftResult<weft_core::infra::InfraSpec> {
+            Ok(weft_core::infra::InfraSpec::default())
+        }
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            self.setups.lock().unwrap().push(ctx.is_setup());
+            ctx.pulse_downstream(NodeOutput::new().set("agent", json!("the-agent"))).await?;
+            if ctx.is_setup() {
+                return Ok(());
+            }
+            let mut state = ctx.keep(()).await?;
+            let bus = ctx.open_bus("stream", Default::default(), "agent").await?;
+            let mut cursor = bus.cursor()?;
+            while cursor.next(&mut state).await?.is_some() {}
+            Ok(())
+        }
+    }
+
+    /// Ends the bus on `bus` as finished.
+    struct EndsBus;
+    test_manifest!(EndsBus, "EndsBus");
+    #[async_trait]
+    impl Node for EndsBus {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            ctx.bus_from_input("bus")?.close();
+            Ok(())
+        }
+    }
+
+    /// `db` (an [`Agent`]) feeds `a` its baked `agent` and `end` its
+    /// `stream`.
+    fn agent_project() -> ProjectDefinition {
+        serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                {
+                    "id": "db", "nodeType": "Agent", "label": null, "config": null, "position": {"x": 0.0, "y": 0.0},
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "agent", "portType": "String", "required": false},
+                        {"name": "stream", "portType": "Bus", "required": false}
+                    ],
+                    "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": true, "images": [],
+                    "bakedOutputs": ["agent"]
+                },
+                {
+                    "id": "a", "nodeType": "Sink", "label": null, "config": null, "position": {"x": 1.0, "y": 0.0},
+                    "inputs": [{"name": "in", "portType": "String", "required": true}], "outputs": [],
+                    "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+                },
+                {
+                    "id": "end", "nodeType": "EndsBus", "label": null, "config": null, "position": {"x": 1.0, "y": 1.0},
+                    "inputs": [{"name": "bus", "portType": "Bus", "required": true}], "outputs": [],
+                    "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+                }
+            ],
+            "edges": [
+                {"id": "agent", "source": "db", "target": "a", "sourceHandle": "agent", "targetHandle": "in"},
+                {"id": "stream", "source": "db", "target": "end", "sourceHandle": "stream", "targetHandle": "bus"}
+            ],
+            "groups": []
+        }))
+        .unwrap()
+    }
+
+    /// A run of [`agent_project`] in `phase`, an infra setup running the
+    /// cut the dispatcher hands it (`db` alone): what `ctx.is_setup()`
+    /// answered, how it ended, its record and what its copy saved.
+    async fn drive_agent(phase: weft_core::context::Phase) -> (Vec<bool>, RunOutcome, Vec<RunEvent>, Arc<Copy>) {
+        let whole = agent_project();
+        let (program, cut_from) = match phase {
+            weft_core::context::Phase::InfraSetup => {
+                let (cut, _) = weft_core::run_spec::setup_cut(&whole, &weft_core::project::infra_places(&whole)).expect("setup cut");
+                (cut, Some(weft_core::project::hash::compute_definition_hash(&whole).unwrap()))
+            }
+            _ => (whole, None),
+        };
+        let run_id = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        let [mut started, kicked] = birth(&program, run_id, phase);
+        if let RunEvent::RunStarted { cut_from: cut, .. } = &mut started {
+            *cut = cut_from;
+        }
+        journal.seed(&[started, kicked]);
+        let setups = Arc::new(StdMutex::new(Vec::new()));
+        let nodes = catalog(vec![
+            ("Agent", Box::new(Agent { setups: setups.clone() })),
+            ("Sink", Box::new(Sink)),
+            ("EndsBus", Box::new(EndsBus)),
+        ]);
+        let copy = Arc::new(Copy::default());
+        let mut clients = clients(journal.clone());
+        clients.infra = copy.clone();
+        clients.infra_state = copy.clone();
+        let drove = drive_on(Arc::new(program), nodes, run_id, journal.clone(), clients, CancellationFlag::new_arc(), None)
+            .await
+            .expect("run_one ok");
+        let setups = setups.lock().unwrap().clone();
+        (setups, drove.outcome, journal.events_of(run_id), copy)
+    }
+
+    /// In the infra setup the body is told it is one: it sends only its
+    /// baked output, which the setup saves, and its `Bus` output, never
+    /// opened, closes as absence with nothing failing.
+    #[tokio::test]
+    async fn an_infra_setup_tells_the_body_it_is_one_and_a_bus_it_never_opens_closes_quietly() {
+        let (setups, outcome, events, copy) = drive_agent(weft_core::context::Phase::InfraSetup).await;
+        assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
+        assert_eq!(setups, vec![true]);
+        assert_eq!(
+            *copy.saves.lock().unwrap(),
+            vec![("db".to_string(), BTreeMap::from([("agent".to_string(), json!("the-agent"))]))],
+            "the setup saved the baked output"
+        );
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::BusCreated { .. })), "no bus in a setup: {events:?}");
+        assert!(ran(&events, "db"), "the body completed with its bus never opened: {events:?}");
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::NodeFailed { .. })), "{events:?}");
+    }
+
+    /// In a real run the same body is told it is not a setup: it opens
+    /// its bus and reads it until a node downstream closes it.
+    #[tokio::test]
+    async fn a_real_run_tells_the_body_it_is_no_setup() {
+        let (setups, outcome, events, copy) = drive_agent(weft_core::context::Phase::Fire).await;
+        assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
+        assert_eq!(setups, vec![false]);
+        assert_eq!(count_created(&events), 1, "{events:?}");
+        assert!(ran(&events, "a") && ran(&events, "end"), "{events:?}");
+        assert!(copy.saves.lock().unwrap().is_empty(), "a run that is no setup saves nothing");
+    }
+
+    fn count_created(events: &[RunEvent]) -> usize {
+        events.iter().filter(|e| matches!(e, RunEvent::BusCreated { .. })).count()
+    }

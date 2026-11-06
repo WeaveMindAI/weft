@@ -8,7 +8,9 @@ description: "Read when a program asks a person something or a person starts a r
 A node parks its run on a person's answer by registering a question and
 waiting for it, and any node can do that for its own service. `HumanQuery`
 is the general form node that asks one; `HumanTrigger` is a form a person
-submits to start a run instead. A parked question reaches people through the
+submits to start a run instead. `AnswerAgent` turns a coding agent's question (from `AskAgent`) into
+a form, with the conversation beside it when `history` is wired, and keeps
+Submit off until every question has an answer. A parked question reaches people through the
 weft browser extension:
 
 1. Build it once: `./setup.sh --browser --no-sign` in the weft checkout

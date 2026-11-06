@@ -49,6 +49,29 @@ describe('the instance door', () => {
 		expect(calls[4].body).toEqual({ node: 'one.read', field: 'spreadsheet', source: 2 });
 	});
 
+	it('names the way a pasted connect was filled for, and hears which ways the install offers', async () => {
+		const spec = { service: 'anthropic', acquisition: { kind: 'static' as const, ways: [{ id: 'apiKey', label: 'API key', fields: [{ name: 'key' }] }] } };
+		const { fetcher, calls } = fakeFetch({
+			'POST /instance/doors': { sharedApps: [], sharedCredential: false, redirectUri: null, offeredWays: ['apiKey'] },
+			'POST /instance/connections/direct': { grant: { id: 'g', service: 'anthropic', way: 'apiKey' } },
+		});
+		const door = new InstanceDoor('t', { base: 'https://weft.example', fetcher });
+		expect((await door.doors(spec)).offeredWays).toEqual(['apiKey']);
+		const request = {
+			spec,
+			door: 'own' as const,
+			paste: false,
+			values: { key: 'sk-1' },
+			way: 'apiKey',
+			label: null,
+			permissions: [],
+			sharedApp: null,
+			registration: null,
+		};
+		expect((await door.connectDirect(request)).grant.way).toBe('apiKey');
+		expect(calls[1].body).toEqual(request);
+	});
+
 	it('never offers the shared key or a mint to an instance', () => {
 		const door = new InstanceDoor('t', { base: 'https://weft.example' });
 		expect(door.allowsSharedKey).toBe(false);

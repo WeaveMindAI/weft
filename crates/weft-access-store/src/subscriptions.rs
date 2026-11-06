@@ -113,12 +113,17 @@ fn subscribe_plan<'a>(
 /// provider must be told where to send, this weft has an address the
 /// internet can reach (`receiver_url`). What only the provider can say (a
 /// refusal of the subscribe itself) is not known until it is asked.
-pub async fn check_subscription<F, Fut>(pool: &Pool, req: &EnsureSubscription, receiver_url: F) -> anyhow::Result<()>
+pub async fn check_subscription<F, Fut>(
+    pool: &Pool,
+    install: weft_core::install::InstallKind,
+    req: &EnsureSubscription,
+    receiver_url: F,
+) -> anyhow::Result<()>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<Option<String>>>,
 {
-    let source = resolve_event_source(pool, &req.tenant, crate::GrantUser::of(req.for_instance.as_ref()), req.access_id, &req.service, &[]).await?;
+    let source = resolve_event_source(pool, install, &req.tenant, crate::GrantUser::of(req.for_instance.as_ref()), req.access_id, &req.service, &[]).await?;
     if subscribe_plan(&source, req)?.is_some() && receiver_url().await?.is_none() {
         return Err(AccessError::Invalid(no_public_url_error(&req.service)).into());
     }
@@ -143,6 +148,7 @@ where
 pub async fn ensure_subscription<F, Fut>(
     pool: &Pool,
     locks: &Pool,
+    install: weft_core::install::InstallKind,
     req: &EnsureSubscription,
     receiver_url: F,
 ) -> anyhow::Result<EnsuredSubscription>
@@ -150,7 +156,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<Option<String>>>,
 {
-    let source = resolve_event_source(pool, &req.tenant, crate::GrantUser::of(req.for_instance.as_ref()), req.access_id, &req.service, &[]).await?;
+    let source = resolve_event_source(pool, install, &req.tenant, crate::GrantUser::of(req.for_instance.as_ref()), req.access_id, &req.service, &[]).await?;
     let Some((calls, planned)) = subscribe_plan(&source, req)? else {
         // The provider pushes without being asked (an app-level
         // events URL); nothing to keep alive.
@@ -282,6 +288,7 @@ where
 pub async fn drop_subscriptions_for_signal(
     pool: &Pool,
     locks: &Pool,
+    install: weft_core::install::InstallKind,
     tenant: &str,
     signal_token: &str,
 ) -> anyhow::Result<u64> {
@@ -291,7 +298,7 @@ pub async fn drop_subscriptions_for_signal(
         for sub in rows {
             let stopped = async {
                 let source =
-                    resolve_event_source(pool, &sub.tenant_id, crate::GrantUser::of(sub.for_instance.as_ref()), sub.access_id, &sub.service, &[])
+                    resolve_event_source(pool, install, &sub.tenant_id, crate::GrantUser::of(sub.for_instance.as_ref()), sub.access_id, &sub.service, &[])
                         .await?;
                 let calls = source
                     .events

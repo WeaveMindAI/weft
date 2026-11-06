@@ -1,0 +1,61 @@
+{
+  "type": "DeepSeekHarnessAccess",
+  "label": "DeepSeek Harness Access",
+  "description": "A DeepSeek login, for the DeepSeekHarness nodes' `access`: a DeepSeek API key. One access for however many DeepSeekHarness nodes.",
+  "tags": [
+    "agent",
+    "deepseek",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#4d6bfe",
+  "service": {
+    "service": "deep_seek_harness",
+    "label": "DeepSeek Harness",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "apiKey",
+          "label": "DeepSeek API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-..."
+            }
+          ],
+          "guide": {
+            "link": "https://platform.deepseek.com/api_keys",
+            "steps": [
+              "Open platform.deepseek.com, API keys, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[deep_seek_harness]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[deep_seek_harness]",
+      "description": "Wire into the DeepSeekHarness nodes' `access` input."
+    }
+  ]
+}

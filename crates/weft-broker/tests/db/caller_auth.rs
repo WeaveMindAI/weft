@@ -10,6 +10,7 @@ use serde_json::json;
 use weft_task_store::db::Pool;
 
 use weft_access_store::connect_direct;
+use weft_core::install::InstallKind;
 use weft_broker::caller_auth::{verify_caller, CallerRefusal, HeldVerifiers};
 use weft_broker_client::protocol::CallerVerifyRequest;
 use weft_core::access::callers::{named_check, CallerScheme};
@@ -38,9 +39,11 @@ fn check(record: serde_json::Value) -> VerifyKind {
 async fn store(pool: &Pool, tenant: &str, spec: AccessSpec, values: &[(&str, &str)]) -> String {
     let done = connect_direct(
         pool,
+        InstallKind::Local,
         tenant,
         ConnectDirect {
             paste: false,
+            way: None,
             spec,
             door: Door::Own,
             registration: None,
@@ -95,29 +98,29 @@ async fn a_stored_key_admits_and_names_which_one(pool: Pool) {
     let keys = named_check("api_keys").unwrap().verify();
     let id = store(&pool, TENANT, CallerScheme::ApiKeys.recipe(), &[("keys", "first-key\nsecond-key\n")]).await;
 
-    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, &keys, &[("x-api-key", "second-key")], b""), 0)
+    let ok = verify_caller(&verifiers(), &pool, InstallKind::Local, &request(TENANT, &id, &keys, &[("x-api-key", "second-key")], b""), 0)
         .await
         .expect("the second key verifies");
     assert_eq!(ok.identity, json!({ "key": 1 }));
     assert_eq!(ok.credential_headers, ["X-Api-Key", "authorization"], "the run never writes the key down");
-    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, &keys, &[("authorization", "Bearer first-key")], b""), 0)
+    let ok = verify_caller(&verifiers(), &pool, InstallKind::Local, &request(TENANT, &id, &keys, &[("authorization", "Bearer first-key")], b""), 0)
         .await
         .expect("the bearer slot works");
     assert_eq!(ok.identity, json!({ "key": 0 }));
 
-    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, &keys, &[("x-api-key", "nope")], b""), 0).await);
+    let why = refused(verify_caller(&verifiers(), &pool, InstallKind::Local, &request(TENANT, &id, &keys, &[("x-api-key", "nope")], b""), 0).await);
     assert!(why.contains("does not match"), "{why}");
-    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, &keys, &[], b""), 0).await);
+    let why = refused(verify_caller(&verifiers(), &pool, InstallKind::Local, &request(TENANT, &id, &keys, &[], b""), 0).await);
     assert!(why.contains("X-Api-Key"), "{why}");
 
     // The same connection under a route that reads its key elsewhere: the
     // route's check decides, the connection only holds the keys.
     let team = check(json!({ "kind": "api_keys", "header": "X-Team-Key", "bearer": false }));
-    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, &team, &[("x-team-key", "first-key")], b""), 0)
+    let ok = verify_caller(&verifiers(), &pool, InstallKind::Local, &request(TENANT, &id, &team, &[("x-team-key", "first-key")], b""), 0)
         .await
         .expect("the route's own header verifies");
     assert_eq!(ok.credential_headers, ["X-Team-Key"]);
-    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, &team, &[("authorization", "Bearer first-key")], b""), 0).await);
+    let why = refused(verify_caller(&verifiers(), &pool, InstallKind::Local, &request(TENANT, &id, &team, &[("authorization", "Bearer first-key")], b""), 0).await);
     assert!(why.contains("X-Team-Key"), "{why}");
 }
 
@@ -139,11 +142,11 @@ async fn a_signed_body_admits_with_the_stored_secret(pool: Pool) {
     let signature = sign(&verify, "s3cret", Some("1700000000"), body, &[], None);
     let headers = [("x-signature", signature.as_str()), ("x-timestamp", "1700000000")];
     let hmac = check(verify);
-    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, &hmac, &headers, body), now)
+    let ok = verify_caller(&verifiers(), &pool, InstallKind::Local, &request(TENANT, &id, &hmac, &headers, body), now)
         .await
         .expect("a genuine signature verifies");
     assert_eq!(ok.identity, json!({}));
-    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, &hmac, &headers, b"{}"), now).await);
+    let why = refused(verify_caller(&verifiers(), &pool, InstallKind::Local, &request(TENANT, &id, &hmac, &headers, b"{}"), now).await);
     assert!(why.contains("does not match"), "{why}");
 }
 
@@ -185,14 +188,14 @@ async fn a_route_gated_by_a_url_signing_scheme_verifies_the_address_called(pool:
     let headers = [("x-twilio-signature", "RSOYDt4T1cUTdK1PDd93/VVr8B8=")];
     let mut req = request(TENANT, &id, &twilio, &headers, body);
     req.url = Some("https://mycompany.com/myapp.php?foo=1&bar=2".into());
-    let ok = verify_caller(&verifiers(), &pool, &req, 0).await.expect("the address called verifies");
+    let ok = verify_caller(&verifiers(), &pool, InstallKind::Local, &req, 0).await.expect("the address called verifies");
     assert_eq!(ok.identity, json!({}));
 
     req.url = Some("https://mycompany.com/myapp.php".into());
-    let why = refused(verify_caller(&verifiers(), &pool, &req, 0).await);
+    let why = refused(verify_caller(&verifiers(), &pool, InstallKind::Local, &req, 0).await);
     assert!(why.contains("does not match"), "{why}");
     req.url = None;
-    let why = refused(verify_caller(&verifiers(), &pool, &req, 0).await);
+    let why = refused(verify_caller(&verifiers(), &pool, InstallKind::Local, &req, 0).await);
     assert!(why.contains("public receiver address"), "{why}");
 }
 
@@ -222,17 +225,17 @@ async fn a_standard_webhooks_signature_admits_from_any_header_copy(pool: Pool) {
         h.extend(signatures.iter().map(|s| ("webhook-signature", *s)));
         request(TENANT, &id, &standard, &h, body)
     };
-    let ok = verify_caller(&verifiers(), &pool, &with(&["v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE="]), ts)
+    let ok = verify_caller(&verifiers(), &pool, InstallKind::Local, &with(&["v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE="]), ts)
         .await
         .expect("the reference vector verifies");
     assert_eq!(ok.identity, json!({}));
     assert_eq!(ok.credential_headers, ["webhook-signature"]);
-    verify_caller(&verifiers(), &pool, &with(&["v1,bm90IGl0", "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE="]), ts)
+    verify_caller(&verifiers(), &pool, InstallKind::Local, &with(&["v1,bm90IGl0", "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE="]), ts)
         .await
         .expect("the second copy of the header verifies");
-    let why = refused(verify_caller(&verifiers(), &pool, &with(&["v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OA="]), ts).await);
+    let why = refused(verify_caller(&verifiers(), &pool, InstallKind::Local, &with(&["v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OA="]), ts).await);
     assert!(why.contains("does not match"), "{why}");
-    let why = refused(verify_caller(&verifiers(), &pool, &with(&["v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE="]), ts + 301).await);
+    let why = refused(verify_caller(&verifiers(), &pool, InstallKind::Local, &with(&["v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE="]), ts + 301).await);
     assert!(why.contains("replay"), "{why}");
 }
 
@@ -246,31 +249,31 @@ async fn the_wall_the_service_and_a_wrong_check_all_refuse(pool: Pool) {
     let id = store(&pool, TENANT, CallerScheme::ApiKeys.recipe(), &[("keys", "k")]).await;
     let headers = [("x-api-key", "k")];
 
-    let why = refused(verify_caller(&verifiers(),&pool, &request("tenant-b", &id, &keys, &headers, b""), 0).await);
+    let why = refused(verify_caller(&verifiers(), &pool, InstallKind::Local, &request("tenant-b", &id, &keys, &headers, b""), 0).await);
     assert!(why.contains("no such connection"), "{why}");
 
     // An hmac check against the api_keys connection: the store refuses a
     // connection of another service than the one asked for.
     let hmac = named_check("hmac_sha256").unwrap().verify();
-    match verify_caller(&verifiers(),&pool, &request(TENANT, &id, &hmac, &headers, b""), 0).await {
+    match verify_caller(&verifiers(), &pool, InstallKind::Local, &request(TENANT, &id, &hmac, &headers, b""), 0).await {
         Err(CallerRefusal::Failed(e)) => assert!(format!("{e:#}").contains("hmac_auth"), "{e:#}"),
         other => panic!("a wrong service is a loud failure, got {other:?}"),
     }
 
     let mut mismatched = request(TENANT, &id, &keys, &headers, b"");
     mismatched.service = "hmac_auth".into();
-    match verify_caller(&verifiers(),&pool, &mismatched, 0).await {
+    match verify_caller(&verifiers(), &pool, InstallKind::Local, &mismatched, 0).await {
         Err(CallerRefusal::Malformed(why)) => assert!(why.contains("api_keys") && why.contains("hmac_auth"), "{why}"),
         other => panic!("a check naming another service is the asker's mistake, got {other:?}"),
     }
     let mut echo = request(TENANT, &id, &keys, &headers, b"");
     echo.verify = check(json!({ "kind": "token_echo" }));
-    match verify_caller(&verifiers(),&pool, &echo, 0).await {
+    match verify_caller(&verifiers(), &pool, InstallKind::Local, &echo, 0).await {
         Err(CallerRefusal::Malformed(why)) => assert!(why.contains("token_echo"), "{why}"),
         other => panic!("a check that cannot check a caller is the asker's mistake, got {other:?}"),
     }
 
-    match verify_caller(&verifiers(),&pool, &request(TENANT, "not-a-uuid", &keys, &headers, b""), 0).await {
+    match verify_caller(&verifiers(), &pool, InstallKind::Local, &request(TENANT, "not-a-uuid", &keys, &headers, b""), 0).await {
         Err(CallerRefusal::Malformed(why)) => assert!(why.contains("not-a-uuid"), "{why}"),
         other => panic!("a malformed id is the asker's mistake, got {other:?}"),
     }
@@ -290,9 +293,11 @@ async fn a_jwt_gate_connection_cannot_be_saved_without_an_audience(pool: Pool) {
     schema(&pool).await;
     let unsaved = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT,
         ConnectDirect {
             paste: false,
+            way: None,
             spec: jwt_spec(),
             door: Door::Own,
             registration: None,
@@ -320,7 +325,7 @@ async fn a_jwt_gate_with_an_http_key_address_is_refused(pool: Pool) {
     let values = [("issuer", "https://auth.example"), ("jwksUrl", "http://auth.example/jwks.json"), ("audience", "my-app")];
     let id = store(&pool, TENANT, jwt_spec(), &values).await;
     let why = refused(
-        verify_caller(&verifiers(), &pool, &request(TENANT, &id, &named_check("oidc").unwrap().verify(), &[("authorization", "Bearer a.b.c")], b""), 0).await,
+        verify_caller(&verifiers(), &pool, InstallKind::Local, &request(TENANT, &id, &named_check("oidc").unwrap().verify(), &[("authorization", "Bearer a.b.c")], b""), 0).await,
     );
     assert!(why.contains("not an https:// address"), "{why}");
 }

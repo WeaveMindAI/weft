@@ -5,6 +5,8 @@
 //! run from its rows, so a resumed worker holds what the live
 //! one held.
 
+#[cfg(feature = "runtime")]
+pub mod bus_reach;
 pub mod cancel;
 pub mod completion;
 pub mod emission;

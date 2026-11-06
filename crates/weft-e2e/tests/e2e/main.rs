@@ -3,6 +3,7 @@
 //! file. A test is named `<file>::<test>` after the module it is in, which
 //! is how `scripts/run-e2e.sh` names and selects it.
 
+mod agents;
 mod api_auth;
 mod api_reply;
 mod api_stream;

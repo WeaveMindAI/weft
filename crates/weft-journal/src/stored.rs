@@ -45,7 +45,28 @@ const STEPS: &[&[weft_core::stored::Op]] = &[
         weft_core::stored::Op::Within { at: "*.spec", ops: weft_core::primitive::SIGNAL_SPEC_V2 },
         weft_core::stored::Op::Within { at: "*.stand_in", ops: weft_core::primitive::SIGNAL_SPEC_V2 },
     ],
+    // 3 -> 4: a name leaving a bus says how its body returned (`end`),
+    // which is how a bus nobody is on ends once no node can still join
+    // it. Before, the last one leaving ended the bus in the same breath,
+    // its `bus_closed` row right after, so every older leave reads as
+    // finished.
+    &[weft_core::stored::Op::Code { at: "", run: bus_left_finished }],
 ];
+
+/// Every `bus_left` event of a row says it left finished (version 3 to 4).
+fn bus_left_finished(row: &mut serde_json::Value) -> Result<(), String> {
+    let serde_json::Value::Array(events) = row else {
+        return Err(format!("a record row should be a list of events, and is {row}"));
+    };
+    for event in events.iter_mut().filter(|event| event.get("kind").and_then(serde_json::Value::as_str) == Some("bus_left")) {
+        let serde_json::Value::Object(fields) = event else { continue };
+        if fields.contains_key("end") {
+            return Err(format!("a bus_left event of a version 3 row already says how it ended: {event}"));
+        }
+        fields.insert("end".into(), serde_json::json!({ "kind": "finished" }));
+    }
+    Ok(())
+}
 
 /// Drop every `run_output` event of a row (version 1 to 2).
 fn drop_run_outputs(row: &mut serde_json::Value) -> Result<(), String> {

@@ -7,6 +7,7 @@
 
 mod caller_auth;
 mod door_let_go;
+mod endpoint_within;
 mod held_signals;
 mod held_stop;
 mod install_cli;

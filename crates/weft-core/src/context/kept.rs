@@ -99,7 +99,10 @@ impl<S: Serialize + DeserializeOwned + Send> Kept<S> {
     /// is empty: run `work`, put its result in `field`, save, and hand it
     /// back. The one gap is a crash between `work` returning and the save
     /// landing, which runs `work` again; a service that must not see it
-    /// twice has to refuse the duplicate itself.
+    /// twice has to refuse the duplicate itself. Hand it
+    /// `ctx.firing_key()` ([`crate::context::RunContext::firing_key`]):
+    /// the body run again sends the same key, so the service can answer
+    /// the second call with what it answered the first.
     ///
     /// The result has to save as something (not JSON `null`: a `()`, a
     /// `None`, a unit struct), or a body run again could not tell the step

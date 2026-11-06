@@ -1,0 +1,364 @@
+{
+  "type": "MuseCode",
+  "label": "Muse Code",
+  "description": "One conversation with Muse Code, Meta's coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, Muse Code runs on your machine (a local install only) with your own login, working in `folder`. If `muse` is missing, weft installs it into a folder of its own, shared by the whole machine, before the node runs. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs, and it logs in with the connection on `access`. It runs on Meta's models only. Other tools' personal rules and skills (Claude Code's, Codex's) are always kept out of it. A shell pipeline is asked about stage by stage, each stage its own question. A Muse Code subscription works only through your machine's own `muse login`. Its card shows what it is doing and a Start over button. What is exposed: the permission setting, the model, the reasoning effort, extra folders, project trust, Meta's Contributor pricing, its question tool, its sandbox and its network. Your program's tools reach Muse Code's model as `mcp__weft__<name>`, and `toolCall` still gives the plain name back. Muse Code cannot give up any of its own tools, so a tool named like one of them is refused when the program is built.",
+  "tags": [
+    "agent",
+    "coding",
+    "muse",
+    "meta",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run Muse Code in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[muse_code]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A MuseCodeAccess's `access`: a Meta Model API key. Required with a `computer`. Left out on your machine, Muse Code uses the login already on it (`muse login`)."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder Muse Code works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`muse` on your PATH",
+      "description": "On your machine: the Muse Code program to run, when it is not the `muse` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "on_request",
+          "auto_review",
+          "read_only",
+          "deny_unmatched",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What Muse Code may do without asking. `ask`: every action no permission rule covers comes out of AskAgent as a question, with no AI reviewer deciding first. `on_request`: it asks only for what it judges needs approval (protected writes, new network targets, risky shell stages). `auto_review`: its AI reviewer decides, and only what it escalates asks. `read_only`: it reads files only. `deny_unmatched`: nothing asks: anything no rule covers is refused, and it carries on. `bypass`: nothing asks and there is no filesystem sandbox; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "Muse's default",
+      "description": "A Meta model id, such as `muse-spark-1.3`. Left out, Muse's default."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultra"
+        ]
+      },
+      "label": "Reasoning effort",
+      "description": "How hard the model thinks. Left out, Muse's default, `high`."
+    },
+    {
+      "name": "addDirs",
+      "type": "List[String]",
+      "label": "Extra folders",
+      "description": "Folders besides `folder` Muse Code may work in; they get no project trust."
+    },
+    {
+      "name": "trustWorkspace",
+      "type": "Boolean",
+      "default": false,
+      "label": "Trust the folder",
+      "description": "Load the folder's rules (`AGENTS.md`, `CLAUDE.md`, ...) and project skills."
+    },
+    {
+      "name": "contributorMode",
+      "type": "Boolean",
+      "default": false,
+      "label": "Contributor pricing",
+      "description": "Meta's cheaper Contributor pricing, where the conversation is used to improve Meta's products. Off leaves Muse's own setting alone."
+    },
+    {
+      "name": "disableQuestions",
+      "type": "Boolean",
+      "default": false,
+      "label": "No questions",
+      "description": "Take its question tool away: the model makes reasonable assumptions and says them."
+    },
+    {
+      "name": "disableSandbox",
+      "type": "Boolean",
+      "default": false,
+      "label": "No sandbox",
+      "description": "Run shell commands outside its bubblewrap sandbox, for a machine where bubblewrap cannot run (Muse then fails every shell command)."
+    },
+    {
+      "name": "network",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "restricted",
+          "proxy_only",
+          "enabled"
+        ]
+      },
+      "label": "Network",
+      "description": "What its sandbox lets out: `restricted`, no network; `proxy_only`, each new host is a question; `enabled`, open. Left out, `proxy_only`."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MuseCode '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MuseCode '{id}' runs in a computer, where no login is waiting for it; give it a MuseCodeAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MuseCode '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "on_request",
+                "auto_review",
+                "read_only",
+                "deny_unmatched",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MuseCode '{id}' has a `permission` it does not know; pick one of ask, on_request, auto_review, read_only, deny_unmatched, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "MuseCode '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "MuseCode '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs Muse Code itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "workflow",
+      "read_file",
+      "search",
+      "write_file",
+      "edit_file",
+      "read_memory",
+      "add_memory",
+      "edit_memory",
+      "work_stop",
+      "work_list",
+      "web_fetch",
+      "web_search",
+      "bash",
+      "bash_input",
+      "monitor",
+      "cron_create",
+      "cron_delete",
+      "cron_list",
+      "get_goal",
+      "create_goal",
+      "update_goal",
+      "report_progress",
+      "subagent_spawn",
+      "subagent_status",
+      "subagent_send_message",
+      "subagent_wait",
+      "subagent_read_result",
+      "subagent_cancel",
+      "read_skill",
+      "work_status",
+      "snooze_reminder",
+      "write_todos",
+      "request_user_input"
+    ]
+  }
+}

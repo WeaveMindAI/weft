@@ -11,6 +11,7 @@ use weft_task_store::db::{Client as _, Pool};
 use weft_access_store::migrate::{begin_import, export, import, make_transfer_key};
 use weft_access_store::{connect_direct, list_grants, resolve_for_worker, GrantOwnerScope, GrantUser};
 use weft_core::access::spec::Door;
+use weft_core::install::InstallKind;
 use weft_core::access::wire::ConnectDirect;
 use weft_core::migrate::{Outcome, Selection};
 use weft_core::AccessSpec;
@@ -25,7 +26,7 @@ fn keyed() -> AccessSpec {
     serde_json::from_value(json!({
         "service": "keyed",
         "doors": ["shared", "own"],
-        "acquisition": { "kind": "static", "fields": [{ "name": "token" }] },
+        "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "token" }] }] },
         "auth": [{ "kind": "header", "name": "Authorization", "value": "Bearer {token}" }],
     }))
     .unwrap()
@@ -34,9 +35,11 @@ fn keyed() -> AccessSpec {
 async fn connect(pool: &Pool, door: Door, token: &str, project_id: Option<uuid::Uuid>) -> uuid::Uuid {
     connect_direct(
         pool,
+        InstallKind::Local,
         SOURCE,
         ConnectDirect {
             paste: false,
+            way: None,
             spec: keyed(),
             door,
             registration: None,
@@ -70,7 +73,7 @@ async fn import_as(
     shared_keys: &[&str],
 ) -> anyhow::Result<weft_core::migrate::ImportedConnections> {
     let opened = begin_import(pool, tenant, *key_id, sealed).await?;
-    import(opened, tenant, &shared_keys.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>()).await
+    import(opened, InstallKind::Local, tenant, &shared_keys.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>()).await
 }
 
 fn outcome(imported: &weft_core::migrate::ImportedConnections, id: uuid::Uuid) -> Outcome {
@@ -113,7 +116,7 @@ async fn a_connection_copies_with_its_id_and_its_secret(pool: Pool) {
     assert!(why.contains("holds none"), "{why}");
     assert!(import_as(&pool, TARGET, &(first_key, first), &[]).await.is_err(), "a key opens one batch");
 
-    let resolved = resolve_for_worker(&pool, TARGET, GrantUser::Author, own, "keyed", &[], &[]).await.unwrap();
+    let resolved = resolve_for_worker(&pool, InstallKind::Local, TARGET, GrantUser::Author, own, "keyed", &[], &[]).await.unwrap();
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-1"), "the secret arrived whole");
     let (tenant, created_at, project): (String, chrono::DateTime<chrono::Utc>, Option<uuid::Uuid>) =
         pool.one("SELECT tenant_id, created_at, project_id FROM access_grant WHERE id = $1", &[&own]).await.unwrap();
@@ -218,4 +221,101 @@ async fn a_transfer_key_is_its_tenants_and_expires(pool: Pool) {
     make_transfer_key(&pool, TARGET).await.unwrap();
     let left: i64 = pool.scalar("SELECT count(*) FROM access_transfer_key", &[]).await.unwrap();
     assert_eq!(left, 1, "a key past its time goes as the next one is made");
+}
+
+/// A connection made with a way to sign in that keeps its credential on
+/// the person's own machine is not copied to a cloud install, which would
+/// refuse to open it; the reason names the ways that work there. Its way
+/// travels with every connection that copies.
+#[weft_db_macros::test]
+async fn a_local_only_connection_is_not_copied_to_a_cloud(pool: Pool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let agent: AccessSpec = serde_json::from_value(json!({
+        "service": "agent",
+        "label": "Agent",
+        "acquisition": { "kind": "static", "ways": [
+            { "id": "subscription", "label": "Subscription", "localOnly": true, "fields": [{ "name": "token" }] },
+            { "id": "apiKey", "label": "API key", "fields": [{ "name": "key" }] }
+        ] }
+    }))
+    .unwrap();
+    let made = |way: &str, field: &str| {
+        let pool = pool.clone();
+        let (agent, way, field) = (agent.clone(), way.to_string(), field.to_string());
+        async move {
+            connect_direct(
+                &pool,
+                InstallKind::Local,
+                SOURCE,
+                ConnectDirect {
+                    paste: false,
+                    way: Some(way),
+                    spec: agent,
+                    door: Door::Own,
+                    registration: None,
+                    values: [(field, "secret".to_string())].into_iter().collect(),
+                    label: Some("mine".into()),
+                    permissions: Vec::new(),
+                    project_id: None,
+                    instance: None,
+                },
+            )
+            .await
+            .unwrap()
+            .grant
+            .id
+        }
+    };
+    let subscription = made("subscription", "token").await;
+    let api_key = made("apiKey", "key").await;
+    let (_, key_id, sealed) = sealed_for(&pool, TARGET, &Selection { all: true, ..Default::default() }).await;
+    pool.execute("DELETE FROM access_grant", &[]).await.unwrap();
+
+    let opened = begin_import(&pool, TARGET, key_id, &sealed).await.unwrap();
+    let imported = import(opened, InstallKind::Cloud, TARGET, &BTreeSet::new()).await.unwrap();
+    let Outcome::Skipped { why } = outcome(&imported, subscription) else { panic!("a local-only connection stays behind") };
+    assert!(why.contains("works only on a local install") && why.ends_with("connect it with 'API key' instead"), "{why}");
+    assert_eq!(outcome(&imported, api_key), Outcome::Copied);
+    let way: Option<String> = pool.scalar("SELECT way FROM access_grant WHERE id = $1", &[&api_key]).await.unwrap();
+    assert_eq!(way.as_deref(), Some("apiKey"), "the way travels with the connection");
+}
+
+/// A pasted connection exported by a weft from before ways to sign in
+/// names no way, and its recipe is stored at the shape before them. It
+/// copies, made with its recipe's one way, the same as the boot fills a
+/// row of this database from then; and the same batch again finds it
+/// already there.
+#[weft_db_macros::test]
+async fn a_connection_from_before_ways_copies_with_its_one_way(pool: Pool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let id = connect(&pool, Door::Own, "tok-old", None).await;
+    // The row as that weft wrote it: version 3 of the recipe (its fields
+    // on the acquisition) and no way.
+    let before_ways = json!({
+        "service": "keyed",
+        "doors": ["shared", "own"],
+        "acquisition": { "kind": "static", "fields": [{ "name": "token" }] },
+        "auth": [{ "kind": "header", "name": "Authorization", "value": "Bearer {token}" }],
+    });
+    pool.execute(
+        "UPDATE access_grant SET way = NULL, spec = $2, spec_version = 3 WHERE id = $1",
+        &[&id, &before_ways.to_string()],
+    )
+    .await
+    .unwrap();
+    let all = Selection { all: true, ..Default::default() };
+    let (_, first_key, first) = sealed_for(&pool, TARGET, &all).await;
+    let second = { let (_, k, b) = sealed_for(&pool, TARGET, &all).await; (k, b) };
+    pool.execute("DELETE FROM access_grant", &[]).await.unwrap();
+
+    let imported = import_as(&pool, TARGET, &(first_key, first), &[]).await.unwrap();
+    assert_eq!(outcome(&imported, id), Outcome::Copied);
+    let way: Option<String> = pool.scalar("SELECT way FROM access_grant WHERE id = $1", &[&id]).await.unwrap();
+    assert_eq!(way.as_deref(), Some(weft_core::access::spec::DEFAULT_WAY), "it was made with its recipe's one way");
+    let resolved = resolve_for_worker(&pool, InstallKind::Local, TARGET, GrantUser::Author, id, "keyed", &[], &[]).await.unwrap();
+    assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-old"));
+    assert_eq!(resolved.way.as_deref(), Some(weft_core::access::spec::DEFAULT_WAY));
+
+    let imported = import_as(&pool, TARGET, &second, &[]).await.unwrap();
+    assert_eq!(outcome(&imported, id), Outcome::AlreadyThere, "its way filled on both sides, the copies match");
 }

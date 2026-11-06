@@ -1,0 +1,136 @@
+[
+  [
+    {
+      "kind": "run_started",
+      "project_id": "6f1d3c2a-8e4b-4a7f-9c1d-2b3e4f5a6b7c",
+      "entry_node": "hook",
+      "phase": "fire",
+      "definition_hash": "9a7c1e0f3b5d4e2a8c6b1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a",
+      "binary_hash": "1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00",
+      "source_version": "v12",
+      "fired_trigger": "hook",
+      "at_unix": 1760000000
+    },
+    {
+      "kind": "node_kicked",
+      "node_id": "hook",
+      "firing": true,
+      "payload": {
+        "body": {
+          "text": "hello"
+        },
+        "caller": {
+          "key": 0
+        }
+      },
+      "at_unix": 1760000000
+    },
+    {
+      "kind": "node_started",
+      "node_id": "show",
+      "frames": [],
+      "at_unix": 1760000001
+    },
+    {
+      "kind": "port_emitted",
+      "emission_id": "0d9e8f7a-6b5c-4d3e-8f1a-2b3c4d5e6f70",
+      "node_id": "show",
+      "frames": [],
+      "port": "body",
+      "value": {
+        "caller": {
+          "key": 0
+        },
+        "text": "hello"
+      },
+      "at_unix": 1760000001
+    },
+    {
+      "kind": "log_line",
+      "node_id": "show",
+      "frames": [],
+      "level": "info",
+      "message": "answered",
+      "at_unix_ms": 1760000001250,
+      "seq": 0,
+      "at_unix": 1760000001
+    },
+    {
+      "kind": "suspension_registered",
+      "node_id": "review",
+      "frames": [],
+      "token": "sig_4f2a9c",
+      "spec": {
+        "kind": "form",
+        "config": {
+          "title": "Approve?"
+        },
+        "consumerKind": "browser"
+      },
+      "wait_index": 0,
+      "at_unix": 1760000002
+    },
+    {
+      "kind": "node_suspended",
+      "node_id": "review",
+      "frames": [],
+      "token": "sig_4f2a9c",
+      "at_unix": 1760000002
+    }
+  ],
+  [
+    {
+      "kind": "suspension_resolved",
+      "token": "sig_4f2a9c",
+      "value": {
+        "approved": true
+      },
+      "at_unix": 1760000300
+    },
+    {
+      "kind": "node_resumed",
+      "node_id": "review",
+      "frames": [],
+      "token": "sig_4f2a9c",
+      "at_unix": 1760000300
+    },
+    {
+      "kind": "node_completed",
+      "node_id": "show",
+      "frames": [],
+      "at_unix": 1760000300
+    },
+    {
+      "kind": "run_completed",
+      "at_unix": 1760000301
+    }
+  ],
+  [
+    {
+      "kind": "trigger_captured",
+      "node_id": "secure",
+      "spec": { "kind": "route", "config": { "path": "secure", "auth": { "kind": "connection", "access_id": "3b8e1f2a-6c4d-4e5f-9a0b-1c2d3e4f5a6b", "service": "api_key_auth", "verify": { "kind": "api_keys" } } } },
+      "port_snapshot": {},
+      "at_unix": 1760000400
+    }
+  ],
+  [
+    {
+      "kind": "bus_joined",
+      "bus_id": "5b1e2c3d-4f5a-4b6c-8d7e-9f0a1b2c3d4e",
+      "offset": 0,
+      "name": "host",
+      "at_unix": 1760000000
+    },
+    {
+      "kind": "bus_left",
+      "bus_id": "5b1e2c3d-4f5a-4b6c-8d7e-9f0a1b2c3d4e",
+      "offset": 1,
+      "name": "host",
+      "end": {
+        "kind": "finished"
+      },
+      "at_unix": 1760000001
+    }
+  ]
+]

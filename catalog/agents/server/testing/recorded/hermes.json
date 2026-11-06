@@ -1,0 +1,3369 @@
+{
+ "kind": "hermes",
+ "command": "hermes",
+ "source": "Real, on Hermes Agent 0.22.6 (`hermes acp`) with an OpenRouter key (login way openRouter, model deepseek/deepseek-v4-flash), driven through weft's own agent server and this spec, every line teed (scratchpad acp12/drive.py, acp12/hermes/transcript.jsonl): hello; tool, with the program's tools `lookup` and `web_search` (weft's plugin, its `web_search` in the built-in's place; both reached weft's route, neither asked); permission (`mkdir -p junk && rm -rf junk`, on its dangerous list, asked by a permission check of its own id and allowed; the check's end names nothing and is no call). Earlier, against a local scripted OpenAI-compatible model (scratchpad rec/mock_openai.py, rec/tee.py, rec/live.py), rec/hermes4.jsonl: initialize line 14, session/new line 43, session/set_mode line 46, session/load lines 133-187 (its replay, cut to the first two turns, all before its answer at line 187); reject 65-78, edit 79-89, ask 90-100, ask several 101-113. rec/hermes2.jsonl line 47: session/set_config_option (reasoning_effort high). bad key: rec/hermes6.jsonl lines 48-52 (the openRouter login with a made-up key; OpenRouter answered 401). The work folder's path is shortened to /home/me/work and available_commands_update lines are left out. Nothing is composed.",
+ "given": {
+  "model": "mock-model",
+  "credentials": {
+   "way": "openaiCompatible",
+   "values": {
+    "key": "mock-key",
+    "baseUrl": "http://127.0.0.1:28941/v1"
+   }
+  }
+ },
+ "answers": {
+  "initialize": {
+   "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {
+     "image": true
+    },
+    "sessionCapabilities": {
+     "fork": {},
+     "list": {},
+     "resume": {}
+    }
+   },
+   "agentInfo": {
+    "name": "hermes-agent",
+    "version": "0.22.6"
+   },
+   "authMethods": [
+    {
+     "description": "Authenticate Hermes using the currently configured custom runtime credentials.",
+     "id": "custom",
+     "name": "custom runtime credentials"
+    },
+    {
+     "args": [
+      "--setup"
+     ],
+     "description": "Open Hermes' interactive model/provider setup in a terminal. Use this when Hermes has not been configured on this machine yet.",
+     "id": "hermes-setup",
+     "name": "Configure Hermes provider",
+     "type": "terminal"
+    }
+   ],
+   "protocolVersion": 1
+  },
+  "session/new": {
+   "_meta": {
+    "hermes": {
+     "sessionProvenance": {
+      "acpSessionId": "$SESSION",
+      "currentHermesSessionId": "$SESSION",
+      "rootHermesSessionId": "$SESSION",
+      "parentHermesSessionId": null,
+      "sessionKind": "root",
+      "compressionDepth": 0
+     }
+    }
+   },
+   "configOptions": [
+    {
+     "currentValue": "ask",
+     "options": [
+      {
+       "name": "Default",
+       "value": "ask"
+      },
+      {
+       "name": "Accept Edits",
+       "value": "workspace_session"
+      },
+      {
+       "name": "Don't Ask",
+       "value": "session"
+      }
+     ],
+     "category": "mode",
+     "id": "edit_approval_policy",
+     "name": "Edits",
+     "type": "select"
+    },
+    {
+     "currentValue": "custom:mock-model",
+     "options": [
+      {
+       "name": "OpenAI API \u00b7 mock-model",
+       "value": "openai-api:mock-model"
+      },
+      {
+       "name": "Custom endpoint \u00b7 mock-model",
+       "value": "custom:mock-model"
+      }
+     ],
+     "category": "model",
+     "id": "model",
+     "name": "Model",
+     "type": "select"
+    },
+    {
+     "currentValue": "default",
+     "options": [
+      {
+       "name": "default",
+       "value": "default"
+      },
+      {
+       "name": "none",
+       "value": "none"
+      },
+      {
+       "name": "minimal",
+       "value": "minimal"
+      },
+      {
+       "name": "low",
+       "value": "low"
+      },
+      {
+       "name": "medium",
+       "value": "medium"
+      },
+      {
+       "name": "high",
+       "value": "high"
+      },
+      {
+       "name": "xhigh",
+       "value": "xhigh"
+      },
+      {
+       "name": "max",
+       "value": "max"
+      },
+      {
+       "name": "ultra",
+       "value": "ultra"
+      }
+     ],
+     "category": "thought_level",
+     "id": "reasoning_effort",
+     "name": "Reasoning effort",
+     "type": "select"
+    }
+   ],
+   "models": {
+    "availableModels": [
+     {
+      "description": "Provider: OpenAI API",
+      "modelId": "openai-api:mock-model",
+      "name": "OpenAI API \u00b7 mock-model"
+     },
+     {
+      "description": "Provider: Custom endpoint \u2022 current",
+      "modelId": "custom:mock-model",
+      "name": "Custom endpoint \u00b7 mock-model"
+     }
+    ],
+    "currentModelId": "custom:mock-model"
+   },
+   "modes": {
+    "availableModes": [
+     {
+      "description": "Ask before edits.",
+      "id": "default",
+      "name": "Default"
+     },
+     {
+      "description": "Auto-allow workspace and temp-dir edits; still asks for sensitive paths.",
+      "id": "accept_edits",
+      "name": "Accept Edits"
+     },
+     {
+      "description": "Auto-allow file edits for this session except sensitive paths.",
+      "id": "dont_ask",
+      "name": "Don't Ask"
+     }
+    ],
+    "currentModeId": "default"
+   },
+   "sessionId": "$SESSION"
+  },
+  "session/set_mode": {},
+  "session/set_config_option": {
+   "configOptions": [
+    {
+     "currentValue": "ask",
+     "options": [
+      {
+       "name": "Default",
+       "value": "ask"
+      },
+      {
+       "name": "Accept Edits",
+       "value": "workspace_session"
+      },
+      {
+       "name": "Don't Ask",
+       "value": "session"
+      }
+     ],
+     "category": "mode",
+     "id": "edit_approval_policy",
+     "name": "Edits",
+     "type": "select"
+    },
+    {
+     "currentValue": "custom:mock-model",
+     "options": [
+      {
+       "name": "OpenAI API \u00b7 mock-model",
+       "value": "openai-api:mock-model"
+      },
+      {
+       "name": "Custom endpoint \u00b7 mock-model",
+       "value": "custom:mock-model"
+      }
+     ],
+     "category": "model",
+     "id": "model",
+     "name": "Model",
+     "type": "select"
+    },
+    {
+     "currentValue": "high",
+     "options": [
+      {
+       "name": "none",
+       "value": "none"
+      },
+      {
+       "name": "minimal",
+       "value": "minimal"
+      },
+      {
+       "name": "low",
+       "value": "low"
+      },
+      {
+       "name": "medium",
+       "value": "medium"
+      },
+      {
+       "name": "high",
+       "value": "high"
+      },
+      {
+       "name": "xhigh",
+       "value": "xhigh"
+      },
+      {
+       "name": "max",
+       "value": "max"
+      },
+      {
+       "name": "ultra",
+       "value": "ultra"
+      }
+     ],
+     "category": "thought_level",
+     "id": "reasoning_effort",
+     "name": "Reasoning effort",
+     "type": "select"
+    }
+   ]
+  },
+  "session/load": {
+   "_meta": {
+    "hermes": {
+     "sessionProvenance": {
+      "acpSessionId": "$SESSION",
+      "currentHermesSessionId": "$SESSION",
+      "rootHermesSessionId": "$SESSION",
+      "parentHermesSessionId": null,
+      "sessionKind": "root",
+      "compressionDepth": 0
+     }
+    }
+   },
+   "configOptions": [
+    {
+     "currentValue": "ask",
+     "options": [
+      {
+       "name": "Default",
+       "value": "ask"
+      },
+      {
+       "name": "Accept Edits",
+       "value": "workspace_session"
+      },
+      {
+       "name": "Don't Ask",
+       "value": "session"
+      }
+     ],
+     "category": "mode",
+     "id": "edit_approval_policy",
+     "name": "Edits",
+     "type": "select"
+    },
+    {
+     "currentValue": "custom:mock-model",
+     "options": [
+      {
+       "name": "OpenAI API \u00b7 mock-model",
+       "value": "openai-api:mock-model"
+      },
+      {
+       "name": "Custom endpoint \u00b7 mock-model",
+       "value": "custom:mock-model"
+      }
+     ],
+     "category": "model",
+     "id": "model",
+     "name": "Model",
+     "type": "select"
+    },
+    {
+     "currentValue": "default",
+     "options": [
+      {
+       "name": "default",
+       "value": "default"
+      },
+      {
+       "name": "none",
+       "value": "none"
+      },
+      {
+       "name": "minimal",
+       "value": "minimal"
+      },
+      {
+       "name": "low",
+       "value": "low"
+      },
+      {
+       "name": "medium",
+       "value": "medium"
+      },
+      {
+       "name": "high",
+       "value": "high"
+      },
+      {
+       "name": "xhigh",
+       "value": "xhigh"
+      },
+      {
+       "name": "max",
+       "value": "max"
+      },
+      {
+       "name": "ultra",
+       "value": "ultra"
+      }
+     ],
+     "category": "thought_level",
+     "id": "reasoning_effort",
+     "name": "Reasoning effort",
+     "type": "select"
+    }
+   ],
+   "models": {
+    "availableModels": [
+     {
+      "description": "Provider: OpenAI API",
+      "modelId": "openai-api:mock-model",
+      "name": "OpenAI API \u00b7 mock-model"
+     },
+     {
+      "description": "Provider: Custom endpoint \u2022 current",
+      "modelId": "custom:mock-model",
+      "name": "Custom endpoint \u00b7 mock-model"
+     }
+    ],
+    "currentModelId": "custom:mock-model"
+   },
+   "modes": {
+    "availableModes": [
+     {
+      "description": "Ask before edits.",
+      "id": "default",
+      "name": "Default"
+     },
+     {
+      "description": "Auto-allow workspace and temp-dir edits; still asks for sensitive paths.",
+      "id": "accept_edits",
+      "name": "Accept Edits"
+     },
+     {
+      "description": "Auto-allow file edits for this session except sensitive paths.",
+      "id": "dont_ask",
+      "name": "Don't Ask"
+     }
+    ],
+    "currentModeId": "default"
+   }
+  }
+ },
+ "replay": {
+  "before": [
+   {
+    "content": {
+     "text": "hello",
+     "type": "text"
+    },
+    "sessionUpdate": "user_message_chunk"
+   },
+   {
+    "content": {
+     "text": "Done, all good.",
+     "type": "text"
+    },
+    "sessionUpdate": "agent_message_chunk"
+   },
+   {
+    "content": {
+     "text": "permission",
+     "type": "text"
+    },
+    "sessionUpdate": "user_message_chunk"
+   },
+   {
+    "content": [
+     {
+      "content": {
+       "text": "$ rm -rf ./probe_dir",
+       "type": "text"
+      },
+      "type": "content"
+     }
+    ],
+    "kind": "execute",
+    "locations": [],
+    "title": "terminal: rm -rf ./probe_dir",
+    "toolCallId": "call_e663d6",
+    "sessionUpdate": "tool_call"
+   },
+   {
+    "content": [
+     {
+      "content": {
+       "text": "terminal result\n- **exit_code:** 0\n- **approval:** Command required approval (recursive delete) and was approved by the user.",
+       "type": "text"
+      },
+      "type": "content"
+     }
+    ],
+    "kind": "execute",
+    "status": "completed",
+    "toolCallId": "call_e663d6",
+    "sessionUpdate": "tool_call_update"
+   },
+   {
+    "content": {
+     "text": "Removed it.",
+     "type": "text"
+    },
+    "sessionUpdate": "agent_message_chunk"
+   },
+   {
+    "content": {
+     "text": "reject",
+     "type": "text"
+    },
+    "sessionUpdate": "user_message_chunk"
+   },
+   {
+    "content": [
+     {
+      "content": {
+       "text": "$ rm -rf ./probe_dir",
+       "type": "text"
+      },
+      "type": "content"
+     }
+    ],
+    "kind": "execute",
+    "locations": [],
+    "title": "terminal: rm -rf ./probe_dir",
+    "toolCallId": "call_0fcde3",
+    "sessionUpdate": "tool_call"
+   }
+  ],
+  "after": []
+ },
+ "settings": [
+  {
+   "name": "ask",
+   "given": {
+    "permission": "ask"
+   },
+   "expect": {
+    "args": [
+     [
+      "acp"
+     ]
+    ],
+    "env": {
+     "HERMES_HOME": "$HOME",
+     "HERMES_KANBAN_DISPATCH_IN_GATEWAY": "0",
+     "OPENAI_API_KEY": "mock-key"
+    },
+    "unset": [
+     "ANTHROPIC_TOKEN",
+     "CLAUDE_CODE_OAUTH_TOKEN",
+     "GOOGLE_API_KEY",
+     "HERMES_YOLO_MODE",
+     "HERMES_TUI_GATEWAY_URL"
+    ],
+    "requests": [
+     {
+      "method": "initialize",
+      "params": {
+       "clientCapabilities": {
+        "elicitation": {
+         "form": {}
+        }
+       }
+      }
+     },
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "default"
+      }
+     }
+    ],
+    "files": {
+     "config.yaml": [
+      "\"adopt_external_logins\": false",
+      "\"mode\": \"manual\"",
+      "\"timeout\": 31536000",
+      "\"clarify_timeout\": 0",
+      "\"enabled\": \"off\"",
+      "\"clarify\"",
+      "\"model_upgrade_enabled\": false",
+      "\"check\": false"
+     ]
+    }
+   }
+  },
+  {
+   "name": "accept_edits",
+   "given": {
+    "permission": "accept_edits"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "accept_edits"
+      }
+     }
+    ],
+    "files": {
+     "config.yaml": "\"mode\": \"manual\""
+    }
+   }
+  },
+  {
+   "name": "auto",
+   "given": {
+    "permission": "auto"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "dont_ask"
+      }
+     }
+    ],
+    "files": {
+     "config.yaml": "\"mode\": \"manual\""
+    }
+   }
+  },
+  {
+   "name": "bypass",
+   "given": {
+    "permission": "bypass"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "dont_ask"
+      }
+     }
+    ],
+    "files": {
+     "config.yaml": "\"mode\": \"off\""
+    }
+   }
+  },
+  {
+   "name": "model_and_effort",
+   "given": {
+    "model": "anthropic/claude-sonnet-4.5",
+    "options": {
+     "effort": "high"
+    }
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "reasoning_effort",
+       "value": "high"
+      }
+     }
+    ],
+    "files": {
+     "config.yaml": "\"default\": \"anthropic/claude-sonnet-4.5\""
+    }
+   }
+  },
+  {
+   "name": "login_openRouter",
+   "given": {
+    "credentials": {
+     "way": "openRouter",
+     "values": {
+      "key": "sk-or-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "OPENROUTER_API_KEY": "sk-or-test",
+     "HERMES_HOME": "$HOME"
+    },
+    "files": {
+     "config.yaml": [
+      "\"provider\": \"openrouter\""
+     ]
+    }
+   }
+  },
+  {
+   "name": "login_anthropicKey",
+   "given": {
+    "credentials": {
+     "way": "anthropicKey",
+     "values": {
+      "key": "sk-ant-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "ANTHROPIC_API_KEY": "sk-ant-test",
+     "HERMES_HOME": "$HOME"
+    },
+    "files": {
+     "config.yaml": [
+      "\"provider\": \"anthropic\""
+     ]
+    }
+   }
+  },
+  {
+   "name": "login_openaiKey",
+   "given": {
+    "credentials": {
+     "way": "openaiKey",
+     "values": {
+      "key": "sk-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "OPENAI_API_KEY": "sk-test",
+     "HERMES_HOME": "$HOME"
+    },
+    "files": {
+     "config.yaml": [
+      "\"provider\": \"openai-api\""
+     ]
+    }
+   }
+  },
+  {
+   "name": "login_geminiKey",
+   "given": {
+    "credentials": {
+     "way": "geminiKey",
+     "values": {
+      "key": "AIza-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "GEMINI_API_KEY": "AIza-test",
+     "HERMES_HOME": "$HOME"
+    },
+    "files": {
+     "config.yaml": [
+      "\"provider\": \"gemini\""
+     ]
+    }
+   }
+  },
+  {
+   "name": "login_openaiCompatible",
+   "given": {
+    "credentials": {
+     "way": "openaiCompatible",
+     "values": {
+      "key": "sk-test",
+      "baseUrl": "http://127.0.0.1:9/v1"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "OPENAI_API_KEY": "sk-test",
+     "HERMES_HOME": "$HOME"
+    },
+    "files": {
+     "config.yaml": [
+      "\"provider\": \"custom\"",
+      "\"base_url\": \"http://127.0.0.1:9/v1\"",
+      "\"key_env\": \"OPENAI_API_KEY\""
+     ]
+    }
+   }
+  },
+  {
+   "name": "no_model",
+   "given": {
+    "model": null
+   },
+   "expect": {
+    "error": "needs `model`"
+   }
+  },
+  {
+   "name": "machine_login",
+   "given": {
+    "credentials": null
+   },
+   "expect": {
+    "error": "runs only on a connection's login"
+   }
+  },
+  {
+   "name": "bad_effort",
+   "given": {
+    "options": {
+     "effort": "maybe"
+    }
+   },
+   "expect": {
+    "error": "takes none, minimal"
+   }
+  }
+ ],
+ "turns": {
+  "hello": {
+   "steps": [
+    {
+     "update": {
+      "content": {
+       "text": "The",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " user",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " wants",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " me",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " to",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " reply",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " with",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " exactly",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " \"",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "Hello",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " there",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ".\"",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "Hello",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " there",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ".",
+       "type": "text"
+      },
+      "messageId": "bfbc88f9-ee68-4f95-a0a3-b4427a074f6e",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 14149,
+       "outputTokens": 17,
+       "thoughtTokens": 12,
+       "totalTokens": 14166
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "text",
+     "done"
+    ],
+    "reply": "Hello there."
+   }
+  },
+  "permission": {
+   "steps": [
+    {
+     "update": {
+      "content": {
+       "text": "The",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " user",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " wants",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " me",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " to",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " run",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " a",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " shell",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " command",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " that",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " makes",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " a",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " directory",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " called",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " \"",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "j",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "unk",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "\"",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " and",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " then",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " removes",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " it",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ".",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " This",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " is",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " a",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " simple",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " one",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "-shot",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " command",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ".",
+       "type": "text"
+      },
+      "messageId": "7ddc27a6-3c83-41ca-9821-fbf6af3058bc",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": [
+       {
+        "content": {
+         "text": "$ mkdir -p junk && rm -rf junk",
+         "type": "text"
+        },
+        "type": "content"
+       }
+      ],
+      "kind": "execute",
+      "locations": [],
+      "title": "terminal: mkdir -p junk + 1 command",
+      "toolCallId": "call_e8cb775411b14e9487a08f91",
+      "sessionUpdate": "tool_call"
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "options": [
+        {
+         "kind": "allow_once",
+         "name": "Allow once",
+         "optionId": "allow_once"
+        },
+        {
+         "kind": "allow_always",
+         "name": "Allow for session",
+         "optionId": "allow_session"
+        },
+        {
+         "kind": "allow_always",
+         "name": "Allow always",
+         "optionId": "allow_always"
+        },
+        {
+         "kind": "reject_once",
+         "name": "Deny",
+         "optionId": "deny"
+        },
+        {
+         "kind": "reject_always",
+         "name": "Deny always",
+         "optionId": "deny_always"
+        }
+       ],
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "content": [
+         {
+          "content": {
+           "text": "recursive delete\n$ mkdir -p junk && rm -rf junk",
+           "type": "text"
+          },
+          "type": "content"
+         }
+        ],
+        "kind": "execute",
+        "rawInput": {
+         "command": "mkdir -p junk && rm -rf junk",
+         "description": "recursive delete"
+        },
+        "status": "pending",
+        "title": "recursive delete: mkdir -p junk && rm -rf junk",
+        "toolCallId": "perm-check-1"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "status": "completed",
+      "toolCallId": "perm-check-1",
+      "sessionUpdate": "tool_call_update"
+     }
+    },
+    {
+     "update": {
+      "content": [
+       {
+        "content": {
+         "text": "terminal result\n- **exit_code:** 0\n- **approval:** Command required approval (recursive delete) and was approved by the user.",
+         "type": "text"
+        },
+        "type": "content"
+       }
+      ],
+      "kind": "execute",
+      "status": "completed",
+      "toolCallId": "call_e8cb775411b14e9487a08f91",
+      "sessionUpdate": "tool_call_update"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "The",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " command",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " ran",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " successfully",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " (",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "exit",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " code",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " ",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "0",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "),",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " though",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " it",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " required",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " approval",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " for",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " the",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " recursive",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " delete",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ".",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " The",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " user",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " approved",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " it",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ".",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " Now",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " I",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " reply",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " with",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " exactly",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " \"",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "Done",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ".\"",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "\n\nDone",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ".",
+       "type": "text"
+      },
+      "messageId": "55e6f059-7332-47fa-bb15-644547ba26b2",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "cachedReadTokens": 28518,
+       "inputTokens": 354,
+       "outputTokens": 119,
+       "thoughtTokens": 63,
+       "totalTokens": 28991
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "tool_use",
+     "question",
+     "tool_result",
+     "thinking",
+     "text",
+     "done"
+    ],
+    "reply": "\n\nDone.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "execute",
+        "title": "recursive delete: mkdir -p junk && rm -rf junk",
+        "detail": "mkdir -p junk && rm -rf junk"
+       }
+      },
+      "answer": {
+       "choice": "allow_once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "allow_once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "reject": {
+   "steps": [
+    {
+     "update": {
+      "content": [
+       {
+        "content": {
+         "text": "$ rm -rf ./probe_dir",
+         "type": "text"
+        },
+        "type": "content"
+       }
+      ],
+      "kind": "execute",
+      "locations": [],
+      "title": "terminal: rm -rf ./probe_dir",
+      "toolCallId": "call_0fcde3",
+      "sessionUpdate": "tool_call"
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "options": [
+        {
+         "kind": "allow_once",
+         "name": "Allow once",
+         "optionId": "allow_once"
+        },
+        {
+         "kind": "allow_always",
+         "name": "Allow for session",
+         "optionId": "allow_session"
+        },
+        {
+         "kind": "allow_always",
+         "name": "Allow always",
+         "optionId": "allow_always"
+        },
+        {
+         "kind": "reject_once",
+         "name": "Deny",
+         "optionId": "deny"
+        },
+        {
+         "kind": "reject_always",
+         "name": "Deny always",
+         "optionId": "deny_always"
+        }
+       ],
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "content": [
+         {
+          "content": {
+           "text": "recursive delete\n$ rm -rf ./probe_dir",
+           "type": "text"
+          },
+          "type": "content"
+         }
+        ],
+        "kind": "execute",
+        "rawInput": {
+         "command": "rm -rf ./probe_dir",
+         "description": "recursive delete"
+        },
+        "status": "pending",
+        "title": "recursive delete: rm -rf ./probe_dir",
+        "toolCallId": "perm-check-2"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "status": "failed",
+      "toolCallId": "perm-check-2",
+      "sessionUpdate": "tool_call_update"
+     }
+    },
+    {
+     "update": {
+      "content": [
+       {
+        "content": {
+         "text": "terminal failed: BLOCKED: Command denied by user. The user has NOT consented to this action. Do NOT retry this command, do NOT rephrase it, and do NOT attempt the same outcome via a different command. Stop the current workflow and wait for the user to respond before taking any further destructive or irreversible action.",
+         "type": "text"
+        },
+        "type": "content"
+       }
+      ],
+      "kind": "execute",
+      "status": "failed",
+      "toolCallId": "call_0fcde3",
+      "sessionUpdate": "tool_call_update"
+     }
+    },
+    {
+     "update": {
+      "size": 256000,
+      "used": 156,
+      "sessionUpdate": "usage_update"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "\n\nI ",
+       "type": "text"
+      },
+      "messageId": "00493635-ba50-47d0-90a3-f0a38406a750",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "did ",
+       "type": "text"
+      },
+      "messageId": "00493635-ba50-47d0-90a3-f0a38406a750",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "not ",
+       "type": "text"
+      },
+      "messageId": "00493635-ba50-47d0-90a3-f0a38406a750",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "remove ",
+       "type": "text"
+      },
+      "messageId": "00493635-ba50-47d0-90a3-f0a38406a750",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "it.",
+       "type": "text"
+      },
+      "messageId": "00493635-ba50-47d0-90a3-f0a38406a750",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "size": 256000,
+      "used": 187,
+      "sessionUpdate": "usage_update"
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 50,
+       "outputTokens": 25,
+       "totalTokens": 75
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "\n\nI did not remove it.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission"
+      },
+      "answer": {
+       "choice": "deny"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "deny"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "edit": {
+   "steps": [
+    {
+     "update": {
+      "content": [
+       {
+        "content": {
+         "text": "Preparing write to hello.txt. Approval prompt shows the diff.",
+         "type": "text"
+        },
+        "type": "content"
+       }
+      ],
+      "kind": "edit",
+      "locations": [
+       {
+        "path": "hello.txt"
+       }
+      ],
+      "title": "write_file: hello.txt",
+      "toolCallId": "call_8eceaf",
+      "sessionUpdate": "tool_call"
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "options": [
+        {
+         "kind": "allow_once",
+         "name": "Allow once",
+         "optionId": "allow_once"
+        },
+        {
+         "kind": "reject_once",
+         "name": "Deny",
+         "optionId": "deny"
+        }
+       ],
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "content": [
+         {
+          "newText": "hi\n",
+          "path": "/home/me/work/hello.txt",
+          "type": "diff"
+         }
+        ],
+        "kind": "edit",
+        "rawInput": {
+         "tool": "write_file",
+         "arguments": {
+          "path": "hello.txt",
+          "content": "hi\n"
+         }
+        },
+        "status": "pending",
+        "title": "Approve edit: /home/me/work/hello.txt",
+        "toolCallId": "edit-approval-1"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "status": "completed",
+      "toolCallId": "edit-approval-1",
+      "sessionUpdate": "tool_call_update"
+     }
+    },
+    {
+     "update": {
+      "content": [
+       {
+        "content": {
+         "text": "\u2705 write_file completed for `hello.txt`\nFiles: `/home/me/work/hello.txt`",
+         "type": "text"
+        },
+        "type": "content"
+       }
+      ],
+      "kind": "edit",
+      "status": "completed",
+      "toolCallId": "call_8eceaf",
+      "sessionUpdate": "tool_call_update"
+     }
+    },
+    {
+     "update": {
+      "size": 256000,
+      "used": 165,
+      "sessionUpdate": "usage_update"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "\n\nWrote ",
+       "type": "text"
+      },
+      "messageId": "8d19f4e3-28f9-4c49-8220-cd35ebc80d7c",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "hello.txt.",
+       "type": "text"
+      },
+      "messageId": "8d19f4e3-28f9-4c49-8220-cd35ebc80d7c",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "size": 256000,
+      "used": 195,
+      "sessionUpdate": "usage_update"
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 70,
+       "outputTokens": 35,
+       "totalTokens": 105
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "\n\nWrote hello.txt.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "edit",
+        "title": "Approve edit: /home/me/work/hello.txt",
+        "choices": [
+         {
+          "id": "allow_once",
+          "kind": "allow_once"
+         },
+         {
+          "id": "deny",
+          "kind": "reject"
+         }
+        ]
+       }
+      },
+      "answer": {
+       "choice": "allow_once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "allow_once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "ask": {
+   "steps": [
+    {
+     "update": {
+      "content": [
+       {
+        "content": {
+         "text": "{\n  \"questions\": [\n    {\n      \"question\": \"Which color?\",\n      \"choices\": [\n        \"red\",\n        \"blue\"\n      ]\n    }\n  ]\n}",
+         "type": "text"
+        },
+        "type": "content"
+       }
+      ],
+      "kind": "other",
+      "locations": [],
+      "title": "clarify: Which color?",
+      "toolCallId": "call_e16f67",
+      "sessionUpdate": "tool_call"
+     }
+    },
+    {
+     "ask": {
+      "method": "elicitation/create",
+      "params": {
+       "sessionId": "$SESSION",
+       "mode": "form",
+       "message": "Which color?",
+       "requestedSchema": {
+        "type": "object",
+        "properties": {
+         "answer": {
+          "type": "string",
+          "enum": [
+           "red (Recommended)",
+           "blue"
+          ]
+         }
+        },
+        "required": [
+         "answer"
+        ]
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "content": [
+       {
+        "content": {
+         "text": "clarify result\n- **responses:** 1 item\n  1.\n    - **question:** Which color?\n    - **choices_offered:** 2 items\n      1. red\n      2. blue\n    - **status:** answered\n    - **user_response:** blue\n- **outcome:** submitted",
+         "type": "text"
+        },
+        "type": "content"
+       }
+      ],
+      "kind": "other",
+      "status": "completed",
+      "toolCallId": "call_e16f67",
+      "sessionUpdate": "tool_call_update"
+     }
+    },
+    {
+     "update": {
+      "size": 256000,
+      "used": 85,
+      "sessionUpdate": "usage_update"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "\n\nBlue ",
+       "type": "text"
+      },
+      "messageId": "9cc5cbfc-5b89-4bde-bdf8-efd78f65e17b",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "it ",
+       "type": "text"
+      },
+      "messageId": "9cc5cbfc-5b89-4bde-bdf8-efd78f65e17b",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "is.",
+       "type": "text"
+      },
+      "messageId": "9cc5cbfc-5b89-4bde-bdf8-efd78f65e17b",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "size": 256000,
+      "used": 114,
+      "sessionUpdate": "usage_update"
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 90,
+       "outputTokens": 45,
+       "totalTokens": 135
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "\n\nBlue it is.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "id": "answer",
+         "question": "Which color?",
+         "options": [
+          {
+           "label": "red (Recommended)"
+          },
+          {
+           "label": "blue"
+          }
+         ],
+         "multiSelect": false,
+         "allowOther": false
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "answer": [
+         "blue"
+        ]
+       }
+      },
+      "agentGot": {
+       "action": "accept",
+       "content": {
+        "answer": "blue"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "ask several": {
+   "steps": [
+    {
+     "update": {
+      "content": [
+       {
+        "content": {
+         "text": "{\n  \"questions\": [\n    {\n      \"question\": \"Which color?\",\n      \"choices\": [\n        \"red\",\n        \"blue\"\n      ]\n    },\n    {\n      \"question\": \"Which sizes?\",\n      \"choices\": [\n        \"small\",\n        \"large\"\n      ],\n      \"multi_select\": true\n    },\n    {\n      \"question\": \"Any name for it?\"\n    }\n  ]\n}",
+         "type": "text"
+        },
+        "type": "content"
+       }
+      ],
+      "kind": "other",
+      "locations": [],
+      "title": "clarify: Which color?",
+      "toolCallId": "call_2cc35d",
+      "sessionUpdate": "tool_call"
+     }
+    },
+    {
+     "ask": {
+      "method": "elicitation/create",
+      "params": {
+       "sessionId": "$SESSION",
+       "mode": "form",
+       "message": "Which color?",
+       "requestedSchema": {
+        "type": "object",
+        "properties": {
+         "answer": {
+          "type": "string",
+          "enum": [
+           "red (Recommended)",
+           "blue"
+          ]
+         }
+        },
+        "required": [
+         "answer"
+        ]
+       }
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "elicitation/create",
+      "params": {
+       "sessionId": "$SESSION",
+       "mode": "form",
+       "message": "Which sizes?",
+       "requestedSchema": {
+        "type": "object",
+        "properties": {
+         "answer": {
+          "type": "array",
+          "items": {
+           "type": "string",
+           "enum": [
+            "small (Recommended)",
+            "large"
+           ]
+          }
+         }
+        },
+        "required": [
+         "answer"
+        ]
+       }
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "elicitation/create",
+      "params": {
+       "sessionId": "$SESSION",
+       "mode": "form",
+       "message": "Any name for it?",
+       "requestedSchema": {
+        "type": "object",
+        "properties": {
+         "answer": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "answer"
+        ]
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "content": [
+       {
+        "content": {
+         "text": "clarify result\n- **responses:** 3 items\n  1.\n    - **question:** Which color?\n    - **choices_offered:** 2 items\n      1. red\n      2. blue\n    - **status:** answered\n    - **user_response:** red\n  2.\n    - **question:** Which sizes?\n    - **choices_offered:** 2 items\n      1. small\n      2. large\n    - **status:** answered\n    - **user_response:** 2 items\n      1. small\n      2. large\n  3.\n    - **question:** Any name for it?\n    - **status:** answered\n    - **user_response:** Bob\n- **outcome:** submitted",
+         "type": "text"
+        },
+        "type": "content"
+       }
+      ],
+      "kind": "other",
+      "status": "completed",
+      "toolCallId": "call_2cc35d",
+      "sessionUpdate": "tool_call_update"
+     }
+    },
+    {
+     "update": {
+      "size": 256000,
+      "used": 143,
+      "sessionUpdate": "usage_update"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "\n\nNoted.",
+       "type": "text"
+      },
+      "messageId": "7a383f22-d0e0-4e35-8daa-05ea4c69467f",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "size": 256000,
+      "used": 171,
+      "sessionUpdate": "usage_update"
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "inputTokens": 110,
+       "outputTokens": 55,
+       "totalTokens": 165
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "question",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "\n\nNoted.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "question": "Which color?",
+         "multiSelect": false
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "answer": [
+         "red (Recommended)"
+        ]
+       }
+      },
+      "agentGot": {
+       "action": "accept",
+       "content": {
+        "answer": "red (Recommended)"
+       }
+      }
+     },
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "question": "Which sizes?",
+         "multiSelect": true,
+         "options": [
+          {
+           "label": "small (Recommended)"
+          },
+          {
+           "label": "large"
+          }
+         ]
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "answer": [
+         "small (Recommended)",
+         "large"
+        ]
+       }
+      },
+      "agentGot": {
+       "action": "accept",
+       "content": {
+        "answer": [
+         "small (Recommended)",
+         "large"
+        ]
+       }
+      }
+     },
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "question": "Any name for it?",
+         "options": [],
+         "allowOther": true
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "answer": [
+         "Bob"
+        ]
+       }
+      },
+      "agentGot": {
+       "action": "accept",
+       "content": {
+        "answer": "Bob"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "tool": {
+   "tools": [
+    "lookup",
+    "web_search"
+   ],
+   "steps": [
+    {
+     "update": {
+      "content": {
+       "text": "Let",
+       "type": "text"
+      },
+      "messageId": "c837700a-5657-44f4-b64a-1b0e6c0a7bc9",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " me",
+       "type": "text"
+      },
+      "messageId": "c837700a-5657-44f4-b64a-1b0e6c0a7bc9",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " call",
+       "type": "text"
+      },
+      "messageId": "c837700a-5657-44f4-b64a-1b0e6c0a7bc9",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " both",
+       "type": "text"
+      },
+      "messageId": "c837700a-5657-44f4-b64a-1b0e6c0a7bc9",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " tools",
+       "type": "text"
+      },
+      "messageId": "c837700a-5657-44f4-b64a-1b0e6c0a7bc9",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " simultaneously",
+       "type": "text"
+      },
+      "messageId": "c837700a-5657-44f4-b64a-1b0e6c0a7bc9",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " since",
+       "type": "text"
+      },
+      "messageId": "c837700a-5657-44f4-b64a-1b0e6c0a7bc9",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " they",
+       "type": "text"
+      },
+      "messageId": "c837700a-5657-44f4-b64a-1b0e6c0a7bc9",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "'re",
+       "type": "text"
+      },
+      "messageId": "c837700a-5657-44f4-b64a-1b0e6c0a7bc9",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " independent",
+       "type": "text"
+      },
+      "messageId": "c837700a-5657-44f4-b64a-1b0e6c0a7bc9",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ".",
+       "type": "text"
+      },
+      "messageId": "c837700a-5657-44f4-b64a-1b0e6c0a7bc9",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "kind": "other",
+      "locations": [],
+      "title": "lookup",
+      "toolCallId": "call_d159708581464b528cf70f9e",
+      "sessionUpdate": "tool_call"
+     }
+    },
+    {
+     "tool": {
+      "name": "lookup",
+      "arguments": {}
+     }
+    },
+    {
+     "update": {
+      "content": [
+       {
+        "content": {
+         "text": "42",
+         "type": "text"
+        },
+        "type": "content"
+       }
+      ],
+      "kind": "other",
+      "rawOutput": "42",
+      "status": "completed",
+      "toolCallId": "call_d159708581464b528cf70f9e",
+      "sessionUpdate": "tool_call_update"
+     }
+    },
+    {
+     "update": {
+      "content": [
+       {
+        "content": {
+         "text": "Searching the web",
+         "type": "text"
+        },
+        "type": "content"
+       }
+      ],
+      "kind": "fetch",
+      "locations": [],
+      "title": "web_search",
+      "toolCallId": "call_ca61b3cd03b84e25b1a7f773",
+      "sessionUpdate": "tool_call"
+     }
+    },
+    {
+     "tool": {
+      "name": "web_search",
+      "arguments": {
+       "query": ""
+      }
+     }
+    },
+    {
+     "update": {
+      "content": [
+       {
+        "content": {
+         "text": "no results",
+         "type": "text"
+        },
+        "type": "content"
+       }
+      ],
+      "kind": "fetch",
+      "status": "completed",
+      "toolCallId": "call_ca61b3cd03b84e25b1a7f773",
+      "sessionUpdate": "tool_call_update"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "The",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " lookup",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " tool",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " returned",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " \"",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "42",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "\"",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " and",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " the",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " web",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "_search",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " tool",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " returned",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " \"",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "no",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " results",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "\"",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " (",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "as",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " expected",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " with",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " no",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " query",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ").",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " The",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " user",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " wants",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " me",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " to",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " reply",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " with",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " exactly",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ":",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " \"",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "It",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " is",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " <",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "the",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " lookup",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " answer",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ">",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ".\"",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " So",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " the",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " lookup",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " answer",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " is",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " \"",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "42",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "\".",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_thought_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "\n\nIt",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " is",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": " ",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "42",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": ".",
+       "type": "text"
+      },
+      "messageId": "d76442bb-0c97-4dcc-a8a1-6e8d59957957",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "cachedReadTokens": 22850,
+       "inputTokens": 5716,
+       "outputTokens": 126,
+       "thoughtTokens": 61,
+       "totalTokens": 28692
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "tool_use",
+     "tool_call",
+     "tool_result",
+     "tool_use",
+     "tool_call",
+     "tool_result",
+     "thinking",
+     "text",
+     "done"
+    ],
+    "reply": "\n\nIt is 42.",
+    "blocks": [
+     {
+      "tool": "lookup",
+      "result": "42"
+     },
+     {
+      "tool": "web_search",
+      "result": "no results"
+     }
+    ]
+   }
+  },
+  "bad key": {
+   "given": {
+    "model": "openai/gpt-4o-mini",
+    "credentials": {
+     "way": "openRouter",
+     "values": {
+      "key": "sk-or-v1-invalid"
+     }
+    }
+   },
+   "steps": [
+    {
+     "update": {
+      "title": "bad key",
+      "updatedAt": "2026-11-04T07:51:33.487564+00:00",
+      "sessionUpdate": "session_info_update"
+     }
+    },
+    {
+     "update": {
+      "size": 128000,
+      "used": 0,
+      "sessionUpdate": "usage_update"
+     }
+    },
+    {
+     "update": {
+      "content": {
+       "text": "OpenRouter rejected your API key, so the model can't be reached. Update it in Settings \u2192 Providers, or run `hermes setup` in a terminal.\n\nProvider said: HTTP 401: User not found.\n\nYour request was not processed. Send it again if you still want me to carry it out.",
+       "type": "text"
+      },
+      "messageId": "4efb5eb7-6544-4304-a3c6-8314a483fb55",
+      "sessionUpdate": "agent_message_chunk"
+     }
+    },
+    {
+     "fail": {
+      "code": -32603,
+      "message": "Internal error",
+      "data": {
+       "details": "admitted_turn_failed"
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "text",
+     "error"
+    ],
+    "status": "failed",
+    "error": "OpenRouter rejected your API key, so the model can't be reached."
+   }
+  }
+ },
+ "mcpFrom": {
+  "list": {
+   "home": "HERMES_HOME",
+   "file": "plugins/weft/tools.json"
+  }
+ },
+ "pluginLoaded": {
+  "home": "HERMES_HOME",
+  "file": "plugins/weft/loaded.json"
+ }
+}

@@ -562,6 +562,15 @@ impl InstallConfig {
         }
     }
 
+    /// Whether this install runs on the machine weft runs on or on a
+    /// cloud: what its version build compiles a program for.
+    pub fn install_kind(&self) -> weft_core::install::InstallKind {
+        match &self.platform {
+            PlatformConfig::Local(_) => weft_core::install::InstallKind::Local,
+            PlatformConfig::Gcp(_) => weft_core::install::InstallKind::Cloud,
+        }
+    }
+
     /// Refuse a config no install could run, naming the setting.
     pub fn validate(&self) -> Result<(), String> {
         self.worker_settings().validate()?;

@@ -1,0 +1,295 @@
+{
+  "type": "GoogleAntigravity",
+  "label": "Google Antigravity",
+  "description": "One conversation with Google Antigravity, Google's coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. weft drives Antigravity through its SDK, `google-antigravity` on PyPI, which runs Antigravity's own harness and lives in a Python environment of its own, `antigravity-sdk`. With no `computer`, Antigravity runs on your machine (a local install only) with the key already in your environment (`GEMINI_API_KEY`, or Vertex AI's variables with your Google Cloud application default login), working in `folder`: weft sets that environment up itself, once, in a folder of its own shared by every program on the machine. With a `computer` wired, it is set up and run inside that computer, which a cloud install needs, and it logs in with the connection on `access`, in a home of its own. The program's tools reach the model under their own names, and a tool named like one of Antigravity's own takes its place: by the name the model sees (`view_file`, `write_to_file`, `replace_file_content`, `run_command`, `search_web`, `invoke_subagent`, ...) or by the SDK's (`create_file`, `edit_file`). Its skill tools (`list_skills`, `lookup_skill`, `lookup_skills`, `get_skill_resources`, `skill_lookup`) are the names it cannot give up, so a tool of one of those names is refused when the program is built. Its question tool asks several questions at once, each with answers to pick from and room for one of your own. Its card shows what it is doing and a Start over button. What is exposed: the permission mode, the model, the effort, instructions added to its system prompt and extra folders.",
+  "tags": [
+    "agent",
+    "coding",
+    "antigravity",
+    "google",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run Google Antigravity in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[google_antigravity]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A GoogleAntigravityAccess's `access`: a Gemini API key or a Vertex AI key. Required with a `computer`. Left out on your machine, Google Antigravity uses the key already in your environment."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder Google Antigravity works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`antigravity-sdk` on your PATH",
+      "description": "On your machine: the runner of Google Antigravity's SDK to use, when it is not the `antigravity-sdk` on your PATH or the one weft installs (one on another google-antigravity release, say): a program that runs the Python file it is given on an environment that has google-antigravity. A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "accept_edits",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What Google Antigravity may do without asking. `ask`: it reads freely, and every other tool it would use (a command, a file change, a web search, a sub-agent, ...) comes out of AskAgent as a question. `accept_edits`: file changes go ahead too, the rest asks. `bypass`: nothing asks, nothing is refused; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "its default",
+      "description": "A Gemini model its key offers (`gemini-3.1-pro`, `gemini-3.8-flash`, ...). Left out, the SDK's default."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "extra_high"
+        ]
+      },
+      "label": "Effort",
+      "description": "How hard the model thinks, among the levels its model offers. Left out, the model's default."
+    },
+    {
+      "name": "appendSystemPrompt",
+      "type": "String",
+      "widget": {
+        "kind": "textarea"
+      },
+      "label": "Add to the system prompt",
+      "description": "Instructions added to its system prompt, for the whole conversation."
+    },
+    {
+      "name": "addDirs",
+      "type": "List[String]",
+      "label": "Extra folders",
+      "description": "Folders besides `folder` Google Antigravity may read and change."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GoogleAntigravity '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GoogleAntigravity '{id}' runs in a computer, where no login is waiting for it; give it a GoogleAntigravityAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GoogleAntigravity '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "accept_edits",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GoogleAntigravity '{id}' has a `permission` it does not know; pick one of ask, accept_edits, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GoogleAntigravity '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "GoogleAntigravity '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs Google Antigravity itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "list_skills",
+      "lookup_skill",
+      "lookup_skills",
+      "get_skill_resources",
+      "skill_lookup"
+    ]
+  }
+}

@@ -314,7 +314,7 @@ async fn hand_answer(
         weft_task_store::announce::news_written(&state.pg_pool);
     }
     if let Some(consumed) = consumed {
-        state.listener.unregister_many(&[consumed]).await;
+        state.listener.unregister_many(&consumed).await;
     }
     Ok(true)
 }

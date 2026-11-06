@@ -38,6 +38,10 @@ pub fn validate(project: &ProjectDefinition, catalog: &dyn MetadataCatalog) -> V
     validate_with_mode(project, catalog, ValidationMode::Structural)
 }
 
+/// [`validate`] at `mode`. A node's rule asking which install the program
+/// is built for (`local_install`) is answered with the one it was
+/// compiled for (`ProjectDefinition::install`), and has no answer, so
+/// does not fire, in a program compiled for none.
 pub fn validate_with_mode(
     project: &ProjectDefinition,
     catalog: &dyn MetadataCatalog,
@@ -1193,7 +1197,15 @@ fn check_declarative_rules(
     for node in &project.nodes {
         let Some(meta) = catalog.lookup(&node.node_type) else { continue };
         let custom = weft_core::rules::CustomPorts::of(node, meta);
-        for rule in &node_rules(meta, node) {
+        let node_rules = node_rules(meta, node);
+        // A list a rule reads off the node wired in, which that node does
+        // not declare, or whose regexes do not compile: the rule would
+        // refuse nothing, so the program is refused, at both nodes (a cut
+        // keeping either hits it).
+        for (lister, code, told) in weft_core::rules::wired_list_faults(&node_rules, node, &rules) {
+            push(out, &[node.part(), lister.part()], node.source_file.as_deref(), node.header_span_or_default(), Severity::Error, code, told);
+        }
+        for rule in &node_rules {
             // Skip runtime-only rules in structural mode (the build and
             // the Problems panel). Runtime mode runs them: the editor's
             // pre-flight gate before Run/Activate/Resync, and the
@@ -1217,6 +1229,12 @@ fn check_declarative_rules(
 /// (`weft_core::rules::recheck`). Every rule a node answers to, at both
 /// levels: a run is a run. A node whose rules were all decided records
 /// nothing and pays nothing when it fires.
+///
+/// Folded with the install the program is compiled for
+/// (`ProjectDefinition::install`), so a rule the install settles is never
+/// recorded. The rechecks are hashed with the program, so a command whose
+/// compile is held to an install's (`weft status`) compiles for that
+/// install's kind too.
 pub(crate) fn record_rechecks(project: &mut ProjectDefinition, catalog: &dyn MetadataCatalog) {
     let rechecks: Vec<Vec<weft_core::rules::Recheck>> = {
         let rules = weft_core::rules::RuleContext::new(project);
@@ -3256,7 +3274,7 @@ fn check_config_derived_ports(
                 // filled in" (a form field's label falls back to its key).
                 // SYNC: null-is-absent <->
                 //       packages/weft-graph/src/webview/lib/utils/port-specs.ts (hasValue),
-                //       catalog/human/form_helpers.rs (build_form_fields)
+                //       crates/weft-core/src/signal/form/from_config.rs (ConfigForm::fields)
                 match obj.get(field.key.as_str()).filter(|v| !v.is_null()) {
                     Some(value) => {
                         // Where the list IS the choice set, an empty one

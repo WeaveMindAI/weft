@@ -76,6 +76,18 @@ pub struct InstallInfo {
     pub source: Option<WeftSource>,
 }
 
+impl InstallInfo {
+    /// Which kind of install this is: a cloud one when it runs on a cloud,
+    /// a local one otherwise. What a command compiles a program for when
+    /// its compile is held to this install's (`weft status`).
+    pub fn kind(&self) -> InstallKind {
+        match self.cloud {
+            Some(_) => InstallKind::Cloud,
+            None => InstallKind::Local,
+        }
+    }
+}
+
 /// A commit of a weft repository (upstream, or the fork the install
 /// workflow ran in).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +102,19 @@ pub struct WeftSource {
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CloudInstall {
     Gcp(GcpInstall),
+}
+
+/// Where an install runs what it runs: on the machine weft itself runs on
+/// (a laptop or a server), or on a cloud. What the install's version build
+/// compiles a program for, which a node's rules may ask about
+/// (`crate::node::Condition::LocalInstall`). Kept on the program it was
+/// compiled for (`crate::project::ProjectDefinition::install`), as
+/// `"local"` or `"cloud"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallKind {
+    Local,
+    Cloud,
 }
 
 /// What a project's CI needs to deploy a frontend beside a GCP install.

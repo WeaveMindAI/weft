@@ -47,7 +47,7 @@ export function isFilledIn(v: unknown): boolean {
  *  one the compiler accepts, so it must survive a save).
  *  SYNC: null-is-absent <->
  *        crates/weft-compiler/src/validate.rs (the spec-field loop),
- *        catalog/human/form_helpers.rs (build_form_fields) */
+ *        crates/weft-core/src/signal/form/from_config.rs (ConfigForm::fields) */
 export function hasValue(draft: PortEntryDef, field: SpecField): boolean {
 	return isFilledIn(draft[field.key]);
 }

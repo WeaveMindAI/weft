@@ -628,18 +628,28 @@ pub async fn infra_endpoint_url(
         (StatusCode::NOT_FOUND, format!("{}: the run's project is no longer registered", req.infra))
     })?;
     require_declared_infra(&declared, &req.infra)?;
-    let stored = state
+    // An endpoint inside another node's endpoint is read through to where
+    // that one answers now; the one it lives inside is held to the same
+    // rules as the handle the run asked with.
+    let allowed = |inner: &weft_core::infra::InfraHandle| {
+        if inner.instance().is_some() && inner.instance() != run.instance.as_ref() {
+            return Err(format!("{inner} belongs to another instance than the run asking for it"));
+        }
+        require_declared_infra(&declared, inner).map_err(|(_, why)| why)
+    };
+    let reached = state
         .infra
-        .endpoint(run.project, req.infra.place(), instance, req.infra.endpoint())
+        .reach(run.project, req.infra.place(), instance, req.infra.endpoint(), allowed)
         .await
         .map_err(|e| unavailable_or_internal(e.context("read the infra endpoint")))?;
     // A public endpoint hangs off the address the open internet reaches
     // now (a quick tunnel's moves when it is opened again), read only for
     // an endpoint that has one.
-    let address = match stored {
+    let address = match reached {
         None => None,
-        Some(weft_task_store::StoredEndpoint { url, public_path: None }) => Some(weft_core::infra::EndpointAddress { url, public_url: None }),
-        Some(weft_task_store::StoredEndpoint { url, public_path: Some(path) }) => {
+        Some(weft_task_store::Reached::Unreachable(why)) => return Err((StatusCode::CONFLICT, format!("{}: {why}", req.infra))),
+        Some(weft_task_store::Reached::At { url, public_path: None }) => Some(weft_core::infra::EndpointAddress { url, public_url: None }),
+        Some(weft_task_store::Reached::At { url, public_path: Some(path) }) => {
             let base = state.front_door().await.map_err(|e| unavailable_or_internal(e.context("read the install's outside address")))?;
             Some(weft_core::infra::EndpointAddress { url, public_url: Some(weft_core::infra::public_url(&base, &path)) })
         }
@@ -802,16 +812,37 @@ pub async fn resolve_connection(
         .instance
         .clone()
         .map(|instance| weft_core::instance::InstanceScope { project_id: owner.project, instance });
-    let resolved = weft_access_store::resolve_for_worker(
-        &state.pool,
-        &tenant,
-        weft_access_store::GrantUser::of(for_instance.as_ref()),
-        connection_id,
-        &req.service,
-        &req.required_permissions,
-        &req.required_values,
-    )
-    .await
+    let user = weft_access_store::GrantUser::of(for_instance.as_ref());
+    let resolved = match req.stale.as_deref() {
+        // A renewal (`ctx.renew`): the values the firing was handed stopped working.
+        Some(stale) => {
+            weft_access_store::renew_for_worker(
+                &state.pool,
+                state.install,
+                &tenant,
+                user,
+                connection_id,
+                &req.service,
+                &req.required_permissions,
+                &req.required_values,
+                stale,
+            )
+            .await
+        }
+        None => {
+            weft_access_store::resolve_for_worker(
+                &state.pool,
+                state.install,
+                &tenant,
+                user,
+                connection_id,
+                &req.service,
+                &req.required_permissions,
+                &req.required_values,
+            )
+            .await
+        }
+    }
     .map_err(|e| match e.downcast_ref::<weft_access_store::AccessError>() {
         // The store's own words name no place to fix it from; a node does.
         Some(weft_access_store::AccessError::NotFound) => (
@@ -830,6 +861,7 @@ pub async fn resolve_connection(
             owner: resolved.owner,
             keep_until_unix: Some(resolved.fresh_until.map_or(i64::MAX, |at| at.timestamp())),
             published_by: resolved.published_by,
+            way: resolved.way,
         },
         weft_core::CredentialOwner::Platform => {
             // The row's service (already matched against the request)
@@ -865,6 +897,7 @@ pub async fn resolve_connection(
                         // Leased per firing: never kept.
                         keep_until_unix: None,
                         published_by: resolved.published_by,
+                        way: resolved.way,
                     }
                 }
                 crate::credential::KeyResolution::NotConfigured => {

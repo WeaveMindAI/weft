@@ -1,0 +1,708 @@
+[
+  {
+    "service": "slack",
+    "label": "Slack",
+    "grants": "exclusive",
+    "acquisition": {
+      "kind": "oauth2",
+      "grant": {
+        "kind": "authorization_code",
+        "authUrl": "https://slack.com/oauth/v2/authorize",
+        "pkce": false
+      },
+      "tokenUrl": "https://slack.com/api/oauth.v2.access",
+      "scopeDelimiter": ",",
+      "registrationFields": [
+        {
+          "name": "appToken",
+          "label": "App-level token (xapp-...)",
+          "optional": true,
+          "secret": true,
+          "placeholder": "xapp-... (only needed for event triggers; mint it under Basic Information > App-Level Tokens with the connections:write scope)"
+        }
+      ],
+      "captures": [
+        {
+          "name": "team",
+          "path": "team.name",
+          "optional": false
+        },
+        {
+          "name": "teamId",
+          "path": "team.id",
+          "optional": false
+        }
+      ],
+      "tokenAuth": "body"
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {token}"
+      }
+    ],
+    "test": {
+      "url": "https://slack.com/api/auth.test",
+      "method": "POST",
+      "expectStatus": 200,
+      "captures": [
+        {
+          "name": "team",
+          "path": "team",
+          "optional": false
+        },
+        {
+          "name": "teamId",
+          "path": "team_id",
+          "optional": false
+        }
+      ]
+    },
+    "identity": "{team}",
+    "doors": [
+      "shared",
+      "own"
+    ],
+    "callback": "https",
+    "ownPage": {
+      "guide": {
+        "link": "https://api.slack.com/apps",
+        "steps": [
+          "Open api.slack.com/apps and click Create New App (From scratch), picking your workspace.",
+          "Under OAuth & Permissions, add the callback URL shown here as a Redirect URL.",
+          "Add these bot scopes: {permissions}.",
+          "Copy the Client ID and Client Secret from Basic Information into the fields below.",
+          "For event triggers, enable Socket Mode and mint an app-level token with the connections:write scope under Basic Information > App-Level Tokens; paste it in the app token field."
+        ]
+      },
+      "paste": {
+        "fields": [
+          {
+            "name": "token",
+            "label": "Bot token",
+            "secret": true,
+            "placeholder": "xoxb-..."
+          },
+          {
+            "name": "appToken",
+            "label": "App-level token (xapp-...)",
+            "optional": true,
+            "secret": true,
+            "placeholder": "xapp-... (only needed for event triggers)"
+          }
+        ]
+      }
+    },
+    "permissions": [
+      {
+        "id": "chat:write",
+        "label": "Send messages",
+        "description": "Post messages to channels the bot is in.",
+        "default": true
+      },
+      {
+        "id": "channels:read",
+        "label": "List public channels",
+        "description": "See the workspace's public channel list.",
+        "default": true
+      },
+      {
+        "id": "channels:history",
+        "label": "Read channel messages",
+        "description": "Read the message history of public channels the bot is in.",
+        "default": false
+      },
+      {
+        "id": "groups:read",
+        "label": "List private channels",
+        "description": "See the private channels the bot has been invited into.",
+        "default": false
+      },
+      {
+        "id": "groups:history",
+        "label": "Read private channel messages",
+        "description": "Read the message history of private channels the bot is in.",
+        "default": false
+      },
+      {
+        "id": "im:write",
+        "label": "Start direct messages",
+        "description": "Open direct-message conversations to send to a user.",
+        "default": false
+      },
+      {
+        "id": "reactions:read",
+        "label": "See reactions",
+        "description": "See emoji reactions (needed by the reaction trigger).",
+        "default": false
+      },
+      {
+        "id": "reactions:write",
+        "label": "Add reactions",
+        "description": "Add and remove emoji reactions on messages.",
+        "default": false
+      },
+      {
+        "id": "files:read",
+        "label": "Read shared files",
+        "description": "See and download files shared in channels the bot is in.",
+        "default": false
+      },
+      {
+        "id": "files:write",
+        "label": "Upload files",
+        "description": "Upload and share files into channels.",
+        "default": false
+      },
+      {
+        "id": "users:read",
+        "label": "Look up users",
+        "description": "See workspace members' names and profiles.",
+        "default": false
+      },
+      {
+        "id": "users:read.email",
+        "label": "Look up users by email",
+        "description": "Resolve a workspace member from their email address.",
+        "default": false
+      }
+    ],
+    "allPermissionsUrl": "https://docs.slack.dev/reference/scopes",
+    "verification": {
+      "rung": "reports_permissions",
+      "cost": "free"
+    },
+    "events": {
+      "files": {
+        "fields": {
+          "channel": "channel_id",
+          "fileId": "file_id",
+          "type": "type",
+          "user": "user_id"
+        },
+        "account": {
+          "value": "teamId",
+          "path": "team_id"
+        },
+        "socket": {
+          "connect": {
+            "url": "https://slack.com/api/apps.connections.open",
+            "method": "POST",
+            "auth": [
+              {
+                "kind": "header",
+                "name": "Authorization",
+                "value": "Bearer {appToken}"
+              }
+            ],
+            "captures": [
+              {
+                "name": "url",
+                "path": "url",
+                "optional": false
+              }
+            ]
+          },
+          "replies": [
+            {
+              "whenField": "envelope_id",
+              "frame": "{\"envelope_id\":\"{value}\"}"
+            }
+          ],
+          "eventPath": "payload.event",
+          "multiAccount": true
+        },
+        "webhook": {
+          "handshake": {
+            "kind": "echo_body_field",
+            "path": "challenge"
+          },
+          "eventPath": "event",
+          "verify": {
+            "kind": "hmac",
+            "signature": {
+              "in": "header:X-Slack-Signature",
+              "pair": "=",
+              "key": "v0"
+            },
+            "timestamp": {
+              "in": "header:X-Slack-Request-Timestamp"
+            },
+            "concat": "v0:{timestamp}:{body}"
+          },
+          "routeBy": "account"
+        }
+      },
+      "interactions": {
+        "fields": {
+          "action": "actions.0.action_id",
+          "callbackId": "message.metadata.event_payload.callback",
+          "channel": "channel.id",
+          "responseUrl": "response_url",
+          "ts": "message.ts",
+          "type": "type",
+          "user": "user.id",
+          "userName": "user.username",
+          "value": "actions.0.value"
+        },
+        "account": {
+          "value": "teamId",
+          "path": "team.id"
+        },
+        "socket": {
+          "connect": {
+            "url": "https://slack.com/api/apps.connections.open",
+            "method": "POST",
+            "auth": [
+              {
+                "kind": "header",
+                "name": "Authorization",
+                "value": "Bearer {appToken}"
+              }
+            ],
+            "captures": [
+              {
+                "name": "url",
+                "path": "url",
+                "optional": false
+              }
+            ]
+          },
+          "replies": [
+            {
+              "whenField": "envelope_id",
+              "frame": "{\"envelope_id\":\"{value}\"}"
+            }
+          ],
+          "eventPath": "payload"
+        },
+        "webhook": {
+          "verify": {
+            "kind": "hmac",
+            "signature": {
+              "in": "header:X-Slack-Signature",
+              "pair": "=",
+              "key": "v0"
+            },
+            "timestamp": {
+              "in": "header:X-Slack-Request-Timestamp"
+            },
+            "concat": "v0:{timestamp}:{body}"
+          },
+          "routeBy": "account",
+          "decode": {
+            "path": "payload",
+            "encoding": "form_json"
+          }
+        }
+      },
+      "messages": {
+        "fields": {
+          "bot": "bot_id",
+          "channel": "channel",
+          "text": "text",
+          "thread": "thread_ts",
+          "ts": "ts",
+          "type": "type",
+          "user": "user",
+          "workspace": "team"
+        },
+        "account": {
+          "value": "teamId",
+          "path": "team_id"
+        },
+        "socket": {
+          "connect": {
+            "url": "https://slack.com/api/apps.connections.open",
+            "method": "POST",
+            "auth": [
+              {
+                "kind": "header",
+                "name": "Authorization",
+                "value": "Bearer {appToken}"
+              }
+            ],
+            "captures": [
+              {
+                "name": "url",
+                "path": "url",
+                "optional": false
+              }
+            ]
+          },
+          "replies": [
+            {
+              "whenField": "envelope_id",
+              "frame": "{\"envelope_id\":\"{value}\"}"
+            }
+          ],
+          "eventPath": "payload.event",
+          "multiAccount": true
+        },
+        "webhook": {
+          "handshake": {
+            "kind": "echo_body_field",
+            "path": "challenge"
+          },
+          "eventPath": "event",
+          "verify": {
+            "kind": "hmac",
+            "signature": {
+              "in": "header:X-Slack-Signature",
+              "pair": "=",
+              "key": "v0"
+            },
+            "timestamp": {
+              "in": "header:X-Slack-Request-Timestamp"
+            },
+            "concat": "v0:{timestamp}:{body}"
+          },
+          "routeBy": "account"
+        }
+      },
+      "reactions": {
+        "fields": {
+          "channel": "item.channel",
+          "emoji": "reaction",
+          "messageUser": "item_user",
+          "ts": "item.ts",
+          "type": "type",
+          "user": "user"
+        },
+        "account": {
+          "value": "teamId",
+          "path": "team_id"
+        },
+        "socket": {
+          "connect": {
+            "url": "https://slack.com/api/apps.connections.open",
+            "method": "POST",
+            "auth": [
+              {
+                "kind": "header",
+                "name": "Authorization",
+                "value": "Bearer {appToken}"
+              }
+            ],
+            "captures": [
+              {
+                "name": "url",
+                "path": "url",
+                "optional": false
+              }
+            ]
+          },
+          "replies": [
+            {
+              "whenField": "envelope_id",
+              "frame": "{\"envelope_id\":\"{value}\"}"
+            }
+          ],
+          "eventPath": "payload.event",
+          "multiAccount": true
+        },
+        "webhook": {
+          "handshake": {
+            "kind": "echo_body_field",
+            "path": "challenge"
+          },
+          "eventPath": "event",
+          "verify": {
+            "kind": "hmac",
+            "signature": {
+              "in": "header:X-Slack-Signature",
+              "pair": "=",
+              "key": "v0"
+            },
+            "timestamp": {
+              "in": "header:X-Slack-Request-Timestamp"
+            },
+            "concat": "v0:{timestamp}:{body}"
+          },
+          "routeBy": "account"
+        }
+      }
+    }
+  },
+  {
+    "service": "hmac_auth",
+    "label": "Signing secret",
+    "grants": "coexisting",
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "fields": [
+            {
+              "name": "signingSecret",
+              "label": "Signing secret",
+              "secret": true,
+              "placeholder": "the secret the caller signs with"
+            }
+          ]
+        }
+      ]
+    },
+    "auth": [],
+    "identity": "Signing secret"
+  },
+  {
+    "service": "google",
+    "label": "Google",
+    "grants": "coexisting",
+    "acquisition": {
+      "kind": "oauth2",
+      "grant": {
+        "kind": "authorization_code",
+        "authUrl": "https://accounts.google.com/o/oauth2/v2/auth",
+        "pkce": true
+      },
+      "tokenUrl": "https://oauth2.googleapis.com/token",
+      "authParams": {
+        "access_type": "offline",
+        "prompt": "consent"
+      },
+      "tokenAuth": "body"
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {token}"
+      }
+    ],
+    "test": {
+      "url": "https://openidconnect.googleapis.com/v1/userinfo",
+      "method": "GET",
+      "expectStatus": 200,
+      "captures": [
+        {
+          "name": "userEmail",
+          "path": "email",
+          "optional": false
+        }
+      ]
+    },
+    "identity": "{userEmail}",
+    "doors": [
+      "shared",
+      "own"
+    ],
+    "callback": "domain",
+    "ownPage": {
+      "guide": {
+        "link": "https://console.cloud.google.com/apis/credentials",
+        "steps": [
+          "Open the Google Cloud Console credentials page and create an OAuth 2.0 Client ID (Web application).",
+          "Enable the APIs your permissions need (Drive, Sheets, Docs, Gmail, Calendar) under APIs & Services.",
+          "Add the callback URL shown here as an Authorized redirect URI.",
+          "On the consent screen, allow these scopes: {permissions}.",
+          "Copy the Client ID and Client Secret into the fields below."
+        ]
+      }
+    },
+    "permissions": [
+      {
+        "id": "openid",
+        "label": "Know who you are",
+        "description": "Confirm which Google account this is (asked on every connection, whatever else is picked).",
+        "default": false,
+        "always": true
+      },
+      {
+        "id": "https://www.googleapis.com/auth/userinfo.email",
+        "label": "See your email address",
+        "description": "Read the account's email address, which names the connection (asked on every connection, whatever else is picked).",
+        "default": false,
+        "always": true
+      },
+      {
+        "id": "https://www.googleapis.com/auth/drive.file",
+        "label": "Files you pick",
+        "description": "Read and write only the files you pick or this project creates.",
+        "default": true
+      },
+      {
+        "id": "https://www.googleapis.com/auth/drive.readonly",
+        "label": "Read all of Drive",
+        "description": "Read every file the account can see (needed to browse or search Drive).",
+        "default": false
+      },
+      {
+        "id": "https://www.googleapis.com/auth/spreadsheets",
+        "label": "Read and write all spreadsheets",
+        "description": "Read and edit every spreadsheet the account can see (the files-you-pick grant already covers picked sheets; this one covers sheets chosen from the list).",
+        "default": false
+      },
+      {
+        "id": "https://www.googleapis.com/auth/gmail.send",
+        "label": "Send mail",
+        "description": "Send email as this account.",
+        "default": false
+      },
+      {
+        "id": "https://www.googleapis.com/auth/gmail.metadata",
+        "label": "Read mail headers",
+        "description": "Read subjects, senders and message ids, never message bodies (enough to thread a reply).",
+        "default": false
+      },
+      {
+        "id": "https://www.googleapis.com/auth/gmail.readonly",
+        "label": "Read mail",
+        "description": "Read the account's email (needed by the new-email trigger and message reads; sending from another address needs this or Organize mail).",
+        "default": false
+      },
+      {
+        "id": "https://www.googleapis.com/auth/gmail.modify",
+        "label": "Organize mail",
+        "description": "Read the account's email and add and remove its labels.",
+        "default": false
+      },
+      {
+        "id": "https://www.googleapis.com/auth/calendar.events",
+        "label": "Manage calendar events",
+        "description": "Read and create events on the account's calendars.",
+        "default": false
+      },
+      {
+        "id": "https://www.googleapis.com/auth/documents",
+        "label": "Read and write documents",
+        "description": "Create and edit Google Docs (the files-you-pick grant already covers picked docs).",
+        "default": false
+      }
+    ],
+    "allPermissionsUrl": "https://developers.google.com/identity/protocols/oauth2/scopes",
+    "verification": {
+      "rung": "reports_permissions",
+      "cost": "free"
+    },
+    "events": {
+      "drive_changes": {
+        "fields": {
+          "changed": "header:X-Goog-Changed",
+          "messageNumber": "header:X-Goog-Message-Number",
+          "resource": "header:X-Goog-Resource-Id",
+          "resourceUri": "header:X-Goog-Resource-URI",
+          "state": "header:X-Goog-Resource-State"
+        },
+        "account": {
+          "value": "userEmail",
+          "path": "header:X-Goog-Channel-Token"
+        },
+        "webhook": {
+          "idPath": "header:X-Goog-Channel-ID",
+          "tokenPath": "header:X-Goog-Channel-Token",
+          "verify": {
+            "kind": "token_echo"
+          },
+          "routeBy": "subscription",
+          "subscribe": {
+            "subscribe": {
+              "url": "https://www.googleapis.com/drive/v3/files/{target}/watch?supportsAllDrives=true",
+              "method": "POST",
+              "body": {
+                "id": "{subscriptionId}",
+                "type": "web_hook",
+                "address": "{receiverUrl}",
+                "token": "{subscriptionToken}"
+              },
+              "auth": [
+                {
+                  "kind": "header",
+                  "name": "Authorization",
+                  "value": "Bearer {token}"
+                }
+              ],
+              "captures": [
+                {
+                  "name": "expiresAt",
+                  "path": "expiration",
+                  "optional": false
+                },
+                {
+                  "name": "resourceId",
+                  "path": "resourceId",
+                  "optional": false
+                }
+              ]
+            },
+            "unsubscribe": {
+              "url": "https://www.googleapis.com/drive/v3/channels/stop",
+              "method": "POST",
+              "body": {
+                "id": "{subscriptionId}",
+                "resourceId": "{resourceId}"
+              },
+              "auth": [
+                {
+                  "kind": "header",
+                  "name": "Authorization",
+                  "value": "Bearer {token}"
+                }
+              ]
+            },
+            "renewMarginSecs": 600
+          }
+        }
+      }
+    }
+  },
+  {
+    "service": "stripe_like",
+    "label": "Stripe-like signing secret",
+    "grants": "coexisting",
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "fields": [
+            {
+              "name": "signingSecret",
+              "label": "Signing secret",
+              "secret": true,
+              "placeholder": "the secret the caller signs with"
+            }
+          ]
+        }
+      ]
+    },
+    "auth": [],
+    "identity": "Stripe-like signing secret"
+  },
+  {
+    "service": "guided_key",
+    "label": "Guided key",
+    "grants": "coexisting",
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "fields": [
+            {
+              "name": "apiKey",
+              "label": "API key",
+              "secret": true,
+              "placeholder": "pk-..."
+            }
+          ],
+          "guide": {
+            "link": "https://example.com/settings/keys",
+            "steps": [
+              "Open example.com/settings/keys and click Create key.",
+              "Copy the key into the field below."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {apiKey}"
+      }
+    ],
+    "identity": "Guided key"
+  }
+]

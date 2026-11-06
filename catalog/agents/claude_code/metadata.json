@@ -1,0 +1,334 @@
+{
+  "type": "ClaudeCode",
+  "label": "Claude Code",
+  "description": "One conversation with Claude Code, Anthropic's coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, Claude Code runs on your machine (a local install only) with your own login, working in `folder`, from your own install of `claude` when there is one on PATH; when there is none, weft installs Claude Code itself, once, into a folder of its own shared by every program on the machine. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs, and it logs in with the connection on `access`. Its card shows what it is doing and a Start over button. What is exposed, and why the rest is not: the permission mode, the model and effort, a system prompt to append, extra folders, the tools it may or may not use without asking, a fallback model, subagents, Claude in Chrome and Remote Control are its settings; flags that would break the conversation weft holds (`--bare`, which skips the subscription login, `--print` formats, `--resume`) are weft's own, set for every turn. Your program's tools reach Claude Code under their plain names, and a tool named like one of its own (`Read`, `WebSearch`, `Agent`, ...) takes that one's place; `ToolSearch` is the one it cannot give up, so a tool of that name is refused when the program is built.",
+  "tags": [
+    "agent",
+    "coding",
+    "claude",
+    "anthropic",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run Claude Code in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[claude_code]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A ClaudeCodeAccess's `access`: your subscription token (on a local install) or an API key. Required with a `computer`. Left out on your machine, Claude Code uses the login already on it."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder Claude Code works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`claude` on your PATH",
+      "description": "On your machine: the Claude Code program to run, when it is not the `claude` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "accept_edits",
+          "auto",
+          "plan",
+          "dont_ask",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What Claude Code may do without asking. `ask`: every request it would put to a person comes out of AskAgent as a question. `accept_edits`: file edits go ahead, the rest asks. `auto`: Anthropic's classifier lets safe actions through and asks about the rest. `plan`: it only plans, and asks before acting on the plan. `dont_ask`: anything not allowed beforehand (`allowedTools`) is refused without asking. `bypass`: nothing asks, nothing is refused; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "Claude Code's default",
+      "description": "An alias (`opus`, `sonnet`, `haiku`, `fable`) or a model's full name. Left out, Claude Code's own default for your login."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "label": "Effort",
+      "description": "How hard the model thinks. Left out, Claude Code's default."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "appendSystemPrompt",
+      "type": "String",
+      "widget": {
+        "kind": "textarea"
+      },
+      "label": "Add to the system prompt",
+      "description": "Text added after Claude Code's own system prompt, for every turn."
+    },
+    {
+      "name": "addDirs",
+      "type": "List[String]",
+      "label": "Extra folders",
+      "description": "Folders besides `folder` Claude Code may read and write."
+    },
+    {
+      "name": "allowedTools",
+      "type": "List[String]",
+      "label": "Allowed without asking",
+      "description": "Tools it may use without asking, in Claude Code's own rule syntax (`Bash(git *)`, `Edit`)."
+    },
+    {
+      "name": "disallowedTools",
+      "type": "List[String]",
+      "label": "Never allowed",
+      "description": "Tools it may never use, in the same syntax."
+    },
+    {
+      "name": "fallbackModel",
+      "type": "String",
+      "label": "Fallback model",
+      "description": "A model to fall back on when the chosen one is overloaded."
+    },
+    {
+      "name": "agents",
+      "type": "JsonDict",
+      "label": "Subagents",
+      "description": "Subagents Claude Code may hand work to, by name: `{ \"reviewer\": { \"description\": \"Reviews code\", \"prompt\": \"You are a code reviewer\" } }`."
+    },
+    {
+      "name": "chrome",
+      "type": "Boolean",
+      "default": false,
+      "label": "Claude in Chrome",
+      "description": "Let Claude Code drive Chrome through the Claude in Chrome extension, on the machine it runs on."
+    },
+    {
+      "name": "remoteControl",
+      "type": "String",
+      "label": "Remote Control name",
+      "description": "Set, the conversation is also reachable from claude.ai/code and the Claude app under this name (Remote Control), which needs a subscription login."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ClaudeCode '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ClaudeCode '{id}' runs in a computer, where no login is waiting for it; give it a ClaudeCodeAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ClaudeCode '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "accept_edits",
+                "auto",
+                "plan",
+                "dont_ask",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ClaudeCode '{id}' has a `permission` it does not know; pick one of ask, accept_edits, auto, plan, dont_ask, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ClaudeCode '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "ClaudeCode '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs Claude Code itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "ToolSearch"
+    ]
+  }
+}

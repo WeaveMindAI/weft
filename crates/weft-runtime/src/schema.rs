@@ -66,14 +66,15 @@ pub fn documents() -> Vec<&'static Document> {
 
 static DOCUMENTS: &[Document] = &[
     // A connection's snapshot of its service's recipe, kept as long as the
-    // connection. Its events recipes are hashed into `events_recipe_hash`.
+    // connection. Its events recipes are hashed into `events_recipe_hash`,
+    // and a pasted connection made before ways records its one way in `way`.
     Document::of(
         &weft_core::AccessSpec::STORED,
         "access_grant",
         "spec",
         Encoding::Json,
         weft_access_store::SPEC_FILLS,
-        Some(weft_access_store::rehash_grant_recipes),
+        Some(weft_access_store::rederive_grant_columns),
     ),
     // The events recipes a service declared, kept under their hash.
     Document::of(

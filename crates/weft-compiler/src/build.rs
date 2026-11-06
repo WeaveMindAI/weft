@@ -85,16 +85,15 @@ pub const WORKER_CRATE_NAME: &str = "weft-worker";
 pub struct StockProject {
     _dir: tempfile::TempDir,
     pub project: Project,
-    pub definition: weft_core::project::ProjectDefinition,
-    /// The value of each file content `definition` names.
-    pub contents: weft_core::content::ContentValues,
+    /// Compiled for no install: its worker serves every install alike.
+    pub compiled: crate::Compiled,
     pub catalog: FsCatalog,
 }
 
 impl StockProject {
     /// Every catalog node type: the set the stock worker compiles.
     pub fn node_types(&self) -> BTreeSet<String> {
-        codegen::node_types_for(&self.definition, &self.catalog, weft_core::builds::NodeSet::Full)
+        codegen::node_types_for(&self.compiled.definition, &self.catalog, weft_core::builds::NodeSet::Full)
     }
 
     /// What the builder base installs and exports to compile this
@@ -120,10 +119,9 @@ impl StockProject {
         std::os::unix::fs::symlink(&stdlib, crate::project::base_catalog_dir(dir.path()))
             .map_err(BuildError::Io)?;
         let project = Project::load(dir.path())?;
-        let (definition, catalog, contents) =
-            crate::hash::load_program_in(&project, std::sync::Arc::new(weft_catalog::DiskTree))
-                .map_err(|e| BuildError::Build(format!("compile the stock project: {e}")))?;
-        Ok(Self { _dir: dir, project, definition, contents, catalog })
+        let (compiled, catalog) = crate::hash::load_program_in(&project, std::sync::Arc::new(weft_catalog::DiskTree), None)
+            .map_err(|e| BuildError::Build(format!("compile the stock project: {e}")))?;
+        Ok(Self { _dir: dir, project, compiled, catalog })
     }
 }
 
@@ -154,8 +152,9 @@ pub fn stock_binary_hash(packaging: &weft_core::builds::WorkerPackaging) -> Buil
 /// 1. Check the (resolved) definition was settled after its last change
 ///    (`crate::unsettled`): every error in it is one of its broken parts.
 ///    `fs` is the view the definition was compiled through, whose reader
-///    places each finding's file the way the compile placed it, and
-///    `contents` the value of each file content it names.
+///    places each finding's file the way the compile placed it; the
+///    install it was compiled for and the value of each file content it
+///    names ride on `compiled`.
 /// 2. For a program compiled on the machine (`WorkerPackaging::Host`),
 ///    [`stage_host_build`] at `.weft/target/worker-host/`, its shared
 ///    crates in the packaging's folder. For an image:
@@ -177,11 +176,9 @@ pub fn stock_binary_hash(packaging: &weft_core::builds::WorkerPackaging) -> Buil
 /// platform was set up with. When it kicks in (debian-family runtime, no
 /// custom template), the build context omits `weft/` because the engine
 /// workspace already lives inside the base image at `/weft/`.
-#[allow(clippy::too_many_arguments)]
 pub fn build_project(
     project: &Project,
-    definition: &weft_core::project::ProjectDefinition,
-    contents: &weft_core::content::ContentValues,
+    compiled: &crate::Compiled,
     catalog: &FsCatalog,
     fs: crate::CompileFs,
     packaging: &weft_core::builds::WorkerPackaging,
@@ -189,11 +186,12 @@ pub fn build_project(
     fingerprints: &crate::hash::Fingerprints,
 ) -> BuildResult<StagedImageBuild> {
     let project_root = project.root.as_path();
+    let definition = &compiled.definition;
     // What does not compile is already in the definition as broken parts
     // (`crate::compile_program`), and the build goes on around them: a
     // part a run needs is refused when the run is cut. Anything else is a
     // definition changed since its check.
-    crate::bail_on_errors(crate::unsettled(definition, contents, catalog, fs))?;
+    crate::bail_on_errors(crate::unsettled(compiled, catalog, fs))?;
     // Project identity arrives with each run, never in the worker image.
     let crate_name = WORKER_CRATE_NAME;
 
@@ -330,8 +328,8 @@ pub fn stage_host_test_build(ctx: &Path, shared: &Path, catalog: &FsCatalog, pac
     stage_host_crate(ctx, shared, catalog, &|crate_root, paths| {
         let test_crate = codegen::emit_test_crate(crate_root, catalog, package_name, paths)?;
         Ok(HostCrate {
-            package_dirs: BTreeMap::from([(package_name.to_string(), test_crate.package_crate)]),
-            node_types: test_crate.node_types.into_iter().collect(),
+            package_dirs: test_crate.package_crates,
+            node_types: test_crate.compiled_node_types.into_iter().collect(),
             binary_name: test_crate.binary_name,
         })
     })
@@ -612,7 +610,7 @@ pub fn build_test_artifact(project: &Project, catalog: &FsCatalog, package_name:
 /// server runs on while it runs: what a live test is held to before it
 /// starts.
 pub fn package_run_needs(catalog: &FsCatalog, package_name: &str) -> BuildResult<weft_core::needs::NodeNeeds> {
-    let Some(package) = catalog.packages().find(|p| p.name == package_name) else {
+    let Some(package) = catalog.package_named(package_name) else {
         return Err(BuildError::Build(format!("no package named '{package_name}' in the catalog")));
     };
     Ok(run_needs(codegen::node_needs(&package.node_types.iter().cloned().collect(), catalog)?))
@@ -651,8 +649,7 @@ pub fn node_test_cache_hash(catalog: &FsCatalog, package_name: &str) -> BuildRes
 /// project's nodes/ as the place it was looked for.
 fn package_root(catalog: &FsCatalog, package_name: &str) -> BuildResult<PathBuf> {
     catalog
-        .packages()
-        .find(|p| p.name == package_name)
+        .package_named(package_name)
         .map(|p| p.root.clone())
         .ok_or_else(|| {
             BuildError::Build(format!("no package named '{package_name}' in this project (nodes/ or src/)"))
@@ -946,7 +943,7 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path) -> BuildResul
     let stock = StockProject::materialize()?;
     let referenced = stock.node_types();
     codegen::emit(
-        &stock.definition,
+        &stock.compiled.definition,
         &ctx.join(worker_image::WARMUP_CRATE_DIR),
         &stock.catalog,
         WORKER_CRATE_NAME,
@@ -1300,23 +1297,26 @@ pub fn prepare_test_workspace(
         eprintln!("another weft test-node in this project is using its test workspace; waiting for it to finish")
     })
     .map_err(BuildError::Io)?;
+    // The package crates every member shares (`EmitPaths::Local`), emitted
+    // afresh by this run like the members are. Its name holds a `-`, which
+    // no member's name does (`sanitize_crate_name`).
+    let package_crates = dirs.crates_root.join("package-crates");
+    if package_crates.exists() {
+        std::fs::remove_dir_all(&package_crates).map_err(BuildError::Io)?;
+    }
+    let paths = codegen::EmitPaths::Local { weft_root: weft_root.clone(), package_crates };
     let mut crates = BTreeMap::new();
     let mut members = Vec::new();
     for package in packages {
         let member = sanitize_crate_name(package);
         let crate_root = dirs.crates_root.join(&member);
-        let test_crate = codegen::emit_test_crate(
-            &crate_root,
-            catalog,
-            package,
-            &codegen::EmitPaths::Local { weft_root: weft_root.clone() },
-        )
+        let test_crate = codegen::emit_test_crate(&crate_root, catalog, package, &paths)
         .map_err(|e| BuildError::Build(format!("emit test crate for '{package}': {e}")))?;
         crates.insert(package.clone(), test_crate);
         members.push(member);
     }
     codegen::emit_test_workspace(&dirs.crates_root, &members)?;
-    let node_types: BTreeSet<String> = crates.values().flat_map(|c| c.node_types.iter().cloned()).collect();
+    let node_types: BTreeSet<String> = crates.values().flat_map(|c| c.compiled_node_types.iter().cloned()).collect();
     let build_env = worker_image::collect_build_env(catalog, &node_types, &|_, source_dir| Ok(source_dir.display().to_string()))?;
     Ok(TestWorkspace {
         crates,

@@ -10,6 +10,14 @@
 //! the same packages into the image. A node that finds one missing as it
 //! runs fails saying so (`crate::error::need_missing`), with the same
 //! words ([`missing_at_run`]).
+//!
+//! A need may also say how weft installs it itself ([`Recipe`]), into a
+//! folder of its own that every program and every install on the machine
+//! shares ([`setup`]): a process unit's need is met that way when the
+//! machine does not have it yet.
+
+#[cfg(feature = "runtime")]
+pub mod setup;
 
 use std::collections::BTreeMap;
 
@@ -37,6 +45,93 @@ pub struct Need {
     /// The packages that meet it, by package manager.
     #[serde(default)]
     pub install: BTreeMap<PackageManager, DistroPackages>,
+    /// How a person gets it when no package manager has it (a vendor's own
+    /// installer: `curl -fsSL https://claude.ai/install.sh | bash`), said
+    /// wherever the need is reported missing in place of "install it by
+    /// hand".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub how: Option<String>,
+    /// How weft installs it itself when the machine does not have it
+    /// ([`setup::meet`]). `install` then names the system packages the
+    /// recipe needs first, which it cannot install without `sudo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<Recipe>,
+}
+
+/// How weft installs a need into a folder of its own: a bash script per
+/// system, run as the person (never with `sudo`), and the folders in it
+/// that hold the programs it installs.
+///
+/// The folder is `<group>/<name>` under `needs/` in weft's data folder
+/// (`~/.local/share/weft/needs`), the one every install on the machine shares,
+/// so a need installed once serves every program of every install. The
+/// group is the needs that share runtimes (a Node.js several of them run
+/// on), which their scripts keep in the group's folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Recipe {
+    /// `<group>/<name>`: two plain folder names.
+    pub folder: String,
+    /// The script installing it, by system. It runs with `set -euo
+    /// pipefail` after sourcing `prelude`, with `WEFT_NEED_DIR` (its own
+    /// folder, made empty before it runs, the only place it writes) and
+    /// `WEFT_NEEDS_ROOT` (the group's folder) set.
+    pub script: BTreeMap<Os, String>,
+    /// The folders holding its programs, relative to its folder: put first
+    /// on the `PATH` of whatever runs them.
+    #[serde(default)]
+    pub bin: Vec<String>,
+    /// Bash every script of the group sources first: the helpers its
+    /// scripts share. Text the need's owner hands over, so weft holds no
+    /// helper of any one kind of need.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prelude: String,
+}
+
+impl Recipe {
+    /// Why this recipe cannot be used, if it cannot: a folder that is not
+    /// `<group>/<name>`, or a `bin` that leaves it.
+    pub fn refusal(&self) -> Option<String> {
+        let plain = |part: &str| !part.is_empty() && part != "." && part != ".." && part.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+        let parts: Vec<&str> = self.folder.split('/').collect();
+        if parts.len() != 2 || !parts.iter().all(|p| plain(p)) {
+            return Some(format!("installs into '{}', which is not `<group>/<name>` (two folder names of letters, digits, '-', '_' and '.')", self.folder));
+        }
+        // A `bin` of `..` reaches the group's shared runtimes (a Node.js
+        // the group's scripts share); never above the group.
+        if let Some(bin) = self.bin.iter().find(|b| b.starts_with('/') || b.split('/').filter(|s| *s == "..").count() > 1) {
+            return Some(format!("names the program folder '{bin}', which is outside its group's folder"));
+        }
+        None
+    }
+}
+
+/// The systems a [`Recipe`] has a script for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Os {
+    Linux,
+    Macos,
+}
+
+impl Os {
+    /// The system this program runs on, when it is one weft installs on.
+    pub fn here() -> Option<Self> {
+        if cfg!(target_os = "linux") {
+            Some(Self::Linux)
+        } else if cfg!(target_os = "macos") {
+            Some(Self::Macos)
+        } else {
+            None
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Linux => "Linux",
+            Self::Macos => "macOS",
+        }
+    }
 }
 
 /// When a need matters.
@@ -84,6 +179,14 @@ impl Need {
         let table = self.install.get(&manager)?;
         distro.and_then(|d| table.get(d)).or_else(|| table.get(DEFAULT_DISTRO)).map(Vec::as_slice)
     }
+
+    /// How to get it by hand: its own words, or that it must be installed by hand.
+    pub fn by_hand(&self) -> String {
+        match &self.how {
+            Some(how) => how.clone(),
+            None => "install it by hand".to_string(),
+        }
+    }
 }
 
 /// The longest a need's `check` may take before it counts as unmet: a
@@ -95,8 +198,22 @@ impl Need {
     /// first word found on the PATH), and exits 0 within [`CHECK_LIMIT`].
     /// Blocks while the check runs.
     pub fn is_met(&self) -> bool {
+        self.check_passes(None)
+    }
+
+    /// [`Self::is_met`], with `path` as the check's `PATH`.
+    pub fn is_met_on(&self, path: &str) -> bool {
+        self.check_passes(Some(path))
+    }
+
+    fn check_passes(&self, path: Option<&str>) -> bool {
         let Some((program, args)) = self.check.split_first() else { return false };
-        let child = std::process::Command::new(program)
+        let mut command = std::process::Command::new(program);
+        // Set, the child's PATH is also where its program is looked up.
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        let child = command
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -172,6 +289,40 @@ impl System {
         command.extend(packages.iter().cloned());
         command
     }
+
+    /// The ones of `packages` this machine's package manager has not
+    /// installed, asked of the manager itself: a need's system packages
+    /// name no program to check, so their manager is what knows them.
+    /// Blocks while it answers.
+    pub fn lacking(&self, packages: &[String]) -> Vec<String> {
+        packages
+            .iter()
+            .filter(|package| {
+                let query = package_query(self.manager, package);
+                let answer = std::process::Command::new(&query[0]).args(&query[1..]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output();
+                !answer.is_ok_and(|out| package_installed(self.manager, out.status.success(), &String::from_utf8_lossy(&out.stdout)))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// The command asking `manager` whether it installed `package`.
+fn package_query(manager: PackageManager, package: &str) -> Vec<String> {
+    let words: &[&str] = match manager {
+        PackageManager::Apt => &["dpkg-query", "-W", "-f=${db:Status-Status}"],
+        PackageManager::Dnf => &["rpm", "-q"],
+        PackageManager::Apk => &["apk", "info", "-e"],
+        PackageManager::Brew => &["brew", "list", "--versions"],
+    };
+    words.iter().map(|w| w.to_string()).chain(std::iter::once(package.to_string())).collect()
+}
+
+/// Whether [`package_query`]'s answer says the package is installed: dpkg
+/// also knows a package that was removed and left its configuration
+/// behind, which it answers 0 for with another status.
+fn package_installed(manager: PackageManager, succeeded: bool, printed: &str) -> bool {
+    succeeded && (manager != PackageManager::Apt || printed.trim() == "installed")
 }
 
 /// One need of a node type, with the program's nodes of that type, met
@@ -237,6 +388,39 @@ pub fn missing_at_run(node_type: &str, node: &str, need: &str, from: NeedsFrom) 
 }
 
 const MISSING_HEADER: &str = "this program uses nodes that need things the machine its workers run on doesn't have:";
+
+/// The refusal of the process the unit `unit` of the infra node `node`
+/// runs (`crate::infra::Process::needs`), whose needs `missing` the
+/// machine weft runs on lacks, in the words of a program's [`refusal`]:
+/// what is missing, then the way to install it on `system` (this
+/// machine's, or why it is not known) with the packages each need names
+/// for it. A need naming none for this system is said to be installed by
+/// hand, as `weft deps-install` says it.
+pub fn process_refusal(node: &str, unit: &str, missing: &[Need], system: &Result<System, String>) -> String {
+    let mut lines = vec![format!(
+        "infra node '{}' runs a process (unit '{unit}') that needs things the machine weft runs on doesn't have:",
+        crate::project::plain_id(node)
+    )];
+    let mut packages: Vec<String> = Vec::new();
+    for need in missing {
+        let named = system.as_ref().ok().and_then(|s| need.packages_for(s.manager, s.distro.as_deref()));
+        match (named, system) {
+            (Some(named), _) => {
+                lines.push(format!("  {}", need.name));
+                packages.extend(named.iter().filter(|p| !packages.contains(p)).cloned().collect::<Vec<_>>());
+            }
+            (None, Ok(_)) => lines.push(format!("  {} (it names no package for this system: {})", need.name, need.by_hand())),
+            (None, Err(_)) => lines.push(format!("  {}", need.name)),
+        }
+    }
+    match system {
+        Ok(system) if !packages.is_empty() => lines.push(format!("install them with:  {}", system.install_command(&packages).join(" "))),
+        Ok(_) => {}
+        Err(why) => lines.push(format!("{why}; install them by hand")),
+    }
+    lines.push("then start the infra again".to_string());
+    lines.join("\n")
+}
 
 fn need_line(node_type: &str, nodes: &[String], need: &str) -> String {
     let nodes = nodes.iter().map(|n| format!("'{}'", crate::project::plain_id(n))).collect::<Vec<_>>().join(", ");
@@ -322,7 +506,7 @@ mod tests {
 
     #[test]
     fn a_need_is_met_when_its_check_exits_zero() {
-        let need = |check: &[&str]| Need { name: "x".into(), stage: NeedStage::Run, check: check.iter().map(|s| s.to_string()).collect(), install: BTreeMap::new() };
+        let need = |check: &[&str]| Need { name: "x".into(), stage: NeedStage::Run, check: check.iter().map(|s| s.to_string()).collect(), install: BTreeMap::new(), how: None, recipe: None };
         assert!(need(&["true"]).is_met());
         assert!(!need(&["false"]).is_met());
         assert!(!need(&["weft-no-such-program-anywhere"]).is_met());
@@ -348,6 +532,20 @@ mod tests {
     }
 
     #[test]
+    fn a_package_is_asked_of_its_own_manager() {
+        assert_eq!(package_query(PackageManager::Apt, "git"), ["dpkg-query", "-W", "-f=${db:Status-Status}", "git"]);
+        assert_eq!(package_query(PackageManager::Brew, "git"), ["brew", "list", "--versions", "git"]);
+        assert!(package_installed(PackageManager::Apt, true, "installed"));
+        assert!(!package_installed(PackageManager::Apt, true, "config-files"), "removed, its configuration left");
+        assert!(!package_installed(PackageManager::Apt, false, ""));
+        assert!(package_installed(PackageManager::Dnf, true, "git-2.47.1-1.fc41.x86_64\n"));
+        let nowhere = System { manager: PackageManager::Apk, distro: None };
+        if std::process::Command::new("apk").arg("--version").output().is_err() {
+            assert_eq!(nowhere.lacking(&["git".into()]), ["git"], "a manager that is not there installed nothing");
+        }
+    }
+
+    #[test]
     fn a_program_is_asked_only_about_the_node_types_it_uses() {
         let definition: crate::ProjectDefinition = serde_json::from_value(serde_json::json!({
             "id": "00000000-0000-0000-0000-000000000001",
@@ -359,7 +557,7 @@ mod tests {
             "edges": []
         }))
         .unwrap();
-        let python = Need { name: "python3".into(), stage: NeedStage::Run, check: vec!["python3".into()], install: BTreeMap::new() };
+        let python = Need { name: "python3".into(), stage: NeedStage::Run, check: vec!["python3".into()], install: BTreeMap::new(), how: None, recipe: None };
         let ffmpeg = Need { name: "ffmpeg".into(), ..python.clone() };
         let node_needs: NodeNeeds = [("ExecPython".to_string(), vec![python.clone()]), ("Studio".to_string(), vec![ffmpeg])].into();
         let rows = program_needs(&definition, &node_needs);
@@ -381,6 +579,37 @@ mod tests {
             assert_eq!(NeedsFrom::from_env_value(from.env_value()), Ok(from));
         }
         assert!(NeedsFrom::from_env_value("cloud").unwrap_err().contains(NEEDS_FROM_ENV));
+    }
+
+    /// A process's missing needs are said with the command that installs
+    /// the ones this system has packages for, each package once, and the
+    /// one with none said to be installed by hand (in its own words when it
+    /// says how, a vendor's installer); a system weft cannot
+    /// tell leaves them all to install by hand, saying why.
+    #[test]
+    fn a_process_refusal_names_each_need_and_how_to_install_it_here() {
+        let need = |name: &str, apt: &[&str]| {
+            let mut install = BTreeMap::new();
+            if !apt.is_empty() {
+                install.insert(PackageManager::Apt, [(DEFAULT_DISTRO.to_string(), apt.iter().map(|p| p.to_string()).collect())].into());
+            }
+            Need { name: name.into(), stage: NeedStage::Run, check: vec![name.into()], install, how: None, recipe: None }
+        };
+        let missing = [need("python3", &["python3"]), need("pip", &["python3", "python3-pip"]), need("claude", &[])];
+        let apt = Ok(System { manager: PackageManager::Apt, distro: Some("debian_12".into()) });
+        assert_eq!(
+            process_refusal("one.agent", "server", &missing, &apt),
+            "infra node 'one.agent' runs a process (unit 'server') that needs things the machine weft runs on doesn't have:\n  python3\n  pip\n  claude (it names no package for this system: install it by hand)\ninstall them with:  sudo apt-get install -y python3 python3-pip\nthen start the infra again"
+        );
+        let vendor = Need { how: Some("curl -fsSL https://claude.ai/install.sh | bash".into()), ..need("Claude Code", &[]) };
+        assert!(
+            process_refusal("agent", "server", &[vendor], &apt).contains("  Claude Code (it names no package for this system: curl -fsSL https://claude.ai/install.sh | bash)"),
+            "a need that says how is installed its own way"
+        );
+        let unknown = process_refusal("agent", "server", &missing[2..], &apt);
+        assert!(!unknown.contains("install them with"), "{unknown}");
+        let odd = process_refusal("agent", "server", &missing[..1], &Err("this system (arch) has no package manager weft installs with".into()));
+        assert!(odd.ends_with("  python3\nthis system (arch) has no package manager weft installs with; install them by hand\nthen start the infra again"), "{odd}");
     }
 
     #[test]

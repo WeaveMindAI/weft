@@ -86,6 +86,10 @@ pub struct WaitTracker {
     held: Arc<crate::held_waits::HeldWaits>,
     /// Set once the drive pauses the run ([`Self::pause`]); never unset.
     pausing: std::sync::atomic::AtomicBool,
+    /// The buses that told the run nobody is on them since the drive last
+    /// took them ([`Self::take_unattended`]): the drive ends each once no
+    /// node can still join it.
+    unattended: Mutex<Vec<Uuid>>,
 }
 
 impl WaitTracker {
@@ -96,7 +100,14 @@ impl WaitTracker {
             next_wait_id: AtomicU64::new(0),
             held: crate::held_waits::HeldWaits::new(),
             pausing: std::sync::atomic::AtomicBool::new(false),
+            unattended: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The buses that said nobody is on them since the last take
+    /// ([`WaitLiveness::unattended`]).
+    pub fn take_unattended(&self) -> Vec<Uuid> {
+        std::mem::take(&mut *self.unattended.lock().expect("unattended buses poisoned"))
     }
 
     /// Pause the run: every pausable wait ends (its call saves its
@@ -276,6 +287,12 @@ impl WaitTracker {
 impl WaitLiveness for WaitTracker {
     fn pausing(&self) -> bool {
         self.pausing.load(Ordering::SeqCst)
+    }
+    fn unattended(&self, bus: Uuid) {
+        self.unattended.lock().expect("unattended buses poisoned").push(bus);
+        // A permit, as a wait starting does: the drive may not be parked
+        // on the notify yet.
+        self.wait_notify.notify_one();
     }
     fn enter_wait(&self, node: &FiringLocation, source: &Arc<dyn WaitSource>, pausable: bool) -> WaitId {
         let id = self.next_wait_id.fetch_add(1, Ordering::AcqRel) + 1;

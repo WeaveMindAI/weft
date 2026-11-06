@@ -1,0 +1,79 @@
+{
+  "type": "GeminiCliAccess",
+  "label": "Gemini CLI Access",
+  "description": "A Gemini CLI login, for the GeminiCli nodes' `access`: a Gemini API key or a Vertex AI key, anywhere. One access for however many GeminiCli nodes. Your Google account login is not offered here: Google's terms call using the Gemini CLI login from third-party software a violation, so it is never copied into a connection. On your own machine, leave `access` unwired and Gemini CLI uses the login it already has.",
+  "tags": [
+    "agent",
+    "gemini",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#4285f4",
+  "service": {
+    "service": "gemini_cli",
+    "label": "Gemini CLI",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "apiKey",
+          "label": "Gemini API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "AQ... or AIza..."
+            }
+          ],
+          "guide": {
+            "link": "https://aistudio.google.com/apikey",
+            "steps": [
+              "Open aistudio.google.com, Get API key, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "vertexKey",
+          "label": "Vertex AI key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "AIza..."
+            }
+          ],
+          "guide": {
+            "link": "https://geminicli.com/docs/get-started/authentication/",
+            "steps": [
+              "In the Google Cloud console, create an API key for Vertex AI (its express mode).",
+              "Paste it below and name the connection. Calls are billed to that Google Cloud project."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[gemini_cli]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[gemini_cli]",
+      "description": "Wire into the GeminiCli nodes' `access` input."
+    }
+  ]
+}

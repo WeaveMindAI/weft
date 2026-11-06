@@ -72,7 +72,7 @@ mod tests {
     }
 
     fn need(name: &str, stage: NeedStage) -> Need {
-        Need { name: name.into(), stage, check: vec![name.into()], install: Default::default() }
+        Need { name: name.into(), stage, check: vec![name.into()], install: Default::default(), how: None, recipe: None }
     }
 
     fn refused(result: Result<(), Unrunnable>) -> Option<(StatusCode, String)> {

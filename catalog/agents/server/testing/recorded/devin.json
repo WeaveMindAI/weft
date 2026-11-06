@@ -1,0 +1,1525 @@
+{
+ "kind": "devin",
+ "command": "devin",
+ "source": "Real, on Devin CLI 3000.11.234 (`devin acp`) with a Windsurf key (the account of this machine's `devin auth login`, handed in as the connection's key, in a private home), model swe-2-flash-medium, driven through weft's own agent server and this spec, every line teed (scratchpad acp12/drive.py, acp12/devin/transcript.jsonl): hello, tool (it listed the weft server's tools, then called `lookup`, shown as `Calling lookup from weft` and named `mcp__weft__lookup` in `_meta`; the permission request names the call by its id alone) and permission (`touch made.txt`, allowed). From the earlier run here with no login (scratchpad w5/dev/r1/run.jsonl): initialize, session/new, session/set_mode and `not logged in`. Composed from the option ids and names in its binary: reject, ask and the replay; their texts and ids are made up.",
+ "given": {
+  "credentials": {
+   "way": "apiKey",
+   "values": {
+    "key": "wsk-test"
+   }
+  }
+ },
+ "answers": {
+  "initialize": {
+   "protocolVersion": 1,
+   "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {
+     "image": true,
+     "audio": false,
+     "embeddedContext": true
+    },
+    "mcpCapabilities": {
+     "http": true,
+     "sse": true
+    },
+    "sessionCapabilities": {
+     "list": {},
+     "delete": {},
+     "additionalDirectories": {},
+     "close": {
+      "_meta": {
+       "cognition.ai/force": true
+      }
+     }
+    },
+    "auth": {},
+    "_meta": {
+     "cognition.ai/sessionDefaultConfigOptions": true,
+     "cognition.ai/multiRootWorkspace": true,
+     "cognition.ai/sessionListContentSearch": true,
+     "cognition.ai/sessionListOrderBy": [
+      "updated_at",
+      "created_at"
+     ],
+     "cognition.ai/sessionRename": true,
+     "cognition.ai/persistOnCreate": true,
+     "cognition.ai/sessionShare": true,
+     "cognition.ai/documentLifecycle": true,
+     "cognition.ai/userEdits": true,
+     "cognition.ai/terminalLifecycle": true,
+     "cognition.ai/userConfig": true,
+     "cognition.ai/userShellCommand": true,
+     "cognition.ai/editableCommands": true,
+     "cognition.ai/commandRevision": true,
+     "cognition.ai/chains": true,
+     "cognition.ai/megaplan": true,
+     "cognition.ai/ruleMentions": true,
+     "cognition.ai/mentionTypes": [
+      {
+       "type": "file"
+      },
+      {
+       "type": "directory"
+      },
+      {
+       "type": "git"
+      },
+      {
+       "type": "rule",
+       "icon": "book",
+       "label": "Rules"
+      },
+      {
+       "type": "skill",
+       "icon": "zap",
+       "label": "Skills"
+      },
+      {
+       "type": "plan",
+       "icon": "file-text",
+       "label": "Plans"
+      },
+      {
+       "type": "conversation"
+      },
+      {
+       "type": "terminal"
+      },
+      {
+       "type": "codemap"
+      }
+     ],
+     "cognition.ai/midTurnPrompts": true
+    }
+   },
+   "authMethods": [
+    {
+     "id": "devin-browser",
+     "name": "Log in with browser",
+     "description": "Sign in via your browser"
+    }
+   ],
+   "agentInfo": {
+    "name": "affogato",
+    "title": "Devin Agent",
+    "version": "0.0.0-dev"
+   },
+   "_meta": {
+    "mcpConfigPath": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/w5/dev/r1/home/.config/devin/mcp_config.json"
+   }
+  },
+  "session/new": {
+   "sessionId": "$SESSION",
+   "modes": {
+    "currentModeId": "accept-edits",
+    "availableModes": [
+     {
+      "id": "accept-edits",
+      "name": "Code"
+     },
+     {
+      "id": "ask",
+      "name": "Ask"
+     },
+     {
+      "id": "plan",
+      "name": "Plan"
+     },
+     {
+      "id": "bypass",
+      "name": "Bypass Permissions"
+     }
+    ]
+   },
+   "configOptions": [
+    {
+     "id": "mode",
+     "name": "Session Mode",
+     "category": "mode",
+     "type": "select",
+     "currentValue": "accept-edits",
+     "options": [
+      {
+       "value": "accept-edits",
+       "name": "Code",
+       "description": "Write and edit code",
+       "_meta": {
+        "cognition.ai/icon": "code"
+       }
+      },
+      {
+       "value": "ask",
+       "name": "Ask",
+       "description": "Answer questions without code changes",
+       "_meta": {
+        "cognition.ai/icon": "message-circle"
+       }
+      },
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Plan changes before implementing",
+       "_meta": {
+        "cognition.ai/icon": "file-text"
+       }
+      },
+      {
+       "value": "bypass",
+       "name": "Bypass Permissions",
+       "description": "Auto-approve all tool calls unless your organization's policy requires approval",
+       "_meta": {
+        "cognition.ai/icon": "shield-off"
+       }
+      }
+     ]
+    },
+    {
+     "id": "model",
+     "name": "Model",
+     "description": "AI model to use",
+     "category": "model",
+     "type": "select",
+     "currentValue": "swe-1-6-fast",
+     "options": []
+    }
+   ],
+   "_meta": {
+    "cognition.ai/isLocked": false,
+    "cognition.ai/lockHolderPid": null
+   }
+  },
+  "session/set_mode": {},
+  "session/load": {
+   "modes": {
+    "currentModeId": "accept-edits",
+    "availableModes": [
+     {
+      "id": "accept-edits",
+      "name": "Code"
+     },
+     {
+      "id": "ask",
+      "name": "Ask"
+     },
+     {
+      "id": "plan",
+      "name": "Plan"
+     },
+     {
+      "id": "bypass",
+      "name": "Bypass Permissions"
+     }
+    ]
+   },
+   "configOptions": [
+    {
+     "id": "mode",
+     "name": "Session Mode",
+     "category": "mode",
+     "type": "select",
+     "currentValue": "accept-edits",
+     "options": [
+      {
+       "value": "accept-edits",
+       "name": "Code",
+       "description": "Write and edit code",
+       "_meta": {
+        "cognition.ai/icon": "code"
+       }
+      },
+      {
+       "value": "ask",
+       "name": "Ask",
+       "description": "Answer questions without code changes",
+       "_meta": {
+        "cognition.ai/icon": "message-circle"
+       }
+      },
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Plan changes before implementing",
+       "_meta": {
+        "cognition.ai/icon": "file-text"
+       }
+      },
+      {
+       "value": "bypass",
+       "name": "Bypass Permissions",
+       "description": "Auto-approve all tool calls unless your organization's policy requires approval",
+       "_meta": {
+        "cognition.ai/icon": "shield-off"
+       }
+      }
+     ]
+    },
+    {
+     "id": "model",
+     "name": "Model",
+     "description": "AI model to use",
+     "category": "model",
+     "type": "select",
+     "currentValue": "swe-1-6-fast",
+     "options": []
+    }
+   ],
+   "_meta": {
+    "cognition.ai/isLocked": false,
+    "cognition.ai/lockHolderPid": null
+   }
+  }
+ },
+ "replay": {
+  "before": [
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "hello"
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "plain hello"
+    }
+   }
+  ],
+  "after": []
+ },
+ "turns": {
+  "hello": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "The user asks to reply exactly two words: \"Hello there.\" Need final exactly that? They said reply"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:37.990714886+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with exactly the two words: Hello there. Likely output \"Hello there\" maybe include period? They"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:38.989785925+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " said two words, Hello there. The colon introduces words \"Hello there.\" Could include period? Exact"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:39.129856533+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " two words maybe \"Hello there\". Need no extra. Final channel only."
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:39.271463792+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Hello there"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:39.271523044+00:00"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "totalTokens": 11524,
+       "inputTokens": 11439,
+       "outputTokens": 85
+      },
+      "_meta": {
+       "cognition.ai/userMessageId": "c5c698ec-c6e9-46b9-b8e7-eecb51fef638"
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "text",
+     "done"
+    ],
+    "reply": "Hello there"
+   }
+  },
+  "permission": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "We need run shell command touch made.txt once then reply Done. Need maybe cwd workspace. Use exec."
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:46.611473904+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " Then final."
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:46.684354957+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_98f43ba4fa091231",
+      "title": "Ran touch",
+      "kind": "execute",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "resource",
+         "resource": {
+          "mimeType": "text/x-shellscript",
+          "text": "touch made.txt",
+          "uri": "tool://preview"
+         },
+         "_meta": {
+          "cognition.ai/preview_is_shell_command": true
+         }
+        }
+       }
+      ],
+      "rawInput": {
+       "command": "touch made.txt",
+       "workdir": "/home/me/work"
+      },
+      "_meta": {
+       "cognition.ai/commandNames": [
+        "touch"
+       ],
+       "cognition.ai/inferenceToolName": "exec",
+       "cognition.ai/timestamp": "2026-11-05T14:13:47.077516440+00:00"
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "call_98f43ba4fa091231",
+        "_meta": {
+         "cognition.ai/editableCommand": "touch made.txt",
+         "cognition.ai/permissionRule": "Exec(touch)"
+        }
+       },
+       "options": [
+        {
+         "optionId": "allow_once",
+         "name": "Allow",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "allow_session",
+         "name": "Yes, allow `touch` commands (this session)",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "allow_always",
+         "name": "Yes, always allow `touch` commands in `work`",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "allow_always_global",
+         "name": "Yes, always allow `touch` commands in all projects",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "switch_bypass",
+         "name": "Yes, switch to bypass mode",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "reject_once",
+         "name": "Reject",
+         "kind": "reject_once"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_98f43ba4fa091231",
+      "status": "in_progress",
+      "_meta": {
+       "cognition.ai/inferenceToolName": "exec"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_98f43ba4fa091231",
+      "status": "in_progress",
+      "_meta": {
+       "cognition.ai/inferenceToolName": "exec",
+       "cognition.ai/cwd": "/home/me/work"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_98f43ba4fa091231",
+      "status": "in_progress",
+      "_meta": {
+       "cognition.ai/inferenceToolName": "exec",
+       "terminal_exit": {
+        "terminal_id": "bc9a98",
+        "exit_code": 0,
+        "signal": null
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_98f43ba4fa091231",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "Exited with code 0"
+        }
+       }
+      ],
+      "_meta": {
+       "cognition.ai/inferenceToolName": "exec"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "Need final exactly Done."
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:47.676558469+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:47.676615892+00:00"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "totalTokens": 12180,
+       "inputTokens": 12168,
+       "outputTokens": 12,
+       "cachedReadTokens": 12032
+      },
+      "_meta": {
+       "cognition.ai/userMessageId": "bcc5ee06-d558-4ab3-8490-dfe801a05547"
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "tool_use",
+     "question",
+     "tool_result",
+     "thinking",
+     "text",
+     "done"
+    ],
+    "reply": "Done",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "title": "Ran touch",
+        "detail": "touch made.txt"
+       }
+      },
+      "answer": {
+       "choice": "allow_once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "allow_once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "reject": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "tc2",
+      "title": "touch made.txt",
+      "kind": "execute",
+      "status": "pending",
+      "rawInput": {
+       "command": "touch made.txt"
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "options": [
+        {
+         "optionId": "allow_once",
+         "name": "Allow",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "allow_always_global",
+         "name": "Always allow `touch`",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "switch_bypass",
+         "name": "Yes, switch to bypass mode",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "reject_once",
+         "name": "Reject",
+         "kind": "reject_once"
+        }
+       ],
+       "toolCall": {
+        "toolCallId": "tc2",
+        "title": "touch made.txt",
+        "kind": "execute",
+        "status": "pending",
+        "rawInput": {
+         "command": "touch made.txt"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "tc2",
+      "status": "failed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "Rejected by user"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "left it"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "left it",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission"
+      },
+      "answer": {
+       "choice": "reject_once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "reject_once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "ask": {
+   "steps": [
+    {
+     "ask": {
+      "method": "elicitation/create",
+      "params": {
+       "mode": "form",
+       "message": "Which colour should the button be?",
+       "requestedSchema": {
+        "type": "object",
+        "required": [
+         "colour"
+        ],
+        "properties": {
+         "colour": {
+          "type": "string",
+          "title": "Colour",
+          "oneOf": [
+           {
+            "const": "blue",
+            "title": "Blue"
+           },
+           {
+            "const": "red",
+            "title": "Red"
+           }
+          ]
+         }
+        }
+       },
+       "sessionId": "$SESSION"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "blue it is"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "question",
+     "text",
+     "done"
+    ],
+    "reply": "blue it is",
+    "blocks": [
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "id": "colour",
+         "question": "Which colour should the button be?",
+         "options": [
+          {
+           "label": "Blue",
+           "description": ""
+          },
+          {
+           "label": "Red",
+           "description": ""
+          }
+         ],
+         "multiSelect": false,
+         "allowOther": false
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "colour": [
+         "Blue"
+        ]
+       }
+      },
+      "agentGot": {
+       "action": "accept",
+       "content": {
+        "colour": "blue"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "tool": {
+   "tools": true,
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "We need call lookup tool of weft MCP server once no args, then reply exactly \"It is "
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:41.341590858+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "<its answer>\". Must list tools first per instructions. Need use mcp_list_tools server weft."
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:41.464973955+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " Then call mcp_call_tool. Then final exact format. Need be careful answer maybe string. Let's"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:41.603211757+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " list tools."
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:41.732353655+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_b84f88d92c66a347",
+      "title": "Listed MCP tools for weft",
+      "rawInput": {
+       "server_name": "weft"
+      },
+      "_meta": {
+       "cognition.ai/inferenceToolName": "mcp_list_tools",
+       "cognition.ai/timestamp": "2026-11-05T14:13:41.779892332+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_b84f88d92c66a347",
+      "status": "in_progress",
+      "_meta": {
+       "cognition.ai/inferenceToolName": "mcp_list_tools"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_b84f88d92c66a347",
+      "status": "in_progress",
+      "title": "Listed MCP tools for weft",
+      "_meta": {
+       "cognition.ai/inferenceToolName": "mcp_list_tools"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_b84f88d92c66a347",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "\n- `lookup`"
+        }
+       }
+      ],
+      "_meta": {
+       "cognition.ai/inferenceToolName": "mcp_list_tools"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "Need call lookup no arguments. Then reply exact."
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:42.524111948+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_9e045added3c2b36",
+      "title": "Calling lookup from weft",
+      "rawInput": {},
+      "_meta": {
+       "cognition.ai/toolName": "mcp__weft__lookup",
+       "cognition.ai/eventType": "mcp_tool_call",
+       "cognition.ai/inferenceToolName": "mcp__weft__lookup",
+       "cognition.ai/timestamp": "2026-11-05T14:13:42.650748312+00:00"
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "call_9e045added3c2b36",
+        "_meta": {
+         "cognition.ai/permissionRule": "mcp__weft__lookup"
+        }
+       },
+       "options": [
+        {
+         "optionId": "allow_once",
+         "name": "Allow",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "allow_session",
+         "name": "Yes, allow calling lookup on the weft MCP server (this session)",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "allow_always",
+         "name": "Yes, always allow calling lookup on the weft MCP server",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "allow_server_session",
+         "name": "Yes, allow calling all tools on the weft MCP server (this session)",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "allow_server_always",
+         "name": "Yes, always allow calling tools on the weft MCP server",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "switch_bypass",
+         "name": "Yes, switch to bypass mode",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "reject_once",
+         "name": "Reject",
+         "kind": "reject_once"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_9e045added3c2b36",
+      "status": "in_progress",
+      "_meta": {
+       "cognition.ai/inferenceToolName": "mcp__weft__lookup"
+      }
+     }
+    },
+    {
+     "tool": {
+      "name": "lookup",
+      "arguments": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_9e045added3c2b36",
+      "status": "in_progress",
+      "title": "Called lookup from weft",
+      "_meta": {
+       "cognition.ai/inferenceToolName": "mcp__weft__lookup"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_9e045added3c2b36",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "42"
+        }
+       }
+      ],
+      "_meta": {
+       "cognition.ai/inferenceToolName": "mcp__weft__lookup"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "Need final exactly \"It is <its answer>\". Answer is 42. So \"It is "
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:43.283986408+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "42.\"? They said exactly: It is <its answer>. Include period? Template has period after answer?"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:43.385899248+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \"It is <its answer>.\" Means if answer 42 then \"It is 42.\""
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:43.474730633+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " But earlier asked two words no punctuation. Now exact string includes \"It is \" plus answer plus period maybe."
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:43.729059428+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " They wrote \"Then reply with exactly: It is <its answer>.\" The period could be sentence"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:43.836266389+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " punctuation not part. Usually these tasks expect \"It is 42\". Need decide. They say exactly"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:43.983492620+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ": It is <its answer>. The angle bracket placeholder replaced by answer; there is a period at"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:44.087966055+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " end in instruction. To be safe exact maybe \"It is 42.\" since they included period."
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:44.226763722+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " But placeholder includes answer only. Many benchmark tasks expect no extra? Let's parse: \"reply with exactly: It"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:44.369743592+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " is <its answer>.\" In prior user asked \"Reply with exactly the two words: Hello there"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:44.448953393+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".\" We output \"Hello there\" no period despite colon sentence had period. So period is instruction punctuation"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:44.582870087+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ", not required. Thus output \"It is 42\"."
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:44.661817779+00:00"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "It is 42"
+      },
+      "_meta": {
+       "cognition.ai/timestamp": "2026-11-05T14:13:44.661859634+00:00"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "totalTokens": 12096,
+       "inputTokens": 11848,
+       "outputTokens": 248,
+       "cachedReadTokens": 11776
+      },
+      "_meta": {
+       "cognition.ai/userMessageId": "3409a6e4-6904-4f85-97a4-f3a8f7ec64ed"
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "tool_use",
+     "tool_result",
+     "thinking",
+     "tool_use",
+     "question",
+     "tool_call",
+     "tool_result",
+     "thinking",
+     "text",
+     "done"
+    ],
+    "reply": "It is 42",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "title": "Calling lookup from weft"
+       }
+      },
+      "answer": {
+       "choice": "allow_once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "allow_once"
+       }
+      }
+     },
+     {
+      "tool": "lookup",
+      "result": "42"
+     }
+    ]
+   }
+  },
+  "not logged in": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "title": "hello"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "cognition.ai/timestamp": 1793779985906,
+       "cognition.ai/eventType": "status_update",
+       "cognition.ai/statusEnum": "working",
+       "cognition.ai/userActionRequired": null
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "cognition.ai/timestamp": 1793779985907,
+       "cognition.ai/eventType": "status_update",
+       "cognition.ai/statusEnum": "blocked",
+       "cognition.ai/userActionRequired": null
+      }
+     }
+    },
+    {
+     "send": {
+      "method": "_cognition.ai/turn_stats",
+      "params": {
+       "sessionId": "$SESSION",
+       "turnClientMessageId": "dc6b5d19-2052-44e5-a377-03d9b520a962"
+      }
+     }
+    },
+    {
+     "send": {
+      "method": "_cognition.ai/agent_stopped",
+      "params": {
+       "cause": "auth_required",
+       "errorMessage": "Please authenticate to continue. Run `/login` to log in.",
+       "stats": {
+        "toolCalls": 0,
+        "filesChanged": 0,
+        "commandsRun": 0
+       },
+       "sessionId": "$SESSION"
+      }
+     }
+    },
+    {
+     "fail": {
+      "code": -32000,
+      "message": "Please log in to use Devin. Use `/login` to authenticate again."
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "error"
+    ],
+    "status": "failed",
+    "error": "Please log in to use Devin."
+   }
+  }
+ },
+ "settings": [
+  {
+   "name": "ask",
+   "given": {
+    "permission": "ask",
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "wsk-test"
+     }
+    }
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "accept-edits"
+      }
+     },
+     {
+      "method": "initialize",
+      "params": {
+       "clientCapabilities": {
+        "elicitation": {
+         "form": {}
+        }
+       }
+      }
+     }
+    ],
+    "files": {
+     ".config/devin/config.json": [
+      "\"auto_update\": false",
+      "\"ask\": [\n      \"edit\""
+     ]
+    }
+   }
+  },
+  {
+   "name": "accept_edits",
+   "given": {
+    "permission": "accept_edits",
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "wsk-test"
+     }
+    }
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "accept-edits"
+      }
+     }
+    ],
+    "files": {
+     ".config/devin/config.json": "\"permissions\": {}"
+    }
+   }
+  },
+  {
+   "name": "read_only",
+   "given": {
+    "permission": "read_only",
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "wsk-test"
+     }
+    }
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "ask"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "plan",
+   "given": {
+    "permission": "plan",
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "wsk-test"
+     }
+    }
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "plan"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "bypass",
+   "given": {
+    "permission": "bypass",
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "wsk-test"
+     }
+    }
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "bypass"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "api_key",
+   "given": {
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "wsk-test"
+     }
+    }
+   },
+   "expect": {
+    "args": [
+     [
+      "acp"
+     ]
+    ],
+    "env": {
+     "WINDSURF_API_KEY": "wsk-test",
+     "HOME": "$HOME"
+    },
+    "unset": [
+     "XDG_CONFIG_HOME",
+     "DEVIN_MODEL"
+    ]
+   }
+  },
+  {
+   "name": "model_and_options",
+   "given": {
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "wsk-test"
+     }
+    },
+    "model": "opus",
+    "options": {
+     "refusalFallback": [
+      "sonnet",
+      "gpt"
+     ]
+    }
+   },
+   "expect": {
+    "args": [
+     [
+      "--model",
+      "opus"
+     ]
+    ],
+    "env": {
+     "DEVIN_REFUSAL_FALLBACK": "sonnet,gpt"
+    }
+   }
+  },
+  {
+   "name": "machine_login",
+   "given": {
+    "credentials": null
+   },
+   "expect": {
+    "error": "runs only on a connection's login"
+   }
+  }
+ ]
+}

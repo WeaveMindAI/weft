@@ -15,6 +15,7 @@
 - [Connecting an account](build/connections.md)
 - [A public address](build/public-address.md)
 - [Putting a person in the loop](build/a-person-in-the-loop.md)
+- [Driving a coding agent](build/coding-agents.md)
 
 # The language
 

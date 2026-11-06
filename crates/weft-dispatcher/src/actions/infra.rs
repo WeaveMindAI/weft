@@ -588,7 +588,7 @@ async fn infra_status(state: &DispatcherState, project_id: uuid::Uuid) -> Result
             // Coarse UI hint: the first endpoint by name (BTreeMap, so
             // deterministic). Node code resolves a specific endpoint by
             // name via ctx.endpoint(...); this is just a status summary.
-            entry.endpoint_url = row.endpoints.values().next().cloned();
+            entry.endpoint_url = row.endpoints.values().next().map(weft_core::infra::EndpointRecord::summary);
             entry.failure_stage = row.failure_stage.map(|f| f.as_str().to_string());
             entry.notes = row.notes;
         }

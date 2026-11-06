@@ -109,6 +109,10 @@ pub struct BrokerState {
     /// outside is then the store's, straight, and never goes through the
     /// install. A local install never sets it.
     pub object_store_public_internet: bool,
+    /// Where this install runs: what decides whether a way to sign in
+    /// that keeps its credential on the person's own machine (a
+    /// local-only way) may be connected or opened here.
+    pub install: weft_core::install::InstallKind,
     /// What signs and reads the upload slots pages send files through
     /// (`weft_core::storage::slot`).
     pub slot_key: weft_core::storage::slot::SlotKey,
@@ -142,6 +146,8 @@ pub struct BrokerSettings {
     /// store at the workers' address: a link for them goes through it.
     pub container_files_base: Option<String>,
     pub object_store_public_internet: bool,
+    /// See [`BrokerState::install`].
+    pub install: weft_core::install::InstallKind,
     pub slot_key: weft_core::storage::slot::SlotKey,
     /// How long this process's platform lets one line live before cutting
     /// it, `None` when it never does (`crate::line::LineFanout::start`).
@@ -229,6 +235,7 @@ impl BrokerState {
             own_base_url: settings.own_base_url.trim_end_matches('/').to_string(),
             container_files_base: settings.container_files_base.map(|base| base.trim_end_matches('/').to_string()),
             object_store_public_internet: settings.object_store_public_internet,
+            install: settings.install,
             slot_key: settings.slot_key,
             supervisor_booking: settings.supervisor_booking,
             stopping: settings.stopping,

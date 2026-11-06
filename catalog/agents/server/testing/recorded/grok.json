@@ -1,0 +1,2031 @@
+{
+ "kind": "grok",
+ "command": "grok",
+ "source": "Recorded from grok 1.0.70 (`grok agent stdio`) against a local fake OpenAI-compatible model server (scratchpad grokrec/: a `[model.fake]` in the private GROK_HOME's config.toml, `XAI_API_KEY` set to a fake key): initialize grokrec/rec5.jsonl line 2, authenticate line 4, session/new line 15, set_config_option line 131, set_mode line 135; turn hello rec1.jsonl lines 30-38; permission rec5.jsonl lines 33-49; reject rec5.jsonl lines 58-69; tool rec5.jsonl lines 77-100 (the program's tool answered by a stand-in MCP server there, `$TOOL` here); edit rec5.jsonl lines 111-126; ask rec4.jsonl lines 30-47 (the answer shape found by trying shapes, lines 36 onward); plan rec6.jsonl lines 214-233. session/resume answer agents/grok.transcript.jsonl line 92; the bad key prompt error agents/grok.transcript.jsonl line 60. Nothing composed; only the per-chunk `_meta` outside each update and the prompt answers' usage `_meta` are left out.",
+ "answers": {
+  "initialize": {
+   "protocolVersion": 1,
+   "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {
+     "image": true,
+     "audio": false,
+     "embeddedContext": true
+    },
+    "mcpCapabilities": {
+     "http": true,
+     "sse": true
+    },
+    "sessionCapabilities": {
+     "list": {},
+     "resume": {},
+     "close": {}
+    },
+    "auth": {},
+    "_meta": {
+     "x.ai/fs_notify": true,
+     "x.ai/hooks": {
+      "blockingEvents": [
+       "pre_tool_use",
+       "stop",
+       "subagent_stop"
+      ],
+      "decisions": [
+       "deny",
+       "block"
+      ],
+      "stopSignals": [
+       "continue",
+       "stopReason",
+       "additionalContext"
+      ]
+     },
+     "x.ai/capabilities": {
+      "toolOverrides": {
+       "x_keyword_search": true,
+       "x_semantic_search": true,
+       "x_user_search": false,
+       "x_thread_fetch": false
+      }
+     }
+    }
+   },
+   "authMethods": [
+    {
+     "id": "xai.api_key",
+     "name": "xai.api_key",
+     "description": "XAI_API_KEY or api_key/env_key in config.toml"
+    },
+    {
+     "id": "grok.com",
+     "name": "Grok",
+     "description": "Sign in with Grok"
+    }
+   ],
+   "_meta": {
+    "currentWorkingDirectory": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj",
+    "agentVersion": "1.0.70",
+    "agentId": "af126fc3-099f-5a87-92ad-2afc565bc9d8",
+    "agentInstanceId": "657944eb-cc36-4ac4-9851-018bf09c7420",
+    "hostname": "Tower",
+    "metadata": null,
+    "grokShell": true,
+    "defaultAuthMethodId": "xai.api_key",
+    "x.ai/mcp/sdk": true,
+    "x.ai/pluginDirs": true,
+    "modelState": {
+     "currentModelId": "fake",
+     "availableModels": [
+      {
+       "modelId": "grok-4.6",
+       "name": "Grok 4.6",
+       "description": "SpaceXAI's latest frontier model",
+       "_meta": {
+        "totalContextTokens": 500000,
+        "agentType": "grok-build-plan",
+        "supportsReasoningEffort": true,
+        "reasoningEffort": "high",
+        "reasoningEfforts": [
+         {
+          "id": "xhigh",
+          "value": "xhigh",
+          "label": "Extra High Effort",
+          "description": "Highest effort and reasoning level",
+          "default": false
+         },
+         {
+          "id": "high",
+          "value": "high",
+          "label": "High Effort",
+          "description": "Higher implementation quality with extensive reasoning",
+          "default": true
+         },
+         {
+          "id": "medium",
+          "value": "medium",
+          "label": "Medium Effort",
+          "description": "Balanced effort with standard implementation and testing",
+          "default": false
+         },
+         {
+          "id": "low",
+          "value": "low",
+          "label": "Low Effort",
+          "description": "Quick, fast implementations",
+          "default": false
+         }
+        ]
+       }
+      },
+      {
+       "modelId": "grok-4.5",
+       "name": "Grok 4.5",
+       "_meta": {
+        "totalContextTokens": 500000,
+        "agentType": "grok-build-plan",
+        "supportsReasoningEffort": true,
+        "reasoningEffort": "high",
+        "reasoningEfforts": [
+         {
+          "id": "high",
+          "value": "high",
+          "label": "High Effort",
+          "description": "Highest implementation quality with extensive reasoning",
+          "default": true
+         },
+         {
+          "id": "medium",
+          "value": "medium",
+          "label": "Medium Effort",
+          "description": "Balanced effort with standard implementation and testing",
+          "default": false
+         },
+         {
+          "id": "low",
+          "value": "low",
+          "label": "Low Effort",
+          "description": "Quick, fast implementations",
+          "default": false
+         }
+        ]
+       }
+      },
+      {
+       "modelId": "fake",
+       "name": "Fake",
+       "_meta": {
+        "totalContextTokens": 128000,
+        "agentType": "grok-build-plan"
+       }
+      }
+     ]
+    },
+    "mcpServers": [],
+    "mcpApps": false,
+    "availableCommands": [
+     {
+      "name": "compact",
+      "description": "Compress conversation history to save context window",
+      "input": null
+     },
+     {
+      "name": "always-approve",
+      "description": "Toggle always-approve mode (skip all permission prompts)",
+      "input": {
+       "hint": "on|off"
+      }
+     },
+     {
+      "name": "context",
+      "description": "Show context window usage and session stats",
+      "input": null
+     },
+     {
+      "name": "session-info",
+      "description": "Show session details (model, turns, context usage)",
+      "input": null
+     },
+     {
+      "name": "deep-research",
+      "description": "Research with bounded parallel agents, cross-check evidence, and write a cited report",
+      "input": {
+       "hint": "<query>"
+      }
+     },
+     {
+      "name": "workflow",
+      "description": "Launch a saved workflow, list runs, or manage a run (pause, resume, stop, save)",
+      "input": {
+       "hint": "<name> [--agent-budget N] [--effort LEVEL] [args] | runs | pause|resume|stop|save [name]"
+      }
+     },
+     {
+      "name": "goal",
+      "description": "Set, manage, or check an autonomous goal",
+      "input": {
+       "hint": "<objective> [--budget <tokens>] | status | pause | resume | clear"
+      }
+     }
+    ],
+    "cancelRewind": true,
+    "sessionRecap": true,
+    "feedbackTraceOffer": false,
+    "voiceMode": true
+   }
+  },
+  "authenticate": {},
+  "session/new": {
+   "sessionId": "$SESSION",
+   "models": {
+    "currentModelId": "fake",
+    "availableModels": [
+     {
+      "modelId": "grok-4.6",
+      "name": "Grok 4.6",
+      "description": "SpaceXAI's latest frontier model",
+      "_meta": {
+       "totalContextTokens": 500000,
+       "agentType": "grok-build-plan",
+       "supportsReasoningEffort": true,
+       "reasoningEffort": "high",
+       "reasoningEfforts": [
+        {
+         "id": "xhigh",
+         "value": "xhigh",
+         "label": "Extra High Effort",
+         "description": "Highest effort and reasoning level",
+         "default": false
+        },
+        {
+         "id": "high",
+         "value": "high",
+         "label": "High Effort",
+         "description": "Higher implementation quality with extensive reasoning",
+         "default": true
+        },
+        {
+         "id": "medium",
+         "value": "medium",
+         "label": "Medium Effort",
+         "description": "Balanced effort with standard implementation and testing",
+         "default": false
+        },
+        {
+         "id": "low",
+         "value": "low",
+         "label": "Low Effort",
+         "description": "Quick, fast implementations",
+         "default": false
+        }
+       ]
+      }
+     },
+     {
+      "modelId": "grok-4.5",
+      "name": "Grok 4.5",
+      "_meta": {
+       "totalContextTokens": 500000,
+       "agentType": "grok-build-plan",
+       "supportsReasoningEffort": true,
+       "reasoningEffort": "high",
+       "reasoningEfforts": [
+        {
+         "id": "high",
+         "value": "high",
+         "label": "High Effort",
+         "description": "Highest implementation quality with extensive reasoning",
+         "default": true
+        },
+        {
+         "id": "medium",
+         "value": "medium",
+         "label": "Medium Effort",
+         "description": "Balanced effort with standard implementation and testing",
+         "default": false
+        },
+        {
+         "id": "low",
+         "value": "low",
+         "label": "Low Effort",
+         "description": "Quick, fast implementations",
+         "default": false
+        }
+       ]
+      }
+     },
+     {
+      "modelId": "fake",
+      "name": "Fake",
+      "_meta": {
+       "totalContextTokens": 128000,
+       "agentType": "grok-build-plan"
+      }
+     }
+    ]
+   },
+   "configOptions": [
+    {
+     "id": "model",
+     "name": "Model",
+     "category": "model",
+     "type": "select",
+     "currentValue": "fake",
+     "options": [
+      {
+       "value": "grok-4.6",
+       "name": "Grok 4.6"
+      },
+      {
+       "value": "grok-4.5",
+       "name": "Grok 4.5"
+      },
+      {
+       "value": "fake",
+       "name": "Fake"
+      }
+     ]
+    }
+   ],
+   "_meta": {
+    "currentWorkingDirectory": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj",
+    "isGitRepo": false,
+    "gitRoot": null,
+    "showNonGitWarning": false,
+    "feedbackEnabled": true,
+    "codebaseIndexed": [],
+    "x.ai/sessionConfig": {
+     "options": [
+      {
+       "id": "grok-4.6",
+       "category": "model",
+       "label": "Grok 4.6",
+       "selected": false
+      },
+      {
+       "id": "grok-4.5",
+       "category": "model",
+       "label": "Grok 4.5",
+       "selected": false
+      },
+      {
+       "id": "fake",
+       "category": "model",
+       "label": "Fake",
+       "selected": true
+      }
+     ]
+    },
+    "x.ai/sessionDetail": {
+     "sessionId": "$SESSION",
+     "kind": "build",
+     "cwd": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj",
+     "currentModelId": "fake"
+    },
+    "x.ai/memoryNotesWritable": false
+   }
+  },
+  "session/resume": {
+   "models": {
+    "currentModelId": "grok-4.6",
+    "availableModels": [
+     {
+      "modelId": "grok-4.6",
+      "name": "Grok 4.6",
+      "description": "SpaceXAI's latest frontier model",
+      "_meta": {
+       "totalContextTokens": 500000,
+       "agentType": "grok-build-plan",
+       "supportsReasoningEffort": true,
+       "reasoningEffort": "low",
+       "reasoningEfforts": [
+        {
+         "id": "xhigh",
+         "value": "xhigh",
+         "label": "Extra High Effort",
+         "description": "Highest effort and reasoning level",
+         "default": false
+        },
+        {
+         "id": "high",
+         "value": "high",
+         "label": "High Effort",
+         "description": "Higher implementation quality with extensive reasoning",
+         "default": true
+        },
+        {
+         "id": "medium",
+         "value": "medium",
+         "label": "Medium Effort",
+         "description": "Balanced effort with standard implementation and testing",
+         "default": false
+        },
+        {
+         "id": "low",
+         "value": "low",
+         "label": "Low Effort",
+         "description": "Quick, fast implementations",
+         "default": false
+        }
+       ]
+      }
+     },
+     {
+      "modelId": "grok-4.5",
+      "name": "Grok 4.5",
+      "_meta": {
+       "totalContextTokens": 500000,
+       "agentType": "grok-build-plan",
+       "supportsReasoningEffort": true,
+       "reasoningEffort": "high",
+       "reasoningEfforts": [
+        {
+         "id": "high",
+         "value": "high",
+         "label": "High Effort",
+         "description": "Highest implementation quality with extensive reasoning",
+         "default": true
+        },
+        {
+         "id": "medium",
+         "value": "medium",
+         "label": "Medium Effort",
+         "description": "Balanced effort with standard implementation and testing",
+         "default": false
+        },
+        {
+         "id": "low",
+         "value": "low",
+         "label": "Low Effort",
+         "description": "Quick, fast implementations",
+         "default": false
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "configOptions": [
+    {
+     "id": "model",
+     "name": "Model",
+     "category": "model",
+     "type": "select",
+     "currentValue": "grok-4.6",
+     "options": [
+      {
+       "value": "grok-4.6",
+       "name": "Grok 4.6"
+      },
+      {
+       "value": "grok-4.5",
+       "name": "Grok 4.5"
+      }
+     ]
+    },
+    {
+     "id": "reasoning_effort",
+     "name": "Reasoning Effort",
+     "category": "thought_level",
+     "type": "select",
+     "currentValue": "low",
+     "options": [
+      {
+       "value": "xhigh",
+       "name": "Extra High Effort",
+       "description": "Highest effort and reasoning level"
+      },
+      {
+       "value": "high",
+       "name": "High Effort",
+       "description": "Higher implementation quality with extensive reasoning"
+      },
+      {
+       "value": "medium",
+       "name": "Medium Effort",
+       "description": "Balanced effort with standard implementation and testing"
+      },
+      {
+       "value": "low",
+       "name": "Low Effort",
+       "description": "Quick, fast implementations"
+      }
+     ]
+    }
+   ],
+   "_meta": {
+    "sessionId": "01a1a32e-878f-7c10-837e-ab90a2316b24",
+    "codebaseIndexed": [],
+    "x.ai/sessionConfig": {
+     "options": [
+      {
+       "id": "grok-4.6",
+       "category": "model",
+       "label": "Grok 4.6",
+       "selected": true
+      },
+      {
+       "id": "grok-4.5",
+       "category": "model",
+       "label": "Grok 4.5",
+       "selected": false
+      },
+      {
+       "id": "xhigh",
+       "category": "mode",
+       "label": "Extra High Effort",
+       "description": "Highest effort and reasoning level",
+       "selected": false
+      },
+      {
+       "id": "high",
+       "category": "mode",
+       "label": "High Effort",
+       "description": "Higher implementation quality with extensive reasoning",
+       "selected": false
+      },
+      {
+       "id": "medium",
+       "category": "mode",
+       "label": "Medium Effort",
+       "description": "Balanced effort with standard implementation and testing",
+       "selected": false
+      },
+      {
+       "id": "low",
+       "category": "mode",
+       "label": "Low Effort",
+       "description": "Quick, fast implementations",
+       "selected": true
+      }
+     ]
+    },
+    "x.ai/sessionDetail": {
+     "sessionId": "01a1a32e-878f-7c10-837e-ab90a2316b24",
+     "kind": "build",
+     "cwd": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokwork/proj",
+     "currentModelId": "grok-4.6",
+     "title": "say hi"
+    },
+    "x.ai/memoryNotesWritable": false
+   }
+  },
+  "session/set_mode": {},
+  "session/set_config_option": {
+   "configOptions": [
+    {
+     "id": "model",
+     "name": "Model",
+     "category": "model",
+     "type": "select",
+     "currentValue": "fake",
+     "options": [
+      {
+       "value": "grok-4.6",
+       "name": "Grok 4.6"
+      },
+      {
+       "value": "grok-4.5",
+       "name": "Grok 4.5"
+      },
+      {
+       "value": "fake",
+       "name": "Fake"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "turns": {
+  "hello": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Hello "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "there."
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "text",
+     "done"
+    ],
+    "reply": "Hello there."
+   }
+  },
+  "permission": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_1",
+      "title": "run_terminal_command",
+      "rawInput": {
+       "command": "echo hi > out.txt",
+       "description": "make a file"
+      },
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "run_terminal_command",
+        "kind": "execute",
+        "namespace": "grok_build",
+        "label": "Run Command",
+        "read_only": false
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1",
+      "kind": "execute",
+      "title": "Execute `echo hi > out.txt`",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "make a file"
+        }
+       }
+      ],
+      "locations": [],
+      "rawInput": {
+       "variant": "Bash",
+       "command": "echo hi > out.txt",
+       "description": "make a file",
+       "is_background": false
+      },
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "run_terminal_command",
+        "kind": "execute",
+        "namespace": "grok_build",
+        "label": "Run Command",
+        "read_only": false,
+        "input": {
+         "command": "echo hi > out.txt",
+         "description": "make a file"
+        }
+       }
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "call_1",
+        "kind": "execute",
+        "title": "Execute `echo hi > out.txt`",
+        "rawInput": {
+         "variant": "Bash",
+         "command": "echo hi > out.txt",
+         "description": "make a file",
+         "is_background": false
+        },
+        "_meta": {
+         "x.ai/tool": {
+          "version": 1,
+          "name": "run_terminal_command",
+          "kind": "execute",
+          "namespace": "grok_build",
+          "label": "Run Command",
+          "read_only": false,
+          "input": {
+           "command": "echo hi > out.txt",
+           "description": "make a file"
+          }
+         },
+         "x.ai/requestingSessionId": "$SESSION"
+        }
+       },
+       "options": [
+        {
+         "optionId": "always-allow",
+         "name": "Yes, and don't ask again for bash commands",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "allow-once",
+         "name": "Yes, proceed",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "reject-once",
+         "name": "No, and tell Grok what to do differently",
+         "kind": "reject_once"
+        },
+        {
+         "optionId": "reject-always",
+         "name": "No, and don't ask again for this command",
+         "kind": "reject_always"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1",
+      "status": "in_progress",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": ""
+        }
+       }
+      ],
+      "rawOutput": {
+       "type": "Bash",
+       "output": [],
+       "output_for_prompt": "",
+       "exit_code": 0,
+       "command": "echo hi > out.txt",
+       "truncated": false,
+       "signal": null,
+       "timed_out": false,
+       "description": null,
+       "current_dir": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj",
+       "output_file": "",
+       "total_bytes": 0
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": ""
+        }
+       }
+      ],
+      "rawOutput": {
+       "type": "Bash",
+       "output": [],
+       "output_for_prompt": "exit: 0\n",
+       "exit_code": 0,
+       "command": "echo hi > out.txt",
+       "truncated": false,
+       "signal": null,
+       "timed_out": false,
+       "description": "make a file",
+       "current_dir": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj",
+       "output_file": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/home/sessions/%2Ftmp%2Fclaude-1000%2F-home-quent-projekt-Weavemind-weft-trees-agent-nodes%2Faaed3bfd-c92a-4974-adf0-05cea1ae404c%2Fscratchpad%2Fgrokrec%2Fproj/$SESSION/terminal/call_1.log",
+       "total_bytes": 0
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done: "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "\"exit: 0\\n\""
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "Done: \"exit: 0\\n\"",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "execute",
+        "title": "Execute `echo hi > out.txt`",
+        "detail": "echo hi > out.txt",
+        "choices": [
+         {
+          "id": "always-allow",
+          "kind": "allow_always"
+         },
+         {
+          "id": "allow-once",
+          "kind": "allow_once"
+         },
+         {
+          "id": "reject-once",
+          "kind": "reject"
+         },
+         {
+          "id": "reject-always",
+          "kind": "reject"
+         }
+        ]
+       }
+      },
+      "answer": {
+       "choice": "allow-once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "allow-once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "reject": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_4",
+      "title": "run_terminal_command",
+      "rawInput": {
+       "command": "echo hi > out.txt",
+       "description": "make a file"
+      },
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "run_terminal_command",
+        "kind": "execute",
+        "namespace": "grok_build",
+        "label": "Run Command",
+        "read_only": false
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_4",
+      "kind": "execute",
+      "title": "Execute `echo hi > out.txt`",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "make a file"
+        }
+       }
+      ],
+      "locations": [],
+      "rawInput": {
+       "variant": "Bash",
+       "command": "echo hi > out.txt",
+       "description": "make a file",
+       "is_background": false
+      },
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "run_terminal_command",
+        "kind": "execute",
+        "namespace": "grok_build",
+        "label": "Run Command",
+        "read_only": false,
+        "input": {
+         "command": "echo hi > out.txt",
+         "description": "make a file"
+        }
+       }
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "call_4",
+        "kind": "execute",
+        "title": "Execute `echo hi > out.txt`",
+        "rawInput": {
+         "variant": "Bash",
+         "command": "echo hi > out.txt",
+         "description": "make a file",
+         "is_background": false
+        },
+        "_meta": {
+         "x.ai/tool": {
+          "version": 1,
+          "name": "run_terminal_command",
+          "kind": "execute",
+          "namespace": "grok_build",
+          "label": "Run Command",
+          "read_only": false,
+          "input": {
+           "command": "echo hi > out.txt",
+           "description": "make a file"
+          }
+         },
+         "x.ai/requestingSessionId": "$SESSION"
+        }
+       },
+       "options": [
+        {
+         "optionId": "always-allow",
+         "name": "Yes, and don't ask again for bash commands",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "allow-once",
+         "name": "Yes, proceed",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "reject-once",
+         "name": "No, and tell Grok what to do differently",
+         "kind": "reject_once"
+        },
+        {
+         "optionId": "reject-always",
+         "name": "No, and don't ask again for this command",
+         "kind": "reject_always"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_4",
+      "status": "failed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "User rejected the execution for tool `run_terminal_command`"
+        }
+       }
+      ],
+      "_meta": {
+       "toolNotRun": "rejected"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "cancelled"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "error"
+    ],
+    "status": "failed",
+    "error": "ended the turn when `Execute `echo hi > out.txt`` was refused",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission"
+      },
+      "answer": {
+       "choice": "reject-once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "reject-once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "tool": {
+   "tools": true,
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_5",
+      "title": "search_tool",
+      "rawInput": {
+       "query": "weft lookup"
+      },
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "search_tool",
+        "kind": "search_tool",
+        "namespace": "grok_build",
+        "label": "Search Tools",
+        "read_only": false
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_5",
+      "kind": "other",
+      "title": "Search tools: \"weft lookup\"",
+      "locations": [],
+      "rawInput": {
+       "variant": "SearchTool",
+       "query": "weft lookup",
+       "limit": 5
+      },
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "search_tool",
+        "kind": "search_tool",
+        "namespace": "grok_build",
+        "label": "Search Tools",
+        "read_only": false
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_5",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "{\n  \"results\": [\n    {\n      \"server\": \"weft\",\n      \"tools\": [\n        {\n          \"tool_name\": \"weft__lookup\",\n          \"description\": \"Look up the magic number\",\n          \"score\": 0.7911258339881897,\n          \"input_schema\": {\n            \"type\": \"object\",\n            \"properties\": {}\n          }\n        }\n      ]\n    }\n  ],\n  \"total_hidden_tools\": 1,\n  \"status\": \"ready\",\n  \"note\": null\n}"
+        }
+       }
+      ],
+      "rawOutput": {
+       "type": "SearchTool",
+       "result_count": 1,
+       "content": "{\n  \"results\": [\n    {\n      \"server\": \"weft\",\n      \"tools\": [\n        {\n          \"tool_name\": \"weft__lookup\",\n          \"description\": \"Look up the magic number\",\n          \"score\": 0.7911258339881897,\n          \"input_schema\": {\n            \"type\": \"object\",\n            \"properties\": {}\n          }\n        }\n      ]\n    }\n  ],\n  \"total_hidden_tools\": 1,\n  \"status\": \"ready\",\n  \"note\": null\n}"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_6",
+      "title": "use_tool",
+      "rawInput": {
+       "tool_name": "weft__lookup",
+       "tool_input": {}
+      },
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "use_tool",
+        "kind": "use_tool",
+        "namespace": "grok_build",
+        "label": "Use Tool",
+        "read_only": false
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_6",
+      "kind": "other",
+      "title": "weft__lookup",
+      "locations": [],
+      "rawInput": {
+       "variant": "UseTool",
+       "tool_name": "weft__lookup",
+       "tool_input": {}
+      },
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "use_tool",
+        "kind": "use_tool",
+        "namespace": "grok_build",
+        "label": "Use Tool",
+        "read_only": false
+       }
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "call_6",
+        "kind": "other",
+        "title": "weft__lookup",
+        "rawInput": {
+         "variant": "UseTool",
+         "tool_name": "weft__lookup",
+         "tool_input": {}
+        },
+        "_meta": {
+         "x.ai/tool": {
+          "version": 1,
+          "name": "use_tool",
+          "kind": "use_tool",
+          "namespace": "grok_build",
+          "label": "Use Tool",
+          "read_only": false
+         },
+         "x.ai/requestingSessionId": "$SESSION"
+        }
+       },
+       "options": [
+        {
+         "optionId": "always-allow",
+         "name": "always allow",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "allow-once",
+         "name": "allow once",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "reject-once",
+         "name": "reject once",
+         "kind": "reject_once"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "tool": {
+      "name": "lookup",
+      "arguments": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_6",
+      "status": "completed",
+      "rawOutput": {
+       "type": "MCP",
+       "tool_name": "lookup",
+       "server_name": "weft",
+       "output": {
+        "OkayOutput": "$TOOL"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done: "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "\"$TOOL\""
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "tool_result",
+     "tool_use",
+     "question",
+     "tool_call",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "Done: \"42\"",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "title": "weft__lookup"
+       }
+      },
+      "answer": {
+       "choice": "allow-once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "allow-once"
+       }
+      }
+     },
+     {
+      "tool": "lookup",
+      "result": "42"
+     }
+    ]
+   }
+  },
+  "edit": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_10",
+      "title": "write",
+      "rawInput": {
+       "file_path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj/hello.txt",
+       "content": "hi\n"
+      },
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "write",
+        "kind": "write",
+        "namespace": "grok_build",
+        "label": "Write",
+        "read_only": false
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_10",
+      "kind": "edit",
+      "title": "Write `/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj/hello.txt`",
+      "content": [
+       {
+        "type": "diff",
+        "path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj/hello.txt",
+        "oldText": "",
+        "newText": "hi\n"
+       }
+      ],
+      "locations": [
+       {
+        "path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj/hello.txt"
+       }
+      ],
+      "rawInput": {
+       "variant": "Write",
+       "file_path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj/hello.txt",
+       "content": "hi\n"
+      },
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "write",
+        "kind": "write",
+        "namespace": "grok_build",
+        "label": "Write",
+        "read_only": false,
+        "input": {
+         "path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj/hello.txt"
+        }
+       }
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "call_10",
+        "kind": "edit",
+        "title": "Write `/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj/hello.txt`",
+        "rawInput": {
+         "variant": "Write",
+         "file_path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj/hello.txt",
+         "content": "hi\n"
+        },
+        "_meta": {
+         "x.ai/tool": {
+          "version": 1,
+          "name": "write",
+          "kind": "write",
+          "namespace": "grok_build",
+          "label": "Write",
+          "read_only": false,
+          "input": {
+           "path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj/hello.txt"
+          }
+         },
+         "x.ai/requestingSessionId": "$SESSION"
+        }
+       },
+       "options": [
+        {
+         "optionId": "allow-edits-session",
+         "name": "Yes, allow all edits during this session",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "allow-once",
+         "name": "Yes",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "reject-once",
+         "name": "No, and tell Grok what to do differently",
+         "kind": "reject_once"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_10",
+      "status": "completed",
+      "content": [
+       {
+        "type": "diff",
+        "path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj/hello.txt",
+        "oldText": "",
+        "newText": "hi\n",
+        "_meta": {
+         "details": [
+          {
+           "old_string": "",
+           "old_line": 1,
+           "new_string": "hi\n",
+           "new_line": 1,
+           "context_before": "",
+           "context_after": "",
+           "line_prefix": ""
+          }
+         ]
+        }
+       }
+      ],
+      "rawOutput": {
+       "type": "SearchReplace",
+       "EditsApplied": {
+        "old_string": "",
+        "new_string": "hi\n",
+        "tool_output_for_prompt": "The file /tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj/hello.txt has been created.",
+        "tool_output_for_prompt_concise": "The file /tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj/hello.txt has been created.",
+        "absolute_path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/proj/hello.txt",
+        "edits": {
+         "details": [
+          {
+           "old_string": "",
+           "old_line": 1,
+           "new_string": "hi\n",
+           "new_line": 1,
+           "context_before": "",
+           "context_after": "",
+           "line_prefix": ""
+          }
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done: "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "\"The file /tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scr"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "file_change",
+     "text",
+     "done"
+    ],
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "edit"
+       }
+      },
+      "answer": {
+       "choice": "allow-edits-session"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "allow-edits-session"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "ask": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_21",
+      "title": "ask_user_question",
+      "rawInput": {
+       "questions": [
+        {
+         "question": "Which color?",
+         "options": [
+          {
+           "label": "Red",
+           "description": "warm"
+          },
+          {
+           "label": "Blue",
+           "description": "cool"
+          }
+         ],
+         "multi_select": false
+        }
+       ]
+      },
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "ask_user_question",
+        "kind": "ask_user",
+        "namespace": "grok_build",
+        "label": "Ask User",
+        "read_only": true
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_21",
+      "kind": "other",
+      "title": "Ask: Which color?",
+      "locations": [],
+      "rawInput": {
+       "variant": "AskUserQuestion",
+       "questions": [
+        {
+         "question": "Which color?",
+         "options": [
+          {
+           "label": "Red",
+           "description": "warm"
+          },
+          {
+           "label": "Blue",
+           "description": "cool"
+          }
+         ],
+         "multiSelect": false
+        }
+       ]
+      },
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "ask_user_question",
+        "kind": "ask_user",
+        "namespace": "grok_build",
+        "label": "Ask User",
+        "read_only": true
+       }
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "_x.ai/ask_user_question",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCallId": "call_21",
+       "questions": [
+        {
+         "question": "Which color?",
+         "options": [
+          {
+           "label": "Red",
+           "description": "warm"
+          },
+          {
+           "label": "Blue",
+           "description": "cool"
+          }
+         ],
+         "multiSelect": false
+        }
+       ],
+       "mode": "default"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_21",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "User has answered your questions: \"Which color?\"=\"Red\". You can now continue with the user's answers in mind."
+        }
+       }
+      ],
+      "rawOutput": {
+       "type": "AskUserQuestion",
+       "UserAnswered": {
+        "message": "User has answered your questions: \"Which color?\"=\"Red\". You can now continue with the user's answers in mind.",
+        "answers": [
+         {
+          "question": "Which color?",
+          "options": [
+           "Red",
+           "Blue"
+          ],
+          "descriptions": [
+           "warm",
+           "cool"
+          ],
+          "picked": [
+           "Red"
+          ]
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done: "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "\"User has answered your questions: \\\"Which color?\\\"=\\\"Red\\\". You can now continue with the user's answers in mind.\""
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "blocks": [
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "id": "0",
+         "question": "Which color?",
+         "multiSelect": false,
+         "allowOther": true,
+         "options": [
+          {
+           "label": "Red",
+           "description": "warm"
+          },
+          {
+           "label": "Blue",
+           "description": "cool"
+          }
+         ]
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "0": [
+         "Red"
+        ]
+       }
+      },
+      "agentGot": {
+       "outcome": "accepted",
+       "answers": {
+        "Which color?": "Red"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "plan": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_18",
+      "title": "exit_plan_mode",
+      "rawInput": {},
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "exit_plan_mode",
+        "kind": "exit_plan",
+        "namespace": "grok_build",
+        "label": "Exit Plan Mode",
+        "read_only": true
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_18",
+      "kind": "other",
+      "title": "Plan: Exit",
+      "locations": [],
+      "rawInput": {
+       "variant": "ExitPlanMode"
+      },
+      "_meta": {
+       "x.ai/tool": {
+        "version": 1,
+        "name": "exit_plan_mode",
+        "kind": "exit_plan",
+        "namespace": "grok_build",
+        "label": "Exit Plan Mode",
+        "read_only": true
+       }
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "_x.ai/exit_plan_mode",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCallId": "call_18",
+       "planContent": null
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "current_mode_update",
+      "currentModeId": "default"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_18",
+      "status": "completed",
+      "title": "Plan mode exited",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "Plan file: /tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/home/sessions/%2Ftmp%2Fclaude-1000%2F-home-quent-projekt-Weavemind-weft-trees-agent-nodes%2Faaed3bfd-c92a-4974-adf0-05cea1ae404c%2Fscratchpad%2Fgrokrec%2Fproj/$SESSION/plan.md"
+        }
+       }
+      ],
+      "rawOutput": {
+       "type": "ExitPlanMode",
+       "EmptyPlan": {
+        "message": "Plan mode exit approved. No plan content was found \u2014 you can proceed.",
+        "plan_file_path": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/grokrec/home/sessions/%2Ftmp%2Fclaude-1000%2F-home-quent-projekt-Weavemind-weft-trees-agent-nodes%2Faaed3bfd-c92a-4974-adf0-05cea1ae404c%2Fscratchpad%2Fgrokrec%2Fproj/$SESSION/plan.md"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done: "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "\"Plan mode exit approved. No plan content was found \\u2014 you can proceed.\""
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "plan",
+        "choices": [
+         {
+          "id": "approved",
+          "kind": "allow_once"
+         },
+         {
+          "id": "cancelled",
+          "kind": "reject"
+         }
+        ]
+       }
+      },
+      "answer": {
+       "choice": "approved"
+      },
+      "agentGot": {
+       "outcome": "approved"
+      }
+     }
+    ]
+   }
+  },
+  "bad key": {
+   "steps": [
+    {
+     "fail": {
+      "code": -32603,
+      "message": "Internal error",
+      "data": {
+       "message": "API error (status 400 Bad Request): invalid-argument: Incorrect API key provided. You can obtain an API key from https://console.x.ai.",
+       "http_status": 400
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "error"
+    ],
+    "status": "failed",
+    "error": "Incorrect API key provided"
+   }
+  }
+ },
+ "settings": [
+  {
+   "name": "ask",
+   "given": {
+    "permission": "ask"
+   },
+   "expect": {
+    "args": [
+     [
+      "agent",
+      "stdio"
+     ]
+    ],
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "default"
+      }
+     },
+     {
+      "method": "authenticate",
+      "params": {
+       "methodId": "cached_token"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "auto",
+   "given": {
+    "permission": "auto"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/new",
+      "params": {
+       "_meta": {
+        "autoMode": true
+       }
+      }
+     },
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "default"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "plan",
+   "given": {
+    "permission": "plan"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "plan"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "bypass",
+   "given": {
+    "permission": "bypass"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/new",
+      "params": {
+       "_meta": {
+        "yoloMode": true
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "model_and_options",
+   "given": {
+    "model": "grok-4.6",
+    "options": {
+     "effort": "low",
+     "appendSystemPrompt": "Answer in French.",
+     "sandbox": "workspace"
+    }
+   },
+   "expect": {
+    "env": {
+     "GROK_SANDBOX": "workspace",
+     "DISABLE_TELEMETRY": "1"
+    },
+    "requests": [
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "model",
+       "value": "grok-4.6"
+      }
+     },
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "reasoning_effort",
+       "value": "low"
+      }
+     },
+     {
+      "method": "session/new",
+      "params": {
+       "_meta": {
+        "rules": "Answer in French."
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "api_key",
+   "given": {
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "xai-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "XAI_API_KEY": "xai-test",
+     "HOME": "$HOME"
+    },
+    "requests": [
+     {
+      "method": "authenticate",
+      "params": {
+       "methodId": "xai.api_key"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "bad_option_value",
+   "given": {
+    "options": {
+     "effort": "max"
+    }
+   },
+   "expect": {
+    "error": "takes low, medium, high, xhigh"
+   }
+  }
+ ]
+}

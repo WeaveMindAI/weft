@@ -185,8 +185,8 @@ either.
 anything went out on a `Bus` or `Generator` output, the readers already hold
 part of the answer, and a backup gated on `_error` would send a second answer
 on top of it.
-The stream ends failed instead, and its readers are told (go and read [how a
-bus ends](streams-and-buses.md#how-a-bus-ends)). A producer can open its bus
+The stream ends failed instead (a bus once nobody else is on it), and its
+readers are told (go and read [how a bus ends](streams-and-buses.md#how-a-bus-ends)). A producer can open its bus
 on the first piece, the way `LlmStream` does. So if a model refuses a prompt
 before writing a word, the refusal still comes out on `_error`. The node's bus
 port then closes like any output it never sent: a reader that needs the bus

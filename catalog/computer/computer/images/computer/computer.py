@@ -13,6 +13,21 @@ manager and a terminal open on it:
                  read afterwards in pieces, through the `output` action.
   GET /live      the node's card: the screen, the shell, the buttons.
   GET /health    ready once the screen answers.
+  /apps/<name>/  any request, handed on to the program started on the
+                 computer under that name (one that wrote the loopback port
+                 it serves on into ~/.weft/apps/<name>), and its answer
+                 handed back: how a node reaches a server it started inside
+                 the computer, through the one endpoint the computer has.
+                 An app that registered its start command beside that file
+                 (~/.weft/apps/<name>.start) is started again each time the
+                 computer starts, so it outlives a restart of the computer.
+  DELETE /apps/<name>
+                 removes the app: runs the remove command it registered
+                 (~/.weft/apps/<name>.remove), which stops it and deletes
+                 what it keeps, then its files in ~/.weft/apps. Answers
+                 {"removed": true}, or {"removed": false} for an app that
+                 is not there (removed already, or never started), so weft
+                 terminating the node that started it can ask again.
 
 Coordinates are pixels of the screen, which is the size of every
 screenshot, so a coordinate read off a screenshot is where the click lands.
@@ -35,6 +50,7 @@ container, so the two sides cannot drift.
 
 import base64
 import codecs
+import fcntl
 import http.server
 import json
 import math
@@ -66,6 +82,22 @@ HEALTH_PATH = "/health"
 LIVE_PATH = "/live"
 ACTION_PATH = "/action"
 JOBS_PREFIX = "/jobs/"
+# SYNC: the computer's apps <-> catalog/computer/apps.rs (PREFIX, DIR, START_SUFFIX, REMOVE_SUFFIX, LOCK_SUFFIX),
+#       catalog/agents/agent.rs (start_script, remove_script)
+APPS_PREFIX = "/apps/"
+# Where a program started on the computer says which loopback port it
+# serves on: one file per app, named after it, holding the port. Beside it,
+# `<name>.start` is the bash script that starts the app unless it is up,
+# which the computer runs at each start, `<name>.remove` the bash script
+# that stops it and deletes everything it keeps, which the computer runs
+# when the app is removed (`DELETE /apps/<name>`), and `<name>.lock` the
+# file whoever runs either script holds an flock on, so two starts at once
+# start one app and a start never runs beside a removal.
+# An app's name holds no `.`, so no app is named like one of those files.
+APPS_DIR = os.path.join(HOME, ".weft", "apps")
+START_SUFFIX = ".start"
+REMOVE_SUFFIX = ".remove"
+LOCK_SUFFIX = ".lock"
 
 # How long `exec` holds its answer for a command to finish, so a quick
 # command answers in the same call; a longer one answers with its id and
@@ -116,7 +148,8 @@ MOST_WHEEL_CLICKS = 100
 MODIFIERS = {"shift", "ctrl", "control", "alt", "super", "meta", "hyper"}
 
 # The answer to an `exec` and to `/jobs/<id>`.
-# SYNC: job answer <-> catalog/computer/run_command/mod.rs (finished: the statuses and fields)
+# SYNC: job answer <-> catalog/computer/command.rs (RUNNING, DONE, LOST, finished, piece)
+# and the output piece `Job.read` answers, read by `piece`.
 RUNNING = "running"
 DONE = "done"
 LOST = "lost"
@@ -941,6 +974,7 @@ def end_session(payload: dict) -> dict:
     return {"ended": SHELL.end(name, "ended by EndSession")}
 
 
+# SYNC: the action names <-> catalog/computer/actions.rs (SCREENSHOT ... END_SESSION)
 ACTIONS = {
     "screenshot": lambda payload: screenshot(),
     "zoom": zoom,
@@ -1016,8 +1050,60 @@ def live_items() -> list:
     return items
 
 
+def check_app_name(name: str) -> None:
+    """Refuse a name that is not an app's: it names files in APPS_DIR."""
+    if not name or not all(c.isascii() and (c.isalnum() or c in "-_") for c in name):
+        raise Refused(f"{name!r} is not an app name: letters, digits, '-' and '_' only")
+
+
+def app_port(name: str) -> int:
+    """The loopback port the app `name` serves on, as it wrote it down."""
+    check_app_name(name)
+    try:
+        with open(os.path.join(APPS_DIR, name), encoding="utf-8") as f:
+            return int(f.read().strip())
+    except FileNotFoundError:
+        raise Refused(
+            f"no app {name!r} runs on this computer yet: nothing started it, or the computer is starting it "
+            "again after a restart; the node that starts it starts it on its next run"
+        )
+    except ValueError:
+        raise Refused(f"the app {name!r} wrote something that is not a port into {os.path.join(APPS_DIR, name)}")
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
+
+    def _forward(self, method: str) -> None:
+        """Hand the request on to the app its path names, and its answer back."""
+        import http.client  # noqa: PLC0415 (only this route needs it)
+        rest = self.path[len(APPS_PREFIX):]
+        name, _, tail = rest.partition("/")
+        try:
+            port = app_port(name)
+        except Refused as refused:
+            self._send(502, {"error": str(refused)})
+            return
+        length = max(0, int(self.headers.get("Content-Length", "0")))
+        body = self.rfile.read(length) if length else None
+        headers = {k: v for k, v in self.headers.items() if k.lower() in ("content-type", "accept")}
+        # No timeout: an app may hold a request open as long as it means to
+        # (a long poll), and the caller decides how long it waits.
+        upstream = http.client.HTTPConnection("127.0.0.1", port)
+        try:
+            upstream.request(method, "/" + tail, body=body, headers=headers)
+            answer = upstream.getresponse()
+            payload = answer.read()
+        except OSError as e:
+            self._send(502, {"error": f"the app {name!r} on port {port} did not answer: {e}"})
+            return
+        finally:
+            upstream.close()
+        self.send_response(answer.status)
+        self.send_header("Content-Type", answer.getheader("Content-Type") or "application/octet-stream")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _send(self, status: int, body: dict) -> None:
         payload = json.dumps(body).encode("utf-8")
@@ -1028,6 +1114,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self) -> None:  # noqa: N802 (the stdlib's spelling)
+        if self.path.startswith(APPS_PREFIX):
+            self._forward("GET")
+            return
         if self.path == HEALTH_PATH:
             if DESKTOP.healthy():
                 self._send(200, {"ok": True})
@@ -1050,7 +1139,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self._send(404, {"error": "no such path"})
 
+    def do_DELETE(self) -> None:  # noqa: N802
+        if not self.path.startswith(APPS_PREFIX):
+            self._send(404, {"error": "no such path"})
+            return
+        name = self.path[len(APPS_PREFIX):]
+        if "/" in name or "?" in name:
+            # Below an app's own path: the app's to answer.
+            self._forward("DELETE")
+            return
+        try:
+            self._send(200, {"removed": remove_app(name)})
+        except Refused as refused:
+            self._send(400, {"error": str(refused)})
+        except (RemoveFailed, OSError) as e:
+            log(f"app {name!r} not removed: {e}")
+            self._send(500, {"error": str(e)})
+
     def do_POST(self) -> None:  # noqa: N802
+        if self.path.startswith(APPS_PREFIX):
+            self._forward("POST")
+            return
         if self.path != ACTION_PATH:
             self._send(404, {"error": "no such path"})
             return
@@ -1088,12 +1197,90 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def start_app(name: str) -> None:
+    """Run the app `name`'s start script, holding its lock; a failure is logged, never raised:
+    one app that does not start leaves the computer and every other app working."""
+    script = os.path.join(APPS_DIR, name + START_SUFFIX)
+    try:
+        with open(os.path.join(APPS_DIR, name + LOCK_SUFFIX), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            done = subprocess.run(["bash", script], cwd=HOME, env=base_env(), stdin=subprocess.DEVNULL, capture_output=True)
+    except OSError as e:
+        log(f"app {name!r} was not started again: {e}")
+        return
+    if done.returncode != 0:
+        said = (done.stdout + done.stderr).decode("utf-8", "replace").strip()
+        log(f"app {name!r} was not started again (exit {done.returncode}): {said}")
+        return
+    log(f"app {name!r} up")
+
+
+class RemoveFailed(Exception):
+    """An app's remove command failed; its text says what it printed."""
+
+
+def unlink(path: str) -> None:
+    """Delete the file `path`; one gone already is fine."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def remove_app(name: str) -> bool:
+    """Remove the app `name` (`DELETE /apps/<name>`), holding its lock: its
+    start file first, so no restart of the computer from here on starts it
+    again, then its remove command (it stops the app and deletes what the
+    app keeps), then its port file and the rest. Whether it was there.
+
+    A remove command that fails leaves the app's other files, its remove
+    command among them, so asking again runs it again. An app with a port
+    or a start file and no remove command was started by something that
+    never said how to remove it: refused, naming what is left."""
+    check_app_name(name)
+    port, start, remove, lock = (os.path.join(APPS_DIR, name + suffix) for suffix in ("", START_SUFFIX, REMOVE_SUFFIX, LOCK_SUFFIX))
+    if not any(os.path.exists(path) for path in (port, start, remove, lock)):
+        return False
+    with open(lock, "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        if not os.path.exists(remove) and (os.path.exists(port) or os.path.exists(start)):
+            raise RemoveFailed(f"the app {name!r} registered no remove command ({remove}), so the computer cannot tell "
+                               f"what it leaves behind; stop it and delete what it keeps yourself, then delete {port} "
+                               f"and {start}")
+        unlink(start)
+        if os.path.exists(remove):
+            done = subprocess.run(["bash", remove], cwd=HOME, env=base_env(), stdin=subprocess.DEVNULL, capture_output=True)
+            if done.returncode != 0:
+                said = (done.stdout + done.stderr).decode("utf-8", "replace").strip()
+                raise RemoveFailed(f"removing the app {name!r} failed (exit {done.returncode}): {said}")
+        unlink(port)
+        unlink(remove)
+        # Still held: whoever waits on it next holds a file nobody else
+        # will, and the next start of an app by this name makes a new one.
+        unlink(lock)
+    log(f"app {name!r} removed")
+    return True
+
+
+def start_apps() -> None:
+    """Start every app registered on this computer: what was running before it restarted."""
+    try:
+        entries = sorted(os.listdir(APPS_DIR))
+    except FileNotFoundError:
+        return
+    for entry in entries:
+        if entry.endswith(START_SUFFIX):
+            start_app(entry[: -len(START_SUFFIX)])
+
+
 def serve() -> None:
     DESKTOP.start()
     SSH.start()
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
     log(f"listening on {PORT}")
+    # Beside the server, so the computer answers while its apps come up.
+    threading.Thread(target=start_apps, daemon=True).start()
     server.serve_forever()
 
 

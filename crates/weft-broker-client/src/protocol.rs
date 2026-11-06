@@ -575,6 +575,14 @@ pub struct ResolveConnectionRequest {
     /// and the runtime may retire it after (the crash backstop for a
     /// worker that dies without releasing).
     pub expected_duration_secs: u64,
+    /// A renewal (`ctx.renew`): the values this firing was handed, which
+    /// stopped working, as `weft_core::access::handed_digest`. The store
+    /// renews the connection while it still hands exactly those, once
+    /// however many ask, and otherwise answers what it holds now (another
+    /// renewal already replaced them). Harmless twice for that reason: a
+    /// renewal sent again finds the renewed values there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<String>,
 }
 
 /// A node handing out a connection to what it runs itself. Harmless twice: a
@@ -713,6 +721,11 @@ pub struct ResolveConnectionResponse {
     /// when one did (`weft_access_store::ResolvedAccess::published_by`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_by: Option<String>,
+    /// The way to sign in a pasted connection was made with
+    /// (`weft_access_store::ResolvedAccess::way`), what
+    /// `OpenedConnection::way` answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub way: Option<String>,
 }
 
 /// Releasing a connection after a firing. Harmless twice: releasing one released already does nothing.
@@ -1509,8 +1522,10 @@ pub struct AppliedEndpoints {
     /// Endpoint name to where the project's workers and weft's own roles
     /// (the front door passing a `Public` endpoint on, the dispatcher
     /// reading a unit's `/live`) reach it.
+    /// An endpoint inside another node's is kept as that endpoint and
+    /// its path (`EndpointRecord::Within`), followed by every reader.
     #[serde(rename = "endpoints")]
-    pub urls: std::collections::BTreeMap<String, String>,
+    pub urls: std::collections::BTreeMap<String, weft_core::infra::EndpointRecord>,
     /// Endpoint name to the path it answers at on the front door, for
     /// `Public` endpoints only (`weft_core::infra::public_path`).
     pub public_paths: std::collections::BTreeMap<String, String>,
@@ -2927,7 +2942,7 @@ mod supervisor_protocol_tests {
         // from the run, so a worker cannot name someone else's.
         let spec: weft_core::AccessSpec = serde_json::from_value(json!({
             "service": "postgres",
-            "acquisition": { "kind": "static", "fields": [{ "name": "host" }] },
+            "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "host" }] }] },
         }))
         .unwrap();
         let req = PublishAccessRequest {
@@ -2971,6 +2986,18 @@ mod supervisor_protocol_tests {
         }))
         .unwrap();
         assert_eq!(some.connection().expect("a connection").connection_id, "id-1");
+    }
+
+    /// The way a resolve answers rides beside the values.
+    #[test]
+    fn a_resolve_answers_its_way() {
+        let resolved: ResolveConnectionResponse = serde_json::from_value(json!({
+            "values": { "token": "t" }, "auth": [], "identity": null, "relay_url": null,
+            "owner": "author", "keep_until_unix": null, "way": "subscription",
+        }))
+        .unwrap();
+        assert_eq!(resolved.way.as_deref(), Some("subscription"));
+        assert_eq!(serde_json::to_value(&resolved).unwrap()["way"], "subscription");
     }
 
     #[test]
@@ -3179,7 +3206,7 @@ mod supervisor_protocol_tests {
         });
         let resp: SupervisorInfraNodesResponse = serde_json::from_value(json).unwrap();
         assert_eq!(resp.nodes[0].health_rules.as_ref().unwrap()[0].when.units_named(), vec!["main"]);
-        assert_eq!(resp.nodes[0].addresses.urls.get("api").unwrap(), "http://x.svc:8080");
+        assert_eq!(resp.nodes[0].addresses.urls.get("api").unwrap(), &weft_core::infra::EndpointRecord::Url("http://x.svc:8080".into()));
         assert_eq!(resp.nodes[0].addresses.public_paths.get("api").unwrap(), "/infra/p/wn-abc-tgi-12/hooks");
         assert_eq!(resp.nodes[0].addresses.doors.get("sql").unwrap(), "10.0.0.7:5432");
         assert_eq!(resp.nodes[0].units.get("main").unwrap().status, InfraNodeStatus::Running);
@@ -3219,7 +3246,7 @@ mod supervisor_protocol_tests {
             copy_id: "wn-abc-tgi-12".into(),
             applied_spec_hash: "deadbeef".into(),
             addresses: AppliedEndpoints {
-                urls: [("api".to_string(), "http://x".to_string())].into(),
+                urls: [("api".to_string(), weft_core::infra::EndpointRecord::Url("http://x".into()))].into(),
                 public_paths: [("api".to_string(), "/infra/p/wn-abc-tgi-12/hooks".to_string())].into(),
                 doors: [("sql".to_string(), "10.0.0.7:5432".to_string())].into(),
             },
@@ -3255,6 +3282,7 @@ mod supervisor_protocol_tests {
             required_permissions: vec!["drive.readonly".into()],
             required_values: vec!["imapHost".into()],
             expected_duration_secs: 120,
+            stale: None,
         };
         // The full literal object pins the FIELD NAMES on the wire: a
         // symmetric struct-field rename round-trips fine but breaks the
@@ -3278,6 +3306,11 @@ mod supervisor_protocol_tests {
         assert_eq!(back.frames, vec![weft_core::frames::Frame::Loop { index: 3 }]);
         assert_eq!(back.service, "openrouter");
         assert_eq!(back.expected_duration_secs, 120);
+        assert_eq!(back.stale, None, "an open names no stale values, and sends no key for them");
+
+        let renew = ResolveConnectionRequest { stale: Some("ab12".into()), ..back };
+        let v = serde_json::to_value(&renew).unwrap();
+        assert_eq!(v["stale"], "ab12", "a renewal names the values that stopped working");
     }
 
     #[test]
@@ -3294,6 +3327,7 @@ mod supervisor_protocol_tests {
                 owner: weft_core::CredentialOwner::Platform,
                 keep_until_unix: None,
                 published_by: None,
+                way: None,
             };
             // Field names pinned literally (a symmetric rename would
             // round-trip but break the peer).

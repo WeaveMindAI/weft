@@ -33,49 +33,53 @@
     "identity": "{user}@{host}/{database}",
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "host",
-          "label": "Host",
-          "secret": false,
-          "placeholder": "db.example.com"
-        },
-        {
-          "name": "port",
-          "label": "Port",
-          "secret": false,
-          "optional": true,
-          "placeholder": "5432"
-        },
-        {
-          "name": "database",
-          "label": "Database",
-          "secret": false,
-          "placeholder": "postgres"
-        },
-        {
-          "name": "user",
-          "label": "User",
-          "secret": false,
-          "placeholder": "postgres"
-        },
-        {
-          "name": "password",
-          "label": "Password"
-        },
-        {
-          "name": "sslmode",
-          "label": "TLS",
-          "secret": false,
-          "optional": true,
-          "placeholder": "require (or verify-ca / verify-full; disable turns TLS off)"
-        },
-        {
-          "name": "watchDatabase",
-          "label": "Database for watching queries",
-          "secret": false,
-          "optional": true,
-          "placeholder": "the same as Database (a pooler's separate name for long-held connections)"
+          "fields": [
+            {
+              "name": "host",
+              "label": "Host",
+              "secret": false,
+              "placeholder": "db.example.com"
+            },
+            {
+              "name": "port",
+              "label": "Port",
+              "secret": false,
+              "optional": true,
+              "placeholder": "5432"
+            },
+            {
+              "name": "database",
+              "label": "Database",
+              "secret": false,
+              "placeholder": "postgres"
+            },
+            {
+              "name": "user",
+              "label": "User",
+              "secret": false,
+              "placeholder": "postgres"
+            },
+            {
+              "name": "password",
+              "label": "Password"
+            },
+            {
+              "name": "sslmode",
+              "label": "TLS",
+              "secret": false,
+              "optional": true,
+              "placeholder": "require (or verify-ca / verify-full; disable turns TLS off)"
+            },
+            {
+              "name": "watchDatabase",
+              "label": "Database for watching queries",
+              "secret": false,
+              "optional": true,
+              "placeholder": "the same as Database (a pooler's separate name for long-held connections)"
+            }
+          ]
         }
       ]
     }

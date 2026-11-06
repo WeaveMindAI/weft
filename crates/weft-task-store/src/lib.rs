@@ -87,4 +87,4 @@ pub use tasks::{
     claim_duration_secs, claim_heartbeat_interval, claim_next, complete, enqueue, enqueue_dedup, fail, heartbeat, Claim,
     DedupOutcome, NewTask, Task, TaskOutcome, TaskStatus, TERMINAL_RETENTION_SECS,
 };
-pub use traits::{InfraReader, PostgresInfraReader, PostgresTaskStoreClient, StoredEndpoint, TaskStoreClient};
+pub use traits::{InfraReader, PostgresInfraReader, PostgresTaskStoreClient, Reached, StoredEndpoint, TaskStoreClient};

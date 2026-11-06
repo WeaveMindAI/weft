@@ -74,6 +74,60 @@ pub trait Processes: Send + Sync {
     fn free_port(&self) -> anyhow::Result<u16>;
 }
 
+/// Whether the process `pid` that started at the mark `started`
+/// (`Processes::started`) still runs: its pid is held by that process,
+/// not by one that took the pid since.
+pub async fn runs(processes: &dyn Processes, pid: u32, started: &str) -> anyhow::Result<bool> {
+    Ok(processes.started(pid).await?.as_deref() == Some(started))
+}
+
+/// Stop the process `pid` (started at the mark `started`) the way a
+/// platform stops one: told to stop, given `grace` to exit on its own,
+/// then its whole process group killed, whatever it started with it.
+/// Answers whether it still ran when asked; one gone already (ended on its
+/// own, or a pid another program took since) is sent nothing.
+pub async fn stop(processes: &dyn Processes, pid: u32, started: &str, grace: std::time::Duration) -> anyhow::Result<bool> {
+    if !runs(processes, pid, started).await? {
+        return Ok(false);
+    }
+    processes.signal(pid, Signal::Term)?;
+    let asked = std::time::Instant::now();
+    while runs(processes, pid, started).await? && asked.elapsed() < grace {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // Its process group, whether it exited within the grace or not: a
+    // program it started can outlive it. Sent the moment it was seen gone
+    // (or still there), so its group's number is still its own: one found
+    // long dead above is never sent this.
+    processes.signal(pid, Signal::Kill)?;
+    Ok(true)
+}
+
+/// Kill what is left of the process group of `pid`, a process
+/// [`Processes::spawn`] started (at the mark `started`) that is gone: the
+/// programs it started, which keep its group alive after it ended (a
+/// child it never took down with it, because something killed it first).
+/// Answers whether it sent anything.
+///
+/// The group's number is the gone process's pid, and the kernel never
+/// hands out as a new pid a number a process group still holds. So while
+/// no process has the pid, a group by that number can only be what is
+/// left of the gone one, and killing it touches nothing else; once a
+/// process has the pid again (whatever its mark), that group emptied
+/// before the number was reused, nothing of the gone one is left in it,
+/// and it is sent nothing. A process that still runs as `started` is not
+/// gone, and is sent nothing either: stopping it is [`stop`]'s.
+pub async fn kill_leftovers(processes: &dyn Processes, pid: u32, started: &str) -> anyhow::Result<bool> {
+    match processes.started(pid).await? {
+        None => {
+            processes.signal(pid, Signal::Kill)?;
+            Ok(true)
+        }
+        Some(mark) if mark == started => anyhow::bail!("process {pid} still runs, so what it started is not left over: stop it instead"),
+        Some(_) => Ok(false),
+    }
+}
+
 /// The machine's own processes.
 pub struct MachineProcesses;
 
@@ -200,6 +254,10 @@ pub mod fake {
     pub enum Behaviour {
         /// Serves `/_weft/healthz` on its `PORT`, answering `driving`.
         Serves,
+        /// Serves the same on the port its variable `0` holds.
+        ServesOn(String),
+        /// Runs, serving nothing, until a signal ends it.
+        Runs,
         /// Prints `printed` to its log and ends with `exit` at once.
         Ends { printed: String, exit: Exit },
     }
@@ -310,9 +368,18 @@ pub mod fake {
                     std::fs::write(&spec.log, printed)?;
                     tx.send(Some(exit)).unwrap();
                 }
-                Behaviour::Serves => {
+                Behaviour::Runs => {
                     self.alive.lock().insert(pid, format!("t{pid}"));
-                    let port: u16 = spec.env["PORT"].parse()?;
+                    // Held, never sent: the process has not ended.
+                    std::mem::forget(tx);
+                }
+                behaviour @ (Behaviour::Serves | Behaviour::ServesOn(_)) => {
+                    self.alive.lock().insert(pid, format!("t{pid}"));
+                    let variable = match &behaviour {
+                        Behaviour::ServesOn(variable) => variable.as_str(),
+                        _ => "PORT",
+                    };
+                    let port: u16 = spec.env[variable].parse()?;
                     let reserved = self.reserved.lock().remove(&port);
                     let listener = match reserved {
                         Some(listener) => listener,

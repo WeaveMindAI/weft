@@ -228,6 +228,13 @@ pub trait WaitLiveness: Send + Sync {
     /// (every wake re-evaluates before any re-park, by construction of
     /// the wait loops).
     fn parked(&self, node: &FiringLocation, id: WaitId);
+    /// Nobody is on bus `bus` any more (its last member left, or the
+    /// firing that made it without joining it ended). The bus stays open
+    /// while a node can still join it; whether one can is the engine's to
+    /// say, from where the bus's marker still is in the run
+    /// (`crate::run::bus_reach`), and once none can it ends the bus
+    /// ([`crate::bus::BusInner::end_unattended`]).
+    fn unattended(&self, bus: uuid::Uuid);
 }
 
 /// Concrete zero-state type used to spell `Weak<dyn WaitLiveness>` when
@@ -255,6 +262,9 @@ impl WaitLiveness for NoLiveness {
         unreachable!("NoLiveness is never constructed")
     }
     fn parked(&self, _node: &FiringLocation, _id: WaitId) {
+        unreachable!("NoLiveness is never constructed")
+    }
+    fn unattended(&self, _bus: uuid::Uuid) {
         unreachable!("NoLiveness is never constructed")
     }
 }

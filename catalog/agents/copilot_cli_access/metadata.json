@@ -1,0 +1,104 @@
+{
+  "type": "CopilotCliAccess",
+  "label": "GitHub Copilot CLI Access",
+  "description": "A GitHub Copilot CLI login, for the CopilotCli nodes' `access`: a GitHub token with Copilot Requests, or a model provider of your own (no GitHub account). One access for however many CopilotCli nodes.",
+  "tags": [
+    "agent",
+    "copilot",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#24292f",
+  "service": {
+    "service": "copilot_cli",
+    "label": "GitHub Copilot CLI",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "githubToken",
+          "label": "GitHub token",
+          "fields": [
+            {
+              "name": "token",
+              "label": "Fine-grained personal access token",
+              "placeholder": "github_pat_..."
+            }
+          ],
+          "guide": {
+            "link": "https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli",
+            "steps": [
+              "On github.com, create a fine-grained personal access token with your personal account as its resource owner.",
+              "Under Permissions, open Account, add permissions and pick Copilot Requests. A classic token (`ghp_`) does not work.",
+              "Paste the token below and name the connection."
+            ]
+          }
+        },
+        {
+          "id": "ownProvider",
+          "label": "Your own model provider",
+          "fields": [
+            {
+              "name": "baseUrl",
+              "label": "Endpoint",
+              "secret": false,
+              "placeholder": "https://api.openai.com/v1"
+            },
+            {
+              "name": "type",
+              "label": "Kind",
+              "secret": false,
+              "placeholder": "openai, azure or anthropic"
+            },
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-..."
+            },
+            {
+              "name": "model",
+              "label": "Model",
+              "secret": false,
+              "placeholder": "gpt-5.4"
+            },
+            {
+              "name": "wireApi",
+              "label": "Wire API",
+              "secret": false,
+              "placeholder": "completions, or responses for GPT-5 models"
+            }
+          ],
+          "guide": {
+            "link": "https://github.com/github/copilot-sdk/blob/main/docs/auth/byok.md",
+            "steps": [
+              "Copilot runs on any provider of these kinds: `openai` (also Ollama, vLLM, Foundry Local), `azure` or `anthropic`.",
+              "Fill in its endpoint, its kind, a key (any text for a local server that takes none), the model to run and the wire API, then name the connection."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[copilot_cli]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[copilot_cli]",
+      "description": "Wire into the CopilotCli nodes' `access` input."
+    }
+  ]
+}

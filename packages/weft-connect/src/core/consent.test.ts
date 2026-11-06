@@ -12,7 +12,7 @@ function transport(outcomes: ConsentOutcome[]): ConnectTransport & { opened: str
 		allowsSharedKey: false,
 		connections: async () => [],
 		forget: async () => {},
-		doors: async () => ({ sharedApps: [], sharedCredential: false, redirectUri: null }),
+		doors: async () => ({ sharedApps: [], sharedCredential: false, redirectUri: null, offeredWays: [] }),
 		connectDirect: async () => ({ grant }),
 		beginConsent: async () => ({ consentUrl: 'https://provider/consent', state: 'st' }),
 		consentOutcome: async () => outcomes.shift() ?? null,

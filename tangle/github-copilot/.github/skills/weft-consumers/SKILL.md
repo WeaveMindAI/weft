@@ -216,7 +216,15 @@ A form's payload is `formSchema.fields`, each field:
 }
 ```
 
-`render.component` is what you draw; `key` is what you answer under.
+`render.component` is what you draw; `key` is what you answer under. A field
+may also carry `"required": true` (keep Submit off until it is answered) and
+`"answersFor": "<key>"` (a box that is a second way to answer that other
+field, so text in it counts as that field's answer). A select's
+`config.options` are strings or `{ "value", "label", "description"? }`
+objects: draw the label, with the description under it, and answer the
+value. A `chat_history` component shows a conversation file (fetched through
+the files [door] like an image) as its messages and asks nothing; a node
+asking about a coding agent's question sends one beside the question.
 
 | Kind | Draw | Prefill in `value` | Answer under `key` |
 |---|---|---|---|

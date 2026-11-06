@@ -49,7 +49,37 @@ impl CallbackAddress {
 /// The steps a stored [`AccessSpec`] (a connection's snapshot of its
 /// recipe, a program's published or instance service) takes from the
 /// shape an older weft wrote; `crate::stored` says how they run.
-pub const ACCESS_SPEC_UPGRADES: &[&[crate::stored::Op]] = &[ACCESS_SPEC_V2, ACCESS_SPEC_V3];
+pub const ACCESS_SPEC_UPGRADES: &[&[crate::stored::Op]] = &[ACCESS_SPEC_V2, ACCESS_SPEC_V3, ACCESS_SPEC_V4];
+
+/// Version 4: a pasted credential's recipe offers ways to sign in
+/// ([`LoginWay`]). Its fields became its one way's, under
+/// [`DEFAULT_WAY`] (left out, the way a recipe offering one way writes
+/// it), and its "Your own" page's guide, which said how to get what is
+/// pasted, moved onto that way.
+pub const ACCESS_SPEC_V4: &[crate::stored::Op] = &[crate::stored::Op::Code { at: "", run: static_to_ways }];
+
+/// [`ACCESS_SPEC_V4`] on one recipe's raw JSON.
+fn static_to_ways(spec: &mut Value) -> Result<(), String> {
+    let recipe = spec.as_object_mut().ok_or("a recipe is no object")?;
+    let is_static = recipe.get("acquisition").and_then(|a| a.get("kind")).and_then(Value::as_str) == Some("static");
+    if !is_static {
+        return Ok(());
+    }
+    let mut way = serde_json::Map::new();
+    if let Some(page) = recipe.get_mut("ownPage").and_then(Value::as_object_mut) {
+        if let Some(guide) = page.remove("guide") {
+            way.insert("guide".into(), guide);
+        }
+        if page.is_empty() {
+            recipe.remove("ownPage");
+        }
+    }
+    let acquisition = recipe.get_mut("acquisition").and_then(Value::as_object_mut).ok_or("a recipe's acquisition is no object")?;
+    let fields = acquisition.remove("fields").ok_or("a static acquisition holds no fields")?;
+    way.insert("fields".into(), fields);
+    acquisition.insert("ways".into(), Value::Array(vec![Value::Object(way)]));
+    Ok(())
+}
 
 /// Version 3: a recipe no longer says how a route checks its callers (a
 /// Route or Socket names its scheme in its own `auth`,
@@ -277,9 +307,10 @@ pub struct MintApp {
     pub captures: Vec<Capture>,
 }
 
-/// The hand-creation guide on the "Your own" page. `steps` may embed
-/// `{permissions}`, replaced by the ticked permissions' labels; see
-/// [`AccessSpec::guide_steps`].
+/// The hand-creation guide on the "Your own" page, or on a way to sign
+/// in. `steps` may embed `{permissions}`, replaced by the ticked
+/// permissions' labels; see [`AccessSpec::guide_steps`].
+// SYNC: Guide <-> packages/weft-connect/src/core/wire.ts GuideWire
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Guide {
@@ -585,15 +616,187 @@ fn default_true() -> bool {
     true
 }
 
+/// The id of a way to sign in whose recipe names none: the one way of a
+/// service that offers a single way (every recipe written before ways
+/// existed carries its fields under it), and the way of a credential
+/// pasted through a consent service's `ownPage.paste` section.
+// SYNC: DEFAULT_WAY <-> packages/weft-connect/src/core/wire.ts DEFAULT_WAY
+pub const DEFAULT_WAY: &str = "default";
+
+fn default_way_id() -> String {
+    DEFAULT_WAY.to_string()
+}
+
+fn is_default_way_id(id: &str) -> bool {
+    id == DEFAULT_WAY
+}
+
+/// One way to sign in to a service whose credential is pasted
+/// ([`Acquisition::Static`]): what the person pastes, how they get it,
+/// and where it may be used. A service offers one way (an API key) or a
+/// choice (a subscription's token or an API key), and the connect form
+/// shows the choice.
+///
+/// A connection records the way it was made with (`access_grant.way`)
+/// and stores only that way's fields, so a node reading it knows which
+/// credential it holds (`OpenedConnection::way`).
+// SYNC: LoginWay <-> packages/weft-connect/src/core/wire.ts LoginWayWire
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoginWay {
+    /// What the connection records, and what a node compares
+    /// (`subscription`, `apiKey`), camelCase and unique in the service.
+    /// [`DEFAULT_WAY`] when left out, which only a service offering one
+    /// way does.
+    #[serde(default = "default_way_id", skip_serializing_if = "is_default_way_id")]
+    pub id: String,
+    /// What the choice shows ("Claude subscription"). Required when the
+    /// service offers more than one way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// What the person pastes this way. What the connection stores.
+    pub fields: Vec<CredentialField>,
+    /// How to get what this way pastes, shown above its fields. `steps`
+    /// may embed `{permissions}` like the "Your own" page's guide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide: Option<Guide>,
+    /// Offered only on a local install, where the credential stays on
+    /// the person's own machine: a provider whose terms keep its
+    /// consumer sign-in out of third-party services (a subscription's
+    /// token) is used this way. A cloud install never offers it, refuses
+    /// a connect made with it, and refuses to open a connection made
+    /// with it elsewhere.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_only: bool,
+    /// What is pasted this way is a sign-in weft keeps alive: the
+    /// provider's token set (a login file), read once at the paste into
+    /// what the connection stores, and renewed by weft when it is due.
+    /// For a provider whose refresh token rotates (each renewal retires
+    /// the one before), so that only weft ever renews it: every node
+    /// holding the connection is handed the same short-lived token, and
+    /// one renewal serves them all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal: Option<Box<WayRenewal>>,
+}
+
+/// How a pasted sign-in is kept alive ([`LoginWay::renewal`]).
+// The shape is the OAuth2 renewal's own vocabulary ([`TokenAnswer`],
+// [`Capture`], [`TokenCall`]) so a pasted login and a consent store the
+// same values (`token`, `refresh_token`) and renew through the same code:
+// one renewal path, whatever made the connection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WayRenewal {
+    /// How the pasted token set is read.
+    pub paste: PastedTokens,
+    /// The call that renews it, over what the connection stores
+    /// (`{refresh_token}`, the captures). Its answer, read with its own
+    /// reader, replaces the token, its expiry and (when it carries one)
+    /// the refresh token.
+    pub call: TokenCall,
+}
+
+/// The pasted document a renewed way reads its tokens from
+/// ([`WayRenewal::paste`]): one of the way's fields, holding JSON. The
+/// field itself is not stored: it holds the refresh token, which a
+/// connection keeps out of every hand but the store's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PastedTokens {
+    /// The way's field holding the document.
+    pub field: String,
+    /// Where the document keeps the token, the refresh token and the
+    /// expiry, flat (`tokenPath`, `refreshTokenPath`, `jwtExpiry`, ...).
+    #[serde(flatten)]
+    pub answer: TokenAnswer,
+    /// Other values read off the document and stored (an account id).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captures: Vec<Capture>,
+}
+
+/// What a paste made with a renewed way stores ([`LoginWay::renewal`]):
+/// `values`, the way's fields as filled ([`storable_values`]), with the
+/// pasted document replaced by the token, the refresh token and the
+/// captures read off it, and when the token stops working. A token
+/// already past its expiry is stored all the same, due at once: a login
+/// file is often older than its token, and the first open renews it.
+/// The reason the paste cannot be used otherwise, in the words of the
+/// person who pasted it.
+pub fn unpacked_paste(
+    renewal: &WayRenewal,
+    mut values: BTreeMap<String, String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(BTreeMap<String, String>, TokenLife), String> {
+    let paste = &renewal.paste;
+    let text = values.remove(&paste.field).ok_or_else(|| format!("field '{}' is required", paste.field))?;
+    let document: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("'{}' is not the JSON document it should be ({e}); paste the whole file", paste.field))?;
+    let read = paste.answer.read(&document, now).map_err(|e| format!("'{}': {e}", paste.field))?;
+    let life = match read.expiry {
+        TokenExpiry::At(life) => life,
+        // Past already: stored due, renewed by the first open.
+        _ if paste.answer.jwt_expiry => jwt_life(&read.token, now).map_err(|e| format!("'{}': {e}", paste.field))?,
+        TokenExpiry::Unreadable(why) => return Err(format!("'{}': {why}", paste.field)),
+        TokenExpiry::Never | TokenExpiry::Unknown => {
+            return Err(format!(
+                "'{}' says no expiry where the recipe reads it ({}), so weft would not know when to renew it",
+                paste.field,
+                paste.answer.expiry_source()
+            ))
+        }
+    };
+    values.insert("token".into(), read.token);
+    if let Some(refresh_token) = read.refresh_token {
+        values.insert("refresh_token".into(), refresh_token);
+    }
+    for capture in &paste.captures {
+        match lookup_path(&document, &capture.path) {
+            Some(Value::String(v)) => {
+                values.insert(capture.name.clone(), v.clone());
+            }
+            Some(Value::Null) | None if capture.optional => {}
+            Some(other) if !other.is_null() => {
+                values.insert(capture.name.clone(), other.to_string());
+            }
+            _ => return Err(format!("'{}' holds nothing at '{}' (capture '{}')", paste.field, capture.path, capture.name)),
+        }
+    }
+    // Everything the renewal sends must be there now, or the first
+    // renewal would fail long after the paste looked fine.
+    for name in renewal.call.value_names()? {
+        if !values.contains_key(&name) {
+            return Err(format!(
+                "'{}' holds no {} (the renewal needs '{name}'); paste the whole file, from a machine signed in",
+                paste.field,
+                if name == "refresh_token" { "refresh token".to_string() } else { format!("'{name}'") }
+            ));
+        }
+    }
+    Ok((values, life))
+}
+
+impl LoginWay {
+    /// Whether an install of `kind` offers this way.
+    pub fn offered_on(&self, kind: crate::install::InstallKind) -> bool {
+        !self.local_only || kind == crate::install::InstallKind::Local
+    }
+
+    /// The way's name as a message says it: its label, else its id.
+    // SYNC: LoginWay::display_label <-> packages/weft-connect/src/core/recipe.ts wayLabel
+    pub fn display_label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.id)
+    }
+}
+
 /// How a grant's stored values are acquired.
 // SYNC: Acquisition <-> packages/weft-connect/src/core/wire.ts AccessSpecWire.acquisition
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum Acquisition {
-    /// The user pastes the declared fields (a bot token, an API key
-    /// pair). Scoping, if any, happened on the provider's own site, so
-    /// a static spec never declares scopes.
-    Static { fields: Vec<CredentialField> },
+    /// The user pastes a credential (a bot token, an API key pair), in
+    /// one of the declared ways. Scoping, if any, happened on the
+    /// provider's own site, so a static spec never declares scopes.
+    Static { ways: Vec<LoginWay> },
     /// OAuth2. The connect uses an app (client id + secret, plus any
     /// `registrationFields` extras): the door decides whose. The
     /// ticked permissions (from [`AccessSpec::permissions`]) drive the
@@ -800,6 +1003,13 @@ pub struct TokenAnswer {
     /// refreshes it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub never_expires: bool,
+    /// The token is a JWT whose own `exp` claim says when it stops
+    /// working, for a provider whose answer states no lifetime beside it
+    /// (OpenAI's sign-in answers only its tokens). Read unverified: weft
+    /// uses it only to know when to renew, and the provider is the judge
+    /// of the token itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub jwt_expiry: bool,
     /// The granted-scope echo: a string split on spaces and commas, or
     /// a list of strings. Default `scope`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -877,11 +1087,12 @@ impl TokenAnswer {
     }
 
     /// The relative-lifetime path in effect: the declared one, else
-    /// `expires_in` unless the reader reads an absolute expiry or none.
+    /// `expires_in` unless the reader reads an absolute expiry, the
+    /// token's own, or none.
     fn expires_in_path(&self) -> Option<&str> {
         match (&self.expires_in_path, &self.expires_path) {
             (Some(path), _) => Some(path),
-            (None, None) if !self.never_expires => Some("expires_in"),
+            (None, None) if !self.never_expires && !self.jwt_expiry => Some("expires_in"),
             _ => None,
         }
     }
@@ -892,8 +1103,15 @@ impl TokenAnswer {
         match (&self.expires_path, self.expires_in_path()) {
             (Some(at), _) => format!("'{at}' (expiresPath)"),
             (None, Some(path)) => format!("'{path}' (expiresInPath)"),
+            (None, None) if self.jwt_expiry => "the token's own `exp` claim (jwtExpiry)".into(),
             (None, None) => "nowhere (neverExpires)".into(),
         }
+    }
+
+    /// Whether this reader reads an expiry at all: anything but
+    /// `neverExpires`.
+    pub fn reads_expiry(&self) -> bool {
+        !self.never_expires
     }
 
     /// Refuse a contradictory reader, naming the site (`what`).
@@ -920,6 +1138,12 @@ impl TokenAnswer {
         if self.never_expires && (self.expires_in_path.is_some() || self.expires_path.is_some()) {
             return Err(format!(
                 "{what} declares neverExpires and also where the expiry is; keep one"
+            ));
+        }
+        if self.jwt_expiry && (self.never_expires || self.expires_in_path.is_some() || self.expires_path.is_some()) {
+            return Err(format!(
+                "{what} declares jwtExpiry (the token says its own expiry) and also another place the \
+                 expiry is, or neverExpires; keep one"
             ));
         }
         Ok(())
@@ -970,6 +1194,15 @@ impl TokenAnswer {
         };
         let expiry = if self.never_expires {
             TokenExpiry::Never
+        } else if self.jwt_expiry {
+            match jwt_life(&token, now) {
+                Ok(life) if life.at > now => TokenExpiry::At(life),
+                Ok(life) => TokenExpiry::Unreadable(format!(
+                    "the token's own expiry ({}) is already past when the answer arrived",
+                    life.at.to_rfc3339()
+                )),
+                Err(why) => TokenExpiry::Unreadable(why),
+            }
         } else if let Some(path) = &self.expires_path {
             match lookup_path(body, path) {
                 None | Some(Value::Null) => TokenExpiry::Unreadable(declared_but_missing(path)),
@@ -1146,6 +1379,59 @@ fn absolute_time(v: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
         return Some(at.with_timezone(&chrono::Utc));
     }
     seconds_of(v).and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+}
+
+/// When a JWT stops working, read off its own claims: `exp`, and the
+/// lifetime it was issued with, `exp` less `iat` when it says when it
+/// was issued (else less `now`). Unverified (the payload is only
+/// decoded): weft reads it to know when to renew, never to trust it.
+/// The reason it cannot be read otherwise.
+pub fn jwt_life(token: &str, now: chrono::DateTime<chrono::Utc>) -> Result<TokenLife, String> {
+    let payload = token.split('.').nth(1).filter(|_| token.split('.').count() == 3).ok_or_else(|| {
+        "the token is not a JWT (three parts joined by dots), so it says no expiry of its own".to_string()
+    })?;
+    let bytes = base64url_decode(payload).ok_or_else(|| "the token's JWT payload is not base64url".to_string())?;
+    let claims: Value = serde_json::from_slice(&bytes).map_err(|e| format!("the token's JWT payload is not JSON ({e})"))?;
+    let at = claims
+        .get("exp")
+        .and_then(seconds_of)
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .ok_or_else(|| "the token's JWT payload has no `exp` claim in epoch seconds".to_string())?;
+    let issued = claims.get("iat").and_then(seconds_of).and_then(|secs| chrono::DateTime::from_timestamp(secs, 0));
+    let lifetime = match issued {
+        Some(issued) if issued < at => at - issued,
+        _ => at - now,
+    };
+    Ok(TokenLife { at, lifetime })
+}
+
+/// Decode base64url (padded or not); `None` on anything else. Written
+/// out because the pure type layer carries no base64 crate (the WASM
+/// build has none), as [`crate::access::hex_to_bytes`] is.
+fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let text = text.trim_end_matches('=').as_bytes();
+    if text.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    for chunk in text.chunks(4) {
+        let mut bits = 0u32;
+        for (i, c) in chunk.iter().enumerate() {
+            bits |= value(*c)? << (18 - 6 * i);
+        }
+        out.extend_from_slice(&bits.to_be_bytes()[1..chunk.len()]);
+    }
+    Some(out)
 }
 
 /// A declared call that answers a token: a [`ConnectCall`] whose
@@ -1959,16 +2245,26 @@ pub fn worker_value_names_of(steps: &[AuthStep]) -> Result<Vec<String>, String> 
 /// is looking) and the store refuse it at write time (where the input
 /// is untrusted), without the two drifting apart.
 ///
-/// Hands back the settings a publisher fills, because the caller that
-/// needs them is the caller that just proved they exist. Returning
-/// them here is what keeps a `let else { unreachable!() }` out of a
-/// request handler serving untrusted callers.
-pub fn publishable_fields(spec: &AccessSpec) -> Result<&[CredentialField], String> {
-    let Acquisition::Static { fields } = &spec.acquisition else {
+/// Hands back the one way a publisher fills (a published connection is
+/// described by its settings alone, so its recipe offers exactly one
+/// way to sign in), because the caller that needs it is the caller that
+/// just proved it exists. Returning it here is what keeps a `let else {
+/// unreachable!() }` out of a request handler serving untrusted callers.
+pub fn publishable_way(spec: &AccessSpec) -> Result<&LoginWay, String> {
+    let Acquisition::Static { ways } = &spec.acquisition else {
         return Err(format!(
             "a node publishes a connection to something it runs itself, which is described \
              by its stored settings alone; the '{}' service is acquired another way",
             spec.service
+        ));
+    };
+    let [way] = ways.as_slice() else {
+        return Err(format!(
+            "a node publishes a connection to something it runs itself, which is described \
+             by its stored settings alone, so its recipe offers one way to sign in; the '{}' \
+             service offers {}",
+            spec.service,
+            ways.len()
         ));
     };
     if !spec.events.is_empty() {
@@ -1985,21 +2281,30 @@ pub fn publishable_fields(spec: &AccessSpec) -> Result<&[CredentialField], Strin
             spec.service
         ));
     }
-    Ok(fields)
+    if way.renewal.is_some() {
+        return Err(format!(
+            "the '{}' service's way to sign in is renewed by weft, and a published connection's \
+             values are its node's alone to write",
+            spec.service
+        ));
+    }
+    Ok(way)
 }
 
 /// `values` reduced to what may actually be STORED for `spec`, or the
 /// reason they cannot be: every required field present and non-blank,
 /// no name the service does not declare, the service's all-or-nothing
 /// groups satisfied, and blanks dropped so a later read sees "missing"
-/// rather than an empty secret.
+/// rather than an empty secret. `fields` are the ones that were filled
+/// in (a way to sign in's, a minted JWT's), and only the groups among
+/// them apply: a group of another way's fields was not asked for.
 ///
 /// The gate for every set of values a PERSON or a NODE supplied: a
-/// pasted connection, a minted one, and one a node published all
-/// answer the same questions and are held to the same standard. A
-/// browser consent is the one that does not come through here, and
-/// cannot: its values are the provider's own answer to the token
-/// exchange, not fields anybody filled in.
+/// pasted connection, a minted one, and one a node published all answer
+/// the same questions and are held to the same standard. A browser consent is the one that
+/// does not come through here, and cannot: its values are the
+/// provider's own answer to the token exchange, not fields anybody
+/// filled in.
 ///
 /// A node's publish reaches it through [`publishable_connection`],
 /// which holds the recipe and the values together.
@@ -2020,7 +2325,13 @@ pub fn storable_values(
             spec.service
         ));
     }
-    capability_shortfall(&spec.capabilities, |name| {
+    let asked: Vec<Capability> = spec
+        .capabilities
+        .iter()
+        .filter(|cap| cap.fields.iter().all(|name| fields.iter().any(|f| &f.name == name)))
+        .cloned()
+        .collect();
+    capability_shortfall(&asked, |name| {
         values.get(name).is_some_and(|v| !v.trim().is_empty())
     })?;
     values.retain(|_, v| !v.trim().is_empty());
@@ -2028,17 +2339,20 @@ pub fn storable_values(
 }
 
 /// What a node's publish stores: the values as the store keeps them
-/// (blanks dropped), and the connection's display identity resolved
-/// from them, which the published connection carries back to the node.
+/// (blanks dropped), the connection's display identity resolved from
+/// them, which the published connection carries back to the node, and
+/// the id of the recipe's one way to sign in, which the connection
+/// records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishableConnection {
     pub values: BTreeMap<String, String>,
     pub identity: Option<String>,
+    pub way: String,
 }
 
 /// The whole check a node's publish passes, or the reason it cannot:
 /// the recipe valid ([`AccessSpec::validate`]) and of the shape a
-/// published connection has ([`publishable_fields`]), the values
+/// published connection has ([`publishable_way`]), the values
 /// storable ([`storable_values`]), and the identity resolvable from
 /// what is stored (an identity naming an optional value left blank is
 /// refused here, not shown as a broken label).
@@ -2053,15 +2367,15 @@ pub fn publishable_connection(
     values: BTreeMap<String, String>,
 ) -> Result<PublishableConnection, String> {
     spec.validate()?;
-    let fields = publishable_fields(spec)?;
-    let values = storable_values(spec, fields, values)?;
+    let way = publishable_way(spec)?;
+    let values = storable_values(spec, &way.fields, values)?;
     let identity = spec.identity_of(&values)?;
-    Ok(PublishableConnection { values, identity })
+    Ok(PublishableConnection { values, identity, way: way.id.clone() })
 }
 
 /// The recipe a node publishing `service` carries, from whichever
 /// node's metadata declares the service, held to the shape a published
-/// connection can have ([`publishable_fields`]). `publisher` names the
+/// connection can have ([`publishable_way`]). `publisher` names the
 /// publishing node in the refusal.
 ///
 /// Discovery refuses a second node claiming one service, so a catalog
@@ -2095,7 +2409,7 @@ pub fn published_recipe<'a>(
                  catalog declares that service"
             )
         })?;
-    publishable_fields(spec)?;
+    publishable_way(spec)?;
     Ok(spec)
 }
 
@@ -2152,6 +2466,18 @@ impl AccessSpec {
         worker_value_names_of(&self.auth)
     }
 
+    /// Whether weft can renew a connection of this service made with
+    /// `way` (its id, for a pasted one): a consent, a minted key, and a
+    /// pasted sign-in whose way declares a renewal can; a pasted key and
+    /// the runtime's own credential cannot.
+    pub fn renews(&self, way: Option<&str>) -> bool {
+        match &self.acquisition {
+            Acquisition::OAuth2 { .. } | Acquisition::MintJwt { .. } => true,
+            Acquisition::Static { .. } => way.and_then(|id| self.way(id)).is_some_and(|way| way.renewal.is_some()),
+            Acquisition::Runtime {} => false,
+        }
+    }
+
     /// The display identity of a connection holding `values`, from the
     /// recipe's `identity` template; `None` when it declares none. A
     /// name the values do not hold is refused, never shown blank.
@@ -2200,11 +2526,9 @@ impl AccessSpec {
             }
         }
         let field_lists: Vec<&Vec<CredentialField>> = match &self.acquisition {
-            Acquisition::Static { fields } => {
-                if fields.is_empty() {
-                    return Err("a static acquisition needs at least one field".into());
-                }
-                vec![fields]
+            Acquisition::Static { ways } => {
+                self.validate_ways(ways)?;
+                ways.iter().map(|w| &w.fields).collect()
             }
             Acquisition::OAuth2 {
                 extra_params,
@@ -2291,25 +2615,33 @@ impl AccessSpec {
                     cap.label
                 ));
             }
-            for name in &cap.fields {
-                let declared = field_lists.iter().flat_map(|fs| fs.iter()).find(|f| &f.name == name);
-                match declared {
-                    None => {
-                        return Err(format!(
-                            "capability '{}' names the field '{name}', which this service does \
-                             not declare",
-                            cap.label
-                        ))
-                    }
-                    Some(f) if !f.optional => {
-                        return Err(format!(
-                            "capability '{}' names '{name}', but that field is required, so the \
-                             group can never be the thing that is missing; mark it optional",
-                            cap.label
-                        ))
-                    }
-                    Some(_) => {}
-                }
+            // A group stands or falls together, so its fields are
+            // filled together: all of them in one list a connect fills
+            // (one way to sign in, for a pasted credential).
+            let home = field_lists.iter().find(|fs| cap.fields.iter().all(|name| fs.iter().any(|f| &f.name == name)));
+            let Some(home) = home else {
+                let undeclared = cap
+                    .fields
+                    .iter()
+                    .find(|name| !field_lists.iter().flat_map(|fs| fs.iter()).any(|f| &f.name == *name));
+                return Err(match undeclared {
+                    Some(name) => format!(
+                        "capability '{}' names the field '{name}', which this service does not declare",
+                        cap.label
+                    ),
+                    None => format!(
+                        "capability '{}' names fields of more than one way to sign in; a group stands \
+                         or falls together, so keep its fields in one way",
+                        cap.label
+                    ),
+                });
+            };
+            if let Some(required) = home.iter().find(|f| !f.optional && cap.fields.contains(&f.name)) {
+                return Err(format!(
+                    "capability '{}' names '{}', but that field is required, so the group can \
+                     never be the thing that is missing; mark it optional",
+                    cap.label, required.name
+                ));
             }
         }
         let secret_fields: std::collections::HashSet<String> = field_lists
@@ -2345,6 +2677,9 @@ impl AccessSpec {
                     Some(_) => {}
                 }
             }
+        }
+        if let Acquisition::Static { ways } = &self.acquisition {
+            self.ways_collect_what_the_service_names(ways)?;
         }
         for fields in field_lists {
             let mut seen = std::collections::HashSet::new();
@@ -2452,6 +2787,14 @@ impl AccessSpec {
                 validate_captures(&mint.captures)?;
             }
             if let Some(guide) = &page.guide {
+                if matches!(self.acquisition, Acquisition::Static { .. }) {
+                    return Err(
+                        "ownPage.guide says how to create a consent service's app; a pasted \
+                         credential's guide says how to get what each way pastes, so it goes on \
+                         that way (`acquisition.ways[].guide`)"
+                            .into(),
+                    );
+                }
                 if guide.steps.is_empty() {
                     return Err("a guide needs at least one step".into());
                 }
@@ -2483,6 +2826,11 @@ impl AccessSpec {
                         ));
                     }
                 }
+                // The recipe a pasted connection stores is held to every
+                // rule now, at load, rather than at its first connect.
+                if let Some(variant) = self.paste_variant() {
+                    variant.validate().map_err(|why| format!("ownPage.paste: {why}"))?;
+                }
             }
         }
         Ok(())
@@ -2490,14 +2838,24 @@ impl AccessSpec {
 
     /// The spec a PASTED connection stores: this spec with its
     /// acquisition replaced by `Static` over the `ownPage.paste`
-    /// fields. `None` when the service declares no paste section.
+    /// fields, as its one way to sign in ([`DEFAULT_WAY`]). `None` when
+    /// the service declares no paste section.
     /// The variant is what connect validates and snapshots, so a
     /// pasted row refreshes (i.e. asks for a fresh paste) and
     /// resolves exactly like a natively static service's.
     pub fn paste_variant(&self) -> Option<AccessSpec> {
         let paste = self.own_page.as_ref()?.paste.as_ref()?;
         let mut variant = self.clone();
-        variant.acquisition = Acquisition::Static { fields: paste.fields.clone() };
+        variant.acquisition = Acquisition::Static {
+            ways: vec![LoginWay {
+                id: DEFAULT_WAY.to_string(),
+                label: None,
+                fields: paste.fields.clone(),
+                guide: None,
+                local_only: false,
+                renewal: None,
+            }],
+        };
         // Only capability groups the paste fields can actually fill
         // survive; one over registration fields would make the variant
         // refuse validation forever.
@@ -2583,12 +2941,13 @@ impl AccessSpec {
 
     /// The paste fields the "Your own" page renders, DERIVED from the
     /// acquisition rather than re-declared: a pasted-credential service
-    /// pastes its own fields; a consent service pastes its app's
-    /// credentials (client id, secret, declared extras). A name field
-    /// for the connection list is always prepended by the editor,
-    /// whatever this returns.
+    /// pastes the fields of the way to sign in the person chose (`way`,
+    /// none asked for until one is), a minted JWT's service its key
+    /// fields, a consent service its app's credentials (client id,
+    /// secret, declared extras). A name field for the connection list is
+    /// always prepended by the editor, whatever this returns.
     // SYNC: AccessSpec::own_fields <-> packages/weft-connect/src/core/recipe.ts ownFields
-    pub fn own_fields(&self) -> Vec<CredentialField> {
+    pub fn own_fields(&self, way: Option<&LoginWay>) -> Vec<CredentialField> {
         let field = |name: &str, label: &str, secret: bool| CredentialField {
             name: name.into(),
             label: Some(label.into()),
@@ -2597,9 +2956,8 @@ impl AccessSpec {
             placeholder: None,
         };
         match &self.acquisition {
-            Acquisition::Static { fields } | Acquisition::MintJwt { fields, .. } => {
-                fields.clone()
-            }
+            Acquisition::Static { .. } => way.map(|w| w.fields.clone()).unwrap_or_default(),
+            Acquisition::MintJwt { fields, .. } => fields.clone(),
             Acquisition::OAuth2 { registration_fields, .. } => {
                 let mut out = vec![
                     field("client_id", "Client ID", false),
@@ -2612,12 +2970,23 @@ impl AccessSpec {
         }
     }
 
-    /// The guide's steps with `{permissions}` replaced by the requested
-    /// permissions' labels (comma-joined), generated per pick rather
-    /// than written as a static blob. Empty when no guide is declared.
+    /// The guide the "Your own" page shows: the chosen way's (`way`) for a
+    /// pasted-credential service, else the page's own.
+    // SYNC: AccessSpec::own_guide <-> packages/weft-connect/src/core/recipe.ts ownGuide
+    fn own_guide<'a>(&'a self, way: Option<&'a LoginWay>) -> Option<&'a Guide> {
+        match &self.acquisition {
+            Acquisition::Static { .. } => way?.guide.as_ref(),
+            _ => self.own_page.as_ref()?.guide.as_ref(),
+        }
+    }
+
+    /// The guide's steps ([`Self::own_guide`]) with `{permissions}`
+    /// replaced by the requested permissions' labels (comma-joined),
+    /// generated per pick rather than written as a static blob. Empty
+    /// when no guide is declared.
     // SYNC: guide_steps <-> packages/weft-connect/src/core/recipe.ts guideSteps
-    pub fn guide_steps(&self, ticked: &[String]) -> Vec<String> {
-        let Some(guide) = self.own_page.as_ref().and_then(|p| p.guide.as_ref()) else {
+    pub fn guide_steps(&self, way: Option<&LoginWay>, ticked: &[String]) -> Vec<String> {
+        let Some(guide) = self.own_guide(way) else {
             return Vec::new();
         };
         let requested = self.requested_permissions(ticked);
@@ -2631,16 +3000,163 @@ impl AccessSpec {
         guide.steps.iter().map(|s| s.replace("{permissions}", &joined)).collect()
     }
 
-    /// The guide's link with `{permissions}` replaced by the requested
-    /// permission IDS, urlencoded and comma-joined: a link goes to a
-    /// provider console, which wants machine ids where the steps'
-    /// prose wants labels. The ONE substitution, so no surface renders
-    /// the same link differently. None when no guide or no link is
-    /// declared.
+    /// The guide's link ([`Self::own_guide`]) with `{permissions}`
+    /// replaced by the requested permission IDS, urlencoded and
+    /// comma-joined: a link goes to a provider console, which wants
+    /// machine ids where the steps' prose wants labels. The ONE
+    /// substitution, so no surface renders the same link differently.
+    /// None when no guide or no link is declared.
     // SYNC: guide_link <-> packages/weft-connect/src/core/recipe.ts guideLink
-    pub fn guide_link(&self, ticked: &[String]) -> Option<String> {
-        let link = self.own_page.as_ref()?.guide.as_ref()?.link.as_ref()?;
+    pub fn guide_link(&self, way: Option<&LoginWay>, ticked: &[String]) -> Option<String> {
+        let link = self.own_guide(way)?.link.as_ref()?;
         Some(link.replace("{permissions}", &percent_encode(&self.requested_permissions(ticked).join(","))))
+    }
+
+    /// The ways to sign in this service offers: a pasted-credential
+    /// service's, none for any other.
+    // SYNC: AccessSpec::ways <-> packages/weft-connect/src/core/recipe.ts ways
+    pub fn ways(&self) -> &[LoginWay] {
+        match &self.acquisition {
+            Acquisition::Static { ways } => ways,
+            _ => &[],
+        }
+    }
+
+    /// The way to sign in named `id`, when this service offers it.
+    // SYNC: AccessSpec::way <-> packages/weft-connect/src/core/recipe.ts findWay
+    pub fn way(&self, id: &str) -> Option<&LoginWay> {
+        self.ways().iter().find(|w| w.id == id)
+    }
+
+    /// The way a connect's values were filled for: the one named `id`,
+    /// or, named none, the service's only way. Refused, saying why, for a
+    /// service that takes no pasted credential, a name it does not offer,
+    /// and no name where it offers several.
+    pub fn chosen_way(&self, id: Option<&str>) -> Result<&LoginWay, String> {
+        let ways = self.ways();
+        let offered = || ways.iter().map(|w| format!("'{}'", w.id)).collect::<Vec<_>>().join(", ");
+        match (id, ways) {
+            (_, []) => Err(format!(
+                "the '{}' service takes no pasted credential, so no way to sign in applies to it",
+                self.service
+            )),
+            (None, [only]) => Ok(only),
+            (None, _) => Err(format!(
+                "the '{}' service offers several ways to sign in ({}); say which one the values are for",
+                self.service,
+                offered()
+            )),
+            (Some(id), _) => self.way(id).ok_or_else(|| {
+                format!("the '{}' service offers no way to sign in named '{id}' (it offers {})", self.service, offered())
+            }),
+        }
+    }
+
+    /// Why `way` cannot be used on a cloud install, and what to use
+    /// instead: the words every refusal of a local-only way ends with (a
+    /// connect, an opened connection, a copy to another install).
+    pub fn cloud_refusal(&self, way: &LoginWay) -> String {
+        let service = self.display_label();
+        let what = match self.ways() {
+            [_] => format!("{service} signs in only on a local install"),
+            _ => format!("signing in to {service} with '{}' works only on a local install", way.display_label()),
+        };
+        let others: Vec<String> = self
+            .ways()
+            .iter()
+            .filter(|w| w.id != way.id && !w.local_only)
+            .map(|w| format!("'{}'", w.display_label()))
+            .collect();
+        let instead = match others.as_slice() {
+            [] => format!("{service} offers no way to sign in that works on this install"),
+            _ => format!("connect it with {} instead", others.join(" or ")),
+        };
+        format!("{what}, so that the credential stays on the person's own machine, and this install runs on a cloud; {instead}")
+    }
+
+    /// The rules a static acquisition's ways keep, run by [`Self::validate`]:
+    /// at least one; ids camelCase and unique; every way with at least one
+    /// field; a label on each when there is a choice to show. Its field
+    /// names are checked with every other list of fields, and what it must
+    /// collect by [`Self::ways_collect_what_the_service_names`].
+    fn validate_ways(&self, ways: &[LoginWay]) -> Result<(), String> {
+        if ways.is_empty() {
+            return Err("a static acquisition needs at least one way to sign in (`ways`)".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut labels = std::collections::HashSet::new();
+        for way in ways {
+            crate::casing::Casing::Camel.check("way id", &way.id)?;
+            if !ids.insert(&way.id) {
+                return Err(format!(
+                    "two ways to sign in share the id '{}'; give each its own `id`",
+                    way.id
+                ));
+            }
+            if way.fields.is_empty() {
+                return Err(format!("way '{}' needs at least one field", way.id));
+            }
+            if way.guide.as_ref().is_some_and(|g| g.steps.is_empty()) {
+                return Err(format!("way '{}' has a guide with no steps", way.id));
+            }
+            if let Some(renewal) = &way.renewal {
+                validate_renewal(way, renewal)?;
+            }
+            match way.label.as_deref().map(str::trim) {
+                Some("") => return Err(format!("way '{}' has an empty label", way.id)),
+                Some(label) if !labels.insert(label.to_string()) => {
+                    return Err(format!("two ways to sign in are both labelled '{label}'; the choice could not tell them apart"))
+                }
+                None if ways.len() > 1 => {
+                    return Err(format!(
+                        "way '{}' needs a `label`: this service offers several ways to sign in, and the \
+                         connect form shows them as a choice",
+                        way.id
+                    ))
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The last rule [`Self::validate_ways`] states, run once the auth
+    /// steps' own names are checked: everything the service declares
+    /// beside its ways (its auth steps, its test call, its identity) works
+    /// for every way, since it is the same for all of them.
+    fn ways_collect_what_the_service_names(&self, ways: &[LoginWay]) -> Result<(), String> {
+        // What the connect-time check captures is stored on every
+        // connection that passes it, so the auth steps and the identity
+        // may name it whichever way was used.
+        let captured: Vec<&str> =
+            self.test.iter().flat_map(|t| t.captures.iter()).map(|c| c.name.as_str()).collect();
+        let test_url = match &self.test {
+            Some(test) => test.url.placeholders()?,
+            None => Vec::new(),
+        };
+        let identity = match &self.identity {
+            Some(identity) => identity.placeholders()?,
+            None => Vec::new(),
+        };
+        let needs = self
+            .worker_value_names()?
+            .into_iter()
+            .map(|name| (name, "the service's auth steps interpolate it, so every request through such a connection would fail", true))
+            .chain(test_url.into_iter().map(|name| (name, "the test call's url interpolates it, so every connect that way would fail", false)))
+            .chain(identity.into_iter().map(|name| (name, "the identity names it, so every connect that way would fail", true)));
+        for (name, why, may_be_captured) in needs {
+            for way in ways {
+                let collected = way.fields.iter().any(|f| f.name == name) || (may_be_captured && captured.contains(&name.as_str()));
+                if !collected {
+                    return Err(format!(
+                        "way '{}' does not collect '{name}': {why}. Add the field to that way, or leave \
+                         '{name}' out of what the service declares for all its ways",
+                        way.id
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2707,6 +3223,35 @@ fn check_params(
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// A renewed way's own rules ([`LoginWay::renewal`]): its document is
+/// one of the way's fields, the document says when its token dies, and
+/// the renewal call interpolates only what the paste stores.
+fn validate_renewal(way: &LoginWay, renewal: &WayRenewal) -> Result<(), String> {
+    let what = format!("way '{}'.renewal", way.id);
+    let paste = &renewal.paste;
+    if !way.fields.iter().any(|f| f.name == paste.field) {
+        return Err(format!("{what}.paste.field '{}' is not one of the way's fields", paste.field));
+    }
+    paste.answer.validate(&format!("{what}.paste"))?;
+    if !paste.answer.reads_expiry() {
+        return Err(format!(
+            "{what}.paste declares neverExpires: a token that never expires needs no renewal; leave `renewal` out"
+        ));
+    }
+    validate_captures(&paste.captures).map_err(|e| format!("{what}.paste: {e}"))?;
+    let stored: Vec<String> = ["token", "refresh_token"]
+        .into_iter()
+        .map(str::to_string)
+        .chain(paste.captures.iter().map(|c| c.name.clone()))
+        .chain(way.fields.iter().filter(|f| f.name != paste.field).map(|f| f.name.clone()))
+        .collect();
+    renewal.call.validate_over(&format!("{what}.call"), &stored)?;
+    if !renewal.call.answer.reads_expiry() {
+        return Err(format!("{what}.call declares neverExpires, so a renewed token would never be renewed again"));
     }
     Ok(())
 }
@@ -2874,7 +3419,8 @@ mod tests {
             "auth": [
                 { "kind": "header", "name": "Authorization", "value": "Bearer {token}" }
             ],
-            "test": { "url": "https://slack.com/api/auth.test", "method": "POST" },
+            "test": { "url": "https://slack.com/api/auth.test", "method": "POST",
+                      "captures": [{ "name": "team", "path": "team" }] },
             "identity": "{team}"
         }))
         .expect("slack spec parses")
@@ -2898,7 +3444,7 @@ mod tests {
         spec.validate().expect("paste covering {token} is valid");
         let variant = spec.paste_variant().expect("declared, so present");
         assert!(
-            matches!(&variant.acquisition, Acquisition::Static { fields } if fields.len() == 1),
+            matches!(&variant.acquisition, Acquisition::Static { ways } if ways.len() == 1 && ways[0].id == DEFAULT_WAY && ways[0].fields.len() == 1),
             "the variant is a static acquisition over the paste fields"
         );
         assert!(variant.own_page.is_none(), "a snapshot carries no creation page");
@@ -2969,7 +3515,7 @@ mod tests {
         let mut spec: AccessSpec = serde_json::from_value(json!({
             "service": "x",
             "acquisition": { "kind": "static",
-                             "fields": [{ "name": "token" }] },
+                             "ways": [{ "fields": [{ "name": "token" }] }] },
             "auth": [{ "kind": "header", "name": "Authorization", "value": "Bearer {token}" }]
         }))
         .unwrap();
@@ -3040,17 +3586,18 @@ mod tests {
     #[test]
     fn own_fields_derive_from_the_acquisition() {
         let slack = slack_spec();
-        let names: Vec<String> = slack.own_fields().into_iter().map(|f| f.name).collect();
+        let names: Vec<String> = slack.own_fields(None).into_iter().map(|f| f.name).collect();
         assert_eq!(names, vec!["client_id", "client_secret"]);
 
         let telegram: AccessSpec = serde_json::from_value(json!({
             "service": "telegram",
             "acquisition": { "kind": "static",
-                             "fields": [{ "name": "token", "label": "Bot token" }] },
+                             "ways": [{ "fields": [{ "name": "token", "label": "Bot token" }] }] },
             "auth": [{ "kind": "path_prefix", "value": "/bot{token}" }]
         }))
         .unwrap();
-        let names: Vec<String> = telegram.own_fields().into_iter().map(|f| f.name).collect();
+        assert!(telegram.own_fields(None).is_empty(), "no way chosen, nothing to paste yet");
+        let names: Vec<String> = telegram.own_fields(telegram.ways().first()).into_iter().map(|f| f.name).collect();
         assert_eq!(names, vec!["token"]);
     }
 
@@ -3061,10 +3608,10 @@ mod tests {
         let spec = |identity: &str| -> AccessSpec {
             serde_json::from_value(json!({
                 "service": "svc",
-                "acquisition": { "kind": "static", "fields": [
+                "acquisition": { "kind": "static", "ways": [{ "fields": [
                     { "name": "api_key", "label": "Key" },
                     { "name": "user", "label": "User", "secret": false }
-                ] },
+                ] }] },
                 "doors": ["own"],
                 "identity": identity
             }))
@@ -3083,10 +3630,10 @@ mod tests {
     #[test]
     fn guide_steps_interpolate_the_ticked_permissions() {
         let spec = slack_spec();
-        let steps = spec.guide_steps(&["chat:write".into(), "files:write".into()]);
+        let steps = spec.guide_steps(None, &["chat:write".into(), "files:write".into()]);
         assert_eq!(steps[0], "Create an app at api.slack.com/apps.");
         assert_eq!(steps[1], "Add these bot scopes: Send messages, Upload files.");
-        assert!(spec.guide_steps(&[])[1].ends_with(": ."), "no ticks, empty list");
+        assert!(spec.guide_steps(None, &[])[1].ends_with(": ."), "no ticks, empty list");
     }
 
     /// The guide LINK interpolates the ticked permission IDS,
@@ -3099,7 +3646,7 @@ mod tests {
             guide.link = Some("https://example.com/apps?scopes={permissions}".into());
         }
         let link = spec
-            .guide_link(&["chat:write".into(), "files:write".into()])
+            .guide_link(None, &["chat:write".into(), "files:write".into()])
             .expect("a link is declared");
         assert_eq!(link, "https://example.com/apps?scopes=chat%3Awrite%2Cfiles%3Awrite");
     }
@@ -3112,11 +3659,11 @@ mod tests {
         let s3: AccessSpec = serde_json::from_value(json!({
             "service": "s3",
             "doors": ["shared", "own"],
-            "acquisition": { "kind": "static", "fields": [
+            "acquisition": { "kind": "static", "ways": [{ "fields": [
                 { "name": "accessKeyId", "secret": false },
                 { "name": "secretAccessKey" },
                 { "name": "region", "secret": false }
-            ]},
+            ]}]},
             "auth": [{ "kind": "sign", "with": {
                 "kind": "sigv4", "service": "s3", "region": "{region}",
                 "accessKeyId": "{accessKeyId}",
@@ -3145,7 +3692,7 @@ mod tests {
         let telegram: AccessSpec = serde_json::from_value(json!({
             "service": "telegram",
             "acquisition": { "kind": "static",
-                             "fields": [{ "name": "token", "label": "Bot token" }] },
+                             "ways": [{ "fields": [{ "name": "token", "label": "Bot token" }] }] },
             "auth": [{ "kind": "path_prefix", "value": "/bot{token}" }]
         }))
         .unwrap();
@@ -3180,11 +3727,11 @@ mod tests {
     fn sigv4_and_oauth1a_are_typed_variants() {
         let s3: AccessSpec = serde_json::from_value(json!({
             "service": "s3",
-            "acquisition": { "kind": "static", "fields": [
+            "acquisition": { "kind": "static", "ways": [{ "fields": [
                 { "name": "accessKeyId", "secret": false },
                 { "name": "secretAccessKey" },
                 { "name": "region", "secret": false }
-            ]},
+            ]}]},
             "auth": [{ "kind": "sign", "with": {
                 "kind": "sigv4", "service": "s3", "region": "{region}",
                 "accessKeyId": "{accessKeyId}",
@@ -3210,13 +3757,13 @@ mod tests {
         // could never produce.
         let spec: AccessSpec = serde_json::from_value(serde_json::json!({
             "service": "pg",
-            "acquisition": { "kind": "static", "fields": [
+            "acquisition": { "kind": "static", "ways": [{ "fields": [
                 { "name": "host" },
                 { "name": "port", "optional": true },
-            ]},
+            ]}]},
         }))
         .expect("a static spec");
-        let fields = publishable_fields(&spec).expect("a static spec publishes");
+        let fields = &publishable_way(&spec).expect("a static spec publishes").fields;
         let values = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
             pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
         };
@@ -3247,10 +3794,10 @@ mod tests {
     fn a_publish_resolves_its_identity_from_what_is_stored() {
         let spec: AccessSpec = serde_json::from_value(serde_json::json!({
             "service": "pg",
-            "acquisition": { "kind": "static", "fields": [
+            "acquisition": { "kind": "static", "ways": [{ "fields": [
                 { "name": "host", "secret": false },
                 { "name": "database", "optional": true, "secret": false },
-            ]},
+            ]}]},
             "identity": "{host}/{database}",
         }))
         .expect("a static spec");
@@ -3319,10 +3866,10 @@ mod tests {
     fn capabilities_must_name_declared_optional_fields() {
         let mut spec: AccessSpec = serde_json::from_value(serde_json::json!({
             "service": "mail",
-            "acquisition": { "kind": "static", "fields": [
+            "acquisition": { "kind": "static", "ways": [{ "fields": [
                 { "name": "user" },
                 { "name": "imapHost", "optional": true }
-            ]},
+            ]}]},
             "auth": [{ "kind": "header", "name": "A", "value": "{user}" }],
             "capabilities": [{ "label": "receive mail", "fields": ["imapHost"] }]
         }))
@@ -3364,7 +3911,7 @@ mod tests {
     fn always_belongs_to_a_browser_consent() {
         let mut keyed: AccessSpec = serde_json::from_value(json!({
             "service": "keyed",
-            "acquisition": { "kind": "static", "fields": [{ "name": "key", "secret": true }] },
+            "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "key", "secret": true }] }] },
             "permissions": [{ "id": "who", "label": "Who", "description": "Know the account.", "always": true }]
         }))
         .unwrap();
@@ -3413,7 +3960,7 @@ mod tests {
 
         let empty_static: AccessSpec = serde_json::from_value(json!({
             "service": "x",
-            "acquisition": { "kind": "static", "fields": [] }
+            "acquisition": { "kind": "static", "ways": [] }
         }))
         .unwrap();
         assert!(empty_static.validate().is_err());
@@ -3433,7 +3980,7 @@ mod tests {
                 "service": "x",
                 "label": "X",
                 "doors": ["own"],
-                "acquisition": { "kind": "static", "fields": fields },
+                "acquisition": { "kind": "static", "ways": [{ "fields": fields }] },
                 "auth": [{ "kind": "header", "name": name, "value": "{value}" }]
             }))
             .unwrap();
@@ -3563,12 +4110,12 @@ mod tests {
     fn a_connection_with_no_request_signing_still_hands_over_its_values() {
         let mail: AccessSpec = serde_json::from_value(json!({
             "service": "mailbox",
-            "acquisition": { "kind": "static", "fields": [
+            "acquisition": { "kind": "static", "ways": [{ "fields": [
                 { "name": "host", "secret": false },
                 { "name": "port", "secret": false },
                 { "name": "username", "secret": false },
                 { "name": "password" }
-            ]}
+            ]}]}
         }))
         .unwrap();
         mail.validate().expect("a service with no request signing is valid");
@@ -3638,7 +4185,7 @@ mod tests {
         let pushed = |verify: serde_json::Value| -> AccessSpec {
             serde_json::from_value(json!({
                 "service": "svc",
-                "acquisition": { "kind": "static", "fields": [{ "name": "token" }] },
+                "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "token" }] }] },
                 "events": {
                     "pushes": {
                         "fields": { "text": "event.text" },
@@ -3952,5 +4499,336 @@ mod tests {
         let mut spec = slack_spec();
         spec.identity = Some(Template::new("{token}"));
         assert!(spec.validate().unwrap_err().contains("'token'"));
+    }
+    /// A coding agent's recipe: a subscription's token, kept to a local
+    /// install, or an API key anywhere, each with its own guide.
+    fn agent_spec() -> AccessSpec {
+        serde_json::from_value(json!({
+            "service": "claude_code",
+            "label": "Claude Code",
+            "acquisition": { "kind": "static", "ways": [
+                { "id": "subscription", "label": "Claude subscription", "localOnly": true,
+                  "fields": [{ "name": "token", "label": "Token" }],
+                  "guide": { "steps": ["Run `claude setup-token`.", "Paste what it prints."] } },
+                { "id": "apiKey", "label": "API key",
+                  "fields": [{ "name": "key", "label": "API key" }],
+                  "guide": { "link": "https://console.anthropic.com/settings/keys", "steps": ["Create a key."] } }
+            ] }
+        }))
+        .expect("an agent recipe parses")
+    }
+
+    /// Layer 2: ways round-trip as written, and a way that names no id
+    /// is the default one, written back without it.
+    #[test]
+    fn ways_round_trip_and_an_unnamed_way_is_the_default() {
+        let spec = agent_spec();
+        spec.validate().expect("valid");
+        let back: AccessSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(back, spec);
+        assert_eq!(spec.ways().iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["subscription", "apiKey"]);
+        assert!(spec.ways()[0].local_only && !spec.ways()[1].local_only);
+
+        let one: AccessSpec = serde_json::from_value(json!({
+            "service": "keyed", "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "key" }] }] }
+        }))
+        .unwrap();
+        assert_eq!(one.ways()[0].id, DEFAULT_WAY);
+        let written = serde_json::to_value(&one).unwrap();
+        assert_eq!(written["acquisition"], json!({ "kind": "static", "ways": [{ "fields": [{ "name": "key", "secret": true }] }] }));
+    }
+
+    /// The way a connect fills: named, or the only one; and which way an
+    /// install offers.
+    #[test]
+    fn the_chosen_way_is_named_or_the_only_one() {
+        let spec = agent_spec();
+        assert_eq!(spec.chosen_way(Some("apiKey")).unwrap().id, "apiKey");
+        let err = spec.chosen_way(None).unwrap_err();
+        assert!(err.contains("several ways") && err.contains("'subscription'"), "{err}");
+        let err = spec.chosen_way(Some("oauth")).unwrap_err();
+        assert!(err.contains("no way to sign in named 'oauth'"), "{err}");
+        let keyed: AccessSpec = serde_json::from_value(json!({
+            "service": "keyed", "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "key" }] }] }
+        }))
+        .unwrap();
+        assert_eq!(keyed.chosen_way(None).unwrap().id, DEFAULT_WAY);
+        assert!(slack_spec().chosen_way(None).unwrap_err().contains("takes no pasted credential"));
+
+        use crate::install::InstallKind::{Cloud, Local};
+        let (subscription, api_key) = (&spec.ways()[0], &spec.ways()[1]);
+        assert!(subscription.offered_on(Local) && !subscription.offered_on(Cloud));
+        assert!(api_key.offered_on(Local) && api_key.offered_on(Cloud));
+    }
+
+    /// The refusal of a local-only way names it and the ways that work
+    /// on a cloud, or says there are none.
+    #[test]
+    fn a_local_only_way_is_refused_naming_what_works_instead() {
+        let spec = agent_spec();
+        let why = spec.cloud_refusal(&spec.ways()[0]);
+        assert_eq!(
+            why,
+            "signing in to Claude Code with 'Claude subscription' works only on a local install, so that the \
+             credential stays on the person's own machine, and this install runs on a cloud; connect it with \
+             'API key' instead"
+        );
+        let mut only_local = spec.clone();
+        if let Acquisition::Static { ways } = &mut only_local.acquisition {
+            ways.truncate(1);
+        }
+        let why = only_local.cloud_refusal(&only_local.ways()[0]);
+        assert!(why.starts_with("Claude Code signs in only on a local install"), "{why}");
+        assert!(why.ends_with("Claude Code offers no way to sign in that works on this install"), "{why}");
+    }
+
+    /// The own page of a pasted credential shows the chosen way's guide
+    /// and fields, and nothing of another way's.
+    #[test]
+    fn the_own_page_shows_the_chosen_ways_guide_and_fields() {
+        let spec = agent_spec();
+        let (subscription, api_key) = (&spec.ways()[0], &spec.ways()[1]);
+        assert_eq!(spec.own_fields(Some(subscription)).iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["token"]);
+        assert_eq!(spec.own_fields(Some(api_key)).iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["key"]);
+        assert_eq!(spec.guide_steps(Some(subscription), &[])[0], "Run `claude setup-token`.");
+        assert_eq!(spec.guide_link(Some(subscription), &[]), None);
+        assert_eq!(spec.guide_link(Some(api_key), &[]).as_deref(), Some("https://console.anthropic.com/settings/keys"));
+        assert!(spec.guide_steps(None, &[]).is_empty(), "no way chosen, no guide");
+    }
+
+    /// Every rule a static acquisition's ways keep is refused at load,
+    /// naming the way.
+    #[test]
+    fn ways_are_validated_at_load() {
+        let refused = |acquisition: serde_json::Value, rest: serde_json::Value| -> String {
+            let mut recipe = json!({ "service": "svc", "acquisition": acquisition });
+            for (k, v) in rest.as_object().unwrap() {
+                recipe[k] = v.clone();
+            }
+            serde_json::from_value::<AccessSpec>(recipe).unwrap().validate().unwrap_err()
+        };
+        let key = |id: &str, label: Option<&str>| {
+            let mut way = json!({ "id": id, "fields": [{ "name": "key" }] });
+            if let Some(label) = label {
+                way["label"] = json!(label);
+            }
+            way
+        };
+        let ways = |ways: serde_json::Value| json!({ "kind": "static", "ways": ways });
+        assert!(refused(ways(json!([])), json!({})).contains("at least one way"));
+        assert!(refused(ways(json!([key("a", Some("A")), key("a", Some("B"))])), json!({})).contains("share the id 'a'"));
+        assert!(refused(ways(json!([key("api_key", None)])), json!({})).contains("way id 'api_key' is not camelCase"));
+        assert!(refused(ways(json!([key("a", Some("A")), key("b", None)])), json!({})).contains("way 'b' needs a `label`"));
+        assert!(refused(ways(json!([key("a", Some("Same")), key("b", Some("Same"))])), json!({})).contains("both labelled 'Same'"));
+        assert!(refused(ways(json!([{ "id": "a", "fields": [] }])), json!({})).contains("way 'a' needs at least one field"));
+        let err = refused(ways(json!([key("a", None)])), json!({ "ownPage": { "guide": { "steps": ["s"] } } }));
+        assert!(err.contains("acquisition.ways[].guide"), "{err}");
+
+        // What the service declares beside its ways is the same for all of
+        // them, so each way collects what it names.
+        let two = ways(json!([
+            { "id": "subscription", "label": "Subscription", "fields": [{ "name": "token" }] },
+            { "id": "apiKey", "label": "API key", "fields": [{ "name": "key" }] }
+        ]));
+        let err = refused(two.clone(), json!({ "auth": [{ "kind": "header", "name": "x-api-key", "value": "{key}" }] }));
+        assert!(err.contains("way 'subscription' does not collect 'key'") && err.contains("auth steps"), "{err}");
+        let err = refused(two.clone(), json!({ "test": { "url": "https://x/{token}" } }));
+        assert!(err.contains("way 'apiKey' does not collect 'token'") && err.contains("test call"), "{err}");
+        let err = refused(two.clone(), json!({ "identity": "{key}" }));
+        assert!(err.contains("way 'subscription' does not collect 'key'"), "{err}");
+        // A value the connect-time check captures is stored however the
+        // connection was made.
+        let captured: AccessSpec = serde_json::from_value(json!({
+            "service": "svc", "acquisition": two,
+            "test": { "url": "https://x/whoami", "captures": [{ "name": "account", "path": "name" }] },
+            "identity": "{account}"
+        }))
+        .unwrap();
+        captured.validate().expect("a captured identity serves every way");
+
+        // A group stands or falls together, so its fields are one way's.
+        let err = refused(
+            ways(json!([
+                { "id": "a", "label": "A", "fields": [{ "name": "host", "optional": true }] },
+                { "id": "b", "label": "B", "fields": [{ "name": "port", "optional": true }] }
+            ])),
+            json!({ "capabilities": [{ "label": "receive", "fields": ["host", "port"] }] }),
+        );
+        assert!(err.contains("more than one way"), "{err}");
+    }
+
+    /// Version 4: a v3 recipe's pasted fields become its one way, and its
+    /// own page's guide moves onto that way; any other recipe is left as
+    /// it was.
+    #[test]
+    fn a_v3_static_recipe_carries_to_one_way() {
+        let mut v3 = json!({
+            "service": "openai",
+            "acquisition": { "kind": "static", "fields": [{ "name": "key", "label": "API key" }] },
+            "ownPage": { "guide": { "link": "https://platform.openai.com/api-keys", "steps": ["Create a key."] } }
+        });
+        crate::stored::apply(ACCESS_SPEC_V4, &mut v3).unwrap();
+        assert_eq!(
+            v3,
+            json!({
+                "service": "openai",
+                "acquisition": { "kind": "static", "ways": [{
+                    "fields": [{ "name": "key", "label": "API key" }],
+                    "guide": { "link": "https://platform.openai.com/api-keys", "steps": ["Create a key."] }
+                }] }
+            })
+        );
+        let read = AccessSpec::STORED
+            .decode(json!({ "service": "x", "acquisition": { "kind": "static", "fields": [{ "name": "k" }] } }), 3)
+            .expect("a v3 recipe reads");
+        assert_eq!(read.chosen_way(None).unwrap().id, DEFAULT_WAY);
+
+        let mut consent = serde_json::to_value(slack_spec()).unwrap();
+        let before = consent.clone();
+        crate::stored::apply(ACCESS_SPEC_V4, &mut consent).unwrap();
+        assert_eq!(consent, before, "a consent's recipe keeps its own page's guide");
+    }
+
+    /// A login file whose refresh token rotates, as the Codex recipe
+    /// declares it (OpenAI's token set, the expiry inside the token).
+    fn renewed_spec() -> AccessSpec {
+        serde_json::from_value(json!({
+            "service": "codex", "label": "Codex",
+            "acquisition": { "kind": "static", "ways": [
+                { "id": "subscription", "label": "ChatGPT login", "fields": [{ "name": "authJson" }],
+                  "renewal": {
+                      "paste": { "field": "authJson", "tokenPath": "tokens.access_token",
+                                 "refreshTokenPath": "tokens.refresh_token", "jwtExpiry": true,
+                                 "captures": [{ "name": "accountId", "path": "tokens.account_id" }] },
+                      "call": { "url": "https://auth.example.com/oauth/token", "method": "POST",
+                                "body": { "grant_type": "refresh_token", "refresh_token": "{refresh_token}" },
+                                "jwtExpiry": true } } },
+                { "id": "apiKey", "label": "API key", "fields": [{ "name": "key" }] }
+            ] }
+        }))
+        .unwrap()
+    }
+
+    /// A JWT with these claims, unsigned: all `jwt_life` reads.
+    fn jwt(claims: Value) -> String {
+        let part = |v: &Value| {
+            let text = serde_json::to_vec(v).unwrap();
+            // base64url, no padding: the encoder the test needs, beside the decoder under test.
+            const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            for chunk in text.chunks(3) {
+                let mut bits = 0u32;
+                for (i, b) in chunk.iter().enumerate() {
+                    bits |= (*b as u32) << (16 - 8 * i);
+                }
+                for i in 0..=chunk.len() {
+                    out.push(ALPHABET[((bits >> (18 - 6 * i)) & 63) as usize] as char);
+                }
+            }
+            out
+        };
+        format!("{}.{}.sig", part(&json!({"alg": "none"})), part(&claims))
+    }
+
+    /// The paste is read into the token set the renewal works from: the
+    /// document itself is not stored (it holds the refresh token), the
+    /// expiry is the token's own, and one already past is stored due.
+    #[test]
+    fn a_renewed_paste_stores_the_token_set_and_its_expiry() {
+        let spec = renewed_spec();
+        spec.validate().unwrap();
+        let renewal = spec.way("subscription").unwrap().renewal.as_deref().unwrap();
+        let now = chrono::DateTime::from_timestamp(1_000_000, 0).unwrap();
+        let paste = |exp: i64| {
+            let token = jwt(json!({ "exp": exp, "iat": exp - 864_000 }));
+            let file = json!({ "tokens": { "access_token": token, "refresh_token": "rt", "account_id": "acct" } });
+            (token, BTreeMap::from([("authJson".to_string(), file.to_string())]))
+        };
+        let (token, values) = paste(1_500_000);
+        let (stored, life) = unpacked_paste(renewal, values, now).unwrap();
+        assert_eq!(stored.keys().map(String::as_str).collect::<Vec<_>>(), ["accountId", "refresh_token", "token"]);
+        assert_eq!(stored["token"], token);
+        assert_eq!(life.at.timestamp(), 1_500_000);
+        assert_eq!(life.lifetime, chrono::Duration::seconds(864_000), "the lifetime the token was issued with");
+
+        let (_, values) = paste(900_000);
+        let (_, life) = unpacked_paste(renewal, values, now).expect("a login file older than its token still pastes");
+        assert!(life.at < now, "stored due, so the first open renews it");
+
+        let no_refresh = BTreeMap::from([(
+            "authJson".to_string(),
+            json!({ "tokens": { "access_token": jwt(json!({"exp": 1_500_000})), "account_id": "acct" } }).to_string(),
+        )]);
+        let err = unpacked_paste(renewal, no_refresh, now).unwrap_err();
+        assert!(err.contains("holds no refresh token"), "{err}");
+        let err = unpacked_paste(renewal, BTreeMap::from([("authJson".to_string(), "not json".to_string())]), now).unwrap_err();
+        assert!(err.contains("paste the whole file"), "{err}");
+    }
+
+    /// A renewal answer naming its expiry only inside the token reads it
+    /// there; a token that is no JWT, or one dead on arrival, is an
+    /// unreadable expiry, never a token dropped.
+    #[test]
+    fn a_jwt_expiry_reads_the_tokens_own_claim() {
+        let reader = TokenAnswer { jwt_expiry: true, ..Default::default() };
+        let now = chrono::DateTime::from_timestamp(1_000_000, 0).unwrap();
+        let read = reader.read(&json!({ "access_token": jwt(json!({"exp": 1_003_600})) }), now).unwrap();
+        assert_eq!(read.expiry, TokenExpiry::At(TokenLife { at: chrono::DateTime::from_timestamp(1_003_600, 0).unwrap(), lifetime: chrono::Duration::seconds(3600) }));
+        let read = reader.read(&json!({ "access_token": "opaque" }), now).unwrap();
+        assert!(matches!(read.expiry, TokenExpiry::Unreadable(ref why) if why.contains("not a JWT")), "{:?}", read.expiry);
+        let read = reader.read(&json!({ "access_token": jwt(json!({"exp": 999_000})) }), now).unwrap();
+        assert!(matches!(read.expiry, TokenExpiry::Unreadable(ref why) if why.contains("already past")), "{:?}", read.expiry);
+        let both = TokenAnswer { jwt_expiry: true, expires_in_path: Some("expires_in".into()), ..Default::default() };
+        assert!(both.validate("x").unwrap_err().contains("jwtExpiry"));
+    }
+
+    /// A renewal is checked where the recipe loads: its document is a
+    /// field of the way, its call sends only what the paste stores, and a
+    /// node never publishes a connection weft renews.
+    #[test]
+    fn a_renewal_is_refused_where_it_could_not_work() {
+        let with = |edit: &dyn Fn(&mut Value)| {
+            let mut spec = serde_json::to_value(renewed_spec()).unwrap();
+            edit(&mut spec["acquisition"]["ways"][0]["renewal"]);
+            serde_json::from_value::<AccessSpec>(spec).unwrap().validate().unwrap_err()
+        };
+        let err = with(&|r| r["paste"]["field"] = json!("other"));
+        assert!(err.contains("not one of the way's fields"), "{err}");
+        let err = with(&|r| r["call"]["body"]["extra"] = json!("{nothing}"));
+        assert!(err.contains("'{nothing}'"), "{err}");
+        let err = with(&|r| {
+            r["paste"]["jwtExpiry"] = json!(false);
+            r["paste"]["neverExpires"] = json!(true);
+        });
+        assert!(err.contains("needs no renewal"), "{err}");
+
+        let mut one = serde_json::to_value(renewed_spec()).unwrap();
+        one["acquisition"]["ways"].as_array_mut().unwrap().truncate(1);
+        let one: AccessSpec = serde_json::from_value(one).unwrap();
+        assert!(publishable_way(&one).unwrap_err().contains("renewed by weft"));
+    }
+
+    /// A paste fills one way, so only the groups among that way's fields
+    /// apply to it.
+    #[test]
+    fn a_paste_answers_only_its_ways_groups() {
+        let spec: AccessSpec = serde_json::from_value(json!({
+            "service": "mail",
+            "acquisition": { "kind": "static", "ways": [
+                { "id": "password", "label": "Password", "fields": [
+                    { "name": "user" }, { "name": "imapHost", "optional": true }
+                ] },
+                { "id": "token", "label": "Token", "fields": [{ "name": "token" }] }
+            ] },
+            "capabilities": [{ "label": "receive mail", "fields": ["imapHost"] }]
+        }))
+        .unwrap();
+        spec.validate().unwrap();
+        let values = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>();
+        let token = &spec.way("token").unwrap().fields;
+        storable_values(&spec, token, values(&[("token", "t")])).expect("the token way holds no group");
+        let password = &spec.way("password").unwrap().fields;
+        let err = storable_values(&spec, password, values(&[("user", "u")])).unwrap_err();
+        assert!(err.contains("would be able to do nothing"), "{err}");
     }
 }

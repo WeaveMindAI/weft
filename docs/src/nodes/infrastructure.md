@@ -53,7 +53,10 @@ Compute Engine's `e2-micro`. A number left unset is the sum of the
 containers' own limits. If you need one machine type in particular,
 `machine.kind` names it (`n2-highmem-8`) and skips the pick. On your machine
 the unit's numbers cap nothing: only a container's own `limits.memory` caps
-it. weft refuses a unit there that asks for a GPU you do not have.
+it. weft refuses a unit there that asks for a GPU you do not have. If your
+unit has to run a program on the person's own machine instead of containers,
+a local install can do that: for how, go and read
+[a process on your machine](#a-process-on-your-machine).
 
 Whoever uses your node pays for that machine, so if the right size depends on
 their load, let them set it. Declare the size your node needs by default in
@@ -137,6 +140,293 @@ An upstream image reference passes through exactly as you wrote it, and **a
 mutable tag is not resolved to a digest**. So `postgres:16` rolling underneath
 you produces no change in the spec and no re-apply. Pin by digest if you want
 an image change to actually land.
+
+## A process on your machine
+
+Some programs cannot work from a container, because what they need is on the
+person's own machine, such as their login to a CLI like `claude` or `codex`,
+or a folder of theirs to work in. If your node needs one of those,
+give the unit a `process` instead of containers: weft runs that one program
+directly on the person's own machine, as them. Only a local install has
+such a machine, so a cloud install refuses the node before anything starts,
+naming the unit.
+
+```rust
+use weft::infra::{Endpoint, EndpointTarget, Expose, InfraSpec, Process, ProcessPort, ProcessReadiness, Unit};
+use weft::needs::{Need, NeedStage, PackageManager};
+
+let python3 = Need {
+    name: "python3".into(),
+    stage: NeedStage::Run,
+    check: vec!["python3".into(), "--version".into()],
+    install: [(PackageManager::Apt, [("default".to_string(), vec!["python3".to_string()])].into())].into(),
+    how: None,
+    recipe: None,
+};
+let tool = Need {
+    name: "Tool".into(),
+    stage: NeedStage::Run,
+    check: vec!["tool".into(), "--version".into()],
+    install: Default::default(),
+    how: Some("download it from https://tool.example".into()),
+    recipe: None,
+};
+Ok(InfraSpec {
+    units: vec![Unit {
+        name: "server".into(),
+        process: Some(
+            Process::new(vec!["python3".into(), "server.py".into()])
+                .with_file("server.py", include_str!("server.py"))
+                .with_ports(vec![ProcessPort::new("http", "PORT")])
+                .with_readiness(ProcessReadiness::http("http", "/health"))
+                .with_needs(vec![python3, tool]),
+        ),
+        ..Default::default()
+    }],
+    endpoints: vec![Endpoint {
+        name: "api".into(),
+        target: EndpointTarget::Process { unit: "server".into(), port: "http".into() },
+        expose: Expose::Project,
+    }],
+    ..Default::default()
+})
+```
+
+| Field | What it holds |
+|---|---|
+| `command` | The program and its arguments. The first word is looked up on the process's `PATH`, and a start is refused when it is not there |
+| `files` | Text files weft writes into the process's folder, by their path in it (`server.py`, `conf/settings.json`). They are not executable, so run a script through its interpreter (`python3 server.py`, `sh run.sh`) |
+| `env` | Variables for the process. One with the same name as a variable it gets from the machine wins |
+| `ports` | Each port it listens on, as `ProcessPort::new(name, variable)`: endpoints and the readiness check use the name, and weft puts the port's number in the variable. The variable is uppercase letters, digits and `_`, not starting with a digit, and no other port or `env` entry may use it |
+| `readiness` | If you leave it out, the unit is ready as soon as the process runs. With `ProcessReadiness::http(port, path)` it is ready once `GET path` on that port answers 2xx or 3xx within a second. For 30 seconds after each start (`.with_startup_seconds(n)` to change it), a failing check still counts as starting |
+| `needs` | What it needs from the machine, checked before it starts. Each is a `Need` like the ones in `deps.toml` (for the fields, go and read [what a node needs from the machine](packaging.md#what-a-node-needs-from-the-machine)). It must be a `NeedStage::Run` one: a process is never built, so a build need is refused. One with a `recipe` is installed by weft when it is missing, see [needs weft installs itself](#needs-weft-installs-itself) |
+
+Have the process listen on `127.0.0.1`, at the number in its port's
+variable: that is where weft checks it and where every endpoint points. Any
+program on the machine can reach that port, whatever `expose` says, so never
+serve a secret on it to whoever asks.
+
+The process runs in a folder of its own, which is its working directory:
+`infra-processes/<copy>/<unit>/work/` in the install's folder
+(`~/.local/share/weft` for the default install; `weft daemon which` prints
+it). weft writes `files` there each time it starts the unit. What the process
+writes there itself stays until the unit is removed from the spec or the node
+is terminated, except changes to one of your `files`, which weft writes over
+at the next start. The files are part of the unit, so a changed script is a
+changed unit: like a changed container, it lands after a stop and a start
+(`weft infra stop --force` for a unit that keeps running through a stop), or
+when `weft infra upgrade` restarts the copy on your new build. If the process
+crashes or the machine restarts, the start that follows runs the version
+already applied.
+
+It gets `HOME` and the `PATH` weft's runtime was started with (the one your
+shell had at `weft daemon start`), so a program finds the person's own
+installs and logins the way it does when they run it by hand. When weft
+installed a need for it, that need's `bin` folders come first on that `PATH`. It also gets each of `USER`, `LOGNAME`, `SHELL`,
+`LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR` and the `XDG_*` folder variables that
+the runtime has, because a program the person runs by hand reads them. Then
+come `env` and one variable per port. Nothing else of weft's environment
+reaches it. If a value you set in `env` has a line break, the spec is refused:
+put text of several lines in one of its `files` instead.
+
+If a need is missing, the start fails and names it. When the need lists a
+package for this system, the message includes the command that installs it.
+For a program no package manager has, leave `install` empty and put the
+command that installs it in `how`: the message gives that command, or says to
+install it by hand when `how` is empty. Or give the need a `recipe`, and weft
+installs it for the person.
+
+### Needs weft installs itself
+
+If the program your process runs is one weft can download and install
+without `sudo` (a CLI shipped as a release archive, an npm package), give its
+`Need` a `recipe`, and the person never has to install it:
+
+```rust
+use weft::needs::{Os, Recipe};
+
+let tool = Need {
+    name: "Tool".into(),
+    stage: NeedStage::Run,
+    check: vec!["tool".into(), "--version".into()],
+    install: Default::default(),
+    how: Some("download it from https://tool.example".into()),
+    recipe: Some(Recipe {
+        folder: "tools/tool".into(),
+        script: [(Os::Linux, include_str!("install_linux.sh").into()), (Os::Macos, include_str!("install_macos.sh").into())].into(),
+        bin: vec!["bin".into()],
+        prelude: String::new(),
+    }),
+};
+```
+
+Before the process first starts, weft looks for the program in three places,
+in order:
+
+1. On the process's `PATH`. If the person has their own install, that one is
+   used and nothing is installed.
+2. In weft's folder for it, `~/.local/share/weft/needs/<folder>/` (here
+   `~/.local/share/weft/needs/tools/tool/`), if an earlier install finished there
+   and `check` passes with the `bin` folders first on the `PATH`.
+3. Nowhere: weft runs the script for this system into that folder. While it
+   runs, the unit is starting, and the infra's progress says
+   `server: installing Tool (its log: /home/you/.local/share/weft/needs/tools/tool.install.log)`.
+   There is no time limit, since a download takes as long as it takes.
+
+The process then starts with the `bin` folders first on its `PATH`.
+
+That folder is the machine's, not the install's: every program of every weft
+install on the machine uses the same one, so a need is installed once and
+never again. If two units start the same need at once (two nodes, two
+projects, two installs), one installs it while the others say
+`waiting for another setup to finish installing Tool`, and then they use what
+it installed. They take turns through a lock file beside the folder,
+`needs/tools/tool.lock`.
+
+The script runs in bash with `set -euo pipefail`, as the person (`sudo` is
+never available to it), after sourcing `prelude`: put helpers that several
+scripts share there. It gets these variables:
+
+| Variable | What it holds |
+|---|---|
+| `WEFT_NEED_DIR` | The need's own folder, empty when the script starts. Install into it and nowhere else |
+| `WEFT_NEEDS_ROOT` | The group's folder, `~/.local/share/weft/needs/tools/` here: the first half of `folder`. Scripts of one group can keep something they share there, such as a runtime several of them run on |
+
+`folder` is two names, `<group>/<name>`. A `bin` entry is a path inside the
+need's folder, or a `../` path into the group's folder.
+
+A folder only counts as installed once the script exited 0 and `check`
+passed. weft then writes a `.weft-installed` file into it. If the script is
+stopped halfway (a stop, a crash, the machine shutting down), that file is
+missing, so the next start empties the folder and runs the script again. If
+you want a newer version later, delete the folder, and the next start
+installs it again.
+
+If the script needs system packages it cannot install without `sudo`, list
+them in the need's `install`. weft checks them with the package manager
+before the script runs, and the unit fails naming the command that installs
+them:
+
+```text
+Tool needs system packages weft cannot install without sudo; install them with:  sudo apt-get install -y git
+then start the infra again (`weft deps-install`, in the project's folder, installs what this machine lacks for it, asking for your password where a system package needs it)
+```
+
+If the script fails, the unit fails with the last 20 lines of its log and the
+need's `how`. `weft deps-install`, run in the project's folder, installs these
+needs too, the same way and through the same lock, after asking for the
+system packages they lack.
+
+Only an infra process's need can have a recipe. For why a need in a node's
+own `deps.toml` cannot, go and read [what a node needs from the
+machine](packaging.md#what-a-node-needs-from-the-machine).
+
+A process shares the machine with everything else the person runs, so a unit
+that runs one and sets `machine` or `fsGroup` is refused. It mounts none of
+the node's `volumes` either: the only storage weft gives it is its own folder.
+A unit runs containers (init containers included) or a process, never both.
+
+An endpoint to one of its ports is an `EndpointTarget::Process`, and its
+address is `http://127.0.0.1:<port>`. weft picks a free port when the unit
+first starts and keeps it until the unit is removed, so the address stays the
+same across restarts. With `Expose::SameNetwork`, weft also gives out that
+same `127.0.0.1:<port>` as the endpoint's address on the machine's network,
+which is the address a frontend asks for.
+`Expose::Public` and a [live panel](#a-live-panel) reach it the same way they
+reach a container.
+
+Through its life it behaves like a container:
+
+- If the process exits on its own, weft starts it again: after a tenth of a
+  second the first time, twice as long each time after that up to a minute,
+  and a tenth of a second again once it ran for ten seconds. Its files are not
+  written again for that. While it waits, the unit is not ready, and the
+  reason weft gives is the exit code and the last 20 lines it printed.
+- It keeps running when weft's runtime restarts, and the runtime finds it
+  again instead of starting a second one. If the machine restarted, or the
+  agent that runs it (below) died, weft starts it again the next time it
+  checks on its units, writing its files again first, and kills whatever the
+  old one left running before it does. If that start fails, the unit reads as
+  failed, with the reason, and weft tries the start again each time it
+  checks, so a cause that clears by itself (a program that comes back on the
+  `PATH` a little after a reboot) brings the unit back without you.
+- If the first start of an apply fails (a program the command names is not
+  there, say), what was applied is what is wrong, so weft does not try it
+  again: the unit reads as failed, with the reason, until the next apply.
+- A stop asks the process to exit (`SIGTERM`) and gives it up to ten seconds.
+  Then weft kills whatever is left of it and of everything it started. A unit with
+  `on_stop: StopBehavior::KeepRunning` keeps running through a stop, as a
+  container unit does.
+- `weft infra logs` shows what it printed.
+
+In `ps`, each process unit shows up as `weft-runtime unit-agent process`: a
+small agent weft starts for it, which runs your process, starts it again when
+it exits, and is what stays up when weft's runtime restarts. If the agent
+dies, on Linux your process dies with it, and on macOS weft kills it before
+it starts the unit again. What your process
+printed is in `process.log` beside its `work/` folder, and if the agent itself
+cannot start, the error points at `agent.log` there.
+
+## A server inside another infra node
+
+If your node runs its server inside another infra node (a program it
+installs and starts in a computer, which the computer's own server passes a
+path on to), it declares no unit, only the endpoint, as an
+`EndpointTarget::Within`: the other node's endpoint, as the program wired it
+into your node's input, and the path under it.
+
+```rust
+let computer: InfraHandle = input.get("computer")?;
+Ok(InfraSpec {
+    endpoints: vec![Endpoint {
+        name: "api".into(),
+        target: EndpointTarget::Within { infra: computer, path: "/apps/claude".into() },
+        expose: Expose::Project,
+    }],
+    ..Default::default()
+})
+```
+
+`provision_infra` gets the handle because your node fires once its input
+arrives, after the other node is up. weft keeps the handle and the path, not
+an address: every `ctx.endpoint("api")`, `ctx.endpoint_of`, and read of a
+[live panel](#a-live-panel) asks where the other node's endpoint answers at
+that moment and adds the path, so your endpoint still works after the other
+node is made again on another port. If the other node is not running, the
+lookup fails saying so and naming it. The path must be a plain path with at
+least one segment, the endpoint can only be `Expose::Project`, and the
+endpoint it lives inside must have an address of its own, so a `Within`
+inside a `Within` is refused when it is looked up. A node with no unit gives
+the host nothing to do: a start marks it running, and a stop marks it
+stopped (its endpoint stops resolving, and your server keeps running inside
+the other node). `weft infra status` shows
+`inside endpoint 'api' of 'box' at /apps/claude` where other nodes show their
+address.
+
+A terminate has more to do, because your server and its files are inside the
+other node, and forgetting the row would leave them there. So before the row
+goes, weft sends `DELETE` to your endpoint's own path on the other node
+(`DELETE <the computer's address>/apps/claude`, never a path below it), and
+the other node answers with a 2xx once nothing of yours is left there, or when
+nothing was. If you write a node that other nodes live inside, that is the
+request it has to answer. A computer answers it by running the remove command
+the app registered beside its start command (`~/.weft/apps/<name>.remove`),
+then deleting the app's files in `~/.weft/apps/`.
+
+If the other node is there but not running, nothing can answer, so the
+terminate fails before it touches anything and leaves your node as it was:
+
+```text
+'claude' lives inside 'box' (endpoint 'api' at /apps/claude), which is stopped, so what 'claude' put there cannot be removed and 'claude' was left as it was. Start 'box' (`weft infra start box`) and terminate 'claude' again, or terminate 'box' too, which removes everything inside it
+```
+
+If the other node answers with an error, the terminate fails with
+`asking 'box' to remove it failed:` and what it answered, and your node reads
+`terminating` until a terminate gets through. If the other node has no copy
+at all, nothing of yours can be in it, so weft asks nothing. When you
+terminate the whole program, your node goes first if the other node is
+running, and after it if it is not, since its disk and your files on it are
+deleted with it.
 
 ## Reaching it
 
@@ -231,6 +521,13 @@ upgrade`, `weft infra rebake <node>`, or a program's own
 alongside that infrastructure. A baked output your `run` sent nothing on keeps the value saved
 last time.
 
+If your `run` does more in a real run than the run after an apply needs (it
+keeps a session open and streams what happens on a bus, say), check
+`ctx.is_setup()`. It is true in the run right after an apply, and in a
+trigger setup. Only the nodes the setup needs run in it, so nothing reads
+your other outputs there: send your baked outputs and return. An output you
+send nothing on closes, a `Bus` output included, and nothing fails.
+
 While the infrastructure is running, if everything a run reads from your
 node comes from baked outputs that have a saved value, your node does not
 run: the saved values go down its wires instead.
@@ -246,6 +543,11 @@ changes while the bridge runs), your node runs as usual, and if its `run`
 sends nothing on a baked output, the saved value goes out on it instead of
 the output closing. Only wires into nodes that are part of this run count: a
 `status` wired to a node outside the run does not make your node run.
+
+That saved value goes out only once your body returns without an error. So if
+your body stays up for the whole run, every node reading the baked output
+waits the whole run. Send your baked outputs yourself before the long part
+starts.
 
 If your container changes a value itself (a password reset from a button,
 say), have it POST the new value to the address in

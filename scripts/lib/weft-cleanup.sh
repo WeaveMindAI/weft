@@ -164,6 +164,42 @@ weft_stop_workers() { # dir
   fi
 }
 
+# Kill every process unit's agent the install in dir holds, with its
+# process and whatever that started (an agent runs in a process group of
+# its own, which its process shares), and what is left of an agent found
+# gone: its group, while no process has its pid (the kernel never reuses a
+# pid a group still holds, so such a group is only ever what the agent
+# left). A pid another program took since (its start mark differs) is
+# left alone. Read from the install's registry
+# (`infra-processes/units.json`) rather than asked of a weft binary, which
+# may be gone already, as for the workers above.
+# SYNC: the registry and the kill <-> crates/weft-platform-local/src/process_units.rs
+#       (Held, Run::Agent, Agent, kill_all), crates/weft-platform-local/src/processes.rs (kill_leftovers)
+weft_stop_process_units() { # dir
+  local file="$1/infra-processes/units.json" line pid="" mark killed=0
+  [[ -e "${file}" ]] || return 0
+  # The registry is written pretty, one field a line: an agent's pid on a
+  # line of its own, its start mark on the next. Anchored to the whole
+  # line, so text inside a process's files or environment (one string on
+  # one line) never reads as either.
+  while IFS= read -r line; do
+    if [[ "${line}" =~ ^\ *\"pid\":\ ([0-9]+),$ ]]; then
+      pid="${BASH_REMATCH[1]}"
+    elif [[ -n "${pid}" && "${line}" =~ ^\ *\"started\":\ \"([^\"]*)\"$ ]]; then
+      mark="$(weft_started_mark "${pid}")"
+      if [[ "${mark}" == "${BASH_REMATCH[1]}" || -z "${mark}" ]]; then
+        kill -KILL -- "-${pid}" 2>/dev/null && killed=$((killed + 1))
+      fi
+      pid=""
+    else
+      pid=""
+    fi
+  done < "${file}"
+  if [[ ${killed} -gt 0 ]]; then
+    ok "stopped ${killed} process unit(s) of ${1}"
+  fi
+}
+
 # The start mark weft keeps for pid: the kernel's start time (the 22nd
 # field of /proc/<pid>/stat) on Linux, `ps`'s start time elsewhere; empty
 # when no process has the pid.
@@ -402,6 +438,12 @@ weft_remove_kind_images() { # [note]
 # survived; the caller reports.
 weft_remove_state_dir() {
   [[ -d "${weft_state_dir}" ]] || return 0
+  # Every install's process units first: the files that name them go
+  # below, and nothing could find them after.
+  local dir
+  for dir in "${weft_state_dir}" "${weft_state_dir}"/installs/*; do
+    [[ -d "${dir}" ]] && weft_stop_process_units "${dir}"
+  done
   if ! rm -rf "${weft_state_dir}" 2>/dev/null; then
     docker run --rm -v "${weft_state_dir}:/wipe" alpine:3 \
       sh -c 'rm -rf /wipe/* /wipe/.[!.]*' >/dev/null 2>&1 || true

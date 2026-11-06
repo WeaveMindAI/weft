@@ -144,7 +144,12 @@ node and the wrong value.
    bug (a wire the compiler could not catch). The `run_failed` line
    names every firing left holding a pulse and the wired ports it never
    received (`theirs has value, still waiting on go`): walk to whatever
-   should have driven the missing port.
+   should have driven the missing port. A node failing with `the bus ended failed: the run was
+   stuck: every node on this bus waited on another, and nothing could end
+   the wait` is a bus nobody ends: its last member waits on it (an agent
+   node holding its `stream` once the loop's last turn is done). The fix is
+   a `CloseBus` on that bus after the last node sending on it, its
+   `_should_flow` wired to an output that arrives once they are all done.
 7. **Nothing ran.** Nothing reached the branch: check that the trigger that
    should have fired is on, then walk from it down to the first
    `_should_flow` or required input that closed. If the trigger is off,

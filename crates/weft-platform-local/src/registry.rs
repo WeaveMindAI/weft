@@ -108,33 +108,42 @@ impl Registry {
     /// over it, so a reader sees the old list or the new one. Readable by
     /// this user alone: it holds the workers' keys.
     pub fn save(&self, entries: &[Entry]) -> anyhow::Result<()> {
-        use std::io::Write as _;
-        let dir = self.dir();
-        std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
-        let partial = dir.join(format!("{FILE}.{}.tmp", std::process::id()));
-        let written = (|| -> std::io::Result<()> {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-            let mut file = opts.open(&partial)?;
-            file.write_all(&serde_json::to_vec_pretty(entries).expect("entries serialize"))?;
-            file.sync_all()?;
-            std::fs::rename(&partial, &self.path)
-        })();
-        if let Err(e) = written {
-            // The save failed either way; this only keeps a stray file out
-            // of the folder.
-            let _ = std::fs::remove_file(&partial);
-            anyhow::bail!("write {}: {e}", self.path.display());
-        }
-        Ok(())
+        write_private(&self.path, &serde_json::to_vec_pretty(entries).expect("entries serialize"))
     }
+}
+
+/// Make `bytes` the file at `path` (its folder made when missing): written
+/// beside it, then renamed over it, so a reader sees the old content or the
+/// new. Readable by this user alone: what weft keeps this way holds keys
+/// and environments.
+pub fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let dir = path.parent().expect("a file weft keeps is in a folder");
+    std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
+    let name = path.file_name().expect("a file weft keeps has a name").to_string_lossy();
+    let partial = dir.join(format!("{name}.{}.tmp", std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let mut file = opts.open(&partial)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&partial, path)
+    })();
+    if let Err(e) = written {
+        // The save failed either way; this only keeps a stray file out of
+        // the folder.
+        let _ = std::fs::remove_file(&partial);
+        anyhow::bail!("write {}: {e}", path.display());
+    }
+    Ok(())
 }
 
 /// Whether `entry`'s process still runs: its pid is held by the process
 /// that started then, not by one that took the pid since.
 pub async fn still_runs(processes: &dyn Processes, entry: &Entry) -> anyhow::Result<bool> {
-    Ok(processes.started(entry.pid).await?.as_deref() == Some(entry.started.as_str()))
+    crate::processes::runs(processes, entry.pid, &entry.started).await
 }
 
 /// Stop every worker process the install's registry (in `dir`) names,

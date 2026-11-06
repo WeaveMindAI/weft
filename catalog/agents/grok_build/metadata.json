@@ -1,0 +1,326 @@
+{
+  "type": "GrokBuild",
+  "label": "Grok Build",
+  "description": "One conversation with Grok Build, xAI's coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, Grok Build runs on your machine (a local install only) from your own install of `grok` with your own login, working in `folder`. If `grok` is missing, weft installs it into a folder of its own, shared by the whole machine, before the node runs. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs, and it logs in with the connection on `access`. With a connection it runs in a home of its own, so your Claude Code setup (`~/.claude`), which Grok Build reads as its own, stays out of it. Refusing one of its permission requests ends its whole turn. Your program's tools reach its model through its own tool search, never as tools of their own; nothing turns that off. Its card shows what it is doing and a Start over button. What is exposed: the permission mode, the model, the reasoning effort, rules added to its system prompt and its sandbox. Your program's tools never sit on Grok's own list of tools: its model finds them with `search_tool` and calls them through `use_tool` as `weft__<tool>`, and they come back to your program under their plain names. Grok Build cannot let a program's tool take one of its own tools' places, so a tool named like one of them (`read_file`, `run_terminal_command`, `web_search` and the rest of this node's list) is refused when the program is built.",
+  "tags": [
+    "agent",
+    "coding",
+    "grok",
+    "xai",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run Grok Build in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[grok_build]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A GrokBuildAccess's `access`: an xAI API key. Required with a `computer`. Left out on your machine, Grok Build uses the login `grok login` saved there."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder Grok Build works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`grok` on your PATH",
+      "description": "On your machine: the Grok Build program to run, when it is not the `grok` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "auto",
+          "plan",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What Grok Build may do without asking. `ask`: every request it would put to a person comes out of AskAgent as a question. `auto`: its own judgement lets safe actions through and asks about the rest. `plan`: it only plans, and asks before leaving plan mode to act on the plan. `bypass`: nothing asks, nothing is refused; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "Grok Build's default",
+      "description": "A Grok model id, such as `grok-4.6` (`grok models` lists them). Left out, Grok Build's default."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "label": "Reasoning effort",
+      "description": "How hard the model reasons; `xhigh` only on the models that offer it. Left out, the model's default."
+    },
+    {
+      "name": "appendSystemPrompt",
+      "type": "String",
+      "widget": {
+        "kind": "textarea"
+      },
+      "label": "Add to the system prompt",
+      "description": "Rules added to its system prompt, for the whole conversation."
+    },
+    {
+      "name": "sandbox",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "workspace",
+          "devbox",
+          "read-only",
+          "strict"
+        ]
+      },
+      "label": "Sandbox",
+      "description": "The sandbox profile its commands run in, which needs bubblewrap on Linux. Left out, no sandbox."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GrokBuild '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GrokBuild '{id}' runs in a computer, where no login is waiting for it; give it a GrokBuildAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GrokBuild '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "auto",
+                "plan",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GrokBuild '{id}' has a `permission` it does not know; pick one of ask, auto, plan, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "GrokBuild '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "GrokBuild '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs Grok Build itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "ask_user_question",
+      "enter_plan_mode",
+      "exit_plan_mode",
+      "get_command_or_subagent_output",
+      "grep",
+      "image_edit",
+      "image_gen",
+      "image_to_video",
+      "kill_command_or_subagent",
+      "list_dir",
+      "monitor",
+      "read_file",
+      "reference_to_video",
+      "run_terminal_command",
+      "scheduler_create",
+      "scheduler_delete",
+      "scheduler_list",
+      "search_replace",
+      "search_tool",
+      "send_feedback",
+      "spawn_subagent",
+      "todo_write",
+      "use_tool",
+      "web_search",
+      "workflow",
+      "write"
+    ]
+  }
+}

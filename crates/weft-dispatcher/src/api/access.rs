@@ -168,7 +168,15 @@ pub(crate) async fn doors_status(state: &DispatcherState, req: &DoorsRequest) ->
         Ok(uri) => (Some(uri), None),
         Err((_, msg)) => (None, Some(msg)),
     };
-    Ok(DoorsStatus { doors, redirect_uri, consent_blocked })
+    // Where this install runs decides which ways to sign in it offers:
+    // a local-only one never on a cloud (the broker refuses its connect
+    // too; this is what keeps the form from offering it).
+    let install = match state.install_info.cloud {
+        None => weft_core::install::InstallKind::Local,
+        Some(_) => weft_core::install::InstallKind::Cloud,
+    };
+    let offered_ways = req.spec.ways().iter().filter(|w| w.offered_on(install)).map(|w| w.id.clone()).collect();
+    Ok(DoorsStatus { doors, redirect_uri, consent_blocked, offered_ways })
 }
 
 /// POST /access/mint-app: run the service's "Create it for me" recipe;
@@ -635,6 +643,7 @@ mod credential_stamp_tests {
             instance: None,
             identity: None,
             label: None,
+            way: None,
             scopes: vec![],
             permissions_verified: false,
             owner,

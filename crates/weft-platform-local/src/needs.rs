@@ -4,7 +4,7 @@
 //! get (`runner`).
 
 use async_trait::async_trait;
-use weft_core::needs::NodeNeed;
+use weft_core::needs::Need;
 use weft_platform_traits::MachineNeeds;
 
 pub struct LocalNeeds;
@@ -12,12 +12,12 @@ pub struct LocalNeeds;
 #[async_trait]
 impl MachineNeeds for LocalNeeds {
     /// Every check runs at once, each on a blocking thread.
-    async fn missing(&self, needs: &[NodeNeed]) -> anyhow::Result<Vec<NodeNeed>> {
+    async fn unmet(&self, needs: &[Need]) -> anyhow::Result<Vec<Need>> {
         let checks: Vec<_> = needs
             .iter()
             .map(|need| {
                 let need = need.clone();
-                tokio::task::spawn_blocking(move || (!need.need.is_met()).then_some(need))
+                tokio::task::spawn_blocking(move || (!need.is_met()).then_some(need))
             })
             .collect();
         let mut missing = Vec::new();

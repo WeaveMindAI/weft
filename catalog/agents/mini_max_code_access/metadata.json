@@ -1,0 +1,97 @@
+{
+  "type": "MiniMaxCodeAccess",
+  "label": "MiniMax Code Access",
+  "description": "A MiniMax Code login, for the MiniMaxCode nodes' `access`: a MiniMax API key, or a model provider of your own. One access for however many MiniMaxCode nodes. A MiniMax account login is not offered: MiniMax's terms forbid automated access to the service and keep an account to its owner; on your machine, leaving `access` out uses your own `mcode login`.",
+  "tags": [
+    "agent",
+    "minimax",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#e73c3c",
+  "service": {
+    "service": "mini_max_code",
+    "label": "MiniMax Code",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "apiKey",
+          "label": "MiniMax API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "MiniMax API key",
+              "placeholder": "sk-..."
+            }
+          ],
+          "guide": {
+            "link": "https://github.com/MiniMax-AI/minimax-code",
+            "steps": [
+              "Create an API key on the MiniMax platform.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "customProvider",
+          "label": "Your own model provider",
+          "fields": [
+            {
+              "name": "baseUrl",
+              "label": "Base URL",
+              "secret": false,
+              "placeholder": "https://api.example.com/v1"
+            },
+            {
+              "name": "apiFormat",
+              "label": "API format",
+              "secret": false,
+              "placeholder": "anthropic-messages, openai-completions, openai-responses or google-generative-ai"
+            },
+            {
+              "name": "model",
+              "label": "Model id",
+              "secret": false,
+              "placeholder": "gpt-5-mini"
+            },
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-..."
+            }
+          ],
+          "guide": {
+            "link": "https://github.com/MiniMax-AI/minimax-code",
+            "steps": [
+              "Fill in the provider's base URL, the API it speaks, the model to run and its key, as `mcode provider add` takes them.",
+              "Name the connection."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[mini_max_code]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[mini_max_code]",
+      "description": "Wire into the MiniMaxCode nodes' `access` input."
+    }
+  ]
+}

@@ -1172,18 +1172,40 @@ pub(crate) async fn live_endpoint_url(
             Some(instance) => (StatusCode::NOT_FOUND, format!("instance '{instance}' has no copy of infra node '{node}'")),
             None => (StatusCode::NOT_FOUND, "no such infra node".to_string()),
         })?;
-    live_endpoint_of(&row, node, live_endpoint)
+    let record = live_endpoint_of(&row, node, live_endpoint)?;
+    // The endpoint it lives inside, if any, is held to what a run's
+    // handle is held to at the broker: the program declares that copy,
+    // and it is the shared one or this copy's own instance's. Worked out
+    // only for an endpoint that lives inside another.
+    let allowed = |inner: &weft_core::infra::InfraHandle| {
+        if inner.instance().is_some() && inner.instance() != instance {
+            return Err(format!("{inner} belongs to another instance than the copy that runs inside it"));
+        }
+        match weft_core::project::DeclaredInfra::of(&project).declares(inner.place(), inner.instance().is_some()) {
+            true => Ok(()),
+            false => Err(format!("{inner} is not infra this program declares")),
+        }
+    };
+    weft_task_store::PostgresInfraReader::new(state.pg_pool.clone())
+        .address_of(id, record, allowed)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?
+        .map_err(|why| (StatusCode::NOT_FOUND, why))
 }
 
 /// Where copy `row` of the infra node at `node` serves its display, its
 /// endpoint named `live_endpoint`, or the 404 saying why it has none.
-pub(crate) fn live_endpoint_of(row: &infra_node::InfraNodeRow, node: &str, live_endpoint: &str) -> Result<String, (StatusCode, String)> {
+pub(crate) fn live_endpoint_of(
+    row: &infra_node::InfraNodeRow,
+    node: &str,
+    live_endpoint: &str,
+) -> Result<weft_core::infra::EndpointRecord, (StatusCode, String)> {
     // A copy that is not up has nothing behind its address (a stopped
     // one runs nothing, a starting one is not ready yet), so
     // asking it would be a connection error. Nothing to show is a 404,
     // naming the state so a reader can say "starting" rather than
     // "not started".
-    if !matches!(row.status, InfraNodeStatus::Running | InfraNodeStatus::Flaky) {
+    if !row.status.answers() {
         return Err((
             StatusCode::NOT_FOUND,
             format!("infra node '{node}' is {}, so it has nothing to show yet", row.status.as_str()),

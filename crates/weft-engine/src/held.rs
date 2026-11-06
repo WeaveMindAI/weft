@@ -195,7 +195,11 @@ impl AccessBroker for HeldAccess {
             run_instance: run_instance.cloned(),
         };
         let now = crate::now_unix() as i64;
-        if let Some(held) = self.opened.held(&key).filter(|held| held.keep_until_unix.is_some_and(|until| until > now)) {
+        // A renewal (`stale`) is the broker's every time: the values kept
+        // here are the ones that stopped working, and its answer replaces
+        // them for every run of this worker.
+        let kept = self.opened.held(&key).filter(|held| req.stale.is_none() && held.keep_until_unix.is_some_and(|until| until > now));
+        if let Some(held) = kept {
             return Ok((*held).clone());
         }
         let answer = self.opened.load_fresh(key, || self.inner.resolve_connection(req, run_instance)).await?;
@@ -382,6 +386,7 @@ mod tests {
                 owner: weft_core::CredentialOwner::Author,
                 keep_until_unix: self.keep_until,
                 published_by: None,
+                way: None,
             })
         }
         async fn release_connection(
@@ -432,6 +437,7 @@ mod tests {
             required_permissions: Vec::new(),
             required_values: Vec::new(),
             expected_duration_secs: 60,
+            stale: None,
         }
     }
 
@@ -467,7 +473,7 @@ mod tests {
         let inner = Arc::new(CountingAccess { resolves: AtomicUsize::new(0), publishes: AtomicUsize::new(0), keep_until: None });
         let access = held_access(inner.clone());
         let spec: weft_core::AccessSpec = serde_json::from_value(serde_json::json!({
-            "service": "postgres", "acquisition": { "kind": "static", "fields": [] }, "auth": []
+            "service": "postgres", "acquisition": { "kind": "static", "ways": [{ "fields": [] }] }, "auth": []
         }))
         .unwrap();
         let publish = |password: &str| PublishAccessRequest {
@@ -484,5 +490,20 @@ mod tests {
         assert_eq!(inner.publishes.load(Ordering::SeqCst), 1);
         access.publish_access(&publish("b"), None).await.unwrap();
         assert_eq!(inner.publishes.load(Ordering::SeqCst), 2);
+    }
+
+    /// A renewal goes to the broker even while an answer is kept, and its
+    /// answer is what the next open of this worker is handed, before the
+    /// notice of the renewal arrives (none arrives in this rig).
+    #[tokio::test]
+    async fn a_renewal_is_asked_every_time_and_replaces_the_kept_answer() {
+        let inner = Arc::new(CountingAccess { resolves: AtomicUsize::new(0), publishes: AtomicUsize::new(0), keep_until: Some(i64::MAX) });
+        let access = held_access(inner.clone());
+        access.resolve_connection(&resolve(), None).await.unwrap();
+        let renew = ResolveConnectionRequest { stale: Some("digest".into()), ..resolve() };
+        access.resolve_connection(&renew, None).await.unwrap();
+        assert_eq!(inner.resolves.load(Ordering::SeqCst), 2, "the renewal reached the broker");
+        access.resolve_connection(&resolve(), None).await.unwrap();
+        assert_eq!(inner.resolves.load(Ordering::SeqCst), 2, "the renewal's answer is kept");
     }
 }

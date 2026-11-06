@@ -109,6 +109,7 @@ async fn listener_resolve(
     let access_id = parse_access_id(&req.access_id)?;
     let source = weft_access_store::resolve_event_source(
         &state.pool,
+        state.install,
         &req.tenant,
         weft_access_store::GrantUser::of(req.for_instance.as_ref()),
         access_id,
@@ -149,6 +150,7 @@ async fn subscription_ensure(
     let ensured = weft_access_store::ensure_subscription(
         &state.pool,
         &state.lock_pool,
+        state.install,
         &weft_access_store::EnsureSubscription {
             for_instance: req.for_instance,
             tenant: req.tenant,
@@ -185,6 +187,7 @@ async fn subscription_check(
     let receiver = || async { receiver_url(&state, &service, &topic).await };
     weft_access_store::check_subscription(
         &state.pool,
+        state.install,
         &weft_access_store::EnsureSubscription {
             for_instance: req.for_instance,
             tenant: req.tenant,
@@ -210,7 +213,7 @@ async fn subscription_drop(
 ) -> Result<Json<Value>, ApiError> {
     listener_only(&caller)?;
     let dropped =
-        weft_access_store::drop_subscriptions_for_signal(&state.pool, &state.lock_pool, &req.tenant, &req.signal_token)
+        weft_access_store::drop_subscriptions_for_signal(&state.pool, &state.lock_pool, state.install, &req.tenant, &req.signal_token)
             .await
             .map_err(crate::handlers::store_err)?;
     Ok(Json(serde_json::json!({ "dropped": dropped })))

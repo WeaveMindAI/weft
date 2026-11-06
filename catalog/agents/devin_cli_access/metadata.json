@@ -1,0 +1,61 @@
+{
+  "type": "DevinCliAccess",
+  "label": "Devin CLI Access",
+  "description": "A Devin login, for the DevinCli nodes' `access`: a Devin API key. One access for however many DevinCli nodes.",
+  "tags": [
+    "agent",
+    "devin",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#2a6f6f",
+  "service": {
+    "service": "devin_cli",
+    "label": "Devin CLI",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "apiKey",
+          "label": "API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "your Devin API key"
+            }
+          ],
+          "guide": {
+            "link": "https://docs.devin.ai/cli",
+            "steps": [
+              "In your Devin (Windsurf) account, create an API key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[devin_cli]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[devin_cli]",
+      "description": "Wire into the DevinCli nodes' `access` input."
+    }
+  ]
+}

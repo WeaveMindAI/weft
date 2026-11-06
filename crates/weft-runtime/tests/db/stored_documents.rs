@@ -95,6 +95,18 @@ async fn a_database_an_older_weft_filled_boots_and_every_row_reads(pool: Pool) {
     // the connection still reads, its service the one plain `hmac` reads.
     let hmac_spec = read_spec(hmac_id).await;
     assert_eq!(hmac_spec.service, weft_core::access::callers::CallerScheme::Hmac.service());
+    // A pasted connection from before ways was made with its recipe's one
+    // way, which the carry named the default one; a consent has none.
+    let way_of = |id: uuid::Uuid| {
+        let pool = pool.clone();
+        async move {
+            let way: Option<String> = pool.scalar("SELECT way FROM access_grant WHERE id = $1", &[&id]).await.unwrap();
+            way
+        }
+    };
+    assert_eq!(way_of(hmac_id).await.as_deref(), Some(weft_core::access::spec::DEFAULT_WAY));
+    assert_eq!(hmac_spec.chosen_way(None).unwrap().id, weft_core::access::spec::DEFAULT_WAY);
+    assert_eq!(way_of(slack_id).await, None);
 
     // The recorded recipe is kept under the hash of its new JSON, and the
     // Slack connection names that hash, so a verified push finds it.

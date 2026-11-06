@@ -91,6 +91,7 @@ of [CONTRIBUTING](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#
 | `features` | Object | all off | Small flags about what the node is |
 | `display` | Object | none | What to render on the node's body after a firing |
 | `validate` | List | `[]` | Rules the compiler checks against the graph |
+| `lists` | Map | `{}` | Named lists of text that a rule of another node reads off this one, when this node is wired into it. Names are camelCase. Go and read [a list another node declares](#a-list-another-node-declares) |
 | `portsFromConfig` | Object | none | Says this node's ports come from a list in its own config |
 | `types` | Map | `{}` | Named types this node contributes to the project. Go and read [custom types](custom-types.md) |
 | `typeParams` | Map | `{}` | What each type variable of the ports may stand for. Go and read [typeParams](#typeparams) |
@@ -325,6 +326,7 @@ The conditions are a closed list:
 | `downstream_of` | `with` | Is a node `with` a feature wired upstream of this one, so it runs first. `{with}` in the message names those nodes |
 | `per_instance` | | Does this node exist once per instance: marked `@per_instance`, with an `@instance_filled` field, or reading one of those (a group that receives a per-instance value on any port counts for everything reading its ports). `{perInstanceReason}` in the message says why, path included: "it reads 'blender'", or "it sits inside group 'work', which receives 'blender'" |
 | `input_names` | `port`, `names` | Does every name written on this input name a node or a field of this program. If the input holds a String, that is the name; if a list, each String in it; if an object, each of its keys. `names` says what they name: `{"node": {}}` is a node spelled the way the program writes it (`bridge`, `one.bridge`), narrowed with `role` (`infra` or `trigger`) and `perInstance` (`true` or `false`); `{"field": {}}` is a node's field written `node.field` (`send.model`), narrowed with `instanceFilled` (`true` or `false`). Nothing written is fine. A wired or `@instance_filled` input holds names only known at run time, so it is not checked. `{names}` in the message lists the ones that fail |
+| `local_install` | | Is the program being built for a local install, one that runs things on the machine weft runs on. Only a build for an install has the answer (go and read [a rule that asks which install](#a-rule-that-asks-which-install)) |
 | `all` / `any` | `of` | Every one, or at least one |
 | `not` | `of` | The opposite |
 
@@ -336,6 +338,8 @@ hold. In each `{ "min", "max" }`, both bounds are optional and both included.
 | `"nonempty": true` | The value is not blank or empty |
 | `"equals": <value>` | It equals this exact value |
 | `"oneOf": [...]` | It is one of these values, compared as JSON (a string against strings) |
+| `"noneOf": [...]` | It is none of these values. In place of the list you can write `{ "list": "<name>", "ofNodeWiredInto": "<input>" }`: the list of that name declared by the node wired into that input of yours (go and read [a list another node declares](#a-list-another-node-declares)). `{noneOfFound}` in the message names the values it refused, and `{wiredNode}` the node the list came from, with its type |
+| `"noneMatch": [...]` | It is text that none of these regexes matches. A regex matches anywhere in the text unless you anchor it (`"^mcp__"` only at the start). It takes a list another node declares the same way `noneOf` does, and the catalog refuses a written regex that does not compile. `{noneMatchFound}` in the message names the values it refused, and `{wiredNode}` works here too |
 | `"matches": "<regex>"` | It is text and matches |
 | `"count": { "min", "max" }` | It holds that many items. A list counts its items, a dict its entries, any other value one |
 | `"range": { "min", "max" }` | It is a number in that range |
@@ -392,12 +396,112 @@ a key that is no field an instance fills:
   "then": { "message": "SetInstanceValues '{id}' gives {names} in `values`...", "port": "values" } }
 ```
 
+### A rule that asks which install
+
+If your node needs the machine weft runs on, a cloud install does not have
+one. Here an agent node whose optional `computer` input has to be wired on a
+cloud install:
+
+```json
+{ "when": { "kind": "all", "of": [
+    { "kind": "not", "of": { "kind": "local_install" } },
+    { "kind": "not", "of": { "kind": "input_wired", "port": "computer" } } ] },
+  "then": { "message": "'{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`", "port": "computer" } }
+```
+
+Only an install knows what kind it is, so `local_install` is answered by the
+builds made for one: the install's own build of your program, and the
+commands that compare the folder with an install, `weft status` and `weft
+run`, which compile for that install's kind. The program records the kind it
+was built for, and a run reads it from there. `weft validate` and the editor
+build for no install, so there `local_install` has no answer, and the rule
+above does not fire there. On a cloud install the build reports the node as not
+compiling, and a run that needs it is refused with your message.
+
+Every condition answers yes, no or not known yet, and `all`, `any` and `not`
+fold those answers: one no settles an `all`, one yes settles an `any`, and
+otherwise the unknown parts are what is left to ask. The build keeps only
+that leftover on the node, and weft asks it when the node fires, with the
+values that arrived (go and read [rules on a value that arrives on a
+wire](#rules-on-a-value-that-arrives-on-a-wire)). So if you pair `local_install` with a value a
+wire brings, `all` of `not local_install` and a wired `folder` is settled by
+a local install's build and nothing is left for the run, while a cloud
+install's build keeps only the `folder` part, and the run refuses a folder
+that arrives. Your node's own code does not have to check either.
+
+### A list another node declares
+
+Sometimes what your node must refuse depends on the node wired into it. A
+node that drives a coding agent, for example, must refuse a tool named like
+one of that agent's own tools, and only the agent node knows those names. So
+the agent node declares them at the top of its `metadata.json`:
+
+```json
+"lists": { "reservedToolNames": ["apply_patch", "exec_command"] }
+```
+
+and the node it is wired into reads them with a `noneOf`, naming the list and
+its own input the agent comes in on:
+
+```json
+{ "when": { "kind": "all", "of": [
+    { "kind": "value", "field": "tools" },
+    { "kind": "not", "of": { "kind": "value", "field": "tools",
+        "each": { "key": "name", "noneOf": { "list": "reservedToolNames", "ofNodeWiredInto": "agent" } } } } ] },
+  "then": { "message": "{wiredNode} cannot give up its built-in tool {noneOfFound}; rename your tool", "port": "tools" } }
+```
+
+On a program with `codex = Codex` wired into `agent` and a tool named
+`apply_patch`, that says `Codex 'codex' cannot give up its built-in tool
+'apply_patch'; rename your tool`.
+
+The compiler follows the wire back to the node it comes from, through groups,
+included files and a loop's way in. If nothing is wired into that input, the
+list is empty and the check holds (the input's own rules say it is missing).
+If the node wired there declares no list of that name, the build refuses the
+program and says so:
+
+```text
+ClaudeCode 'claude' declares no list 'reservedToolNames' that AskAgent 'ask' reads through `agent`
+```
+
+Some lists only a few of the nodes wired in have. If yours is one, add
+`"optional": true` beside `ofNodeWiredInto`, and a node declaring no list of
+that name then lists nothing. The agent example uses that for the shapes of
+tool name an agent refuses: Codex refuses a name starting `mcp__` or holding
+a character other than a letter, a digit, `_` or `-`, so it lists two
+regexes,
+
+```json
+"lists": { "reservedToolNamePatterns": ["^mcp__", "[^A-Za-z0-9_-]"] }
+```
+
+and the node it is wired into reads them with a `noneMatch`:
+
+```json
+"each": { "key": "name", "noneMatch": { "list": "reservedToolNamePatterns", "ofNodeWiredInto": "agent", "optional": true } }
+```
+
+Most agents refuse no shape of name, and they leave the list out. A list
+with no `optional` stays required, because a node that forgot to declare it
+would otherwise refuse nothing. A regex in a list a `noneMatch` reads is
+checked when the program is built, and one that does not compile breaks it:
+
+```text
+Garbled 'bad' lists '(' is no regex (...) in 'reservedToolNamePatterns', which AskAgent 'ask' matches against through `agent`
+```
+
+If the value arrives on a wire, the rule is kept for the run
+with the list's values written into it, so the run reads no other node. The
+catalog refuses a list name that is not camelCase, an item that is not text,
+and an `ofNodeWiredInto` that is not one of your inputs.
+
 ### Rules on a value that arrives on a wire
 
 If a rule's answer depends on a value a wire brings, the compiler cannot
-decide it. It records the rule on the node in the compiled program, and the
-rule is checked again with the values that actually arrived, before your
-node's body runs. If it fires, the node fails with the rule's own message.
+decide it. It keeps on the node, in the compiled program, only the parts of
+the rule it could not answer, and those are checked again with the values
+that actually arrived, before your node's body runs. If it fires, the node fails with the rule's own message.
 That failure is an input error, so a wired `_error` does not catch it: the fix
 is in the program. A rule asking whether an optional wired input is set
 (`input_satisfied`) is one of these too, because the wire may close empty.

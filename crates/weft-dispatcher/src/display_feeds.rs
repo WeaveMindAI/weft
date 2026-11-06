@@ -95,8 +95,10 @@ pub struct NodeDisplay {
 pub enum DisplayAt {
     /// Nothing serves it yet (no copy running, no signal registered).
     Nowhere,
-    /// An infra node's container, at its `live_endpoint`.
-    Container { endpoint_url: String },
+    /// An infra node's endpoint named by its `live_endpoint`, at the
+    /// address it answers at now (a container's port, a process's, or a
+    /// path inside another node's endpoint).
+    InfraEndpoint { endpoint_url: String },
     /// The listener, holding the trigger's signal.
     Listener(crate::api::signal::SignalLiveAt),
 }
@@ -421,7 +423,7 @@ impl DisplayReader for StateReader {
         let found = match key.source {
             DisplaySource::Infra => crate::api::infra::live_endpoint_url(state, key.project, &key.node, instance)
                 .await
-                .map(|endpoint_url| DisplayAt::Container { endpoint_url }),
+                .map(|endpoint_url| DisplayAt::InfraEndpoint { endpoint_url }),
             DisplaySource::Signal => crate::api::signal::signal_live_at(state, key.project, &key.node, instance).await.map(DisplayAt::Listener),
             // A wait belongs to one run, and its run's stream reads it
             // (`run_waits`); a node's own feed never names one.
@@ -437,7 +439,7 @@ impl DisplayReader for StateReader {
     async fn read(&self, key: &DisplayKey, at: &DisplayAt) -> NodeFeed {
         let read = match at {
             DisplayAt::Nowhere => return NodeFeed::Absent,
-            DisplayAt::Container { endpoint_url } => crate::api::infra::fetch_live(&self.0, endpoint_url).await,
+            DisplayAt::InfraEndpoint { endpoint_url } => crate::api::infra::fetch_live(&self.0, endpoint_url).await,
             DisplayAt::Listener(at) => crate::api::signal::fetch_signal_live(&self.0, &key.node, at).await,
         };
         match read {
@@ -519,7 +521,7 @@ mod tests {
     impl DisplayReader for CountingReader {
         async fn find(&self, _key: &DisplayKey) -> Result<DisplayAt, String> {
             self.finds.fetch_add(1, Ordering::SeqCst);
-            Ok(DisplayAt::Container { endpoint_url: "http://db".into() })
+            Ok(DisplayAt::InfraEndpoint { endpoint_url: "http://db".into() })
         }
 
         async fn read(&self, _key: &DisplayKey, _at: &DisplayAt) -> NodeFeed {

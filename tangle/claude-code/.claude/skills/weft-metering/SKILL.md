@@ -39,7 +39,7 @@ All three carry one string, the [service name], and a [meter] whose [service nam
     "label": "Acme",
     "acquisition": {
       "kind": "static",
-      "fields": [{ "name": "key", "label": "API key", "placeholder": "acme-..." }]
+      "ways": [{ "fields": [{ "name": "key", "label": "API key", "placeholder": "acme-..." }] }]
     },
     "auth": [{ "kind": "header", "name": "Authorization", "value": "Bearer {key}" }]
   }

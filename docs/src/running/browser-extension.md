@@ -67,6 +67,13 @@ option buttons, approve and reject pairs, images and files.
 | **Skip** | Declines the question: the node that asked ends skipped, and the nodes reading its answer skip too. The rest of the run carries on. Not shown on a trigger, which has no question to skip (weft refuses it) |
 | **Cancel run** | Ends the whole run. Also not shown on a trigger |
 
+A field marked with a red `*` needs an answer, and **Submit** stays off until
+it has one. If the card shows a conversation (what an agent and the program
+said so far, beside its question), it opens on the latest messages, and
+**Show earlier messages** reaches back. While you read further up, new
+messages arriving at the end do not move you, and whatever you unfolded stays
+unfolded while the list refreshes.
+
 Approve and reject are labelled by whoever wrote the program (the field's
 `approveLabel` and `rejectLabel`), so they can read **Send it** and **Hold it**
 rather than the defaults.

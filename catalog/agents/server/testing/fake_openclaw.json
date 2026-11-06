@@ -1,0 +1,3997 @@
+{
+ "source": "OpenClaw 2026.11.1 (`openclaw gateway run` under weft's tether), every frame verbatim but these placeholders: $RUN the run (chat.send's idempotencyKey), $KEY the session key, $FOLDER the node's folder, $HOME the private home, $TOOL the text the program's tool answered. Recorded on Node 24.22.2 with weft's own agent server and this adapter (adapter_openclaw.py, every frame each way logged: scratchpad gw/live.py, runs L-tool, L-permission, L-edit, L-resume against a local fake OpenAI-compatible model, gw/model.py; L-real against OpenRouter's openai/gpt-oss-120b), and with the probe client gw/probe.py (r1: OpenRouter's openai/gpt-oss-120b, its second message, the program's tool `lookup` through weft's plugin; q1: a model that could not be reached, the Gateway's final `chat` error; q2: `sessions.describe` of a key the Gateway never had). Cut by gw/build.py: the events of the turn's own run and every approval and question, without the Gateway's ticks, presence, health, session-list and chat-metadata broadcasts, its `chat` deltas and status lines (the same text and phases as its `agent` events), its `usage`, `run_status`, `item` and `command_output` streams, and all but the first three thinking pieces of each thought; `connect`'s hello-ok keeps type, protocol, server, auth and policy (its method and event lists and its snapshot are hundreds of names). A `tool` step stands where the plugin's call reached the route, an `await` step where the Gateway waited for this side's answer. Nothing is composed.",
+ "challenge": {
+  "type": "event",
+  "event": "connect.challenge",
+  "payload": {
+   "nonce": "878a3205-9035-458c-b82b-3a8dab19593d",
+   "ts": 1793889158465,
+   "capabilities": [
+    "model-catalog-snapshot"
+   ]
+  }
+ },
+ "answers": {
+  "connect.starting": {
+   "type": "res",
+   "id": "weft-1",
+   "ok": false,
+   "error": {
+    "code": "UNAVAILABLE",
+    "message": "gateway starting; retry shortly",
+    "retryable": true,
+    "retryAfterMs": 500,
+    "details": {
+     "reason": "startup-sidecars"
+    }
+   }
+  },
+  "connect": {
+   "type": "res",
+   "id": "weft-3",
+   "ok": true,
+   "payload": {
+    "type": "hello-ok",
+    "protocol": 4,
+    "server": {
+     "version": "2026.11.1",
+     "buildId": "2026.11.1-release-4ffdd2047d19-2026-11-05T01-26-26.075Z",
+     "bootId": "e2624efb-3a9d-4a00-a126-fe70b65f2f0f",
+     "controlUiBuildSource": "bundled",
+     "connId": "c6bb2ccc-cf09-4a76-9f90-64174286858f"
+    },
+    "auth": {
+     "method": "token",
+     "role": "operator",
+     "scopes": [
+      "operator.admin",
+      "operator.read",
+      "operator.write",
+      "operator.approvals",
+      "operator.questions"
+     ],
+     "recoveryScope": "iYJEtJh9RpLKwDk4N_pLtJX303492EVhVy159k60ppI"
+    },
+    "policy": {
+     "maxPayload": 26214400,
+     "maxBufferedBytes": 52428800,
+     "tickIntervalMs": 30000,
+     "attachments": {
+      "maxBytes": 19464192,
+      "maxImageBytes": 6291456
+     },
+     "allowedSessionVisibilities": [
+      "shared",
+      "read-only",
+      "suggest",
+      "draft"
+     ],
+     "hasMultipleSessionSharingIdentities": false
+    }
+   }
+  },
+  "sessions.create": {
+   "type": "res",
+   "id": "weft-4",
+   "ok": true,
+   "payload": {
+    "ok": true,
+    "key": "$KEY",
+    "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+    "entry": {
+     "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+     "lifecycleRevision": "61de2e6b-c3eb-4333-8fa9-24bd14e66555",
+     "updatedAt": 1793889161559,
+     "sessionRoot": "$FOLDER",
+     "delivery": {
+      "kind": "none"
+     },
+     "createdVia": "operator",
+     "createdAt": 1793889161560,
+     "spawnedCwd": "$FOLDER",
+     "spawnDepth": 0,
+     "modelOverrideSource": "default",
+     "chatType": "direct",
+     "parentSessionKey": "agent:weft:main"
+    },
+    "runStarted": false,
+    "publicRead": false,
+    "resolved": {
+     "modelProvider": "custom",
+     "model": "fake-model"
+    }
+   }
+  },
+  "sessions.patch": {
+   "type": "res",
+   "id": "weft-5",
+   "ok": true,
+   "payload": {
+    "ok": true,
+    "path": "$HOME/.openclaw/agents/weft/agent/openclaw-agent.sqlite",
+    "key": "$KEY",
+    "entry": {
+     "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+     "lifecycleRevision": "61de2e6b-c3eb-4333-8fa9-24bd14e66555",
+     "updatedAt": 1793889161974,
+     "sessionRoot": "$FOLDER",
+     "delivery": {
+      "kind": "none"
+     },
+     "createdVia": "operator",
+     "createdAt": 1793889161560,
+     "spawnedCwd": "$FOLDER",
+     "spawnDepth": 0,
+     "modelOverrideSource": "default",
+     "chatType": "direct",
+     "parentSessionKey": "agent:weft:main"
+    },
+    "resolved": {
+     "modelProvider": "custom",
+     "model": "fake-model",
+     "agentRuntime": {
+      "id": "openclaw",
+      "source": "implicit"
+     },
+     "runtimeSelectionLocked": false
+    }
+   }
+  },
+  "chat.send": {
+   "type": "res",
+   "id": "weft-6",
+   "ok": true,
+   "payload": {
+    "runId": "$RUN",
+    "status": "started"
+   }
+  },
+  "sessions.describe": {
+   "type": "res",
+   "id": "weft-6",
+   "ok": true,
+   "payload": {
+    "session": {
+     "key": "$KEY",
+     "sessionModelRevision": "ShVSEV3tASPniUbLQvQfkXrivv2udmTzMLd7zrbQyD8",
+     "visibility": "shared",
+     "spawnedCwd": "$FOLDER",
+     "workspaceDir": "$FOLDER",
+     "effectiveCommunication": {
+      "send": "always",
+      "receive": "always"
+     },
+     "permissionModePending": false,
+     "spawnDepth": 0,
+     "createdVia": "operator",
+     "participants": [
+      {
+       "identity": {
+        "type": "observation",
+        "pluginId": null,
+        "accountId": null,
+        "senderKind": "unknown",
+        "id": "gateway-client"
+       }
+      }
+     ],
+     "expandedParticipants": [
+      {
+       "identity": {
+        "type": "observation",
+        "pluginId": null,
+        "accountId": null,
+        "senderKind": "unknown",
+        "id": "gateway-client"
+       }
+      }
+     ],
+     "participantCount": 1,
+     "createdAt": 1793889231202,
+     "kind": "direct",
+     "classification": "direct",
+     "agentId": "weft",
+     "isMain": false,
+     "isDock": false,
+     "isBackground": false,
+     "chatType": "direct",
+     "updatedAt": 1793889234687,
+     "archived": false,
+     "pinned": false,
+     "sidebarRoot": false,
+     "unread": true,
+     "lastInteractionAt": 1793889232216,
+     "lastActivityAt": 1793889234602,
+     "sessionId": "d0e45a69-01e5-4853-9868-f759c672560b",
+     "lifecycleRevision": "46f7456d-359b-4bc5-8966-4e4a8d23d144",
+     "systemSent": true,
+     "abortedLastRun": false,
+     "thinkingLevels": [
+      {
+       "id": "off",
+       "label": "off"
+      },
+      {
+       "id": "ultra",
+       "label": "ultra"
+      }
+     ],
+     "thinkingOptions": [
+      "off",
+      "ultra"
+     ],
+     "thinkingDefault": "off",
+     "effectiveFastMode": false,
+     "effectiveFastModeSource": "default",
+     "fastAutoOnSeconds": 60,
+     "inputTokens": 2,
+     "outputTokens": 2,
+     "usageReport": {
+      "state": "available"
+     },
+     "lastRunId": "250c968d-5223-4943-8acf-d72def2e6990",
+     "parentSessionKey": "agent:weft:main",
+     "effectiveResponseUsage": "off",
+     "effectiveQueueMode": "steer",
+     "modelProvider": "custom",
+     "model": "fake-model",
+     "modelOverrideSource": null,
+     "runtimeSelectionLocked": false,
+     "agentRuntime": {
+      "id": "openclaw",
+      "cloudPlacementSupported": true,
+      "cloudPlacementExecutionMode": "worker-turn",
+      "devicePlacement": {
+       "requiredNodeCommands": [],
+       "consumesWorkerSlot": true
+      },
+      "devicePlacementSupported": true,
+      "source": "implicit"
+     },
+     "snapshotAt": 1793889247095,
+     "status": "done",
+     "startedAt": 1793889233807,
+     "endedAt": 1793889234602,
+     "runtimeMs": 795,
+     "totalTokens": 1,
+     "totalTokensFresh": true,
+     "placement": {
+      "state": "local",
+      "generation": 0,
+      "createdAtMs": 1793889233423,
+      "updatedAtMs": 1793889234593,
+      "stateChangedAtMs": 1793889233423
+     },
+     "activitySummary": {
+      "state": "unavailable",
+      "canEnsure": true
+     },
+     "hasBoard": false,
+     "childOwnerSessionKeys": [
+      "agent:weft:main"
+     ],
+     "hasActiveRun": false,
+     "activeRunIds": [],
+     "sharingRole": "admin",
+     "sendDisabledReason": null
+    }
+   }
+  },
+  "exec.approval.resolve": {
+   "type": "res",
+   "id": "weft-7",
+   "ok": true,
+   "payload": {
+    "ok": true
+   }
+  },
+  "question.resolve": {
+   "type": "res",
+   "id": "weft-7",
+   "ok": true,
+   "payload": {
+    "status": "answered",
+    "answers": {
+     "answers": {
+      "color_choice": [
+       "Blue"
+      ]
+     }
+    }
+   }
+  },
+  "sessions.describe.unknown": {
+   "type": "res",
+   "id": "r3",
+   "ok": true,
+   "payload": {
+    "session": null
+   }
+  }
+ },
+ "turns": {
+  "look it up": [
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "start",
+       "startedAt": 1793889164315
+      },
+      "seq": 3,
+      "ts": 1793889164315,
+      "isHeartbeat": false
+     },
+     "seq": 14
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": "custom",
+       "model": "fake-model"
+      },
+      "seq": 5,
+      "ts": 1793889164908,
+      "isHeartbeat": false
+     },
+     "seq": 17
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "tool",
+      "data": {
+       "phase": "start",
+       "name": "lookup",
+       "toolCallId": "call_1793889164900",
+       "args": {
+        "q": "weft"
+       }
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 8,
+      "ts": 1793889164943,
+      "isHeartbeat": false,
+      "session": {
+       "key": "$KEY",
+       "sessionModelRevision": "6B5DRPkw9D1nZjiyO7RS5y3Jy6jTbyfVqDC5K0kVPK4",
+       "visibility": "shared",
+       "spawnedCwd": "$FOLDER",
+       "workspaceDir": "$FOLDER",
+       "effectiveCommunication": {
+        "send": "always",
+        "receive": "always"
+       },
+       "permissionModePending": false,
+       "spawnDepth": 0,
+       "createdVia": "operator",
+       "participants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "expandedParticipants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "participantCount": 1,
+       "createdAt": 1793889161560,
+       "kind": "direct",
+       "classification": "direct",
+       "agentId": "weft",
+       "isMain": false,
+       "isDock": false,
+       "isBackground": false,
+       "chatType": "direct",
+       "updatedAt": 1793889164363,
+       "archived": false,
+       "pinned": false,
+       "sidebarRoot": false,
+       "unread": true,
+       "lastInteractionAt": 1793889162602,
+       "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+       "lifecycleRevision": "61de2e6b-c3eb-4333-8fa9-24bd14e66555",
+       "systemSent": true,
+       "abortedLastRun": false,
+       "effectiveFastMode": false,
+       "effectiveFastModeSource": "default",
+       "fastAutoOnSeconds": 60,
+       "parentSessionKey": "agent:weft:main",
+       "effectiveResponseUsage": "off",
+       "effectiveQueueMode": "steer",
+       "modelProvider": "custom",
+       "model": "fake-model",
+       "modelOverrideSource": null,
+       "runtimeSelectionLocked": false,
+       "agentRuntime": {
+        "id": "openclaw",
+        "cloudPlacementSupported": true,
+        "cloudPlacementExecutionMode": "worker-turn",
+        "devicePlacement": {
+         "requiredNodeCommands": [],
+         "consumesWorkerSlot": true
+        },
+        "devicePlacementSupported": true,
+        "source": "implicit"
+       },
+       "contextTokens": 128000,
+       "snapshotAt": 1793889164946,
+       "lastRunError": null,
+       "startedAt": 1793889164315,
+       "endedAt": null,
+       "runtimeMs": null,
+       "totalTokensFresh": false,
+       "agentStatus": null,
+       "controlOwnerSessionKey": null,
+       "goal": null,
+       "activeModelProvider": "custom",
+       "activeModel": "fake-model",
+       "placement": {
+        "state": "local",
+        "generation": 0,
+        "createdAtMs": 1793889163906,
+        "updatedAtMs": 1793889163906,
+        "stateChangedAtMs": 1793889163906
+       },
+       "activitySummary": {
+        "state": "unavailable"
+       },
+       "hasBoard": false,
+       "createdActor": null,
+       "owner": null,
+       "archivedAt": null,
+       "archivedBy": null,
+       "archiveReason": null,
+       "pinnedAt": null,
+       "snoozedUntil": null,
+       "snoozedAt": null,
+       "markedUnreadAt": null,
+       "observerDigest": null,
+       "deviceFolder": null,
+       "permissionMode": null,
+       "communication": null,
+       "label": null,
+       "autoLabel": null,
+       "icon": null,
+       "color": null,
+       "channelAvatarUrl": null,
+       "category": null,
+       "boardPresentation": null,
+       "displayName": null,
+       "thinkingLevel": null,
+       "toolOverrides": null,
+       "restartRecoveryStatus": null,
+       "contextBudgetStatus": null,
+       "providerReview": null,
+       "lastRunId": null,
+       "hasAutomation": false
+      },
+      "updatedAt": 1793889164363,
+      "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+      "createdActor": null,
+      "owner": null,
+      "participants": [
+       {
+        "identity": {
+         "type": "observation",
+         "pluginId": null,
+         "accountId": null,
+         "senderKind": "unknown",
+         "id": "gateway-client"
+        }
+       }
+      ],
+      "participantCount": 1,
+      "kind": "direct",
+      "visibility": "shared",
+      "chatType": "direct",
+      "archived": false,
+      "archivedAt": null,
+      "archivedBy": null,
+      "archiveReason": null,
+      "pinned": false,
+      "sidebarRoot": false,
+      "pinnedAt": null,
+      "snoozedUntil": null,
+      "snoozedAt": null,
+      "unread": true,
+      "markedUnreadAt": null,
+      "agentStatus": null,
+      "observerDigest": null,
+      "activitySummary": {
+       "state": "unavailable"
+      },
+      "controlOwnerSessionKey": null,
+      "spawnedCwd": "$FOLDER",
+      "deviceFolder": null,
+      "permissionMode": null,
+      "communication": null,
+      "effectiveCommunication": {
+       "send": "always",
+       "receive": "always"
+      },
+      "permissionModePending": false,
+      "spawnDepth": 0,
+      "createdVia": "operator",
+      "createdAt": 1793889161560,
+      "label": null,
+      "autoLabel": null,
+      "icon": null,
+      "color": null,
+      "channelAvatarUrl": null,
+      "category": null,
+      "boardPresentation": null,
+      "displayName": null,
+      "parentSessionKey": "agent:weft:main",
+      "thinkingLevel": null,
+      "effectiveFastMode": false,
+      "effectiveFastModeSource": "default",
+      "fastAutoOnSeconds": 60,
+      "toolOverrides": null,
+      "systemSent": true,
+      "abortedLastRun": false,
+      "restartRecoveryStatus": null,
+      "totalTokensFresh": false,
+      "goal": null,
+      "contextTokens": 128000,
+      "contextBudgetStatus": null,
+      "effectiveResponseUsage": "off",
+      "modelProvider": "custom",
+      "model": "fake-model",
+      "activeModelProvider": "custom",
+      "activeModel": "fake-model",
+      "modelOverrideSource": null,
+      "agentRuntime": {
+       "id": "openclaw",
+       "cloudPlacementSupported": true,
+       "cloudPlacementExecutionMode": "worker-turn",
+       "devicePlacement": {
+        "requiredNodeCommands": [],
+        "consumesWorkerSlot": true
+       },
+       "devicePlacementSupported": true,
+       "source": "implicit"
+      },
+      "runtimeSelectionLocked": false,
+      "lastRunError": null,
+      "providerReview": null,
+      "lastRunId": null,
+      "hasAutomation": false,
+      "startedAt": 1793889164315,
+      "endedAt": null,
+      "runtimeMs": null
+     },
+     "seq": 20
+    }
+   },
+   {
+    "tool": {
+     "name": "lookup",
+     "arguments": {
+      "q": "weft"
+     }
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "tool",
+      "data": {
+       "phase": "result",
+       "name": "lookup",
+       "toolCallId": "call_1793889164900",
+       "isError": false,
+       "commandBearing": false,
+       "result": {
+        "content": [
+         {
+          "type": "text",
+          "text": "$TOOL"
+         }
+        ],
+        "details": {}
+       }
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 9,
+      "ts": 1793889164969,
+      "isHeartbeat": false,
+      "session": {
+       "key": "$KEY",
+       "sessionModelRevision": "6B5DRPkw9D1nZjiyO7RS5y3Jy6jTbyfVqDC5K0kVPK4",
+       "visibility": "shared",
+       "spawnedCwd": "$FOLDER",
+       "workspaceDir": "$FOLDER",
+       "effectiveCommunication": {
+        "send": "always",
+        "receive": "always"
+       },
+       "permissionModePending": false,
+       "spawnDepth": 0,
+       "createdVia": "operator",
+       "participants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "expandedParticipants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "participantCount": 1,
+       "createdAt": 1793889161560,
+       "kind": "direct",
+       "classification": "direct",
+       "agentId": "weft",
+       "isMain": false,
+       "isDock": false,
+       "isBackground": false,
+       "chatType": "direct",
+       "updatedAt": 1793889164363,
+       "archived": false,
+       "pinned": false,
+       "sidebarRoot": false,
+       "unread": true,
+       "lastInteractionAt": 1793889162602,
+       "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+       "lifecycleRevision": "61de2e6b-c3eb-4333-8fa9-24bd14e66555",
+       "systemSent": true,
+       "abortedLastRun": false,
+       "effectiveFastMode": false,
+       "effectiveFastModeSource": "default",
+       "fastAutoOnSeconds": 60,
+       "parentSessionKey": "agent:weft:main",
+       "effectiveResponseUsage": "off",
+       "effectiveQueueMode": "steer",
+       "modelProvider": "custom",
+       "model": "fake-model",
+       "modelOverrideSource": null,
+       "runtimeSelectionLocked": false,
+       "agentRuntime": {
+        "id": "openclaw",
+        "cloudPlacementSupported": true,
+        "cloudPlacementExecutionMode": "worker-turn",
+        "devicePlacement": {
+         "requiredNodeCommands": [],
+         "consumesWorkerSlot": true
+        },
+        "devicePlacementSupported": true,
+        "source": "implicit"
+       },
+       "contextTokens": 128000,
+       "snapshotAt": 1793889164970,
+       "lastRunError": null,
+       "startedAt": 1793889164315,
+       "endedAt": null,
+       "runtimeMs": null,
+       "totalTokensFresh": false,
+       "agentStatus": null,
+       "controlOwnerSessionKey": null,
+       "goal": null,
+       "activeModelProvider": "custom",
+       "activeModel": "fake-model",
+       "placement": {
+        "state": "local",
+        "generation": 0,
+        "createdAtMs": 1793889163906,
+        "updatedAtMs": 1793889163906,
+        "stateChangedAtMs": 1793889163906
+       },
+       "activitySummary": {
+        "state": "unavailable"
+       },
+       "hasBoard": false,
+       "createdActor": null,
+       "owner": null,
+       "archivedAt": null,
+       "archivedBy": null,
+       "archiveReason": null,
+       "pinnedAt": null,
+       "snoozedUntil": null,
+       "snoozedAt": null,
+       "markedUnreadAt": null,
+       "observerDigest": null,
+       "deviceFolder": null,
+       "permissionMode": null,
+       "communication": null,
+       "label": null,
+       "autoLabel": null,
+       "icon": null,
+       "color": null,
+       "channelAvatarUrl": null,
+       "category": null,
+       "boardPresentation": null,
+       "displayName": null,
+       "thinkingLevel": null,
+       "toolOverrides": null,
+       "restartRecoveryStatus": null,
+       "contextBudgetStatus": null,
+       "providerReview": null,
+       "lastRunId": null,
+       "hasAutomation": false
+      },
+      "updatedAt": 1793889164363,
+      "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+      "createdActor": null,
+      "owner": null,
+      "participants": [
+       {
+        "identity": {
+         "type": "observation",
+         "pluginId": null,
+         "accountId": null,
+         "senderKind": "unknown",
+         "id": "gateway-client"
+        }
+       }
+      ],
+      "participantCount": 1,
+      "kind": "direct",
+      "visibility": "shared",
+      "chatType": "direct",
+      "archived": false,
+      "archivedAt": null,
+      "archivedBy": null,
+      "archiveReason": null,
+      "pinned": false,
+      "sidebarRoot": false,
+      "pinnedAt": null,
+      "snoozedUntil": null,
+      "snoozedAt": null,
+      "unread": true,
+      "markedUnreadAt": null,
+      "agentStatus": null,
+      "observerDigest": null,
+      "activitySummary": {
+       "state": "unavailable"
+      },
+      "controlOwnerSessionKey": null,
+      "spawnedCwd": "$FOLDER",
+      "deviceFolder": null,
+      "permissionMode": null,
+      "communication": null,
+      "effectiveCommunication": {
+       "send": "always",
+       "receive": "always"
+      },
+      "permissionModePending": false,
+      "spawnDepth": 0,
+      "createdVia": "operator",
+      "createdAt": 1793889161560,
+      "label": null,
+      "autoLabel": null,
+      "icon": null,
+      "color": null,
+      "channelAvatarUrl": null,
+      "category": null,
+      "boardPresentation": null,
+      "displayName": null,
+      "parentSessionKey": "agent:weft:main",
+      "thinkingLevel": null,
+      "effectiveFastMode": false,
+      "effectiveFastModeSource": "default",
+      "fastAutoOnSeconds": 60,
+      "toolOverrides": null,
+      "systemSent": true,
+      "abortedLastRun": false,
+      "restartRecoveryStatus": null,
+      "totalTokensFresh": false,
+      "goal": null,
+      "contextTokens": 128000,
+      "contextBudgetStatus": null,
+      "effectiveResponseUsage": "off",
+      "modelProvider": "custom",
+      "model": "fake-model",
+      "activeModelProvider": "custom",
+      "activeModel": "fake-model",
+      "modelOverrideSource": null,
+      "agentRuntime": {
+       "id": "openclaw",
+       "cloudPlacementSupported": true,
+       "cloudPlacementExecutionMode": "worker-turn",
+       "devicePlacement": {
+        "requiredNodeCommands": [],
+        "consumesWorkerSlot": true
+       },
+       "devicePlacementSupported": true,
+       "source": "implicit"
+      },
+      "runtimeSelectionLocked": false,
+      "lastRunError": null,
+      "providerReview": null,
+      "lastRunId": null,
+      "hasAutomation": false,
+      "startedAt": 1793889164315,
+      "endedAt": null,
+      "runtimeMs": null
+     },
+     "seq": 21
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": "custom",
+       "model": "fake-model"
+      },
+      "seq": 11,
+      "ts": 1793889165011,
+      "isHeartbeat": false
+     },
+     "seq": 23
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "assistant",
+      "data": {
+       "text": "done",
+       "delta": "done",
+       "itemId": "3d1b234c-29c4-42d6-8ab0-5f80a455d4f2:2"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 12,
+      "ts": 1793889165018,
+      "isHeartbeat": false
+     },
+     "seq": 24
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "finishing",
+       "stopReason": "stop",
+       "aborted": false,
+       "livenessState": "working",
+       "replayInvalid": true,
+       "endedAt": 1793889165043
+      },
+      "seq": 14,
+      "ts": 1793889165043,
+      "isHeartbeat": false
+     },
+     "seq": 28
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "agentId": "weft",
+      "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+      "sessionKey": "$KEY",
+      "sessionLifecycleRevision": "61de2e6b-c3eb-4333-8fa9-24bd14e66555",
+      "lane": "main",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": null,
+       "model": null
+      },
+      "seq": 15,
+      "ts": 1793889165107,
+      "isHeartbeat": false
+     },
+     "seq": 29
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "stream": "lifecycle",
+      "data": {
+       "stopReason": "stop",
+       "aborted": false,
+       "livenessState": "working",
+       "replayInvalid": true,
+       "phase": "end",
+       "endedAt": 1793889165113,
+       "startedAt": 1793889164315,
+       "terminalReply": {
+        "disposition": "visible",
+        "text": "done"
+       },
+       "terminalReceipt": {
+        "runId": "$RUN",
+        "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+        "turnId": "$RUN",
+        "requested": {
+         "provider": "custom",
+         "model": "fake-model"
+        },
+        "effective": {
+         "provider": "custom",
+         "model": "fake-model",
+         "responseModel": "fake-model"
+        },
+        "successfulToolNames": [
+         "lookup"
+        ],
+        "sourceReplyDelivered": true,
+        "rerouted": false,
+        "terminalDisposition": "visible"
+       },
+       "executionSettled": true
+      },
+      "sessionId": "e34e37b6-f671-4582-ad37-97cdf29f2072",
+      "agentId": "weft",
+      "seq": 16,
+      "ts": 1793889165113,
+      "isHeartbeat": false
+     },
+     "seq": 30
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "chat",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 16,
+      "state": "final",
+      "stopReason": "stop",
+      "message": {
+       "role": "assistant",
+       "content": [
+        {
+         "type": "text",
+         "text": "done"
+        }
+       ],
+       "timestamp": 1793889165118,
+       "openclawDisplayContent": []
+      }
+     },
+     "seq": 31
+    }
+   }
+  ],
+  "go": [
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "fab188fe-0044-4987-ad75-1f0b344c497b",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "start",
+       "startedAt": 1793889276963
+      },
+      "seq": 3,
+      "ts": 1793889276963,
+      "isHeartbeat": false
+     },
+     "seq": 14
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "fab188fe-0044-4987-ad75-1f0b344c497b",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": "custom",
+       "model": "fake-model"
+      },
+      "seq": 5,
+      "ts": 1793889277552,
+      "isHeartbeat": false
+     },
+     "seq": 17
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "tool",
+      "data": {
+       "phase": "start",
+       "name": "exec",
+       "toolCallId": "call_1793889277542",
+       "args": {
+        "command": "touch approved.txt"
+       }
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 8,
+      "ts": 1793889277588,
+      "isHeartbeat": false,
+      "session": {
+       "key": "$KEY",
+       "sessionModelRevision": "lYykABpylEYPvwF-kevkETCnOmHXJ3o9o1BL6zx1rE0",
+       "visibility": "shared",
+       "spawnedCwd": "$FOLDER",
+       "workspaceDir": "$FOLDER",
+       "effectiveCommunication": {
+        "send": "always",
+        "receive": "always"
+       },
+       "permissionModePending": false,
+       "spawnDepth": 0,
+       "createdVia": "operator",
+       "participants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "expandedParticipants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "participantCount": 1,
+       "createdAt": 1793889274355,
+       "kind": "direct",
+       "classification": "direct",
+       "agentId": "weft",
+       "isMain": false,
+       "isDock": false,
+       "isBackground": false,
+       "chatType": "direct",
+       "updatedAt": 1793889277002,
+       "archived": false,
+       "pinned": false,
+       "sidebarRoot": false,
+       "unread": true,
+       "lastInteractionAt": 1793889275378,
+       "sessionId": "fab188fe-0044-4987-ad75-1f0b344c497b",
+       "lifecycleRevision": "217c5c96-fbd5-4191-b110-d2f9122140bc",
+       "systemSent": true,
+       "abortedLastRun": false,
+       "thinkingLevel": "off",
+       "effectiveFastMode": false,
+       "effectiveFastModeSource": "default",
+       "fastAutoOnSeconds": 60,
+       "parentSessionKey": "agent:weft:main",
+       "effectiveResponseUsage": "off",
+       "effectiveQueueMode": "steer",
+       "modelProvider": "custom",
+       "model": "fake-model",
+       "modelOverrideSource": null,
+       "runtimeSelectionLocked": false,
+       "agentRuntime": {
+        "id": "openclaw",
+        "cloudPlacementSupported": true,
+        "cloudPlacementExecutionMode": "worker-turn",
+        "devicePlacement": {
+         "requiredNodeCommands": [],
+         "consumesWorkerSlot": true
+        },
+        "devicePlacementSupported": true,
+        "source": "implicit"
+       },
+       "contextTokens": 128000,
+       "snapshotAt": 1793889277591,
+       "lastRunError": null,
+       "startedAt": 1793889276963,
+       "endedAt": null,
+       "runtimeMs": null,
+       "totalTokensFresh": false,
+       "agentStatus": null,
+       "controlOwnerSessionKey": null,
+       "goal": null,
+       "activeModelProvider": "custom",
+       "activeModel": "fake-model",
+       "placement": {
+        "state": "local",
+        "generation": 0,
+        "createdAtMs": 1793889276576,
+        "updatedAtMs": 1793889276576,
+        "stateChangedAtMs": 1793889276576
+       },
+       "activitySummary": {
+        "state": "unavailable"
+       },
+       "hasBoard": false,
+       "createdActor": null,
+       "owner": null,
+       "archivedAt": null,
+       "archivedBy": null,
+       "archiveReason": null,
+       "pinnedAt": null,
+       "snoozedUntil": null,
+       "snoozedAt": null,
+       "markedUnreadAt": null,
+       "observerDigest": null,
+       "deviceFolder": null,
+       "permissionMode": null,
+       "communication": null,
+       "label": null,
+       "autoLabel": null,
+       "icon": null,
+       "color": null,
+       "channelAvatarUrl": null,
+       "category": null,
+       "boardPresentation": null,
+       "displayName": null,
+       "toolOverrides": null,
+       "restartRecoveryStatus": null,
+       "contextBudgetStatus": null,
+       "providerReview": null,
+       "lastRunId": null,
+       "hasAutomation": false
+      },
+      "updatedAt": 1793889277002,
+      "sessionId": "fab188fe-0044-4987-ad75-1f0b344c497b",
+      "createdActor": null,
+      "owner": null,
+      "participants": [
+       {
+        "identity": {
+         "type": "observation",
+         "pluginId": null,
+         "accountId": null,
+         "senderKind": "unknown",
+         "id": "gateway-client"
+        }
+       }
+      ],
+      "participantCount": 1,
+      "kind": "direct",
+      "visibility": "shared",
+      "chatType": "direct",
+      "archived": false,
+      "archivedAt": null,
+      "archivedBy": null,
+      "archiveReason": null,
+      "pinned": false,
+      "sidebarRoot": false,
+      "pinnedAt": null,
+      "snoozedUntil": null,
+      "snoozedAt": null,
+      "unread": true,
+      "markedUnreadAt": null,
+      "agentStatus": null,
+      "observerDigest": null,
+      "activitySummary": {
+       "state": "unavailable"
+      },
+      "controlOwnerSessionKey": null,
+      "spawnedCwd": "$FOLDER",
+      "deviceFolder": null,
+      "permissionMode": null,
+      "communication": null,
+      "effectiveCommunication": {
+       "send": "always",
+       "receive": "always"
+      },
+      "permissionModePending": false,
+      "spawnDepth": 0,
+      "createdVia": "operator",
+      "createdAt": 1793889274355,
+      "label": null,
+      "autoLabel": null,
+      "icon": null,
+      "color": null,
+      "channelAvatarUrl": null,
+      "category": null,
+      "boardPresentation": null,
+      "displayName": null,
+      "parentSessionKey": "agent:weft:main",
+      "thinkingLevel": "off",
+      "effectiveFastMode": false,
+      "effectiveFastModeSource": "default",
+      "fastAutoOnSeconds": 60,
+      "toolOverrides": null,
+      "systemSent": true,
+      "abortedLastRun": false,
+      "restartRecoveryStatus": null,
+      "totalTokensFresh": false,
+      "goal": null,
+      "contextTokens": 128000,
+      "contextBudgetStatus": null,
+      "effectiveResponseUsage": "off",
+      "modelProvider": "custom",
+      "model": "fake-model",
+      "activeModelProvider": "custom",
+      "activeModel": "fake-model",
+      "modelOverrideSource": null,
+      "agentRuntime": {
+       "id": "openclaw",
+       "cloudPlacementSupported": true,
+       "cloudPlacementExecutionMode": "worker-turn",
+       "devicePlacement": {
+        "requiredNodeCommands": [],
+        "consumesWorkerSlot": true
+       },
+       "devicePlacementSupported": true,
+       "source": "implicit"
+      },
+      "runtimeSelectionLocked": false,
+      "lastRunError": null,
+      "providerReview": null,
+      "lastRunId": null,
+      "hasAutomation": false,
+      "startedAt": 1793889276963,
+      "endedAt": null,
+      "runtimeMs": null
+     },
+     "seq": 20
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "exec.approval.requested",
+     "payload": {
+      "approvalKind": "exec",
+      "id": "31b034cb-6daa-45ec-b08a-543ead1e4c53",
+      "request": {
+       "command": "touch approved.txt",
+       "systemRunBinding": null,
+       "systemRunPlan": null,
+       "cwd": "$FOLDER",
+       "nodeId": null,
+       "host": "gateway",
+       "security": "allowlist",
+       "ask": "on-miss",
+       "warningText": null,
+       "scope": null,
+       "commandAnalysis": {
+        "commandCount": 1,
+        "nestedCommandCount": 0,
+        "riskKinds": [],
+        "warningLines": []
+       },
+       "allowedDecisions": [
+        "allow-once",
+        "allow-always",
+        "deny"
+       ],
+       "agentId": "weft",
+       "resolvedPath": "/usr/bin/touch",
+       "sessionKey": "$KEY",
+       "sessionId": null,
+       "runId": "$RUN",
+       "toolCallId": "call_1793889277542",
+       "turnSourceChannel": "webchat",
+       "turnSourceTo": "$KEY",
+       "turnSourceAccountId": null,
+       "turnSourceThreadId": null,
+       "cronExecutionSource": null,
+       "cronOperationBinding": null
+      },
+      "createdAtMs": 1793889277718,
+      "expiresAtMs": 1793891077718
+     },
+     "seq": 21
+    }
+   },
+   {
+    "await": "exec.approval.resolve"
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "fab188fe-0044-4987-ad75-1f0b344c497b",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "waiting-approval",
+       "approvalId": "31b034cb-6daa-45ec-b08a-543ead1e4c53",
+       "toolCallId": "call_1793889277542"
+      },
+      "agentId": "weft",
+      "seq": 9,
+      "ts": 1793889277747,
+      "isHeartbeat": false
+     },
+     "seq": 22
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "exec.approval.resolved",
+     "payload": {
+      "id": "31b034cb-6daa-45ec-b08a-543ead1e4c53",
+      "decision": "allow-once",
+      "resolvedBy": "weft",
+      "ts": 1793889277754,
+      "request": {
+       "command": "touch approved.txt",
+       "systemRunBinding": null,
+       "systemRunPlan": null,
+       "cwd": "$FOLDER",
+       "nodeId": null,
+       "host": "gateway",
+       "security": "allowlist",
+       "ask": "on-miss",
+       "warningText": null,
+       "scope": null,
+       "commandAnalysis": {
+        "commandCount": 1,
+        "nestedCommandCount": 0,
+        "riskKinds": [],
+        "warningLines": []
+       },
+       "allowedDecisions": [
+        "allow-once",
+        "allow-always",
+        "deny"
+       ],
+       "agentId": "weft",
+       "resolvedPath": "/usr/bin/touch",
+       "sessionKey": "$KEY",
+       "sessionId": null,
+       "runId": "$RUN",
+       "toolCallId": "call_1793889277542",
+       "turnSourceChannel": "webchat",
+       "turnSourceTo": "$KEY",
+       "turnSourceAccountId": null,
+       "turnSourceThreadId": null,
+       "cronExecutionSource": null,
+       "cronOperationBinding": null
+      }
+     },
+     "seq": 23
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "fab188fe-0044-4987-ad75-1f0b344c497b",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "approval-resolved",
+       "approvalId": "31b034cb-6daa-45ec-b08a-543ead1e4c53",
+       "toolCallId": "call_1793889277542"
+      },
+      "agentId": "weft",
+      "seq": 10,
+      "ts": 1793889277757,
+      "isHeartbeat": false
+     },
+     "seq": 24
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "tool",
+      "data": {
+       "phase": "result",
+       "name": "exec",
+       "toolCallId": "call_1793889277542",
+       "meta": "create file approved.txt",
+       "isError": false,
+       "commandBearing": true,
+       "result": {
+        "content": [
+         {
+          "type": "text",
+          "text": "(no output)"
+         }
+        ],
+        "details": {
+         "status": "completed",
+         "exitCode": 0,
+         "exitSignal": null,
+         "exitReason": "exit",
+         "durationMs": 13,
+         "aggregated": "",
+         "noOutputTimedOut": false,
+         "cwd": "$FOLDER"
+        }
+       }
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 11,
+      "ts": 1793889277799,
+      "isHeartbeat": false,
+      "session": {
+       "key": "$KEY",
+       "sessionModelRevision": "lYykABpylEYPvwF-kevkETCnOmHXJ3o9o1BL6zx1rE0",
+       "visibility": "shared",
+       "spawnedCwd": "$FOLDER",
+       "workspaceDir": "$FOLDER",
+       "effectiveCommunication": {
+        "send": "always",
+        "receive": "always"
+       },
+       "permissionModePending": false,
+       "spawnDepth": 0,
+       "createdVia": "operator",
+       "participants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "expandedParticipants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "participantCount": 1,
+       "createdAt": 1793889274355,
+       "kind": "direct",
+       "classification": "direct",
+       "agentId": "weft",
+       "isMain": false,
+       "isDock": false,
+       "isBackground": false,
+       "chatType": "direct",
+       "updatedAt": 1793889277002,
+       "archived": false,
+       "pinned": false,
+       "sidebarRoot": false,
+       "unread": true,
+       "lastInteractionAt": 1793889275378,
+       "sessionId": "fab188fe-0044-4987-ad75-1f0b344c497b",
+       "lifecycleRevision": "217c5c96-fbd5-4191-b110-d2f9122140bc",
+       "systemSent": true,
+       "abortedLastRun": false,
+       "thinkingLevel": "off",
+       "effectiveFastMode": false,
+       "effectiveFastModeSource": "default",
+       "fastAutoOnSeconds": 60,
+       "parentSessionKey": "agent:weft:main",
+       "effectiveResponseUsage": "off",
+       "effectiveQueueMode": "steer",
+       "modelProvider": "custom",
+       "model": "fake-model",
+       "modelOverrideSource": null,
+       "runtimeSelectionLocked": false,
+       "agentRuntime": {
+        "id": "openclaw",
+        "cloudPlacementSupported": true,
+        "cloudPlacementExecutionMode": "worker-turn",
+        "devicePlacement": {
+         "requiredNodeCommands": [],
+         "consumesWorkerSlot": true
+        },
+        "devicePlacementSupported": true,
+        "source": "implicit"
+       },
+       "contextTokens": 128000,
+       "snapshotAt": 1793889277801,
+       "lastRunError": null,
+       "startedAt": 1793889276963,
+       "endedAt": null,
+       "runtimeMs": null,
+       "totalTokensFresh": false,
+       "agentStatus": null,
+       "controlOwnerSessionKey": null,
+       "goal": null,
+       "activeModelProvider": "custom",
+       "activeModel": "fake-model",
+       "placement": {
+        "state": "local",
+        "generation": 0,
+        "createdAtMs": 1793889276576,
+        "updatedAtMs": 1793889276576,
+        "stateChangedAtMs": 1793889276576
+       },
+       "activitySummary": {
+        "state": "unavailable"
+       },
+       "hasBoard": false,
+       "createdActor": null,
+       "owner": null,
+       "archivedAt": null,
+       "archivedBy": null,
+       "archiveReason": null,
+       "pinnedAt": null,
+       "snoozedUntil": null,
+       "snoozedAt": null,
+       "markedUnreadAt": null,
+       "observerDigest": null,
+       "deviceFolder": null,
+       "permissionMode": null,
+       "communication": null,
+       "label": null,
+       "autoLabel": null,
+       "icon": null,
+       "color": null,
+       "channelAvatarUrl": null,
+       "category": null,
+       "boardPresentation": null,
+       "displayName": null,
+       "toolOverrides": null,
+       "restartRecoveryStatus": null,
+       "contextBudgetStatus": null,
+       "providerReview": null,
+       "lastRunId": null,
+       "hasAutomation": false
+      },
+      "updatedAt": 1793889277002,
+      "sessionId": "fab188fe-0044-4987-ad75-1f0b344c497b",
+      "createdActor": null,
+      "owner": null,
+      "participants": [
+       {
+        "identity": {
+         "type": "observation",
+         "pluginId": null,
+         "accountId": null,
+         "senderKind": "unknown",
+         "id": "gateway-client"
+        }
+       }
+      ],
+      "participantCount": 1,
+      "kind": "direct",
+      "visibility": "shared",
+      "chatType": "direct",
+      "archived": false,
+      "archivedAt": null,
+      "archivedBy": null,
+      "archiveReason": null,
+      "pinned": false,
+      "sidebarRoot": false,
+      "pinnedAt": null,
+      "snoozedUntil": null,
+      "snoozedAt": null,
+      "unread": true,
+      "markedUnreadAt": null,
+      "agentStatus": null,
+      "observerDigest": null,
+      "activitySummary": {
+       "state": "unavailable"
+      },
+      "controlOwnerSessionKey": null,
+      "spawnedCwd": "$FOLDER",
+      "deviceFolder": null,
+      "permissionMode": null,
+      "communication": null,
+      "effectiveCommunication": {
+       "send": "always",
+       "receive": "always"
+      },
+      "permissionModePending": false,
+      "spawnDepth": 0,
+      "createdVia": "operator",
+      "createdAt": 1793889274355,
+      "label": null,
+      "autoLabel": null,
+      "icon": null,
+      "color": null,
+      "channelAvatarUrl": null,
+      "category": null,
+      "boardPresentation": null,
+      "displayName": null,
+      "parentSessionKey": "agent:weft:main",
+      "thinkingLevel": "off",
+      "effectiveFastMode": false,
+      "effectiveFastModeSource": "default",
+      "fastAutoOnSeconds": 60,
+      "toolOverrides": null,
+      "systemSent": true,
+      "abortedLastRun": false,
+      "restartRecoveryStatus": null,
+      "totalTokensFresh": false,
+      "goal": null,
+      "contextTokens": 128000,
+      "contextBudgetStatus": null,
+      "effectiveResponseUsage": "off",
+      "modelProvider": "custom",
+      "model": "fake-model",
+      "activeModelProvider": "custom",
+      "activeModel": "fake-model",
+      "modelOverrideSource": null,
+      "agentRuntime": {
+       "id": "openclaw",
+       "cloudPlacementSupported": true,
+       "cloudPlacementExecutionMode": "worker-turn",
+       "devicePlacement": {
+        "requiredNodeCommands": [],
+        "consumesWorkerSlot": true
+       },
+       "devicePlacementSupported": true,
+       "source": "implicit"
+      },
+      "runtimeSelectionLocked": false,
+      "lastRunError": null,
+      "providerReview": null,
+      "lastRunId": null,
+      "hasAutomation": false,
+      "startedAt": 1793889276963,
+      "endedAt": null,
+      "runtimeMs": null
+     },
+     "seq": 25
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "fab188fe-0044-4987-ad75-1f0b344c497b",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": "custom",
+       "model": "fake-model"
+      },
+      "seq": 14,
+      "ts": 1793889277841,
+      "isHeartbeat": false
+     },
+     "seq": 28
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "assistant",
+      "data": {
+       "text": "done",
+       "delta": "done",
+       "itemId": "3675c279-44b8-4009-88db-ef66eedfc28b:2"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 15,
+      "ts": 1793889277849,
+      "isHeartbeat": false
+     },
+     "seq": 29
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "fab188fe-0044-4987-ad75-1f0b344c497b",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "finishing",
+       "stopReason": "stop",
+       "aborted": false,
+       "livenessState": "working",
+       "replayInvalid": true,
+       "endedAt": 1793889277874
+      },
+      "seq": 17,
+      "ts": 1793889277875,
+      "isHeartbeat": false
+     },
+     "seq": 33
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "agentId": "weft",
+      "sessionId": "fab188fe-0044-4987-ad75-1f0b344c497b",
+      "sessionKey": "$KEY",
+      "sessionLifecycleRevision": "217c5c96-fbd5-4191-b110-d2f9122140bc",
+      "lane": "main",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": null,
+       "model": null
+      },
+      "seq": 18,
+      "ts": 1793889277952,
+      "isHeartbeat": false
+     },
+     "seq": 34
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "stream": "lifecycle",
+      "data": {
+       "stopReason": "stop",
+       "aborted": false,
+       "livenessState": "working",
+       "replayInvalid": true,
+       "phase": "end",
+       "endedAt": 1793889277958,
+       "startedAt": 1793889276963,
+       "terminalReply": {
+        "disposition": "visible",
+        "text": "done"
+       },
+       "terminalReceipt": {
+        "runId": "$RUN",
+        "sessionId": "fab188fe-0044-4987-ad75-1f0b344c497b",
+        "turnId": "$RUN",
+        "requested": {
+         "provider": "custom",
+         "model": "fake-model"
+        },
+        "effective": {
+         "provider": "custom",
+         "model": "fake-model",
+         "responseModel": "fake-model"
+        },
+        "successfulToolNames": [
+         "exec"
+        ],
+        "sourceReplyDelivered": true,
+        "rerouted": false,
+        "terminalDisposition": "visible"
+       },
+       "executionSettled": true
+      },
+      "sessionId": "fab188fe-0044-4987-ad75-1f0b344c497b",
+      "agentId": "weft",
+      "seq": 19,
+      "ts": 1793889277958,
+      "isHeartbeat": false
+     },
+     "seq": 35
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "chat",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 19,
+      "state": "final",
+      "stopReason": "stop",
+      "message": {
+       "role": "assistant",
+       "content": [
+        {
+         "type": "text",
+         "text": "done"
+        }
+       ],
+       "timestamp": 1793889277963,
+       "openclawDisplayContent": []
+      }
+     },
+     "seq": 36
+    }
+   }
+  ],
+  "write a file": [
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "b32f2f26-23df-45cb-b6b1-f09194a72cd6",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "start",
+       "startedAt": 1793889217359
+      },
+      "seq": 3,
+      "ts": 1793889217359,
+      "isHeartbeat": false
+     },
+     "seq": 14
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "b32f2f26-23df-45cb-b6b1-f09194a72cd6",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": "custom",
+       "model": "fake-model"
+      },
+      "seq": 5,
+      "ts": 1793889217956,
+      "isHeartbeat": false
+     },
+     "seq": 17
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "tool",
+      "data": {
+       "phase": "input_delta",
+       "toolCallId": "call_1793889217948",
+       "name": "write",
+       "diff": {
+        "added": 1,
+        "removed": 0
+       }
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 6,
+      "ts": 1793889217966,
+      "isHeartbeat": false,
+      "session": {
+       "key": "$KEY",
+       "sessionModelRevision": "ARx0QsuG2OeIK2pbFneiCwJ4Fnu8fqgQdaUe66BSTr4",
+       "visibility": "shared",
+       "spawnedCwd": "$FOLDER",
+       "workspaceDir": "$FOLDER",
+       "effectiveCommunication": {
+        "send": "always",
+        "receive": "always"
+       },
+       "permissionModePending": false,
+       "spawnDepth": 0,
+       "createdVia": "operator",
+       "participants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "expandedParticipants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "participantCount": 1,
+       "createdAt": 1793889214804,
+       "kind": "direct",
+       "classification": "direct",
+       "agentId": "weft",
+       "isMain": false,
+       "isDock": false,
+       "isBackground": false,
+       "chatType": "direct",
+       "updatedAt": 1793889217397,
+       "archived": false,
+       "pinned": false,
+       "sidebarRoot": false,
+       "unread": true,
+       "lastInteractionAt": 1793889215788,
+       "sessionId": "b32f2f26-23df-45cb-b6b1-f09194a72cd6",
+       "lifecycleRevision": "338c4cb4-429a-4018-b502-7bd3e3f8c517",
+       "systemSent": true,
+       "abortedLastRun": false,
+       "effectiveFastMode": false,
+       "effectiveFastModeSource": "default",
+       "fastAutoOnSeconds": 60,
+       "parentSessionKey": "agent:weft:main",
+       "effectiveResponseUsage": "off",
+       "effectiveQueueMode": "steer",
+       "modelProvider": "custom",
+       "model": "fake-model",
+       "modelOverrideSource": null,
+       "runtimeSelectionLocked": false,
+       "agentRuntime": {
+        "id": "openclaw",
+        "cloudPlacementSupported": true,
+        "cloudPlacementExecutionMode": "worker-turn",
+        "devicePlacement": {
+         "requiredNodeCommands": [],
+         "consumesWorkerSlot": true
+        },
+        "devicePlacementSupported": true,
+        "source": "implicit"
+       },
+       "contextTokens": 128000,
+       "snapshotAt": 1793889217967,
+       "lastRunError": null,
+       "startedAt": 1793889217359,
+       "endedAt": null,
+       "runtimeMs": null,
+       "totalTokensFresh": false,
+       "agentStatus": null,
+       "controlOwnerSessionKey": null,
+       "goal": null,
+       "activeModelProvider": "custom",
+       "activeModel": "fake-model",
+       "placement": {
+        "state": "local",
+        "generation": 0,
+        "createdAtMs": 1793889216964,
+        "updatedAtMs": 1793889216964,
+        "stateChangedAtMs": 1793889216964
+       },
+       "activitySummary": {
+        "state": "unavailable"
+       },
+       "hasBoard": false,
+       "createdActor": null,
+       "owner": null,
+       "archivedAt": null,
+       "archivedBy": null,
+       "archiveReason": null,
+       "pinnedAt": null,
+       "snoozedUntil": null,
+       "snoozedAt": null,
+       "markedUnreadAt": null,
+       "observerDigest": null,
+       "deviceFolder": null,
+       "permissionMode": null,
+       "communication": null,
+       "label": null,
+       "autoLabel": null,
+       "icon": null,
+       "color": null,
+       "channelAvatarUrl": null,
+       "category": null,
+       "boardPresentation": null,
+       "displayName": null,
+       "thinkingLevel": null,
+       "toolOverrides": null,
+       "restartRecoveryStatus": null,
+       "contextBudgetStatus": null,
+       "providerReview": null,
+       "lastRunId": null,
+       "hasAutomation": false
+      },
+      "updatedAt": 1793889217397,
+      "sessionId": "b32f2f26-23df-45cb-b6b1-f09194a72cd6",
+      "createdActor": null,
+      "owner": null,
+      "participants": [
+       {
+        "identity": {
+         "type": "observation",
+         "pluginId": null,
+         "accountId": null,
+         "senderKind": "unknown",
+         "id": "gateway-client"
+        }
+       }
+      ],
+      "participantCount": 1,
+      "kind": "direct",
+      "visibility": "shared",
+      "chatType": "direct",
+      "archived": false,
+      "archivedAt": null,
+      "archivedBy": null,
+      "archiveReason": null,
+      "pinned": false,
+      "sidebarRoot": false,
+      "pinnedAt": null,
+      "snoozedUntil": null,
+      "snoozedAt": null,
+      "unread": true,
+      "markedUnreadAt": null,
+      "agentStatus": null,
+      "observerDigest": null,
+      "activitySummary": {
+       "state": "unavailable"
+      },
+      "controlOwnerSessionKey": null,
+      "spawnedCwd": "$FOLDER",
+      "deviceFolder": null,
+      "permissionMode": null,
+      "communication": null,
+      "effectiveCommunication": {
+       "send": "always",
+       "receive": "always"
+      },
+      "permissionModePending": false,
+      "spawnDepth": 0,
+      "createdVia": "operator",
+      "createdAt": 1793889214804,
+      "label": null,
+      "autoLabel": null,
+      "icon": null,
+      "color": null,
+      "channelAvatarUrl": null,
+      "category": null,
+      "boardPresentation": null,
+      "displayName": null,
+      "parentSessionKey": "agent:weft:main",
+      "thinkingLevel": null,
+      "effectiveFastMode": false,
+      "effectiveFastModeSource": "default",
+      "fastAutoOnSeconds": 60,
+      "toolOverrides": null,
+      "systemSent": true,
+      "abortedLastRun": false,
+      "restartRecoveryStatus": null,
+      "totalTokensFresh": false,
+      "goal": null,
+      "contextTokens": 128000,
+      "contextBudgetStatus": null,
+      "effectiveResponseUsage": "off",
+      "modelProvider": "custom",
+      "model": "fake-model",
+      "activeModelProvider": "custom",
+      "activeModel": "fake-model",
+      "modelOverrideSource": null,
+      "agentRuntime": {
+       "id": "openclaw",
+       "cloudPlacementSupported": true,
+       "cloudPlacementExecutionMode": "worker-turn",
+       "devicePlacement": {
+        "requiredNodeCommands": [],
+        "consumesWorkerSlot": true
+       },
+       "devicePlacementSupported": true,
+       "source": "implicit"
+      },
+      "runtimeSelectionLocked": false,
+      "lastRunError": null,
+      "providerReview": null,
+      "lastRunId": null,
+      "hasAutomation": false,
+      "startedAt": 1793889217359,
+      "endedAt": null,
+      "runtimeMs": null
+     },
+     "seq": 18
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "tool",
+      "data": {
+       "phase": "start",
+       "name": "write",
+       "toolCallId": "call_1793889217948",
+       "args": {
+        "path": "notes.txt",
+        "content": "hi\n"
+       }
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 9,
+      "ts": 1793889217994,
+      "isHeartbeat": false,
+      "session": {
+       "key": "$KEY",
+       "sessionModelRevision": "ARx0QsuG2OeIK2pbFneiCwJ4Fnu8fqgQdaUe66BSTr4",
+       "visibility": "shared",
+       "spawnedCwd": "$FOLDER",
+       "workspaceDir": "$FOLDER",
+       "effectiveCommunication": {
+        "send": "always",
+        "receive": "always"
+       },
+       "permissionModePending": false,
+       "spawnDepth": 0,
+       "createdVia": "operator",
+       "participants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "expandedParticipants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "participantCount": 1,
+       "createdAt": 1793889214804,
+       "kind": "direct",
+       "classification": "direct",
+       "agentId": "weft",
+       "isMain": false,
+       "isDock": false,
+       "isBackground": false,
+       "chatType": "direct",
+       "updatedAt": 1793889217397,
+       "archived": false,
+       "pinned": false,
+       "sidebarRoot": false,
+       "unread": true,
+       "lastInteractionAt": 1793889215788,
+       "sessionId": "b32f2f26-23df-45cb-b6b1-f09194a72cd6",
+       "lifecycleRevision": "338c4cb4-429a-4018-b502-7bd3e3f8c517",
+       "systemSent": true,
+       "abortedLastRun": false,
+       "effectiveFastMode": false,
+       "effectiveFastModeSource": "default",
+       "fastAutoOnSeconds": 60,
+       "parentSessionKey": "agent:weft:main",
+       "effectiveResponseUsage": "off",
+       "effectiveQueueMode": "steer",
+       "modelProvider": "custom",
+       "model": "fake-model",
+       "modelOverrideSource": null,
+       "runtimeSelectionLocked": false,
+       "agentRuntime": {
+        "id": "openclaw",
+        "cloudPlacementSupported": true,
+        "cloudPlacementExecutionMode": "worker-turn",
+        "devicePlacement": {
+         "requiredNodeCommands": [],
+         "consumesWorkerSlot": true
+        },
+        "devicePlacementSupported": true,
+        "source": "implicit"
+       },
+       "contextTokens": 128000,
+       "snapshotAt": 1793889217996,
+       "lastRunError": null,
+       "startedAt": 1793889217359,
+       "endedAt": null,
+       "runtimeMs": null,
+       "totalTokensFresh": false,
+       "agentStatus": null,
+       "controlOwnerSessionKey": null,
+       "goal": null,
+       "activeModelProvider": "custom",
+       "activeModel": "fake-model",
+       "placement": {
+        "state": "local",
+        "generation": 0,
+        "createdAtMs": 1793889216964,
+        "updatedAtMs": 1793889216964,
+        "stateChangedAtMs": 1793889216964
+       },
+       "activitySummary": {
+        "state": "unavailable"
+       },
+       "hasBoard": false,
+       "createdActor": null,
+       "owner": null,
+       "archivedAt": null,
+       "archivedBy": null,
+       "archiveReason": null,
+       "pinnedAt": null,
+       "snoozedUntil": null,
+       "snoozedAt": null,
+       "markedUnreadAt": null,
+       "observerDigest": null,
+       "deviceFolder": null,
+       "permissionMode": null,
+       "communication": null,
+       "label": null,
+       "autoLabel": null,
+       "icon": null,
+       "color": null,
+       "channelAvatarUrl": null,
+       "category": null,
+       "boardPresentation": null,
+       "displayName": null,
+       "thinkingLevel": null,
+       "toolOverrides": null,
+       "restartRecoveryStatus": null,
+       "contextBudgetStatus": null,
+       "providerReview": null,
+       "lastRunId": null,
+       "hasAutomation": false
+      },
+      "updatedAt": 1793889217397,
+      "sessionId": "b32f2f26-23df-45cb-b6b1-f09194a72cd6",
+      "createdActor": null,
+      "owner": null,
+      "participants": [
+       {
+        "identity": {
+         "type": "observation",
+         "pluginId": null,
+         "accountId": null,
+         "senderKind": "unknown",
+         "id": "gateway-client"
+        }
+       }
+      ],
+      "participantCount": 1,
+      "kind": "direct",
+      "visibility": "shared",
+      "chatType": "direct",
+      "archived": false,
+      "archivedAt": null,
+      "archivedBy": null,
+      "archiveReason": null,
+      "pinned": false,
+      "sidebarRoot": false,
+      "pinnedAt": null,
+      "snoozedUntil": null,
+      "snoozedAt": null,
+      "unread": true,
+      "markedUnreadAt": null,
+      "agentStatus": null,
+      "observerDigest": null,
+      "activitySummary": {
+       "state": "unavailable"
+      },
+      "controlOwnerSessionKey": null,
+      "spawnedCwd": "$FOLDER",
+      "deviceFolder": null,
+      "permissionMode": null,
+      "communication": null,
+      "effectiveCommunication": {
+       "send": "always",
+       "receive": "always"
+      },
+      "permissionModePending": false,
+      "spawnDepth": 0,
+      "createdVia": "operator",
+      "createdAt": 1793889214804,
+      "label": null,
+      "autoLabel": null,
+      "icon": null,
+      "color": null,
+      "channelAvatarUrl": null,
+      "category": null,
+      "boardPresentation": null,
+      "displayName": null,
+      "parentSessionKey": "agent:weft:main",
+      "thinkingLevel": null,
+      "effectiveFastMode": false,
+      "effectiveFastModeSource": "default",
+      "fastAutoOnSeconds": 60,
+      "toolOverrides": null,
+      "systemSent": true,
+      "abortedLastRun": false,
+      "restartRecoveryStatus": null,
+      "totalTokensFresh": false,
+      "goal": null,
+      "contextTokens": 128000,
+      "contextBudgetStatus": null,
+      "effectiveResponseUsage": "off",
+      "modelProvider": "custom",
+      "model": "fake-model",
+      "activeModelProvider": "custom",
+      "activeModel": "fake-model",
+      "modelOverrideSource": null,
+      "agentRuntime": {
+       "id": "openclaw",
+       "cloudPlacementSupported": true,
+       "cloudPlacementExecutionMode": "worker-turn",
+       "devicePlacement": {
+        "requiredNodeCommands": [],
+        "consumesWorkerSlot": true
+       },
+       "devicePlacementSupported": true,
+       "source": "implicit"
+      },
+      "runtimeSelectionLocked": false,
+      "lastRunError": null,
+      "providerReview": null,
+      "lastRunId": null,
+      "hasAutomation": false,
+      "startedAt": 1793889217359,
+      "endedAt": null,
+      "runtimeMs": null
+     },
+     "seq": 21
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "tool",
+      "data": {
+       "phase": "result",
+       "name": "write",
+       "toolCallId": "call_1793889217948",
+       "meta": "to notes.txt (3 chars)",
+       "isError": false,
+       "commandBearing": false,
+       "result": {
+        "content": [
+         {
+          "type": "text",
+          "text": "Successfully wrote 3 bytes to $FOLDER/notes.txt"
+         }
+        ],
+        "details": {
+         "changed": true,
+         "created": true,
+         "diff": "+1 hi",
+         "firstChangedLine": 1,
+         "patch": "--- $FOLDER/notes.txt\n+++ $FOLDER/notes.txt\n@@ -0,0 +1,1 @@\n+hi\n"
+        }
+       }
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 10,
+      "ts": 1793889218317,
+      "isHeartbeat": false,
+      "session": {
+       "key": "$KEY",
+       "sessionModelRevision": "ARx0QsuG2OeIK2pbFneiCwJ4Fnu8fqgQdaUe66BSTr4",
+       "visibility": "shared",
+       "spawnedCwd": "$FOLDER",
+       "workspaceDir": "$FOLDER",
+       "effectiveCommunication": {
+        "send": "always",
+        "receive": "always"
+       },
+       "permissionModePending": false,
+       "spawnDepth": 0,
+       "createdVia": "operator",
+       "participants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "expandedParticipants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "participantCount": 1,
+       "createdAt": 1793889214804,
+       "kind": "direct",
+       "classification": "direct",
+       "agentId": "weft",
+       "isMain": false,
+       "isDock": false,
+       "isBackground": false,
+       "chatType": "direct",
+       "updatedAt": 1793889217397,
+       "archived": false,
+       "pinned": false,
+       "sidebarRoot": false,
+       "unread": true,
+       "lastInteractionAt": 1793889215788,
+       "sessionId": "b32f2f26-23df-45cb-b6b1-f09194a72cd6",
+       "lifecycleRevision": "338c4cb4-429a-4018-b502-7bd3e3f8c517",
+       "systemSent": true,
+       "abortedLastRun": false,
+       "effectiveFastMode": false,
+       "effectiveFastModeSource": "default",
+       "fastAutoOnSeconds": 60,
+       "parentSessionKey": "agent:weft:main",
+       "effectiveResponseUsage": "off",
+       "effectiveQueueMode": "steer",
+       "modelProvider": "custom",
+       "model": "fake-model",
+       "modelOverrideSource": null,
+       "runtimeSelectionLocked": false,
+       "agentRuntime": {
+        "id": "openclaw",
+        "cloudPlacementSupported": true,
+        "cloudPlacementExecutionMode": "worker-turn",
+        "devicePlacement": {
+         "requiredNodeCommands": [],
+         "consumesWorkerSlot": true
+        },
+        "devicePlacementSupported": true,
+        "source": "implicit"
+       },
+       "contextTokens": 128000,
+       "snapshotAt": 1793889218319,
+       "lastRunError": null,
+       "startedAt": 1793889217359,
+       "endedAt": null,
+       "runtimeMs": null,
+       "totalTokensFresh": false,
+       "agentStatus": null,
+       "controlOwnerSessionKey": null,
+       "goal": null,
+       "activeModelProvider": "custom",
+       "activeModel": "fake-model",
+       "placement": {
+        "state": "local",
+        "generation": 0,
+        "createdAtMs": 1793889216964,
+        "updatedAtMs": 1793889216964,
+        "stateChangedAtMs": 1793889216964
+       },
+       "activitySummary": {
+        "state": "unavailable"
+       },
+       "hasBoard": false,
+       "createdActor": null,
+       "owner": null,
+       "archivedAt": null,
+       "archivedBy": null,
+       "archiveReason": null,
+       "pinnedAt": null,
+       "snoozedUntil": null,
+       "snoozedAt": null,
+       "markedUnreadAt": null,
+       "observerDigest": null,
+       "deviceFolder": null,
+       "permissionMode": null,
+       "communication": null,
+       "label": null,
+       "autoLabel": null,
+       "icon": null,
+       "color": null,
+       "channelAvatarUrl": null,
+       "category": null,
+       "boardPresentation": null,
+       "displayName": null,
+       "thinkingLevel": null,
+       "toolOverrides": null,
+       "restartRecoveryStatus": null,
+       "contextBudgetStatus": null,
+       "providerReview": null,
+       "lastRunId": null,
+       "hasAutomation": false
+      },
+      "updatedAt": 1793889217397,
+      "sessionId": "b32f2f26-23df-45cb-b6b1-f09194a72cd6",
+      "createdActor": null,
+      "owner": null,
+      "participants": [
+       {
+        "identity": {
+         "type": "observation",
+         "pluginId": null,
+         "accountId": null,
+         "senderKind": "unknown",
+         "id": "gateway-client"
+        }
+       }
+      ],
+      "participantCount": 1,
+      "kind": "direct",
+      "visibility": "shared",
+      "chatType": "direct",
+      "archived": false,
+      "archivedAt": null,
+      "archivedBy": null,
+      "archiveReason": null,
+      "pinned": false,
+      "sidebarRoot": false,
+      "pinnedAt": null,
+      "snoozedUntil": null,
+      "snoozedAt": null,
+      "unread": true,
+      "markedUnreadAt": null,
+      "agentStatus": null,
+      "observerDigest": null,
+      "activitySummary": {
+       "state": "unavailable"
+      },
+      "controlOwnerSessionKey": null,
+      "spawnedCwd": "$FOLDER",
+      "deviceFolder": null,
+      "permissionMode": null,
+      "communication": null,
+      "effectiveCommunication": {
+       "send": "always",
+       "receive": "always"
+      },
+      "permissionModePending": false,
+      "spawnDepth": 0,
+      "createdVia": "operator",
+      "createdAt": 1793889214804,
+      "label": null,
+      "autoLabel": null,
+      "icon": null,
+      "color": null,
+      "channelAvatarUrl": null,
+      "category": null,
+      "boardPresentation": null,
+      "displayName": null,
+      "parentSessionKey": "agent:weft:main",
+      "thinkingLevel": null,
+      "effectiveFastMode": false,
+      "effectiveFastModeSource": "default",
+      "fastAutoOnSeconds": 60,
+      "toolOverrides": null,
+      "systemSent": true,
+      "abortedLastRun": false,
+      "restartRecoveryStatus": null,
+      "totalTokensFresh": false,
+      "goal": null,
+      "contextTokens": 128000,
+      "contextBudgetStatus": null,
+      "effectiveResponseUsage": "off",
+      "modelProvider": "custom",
+      "model": "fake-model",
+      "activeModelProvider": "custom",
+      "activeModel": "fake-model",
+      "modelOverrideSource": null,
+      "agentRuntime": {
+       "id": "openclaw",
+       "cloudPlacementSupported": true,
+       "cloudPlacementExecutionMode": "worker-turn",
+       "devicePlacement": {
+        "requiredNodeCommands": [],
+        "consumesWorkerSlot": true
+       },
+       "devicePlacementSupported": true,
+       "source": "implicit"
+      },
+      "runtimeSelectionLocked": false,
+      "lastRunError": null,
+      "providerReview": null,
+      "lastRunId": null,
+      "hasAutomation": false,
+      "startedAt": 1793889217359,
+      "endedAt": null,
+      "runtimeMs": null
+     },
+     "seq": 22
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "b32f2f26-23df-45cb-b6b1-f09194a72cd6",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": "custom",
+       "model": "fake-model"
+      },
+      "seq": 12,
+      "ts": 1793889218359,
+      "isHeartbeat": false
+     },
+     "seq": 24
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "assistant",
+      "data": {
+       "text": "done",
+       "delta": "done",
+       "itemId": "ce54bbbc-d92b-4b67-bcea-c5c53f6e0105:2"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 13,
+      "ts": 1793889218367,
+      "isHeartbeat": false
+     },
+     "seq": 25
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "b32f2f26-23df-45cb-b6b1-f09194a72cd6",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "finishing",
+       "stopReason": "stop",
+       "aborted": false,
+       "livenessState": "working",
+       "replayInvalid": true,
+       "endedAt": 1793889218391
+      },
+      "seq": 15,
+      "ts": 1793889218391,
+      "isHeartbeat": false
+     },
+     "seq": 29
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "agentId": "weft",
+      "sessionId": "b32f2f26-23df-45cb-b6b1-f09194a72cd6",
+      "sessionKey": "$KEY",
+      "sessionLifecycleRevision": "338c4cb4-429a-4018-b502-7bd3e3f8c517",
+      "lane": "main",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": null,
+       "model": null
+      },
+      "seq": 16,
+      "ts": 1793889218457,
+      "isHeartbeat": false
+     },
+     "seq": 30
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "stream": "lifecycle",
+      "data": {
+       "stopReason": "stop",
+       "aborted": false,
+       "livenessState": "working",
+       "replayInvalid": true,
+       "phase": "end",
+       "endedAt": 1793889218462,
+       "startedAt": 1793889217359,
+       "terminalReply": {
+        "disposition": "visible",
+        "text": "done"
+       },
+       "terminalReceipt": {
+        "runId": "$RUN",
+        "sessionId": "b32f2f26-23df-45cb-b6b1-f09194a72cd6",
+        "turnId": "$RUN",
+        "requested": {
+         "provider": "custom",
+         "model": "fake-model"
+        },
+        "effective": {
+         "provider": "custom",
+         "model": "fake-model",
+         "responseModel": "fake-model"
+        },
+        "successfulToolNames": [
+         "write"
+        ],
+        "sourceReplyDelivered": true,
+        "rerouted": false,
+        "terminalDisposition": "visible"
+       },
+       "executionSettled": true
+      },
+      "sessionId": "b32f2f26-23df-45cb-b6b1-f09194a72cd6",
+      "agentId": "weft",
+      "seq": 17,
+      "ts": 1793889218462,
+      "isHeartbeat": false
+     },
+     "seq": 31
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "chat",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 17,
+      "state": "final",
+      "stopReason": "stop",
+      "message": {
+       "role": "assistant",
+       "content": [
+        {
+         "type": "text",
+         "text": "done"
+        }
+       ],
+       "timestamp": 1793889218468,
+       "openclawDisplayContent": []
+      }
+     },
+     "seq": 32
+    }
+   }
+  ],
+  "pick a color": [
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "ff1fc5ac-2d72-46bf-8d6e-0d1a0e6296ab",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "start",
+       "startedAt": 1793889300110
+      },
+      "seq": 3,
+      "ts": 1793889300110,
+      "isHeartbeat": false
+     },
+     "seq": 11
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "ff1fc5ac-2d72-46bf-8d6e-0d1a0e6296ab",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": "openrouter",
+       "model": "openai/gpt-oss-120b"
+      },
+      "seq": 5,
+      "ts": 1793889303396,
+      "isHeartbeat": false
+     },
+     "seq": 17
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "thinking",
+      "data": {
+       "text": "The",
+       "delta": "The",
+       "itemId": "031c9f7d-fc52-4c2e-9d0c-cf11b13130c9"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 6,
+      "ts": 1793889303471,
+      "isHeartbeat": false
+     },
+     "seq": 18
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "thinking",
+      "data": {
+       "text": "The user wants to use ask_user tool",
+       "delta": " user wants to use ask_user tool",
+       "itemId": "031c9f7d-fc52-4c2e-9d0c-cf11b13130c9"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 11,
+      "ts": 1793889303537,
+      "isHeartbeat": false
+     },
+     "seq": 19
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "thinking",
+      "data": {
+       "text": "The user wants to use ask_user tool to ask a single",
+       "delta": " to ask a single",
+       "itemId": "031c9f7d-fc52-4c2e-9d0c-cf11b13130c9"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 14,
+      "ts": 1793889303609,
+      "isHeartbeat": false
+     },
+     "seq": 20
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "thinking",
+      "data": {
+       "phase": "persisted",
+       "itemId": "031c9f7d-fc52-4c2e-9d0c-cf11b13130c9",
+       "messageId": "c2c4a44a-b9fc-4a16-b231-28be9a377cfc",
+       "messageRunId": "$RUN"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 138,
+      "ts": 1793889308449,
+      "isHeartbeat": false
+     },
+     "seq": 57
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "tool",
+      "data": {
+       "phase": "start",
+       "name": "ask_user",
+       "toolCallId": "chatcmpl-tool-872300c5ee6abb4e",
+       "args": {
+        "questions": [
+         {
+          "id": "color_choice",
+          "header": "Color",
+          "question": "Red or blue?",
+          "options": [
+           {
+            "label": "Red (Recommended)",
+            "value": "Red"
+           },
+           {
+            "label": "Blue",
+            "value": "Blue"
+           }
+          ]
+         }
+        ],
+        "timeoutSeconds": 120
+       }
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 140,
+      "ts": 1793889308459,
+      "isHeartbeat": false
+     },
+     "seq": 59
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "question.requested",
+     "payload": {
+      "id": "ask_5f9e95eb0608d4cbeeefa56a49647fa0",
+      "questions": [
+       {
+        "questionId": "color_choice",
+        "header": "Color",
+        "question": "Red or blue?",
+        "options": [
+         {
+          "label": "Red (Recommended)"
+         },
+         {
+          "label": "Blue"
+         }
+        ],
+        "isOther": true
+       }
+      ],
+      "agentId": "weft",
+      "sessionKey": "$KEY",
+      "runId": "$RUN",
+      "createdAtMs": 1793889308500,
+      "expiresAtMs": 1793892908500,
+      "status": "pending"
+     },
+     "seq": 60
+    }
+   },
+   {
+    "await": "question.resolve"
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "question.resolved",
+     "payload": {
+      "id": "ask_5f9e95eb0608d4cbeeefa56a49647fa0",
+      "status": "answered",
+      "answers": {
+       "answers": {
+        "color_choice": [
+         "Blue"
+        ]
+       }
+      }
+     },
+     "seq": 61
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "tool",
+      "data": {
+       "phase": "result",
+       "name": "ask_user",
+       "toolCallId": "chatcmpl-tool-872300c5ee6abb4e",
+       "meta": "Red or blue?",
+       "isError": false,
+       "commandBearing": false,
+       "result": {
+        "content": [
+         {
+          "type": "text",
+          "text": "Color: Blue\n\n{\n  \"status\": \"answered\",\n  \"answers\": {\n    \"answers\": {\n      \"color_choice\": [\n        \"Blue\"\n      ]\n    }\n  }\n}"
+         }
+        ],
+        "details": {
+         "status": "answered",
+         "answers": {
+          "answers": {
+           "color_choice": [
+            "Blue"
+           ]
+          }
+         }
+        }
+       }
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 141,
+      "ts": 1793889308524,
+      "isHeartbeat": false
+     },
+     "seq": 62
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "ff1fc5ac-2d72-46bf-8d6e-0d1a0e6296ab",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": "openrouter",
+       "model": "openai/gpt-oss-120b"
+      },
+      "seq": 143,
+      "ts": 1793889308863,
+      "isHeartbeat": false
+     },
+     "seq": 64
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "assistant",
+      "data": {
+       "text": "Blue",
+       "delta": "Blue",
+       "itemId": "2868f1b2-e74e-475d-8aff-4738ad8536d0:2"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 144,
+      "ts": 1793889309166,
+      "isHeartbeat": false
+     },
+     "seq": 65
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "ff1fc5ac-2d72-46bf-8d6e-0d1a0e6296ab",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "finishing",
+       "stopReason": "stop",
+       "aborted": false,
+       "livenessState": "working",
+       "replayInvalid": true,
+       "endedAt": 1793889309194
+      },
+      "seq": 146,
+      "ts": 1793889309194,
+      "isHeartbeat": false
+     },
+     "seq": 69
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "agentId": "weft",
+      "sessionId": "ff1fc5ac-2d72-46bf-8d6e-0d1a0e6296ab",
+      "sessionKey": "$KEY",
+      "sessionLifecycleRevision": "5728ece8-6aff-4704-9ab7-4e9f3d2d1282",
+      "lane": "main",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": null,
+       "model": null
+      },
+      "seq": 147,
+      "ts": 1793889309264,
+      "isHeartbeat": false
+     },
+     "seq": 70
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "stream": "lifecycle",
+      "data": {
+       "stopReason": "stop",
+       "aborted": false,
+       "livenessState": "working",
+       "replayInvalid": true,
+       "phase": "end",
+       "endedAt": 1793889309271,
+       "startedAt": 1793889300110,
+       "terminalReply": {
+        "disposition": "visible",
+        "text": "Blue"
+       },
+       "terminalReceipt": {
+        "runId": "$RUN",
+        "sessionId": "ff1fc5ac-2d72-46bf-8d6e-0d1a0e6296ab",
+        "turnId": "$RUN",
+        "requested": {
+         "provider": "openrouter",
+         "model": "openai/gpt-oss-120b"
+        },
+        "effective": {
+         "provider": "openrouter",
+         "model": "openai/gpt-oss-120b",
+         "responseModel": "openai/gpt-oss-120b"
+        },
+        "successfulToolNames": [
+         "ask_user"
+        ],
+        "sourceReplyDelivered": true,
+        "rerouted": false,
+        "terminalDisposition": "visible"
+       },
+       "executionSettled": true
+      },
+      "sessionId": "ff1fc5ac-2d72-46bf-8d6e-0d1a0e6296ab",
+      "agentId": "weft",
+      "seq": 148,
+      "ts": 1793889309271,
+      "isHeartbeat": false
+     },
+     "seq": 71
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "chat",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 148,
+      "state": "final",
+      "stopReason": "stop",
+      "message": {
+       "role": "assistant",
+       "content": [
+        {
+         "type": "text",
+         "text": "Blue"
+        }
+       ],
+       "timestamp": 1793889309277,
+       "openclawDisplayContent": []
+      }
+     },
+     "seq": 72
+    }
+   }
+  ],
+  "call the lookup tool": [
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "e5fc0148-1cd0-49ef-956f-7dd06e0a2995",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "start",
+       "startedAt": 1793888463628
+      },
+      "seq": 3,
+      "ts": 1793888463629,
+      "isHeartbeat": false
+     },
+     "seq": 7
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "e5fc0148-1cd0-49ef-956f-7dd06e0a2995",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": "openrouter",
+       "model": "openai/gpt-oss-120b"
+      },
+      "seq": 5,
+      "ts": 1793888465055,
+      "isHeartbeat": false
+     },
+     "seq": 13
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "thinking",
+      "data": {
+       "text": "The",
+       "delta": "The",
+       "itemId": "fa732c14-4236-4c9b-ba31-8fc504bf0930"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 6,
+      "ts": 1793888465058,
+      "isHeartbeat": false
+     },
+     "seq": 15
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "thinking",
+      "data": {
+       "text": "The user wants us to call the lookup tool",
+       "delta": " user wants us to call the lookup tool",
+       "itemId": "fa732c14-4236-4c9b-ba31-8fc504bf0930"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 14,
+      "ts": 1793888465353,
+      "isHeartbeat": false
+     },
+     "seq": 16
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "thinking",
+      "data": {
+       "text": "The user wants us to call the lookup tool with q set to weft, then reply",
+       "delta": " with q set to weft, then reply",
+       "itemId": "fa732c14-4236-4c9b-ba31-8fc504bf0930"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 21,
+      "ts": 1793888465360,
+      "isHeartbeat": false
+     },
+     "seq": 17
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "thinking",
+      "data": {
+       "phase": "persisted",
+       "itemId": "fa732c14-4236-4c9b-ba31-8fc504bf0930",
+       "messageId": "fbf470f7-68be-4801-bc64-70f3aa57dda5",
+       "messageRunId": "$RUN"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 202,
+      "ts": 1793888467213,
+      "isHeartbeat": false
+     },
+     "seq": 35
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "tool",
+      "data": {
+       "phase": "start",
+       "name": "lookup",
+       "toolCallId": "call_resp_01a1ac15-ad47-7475-857a-db2f66b4b910_0",
+       "args": {}
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 204,
+      "ts": 1793888467216,
+      "isHeartbeat": false
+     },
+     "seq": 37
+    }
+   },
+   {
+    "tool": {
+     "name": "lookup",
+     "arguments": {}
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "tool",
+      "data": {
+       "phase": "result",
+       "name": "lookup",
+       "toolCallId": "call_resp_01a1ac15-ad47-7475-857a-db2f66b4b910_0",
+       "isError": false,
+       "commandBearing": false,
+       "result": {
+        "content": [
+         {
+          "type": "text",
+          "text": "$TOOL"
+         }
+        ],
+        "details": {}
+       }
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 205,
+      "ts": 1793888467229,
+      "isHeartbeat": false,
+      "session": {
+       "key": "$KEY",
+       "sessionModelRevision": "0b_rJyoU0HRl25-IFzwFGzTMzGa6ylxLxS969q_nfrU",
+       "visibility": "shared",
+       "spawnedCwd": "$FOLDER",
+       "workspaceDir": "$FOLDER",
+       "effectiveCommunication": {
+        "send": "always",
+        "receive": "always"
+       },
+       "permissionModePending": false,
+       "spawnDepth": 0,
+       "createdVia": "operator",
+       "participants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "expandedParticipants": [
+        {
+         "identity": {
+          "type": "observation",
+          "pluginId": null,
+          "accountId": null,
+          "senderKind": "unknown",
+          "id": "gateway-client"
+         }
+        }
+       ],
+       "participantCount": 1,
+       "createdAt": 1793888412522,
+       "kind": "direct",
+       "classification": "direct",
+       "agentId": "weft",
+       "isMain": false,
+       "isDock": false,
+       "isBackground": false,
+       "chatType": "direct",
+       "updatedAt": 1793888463660,
+       "archived": false,
+       "pinned": false,
+       "sidebarRoot": false,
+       "unread": true,
+       "lastInteractionAt": 1793888463388,
+       "lastActivityAt": 1793888446202,
+       "sessionId": "e5fc0148-1cd0-49ef-956f-7dd06e0a2995",
+       "lifecycleRevision": "1b6b2bd2-0ede-4b7a-af21-307e2b4cbc9d",
+       "systemSent": true,
+       "abortedLastRun": false,
+       "effectiveFastMode": false,
+       "effectiveFastModeSource": "default",
+       "fastAutoOnSeconds": 60,
+       "inputTokens": 18763,
+       "outputTokens": 1477,
+       "usageReport": {
+        "state": "available"
+       },
+       "parentSessionKey": "agent:weft:main",
+       "effectiveResponseUsage": "off",
+       "effectiveQueueMode": "steer",
+       "modelProvider": "openrouter",
+       "model": "openai/gpt-oss-120b",
+       "modelOverrideSource": null,
+       "runtimeSelectionLocked": false,
+       "agentRuntime": {
+        "id": "openclaw",
+        "cloudPlacementSupported": true,
+        "cloudPlacementExecutionMode": "worker-turn",
+        "devicePlacement": {
+         "requiredNodeCommands": [],
+         "consumesWorkerSlot": true
+        },
+        "devicePlacementSupported": true,
+        "source": "implicit"
+       },
+       "contextTokens": 131072,
+       "contextBudgetStatus": {
+        "schemaVersion": 1,
+        "source": "pre-prompt-estimate",
+        "updatedAt": 1793888415347,
+        "provider": "openrouter",
+        "model": "openai/gpt-oss-120b",
+        "route": "fits",
+        "shouldCompact": false,
+        "estimatedPromptTokens": 33123,
+        "contextTokenBudget": 131072,
+        "promptBudgetBeforeReserve": 111072,
+        "reserveTokens": 20000,
+        "effectiveReserveTokens": 20000,
+        "remainingPromptBudgetTokens": 77949,
+        "overflowTokens": 0,
+        "toolResultReducibleChars": 0,
+        "messageCount": 0,
+        "unwindowedMessageCount": 0,
+        "sessionId": "e5fc0148-1cd0-49ef-956f-7dd06e0a2995"
+       },
+       "snapshotAt": 1793888467230,
+       "lastRunError": null,
+       "startedAt": 1793888463628,
+       "endedAt": null,
+       "runtimeMs": null,
+       "totalTokens": 19645,
+       "totalTokensFresh": true,
+       "agentStatus": null,
+       "controlOwnerSessionKey": null,
+       "goal": null,
+       "estimatedCostUsd": 0.00501952,
+       "activeModelProvider": "openrouter",
+       "activeModel": "openai/gpt-oss-120b",
+       "placement": {
+        "state": "local",
+        "generation": 0,
+        "createdAtMs": 1793888414926,
+        "updatedAtMs": 1793888463505,
+        "stateChangedAtMs": 1793888414926
+       },
+       "activitySummary": {
+        "state": "unavailable"
+       },
+       "hasBoard": false,
+       "createdActor": null,
+       "owner": null,
+       "archivedAt": null,
+       "archivedBy": null,
+       "archiveReason": null,
+       "pinnedAt": null,
+       "snoozedUntil": null,
+       "snoozedAt": null,
+       "markedUnreadAt": null,
+       "observerDigest": null,
+       "deviceFolder": null,
+       "permissionMode": null,
+       "communication": null,
+       "label": null,
+       "autoLabel": null,
+       "icon": null,
+       "color": null,
+       "channelAvatarUrl": null,
+       "category": null,
+       "boardPresentation": null,
+       "displayName": null,
+       "thinkingLevel": null,
+       "toolOverrides": null,
+       "restartRecoveryStatus": null,
+       "providerReview": null,
+       "lastRunId": null,
+       "hasAutomation": false
+      },
+      "updatedAt": 1793888463660,
+      "sessionId": "e5fc0148-1cd0-49ef-956f-7dd06e0a2995",
+      "createdActor": null,
+      "owner": null,
+      "participants": [
+       {
+        "identity": {
+         "type": "observation",
+         "pluginId": null,
+         "accountId": null,
+         "senderKind": "unknown",
+         "id": "gateway-client"
+        }
+       }
+      ],
+      "participantCount": 1,
+      "kind": "direct",
+      "visibility": "shared",
+      "chatType": "direct",
+      "archived": false,
+      "archivedAt": null,
+      "archivedBy": null,
+      "archiveReason": null,
+      "pinned": false,
+      "sidebarRoot": false,
+      "pinnedAt": null,
+      "snoozedUntil": null,
+      "snoozedAt": null,
+      "unread": true,
+      "markedUnreadAt": null,
+      "agentStatus": null,
+      "observerDigest": null,
+      "activitySummary": {
+       "state": "unavailable"
+      },
+      "lastActivityAt": 1793888446202,
+      "controlOwnerSessionKey": null,
+      "spawnedCwd": "$FOLDER",
+      "deviceFolder": null,
+      "permissionMode": null,
+      "communication": null,
+      "effectiveCommunication": {
+       "send": "always",
+       "receive": "always"
+      },
+      "permissionModePending": false,
+      "spawnDepth": 0,
+      "createdVia": "operator",
+      "createdAt": 1793888412522,
+      "label": null,
+      "autoLabel": null,
+      "icon": null,
+      "color": null,
+      "channelAvatarUrl": null,
+      "category": null,
+      "boardPresentation": null,
+      "displayName": null,
+      "parentSessionKey": "agent:weft:main",
+      "thinkingLevel": null,
+      "effectiveFastMode": false,
+      "effectiveFastModeSource": "default",
+      "fastAutoOnSeconds": 60,
+      "toolOverrides": null,
+      "systemSent": true,
+      "abortedLastRun": false,
+      "restartRecoveryStatus": null,
+      "inputTokens": 18763,
+      "outputTokens": 1477,
+      "usageReport": {
+       "state": "available"
+      },
+      "totalTokens": 19645,
+      "totalTokensFresh": true,
+      "goal": null,
+      "contextTokens": 131072,
+      "contextBudgetStatus": {
+       "schemaVersion": 1,
+       "source": "pre-prompt-estimate",
+       "updatedAt": 1793888415347,
+       "provider": "openrouter",
+       "model": "openai/gpt-oss-120b",
+       "route": "fits",
+       "shouldCompact": false,
+       "estimatedPromptTokens": 33123,
+       "contextTokenBudget": 131072,
+       "promptBudgetBeforeReserve": 111072,
+       "reserveTokens": 20000,
+       "effectiveReserveTokens": 20000,
+       "remainingPromptBudgetTokens": 77949,
+       "overflowTokens": 0,
+       "toolResultReducibleChars": 0,
+       "messageCount": 0,
+       "unwindowedMessageCount": 0,
+       "sessionId": "e5fc0148-1cd0-49ef-956f-7dd06e0a2995"
+      },
+      "estimatedCostUsd": 0.00501952,
+      "effectiveResponseUsage": "off",
+      "modelProvider": "openrouter",
+      "model": "openai/gpt-oss-120b",
+      "activeModelProvider": "openrouter",
+      "activeModel": "openai/gpt-oss-120b",
+      "modelOverrideSource": null,
+      "agentRuntime": {
+       "id": "openclaw",
+       "cloudPlacementSupported": true,
+       "cloudPlacementExecutionMode": "worker-turn",
+       "devicePlacement": {
+        "requiredNodeCommands": [],
+        "consumesWorkerSlot": true
+       },
+       "devicePlacementSupported": true,
+       "source": "implicit"
+      },
+      "runtimeSelectionLocked": false,
+      "lastRunError": null,
+      "providerReview": null,
+      "lastRunId": null,
+      "hasAutomation": false,
+      "startedAt": 1793888463628,
+      "endedAt": null,
+      "runtimeMs": null
+     },
+     "seq": 39
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "e5fc0148-1cd0-49ef-956f-7dd06e0a2995",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": "openrouter",
+       "model": "openai/gpt-oss-120b"
+      },
+      "seq": 207,
+      "ts": 1793888470384,
+      "isHeartbeat": false
+     },
+     "seq": 41
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "assistant",
+      "data": {
+       "text": "we",
+       "delta": "we",
+       "itemId": "c7c26046-1253-4271-abc6-e7b8a6992346:2"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 208,
+      "ts": 1793888470388,
+      "isHeartbeat": false
+     },
+     "seq": 42
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "assistant",
+      "data": {
+       "delta": "ft answered lookup {}\n\nRed (",
+       "itemId": "c7c26046-1253-4271-abc6-e7b8a6992346:2"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 214,
+      "ts": 1793888470472,
+      "isHeartbeat": false
+     },
+     "seq": 44
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "stream": "assistant",
+      "data": {
+       "delta": "Recommended)",
+       "itemId": "c7c26046-1253-4271-abc6-e7b8a6992346:2"
+      },
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 216,
+      "ts": 1793888470566,
+      "isHeartbeat": false
+     },
+     "seq": 46
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "sessionId": "e5fc0148-1cd0-49ef-956f-7dd06e0a2995",
+      "agentId": "weft",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "finishing",
+       "stopReason": "stop",
+       "aborted": false,
+       "livenessState": "working",
+       "replayInvalid": true,
+       "endedAt": 1793888470583
+      },
+      "seq": 218,
+      "ts": 1793888470583,
+      "isHeartbeat": false
+     },
+     "seq": 49
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "agentId": "weft",
+      "sessionId": "e5fc0148-1cd0-49ef-956f-7dd06e0a2995",
+      "sessionKey": "$KEY",
+      "sessionLifecycleRevision": "1b6b2bd2-0ede-4b7a-af21-307e2b4cbc9d",
+      "lane": "main",
+      "stream": "lifecycle",
+      "data": {
+       "phase": "model",
+       "provider": null,
+       "model": null
+      },
+      "seq": 219,
+      "ts": 1793888470606,
+      "isHeartbeat": false
+     },
+     "seq": 52
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "agent",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "stream": "lifecycle",
+      "data": {
+       "stopReason": "stop",
+       "aborted": false,
+       "livenessState": "working",
+       "replayInvalid": true,
+       "phase": "end",
+       "endedAt": 1793888470609,
+       "startedAt": 1793888463628,
+       "terminalReply": {
+        "disposition": "visible",
+        "text": "weft answered lookup {}\n\nRed (Recommended)"
+       },
+       "terminalReceipt": {
+        "runId": "$RUN",
+        "sessionId": "e5fc0148-1cd0-49ef-956f-7dd06e0a2995",
+        "turnId": "$RUN",
+        "requested": {
+         "provider": "openrouter",
+         "model": "openai/gpt-oss-120b"
+        },
+        "effective": {
+         "provider": "openrouter",
+         "model": "openai/gpt-oss-120b",
+         "responseModel": "openai/gpt-oss-120b"
+        },
+        "successfulToolNames": [
+         "lookup"
+        ],
+        "sourceReplyDelivered": true,
+        "rerouted": false,
+        "terminalDisposition": "visible"
+       },
+       "executionSettled": true
+      },
+      "sessionId": "e5fc0148-1cd0-49ef-956f-7dd06e0a2995",
+      "agentId": "weft",
+      "seq": 220,
+      "ts": 1793888470609,
+      "isHeartbeat": false
+     },
+     "seq": 53
+    }
+   },
+   {
+    "send": {
+     "type": "event",
+     "event": "chat",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 220,
+      "state": "final",
+      "stopReason": "stop",
+      "message": {
+       "role": "assistant",
+       "content": [
+        {
+         "type": "text",
+         "text": "weft answered lookup {}\n\nRed (Recommended)"
+        }
+       ],
+       "timestamp": 1793888470613,
+       "openclawDisplayContent": []
+      }
+     },
+     "seq": 54
+    }
+   }
+  ],
+  "fail please": [
+   {
+    "send": {
+     "type": "event",
+     "event": "chat",
+     "payload": {
+      "runId": "$RUN",
+      "sessionKey": "$KEY",
+      "agentId": "weft",
+      "seq": 58,
+      "state": "error",
+      "errorMessage": "Couldn't connect to the AI service. Check your connection, then try again. For details, open Settings \u2192 Logs in the Control UI or run `openclaw logs --follow`.",
+      "errorDetail": {
+       "provider": "custom",
+       "model": "fake-model",
+       "failoverReason": "timeout",
+       "providerRuntimeFailureKind": "timeout"
+      }
+     },
+     "seq": 33
+    }
+   }
+  ]
+ }
+}

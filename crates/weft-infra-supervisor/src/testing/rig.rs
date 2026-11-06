@@ -8,15 +8,18 @@ use weft_platform_traits::clock::FakeClock;
 use weft_platform_traits::FakeInfraHost;
 
 use crate::broker_ops::FakeBroker;
+use crate::inside::fake::FakeInsideRemover;
 use crate::{health, lifecycle, ownership, SupervisorState};
 
 /// Drives the supervisor's three loops against in-memory fakes.
 /// Construct with `new()`; seed dependencies via the public
-/// `broker`/`host`/`clock` handles; step via `tick_ownership` /
+/// `broker`/`host`/`inside`/`clock` handles; step via `tick_ownership` /
 /// `tick_health` / `tick_lifecycle`.
 pub struct SupervisorTestRig {
     pub broker: Arc<FakeBroker>,
     pub host: Arc<FakeInfraHost>,
+    /// What terminates asked nodes to remove from inside them.
+    pub inside: Arc<FakeInsideRemover>,
     pub clock: Arc<FakeClock>,
     pub state: SupervisorState,
     /// What this supervisor owned after the last `tick_ownership`, and
@@ -36,11 +39,13 @@ impl SupervisorTestRig {
     pub fn with_tenant(tenant_id: &str) -> Self {
         let broker = FakeBroker::new(tenant_id);
         let host = Arc::new(FakeInfraHost::new());
+        let inside = Arc::new(FakeInsideRemover::default());
         let clock = FakeClock::new();
         let state = SupervisorState {
             broker: broker.clone() as Arc<dyn crate::broker_ops::BrokerSupervisorOps>,
             replica: "test-supervisor".to_string(),
             host: host.clone() as Arc<dyn weft_platform_traits::InfraHost>,
+            inside: inside.clone() as Arc<dyn crate::inside::InsideRemover>,
             clock: clock.clone() as Arc<dyn weft_platform_traits::clock::Clock>,
             ownership_interval: Duration::from_secs(15),
             health_interval: Duration::from_secs(30),
@@ -49,7 +54,7 @@ impl SupervisorTestRig {
             project_locks: Arc::default(),
             pass: Arc::default(),
         };
-        Self { broker, host, clock, state, ownership: Mutex::default() }
+        Self { broker, host, inside, clock, state, ownership: Mutex::default() }
     }
 
     /// Step the ownership loop once (renew + claim owned projects, then

@@ -246,6 +246,17 @@ nodes' run needs the same way before it starts. That command prints the system's
 apt-get install -y ...`, `brew install ...`) and asks before running it;
 `--print` only prints it, `--yes` runs it without asking.
 
+An infra node that runs a program on this machine instead of a container
+(a coding agent node with nothing on `computer`) checks what that program
+needs when its infra starts, not before a run. A program weft knows how to
+install it installs itself, without `sudo`, into `~/.local/share/weft/needs/<group>/<name>/`,
+once for every program and install on the machine, and while it does the
+infra's progress says so (`server: installing Claude Code (its log: ...)`). A
+system package only `sudo` can add fails the start naming the exact command;
+`weft deps-install` in the project's folder installs those (asking for the
+password) and then the rest. A cloud install refuses such a node before
+anything starts.
+
 `weft build` skips [the runtime tier] (a connection not yet picked), so a
 half-wired program still builds. A run is refused before it starts when a
 node it reaches needs a connection nobody picked on this install, naming
@@ -335,7 +346,9 @@ A command that does reach it is refused, naming each file and line: `it
 needs parts of the program that do not compile:` and the list. What still stops everything is `src/main.weft` itself not parsing,
 and the few errors no part can be blamed for: the command then fails with
 `compile failed:` and the list. `weft validate` stays strict and reports every
-error in the program, wherever it sits.
+error in the program, wherever it sits, except a rule that asks which install
+this is (`local_install`): validate builds for no install, so only `weft run`
+and `weft status`, which build for this install, decide it.
 
 `weft activate` refuses a trigger whose FIRES would reach a broken part,
 even when its setup would not: `a fire of 'post' cannot run: it needs parts

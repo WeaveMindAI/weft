@@ -1,0 +1,1222 @@
+{
+ "kind": "cursor",
+ "command": "agent",
+ "source": "Cursor CLI 2026.10.22-27dcf5f (`agent --trust acp`). Real, logged by a pass-through shim while weft's own agent server drove it on this machine's own Cursor login (2026-11-05): the initialize, session/new (its model lists cut to three entries) and session/set_mode answers, and the `upgrade` turn, which is every turn that account ran: Cursor's ACP layer catches the backend's `action` error and says it as a message chunk (6136.index.js: login, upgrade, payment, config), then ends the prompt with end_turn. Composed, because that account ran no model turn: the session/load answer, the replay and every other turn, written from Cursor's ACP page (https://cursor.com/docs/cli/acp.md: the permission options, `cursor/ask_question` and `cursor/create_plan` with their answers) and the bundled CLI (versions/2026.10.22-27dcf5f/6136.index.js: the session/update shapes it sends, `sendToolCall` and `sendToolCallUpdate`, and the MCP tool title `<providerIdentifier>: <toolName>`).",
+ "answers": {
+  "initialize": {
+   "protocolVersion": 1,
+   "agentCapabilities": {
+    "loadSession": true,
+    "mcpCapabilities": {
+     "http": true,
+     "sse": true
+    },
+    "promptCapabilities": {
+     "audio": false,
+     "embeddedContext": false,
+     "image": true
+    },
+    "sessionCapabilities": {
+     "list": {}
+    }
+   },
+   "authMethods": [
+    {
+     "id": "cursor_login",
+     "name": "Cursor Login",
+     "description": "Authenticate using existing Cursor login credentials. Run 'agent login' first if not logged in."
+    }
+   ]
+  },
+  "session/new": {
+   "sessionId": "$SESSION",
+   "modes": {
+    "currentModeId": "agent",
+    "availableModes": [
+     {
+      "id": "agent",
+      "name": "Agent",
+      "description": "Full agent capabilities with tool access"
+     },
+     {
+      "id": "plan",
+      "name": "Plan",
+      "description": "Read-only mode for planning and designing before implementation"
+     },
+     {
+      "id": "ask",
+      "name": "Ask",
+      "description": "Q&A mode - no edits or command execution"
+     }
+    ]
+   },
+   "models": {
+    "currentModelId": "gemini-3.7-flash[effort=high]",
+    "availableModels": [
+     {
+      "modelId": "default[]",
+      "name": "Auto"
+     },
+     {
+      "modelId": "composer-2.5[fast=true]",
+      "name": "composer-2.5"
+     },
+     {
+      "modelId": "gemini-3.7-flash[effort=high]",
+      "name": "gemini-3.7-flash"
+     }
+    ]
+   },
+   "configOptions": [
+    {
+     "id": "mode",
+     "name": "Mode",
+     "description": "Controls how the agent executes tasks",
+     "category": "mode",
+     "type": "select",
+     "currentValue": "agent",
+     "options": [
+      {
+       "value": "agent",
+       "name": "Agent",
+       "description": "Full agent capabilities with tool access"
+      },
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Read-only mode for planning and designing before implementation"
+      },
+      {
+       "value": "ask",
+       "name": "Ask",
+       "description": "Q&A mode - no edits or command execution"
+      }
+     ]
+    },
+    {
+     "id": "model",
+     "name": "Model",
+     "description": "Controls which model variant is used for responses",
+     "category": "model",
+     "type": "select",
+     "currentValue": "gemini-3.7-flash[effort=high]",
+     "options": [
+      {
+       "value": "default[]",
+       "name": "Auto"
+      },
+      {
+       "value": "composer-2.5[fast=true]",
+       "name": "composer-2.5"
+      },
+      {
+       "value": "gemini-3.7-flash[effort=high]",
+       "name": "gemini-3.7-flash"
+      }
+     ]
+    }
+   ]
+  },
+  "session/set_mode": {},
+  "session/load": {
+   "modes": {
+    "currentModeId": "agent",
+    "availableModes": [
+     {
+      "id": "agent",
+      "name": "Agent"
+     },
+     {
+      "id": "plan",
+      "name": "Plan"
+     },
+     {
+      "id": "ask",
+      "name": "Ask"
+     }
+    ]
+   }
+  }
+ },
+ "replay": {
+  "before": [
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "hello"
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "Hello! What should we work on?"
+    }
+   }
+  ],
+  "after": []
+ },
+ "settings": [
+  {
+   "name": "ask",
+   "given": {
+    "permission": "ask"
+   },
+   "expect": {
+    "args": [
+     [
+      "--trust",
+      "acp"
+     ]
+    ],
+    "unset": [
+     "CURSOR_API_KEY",
+     "XDG_CONFIG_HOME",
+     "CURSOR_CONFIG_DIR",
+     "CURSOR_DATA_DIR",
+     "CURSOR_AUTH_TOKEN"
+    ],
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "agent"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "plan",
+   "given": {
+    "permission": "plan"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "plan"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "bypass",
+   "given": {
+    "permission": "bypass"
+   },
+   "expect": {
+    "args": [
+     [
+      "--trust",
+      "--force",
+      "acp"
+     ]
+    ],
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "agent"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "model_and_options",
+   "given": {
+    "model": "gpt-5",
+    "options": {
+     "sandbox": "disabled",
+     "addDirs": [
+      "/a",
+      "/b"
+     ]
+    }
+   },
+   "expect": {
+    "args": [
+     [
+      "--model",
+      "gpt-5",
+      "--sandbox",
+      "disabled",
+      "--add-dir",
+      "/a",
+      "--add-dir",
+      "/b",
+      "acp"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "api_key",
+   "given": {
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "key_test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "CURSOR_API_KEY": "key_test",
+     "XDG_CONFIG_HOME": "$HOME",
+     "CURSOR_CONFIG_DIR": "$HOME",
+     "CURSOR_DATA_DIR": "$HOME"
+    }
+   }
+  },
+  {
+   "name": "bad_sandbox",
+   "given": {
+    "options": {
+     "sandbox": "maybe"
+    }
+   },
+   "expect": {
+    "error": "takes enabled, disabled"
+   }
+  }
+ ],
+ "turns": {
+  "hello": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Hello! "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "What "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "should "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "we "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "work "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "on?"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "text",
+     "done"
+    ],
+    "reply": "Hello! What should we work on?"
+   }
+  },
+  "permission": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "tool_1",
+      "title": "`npm test`",
+      "kind": "execute",
+      "status": "pending",
+      "rawInput": {
+       "command": "npm test"
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "tool_1",
+        "title": "`npm test`",
+        "kind": "execute",
+        "status": "pending",
+        "content": [
+         {
+          "type": "content",
+          "content": {
+           "type": "text",
+           "text": "Run the test suite"
+          }
+         }
+        ]
+       },
+       "options": [
+        {
+         "optionId": "allow-once",
+         "name": "Allow once",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "allow-always",
+         "name": "Allow always",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "reject-once",
+         "name": "Reject",
+         "kind": "reject_once"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "tool_1",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "4 passing"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "The "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "tests "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "pass."
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "The tests pass.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "execute",
+        "title": "`npm test`",
+        "choices": [
+         {
+          "id": "allow-once",
+          "kind": "allow_once"
+         },
+         {
+          "id": "allow-always",
+          "kind": "allow_always"
+         },
+         {
+          "id": "reject-once",
+          "kind": "reject"
+         }
+        ]
+       }
+      },
+      "answer": {
+       "choice": "allow-once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "allow-once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "reject": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "tool_2",
+      "title": "`npm test`",
+      "kind": "execute",
+      "status": "pending",
+      "rawInput": {
+       "command": "npm test"
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "tool_2",
+        "title": "`npm test`",
+        "kind": "execute",
+        "status": "pending",
+        "content": [
+         {
+          "type": "content",
+          "content": {
+           "type": "text",
+           "text": "Run the test suite"
+          }
+         }
+        ]
+       },
+       "options": [
+        {
+         "optionId": "allow-once",
+         "name": "Allow once",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "allow-always",
+         "name": "Allow always",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "reject-once",
+         "name": "Reject",
+         "kind": "reject_once"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "tool_2",
+      "status": "failed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "User rejected"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "I "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "left "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "the "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "tests "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "alone."
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "I left the tests alone.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission"
+      },
+      "answer": {
+       "choice": "reject-once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "reject-once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "ask": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_123",
+      "title": "Ask question",
+      "kind": "think",
+      "status": "pending"
+     }
+    },
+    {
+     "ask": {
+      "method": "cursor/ask_question",
+      "params": {
+       "toolCallId": "call_123",
+       "title": "Need input",
+       "questions": [
+        {
+         "id": "q1",
+         "prompt": "Which mode should I use?",
+         "options": [
+          {
+           "id": "agent",
+           "label": "Agent"
+          },
+          {
+           "id": "plan",
+           "label": "Plan"
+          }
+         ],
+         "allowMultiple": false
+        },
+        {
+         "id": "q2",
+         "prompt": "Which checks should run?",
+         "options": [
+          {
+           "id": "lint",
+           "label": "Lint"
+          },
+          {
+           "id": "test",
+           "label": "Tests"
+          }
+         ],
+         "allowMultiple": true
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_123",
+      "status": "completed"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Planning "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "first, "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "then "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "lint "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "and "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "tests."
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "Planning first, then lint and tests.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "id": "q1",
+         "header": "Need input",
+         "question": "Which mode should I use?",
+         "options": [
+          {
+           "label": "Agent"
+          },
+          {
+           "label": "Plan"
+          }
+         ],
+         "multiSelect": false,
+         "allowOther": false
+        },
+        {
+         "id": "q2",
+         "question": "Which checks should run?",
+         "multiSelect": true,
+         "allowOther": false
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "q1": [
+         "Plan"
+        ],
+        "q2": [
+         "Lint",
+         "Tests"
+        ]
+       }
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "answered",
+        "answers": [
+         {
+          "questionId": "q1",
+          "selectedOptionIds": [
+           "plan"
+          ]
+         },
+         {
+          "questionId": "q2",
+          "selectedOptionIds": [
+           "lint",
+           "test"
+          ]
+         }
+        ]
+       }
+      }
+     }
+    ]
+   }
+  },
+  "plan": {
+   "steps": [
+    {
+     "ask": {
+      "method": "cursor/create_plan",
+      "params": {
+       "toolCallId": "call_200",
+       "name": "Add a health check",
+       "overview": "A /health route that answers ok.",
+       "plan": "1. Add the route\n2. Test it",
+       "todos": [
+        {
+         "id": "t1",
+         "content": "Add the route",
+         "status": "pending"
+        },
+        {
+         "id": "t2",
+         "content": "Test it",
+         "status": "pending"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Starting "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "on "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "the "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "plan."
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "question",
+     "text",
+     "done"
+    ],
+    "reply": "Starting on the plan.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "plan",
+        "title": "Add a health check",
+        "detail": "A /health route that answers ok.\n\n1. Add the route\n2. Test it\n\n- Add the route\n- Test it",
+        "choices": [
+         {
+          "id": "accept",
+          "kind": "allow_once"
+         },
+         {
+          "id": "reject",
+          "kind": "reject"
+         }
+        ]
+       }
+      },
+      "answer": {
+       "choice": "accept"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "accepted"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "plan rejected": {
+   "steps": [
+    {
+     "ask": {
+      "method": "cursor/create_plan",
+      "params": {
+       "toolCallId": "call_201",
+       "plan": "1. Rewrite everything"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Understood, "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "a "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "smaller "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "plan "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "then."
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "question",
+     "text",
+     "done"
+    ],
+    "reply": "Understood, a smaller plan then.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "title": "Cursor proposes a plan"
+       }
+      },
+      "answer": {
+       "choice": "reject",
+       "note": "too big"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "rejected",
+        "reason": "too big"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "tool": {
+   "tools": true,
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "tool_3",
+      "title": "weft: lookup",
+      "kind": "other",
+      "status": "pending",
+      "rawInput": {}
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "tool_3",
+        "title": "weft: lookup",
+        "kind": "other",
+        "status": "pending"
+       },
+       "options": [
+        {
+         "optionId": "allow-once",
+         "name": "Allow once",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "allow-always",
+         "name": "Allow always",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "reject-once",
+         "name": "Reject",
+         "kind": "reject_once"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "tool": {
+      "name": "lookup",
+      "arguments": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "tool_3",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "$TOOL"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "The "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "magic "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "number "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "is "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "$TOOL."
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_call",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "The magic number is 42.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "title": "weft: lookup"
+       }
+      },
+      "answer": {
+       "choice": "allow-once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "allow-once"
+       }
+      }
+     },
+     {
+      "tool": "lookup",
+      "result": "42"
+     }
+    ]
+   }
+  },
+  "upgrade": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "\n\nUpgrade your plan to continue"
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "text",
+     "error"
+    ],
+    "status": "failed",
+    "error": "Upgrade your plan to continue"
+   }
+  }
+ }
+}

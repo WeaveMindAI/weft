@@ -616,3 +616,445 @@ fn the_recorded_rules_round_trip_in_the_compiled_program() {
         "a recorded rule carries its condition and its message, nothing else"
     );
 }
+
+/// `p` as compiled for `install`.
+fn built_for(mut p: ProjectDefinition, install: Option<crate::install::InstallKind>) -> ProjectDefinition {
+    p.install = install;
+    p
+}
+
+/// `local_install` is answered only for a program built for an install,
+/// and `all` / `any` / `not` around it stay unanswered without one.
+#[test]
+fn local_install_is_answered_only_for_a_known_install() {
+    use crate::install::InstallKind;
+    let eval = |when: Value, install: Option<InstallKind>| eval_on(&built_for(wired(false, true), install), when);
+    let local = json!({ "kind": "local_install" });
+    let not_local = json!({ "kind": "not", "of": local });
+    assert_eq!(eval(local.clone(), Some(InstallKind::Local)), Some(true));
+    assert_eq!(eval(local.clone(), Some(InstallKind::Cloud)), Some(false));
+    assert_eq!(eval(local.clone(), None), None);
+    assert_eq!(eval(not_local.clone(), Some(InstallKind::Cloud)), Some(true));
+    assert_eq!(eval(not_local.clone(), None), None, "`not` of no answer is no answer");
+    // A cloud install refusing a port left unwired: `cron` is wired, `out`
+    // reads nothing.
+    let wired_in = json!({ "kind": "input_wired", "port": "cron" });
+    let cloud_needs = |second: &Value| json!({ "kind": "all", "of": [not_local, { "kind": "not", "of": second }] });
+    assert_eq!(eval(cloud_needs(&wired_in), Some(InstallKind::Cloud)), Some(false), "wired: nothing to refuse");
+    assert_eq!(eval(cloud_needs(&wired_in), None), Some(false), "a false part decides `all` with no install");
+    let ghost = json!({ "kind": "output_wired", "port": "out" });
+    assert_eq!(eval(cloud_needs(&ghost), Some(InstallKind::Cloud)), Some(true));
+    assert_eq!(eval(cloud_needs(&ghost), Some(InstallKind::Local)), Some(false));
+    assert_eq!(eval(cloud_needs(&ghost), None), None);
+}
+
+/// Three answers, folded: `y` holds (`cron` is wired), `n` does not
+/// (nothing reads `out`), `u` is not known (what arrives on `cron`).
+fn three() -> (Value, Value, Value) {
+    (
+        json!({ "kind": "input_wired", "port": "cron" }),
+        json!({ "kind": "output_wired", "port": "out" }),
+        json!({ "kind": "value", "field": "cron", "equals": "x" }),
+    )
+}
+
+/// Every combinator over every mix of yes, no and unknown folds as
+/// three-valued logic: one no settles an `all`, one yes settles an `any`,
+/// otherwise an unknown part leaves it unknown; `not` of unknown is
+/// unknown. Nested the same at every depth.
+#[test]
+fn every_combinator_folds_yes_no_and_unknown() {
+    let p = wired(false, true);
+    let (y, n, u) = three();
+    let answer = |v: &Value| -> Option<bool> {
+        if *v == y { Some(true) } else if *v == n { Some(false) } else { None }
+    };
+    let leaves = [y.clone(), n.clone(), u.clone()];
+    for a in &leaves {
+        assert_eq!(eval_on(&p, json!({ "kind": "not", "of": a })), answer(a).map(|b| !b), "not {a}");
+        for b in &leaves {
+            let (x, z) = (answer(a), answer(b));
+            let all = match (x, z) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            };
+            let any = match (x, z) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            };
+            assert_eq!(eval_on(&p, json!({ "kind": "all", "of": [a, b] })), all, "all [{a}, {b}]");
+            assert_eq!(eval_on(&p, json!({ "kind": "any", "of": [a, b] })), any, "any [{a}, {b}]");
+        }
+    }
+    let all = |of: Vec<Value>| json!({ "kind": "all", "of": of });
+    let any = |of: Vec<Value>| json!({ "kind": "any", "of": of });
+    let not = |of: Value| json!({ "kind": "not", "of": of });
+    assert_eq!(eval_on(&p, all(vec![any(vec![n.clone(), u.clone()]), not(n.clone())])), None);
+    assert_eq!(eval_on(&p, all(vec![any(vec![n.clone(), u.clone()]), not(y.clone())])), Some(false));
+    assert_eq!(eval_on(&p, any(vec![all(vec![y.clone(), u.clone()]), not(not(y.clone()))])), Some(true));
+    assert_eq!(eval_on(&p, not(all(vec![y.clone(), any(vec![n.clone(), not(u.clone())])]))), None);
+    assert_eq!(eval_on(&p, all(vec![])), Some(true), "an empty `all` holds");
+    assert_eq!(eval_on(&p, any(vec![])), Some(false), "an empty `any` does not");
+}
+
+/// What a rule folds to on one reading: settled, or its leftover.
+fn folded(p: &ProjectDefinition, cx: &RuleContext, when: Value) -> Result<bool, Value> {
+    match fold(&rule(when).when, the_node(p), &Reading::Program { cx, custom: &CustomPorts::default() }) {
+        Folded::Known(b) => Ok(b),
+        Folded::Open(left) => Err(serde_json::to_value(left).unwrap()),
+    }
+}
+
+/// An undecided rule is simplified to its leftover: every settled part
+/// folded away, a lone part standing for itself, nesting kept where it
+/// still asks something. The install's answer is one more settled part.
+#[test]
+fn an_undecided_rule_is_simplified_to_its_leftover() {
+    use crate::install::InstallKind;
+    let p = wired(false, true);
+    let cx = RuleContext::new(&p);
+    let (y, n, u) = three();
+    let u2 = json!({ "kind": "value", "field": "cron", "matches": "^a" });
+    let all = |of: Vec<Value>| json!({ "kind": "all", "of": of });
+    let any = |of: Vec<Value>| json!({ "kind": "any", "of": of });
+    let not = |of: Value| json!({ "kind": "not", "of": of });
+    assert_eq!(folded(&p, &cx, all(vec![y.clone(), u.clone()])), Err(u.clone()));
+    assert_eq!(folded(&p, &cx, any(vec![n.clone(), u.clone()])), Err(u.clone()));
+    assert_eq!(folded(&p, &cx, not(all(vec![y.clone(), u.clone()]))), Err(not(u.clone())));
+    assert_eq!(
+        folded(&p, &cx, all(vec![y.clone(), any(vec![n.clone(), u.clone(), u2.clone()]), not(n.clone())])),
+        Err(any(vec![u.clone(), u2.clone()]))
+    );
+    assert_eq!(folded(&p, &cx, all(vec![any(vec![n.clone(), u.clone()]), u2.clone()])), Err(all(vec![u.clone(), u2.clone()])));
+    assert_eq!(folded(&p, &cx, all(vec![n.clone(), u.clone()])), Ok(false), "settled, nothing left");
+    // The brief's rule: a folder a wire brings, needed off a local install.
+    let rule_on = |install| {
+        let built = built_for(wired(false, true), install);
+        let when = all(vec![not(json!({ "kind": "local_install" })), json!({ "kind": "value", "field": "cron" })]);
+        folded(&built, &RuleContext::new(&built), when)
+    };
+    assert_eq!(rule_on(Some(InstallKind::Local)), Ok(false), "local: settled, nothing left");
+    assert_eq!(rule_on(Some(InstallKind::Cloud)), Err(json!({ "kind": "value", "field": "cron" })), "cloud: the value is left");
+    assert_eq!(
+        rule_on(None),
+        Err(all(vec![not(json!({ "kind": "local_install" })), json!({ "kind": "value", "field": "cron" })])),
+        "no install: both parts are left"
+    );
+}
+
+/// A rule pairing the install with a value a wire brings is recorded
+/// folded with the install the program is compiled for: on a cloud install
+/// only the value is left, and the run refuses what arrived; on a local
+/// one the install settles it and nothing is recorded. Only a compile for
+/// no install records the install's question, and a run of such a program
+/// says it was compiled for none.
+#[test]
+fn a_rule_the_install_settles_is_never_left_to_the_run() {
+    use crate::install::InstallKind;
+    let needs = [rule(json!({ "kind": "all", "of": [
+        { "kind": "not", "of": { "kind": "local_install" } },
+        { "kind": "value", "field": "cron" }
+    ] }))];
+    let built = |install| {
+        let p = built_for(wired(false, true), install);
+        let mut node = the_node(&p).clone();
+        node.recheck = undecided(&needs, &node, &RuleContext::new(&p), &CustomPorts::default());
+        (p, node)
+    };
+    let (cloud, on_cloud) = built(Some(InstallKind::Cloud));
+    assert_eq!(serde_json::to_value(&on_cloud.recheck).unwrap(), json!([{ "when": { "kind": "value", "field": "cron" }, "message": "'n' cron is bad" }]));
+    let refused = recheck(&on_cloud, &cloud, json!({ "cron": "/data" }).as_object().unwrap());
+    assert!(matches!(&refused, Err(crate::error::WeftError::Input(m)) if m == "'n' cron is bad"), "{refused:?}");
+    assert!(recheck(&on_cloud, &cloud, &serde_json::Map::new()).is_ok(), "nothing arrived: nothing to refuse");
+    let (_, on_local) = built(Some(InstallKind::Local));
+    assert!(on_local.recheck.is_empty(), "settled on a local install: {:?}", on_local.recheck);
+    let (nowhere, unbuilt) = built(None);
+    assert_eq!(serde_json::to_value(&unbuilt.recheck[0].when).unwrap(), serde_json::to_value(&needs[0].when).unwrap());
+    let refused = recheck(&unbuilt, &nowhere, json!({ "cron": "/data" }).as_object().unwrap()).unwrap_err().to_string();
+    assert!(refused.contains("asks which install the program is built for, and this program was compiled for none"), "{refused}");
+}
+
+/// A program the agent node `claude` (of type `Claude`, declaring the
+/// list `reservedToolNames`) feeds through `ask`'s input `agent`, `ask`
+/// holding `tools` (written, or wired from `src` when `None`). With
+/// `through_loop`, the agent reaches `ask` through a loop's `LoopIn`.
+fn agent_program(tools: Option<Value>, through_loop: bool) -> ProjectDefinition {
+    let node = |id: &str, ty: &str, inputs: Value, outputs: Value| json!({
+        "id": id, "nodeType": ty, "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
+        "inputs": inputs, "outputs": outputs, "features": {}, "scope": [], "groupBoundary": null,
+        "requiresInfra": false, "images": []
+    });
+    let mut ask = node(
+        "ask", "Ask",
+        json!([{ "name": "agent", "portType": "String", "required": true }, { "name": "tools", "portType": "JsonDict", "required": false }]),
+        json!([]),
+    );
+    if let Some(tools) = &tools {
+        ask["portLiterals"] = json!({ "tools": tools });
+    }
+    let mut claude = node("claude", "Claude", json!([]), json!([{ "name": "agent", "portType": "String", "required": false }]));
+    claude["lists"] = json!({ "reservedToolNames": ["Read", "Task"] });
+    let mut nodes = vec![claude, ask];
+    let mut edges = Vec::new();
+    let edge = |id: &str, source: &str, sport: &str, target: &str, tport: &str| {
+        json!({ "id": id, "source": source, "sourceHandle": sport, "target": target, "targetHandle": tport })
+    };
+    if through_loop {
+        nodes.push(node(
+            "each__in", "LoopIn",
+            json!([{ "name": "agent", "portType": "String", "required": true }]),
+            json!([{ "name": "agent", "portType": "String", "required": false }]),
+        ));
+        edges.push(edge("e1", "claude", "agent", "each__in", "agent"));
+        edges.push(edge("e2", "each__in", "agent", "ask", "agent"));
+    } else {
+        edges.push(edge("e1", "claude", "agent", "ask", "agent"));
+    }
+    if tools.is_none() {
+        nodes.push(node("src", "Src", json!([]), json!([{ "name": "out", "portType": "JsonDict", "required": false }])));
+        edges.push(edge("e3", "src", "out", "ask", "tools"));
+    }
+    serde_json::from_value(json!({
+        "id": uuid::Uuid::new_v4(), "nodes": nodes, "edges": edges,
+        "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+    }))
+    .expect("project")
+}
+
+fn reserved_rule() -> ValidationRule {
+    serde_json::from_value(json!({
+        "when": { "kind": "all", "of": [
+            { "kind": "value", "field": "tools" },
+            { "kind": "not", "of": { "kind": "value", "field": "tools",
+                "each": { "key": "name", "noneOf": { "list": "reservedToolNames", "ofNodeWiredInto": "agent" } } } }
+        ] },
+        "then": { "message": "{wiredNode} cannot give up its built-in tool {noneOfFound}; rename your tool on '{id}'" }
+    }))
+    .unwrap()
+}
+
+fn ask_of(p: &ProjectDefinition) -> &NodeDefinition {
+    p.nodes.iter().find(|n| n.id == "ask").expect("ask")
+}
+
+/// `noneOf` refuses the values its list holds: a list written in the
+/// rule, or the list the node wired into an input declares, read through
+/// a loop's `LoopIn` too. A name the agent reserves is refused naming the
+/// agent and the name; a free one passes; nothing wired lists nothing.
+#[test]
+fn none_of_refuses_what_its_list_holds() {
+    let literal = rule(json!({ "kind": "not", "of": { "kind": "value", "field": "cron", "noneOf": ["root", "admin"] } }));
+    assert!(fires_on(&program(Some(json!("root"))), &literal));
+    assert!(!fires_on(&program(Some(json!("ada"))), &literal));
+    let nested = rule(json!({ "kind": "not", "of": { "kind": "value", "field": "cron", "each": { "noneOf": ["root"] } } }));
+    assert!(fires_on(&program(Some(json!(["ada", "root"]))), &nested));
+    assert!(!fires_on(&program(Some(json!(["ada"]))), &nested));
+
+    let reserved = reserved_rule();
+    let cx_fires = |p: &ProjectDefinition| {
+        let cx = RuleContext::new(p);
+        fires(&reserved, ask_of(p), &cx, &CustomPorts::default()).then(|| message(&reserved, ask_of(p), &cx, &CustomPorts::default()))
+    };
+    let tools = json!([{ "name": "search" }, { "name": "Read" }, { "name": "Task" }]);
+    assert_eq!(
+        cx_fires(&agent_program(Some(tools.clone()), false)).as_deref(),
+        Some("Claude 'claude' cannot give up its built-in tool 'Read', 'Task'; rename your tool on 'ask'")
+    );
+    assert_eq!(
+        cx_fires(&agent_program(Some(tools), true)).as_deref(),
+        Some("Claude 'claude' cannot give up its built-in tool 'Read', 'Task'; rename your tool on 'ask'"),
+        "through a loop's LoopIn"
+    );
+    assert_eq!(cx_fires(&agent_program(Some(json!([{ "name": "search" }, { "label": "no name" }])), false)), None, "a free name passes");
+    assert_eq!(cx_fires(&agent_program(None, false)).as_deref(), None, "a wired list of tools is not known yet");
+    let mut unwired = agent_program(Some(json!([{ "name": "Read" }])), false);
+    unwired.edges.clear();
+    assert_eq!(cx_fires(&unwired), None, "nothing wired into `agent` lists nothing");
+}
+
+/// A node wired in that declares no list of the name a `noneOf` reads is
+/// named, with the list and the reader, for the compile to refuse; an
+/// input nothing is wired into names nobody; a node declaring the list
+/// is fine.
+#[test]
+fn a_wired_node_declaring_no_such_list_is_named() {
+    let undeclared = |p: &ProjectDefinition| -> Vec<(String, String)> {
+        let cx = RuleContext::new(p);
+        wired_list_faults(&[reserved_rule()], ask_of(p), &cx)
+            .into_iter()
+            .map(|(n, code, told)| {
+                assert_eq!(code, "list-not-declared");
+                (n.id.clone(), told)
+            })
+            .collect()
+    };
+    assert!(undeclared(&agent_program(Some(json!([])), false)).is_empty());
+    let mut unlisted = agent_program(Some(json!([{ "name": "Read" }])), true);
+    unlisted.nodes[0].lists.clear();
+    assert_eq!(
+        undeclared(&unlisted),
+        vec![("claude".to_string(), "Claude 'claude' declares no list 'reservedToolNames' that Ask 'ask' reads through `agent`".to_string())]
+    );
+    let mut unwired = unlisted.clone();
+    unwired.edges.clear();
+    assert!(undeclared(&unwired).is_empty(), "nothing wired in names nobody");
+}
+
+/// Tools that arrive on a wire leave the rule to the run, recorded with
+/// the agent's list written in and the agent named, so the run reads no
+/// other node: it refuses a reserved name that arrived, naming it.
+#[test]
+fn a_wired_none_of_is_recorded_with_its_list_written_in() {
+    let p = agent_program(None, false);
+    let recorded = undecided(&[reserved_rule()], ask_of(&p), &RuleContext::new(&p), &CustomPorts::default());
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&recorded[0].when).unwrap(),
+        // The wire cannot close empty, so whether tools are given is
+        // settled and folded away.
+        json!({ "kind": "not", "of": { "kind": "value", "field": "tools", "each": { "key": "name", "noneOf": ["Read", "Task"] } } })
+    );
+    assert_eq!(recorded[0].message, "Claude 'claude' cannot give up its built-in tool {noneOfFound}; rename your tool on 'ask'");
+    let mut node = ask_of(&p).clone();
+    node.recheck = recorded;
+    let arrived = |tools: Value| recheck(&node, &p, json!({ "tools": tools }).as_object().unwrap());
+    let refused = arrived(json!([{ "name": "Task" }, { "name": "search" }])).unwrap_err().to_string();
+    assert_eq!(refused, "input error: Claude 'claude' cannot give up its built-in tool 'Task'; rename your tool on 'ask'");
+    assert!(arrived(json!([{ "name": "search" }])).is_ok());
+    // A rule another weft recorded with the list unresolved has no
+    // answer here, and says so.
+    node.recheck[0].when = reserved_rule().when;
+    let stale = recheck(&node, &p, json!({ "tools": [{ "name": "Task" }] }).as_object().unwrap()).unwrap_err().to_string();
+    assert!(stale.contains("which the values that arrived cannot answer"), "{stale}");
+}
+
+/// Codex's two refusals, written as a `noneMatch` list.
+const PATTERNS: [&str; 2] = ["^mcp__", "[^a-zA-Z0-9_-]"];
+
+/// `ask` refusing a tool whose name matches a pattern the agent wired
+/// into `agent` lists in `reservedToolNamePatterns`, which an agent may
+/// leave out (`optional`).
+fn pattern_rule() -> ValidationRule {
+    serde_json::from_value(json!({
+        "when": { "kind": "all", "of": [
+            { "kind": "value", "field": "tools" },
+            { "kind": "not", "of": { "kind": "value", "field": "tools",
+                "each": { "key": "name", "noneMatch": { "list": "reservedToolNamePatterns", "ofNodeWiredInto": "agent", "optional": true } } } }
+        ] },
+        "then": { "message": "{wiredNode} refuses the tool name {noneMatchFound} on '{id}'" }
+    }))
+    .unwrap()
+}
+
+/// [`agent_program`] with the agent listing [`PATTERNS`].
+fn patterned(tools: Option<Value>, through_loop: bool) -> ProjectDefinition {
+    let mut p = agent_program(tools, through_loop);
+    p.nodes[0].lists.insert("reservedToolNamePatterns".into(), PATTERNS.map(String::from).to_vec());
+    p
+}
+
+/// `noneMatch` refuses a text one of its regexes matches: a list written
+/// in the rule, at the top and under `each`, or the list the node wired
+/// into an input declares, under `each` with a `key`, through a loop's
+/// `LoopIn` too. A value that is no text fails it at the top and passes
+/// inside `each`, like `matches`.
+#[test]
+fn none_match_refuses_what_its_regexes_match() {
+    let literal = rule(json!({ "kind": "not", "of": { "kind": "value", "field": "cron", "noneMatch": PATTERNS } }));
+    assert!(fires_on(&program(Some(json!("mcp__files"))), &literal));
+    assert!(fires_on(&program(Some(json!("read file"))), &literal), "a space is outside the set");
+    assert!(!fires_on(&program(Some(json!("read_file-2"))), &literal));
+    assert!(!fires_on(&program(Some(json!("my_mcp__x"))), &literal), "anchored: only a name starting `mcp__`");
+    assert!(fires_on(&program(Some(json!(3))), &literal), "a number is no text, so the check fails at the top");
+    let nested = rule(json!({ "kind": "not", "of": { "kind": "value", "field": "cron", "each": { "noneMatch": PATTERNS } } }));
+    assert!(fires_on(&program(Some(json!(["ok", "mcp__x"]))), &nested));
+    assert!(!fires_on(&program(Some(json!(["ok", 3]))), &nested), "inside `each`, an item of the wrong kind passes");
+
+    let refused = pattern_rule();
+    let cx_fires = |p: &ProjectDefinition| {
+        let cx = RuleContext::new(p);
+        fires(&refused, ask_of(p), &cx, &CustomPorts::default()).then(|| message(&refused, ask_of(p), &cx, &CustomPorts::default()))
+    };
+    let tools = json!([{ "name": "search" }, { "name": "mcp__files" }, { "name": "read.file" }]);
+    for through_loop in [false, true] {
+        assert_eq!(
+            cx_fires(&patterned(Some(tools.clone()), through_loop)).as_deref(),
+            Some("Claude 'claude' refuses the tool name 'mcp__files', 'read.file' on 'ask'"),
+            "through_loop: {through_loop}"
+        );
+    }
+    assert_eq!(cx_fires(&patterned(Some(json!([{ "name": "search_web" }])), false)), None, "a free name passes");
+    assert_eq!(cx_fires(&agent_program(Some(tools), false)), None, "an agent listing no patterns refuses nothing");
+}
+
+/// An `optional` list a wired node leaves out is no fault, where the same
+/// list without `optional` is `list-not-declared`; a `noneMatch` list
+/// holding an item that is no regex is `list-not-regex`, naming it.
+#[test]
+fn a_wired_pattern_list_is_optional_and_must_compile() {
+    let faults = |p: &ProjectDefinition, rule: &ValidationRule| -> Vec<(String, &'static str, String)> {
+        let cx = RuleContext::new(p);
+        wired_list_faults(std::slice::from_ref(rule), ask_of(p), &cx).into_iter().map(|(n, code, told)| (n.id.clone(), code, told)).collect()
+    };
+    let tools = Some(json!([{ "name": "x" }]));
+    assert!(faults(&agent_program(tools.clone(), false), &pattern_rule()).is_empty(), "optional: left out is fine");
+    assert!(faults(&patterned(tools.clone(), false), &pattern_rule()).is_empty());
+    let mut required = pattern_rule();
+    let Condition::All { of } = &mut required.when else { unreachable!() };
+    let Condition::Not { of } = &mut of[1] else { unreachable!() };
+    let Condition::Value { checks, .. } = of.as_mut() else { unreachable!() };
+    let each = checks.each.as_mut().unwrap();
+    let Some(ValueList::Wired(wired)) = &mut each.checks.none_match else { unreachable!() };
+    wired.optional = false;
+    assert_eq!(
+        faults(&agent_program(tools.clone(), false), &required),
+        vec![(
+            "claude".to_string(),
+            "list-not-declared",
+            "Claude 'claude' declares no list 'reservedToolNamePatterns' that Ask 'ask' reads through `agent`".to_string()
+        )]
+    );
+    let mut broken = agent_program(tools, false);
+    broken.nodes[0].lists.insert("reservedToolNamePatterns".into(), vec!["^mcp__".into(), "(".into()]);
+    let found = faults(&broken, &pattern_rule());
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!((found[0].0.as_str(), found[0].1), ("claude", "list-not-regex"));
+    assert!(
+        found[0].2.starts_with("Claude 'claude' lists '(' is no regex (")
+            && found[0].2.ends_with("in 'reservedToolNamePatterns', which Ask 'ask' matches against through `agent`"),
+        "{}",
+        found[0].2
+    );
+}
+
+/// Tools that arrive on a wire leave a `noneMatch` rule to the run,
+/// recorded with the agent's patterns written in and `{noneMatchFound}`
+/// left for what arrives.
+#[test]
+fn a_wired_none_match_is_recorded_with_its_list_written_in() {
+    let p = patterned(None, false);
+    let recorded = undecided(&[pattern_rule()], ask_of(&p), &RuleContext::new(&p), &CustomPorts::default());
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&recorded[0].when).unwrap(),
+        json!({ "kind": "not", "of": { "kind": "value", "field": "tools", "each": { "key": "name", "noneMatch": PATTERNS } } })
+    );
+    assert_eq!(recorded[0].message, "Claude 'claude' refuses the tool name {noneMatchFound} on 'ask'");
+    let mut node = ask_of(&p).clone();
+    node.recheck = recorded;
+    let arrived = |tools: Value| recheck(&node, &p, json!({ "tools": tools }).as_object().unwrap());
+    let refused = arrived(json!([{ "name": "mcp__a" }, { "name": "ok" }])).unwrap_err().to_string();
+    assert_eq!(refused, "input error: Claude 'claude' refuses the tool name 'mcp__a' on 'ask'");
+    assert!(arrived(json!([{ "name": "ok" }])).is_ok());
+}
+
+/// `local_install` reads with no field, and a stray one is refused.
+#[test]
+fn local_install_reads_with_no_field() {
+    let read = serde_json::from_value::<Condition>(json!({ "kind": "local_install" })).unwrap();
+    assert!(matches!(read, Condition::LocalInstall {}));
+    assert_eq!(serde_json::to_value(&read).unwrap(), json!({ "kind": "local_install" }));
+    assert!(serde_json::from_value::<Condition>(json!({ "kind": "local_install", "port": "x" })).is_err());
+}

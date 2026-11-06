@@ -13,11 +13,15 @@
     "label": "Instance key",
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "keys",
-          "label": "Keys",
-          "secret": true
+          "fields": [
+            {
+              "name": "keys",
+              "label": "Keys",
+              "secret": true
+            }
+          ]
         }
       ]
     },

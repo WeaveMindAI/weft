@@ -205,7 +205,7 @@ async fn infra_look(ctx: &Ctx) -> Result<()> {
 /// lists a node under it, and refused with the program's answer otherwise.
 pub(crate) async fn place_named(ctx: &Ctx, spelled: &str) -> Result<String> {
     let Some(project) = ctx.project_here()? else { return Ok(spelled.to_string()) };
-    let checked = weft_compiler::hash::load_program(project).and_then(|(definition, _)| {
+    let checked = weft_compiler::hash::load_program(project, None).and_then(|(definition, _)| {
         let (id, call_path) = super::resolve_node(project, &definition, spelled)?;
         Ok(weft_core::project::address_of(&definition, &id, &call_path))
     });

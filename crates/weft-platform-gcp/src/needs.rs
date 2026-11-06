@@ -9,14 +9,14 @@
 //! before it starts.
 
 use async_trait::async_trait;
-use weft_core::needs::NodeNeed;
+use weft_core::needs::Need;
 use weft_platform_traits::MachineNeeds;
 
 pub struct ImageNeeds;
 
 #[async_trait]
 impl MachineNeeds for ImageNeeds {
-    async fn missing(&self, needs: &[NodeNeed]) -> anyhow::Result<Vec<NodeNeed>> {
+    async fn unmet(&self, needs: &[Need]) -> anyhow::Result<Vec<Need>> {
         Ok(needs.to_vec())
     }
 
@@ -31,10 +31,10 @@ mod tests {
 
     #[tokio::test]
     async fn every_need_the_image_left_to_the_machine_is_missing() {
-        let asked = [NodeNeed {
+        let asked = [weft_core::needs::NodeNeed {
             node_type: "ExecPython".into(),
             nodes: vec!["greet".into()],
-            need: weft_core::needs::Need { name: "xcode".into(), stage: Default::default(), check: vec!["xcode".into()], install: Default::default() },
+            need: weft_core::needs::Need { name: "xcode".into(), stage: Default::default(), check: vec!["xcode".into()], install: Default::default(), how: None, recipe: None },
         }];
         assert_eq!(ImageNeeds.missing(&asked).await.unwrap(), asked.to_vec());
     }
