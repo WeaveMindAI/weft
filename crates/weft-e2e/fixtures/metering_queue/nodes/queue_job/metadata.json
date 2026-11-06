@@ -23,9 +23,13 @@
     "label": "Queue fake (e2e)",
     "acquisition": {
       "kind": "static",
-      "fields": [
-        { "name": "key", "label": "API key", "placeholder": "anything" },
-        { "name": "base", "label": "Base URL", "placeholder": "http://host:port" }
+      "ways": [
+        {
+          "fields": [
+            { "name": "key", "label": "API key", "placeholder": "anything" },
+            { "name": "base", "label": "Base URL", "placeholder": "http://host:port" }
+          ]
+        }
       ]
     },
     "auth": [

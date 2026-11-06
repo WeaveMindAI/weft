@@ -1,0 +1,282 @@
+{
+  "type": "KiloCode",
+  "label": "Kilo Code",
+  "description": "One conversation with Kilo Code, Kilo's open source coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, Kilo Code runs on your machine (a local install only) with your own login, working in `folder`, from your own install of `kilo` when there is one on PATH; when there is none, weft installs Kilo Code itself, once, into a folder of its own shared by every program on the machine. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs, and it logs in with the connection on `access`. Each permission setting is a set of rules weft hands Kilo, which win over the folder's own `kilo.json`. Refusing one of its permission requests with a note hands Kilo the note and its turn goes on; refusing without one ends its whole turn. A conversation runs in the agent your Kilo config makes the default (Kilo's own `code` when it names none), and stays in it across restarts; only `plan` switches it, and fails the turn when your Kilo config turns `plan` off. Its questions (its question tool, several at once) come out of AskAgent. When it cannot reach its model, it waits for the network and goes on by itself once it is back, and its card says so meanwhile, as it does while Kilo retries a refused request. Claude Code's folder (`~/.claude`), which Kilo would read as its own config, is kept out. Your program's tools reach Kilo under their plain names, through a plugin weft writes for it, and a tool named like one of Kilo's own (`read`, `bash`, `edit`, `task`, its `question`, ...) takes that one's place. The names of the tools Kilo adds for your own MCP servers' resources (`list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`) are refused when the program is built, since Kilo's would win over them. With a provider's key, `model` must name one of that provider's models: left out, Kilo would pick a model of its own gateway. Its card shows what it is doing and a Start over button. What is exposed: the permission rules, the model and the effort.",
+  "tags": [
+    "agent",
+    "coding",
+    "kilo",
+    "kilo-org",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run Kilo Code in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[kilo_code]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A KiloCodeAccess's `access`: a Kilo API key, or a model provider's key (Anthropic, OpenAI, OpenRouter, or Gemini). Required with a `computer`. Left out on your machine, Kilo Code uses the login and the providers already set up there."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder Kilo Code works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`kilo` on your PATH",
+      "description": "On your machine: the Kilo Code program to run, when it is not the `kilo` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "accept_edits",
+          "plan",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What Kilo Code may do without asking. `ask`: commands, edits, web fetches and searches, and folders outside `folder` come out of AskAgent as questions; reading, searching and your program's tools go ahead. `accept_edits`: the same, but edits go ahead. `plan`: its plan mode: it reads and runs read-only commands, refuses any other command without asking, and writes nothing but its plan; it offers the model no tool it does not know, so a turn handed your program's tools is refused. `bypass`: nothing asks, nothing is refused; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "anthropic/claude-sonnet-4-6",
+      "description": "The model as `<provider>/<model>`, such as `anthropic/claude-sonnet-4-6`. Required with a provider's key. Left out, the model the conversation began on: the one your Kilo config names, else one of Kilo's gateway."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "none",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "label": "Effort",
+      "description": "How hard the model thinks, among the levels the model offers: a level it does not offer fails the turn. Left out, the model's default."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "KiloCode '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "KiloCode '{id}' runs in a computer, where no login is waiting for it; give it a KiloCodeAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "KiloCode '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "accept_edits",
+                "plan",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "KiloCode '{id}' has a `permission` it does not know; pick one of ask, accept_edits, plan, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "KiloCode '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "KiloCode '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs Kilo Code itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "list_mcp_resources",
+      "list_mcp_resource_templates",
+      "read_mcp_resource"
+    ]
+  }
+}

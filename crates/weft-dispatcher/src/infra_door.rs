@@ -56,8 +56,14 @@ pub async fn forward(State(state): State<DispatcherState>, request: Request) -> 
     let Some((endpoint, under)) = route(row.public_paths.iter(), &path) else {
         return (StatusCode::NOT_FOUND, "no public endpoint at this path").into_response();
     };
-    let Some(base_url) = row.endpoints.get(endpoint).cloned() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "the endpoint has no address yet; its node is still starting").into_response();
+    // Only an endpoint with an address of its own is ever public: one
+    // inside another node's endpoint is refused an expose at resolve.
+    let base_url = match row.endpoints.get(endpoint) {
+        Some(weft_core::infra::EndpointRecord::Url(url)) => url.clone(),
+        Some(weft_core::infra::EndpointRecord::Within(_)) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "a public endpoint lives inside another node's endpoint, which is never public").into_response()
+        }
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "the endpoint has no address yet; its node is still starting").into_response(),
     };
     let path_and_query = match request.uri().query() {
         Some(q) => format!("{under}?{q}"),

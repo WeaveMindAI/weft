@@ -2,7 +2,8 @@
 //!
 //! [`resolve`] checks an [`InfraSpec`] (every name a unit, a container, a
 //! port or a volume is referred by exists; a disk is mounted by one unit
-//! only; a public path is a plain path) and swaps every locally built image
+//! only; a public path is a plain path; a unit runs containers or one
+//! process, and a process only what a process takes) and swaps every locally built image
 //! name for the ref its version build registered. What comes out is a
 //! [`ResolvedNode`]: the same spec with nothing left to look up, plus one
 //! hash per unit, which is how an apply tells a unit that changed (replace
@@ -14,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::types::{Endpoint, EndpointTarget, Expose, Image, InfraSpec, Unit, VolumeKind};
+use super::types::{Endpoint, EndpointTarget, Expose, Image, InfraSpec, MachineShape, Process, Unit, VolumeKind};
 
 /// Which copy of which infra node of which project: what a platform names
 /// everything it runs for the node by.
@@ -160,8 +161,33 @@ pub enum ResolveError {
     #[error("infra node '{node}': disk '{volume}' is mounted by units '{first}' and '{second}'; a \
              disk attaches to one machine, so give each unit a disk of its own")]
     DiskShared { node: String, volume: String, first: String, second: String },
-    #[error("infra node '{node}': unit '{unit}' runs no container")]
+    #[error("infra node '{node}': unit '{unit}' runs no container and no process; give it containers, or one process")]
     EmptyUnit { node: String, unit: String },
+    #[error("infra node '{node}': unit '{unit}' runs a process and containers; a unit runs one or the other, so \
+             give the process a unit of its own")]
+    UnitRunsBoth { node: String, unit: String },
+    #[error("infra node '{node}': unit '{unit}' runs a process and sets its {what}, which a process does not take: it \
+             runs as you, on the machine weft runs on, sharing it with everything else you run; remove its {what}")]
+    ProcessTakesNo { node: String, unit: String, what: &'static str },
+    #[error("infra node '{node}': unit '{unit}' runs a process with an empty command; name the program to run first")]
+    ProcessCommandEmpty { node: String, unit: String },
+    #[error("infra node '{node}': unit '{unit}' writes the file '{path}', which is not a plain path inside its folder. \
+             It must be relative, and every segment between slashes must be non-empty and not '.' or '..'")]
+    ProcessFilePath { node: String, unit: String, path: String },
+    #[error("infra node '{node}': the process of unit '{unit}' sets {name} to a value with a line break, which an \
+             environment variable does not carry; write text of several lines into one of its files instead")]
+    ProcessEnvLineBreak { node: String, unit: String, name: String },
+    #[error("infra node '{node}': the process of unit '{unit}' gets port '{port}' in the variable '{env}', which is \
+             no variable name: use uppercase letters, digits and '_', not starting with a digit")]
+    ProcessPortEnvInvalid { node: String, unit: String, port: String, env: String },
+    #[error("infra node '{node}': the readiness check of unit '{unit}' reads port '{port}', which its process does not \
+             declare")]
+    ProcessReadinessPortMissing { node: String, unit: String, port: String },
+    #[error("infra node '{node}': the process of unit '{unit}' needs '{need}' at build time, and a process is never \
+             built; give the need `stage = \"run\"` (the default), or drop it")]
+    ProcessBuildNeed { node: String, unit: String, need: String },
+    #[error("infra node '{node}': the process of unit '{unit}' needs '{need}', whose recipe {why}")]
+    ProcessNeedRecipe { node: String, unit: String, need: String, why: String },
     #[error("infra node '{node}': container '{container}' sets {name}, which weft sets itself on \
              every container (where to push the values that changed); read it instead of setting it")]
     ReservedEnv { node: String, container: String, name: &'static str },
@@ -179,6 +205,13 @@ pub enum ResolveError {
     #[error("infra node '{node}': endpoint '{endpoint}' points at an outside address, so it \
              cannot be exposed: whoever runs that service decides who reaches it")]
     ExternalExposed { node: String, endpoint: String },
+    #[error("infra node '{node}': endpoint '{endpoint}' lives inside another node's endpoint at '{path}', which is \
+             not a plain path under it. It must start with '/', name at least one segment, and every segment between \
+             slashes must be non-empty, not '.' or '..', and use only letters, digits, '-', '_', '.' and '~'")]
+    WithinPathInvalid { node: String, endpoint: String, path: String },
+    #[error("infra node '{node}': endpoint '{endpoint}' lives inside another node's endpoint, so it cannot be \
+             exposed: open the endpoint it lives inside instead")]
+    WithinExposed { node: String, endpoint: String },
     #[error("infra node '{node}': keep_on_terminate names '{volume}', which is not a declared disk")]
     KeptVolumeMissing { node: String, volume: String },
     #[error("infra node '{node}': health rule '{rule}' reads unit '{unit}', which is not declared; \
@@ -265,6 +298,19 @@ fn check_endpoint(node: &str, spec: &InfraSpec, ep: &Endpoint) -> Result<(), Res
             let c = u.containers.iter().find(|c| &c.name == container).ok_or_else(|| missing("container", container))?;
             c.ports.iter().find(|p| &p.name == port).ok_or_else(|| missing("port", port))?;
         }
+        EndpointTarget::Process { unit, port } => {
+            let u = spec.units.iter().find(|u| &u.name == unit).ok_or_else(|| missing("unit", unit))?;
+            let p = u.process.as_ref().ok_or_else(|| missing("the process of unit", unit))?;
+            p.ports.iter().find(|p| &p.name == port).ok_or_else(|| missing("process port", port))?;
+        }
+        EndpointTarget::Within { path, .. } => {
+            if !plain_public_path(path) || path == "/" {
+                return Err(ResolveError::WithinPathInvalid { node: plain(node), endpoint: ep.name.clone(), path: path.clone() });
+            }
+            if ep.expose != Expose::Project {
+                return Err(ResolveError::WithinExposed { node: plain(node), endpoint: ep.name.clone() });
+            }
+        }
         EndpointTarget::External { url } => {
             let scheme_ok = ["http://", "https://", "tcp://"].iter().any(|s| url.starts_with(s) && url.len() > s.len());
             if !scheme_ok {
@@ -297,6 +343,10 @@ pub fn resolve(spec: &InfraSpec, node: &NodeRef, tags: &BTreeMap<String, String>
     unique(id, "endpoint", spec.endpoints.iter().map(|e| e.name.as_str()))?;
     for u in &spec.units {
         check_name(id, "unit", &u.name, MAX_UNIT)?;
+        if let Some(process) = &u.process {
+            check_process(id, u, process)?;
+            continue;
+        }
         if u.containers.is_empty() {
             return Err(ResolveError::EmptyUnit { node: plain(id), unit: u.name.clone() });
         }
@@ -371,8 +421,69 @@ pub fn resolve(spec: &InfraSpec, node: &NodeRef, tags: &BTreeMap<String, String>
     Ok(ResolvedNode { node: node.clone(), units, spec: spec.clone() })
 }
 
+/// Check the unit `unit` of node `node`, which runs `process`: nothing of
+/// a container unit set, every file a plain path in its folder, every
+/// variable one an environment carries, every port named once and found
+/// in a variable of its own, and only run-time needs.
+fn check_process(node: &str, unit: &Unit, process: &Process) -> Result<(), ResolveError> {
+    let (node, name) = (plain(node), unit.name.clone());
+    if !unit.containers.is_empty() || !unit.init_containers.is_empty() {
+        return Err(ResolveError::UnitRunsBoth { node, unit: name });
+    }
+    if unit.machine != MachineShape::default() {
+        return Err(ResolveError::ProcessTakesNo { node, unit: name, what: "machine" });
+    }
+    if unit.fs_group.is_some() {
+        return Err(ResolveError::ProcessTakesNo { node, unit: name, what: "fsGroup" });
+    }
+    if process.command.first().is_none_or(|program| program.is_empty()) {
+        return Err(ResolveError::ProcessCommandEmpty { node, unit: name });
+    }
+    if let Some(path) = process.files.keys().find(|path| !plain_relative_path(path)) {
+        return Err(ResolveError::ProcessFilePath { node, unit: name, path: path.clone() });
+    }
+    if let Some(e) = process.env.iter().find(|e| e.value.contains(['\n', '\r'])) {
+        return Err(ResolveError::ProcessEnvLineBreak { node, unit: name, name: e.name.clone() });
+    }
+    unique(&node, "process port", process.ports.iter().map(|p| p.name.as_str()))?;
+    if let Some(p) = process.ports.iter().find(|p| !variable_name(&p.env)) {
+        return Err(ResolveError::ProcessPortEnvInvalid { node, unit: name, port: p.name.clone(), env: p.env.clone() });
+    }
+    // A port's variable is the host's to set: one the spec sets too, or
+    // a second port's, would leave the process reading the wrong number.
+    unique(&node, "environment variable", process.env.iter().map(|e| e.name.as_str()).chain(process.ports.iter().map(|p| p.env.as_str())))?;
+    if let Some(readiness) = &process.readiness {
+        if !process.ports.iter().any(|p| p.name == readiness.port) {
+            return Err(ResolveError::ProcessReadinessPortMissing { node, unit: name, port: readiness.port.clone() });
+        }
+    }
+    if let Some(need) = process.needs.iter().find(|n| n.stage != crate::needs::NeedStage::Run) {
+        return Err(ResolveError::ProcessBuildNeed { node, unit: name, need: need.name.clone() });
+    }
+    for need in &process.needs {
+        if let Some(why) = need.recipe.as_ref().and_then(|r| r.refusal()) {
+            return Err(ResolveError::ProcessNeedRecipe { node, unit: name, need: need.name.clone(), why });
+        }
+    }
+    Ok(())
+}
+
+/// Whether `path` names a file inside a folder: relative, and no segment
+/// empty, `.` or `..`.
+fn plain_relative_path(path: &str) -> bool {
+    !path.is_empty() && !path.starts_with('/') && path.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// Whether `name` is an environment variable's name: uppercase letters,
+/// digits and `_`, not starting with a digit.
+fn variable_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_uppercase() || c == '_') && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
 /// The unit's own definition plus every volume it mounts and every
-/// endpoint that targets it, canonically serialized and hashed.
+/// endpoint that targets it, canonically serialized and hashed. A process
+/// unit's definition holds its files, so a changed script is a changed
+/// unit.
 fn unit_hash(unit: &Unit, spec: &InfraSpec) -> String {
     let mounted: BTreeSet<&str> = unit
         .containers
@@ -384,7 +495,7 @@ fn unit_hash(unit: &Unit, spec: &InfraSpec) -> String {
     let endpoints: Vec<_> = spec
         .endpoints
         .iter()
-        .filter(|e| matches!(&e.target, EndpointTarget::Unit { unit: u, .. } if *u == unit.name))
+        .filter(|e| e.target.unit() == Some(unit.name.as_str()))
         .collect();
     let doc = serde_json::json!({ "unit": unit, "volumes": volumes, "endpoints": endpoints });
     let mut hasher = Sha256::new();
@@ -570,6 +681,176 @@ mod tests {
         let mut s = spec();
         s.keep_on_terminate = vec!["ghost".into()];
         assert!(matches!(resolve(&s, &node(), &tags()).unwrap_err(), ResolveError::KeptVolumeMissing { .. }));
+    }
+
+    fn process_spec() -> InfraSpec {
+        InfraSpec {
+            units: vec![Unit {
+                name: "server".into(),
+                process: Some(
+                    Process::new(vec!["python3".into(), "server.py".into()])
+                        .with_file("server.py", "serve()\n")
+                        .with_env(vec![EnvEntry::new("MODE", "prod")])
+                        .with_ports(vec![ProcessPort::new("http", "PORT")])
+                        .with_readiness(ProcessReadiness::http("http", "/health")),
+                ),
+                ..Default::default()
+            }],
+            endpoints: vec![Endpoint {
+                name: "api".into(),
+                target: EndpointTarget::Process { unit: "server".into(), port: "http".into() },
+                expose: Expose::Public { path: "/agent".into() },
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A process unit resolves as written (it has no image to resolve),
+    /// and its hash follows its files and the endpoints to its ports.
+    #[test]
+    fn a_process_unit_resolves_and_its_files_are_in_its_hash() {
+        let r = resolve(&process_spec(), &node(), &BTreeMap::new()).unwrap();
+        assert_eq!(r.units[0].unit, process_spec().units[0]);
+        let mut edited = process_spec();
+        edited.units[0].process.as_mut().unwrap().files.insert("server.py".into(), "serve(2)\n".into());
+        assert_ne!(r.units[0].hash, resolve(&edited, &node(), &BTreeMap::new()).unwrap().units[0].hash, "a changed script counts");
+        let mut opened = process_spec();
+        opened.endpoints[0].expose = Expose::SameNetwork;
+        assert_ne!(r.units[0].hash, resolve(&opened, &node(), &BTreeMap::new()).unwrap().units[0].hash, "an endpoint to it counts");
+        assert!(unit_image_refs(&r.units[0].unit, "db", &BTreeMap::new()).unwrap().is_empty(), "no image to keep");
+    }
+
+    /// Everything a process unit cannot be is refused by name: a unit
+    /// running a process and containers, or neither; what only a container
+    /// takes; a file outside its folder; a port variable that is no
+    /// variable, or one the spec sets too; a readiness check on a port it
+    /// does not have; a need at build time; an endpoint asking a process
+    /// for a container.
+    #[test]
+    fn what_a_process_unit_cannot_be_is_refused_by_name() {
+        let refused = |change: &dyn Fn(&mut InfraSpec)| {
+            let mut s = process_spec();
+            change(&mut s);
+            resolve(&s, &node(), &BTreeMap::new()).unwrap_err()
+        };
+        fn process(s: &mut InfraSpec) -> &mut Process {
+            s.units[0].process.as_mut().unwrap()
+        }
+        let both = refused(&|s| s.units[0].containers = spec().units[0].containers.clone());
+        assert_eq!(both, ResolveError::UnitRunsBoth { node: "db".into(), unit: "server".into() });
+        let neither = refused(&|s| s.units[0].process = None);
+        assert!(matches!(&neither, ResolveError::EmptyUnit { unit, .. } if unit == "server"), "{neither}");
+        assert!(neither.to_string().contains("no container and no process"), "{neither}");
+        let gpu = refused(&|s| s.units[0].machine.gpu = Some(Gpu { kind: "nvidia-l4".into(), count: 1 }));
+        assert_eq!(gpu, ResolveError::ProcessTakesNo { node: "db".into(), unit: "server".into(), what: "machine" });
+        assert!(matches!(refused(&|s| s.units[0].fs_group = Some(1)), ResolveError::ProcessTakesNo { what: "fsGroup", .. }));
+        assert!(matches!(refused(&|s| process(s).command = Vec::new()), ResolveError::ProcessCommandEmpty { .. }));
+        for path in ["/etc/passwd", "../out", "a//b", "./x", ""] {
+            let e = refused(&|s| {
+                process(s).files.insert(path.into(), "x".into());
+            });
+            assert_eq!(e, ResolveError::ProcessFilePath { node: "db".into(), unit: "server".into(), path: path.into() }, "{path}");
+        }
+        let broken = refused(&|s| process(s).env.push(EnvEntry::new("SETTINGS", "a\nb")));
+        assert!(matches!(&broken, ResolveError::ProcessEnvLineBreak { name, .. } if name == "SETTINGS"), "{broken}");
+        let lower = refused(&|s| process(s).ports[0].env = "port".into());
+        assert!(matches!(&lower, ResolveError::ProcessPortEnvInvalid { env, .. } if env == "port"), "{lower}");
+        let clash = refused(&|s| process(s).env.push(EnvEntry::new("PORT", "1")));
+        assert_eq!(clash, ResolveError::Duplicate { node: "db".into(), what: "environment variable", name: "PORT".into() });
+        let twice = refused(&|s| process(s).ports.push(ProcessPort::new("http", "OTHER_PORT")));
+        assert!(matches!(twice, ResolveError::Duplicate { what: "process port", .. }));
+        let unread = refused(&|s| process(s).readiness = Some(ProcessReadiness::http("admin", "/")));
+        assert!(matches!(&unread, ResolveError::ProcessReadinessPortMissing { port, .. } if port == "admin"), "{unread}");
+        let build = refused(&|s| {
+            process(s).needs.push(crate::needs::Need {
+                name: "cc".into(),
+                stage: crate::needs::NeedStage::Build,
+                check: vec!["cc".into()],
+                install: BTreeMap::new(),
+                how: None,
+                recipe: None,
+            })
+        });
+        assert!(matches!(&build, ResolveError::ProcessBuildNeed { need, .. } if need == "cc"), "{build}");
+        let outside = refused(&|s| {
+            let recipe = crate::needs::Recipe { folder: "../etc".into(), script: BTreeMap::new(), bin: Vec::new(), prelude: String::new() };
+            process(s).needs.push(crate::needs::Need {
+                name: "tool".into(),
+                stage: crate::needs::NeedStage::Run,
+                check: vec!["tool".into()],
+                install: BTreeMap::new(),
+                how: None,
+                recipe: Some(recipe),
+            })
+        });
+        assert!(matches!(&outside, ResolveError::ProcessNeedRecipe { need, .. } if need == "tool"), "{outside}");
+        let no_port = refused(&|s| s.endpoints[0].target = EndpointTarget::Process { unit: "server".into(), port: "ssh".into() });
+        assert!(no_port.to_string().contains("process port 'ssh'"), "{no_port}");
+        let container = refused(&|s| s.endpoints[0].target = EndpointTarget::Unit { unit: "server".into(), container: "main".into(), port: "http".into() });
+        assert!(container.to_string().contains("container 'main'"), "{container}");
+        // And a process target on a container unit.
+        let mut s = spec();
+        s.endpoints[0].target = EndpointTarget::Process { unit: "db".into(), port: "sql".into() };
+        let e = resolve(&s, &node(), &tags()).unwrap_err();
+        assert!(e.to_string().contains("the process of unit 'db'"), "{e}");
+    }
+
+    /// A node with no unit and one endpoint inside another node's
+    /// resolves; the endpoint's path is a plain path under it, and it is
+    /// never exposed.
+    #[test]
+    fn an_endpoint_inside_another_nodes_is_checked_and_never_exposed() {
+        let computer = crate::infra::InfraHandle::new("box", "api", None);
+        let mut s = InfraSpec {
+            endpoints: vec![Endpoint {
+                name: "api".into(),
+                target: EndpointTarget::Within { infra: computer, path: "/apps/claude".into() },
+                expose: Expose::Project,
+            }],
+            ..Default::default()
+        };
+        let r = resolve(&s, &node(), &BTreeMap::new()).unwrap();
+        assert!(r.units.is_empty());
+        let wire = serde_json::to_value(&s.endpoints[0].target).unwrap();
+        assert_eq!(wire["kind"], "within");
+        assert_eq!(wire["path"], "/apps/claude");
+        assert_eq!(serde_json::from_value::<EndpointTarget>(wire).unwrap(), s.endpoints[0].target);
+        for bad in ["apps", "/", "/apps/../x", "/a//b"] {
+            let EndpointTarget::Within { path, .. } = &mut s.endpoints[0].target else { unreachable!() };
+            *path = bad.into();
+            assert!(matches!(resolve(&s, &node(), &BTreeMap::new()).unwrap_err(), ResolveError::WithinPathInvalid { .. }), "{bad}");
+        }
+        let EndpointTarget::Within { path, .. } = &mut s.endpoints[0].target else { unreachable!() };
+        *path = "/apps/claude".into();
+        s.endpoints[0].expose = Expose::SameNetwork;
+        assert_eq!(resolve(&s, &node(), &BTreeMap::new()).unwrap_err(), ResolveError::WithinExposed { node: "db".into(), endpoint: "api".into() });
+    }
+
+    /// A record keeps an address as the plain string rows always held,
+    /// and an endpoint inside another as the handle and path, followed one
+    /// hop at every read: an inner copy not running says so naming it, and
+    /// one inside yet another is refused.
+    #[test]
+    fn a_record_inside_another_endpoint_is_followed_one_hop() {
+        let url = EndpointRecord::Url("http://127.0.0.1:9".into());
+        assert_eq!(serde_json::to_value(&url).unwrap(), serde_json::json!("http://127.0.0.1:9"));
+        assert_eq!(url.within(), None);
+        let computer = crate::infra::InfraHandle::new("box", "api", None);
+        let within = EndpointRecord::Within(WithinRecord { within: computer.clone(), path: "/apps/claude".into() });
+        let wire = serde_json::to_value(&within).unwrap();
+        assert_eq!(wire["path"], "/apps/claude");
+        assert_eq!(serde_json::from_value::<EndpointRecord>(wire).unwrap(), within);
+        assert_eq!(serde_json::from_value::<EndpointRecord>(serde_json::json!("http://x")).unwrap(), EndpointRecord::Url("http://x".into()));
+        assert_eq!(within.within(), Some(&computer));
+        assert_eq!(within.summary(), "inside endpoint 'api' of 'box' at /apps/claude");
+
+        assert_eq!(url.address(None).unwrap(), "http://127.0.0.1:9");
+        let inner = EndpointRecord::Url("http://127.0.0.1:5000/".into());
+        assert_eq!(within.clone().address(Some(inner)).unwrap(), "http://127.0.0.1:5000/apps/claude");
+        let down = within.clone().address(None).unwrap_err();
+        assert_eq!(down, "the infra node 'box' this endpoint runs inside is not running: start it with `weft infra start`");
+        let chained = within.clone().address(Some(within)).unwrap_err();
+        assert!(chained.contains("followed one step only"), "{chained}");
     }
 
     #[test]

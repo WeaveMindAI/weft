@@ -14,11 +14,15 @@
     "label": "Telegram",
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "token",
-          "label": "Bot token",
-          "placeholder": "123456789:AA..."
+          "fields": [
+            {
+              "name": "token",
+              "label": "Bot token",
+              "placeholder": "123456789:AA..."
+            }
+          ]
         }
       ]
     },

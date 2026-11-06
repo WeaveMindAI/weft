@@ -427,13 +427,14 @@ impl RunProjector {
                     at_unix,
                 }]
             }
-            RunEvent::BusLeft { bus_id, offset, name, .. } => {
+            RunEvent::BusLeft { bus_id, offset, name, end, .. } => {
                 vec![DispatcherEvent::BusLeft {
                     run_id,
                     project_id,
                     bus_id: bus_id.clone(),
                     offset: *offset,
                     name: name.clone(),
+                    end: end.clone(),
                     at_unix,
                 }]
             }

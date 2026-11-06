@@ -183,9 +183,10 @@
 #                 seaweedfs image, the BuildKit cache, the workspace
 #                 target/ cargo cache, ~/.local/share/weft (THE
 #                 DATABASE'S FILES under postgres-data/, the install's
-#                 config and keys, prebuilt binaries, and every branch's
-#                 install under installs/), this checkout's
-#                 .weft-install, and the
+#                 config and keys, prebuilt binaries, every branch's
+#                 install under installs/, and the coding agents and
+#                 other tools weft installed itself under needs/), this
+#                 checkout's .weft-install, and the
 #                 untracked extension build artifacts. Also deletes the
 #                 Kubernetes cluster an older weft ran, if this machine
 #                 still has it. The next install pays a full

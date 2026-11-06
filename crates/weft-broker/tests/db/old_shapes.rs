@@ -64,6 +64,7 @@ pub(crate) async fn broker_state_on(pool: Pool, object_store: Arc<dyn weft_platf
             own_base_url: "http://broker".into(),
             container_files_base: None,
             object_store_public_internet: false,
+            install: weft_core::install::InstallKind::Local,
             slot_key: weft_core::storage::slot::SlotKey::of(b"a test secret"),
             line_max_age: None,
             dispatcher_alarm: None,

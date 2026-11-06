@@ -1,7 +1,9 @@
 //! TickBus: a producer standing in for an LLM stream in the streaming e2e.
 //! Sends three text deltas on `ticks` the way `LlmStream` sends its
 //! fragments (`delta` messages carrying a string), opening the bus with
-//! the first one; the bus ends when the body returns. With `failAt` it
+//! the first one; it is the bus's only member, so the bus ends when the
+//! body returns and no node can still join it, failed when the body
+//! failed. With `failAt` it
 //! fails instead when it reaches that tick: at 0 before the bus opened
 //! (a provider refusing the call), later halfway through the stream.
 

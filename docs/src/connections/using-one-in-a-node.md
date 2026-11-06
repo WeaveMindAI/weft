@@ -76,8 +76,21 @@ optional, like fetching a link that is usually public.
 | `value(name)` | One stored value, like `imapHost` |
 | `identity()` | Who it is, for a log line |
 | `owner()` | Whether it is theirs or the runtime's |
+| `way()` | Which [way to sign in](declaring-a-service.md#pasting-a-key) the connection was made with, like `"subscription"`, or `"default"` when its service offers only one. `None` for a connection signed in through a consent flow, a minted key or the runtime's own key; a key pasted on a consent service's own page reads `"default"` |
 
-Keep those out of your outputs and out of your logs. Anything you emit is
+If your service offers several ways, `way()` is how you tell the credentials
+apart. A Claude subscription's token and an API key go into different
+variables:
+
+```rust
+let conn = ctx.open(&account).await?;
+match conn.way() {
+    Some("subscription") => env.insert("CLAUDE_CODE_OAUTH_TOKEN", conn.value("token")?),
+    _ => env.insert("ANTHROPIC_API_KEY", conn.value("key")?),
+};
+```
+
+Keep the values out of your outputs and out of your logs. Anything you emit is
 journaled and shows in the inspector.
 
 ## Saying what you need
@@ -134,6 +147,48 @@ The default is fifteen minutes, which is generous for an API call including its
 stream and its cost resolution, and short enough that a lease left by a crashed
 worker goes stale the same quarter hour.
 
+## When the service refuses the values
+
+If the service refuses the token your node was handed, or something you handed
+it to says it is about to die, ask weft to renew the connection:
+
+```rust
+let conn = ctx.open(&account).await?;
+let token = match call_with(conn.value("token")?).await {
+    Err(Refused::Unauthorized) => ctx.renew(&account).await?.value("token")?.to_string(),
+    answer => answer?,
+};
+```
+
+`ctx.renew` hands back the connection opened again, renewed. weft renews it
+only while the connection still holds exactly what your firing was handed. If
+another node renewed it in the meantime, you get its new values and the
+provider is not asked again. If ten nodes ask at the same moment, the provider
+sees one renewal and all ten get its result. That matters for a provider whose
+refresh token rotates, where each renewal retires the refresh token before it:
+weft is the only one ever holding it, so no node can spend it under another.
+
+Open the connection in the same firing first, because the renewal is of what
+you were handed. Without an open, the node fails:
+
+```text
+renew the 'codex' connection: this node has not opened it in this firing, so
+nothing says which values stopped working; open it (`ctx.open`) first
+```
+
+A connection weft has nothing to renew with, like a pasted API key, fails the
+node with a reconnect:
+
+```text
+the service refused what the 'my key' connection holds, and weft holds nothing
+to renew it with; connect the account again (Connect on its access node in the
+editor, or `weft connect` in the project's folder)
+```
+
+So does a renewal the provider refuses (a revoked sign-in, say). For a pasted
+login weft can renew, the recipe declares how, and for that, go and read
+[declaring a service](declaring-a-service.md#a-pasted-login-weft-keeps-alive).
+
 ## A connection your own node hands out
 
 If your node runs the service, it publishes the connection rather than
@@ -171,5 +226,13 @@ it checks the node's `requiresScopes`; leave it out and the permission check is
 skipped. `rig.connection_value("slack", "teamId", "T123")` gives the connection
 a stored value, for a node that reads one. `rig.respond` sets up a canned answer
 for a route, so no request leaves the test.
+
+If your node reads `way()`, `rig.connection_way("codex", "subscription")` makes
+it answer `"subscription"`. If your node renews a connection,
+`rig.connection_renewal("codex", Ok(&[("token", "t2")]))` says what a renewal
+hands, and `Err("why")` makes the provider refuse it. `rig.connection_renewals("codex")`
+counts the renewals that reached the provider. The rig renews the way a real
+run does: it refuses a renewal before an open, and a node handed values the
+connection no longer holds gets the newer ones with no renewal counted.
 
 The test uses no real credential and makes no real call, so it costs nothing.

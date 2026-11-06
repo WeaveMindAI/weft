@@ -40,7 +40,7 @@
 //!   and its caller's last words go on its record first, then its ending
 //!   (`run_one_observed`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -870,7 +870,7 @@ async fn drive_run_id(
             *record.owed.lock().expect("owed calls poisoned") = owed;
             let born_with = BornWith::of_birth(run_id, &birth)?;
             let (fold, mut snap) = RunFold::of_live(run_id, project_arc.clone(), chain, fold).await?;
-            let open_buses = std::mem::take(&mut snap.open_buses);
+            let buses = std::mem::take(&mut snap.buses);
             let crashed = apply_snapshot(
                 &program, snap, &mut pulses, &mut firings, &mut kicked, &mut scopes, &mut carried,
                 &mut loop_runtime, &mut forgetting,
@@ -881,7 +881,7 @@ async fn drive_run_id(
             let left_running = firings
                 .open()
                 .any(|e| e.status() == NodeFiringStatus::Running && !program.boundaries.contains(&e.node_id));
-            reopen_buses(&bus_coordinator, &open_buses, &firings, &carried, left_running)
+            reopen_buses(&bus_coordinator, &buses, &firings, &carried, left_running)
                 .map_err(|why| anyhow::anyhow!("run {run_id} cannot carry on: {why}"))?;
             // A run claimed with its cancel waiting ends every open firing
             // Cancelled below, a body a dead drive left behind included.
@@ -1277,6 +1277,62 @@ impl Bodies {
     }
 }
 
+/// End every bus nobody is on that no node of the run can still join
+/// ([`weft_core::run::bus_reach`]), as its last member left: the buses
+/// that said they are unattended since the last turn join `unattended`,
+/// and each stays there until it ends, or somebody joins it. Answers
+/// whether one ended: its readers wake to its end, which moves the run.
+fn end_unattended_buses(
+    unattended: &mut HashSet<uuid::Uuid>,
+    waits: &crate::wait_tracker::WaitTracker,
+    bus_coordinator: &crate::context::BusCoordinator,
+    pulses: &PulseTable,
+    firings: &NodeFiringTable,
+    loop_runtime: &LoopRuntime,
+) -> bool {
+    unattended.extend(waits.take_unattended());
+    unattended.retain(|id| bus_coordinator.bus(*id).is_some_and(|bus| !bus.is_closed() && !bus.attended()));
+    if unattended.is_empty() {
+        return false;
+    }
+    // A running body's use is its bus's; a parked firing's body runs again
+    // and uses the bus again if it does.
+    let joinable = weft_core::run::bus_reach::joinable_buses(pulses, firings, loop_runtime, |firing, id| {
+        firing.status() == NodeFiringStatus::Running
+            && uuid::Uuid::parse_str(id).ok().and_then(|id| bus_coordinator.bus(id)).is_some_and(|bus| {
+                bus.used_by(&FiringLocation::new(firing.node_id.clone(), firing.frames.clone()))
+            })
+    });
+    let mut ended = false;
+    unattended.retain(|id| {
+        let Some(bus) = bus_coordinator.bus(*id) else { return false };
+        let made_not_sent = bus_coordinator
+            .maker_of(*id)
+            .is_some_and(|(at, port)| weft_core::run::bus_reach::not_sent_yet(firings, &at, &port));
+        if made_not_sent || joinable.contains(&id.to_string()) {
+            return true;
+        }
+        ended |= bus.end_unattended();
+        false
+    });
+    ended
+}
+
+/// The run cannot move any other way (every running node waits, and
+/// nothing outside the run can answer): no node a marker is on its way to
+/// can start before something ends, so every bus nobody is on ends now, as
+/// its last member left, instead of the run being found stuck. Answers
+/// whether one ended.
+fn end_every_unattended_bus(unattended: &mut HashSet<uuid::Uuid>, bus_coordinator: &crate::context::BusCoordinator) -> bool {
+    let mut ended = false;
+    for id in unattended.drain() {
+        if let Some(bus) = bus_coordinator.bus(id) {
+            ended |= bus.end_unattended();
+        }
+    }
+    ended
+}
+
 /// A body ended: its firing is forgotten, so the location is free to fire
 /// again. Returns whether a location was freed: the caller treats that as
 /// a turn with work (the scan that ran before the reap held the location,
@@ -1381,9 +1437,13 @@ impl Carried {
     }
 }
 
-/// Open again, before any body runs, every bus a run that paused left open
-/// (`open`, from its record), with the names its paused firings hold on
-/// each (their saved positions). A drive that ended with nodes still
+/// Open again, before any body runs, every bus a run that paused created
+/// (`buses`, from its record: open ones as they stood, ended ones ended),
+/// with who was on each (its record's members), each name given back to
+/// the paused firing whose saved position holds it. A bus whose members
+/// and those names disagree had a join or a leave lost from its record:
+/// a name nobody holds would never leave, so the bus could never end by
+/// its last member leaving, and it is ended failed instead. A drive that ended with nodes still
 /// running (`left_running`: its worker died, or a hand-back went overdue)
 /// may have left a bus's last messages off the record, so each such bus
 /// is opened only to end it failed, whether those nodes run again from
@@ -1392,7 +1452,7 @@ impl Carried {
 /// is ahead of (the record lost its last entries before the pause).
 fn reopen_buses(
     coordinator: &Arc<crate::context::BusCoordinator>,
-    open: &BTreeMap<uuid::Uuid, weft_core::primitive::OpenBus>,
+    buses: &BTreeMap<uuid::Uuid, weft_core::primitive::RecordedBus>,
     firings: &NodeFiringTable,
     carried: &Carried,
     left_running: bool,
@@ -1411,7 +1471,7 @@ fn reopen_buses(
     // rows never landed: a write that failed before the pause, a worker
     // gone before its buses were written) would have the reopened bus hand
     // out those offsets again under the readers' feet.
-    let behind_the_record: Vec<uuid::Uuid> = open
+    let behind_the_record: Vec<uuid::Uuid> = buses
         .iter()
         .filter(|(id, bus)| {
             carried.saved.values().filter_map(|saved| saved.positions.buses.get(&id.to_string())).any(|position| {
@@ -1421,11 +1481,28 @@ fn reopen_buses(
         })
         .map(|(id, _)| *id)
         .collect();
-    coordinator.reopen(open, held)?;
+    let unaccounted: Vec<(uuid::Uuid, String)> = buses
+        .iter()
+        .filter(|(_, bus)| bus.end.is_none())
+        .filter_map(|(id, bus)| {
+            let holding: std::collections::BTreeSet<String> = held.get(id).into_iter().flatten().map(|(name, _, _)| name.clone()).collect();
+            let nobody_holds: Vec<&String> = bus.members.difference(&holding).collect();
+            let not_on_it: Vec<&String> = holding.difference(&bus.members).collect();
+            (!nobody_holds.is_empty() || !not_on_it.is_empty()).then(|| {
+                (*id, format!(
+                    "the run's record of who was on this bus disagrees with the nodes that paused on it (on it, held by no paused node: {nobody_holds:?}; held, not on it: {not_on_it:?}), so it lost a join or a leave and its members can no longer end it"
+                ))
+            })
+        })
+        .collect();
+    coordinator.reopen(buses, held)?;
     if left_running {
         coordinator.close_all(StreamEnd::Failed {
             error: "the worker holding this bus went away, so messages it carried may be lost".into(),
         });
+    }
+    for (id, why) in unaccounted {
+        coordinator.close_bus(id, StreamEnd::Failed { error: why });
     }
     for id in behind_the_record {
         coordinator.close_bus(id, StreamEnd::Failed {
@@ -1891,6 +1968,9 @@ async fn drive(
     // (an answer from outside picks it up again) or, paused for a
     // hand-back, `HandedBack` (the next worker does).
     let mut paused: Option<RunOutcome> = None;
+    // The buses nobody is on that a node of the run may still join: each
+    // turn ends the ones none can join any more ([`end_unattended_buses`]).
+    let mut unattended: HashSet<uuid::Uuid> = HashSet::new();
     'turn: loop {
         // Poison checkpoint: a journal write failed somewhere since
         // the last iteration. The journal is now a strict prefix of
@@ -2650,6 +2730,7 @@ async fn drive(
                 group.frames.clone(),
                 instance.cloned(),
                 inputs,
+                phase,
                 handle,
             )
             .marked_pure(node_def.features.pure);
@@ -2700,8 +2781,10 @@ async fn drive(
             // `setup_trigger` at TriggerSetup; at Fire, `run` for THE
             // firing trigger (its dispatch carries the wake payload)
             // while every other trigger terminates as Completed so its
-            // ports close; nothing at InfraSetup either. Nodes never
-            // see the phase. The task sends its terminal back on the
+            // ports close; nothing at InfraSetup either. A body sees the
+            // phase only as `ctx.is_setup()` (set on the ctx above), for
+            // a node whose `run` does less in a setup than in a real
+            // run. The task sends its terminal back on the
             // shared `task_tx` (after any emissions it sent on the same
             // channel); the main loop applies the effect on
             // `pulses`/`firings`.
@@ -2950,7 +3033,12 @@ async fn drive(
         // running keeps its firing's record: its late messages read it.
         forget_what_ended(program, run_id, forgetting, pulses, firings, kicked, scopes, &mut carried, loop_runtime, |at| bodies.runs(at));
 
-        if progress {
+        // A bus nobody is on ends once no node can still join it: read
+        // after every message of the turn is applied, so a pulse a body
+        // sent before it returned is on its wire here.
+        let ended_a_bus = end_unattended_buses(&mut unattended, waits, bus_coordinator, pulses, firings, loop_runtime);
+
+        if progress || ended_a_bus {
             idled_since_progress = false;
             continue;
         }
@@ -3122,7 +3210,12 @@ async fn drive(
                 waits.pause();
             }
             Some(WhenAllWait::Unwind) => {
-                unwind(run_id, bus_coordinator, &mut stream_rt, waits, bodies.len());
+                // A bus nobody is on, held open only by a node that waits on
+                // its end itself, ends first; only a run still stuck after
+                // that is unwound.
+                if !end_every_unattended_bus(&mut unattended, bus_coordinator) {
+                    unwind(run_id, bus_coordinator, &mut stream_rt, waits, bodies.len());
+                }
                 // Don't `continue`: the waiting tasks wake in other tokio
                 // tasks; their results arrive on `result_rx` shortly.
                 // Falling through to the idle-wait yields to the runtime
@@ -6132,8 +6225,8 @@ fn mark_cancelled(
 
 
 /// Which `Node` trait method a dispatch invokes. The engine picks it
-/// from the phase plus the manifest, so a node never inspects the
-/// phase itself.
+/// from the phase plus the manifest, so a node never picks its own
+/// body; inside `run` it can still ask `ctx.is_setup()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NodeBody {
     /// The node's normal body (`Node::run`).

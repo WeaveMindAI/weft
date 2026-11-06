@@ -83,6 +83,9 @@ pub struct RunContext {
     /// non-object payload has no named fields; the whole-record read
     /// ([`ValueBag::object`]) fails loud on it.
     pub wake: ValueBag,
+    /// Which phase of the program's life this run is: read through
+    /// [`Self::is_setup`].
+    phase: Phase,
     pub(crate) handle: Arc<dyn ContextHandle>,
 }
 
@@ -181,6 +184,12 @@ pub fn caught_failure(catchable: Option<String>, opened_a_stream: bool, error_wi
     catchable.filter(|_| error_wired && !opened_a_stream)
 }
 
+/// Register `name` on `bus` for a body, a refusal failing the node with
+/// the name and why.
+fn registered_as(bus: &mut crate::bus::BusHandle, name: &str) -> WeftResult<()> {
+    bus.register(name).map_err(|e| WeftError::NodeFailed(format!("register '{name}' on the bus: {e}")))
+}
+
 /// Waiting out another write of the same file: short and growing
 /// pauses, and a line in the node's log every minute so a wait that
 /// does not end reads as one. It ends when that write does; one whose
@@ -233,12 +242,13 @@ impl RunContext {
         frames: LoopFrames,
         instance: Option<crate::instance::InstanceId>,
         inputs: ValueBag,
+        phase: Phase,
         handle: Arc<dyn ContextHandle>,
     ) -> Self {
         let wake = ValueBag::wake(handle.wake_payload());
         Self {
             project_id, node_id, node_type, node_label, run_id, frames, instance,
-            inputs, wake, handle,
+            inputs, wake, phase, handle,
         }
     }
 
@@ -263,6 +273,43 @@ impl RunContext {
     /// node without one.
     pub fn instance(&self) -> Option<&crate::instance::InstanceId> {
         self.instance.as_ref()
+    }
+
+    /// This firing's place in the run, as one opaque text: the same every
+    /// time this body runs again (on a resume after a pause, or after a
+    /// crash), and different on every loop iteration, at every call site
+    /// of an included file, and in every other run (a run again of the
+    /// same program is a new run). Built from the run id, the node and the
+    /// loop and call frames it fires under
+    /// ([`crate::frames::FiringLocation::key`]).
+    ///
+    /// The key to hand a service that must refuse a duplicate (an
+    /// idempotency key): a body run again after a crash, between a call
+    /// and the save of its result (the gap [`Kept::once`] leaves), sends
+    /// the same key, and a service that answers a key it has seen with
+    /// what it answered before starts nothing twice. It names one firing,
+    /// so a body that makes several such calls tells them apart itself
+    /// (`format!("{}-charge", ctx.firing_key())`).
+    pub fn firing_key(&self) -> String {
+        crate::frames::FiringLocation::new(self.node_id.clone(), self.frames.clone()).key(self.run_id)
+    }
+
+    /// Whether this body runs in a setup rather than in a real run. A
+    /// setup runs the body for what it hands on and nothing more: right
+    /// after its infrastructure is applied (an infra node's `run`, whose
+    /// baked outputs are then saved), or while the program's triggers are
+    /// set up (a node feeding a trigger's settings). Only the nodes the
+    /// setup needs run in it, so nothing downstream reads what the body
+    /// would open for a real run: a body that keeps a session or a bus
+    /// open while a run lasts emits what the setup needs and returns. An
+    /// output it emits nothing on closes as absence, a `Bus` output
+    /// included. False in every run a trigger, a call or `weft run`
+    /// starts.
+    pub fn is_setup(&self) -> bool {
+        match self.phase {
+            Phase::InfraSetup | Phase::TriggerSetup => true,
+            Phase::Fire => false,
+        }
     }
 
     // ----- Saved state ------------------------------------------------
@@ -529,8 +576,6 @@ impl RunContext {
     /// `BusOptions { journal: ctx.journal_policy()?, .. }`. A journal
     /// window out of range is refused here, naming the range.
     ///
-    /// The bus ends when this body does, with how it returned
-    /// ([`crate::bus::FiringBuses`]), unless the body closes it first.
     /// What this node's users set on the journal settings the language
     /// gave it (`journalEphemeral`, `journalWindowMs`: a node declaring
     /// `features.journalSettings`, or a live-connection trigger), as the
@@ -545,7 +590,11 @@ impl RunContext {
     /// value to emit there). A firing creates one bus per port: a resumed
     /// body creating its bus on a port again gets the bus it created there
     /// before the pause, with its messages, its members and its readers'
-    /// places. Held by this firing ([`crate::bus::FiringBuses`]).
+    /// places. Creating a bus does not make this node a member: it becomes
+    /// one when it registers a name on it ([`Self::open_bus`] does both).
+    /// The bus lives until nobody is on it and no node can still join it
+    /// ([`crate::run::bus_reach`]), so a bus nobody ever joins ends once
+    /// its marker went nowhere that could.
     pub fn create_bus(
         &self,
         port: &str,
@@ -561,9 +610,7 @@ impl RunContext {
                 self.node_id, self.node_type
             )));
         }
-        let (bus, marker) = self.handle.create_bus(port, opts)?;
-        self.handle.firing_buses().hold(&bus);
-        Ok((bus, marker))
+        self.handle.create_bus(port, opts)
     }
 
     /// Resolve a Bus-marker JSON value to a fresh handle on the live
@@ -576,13 +623,21 @@ impl RunContext {
     }
 
     /// The whole PRODUCER ritual in one call: create the bus, emit its
-    /// marker on output `port`, and register `name` on it. The bus ends
-    /// when the body does, with how it returned, so every exit path
-    /// (success, error, unwind) ends the stream for readers instead of
-    /// leaving them parked, and a failure reaches them as one; no
-    /// manual close-on-every-path blocks in node code. A body that is
-    /// done sending before it is done working closes it itself
-    /// (`close`, which ends it finished).
+    /// marker on output `port`, and register `name` on it, which makes
+    /// this node a member until its body returns, however it returns
+    /// (success, error, unwind). The creator owns nothing more than any
+    /// other member: when its body returns its name leaves, and the bus
+    /// ends once nobody is left on it and no node can still join it (one
+    /// its marker is on its way to, [`crate::run::bus_reach`]), as the
+    /// last one to leave returned (finished, or failed with its error).
+    /// A creator can return at once: the nodes it handed the bus to still
+    /// get to join it. So a producer
+    /// alone on its bus ends the stream for its readers on every exit
+    /// path, a failure reaching them as one, with no manual
+    /// close-on-every-path blocks in node code; a producer with a member
+    /// still talking leaves the bus to it. A body that is done sending
+    /// before it is done working closes it itself (`close`, which ends it
+    /// finished).
     ///
     /// Call it on the first piece, not before the work that makes the
     /// pieces: until the marker goes out the node has opened no bus, so
@@ -599,8 +654,7 @@ impl RunContext {
     ) -> WeftResult<crate::bus::BusHandle> {
         let (mut bus, marker) = self.create_bus(port, opts)?;
         self.pulse_downstream(crate::node::NodeOutput::new().set(port, marker)).await?;
-        bus.register(name)
-            .map_err(|e| WeftError::NodeFailed(format!("register '{name}' on the bus: {e}")))?;
+        registered_as(&mut bus, name)?;
         Ok(bus)
     }
 
@@ -616,23 +670,37 @@ impl RunContext {
     }
 
     /// The consuming twin of [`Self::open_bus`]: resolve the bus on
-    /// input `port` and register `name` on it, held by this firing like
-    /// a bus it created, so a consumer that dies mid-conversation ends
-    /// the bus failed and never leaves the producer parked on
-    /// `wait_for`. An observer that must NOT end the bus on exit (a
-    /// debug tap, a reader streaming it out) uses
-    /// [`Self::bus_from_input`] instead.
+    /// input `port` and register `name` on it, which makes this node a
+    /// member exactly as the creator is one. When its body returns,
+    /// however it returns, its name leaves and nothing else happens: a
+    /// member that fails does not end the bus for the others, and one
+    /// that fires many times against a bus that outlives it (each turn of
+    /// a loop sending on a session's stream) sends its part and goes. The
+    /// bus ends once nobody is on it and no node can still join it, or
+    /// when a node closes it. Join first, before any other use of the bus:
+    /// a node that opened its reader or waited on it without joining no
+    /// longer keeps it open, so once nobody else is on it the bus may end
+    /// before the node joins.
+    ///
+    /// A body resumed after a pause calling it again with the same name
+    /// gets that name back, with nobody on the bus reading it leave. Two
+    /// firings on the bus at once register two names: a name is held by
+    /// one member at a time. An observer that keeps nothing open (a debug
+    /// tap, a reader streaming it out) uses [`Self::bus_from_input`].
     pub fn join_bus(&self, port: &str, name: &str) -> WeftResult<crate::bus::BusHandle> {
         let mut bus = self.bus_from_input(port)?;
-        self.handle.firing_buses().hold(&bus);
-        bus.register(name)
-            .map_err(|e| WeftError::NodeFailed(format!("register '{name}' on the bus: {e}")))?;
+        registered_as(&mut bus, name)?;
         Ok(bus)
     }
 
     /// Convenience: read input `name` and resolve it to a bus
     /// handle in one call. Equivalent to `ctx.bus(ctx.inputs.raw(name))`
-    /// but with a clearer error message naming the input.
+    /// but with a clearer error message naming the input. The handle
+    /// reads and is no member: once it reads or waits on the bus it keeps
+    /// nothing open, and the bus ends once nobody is on it and no node can
+    /// still join it, or when a body closes it (`close`, which ends it
+    /// finished, whoever calls it). Registering a name on it makes this
+    /// node a member, as [`Self::join_bus`] does.
     pub fn bus_from_input(&self, name: &str) -> WeftResult<crate::bus::BusHandle> {
         let value = self
             .inputs
@@ -893,6 +961,33 @@ impl RunContext {
     /// once in the life of the thing that owns it.
     pub async fn published_access(&self) -> WeftResult<Option<crate::access::Access>> {
         self.handle.published_access().await
+    }
+
+    /// [`Self::open`] again, after the values this firing was handed
+    /// stopped working (the service refused them, or something this node
+    /// handed them to says they are about to die): weft renews the
+    /// connection and hands the renewed values. Renewed once, however
+    /// many nodes ask at the same moment, and only while the connection
+    /// still holds what this firing was handed: a node whose values
+    /// another node's renewal already replaced gets those, with no call
+    /// to the service. So a credential whose renewal retires the one
+    /// before it (a rotating refresh token) is renewed by weft alone, and
+    /// every node holding the connection shares the result.
+    ///
+    /// ```ignore
+    /// let opened = ctx.open(&access).await?;
+    /// let token = match call_with(opened.value("token")?).await {
+    ///     Err(Refused::Unauthorized) => ctx.renew(&access).await?.value("token")?.to_string(),
+    ///     other => other?,
+    /// };
+    /// ```
+    ///
+    /// This firing opens the connection first (the renewal is of what it
+    /// was handed). A connection weft cannot renew (a pasted key with no
+    /// renewal, the runtime's own credential) fails the node saying to
+    /// reconnect it; so does a renewal the service refuses.
+    pub async fn renew(&self, access: &crate::access::Access) -> WeftResult<crate::access::OpenedConnection> {
+        Ok(self.handle.renew_connection(access, DEFAULT_PROVIDER_WINDOW).await?.ends_with_run(self.cancellation()))
     }
 
     // ----- Secrets ---------------------------------------------------
@@ -2857,6 +2952,14 @@ pub trait ContextHandle: Send + Sync {
     ) -> WeftResult<crate::access::Access>;
     /// Backs [`RunContext::published_access`].
     async fn published_access(&self) -> WeftResult<Option<crate::access::Access>>;
+    /// Backs [`RunContext::renew`]: [`Self::open_connection`], saying
+    /// the values this firing was last handed for `access` stopped
+    /// working, so the runtime renews them unless they were renewed since.
+    async fn renew_connection(
+        &self,
+        access: &crate::access::Access,
+        window: std::time::Duration,
+    ) -> WeftResult<crate::access::OpenedConnection>;
     /// Backs [`RunContext::secret`]: keep `value` as a secret of this run
     /// under a fresh id (in memory, and sealed with the run's record when
     /// it is recorded), answering the id.
@@ -2923,11 +3026,11 @@ pub trait ContextHandle: Send + Sync {
     /// Backs [`RunContext::is_output_wired`].
     fn wired_output_ports(&self) -> &std::collections::HashSet<String>;
 
-    /// The buses this firing ends when its body does
-    /// ([`crate::bus::FiringBuses`]): the ctx holds every bus the body
-    /// creates or joins here, and the runtime ends them with how the
-    /// body returned.
-    fn firing_buses(&self) -> &crate::bus::FiringBuses;
+    /// The body returned as `end` (not paused): this firing's names leave
+    /// every bus it is a member of ([`crate::bus::FiringBuses::leave`]),
+    /// and a bus that leaves with nobody on it ends as `end`. The runtime
+    /// calls it once per body; a node never does.
+    fn leave_buses(&self, end: crate::bus::StreamEnd);
 
     /// Fire downstream with `output`. The engine turns each mentioned
     /// output port into pulses on its outgoing edges, at the firing's
@@ -3421,6 +3524,7 @@ mod value_bag_tests {
         async fn open_connection(&self, _: &crate::access::Access, _: std::time::Duration) -> WeftResult<crate::access::OpenedConnection> { unreachable!() }
         async fn publish_access(&self, _: std::collections::BTreeMap<String, String>) -> WeftResult<crate::access::Access> { unreachable!() }
         async fn published_access(&self) -> WeftResult<Option<crate::access::Access>> { unreachable!() }
+        async fn renew_connection(&self, _: &crate::access::Access, _: std::time::Duration) -> WeftResult<crate::access::OpenedConnection> { unreachable!() }
         async fn after_node(&self, _: crate::signal::CancelCall, _: Option<crate::primitive::AccessRef>) -> WeftResult<()> { unreachable!() }
         fn keep_secret(&self, _: Value) -> WeftResult<crate::secret::SecretId> { unreachable!() }
         async fn reveal_secret(&self, _: crate::secret::SecretId) -> WeftResult<Value> { unreachable!() }
@@ -3433,7 +3537,7 @@ mod value_bag_tests {
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         fn declared_input_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         fn wired_output_ports(&self) -> &std::collections::HashSet<String> { unreachable!() }
-        fn firing_buses(&self) -> &crate::bus::FiringBuses { unreachable!() }
+        fn leave_buses(&self, _: crate::bus::StreamEnd) { unreachable!() }
         async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: Delivery) -> WeftResult<()> { unreachable!() }
         fn set_max_buffered_items(&self, _: &str, _: usize) -> WeftResult<()> { unreachable!() }
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
@@ -3515,6 +3619,7 @@ mod value_bag_tests {
         async fn open_connection(&self, _: &crate::access::Access, _: std::time::Duration) -> WeftResult<crate::access::OpenedConnection> { unreachable!() }
         async fn publish_access(&self, _: std::collections::BTreeMap<String, String>) -> WeftResult<crate::access::Access> { unreachable!() }
         async fn published_access(&self) -> WeftResult<Option<crate::access::Access>> { unreachable!() }
+        async fn renew_connection(&self, _: &crate::access::Access, _: std::time::Duration) -> WeftResult<crate::access::OpenedConnection> { unreachable!() }
         async fn after_node(&self, _: crate::signal::CancelCall, _: Option<crate::primitive::AccessRef>) -> WeftResult<()> { unreachable!() }
         fn keep_secret(&self, _: Value) -> WeftResult<crate::secret::SecretId> { unreachable!() }
         async fn reveal_secret(&self, _: crate::secret::SecretId) -> WeftResult<Value> { unreachable!() }
@@ -3527,7 +3632,7 @@ mod value_bag_tests {
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         fn declared_input_ports(&self) -> &HashMap<String, WeftType> { &self.inputs }
         fn wired_output_ports(&self) -> &std::collections::HashSet<String> { unreachable!() }
-        fn firing_buses(&self) -> &crate::bus::FiringBuses { unreachable!() }
+        fn leave_buses(&self, _: crate::bus::StreamEnd) { unreachable!() }
         async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: Delivery) -> WeftResult<()> { unreachable!() }
         fn set_max_buffered_items(&self, _: &str, _: usize) -> WeftResult<()> { unreachable!() }
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
@@ -3613,6 +3718,7 @@ mod value_bag_tests {
             LoopFrames::default(),
             None,
             inputs_bag(json!({})),
+            Phase::Fire,
             handle,
         )
     }
@@ -3940,6 +4046,7 @@ mod value_bag_tests {
             LoopFrames::default(),
             None,
             inputs_bag(inputs_json),
+            Phase::Fire,
             Arc::new(DeadHandle),
         )
     }

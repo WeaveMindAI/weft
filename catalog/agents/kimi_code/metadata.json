@@ -1,0 +1,305 @@
+{
+  "type": "KimiCode",
+  "label": "Kimi Code",
+  "description": "One conversation with Kimi Code, Moonshot AI's coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. weft drives Kimi Code through its SDK, which Moonshot AI does not publish: weft builds it from Kimi Code's source as `kimi-code-sdk`. With no `computer`, Kimi Code runs on your machine (a local install only) with your own login (`kimi login`), working in `folder`, from that build, which weft makes itself, once, into a folder of its own shared by every program on the machine. With a `computer` wired, it is built and run inside that computer, which a cloud install needs, and it logs in with the connection on `access`. With a Moonshot API key, `model` is required: the Moonshot model id to run. A Kimi Code subscription works only through your machine's own `kimi login`, and only while a person drives the conversation: its terms keep it to personal interactive use. The program's tools reach the model under their own names, and a tool named like one of Kimi Code's own (`Read`, `Grep`, `Agent`, ...) takes its place; `ReadMediaFile` is the one name it cannot give up. Its permission settings are named for what they do, which is not what Kimi's own modes are called. Its card shows what it is doing and a Start over button. What is exposed: the permission mode, the model, thinking and extra folders.",
+  "tags": [
+    "agent",
+    "coding",
+    "kimi",
+    "moonshot",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run Kimi Code in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[kimi_code]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A KimiCodeAccess's `access`: a Moonshot API key. Required with a `computer`. Left out on your machine, Kimi Code uses the login already on it (`kimi login`)."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder Kimi Code works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`kimi-code-sdk` on your PATH",
+      "description": "On your machine: the build of Kimi Code's SDK to run, when it is not the `kimi-code-sdk` on your PATH or the one weft installs (one built from another Kimi Code release, say). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "plan",
+          "auto",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What Kimi Code may do without asking. `ask`: every command, file write and MCP tool comes out of AskAgent as a question; reading never asks. `plan`: it only plans, and asks you to approve the plan before acting on it. `auto`: ordinary commands and writes go ahead; dangerous commands and sensitive files still ask. `bypass`: nothing asks, not even a dangerous command, and its question tool is off; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "kimi-k2-turbo-preview",
+      "description": "On your machine's own login, an alias of your `config.toml`. With an API key, the Moonshot model id (`kimi-k2-turbo-preview`), which is then required."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "thinking",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "on",
+          "off"
+        ]
+      },
+      "label": "Thinking",
+      "description": "Whether the model thinks before it answers; a model without thinking refuses `on`. Left out, the model's default."
+    },
+    {
+      "name": "addDirs",
+      "type": "List[String]",
+      "label": "Extra folders",
+      "description": "Folders besides `folder` Kimi Code may read and change, taken when the conversation starts."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "KimiCode '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "KimiCode '{id}' runs in a computer, where no login is waiting for it; give it a KimiCodeAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "KimiCode '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "access"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "model"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "KimiCode '{id}' with a Moonshot API key needs `model`: the Moonshot model id to run, such as kimi-k2-turbo-preview.",
+        "level": "structural",
+        "severity": "error",
+        "port": "model"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "plan",
+                "auto",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "KimiCode '{id}' has a `permission` it does not know; pick one of ask, plan, auto, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "KimiCode '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "KimiCode '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer builds Kimi Code's SDK itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "ReadMediaFile"
+    ]
+  }
+}

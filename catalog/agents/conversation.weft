@@ -1,0 +1,63 @@
+# A conversation with a coding agent: it works on `task`, a person answers each question it asks along the way, and after each reply the person writes the next message, or leaves it empty to end the conversation.
+Group(agent: Infra, stream: Bus, task: String) -> (reply: String | Null, history: File | Null) {
+  # Give `agent` and `stream` an agent node's two outputs (ClaudeCode, Codex, or any other). The agent starts on `task`. Its questions and permission requests come to a person as a form (AnswerAgent), and its turn carries on with the answer. When it replies, the person sees the reply and writes the next message; an empty one ends the conversation, and `reply` and `history` are the last ones. Once the conversation ends, `stream` is closed, which ends the agent node's part of the run. To give the agent tools of your own, copy this file into your own `src/`, wire your tool nodes' `tools` into `ask.tools`, route `ask.toolCall` to them through a Dispatch, and give the `turn` loop a `toolResult` input, carried like `answer`, set from your tool's result.
+
+  messages = Loop(agent: Infra, stream: Bus, message: String, reply?: String | Null, history?: File | Null) -> (message: String, reply: String | Null, history: File | Null) {
+    # One message to the agent and its reply, then the person's next message
+    carry: ["message", "reply", "history"]
+
+    turn = Loop(agent: Infra, stream: Bus, message: String, answer?: AgentAnswer | Null, reply?: String | Null, history?: File | Null) -> (answer: AgentAnswer | Null, reply: String | Null, history: File | Null) {
+      # The agent's turn: the message first, then the answer to each question it asks, until it replies
+      carry: ["answer", "reply", "history"]
+
+      first = Switch {
+        value: self.index
+        cases: [{ "kind": "equals", "value": 0, "port": "yes" }, { "kind": "otherwise", "port": "no" }]
+      }
+      ask = AskAgent {
+        agent: self.agent
+        stream: self.stream
+        message: Text { value: self.message, _should_flow: first.yes }.value
+        answer: self.answer
+      }
+      answerIt = AnswerAgent(history?: File | Null) {
+        question: ask.question
+        history: self.history
+      }
+      self.answer = answerIt.answer
+      self.reply = ask.reply
+      self.history = ask.history
+      self.done = All { replied: ask.reply }.yes
+    }
+    turn.agent = self.agent
+    turn.stream = self.stream
+    turn.message = self.message
+
+    next = HumanQuery {
+      title: "The agent replied"
+      fields: [
+        { "kind": "display", "key": "said", "label": "It said" },
+        { "kind": "textarea", "key": "nextMessage", "label": "Your next message", "placeholder": "Leave it empty to end the conversation" }
+      ]
+      said: turn.reply
+    }
+    ended = Switch {
+      value: next.nextMessage
+      cases: [{ "kind": "equals", "value": "", "port": "yes" }, { "kind": "otherwise", "port": "no" }]
+    }
+
+    self.message = next.nextMessage
+    self.reply = turn.reply
+    self.history = turn.history
+    self.done = All { ended: ended.yes }.yes
+  }
+  messages.agent = self.agent
+  messages.stream = self.stream
+  messages.message = self.task
+
+  # The conversation is over: the agent node's run has nothing more to stream.
+  close = CloseBus { bus: self.stream, _should_flow: messages.message }
+
+  self.reply = messages.reply
+  self.history = messages.history
+}

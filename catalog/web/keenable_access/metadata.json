@@ -14,11 +14,22 @@
     "label": "Keenable",
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "key",
-          "label": "API key",
-          "placeholder": "keen_..."
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "keen_..."
+            }
+          ],
+          "guide": {
+            "link": "https://app.keenable.ai/console",
+            "steps": [
+              "Open app.keenable.ai/console and create an API key.",
+              "Paste it below and name the connection."
+            ]
+          }
         }
       ]
     },
@@ -38,15 +49,6 @@
     "verification": {
       "rung": "reports_validity",
       "cost": "free"
-    },
-    "ownPage": {
-      "guide": {
-        "link": "https://app.keenable.ai/console",
-        "steps": [
-          "Open app.keenable.ai/console and create an API key.",
-          "Paste it below and name the connection."
-        ]
-      }
     }
   },
   "inputs": [

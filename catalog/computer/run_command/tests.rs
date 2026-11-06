@@ -11,8 +11,9 @@ use weft::signal::Predicate;
 use weft::storage::StoredFile;
 use weft::{FakeRig, NodeTest, WeftResult};
 
+use super::super::command::{finished, piece, Finished};
 use super::super::testing::{answers, asked, computer};
-use super::{finished, piece, RunCommandNode, RESTARTED};
+use super::{RunCommandNode, RESTARTED};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -34,7 +35,12 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 fn finished_reads() -> WeftResult<()> {
-    assert_eq!(finished(&json!({ "status": "done", "id": "j1", "exitCode": 2, "size": 40 }))?, (2, 40));
+    assert_eq!(
+        finished(&json!({ "status": "done", "id": "j1", "exitCode": 2, "size": 40 }))?,
+        Finished { id: "j1".into(), exit_code: 2, size: 40 }
+    );
+    let error = finished(&json!({ "status": "done", "exitCode": 2, "size": 40 })).expect_err("no id").to_string();
+    assert!(error.contains("finished command with no id"), "{error}");
     let error = finished(&json!({ "status": "done", "id": "j1", "exitCode": 0 })).expect_err("no size").to_string();
     assert!(error.contains("no output size"), "{error}");
     let error = finished(&json!({ "status": "running", "id": "j1" })).expect_err("not finished").to_string();

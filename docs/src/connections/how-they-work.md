@@ -54,6 +54,28 @@ A permission a recipe marks as only working on your own account can never be
 served by the runtime's credential. The editor greys that option out and
 resolution refuses it.
 
+## A way that stays on your machine
+
+A service whose key is pasted can offer more than one way to sign in, and a
+recipe can keep one of them to a local install, so the credential never leaves
+your own machine. A Claude subscription's token is one: Anthropic does not let
+another product hold a claude.ai login.
+
+On a cloud install, the connect form leaves that way out and `weft connect`
+refuses it. `weft migrate connections` skips a connection made with it and
+says why. If one is on a cloud install some other way, opening it fails before
+its credential is handed to anything:
+
+```text
+the 'claude_code' access needs reconnecting: the 'my sub' connection was made on
+a local install; signing in to Claude Code with 'Claude subscription' works only
+on a local install, so that the credential stays on the person's own machine,
+and this install runs on a cloud; connect it with 'API key' instead
+```
+
+To declare one, go and read
+[declaring a service](declaring-a-service.md#pasting-a-key).
+
 ## An instance's own connections
 
 In a program with instances, an access node whose connection is written
@@ -98,9 +120,19 @@ the next minute. There is no background keep-alive.
 Two things opening the same connection at once queue behind each other, so it
 refreshes once and both get the fresh values.
 
+A node can also ask for a refresh itself, when the service refused the token
+it was handed (`ctx.renew`). weft refreshes only while the connection still
+holds exactly what that node was handed. So if ten nodes ask at once, there is
+one refresh and all ten get its result, and a node that asks after another
+node's refresh landed gets the new token without weft calling the provider
+again. A provider whose refresh token rotates (each refresh retires the one
+before) is safe to share for that reason: weft alone ever holds the refresh
+token, so no node can use it up under another.
+
 How it refreshes depends on the recipe. A sign-in sends its refresh token to
 the token endpoint, a `client_credentials` app asks for a new token, and a
-recipe that declares its own `refresh` call runs that instead. Whichever it
+recipe that declares its own `refresh` call runs that instead. A pasted login
+whose way declares a `renewal` (Codex's ChatGPT login) runs that renewal. Whichever it
 is, the answer is read the way the recipe says, the new token and expiry are
 stored, a new refresh token replaces the old one when the provider rotates
 them, and the recipe's captures update what they find. For those keys, go and

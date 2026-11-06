@@ -741,7 +741,7 @@ mod fan_in_tests {
             scope: Vec::new(),
             group_boundary: None,
             requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             images: Vec::new(),
             published_service: None,
             instance_service: None,

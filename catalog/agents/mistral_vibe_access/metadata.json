@@ -1,0 +1,61 @@
+{
+  "type": "MistralVibeAccess",
+  "label": "Mistral Vibe Access",
+  "description": "A Mistral login, for the MistralVibe nodes' `access`: a Mistral API key. One access for however many MistralVibe nodes.",
+  "tags": [
+    "agent",
+    "vibe",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#fa500f",
+  "service": {
+    "service": "mistral_vibe",
+    "label": "Mistral Vibe",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "apiKey",
+          "label": "API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "your Mistral API key"
+            }
+          ],
+          "guide": {
+            "link": "https://docs.mistral.ai/vibe/code/cli/api-keys-profiles",
+            "steps": [
+              "Sign in at chat.mistral.ai (a free account works), open Code, then Vibe CLI, and create a key there.",
+              "Paste it below and name the connection. Turns use that account's plan: its free mode, a paid plan or pay-as-you-go."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[mistral_vibe]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[mistral_vibe]",
+      "description": "Wire into the MistralVibe nodes' `access` input."
+    }
+  ]
+}

@@ -47,6 +47,10 @@ pub mod listener_protocol;
 // upgrade steps (`crate::primitive::SIGNAL_SPEC_V2`) are read wherever
 // the spec is.
 pub mod auth;
+// Wire-pure in part: `SignalSpec` carries a branch's `BranchOf`.
+pub mod first_of;
+#[cfg(feature = "runtime")]
+pub use first_of::{Either, FirstOf};
 #[cfg(feature = "runtime")]
 pub mod timer;
 #[cfg(feature = "runtime")]
@@ -73,7 +77,7 @@ pub use provider_events::{EventScope, ProviderEvents};
 #[cfg(feature = "runtime")]
 pub use timer::{Timer, TimerSpec};
 #[cfg(feature = "runtime")]
-pub use form::{Form, FormSchema, FormField};
+pub use form::{Answer, Answers, ChoiceOption, ConfigForm, Form, FormField, FormSchema};
 #[cfg(feature = "runtime")]
 pub use sse_subscribe::SseSubscribe;
 #[cfg(feature = "runtime")]
@@ -205,6 +209,7 @@ pub fn to_spec<K: Signal>(kind: K) -> SignalSpec {
         limits: crate::signal::EntryLimits::default(),
         settings: crate::run_settings::RunSettings::default(),
         on_cancel: None,
+        branch_of: None,
     }
 }
 
@@ -329,6 +334,12 @@ pub fn stored_file(spec: &SignalSpec, field: &str) -> Result<Option<crate::stora
 /// kind-reported failures alike.
 #[cfg(feature = "runtime")]
 pub fn validate_spec(spec: &SignalSpec) -> Result<(), String> {
+    // A wait on the first of several signals is no kind the listener
+    // serves: the dispatcher splits it into its branches, each validated
+    // as the signal it is.
+    if spec.kind == first_of::TAG {
+        return first_of::validate(spec);
+    }
     let entry = lookup(&spec.kind)
         .ok_or_else(|| format!("unknown signal kind: '{}'", spec.kind))?;
     // Registration time is the only moment a bad filter can be
@@ -407,21 +418,9 @@ mod tests {
         let spec = to_spec(Form {
             form_type: "any".into(),
             schema: FormSchema {
-                fields: vec![FormField {
-                    field_type: "display_image".into(),
-                    key: "pic".into(),
-                    label: String::new(),
-                    render: crate::node::FormFieldRender {
-                        component: "image".into(),
-                        source: None,
-                        multiple: false,
-                        prefilled: false,
-                    },
-                    value: Some(serde_json::json!({ "__weft_image__": {
+                fields: vec![FormField::display_image("pic", "", serde_json::json!({ "__weft_image__": {
                         "key": "t/project/p/cat", "mimeType": "image/png", "sizeBytes": 7, "filename": "cat.png"
-                    } })),
-                    config: Default::default(),
-                }],
+                    } }))],
             },
             title: None,
             description: None,

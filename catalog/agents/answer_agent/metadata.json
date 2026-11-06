@@ -1,0 +1,40 @@
+{
+  "type": "AnswerAgent",
+  "label": "Answer Agent",
+  "description": "Put a coding agent's `question` (from AskAgent) to a person as a form, and hand their `answer` back for AskAgent's next firing. The form is built from the question itself: each of the agent's questions with its options to pick (one, or several when the agent allows it) and a box for another answer when the agent takes one; for a permission request, what the agent wants to run, the choices it offers (allow, allow from now on, deny) and a note the agent reads. The form cannot be sent until every question has an answer (a pick, or text in its own box) and a permission request has a choice picked. Give it `history` (AskAgent's last one) and the person sees the conversation beside the question. The run waits for the person without holding a worker, for as long as they take, while the agent still waits for the answer. If the agent stops waiting on its own (some agents drop a question after a while and carry on without it), the form is withdrawn and `answer` says the question was dropped (`dropped: true`): the next AskAgent firing hands that on, and comes back with what the agent did after it gave up. A question the agent marks secret is refused, because a form's answer is kept in the run in plain text: put the value in a file in the agent's folder and tell the agent where it is.",
+  "tags": [
+    "agent",
+    "human",
+    "form",
+    "question",
+    "permission"
+  ],
+  "icon": "MessageCircleQuestion",
+  "color": "#ec4899",
+  "inputs": [
+    {
+      "name": "question",
+      "type": "AgentQuestion",
+      "required": true,
+      "accepts": [
+        "wire"
+      ],
+      "description": "AskAgent's `question`."
+    },
+    {
+      "name": "history",
+      "type": "File | Null",
+      "accepts": [
+        "wire"
+      ],
+      "description": "The conversation so far (a ChatHistory file, AskAgent's `history`), shown beside the question."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "answer",
+      "type": "AgentAnswer",
+      "description": "The person's answer, or word that the agent dropped the question (`dropped: true`): wire it into AskAgent's `answer`."
+    }
+  ]
+}

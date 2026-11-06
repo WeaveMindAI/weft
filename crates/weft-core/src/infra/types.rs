@@ -11,6 +11,10 @@
 //! A unit is ONE running copy of a small group of containers that share a
 //! network and can share scratch space and disks, the way a program and its
 //! helper sit side by side on one machine. More copies means more units.
+//! A unit may instead run one [`Process`] straight on the machine weft
+//! runs on (a local install's), as the person running weft, for a
+//! program that needs what only that machine has: their logins, a folder
+//! of theirs, a program they installed.
 //!
 //! Endpoint addresses are computed by the host, never by the node: the
 //! node's code asks `ctx.endpoint(name)` at run time.
@@ -122,6 +126,146 @@ pub struct Unit {
     /// flaky unit is the node's `InfraSpec::health_rules`.
     #[serde(default)]
     pub health: UnitHealth,
+
+    /// The one process the unit runs on the machine weft runs on, in place
+    /// of containers: a unit runs containers or a process, never both
+    /// (`super::resolve` refuses either mix, and a unit with neither).
+    /// Left out of the serialized unit when `None`, so a container unit
+    /// reads and hashes as it did before units could run a process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<Process>,
+}
+
+// =============================================================
+// Process units
+// =============================================================
+
+/// One program a unit runs as a process on the machine weft runs on, as
+/// the person running weft: for a program that needs what only that
+/// machine has (the person's logins, a folder of theirs, a program they
+/// installed). Only a local install has such a machine; a cloud install
+/// refuses the unit before anything starts.
+///
+/// The process starts in a folder of its own (its working directory),
+/// with `files` written into it before every start, the machine's `PATH`
+/// with the program folders of each of its `needs` weft installs itself
+/// ([`crate::needs::Recipe`]) put first, `HOME` (and the few variables a
+/// program run by the person reads, when the machine sets them), `env`,
+/// and one free loopback port per entry of `ports`. A process that exits on its own is started again,
+/// the way a container is.
+///
+/// Built with [`Process::new`] and the `with_*` setters. A process mounts
+/// no volume, takes no memory or CPU limit and runs as no other user: it
+/// shares the machine with everything else the person runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Process {
+    /// The program and its arguments; the first word is looked up on the
+    /// `PATH` the process gets.
+    pub command: Vec<String>,
+    /// Files written into the process's folder before every start, by
+    /// their path in it (`server.py`, `conf/settings.json`) to their
+    /// content. Part of the unit's hash, so changing one starts the
+    /// process again with it. What the process writes there itself stays
+    /// across its restarts and stops; terminate removes the folder.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<EnvEntry>,
+    /// The ports it listens on, by name: the host picks a free loopback
+    /// port for each and puts its number in the variable the port names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<ProcessPort>,
+    /// When it counts as ready. Absent: ready once it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<ProcessReadiness>,
+    /// What it needs from the machine (its `command`'s program, what that
+    /// one runs), checked before it starts: one missing refuses the start,
+    /// naming it and how to install it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<crate::needs::Need>,
+}
+
+impl Process {
+    pub fn new(command: Vec<String>) -> Self {
+        Self { command, files: BTreeMap::new(), env: Vec::new(), ports: Vec::new(), readiness: None, needs: Vec::new() }
+    }
+
+    /// The file at `path` in the process's folder holds `content`.
+    pub fn with_file(mut self, path: impl Into<String>, content: impl Into<String>) -> Self {
+        self.files.insert(path.into(), content.into());
+        self
+    }
+
+    pub fn with_env(mut self, env: Vec<EnvEntry>) -> Self {
+        self.env = env;
+        self
+    }
+
+    pub fn with_ports(mut self, ports: Vec<ProcessPort>) -> Self {
+        self.ports = ports;
+        self
+    }
+
+    pub fn with_readiness(mut self, readiness: ProcessReadiness) -> Self {
+        self.readiness = Some(readiness);
+        self
+    }
+
+    pub fn with_needs(mut self, needs: Vec<crate::needs::Need>) -> Self {
+        self.needs = needs;
+        self
+    }
+}
+
+/// A port a process listens on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessPort {
+    /// Named so endpoints and the readiness check can reference it.
+    pub name: String,
+    /// The environment variable the process finds the port's number in
+    /// (`PORT`, `WEFT_AGENT_PORT`).
+    pub env: String,
+}
+
+impl ProcessPort {
+    pub fn new(name: impl Into<String>, env: impl Into<String>) -> Self {
+        Self { name: name.into(), env: env.into() }
+    }
+}
+
+/// When a process counts as ready: `GET path` on its port `port` answers
+/// 2xx or 3xx.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessReadiness {
+    /// The port, by its name in `Process::ports`.
+    pub port: String,
+    pub path: String,
+    /// How long after it starts it may fail the check and still count as
+    /// starting rather than not ready: what a container's probe makes of
+    /// its own defaults (no delay, three failures ten seconds apart).
+    #[serde(default = "default_startup_seconds", rename = "startupSeconds")]
+    pub startup_seconds: u32,
+    #[serde(default = "default_timeout_seconds", rename = "timeoutSeconds")]
+    pub timeout_seconds: u32,
+}
+
+fn default_startup_seconds() -> u32 {
+    30
+}
+
+impl ProcessReadiness {
+    /// Ready when `GET path` on the port named `port` answers 2xx or 3xx.
+    pub fn http(port: impl Into<String>, path: impl Into<String>) -> Self {
+        Self { port: port.into(), path: path.into(), startup_seconds: default_startup_seconds(), timeout_seconds: default_timeout_seconds() }
+    }
+
+    pub fn with_startup_seconds(mut self, seconds: u32) -> Self {
+        self.startup_seconds = seconds;
+        self
+    }
 }
 
 /// A memory size as `MachineShape::memory` and a container's limit write
@@ -629,9 +773,110 @@ pub struct Endpoint {
 pub enum EndpointTarget {
     /// A named port of one container of one of this node's units.
     Unit { unit: String, container: String, port: String },
+    /// A named port of the process one of this node's units runs
+    /// (`Unit::process`).
+    Process { unit: String, port: String },
     /// A service that already exists somewhere else: nothing is started
     /// for it, and the endpoint answers this address.
     External { url: String },
+    /// A path inside another infra node's endpoint: `infra` is that
+    /// endpoint, as the program wired it into this node's input (a
+    /// program this node started inside a computer, which the computer's
+    /// own server passes `path` on to). Nothing is started for it, and
+    /// its address is never kept: every lookup reads where `infra`
+    /// answers now and adds `path` (`EndpointRecord::Within`), so the
+    /// other node moving (recreated on another port) moves this one with
+    /// it. One hop: `infra` must not itself be such an endpoint, and it is
+    /// reached by the project's own workers only (`Expose::Project`).
+    ///
+    /// Whatever answers at `path` was put there by this node, so a
+    /// terminate of this node asks the other one to remove it: weft sends
+    /// `DELETE` to `path` itself (never below it), and the other node's
+    /// server answers 2xx once nothing of it is left there, also when
+    /// nothing was (`weft_infra_supervisor::inside`). A stop asks nothing.
+    Within { infra: super::InfraHandle, path: String },
+}
+
+impl EndpointTarget {
+    /// The unit that serves it; `None` for an outside address or a path
+    /// inside another node's endpoint.
+    pub fn unit(&self) -> Option<&str> {
+        match self {
+            EndpointTarget::Unit { unit, .. } | EndpointTarget::Process { unit, .. } => Some(unit),
+            EndpointTarget::External { .. } | EndpointTarget::Within { .. } => None,
+        }
+    }
+}
+
+/// Where one endpoint of a running copy answers, as the copy's row keeps
+/// it (`infra_node.endpoints_json`, endpoint name to this): the address
+/// its host gave it, or, for an [`EndpointTarget::Within`], the other
+/// node's endpoint and the path under it, which every reader follows
+/// itself ([`EndpointRecord::address`]). An address is a plain string on
+/// the wire, the way every row stored one before an endpoint could live
+/// inside another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EndpointRecord {
+    Url(String),
+    Within(WithinRecord),
+}
+
+/// An [`EndpointTarget::Within`] as its copy's row keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WithinRecord {
+    pub within: super::InfraHandle,
+    pub path: String,
+}
+
+impl EndpointRecord {
+    /// The endpoint this one lives inside, which a reader reads the record
+    /// of before asking [`Self::address`]; `None` for an address.
+    pub fn within(&self) -> Option<&super::InfraHandle> {
+        match self {
+            EndpointRecord::Url(_) => None,
+            EndpointRecord::Within(record) => Some(&record.within),
+        }
+    }
+
+    /// What a status line says of it: the address, or where it lives
+    /// (`inside endpoint 'api' of 'box' at /apps/claude`), which a reader
+    /// follows at every lookup.
+    pub fn summary(&self) -> String {
+        match self {
+            EndpointRecord::Url(url) => url.clone(),
+            EndpointRecord::Within(WithinRecord { within, path }) => format!("inside {within} at {path}"),
+        }
+    }
+
+    /// The address this record says, given the record of the endpoint it
+    /// lives inside when it does (`inner`, read for [`Self::within`]:
+    /// `None` when that copy is not running or has no such endpoint).
+    /// Followed one hop: an endpoint inside one that is itself inside
+    /// another is refused. `Err` says why, for a person.
+    pub fn address(self, inner: Option<EndpointRecord>) -> Result<String, String> {
+        let WithinRecord { within, path } = match self {
+            EndpointRecord::Url(url) => return Ok(url),
+            EndpointRecord::Within(record) => record,
+        };
+        match inner {
+            Some(EndpointRecord::Url(url)) => Ok(within_url(&url, &path)),
+            Some(EndpointRecord::Within(_)) => Err(format!(
+                "{within} is itself inside another infra node's endpoint, and an endpoint inside one is followed one \
+                 step only: point it at the node that runs the server"
+            )),
+            None => Err(format!(
+                "the infra node '{}' this endpoint runs inside is not running: start it with `weft infra start`",
+                crate::project::plain_id(within.place())
+            )),
+        }
+    }
+}
+
+/// The address of a path `path` inside the endpoint answering at `url`.
+pub fn within_url(url: &str, path: &str) -> String {
+    format!("{}{path}", url.trim_end_matches('/'))
 }
 
 /// Where one declared endpoint of a running infra node answers: what
@@ -791,6 +1036,67 @@ mod tests {
         let mut v = serde_json::to_value(spec()).unwrap();
         v["units"][0]["instanceOptions"] = serde_json::json!({});
         assert!(serde_json::from_value::<InfraSpec>(v).is_err());
+    }
+
+    /// A container unit serializes exactly as it did before units could
+    /// run a process: the applied hash of every running copy is taken over
+    /// this shape, so one more key would replace every copy at the next
+    /// apply.
+    #[test]
+    fn a_container_unit_serializes_as_it_always_did() {
+        let unit = Unit {
+            name: "db".into(),
+            containers: vec![Container::new("pg", Image::Upstream { reference: "postgres:18".into() })
+                .with_ports(vec![ContainerPort { name: "sql".into(), port: 5432, protocol: Protocol::Tcp }])],
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&unit).unwrap(),
+            r#"{"name":"db","containers":[{"name":"pg","image":{"kind":"upstream","reference":"postgres:18"},"args":[],"env":[],"ports":[{"name":"sql","port":5432,"protocol":"TCP"}],"limits":{},"mounts":[]}],"initContainers":[],"machine":{},"onStop":{"kind":"stop"},"health":{}}"#
+        );
+    }
+
+    /// A process unit and the endpoint to one of its ports round-trip,
+    /// in the casing every JSON field weft produces has, and the parts a
+    /// process leaves unset are left out.
+    #[test]
+    fn a_process_unit_round_trips() {
+        let python = crate::needs::Need {
+            name: "python3".into(),
+            stage: crate::needs::NeedStage::Run,
+            check: vec!["python3".into(), "--version".into()],
+            install: BTreeMap::new(),
+            how: None,
+            recipe: None,
+        };
+        let unit = Unit {
+            name: "server".into(),
+            process: Some(
+                Process::new(vec!["python3".into(), "server.py".into()])
+                    .with_file("server.py", "print('hi')\n")
+                    .with_env(vec![EnvEntry::new("MODE", "prod")])
+                    .with_ports(vec![ProcessPort::new("http", "PORT")])
+                    .with_readiness(ProcessReadiness::http("http", "/health").with_startup_seconds(60))
+                    .with_needs(vec![python]),
+            ),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&unit).unwrap();
+        assert_eq!(v["process"]["files"]["server.py"], "print('hi')\n");
+        assert_eq!(v["process"]["ports"][0], serde_json::json!({ "name": "http", "env": "PORT" }));
+        assert_eq!(v["process"]["readiness"], serde_json::json!({ "port": "http", "path": "/health", "startupSeconds": 60, "timeoutSeconds": 1 }));
+        assert_eq!(serde_json::from_value::<Unit>(v).unwrap(), unit);
+        let bare = serde_json::to_value(Process::new(vec!["true".into()])).unwrap();
+        assert_eq!(bare, serde_json::json!({ "command": ["true"] }));
+        let readiness: ProcessReadiness = serde_json::from_value(serde_json::json!({ "port": "http", "path": "/" })).unwrap();
+        assert_eq!(readiness, ProcessReadiness::http("http", "/"));
+
+        let target = EndpointTarget::Process { unit: "server".into(), port: "http".into() };
+        let v = serde_json::to_value(&target).unwrap();
+        assert_eq!(v, serde_json::json!({ "kind": "process", "unit": "server", "port": "http" }));
+        assert_eq!(serde_json::from_value::<EndpointTarget>(v).unwrap(), target);
+        assert_eq!(target.unit(), Some("server"));
+        assert_eq!(EndpointTarget::External { url: "http://x".into() }.unit(), None);
     }
 
     #[test]

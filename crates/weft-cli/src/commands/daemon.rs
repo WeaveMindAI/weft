@@ -1935,6 +1935,9 @@ async fn remove(install: &Install) -> Result<()> {
     };
     stop_runtime(install).await?;
     stop_workers(install).await?;
+    // Its process units, which no container listing finds, and which
+    // nothing would stop once the folder that names them is gone.
+    weft_platform_local::process_units::kill_all(&weft_platform_local::MachineProcesses, &weft_platform_local::InstallLayout::new(&install.dir).process_units()).await?;
     for path in [systemd_unit_path(install), launchd_plist_path(install)] {
         let _ = std::fs::remove_file(path);
     }

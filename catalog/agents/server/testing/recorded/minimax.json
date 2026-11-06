@@ -1,0 +1,1656 @@
+{
+ "kind": "minimax",
+ "command": "mcode",
+ "source": "MiniMax Code 0.7.4 run for real against a local fake OpenAI-compatible model (scratchpad/discC/tools/fake.py, plan scratchpad/mm/plan.json), driven by scratchpad/mm/tools/acpdrive2.py, raw lines in scratchpad/mm/rec. answers: initialize, session/new, session/set_config_option and session/set_mode from rec1.jsonl (ids 1, 2, 3, 5), session/load and its replay (all of it before the answer) from load1.jsonl. Turns: hello from rec1.jsonl prompt 6; tool from rec1.jsonl prompt 7 (a call of the probe's weft_echo, renamed lookup with its text replaced by $TOOL, and the `tool` step put where the agent called it: composed from that recorded call); permission from allow.jsonl; reject from agents/minimax.transcript.jsonl lines 86-103; ask from decline.jsonl prompt 4 (answered after 4 s, as a person would); ask_three_questions from ask2.jsonl (its answer message has no recorded reply, so the follow-up prompt that carries it ends at the stand-in's own `the recording has no turn` error, which names the message sent); the answer message (the turn named after it) from decline.jsonl prompt 8; queued from the transcript lines 187-189; provider down from dead.jsonl. Session ids replaced by $SESSION. Updates MiniMax sends that weft ignores (session_info_update, usage_update, available_commands_update, config_option_update) are left out.",
+ "answers": {
+  "initialize": {
+   "protocolVersion": 1,
+   "agentCapabilities": {
+    "loadSession": true,
+    "mcpCapabilities": {
+     "http": true,
+     "sse": true
+    },
+    "promptCapabilities": {
+     "image": true,
+     "audio": false,
+     "embeddedContext": false
+    },
+    "sessionCapabilities": {
+     "list": {},
+     "fork": {},
+     "resume": {},
+     "close": {}
+    }
+   },
+   "agentInfo": {
+    "name": "minimax-code",
+    "title": "MiniMax Code",
+    "version": "0.7.4"
+   },
+   "_meta": {
+    "minimax-code/extensions": {
+     "version": 1,
+     "methods": [
+      "session/activate",
+      "mcode/session/activate",
+      "mcode/session/steer",
+      "mcode/session/queue/list",
+      "mcode/session/queue/enqueue",
+      "mcode/session/queue/update",
+      "mcode/session/queue/delete",
+      "mcode/session/queue/steer",
+      "mcode/session/goal/get",
+      "mcode/session/goal/create",
+      "mcode/session/goal/patch",
+      "mcode/session/goal/clear",
+      "mcode/session/delegation/get",
+      "mcode/session/delegation/stop"
+     ],
+     "notifications": [
+      "mcode/session/current_session_update",
+      "mcode/session/queue_update",
+      "mcode/session/goal_update",
+      "mcode/session/delegation_update"
+     ]
+    }
+   }
+  },
+  "session/new": {
+   "sessionId": "$SESSION",
+   "modes": {
+    "currentModeId": "default",
+    "availableModes": [
+     {
+      "id": "default",
+      "name": "Default",
+      "description": "Work normally with the configured tools and permission policy."
+     },
+     {
+      "id": "plan",
+      "name": "Plan",
+      "description": "Research and prepare an implementation plan before making changes."
+     }
+    ]
+   },
+   "configOptions": [
+    {
+     "type": "select",
+     "id": "permissionMode",
+     "name": "Permission mode",
+     "description": "Controls how MiniMax Code handles tool permission requests in this process.",
+     "category": "_permission",
+     "currentValue": "auto",
+     "options": [
+      {
+       "value": "default",
+       "name": "Ask"
+      },
+      {
+       "value": "auto",
+       "name": "Auto"
+      },
+      {
+       "value": "bypassPermissions",
+       "name": "Full access"
+      }
+     ],
+     "_meta": {
+      "minimax-code/scope": "process"
+     }
+    },
+    {
+     "type": "select",
+     "id": "model",
+     "name": "Model",
+     "description": "Selects the model used by subsequent turns in this Session.",
+     "category": "model",
+     "currentValue": "m:custom_provider%3Aweft:fake-model:v:",
+     "options": [
+      {
+       "value": "m:minimax:MiniMax-M3.1-Flash:v:",
+       "name": "M3.1-Flash"
+      },
+      {
+       "value": "m:minimax:MiniMax-M3.1-Flash:v:thinking",
+       "name": "M3.1-Flash \u00b7 thinking"
+      },
+      {
+       "value": "m:minimax:MiniMax-M3:v:",
+       "name": "M3"
+      },
+      {
+       "value": "m:minimax:MiniMax-M3:v:thinking",
+       "name": "M3 \u00b7 thinking"
+      },
+      {
+       "value": "m:custom_provider%3Aweft:fake-model:v:",
+       "name": "fake-model"
+      }
+     ]
+    }
+   ]
+  },
+  "session/load": {
+   "modes": {
+    "currentModeId": "plan",
+    "availableModes": [
+     {
+      "id": "default",
+      "name": "Default",
+      "description": "Work normally with the configured tools and permission policy."
+     },
+     {
+      "id": "plan",
+      "name": "Plan",
+      "description": "Research and prepare an implementation plan before making changes."
+     }
+    ]
+   },
+   "configOptions": [
+    {
+     "type": "select",
+     "id": "permissionMode",
+     "name": "Permission mode",
+     "description": "Controls how MiniMax Code handles tool permission requests in this process.",
+     "category": "_permission",
+     "currentValue": "default",
+     "options": [
+      {
+       "value": "default",
+       "name": "Ask"
+      },
+      {
+       "value": "auto",
+       "name": "Auto"
+      },
+      {
+       "value": "bypassPermissions",
+       "name": "Full access"
+      }
+     ],
+     "_meta": {
+      "minimax-code/scope": "process"
+     }
+    },
+    {
+     "type": "select",
+     "id": "model",
+     "name": "Model",
+     "description": "Selects the model used by subsequent turns in this Session.",
+     "category": "model",
+     "currentValue": "m:custom_provider%3Aweft:fake-model:v:",
+     "options": [
+      {
+       "value": "m:minimax:MiniMax-M3.1-Flash:v:",
+       "name": "M3.1-Flash"
+      },
+      {
+       "value": "m:minimax:MiniMax-M3.1-Flash:v:thinking",
+       "name": "M3.1-Flash \u00b7 thinking"
+      },
+      {
+       "value": "m:minimax:MiniMax-M3:v:",
+       "name": "M3"
+      },
+      {
+       "value": "m:minimax:MiniMax-M3:v:thinking",
+       "name": "M3 \u00b7 thinking"
+      },
+      {
+       "value": "m:custom_provider%3Aweft:fake-model:v:",
+       "name": "fake-model"
+      }
+     ]
+    }
+   ]
+  },
+  "session/set_config_option": {
+   "configOptions": [
+    {
+     "type": "select",
+     "id": "permissionMode",
+     "name": "Permission mode",
+     "description": "Controls how MiniMax Code handles tool permission requests in this process.",
+     "category": "_permission",
+     "currentValue": "default",
+     "options": [
+      {
+       "value": "default",
+       "name": "Ask"
+      },
+      {
+       "value": "auto",
+       "name": "Auto"
+      },
+      {
+       "value": "bypassPermissions",
+       "name": "Full access"
+      }
+     ],
+     "_meta": {
+      "minimax-code/scope": "process"
+     }
+    },
+    {
+     "type": "select",
+     "id": "model",
+     "name": "Model",
+     "description": "Selects the model used by subsequent turns in this Session.",
+     "category": "model",
+     "currentValue": "m:custom_provider%3Aweft:fake-model:v:",
+     "options": [
+      {
+       "value": "m:minimax:MiniMax-M3.1-Flash:v:",
+       "name": "M3.1-Flash"
+      },
+      {
+       "value": "m:minimax:MiniMax-M3.1-Flash:v:thinking",
+       "name": "M3.1-Flash \u00b7 thinking"
+      },
+      {
+       "value": "m:minimax:MiniMax-M3:v:",
+       "name": "M3"
+      },
+      {
+       "value": "m:minimax:MiniMax-M3:v:thinking",
+       "name": "M3 \u00b7 thinking"
+      },
+      {
+       "value": "m:custom_provider%3Aweft:fake-model:v:",
+       "name": "fake-model"
+      }
+     ]
+    }
+   ]
+  },
+  "session/set_mode": {
+   "_meta": {
+    "minimax-code/transition": "next_prompt"
+   }
+  }
+ },
+ "replay": {
+  "before": [
+   {
+    "sessionUpdate": "user_message_chunk",
+    "messageId": "msg-user-v1-6Lal2ndhXI_wEnJC_XxIJYz7Pm4qxHMIxqDMxKmxii4",
+    "content": {
+     "type": "text",
+     "text": "say hi"
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "messageId": "8663c223-68f9-4ec5-b0c1-2a7108b7c624",
+    "content": {
+     "type": "text",
+     "text": "hello from fake "
+    }
+   },
+   {
+    "sessionUpdate": "user_message_chunk",
+    "messageId": "msg-user-v1-wjDjq1Sb3caMQUhnWWSSmDgEwuCzFftumj7CwHd-zHc",
+    "content": {
+     "type": "text",
+     "text": "MCPCALL please"
+    }
+   },
+   {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call_1793744874718",
+    "title": "mcp__weft__weft_echo",
+    "name": "mcp__weft__weft_echo",
+    "kind": "other",
+    "status": "completed",
+    "rawInput": {
+     "text": "from-agent"
+    },
+    "rawOutput": {
+     "content": [
+      {
+       "type": "text",
+       "text": "echo: from-agent"
+      }
+     ],
+     "details": {
+      "mcp": {
+       "content": [
+        {
+         "type": "text",
+         "text": "echo: from-agent"
+        }
+       ],
+       "isError": false
+      },
+      "server": "weft",
+      "tool": "weft_echo",
+      "is_error": false
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "messageId": "07e327f4-76d3-4c9f-9581-98f5700b40d7",
+    "content": {
+     "type": "text",
+     "text": "done after tool "
+    }
+   }
+  ],
+  "after": []
+ },
+ "turns": {
+  "hello": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "current_mode_update",
+      "currentModeId": "plan"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "8663c223-68f9-4ec5-b0c1-2a7108b7c624",
+      "content": {
+       "type": "text",
+       "text": "hello "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "8663c223-68f9-4ec5-b0c1-2a7108b7c624",
+      "content": {
+       "type": "text",
+       "text": "from "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "8663c223-68f9-4ec5-b0c1-2a7108b7c624",
+      "content": {
+       "type": "text",
+       "text": "fake "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "current_mode_update",
+      "currentModeId": "plan"
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "text",
+     "done"
+    ],
+    "reply": "hello from fake "
+   }
+  },
+  "permission": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_1793744733800",
+      "title": "bash",
+      "name": "bash",
+      "kind": "execute"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744733800"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744733800"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744733800",
+      "status": "in_progress",
+      "rawInput": {
+       "command": "echo 'echo installed' | sh"
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "perm_eb207fd8454d4d2d8f9060075abb329b",
+        "title": "bash",
+        "name": "bash",
+        "kind": "execute",
+        "status": "pending",
+        "rawInput": {
+         "command": "echo 'echo installed' | sh"
+        }
+       },
+       "options": [
+        {
+         "optionId": "allow-once",
+         "name": "Allow once",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "allow-always",
+         "name": "Always allow",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "deny",
+         "name": "Deny",
+         "kind": "reject_once"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744733800",
+      "status": "completed",
+      "rawInput": {
+       "command": "echo 'echo installed' | sh"
+      },
+      "rawOutput": {
+       "content": [
+        {
+         "type": "text",
+         "text": "installed\n"
+        }
+       ],
+       "details": {
+        "execution": {
+         "status": "succeeded",
+         "reason": "exited",
+         "exitCode": 0
+        },
+        "timing": {
+         "commandTimeoutSeconds": 3600,
+         "commandTimerStartedAt": 1793744733917,
+         "commandDeadlineAt": 1793748333917
+        },
+        "output": {
+         "rawBytes": 10,
+         "persistence": "complete",
+         "omittedBytes": 0
+        },
+        "processOutput": {
+         "stdout": "installed\n",
+         "stderr": "",
+         "exitCode": 0,
+         "interrupted": false,
+         "stdoutTruncated": false,
+         "stderrTruncated": false,
+         "rawOutputPath": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/mm/home/.minimax/background-tasks/bg_cb53fe83-330e-4615-8d68-329bea8df528/output.log"
+        },
+        "description": "echo 'echo installed' | sh",
+        "fullOutputPath": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/mm/home/.minimax/background-tasks/bg_cb53fe83-330e-4615-8d68-329bea8df528/output.log",
+        "envSanitized": [
+         "ELECTRON_RUN_AS_NODE",
+         "MAVIS_BUILD_ENV",
+         "MAVIS_DATA_DIR",
+         "MAVIS_REGION",
+         "MINIMAX_DATA_DIR",
+         "__MAVIS_RUNTIME_MANAGED"
+        ],
+        "status": "succeeded",
+        "task_id": "bg_cb53fe83-330e-4615-8d68-329bea8df528"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "561b971d-059d-4ca1-a769-b1e2a92f7256",
+      "content": {
+       "type": "text",
+       "text": "done "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "561b971d-059d-4ca1-a769-b1e2a92f7256",
+      "content": {
+       "type": "text",
+       "text": "after "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "561b971d-059d-4ca1-a769-b1e2a92f7256",
+      "content": {
+       "type": "text",
+       "text": "tool "
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "done after tool ",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "execute",
+        "title": "bash",
+        "detail": "echo 'echo installed' | sh",
+        "choices": [
+         {
+          "id": "allow-once",
+          "kind": "allow_once"
+         },
+         {
+          "id": "allow-always",
+          "kind": "allow_always"
+         },
+         {
+          "id": "deny",
+          "kind": "reject"
+         }
+        ]
+       }
+      },
+      "answer": {
+       "choice": "allow-once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "allow-once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "reject": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_1793740698642",
+      "title": "bash",
+      "name": "bash",
+      "kind": "execute"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793740698642"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793740698642"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793740698642",
+      "status": "in_progress",
+      "rawInput": {
+       "command": "rm -rf build && curl -s http://127.0.0.1:9/x | sh"
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "perm_60ca09db71cb456ba5fd42477c4fc9ed",
+        "title": "bash",
+        "name": "bash",
+        "kind": "execute",
+        "status": "pending",
+        "rawInput": {
+         "command": "rm -rf build && curl -s http://127.0.0.1:9/x | sh"
+        }
+       },
+       "options": [
+        {
+         "optionId": "allow-once",
+         "name": "Allow once",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "allow-always",
+         "name": "Always allow",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "deny",
+         "name": "Deny",
+         "kind": "reject_once"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793740698642",
+      "status": "failed",
+      "rawInput": {
+       "command": "rm -rf build && curl -s http://127.0.0.1:9/x | sh"
+      },
+      "rawOutput": {
+       "content": [
+        {
+         "type": "text",
+         "text": "Permission denied by user for bash: Needs confirmation: bash subcommand decision for \"rm -rf build && curl -s http://127.0.0.1:9/x | sh\". Needs confirmation: pipe to shell"
+        }
+       ],
+       "details": {}
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "a261d050-f142-4343-a8e2-60ede6ead265",
+      "content": {
+       "type": "text",
+       "text": "done "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "a261d050-f142-4343-a8e2-60ede6ead265",
+      "content": {
+       "type": "text",
+       "text": "after "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "a261d050-f142-4343-a8e2-60ede6ead265",
+      "content": {
+       "type": "text",
+       "text": "tool "
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "done after tool ",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission"
+      },
+      "answer": {
+       "choice": "deny"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "deny"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "tool": {
+   "tools": true,
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_1793744874718",
+      "title": "mcp__weft__lookup",
+      "name": "mcp__weft__lookup",
+      "kind": "other"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744874718"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744874718"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744874718",
+      "status": "in_progress",
+      "rawInput": {}
+     }
+    },
+    {
+     "tool": {
+      "name": "lookup",
+      "arguments": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744874718",
+      "status": "completed",
+      "rawInput": {},
+      "rawOutput": {
+       "content": [
+        {
+         "type": "text",
+         "text": "$TOOL"
+        }
+       ],
+       "details": {
+        "mcp": {
+         "content": [
+          {
+           "type": "text",
+           "text": "$TOOL"
+          }
+         ],
+         "isError": false
+        },
+        "server": "weft",
+        "tool": "lookup",
+        "is_error": false
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "07e327f4-76d3-4c9f-9581-98f5700b40d7",
+      "content": {
+       "type": "text",
+       "text": "done "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "07e327f4-76d3-4c9f-9581-98f5700b40d7",
+      "content": {
+       "type": "text",
+       "text": "after "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "07e327f4-76d3-4c9f-9581-98f5700b40d7",
+      "content": {
+       "type": "text",
+       "text": "tool "
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "tool_call",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "done after tool ",
+    "blocks": [
+     {
+      "tool": "lookup",
+      "result": "42"
+     }
+    ]
+   }
+  },
+  "ask": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_1793744268732",
+      "title": "ask_user",
+      "name": "ask_user",
+      "kind": "other"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744268732"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744268732"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744268732",
+      "status": "in_progress",
+      "rawInput": {
+       "async": false,
+       "steps": [
+        {
+         "id": "color",
+         "question": "Which color should the button be?",
+         "options": [
+          {
+           "id": "blue",
+           "label": "Blue"
+          },
+          {
+           "id": "red",
+           "label": "Red"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "elicitation/create",
+      "params": {
+       "mode": "form",
+       "sessionId": "$SESSION",
+       "message": "MiniMax Code needs your input",
+       "requestedSchema": {
+        "type": "object",
+        "properties": {
+         "color": {
+          "type": "string",
+          "title": "Which color should the button be?",
+          "oneOf": [
+           {
+            "const": "blue",
+            "title": "Blue"
+           },
+           {
+            "const": "red",
+            "title": "Red"
+           }
+          ]
+         },
+         "color__other": {
+          "type": "string",
+          "title": "Which color should the button be? \u2014 Other",
+          "description": "Others..."
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744268732",
+      "status": "completed",
+      "rawInput": {
+       "async": false,
+       "steps": [
+        {
+         "id": "color",
+         "question": "Which color should the button be?",
+         "options": [
+          {
+           "id": "blue",
+           "label": "Blue"
+          },
+          {
+           "id": "red",
+           "label": "Red"
+          }
+         ]
+        }
+       ]
+      },
+      "rawOutput": {
+       "content": [
+        {
+         "type": "text",
+         "text": "Questionnaire ask_6b503e311a92872a5a0b2cf5 is waiting for the local user. Stop this turn until the user replies."
+        }
+       ],
+       "details": {
+        "request_id": "ask_6b503e311a92872a5a0b2cf5",
+        "schema_version": 2,
+        "step_count": 1,
+        "waiting_for_user": true
+       },
+       "terminate": true
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "blocks": [
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "id": "color",
+         "header": "MiniMax Code needs your input",
+         "question": "Which color should the button be?",
+         "options": [
+          {
+           "label": "Blue",
+           "description": ""
+          },
+          {
+           "label": "Red",
+           "description": ""
+          }
+         ],
+         "multiSelect": false,
+         "allowOther": true
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "color": [
+         "Blue"
+        ]
+       }
+      },
+      "agentGot": {
+       "action": "decline"
+      }
+     }
+    ],
+    "reply": "hello from fake "
+   }
+  },
+  "ask_three_questions": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_1793744761737",
+      "title": "ask_user",
+      "name": "ask_user",
+      "kind": "other"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744761737"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744761737"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744761737",
+      "status": "in_progress",
+      "rawInput": {
+       "async": false,
+       "title": "Setup choices",
+       "steps": [
+        {
+         "id": "color",
+         "question": "Which color should the button be?",
+         "options": [
+          {
+           "id": "blue",
+           "label": "Blue",
+           "description": "Calm"
+          },
+          {
+           "id": "red",
+           "label": "Red"
+          }
+         ],
+         "allowOther": true
+        },
+        {
+         "id": "sizes",
+         "question": "Which sizes do you need?",
+         "selectionMode": "multiple",
+         "options": [
+          {
+           "id": "s",
+           "label": "Small"
+          },
+          {
+           "id": "l",
+           "label": "Large"
+          }
+         ]
+        },
+        {
+         "id": "name",
+         "question": "What should the project be called?",
+         "options": [
+          {
+           "id": "app",
+           "label": "weft-app"
+          },
+          {
+           "id": "demo",
+           "label": "demo"
+          }
+         ],
+         "allowOther": true,
+         "required": true
+        }
+       ]
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "elicitation/create",
+      "params": {
+       "mode": "form",
+       "sessionId": "$SESSION",
+       "message": "Setup choices",
+       "requestedSchema": {
+        "type": "object",
+        "properties": {
+         "color": {
+          "type": "string",
+          "title": "Which color should the button be?",
+          "oneOf": [
+           {
+            "const": "blue",
+            "title": "Blue",
+            "description": "Calm"
+           },
+           {
+            "const": "red",
+            "title": "Red"
+           }
+          ]
+         },
+         "color__other": {
+          "type": "string",
+          "title": "Which color should the button be? \u2014 Other",
+          "description": "Others..."
+         },
+         "sizes": {
+          "type": "array",
+          "title": "Which sizes do you need?",
+          "items": {
+           "anyOf": [
+            {
+             "const": "s",
+             "title": "Small"
+            },
+            {
+             "const": "l",
+             "title": "Large"
+            }
+           ]
+          }
+         },
+         "sizes__other": {
+          "type": "string",
+          "title": "Which sizes do you need? \u2014 Other",
+          "description": "Others..."
+         },
+         "name": {
+          "type": "string",
+          "title": "What should the project be called?",
+          "oneOf": [
+           {
+            "const": "app",
+            "title": "weft-app"
+           },
+           {
+            "const": "demo",
+            "title": "demo"
+           }
+          ]
+         },
+         "name__other": {
+          "type": "string",
+          "title": "What should the project be called? \u2014 Other",
+          "description": "Others..."
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1793744761737",
+      "status": "completed",
+      "rawInput": {
+       "async": false,
+       "title": "Setup choices",
+       "steps": [
+        {
+         "id": "color",
+         "question": "Which color should the button be?",
+         "options": [
+          {
+           "id": "blue",
+           "label": "Blue",
+           "description": "Calm"
+          },
+          {
+           "id": "red",
+           "label": "Red"
+          }
+         ],
+         "allowOther": true
+        },
+        {
+         "id": "sizes",
+         "question": "Which sizes do you need?",
+         "selectionMode": "multiple",
+         "options": [
+          {
+           "id": "s",
+           "label": "Small"
+          },
+          {
+           "id": "l",
+           "label": "Large"
+          }
+         ]
+        },
+        {
+         "id": "name",
+         "question": "What should the project be called?",
+         "options": [
+          {
+           "id": "app",
+           "label": "weft-app"
+          },
+          {
+           "id": "demo",
+           "label": "demo"
+          }
+         ],
+         "allowOther": true,
+         "required": true
+        }
+       ]
+      },
+      "rawOutput": {
+       "content": [
+        {
+         "type": "text",
+         "text": "Questionnaire ask_01a516071d9f74c02df6f111 is waiting for the local user. Stop this turn until the user replies."
+        }
+       ],
+       "details": {
+        "request_id": "ask_01a516071d9f74c02df6f111",
+        "schema_version": 2,
+        "step_count": 3,
+        "waiting_for_user": true
+       },
+       "terminate": true
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "error"
+    ],
+    "status": "failed",
+    "error": "the recording has no turn 'Q: Which color should the button be?\\nA: Red\\n\\nQ: Which sizes do you need?\\nA: Small, Large\\n\\nQ: What should the project be called?\\nA: my-tool'",
+    "blocks": [
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "id": "color",
+         "header": "Setup choices",
+         "question": "Which color should the button be?",
+         "options": [
+          {
+           "label": "Blue",
+           "description": "Calm"
+          },
+          {
+           "label": "Red",
+           "description": ""
+          }
+         ],
+         "multiSelect": false,
+         "allowOther": true
+        },
+        {
+         "id": "sizes",
+         "question": "Which sizes do you need?",
+         "options": [
+          {
+           "label": "Small",
+           "description": ""
+          },
+          {
+           "label": "Large",
+           "description": ""
+          }
+         ],
+         "multiSelect": true,
+         "allowOther": true
+        },
+        {
+         "id": "name",
+         "question": "What should the project be called?",
+         "multiSelect": false,
+         "allowOther": true
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "color": [
+         "Red"
+        ],
+        "sizes": [
+         "Small",
+         "Large"
+        ],
+        "name": [
+         "my-tool"
+        ]
+       }
+      },
+      "agentGot": {
+       "action": "decline"
+      }
+     }
+    ]
+   }
+  },
+  "Q: Which color should the button be?\nA: Blue": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "13310ae8-b262-4438-8f9f-5b19a17756fa",
+      "content": {
+       "type": "text",
+       "text": "hello "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "13310ae8-b262-4438-8f9f-5b19a17756fa",
+      "content": {
+       "type": "text",
+       "text": "from "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "13310ae8-b262-4438-8f9f-5b19a17756fa",
+      "content": {
+       "type": "text",
+       "text": "fake "
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "text",
+     "done"
+    ],
+    "reply": "hello from fake "
+   }
+  },
+  "queued": {
+   "steps": [
+    {
+     "fail": {
+      "code": -32603,
+      "message": "Internal error: MiniMax Code Runtime failed: An earlier queued message has priority"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "error"
+    ],
+    "status": "failed",
+    "error": "An earlier queued message has priority"
+   }
+  },
+  "provider down": {
+   "steps": [
+    {
+     "fail": {
+      "code": -32603,
+      "message": "Internal error: MiniMax Code Runtime failed: BYOK provider custom_provider:weft upstream error: Connection error."
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "error"
+    ],
+    "status": "failed",
+    "error": "BYOK provider custom_provider:weft upstream error: Connection error."
+   }
+  }
+ },
+ "settings": [
+  {
+   "name": "ask",
+   "given": {
+    "permission": "ask"
+   },
+   "expect": {
+    "args": [
+     [
+      "acp"
+     ]
+    ],
+    "requests": [
+     {
+      "method": "initialize",
+      "params": {
+       "clientCapabilities": {
+        "elicitation": {
+         "form": {}
+        }
+       }
+      }
+     },
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "permissionMode",
+       "value": "default"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "auto",
+   "given": {
+    "permission": "auto"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "permissionMode",
+       "value": "auto"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "plan",
+   "given": {
+    "permission": "plan"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "permissionMode",
+       "value": "default"
+      }
+     },
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "plan"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "bypass",
+   "given": {
+    "permission": "bypass"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "permissionMode",
+       "value": "bypassPermissions"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "model_and_options",
+   "given": {
+    "model": "m:minimax:MiniMax-M3:v:thinking",
+    "options": {
+     "appendSystemPrompt": "Be brief.",
+     "systemPrompt": "You are weft's helper."
+    }
+   },
+   "expect": {
+    "args": [
+     [
+      "--append-system-prompt",
+      "Be brief."
+     ],
+     [
+      "--system-prompt",
+      "You are weft's helper."
+     ]
+    ],
+    "requests": [
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "model",
+       "value": "m:minimax:MiniMax-M3:v:thinking"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "api_key",
+   "given": {
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "sk-test-123"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "MINIMAX_DATA_DIR": "$HOME"
+    },
+    "files": {
+     "config.yaml": [
+      "\"apiKey\": \"sk-test-123\"",
+      "\"minimaxModelSource\": \"minimax_api_key\"",
+      "\"enabled\": false"
+     ]
+    }
+   }
+  },
+  {
+   "name": "custom_provider",
+   "given": {
+    "credentials": {
+     "way": "customProvider",
+     "values": {
+      "baseUrl": "http://127.0.0.1:9/v1",
+      "apiFormat": "openai-completions",
+      "model": "fake-model",
+      "key": "sk-fake"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "MINIMAX_DATA_DIR": "$HOME"
+    },
+    "files": {
+     "config.yaml": [
+      "\"api\": \"openai-completions\"",
+      "\"baseURL\": \"http://127.0.0.1:9/v1\"",
+      "\"apiKey\": \"sk-fake\"",
+      "\"fake-model\": {}",
+      "\"defaultModel\": \"custom_provider:weft/fake-model\""
+     ]
+    }
+   }
+  },
+  {
+   "name": "custom_provider_bad_format",
+   "given": {
+    "credentials": {
+     "way": "customProvider",
+     "values": {
+      "baseUrl": "http://127.0.0.1:9/v1",
+      "apiFormat": "ollama",
+      "model": "fake-model",
+      "key": "sk-fake"
+     }
+    }
+   },
+   "expect": {
+    "error": "apiFormat takes anthropic-messages, openai-completions, openai-responses, google-generative-ai"
+   }
+  },
+  {
+   "name": "api_key_empty",
+   "given": {
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": ""
+     }
+    }
+   },
+   "expect": {
+    "error": "the connection's 'key' is empty"
+   }
+  }
+ ]
+}

@@ -21,6 +21,21 @@
 //! on the node ([`Recheck`], folded down to the questions about values),
 //! and asked again by the same evaluator before the node's body runs,
 //! with the values that arrived ([`recheck`]).
+//!
+//! Every condition answers yes, no or not yet known, and the combinators
+//! fold those answers: one no settles an `all` and one yes an `any`;
+//! otherwise an unknown part leaves the whole unknown, and what is left to
+//! ask (the leftover) is the unknown parts alone. The compile records a
+//! rule's leftover on the node, and the run answers only that.
+//!
+//! Which install the program is built for is read off the program
+//! (`ProjectDefinition::install`, set by the install's own version build,
+//! and by every command whose compile is held to an install's, such as
+//! `weft status`). A compile for no install has no answer to a rule
+//! asking about it (`local_install`), which then does not fire. The
+//! install's answer is folded like any other, so a rule it settles is
+//! never recorded for the run; a program compiled for an install never
+//! records one still asking it.
 
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeSet, HashMap};
@@ -29,7 +44,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::frames::Located;
-use crate::node::{Condition, Named, NodeMetadata, NodeRole, NodeWith, RunDirection, Unique, ValidationRule, ValueChecks};
+use crate::install::InstallKind;
+use crate::node::{Condition, Named, NodeMetadata, NodeRole, NodeWith, Refusal, RunDirection, Unique, ValidationRule, ValueChecks, ValueList, WiredList};
 use crate::project::graph::{GraphView, ProjectGraph};
 use crate::project::{NodeDefinition, ProjectDefinition};
 
@@ -51,6 +67,9 @@ pub struct RuleContext<'a> {
 }
 
 impl<'a> RuleContext<'a> {
+    /// The rules of `project` as the program reads them: `local_install`
+    /// answered with the install it was compiled for
+    /// (`ProjectDefinition::install`), none for a compile for no install.
     pub fn new(project: &'a ProjectDefinition) -> Self {
         Self {
             graph: ProjectGraph::new(project),
@@ -121,14 +140,21 @@ pub fn fires(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, cus
 /// most likely meant when one exists (`'box' (did you mean
 /// 'work.box'?)`), and the added inputs its `custom_inputs_fit`
 /// conditions refuse; `{with}` with the nodes its
-/// `downstream_of` conditions found.
+/// `downstream_of` conditions found; `{noneOfFound}` with the values its
+/// `noneOf` checks refuse (`'Read', 'Task'`), and `{noneMatchFound}` the
+/// ones its `noneMatch` checks refuse ([`Refusal::hole`]); `{wiredNode}`
+/// with the nodes its `noneOf` and `noneMatch` checks read a list off,
+/// each with its type (`ClaudeCode 'claude'`).
 pub fn message(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, custom: &CustomPorts) -> String {
-    let s = holes_but_names(rule, node, cx, custom);
-    names_hole(s, &rule.when, node, &Reading::Program { cx, custom }, cx)
+    let at = Reading::Program { cx, custom };
+    let s = names_hole(holes_but_found(rule, node, cx, custom), &rule.when, node, &at, cx);
+    Refusal::ALL.into_iter().fold(s, |s, refusal| found_hole(s, refusal, &rule.when, node, &at))
 }
 
-/// [`message`] with every hole filled but `{names}`.
-fn holes_but_names(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, custom: &CustomPorts) -> String {
+/// [`message`] with every hole filled but the ones naming what a value
+/// holds (`{names}`, `{noneOfFound}`, `{noneMatchFound}`), which a
+/// recorded rule fills from what arrives.
+fn holes_but_found(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, custom: &CustomPorts) -> String {
     let mut s = rule.then.message.replace("{id}", &node.id);
     if let Some(p) = &rule.then.port {
         s = s.replace("{port}", p);
@@ -154,7 +180,35 @@ fn holes_but_names(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContex
         with_found.dedup();
         s = s.replace("{with}", &quoted(&with_found));
     }
+    if s.contains("{wiredNode}") {
+        let mut listers = Vec::new();
+        collect_listers(&rule.when, node, cx, &mut listers);
+        listers.sort();
+        listers.dedup();
+        s = s.replace("{wiredNode}", &listers.join(", "));
+    }
     s
+}
+
+/// `s` with `refusal`'s hole (`{noneOfFound}`, `{noneMatchFound}`)
+/// filled from what `at` reads of `cond`'s checks of that kind: every
+/// value one refuses, quoted, sorted, each once.
+fn found_hole(s: String, refusal: Refusal, cond: &Condition, node: &NodeDefinition, at: &Reading) -> String {
+    if !s.contains(refusal.hole()) {
+        return s;
+    }
+    let mut found = Vec::new();
+    collect_refused(refusal, cond, node, at, &mut found);
+    let mut found: Vec<String> = found
+        .into_iter()
+        .map(|value| match value {
+            Value::String(text) => format!("'{text}'"),
+            other => other.to_string(),
+        })
+        .collect();
+    found.sort();
+    found.dedup();
+    s.replace(refusal.hole(), &found.join(", "))
 }
 
 /// `s` with `{names}` filled from what `at` reads of `cond`'s
@@ -338,11 +392,158 @@ fn fold(cond: &Condition, node: &NodeDefinition, at: &Reading) -> Folded {
             Folded::Known(b) => Folded::Known(!b),
             Folded::Open(open) => Folded::Open(Condition::Not { of: Box::new(open) }),
         },
-        leaf => match answer(leaf, node, at) {
-            Some(b) => Folded::Known(b),
-            None => Folded::Open(leaf.clone()),
-        },
+        // A list read off a wired node is resolved first, so a leftover
+        // carries the values themselves and a run reads no other node.
+        leaf => {
+            let leaf = listed(leaf, node, at);
+            match answer(&leaf, node, at) {
+                Some(b) => Folded::Known(b),
+                None => Folded::Open(leaf.into_owned()),
+            }
+        }
     }
+}
+
+/// `cond` with every list its `noneOf` and `noneMatch` checks read off a
+/// wired node ([`ValueList::Wired`]) written in as the values it lists. Only the
+/// program's reading sees the wires; a reading of what arrived gets
+/// `cond` as it is, and a recorded rule never holds a wired list.
+fn listed<'c>(cond: &'c Condition, node: &NodeDefinition, at: &Reading) -> std::borrow::Cow<'c, Condition> {
+    use std::borrow::Cow;
+    let (Condition::Value { field, checks }, Reading::Program { cx, .. }) = (cond, at) else { return Cow::Borrowed(cond) };
+    if checks.wired_lists().next().is_none() {
+        return Cow::Borrowed(cond);
+    }
+    let mut checks = checks.clone();
+    let mut level: Option<&mut ValueChecks> = Some(&mut checks);
+    while let Some(here) = level {
+        for refusal in Refusal::ALL {
+            let list = refusal.of_mut(here);
+            if let Some(ValueList::Wired(wired)) = list {
+                *list = Some(ValueList::Listed(wired_values(node, wired, cx)));
+            }
+        }
+        level = here.each.as_deref_mut().map(|each| &mut each.checks);
+    }
+    Cow::Owned(Condition::Value { field: field.clone(), checks })
+}
+
+/// The nodes whose output is wired into `node`'s input `port`: followed
+/// back through a loop's `LoopIn` (which passes a value in under the
+/// same port name) to the node it comes from. A wire crossing a group or
+/// a call site already runs from that node (`crate::project::Edge::via`);
+/// one from a group's own port carries a value written there, and no node.
+fn wired_from<'a>(node: &NodeDefinition, port: &str, cx: &'a RuleContext) -> Vec<&'a NodeDefinition> {
+    let mut found: Vec<&NodeDefinition> = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut pending = vec![(node.id.clone(), port.to_string())];
+    while let Some((id, port)) = pending.pop() {
+        if !seen.insert((id.clone(), port.clone())) {
+            continue;
+        }
+        for edge in cx.graph.edges_into(&id).filter(|e| e.target_handle.as_deref() == Some(port.as_str()) && !e.to_group_port() && !e.from_group_port()) {
+            let Some(source) = cx.graph.node(&edge.source) else { continue };
+            let from = edge.source_port();
+            if source.node_type == crate::project::boundary_types::LOOP_IN && source.inputs.iter().any(|input| input.name == from) {
+                pending.push((source.id.clone(), from.to_string()));
+            } else if !found.iter().any(|n| n.id == source.id) {
+                found.push(source);
+            }
+        }
+    }
+    found
+}
+
+/// What is wrong with the lists `rules` read off a node wired into
+/// `node`, each with the wired node, the diagnostic's code and what to
+/// tell. A list the wired node does not declare is `list-not-declared`
+/// unless the rule marks it `optional`: a check reading a list nobody
+/// there declares would refuse nothing, so the program is refused instead
+/// (a misspelled list, or a node wired in that is not the kind the rule
+/// expects). An item of a list a `noneMatch` reads that is no regex is
+/// `list-not-regex`: it would match nothing. An input nothing is wired
+/// into names no node, and the input's own rules say what is missing.
+pub fn wired_list_faults<'a>(rules: &[ValidationRule], node: &NodeDefinition, cx: &'a RuleContext) -> Vec<(&'a NodeDefinition, &'static str, String)> {
+    fn walk<'c>(cond: &'c Condition, wired: &mut Vec<(Refusal, &'c WiredList)>) {
+        match cond {
+            Condition::Value { checks, .. } => {
+                for level in checks.levels() {
+                    wired.extend(level.lists().filter_map(|(refusal, list)| list.wired().map(|w| (refusal, w))));
+                }
+            }
+            Condition::All { of } | Condition::Any { of } => of.iter().for_each(|c| walk(c, wired)),
+            Condition::Not { of } => walk(of, wired),
+            _ => {}
+        }
+    }
+    let mut wired = Vec::new();
+    rules.iter().for_each(|rule| walk(&rule.when, &mut wired));
+    let mut out: Vec<(&NodeDefinition, &'static str, String)> = Vec::new();
+    let reader = format!("{} '{}'", node.node_type, node.id);
+    for (refusal, list) in wired {
+        for lister in wired_from(node, &list.of_node_wired_into, cx) {
+            let told = match lister.lists.get(&list.list) {
+                None if list.optional => continue,
+                None => vec![(
+                    "list-not-declared",
+                    format!(
+                        "{} declares no list '{}' that {reader} reads through `{}`",
+                        spelled_with_type(lister, cx),
+                        list.list,
+                        list.of_node_wired_into
+                    ),
+                )],
+                Some(_) if refusal == Refusal::NoneOf => continue,
+                Some(items) => items
+                    .iter()
+                    .filter_map(|item| crate::node::pattern_fault(&Value::String(item.clone())).err())
+                    .map(|why| {
+                        let lister = spelled_with_type(lister, cx);
+                        ("list-not-regex", format!("{lister} lists {why} in '{}', which {reader} matches against through `{}`", list.list, list.of_node_wired_into))
+                    })
+                    .collect(),
+            };
+            for (code, told) in told {
+                if !out.iter().any(|(_, _, said)| *said == told) {
+                    out.push((lister, code, told));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `node` as a message names it: its type and every place it runs
+/// (`ClaudeCode 'claude'`).
+fn spelled_with_type(node: &NodeDefinition, cx: &RuleContext) -> String {
+    let places: Vec<String> = cx
+        .places()
+        .iter()
+        .filter(|place| place.id == node.id)
+        .map(|place| format!("'{}'", crate::project::address_of(&cx.graph, &place.id, &place.path)))
+        .collect();
+    match places.is_empty() {
+        true => format!("{} '{}'", node.node_type, node.id),
+        false => format!("{} {}", node.node_type, places.join(", ")),
+    }
+}
+
+/// The values `wired` names: the list of that name each node wired into
+/// its input declares (`NodeDefinition::lists`), every one once, in the
+/// order they come. None at all when nothing is wired there; a node wired
+/// there that declares no such list adds none, and the compile refuses the
+/// program for it ([`wired_list_faults`]).
+fn wired_values(node: &NodeDefinition, wired: &WiredList, cx: &RuleContext) -> Vec<Value> {
+    let mut values: Vec<Value> = Vec::new();
+    for lister in wired_from(node, &wired.of_node_wired_into, cx) {
+        for item in lister.lists.get(&wired.list).into_iter().flatten() {
+            let item = Value::String(item.clone());
+            if !values.contains(&item) {
+                values.push(item);
+            }
+        }
+    }
+    values
 }
 
 /// The three-valued `all` (`decisive` false) or `any` (`decisive` true):
@@ -372,6 +573,10 @@ fn answer(cond: &Condition, node: &NodeDefinition, at: &Reading) -> Option<bool>
         // the run is refused before it starts) and not blank, and says
         // nothing of its content. A wired one is there when the node
         // cannot fire without it; anything more waits for what arrives.
+        // A list still read off a wired node ([`listed`] resolves every
+        // one the program's reading meets) is a recorded rule this
+        // runtime does not read: no answer.
+        Condition::Value { checks, .. } if checks.wired_lists().next().is_some() => None,
         Condition::Value { field, checks } => match written(node, field, at) {
             Written::Known(value) => Some(value_holds(checks, value)),
             Written::Unknown => (!checks.reads_content()).then_some(true),
@@ -388,6 +593,9 @@ fn answer(cond: &Condition, node: &NodeDefinition, at: &Reading) -> Option<bool>
             }
             Reading::Program { .. } => Some(literal_fills(node, port)),
         },
+        // The install the program was compiled for, read off the program
+        // the compile or the run reads.
+        Condition::LocalInstall {} => at.project().install.map(|install| install == InstallKind::Local),
         // The rest is about the program's shape, which only the compile
         // reads (and which it decided, so a recheck never asks it).
         _ => match at {
@@ -419,12 +627,6 @@ fn about_the_program(cond: &Condition, node: &NodeDefinition, cx: &RuleContext, 
     }
 }
 
-/// Whether `regex` matches `text`; a malformed regex matches nothing
-/// (the metadata load refuses one, so only a hand-made rule holds one).
-fn matches(regex: &str, text: &str) -> bool {
-    regex::Regex::new(regex).is_ok_and(|r| r.is_match(text))
-}
-
 /// A `value` condition on what a field holds: nothing there (or null) is
 /// false, unless no check is asked, where it is the answer itself.
 fn value_holds(checks: &ValueChecks, value: Option<&Value>) -> bool {
@@ -440,11 +642,18 @@ fn value_holds(checks: &ValueChecks, value: Option<&Value>) -> bool {
 /// owning kinds.
 fn checks_hold(checks: &ValueChecks, value: &Value, top: bool) -> bool {
     let of_kind = |answer: Option<bool>| answer.unwrap_or(!top);
-    let ValueChecks { nonempty, equals, one_of, matches: regex, count, range, length, unique, each } = checks;
+    let ValueChecks { nonempty, equals, one_of, none_of: _, none_match, matches: regex, count, range, length, unique, each } = checks;
+    let refused = |refusal: Refusal| match refusal.of(checks) {
+        None => false,
+        Some(ValueList::Listed(listed)) => refusal.refuses(listed, value),
+        Some(ValueList::Wired(_)) => unreachable!("a wired list is written in before its checks are asked (`listed`, `answer`)"),
+    };
     (!nonempty || is_nonempty(Some(value)))
         && equals.as_ref().is_none_or(|equals| equals == value)
         && one_of.as_ref().is_none_or(|set| set.contains(value))
-        && regex.as_ref().is_none_or(|regex| of_kind(value.as_str().map(|text| matches(regex, text))))
+        && !refused(Refusal::NoneOf)
+        && (none_match.is_none() || of_kind(value.as_str().map(|_| !refused(Refusal::NoneMatch))))
+        && regex.as_ref().is_none_or(|regex| of_kind(value.as_str().map(|text| crate::node::regex_matches(regex, text))))
         && count.as_ref().is_none_or(|count| count.holds(crate::node::item_count(value)))
         && range.as_ref().is_none_or(|range| of_kind(value.as_f64().map(|n| range.holds(n))))
         && length.as_ref().is_none_or(|length| of_kind(value.as_str().map(|text| length.holds(text.chars().count() as u64))))
@@ -489,15 +698,19 @@ pub struct Recheck {
     /// out ([`Folded::Open`]): only questions about values are left.
     pub when: Condition,
     /// The rule's message with its holes filled at compile time, but
-    /// `{names}` when `when` still asks for names: those are the names
-    /// that arrived, filled when the rule fires.
+    /// `{names}` when `when` still asks for names, and `{noneOfFound}` or
+    /// `{noneMatchFound}` when it still asks that check: those are what
+    /// arrived, filled when the rule fires.
     pub message: String,
 }
 
 /// The rules of `node` (`rules`, the ones its type answers to) the
 /// compile leaves undecided, each folded down to what is left to ask
 /// ([`Recheck`]). Only an error can fail a firing, so a warning, an info
-/// or a hint left undecided is left out: it already said nothing.
+/// or a hint left undecided is left out: it already said nothing. The
+/// install the program is compiled for is answered here like any other
+/// question, so a rule it settles is not recorded, and only a compile for
+/// no install, which never runs, records one still asking it.
 pub fn undecided(rules: &[ValidationRule], node: &NodeDefinition, cx: &RuleContext, custom: &CustomPorts) -> Vec<Recheck> {
     let at = Reading::Program { cx, custom };
     rules
@@ -506,12 +719,38 @@ pub fn undecided(rules: &[ValidationRule], node: &NodeDefinition, cx: &RuleConte
         .filter_map(|rule| match fold(&rule.when, node, &at) {
             Folded::Known(_) => None,
             Folded::Open(when) => {
-                let filled = holes_but_names(rule, node, cx, custom);
-                let message = if asks_names(&when) { filled } else { names_hole(filled, &rule.when, node, &at, cx) };
+                let mut message = holes_but_found(rule, node, cx, custom);
+                if !asks_names(&when) {
+                    message = names_hole(message, &rule.when, node, &at, cx);
+                }
+                for refusal in Refusal::ALL.into_iter().filter(|refusal| !asks_refusal(&when, *refusal)) {
+                    message = found_hole(message, refusal, &rule.when, node, &at);
+                }
                 Some(Recheck { when, message })
             }
         })
         .collect()
+}
+
+/// Whether `cond` holds a `value` condition with a `refusal` check, whose
+/// refused values fill its hole ([`Refusal::hole`]).
+fn asks_refusal(cond: &Condition, refusal: Refusal) -> bool {
+    match cond {
+        Condition::Value { checks, .. } => checks.levels().any(|level| refusal.of(level).is_some()),
+        Condition::All { of } | Condition::Any { of } => of.iter().any(|c| asks_refusal(c, refusal)),
+        Condition::Not { of } => asks_refusal(of, refusal),
+        _ => false,
+    }
+}
+
+/// Whether `cond` holds a `local_install` condition.
+fn asks_install(cond: &Condition) -> bool {
+    match cond {
+        Condition::LocalInstall {} => true,
+        Condition::All { of } | Condition::Any { of } => of.iter().any(asks_install),
+        Condition::Not { of } => asks_install(of),
+        _ => false,
+    }
 }
 
 /// Whether `cond` holds an `input_names` condition, whose refused names
@@ -540,16 +779,29 @@ pub fn recheck(node: &NodeDefinition, project: &ProjectDefinition, values: &dyn 
         match fold(&rule.when, node, &at) {
             Folded::Known(false) => {}
             Folded::Known(true) => {
-                let message = if rule.message.contains("{names}") {
-                    names_hole(rule.message.clone(), &rule.when, node, &at, &RuleContext::new(project))
-                } else {
-                    rule.message.clone()
-                };
+                let mut message = rule.message.clone();
+                if message.contains("{names}") {
+                    message = names_hole(message, &rule.when, node, &at, &RuleContext::new(project));
+                }
+                for refusal in Refusal::ALL {
+                    message = found_hole(message, refusal, &rule.when, node, &at);
+                }
                 return Err(crate::error::WeftError::Input(message));
             }
-            // Every part of a recorded rule asks about a value, and every
-            // value is in by now: a part left open is a compiled program
-            // this runtime does not read.
+            // Only a compile for no install records a rule still asking
+            // the install, and such a program never runs (each install
+            // compiles its own versions): it was made by hand or by a
+            // command's own compile.
+            Folded::Open(open) if project.install.is_none() && asks_install(&open) => {
+                return Err(crate::error::WeftError::Input(format!(
+                    "the rule \"{}\" asks which install the program is built for, and this program was \
+                     compiled for none; run it through an install, which builds it for itself",
+                    rule.message
+                )));
+            }
+            // Every part of a recorded rule asks about a value or the
+            // install, and both are known by now: a part left open is a
+            // compiled program this runtime does not read.
             Folded::Open(open) => {
                 return Err(crate::error::WeftError::Input(format!(
                     "the rule \"{}\" asks {open:?}, which the values that arrived cannot answer; \
@@ -832,6 +1084,76 @@ fn collect_names(cond: &Condition, node: &NodeDefinition, at: &Reading, cx: &Rul
             }
         }
         Condition::Not { of } => collect_names(of, node, at, cx, names),
+        _ => {}
+    }
+}
+
+/// Every value `cond`'s `refusal` checks refuse in what `at` reads (its
+/// hole), walked through the combinators and into `each`.
+fn collect_refused(refusal: Refusal, cond: &Condition, node: &NodeDefinition, at: &Reading, found: &mut Vec<Value>) {
+    match cond {
+        Condition::Value { .. } => {
+            let resolved = listed(cond, node, at);
+            let Condition::Value { field, checks } = &*resolved else { unreachable!("`listed` keeps the kind") };
+            if let Written::Known(Some(value)) = written(node, field, at) {
+                refused_by(refusal, checks, value, found);
+            }
+        }
+        Condition::All { of } | Condition::Any { of } => {
+            for c in of {
+                collect_refused(refusal, c, node, at, found);
+            }
+        }
+        Condition::Not { of } => collect_refused(refusal, of, node, at, found),
+        _ => {}
+    }
+}
+
+/// The values in `value` a `refusal` check of `checks` refuses: the value
+/// itself, and inside `each` every item (or its `key`), as [`checks_hold`]
+/// reads them.
+fn refused_by(refusal: Refusal, checks: &ValueChecks, value: &Value, found: &mut Vec<Value>) {
+    if let Some(ValueList::Listed(listed)) = refusal.of(checks) {
+        if refusal.refuses(listed, value) {
+            found.push(value.clone());
+        }
+    }
+    if let Some(each) = &checks.each {
+        let items = match value {
+            Value::Array(items) => items.as_slice(),
+            one => std::slice::from_ref(one),
+        };
+        for item in items {
+            match &each.key {
+                None => refused_by(refusal, &each.checks, item, found),
+                Some(key) => {
+                    if let Some(set) = item.get(key.as_str()).filter(|v| !v.is_null()) {
+                        refused_by(refusal, &each.checks, set, found);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Every node `cond`'s `noneOf` and `noneMatch` checks read a list off
+/// (`{wiredNode}`),
+/// spelled `Type 'place'`, walked through the combinators.
+fn collect_listers(cond: &Condition, node: &NodeDefinition, cx: &RuleContext, listers: &mut Vec<String>) {
+    match cond {
+        Condition::Value { checks, .. } => {
+            for wired in checks.wired_lists() {
+                for lister in wired_from(node, &wired.of_node_wired_into, cx) {
+                    listers.push(spelled_with_type(lister, cx));
+                }
+            }
+        }
+        Condition::All { of } | Condition::Any { of } => {
+            for c in of {
+                collect_listers(c, node, cx, listers);
+            }
+        }
+        Condition::Not { of } => collect_listers(of, node, cx, listers),
         _ => {}
     }
 }

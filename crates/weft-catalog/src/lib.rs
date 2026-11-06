@@ -15,9 +15,11 @@
 //! - **Package**: a directory with `package.toml` at its root. Member
 //!   nodes are auto-detected (every immediate subdir with a
 //!   `metadata.json`); the author never maintains a node list.
-//!   `package.toml` only names the package and carries shared cargo
-//!   deps. The package root can also hold shared Rust files (`.rs`)
-//!   accessible to every member via `use super::<name>;`, plus an
+//!   `package.toml` names the package, the other packages whose shared
+//!   code it calls (`uses`), and carries shared cargo deps. The package
+//!   root can also hold shared Rust files (`.rs`) accessible to every
+//!   member via `use super::<name>;` (and to a package using this one
+//!   as `<package>::<name>`), plus an
 //!   optional PARTIAL `metadata.json` of defaults (shared keys like
 //!   `provider` or `portsFromConfig`) every member inherits key-by-key;
 //!   a member's own key, when present, wins.
@@ -163,6 +165,59 @@ fn module_problem(shared_rs: &[PathBuf], members: &[CatalogEntry]) -> Option<(Pa
             format!("this shared file would become module `{stem}`, which is also the module of the node {member}; rename the file"),
         ))
     })
+}
+
+/// What makes a package's `uses` impossible to build on the package
+/// alone, as one line about its `package.toml`: using itself, a name its
+/// code could not write (a used package's crate is named by the
+/// package's name, `computer::actions`), or a name one of its own cargo
+/// dependencies already takes in its crate.
+fn uses_problem(unit: &Unit) -> Option<String> {
+    unit.uses.iter().find_map(|used| {
+        if *used == unit.name {
+            return Some(format!("the package '{used}' uses itself; take '{used}' out of `uses`"));
+        }
+        if !weft_core::is_rust_module_name(used) {
+            return Some(format!(
+                "`uses` names the package '{used}', and code reaches a used package by its name, which Rust cannot \
+                 take as a name (a keyword, `_`, or not [A-Za-z_][A-Za-z0-9_]*); only a package named that way can \
+                 be used, so rename it"
+            ));
+        }
+        let deps = unit.package_deps.as_ref()?;
+        deps.keys().find(|dep| dep.replace('-', "_") == *used).map(|dep| {
+            format!(
+                "`uses` names the package '{used}', and the cargo dependency '{dep}' in `[dependencies]` takes the \
+                 same name in this package's code; rename one of them"
+            )
+        })
+    })
+}
+
+/// The ring of packages `start` is part of, as the names around it from
+/// `start` back to `start`, when following what each package uses
+/// (`uses`, by package name) comes back to it. Names not in `uses` are
+/// packages this catalog does not hold, which use nothing.
+fn uses_ring(uses: &BTreeMap<String, Vec<String>>, start: &str) -> Option<Vec<String>> {
+    fn walk(uses: &BTreeMap<String, Vec<String>>, start: &str, path: &mut Vec<String>, seen: &mut BTreeSet<String>) -> bool {
+        let at = path.last().expect("the walk starts on a name").clone();
+        for next in uses.get(&at).into_iter().flatten() {
+            if next == start {
+                path.push(next.clone());
+                return true;
+            }
+            if seen.insert(next.clone()) {
+                path.push(next.clone());
+                if walk(uses, start, path, seen) {
+                    return true;
+                }
+                path.pop();
+            }
+        }
+        false
+    }
+    let mut path = vec![start.to_string()];
+    walk(uses, start, &mut path, &mut BTreeSet::new()).then_some(path)
 }
 
 /// One `.weft` file under a node root, for the listing of what a
@@ -413,6 +468,13 @@ pub struct Package {
     /// package is referenced. `None` for bare nodes (their deps
     /// come from the node's `deps.toml`).
     pub package_deps: Option<toml::Table>,
+    /// The packages whose shared code this one calls, by name, sorted:
+    /// `uses` in its `package.toml` (always empty for a bare node). Each
+    /// is a package of the same catalog, none uses this one back, and
+    /// their package crates are this one's cargo dependencies, so its
+    /// code names one as `computer::actions`. Discovery leaves out a
+    /// package using one that is not there.
+    pub uses: Vec<String>,
 }
 
 /// Something discovery could not load: a node, or a whole package. It
@@ -632,15 +694,51 @@ impl FsCatalog {
     /// one source of truth for what a node's directory tree is.
     /// Unknown node types are skipped (the caller validates references
     /// elsewhere; staging only needs the ones that resolved).
+    ///
+    /// The packages those use come with them: their crates compile into
+    /// the same build.
     pub fn package_roots_for(&self, node_types: &BTreeSet<String>) -> Vec<PathBuf> {
-        let mut roots: Vec<PathBuf> = node_types
-            .iter()
-            .filter_map(|nt| self.package_of(nt))
+        let mut roots: Vec<PathBuf> = self
+            .with_used(node_types.iter().filter_map(|nt| self.package_of(nt)))
+            .into_iter()
             .map(|pkg| pkg.root.clone())
             .collect();
         roots.sort();
-        roots.dedup();
         roots
+    }
+
+    /// The package named `name`.
+    pub fn package_named(&self, name: &str) -> Option<&Package> {
+        self.packages.values().find(|p| p.name == name)
+    }
+
+    /// `packages` and every package they use, directly or through another,
+    /// each once, in an order where a package comes after every package it
+    /// uses (the order their crates build in), ties by name. THE closure
+    /// every consumer of "what a build of these packages compiles" reads:
+    /// codegen's crates, the build staging and every hash over package
+    /// sources, so a change in a used package rebuilds its users.
+    /// Discovery left out any package using one it does not hold, and any
+    /// ring, so every name resolves and the walk ends.
+    pub fn with_used<'a>(&'a self, packages: impl IntoIterator<Item = &'a Package>) -> Vec<&'a Package> {
+        fn visit<'a>(cat: &'a FsCatalog, package: &'a Package, out: &mut Vec<&'a Package>, seen: &mut BTreeSet<&'a str>) {
+            if !seen.insert(package.name.as_str()) {
+                return;
+            }
+            for used in &package.uses {
+                let used = cat.package_named(used).expect("discovery leaves out a package using one it does not hold");
+                visit(cat, used, out, seen);
+            }
+            out.push(package);
+        }
+        let mut start: Vec<&Package> = packages.into_iter().collect();
+        start.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        for package in start {
+            visit(self, package, &mut out, &mut seen);
+        }
+        out
     }
 
     pub fn entry(&self, node_type: &str) -> Option<&CatalogEntry> {
@@ -679,8 +777,22 @@ impl FsCatalog {
         })?;
         let parsed: NodeDeps = toml::from_str(&raw).map_err(|e| CatalogError::Parse {
             error: stale_copy_hint(&deps_path, e.to_string()),
-            path: deps_path,
+            path: deps_path.clone(),
         })?;
+        // A recipe installs into a folder of weft's that only an infra
+        // process is started with on its PATH: a worker never is, and an
+        // image never runs one, so a node's need met that way would still
+        // be missing where the node runs.
+        if let Some(need) = parsed.needs.iter().find(|n| n.recipe.is_some()) {
+            return Err(CatalogError::Parse {
+                error: format!(
+                    "need '{}' has a `recipe`, which only an infra process's need may have (`Process::needs`): a node's \
+                     own need is installed by its package manager (`[needs.install.<manager>]`) or by hand (`how`)",
+                    need.name
+                ),
+                path: deps_path,
+            });
+        }
         Ok(Some(parsed))
     }
 }
@@ -933,8 +1045,11 @@ fn resolve_weft_root_from(sources: &RootSources) -> Result<PathBuf, String> {
 
 /// Shape of `package.toml` for a package root. Members are
 /// auto-detected (any subdir with a `metadata.json`); `package.toml`
-/// only names the package and carries shared cargo deps.
+/// names the package, the packages whose code it calls, and its shared
+/// cargo deps. Any other key is refused, naming it: a misspelled `uses`
+/// read as nothing would only surface as a compile error far from it.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PackageToml {
     package: PackageSection,
     #[serde(default)]
@@ -942,8 +1057,16 @@ struct PackageToml {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PackageSection {
     name: String,
+    /// The packages of this catalog whose shared code this one calls, by
+    /// name (`uses = ["computer"]`). A list of names and nothing more,
+    /// because a name is all that picks one: a catalog holds exactly one
+    /// package per name, so there is no version or source to say. Kept
+    /// out of `[dependencies]`, which is cargo's and names crates.
+    #[serde(default)]
+    uses: Vec<String>,
 }
 
 /// A unit the walk loaded: a package root or a bare node, with every
@@ -956,6 +1079,8 @@ struct Unit {
     entries: Vec<CatalogEntry>,
     shared_rs: Vec<PathBuf>,
     package_deps: Option<toml::Table>,
+    /// The packages it uses, sorted (empty for a bare node).
+    uses: Vec<String>,
     /// The apps a package root's defaults declare under `accessApps`,
     /// checked once against the root's file (`settle`). Empty for a bare
     /// node and for a root that declares none.
@@ -1109,6 +1234,44 @@ impl DiscoverCtx<'_> {
             }
         }
 
+        // What a package says it uses that can never be built, judged on
+        // the package alone: itself, a name its code could not write, a
+        // name its own cargo deps already take. Then a ring of packages
+        // using each other, which no build order can compile (a package
+        // crate is built after the ones it uses). Both refuse the package,
+        // naming its `package.toml`.
+        for unit in &mut units_ok {
+            if let Some(error) = uses_problem(unit) {
+                let error = CatalogError::Parse { path: unit.root.join("package.toml"), error };
+                for entry in &unit.entries {
+                    withdraw(&mut withdrawn, entry, &error);
+                }
+                let node_types = unit.entries.drain(..).map(|e| e.node_type).collect();
+                self.record(node_types, error);
+            }
+        }
+        // Over the packages still standing: one already left out is no
+        // package to use, which the round below says to its users.
+        let uses: BTreeMap<String, Vec<String>> =
+            units_ok.iter().filter(|u| !u.entries.is_empty()).map(|u| (u.name.clone(), u.uses.clone())).collect();
+        for unit in units_ok.iter_mut().filter(|u| !u.entries.is_empty()) {
+            if let Some(ring) = uses_ring(&uses, &unit.name) {
+                let error = CatalogError::Parse {
+                    path: unit.root.join("package.toml"),
+                    error: format!(
+                        "these packages use each other in a ring ({}), and a package can only use one built \
+                         before it; take one of them out of the `uses` that closes the ring",
+                        ring.join(" uses ")
+                    ),
+                };
+                for entry in &unit.entries {
+                    withdraw(&mut withdrawn, entry, &error);
+                }
+                let node_types = unit.entries.drain(..).map(|e| e.node_type).collect();
+                self.record(node_types, error);
+            }
+        }
+
         // Services, over what is left.
         let mut by_service: BTreeMap<String, Vec<&CatalogEntry>> = BTreeMap::new();
         for entry in units_ok.iter().flat_map(|u| &u.entries) {
@@ -1160,7 +1323,41 @@ impl DiscoverCtx<'_> {
                 .collect();
             // (unit index, whether it is the root's app, the types left out, the file, why)
             let mut refused: Vec<(usize, bool, Vec<String>, PathBuf, String)> = Vec::new();
+            // A package used by another has to be one that loads, or the
+            // user's crate has nothing to compile against. Judged in this
+            // same round: a package left out for a used one takes its own
+            // services with it, which an app elsewhere may name.
+            let loaded_packages: BTreeSet<&str> = units_ok
+                .iter()
+                .filter(|u| u.package_deps.is_some() && !u.entries.is_empty())
+                .map(|u| u.name.as_str())
+                .collect();
+            let bare_nodes: BTreeSet<&str> =
+                units_ok.iter().filter(|u| u.package_deps.is_none()).map(|u| u.name.as_str()).collect();
             for (index, unit) in units_ok.iter().enumerate() {
+                if unit.entries.is_empty() {
+                    continue;
+                }
+                if let Some(missing) = unit.uses.iter().find(|used| !loaded_packages.contains(used.as_str())) {
+                    let node_types = unit.entries.iter().map(|e| e.node_type.clone()).collect();
+                    let error = if bare_nodes.contains(missing.as_str()) {
+                        format!(
+                            "the package '{}' uses '{missing}' (`uses` in this file), which is a single node folder, \
+                             not a package: it has no shared code to call. Make it a package (a package.toml beside \
+                             its shared .rs files), or take it out of `uses`",
+                            unit.name
+                        )
+                    } else {
+                        format!(
+                            "the package '{}' uses the package '{missing}' (`uses` in this file), and this project has \
+                             no package of that name that loads; add the '{missing}' package to the project's nodes, \
+                             or take it out of `uses`. `weft describe-nodes` lists every folder left out, and why",
+                            unit.name
+                        )
+                    };
+                    refused.push((index, true, node_types, unit.root.join("package.toml"), error));
+                    continue;
+                }
                 if let Some(error) = refuse_apps(&services, &withdrawn, &unit.root_apps) {
                     let inheriting = unit.entries.iter().filter(|e| unit.inheriting_apps.contains(&e.node_type));
                     let node_types = inheriting.map(|e| e.node_type.clone()).collect();
@@ -1208,6 +1405,7 @@ impl DiscoverCtx<'_> {
                     node_types,
                     shared_rs: unit.shared_rs,
                     package_deps: unit.package_deps,
+                    uses: unit.uses,
                 },
             );
         }
@@ -1583,6 +1781,7 @@ fn register_bare_node(dir: &Path, ctx: &mut DiscoverCtx<'_>) {
         entries: vec![entry],
         shared_rs: Vec::new(),
         package_deps: None,
+        uses: Vec::new(),
         root_apps: BTreeMap::new(),
         inheriting_apps: BTreeSet::new(),
     });
@@ -1708,6 +1907,12 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
         entries: loaded,
         shared_rs,
         package_deps: Some(parsed.dependencies),
+        uses: {
+            let mut uses = parsed.package.uses;
+            uses.sort();
+            uses.dedup();
+            uses
+        },
         root_apps,
         inheriting_apps,
     });
@@ -2884,7 +3089,7 @@ mod package_tests {
         let pkg = cat.package_of("HumanQuery").expect("pkg_of missing");
         assert_eq!(pkg.name, "human");
         assert_eq!(pkg.node_types.len(), 2);
-        assert_eq!(pkg.shared_rs.len(), 1, "should have form_helpers.rs");
+        assert!(pkg.shared_rs.is_empty(), "the form building lives in weft (weft::signal::form)");
     }
 
     /// Bailey triad: bridge is the infra (requires_infra + locally
@@ -2927,6 +3132,117 @@ mod package_tests {
             "package must contain all three node types, got {:?}",
             pkg.node_types,
         );
+    }
+}
+
+// Layer 1: a package's `uses`, as discovery takes it or leaves the package out.
+#[cfg(test)]
+mod uses_tests {
+    use super::*;
+
+    /// A package `name` holding one node of type `node_type`, its
+    /// `package.toml` saying `extra` after the name.
+    fn package(root: &Path, name: &str, extra: &str, node_type: &str) {
+        let dir = root.join(name);
+        let node = dir.join(node_module_name(node_type));
+        fs::create_dir_all(&node).expect("mkdir");
+        fs::write(dir.join("package.toml"), format!("[package]\nname = \"{name}\"\n{extra}\n")).expect("write");
+        fs::write(
+            node.join("metadata.json"),
+            format!(r#"{{"type": "{node_type}", "label": "{node_type}", "description": "d", "inputs": [], "outputs": []}}"#),
+        )
+        .expect("write");
+        fs::write(node.join("mod.rs"), "// impl\n").expect("write");
+    }
+
+    fn problems(cat: &FsCatalog) -> String {
+        cat.problems().iter().map(|p| p.error.to_string()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// A package using another loads with what it uses, and the closure
+    /// of a build comes in build order: a used package before its user,
+    /// through a package in between.
+    #[test]
+    fn a_package_using_another_loads_and_comes_after_it() {
+        let root = tempfile::tempdir().expect("temp root");
+        package(root.path(), "base", "", "Base");
+        package(root.path(), "middle", "uses = [\"base\"]", "Middle");
+        package(root.path(), "top", "uses = [\"middle\", \"base\", \"middle\"]", "Top");
+
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        assert!(cat.problems().is_empty(), "{}", problems(&cat));
+        assert_eq!(cat.package_named("top").expect("top").uses, vec!["base", "middle"], "sorted, once each");
+        let order: Vec<&str> = cat.with_used([cat.package_named("top").unwrap()]).iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(order, vec!["base", "middle", "top"]);
+        let roots = cat.package_roots_for(&["Top".to_string()].into_iter().collect());
+        assert_eq!(roots.len(), 3, "the build stages every package the node's package uses: {roots:?}");
+    }
+
+    /// A package using one the project does not hold is left out, naming
+    /// both and its own file; the rest loads. So is one whose used package
+    /// was itself left out, through any number of users.
+    #[test]
+    fn a_package_using_one_that_does_not_load_is_left_out_naming_both() {
+        let root = tempfile::tempdir().expect("temp root");
+        package(root.path(), "agents", "uses = [\"computer\"]", "Agent");
+        package(root.path(), "outer", "uses = [\"agents\"]", "Outer");
+        package(root.path(), "alone", "", "Alone");
+
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        assert!(cat.lookup("Agent").is_none() && cat.lookup("Outer").is_none());
+        assert!(cat.lookup("Alone").is_some(), "the rest loads");
+        let told = cat.unavailable("Agent").expect("named");
+        assert!(told.contains("the package 'agents' uses the package 'computer'"), "{told}");
+        assert!(told.contains(&root.path().join("agents/package.toml").display().to_string()), "{told}");
+        let told = cat.unavailable("Outer").expect("named");
+        assert!(told.contains("the package 'outer' uses the package 'agents'"), "{told}");
+    }
+
+    /// Packages using each other in a ring are all left out, the ring
+    /// spelled out; a package using itself is told so.
+    #[test]
+    fn a_ring_of_packages_is_left_out() {
+        let root = tempfile::tempdir().expect("temp root");
+        package(root.path(), "a", "uses = [\"b\"]", "A");
+        package(root.path(), "b", "uses = [\"a\"]", "B");
+        package(root.path(), "me", "uses = [\"me\"]", "Me");
+
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        let told = cat.unavailable("A").expect("named");
+        assert!(told.contains("ring (a uses b uses a)"), "{told}");
+        let told = cat.unavailable("B").expect("named");
+        assert!(told.contains("ring (b uses a uses b)"), "{told}");
+        let told = cat.unavailable("Me").expect("named");
+        assert!(told.contains("the package 'me' uses itself"), "{told}");
+    }
+
+    /// What can never build is refused on the package alone: a name its
+    /// code could not write, a name its own cargo deps take, a bare node
+    /// (no package to call into), and any key `package.toml` does not
+    /// know (a misspelled `uses` read as nothing would surface far away).
+    #[test]
+    fn a_use_that_cannot_build_is_refused_naming_why() {
+        let root = tempfile::tempdir().expect("temp root");
+        package(root.path(), "kw", "uses = [\"type\"]", "Kw");
+        package(root.path(), "dup", "uses = [\"base64\"]\n[dependencies]\nbase64 = \"0.23\"", "Dup");
+        package(root.path(), "typo", "use = [\"kw\"]", "Typo");
+        package(root.path(), "on_bare", "uses = [\"lone\"]", "OnBare");
+        let bare = root.path().join("lone");
+        fs::create_dir_all(&bare).expect("mkdir");
+        fs::write(bare.join("metadata.json"), r#"{"type": "Lone", "label": "Lone", "description": "d", "inputs": [], "outputs": []}"#)
+            .expect("write");
+        fs::write(bare.join("mod.rs"), "// impl\n").expect("write");
+
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        let told = cat.unavailable("Kw").expect("named");
+        assert!(told.contains("Rust cannot take as a name"), "{told}");
+        let told = cat.unavailable("Dup").expect("named");
+        assert!(told.contains("the cargo dependency 'base64'"), "{told}");
+        let told = cat.unavailable("Typo").expect("named");
+        assert!(told.contains("unknown field `use`"), "{told}");
+        let told = cat.unavailable("OnBare").expect("named");
+        assert!(told.contains("a single node folder, not a package"), "{told}");
+        assert!(cat.lookup("Lone").is_some(), "the bare node itself loads");
     }
 }
 
@@ -3093,6 +3409,14 @@ mod tree_tests {
             ("libvips", weft_core::needs::NeedStage::Build),
         ]);
         assert_eq!(needs[1].packages_for(weft_core::needs::PackageManager::Apt, Some("debian_12")), Some(&["libvips-dev".to_string()][..]));
+
+        fs::write(
+            node.join("deps.toml"),
+            "[[needs]]\nname = \"tool\"\ncheck = [\"tool\"]\n[needs.recipe]\nfolder = \"tools/tool\"\nscript.linux = \"true\"\n",
+        )
+        .expect("write");
+        let err = catalog.deps("Run").expect_err("a node's need weft would install").to_string();
+        assert!(err.contains("need 'tool' has a `recipe`, which only an infra process's need may have"), "{err}");
 
         fs::write(node.join("deps.toml"), "[system.runtime.apt]\ndefault = [\"python3\"]\n").expect("write");
         let err = catalog.deps("Run").expect_err("an unknown key").to_string();

@@ -59,7 +59,7 @@ async fn caller_verify(
         weft_platform_traits::identity::Principal::InfraCopy { .. } => return Err(crate::auth::infra_copy_refused()),
     }
     let now = chrono::Utc::now().timestamp();
-    match verify_caller(&state.verifiers, &state.pool, &req, now).await {
+    match verify_caller(&state.verifiers, &state.pool, state.install, &req, now).await {
         Ok(verified) => Ok(Json(verified)),
         Err(CallerRefusal::Refused(e)) => {
             tracing::warn!(
@@ -141,6 +141,7 @@ fn names(payload: &str, key: &VerifierKey) -> bool {
 pub async fn verify_caller(
     verifiers: &HeldVerifiers,
     pool: &Pool,
+    install: weft_core::install::InstallKind,
     req: &CallerVerifyRequest,
     now_unix: i64,
 ) -> Result<CallerVerified, CallerRefusal> {
@@ -169,7 +170,7 @@ pub async fn verify_caller(
     }
     let values = verifiers
         .get_or_load(key, || async {
-            weft_access_store::caller_values(pool, &req.tenant, weft_access_store::GrantUser::of(req.for_instance.as_ref()), access_id, &req.service)
+            weft_access_store::caller_values(pool, install, &req.tenant, weft_access_store::GrantUser::of(req.for_instance.as_ref()), access_id, &req.service)
                 .await
                 .map_err(|e| match e.downcast_ref::<weft_access_store::AccessError>() {
                     // A connection that is not there (or another tenant's,

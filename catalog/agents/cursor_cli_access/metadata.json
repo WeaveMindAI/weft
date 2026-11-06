@@ -1,0 +1,61 @@
+{
+  "type": "CursorCliAccess",
+  "label": "Cursor CLI Access",
+  "description": "A Cursor login, for the CursorCli nodes' `access`: a Cursor API key. One access for however many CursorCli nodes.",
+  "tags": [
+    "agent",
+    "cursor",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#1f1f1f",
+  "service": {
+    "service": "cursor_cli",
+    "label": "Cursor CLI",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "apiKey",
+          "label": "API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "your Cursor API key"
+            }
+          ],
+          "guide": {
+            "link": "https://cursor.com/dashboard/api",
+            "steps": [
+              "Open the Cursor dashboard, API Keys, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that Cursor account."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[cursor_cli]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[cursor_cli]",
+      "description": "Wire into the CursorCli nodes' `access` input."
+    }
+  ]
+}

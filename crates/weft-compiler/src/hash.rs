@@ -500,16 +500,19 @@ mod fs_hashes {
     /// copy names the same packages as the weft checkout's `catalog/`.
     pub type Packages = std::collections::BTreeMap<String, PathBuf>;
 
-    /// The packages of `node_types`, by name. A type the catalog does
-    /// not serve has no package (the caller validates references).
+    /// The packages of `node_types`, by name, with every package they use
+    /// (`FsCatalog::with_used`): a used package compiles into their crates,
+    /// so its edit has to flip whatever digest theirs does. A type the
+    /// catalog does not serve has no package (the caller validates
+    /// references).
     pub fn packages_of<'a>(catalog: &FsCatalog, node_types: impl Iterator<Item = &'a String>) -> Packages {
-        node_types
-            .filter_map(|node_type| catalog.package_of(node_type))
+        catalog
+            .with_used(node_types.filter_map(|node_type| catalog.package_of(node_type)))
+            .into_iter()
             .map(|package| (package.name.clone(), package.root.clone()))
             .collect()
     }
 
-    /// The package whose root is `root`, alone, or an error naming it.
     /// The recipes of the services the package at `root` publishes, as its
     /// node-test binary bakes them (`codegen::baked_published_services`).
     /// They may come from another package's metadata, so a change there
@@ -527,12 +530,14 @@ mod fs_hashes {
         Ok(())
     }
 
+    /// The package whose root is `root`, with every package it uses (its
+    /// test crate compiles them too), or an error naming the root.
     fn package_at(catalog: &FsCatalog, root: &Path) -> Result<Packages> {
         let package = catalog
             .packages()
             .find(|p| p.root == root)
             .ok_or_else(|| anyhow::anyhow!("no package of this catalog is at {}", root.display()))?;
-        Ok([(package.name.clone(), package.root.clone())].into_iter().collect())
+        Ok(catalog.with_used([package]).into_iter().map(|p| (p.name.clone(), p.root.clone())).collect())
     }
 
     /// Hash a set of packages, each by its name and its content (sorted
@@ -898,15 +903,20 @@ mod fs_hashes {
         Ok(())
     }
 
-    /// The project's program as every command compiles it
+    /// The project's program as a command compiles it
     /// ([`crate::compile_program`]: what does not compile is left in as
     /// broken parts) AND the catalog it was compiled against, read from
     /// disk, without running cargo / docker. Returns both because every
     /// caller (drift hashes, infra build) needs the same catalog the
     /// definition was built from; returning it here is one discovery per
     /// command instead of each caller re-walking the node roots.
-    pub fn load_program(project: &Project) -> Result<(ProjectDefinition, FsCatalog)> {
-        load_program_with_diagnostics(project).map_err(|e| anyhow::anyhow!("{e}"))
+    ///
+    /// Compiled for `install`: the kind of the install a command holds its
+    /// compile to (what `weft status` compares with the install's own
+    /// build, where a node's rule may ask `local_install`), `None` for one
+    /// that compares with nothing.
+    pub fn load_program(project: &Project, install: Option<weft_core::install::InstallKind>) -> Result<(ProjectDefinition, FsCatalog)> {
+        load_program_with_diagnostics(project, install).map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     /// Same as `load_program` but on a failure of the program as a whole
@@ -916,8 +926,9 @@ mod fs_hashes {
     /// than as a single flattened string.
     pub fn load_program_with_diagnostics(
         project: &Project,
+        install: Option<weft_core::install::InstallKind>,
     ) -> std::result::Result<(ProjectDefinition, FsCatalog), CompileLoadError> {
-        load_program_in(project, std::sync::Arc::new(weft_catalog::DiskTree)).map(|(definition, catalog, _)| (definition, catalog))
+        load_program_in(project, std::sync::Arc::new(weft_catalog::DiskTree), install).map(|(compiled, catalog)| (compiled.definition, catalog))
     }
 
     /// [`load_program_with_diagnostics`] with every file read from `tree`:
@@ -926,11 +937,14 @@ mod fs_hashes {
     /// compiles from that, so nothing written to disk meanwhile reaches
     /// it. A build compiles this way, and also gets the value of each file
     /// content the program names ([`crate::compile_program_with_contents`]),
-    /// which its gate reads.
+    /// which its gate reads, and compiles for the install it builds for
+    /// (`install`); a command compiles for the install it holds its compile
+    /// to, or for none ([`load_program`]).
     pub fn load_program_in(
         project: &Project,
         tree: std::sync::Arc<dyn weft_catalog::SourceTree>,
-    ) -> std::result::Result<(ProjectDefinition, FsCatalog, weft_core::content::ContentValues), CompileLoadError> {
+        install: Option<weft_core::install::InstallKind>,
+    ) -> std::result::Result<(crate::Compiled, FsCatalog), CompileLoadError> {
         let main_weft = project.main_weft();
         let source = tree
             .read_to_string(&main_weft)
@@ -941,12 +955,12 @@ mod fs_hashes {
         let src_dir = project.src_dir();
         let reader = crate::file_reader::TreeFileReader::new(tree.as_ref());
         let fs = crate::CompileFs::with_reader(&reader, Some(&project.root)).anchored_at(Some(&src_dir));
-        let (mut definition, contents) =
-            crate::compile_program_with_contents(&source, project.id(), fs, &catalog).map_err(CompileLoadError::Diagnostics)?;
+        let mut compiled =
+            crate::compile_program_with_contents(&source, project.id(), fs, &catalog, install).map_err(CompileLoadError::Diagnostics)?;
         // What weft.toml says for every run and trigger rides in the
         // program, so a version reads the defaults it was built with.
-        definition.defaults = project.manifest.defaults();
-        Ok((definition, catalog, contents))
+        compiled.definition.defaults = project.manifest.defaults();
+        Ok((compiled, catalog))
     }
 
     /// Error envelope for the diagnostic-bearing loader. `Read` covers

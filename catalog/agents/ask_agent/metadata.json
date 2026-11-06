@@ -1,0 +1,232 @@
+{
+  "type": "AskAgent",
+  "label": "Ask Agent",
+  "description": "One step of a conversation with a coding agent (ClaudeCode, Codex, or any other agent node): give it a `message`, the `toolResult` of a call it made, or the `answer` to its question, exactly one per firing, and it comes back on whichever comes first. `reply` (with `history`, the whole conversation as a ChatHistory file) when the agent ends its turn; `toolCall` when it calls one of the tools you gave it on `tools`, and it waits for that call's result, which you send back as the next firing's `toolResult`; `question` when it asks something with its own ask tool or asks permission to run something, and it waits for your `answer` (an AnswerAgent turns it into a form). The agent's own tools (its shell, its file edits) never come out here: they run inside the agent, and show on `stream`. Wire it inside a Loop: the reply goes to a person or a check that decides the next message, the tool call to the nodes that run it, the question to an AnswerAgent. While the agent works quietly, the run waits for it without holding a worker, for as long as the agent takes. A second run's message to the same agent waits for the first run's turn to end. If the agent's server restarts in the middle of a turn, this fails with the turn lost: send the message again, the conversation itself is kept.",
+  "tags": [
+    "agent",
+    "coding",
+    "claude",
+    "codex",
+    "conversation"
+  ],
+  "icon": "MessagesSquare",
+  "inputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "required": true,
+      "accepts": [
+        "wire"
+      ],
+      "description": "The agent node's `agent` output."
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "accepts": [
+        "wire"
+      ],
+      "description": "The agent node's `stream` output. Wired, every event of the agent goes out on it (its text, its own tool uses and their results, the files it changed, its calls and questions, the end of its turn), numbered once each, never twice, across pauses, and the agent's asks for a fresh login, which its agent node hears there and answers. Left out, nothing streams, and an agent that asks for a fresh login (Codex on a ChatGPT login, about once every ten days) fails this node."
+    },
+    {
+      "name": "message",
+      "type": "String | Null",
+      "description": "A message that starts a turn. One of `message`, `toolResult` and `answer` per firing."
+    },
+    {
+      "name": "toolResult",
+      "type": "AgentToolResult | Null",
+      "description": "The result of the tool call this node handed out on `toolCall`: `{ callId, output, isError? }`, `callId` being that call's `id`. The agent's turn carries on with it."
+    },
+    {
+      "name": "answer",
+      "type": "AgentAnswer | Null",
+      "description": "The answer to the question this node handed out on `question`, as an AnswerAgent gives it. The agent's turn carries on with it."
+    },
+    {
+      "name": "tools",
+      "type": "List[LlmTool]",
+      "description": "The program's own tools the agent may call, with `message`: usually tool nodes' `tools` metadata ports gathered into a list. A call comes out on `toolCall`. A change of tools takes effect from the next message's turn. A tool named like one of the agent's built-in tools replaces it where the agent lets it; one named like a built-in the agent cannot give up (its node's `reservedToolNames`), or in a way the agent refuses (its node's `reservedToolNamePatterns`), is refused when the program builds, or when the tools arrive on a wire, when this node fires."
+    },
+    {
+      "name": "startOver",
+      "type": "Boolean",
+      "default": false,
+      "description": "With `message`: forget the conversation so far, and start a new one with this message."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "reply",
+      "type": "String",
+      "description": "What the agent answered when it ended its turn. Closed when the firing ended on a tool call or a question."
+    },
+    {
+      "name": "history",
+      "type": "File",
+      "description": "The whole conversation so far, as a ChatHistory file (the format LlmInference's `historyFile` takes), with each tool the agent used and what came back. Comes with `reply`."
+    },
+    {
+      "name": "toolCall",
+      "type": "ToolCall",
+      "description": "A call of one of the program's tools (`{ id, name, arguments }`, arguments as a JSON string). The agent waits for its result on the next firing's `toolResult`."
+    },
+    {
+      "name": "question",
+      "type": "AgentQuestion",
+      "description": "A question the agent asks (`kind` `question`: one or several questions, each with options to pick) or a permission it asks for (`kind` `permission`: what it wants to run, and the choices it offers). The agent waits for the answer on the next firing's `answer`."
+    }
+  ],
+  "features": {
+    "oneOfRequired": [
+      [
+        "message",
+        "toolResult",
+        "answer"
+      ]
+    ]
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "output_wired",
+          "port": "question"
+        }
+      },
+      "then": {
+        "message": "AskAgent '{id}' has nothing wired to `question`, so an agent asking a question or asking permission would wait for an answer nobody can give. Wire `question` into an AnswerAgent (or your own node) and its answer back into `answer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "question"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "input_wired",
+          "port": "answer"
+        }
+      },
+      "then": {
+        "message": "AskAgent '{id}' has nothing wired to `answer`, so an agent's question would never get its answer back. Wire the answer of the AnswerAgent (or your own node) that takes `question` into `answer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "answer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "tools"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "output_wired",
+              "port": "toolCall"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "AskAgent '{id}' gives the agent `tools` but has nothing wired to `toolCall`, so a call of one of them would wait for a result nobody sends. Wire `toolCall` to the nodes that run your tools (through a Dispatch), and their result back into `toolResult`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "toolCall"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "output_wired",
+            "port": "toolCall"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "toolResult"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "AskAgent '{id}' hands its tool calls out on `toolCall` but has nothing wired to `toolResult`, so the agent would never get a call's result back. Wire the result of the node that runs the call into `toolResult`, carried by your loop like `answer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "toolResult"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "tools"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "tools",
+              "each": {
+                "key": "name",
+                "noneOf": {
+                  "list": "reservedToolNames",
+                  "ofNodeWiredInto": "agent"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "{wiredNode} cannot give up its built-in tool {noneOfFound}, so AskAgent '{id}' cannot hand it a tool of that name on `tools`; rename your tool.",
+        "level": "structural",
+        "severity": "error",
+        "port": "tools"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "tools"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "tools",
+              "each": {
+                "key": "name",
+                "noneMatch": {
+                  "list": "reservedToolNamePatterns",
+                  "ofNodeWiredInto": "agent",
+                  "optional": true
+                }
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "{wiredNode} refuses a tool named {noneMatchFound} (its node's description says which names it takes), so AskAgent '{id}' cannot hand it that tool on `tools`; rename your tool.",
+        "level": "structural",
+        "severity": "error",
+        "port": "tools"
+      }
+    }
+  ]
+}

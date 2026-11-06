@@ -77,6 +77,12 @@ pub struct SignalSpec {
     /// has no run to cancel, and its registration is refused.
     #[serde(default, rename = "onCancel", skip_serializing_if = "Option::is_none")]
     pub on_cancel: Option<crate::signal::CancelCall>,
+    /// The wait this signal is one branch of, when its run waits on the
+    /// first of several (`crate::signal::first_of`): set by the
+    /// dispatcher as it splits that wait into its branches, never by a
+    /// node. Kind-independent like `onCancel`, and a run's wait only.
+    #[serde(default, rename = "branchOf", skip_serializing_if = "Option::is_none")]
+    pub branch_of: Option<crate::signal::first_of::BranchOf>,
 }
 
 /// Preparing an entry captures it; waiting on a signal registers a live
@@ -122,6 +128,7 @@ impl SignalSpec {
             limits: crate::signal::EntryLimits::default(),
             settings: crate::run_settings::RunSettings::default(),
             on_cancel: None,
+            branch_of: None,
         }
     }
 }
@@ -359,9 +366,11 @@ pub struct RunSnapshot {
     /// Per firing, the last state it saved (`RunEvent::NodeStateSaved`):
     /// what its body gets back when it runs again.
     pub saved_states: HashMap<crate::frames::FiringLocation, crate::run::saved::SavedState>,
-    /// Every bus created and not closed, by id: what a worker that picks
-    /// the run up after a pause opens again before any body runs.
-    pub open_buses: std::collections::BTreeMap<uuid::Uuid, OpenBus>,
+    /// Every bus the run created, open or ended, by id: what a worker
+    /// that picks the run up after a pause opens again before any body
+    /// runs, so a marker handed out before the pause names a bus after it
+    /// too, open or ended as it was.
+    pub buses: std::collections::BTreeMap<uuid::Uuid, RecordedBus>,
     /// Journal rows the fold could not apply because they were
     /// corrupted (unparseable UUID, broken invariants, a row the
     /// program cannot make sense of). Empty in the normal case.
@@ -387,13 +396,13 @@ pub struct JournalCorruption {
     pub reason: String,
 }
 
-/// A bus the run created and has not closed, as its record tells it
-/// (`RunEvent::BusCreated` and the bus rows after it): everything a
-/// worker needs to open it again where it stood, with the same id, so
-/// the markers already handed out keep naming it.
+/// A bus the run created, as its record tells it (`RunEvent::BusCreated`
+/// and the bus rows after it): everything a worker needs to open it again
+/// where it stood, with the same id, so the markers already handed out
+/// keep naming it, and, once it ended, how it ended.
 #[cfg(feature = "runtime")]
 #[derive(Debug, Clone, PartialEq)]
-pub struct OpenBus {
+pub struct RecordedBus {
     /// The firing that created it, and the output port its marker goes
     /// out on: a resumed body creating its bus on that port gets this one.
     pub creator: crate::frames::FiringLocation,
@@ -406,6 +415,14 @@ pub struct OpenBus {
     pub next_offset: u64,
     /// Every name that ever joined it.
     pub joined: std::collections::BTreeSet<String>,
+    /// Who is on it now: every name whose `BusJoined` has no `BusLeft`
+    /// after it. A bus opened again after a pause starts with exactly
+    /// these on it, each the name of a firing that paused.
+    pub members: std::collections::BTreeSet<String>,
+    /// How the last name to leave it left (its last `BusLeft`), `None`
+    /// while none has: how a bus nobody is on ends once no node can still
+    /// join it.
+    pub last_left: Option<crate::bus::StreamEnd>,
     /// The last messages a journaled bus kept whole on its record (at
     /// most `window`), oldest first, every one after `lost_through`: what
     /// a reader reaching back finds again. Empty for an ephemeral bus,
@@ -416,6 +433,11 @@ pub struct OpenBus {
     /// kept without its bytes, or let fall out of `window`): a reader that
     /// had not read it cannot read on as if it had.
     pub lost_through: u64,
+    /// How it ended (`RunEvent::BusClosed`), `None` while it is open. An
+    /// ended bus keeps its last window of messages like an open one: a
+    /// reader given its marker after the pause reads them and comes to
+    /// this end, as it would have before the pause.
+    pub end: Option<crate::bus::StreamEnd>,
 }
 
 /// Closed enum over the places a journal row can be rejected: every
@@ -778,10 +800,11 @@ pub enum LoopTerminationReason {
 /// trigger setup captures settings for listeners, and fire runs the
 /// regular run subgraph. Activation arms the captured listeners.
 ///
-/// Engine/journal vocabulary only: nodes never see it. The engine
+/// Engine/journal vocabulary: a node never matches on it. The engine
 /// routes each phase to the right `Node` method from the manifest
 /// (`setup_trigger` for a trigger at TriggerSetup, `run` otherwise;
-/// a trigger is skipped at InfraSetup).
+/// a trigger is skipped at InfraSetup), and a body that has to tell a
+/// setup from a real run asks `RunContext::is_setup`.
 ///
 /// - `InfraSetup`: an infra node is being provisioned.
 /// - `TriggerSetup`: a trigger node (or its upstream) is being set

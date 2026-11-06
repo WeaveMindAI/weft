@@ -1530,7 +1530,7 @@ pub(crate) fn infra_entries(
         match copies.rows.iter().find(|r| r.node_id == spelled && r.instance.is_none()) {
             Some(row) => infra.push(ProjectInfraEntry {
                 // Coarse UI hint: first endpoint by name (BTreeMap = stable).
-                endpoint_url: row.endpoints.values().next().cloned(),
+                endpoint_url: row.endpoints.values().next().map(weft_core::infra::EndpointRecord::summary),
                 failure_stage: row.failure_stage.map(|f| f.as_str().to_string()),
                 failure_message: row.failure_message.clone(),
                 progress: copies.progress_of(&spelled, None),

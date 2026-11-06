@@ -7,14 +7,17 @@
 //! ## No envelope, close is the goodbye signal
 //!
 //! The bus is a durable log: closing it is itself a journaled `Closed`
-//! entry every cursor reads. A bus from `ctx.open_bus` ends with the
-//! host's body on EVERY exit path (success or error; a pause is no exit,
-//! the bus stays open for the resumed body), so a half-broken host can
-//! never leave the guest's cursor parked forever; the guest's cursor
-//! returns `None` when it reaches the close entry.
+//! entry every cursor reads. Host and guest are both members (each
+//! registered a name), and the bus lives until the last of them leaves
+//! and no node can still join it, so the host returning would leave the
+//! guest on an open bus, reading
+//! on: the host closes it on purpose once it has said its last line, and
+//! the guest's cursor returns `None` when it reaches the close entry. A
+//! host that fails halfway just leaves; the guest, alone on the bus,
+//! waits until the run's stuck check ends it failed.
 //!
 //! Flow:
-//!   1. host: open_bus (create + emit marker + register, ends with the body)
+//!   1. host: open_bus (create + emit marker + register: a member)
 //!   2. host: wait_for("guest")
 //!   3. host: for each line: send "msg", read the guest's next reply
 //!   4. host: close the bus (the goodbye), pulse_downstream(done=true)

@@ -1,0 +1,79 @@
+{
+  "type": "GoogleAntigravityAccess",
+  "label": "Google Antigravity Access",
+  "description": "A Google Antigravity login, for the GoogleAntigravity nodes' `access`: a Gemini API key or a Vertex AI key. One access for however many GoogleAntigravity nodes. A Google account login is not offered: Antigravity's SDK reaches Gemini with a key, or on your own machine with Google Cloud's application default login for Vertex AI; on your machine, leaving `access` out uses what your environment already has.",
+  "tags": [
+    "agent",
+    "antigravity",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#1a73e8",
+  "service": {
+    "service": "google_antigravity",
+    "label": "Google Antigravity",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "apiKey",
+          "label": "Gemini API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "AQ... or AIza..."
+            }
+          ],
+          "guide": {
+            "link": "https://aistudio.google.com/apikey",
+            "steps": [
+              "Open aistudio.google.com, Get API key, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "vertexKey",
+          "label": "Vertex AI key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "AIza..."
+            }
+          ],
+          "guide": {
+            "link": "https://console.cloud.google.com/apis/credentials",
+            "steps": [
+              "In the Google Cloud console, create an API key for Vertex AI (its express mode takes a key alone, no project or region).",
+              "Paste it below and name the connection. Calls are billed to that Google Cloud project."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[google_antigravity]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[google_antigravity]",
+      "description": "Wire into the GoogleAntigravity nodes' `access` input."
+    }
+  ]
+}

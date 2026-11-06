@@ -137,7 +137,7 @@ fn entry_signal(token: &str, project_id: Uuid) -> SignalRegistration {
         run_id: None,
         node_id: "feed".to_string(),
         is_resume: false,
-        spec_json: "{}".to_string(),
+        spec_json: r#"{"kind":"form"}"#.to_string(),
         consumer_kind: None,
         tags: Vec::new(),
         consumer_payload: None,
@@ -1819,6 +1819,42 @@ async fn seed_wait(store: &PostgresStore, token: &str, project: Uuid, run_id: we
     store.signal_insert(&wait).await.expect("seed the wait");
 }
 
+/// A wait on the first of several signals has no row of its own, only its
+/// branches: the first branch answered answers the wait, under the wait's
+/// token and saying which branch, and takes every branch down in the same
+/// transaction; another wait of the run stays, and withdrawing it by its
+/// token takes its branches.
+#[weft_db_macros::test]
+async fn a_branch_answers_its_wait_and_takes_its_siblings_down(pool: Pool) {
+    use weft_dispatcher::store::Answered;
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    let run = queued_run(&store, project).await;
+    pool.execute("UPDATE run SET state = 'parked' WHERE run_id = $1", &[&run]).await.unwrap();
+    for (token, wait, branch) in [("w-0", "w", 0), ("w-1", "w", 1), ("v-0", "v", 0)] {
+        let mut sig = entry_signal(token, project);
+        sig.node_id = format!("wait-{token}");
+        sig.is_resume = true;
+        sig.run_id = Some(run);
+        let mut spec = weft_core::primitive::SignalSpec::of_kind("form", json!({}));
+        spec.branch_of = Some(weft_core::signal::first_of::BranchOf { wait: wait.into(), branch });
+        sig.spec_json = serde_json::to_string(&spec).unwrap();
+        store.signal_insert(&sig).await.expect("seed a branch");
+    }
+    let Answered::Reached { consumed } = store.answer("w-1", &weft_core::primitive::WaitAnswer::Given { value: json!("dropped") }).await.unwrap() else {
+        panic!("reached")
+    };
+    let mut gone: Vec<&str> = consumed.iter().map(|s| s.token.as_str()).collect();
+    gone.sort_unstable();
+    assert_eq!(gone, ["w-0", "w-1"], "both branches go with the answer");
+    assert!(matches!(crate::events(store.events_log(run).await.unwrap()).last(),
+        Some(RunEvent::SuspensionResolved { token, value, .. }) if token == "w" && value == &json!({ "branch": 1, "value": "dropped" })));
+    assert!(matches!(store.answer("w-0", &weft_core::primitive::WaitAnswer::Given { value: json!("late") }).await.unwrap(), Answered::Gone), "the loser is gone");
+    let withdrawn = store.signal_withdraw(run, "v").await.unwrap();
+    assert_eq!(withdrawn.iter().map(|s| s.token.as_str()).collect::<Vec<_>>(), ["v-0"], "a wait withdrawn by its token takes its branches");
+}
+
 /// An answer reaches its run once: a run nobody drives gets it in its
 /// record and is queued to carry on; a run a worker drives has it handed
 /// to that worker (nobody else writes its record); a run that ended takes
@@ -1837,7 +1873,7 @@ async fn an_answer_reaches_its_run_once(pool: Pool) {
     pool.execute("UPDATE run SET state = 'parked' WHERE run_id = $1", &[&parked_run]).await.unwrap();
     seed_wait(&store, "tok-parked", project, parked_run).await;
     let Answered::Reached { consumed } = store.answer("tok-parked", &weft_core::primitive::WaitAnswer::Given { value: json!("yes") }).await.unwrap() else { panic!("reached") };
-    assert_eq!(consumed.token, "tok-parked");
+    assert_eq!(consumed.iter().map(|s| s.token.as_str()).collect::<Vec<_>>(), ["tok-parked"]);
     assert!(store.signal_get("tok-parked").await.unwrap().is_none(), "answered once");
     assert_eq!(run_column::<String>(&pool, "state", parked_run).await.as_deref(), Some("queued"), "queued to carry on");
     assert!(matches!(crate::events(store.events_log(parked_run).await.unwrap()).last(),
@@ -3519,7 +3555,7 @@ async fn what_an_infra_says_changed_is_written_where_its_node_put_it(pool: Pool)
     .unwrap();
     let spec: weft_core::AccessSpec = serde_json::from_value(json!({
         "service": "selfrun",
-        "acquisition": { "kind": "static", "fields": [{ "name": "host", "secret": false }, { "name": "password" }] },
+        "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "host", "secret": false }, { "name": "password" }] }] },
     }))
     .unwrap();
     weft_access_store::publish_grant(

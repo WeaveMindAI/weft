@@ -4,21 +4,26 @@
 //!     register it.
 //!
 //!   - `run`: the wake payload is the raw form payload (a flat JSON
-//!     object keyed by field key). Map the submitted values to output
-//!     ports per the form field definitions.
+//!     object keyed by field key). Read it against the same fields and
+//!     map the answers to output ports.
 
 use async_trait::async_trait;
 use serde_json::Value;
 
+use weft::signal::{ConfigForm, Form, FormSchema};
 use weft::{RunContext, Node, NodeManifest, WeftResult};
-
-use super::form_helpers::{build_form, form_specs, map_response_to_ports, parse_form_fields};
 
 #[derive(NodeManifest)]
 pub struct HumanTriggerNode;
 
 #[cfg(feature = "node-tests")]
 mod tests;
+
+/// Triggers have no upstream input ports, so no value is projected into
+/// display or prefilled fields.
+fn no_prefill() -> Value {
+    Value::Object(serde_json::Map::new())
+}
 
 #[async_trait]
 impl Node for HumanTriggerNode {
@@ -28,23 +33,24 @@ impl Node for HumanTriggerNode {
     }
 
     async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
-        let specs = form_specs(self.manifest())?;
-        // Triggers have no upstream input ports at setup time; an
-        // empty prefill means no value is projected into prefilled /
-        // display fields.
-        let empty_prefill = Value::Object(serde_json::Map::new());
-        let form = build_form(&ctx.inputs, specs, "human-trigger", &empty_prefill)?;
+        let config = ConfigForm::of(self.manifest(), &ctx.inputs)?;
+        let form = Form::for_person(
+            "human-trigger",
+            ctx.inputs.opt("title")?,
+            ctx.inputs.opt("description")?,
+            config.fields(&no_prefill())?,
+        );
         ctx.register_signal(form).await
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // The wake record is the form submission, keyed by field key.
-        // `object()` fails loud on a broken delivery: an empty substitute
+        // `record()` fails loud on a broken delivery: an empty substitute
         // would silently fire a fake "all fields empty" submission (for
         // an approve/reject field, a synthesized `rejected: true` pulse).
         let submission = ctx.wake.record()?;
-        let specs = form_specs(self.manifest())?;
-        let raw_fields = parse_form_fields(&ctx.inputs)?;
-        ctx.pulse_downstream(map_response_to_ports(&submission, &raw_fields, specs)?).await
+        let config = ConfigForm::of(self.manifest(), &ctx.inputs)?;
+        let schema = FormSchema { fields: config.fields(&no_prefill())? };
+        ctx.pulse_downstream(config.outputs(&schema.answers(&submission)?)?).await
     }
 }

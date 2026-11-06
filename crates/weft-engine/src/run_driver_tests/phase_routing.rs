@@ -1,5 +1,6 @@
-    //! The engine-side phase routing: nodes never read the phase; the
-    //! engine picks the trait method from the manifest. Layer 1 pins the
+    //! The engine-side phase routing: the engine picks the trait method
+    //! from the manifest, and a body reads the phase only as
+    //! `ctx.is_setup()`. Layer 1 pins the
     //! pure `node_body_for` rule; layer 3 drives real firings through
     //! `run_one` and asserts which methods actually ran.
 

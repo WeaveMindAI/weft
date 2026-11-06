@@ -47,7 +47,8 @@ fn closed_bus(rig: &FakeRig, messages: &[serde_json::Value]) -> WeftResult<serde
 }
 
 /// A bus carrying `messages` whose producer then failed: weft ended it
-/// failed, as it does a producer's bus when its body returns an error.
+/// failed, as it ends a bus whose only member's body returned an error
+/// once no node can still join it.
 fn failed_bus(rig: &FakeRig, messages: &[serde_json::Value]) -> WeftResult<serde_json::Value> {
     let (mut bus, marker) = rig.seed_bus(BusOptions::default())?;
     bus.register("llm").expect("a fresh bus accepts its first name");

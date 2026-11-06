@@ -76,6 +76,17 @@ impl InfraNodeStatus {
         matches!(self, Self::Running | Self::Flaky)
     }
 
+    /// Whether a copy in this status answers at its endpoints: running,
+    /// or flaky. A flaky copy failed a health check or a few, which says
+    /// something may be wrong, never that nothing is there: a lookup that
+    /// read it as down would tell a run to `weft infra start` a node that
+    /// is up. Every read of where a copy answers (the broker's, the
+    /// dispatcher's `/live`, the supervisor asking a node to remove what
+    /// another put inside it) goes by this one rule.
+    pub fn answers(self) -> bool {
+        matches!(self, Self::Running | Self::Flaky)
+    }
+
     /// Statuses an apply can work on in place, keeping the units that
     /// are up. `Terminating` cannot: a terminate stamped it and did not
     /// finish, so the apply finishes that terminate first and starts the

@@ -15,6 +15,7 @@ use weft_access_store::{
     resolve_for_worker, take_connect_result, AccessError, GrantUser,
 };
 use weft_core::access::spec::Door;
+use weft_core::install::InstallKind;
 use weft_core::access::wire::{BeginOAuth, ConnectDirect, GrantSummary};
 use weft_core::{AccessSpec, AppRegistration, CredentialOwner};
 
@@ -218,7 +219,7 @@ impl FakeProvider {
 fn static_spec(base: &str) -> AccessSpec {
     serde_json::from_value(json!({
         "service": "fakestatic",
-        "acquisition": { "kind": "static", "fields": [{ "name": "token" }] },
+        "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "token" }] }] },
         "auth": [{ "kind": "header", "name": "Authorization", "value": "Bearer {token}" }],
         "test": { "url": format!("{base}/whoami"), "captures": [{ "name": "user", "path": "user" }] },
         "identity": "{user}"
@@ -316,9 +317,11 @@ async fn paste_connect_on_a_consent_service_stores_the_static_variant(pool: Pool
 
     let done = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: true,
+            way: None,
             spec,
             door: Door::Own,
             registration: None,
@@ -337,6 +340,7 @@ async fn paste_connect_on_a_consent_service_stores_the_static_variant(pool: Pool
     // rides the auth step, no app, no refresh.
     let resolved = weft_access_store::resolve_for_worker(
         &pool,
+        InstallKind::Local,
         TENANT_A, GrantUser::Author,
         done.grant.id,
         "fakeoauth",
@@ -352,9 +356,11 @@ async fn paste_connect_on_a_consent_service_stores_the_static_variant(pool: Pool
     // section is a config error, not a quiet static connect.
     let err = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: true,
+            way: None,
             spec: oauth_spec(&base, "coexisting"),
             door: Door::Own,
             registration: None,
@@ -378,9 +384,11 @@ async fn static_connect_runs_the_test_call_and_stores_identity(pool: Pool) {
 
     let done = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: false,
+            way: None,
             spec: static_spec(&base),
             door: Door::Own,
             registration: None,
@@ -402,9 +410,11 @@ async fn static_connect_runs_the_test_call_and_stores_identity(pool: Pool) {
     // A dead token is refused at connect, loudly, and stores nothing.
     let err = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: false,
+            way: None,
             spec: static_spec(&base),
             door: Door::Own,
             registration: None,
@@ -428,9 +438,11 @@ async fn the_tenant_wall_holds_on_every_surface(pool: Pool) {
     let base = fake.serve().await;
     let done = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: false,
+            way: None,
             spec: static_spec(&base),
             door: Door::Own,
             registration: None,
@@ -449,7 +461,7 @@ async fn the_tenant_wall_holds_on_every_surface(pool: Pool) {
     // resolution answers NOT FOUND (no existence leak). A lookup
     // starts from that same resolve, so the wall covers it too.
     assert!(list_grants(&pool, TENANT_B, None, weft_access_store::GrantOwnerScope::Author).await.unwrap().is_empty());
-    let err = resolve_for_worker(&pool, TENANT_B, GrantUser::Author, id, "fakestatic", &[], &[]).await.unwrap_err();
+    let err = resolve_for_worker(&pool, InstallKind::Local, TENANT_B, GrantUser::Author, id, "fakestatic", &[], &[]).await.unwrap_err();
     assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NotFound)), "{err}");
     assert!(delete_grant(&pool, TENANT_B, id, weft_access_store::GrantOwnerScope::Author).await.is_err());
 
@@ -457,7 +469,7 @@ async fn the_tenant_wall_holds_on_every_surface(pool: Pool) {
     // holds: the pasted token AND the value its test call captured.
     // Visibility is "everything except the store's keep-alive
     // material", not "only what the auth steps interpolate".
-    let resolved = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, id, "fakestatic", &[], &[]).await.unwrap();
+    let resolved = resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, id, "fakestatic", &[], &[]).await.unwrap();
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-abc"));
     assert_eq!(resolved.values.get("user").map(String::as_str), Some("quentin"));
     assert!(
@@ -467,7 +479,7 @@ async fn the_tenant_wall_holds_on_every_surface(pool: Pool) {
     assert_eq!(resolved.identity.as_deref(), Some("quentin"));
 
     // A wrong-service marker is refused by name.
-    let err = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, id, "slack", &[], &[]).await.unwrap_err();
+    let err = resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, id, "slack", &[], &[]).await.unwrap_err();
     assert!(err.to_string().contains("wire the right service"), "{err}");
 }
 
@@ -622,14 +634,14 @@ async fn an_exclusive_grant_rotates_in_place_and_upgrades_by_union(pool: Pool) {
     // The drift backstop: a required permission a VERIFIED grant does
     // not hold is refused at resolution with the reconnect affordance.
     let err =
-        resolve_for_worker(&pool, TENANT_A, GrantUser::Author, first.id, "fakeoauth", &["admin".to_string()], &[])
+        resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, first.id, "fakeoauth", &["admin".to_string()], &[])
             .await
             .unwrap_err();
     assert!(
         matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NeedsReconnect { .. })),
         "{err}"
     );
-    resolve_for_worker(&pool, TENANT_A, GrantUser::Author, first.id, "fakeoauth", &["write".to_string()], &[])
+    resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, first.id, "fakeoauth", &["write".to_string()], &[])
         .await
         .expect("a held scope resolves");
 
@@ -711,7 +723,7 @@ async fn refresh_is_lazy_single_flight_and_writes_back_rotated_tokens(pool: Pool
         let pool = pool.clone();
         let id = grant.id;
         handles.push(tokio::spawn(async move {
-            resolve_for_worker(&pool, TENANT_A, GrantUser::Author, id, "fakeoauth", &[], &[]).await
+            resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, id, "fakeoauth", &[], &[]).await
         }));
     }
     for h in handles {
@@ -773,7 +785,7 @@ async fn a_renewal_holds_no_database_connection_while_the_provider_answers(pool:
         .map(|_| {
             let one = one.clone();
             let id = grant.id;
-            tokio::spawn(async move { resolve_for_worker(&one, TENANT_A, GrantUser::Author, id, "fakeoauth", &[], &[]).await })
+            tokio::spawn(async move { resolve_for_worker(&one, InstallKind::Local, TENANT_A, GrantUser::Author, id, "fakeoauth", &[], &[]).await })
         })
         .collect();
     fake.token_arrived.acquire().await.unwrap().forget();
@@ -804,7 +816,7 @@ async fn a_renewed_token_is_written_once_a_connection_can_be_had(pool: Pool) {
     let gate = fake.hold_tokens().await;
     let resolve = {
         let one = one.clone();
-        tokio::spawn(async move { resolve_for_worker(&one, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await })
+        tokio::spawn(async move { resolve_for_worker(&one, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await })
     };
     fake.token_arrived.acquire().await.unwrap().forget();
     // The answer arrives while the one connection is taken, for several
@@ -817,7 +829,7 @@ async fn a_renewed_token_is_written_once_a_connection_can_be_had(pool: Pool) {
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-fresh"));
 
     expire_now(&pool, grant.id).await;
-    resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap();
+    resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap();
     let renewal = fake.calls.lock().unwrap().iter().rfind(|c| c.contains("grant_type=refresh_token")).cloned().unwrap();
     assert!(renewal.contains("refresh_token=refresh-2"), "{renewal}");
 }
@@ -932,7 +944,7 @@ async fn a_declared_renewal_call_replaces_the_standard_refresh(pool: Pool) {
 
     *fake.next_token.lock().unwrap() = "tok-long-lived".into();
     *fake.expires_in.lock().unwrap() = Some(3600);
-    let resolved = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[])
+    let resolved = resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[])
         .await
         .expect("the declared renewal succeeds");
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-long-lived"));
@@ -978,7 +990,7 @@ async fn a_declared_renewal_the_provider_could_not_answer_is_tried_again_not_a_r
     *fake.expires_in.lock().unwrap() = Some(1);
     let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
     expire_now(&pool, grant.id).await;
-    let resolve = || resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
+    let resolve = || resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
 
     for status in [429, 503] {
         *fake.exchange_refusal.lock().unwrap() = Some(status);
@@ -1010,7 +1022,7 @@ async fn a_revoked_refresh_fails_loud_with_the_reconnect_affordance(pool: Pool) 
     let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
     expire_now(&pool, grant.id).await;
     let err =
-        resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap_err();
+        resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap_err();
     match err.downcast_ref::<AccessError>() {
         Some(AccessError::NeedsReconnect { reason, .. }) => {
             assert!(reason.contains("reconnect"), "{reason}");
@@ -1032,7 +1044,7 @@ async fn a_refresh_the_provider_could_not_answer_is_tried_again_not_a_reconnect(
     *fake.expires_in.lock().unwrap() = Some(1);
     let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
     expire_now(&pool, grant.id).await;
-    let resolve = || resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
+    let resolve = || resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
 
     for status in [429, 503] {
         *fake.token_refusal.lock().unwrap() = Some(status);
@@ -1057,9 +1069,11 @@ async fn lookups_run_authed_substitute_and_paginate(pool: Pool) {
     let base = fake.serve().await;
     let done = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: false,
+            way: None,
             spec: static_spec(&base),
             door: Door::Own,
             registration: None,
@@ -1082,7 +1096,7 @@ async fn lookups_run_authed_substitute_and_paginate(pool: Pool) {
     let parents: BTreeMap<String, String> =
         [("team".to_string(), "T1".to_string())].into_iter().collect();
     let resolved =
-        resolve_for_worker(&pool, TENANT_A, GrantUser::Author, done.grant.id, "fakestatic", &[], &[]).await.unwrap();
+        resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, done.grant.id, "fakestatic", &[], &[]).await.unwrap();
     let url = weft_access_store::lookup_url(&lookup_spec, "gen", &parents).unwrap();
     let page = lookup(Some(&resolved), &lookup_spec, None, &url).await.unwrap();
     assert_eq!(page.items.len(), 2);
@@ -1142,9 +1156,11 @@ async fn a_shared_key_connect_stores_a_runtime_owned_row(pool: Pool) {
 
     let done = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: false,
+            way: None,
             spec: spec.clone(),
             door: Door::Shared,
             registration: None,
@@ -1162,7 +1178,7 @@ async fn a_shared_key_connect_stores_a_runtime_owned_row(pool: Pool) {
     assert!(fake.calls.lock().unwrap().is_empty(), "nothing to validate = no provider call");
 
     let resolved =
-        resolve_for_worker(&pool, TENANT_A, GrantUser::Author, done.grant.id, "fakestatic", &[], &[]).await.unwrap();
+        resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, done.grant.id, "fakestatic", &[], &[]).await.unwrap();
     assert_eq!(resolved.owner, CredentialOwner::Platform);
     assert!(resolved.values.is_empty(), "the runtime fills the values per call");
     assert_eq!(resolved.auth.len(), 1, "the declared auth steps carry over");
@@ -1170,9 +1186,11 @@ async fn a_shared_key_connect_stores_a_runtime_owned_row(pool: Pool) {
     // A door the spec does not offer is refused.
     let err = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: false,
+            way: None,
             spec: static_spec(&base),
             door: Door::Shared,
             registration: None,
@@ -1199,9 +1217,11 @@ async fn a_claimed_shortfall_is_let_through_at_resolution(pool: Pool) {
     let base = fake.serve().await;
     let done = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: false,
+            way: None,
             spec: static_spec(&base),
             door: Door::Own,
             registration: None,
@@ -1217,6 +1237,7 @@ async fn a_claimed_shortfall_is_let_through_at_resolution(pool: Pool) {
     assert!(!done.grant.permissions_verified);
     resolve_for_worker(
         &pool,
+        InstallKind::Local,
         TENANT_A, GrantUser::Author,
         done.grant.id,
         "fakestatic",
@@ -1237,6 +1258,7 @@ async fn a_claimed_shortfall_is_let_through_at_resolution(pool: Pool) {
     .unwrap();
     let err = resolve_for_worker(
         &pool,
+        InstallKind::Local,
         TENANT_A, GrantUser::Author,
         done.grant.id,
         "fakestatic",
@@ -1263,14 +1285,16 @@ async fn granted_items_read_the_stored_list_behind_the_wall(pool: Pool) {
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let mut spec = static_spec(&base);
-    if let weft_core::access::spec::Acquisition::Static { fields } = &mut spec.acquisition {
-        fields.push(serde_json::from_value(json!({ "name": "channels", "optional": true })).unwrap());
+    if let weft_core::access::spec::Acquisition::Static { ways } = &mut spec.acquisition {
+        ways[0].fields.push(serde_json::from_value(json!({ "name": "channels", "optional": true })).unwrap());
     }
     let done = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: false,
+            way: None,
             spec,
             door: Door::Own,
             registration: None,
@@ -1294,7 +1318,7 @@ async fn granted_items_read_the_stored_list_behind_the_wall(pool: Pool) {
     let id = done.grant.id;
 
     let items =
-        weft_access_store::granted_items(&pool, TENANT_A, GrantUser::Author, id, "fakestatic", "channels", "name", "id")
+        weft_access_store::granted_items(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, id, "fakestatic", "channels", "name", "id")
             .await
             .unwrap();
     assert_eq!(items.len(), 2);
@@ -1303,7 +1327,7 @@ async fn granted_items_read_the_stored_list_behind_the_wall(pool: Pool) {
     // A name the connection recorded nothing under is an empty list
     // (the editor falls through), not an error.
     assert!(
-        weft_access_store::granted_items(&pool, TENANT_A, GrantUser::Author, id, "fakestatic", "gone", "name", "id")
+        weft_access_store::granted_items(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, id, "fakestatic", "gone", "name", "id")
             .await
             .unwrap()
             .is_empty()
@@ -1311,13 +1335,13 @@ async fn granted_items_read_the_stored_list_behind_the_wall(pool: Pool) {
 
     // The tenant wall and the service check hold like every read.
     let err = weft_access_store::granted_items(
-        &pool, TENANT_B, GrantUser::Author, id, "fakestatic", "channels", "name", "id",
+        &pool, InstallKind::Local, TENANT_B, GrantUser::Author, id, "fakestatic", "channels", "name", "id",
     )
     .await
     .unwrap_err();
     assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NotFound)), "{err}");
     let err = weft_access_store::granted_items(
-        &pool, TENANT_A, GrantUser::Author, id, "slack", "channels", "name", "id",
+        &pool, InstallKind::Local, TENANT_A, GrantUser::Author, id, "slack", "channels", "name", "id",
     )
     .await
     .unwrap_err();
@@ -1494,7 +1518,7 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: Pool) {
 
     // The event-source resolve: recipe + the values its calls name.
     let source =
-        weft_access_store::resolve_event_source(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[])
+        weft_access_store::resolve_event_source(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[])
             .await
             .unwrap();
     assert!(source.events.contains_key("things"));
@@ -1515,7 +1539,7 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: Pool) {
         address_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         anyhow::Ok(Some("https://public.example/events/fakeoauth/things".to_string()))
     };
-    let ensured = weft_access_store::ensure_subscription(&pool, &pool, &req, receiver).await.unwrap();
+    let ensured = weft_access_store::ensure_subscription(&pool, &pool, InstallKind::Local, &req, receiver).await.unwrap();
     assert_eq!(address_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(ensured.expires_at.is_some(), "the recipe declares an expiring channel");
 
@@ -1553,7 +1577,7 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: Pool) {
 
     // A healthy subscription is idempotent: no second provider call, and
     // the address is not even read.
-    weft_access_store::ensure_subscription(&pool, &pool, &req, receiver).await.unwrap();
+    weft_access_store::ensure_subscription(&pool, &pool, InstallKind::Local, &req, receiver).await.unwrap();
     let watch_count =
         fake.calls.lock().unwrap().iter().filter(|c| c.starts_with("/watch/")).count();
     assert_eq!(watch_count, 1, "far from expiry, ensure re-subscribes nothing");
@@ -1562,7 +1586,7 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: Pool) {
     // Dropping stops the channel at the provider (with the captured
     // resource id) and forgets the row.
     let dropped =
-        weft_access_store::drop_subscriptions_for_signal(&pool, &pool, TENANT_A, "sig-1").await.unwrap();
+        weft_access_store::drop_subscriptions_for_signal(&pool, &pool, InstallKind::Local, TENANT_A, "sig-1").await.unwrap();
     assert_eq!(dropped, 1);
     let stops: Vec<String> = fake
         .calls
@@ -1597,6 +1621,7 @@ async fn a_subscribe_topic_without_a_public_address_teaches_the_fix(pool: Pool) 
     let err = weft_access_store::ensure_subscription(
         &pool,
         &pool,
+        InstallKind::Local,
         &weft_access_store::EnsureSubscription {
             tenant: TENANT_A.into(),
             service: "fakeoauth".into(),
@@ -1640,17 +1665,17 @@ async fn a_subscription_is_checked_without_being_made(pool: Pool) {
         signal_token: "sig-x".into(),
         params: params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
     };
-    let unreachable = weft_access_store::check_subscription(&pool, &ask(&[("target", "f")]), || async { anyhow::Ok(None) })
+    let unreachable = weft_access_store::check_subscription(&pool, InstallKind::Local, &ask(&[("target", "f")]), || async { anyhow::Ok(None) })
         .await
         .unwrap_err()
         .to_string();
     assert!(unreachable.contains("--public-url"), "{unreachable}");
-    let replacing = weft_access_store::check_subscription(&pool, &ask(&[("subscriptionId", "x")]), || async { anyhow::Ok(Some("https://weft.test".into())) })
+    let replacing = weft_access_store::check_subscription(&pool, InstallKind::Local, &ask(&[("subscriptionId", "x")]), || async { anyhow::Ok(Some("https://weft.test".into())) })
         .await
         .unwrap_err()
         .to_string();
     assert!(replacing.contains("may not replace the connection's stored value 'subscriptionId'"), "{replacing}");
-    weft_access_store::check_subscription(&pool, &ask(&[("target", "f")]), || async { anyhow::Ok(Some("https://weft.test".into())) })
+    weft_access_store::check_subscription(&pool, InstallKind::Local, &ask(&[("target", "f")]), || async { anyhow::Ok(Some("https://weft.test".into())) })
         .await
         .expect("an install the internet reaches could subscribe");
     assert!(fake.calls.lock().unwrap().iter().all(|c| !c.starts_with("/watch/")), "no provider channel was opened");
@@ -1669,9 +1694,11 @@ async fn an_eventless_service_resolves_with_an_empty_recipe_map(pool: Pool) {
     let base = fake.serve().await;
     let done = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: false,
+            way: None,
             spec: static_spec(&base),
             door: Door::Own,
             registration: None,
@@ -1685,7 +1712,7 @@ async fn an_eventless_service_resolves_with_an_empty_recipe_map(pool: Pool) {
     .await
     .unwrap();
     let source =
-        weft_access_store::resolve_event_source(&pool, TENANT_A, GrantUser::Author, done.grant.id, "fakestatic", &[])
+        weft_access_store::resolve_event_source(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, done.grant.id, "fakestatic", &[])
             .await
             .expect("an eventless service resolves for value-only listening");
     assert!(source.events.is_empty(), "no recipes to serve");
@@ -1753,7 +1780,7 @@ async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(p
         .await
         .unwrap();
         let source =
-            weft_access_store::resolve_event_source(&pool, TENANT_A, GrantUser::Author, id, "fakeoauth", &[])
+            weft_access_store::resolve_event_source(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, id, "fakeoauth", &[])
                 .await
                 .unwrap();
         match door {
@@ -1829,7 +1856,7 @@ async fn a_shared_app_connection_never_carries_the_operators_app_secret(pool: Po
     // What a RESOLUTION hands over: the user's token, never the
     // store's keep-alive material, never the app's secret.
     let resolved =
-        resolve_for_worker(&pool, TENANT_A, GrantUser::Author, done.grant.id, "fakeoauth", &[], &[]).await.unwrap();
+        resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, done.grant.id, "fakeoauth", &[], &[]).await.unwrap();
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-1"));
     assert!(
         !resolved.values.contains_key("refresh_token"),
@@ -1857,13 +1884,13 @@ async fn optional_field_groups_gate_what_a_connection_can_do(pool: Pool) {
     let base = fake.serve().await;
     let spec: AccessSpec = serde_json::from_value(json!({
         "service": "fakemail",
-        "acquisition": { "kind": "static", "fields": [
+        "acquisition": { "kind": "static", "ways": [{ "fields": [
             { "name": "token" },
             { "name": "in_host", "optional": true },
             { "name": "in_port", "optional": true },
             { "name": "out_host", "optional": true },
             { "name": "out_port", "optional": true }
-        ]},
+        ]}]},
         "auth": [{ "kind": "header", "name": "Authorization", "value": "Bearer {token}" }],
         "test": { "url": format!("{base}/whoami"), "captures": [{ "name": "user", "path": "user" }] },
         "identity": "{user}",
@@ -1879,9 +1906,11 @@ async fn optional_field_groups_gate_what_a_connection_can_do(pool: Pool) {
         async move {
             connect_direct(
                 &pool,
+                InstallKind::Local,
                 TENANT_A,
                 ConnectDirect {
                     paste: false,
+                    way: None,
                     spec: spec.clone(),
                     door: Door::Own,
                     registration: None,
@@ -1920,6 +1949,7 @@ async fn optional_field_groups_gate_what_a_connection_can_do(pool: Pool) {
     // A consumer needing that group's values resolves.
     resolve_for_worker(
         &pool,
+        InstallKind::Local,
         TENANT_A, GrantUser::Author,
         done.grant.id,
         "fakemail",
@@ -1933,6 +1963,7 @@ async fn optional_field_groups_gate_what_a_connection_can_do(pool: Pool) {
     // to add. This is the "trigger wired to a send-only mailbox" case.
     let err = resolve_for_worker(
         &pool,
+        InstallKind::Local,
         TENANT_A, GrantUser::Author,
         done.grant.id,
         "fakemail",
@@ -1950,6 +1981,7 @@ async fn optional_field_groups_gate_what_a_connection_can_do(pool: Pool) {
     // refused the same way, which is what an activation reports.
     let err = weft_access_store::resolve_event_source(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         GrantUser::Author,
         done.grant.id,
@@ -1993,9 +2025,11 @@ async fn a_finished_pick_lands_its_grants_on_the_row(pool: Pool) {
     .unwrap();
     let done = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: false,
+            way: None,
             spec,
             door: Door::Own,
             registration: None,
@@ -2057,9 +2091,11 @@ async fn a_instance_cannot_open_a_picker_on_the_authors_connection(pool: Pool) {
     let base = fake.serve().await;
     let done = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: false,
+            way: None,
             spec: static_spec(&base),
             door: Door::Own,
             registration: None,
@@ -2100,11 +2136,11 @@ async fn a_instance_cannot_open_a_picker_on_the_authors_connection(pool: Pool) {
 fn published_spec() -> AccessSpec {
     serde_json::from_value(json!({
         "service": "selfrun",
-        "acquisition": { "kind": "static", "fields": [
+        "acquisition": { "kind": "static", "ways": [{ "fields": [
             { "name": "host", "secret": false },
             { "name": "password" },
             { "name": "port", "optional": true },
-        ]},
+        ]}]},
         "identity": "{host}"
     }))
     .unwrap()
@@ -2215,7 +2251,7 @@ async fn a_published_recipe_describes_something_the_project_runs(pool: Pool) {
         TENANT_A,
         refused(json!({
             "service": "selfrun",
-            "acquisition": { "kind": "static", "fields": [{ "name": "host" }, { "name": "password" }] },
+            "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "host" }, { "name": "password" }] }] },
             "events": { "push": {
                 "fields": { "id": "body.id" },
                 "account": { "value": "host", "path": "body.host" },
@@ -2236,7 +2272,7 @@ async fn a_published_recipe_describes_something_the_project_runs(pool: Pool) {
         TENANT_A,
         refused(json!({
             "service": "selfrun",
-            "acquisition": { "kind": "static", "fields": [{ "name": "host" }, { "name": "password" }] },
+            "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "host" }, { "name": "password" }] }] },
             "test": { "url": "http://example.invalid/whoami" },
         })),
     )
@@ -2306,6 +2342,7 @@ async fn cleanup_removes_what_a_node_published_and_nothing_else(pool: Pool) {
     let spec = published_spec();
     let theirs = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             spec,
@@ -2318,6 +2355,7 @@ async fn cleanup_removes_what_a_node_published_and_nothing_else(pool: Pool) {
             permissions: vec![],
             registration: None,
             paste: false,
+            way: None,
             project_id: Some(PROJECT_1),
             instance: None,
         },
@@ -2368,6 +2406,7 @@ async fn a_instances_connection_and_values_stay_theirs(pool: Pool) {
     let bob = InstanceId::new("bob").unwrap();
     let connect = |instance: &InstanceId, token: &str| ConnectDirect {
         paste: false,
+        way: None,
         spec: static_spec(&base),
         door: Door::Own,
         registration: None,
@@ -2377,12 +2416,12 @@ async fn a_instances_connection_and_values_stay_theirs(pool: Pool) {
         project_id: Some(PROJECT_1),
         instance: Some(instance.clone()),
     };
-    let adas = connect_direct(&pool, TENANT_A, connect(&ada, "tok-ada")).await.expect("ada connects").grant;
+    let adas = connect_direct(&pool, InstallKind::Local, TENANT_A, connect(&ada, "tok-ada")).await.expect("ada connects").grant;
     assert_eq!(adas.owner, CredentialOwner::Instance(ada.clone()));
-    let bobs = connect_direct(&pool, TENANT_A, connect(&bob, "tok-bob")).await.expect("bob connects").grant;
+    let bobs = connect_direct(&pool, InstallKind::Local, TENANT_A, connect(&bob, "tok-bob")).await.expect("bob connects").grant;
     let mut both_doors = static_spec(&base);
     both_doors.doors = vec![Door::Shared, Door::Own];
-    let err = connect_direct(&pool, TENANT_A, ConnectDirect { door: Door::Shared, spec: both_doors, ..connect(&bob, "unused") })
+    let err = connect_direct(&pool, InstallKind::Local, TENANT_A, ConnectDirect { door: Door::Shared, spec: both_doors, ..connect(&bob, "unused") })
         .await
         .expect_err("an instance never spends the shared key");
     assert!(err.to_string().contains("the shared door is the program author's"), "{err}");
@@ -2516,6 +2555,7 @@ async fn a_instances_consent_stays_in_their_project(pool: Pool) {
     assert_eq!(in_p2.project_id, Some(PROJECT_2));
     let p1 = resolve_for_worker(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         GrantUser::Instance { project_id: PROJECT_1, instance: &ada },
         in_p1.id,
@@ -2547,6 +2587,7 @@ async fn the_install_keeps_the_authors_picks(pool: Pool) {
     let base = fake.serve().await;
     let connect = |instance: Option<InstanceId>, token: &str| ConnectDirect {
         paste: false,
+        way: None,
         spec: static_spec(&base),
         door: Door::Own,
         registration: None,
@@ -2556,8 +2597,8 @@ async fn the_install_keeps_the_authors_picks(pool: Pool) {
         project_id: instance.as_ref().map(|_| PROJECT_1),
         instance,
     };
-    let mine = connect_direct(&pool, TENANT_A, connect(None, "tok-mine")).await.expect("the author connects").grant;
-    let adas = connect_direct(&pool, TENANT_A, connect(Some(InstanceId::new("ada").unwrap()), "tok-ada"))
+    let mine = connect_direct(&pool, InstallKind::Local, TENANT_A, connect(None, "tok-mine")).await.expect("the author connects").grant;
+    let adas = connect_direct(&pool, InstallKind::Local, TENANT_A, connect(Some(InstanceId::new("ada").unwrap()), "tok-ada"))
         .await
         .expect("ada connects")
         .grant;
@@ -2607,6 +2648,7 @@ async fn a_move_carries_a_places_picks_and_every_instances_values(pool: Pool) {
     let base = fake.serve().await;
     let connect = |instance: Option<InstanceId>, token: &str| ConnectDirect {
         paste: false,
+        way: None,
         spec: static_spec(&base),
         door: Door::Own,
         registration: None,
@@ -2617,8 +2659,8 @@ async fn a_move_carries_a_places_picks_and_every_instances_values(pool: Pool) {
         instance,
     };
     let ada = InstanceId::new("ada").unwrap();
-    let mine = connect_direct(&pool, TENANT_A, connect(None, "tok-mine")).await.expect("the author connects").grant;
-    let adas = connect_direct(&pool, TENANT_A, connect(Some(ada.clone()), "tok-ada")).await.expect("ada connects").grant;
+    let mine = connect_direct(&pool, InstallKind::Local, TENANT_A, connect(None, "tok-mine")).await.expect("the author connects").grant;
+    let adas = connect_direct(&pool, InstallKind::Local, TENANT_A, connect(Some(ada.clone()), "tok-ada")).await.expect("ada connects").grant;
     let conn = pool.get().await.unwrap();
     change_install_picks(
         &conn,
@@ -2666,9 +2708,11 @@ async fn a_picker_past_its_life_cannot_finish(pool: Pool) {
     let base = fake.serve().await;
     let done = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: false,
+            way: None,
             spec: static_spec(&base),
             door: Door::Own,
             registration: None,
@@ -2823,7 +2867,7 @@ async fn a_provider_naming_the_client_differently_gets_that_name_everywhere(pool
 
     *fake.next_token.lock().unwrap() = "tok-fresh".into();
     *fake.expires_in.lock().unwrap() = Some(3600);
-    let resolved = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[])
+    let resolved = resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[])
         .await
         .expect("the refresh succeeds");
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-fresh"));
@@ -2868,7 +2912,7 @@ async fn a_short_lived_token_is_swapped_after_the_exchange_and_renewed_by_a_get(
 
     *fake.next_token.lock().unwrap() = "tok-long-2".into();
     *fake.expires_in.lock().unwrap() = Some(3600);
-    let resolved = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[])
+    let resolved = resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[])
         .await
         .expect("the declared renewal succeeds");
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-long-2"));
@@ -2908,7 +2952,7 @@ async fn a_nested_answer_is_read_through_its_paths_on_the_exchange_and_the_refre
     *fake.token_answer.lock().unwrap() = Some(json!({
         "result": { "token": "tok-n2", "until": far.to_rfc3339(), "region": "us" }
     }));
-    let resolved = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[])
+    let resolved = resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[])
         .await
         .expect("the refresh reads the same paths");
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-n2"));
@@ -2987,9 +3031,11 @@ async fn a_success_flag_refuses_only_where_the_recipe_declares_it(pool: Pool) {
 
     let done = connect_direct(
         &pool,
+        InstallKind::Local,
         TENANT_A,
         ConnectDirect {
             paste: false,
+            way: None,
             spec: static_spec(&base),
             door: Door::Own,
             registration: None,
@@ -3003,7 +3049,7 @@ async fn a_success_flag_refuses_only_where_the_recipe_declares_it(pool: Pool) {
     .await
     .unwrap();
     let resolved =
-        resolve_for_worker(&pool, TENANT_A, GrantUser::Author, done.grant.id, "fakestatic", &[], &[]).await.unwrap();
+        resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, done.grant.id, "fakestatic", &[], &[]).await.unwrap();
     let lookup_spec: weft_core::node::Lookup = serde_json::from_value(json!({
         "get": format!("{base}/refusing"), "items": "channels", "label": "name", "value": "id",
         "okPath": "ok", "errorPath": "error"
@@ -3032,11 +3078,11 @@ async fn a_refusal_at_a_declared_error_path_is_classified_by_its_code(pool: Pool
 
     *fake.token_answer.lock().unwrap() =
         Some(json!({ "error_type": "temporarily_unavailable", "error": "invalid_grant" }));
-    let err = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap_err();
+    let err = resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap_err();
     assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Unreached(_))), "{err:#}");
 
     *fake.token_answer.lock().unwrap() = Some(json!({ "error_type": "invalid_grant", "error": "ratelimited" }));
-    let err = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap_err();
+    let err = resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap_err();
     assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NeedsReconnect { .. })), "{err:#}");
     assert!(err.to_string().contains("invalid_grant"), "{err:#}");
 }
@@ -3061,7 +3107,7 @@ async fn a_renewal_naming_no_expiry_lasts_the_connections_lifetime(pool: Pool) {
     *fake.expires_in.lock().unwrap() = Some(3600);
     let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
     expire_now(&pool, grant.id).await;
-    let resolve = || resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
+    let resolve = || resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
 
     *fake.next_token.lock().unwrap() = "tok-2".into();
     *fake.next_refresh.lock().unwrap() = Some("refresh-2".into());
@@ -3096,7 +3142,7 @@ async fn an_unusable_renewal_expiry_lasts_the_connections_lifetime(pool: Pool) {
     *fake.next_refresh.lock().unwrap() = Some("refresh-1".into());
     *fake.expires_in.lock().unwrap() = Some(3600);
     let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
-    let resolve = || resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
+    let resolve = || resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
 
     for (n, expires_in) in [json!("soon"), json!(0)].into_iter().enumerate() {
         expire_now(&pool, grant.id).await;
@@ -3136,7 +3182,7 @@ async fn after_exchange_drops_the_exchanges_refresh_token(pool: Pool) {
         .await
         .expect("no refresh token survives the swap, so nothing is renewable and no expiry is needed");
     assert_eq!(grant.expires_at, None);
-    let resolved = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap();
+    let resolved = resolve_for_worker(&pool, InstallKind::Local, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap();
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-long"));
 }
 
@@ -3358,3 +3404,301 @@ async fn a_published_spec_holding_a_nul_is_kept_exactly(pool: Pool) {
     assert_eq!(written_at().await, before, "it read back equal, so nothing was written");
 }
 
+
+/// A coding agent's recipe: a subscription's sign-in file, kept to a
+/// local install, or an API key anywhere. Nothing to sign and no
+/// connect-time call, so nothing outside the test is reached.
+fn agent_spec() -> AccessSpec {
+    serde_json::from_value(json!({
+        "service": "fakeagent",
+        "label": "Fake Agent",
+        "doors": ["shared", "own"],
+        "acquisition": { "kind": "static", "ways": [
+            { "id": "subscription", "label": "Subscription", "localOnly": true,
+              "fields": [{ "name": "authJson" }, { "name": "note", "optional": true, "secret": false }] },
+            { "id": "apiKey", "label": "API key", "fields": [{ "name": "key" }] }
+        ] }
+    }))
+    .unwrap()
+}
+
+async fn agent_connect(
+    pool: &Pool,
+    install: InstallKind,
+    door: Door,
+    way: Option<&str>,
+    values: &[(&str, &str)],
+) -> anyhow::Result<GrantSummary> {
+    connect_direct(
+        pool,
+        install,
+        TENANT_A,
+        ConnectDirect {
+            paste: false,
+            way: way.map(str::to_string),
+            spec: agent_spec(),
+            door,
+            registration: None,
+            values: values.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            label: Some("my agent".into()),
+            permissions: Vec::new(),
+            project_id: None,
+            instance: None,
+        },
+    )
+    .await
+    .map(|done| done.grant)
+}
+
+fn invalid(e: anyhow::Error) -> String {
+    match e.downcast_ref::<AccessError>() {
+        Some(AccessError::Invalid(why)) => why.clone(),
+        _ => panic!("expected a caller-fixable refusal, got: {e:#}"),
+    }
+}
+
+/// A pasted connection records the way it was made with, stores only that
+/// way's fields, and answers the way to the node opening it. A cloud
+/// install refuses a local-only way at the connect, and, for one made on
+/// a local install, every time it is opened, naming the ways that work.
+#[weft_db_macros::test]
+async fn a_connection_records_its_way_and_a_cloud_refuses_a_local_only_one(pool: Pool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    use InstallKind::{Cloud, Local};
+    let grant = agent_connect(&pool, Local, Door::Own, Some("subscription"), &[("authJson", "{\"v\":1}")]).await.unwrap();
+    assert_eq!(grant.way.as_deref(), Some("subscription"));
+    let listed = list_grants(&pool, TENANT_A, None, weft_access_store::GrantOwnerScope::Author).await.unwrap();
+    assert_eq!(listed[0].way.as_deref(), Some("subscription"), "the list shows the way");
+    let opened = resolve_for_worker(&pool, Local, TENANT_A, GrantUser::Author, grant.id, "fakeagent", &[], &[]).await.unwrap();
+    assert_eq!(opened.way.as_deref(), Some("subscription"));
+    assert_eq!(opened.values.get("authJson").map(String::as_str), Some("{\"v\":1}"));
+
+    // A field of another way is not this way's to store.
+    let why = invalid(agent_connect(&pool, Local, Door::Own, Some("subscription"), &[("key", "sk")]).await.unwrap_err());
+    assert!(why.contains("field 'authJson' is required"), "{why}");
+    let why = invalid(agent_connect(&pool, Local, Door::Own, Some("apiKey"), &[("key", "sk"), ("authJson", "{}")]).await.unwrap_err());
+    assert!(why.contains("declares no value named 'authJson'"), "{why}");
+    // Several ways: the connect names one, and only one the service has.
+    let why = invalid(agent_connect(&pool, Local, Door::Own, None, &[("key", "sk")]).await.unwrap_err());
+    assert!(why.contains("several ways"), "{why}");
+    let why = invalid(agent_connect(&pool, Local, Door::Own, Some("oauth"), &[("key", "sk")]).await.unwrap_err());
+    assert!(why.contains("no way to sign in named 'oauth'"), "{why}");
+    // The shared door uses the runtime's key, which no way fills.
+    let why = invalid(agent_connect(&pool, Local, Door::Shared, Some("apiKey"), &[]).await.unwrap_err());
+    assert!(why.contains("names the way to sign in 'apiKey'"), "{why}");
+
+    // On a cloud install: the local-only way is refused at the connect...
+    let why = invalid(agent_connect(&pool, Cloud, Door::Own, Some("subscription"), &[("authJson", "{}")]).await.unwrap_err());
+    assert_eq!(
+        why,
+        "signing in to Fake Agent with 'Subscription' works only on a local install, so that the credential stays on \
+         the person's own machine, and this install runs on a cloud; connect it with 'API key' instead"
+    );
+    let key = agent_connect(&pool, Cloud, Door::Own, Some("apiKey"), &[("key", "sk")]).await.unwrap();
+    assert_eq!(key.way.as_deref(), Some("apiKey"));
+    // ...and one made on a local install is never opened there.
+    let err = resolve_for_worker(&pool, Cloud, TENANT_A, GrantUser::Author, grant.id, "fakeagent", &[], &[]).await.unwrap_err();
+    let Some(AccessError::NeedsReconnect { reason, .. }) = err.downcast_ref::<AccessError>() else { panic!("{err:#}") };
+    assert!(
+        reason.starts_with("the 'my agent' connection was made on a local install; signing in to Fake Agent with 'Subscription'")
+            && reason.ends_with("connect it with 'API key' instead"),
+        "{reason}"
+    );
+    resolve_for_worker(&pool, Cloud, TENANT_A, GrantUser::Author, key.id, "fakeagent", &[], &[]).await.expect("an API key opens anywhere");
+}
+
+/// A JWT whose payload says these claims, unsigned: all a JWT expiry
+/// reads off it.
+fn jwt(claims: serde_json::Value) -> String {
+    use base64::Engine;
+    let part = |v: &serde_json::Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap());
+    format!("{}.{}.sig", part(&json!({"alg": "none"})), part(&claims))
+}
+
+/// A token that dies `secs` from now, unlike any other (its own `jti`).
+fn token_dying_in(secs: i64) -> String {
+    let now = chrono::Utc::now().timestamp();
+    jwt(json!({ "exp": now + secs, "iat": now, "jti": uuid::Uuid::new_v4().to_string() }))
+}
+
+/// A coding agent's login file whose refresh token rotates, as the Codex
+/// recipe declares it: the paste is a token set, the expiry is inside
+/// the token, and the renewal is a JSON POST to `base`'s token endpoint.
+fn renewed_login_spec(base: &str) -> AccessSpec {
+    serde_json::from_value(json!({
+        "service": "fakeagent",
+        "label": "Fake Agent",
+        "doors": ["own"],
+        "acquisition": { "kind": "static", "ways": [
+            { "id": "subscription", "label": "Subscription", "localOnly": true, "fields": [{ "name": "authJson" }],
+              "renewal": {
+                  "paste": { "field": "authJson", "tokenPath": "tokens.access_token",
+                             "refreshTokenPath": "tokens.refresh_token", "jwtExpiry": true,
+                             "captures": [{ "name": "accountId", "path": "tokens.account_id" }] },
+                  "call": { "url": format!("{base}/token"), "method": "POST",
+                            "body": { "client_id": "app_fake", "grant_type": "refresh_token", "refresh_token": "{refresh_token}" },
+                            "jwtExpiry": true } } },
+            { "id": "apiKey", "label": "API key", "fields": [{ "name": "key" }] }
+        ] }
+    }))
+    .unwrap()
+}
+
+/// Paste a login file whose token dies `secs` from now, its refresh
+/// token `refresh`, with `spec`'s `way`.
+async fn paste_login(pool: &Pool, spec: &AccessSpec, way: &str, values: &[(&str, &str)]) -> anyhow::Result<GrantSummary> {
+    connect_direct(
+        pool,
+        InstallKind::Local,
+        TENANT_A,
+        ConnectDirect {
+            paste: false,
+            way: Some(way.to_string()),
+            spec: spec.clone(),
+            door: Door::Own,
+            registration: None,
+            values: values.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            label: Some("my agent".into()),
+            permissions: Vec::new(),
+            project_id: None,
+            instance: None,
+        },
+    )
+    .await
+    .map(|done| done.grant)
+}
+
+fn login_file(token: &str, refresh: &str) -> String {
+    json!({ "auth_mode": "chatgpt", "tokens": { "access_token": token, "refresh_token": refresh, "account_id": "acct-1" } }).to_string()
+}
+
+async fn open_agent(pool: &Pool, id: uuid::Uuid) -> anyhow::Result<weft_access_store::ResolvedAccess> {
+    resolve_for_worker(pool, InstallKind::Local, TENANT_A, GrantUser::Author, id, "fakeagent", &[], &[]).await
+}
+
+async fn renew_agent(pool: &Pool, id: uuid::Uuid, stale: &str) -> anyhow::Result<weft_access_store::ResolvedAccess> {
+    weft_access_store::renew_for_worker(pool, InstallKind::Local, TENANT_A, GrantUser::Author, id, "fakeagent", &[], &[], stale).await
+}
+
+/// A pasted login file weft keeps alive is stored as the token set it
+/// renews from: the file itself nowhere, the refresh token never handed,
+/// the expiry the token's own. Once due, the first opens renew it once
+/// however many ask at once, every one is handed the renewed token, and
+/// the rotated refresh token is what the next renewal sends.
+#[weft_db_macros::test]
+async fn a_pasted_login_is_renewed_once_for_every_node_holding_it(pool: Pool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = renewed_login_spec(&base);
+    // Due at once: it dies inside the renewal margin.
+    let pasted = token_dying_in(30);
+    let grant = paste_login(&pool, &spec, "subscription", &[("authJson", &login_file(&pasted, "rt-0"))]).await.unwrap();
+    let sealed: String = pool.scalar("SELECT values_sealed FROM access_grant WHERE id = $1", &[&grant.id]).await.unwrap();
+    assert!(!sealed.contains("rt-0"), "what is stored is sealed");
+
+    let fresh = token_dying_in(864_000);
+    *fake.next_token.lock().unwrap() = fresh.clone();
+    *fake.next_refresh.lock().unwrap() = Some("rt-1".into());
+    let gate = fake.hold_tokens().await;
+    let opens: Vec<_> = (0..4)
+        .map(|_| {
+            let pool = pool.clone();
+            tokio::spawn(async move { open_agent(&pool, grant.id).await })
+        })
+        .collect();
+    fake.token_arrived.acquire().await.unwrap().forget();
+    drop(gate);
+    for open in opens {
+        let opened = open.await.unwrap().expect("the renewal lands");
+        assert_eq!(opened.values.get("token"), Some(&fresh), "every node is handed the renewed token");
+        assert_eq!(opened.values.get("accountId").map(String::as_str), Some("acct-1"), "what the paste captured stays");
+        assert!(!opened.values.contains_key("refresh_token") && !opened.values.contains_key("authJson"), "{:?}", opened.values.keys());
+    }
+    assert_eq!(fake.token_requests.load(Ordering::SeqCst), 1, "one renewal for four opens");
+    let renewal = fake.calls.lock().unwrap().last().cloned().unwrap();
+    let body: serde_json::Value = serde_json::from_str(renewal.trim_start_matches("/token ")).unwrap();
+    assert_eq!(body, json!({ "client_id": "app_fake", "grant_type": "refresh_token", "refresh_token": "rt-0" }));
+
+    // Fresh for ten days now: an open asks nothing of the provider.
+    open_agent(&pool, grant.id).await.unwrap();
+    assert_eq!(fake.token_requests.load(Ordering::SeqCst), 1);
+    let expires_at: chrono::DateTime<chrono::Utc> = pool.scalar("SELECT expires_at FROM access_grant WHERE id = $1", &[&grant.id]).await.unwrap();
+    assert!(expires_at > chrono::Utc::now() + chrono::Duration::days(9), "the expiry is the renewed token's own: {expires_at}");
+}
+
+/// A node whose values stopped working asks for a renewal with what it
+/// was handed. While the connection still hands that, weft renews it,
+/// once however many nodes ask together; a node asking after another's
+/// renewal landed is handed the renewed values and nothing reaches the
+/// provider, so no node's renewal ever spends a refresh token another
+/// node relies on.
+#[weft_db_macros::test]
+async fn a_renewal_of_values_since_renewed_hands_the_new_ones(pool: Pool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = renewed_login_spec(&base);
+    let grant = paste_login(&pool, &spec, "subscription", &[("authJson", &login_file(&token_dying_in(864_000), "rt-0"))]).await.unwrap();
+    // Two conversations, each handed the connection.
+    let handed = weft_core::access::handed_digest(&open_agent(&pool, grant.id).await.unwrap().values);
+    assert_eq!(fake.token_requests.load(Ordering::SeqCst), 0, "a fresh token is handed as it is");
+
+    let renewed = token_dying_in(864_000);
+    *fake.next_token.lock().unwrap() = renewed.clone();
+    *fake.next_refresh.lock().unwrap() = Some("rt-1".into());
+    let gate = fake.hold_tokens().await;
+    let asks: Vec<_> = (0..3)
+        .map(|_| {
+            let (pool, handed) = (pool.clone(), handed.clone());
+            tokio::spawn(async move { renew_agent(&pool, grant.id, &handed).await })
+        })
+        .collect();
+    fake.token_arrived.acquire().await.unwrap().forget();
+    drop(gate);
+    for ask in asks {
+        assert_eq!(ask.await.unwrap().unwrap().values.get("token"), Some(&renewed));
+    }
+    assert_eq!(fake.token_requests.load(Ordering::SeqCst), 1, "one renewal for three nodes asking at once");
+
+    // The other conversation's values stop working later: it is handed
+    // the renewed ones, and the provider is asked nothing.
+    let late = renew_agent(&pool, grant.id, &handed).await.unwrap();
+    assert_eq!(late.values.get("token"), Some(&renewed));
+    assert_eq!(fake.token_requests.load(Ordering::SeqCst), 1);
+
+    // The renewed values stopping too renew again, with the rotated refresh token.
+    renew_agent(&pool, grant.id, &weft_core::access::handed_digest(&late.values)).await.unwrap();
+    assert_eq!(fake.token_requests.load(Ordering::SeqCst), 2);
+    assert!(fake.calls.lock().unwrap().last().unwrap().contains("\"refresh_token\":\"rt-1\""));
+}
+
+/// A renewal that cannot happen fails loudly, saying to connect the
+/// account again: the provider refusing it, and a connection weft holds
+/// nothing to renew with (an API key). A login file the renewal could
+/// not work from is refused at the paste.
+#[weft_db_macros::test]
+async fn a_renewal_that_cannot_happen_says_to_reconnect(pool: Pool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = renewed_login_spec(&base);
+    let reconnect = |e: anyhow::Error| match e.downcast_ref::<AccessError>() {
+        Some(AccessError::NeedsReconnect { reason, .. }) => reason.clone(),
+        _ => panic!("expected a reconnect, got: {e:#}"),
+    };
+
+    let grant = paste_login(&pool, &spec, "subscription", &[("authJson", &login_file(&token_dying_in(30), "rt-0"))]).await.unwrap();
+    *fake.token_refusal.lock().unwrap() = Some(401);
+    let why = reconnect(open_agent(&pool, grant.id).await.unwrap_err());
+    assert!(why.contains("401 Unauthorized"), "{why}");
+
+    let key = paste_login(&pool, &spec, "apiKey", &[("key", "sk")]).await.unwrap();
+    let handed = weft_core::access::handed_digest(&open_agent(&pool, key.id).await.unwrap().values);
+    let why = reconnect(renew_agent(&pool, key.id, &handed).await.unwrap_err());
+    assert!(why.contains("holds nothing to renew it with") && why.contains("connect the account again"), "{why}");
+
+    let no_refresh = json!({ "tokens": { "access_token": token_dying_in(600), "account_id": "acct-1" } }).to_string();
+    let why = invalid(paste_login(&pool, &spec, "subscription", &[("authJson", &no_refresh)]).await.unwrap_err());
+    assert!(why.contains("holds no refresh token"), "{why}");
+}

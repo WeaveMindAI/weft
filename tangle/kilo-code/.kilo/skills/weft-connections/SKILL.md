@@ -87,6 +87,10 @@ The flags the user runs, in the command you hand them:
   the command line. A key from another service goes in at the hidden
   prompt instead, never through `--set`. An explicitly empty `--set` or `--set-env` value is an
   error, not a silent skip.
+- `--way <id>` picks which way to sign in when a service offers several (a
+  subscription's token or an API key, say); without it the terminal asks. A
+  way marked local only (a subscription login) is offered on this machine's
+  install and refused on a cloud install.
 - `--label <name>` names the new [connection]; without it, it is named
   after the service (or the app it signs in through). Suggest a name with
   the project in it (`acme-scraper`) for a key only this project should

@@ -160,7 +160,9 @@ async fn prepare_check(ctx: &Ctx, args: &RunArgs) -> anyhow::Result<(weft_core::
     seed_bounds_need_a_seed(args)?;
     let project = ctx.project()?;
     let mut spec = spec_for(ctx, args)?;
-    let definition = match weft_compiler::hash::load_program_with_diagnostics(project) {
+    // Compiled for the install, so what is broken is what its build finds.
+    let install = ctx.install_kind().await?;
+    let definition = match weft_compiler::hash::load_program_with_diagnostics(project, Some(install)) {
         Ok((definition, _)) => definition,
         Err(weft_compiler::hash::CompileLoadError::Read(msg)) => bail!("{msg}"),
         Err(weft_compiler::hash::CompileLoadError::Diagnostics(diags)) => {
@@ -351,7 +353,7 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     }
     // Before `--save` writes it: an example whose cut is refused is not
     // kept.
-    refuse_before_building(project, spec.as_ref(), &args)?;
+    refuse_before_building(project, ctx.install_kind().await?, spec.as_ref(), &args)?;
     if let Some(name) = &args.save {
         let spec = spec.as_ref().expect("saving constructs a run spec");
         if super::versions::read_spec_if_present(project, name)?.is_some_and(|existing| existing.is_frozen()) {
@@ -425,8 +427,15 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
 /// it judges the whole run again before it builds any image. A program
 /// that does not compile as a whole is the build's to report, with its
 /// diagnostics.
-fn refuse_before_building(project: &weft_compiler::project::Project, spec: Option<&RunSpec>, args: &RunArgs) -> anyhow::Result<()> {
-    let Ok((definition, _)) = weft_compiler::hash::load_program_with_diagnostics(project) else {
+fn refuse_before_building(
+    project: &weft_compiler::project::Project,
+    install: weft_core::install::InstallKind,
+    spec: Option<&RunSpec>,
+    args: &RunArgs,
+) -> anyhow::Result<()> {
+    // Compiled for the install the run goes to: a part its build finds
+    // broken is a cut it refuses.
+    let Ok((definition, _)) = weft_compiler::hash::load_program_with_diagnostics(project, Some(install)) else {
         return Ok(());
     };
     let graph = weft_core::project::graph::ProjectGraph::new(&definition);

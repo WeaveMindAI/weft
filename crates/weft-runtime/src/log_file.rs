@@ -51,7 +51,9 @@ impl LogFile {
         Ok(Self { path: path.to_path_buf(), max_bytes, carried, state: Mutex::new(State { file, size, roll_failing: false }) })
     }
 
-    fn write_all(&self, buf: &[u8]) -> std::io::Result<()> {
+    /// Append `buf` whole, rolling the file over first when it would pass
+    /// its size.
+    pub fn write_all(&self, buf: &[u8]) -> std::io::Result<()> {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.size > 0 && state.size + buf.len() as u64 > self.max_bytes {
             match self.roll() {

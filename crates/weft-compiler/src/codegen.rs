@@ -45,7 +45,9 @@
 //! the cloud). A plain `cargo build` builds everything.
 //!
 //! Pruning: each package's crate is emitted only if at least one of
-//! its nodes is referenced. Within a crate, only referenced node
+//! its nodes is referenced, or a package that is uses it (`uses` in its
+//! `package.toml`: the used crate is a path dependency of the user's,
+//! named after the used package). Within a crate, only referenced node
 //! subdirs are `#[path]`-included. Package-level shared .rs files
 //! are always included in an emitted shim (they may be load-bearing
 //! for the referenced nodes; dead-code analysis in the Rust compiler
@@ -111,13 +113,19 @@ pub fn emit(
     // recompiles only ITS package's .rlib + relinks the worker, not
     // every package).
     let packages = group_by_package(catalog, &referenced)?;
+    // A package a referenced one uses compiles with it, holding only the
+    // nodes this program references (often none: its shared code is
+    // what the user calls). It is a dependency of its users' crates and
+    // never a feature of the worker's own: one that does not compile
+    // leaves out every package using it, and `weft-isolate` names each.
+    let crates = with_used(catalog, &packages, &|_| Vec::new());
 
     // The `ProjectDefinition` is NOT baked into the binary anymore;
     // workers fetch it from the broker at run claim time keyed
     // by `definition_hash`. A pure-config or pure-topology edit
     // therefore no longer re-bakes any source file into the worker
     // crate, and the binary hash stays cache-hit.
-    let crate_dirs = write_package_crates(&crate_root, catalog, &packages, paths)?;
+    let crate_dirs = write_package_crates(&crate_root, catalog, &crates, paths)?;
     write_worker_cargo_toml(&crate_root, &packages, &crate_dirs, crate_name, paths)?;
     write_rust_toolchain(&crate_root, &weft_root)?;
     let candidates = packages
@@ -133,7 +141,7 @@ pub fn emit(
     write_registry_rs(&src_dir, &packages, PackageGating::Features)?;
     write_main_rs(&src_dir, catalog)?;
 
-    Ok(packages
+    Ok(crates
         .iter()
         .map(|pkg| (pkg.package.name.clone(), paths.package_crates_dir(&crate_root).join(&crate_dirs[&pkg.module_ident])))
         .collect())
@@ -152,6 +160,10 @@ pub fn emit(
 ///   - `Local`: the crate compiles on the host with plain cargo (the
 ///     local node-test binary). `#[path]` includes are the real
 ///     absolute node paths; path deps point at the real weft checkout.
+///     Package crates go in `package_crates`, which every test crate of
+///     one workspace shares: a package one of them tests and another
+///     uses is then ONE crate, because cargo refuses two packages of one
+///     name in a workspace.
 ///   - `Host`: a worker compiled on the machine that runs it. Path deps
 ///     point at `weft`, the worker-linked slice of the weft workspace
 ///     (`build::stage_worker_workspace`, with its empty workspace-hack, so
@@ -163,7 +175,7 @@ pub fn emit(
 ///     whose package has the same content, and cargo reuses its compile.
 pub enum EmitPaths {
     Container { project_root: PathBuf },
-    Local { weft_root: PathBuf },
+    Local { weft_root: PathBuf, package_crates: PathBuf },
     Host { weft: PathBuf, package_crates: PathBuf },
 }
 
@@ -184,8 +196,8 @@ impl EmitPaths {
     /// go in.
     pub fn package_crates_dir(&self, crate_root: &Path) -> PathBuf {
         match self {
-            EmitPaths::Container { .. } | EmitPaths::Local { .. } => crate_root.to_path_buf(),
-            EmitPaths::Host { package_crates, .. } => package_crates.clone(),
+            EmitPaths::Container { .. } => crate_root.to_path_buf(),
+            EmitPaths::Local { package_crates, .. } | EmitPaths::Host { package_crates, .. } => package_crates.clone(),
         }
     }
 
@@ -234,7 +246,7 @@ impl EmitPaths {
             EmitPaths::Container { .. } => {
                 path_table(&format!("{}weft/crates/{crate_dir}", "../".repeat(depth)))
             }
-            EmitPaths::Local { weft_root: weft } | EmitPaths::Host { weft, .. } => path_table(
+            EmitPaths::Local { weft_root: weft, .. } | EmitPaths::Host { weft, .. } => path_table(
                 &weft
                     .join("crates")
                     .join(crate_dir)
@@ -289,6 +301,25 @@ fn group_by_package<'a>(
         });
     }
     Ok(out)
+}
+
+/// Every package crate a build of `packages` compiles, in the order they
+/// build (a package after every package it uses,
+/// `FsCatalog::with_used`): `packages` as they are, and each package one
+/// of them uses with the nodes `used_nodes` picks for it.
+fn with_used<'a>(
+    catalog: &'a FsCatalog,
+    packages: &[PackageEmit<'a>],
+    used_nodes: &dyn Fn(&weft_catalog::Package) -> Vec<String>,
+) -> Vec<PackageEmit<'a>> {
+    catalog
+        .with_used(packages.iter().map(|pkg| pkg.package))
+        .into_iter()
+        .map(|package| match packages.iter().find(|pkg| pkg.package.name == package.name) {
+            Some(pkg) => PackageEmit { package, node_types: pkg.node_types.clone(), module_ident: pkg.module_ident.clone() },
+            None => PackageEmit { package, node_types: used_nodes(package), module_ident: sanitize_pkg_ident(&package.name) },
+        })
+        .collect()
 }
 
 fn sanitize_pkg_ident(raw: &str) -> String {
@@ -455,7 +486,12 @@ path = "src/main.rs"
 /// generator later adds to the emitted root manifest that reaches every
 /// package crate (a `[profile]`, a `[patch]`) has to join the digest.
 ///
-/// Per-package and per-node cargo deps land here, not on the worker.
+/// Per-package and per-node cargo deps land here, not on the worker, and
+/// so does each package a package uses: a path dependency on that
+/// package's crate. `packages` come in build order (`with_used`), so
+/// the crate a package uses is written, and its slot known, before the
+/// user's manifest names it; that slot is in the user's manifest, so a
+/// change in the used package gives its users a new slot too.
 ///
 /// A host build (`EmitPaths::Host`) writes each crate into the
 /// machine-wide folder instead, with its package's sources copied in
@@ -472,7 +508,7 @@ fn write_package_crates(
     let parent = paths.package_crates_dir(crate_root);
     let mut dirs = BTreeMap::new();
     for pkg in packages {
-        let cargo_toml = render_package_cargo_toml(catalog, pkg, paths)?;
+        let cargo_toml = render_package_cargo_toml(catalog, pkg, &dirs, paths)?;
         let lib_rs = render_package_lib_rs(catalog, pkg, paths)?;
         let dir_name = format!(
             "{}-{}",
@@ -515,8 +551,19 @@ fn write_package_crate(pkg_dir: &Path, cargo_toml: &str, lib_rs: &str) -> BuildR
 /// `dir_name` by.
 fn package_crate_path(paths: &EmitPaths, dir_name: &str) -> String {
     match paths {
-        EmitPaths::Container { .. } | EmitPaths::Local { .. } => format!("./{dir_name}"),
-        EmitPaths::Host { package_crates, .. } => package_crates.join(dir_name).display().to_string().replace('\\', "/"),
+        EmitPaths::Container { .. } => format!("./{dir_name}"),
+        EmitPaths::Local { package_crates, .. } | EmitPaths::Host { package_crates, .. } => {
+            package_crates.join(dir_name).display().to_string().replace('\\', "/")
+        }
+    }
+}
+
+/// The path dependency spec a package crate names the package crate
+/// `dir_name` by: its sibling in the folder the package crates share.
+fn used_crate_path(paths: &EmitPaths, dir_name: &str) -> String {
+    match paths {
+        EmitPaths::Container { .. } => format!("../{dir_name}"),
+        EmitPaths::Local { .. } | EmitPaths::Host { .. } => package_crate_path(paths, dir_name),
     }
 }
 
@@ -600,6 +647,7 @@ fn package_build_script(
 fn render_package_cargo_toml(
     catalog: &FsCatalog,
     pkg: &PackageEmit<'_>,
+    crate_dirs: &BTreeMap<String, String>,
     paths: &EmitPaths,
 ) -> BuildResult<String> {
     // Runtime essentials shared with the worker, plus the workspace
@@ -647,6 +695,26 @@ fn render_package_cargo_toml(
         for (name, value) in node_deps.dependencies {
             add_dep(&mut deps, &pkg.package.name, name, value, &format!("node {node_type}"))?;
         }
+    }
+    // Each package it uses, under the used package's own name, so its code
+    // writes `computer::actions` (discovery made sure the name is one Rust
+    // takes and that the package's own `[dependencies]` do not take it).
+    for used in &pkg.package.uses {
+        let ident = sanitize_pkg_ident(used);
+        let dir = crate_dirs.get(&ident).ok_or_else(|| {
+            BuildError::Build(format!("package '{}' uses '{used}', whose crate was not emitted before it", pkg.package.name))
+        })?;
+        if let Some(taken) = deps.keys().find(|dep| dep.replace('-', "_") == *used) {
+            return Err(BuildError::Build(format!(
+                "package '{}' uses the package '{used}', and its crate already depends on the crate '{taken}' \
+                 (one weft gives every package, or one its package.toml or a node's deps.toml names), which \
+                 takes the same name in its code; rename one of them",
+                pkg.package.name
+            )));
+        }
+        let mut dep = path_table(&used_crate_path(paths, dir));
+        dep.insert("package".into(), toml::Value::String(ident));
+        insert_dep(&mut deps, used, toml::Value::Table(dep));
     }
 
     let mut deps_fragment = String::new();
@@ -1517,11 +1585,16 @@ impl NodeCatalog for CatalogRef {{
 pub struct TestCrate {
     /// The emitted binary's name (`<package>_tests`).
     pub binary_name: String,
-    /// The package crate's folder, wherever the emission put it (under
-    /// the crate root, or for a host build in the machine-wide folder).
-    pub package_crate: PathBuf,
+    /// Each package crate's folder, by package name, wherever the
+    /// emission put it (the folder `EmitPaths` names): the tested
+    /// package's, and each package it uses.
+    pub package_crates: BTreeMap<String, PathBuf>,
     /// Every node type the package declares (the test registry's set).
     pub node_types: Vec<String>,
+    /// Every node type the crates compile: the package's own, and every
+    /// node of each package it uses, which compile whole (see
+    /// [`emit_test_crate`]).
+    pub compiled_node_types: Vec<String>,
 }
 
 /// The dev profile every node-test workspace build (`EmitPaths::Local`)
@@ -1626,15 +1699,18 @@ pub fn emit_test_workspace(root: &Path, members: &[String]) -> BuildResult<()> {
 /// Needs ONLY the catalog walk: no `ProjectDefinition`, no graph
 /// parse, no validation of other packages. A broken `main.weft` or a
 /// broken sibling package never blocks testing the package under
-/// work. Packages must not depend on other packages; a violation
-/// fails this crate's compile, which is the loud failure we want.
+/// work.
+///
+/// A package the tested one uses compiles beside it, whole: every node
+/// it holds, as its own test crate compiles it, so the two crates are
+/// one in a workspace testing both (`EmitPaths::Local`).
 pub fn emit_test_crate(
     target_root: &Path,
     catalog: &FsCatalog,
     package_name: &str,
     paths: &EmitPaths,
 ) -> BuildResult<TestCrate> {
-    let Some(package) = catalog.packages().find(|p| p.name == package_name) else {
+    let Some(package) = catalog.package_named(package_name) else {
         let mut known: Vec<&str> = catalog.packages().map(|p| p.name.as_str()).collect();
         known.sort();
         return Err(BuildError::Build(format!(
@@ -1687,7 +1763,9 @@ pub fn emit_test_crate(
     }
 
     let binary_name = format!("{}_tests", crate::build::sanitize_crate_name(&package.name));
-    let crate_dirs = write_package_crates(target_root, catalog, std::slice::from_ref(&pkg), paths)?;
+    let crates = with_used(catalog, std::slice::from_ref(&pkg), &|package| package.node_types.clone());
+    let crate_dirs = write_package_crates(target_root, catalog, &crates, paths)?;
+    let crates_dir = paths.package_crates_dir(target_root);
 
     // Root Cargo.toml: only what the generated main names directly
     // (weft-core for the registry, weft-engine for the runner) plus
@@ -1765,10 +1843,13 @@ fn main() -> std::process::ExitCode {{
     );
     std::fs::write(src_dir.join("main.rs"), main_rs).map_err(BuildError::Io)?;
 
+    let mut compiled_node_types: Vec<String> = crates.iter().flat_map(|c| c.node_types.iter().cloned()).collect();
+    compiled_node_types.sort();
     Ok(TestCrate {
         binary_name,
-        package_crate: paths.package_crates_dir(target_root).join(&crate_dirs[&pkg.module_ident]),
+        package_crates: crates.iter().map(|c| (c.package.name.clone(), crates_dir.join(&crate_dirs[&c.module_ident]))).collect(),
         node_types,
+        compiled_node_types,
     })
 }
 
@@ -1845,7 +1926,7 @@ pub(crate) mod tests {
             group_boundary: None,
             requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
             images: Vec::new(),
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
@@ -1887,6 +1968,7 @@ pub(crate) mod tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            install: None,
             metadata_wires: Vec::new(),
         };
         let types = collect_node_types(&project);
@@ -1961,6 +2043,7 @@ pub(crate) mod tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            install: None,
             metadata_wires: Vec::new(),
         };
         let rows = super::needs_of(&program, &catalog).unwrap();
@@ -1973,6 +2056,80 @@ pub(crate) mod tests {
         ]);
         program.nodes.retain(|n| n.node_type == "Plain");
         assert!(super::needs_of(&program, &catalog).unwrap().is_empty());
+    }
+
+    /// A project with a `base` package (a shared `tools.rs` and one node)
+    /// and a `user` package whose `package.toml` uses it.
+    fn catalog_with_a_use(root: &std::path::Path) -> weft_catalog::FsCatalog {
+        for (name, extra, node_type) in [("base", "", "Base"), ("user", "uses = [\"base\"]", "User")] {
+            let node = root.join("nodes").join(name).join(name);
+            std::fs::create_dir_all(&node).unwrap();
+            std::fs::write(root.join("nodes").join(name).join("package.toml"), format!("[package]\nname = \"{name}\"\n{extra}\n")).unwrap();
+            std::fs::write(
+                node.join("metadata.json"),
+                format!(r#"{{"type": "{node_type}", "label": "{node_type}", "description": "d", "inputs": [], "outputs": []}}"#),
+            )
+            .unwrap();
+            std::fs::write(node.join("mod.rs"), "// impl\n").unwrap();
+        }
+        std::fs::write(root.join("nodes/base/tools.rs"), "pub fn help() {}\n").unwrap();
+        weft_catalog::FsCatalog::discover(&root.join("nodes")).unwrap()
+    }
+
+    fn crate_dir(dirs: &BTreeMap<String, std::path::PathBuf>, name: &str) -> String {
+        dirs[name].file_name().unwrap().to_str().unwrap().to_string()
+    }
+
+    /// A program using only the user's node compiles the used package
+    /// beside it: its crate holds its shared code and none of its nodes,
+    /// it is a path dependency of the user's crate under its own name,
+    /// and it is no feature of the worker's (a failure in it leaves out
+    /// its users). An edit to it moves the user's slot too.
+    #[test]
+    fn a_used_package_compiles_as_a_dependency_of_its_user() {
+        let project = tempfile::tempdir().unwrap();
+        let catalog = catalog_with_a_use(project.path());
+        let program = ProjectDefinition {
+            id: uuid::Uuid::nil(),
+            nodes: vec![make_node("u", "User")],
+            edges: Vec::new(),
+            groups: Vec::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            defaults: Default::default(),
+            given: Default::default(),
+            broken: Vec::new(),
+            install: None,
+            metadata_wires: Vec::new(),
+        };
+        let emit = |catalog: &weft_catalog::FsCatalog, out: &std::path::Path| {
+            let paths = super::EmitPaths::Container { project_root: project.path().to_path_buf() };
+            super::emit(&program, out, catalog, "probe", weft_core::builds::NodeSet::Referenced, &paths).unwrap()
+        };
+        let out = tempfile::tempdir().unwrap();
+        let dirs = emit(&catalog, out.path());
+        assert_eq!(dirs.keys().map(String::as_str).collect::<Vec<_>>(), ["base", "user"]);
+
+        let worker: toml::Value = toml::from_str(&std::fs::read_to_string(out.path().join("Cargo.toml")).unwrap()).unwrap();
+        assert!(worker["dependencies"].get("pkg_user").is_some());
+        assert!(worker["dependencies"].get("pkg_base").is_none(), "reached through its user only");
+        assert!(worker["features"].get("pkg_base").is_none());
+        let isolate = std::fs::read_to_string(out.path().join(super::ISOLATE_CANDIDATES_FILE)).unwrap();
+        assert!(isolate.contains("pkg_user") && !isolate.contains("pkg_base"), "{isolate}");
+
+        let user: toml::Value = toml::from_str(&std::fs::read_to_string(dirs["user"].join("Cargo.toml")).unwrap()).unwrap();
+        let base_dep = &user["dependencies"]["base"];
+        assert_eq!(base_dep["package"].as_str(), Some("pkg_base"));
+        assert_eq!(base_dep["path"].as_str().unwrap(), format!("../{}", crate_dir(&dirs, "base")));
+        let base_lib = std::fs::read_to_string(dirs["base"].join("src/lib.rs")).unwrap();
+        assert!(base_lib.contains("pub mod tools;") && !base_lib.contains("pub mod base;"), "{base_lib}");
+
+        std::fs::write(project.path().join("nodes/base/tools.rs"), "pub fn help() { let _ = 1; }\n").unwrap();
+        let edited = weft_catalog::FsCatalog::discover(&project.path().join("nodes")).unwrap();
+        let again = tempfile::tempdir().unwrap();
+        let moved = emit(&edited, again.path());
+        assert_ne!(crate_dir(&dirs, "base"), crate_dir(&moved, "base"));
+        assert_ne!(crate_dir(&dirs, "user"), crate_dir(&moved, "user"), "the user's manifest names the used crate's slot");
     }
 
     use super::{add_dep, merge_dep_specs};

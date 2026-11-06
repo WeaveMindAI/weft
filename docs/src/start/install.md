@@ -180,4 +180,5 @@ folders, the install's settings and every other install stay. Without a terminal
 removes the CLI and the editor extension. Your database, stored connections
 and your programs' infrastructure stay, so a later `./setup.sh` brings
 everything back. Adding `--purge` deletes all of that too, your programs' own
-databases included.
+databases included, and stops every program an infra node runs as a process
+on your machine, in every install.

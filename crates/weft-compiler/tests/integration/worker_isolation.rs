@@ -29,6 +29,7 @@ fn empty_definition() -> weft_core::project::ProjectDefinition {
         groups: Vec::new(),
         given: Default::default(),
         broken: Vec::new(),
+        install: None,
         metadata_wires: Vec::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -180,8 +181,7 @@ fn image() -> weft_core::builds::WorkerPackaging {
 fn plan(project: &weft_compiler::project::Project, stock: &weft_compiler::build::StockProject, packaging: &weft_core::builds::WorkerPackaging) -> weft_compiler::build_plan::BuildPlan {
     plan_build_from(
         project,
-        &stock.definition,
-        &stock.contents,
+        &stock.compiled,
         &stock.catalog,
         weft_compiler::CompileFs::disk(&stock.project.root),
         packaging,

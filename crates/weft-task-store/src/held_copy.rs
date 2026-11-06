@@ -172,6 +172,13 @@ where
         Ok(read)
     }
 
+    /// Drop what `changed` picks now, as a notification naming it would:
+    /// for a process that changed the rows itself and reads them again
+    /// before the notification of its own write reaches it.
+    pub fn forget(&self, changed: Changed<K, V>) {
+        self.drop_changed(changed);
+    }
+
     fn drop_changed(&self, changed: Changed<K, V>) {
         let mut generation = self.generation.lock().expect("held copy generation");
         *generation += 1;

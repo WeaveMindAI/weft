@@ -233,10 +233,15 @@ pub trait ProjectStorage: Send + Sync {
 
 /// Everything a build needs that belongs to the install rather than the
 /// request: the platform's builder and image store (which also says how
-/// the platform packages a worker), and the image ledger.
+/// the platform packages a worker), what kind of install compiles the
+/// program, and the image ledger.
 #[derive(Clone)]
 pub struct VersionBuilder {
     pub images: Arc<dyn ImageBuilder>,
+    /// The install's kind (`InstallConfig::install_kind`), which a node's
+    /// rules may ask about (`local_install`): every version is compiled
+    /// for it.
+    pub install: weft_core::install::InstallKind,
     pub pool: weft_task_store::db::Pool,
     /// The reclaims registered builds asked for (`prune::AfterBuildPrunes`).
     pub prunes: Arc<prune::AfterBuildPrunes>,
@@ -275,15 +280,16 @@ impl VersionBuilder {
         let node_set = source.inputs.node_set;
         let packaging = self.images.worker_packaging();
         let images = self.images.clone();
+        let install = self.install;
         // The compile and the staging are blocking filesystem work.
-        let (mut compiled, mut contents, catalog, project) = tokio::task::spawn_blocking(move || source::compile(&root, files))
+        let (mut compiled, catalog, project) = tokio::task::spawn_blocking(move || source::compile(&root, files, install))
             .await
             .context("the compile task panicked")??;
-        let Assets { resolutions: assets, contents: asset_contents } = prepare.assets(storage.as_ref(), tenant, &compiled).await?;
-        weft_compiler::file_ref::apply_asset_resolutions(&mut compiled, &assets)
+        let Assets { resolutions: assets, contents: asset_contents } = prepare.assets(storage.as_ref(), tenant, &compiled.definition).await?;
+        weft_compiler::file_ref::apply_asset_resolutions(&mut compiled.definition, &assets)
             .map_err(|errs| anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
-        contents.extend(asset_contents);
-        prepare.check(&compiled).await?;
+        compiled.contents.extend(asset_contents);
+        prepare.check(&compiled.definition).await?;
         let name = project.manifest.package.name.clone();
         // Every file was checked against the version as it was laid out, so
         // the images are named after the version's own fingerprints.
@@ -292,7 +298,6 @@ impl VersionBuilder {
             let plan = weft_compiler::build_plan::plan_build_from(
                 &project,
                 &compiled,
-                &contents,
                 &catalog,
                 // `source::compile` read the project from disk.
                 weft_compiler::CompileFs::disk(&project.root),
@@ -302,7 +307,7 @@ impl VersionBuilder {
                 &fingerprints,
             )
             .map_err(|e| anyhow!("plan the build: {e}"))?;
-            Ok::<_, anyhow::Error>((plan, compiled))
+            Ok::<_, anyhow::Error>((plan, compiled.definition))
         })
         .await
         .context("the planning task panicked")??;

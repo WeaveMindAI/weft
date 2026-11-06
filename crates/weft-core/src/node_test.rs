@@ -529,8 +529,10 @@ pub struct RigOutcome {
     /// The declared infrastructure, on a `run_provision_infra`
     /// outcome. `None` on the ctx-driven verbs (run / setup_trigger).
     pub infra_spec: Option<crate::infra::InfraSpec>,
-    /// The run id the body's ctx carried (`ctx.run_id`), minted fresh for
-    /// each run; `None` when no body ran with a ctx (`run_provision_infra`,
+    /// The run id the body's ctx carried (`ctx.run_id`): minted fresh for
+    /// each run, and kept for a body run again after it saved or crashed
+    /// (`FakeRig::crash_at_next_save`), which is the same firing of the
+    /// same run; `None` when no body ran with a ctx (`run_provision_infra`,
     /// or inputs refused before the body).
     pub run_id: Option<crate::RunId>,
 }
@@ -839,6 +841,9 @@ impl PublishedServices {
 
 /// Shared state behind the fake rig and its handle. Dumb by rule:
 /// plain maps, append-only logs, zero provider logic.
+/// What a renewal of a fake connection hands, or why its provider refuses it.
+type Renewal = Result<BTreeMap<String, String>, String>;
+
 struct FakeState {
     /// Canned provider responses keyed by their canonical
     /// [`RouteKey`]. `respond` declares them; the connection client's
@@ -870,6 +875,16 @@ struct FakeState {
     /// Stored values the fake's opened connections answer
     /// (`conn.value(name)`), keyed by service then value name.
     connection_values: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
+    /// The way to sign in each service's connection was made with
+    /// (`conn.way()`), keyed by service; a service with none was signed
+    /// in another way.
+    connection_ways: Mutex<BTreeMap<String, String>>,
+    /// What a renewal of each service's connection hands (`ctx.renew`),
+    /// or why the service refuses it, keyed by service
+    /// ([`FakeRig::connection_renewal`]).
+    connection_renewals: Mutex<BTreeMap<String, Renewal>>,
+    /// How many renewals reached each service's provider.
+    connection_renewed: Mutex<BTreeMap<String, usize>>,
     /// Services this run published a connection for, each with the
     /// identity the publish resolved, so `published_access` answers
     /// "already published" exactly when the node did publish (None on
@@ -992,14 +1007,24 @@ struct FakeState {
     /// (HTTP requests and endpoint calls together) after which the
     /// rig presses stop. `None` until a test asks.
     stop_after_calls: Mutex<Option<usize>>,
+    /// [`FakeRig::crash_at_next_save`]: the next save any body makes is
+    /// lost, the body ending there as on a worker that died.
+    crash_at_save: std::sync::atomic::AtomicBool,
 }
 
 /// What one node body keeps across `rig.run`s ([`FakeState::kept`]):
 /// the state it last saved, with the line its run paused at
-/// ([`FakeRig::signal_paused`]), which its next run comes back to.
+/// ([`FakeRig::signal_paused`]), which its next run comes back to, and
+/// the run it is part of.
 #[derive(Default, Clone)]
 struct KeptBody {
     saved: Option<SavedState>,
+    /// The run the body's firing belongs to, once it saved or the rig
+    /// crashed it ([`FakeRig::crash_at_next_save`]): its next `rig.run`
+    /// is that firing run again, in the same run (`ctx.run_id`,
+    /// `ctx.firing_key()`). `None` until then, and the body's first run
+    /// is a new run, as every `rig.run` of a body that never saved is.
+    run_id: Option<crate::RunId>,
 }
 
 /// How the node's next wait ends on the rig ([`FakeRig::signal`] and its
@@ -1074,10 +1099,11 @@ impl FakeState {
         })?;
         // The store's check (`publish_grant`), and its refusal reaches
         // the node the way a real one does.
-        let crate::access::spec::PublishableConnection { values, identity } =
+        let crate::access::spec::PublishableConnection { values, identity, way } =
             crate::access::spec::publishable_connection(spec, values)
                 .map_err(|e| WeftError::NodeFailed(format!("publish the '{service}' connection: {e}")))?;
         self.connection_values.lock().unwrap().insert(service.to_string(), values);
+        self.connection_ways.lock().unwrap().insert(service.to_string(), way);
         self.published.lock().unwrap().insert(service.to_string(), identity.clone());
         Ok(identity)
     }
@@ -1093,6 +1119,9 @@ impl FakeState {
             registered_signals: Mutex::new(Vec::new()),
             awaited_signals: Mutex::new(Vec::new()),
             connection_values: Mutex::new(BTreeMap::new()),
+            connection_ways: Mutex::new(BTreeMap::new()),
+            connection_renewals: Mutex::new(BTreeMap::new()),
+            connection_renewed: Mutex::new(BTreeMap::new()),
             published: Mutex::new(BTreeMap::new()),
             services,
             connection_permissions: Mutex::new(BTreeMap::new()),
@@ -1124,6 +1153,7 @@ impl FakeState {
             kept: Mutex::new(BTreeMap::new()),
             cancellation: Arc::new(CancellationFlag::new()),
             stop_after_calls: Mutex::new(None),
+            crash_at_save: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1601,6 +1631,18 @@ impl FakeRig {
         self.state.press_stop_if_due();
     }
 
+    /// Crash the worker at the next save a body makes (`state.save()`,
+    /// the save closing a `once`, a pause's): the save never lands and
+    /// the body ends there, failed, as on a worker that died. The next
+    /// `rig.run` of that body is the same firing run again, in the same
+    /// run (the same `ctx.run_id` and `ctx.firing_key()`), from the state
+    /// it saved before this one, if any. For a test of what a body does
+    /// twice when a crash lands between a call and the save of its
+    /// result (the gap `Kept::once` leaves).
+    pub fn crash_at_next_save(&self) {
+        self.state.crash_at_save.store(true, Ordering::SeqCst);
+    }
+
     /// Every call the node made to an infra endpoint, its own or a
     /// shared one, in order.
     pub fn endpoint_calls(&self) -> Vec<EndpointCall> {
@@ -1617,6 +1659,40 @@ impl FakeRig {
             .entry(service.to_string())
             .or_default()
             .insert(name.to_string(), value.to_string());
+    }
+
+    /// Declare the way to sign in `service`'s connection was made with
+    /// (`conn.way()`), for a node whose service offers several. A
+    /// connection with none declared was signed in another way: its
+    /// `way()` answers `None`.
+    pub fn connection_way(&self, service: &str, way: &str) {
+        self.state.connection_ways.lock().unwrap().insert(service.to_string(), way.to_string());
+    }
+
+    /// What `service`'s connection stores now: the values declared with
+    /// [`Self::connection_value`], as the renewals (`ctx.renew`) left them.
+    pub fn stored_connection_values(&self, service: &str) -> BTreeMap<String, String> {
+        self.state.connection_values.lock().unwrap().get(service).cloned().unwrap_or_default()
+    }
+
+    /// Declare what renewing `service`'s connection hands (`ctx.renew`):
+    /// `Ok(values)` laid over what it stores, the way the provider's
+    /// answer replaces the token; `Err(why)`, the provider refusing it.
+    /// With none declared, the connection stands for one weft cannot
+    /// renew (a pasted key), and a renewal of it fails as production's
+    /// does.
+    pub fn connection_renewal(&self, service: &str, renewal: Result<&[(&str, &str)], &str>) {
+        let renewal = renewal
+            .map(|values| values.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+            .map_err(str::to_string);
+        self.state.connection_renewals.lock().unwrap().insert(service.to_string(), renewal);
+    }
+
+    /// How many renewals of `service`'s connection reached its provider:
+    /// one per renewal of values still held, none for a node handed what
+    /// another renewal already stored.
+    pub fn connection_renewals(&self, service: &str) -> usize {
+        self.state.connection_renewed.lock().unwrap().get(service).copied().unwrap_or(0)
     }
 
     /// Declare the permissions `service`'s connection has granted.
@@ -1636,13 +1712,25 @@ impl FakeRig {
     /// manifest (declared inputs/outputs) + `inputs` (a JSON object of
     /// input name -> value), capture everything it emits.
     pub async fn run(&self, node: &dyn Node, inputs: Value) -> RigOutcome {
+        self.run_body_as(node, RUN_BODY, inputs).await
+    }
+
+    /// Run the node's `run` body as the infra setup right after its
+    /// infrastructure is applied runs it: `ctx.is_setup()` answers true,
+    /// and its state is its own, apart from [`Self::run`]'s.
+    pub async fn run_infra_setup(&self, node: &dyn Node, inputs: Value) -> RigOutcome {
+        self.run_body_as(node, INFRA_SETUP_BODY, inputs).await
+    }
+
+    /// The node's `run` body, run as `body`.
+    async fn run_body_as(&self, node: &dyn Node, body: RigBody, inputs: Value) -> RigOutcome {
         // `_feeds_alive` is LOAD-BEARING despite never being read: it
         // OWNS the run's generator feeds (the registry keeps only a
         // `Weak`, so these `Arc`s are what keep the markers
         // resolvable) and unregisters them when the body returns.
         // Binding it bare `_` would drop it immediately and every
         // `ctx.inputs.get::<Generator<T>>` read would fail "not live".
-        let (handle, ctx, _feeds_alive) = match self.build_ctx(node, RUN_BODY, inputs) {
+        let (handle, ctx, _feeds_alive) = match self.build_ctx(node, body, inputs) {
             Ok(triple) => triple,
             Err(e) => {
                 return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None }
@@ -1700,14 +1788,14 @@ impl FakeRig {
     /// TYPE and body kind, because a rig runs one instance of a type at a
     /// time (`NODE_UNDER_TEST_ID` is every node's id here). Two structs
     /// returning one manifest are one node to the rig.
-    fn body_key(node: &dyn Node, body: &str) -> String {
-        format!("{}/{body}", node.manifest().node_type)
+    fn body_key(node: &dyn Node, body: &RigBody) -> String {
+        format!("{}/{}", node.manifest().node_type, body.key)
     }
 
     fn build_ctx(
         &self,
         node: &dyn Node,
-        body: &str,
+        body: RigBody,
         inputs: Value,
     ) -> WeftResult<(CaptureBox, RunContext, RegisteredFeeds)> {
         let manifest = node.manifest();
@@ -1715,7 +1803,7 @@ impl FakeRig {
         // A body run again picks up where it saved, as production's
         // firing does: its state, its counters, the waits it made, and
         // its stream inputs past what it took.
-        let body_key = Self::body_key(node, body);
+        let body_key = Self::body_key(node, &body);
         let kept = self.state.kept.lock().unwrap().get(&body_key).cloned().unwrap_or_default();
         let (positions, counters) = match &kept.saved {
             Some(saved) => (saved.positions.clone(), saved.counters),
@@ -1745,7 +1833,9 @@ impl FakeRig {
         let config = Value::Object(bag.object()?.clone());
         let mut outputs = declared_output_map(manifest, &config);
         declare_output_types(manifest, &config, &mut outputs, &self.state.output_types.lock().unwrap())?;
-        let run_id = crate::RunId::new_v4();
+        // A body that saved, or that the rig crashed, is its firing run
+        // again, in its run; any other `rig.run` is a new run.
+        let run_id = kept.run_id.unwrap_or_else(crate::RunId::new_v4);
         let handle = Arc::new(TestHandle {
             state: self.state.clone(),
             run_id,
@@ -1771,9 +1861,10 @@ impl FakeRig {
             counters: Mutex::new(counters),
             wait_in_flight: Mutex::new(None),
             body_key,
+            handed: Mutex::new(HashMap::new()),
         });
         let instance = self.state.instance.lock().unwrap().clone();
-        let ctx = test_context(manifest, bag, instance, run_id, handle.clone());
+        let ctx = test_context(manifest, bag, instance, run_id, body.phase, handle.clone());
         Ok((CaptureBox::Fake(handle), ctx, feeds))
     }
 
@@ -1935,7 +2026,7 @@ impl FakeRig {
     /// crash gets it: for a test of a resume whose first run the rig
     /// cannot play (a step it cannot fake).
     pub fn seed_state(&self, node: &dyn Node, state: Value) {
-        self.state.kept.lock().unwrap().entry(Self::body_key(node, RUN_BODY)).or_default().saved =
+        self.state.kept.lock().unwrap().entry(Self::body_key(node, &RUN_BODY)).or_default().saved =
             Some(SavedState { state, positions: Positions::default(), counters: Counters::default(), helper: None });
     }
 
@@ -1943,7 +2034,7 @@ impl FakeRig {
     /// what a second `rig.run(..)` of the node on this rig hands back to
     /// its body. `None` before it saved anything.
     pub fn saved_state(&self, node: &dyn Node) -> Option<Value> {
-        self.state.kept.lock().unwrap().get(&Self::body_key(node, RUN_BODY)).and_then(|kept| kept.saved.as_ref()).map(|saved| saved.state.clone())
+        self.state.kept.lock().unwrap().get(&Self::body_key(node, &RUN_BODY)).and_then(|kept| kept.saved.as_ref()).map(|saved| saved.state.clone())
     }
 
     /// Every tag the node put on its run, one list per
@@ -2211,6 +2302,7 @@ fn test_context(
     inputs: ValueBag,
     instance: Option<crate::instance::InstanceId>,
     run_id: crate::RunId,
+    phase: crate::primitive::Phase,
     handle: Arc<dyn ContextHandle>,
 ) -> RunContext {
     RunContext::new(
@@ -2222,6 +2314,7 @@ fn test_context(
         LoopFrames::default(),
         instance,
         inputs,
+        phase,
         handle,
     )
     .marked_pure(manifest.features.pure)
@@ -2235,9 +2328,9 @@ struct Capture {
     declared: HashMap<String, WeftType>,
     /// The output ports the case wired downstream.
     wired: HashSet<String>,
-    /// The body's side of every bus it creates or joins: ended with how it
-    /// returned as the engine ends them, and where it stands on each
-    /// (from where it saved, on a run of it again).
+    /// The body's side of every bus it is a member of: its names leave
+    /// when it returns, as the engine takes them off, and where it stands
+    /// on each (from where it saved, on a run of it again).
     buses: Arc<crate::bus::FiringBuses>,
     outputs: Mutex<serde_json::Map<String, Value>>,
     /// Items emitted on `Generator[T]` ports, in order. Folded into
@@ -2395,11 +2488,6 @@ impl Capture {
     }
 
     fn into_outcome(self, result: WeftResult<()>) -> RigOutcome {
-        // The body is done: its buses end with how it returned, as the
-        // engine ends them, so a reader under test reads the same end.
-        if let Some(end) = crate::bus::body_end(&result) {
-            self.buses.end(end);
-        }
         let mut outputs = self.outputs.into_inner().unwrap();
         let mut streams = self.stream_outputs.into_inner().unwrap();
         let closed_ports = self.closed_ports.into_inner().unwrap();
@@ -2457,6 +2545,15 @@ enum CaptureBox {
 
 impl CaptureBox {
     fn into_outcome(self, result: WeftResult<()>) -> RigOutcome {
+        // The body is done: its names leave its buses with how it
+        // returned, as the engine takes them off, so a reader under test
+        // reads the same end.
+        if let Some(end) = crate::bus::body_end(&result) {
+            match &self {
+                Self::Fake(handle) => handle.leave_buses(end),
+                Self::Live(handle) => handle.leave_buses(end),
+            }
+        }
         fn unwrap_capture<T>(handle: Arc<T>, capture: impl FnOnce(T) -> Capture) -> Capture {
             match Arc::try_unwrap(handle) {
                 Ok(h) => capture(h),
@@ -2523,6 +2620,12 @@ struct TestHandle {
     feeds: Vec<Arc<crate::generator::GeneratorFeed>>,
     /// How many items it yielded on an earlier run, before this one's.
     yielded_before: u64,
+    /// What this firing was last handed for each connection it opened, by
+    /// service. A renewal is held to it as production holds one (the
+    /// engine's `handed`, the store's compare): none means the node never
+    /// opened the connection in this firing, a stored value that differs
+    /// means another renewal changed it since.
+    handed: Mutex<HashMap<String, BTreeMap<String, String>>>,
 }
 
 impl TestHandle {
@@ -2562,12 +2665,18 @@ impl ContextHandle for TestHandle {
     /// A save is where the body stands, except the one a pause makes
     /// ([`FakeRig::signal_paused`]): its wait takes the same number again.
     async fn save_state(&self, state: Value, at: crate::context::SaveAt) -> WeftResult<()> {
+        if self.state.crash_at_save.swap(false, Ordering::SeqCst) {
+            self.kept().entry(self.body_key.clone()).or_default().run_id = Some(self.run_id);
+            return Err(WeftError::Runtime(anyhow::anyhow!(
+                "the rig crashed the worker at this save (FakeRig::crash_at_next_save): it never landed"
+            )));
+        }
         let mut counters = *self.counters.lock().unwrap();
         let helper = match at {
             crate::context::SaveAt::Pausing { helper } => {
-                // As production pauses a firing: its names held over, its
-                // streams taking no end, its wait numbered again.
-                self.capture.buses.pause();
+                // As production pauses a firing: its streams taking no
+                // end, its wait numbered again (its names stay on its
+                // buses, which only its body returning takes off).
                 self.feeds.iter().for_each(|feed| feed.pause());
                 if let Some(number) = *self.wait_in_flight.lock().unwrap() {
                     counters.waits = number;
@@ -2589,7 +2698,10 @@ impl ContextHandle for TestHandle {
             counters,
             helper,
         };
-        self.kept().entry(self.body_key.clone()).or_default().saved = Some(saved);
+        let mut kept = self.kept();
+        let kept = kept.entry(self.body_key.clone()).or_default();
+        kept.saved = Some(saved);
+        kept.run_id = Some(self.run_id);
         Ok(())
     }
 
@@ -2820,15 +2932,55 @@ impl ContextHandle for TestHandle {
             }
         }
         let client = self.state.canned_client();
+        let way = self.state.connection_ways.lock().unwrap().get(service).cloned();
+        self.handed.lock().unwrap().insert(service.to_string(), values.clone());
         Ok(OpenedConnection::assemble(
             service,
             values,
             Vec::new(),
             None,
             CredentialOwner::Author,
+            way,
             client,
             Arc::new(NoFakeSocket),
         ))
+    }
+
+    /// Renews as the store does: only what this firing was handed (it
+    /// opened the connection first), and only while the connection still
+    /// holds it; a connection another renewal changed since hands what it
+    /// holds now, and nothing reaches the provider. A renewal lays the
+    /// declared values over the stored ones ([`FakeRig::connection_renewal`])
+    /// and counts; a connection with none declared cannot be renewed.
+    async fn renew_connection(&self, access: &Access, window: std::time::Duration) -> WeftResult<OpenedConnection> {
+        let service = access.service();
+        let Some(handed) = self.handed.lock().unwrap().get(service).cloned() else {
+            return Err(WeftError::NodeFailed(crate::access::renew_without_open(service)));
+        };
+        {
+            let mut stored = self.state.connection_values.lock().unwrap();
+            let held = stored.entry(service.to_string()).or_default();
+            if *held == handed {
+                match self.state.connection_renewals.lock().unwrap().get(service) {
+                    Some(Ok(renewed)) => {
+                        held.extend(renewed.clone());
+                        *self.state.connection_renewed.lock().unwrap().entry(service.to_string()).or_default() += 1;
+                    }
+                    Some(Err(why)) => {
+                        return Err(WeftError::NodeFailed(format!(
+                            "renew the '{service}' connection: the '{service}' access needs reconnecting: {why}"
+                        )))
+                    }
+                    None => {
+                        return Err(WeftError::Config(format!(
+                            "the node renewed the '{service}' connection, but the test declares no renewal for it, so \
+                             it stands for one weft cannot renew; declare one with rig.connection_renewal(\"{service}\", ...)"
+                        )))
+                    }
+                }
+            }
+        }
+        self.open_connection(access, window).await
     }
 
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()> {
@@ -2930,8 +3082,10 @@ impl ContextHandle for TestHandle {
         &self.capture.wired
     }
 
-    fn firing_buses(&self) -> &crate::bus::FiringBuses {
-        &self.capture.buses
+    fn leave_buses(&self, end: crate::bus::StreamEnd) {
+        // The body's names, on the buses the rig holds.
+        let buses = self.state.buses.lock().unwrap().values().map(|bus| bus.inner_arc()).collect::<Vec<_>>();
+        self.capture.buses.leave(&node_under_test(), end, |id| buses.iter().find(|bus| bus.id() == id).cloned())
     }
 
     async fn pulse_downstream(&self, output: NodeOutput, _delivery: crate::context::Delivery) -> WeftResult<()> {
@@ -3501,10 +3655,17 @@ pub enum HandleRole<'a> {
     Harness { node_type: &'static str },
 }
 
-/// The two bodies a rig runs for a node, each with a journal of its
-/// own on the rig, as each is its own run in production.
-const RUN_BODY: &str = "run";
-const SETUP_TRIGGER_BODY: &str = "setup_trigger";
+/// A body a rig runs for a node, each with a journal of its own on the
+/// rig, as each is its own run in production: the key its saved state
+/// is under, and the phase its ctx runs in (`RunContext::is_setup`).
+struct RigBody {
+    key: &'static str,
+    phase: crate::primitive::Phase,
+}
+
+const RUN_BODY: RigBody = RigBody { key: "run", phase: crate::primitive::Phase::Fire };
+const INFRA_SETUP_BODY: RigBody = RigBody { key: "infra_setup", phase: crate::primitive::Phase::InfraSetup };
+const SETUP_TRIGGER_BODY: RigBody = RigBody { key: "setup_trigger", phase: crate::primitive::Phase::TriggerSetup };
 
 /// The firing id every [`HandleRole::NodeUnderTest`] handle runs as.
 /// One definition: the runtime's parked-body watchdog keys its
@@ -3759,7 +3920,7 @@ impl LiveRig {
             ),
             declared_inputs: declared_input_map(manifest, &custom),
         });
-        let ctx = test_context(manifest, bag, None, crate::RunId::new_v4(), handle.clone());
+        let ctx = test_context(manifest, bag, None, crate::RunId::new_v4(), crate::primitive::Phase::Fire, handle.clone());
         let run_id = ctx.run_id;
         let result = node.run(ctx).await;
         RigOutcome { run_id: Some(run_id), ..CaptureBox::Live(handle).into_outcome(result) }
@@ -3848,6 +4009,10 @@ impl ContextHandle for CapturingHandle {
         self.inner.published_access().await
     }
 
+    async fn renew_connection(&self, access: &Access, window: std::time::Duration) -> WeftResult<OpenedConnection> {
+        self.inner.renew_connection(access, window).await
+    }
+
     async fn after_node(&self, call: crate::signal::CancelCall, access: Option<crate::primitive::AccessRef>) -> WeftResult<()> {
         self.inner.after_node(call, access).await
     }
@@ -3915,8 +4080,9 @@ impl ContextHandle for CapturingHandle {
         &self.capture.wired
     }
 
-    fn firing_buses(&self) -> &crate::bus::FiringBuses {
-        &self.capture.buses
+    fn leave_buses(&self, end: crate::bus::StreamEnd) {
+        // The body's handles are the production handle's, so are its names.
+        self.inner.leave_buses(end)
     }
 
     async fn pulse_downstream(&self, output: NodeOutput, _delivery: crate::context::Delivery) -> WeftResult<()> {
@@ -4113,6 +4279,60 @@ mod tests {
             ctx.pulse_downstream(NodeOutput::new().set("reply", resp).set("done", true))
                 .await
         }
+    }
+
+    /// A node that keeps its firing key in a `once` and hands it out.
+    struct FiringKeyNode;
+
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct Keyed {
+        key: Option<String>,
+    }
+
+    impl crate::node::NodeManifest for FiringKeyNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            static MANIFEST: std::sync::OnceLock<NodeMetadata> = std::sync::OnceLock::new();
+            MANIFEST.get_or_init(|| {
+                serde_json::from_value(json!({
+                    "type": "FiringKey", "label": "Firing key", "description": "test-only node",
+                    "outputs": [{"name": "key", "type": "String"}]
+                }))
+                .expect("firing key manifest")
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Node for FiringKeyNode {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(Keyed::default()).await?;
+            let key = state.once(|s| &mut s.key, async |_| Ok(ctx.firing_key())).await?;
+            ctx.pulse_downstream(crate::node::NodeOutput::new().set("key", key)).await
+        }
+    }
+
+    /// A body run again after the rig crashed it at a save is the same
+    /// firing of the same run: the same run id and the same firing key,
+    /// which is the run id and the firing's place. Another run (a fresh
+    /// rig) gets another; a body that never saved starts a new run.
+    #[tokio::test]
+    async fn a_body_run_again_after_a_crash_keeps_its_run_and_firing_key() {
+        let rig = FakeRig::new();
+        rig.crash_at_next_save();
+        let crashed = rig.run(&FiringKeyNode, json!({})).await;
+        let error = crashed.result.as_ref().expect_err("the save crashed").to_string();
+        assert!(error.contains("crashed the worker at this save"), "{error}");
+        assert!(rig.saved_state(&FiringKeyNode).is_none());
+        let again = rig.run(&FiringKeyNode, json!({})).await.ok().expect("runs again");
+        assert_eq!(again.run_id, crashed.run_id, "the same run");
+        let run = again.run_id.expect("a ctx ran");
+        let key = crate::frames::FiringLocation::new(NODE_UNDER_TEST_ID, Vec::new()).key(run);
+        assert_eq!(again.outputs["key"], json!(key));
+        // Saved, a third run on the rig picks the firing up again.
+        let third = rig.run(&FiringKeyNode, json!({})).await.ok().expect("runs again");
+        assert_eq!((third.run_id, &third.outputs["key"]), (Some(run), &json!(key)));
+        let other = rig.fresh().run(&FiringKeyNode, json!({})).await.ok().expect("another run");
+        assert_ne!(other.outputs["key"], json!(key), "another run, another key");
     }
 
     /// A node that receives the upload its `slot` input names into a
@@ -4617,10 +4837,10 @@ mod tests {
                 "outputs": [{"name": "access", "type": "Access[probedb]"}],
                 "service": {
                     "service": "probedb",
-                    "acquisition": { "kind": "static", "fields": [
+                    "acquisition": { "kind": "static", "ways": [{ "fields": [
                         { "name": "host", "secret": false },
                         { "name": "port", "optional": true, "secret": false },
-                    ]},
+                    ]}]},
                 }
             }))
             .expect("access manifest")
@@ -4702,9 +4922,9 @@ mod tests {
     async fn a_fake_publish_answers_the_identity_a_real_one_does() {
         let spec: crate::access::spec::AccessSpec = serde_json::from_value(json!({
             "service": "probedb",
-            "acquisition": { "kind": "static", "fields": [
+            "acquisition": { "kind": "static", "ways": [{ "fields": [
                 { "name": "host", "secret": false },
-            ]},
+            ]}]},
             "identity": "{host}",
         }))
         .expect("a static spec");
@@ -5082,6 +5302,94 @@ mod tests {
             .await
             .ok()
             .expect("covered requirements pass");
+    }
+
+    /// A node renewing its connection the way `script` says, on the rig
+    /// it is run on, so it can change the stored row between its open and
+    /// its renewal; it puts the token it ends with on `token`.
+    struct RenewingNode {
+        rig: FakeRig,
+        script: Renew,
+    }
+
+    enum Renew {
+        /// Renews with no open before it in the firing.
+        Unopened,
+        /// Opens, then renews what it was handed.
+        Held,
+        /// Opens, another renewal changes the row, then renews.
+        AfterAnother,
+    }
+
+    impl crate::node::NodeManifest for RenewingNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            static MANIFEST: std::sync::OnceLock<NodeMetadata> = std::sync::OnceLock::new();
+            MANIFEST.get_or_init(|| {
+                serde_json::from_value(json!({
+                    "type": "RenewingProbe",
+                    "label": "Renewing probe",
+                    "description": "test-only node",
+                    "inputs": [{"name": "account", "type": "Access", "required": true}],
+                    "outputs": [{"name": "token", "type": "String"}]
+                }))
+                .expect("renewing manifest")
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl Node for RenewingNode {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let access: Access = ctx.inputs.get("account")?;
+            let renewed = match self.script {
+                Renew::Unopened => ctx.renew(&access).await?,
+                Renew::Held => {
+                    let _conn = ctx.open(&access).await?;
+                    ctx.renew(&access).await?
+                }
+                Renew::AfterAnother => {
+                    let _conn = ctx.open(&access).await?;
+                    self.rig.connection_value("login", "token", "renewed by another run");
+                    ctx.renew(&access).await?
+                }
+            };
+            let token = renewed.value("token")?.to_string();
+            ctx.pulse_downstream(NodeOutput::new().set("token", token)).await
+        }
+    }
+
+    /// The rig holds a renewal to what production holds it to: an open of
+    /// the connection earlier in the firing, one renewal of what it was
+    /// handed, and none when another renewal already changed the row.
+    #[tokio::test]
+    async fn a_renewal_renews_what_the_firing_was_handed_once() {
+        let renew = |script: Renew, renewal: Option<Result<&'static [(&'static str, &'static str)], &'static str>>| async move {
+            let rig = FakeRig::new();
+            rig.connection_value("login", "token", "old");
+            if let Some(renewal) = renewal {
+                rig.connection_renewal("login", renewal);
+            }
+            let node = RenewingNode { rig: rig.clone(), script };
+            let result = rig.run(&node, json!({"account": rig.access("login")})).await;
+            let outcome = result.result.map(|()| result.outputs.get("token").cloned()).map_err(|e| e.to_string());
+            (outcome, rig.connection_renewals("login"))
+        };
+        const NEW: &[(&str, &str)] = &[("token", "new")];
+        let (outcome, renewals) = renew(Renew::Unopened, Some(Ok(NEW))).await;
+        assert!(outcome.unwrap_err().contains("has not opened it in this firing"));
+        assert_eq!(renewals, 0);
+
+        let (outcome, renewals) = renew(Renew::Held, Some(Ok(NEW))).await;
+        assert_eq!(outcome.unwrap(), Some(json!("new")));
+        assert_eq!(renewals, 1, "one renewal of what it held");
+
+        let (outcome, renewals) = renew(Renew::AfterAnother, Some(Ok(NEW))).await;
+        assert_eq!(outcome.unwrap(), Some(json!("renewed by another run")), "handed the newer values");
+        assert_eq!(renewals, 0, "nothing reached the provider");
+
+        let (outcome, _) = renew(Renew::Held, Some(Err("the refresh token was revoked"))).await;
+        assert!(outcome.unwrap_err().contains("needs reconnecting: the refresh token was revoked"));
+        let (outcome, _) = renew(Renew::Held, None).await;
+        assert!(outcome.unwrap_err().contains("declares no renewal"));
     }
 
     struct AwaitingNode;

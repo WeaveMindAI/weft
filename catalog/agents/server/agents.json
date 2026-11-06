@@ -1,0 +1,1026 @@
+{
+  "claude": {
+    "label": "Claude Code",
+    "check": [
+      "claude",
+      "--version"
+    ],
+    "install": {
+      "linux": "# Claude Code's own build for this machine, the one Anthropic's installer (claude.ai/install.sh) fetches, checked against its release's manifest.\nbase=https://downloads.claude.ai/claude-code-releases\nplatform=\"linux-$(weft_arch)\"\n[ \"$(weft_libc)\" = musl ] && platform=\"$platform-musl\"\nfetch \"$base/latest\" \"$WEFT_NEED_DIR/version\"\nversion=$(cat \"$WEFT_NEED_DIR/version\")\nfetch \"$base/$version/manifest.json\" \"$WEFT_NEED_DIR/manifest.json\"\nfetch \"$base/$version/$platform/claude\" \"$WEFT_NEED_DIR/claude\"\ncheck_sha256 \"$WEFT_NEED_DIR/claude\" \"$(json_get \"$WEFT_NEED_DIR/manifest.json\" \"j['platforms']['$platform']['checksum']\")\"\nmkdir -p \"$WEFT_NEED_DIR/bin\" && chmod +x \"$WEFT_NEED_DIR/claude\" && mv \"$WEFT_NEED_DIR/claude\" \"$WEFT_NEED_DIR/bin/claude\"\nrm \"$WEFT_NEED_DIR/version\" \"$WEFT_NEED_DIR/manifest.json\"",
+      "macos": "# Claude Code's own build for this machine, the one Anthropic's installer (claude.ai/install.sh) fetches, checked against its release's manifest.\nbase=https://downloads.claude.ai/claude-code-releases\nplatform=\"darwin-$(weft_arch)\"\nfetch \"$base/latest\" \"$WEFT_NEED_DIR/version\"\nversion=$(cat \"$WEFT_NEED_DIR/version\")\nfetch \"$base/$version/manifest.json\" \"$WEFT_NEED_DIR/manifest.json\"\nfetch \"$base/$version/$platform/claude\" \"$WEFT_NEED_DIR/claude\"\ncheck_sha256 \"$WEFT_NEED_DIR/claude\" \"$(json_get \"$WEFT_NEED_DIR/manifest.json\" \"j['platforms']['$platform']['checksum']\")\"\nmkdir -p \"$WEFT_NEED_DIR/bin\" && chmod +x \"$WEFT_NEED_DIR/claude\" && mv \"$WEFT_NEED_DIR/claude\" \"$WEFT_NEED_DIR/bin/claude\"\nrm \"$WEFT_NEED_DIR/version\" \"$WEFT_NEED_DIR/manifest.json\""
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "When it is missing, weft installs Claude Code (Anthropic's own build, the one its installer fetches) into a folder of its own, shared by every program on the machine. To install it by hand instead: `curl -fsSL https://claude.ai/install.sh | bash` (https://code.claude.com/docs/en/setup), then check `claude --version` works.",
+    "permissions": [
+      "ask",
+      "accept_edits",
+      "auto",
+      "plan",
+      "dont_ask",
+      "bypass"
+    ],
+    "logins": {
+      "subscription": {
+        "env": {
+          "token": "CLAUDE_CODE_OAUTH_TOKEN"
+        }
+      },
+      "apiKey": {
+        "env": {
+          "key": "ANTHROPIC_API_KEY"
+        }
+      }
+    }
+  },
+  "codex": {
+    "label": "Codex",
+    "check": [
+      "codex",
+      "--version"
+    ],
+    "install": {
+      "linux": "# Codex's standalone package for this machine, the one OpenAI's installer (github.com/openai/codex/releases install.sh) fetches: `codex` with the ripgrep and bubblewrap it runs beside it.\ncase \"$(weft_arch)\" in x64) target=x86_64-unknown-linux-musl ;; arm64) target=aarch64-unknown-linux-musl ;; esac\nbase=https://github.com/openai/codex/releases/latest/download\nfetch_summed \"$base/codex-package-$target.tar.gz\" \"$base/codex-package_SHA256SUMS\" \"$WEFT_NEED_DIR/codex.tar.gz\"\nextract \"$WEFT_NEED_DIR/codex.tar.gz\" \"$WEFT_NEED_DIR/package\"\nrm \"$WEFT_NEED_DIR/codex.tar.gz\"\nmv \"$WEFT_NEED_DIR/package\"/* \"$WEFT_NEED_DIR/\" && rmdir \"$WEFT_NEED_DIR/package\"",
+      "macos": "# Codex's standalone package for this machine, the one OpenAI's installer (github.com/openai/codex/releases install.sh) fetches: `codex` with the ripgrep and bubblewrap it runs beside it.\ncase \"$(weft_arch)\" in x64) target=x86_64-apple-darwin ;; arm64) target=aarch64-apple-darwin ;; esac\nbase=https://github.com/openai/codex/releases/latest/download\nfetch_summed \"$base/codex-package-$target.tar.gz\" \"$base/codex-package_SHA256SUMS\" \"$WEFT_NEED_DIR/codex.tar.gz\"\nextract \"$WEFT_NEED_DIR/codex.tar.gz\" \"$WEFT_NEED_DIR/package\"\nrm \"$WEFT_NEED_DIR/codex.tar.gz\"\nmv \"$WEFT_NEED_DIR/package\"/* \"$WEFT_NEED_DIR/\" && rmdir \"$WEFT_NEED_DIR/package\""
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "When it is missing, weft installs Codex (OpenAI's standalone package from its GitHub releases) into a folder of its own, shared by every program on the machine. To install it by hand instead: `npm install -g @openai/codex` (https://developers.openai.com/codex/cli), then check `codex --version` works.",
+    "permissions": [
+      "ask",
+      "on_request",
+      "never",
+      "bypass"
+    ],
+    "logins": {
+      "subscription": {
+        "env": {},
+        "protocol": [
+          "token",
+          "accountId"
+        ]
+      },
+      "apiKey": {
+        "env": {},
+        "protocol": [
+          "key"
+        ]
+      }
+    },
+    "home": "CODEX_HOME"
+  },
+  "gemini": {
+    "label": "Gemini CLI",
+    "check": [
+      "gemini",
+      "--version"
+    ],
+    "install": {
+      "linux": "npm_install 24 @google/gemini-cli",
+      "macos": "npm_install 24 @google/gemini-cli"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "When it is missing, weft installs Gemini CLI (the npm package `@google/gemini-cli`, on a Node.js 24 it keeps beside it) into a folder of its own, shared by every program on the machine. To install it by hand instead: `npm install -g @google/gemini-cli` (Node 20 or newer; https://geminicli.com/docs/get-started/installation/), then check `gemini --version` works.",
+    "permissions": [
+      "ask",
+      "accept_edits",
+      "plan",
+      "bypass"
+    ],
+    "logins": {
+      "apiKey": {
+        "env": {
+          "key": "GEMINI_API_KEY"
+        }
+      },
+      "vertexKey": {
+        "env": {
+          "key": "GOOGLE_API_KEY"
+        }
+      }
+    },
+    "home": "GEMINI_CLI_HOME"
+  },
+  "antigravity": {
+    "label": "Google Antigravity",
+    "check": [
+      "antigravity-sdk",
+      "--version"
+    ],
+    "install": {
+      "linux": "# Google Antigravity's SDK (google-antigravity on PyPI, with Antigravity's harness in it), in a Python environment of its own.\nweft_uv venv -q --python 3.12 \"$WEFT_NEED_DIR/venv\"\nweft_uv pip install -q --python \"$WEFT_NEED_DIR/venv/bin/python\" google-antigravity==0.1.23\nrm -rf \"$WEFT_NEED_DIR/.uv-cache\"\nmkdir -p \"$WEFT_NEED_DIR/bin\"\ncat > \"$WEFT_NEED_DIR/bin/antigravity-sdk\" <<SH\n#!/bin/sh\n# Runs a Python file on the SDK's environment; -I keeps the caller's Python settings and the file's own folder out of it.\nif [ \"\\$1\" = --version ]; then exec \"$WEFT_NEED_DIR/venv/bin/python\" -I -c 'import importlib.metadata as m; print(\"google-antigravity\", m.version(\"google-antigravity\"))'; fi\nexec \"$WEFT_NEED_DIR/venv/bin/python\" -I \"\\$@\"\nSH\nchmod +x \"$WEFT_NEED_DIR/bin/antigravity-sdk\"",
+      "macos": "# Google Antigravity's SDK (google-antigravity on PyPI, with Antigravity's harness in it), in a Python environment of its own.\nweft_uv venv -q --python 3.12 \"$WEFT_NEED_DIR/venv\"\nweft_uv pip install -q --python \"$WEFT_NEED_DIR/venv/bin/python\" google-antigravity==0.1.23\nrm -rf \"$WEFT_NEED_DIR/.uv-cache\"\nmkdir -p \"$WEFT_NEED_DIR/bin\"\ncat > \"$WEFT_NEED_DIR/bin/antigravity-sdk\" <<SH\n#!/bin/sh\n# Runs a Python file on the SDK's environment; -I keeps the caller's Python settings and the file's own folder out of it.\nif [ \"\\$1\" = --version ]; then exec \"$WEFT_NEED_DIR/venv/bin/python\" -I -c 'import importlib.metadata as m; print(\"google-antigravity\", m.version(\"google-antigravity\"))'; fi\nexec \"$WEFT_NEED_DIR/venv/bin/python\" -I \"\\$@\"\nSH\nchmod +x \"$WEFT_NEED_DIR/bin/antigravity-sdk\""
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "weft runs Google Antigravity through its SDK, `google-antigravity` on PyPI, which has to live in a Python environment of its own, so when it is missing weft sets one up (google-antigravity 0.1.23 on a Python 3.12, both through uv) into a folder of its own, shared by every program on the machine. To install it by hand instead: source catalog/agents/server/install_lib.sh in bash and run the script under `antigravity.install.linux` (or `.macos`) in weft's catalog/agents/server/agents.json, with `WEFT_NEED_DIR` the folder to set it up in and `WEFT_NEEDS_ROOT` the folder above it; then put that folder's `bin` on PATH and check `antigravity-sdk --version` works.",
+    "permissions": [
+      "ask",
+      "accept_edits",
+      "bypass"
+    ],
+    "logins": {
+      "apiKey": {
+        "env": {
+          "key": "GEMINI_API_KEY"
+        }
+      },
+      "vertexKey": {
+        "env": {
+          "key": "GOOGLE_API_KEY"
+        }
+      }
+    },
+    "home": "HOME"
+  },
+  "cline": {
+    "label": "Cline CLI",
+    "check": [
+      "cline",
+      "--version"
+    ],
+    "install": {
+      "linux": "# Cline's npm package, on weft's Node 22: weft runs Cline through the SDK it carries, with that `node`.\nnpm_install 22 cline",
+      "macos": "# Cline's npm package, on weft's Node 22: weft runs Cline through the SDK it carries, with that `node`.\nnpm_install 22 cline"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "When it is missing, weft installs Cline CLI (the npm package `cline`, on a Node.js 22 it keeps beside it) into a folder of its own, shared by every program on the machine. To install it by hand instead: `npm install -g cline` (https://docs.cline.bot/cline-cli/overview), on Node 22 or newer: weft runs Cline through the SDK that npm package carries, on that Node. Then check `cline --version` and `node --version` work.",
+    "permissions": [
+      "ask",
+      "plan",
+      "bypass"
+    ],
+    "logins": {
+      "clineKey": {
+        "env": {
+          "key": "CLINE_API_KEY"
+        }
+      },
+      "providerKey": {
+        "env": {
+          "key": "CLINE_API_KEY",
+          "provider": "CLINE_PROVIDER"
+        }
+      }
+    },
+    "home": "CLINE_DIR"
+  },
+  "codebuddy": {
+    "label": "CodeBuddy Code",
+    "check": [
+      "codebuddy",
+      "--version"
+    ],
+    "install": {
+      "linux": "case $(weft_os)-$(weft_arch) in\n    linux-x64) target=Linux_x86_64 ;;\n    linux-arm64) target=Linux_arm64 ;;\n    darwin-x64) target=Darwin_x86_64 ;;\n    darwin-arm64) target=Darwin_arm64 ;;\nesac\nif [ \"$(weft_os)\" = linux ] && [ \"$(weft_libc)\" = musl ]; then target=${target}_musl; fi\nreleases=https://acc-1258344699.cos.accelerate.myqcloud.com/@tencent-ai/codebuddy-code/releases\ncd \"$WEFT_NEED_DIR\"\nfetch \"$releases/latest\" version\nversion=$(tr -d '[:space:]' < version)\narchive=codebuddy-code_$target.tar.gz\nfetch_summed \"$releases/download/$version/$archive\" \"$releases/download/$version/checksums.txt\" \"$archive\"\nrm -rf dist && extract \"$archive\" dist\nmkdir -p bin && ln -sfn ../dist/codebuddy bin/codebuddy\nrm \"$archive\" version",
+      "macos": "case $(weft_os)-$(weft_arch) in\n    linux-x64) target=Linux_x86_64 ;;\n    linux-arm64) target=Linux_arm64 ;;\n    darwin-x64) target=Darwin_x86_64 ;;\n    darwin-arm64) target=Darwin_arm64 ;;\nesac\nif [ \"$(weft_os)\" = linux ] && [ \"$(weft_libc)\" = musl ]; then target=${target}_musl; fi\nreleases=https://acc-1258344699.cos.accelerate.myqcloud.com/@tencent-ai/codebuddy-code/releases\ncd \"$WEFT_NEED_DIR\"\nfetch \"$releases/latest\" version\nversion=$(tr -d '[:space:]' < version)\narchive=codebuddy-code_$target.tar.gz\nfetch_summed \"$releases/download/$version/$archive\" \"$releases/download/$version/checksums.txt\" \"$archive\"\nrm -rf dist && extract \"$archive\" dist\nmkdir -p bin && ln -sfn ../dist/codebuddy bin/codebuddy\nrm \"$archive\" version"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "When it is missing, weft installs CodeBuddy Code (its latest release from Tencent's download site) into a folder of its own, shared by every program on the machine. To install it by hand instead: `curl -fsSL https://www.codebuddy.cn/cli/install.sh | bash` (or `npm install -g @tencent-ai/codebuddy-code`; https://www.codebuddy.ai/docs/cli/installation), then check `codebuddy --version` works.",
+    "permissions": [
+      "ask",
+      "accept_edits",
+      "auto",
+      "plan",
+      "dont_ask",
+      "bypass"
+    ],
+    "logins": {
+      "apiKey": {
+        "env": {
+          "key": "CODEBUDDY_API_KEY"
+        }
+      }
+    },
+    "home": "CODEBUDDY_CONFIG_DIR"
+  },
+  "copilot": {
+    "label": "GitHub Copilot CLI",
+    "check": [
+      "copilot",
+      "--version"
+    ],
+    "install": {
+      "linux": "# GitHub Copilot CLI's own build for this machine, the release GitHub's installer (gh.io/copilot-install) fetches, checked against its SHA256SUMS.txt.\nbase=https://github.com/github/copilot-cli/releases/latest/download\nfetch_summed \"$base/copilot-linux-$(weft_arch).tar.gz\" \"$base/SHA256SUMS.txt\" \"$WEFT_NEED_DIR/copilot.tar.gz\"\nextract \"$WEFT_NEED_DIR/copilot.tar.gz\" \"$WEFT_NEED_DIR/bin\"\nrm \"$WEFT_NEED_DIR/copilot.tar.gz\"",
+      "macos": "# GitHub Copilot CLI's own build for this machine, the release GitHub's installer (gh.io/copilot-install) fetches, checked against its SHA256SUMS.txt.\nbase=https://github.com/github/copilot-cli/releases/latest/download\nfetch_summed \"$base/copilot-darwin-$(weft_arch).tar.gz\" \"$base/SHA256SUMS.txt\" \"$WEFT_NEED_DIR/copilot.tar.gz\"\nextract \"$WEFT_NEED_DIR/copilot.tar.gz\" \"$WEFT_NEED_DIR/bin\"\nrm \"$WEFT_NEED_DIR/copilot.tar.gz\""
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "When it is missing, weft installs GitHub Copilot CLI (its release from GitHub) into a folder of its own, shared by every program on the machine. To install it by hand instead: `curl -fsSL https://gh.io/copilot-install | bash` (https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli), then check `copilot --version` works.",
+    "permissions": [
+      "ask",
+      "plan",
+      "bypass"
+    ],
+    "logins": {
+      "githubToken": {
+        "env": {
+          "token": "COPILOT_GITHUB_TOKEN"
+        }
+      },
+      "ownProvider": {
+        "env": {},
+        "protocol": [
+          "baseUrl",
+          "type",
+          "key",
+          "model",
+          "wireApi"
+        ]
+      }
+    },
+    "home": "COPILOT_HOME"
+  },
+  "cursor": {
+    "label": "Cursor CLI",
+    "check": [
+      "agent",
+      "--version"
+    ],
+    "install": {
+      "linux": "cd \"$WEFT_NEED_DIR\"\nfetch https://cursor.com/install installer.sh\nurl=$(sed -n 's/^DOWNLOAD_URL=\"\\(.*\\)\"$/\\1/p' installer.sh)\n[ -n \"$url\" ] || { echo \"Cursor's installer (https://cursor.com/install) no longer names its download as DOWNLOAD_URL=\\\"...\\\"\" >&2; exit 1; }\nurl=${url//\\$\\{OS\\}/$(weft_os)}\nurl=${url//\\$\\{ARCH\\}/$(weft_arch)}\nfetch \"$url\" agent.tar.gz\nrm -rf dist && extract agent.tar.gz dist 1\nmkdir -p bin && ln -sfn ../dist/cursor-agent bin/agent\nrm agent.tar.gz installer.sh",
+      "macos": "cd \"$WEFT_NEED_DIR\"\nfetch https://cursor.com/install installer.sh\nurl=$(sed -n 's/^DOWNLOAD_URL=\"\\(.*\\)\"$/\\1/p' installer.sh)\n[ -n \"$url\" ] || { echo \"Cursor's installer (https://cursor.com/install) no longer names its download as DOWNLOAD_URL=\\\"...\\\"\" >&2; exit 1; }\nurl=${url//\\$\\{OS\\}/$(weft_os)}\nurl=${url//\\$\\{ARCH\\}/$(weft_arch)}\nfetch \"$url\" agent.tar.gz\nrm -rf dist && extract agent.tar.gz dist 1\nmkdir -p bin && ln -sfn ../dist/cursor-agent bin/agent\nrm agent.tar.gz installer.sh"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "When it is missing, weft installs Cursor CLI (the release its installer at cursor.com/install names) into a folder of its own, shared by every program on the machine. To install it by hand instead: `curl https://cursor.com/install -fsS | bash` (https://cursor.com/docs/cli/installation), then check `agent --version` works.",
+    "permissions": [
+      "ask",
+      "plan",
+      "bypass"
+    ],
+    "logins": {
+      "apiKey": {
+        "env": {
+          "key": "CURSOR_API_KEY"
+        }
+      }
+    },
+    "home": "XDG_CONFIG_HOME"
+  },
+  "devin": {
+    "label": "Devin CLI",
+    "check": [
+      "devin",
+      "--version"
+    ],
+    "install": {
+      "linux": "case $(weft_os)-$(weft_arch) in\n    linux-x64) target=x86_64-unknown-linux ;;\n    linux-arm64) target=aarch64-unknown-linux ;;\n    darwin-x64) target=x86_64-apple-darwin ;;\n    darwin-arm64) target=aarch64-apple-darwin ;;\nesac\ncd \"$WEFT_NEED_DIR\"\nfetch https://static.devin.ai/cli/current/manifest.json manifest.json\nfetch \"$(json_get manifest.json \"j['platforms']['$target']['url']\")\" devin.tar.gz\ncheck_sha256 devin.tar.gz \"$(json_get manifest.json \"j['platforms']['$target']['sha256']\")\"\nrm -rf devin && extract devin.tar.gz devin\necho curl-bash > devin/distribution\nrm devin.tar.gz manifest.json",
+      "macos": "case $(weft_os)-$(weft_arch) in\n    linux-x64) target=x86_64-unknown-linux ;;\n    linux-arm64) target=aarch64-unknown-linux ;;\n    darwin-x64) target=x86_64-apple-darwin ;;\n    darwin-arm64) target=aarch64-apple-darwin ;;\nesac\ncd \"$WEFT_NEED_DIR\"\nfetch https://static.devin.ai/cli/current/manifest.json manifest.json\nfetch \"$(json_get manifest.json \"j['platforms']['$target']['url']\")\" devin.tar.gz\ncheck_sha256 devin.tar.gz \"$(json_get manifest.json \"j['platforms']['$target']['sha256']\")\"\nrm -rf devin && extract devin.tar.gz devin\necho curl-bash > devin/distribution\nrm devin.tar.gz manifest.json"
+    },
+    "bin": [
+      "devin/bin"
+    ],
+    "installHint": "When it is missing, weft installs Devin CLI (its current release from static.devin.ai) into a folder of its own, shared by every program on the machine. To install it by hand instead: `curl -fsSL https://cli.devin.ai/install.sh | bash` (https://docs.devin.ai/cli), then check `devin --version` works.",
+    "permissions": [
+      "ask",
+      "accept_edits",
+      "read_only",
+      "plan",
+      "bypass"
+    ],
+    "logins": {
+      "apiKey": {
+        "env": {
+          "key": "WINDSURF_API_KEY"
+        }
+      }
+    },
+    "home": "HOME"
+  },
+  "dsh": {
+    "label": "DeepSeek Harness",
+    "check": [
+      "dsh",
+      "--version"
+    ],
+    "install": {
+      "linux": "# dsh-subprocess-local's script only restores the executable bit of node-pty's prebuilt helper; the others it would warn about need not run.\nnpm_install 24 @deepseek-ai/dsh --allow-scripts=@deepseek-ai/dsh-subprocess-local\n",
+      "macos": "# dsh-subprocess-local's script only restores the executable bit of node-pty's prebuilt helper; the others it would warn about need not run.\nnpm_install 24 @deepseek-ai/dsh --allow-scripts=@deepseek-ai/dsh-subprocess-local\n"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "If DeepSeek Harness is missing, weft installs it into a folder of its own that the whole machine shares (`npm install -g @deepseek-ai/dsh`, on a Node 24 weft keeps there too). To install it yourself instead, run `npm install -g @deepseek-ai/dsh` (Node 22.19 or newer; https://github.com/deepseek-ai/deepseek-harness), then check `dsh --version` works.",
+    "permissions": [
+      "ask",
+      "read_only",
+      "bypass"
+    ],
+    "logins": {
+      "apiKey": {
+        "env": {
+          "key": "DEEPSEEK_API_KEY"
+        }
+      }
+    },
+    "home": "DSH_HOME"
+  },
+  "goose": {
+    "label": "goose",
+    "check": [
+      "goose",
+      "--version"
+    ],
+    "install": {
+      "linux": "case $(weft_arch) in x64) arch=x86_64 ;; arm64) arch=aarch64 ;; esac\ncase $(weft_os) in\n    darwin) target=$arch-apple-darwin ;;\n    linux) target=$arch-unknown-linux-$(weft_libc) ;;\nesac\nfetch \"https://github.com/aaif-goose/goose/releases/download/stable/goose-$target.tar.bz2\" \"$WEFT_NEED_DIR/goose.tar.bz2\"\nextract \"$WEFT_NEED_DIR/goose.tar.bz2\" \"$WEFT_NEED_DIR/bin\"\nrm \"$WEFT_NEED_DIR/goose.tar.bz2\"",
+      "macos": "case $(weft_arch) in x64) arch=x86_64 ;; arm64) arch=aarch64 ;; esac\ncase $(weft_os) in\n    darwin) target=$arch-apple-darwin ;;\n    linux) target=$arch-unknown-linux-$(weft_libc) ;;\nesac\nfetch \"https://github.com/aaif-goose/goose/releases/download/stable/goose-$target.tar.bz2\" \"$WEFT_NEED_DIR/goose.tar.bz2\"\nextract \"$WEFT_NEED_DIR/goose.tar.bz2\" \"$WEFT_NEED_DIR/bin\"\nrm \"$WEFT_NEED_DIR/goose.tar.bz2\""
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "When it is missing, weft installs goose (its stable release from GitHub) into a folder of its own, shared by every program on the machine. To install it by hand instead: `curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash` (https://goose-docs.ai/docs/getting-started/installation), then check `goose --version` works.",
+    "permissions": [
+      "ask",
+      "smart_approve",
+      "chat",
+      "bypass"
+    ],
+    "logins": {
+      "anthropicKey": {
+        "env": {
+          "key": "ANTHROPIC_API_KEY"
+        }
+      },
+      "openaiKey": {
+        "env": {
+          "key": "OPENAI_API_KEY"
+        }
+      },
+      "googleKey": {
+        "env": {
+          "key": "GOOGLE_API_KEY"
+        }
+      },
+      "openrouterKey": {
+        "env": {
+          "key": "OPENROUTER_API_KEY"
+        }
+      },
+      "openaiCompatible": {
+        "env": {
+          "host": "OPENAI_HOST",
+          "key": "OPENAI_API_KEY"
+        }
+      }
+    },
+    "home": "HOME"
+  },
+  "grok": {
+    "label": "Grok Build",
+    "check": [
+      "grok",
+      "--version"
+    ],
+    "install": {
+      "linux": "case $(weft_arch) in x64) arch=x86_64 ;; arm64) arch=aarch64 ;; esac\nos=$(weft_os)\nif [ \"$os\" = darwin ]; then os=macos; fi\nmkdir -p \"$WEFT_NEED_DIR/bin\" && cd \"$WEFT_NEED_DIR/bin\"\nfetch https://x.ai/cli/stable version\nfetch \"https://x.ai/cli/grok-$(tr -d '[:space:]' < version)-$os-$arch\" grok.part\nrm version && chmod +x grok.part && mv grok.part grok",
+      "macos": "case $(weft_arch) in x64) arch=x86_64 ;; arm64) arch=aarch64 ;; esac\nos=$(weft_os)\nif [ \"$os\" = darwin ]; then os=macos; fi\nmkdir -p \"$WEFT_NEED_DIR/bin\" && cd \"$WEFT_NEED_DIR/bin\"\nfetch https://x.ai/cli/stable version\nfetch \"https://x.ai/cli/grok-$(tr -d '[:space:]' < version)-$os-$arch\" grok.part\nrm version && chmod +x grok.part && mv grok.part grok"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "When it is missing, weft installs Grok Build (its stable release from x.ai) into a folder of its own, shared by every program on the machine. To install it by hand instead: `curl -fsSL https://x.ai/cli/install.sh | bash` (https://docs.x.ai/build/cli/headless-scripting), then check `grok --version` works.",
+    "permissions": [
+      "ask",
+      "auto",
+      "plan",
+      "bypass"
+    ],
+    "logins": {
+      "apiKey": {
+        "env": {
+          "key": "XAI_API_KEY"
+        }
+      }
+    },
+    "home": "HOME"
+  },
+  "hermes": {
+    "label": "Hermes Agent",
+    "check": [
+      "hermes",
+      "acp",
+      "--version"
+    ],
+    "install": {
+      "linux": "# Nous Research's installer, with everything it writes kept in the folder: Hermes' own home (its pinned Python, uv and Node, and the environments a launch under any other HERMES_HOME borrows from) holds the checkout, as in its default layout, and HOME, for the commands it publishes in `~/.local/bin` and the shell files it adds that folder to, is a folder of the agent's own.\nt=\"$WEFT_NEED_DIR/.download\"\nrm -rf \"$t\" && mkdir -p \"$t\"\nfetch https://hermes-agent.nousresearch.com/install.sh \"$t/install.sh\"\nHOME=\"$WEFT_NEED_DIR/home\" bash \"$t/install.sh\" --non-interactive --skip-browser --skip-computer-use \\\n  --hermes-home \"$WEFT_NEED_DIR/hermes\" --dir \"$WEFT_NEED_DIR/hermes/hermes-agent\"\nrm -rf \"$t\" \"$WEFT_NEED_DIR/home/.npm\"\n# `hermes` with no HERMES_HOME of the caller's runs in the home it was installed in: under another, it borrows that one's environments, which a bare `hermes acp --version` does not set up.\nmkdir -p \"$WEFT_NEED_DIR/bin\"\ncat > \"$WEFT_NEED_DIR/bin/hermes\" <<'SH'\n#!/bin/sh\nhere=$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && pwd)\nHERMES_HOME=\"${HERMES_HOME:-$here/hermes}\" exec \"$here/hermes/hermes-agent/.hermes/bin/hermes\" \"$@\"\nSH\nchmod 755 \"$WEFT_NEED_DIR/bin/hermes\"\n",
+      "macos": "# Nous Research's installer, with everything it writes kept in the folder: Hermes' own home (its pinned Python, uv and Node, and the environments a launch under any other HERMES_HOME borrows from) holds the checkout, as in its default layout, and HOME, for the commands it publishes in `~/.local/bin` and the shell files it adds that folder to, is a folder of the agent's own.\nt=\"$WEFT_NEED_DIR/.download\"\nrm -rf \"$t\" && mkdir -p \"$t\"\nfetch https://hermes-agent.nousresearch.com/install.sh \"$t/install.sh\"\nHOME=\"$WEFT_NEED_DIR/home\" bash \"$t/install.sh\" --non-interactive --skip-browser --skip-computer-use \\\n  --hermes-home \"$WEFT_NEED_DIR/hermes\" --dir \"$WEFT_NEED_DIR/hermes/hermes-agent\"\nrm -rf \"$t\" \"$WEFT_NEED_DIR/home/.npm\"\n# `hermes` with no HERMES_HOME of the caller's runs in the home it was installed in: under another, it borrows that one's environments, which a bare `hermes acp --version` does not set up.\nmkdir -p \"$WEFT_NEED_DIR/bin\"\ncat > \"$WEFT_NEED_DIR/bin/hermes\" <<'SH'\n#!/bin/sh\nhere=$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && pwd)\nHERMES_HOME=\"${HERMES_HOME:-$here/hermes}\" exec \"$here/hermes/hermes-agent/.hermes/bin/hermes\" \"$@\"\nSH\nchmod 755 \"$WEFT_NEED_DIR/bin/hermes\"\n"
+    },
+    "bin": [
+      "bin"
+    ],
+    "system": {
+      "apt": [
+        "git",
+        "curl",
+        "libatomic1"
+      ],
+      "dnf": [
+        "git",
+        "curl",
+        "libatomic"
+      ],
+      "apk": [
+        "git",
+        "curl",
+        "libstdc++"
+      ]
+    },
+    "installHint": "If Hermes Agent is missing, weft installs it into a folder of its own that the whole machine shares, with Hermes' own installer pointed there (`install.sh --non-interactive --skip-browser --skip-computer-use`); the installer needs `git` and `curl`, and the Node it fetches needs libatomic on Linux. To install it yourself instead, run `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash` (https://hermes-agent.nousresearch.com/docs/getting-started/installation), then check `hermes acp --check` prints `Hermes ACP check OK`.",
+    "permissions": [
+      "ask",
+      "accept_edits",
+      "auto",
+      "bypass"
+    ],
+    "logins": {
+      "openRouter": {
+        "env": {
+          "key": "OPENROUTER_API_KEY"
+        }
+      },
+      "anthropicKey": {
+        "env": {
+          "key": "ANTHROPIC_API_KEY"
+        }
+      },
+      "openaiKey": {
+        "env": {
+          "key": "OPENAI_API_KEY"
+        }
+      },
+      "geminiKey": {
+        "env": {
+          "key": "GEMINI_API_KEY"
+        }
+      },
+      "openaiCompatible": {
+        "env": {
+          "key": "OPENAI_API_KEY",
+          "baseUrl": "OPENAI_BASE_URL"
+        }
+      }
+    },
+    "home": "HERMES_HOME"
+  },
+  "junie": {
+    "label": "Junie",
+    "check": [
+      "junie",
+      "--version"
+    ],
+    "install": {
+      "linux": "case $(weft_arch) in x64) platform=linux-amd64 ;; arm64) platform=linux-aarch64 ;; esac\ncd \"$WEFT_NEED_DIR\"\nfetch https://raw.githubusercontent.com/jetbrains-junie/junie/main/update-info.jsonl releases.jsonl\nlatest=\"max((e for e in j if e['platform'] == '$platform'), key=lambda e: [int(n) for n in e['version'].split('.')])\"\nfetch \"$(json_get releases.jsonl \"$latest['downloadUrl']\")\" junie.zip\ncheck_sha256 junie.zip \"$(json_get releases.jsonl \"$latest['sha256']\")\"\nrm -rf dist && extract junie.zip dist\nrm junie.zip releases.jsonl\nmkdir -p bin\ncat > bin/junie <<'SH'\n#!/bin/sh\n# What Junie's own launcher (~/.local/bin/junie) sets before it starts Junie.\nexport EJ_RUNNER_PWD=\"${EJ_RUNNER_PWD:-$(pwd)}\"\nexec \"$(dirname \"$0\")/../dist/junie\" \"$@\"\nSH\nchmod +x bin/junie",
+      "macos": "case $(weft_arch) in x64) platform=macos-amd64 ;; arm64) platform=macos-aarch64 ;; esac\ncd \"$WEFT_NEED_DIR\"\nfetch https://raw.githubusercontent.com/jetbrains-junie/junie/main/update-info.jsonl releases.jsonl\nlatest=\"max((e for e in j if e['platform'] == '$platform'), key=lambda e: [int(n) for n in e['version'].split('.')])\"\nfetch \"$(json_get releases.jsonl \"$latest['downloadUrl']\")\" junie.zip\ncheck_sha256 junie.zip \"$(json_get releases.jsonl \"$latest['sha256']\")\"\nrm -rf dist && ditto -x -k junie.zip dist\nrm junie.zip releases.jsonl\nmkdir -p bin\ncat > bin/junie <<'SH'\n#!/bin/sh\n# What Junie's own launcher (~/.local/bin/junie) sets before it starts Junie.\nexport EJ_RUNNER_PWD=\"${EJ_RUNNER_PWD:-$(pwd)}\"\nexec \"$(dirname \"$0\")/../dist/Applications/junie.app/Contents/MacOS/junie\" \"$@\"\nSH\nchmod +x bin/junie"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "When it is missing, weft installs Junie (its release from JetBrains' GitHub) into a folder of its own, shared by every program on the machine. To install it by hand instead: `curl -fsSL https://junie.jetbrains.com/install.sh | bash` (it needs `unzip`; https://junie.jetbrains.com/docs/junie-cli.html), then check `junie --version` works.",
+    "permissions": [
+      "ask",
+      "auto",
+      "plan",
+      "bypass"
+    ],
+    "logins": {
+      "junieToken": {
+        "env": {
+          "token": "JUNIE_API_KEY"
+        }
+      },
+      "anthropicKey": {
+        "env": {
+          "key": "JUNIE_ANTHROPIC_API_KEY"
+        }
+      },
+      "openaiKey": {
+        "env": {
+          "key": "JUNIE_OPENAI_API_KEY"
+        }
+      },
+      "googleKey": {
+        "env": {
+          "key": "JUNIE_GOOGLE_API_KEY"
+        }
+      },
+      "xaiKey": {
+        "env": {
+          "key": "JUNIE_GROK_API_KEY"
+        }
+      },
+      "metaKey": {
+        "env": {
+          "key": "JUNIE_META_API_KEY"
+        }
+      },
+      "openrouterKey": {
+        "env": {
+          "key": "JUNIE_OPENROUTER_API_KEY"
+        }
+      },
+      "litellm": {
+        "env": {
+          "url": "JUNIE_LITELLM_URL",
+          "key": "JUNIE_LITELLM_API_KEY"
+        }
+      }
+    },
+    "home": "JUNIE_HOME"
+  },
+  "kimi": {
+    "label": "Kimi Code",
+    "check": [
+      "kimi-code-sdk",
+      "--version"
+    ],
+    "install": {
+      "linux": "# Kimi Code's SDK is not published: build it, with its engine, from Kimi Code's source at one release, on weft's Node 24.\nTAG=\"@moonshot-ai/kimi-code@2.5.1\"\nD=\"$WEFT_NEED_DIR\"\nnode_bin=$(need_node 24)\nfetch \"https://github.com/MoonshotAI/kimi-code/archive/refs/tags/$TAG.tar.gz\" \"$D/src.tar.gz\"\nextract \"$D/src.tar.gz\" \"$D/src\" 1\nrm \"$D/src.tar.gz\"\n# corepack, pnpm and everything they keep, in this folder.\nexport PATH=\"$node_bin:$PATH\" COREPACK_ENABLE_DOWNLOAD_PROMPT=0 COREPACK_HOME=\"$D/.corepack\" npm_config_cache=\"$D/.npm\" \\\n  XDG_CACHE_HOME=\"$D/.xdg/cache\" XDG_DATA_HOME=\"$D/.xdg/data\" XDG_STATE_HOME=\"$D/.xdg/state\" XDG_CONFIG_HOME=\"$D/.xdg/config\"\ncd \"$D/src\"\ncorepack pnpm install --frozen-lockfile --ignore-scripts --store-dir \"$D/src/.store\" --filter \"@moonshot-ai/kimi-code-sdk...\"\ncd packages/node-sdk\ncat > weft-host.ts <<TS\n// weft's host of Kimi Code's SDK: runs a module's main(sdk, engine, args) on this one build of the SDK and its engine.\n// SYNC: main(sdk, engine, args) <-> catalog/agents/server/kimi_bridge.mjs (main)\nimport { pathToFileURL } from 'node:url';\nimport * as sdk from './src/index.ts';\nimport * as engine from '@moonshot-ai/agent-core-v2';\nconst [what, ...rest] = process.argv.slice(2);\nif (what === '--version') console.log('kimi-code-sdk $TAG');\nelse if (what === undefined) { console.error('usage: kimi-code-sdk <module.mjs> [args...] | --version'); process.exit(2); }\nelse await (await import(pathToFileURL(what).href)).main(sdk, engine, rest);\nTS\ncat > weft-host.config.ts <<TS\nimport { defineConfig } from 'tsdown';\nimport base from './tsdown.config.ts';\nexport default defineConfig({ ...base, entry: ['./weft-host.ts'], outDir: 'weft-host', deps: { alwaysBundle: [/./], neverBundle: [] } });\nTS\ncorepack pnpm exec tsdown --config weft-host.config.ts\nmv weft-host \"$D/host\"\ncd \"$D\" && rm -rf src .corepack .npm .xdg\nmkdir -p bin\nprintf '#!/bin/sh\\nexec \"%s/node\" \"%s/host/weft-host.mjs\" \"$@\"\\n' \"$node_bin\" \"$D\" > bin/kimi-code-sdk\nchmod +x bin/kimi-code-sdk",
+      "macos": "# Kimi Code's SDK is not published: build it, with its engine, from Kimi Code's source at one release, on weft's Node 24.\nTAG=\"@moonshot-ai/kimi-code@2.5.1\"\nD=\"$WEFT_NEED_DIR\"\nnode_bin=$(need_node 24)\nfetch \"https://github.com/MoonshotAI/kimi-code/archive/refs/tags/$TAG.tar.gz\" \"$D/src.tar.gz\"\nextract \"$D/src.tar.gz\" \"$D/src\" 1\nrm \"$D/src.tar.gz\"\n# corepack, pnpm and everything they keep, in this folder.\nexport PATH=\"$node_bin:$PATH\" COREPACK_ENABLE_DOWNLOAD_PROMPT=0 COREPACK_HOME=\"$D/.corepack\" npm_config_cache=\"$D/.npm\" \\\n  XDG_CACHE_HOME=\"$D/.xdg/cache\" XDG_DATA_HOME=\"$D/.xdg/data\" XDG_STATE_HOME=\"$D/.xdg/state\" XDG_CONFIG_HOME=\"$D/.xdg/config\"\ncd \"$D/src\"\ncorepack pnpm install --frozen-lockfile --ignore-scripts --store-dir \"$D/src/.store\" --filter \"@moonshot-ai/kimi-code-sdk...\"\ncd packages/node-sdk\ncat > weft-host.ts <<TS\n// weft's host of Kimi Code's SDK: runs a module's main(sdk, engine, args) on this one build of the SDK and its engine.\n// SYNC: main(sdk, engine, args) <-> catalog/agents/server/kimi_bridge.mjs (main)\nimport { pathToFileURL } from 'node:url';\nimport * as sdk from './src/index.ts';\nimport * as engine from '@moonshot-ai/agent-core-v2';\nconst [what, ...rest] = process.argv.slice(2);\nif (what === '--version') console.log('kimi-code-sdk $TAG');\nelse if (what === undefined) { console.error('usage: kimi-code-sdk <module.mjs> [args...] | --version'); process.exit(2); }\nelse await (await import(pathToFileURL(what).href)).main(sdk, engine, rest);\nTS\ncat > weft-host.config.ts <<TS\nimport { defineConfig } from 'tsdown';\nimport base from './tsdown.config.ts';\nexport default defineConfig({ ...base, entry: ['./weft-host.ts'], outDir: 'weft-host', deps: { alwaysBundle: [/./], neverBundle: [] } });\nTS\ncorepack pnpm exec tsdown --config weft-host.config.ts\nmv weft-host \"$D/host\"\ncd \"$D\" && rm -rf src .corepack .npm .xdg\nmkdir -p bin\nprintf '#!/bin/sh\\nexec \"%s/node\" \"%s/host/weft-host.mjs\" \"$@\"\\n' \"$node_bin\" \"$D\" > bin/kimi-code-sdk\nchmod +x bin/kimi-code-sdk"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "weft runs Kimi Code through its SDK, which Moonshot AI does not publish, so when it is missing weft builds it (from Kimi Code's source at 2.5.1, on a Node.js 24 it keeps beside it) into a folder of its own, shared by every program on the machine. To install it by hand instead: source catalog/agents/server/install_lib.sh in bash and run the script under `kimi.install.linux` (or `.macos`) in weft's catalog/agents/server/agents.json, with `WEFT_NEED_DIR` the folder to build into and `WEFT_NEEDS_ROOT` the folder above it; then put that folder's `bin` on PATH and check `kimi-code-sdk --version` works.",
+    "permissions": [
+      "ask",
+      "plan",
+      "auto",
+      "bypass"
+    ],
+    "logins": {
+      "apiKey": {
+        "env": {
+          "key": "KIMI_API_KEY"
+        }
+      }
+    },
+    "home": "KIMI_CODE_HOME"
+  },
+  "kiro": {
+    "label": "Kiro CLI",
+    "check": [
+      "kiro-cli",
+      "--version"
+    ],
+    "install": {
+      "linux": "case $(weft_arch) in x64) arch=x86_64 min=34 ;; arm64) arch=aarch64 min=39 ;; esac\n# Kiro's own installer takes its musl build on a musl machine and on a glibc\n# older than 2.34 (x86_64) or 2.39 (aarch64).\nsuffix=\nif [ \"$(weft_libc)\" = musl ] || ! python3 -c \"import platform, sys; v = platform.libc_ver()[1].split('.'); sys.exit(not (len(v) > 1 and (int(v[0]), int(v[1])) >= (2, $min)))\"; then\n    suffix=-musl\nfi\nname=kirocli-$arch-linux$suffix.tar.gz\nchannel=https://prod.download.cli.kiro.dev/stable/latest\ncd \"$WEFT_NEED_DIR\"\nfetch \"$channel/manifest.json\" manifest.json\nfetch \"$channel/$name\" kiro.tar.gz\ncheck_sha256 kiro.tar.gz \"$(json_get manifest.json \"next(p['sha256'] for p in j['packages'] if p['download'].endswith('/$name'))\")\"\nrm -rf kirocli && extract kiro.tar.gz .\nrm kiro.tar.gz manifest.json",
+      "macos": "name=kirocli-universal-darwin.tar.gz\nchannel=https://prod.download.cli.kiro.dev/stable/latest\ncd \"$WEFT_NEED_DIR\"\nfetch \"$channel/manifest.json\" manifest.json\nfetch \"$channel/$name\" kiro.tar.gz\ncheck_sha256 kiro.tar.gz \"$(json_get manifest.json \"next(p['sha256'] for p in j['packages'] if p['download'].endswith('/$name'))\")\"\nrm -rf kirocli && extract kiro.tar.gz .\nrm kiro.tar.gz manifest.json"
+    },
+    "bin": [
+      "kirocli/bin"
+    ],
+    "installHint": "When it is missing, weft installs Kiro CLI (its release from prod.download.cli.kiro.dev) into a folder of its own, shared by every program on the machine. To install it by hand instead: `curl -fsSL https://cli.kiro.dev/install | bash` (https://kiro.dev/docs/getting-started/installation/), then check `kiro-cli --version` works.",
+    "permissions": [
+      "ask",
+      "accept_edits",
+      "plan",
+      "bypass"
+    ],
+    "logins": {
+      "apiKey": {
+        "env": {
+          "key": "KIRO_API_KEY"
+        }
+      }
+    },
+    "home": "KIRO_HOME"
+  },
+  "kilo": {
+    "label": "Kilo Code",
+    "check": [
+      "kilo",
+      "--version"
+    ],
+    "install": {
+      "linux": "# Kilo Code CLI's own build for this machine, the one Kilo's installer (kilo.ai/cli/install) picks: the release npm's `latest` names, a `baseline` build on a CPU without AVX2, a `musl` one on a musl Linux.\nfetch https://registry.npmjs.org/-/package/@kilocode%2Fcli/dist-tags \"$WEFT_NEED_DIR/tags.json\"\nversion=$(json_get \"$WEFT_NEED_DIR/tags.json\" \"j['latest']\")\nrm \"$WEFT_NEED_DIR/tags.json\"\ntarget=\"linux-$(weft_arch)\"\n[ \"$(weft_arch)\" = x64 ] && ! grep -qwi avx2 /proc/cpuinfo && target=\"$target-baseline\"\n[ \"$(weft_libc)\" = musl ] && target=\"$target-musl\"\nbase=\"https://github.com/Kilo-Org/kilocode/releases/download/v$version\"\nfetch_summed \"$base/kilo-$target.tar.gz\" \"$base/kilo-cli-SHA256SUMS\" \"$WEFT_NEED_DIR/kilo.tar.gz\"\nextract \"$WEFT_NEED_DIR/kilo.tar.gz\" \"$WEFT_NEED_DIR/bin\"\nrm \"$WEFT_NEED_DIR/kilo.tar.gz\"",
+      "macos": "# Kilo Code CLI's own build for this machine, the one Kilo's installer (kilo.ai/cli/install) picks: the release npm's `latest` names, a `baseline` build on an Intel Mac without AVX2.\nfetch https://registry.npmjs.org/-/package/@kilocode%2Fcli/dist-tags \"$WEFT_NEED_DIR/tags.json\"\nversion=$(json_get \"$WEFT_NEED_DIR/tags.json\" \"j['latest']\")\nrm \"$WEFT_NEED_DIR/tags.json\"\ntarget=\"darwin-$(weft_arch)\"\n[ \"$(weft_arch)\" = x64 ] && [ \"$(sysctl -n hw.optional.avx2_0 2>/dev/null || echo 0)\" != 1 ] && target=\"$target-baseline\"\nbase=\"https://github.com/Kilo-Org/kilocode/releases/download/v$version\"\nfetch_summed \"$base/kilo-$target.zip\" \"$base/kilo-cli-SHA256SUMS\" \"$WEFT_NEED_DIR/kilo.zip\"\nextract \"$WEFT_NEED_DIR/kilo.zip\" \"$WEFT_NEED_DIR/bin\"\nrm \"$WEFT_NEED_DIR/kilo.zip\""
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "When it is missing, weft installs Kilo Code CLI (its release from GitHub, the build Kilo's installer picks) into a folder of its own, shared by every program on the machine. To install it by hand instead: `curl -fsSL https://kilo.ai/cli/install | bash` (https://kilo.ai/docs/cli), then check `kilo --version` works.",
+    "permissions": [
+      "ask",
+      "accept_edits",
+      "plan",
+      "bypass"
+    ],
+    "logins": {
+      "kiloKey": {
+        "env": {
+          "key": "KILO_API_KEY"
+        }
+      },
+      "anthropicKey": {
+        "env": {
+          "key": "ANTHROPIC_API_KEY"
+        }
+      },
+      "openaiKey": {
+        "env": {
+          "key": "OPENAI_API_KEY"
+        }
+      },
+      "openrouterKey": {
+        "env": {
+          "key": "OPENROUTER_API_KEY"
+        }
+      },
+      "googleKey": {
+        "env": {
+          "key": "GEMINI_API_KEY"
+        }
+      }
+    },
+    "home": "HOME"
+  },
+  "minimax": {
+    "label": "MiniMax Code",
+    "check": [
+      "mcode",
+      "--version"
+    ],
+    "install": {
+      "linux": "npm_install 24 @minimax-ai/code --allow-scripts=@minimax-ai/code,better-sqlite3 --registry=https://registry.npmjs.org/",
+      "macos": "npm_install 24 @minimax-ai/code --allow-scripts=@minimax-ai/code,better-sqlite3 --registry=https://registry.npmjs.org/"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "When it is missing, weft installs MiniMax Code (the npm package `@minimax-ai/code`, on a Node.js 24 it keeps beside it) into a folder of its own, shared by every program on the machine. To install it by hand instead: `npm install -g @minimax-ai/code --allow-scripts=@minimax-ai/code,better-sqlite3 --registry=https://registry.npmjs.org/` (Node 22.19+ or 24 to 26; https://github.com/MiniMax-AI/minimax-code), then check `mcode --version` works.",
+    "permissions": [
+      "ask",
+      "auto",
+      "plan",
+      "bypass"
+    ],
+    "logins": {
+      "apiKey": {
+        "env": {},
+        "protocol": [
+          "key"
+        ]
+      },
+      "customProvider": {
+        "env": {},
+        "protocol": [
+          "baseUrl",
+          "apiFormat",
+          "model",
+          "key"
+        ]
+      }
+    },
+    "home": "MINIMAX_DATA_DIR"
+  },
+  "muse": {
+    "label": "Muse Code",
+    "check": [
+      "muse",
+      "--version"
+    ],
+    "install": {
+      "linux": "# Meta's installer, pointed at the folder: it puts its launcher (`muse`, which keeps its build up to date beside itself) in MUSE_INSTALL_DIR, and touches no shell file under MUSE_NO_MODIFY_PATH.\nt=\"$WEFT_NEED_DIR/.download\"\nrm -rf \"$t\" && mkdir -p \"$t\"\nfetch https://dev.meta.ai/install.sh \"$t/install.sh\"\nMUSE_INSTALL_DIR=\"$WEFT_NEED_DIR/bin\" MUSE_NO_MODIFY_PATH=1 MUSE_LOGIN=0 bash \"$t/install.sh\"\nrm -rf \"$t\"\n",
+      "macos": "# Meta's installer, pointed at the folder: it puts its launcher (`muse`, which keeps its build up to date beside itself) in MUSE_INSTALL_DIR, and touches no shell file under MUSE_NO_MODIFY_PATH.\nt=\"$WEFT_NEED_DIR/.download\"\nrm -rf \"$t\" && mkdir -p \"$t\"\nfetch https://dev.meta.ai/install.sh \"$t/install.sh\"\nMUSE_INSTALL_DIR=\"$WEFT_NEED_DIR/bin\" MUSE_NO_MODIFY_PATH=1 MUSE_LOGIN=0 bash \"$t/install.sh\"\nrm -rf \"$t\"\n"
+    },
+    "bin": [
+      "bin"
+    ],
+    "system": {
+      "apt": [
+        "curl"
+      ],
+      "dnf": [
+        "curl"
+      ],
+      "apk": [
+        "curl"
+      ]
+    },
+    "installHint": "If Muse Code is missing, weft installs it into a folder of its own that the whole machine shares, with Meta's installer pointed there (`MUSE_INSTALL_DIR`); it needs `curl`, which Muse also uses to keep itself up to date. To install it yourself instead, run `curl -fsSL https://dev.meta.ai/install.sh | bash` (https://dev.meta.ai/docs/muse-code/), then check `muse --version` works.",
+    "permissions": [
+      "ask",
+      "on_request",
+      "auto_review",
+      "read_only",
+      "deny_unmatched",
+      "bypass"
+    ],
+    "logins": {
+      "apiKey": {
+        "env": {
+          "key": "META_API_KEY"
+        }
+      }
+    }
+  },
+  "nanobot": {
+    "label": "nanobot",
+    "check": [
+      "nanobot",
+      "--version"
+    ],
+    "install": {
+      "linux": "# nanobot-ai from PyPI, as a uv tool in the folder, on a Python uv downloads into it.\nweft_uv tool install nanobot-ai\nrm -rf \"$WEFT_NEED_DIR/.uv-cache\"\n",
+      "macos": "# nanobot-ai from PyPI, as a uv tool in the folder, on a Python uv downloads into it.\nweft_uv tool install nanobot-ai\nrm -rf \"$WEFT_NEED_DIR/.uv-cache\"\n"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "If nanobot is missing, weft installs it into a folder of its own that the whole machine shares (`uv tool install nanobot-ai`, with the uv and the Python it runs on kept there too). To install it yourself instead, run `uv tool install nanobot-ai` (or `pipx install nanobot-ai`; https://github.com/HKUDS/nanobot), then check `nanobot --version` works.",
+    "permissions": [
+      "restricted",
+      "sandboxed",
+      "no_shell",
+      "full"
+    ],
+    "logins": {
+      "anthropicKey": {
+        "env": {
+          "key": "ANTHROPIC_API_KEY"
+        }
+      },
+      "openaiKey": {
+        "env": {
+          "key": "OPENAI_API_KEY"
+        }
+      },
+      "openrouterKey": {
+        "env": {
+          "key": "OPENROUTER_API_KEY"
+        }
+      },
+      "googleKey": {
+        "env": {
+          "key": "GEMINI_API_KEY"
+        }
+      },
+      "deepseekKey": {
+        "env": {
+          "key": "DEEPSEEK_API_KEY"
+        }
+      },
+      "mistralKey": {
+        "env": {
+          "key": "MISTRAL_API_KEY"
+        }
+      },
+      "openaiCompatible": {
+        "env": {
+          "host": "OPENAI_COMPATIBLE_BASE_URL",
+          "key": "OPENAI_COMPATIBLE_API_KEY"
+        }
+      }
+    },
+    "home": "HOME"
+  },
+  "pi": {
+    "label": "Pi",
+    "check": [
+      "pi",
+      "--version"
+    ],
+    "install": {
+      "linux": "npm_install 24 --ignore-scripts @earendil-works/pi-coding-agent\n# npm's download cache, which nothing reads once the install is done.\nrm -rf \"$WEFT_NEED_DIR/.npm\"\n# ripgrep and fd, which Pi otherwise downloads into each home it runs in on its first search: the builds it picks, put on its PATH.\narch=$(weft_arch)\narch=${arch/x64/x86_64}\narch=${arch/arm64/aarch64}\nif [ \"$(weft_os)\" = linux ]; then target=\"$arch-unknown-linux-musl\"; else target=\"$arch-apple-darwin\"; fi\nt=\"$WEFT_NEED_DIR/.download\"\nrm -rf \"$t\" && mkdir -p \"$t\"\nrg=$(github_latest BurntSushi/ripgrep) fd=$(github_latest sharkdp/fd)\nurl=\"https://github.com/BurntSushi/ripgrep/releases/download/$rg/ripgrep-$rg-$target.tar.gz\"\nfetch_summed \"$url\" \"$url.sha256\" \"$t/rg.tar.gz\"\nfetch \"https://github.com/sharkdp/fd/releases/download/$fd/fd-$fd-$target.tar.gz\" \"$t/fd.tar.gz\"\nextract \"$t/rg.tar.gz\" \"$t/rg\" 1\nextract \"$t/fd.tar.gz\" \"$t/fd\" 1\nmv \"$t/rg/rg\" \"$t/fd/fd\" \"$WEFT_NEED_DIR/bin/\"\nrm -rf \"$t\"\n",
+      "macos": "npm_install 24 --ignore-scripts @earendil-works/pi-coding-agent\n# npm's download cache, which nothing reads once the install is done.\nrm -rf \"$WEFT_NEED_DIR/.npm\"\n# ripgrep and fd, which Pi otherwise downloads into each home it runs in on its first search: the builds it picks, put on its PATH.\narch=$(weft_arch)\narch=${arch/x64/x86_64}\narch=${arch/arm64/aarch64}\nif [ \"$(weft_os)\" = linux ]; then target=\"$arch-unknown-linux-musl\"; else target=\"$arch-apple-darwin\"; fi\nt=\"$WEFT_NEED_DIR/.download\"\nrm -rf \"$t\" && mkdir -p \"$t\"\nrg=$(github_latest BurntSushi/ripgrep) fd=$(github_latest sharkdp/fd)\nurl=\"https://github.com/BurntSushi/ripgrep/releases/download/$rg/ripgrep-$rg-$target.tar.gz\"\nfetch_summed \"$url\" \"$url.sha256\" \"$t/rg.tar.gz\"\nfetch \"https://github.com/sharkdp/fd/releases/download/$fd/fd-$fd-$target.tar.gz\" \"$t/fd.tar.gz\"\nextract \"$t/rg.tar.gz\" \"$t/rg\" 1\nextract \"$t/fd.tar.gz\" \"$t/fd\" 1\nmv \"$t/rg/rg\" \"$t/fd/fd\" \"$WEFT_NEED_DIR/bin/\"\nrm -rf \"$t\"\n"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "If Pi is missing, weft installs it into a folder of its own that the whole machine shares (`npm install -g --ignore-scripts @earendil-works/pi-coding-agent`, on a Node 24 weft keeps there too, with ripgrep and fd beside it). To install it yourself instead, run `npm install -g --ignore-scripts @earendil-works/pi-coding-agent` (Node 22.19 or newer; https://pi.dev), then check `pi --version` works.",
+    "permissions": [
+      "ask",
+      "accept_edits",
+      "read_only",
+      "bypass"
+    ],
+    "logins": {
+      "anthropicKey": {
+        "env": {
+          "key": "ANTHROPIC_API_KEY"
+        }
+      },
+      "openaiKey": {
+        "env": {
+          "key": "OPENAI_API_KEY"
+        }
+      },
+      "googleKey": {
+        "env": {
+          "key": "GEMINI_API_KEY"
+        }
+      },
+      "openrouterKey": {
+        "env": {
+          "key": "OPENROUTER_API_KEY"
+        }
+      },
+      "deepseekKey": {
+        "env": {
+          "key": "DEEPSEEK_API_KEY"
+        }
+      },
+      "mistralKey": {
+        "env": {
+          "key": "MISTRAL_API_KEY"
+        }
+      },
+      "xaiKey": {
+        "env": {
+          "key": "XAI_API_KEY"
+        }
+      },
+      "groqKey": {
+        "env": {
+          "key": "GROQ_API_KEY"
+        }
+      },
+      "openaiCompatible": {
+        "env": {
+          "key": "OPENAI_COMPATIBLE_API_KEY"
+        },
+        "protocol": [
+          "host"
+        ]
+      }
+    },
+    "home": "PI_CODING_AGENT_DIR"
+  },
+  "openclaw": {
+    "label": "OpenClaw",
+    "check": [
+      "openclaw",
+      "--version"
+    ],
+    "install": {
+      "linux": "npm_install 24 openclaw --allow-scripts=openclaw\n",
+      "macos": "npm_install 24 openclaw --allow-scripts=openclaw\n"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "If OpenClaw is missing, weft installs it into a folder of its own that the whole machine shares (`npm install -g openclaw --allow-scripts=openclaw`, on a Node 24 weft keeps there too). To install it yourself instead, run `npm install -g openclaw@latest --allow-scripts=openclaw` (Node 24.16 or newer, and npm 11.16 or newer for `--allow-scripts`; https://docs.openclaw.ai/install), then check `openclaw --version` works.",
+    "permissions": [
+      "ask",
+      "auto",
+      "read_only",
+      "bypass"
+    ],
+    "logins": {
+      "anthropicKey": {
+        "env": {
+          "key": "ANTHROPIC_API_KEY"
+        }
+      },
+      "openaiKey": {
+        "env": {
+          "key": "OPENAI_API_KEY"
+        }
+      },
+      "geminiKey": {
+        "env": {
+          "key": "GEMINI_API_KEY"
+        }
+      },
+      "openRouter": {
+        "env": {
+          "key": "OPENROUTER_API_KEY"
+        }
+      },
+      "openaiCompatible": {
+        "env": {
+          "key": "OPENAI_API_KEY"
+        },
+        "protocol": [
+          "baseUrl"
+        ]
+      }
+    },
+    "home": "OPENCLAW_HOME"
+  },
+  "opencode": {
+    "label": "OpenCode",
+    "check": [
+      "opencode",
+      "--version"
+    ],
+    "install": {
+      "linux": "# OpenCode's own build for this machine, as its installer (opencode.ai/v2/install) picks it: the npm package @opencode/cli-<os>-<arch>[-baseline][-musl] holds one program.\nos=$(weft_os) arch=$(weft_arch)\n[ \"$os\" = darwin ] && [ \"$arch\" = x64 ] && [ \"$(sysctl -n sysctl.proc_translated 2>/dev/null)\" = 1 ] && arch=arm64\ntarget=\"$os-$arch\"\nif [ \"$arch\" = x64 ]; then\n  if [ \"$os\" = linux ]; then grep -qwi avx2 /proc/cpuinfo || target=\"$target-baseline\"\n  else [ \"$(sysctl -n hw.optional.avx2_0 2>/dev/null)\" = 1 ] || target=\"$target-baseline\"; fi\nfi\n[ \"$os\" = linux ] && [ \"$(weft_libc)\" = musl ] && target=\"$target-musl\"\nt=\"$WEFT_NEED_DIR/.download\"\nrm -rf \"$t\" && mkdir -p \"$t\"\nfetch https://opencode.ai/update/api/latest/cli/npm \"$t/latest.json\"\nversion=$(json_get \"$t/latest.json\" 'j[\"version\"]') package=$(json_get \"$t/latest.json\" 'j[\"metadata\"][\"package\"]')\nfetch \"https://registry.npmjs.org/$package-$target/-/cli-$target-$version.tgz\" \"$t/opencode.tgz\"\nextract \"$t/opencode.tgz\" \"$WEFT_NEED_DIR\" 1\nrm -rf \"$t\"\n",
+      "macos": "# OpenCode's own build for this machine, as its installer (opencode.ai/v2/install) picks it: the npm package @opencode/cli-<os>-<arch>[-baseline][-musl] holds one program.\nos=$(weft_os) arch=$(weft_arch)\n[ \"$os\" = darwin ] && [ \"$arch\" = x64 ] && [ \"$(sysctl -n sysctl.proc_translated 2>/dev/null)\" = 1 ] && arch=arm64\ntarget=\"$os-$arch\"\nif [ \"$arch\" = x64 ]; then\n  if [ \"$os\" = linux ]; then grep -qwi avx2 /proc/cpuinfo || target=\"$target-baseline\"\n  else [ \"$(sysctl -n hw.optional.avx2_0 2>/dev/null)\" = 1 ] || target=\"$target-baseline\"; fi\nfi\n[ \"$os\" = linux ] && [ \"$(weft_libc)\" = musl ] && target=\"$target-musl\"\nt=\"$WEFT_NEED_DIR/.download\"\nrm -rf \"$t\" && mkdir -p \"$t\"\nfetch https://opencode.ai/update/api/latest/cli/npm \"$t/latest.json\"\nversion=$(json_get \"$t/latest.json\" 'j[\"version\"]') package=$(json_get \"$t/latest.json\" 'j[\"metadata\"][\"package\"]')\nfetch \"https://registry.npmjs.org/$package-$target/-/cli-$target-$version.tgz\" \"$t/opencode.tgz\"\nextract \"$t/opencode.tgz\" \"$WEFT_NEED_DIR\" 1\nrm -rf \"$t\"\n"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "If OpenCode is missing, weft installs it into a folder of its own that the whole machine shares: the build for this machine that OpenCode's installer would pick, from the npm registry. To install it yourself instead, run `curl -fsSL https://opencode.ai/v2/install | bash` (https://opencode.ai/v2/docs/), then check `opencode --version` prints `opencode v2`.",
+    "permissions": [
+      "ask",
+      "accept_edits",
+      "plan",
+      "bypass"
+    ],
+    "logins": {
+      "anthropicKey": {
+        "env": {
+          "key": "ANTHROPIC_API_KEY"
+        }
+      },
+      "openaiKey": {
+        "env": {
+          "key": "OPENAI_API_KEY"
+        }
+      },
+      "openrouterKey": {
+        "env": {
+          "key": "OPENROUTER_API_KEY"
+        }
+      },
+      "googleKey": {
+        "env": {
+          "key": "GEMINI_API_KEY"
+        }
+      },
+      "opencodeKey": {
+        "env": {
+          "key": "OPENCODE_API_KEY"
+        }
+      }
+    },
+    "home": "HOME"
+  },
+  "qwen": {
+    "label": "Qwen Code",
+    "check": [
+      "qwen",
+      "--version"
+    ],
+    "install": {
+      "linux": "# Qwen Code's standalone build (its own Node inside), from its GitHub release, checked against the release's SHA256SUMS.\nos=$(weft_os) arch=$(weft_arch)\nif [ \"$os\" = linux ] && [ \"$(weft_libc)\" = musl ]; then\n  echo \"Qwen Code's standalone build needs glibc, and this Linux runs musl\" >&2\n  exit 1\nfi\nname=\"qwen-code-$os-$arch.tar.gz\" base=https://github.com/QwenLM/qwen-code/releases/latest/download\nt=\"$WEFT_NEED_DIR/.download\"\nrm -rf \"$t\" && mkdir -p \"$t\"\nfetch \"$base/$name\" \"$t/$name\"\nfetch \"$base/SHA256SUMS\" \"$t/SHA256SUMS\"\ncheck_sha256 \"$t/$name\" \"$(awk -v n=\"$name\" '$2 == n { print $1 }' \"$t/SHA256SUMS\")\"\nextract \"$t/$name\" \"$WEFT_NEED_DIR\" 1\nrm -rf \"$t\"\n",
+      "macos": "# Qwen Code's standalone build (its own Node inside), from its GitHub release, checked against the release's SHA256SUMS.\nos=$(weft_os) arch=$(weft_arch)\nif [ \"$os\" = linux ] && [ \"$(weft_libc)\" = musl ]; then\n  echo \"Qwen Code's standalone build needs glibc, and this Linux runs musl\" >&2\n  exit 1\nfi\nname=\"qwen-code-$os-$arch.tar.gz\" base=https://github.com/QwenLM/qwen-code/releases/latest/download\nt=\"$WEFT_NEED_DIR/.download\"\nrm -rf \"$t\" && mkdir -p \"$t\"\nfetch \"$base/$name\" \"$t/$name\"\nfetch \"$base/SHA256SUMS\" \"$t/SHA256SUMS\"\ncheck_sha256 \"$t/$name\" \"$(awk -v n=\"$name\" '$2 == n { print $1 }' \"$t/SHA256SUMS\")\"\nextract \"$t/$name\" \"$WEFT_NEED_DIR\" 1\nrm -rf \"$t\"\n"
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "If Qwen Code is missing, weft installs it into a folder of its own that the whole machine shares: its standalone build, which carries its own Node, from its GitHub release. To install it yourself instead, run `curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash` (or `npm install -g @qwen-code/qwen-code` with Node 22 or newer; https://github.com/QwenLM/qwen-code), then check `qwen --version` works.",
+    "permissions": [
+      "ask",
+      "accept_edits",
+      "auto",
+      "plan",
+      "bypass"
+    ],
+    "logins": {
+      "apiKey": {
+        "env": {
+          "key": "OPENAI_API_KEY",
+          "baseUrl": "OPENAI_BASE_URL"
+        }
+      },
+      "anthropicKey": {
+        "env": {
+          "key": "ANTHROPIC_API_KEY"
+        }
+      }
+    },
+    "home": "QWEN_HOME"
+  },
+  "vibe": {
+    "label": "Mistral Vibe",
+    "check": [
+      "vibe-app-server",
+      "--help"
+    ],
+    "install": {
+      "linux": "# Mistral Vibe as Mistral's installer (mistral.ai/vibe/install.sh) puts it: `mistral-vibe` from PyPI as a uv tool, on CPython 3.14, here with uv, its Python and its programs all in this folder.\nweft_uv tool install --python cpython-3.14 mistral-vibe\nrm -rf \"$WEFT_NEED_DIR/.uv-cache\"",
+      "macos": "# Mistral Vibe as Mistral's installer (mistral.ai/vibe/install.sh) puts it: `mistral-vibe` from PyPI as a uv tool, on CPython 3.14, here with uv, its Python and its programs all in this folder.\nweft_uv tool install --python cpython-3.14 mistral-vibe\nrm -rf \"$WEFT_NEED_DIR/.uv-cache\""
+    },
+    "bin": [
+      "bin"
+    ],
+    "installHint": "When it is missing, weft installs Mistral Vibe (`mistral-vibe` from PyPI, as a uv tool on a CPython 3.14 it keeps beside it) into a folder of its own, shared by every program on the machine. To install it by hand instead: `curl -LsSf https://mistral.ai/vibe/install.sh | bash` (https://docs.mistral.ai/getting-started/quickstarts/vibe-code/install-cli), then check `vibe-app-server --help` works.",
+    "permissions": [
+      "ask",
+      "accept_edits",
+      "bypass"
+    ],
+    "logins": {
+      "apiKey": {
+        "env": {
+          "key": "MISTRAL_API_KEY"
+        }
+      }
+    },
+    "home": "VIBE_HOME"
+  }
+}

@@ -17,11 +17,22 @@
     "doors": ["shared", "own"],
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "key",
-          "label": "API key",
-          "placeholder": "sk_..."
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk_..."
+            }
+          ],
+          "guide": {
+            "link": "https://elevenlabs.io/app/settings/api-keys",
+            "steps": [
+              "Open elevenlabs.io, Settings > API Keys, and create an API key.",
+              "Paste it below and name the connection."
+            ]
+          }
         }
       ]
     },
@@ -92,15 +103,6 @@
     "verification": {
       "rung": "reports_validity",
       "cost": "free"
-    },
-    "ownPage": {
-      "guide": {
-        "link": "https://elevenlabs.io/app/settings/api-keys",
-        "steps": [
-          "Open elevenlabs.io, Settings > API Keys, and create an API key.",
-          "Paste it below and name the connection."
-        ]
-      }
     }
   },
   "inputs": [

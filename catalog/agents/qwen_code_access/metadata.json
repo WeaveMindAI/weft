@@ -1,0 +1,85 @@
+{
+  "type": "QwenCodeAccess",
+  "label": "Qwen Code Access",
+  "description": "A Qwen Code login, for the QwenCode nodes' `access`: a key for any OpenAI-compatible API (Alibaba Cloud Model Studio, pay as you go) or an Anthropic key. One access for however many QwenCode nodes. A Coding Plan key is not offered: Alibaba's terms forbid using it for automated scripts and workflow platforms. On your machine, leave `access` out to use your own login.",
+  "tags": [
+    "agent",
+    "qwen",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#615ced",
+  "service": {
+    "service": "qwen_code",
+    "label": "Qwen Code",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "apiKey",
+          "label": "OpenAI-compatible key",
+          "fields": [
+            {
+              "name": "baseUrl",
+              "label": "Base URL",
+              "secret": false,
+              "placeholder": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+            },
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-..."
+            }
+          ],
+          "guide": {
+            "link": "https://qwenlm.github.io/qwen-code-docs/en/users/configuration/auth/",
+            "steps": [
+              "Create a pay-as-you-go key in Alibaba Cloud Model Studio, or with any provider that speaks the OpenAI API.",
+              "Fill in the provider's base URL (Model Studio's console shows it) and paste the key, then name the connection."
+            ]
+          }
+        },
+        {
+          "id": "anthropicKey",
+          "label": "Anthropic API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-ant-..."
+            }
+          ],
+          "guide": {
+            "link": "https://console.anthropic.com/settings/keys",
+            "steps": [
+              "Open console.anthropic.com, Settings > API Keys, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[qwen_code]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[qwen_code]",
+      "description": "Wire into the QwenCode nodes' `access` input."
+    }
+  ]
+}

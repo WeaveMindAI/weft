@@ -16,7 +16,8 @@
 //! - **stop**: stop each unit per its `on_stop` (Stop), or leave it
 //!   running (KeepRunning); disks are kept.
 //! - **terminate**: remove everything the copy runs and owns, keeping
-//!   the disks the spec listed; remove the `infra_node` row.
+//!   the disks the spec listed, and what it put inside another node's
+//!   endpoint (`inside`); remove the `infra_node` row.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,7 +30,7 @@ use weft_broker_client::protocol::SupervisorClaim;
 use weft_core::infra::{self, InfraSpec, NodeRef, ResolvedNode, TerminateDisks};
 use weft_platform_traits::UnitRunState;
 
-use crate::SupervisorState;
+use crate::{inside, SupervisorState};
 
 /// Resolve the spec's units into the per-unit runtime map stamped on
 /// the infra_node row. Windows + stop_behavior always come from the
@@ -568,6 +569,35 @@ async fn wait_for_readiness(
     }
 }
 
+/// Ask each node that copy `n` lives inside to remove it
+/// ([`inside::removals`]), saying on the row which one it waits on: the
+/// other node stops what runs there and deletes its files, which can
+/// take a while. A refusal fails the terminate naming that node, with the
+/// row left `Terminating`, so the next terminate (or apply) asks again.
+async fn remove_inside(
+    state: &SupervisorState,
+    command_id: i64,
+    project_id: Uuid,
+    n: &weft_broker_client::protocol::SupervisorInfraNode,
+    removals: &[inside::Removal],
+) -> Result<()> {
+    let name = weft_core::project::plain_id(&n.node_id);
+    for removal in removals {
+        let host = weft_core::project::plain_id(removal.host.place());
+        let waiting = format!("asking '{host}' to remove what '{name}' put inside it at {}", removal.path);
+        record_waiting(state, command_id, project_id, &n.node_id, n.instance.as_ref(), &n.copy_id, &waiting).await;
+        state.inside.remove(&removal.url).await.map_err(|e| {
+            anyhow!(
+                "'{name}' lives inside '{host}' (endpoint '{}' at {}), and asking '{host}' to remove it failed: {e:#}. \
+                 Terminate '{name}' again once that is fixed, or terminate '{host}', which removes everything inside it",
+                removal.endpoint,
+                removal.path
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Record on the copy's row what the command `command_id` waits on, for
 /// `weft status`; true once the broker answered. A copy the command no
 /// longer reaches, or a project another supervisor took, is the command's
@@ -766,6 +796,32 @@ async fn execute(
                         }
                     }
                 }
+                // A node with no unit of its own (only endpoints inside
+                // another node's) has nothing for the host to stop: its
+                // stop is the row's, node-wide, so it reads stopped and
+                // its endpoints stop resolving.
+                if n.units.is_empty() {
+                    let outcome = state
+                        .broker
+                        .set_status(
+                            &state.replica,
+                            cmd.id,
+                            cmd.project_id,
+                            &n.node_id,
+                            n.instance.as_ref(),
+                            None,
+                            weft_broker_client::protocol::InfraNodeStatus::Stopped,
+                            None,
+                            None,
+                        )
+                        .await?;
+                    match outcome {
+                        weft_broker_client::WriteOutcome::Applied(_) => any_stopped = true,
+                        // As for a unit's stamp: the new owner runs it again.
+                        weft_broker_client::WriteOutcome::Displaced => return Ok(()),
+                        weft_broker_client::WriteOutcome::Gone => {}
+                    }
+                }
                 // One Stopped event per node that actually stopped a unit
                 // (the event rail is node-scoped; the per-unit detail
                 // lives in the row's units map).
@@ -783,7 +839,10 @@ async fn execute(
             }
         }
         InfraLifecycleVerb::Terminate => {
-            for n in &targets {
+            // The copies taken down so far, for a node living inside one
+            // of them (`inside::removals`).
+            let mut taken_down: Vec<inside::TakenDown> = Vec::new();
+            for n in inside::terminate_order(&targets) {
                 // Interruptible between nodes: already-terminated nodes
                 // are gone; remaining nodes keep their rows (visible
                 // partial state the user acts on per node).
@@ -806,6 +865,10 @@ async fn execute(
                 // means the row vanished under us (a project removal in
                 // flight): the removal below still runs.
                 check_cancel(cancel, "terminating infra nodes")?;
+                // What it put inside another node, worked out before
+                // anything is touched: another node it cannot reach fails
+                // the terminate here, with the row as it was.
+                let removals = inside::removals(n, &nodes, &taken_down).map_err(|why| anyhow!(why))?;
                 match state
                     .broker
                     .set_status(
@@ -838,6 +901,7 @@ async fn execute(
                         "set_status(terminating): row gone; removing the copy anyway"
                     ),
                 }
+                remove_inside(state, cmd.id, cmd.project_id, n, &removals).await?;
                 // The disks the node lists were carried on the row at
                 // apply time (from `InfraSpec.keep_on_terminate`): the
                 // supervisor has no spec at terminate time, but it has the
@@ -872,6 +936,7 @@ async fn execute(
                         weft_broker_client::protocol::InfraEvent::Terminated,
                     )
                     .await?;
+                taken_down.push(inside::TakenDown { node_id: n.node_id.clone(), instance: n.instance.clone(), kept_disks: !keep.is_empty() });
             }
             for copy in &rowless {
                 check_cancel(cancel, "deleting the disks of infra copies already down")?;
@@ -922,12 +987,10 @@ async fn execute_apply(
         state.broker.project_image_tags(cmd.project_id, node_id).await?.into_iter().collect();
 
     // Read the prior infra_node row. Drives skip / fresh / replace.
-    let prior = state
-        .broker
-        .infra_nodes(cmd.project_id)
-        .await?
-        .into_iter()
-        .find(|n| n.node_id == node_id && n.instance.as_ref() == instance);
+    // Every row of the project, kept for a prior terminate to finish
+    // (`inside::removals` reads the nodes this one lives inside).
+    let nodes = state.broker.infra_nodes(cmd.project_id).await?;
+    let prior = nodes.iter().find(|n| n.node_id == node_id && n.instance.as_ref() == instance).cloned();
 
     // The copy's id is derived from what it is a copy of, so it is the
     // same on every apply, a Fresh one after a terminate included: that
@@ -964,7 +1027,10 @@ async fn execute_apply(
     // The host already runs what we want; no host call. The row keeps
     // its copy id, hash, endpoints.
     let hash_matches = prior.as_ref().and_then(|p| p.applied_spec_hash.as_deref()) == Some(applied_spec_hash.as_str());
-    if matches!(mode, ApplyMode::ReplaceOrSkip) && reconcile.is_empty() && hash_matches {
+    // A node with no unit (only endpoints inside another node's) is up
+    // when its row is: one a stop left stopped is applied again.
+    let units_up = !spec.units.is_empty() || prior.as_ref().is_some_and(|p| p.status.expects_running_units());
+    if matches!(mode, ApplyMode::ReplaceOrSkip) && reconcile.is_empty() && hash_matches && units_up {
         // Re-fire `started` so the dispatcher's SSE bus wakes any
         // subscribers waiting on this command. Nothing else changed.
         state
@@ -997,6 +1063,10 @@ async fn execute_apply(
     // apply for the owner), and Gone means the row or the command
     // vanished under a running apply, which fails loud.
     if let (ApplyMode::Fresh, Some(p)) = (&mode, prior.as_ref()) {
+        // What the prior copy put inside another node goes too, or the
+        // fresh copy would find its old server there, its conversation
+        // and all; one it cannot reach fails the apply before anything.
+        let removals = inside::removals(p, &nodes, &[]).map_err(|why| anyhow!(why))?;
         match state
             .broker
             .set_status(
@@ -1029,6 +1099,7 @@ async fn execute_apply(
                 ));
             }
         }
+        remove_inside(state, cmd.id, cmd.project_id, p, &removals).await?;
         state.host.terminate(&node_ref(&project, node_id, &p.copy_id), &p.keep_disks).await?;
     }
 
@@ -1214,8 +1285,17 @@ async fn endpoint_addresses(
 ) -> Result<weft_broker_client::protocol::AppliedEndpoints> {
     let mut out = weft_broker_client::protocol::AppliedEndpoints::default();
     for ep in &resolved.spec.endpoints {
+        // Inside another node's endpoint: kept as that endpoint and the
+        // path, followed at every lookup, since the other node's address
+        // moves whenever it is made again (`infra::EndpointRecord`).
+        // Resolve refused any expose but the project's.
+        if let infra::EndpointTarget::Within { infra: within, path } = &ep.target {
+            let record = infra::WithinRecord { within: within.clone(), path: path.clone() };
+            out.urls.insert(ep.name.clone(), infra::EndpointRecord::Within(record));
+            continue;
+        }
         let at = state.host.endpoint(resolved, &ep.name).await?;
-        out.urls.insert(ep.name.clone(), at.url);
+        out.urls.insert(ep.name.clone(), infra::EndpointRecord::Url(at.url));
         match &ep.expose {
             infra::Expose::Project => {}
             infra::Expose::Public { path } => {

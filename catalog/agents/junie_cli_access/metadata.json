@@ -1,0 +1,201 @@
+{
+  "type": "JunieCliAccess",
+  "label": "Junie CLI Access",
+  "description": "A Junie login, for the JunieCli nodes' `access`: a Junie token, a model provider's key (Anthropic, OpenAI, Google, xAI, Meta, OpenRouter) or a LiteLLM proxy. Every way is offered on a local install only: JetBrains' terms forbid providing Junie, or access to it, to anyone else. One access for however many JunieCli nodes.",
+  "tags": [
+    "agent",
+    "junie",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#000000",
+  "service": {
+    "service": "junie_cli",
+    "label": "Junie CLI",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "junieToken",
+          "label": "Junie token",
+          "localOnly": true,
+          "fields": [
+            {
+              "name": "token",
+              "label": "Junie token",
+              "placeholder": "perm-..."
+            }
+          ],
+          "guide": {
+            "link": "https://junie.jetbrains.com/docs/junie-headless.html",
+            "steps": [
+              "Sign in at junie.jetbrains.com/cli and generate a token.",
+              "Paste it below and name the connection."
+            ]
+          }
+        },
+        {
+          "id": "anthropicKey",
+          "label": "Anthropic API key",
+          "localOnly": true,
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-ant-..."
+            }
+          ],
+          "guide": {
+            "link": "https://console.anthropic.com/settings/keys",
+            "steps": [
+              "Open console.anthropic.com, Settings > API Keys, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "openaiKey",
+          "label": "OpenAI API key",
+          "localOnly": true,
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-..."
+            }
+          ],
+          "guide": {
+            "link": "https://platform.openai.com/api-keys",
+            "steps": [
+              "Open platform.openai.com, API keys, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "googleKey",
+          "label": "Gemini API key",
+          "localOnly": true,
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "AIza..."
+            }
+          ],
+          "guide": {
+            "link": "https://aistudio.google.com/apikey",
+            "steps": [
+              "Open aistudio.google.com, Get API key, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "xaiKey",
+          "label": "xAI API key",
+          "localOnly": true,
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "xai-..."
+            }
+          ],
+          "guide": {
+            "link": "https://console.x.ai",
+            "steps": [
+              "Open console.x.ai and create an API key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "metaKey",
+          "label": "Meta API key",
+          "localOnly": true,
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "LLM_..."
+            }
+          ],
+          "guide": {
+            "link": "https://dev.meta.ai/docs/authentication",
+            "steps": [
+              "Open the Meta Model API dashboard, API keys, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "openrouterKey",
+          "label": "OpenRouter API key",
+          "localOnly": true,
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-or-..."
+            }
+          ],
+          "guide": {
+            "link": "https://openrouter.ai/keys",
+            "steps": [
+              "Open openrouter.ai, Keys, and create a key.",
+              "Paste it below and name the connection. Calls are billed to that account."
+            ]
+          }
+        },
+        {
+          "id": "litellm",
+          "label": "LiteLLM proxy",
+          "localOnly": true,
+          "fields": [
+            {
+              "name": "url",
+              "label": "LiteLLM proxy URL",
+              "secret": false,
+              "placeholder": "http://localhost:4000"
+            },
+            {
+              "name": "key",
+              "label": "LiteLLM key",
+              "placeholder": "sk-..."
+            }
+          ],
+          "guide": {
+            "link": "https://junie.jetbrains.com/docs/environment-variables.html",
+            "steps": [
+              "Fill in your LiteLLM proxy's address and its key, and name the connection.",
+              "Leave the node's `model` empty: Junie then uses the proxy's model."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[junie_cli]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[junie_cli]",
+      "description": "Wire into the JunieCli nodes' `access` input."
+    }
+  ]
+}

@@ -1,0 +1,284 @@
+{
+  "type": "JunieCli",
+  "label": "Junie CLI",
+  "description": "One conversation with Junie CLI, JetBrains' coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, Junie CLI runs on your machine (a local install only) from your own install of `junie` with your own login, working in `folder`. If `junie` is missing, weft installs it into a folder of its own, shared by the whole machine, before the node runs. With a `computer` wired, it is installed and run inside that computer, still on a local install, and it logs in with the connection on `access`. Its logins are offered on a local install only, since JetBrains' terms forbid providing Junie, or access to it, to anyone else, whatever login it runs on; so a cloud install has none to run it on. Before each turn Junie makes model calls of its own (a filter that picks which of your program's tools the turn gets, a task name, a title), which cost tokens on every message; a tool the filter left out the model can switch on itself. Commands it does not count as sensitive (`echo`) run without asking in every setting. Its card shows what it is doing and a Start over button. What is exposed: the permission mode, the model, the effort and instructions added to its guidelines. Your program's tools reach Junie's model as tools of its `weft` MCP server, and come back to your program under their plain names. Junie cannot let a program's tool take one of its own tools' places, so a tool named like one of them (`bash`, `search_project`, `search_replace` and the rest of this node's list) is refused when the program is built.",
+  "tags": [
+    "agent",
+    "coding",
+    "junie",
+    "jetbrains",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run Junie CLI in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[junie_cli]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A JunieCliAccess's `access`: a Junie token or a model provider's key (on a local install). Required with a `computer`. Left out on your machine, Junie uses the login already on it: run `junie` once and log in with your JetBrains account (it keeps the login in `~/.junie`, or in the system keyring where there is one), or wire one here with a token from https://junie.jetbrains.com/cli."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder Junie CLI works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`junie` on your PATH",
+      "description": "On your machine: the Junie CLI program to run, when it is not the `junie` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "auto",
+          "plan",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What Junie CLI may do without asking. `ask`: every action it counts as sensitive comes out of AskAgent as a question. `auto`: its own safety check lets the commands it judges safe through and asks about the rest. `plan`: a planning agent with read-only tools. `bypass`: nothing asks, nothing is refused; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "Junie's default",
+      "description": "A model the login offers (`gemini-3.6-flash`, `claude-sonnet-5-5`, `gpt-5.5`, ...): `junie list-models` lists more than a login may run, and one the login does not offer is refused as the conversation starts, naming those it does. Left out, Junie's default, or the LiteLLM proxy's own model."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "none",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "label": "Effort",
+      "description": "How much the model reasons; each model takes some of these. Left out, the model's default."
+    },
+    {
+      "name": "appendSystemPrompt",
+      "type": "String",
+      "widget": {
+        "kind": "textarea"
+      },
+      "label": "Add to its guidelines",
+      "description": "Instructions added to the agent's guidelines, for the whole conversation."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "local_install"
+        }
+      },
+      "then": {
+        "message": "JunieCli '{id}' runs on a local install only: JetBrains' terms forbid providing Junie, or access to it, to anyone else, so a cloud install offers it no login, with or without a Computer.",
+        "level": "structural",
+        "severity": "error"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "JunieCli '{id}' runs in a computer, where no login is waiting for it; give it a JunieCliAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "JunieCli '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "auto",
+                "plan",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "JunieCli '{id}' has a `permission` it does not know; pick one of ask, auto, plan, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "JunieCli '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "JunieCli '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs Junie CLI itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "bash",
+      "search_project",
+      "search_replace",
+      "create",
+      "apply_patch",
+      "undo_edit",
+      "rename_element",
+      "ask_user",
+      "enable_mcp"
+    ]
+  }
+}

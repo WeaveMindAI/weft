@@ -71,8 +71,9 @@ A new node goes beside the module that uses it under `src/`
 `nodes/` when several parts of the program share it, and is usable by its
 `type` name as soon as it is there; the build compiles its Rust directly.
 Its body may only `use` the `weft` crate, the crates its package declares
-in `deps.toml`, and code inside its own package; a sibling package's code is
-never on its path.
+in `deps.toml`, code inside its own package, and the shared code of a package
+its `package.toml` names in `uses` (below); any other package's code is never
+on its path.
 
 ## Anatomy
 
@@ -87,20 +88,28 @@ nodes/my_thing/
   tests.rs         optional: the node's own tests
 ```
 
-A package is a directory with `package.toml` (`[package] name`, shared
-`[dependencies]`); members are auto-detected as immediate subdirs holding a
+A package is a directory with `package.toml` (`[package] name`, an optional
+`uses` list, shared `[dependencies]`; any other key fails the load, naming it);
+members are auto-detected as immediate subdirs holding a
 `metadata.json`; shared `.rs` files at the package root are reached by
 members as `use super::<file>;`. A package root may hold a partial
 `metadata.json` of defaults every member inherits (key-by-key, member wins;
 `type`/`label`/`description` are never inherited). Never place any of this
 under `nodes/base_catalog/`: `weft catalog update` wipes it.
 
-Each package compiles as its own crate, so a project's node sees its own
-package's shared files and nothing under `nodes/base_catalog/`: you cannot
-`use` a stdlib helper such as `elevenlabs.rs`. If you need one function from
-a stdlib helper, copy it into your package's own shared file and say so in
-[the report]. If you need a whole capability, report it as a ctx feature the
-language is missing.
+Each package compiles as its own crate, so a node sees its own package's
+shared files and nothing else, until its package says otherwise. If it needs
+code another package already has (a stdlib helper such as the `elevenlabs`
+package's `elevenlabs.rs` included), the package names that package in its
+`package.toml`, `uses = ["elevenlabs"]`, and calls its shared files as a crate
+of that name (`use elevenlabs::elevenlabs;`), reaching whatever they make
+`pub`; the used package brings its own `[dependencies]`. Never reach for its
+nodes' `mod.rs`: a build compiles only the nodes a program uses. A `uses` that
+cannot be met (no package of that name loads, two packages using each other,
+a bare node folder with no `package.toml`, a name Rust refuses such as
+`my-tools`) leaves the package out with a reason naming its `package.toml`.
+If you need a whole capability no package has, report it as a ctx feature
+the language is missing.
 
 `weft`, `tokio`, `serde`, `serde_json`, `async-trait`, `anyhow` and `tracing`
 are always available without declaring them; anything else, `uuid` included,
@@ -123,6 +132,7 @@ Unknown keys are a loud parse error. Top level:
 | `firesWith` | trigger only: EVERY field a firing can carry, name to weft type, `?` on the name for sometimes-present (`{"scheduledTime": "String", "caller?": "JsonDict"}`). Checked exactly: a firing missing a required field is refused, and so is one carrying a field you did not name. On a node without `features.isTrigger`, or with a type weft cannot parse, the node fails to load |
 | `display` | inline render: `{ "kind": "media" \| "link", "output" \| "input": "<port>" }` |
 | `validate` | declarative rules: `{ "when": {...}, "then": {message, level: "structural"\|"runtime", field} }` |
+| `lists` | named lists of text a rule of another node reads off this one when it is wired into that node: `{ "reservedToolNames": ["apply_patch"] }`. Names are camelCase, items are text; how a rule reads one is under the `validate` conditions below |
 | `requiresInfra`, `images`, `publishes` | infra nodes |
 | `service` | access nodes only, the connection recipe |
 | `claimsRoute` | a node that claims a public address: `pathField` names the input holding the route pattern, and the optional `methodField` the input holding the HTTP method. Leave `methodField` out and the node serves every method; with it set, a program that leaves that input empty serves every method too. Naming an input the node does not declare fails the load |
@@ -214,7 +224,7 @@ A `validate` rule's `when` is a closed set of conditions, combined with
 `all`, `any` and `not`: the input and config checks (`input_satisfied`,
 `input_wired`, and `value`: `{ "kind": "value", "field": "x" }` is "set", plus
 any of `nonempty`, `equals`, `oneOf`, `matches`, `count`, `range`, `length`,
-`unique`, `each`; a list's fewest items is `not` of `count: { "min": 2 }`),
+`unique`, `each`, `noneOf`, `noneMatch`; a list's fewest items is `not` of `count: { "min": 2 }`),
 plus the graph checks below. A rule a wired value leaves open is checked again
 on the value that arrives, so never repeat one in Rust. A connection input names
 its service in its type (`"type": "Access[fal]"`, a union for several);
@@ -240,9 +250,35 @@ otherwise a rule selects nodes by a feature they declare, `with: {feature: value
   `names: {"field": {}}` is a field written `node.field`, narrowed with
   optional `instanceFilled: true/false`. Wrap it in `not` to refuse a bad
   name. A wired name is not known yet, so the rule does not fire on it.
+- `local_install`: the program is built for a local install, one that runs
+  things on the machine weft runs on. Only a build for an install answers it:
+  the install's own, and `weft run` and `weft status`, which compile for the
+  install they talk to. `weft validate` and the editor build for none, so a
+  rule leaning on it does not fire there. A node a cloud install cannot run
+  without some input refuses it with `all` of `not local_install` and `not
+  input_wired` on that input (the agent nodes' rule on `computer`).
 
-`{with}`, `{perInstanceReason}` and `{names}` in the message name what the
-check found (`{perInstanceReason}` says why, path included: "it reads
+Every condition answers yes, no or not known yet, and `all`, `any` and `not`
+fold those answers. What the build can answer (the install kind) is settled
+there; only the part still unknown (a value a wire brings) is kept and asked
+again when the node fires, with the value in.
+
+`noneOf` (the value is none of these) and `noneMatch` (it is text no regex of
+these matches; a regex matches anywhere unless you anchor it, `"^mcp__"`)
+take a literal list, or a list another node declares under `lists`:
+`{ "list": "<name>", "ofNodeWiredInto": "<one of your inputs>" }`, the list
+of that name on the node wired into that input, followed back through groups,
+included files and a loop's way in. Nothing wired there reads as an empty
+list. A wired node that declares no list of that name fails the build
+(`list-not-declared`) unless you add `"optional": true`, and a listed regex
+that does not compile fails it too (`list-not-regex`). AskAgent's rules,
+reading `reservedToolNames` and `reservedToolNamePatterns` off the agent node
+wired into `agent`, are the worked case.
+
+`{with}`, `{perInstanceReason}`, `{names}`, `{noneOfFound}` and
+`{noneMatchFound}` (the values refused) and `{wiredNode}` (the node a list
+came from, with its type) in the message name what the check found
+(`{perInstanceReason}` says why, path included: "it reads
 'bridge'", "it sits inside group 'work', which receives 'bridge'"). Copy a real rule from `Route`, `Reply` or `StartInfra`
 before writing your own.
 
@@ -414,7 +450,10 @@ If the worker dies while your body runs, a fast run (the default) ends cancelled
 **Pausing: the state says where the node is.** A body that pauses does not carry on from the line it paused on. When the run picks back up, the body runs again from the top and gets back, at once, the last state it saved. That state is all it has to know where it was:
 
 - `let mut state = ctx.keep(S::default()).await?;` first thing, once per firing (a second fails the node). `S` is any `Default + Serialize + Deserialize` struct, usually one `Option` field per step, and `state` reads and writes as `S`. A node with nothing to keep writes `ctx.keep(()).await?`.
-- `state.once(|s| &mut s.field, async |_| { .. }).await?` runs the work only while the field is empty, then stores the result and saves; a filled field hands its value back without running anything. Every call that must not happen twice goes in one. The one gap: a crash after the work returned and before the save landed runs it again.
+- `state.once(|s| &mut s.field, async |_| { .. }).await?` runs the work only while the field is empty, then stores the result and saves; a filled field hands its value back without running anything. Every call that must not happen twice goes in one. The one gap: a crash after the work returned and before the save landed runs it again. If the service on the other end must never see it twice (a payment), send
+`ctx.firing_key()` as its idempotency key: it is the same every time this
+firing's body runs again, and different on every loop iteration and in every
+other run (`format!("{}-refund", ctx.firing_key())` for a second such call).
 - `state.wait(|s| &mut s.field, signal).await?` is the same for a signal (a `Timer`, a `Form`, a `PollEndpoint`, ...): the answer lands in the field, read as its type (`Option<serde_json::Value>` keeps it raw). A wait somebody skipped ends the firing skipped.
 - `state.save().await?` writes the state now, after you change a field yourself.
 - Every call where the run can pause takes `&mut state`: `cursor.next(&mut state)`, `cursor.next_json(kind, &mut state)`, `bus.wait_for(name, &mut state)`, `gen.next(&mut state)`, `ctx.yield_downstream(output, &mut state)`, and the program-call helpers that wait (the tables below). So a node that reads a bus or a stream keeps a state, `()` if nothing else.
@@ -422,6 +461,23 @@ If the worker dies while your body runs, a fast run (the default) ends cancelled
 On resume, the body runs again from its top and knows where it was only from its state, so whatever the steps before decided (the branch taken) goes in the state too. The first time a run reaches a call where it can pause, it must not have read a bus or a stream directly (not through `state.read`) before it, except inside a `state.once` that finished; otherwise the node fails there, on its first run already. The runtime keeps the name the node holds on each bus and how many items it yielded, and re-yielding an item or re-emitting a port already sent sends nothing, so a node can send `stats`, wait, then send `image`.
 
 A run pauses when it is recorded and no caller is connected (a connected caller keeps the run on its worker, whatever `outlivesCaller` says). Open buses and streams do not stop it: once every running node waits, one of them on an answer from outside, and that has lasted the trigger's `pauseAfterSecs` (default 10), they all save together, and the next worker opens the buses again where they were. Until then `state.wait` stays open in your call, and an answer that comes goes straight into it: your body carries on from that line, never run again. Node tests never pause, but a second `rig.run(&Node, inputs)` on the same rig picks the firing up the way a resume does (its saved state back, each wait already answered handing back that answer), and `rig.saved_state(&Node)` shows what it last saved: test the resume that way. Where the run cannot pause, `state.wait` holds in your call: with a caller on the line, for as long as the caller stays; with none, if the run stays quiet for its trigger's `holdSecs`, the call fails with `WeftError::WaitGaveUp` (`0` refuses the wait at once, caller or not), which your node may match and handle (test it with `rig.signal_given_up()`).
+
+**Asking a person** is a `state.wait` on a `Form` built from data, so a
+node can ask what it only learned while it ran
+(`weft::signal::{ChoiceOption, Form, FormField}`):
+`Form::for_person(kind, title, description, fields)` with `FormField::display`,
+`display_image`, `chat_history` (a ChatHistory file shown as its messages),
+`decision` (with `.approve_label` / `.reject_label`), `choice` and `choices`
+(each option a `ChoiceOption::new(value, label)`, optionally `.described(text)`;
+the answer is the value), `text` and `long_text` (`.placeholder(text)`).
+`.required()` keeps Submit off until the field is answered, and
+`.answering_for(key)` makes a box a second way to answer field `key`. Read the
+submission with `schema.answers(&submission)?` (keep `form.schema.clone()`
+before the wait), then `.decision(key)?` or `.value::<T>(key)?`, each failing
+loudly on a wrong shape. A form with two fields under one key, a required field
+that only shows something, or an `answering_for` naming no field is refused
+when it is registered. `nodes/base_catalog/agents/answer_agent/mod.rs` builds
+one from an agent's question.
 
 **Stopping is cooperative.** A cancelled run (the caller left, a person
 pressed stop, a newer run stopped this one) trips a flag, and everything the
@@ -525,8 +581,24 @@ resync` and `weft rm`, all three work.
 ## The special shapes
 
 **Access node**: the whole body is `weft::access_node!(MyServiceAccessNode);`
-plus a `service` recipe in metadata (acquisition fields with `secret: true`,
-auth steps, a test URL, an identity template). The macro reads the `account`
+plus a `service` recipe in metadata (auth steps, a test URL, an identity
+template, and how the credential is acquired). A pasted credential is
+`"acquisition": { "kind": "static", "ways": [...] }`: one way per way to sign
+in, each with an `id` (camelCase, left out when there is only one), a `label`
+(required when there are several), its `fields` (each one secret unless
+marked `"secret": false`), an optional `guide`, and `"localOnly": true` for a credential that
+must stay on the person's machine (a subscription's token), which a cloud
+install never offers and refuses to open. `weft connect` asks which way, or
+takes `--way <id>`. A node that hands each way's credential on differently
+reads which one it holds with `.way()` on what `ctx.open(&access).await?`
+answers (`None` for a connection made another way). If what is pasted is a login that expires
+(a login file with a refresh token), give its way a `renewal`, saying how to
+read the paste and how to renew it, and weft keeps it alive: no node ever
+writes tokens back (`nodes/base_catalog/agents/codex_access/metadata.json` is one to copy). If the
+service refuses the token a node was handed, that node calls
+`ctx.renew(&access).await?`, after opening the connection in the same firing
+(without that open the node fails), and gets the renewed values; weft renews
+once however many nodes ask at the same moment. The macro reads the `account`
 input (typed with its own service, `Access[google]` on GoogleAccess; the
 catalog refuses another) and pulses it on `access`. It has no `tests.rs`: the macro is the whole
 body, so there is nothing of yours to test, and the review does not ask for
@@ -568,7 +640,11 @@ Implement `async fn provision_infra(&self, ctx, input) -> WeftResult<InfraSpec>`
 returning the desired-state spec; the engine applies it, then calls `run`.
 
 **Bake every output that holds as long as the infra does** (an address, a
-connection, a handle): `"baked": true` on the output in `metadata.json`. A baked output is made when the infra is applied, and a run that reads nothing from your node but baked outputs uses the saved values instead of running it, so a route that queries a database never calls the database's side container. A run that also reads an output that moves on its own (a status, a phone number a bridge pairs later) runs your node, and a baked output your `run` sends nothing on then carries the saved value. weft bakes again every time the infra is applied, and on `weft infra rebake <node>`. In between, the container itself tells weft when a value changes (a reset button, a rotated password): it `POST`s `{"connection": {"password": "..."}}` to `$WEFT_VALUES_URL`, which weft sets on every container of the unit (`connection` changes values inside the connection your node published, `outputs` changes baked outputs by name). Only what your node already handed weft can change. The push answers `200` once weft has written the value, or `422` with a body naming the key or output it could not change. If the push came from a button and failed, answer the press with `{ "result": { "error": "..." } }` telling the person to run `weft infra rebake <node>`. The value itself never goes in the press's answer. The Postgres node's reset is the worked example (`nodes/base_catalog/postgres/database/images/credential/bootstrap.py`). Changing what `run` emits on a baked output is not noticed on its own: run `weft infra upgrade`, which rebuilds the infra against your current source and bakes again. A node that fails using a connection an infra node made says to run `weft infra rebake` on that node; your node's own error says only what the driver said.
+connection, a handle): `"baked": true` on the output in `metadata.json`. A baked output is made when the infra is applied, and a run that reads nothing from your node but baked outputs uses the saved values instead of running it, so a route that queries a database never calls the database's side container. A run that also reads an output that moves on its own (a status, a phone number a bridge pairs later) runs your node, and a baked output your `run` sends nothing on then carries the saved value. weft bakes again every time the infra is applied, and on `weft infra rebake <node>`. A bake runs your `run` as a setup: `ctx.is_setup()` is `true` there (and
+while the program's triggers are set up), `false` in every real run, so a body
+that would hold a session or a bus open for a run emits what the setup needs
+and returns (an output it sends nothing on closes, a `Bus` included);
+`rig.run_infra_setup(&MyNode, json!({..}))` runs it that way in a test. In between, the container itself tells weft when a value changes (a reset button, a rotated password): it `POST`s `{"connection": {"password": "..."}}` to `$WEFT_VALUES_URL`, which weft sets on every container of the unit (`connection` changes values inside the connection your node published, `outputs` changes baked outputs by name). Only what your node already handed weft can change. The push answers `200` once weft has written the value, or `422` with a body naming the key or output it could not change. If the push came from a button and failed, answer the press with `{ "result": { "error": "..." } }` telling the person to run `weft infra rebake <node>`. The value itself never goes in the press's answer. The Postgres node's reset is the worked example (`nodes/base_catalog/postgres/database/images/credential/bootstrap.py`). Changing what `run` emits on a baked output is not noticed on its own: run `weft infra upgrade`, which rebuilds the infra against your current source and bakes again. A node that fails using a connection an infra node made says to run `weft infra rebake` on that node; your node's own error says only what the driver said.
 
 Every field of the `InfraSpec` (the machine and its GPU, containers, probes, disks,
 endpoints), long jobs, kept files and the rig calls for all of it are in
@@ -777,10 +853,52 @@ create it) and `read_only` does what it says.
 **Endpoints**: `Endpoint { name, target, expose }`. The target is
 `EndpointTarget::Unit { unit, container, port }` (`port` is the
 `ContainerPort` NAME) or `EndpointTarget::External { url }` for a service
-that already runs elsewhere. `expose` is `Expose::Project` (the default),
+that already runs elsewhere, `EndpointTarget::Process { unit, port }` for a
+process unit (below), or
+`EndpointTarget::Within { infra, path }` for a path inside another infra
+node's endpoint (a program your node started inside the `Computer` wired into
+it, which the computer's server passes on under `path`): `infra` is the
+`InfraHandle` on your input, nothing is started for it, every lookup follows
+where `infra` answers now, one hop only, and it is reached by the project's
+own workers only. `expose` is `Expose::Project` (the default),
 `Expose::SameNetwork` (above), or `Expose::Public { path }`, which serves
 HTTP through the install's front door at `/infra/<project>/<copy_id>/<path>`
 and is reachable from the internet.
+
+**A process instead of containers** runs one program on the person's own
+machine, as them, for what only that machine has (their login to a CLI,
+a folder of theirs). Only a local install has such a machine: a
+cloud install refuses the node before anything starts, so a node that offers
+another way (a `Computer` input) refuses the bad shape with a `local_install`
+rule. A unit runs containers or a process, never both, and a process unit
+takes no `machine`, `fs_group` or volume:
+
+```rust
+Unit {
+    name: "server".into(),
+    process: Some(
+        Process::new(vec!["python3".into(), "server.py".into()])
+            .with_file("server.py", include_str!("server.py"))
+            .with_ports(vec![ProcessPort::new("http", "PORT")])
+            .with_readiness(ProcessReadiness::http("http", "/health"))
+            .with_needs(vec![python3_need]),
+    ),
+    ..Default::default()
+}
+```
+
+It listens on `127.0.0.1` at the number weft puts in the port's variable,
+runs in a folder of its own with `files` written into it before every start,
+and is started again when it exits. Its `needs` are `Need`s as in deps.toml
+(`stage` run only), checked before it starts: a missing one fails the start,
+naming it and its `how`. Give one a `recipe` (`weft::needs::Recipe { folder:
+"<group>/<name>", script: <a bash script per Os>, bin, prelude }`) and weft
+installs it itself when the machine lacks it, without `sudo`, into
+`~/.local/share/weft/needs/<group>/<name>/`, once for every program and install on
+the machine, under a lock; system packages the script needs go in the need's
+`install`, and a missing one fails the start with the exact `sudo` command,
+which `weft deps-install` runs (then the recipes). The agent nodes
+(`nodes/base_catalog/agents/agent.rs`) are the worked case.
 
 The node reaches an endpoint at run time with
 `let api = ctx.endpoint("api").await?;`, which waits until something answers
@@ -1036,16 +1154,46 @@ them, and a `liveConnection` trigger already has them, so do not set both) and
 pass `journal: ctx.journal_policy()?`. Without it the default applies;
 `JournalPolicy::ephemeral()` keeps payloads out whatever anyone sets.
 
-A bus ends when the body of the firing that created or joined it returns:
-finished if the body returned `Ok`, failed with its error if it failed. A
-pause ends nothing: the next worker opens the bus again where it was, and a
-resumed creator calling `open_bus` again gets the same bus (a crash, though,
-ends it failed). Dropping a handle
-closes nothing. `bus.close()` ends it early, as finished ("no more
-messages"); a failed end is never yours to write. So what you have to get
-right is returning when the work is done: a node that runs until the run
-ends waits on `ctx.cancellation()` and returns, and that return is what the
-reader downstream sees as the end of the feed.
+A bus ends once nobody is on it and no node can still join it. A member is
+any firing that registered a name on it (`open_bus`, `pending_bus`,
+`join_bus`), the creator no more than the others, and it leaves when its body
+returns, however it returns; a member leaving does nothing else, even when it
+failed. A node can still join while the bus's marker is on a wire to a node
+that has not started, in a loop that has not ended (what every iteration gets,
+a carried value, the list it goes over, a bus it gathered and hands on), or in
+the input of a firing that has not ended and has not used the bus yet
+(registered on it, opened its reader, waited on it). A skipped node holds
+nothing. Once nothing can join, the bus ends as its last member returned:
+finished if its body returned `Ok` (or if nobody ever joined), failed with its
+error if it failed, so the reader of a lone producer that died halfway reads a
+failure, never a short stream. A pause is not leaving: the next worker opens
+the bus again where it was, its members on it, and a resumed creator calling
+`open_bus` again gets the same bus (a crash, though, ends it failed). Dropping
+a handle is not leaving either. `bus.close()` ends it at once for everyone:
+finished while anybody is on it, and the way its last member left when nobody is,
+so a lone producer's failure survives a later close; a failed end is never
+yours to write, you return the error. A
+creator can return as soon as its own work is done: the nodes it handed the
+marker to still get to join, so it never waits for them first. A joiner calls
+`join_bus` before it reads or waits on the bus: once it read or waited without
+joining it no longer keeps the bus open, so with nobody else on it the bus can
+end first and the late `join_bus` is refused (`bus is closed; cannot
+register`).
+A node that stays on a bus while others use it and has nothing to read there
+(it holds a session for the run) waits with `bus.until_end(&mut state).await?`:
+it is no reader, so it keeps no place on the bus; it returns `Ok` once the bus
+ended finished and fails with `the bus ended failed: ...` otherwise. What ends
+that bus is a `CloseBus` the program puts after the last node sending on it.
+Without one, the waiting node is the last member of a bus only its own leaving
+could end: weft finds the run stuck, ends the bus failed, and the node fails.
+A node that sends on the same bus on every firing (each turn of a loop)
+calls `join_bus` every time: its name leaves when the body returns and the bus
+stays open for whoever is still on it. A body run again after a pause gets
+the same name back, and it also repeats every `send` it made before the
+pause, so keep in the state how far it got. One name has one member at a
+time, so two firings on the bus at once need two names. A bus that ended while
+the run was paused comes back ended: nothing new goes on it, and a reader
+comes to its end.
 
 If you want to read a bus the graph handed you, the choice is what you must not
 miss:
@@ -1055,13 +1203,14 @@ miss:
 | `ctx.join_bus(port, name)?`, then `bus.cursor()?` | you take part in the exchange and want what is sent from now on |
 | `ctx.bus_from_input(port)?`, then `bus.cursor_from_start()?` | you must not miss what was sent before you attached, or the producer may already have finished |
 
-A bus you joined is held by your firing like one you created, so if your
-body fails the bus ends failed. `bus_from_input` never ends it, which is
-what an observer wants (a debug tap, a reader streaming it out), because
-ending a feed the producer still owns is a bug. Read with
-`cursor.next(&mut state).await?` for every entry, or
-`cursor.next_json("<kind>", &mut state).await?` for one kind's payloads. `None` means the bus finished; one that
-ended failed comes back as an error (`the bus ended failed: ...`) from that read.
+`join_bus` makes your firing a member like the creator, and `bus_from_input`
+registers nothing, so an observer (a debug tap, a reader streaming it out) is
+no member and keeps nothing open. To send on a `bus_from_input`
+handle, call `bus.register(name)` first, which is what `join_bus` does for
+you. Read with `cursor.next(&mut state).await?`
+for every entry, or `cursor.next_json("<kind>", &mut state).await?` for one
+kind's payloads. `None` means the bus finished; one that ended failed comes
+back as an error (`the bus ended failed: ...`) from that read.
 
 Do every bus read and wait on your own task, and never move a handle or a
 cursor into a `tokio::spawn`. The engine works out "everyone is stuck, close
@@ -1214,7 +1363,12 @@ when it is there (its first word looked up on the `PATH`), and
 `apk` and `brew`, keyed by distro like `debian_12` or `ubuntu_24_04`, or
 `default`. On a local install a program that uses the node is refused
 before it runs, activates or resyncs when a `run` check fails, naming `weft
-deps-install <NodeType>`; a node it does not use is never checked. A `build` need is not checked before the
+deps-install <NodeType>`; a node it does not use is never checked.
+`how` (optional) is the command that installs a program no package
+manager has (`curl -fsSL https://claude.ai/install.sh | bash`), said wherever
+the need is reported missing. A `recipe` is refused here: only an infra
+process's need may have one (under Infra node reference), since a worker
+never gets weft's install folder on its `PATH`. A `build` need is not checked before the
 package compiles, so a missing one shows as the package failing to compile
 and being left out. A cloud image installs the same packages, using the entry for its own
 package manager: the one for the image's distro, else that manager's

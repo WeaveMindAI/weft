@@ -1,0 +1,62 @@
+{
+  "type": "KimiCodeAccess",
+  "label": "Kimi Code Access",
+  "description": "A Moonshot AI login, for the KimiCode nodes' `access`: a pay-as-you-go Moonshot API key. One access for however many KimiCode nodes; each node names the model. A Kimi Code subscription is not offered here: its terms keep it to personal interactive use, and forbid non-interactive automation. On your machine, leave `access` out to use your own `kimi login`.",
+  "tags": [
+    "agent",
+    "kimi",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#1a1a1a",
+  "service": {
+    "service": "kimi_code",
+    "label": "Kimi Code",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "apiKey",
+          "label": "Moonshot API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-..."
+            }
+          ],
+          "guide": {
+            "link": "https://platform.moonshot.ai/console/api-keys",
+            "steps": [
+              "Sign in at platform.moonshot.ai and create a key under API keys.",
+              "Paste it below and name the connection. Calls are billed to that account, pay as you go.",
+              "Set the node's `model` to a Moonshot model id, such as `kimi-k2-turbo-preview`."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[kimi_code]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[kimi_code]",
+      "description": "Wire into the KimiCode nodes' `access` input."
+    }
+  ]
+}

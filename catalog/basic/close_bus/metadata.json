@@ -1,0 +1,28 @@
+{
+  "type": "CloseBus",
+  "label": "Close Bus",
+  "description": "End a bus: no more messages, and every reader comes to the end, the node that made it included. While anybody is on the bus it ends finished; when nobody is, it ends the way its last member left, so a stream whose only producer failed still reads as failed. For a bus that outlives the nodes sending on it (a session's stream that each turn of a loop sends on), put it after the last of them, with its `_should_flow` wired to an output that arrives only once they are all done, such as the loop's gathered list. A bus that already ended keeps the end it had. If you leave it out and the node that made the bus reads until the bus ends, the run gets stuck after the last sender is done: weft ends the bus failed, and that node fails with it.",
+  "tags": [
+    "bus",
+    "stream",
+    "close",
+    "end"
+  ],
+  "icon": "CircleStop",
+  "color": "#06b6d4",
+  "inputs": [
+    {
+      "name": "bus",
+      "type": "Bus",
+      "required": true,
+      "accepts": [
+        "wire"
+      ],
+      "description": "The bus to end."
+    }
+  ],
+  "outputs": [],
+  "features": {
+    "pure": true
+  }
+}

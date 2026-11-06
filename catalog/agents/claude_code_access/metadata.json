@@ -1,0 +1,51 @@
+{
+  "type": "ClaudeCodeAccess",
+  "label": "Claude Code Access",
+  "description": "A Claude Code login, for the ClaudeCode nodes' `access`: your Claude subscription (a token `claude setup-token` prints; on a local install only, so the token stays on your own machine) or an Anthropic API key (anywhere). One access for however many ClaudeCode nodes.",
+  "tags": ["agent", "claude", "access", "credentials"],
+  "icon": "KeyRound",
+  "color": "#6b6b99",
+  "service": {
+    "service": "claude_code",
+    "label": "Claude Code",
+    "doors": ["own"],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "subscription",
+          "label": "Claude subscription",
+          "localOnly": true,
+          "fields": [{ "name": "token", "label": "Token", "placeholder": "sk-ant-oat01-..." }],
+          "guide": {
+            "link": "https://docs.claude.com/en/docs/claude-code/setup",
+            "steps": [
+              "On a machine where Claude Code is installed and you are logged in with a Pro, Max, Team or Enterprise plan, run `claude setup-token` in a terminal.",
+              "It opens a browser to sign in and prints a token that lasts a year.",
+              "Paste the token below and name the connection. It is offered on a local install only: Anthropic does not let other products offer the claude.ai login, so the token stays on your own machine."
+            ]
+          }
+        },
+        {
+          "id": "apiKey",
+          "label": "API key",
+          "fields": [{ "name": "key", "label": "API key", "placeholder": "sk-ant-..." }],
+          "guide": {
+            "link": "https://console.anthropic.com/settings/keys",
+            "steps": [
+              "Open console.anthropic.com, Settings > API Keys, and create an API key.",
+              "Paste it below and name the connection. Calls are billed to that API account."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    { "name": "account", "type": "Access[claude_code]", "widget": { "kind": "access" }, "label": "Account" }
+  ],
+  "outputs": [
+    { "name": "access", "type": "Access[claude_code]", "description": "Wire into the ClaudeCode nodes' `access` input." }
+  ]
+}

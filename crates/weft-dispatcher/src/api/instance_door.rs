@@ -85,6 +85,9 @@ pub async fn fields(State(state): State<DispatcherState>, headers: HeaderMap) ->
         .map_err(access_store_error)?;
     let picks = crate::api::project::stored_picks(&state, caller.project).await?;
     let mut out = Vec::new();
+    // Asked as a run's birth asks it (`run_spec::instance_run_values`),
+    // which knows no install, so a field is marked needed exactly when a
+    // run would refuse without it.
     let rules = weft_core::rules::RuleContext::new(&project);
     for weft_core::project::FilledPlace { spelled: place, place: at, node } in weft_core::project::instance_filled_places(&project) {
         for input in &node.inputs {

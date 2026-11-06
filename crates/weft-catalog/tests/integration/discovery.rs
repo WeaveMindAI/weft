@@ -161,7 +161,7 @@ fn duplicate_service_leaves_both_out() {
                       "outputs": [],
                       "service": {{ "service": "{service}",
                                     "acquisition": {{ "kind": "static",
-                                                      "fields": [{{ "name": "host" }}] }} }} }}"#
+                                                      "ways": [{{ "fields": [{{ "name": "host" }}] }}] }} }} }}"#
             ),
         )
         .unwrap();
@@ -211,7 +211,7 @@ fn a_connection_output_names_its_own_service() {
         format!(
             r#""inputs": [{{ "name": "account", "type": "{input}", "widget": {{ "kind": "access" }} }}],
                "outputs": [{{ "name": "access", "type": "{output}" }}],
-               "service": {{ "service": "tg", "acquisition": {{ "kind": "static", "fields": [{{ "name": "token" }}] }} }}"#
+               "service": {{ "service": "tg", "acquisition": {{ "kind": "static", "ways": [{{ "fields": [{{ "name": "token" }}] }}] }} }}"#
         )
     };
     let access_node = |output: &str| access_node_taking("Access[tg]", output);

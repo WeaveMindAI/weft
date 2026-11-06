@@ -1,4 +1,6 @@
-//! Infra units on the local Docker daemon.
+//! Infra units on the local Docker daemon. A unit that runs a process
+//! instead of containers is `process_units`'; a local install's host
+//! routes each unit to the one that runs it (`machine_host`).
 //!
 //! A unit is a small group of containers sharing one network, the way
 //! they would share one machine. The network belongs to the unit's agent
@@ -220,6 +222,34 @@ impl LocalInfraHost {
     pub async fn detect_gpu(docker: &dyn Docker) -> anyhow::Result<GpuAccess> {
         let out = docker::run(docker, vec!["info".into(), "--format".into(), "{{json .Runtimes}}".into()]).await?;
         Ok(if out.contains("\"nvidia\"") { GpuAccess::DockerGpus } else { GpuAccess::None })
+    }
+
+    /// Refuse, before anything starts, a unit this host cannot run: a
+    /// container's memory cap it cannot read, a GPU this machine's Docker
+    /// has none of, or a process (`weft_core::infra::Process`), which runs
+    /// on the machine weft runs on and never in a container: on a local
+    /// install `ProcessUnits` runs it, and a cloud machine, whose units
+    /// this host runs too, has none.
+    pub fn check_unit(&self, node: &ResolvedNode, u: &ResolvedUnit) -> Result<(), String> {
+        if u.unit.process.is_some() {
+            return Err(format!(
+                "unit '{}' of '{}' runs a process, which runs on the machine weft runs on and never in a container; \
+                 only a local install runs one",
+                u.unit.name, node.node.node
+            ));
+        }
+        for c in u.unit.init_containers.iter().chain(&u.unit.containers) {
+            memory_cap(c).map_err(|why| format!("unit '{}' of '{}': {why}", u.unit.name, node.node.node))?;
+        }
+        if u.unit.machine.gpu.is_some() && self.cfg.gpu == GpuAccess::None {
+            return Err(format!(
+                "unit '{}' of '{}' asks for a GPU, and this machine's Docker has none (no NVIDIA runtime); \
+                 install the NVIDIA container toolkit and restart weft (`weft daemon start`; weft \
+                 looks for the runtime when it starts), or remove the unit's machine.gpu",
+                u.unit.name, node.node.node
+            ));
+        }
+        Ok(())
     }
 
     fn unit<'a>(node: &'a ResolvedNode, unit: &str) -> anyhow::Result<&'a ResolvedUnit> {
@@ -735,20 +765,7 @@ fn timestamped_lines(stdout: &str, stderr: &str) -> anyhow::Result<Vec<LogLine>>
 #[async_trait]
 impl InfraHost for LocalInfraHost {
     fn check(&self, node: &ResolvedNode) -> Result<(), String> {
-        for u in &node.units {
-            for c in u.unit.init_containers.iter().chain(&u.unit.containers) {
-                memory_cap(c).map_err(|why| format!("unit '{}' of '{}': {why}", u.unit.name, node.node.node))?;
-            }
-            if u.unit.machine.gpu.is_some() && self.cfg.gpu == GpuAccess::None {
-                return Err(format!(
-                    "unit '{}' of '{}' asks for a GPU, and this machine's Docker has none (no NVIDIA runtime); \
-                     install the NVIDIA container toolkit and restart weft (`weft daemon start`; weft \
-                     looks for the runtime when it starts), or remove the unit's machine.gpu",
-                    u.unit.name, node.node.node
-                ));
-            }
-        }
-        Ok(())
+        node.units.iter().try_for_each(|u| self.check_unit(node, u))
     }
 
     fn notes(&self, node: &ResolvedNode) -> Vec<String> {
@@ -843,14 +860,24 @@ impl InfraHost for LocalInfraHost {
         let mut out = Vec::with_capacity(by_unit.len());
         for ((copy_id, unit), rows) in by_unit {
             let hash = rows.iter().find_map(|r| r.label(labels::UNIT_HASH)).unwrap_or_default().to_string();
-            let mut probes = HashMap::new();
-            for r in &rows {
-                if let Some(raw) = r.label(PROBES) {
-                    probes.insert(container_short(r).to_string(), decode_probes(raw)?);
+            let looked = async {
+                let mut probes = HashMap::new();
+                for r in &rows {
+                    if let Some(raw) = r.label(PROBES) {
+                        probes.insert(container_short(r).to_string(), decode_probes(raw)?);
+                    }
                 }
-            }
-            let state = self.unit_state(project, &probes, &rows).await?;
-            let restart = self.restart(project, &rows, &stops, &kills).await?;
+                let state = self.unit_state(project, &probes, &rows).await?;
+                let restart = self.restart(project, &rows, &stops, &kills).await?;
+                anyhow::Ok((state, restart))
+            };
+            // One unit that cannot be looked at (checks labelled by another
+            // weft, a call about one of its containers that fails) is that
+            // unit failed, never every unit of the project unseen.
+            let (state, restart) = match looked.await {
+                Ok(looked) => looked,
+                Err(e) => (UnitRunState::Failed { why: format!("{e:#}") }, None),
+            };
             out.push(UnitObservation { copy_id, unit, hash, state, restart });
         }
         Ok(out)
@@ -926,6 +953,13 @@ impl InfraHost for LocalInfraHost {
                 };
                 let same_network = matches!(ep.expose, Expose::SameNetwork).then_some(on_machine);
                 Ok(EndpointAt { url, same_network })
+            }
+            // Never a host's: every lookup follows it to the endpoint it
+            // lives inside (`weft_core::infra::EndpointRecord`).
+            EndpointTarget::Within { .. } => anyhow::bail!("endpoint '{endpoint}' of '{}' lives inside another node's endpoint, which no host serves", node.node.node),
+            // Refused by `check` before anything starts.
+            EndpointTarget::Process { unit, .. } => {
+                anyhow::bail!("endpoint '{endpoint}' of '{}' is a port of the process of unit '{unit}', which no container serves", node.node.node)
             }
         }
     }
@@ -1829,6 +1863,32 @@ mod tests {
         assert_eq!((docker.calls_to("info").len(), docker.calls_to("events").len()), (2, 2));
         let call = &docker.calls_to("events")[1];
         assert_eq!(call[call.iter().position(|a| a == "--since").unwrap() + 1], "1793102700.000000001");
+    }
+
+    /// One unit that cannot be looked at (checks labelled in a shape this
+    /// weft cannot read) reads as failed, saying why, and the project's
+    /// other units are still looked at.
+    #[tokio::test]
+    async fn one_unit_that_cannot_be_looked_at_fails_alone() {
+        let docker = Arc::new(FakeDocker::new());
+        docker.answer(&["port"], "127.0.0.1:40000\n");
+        let h = host(docker.clone(), false);
+        let row = |name: &str, unit: &str, part: &str, extra: &str| {
+            format!(r#"{{"Names":"{name}","State":"running","Labels":"weft.part={part},weft.container={name},weft.copy=wn-1,weft.unit={unit}{extra}"}}"#)
+        };
+        let ps = [row("c-agent-a", "a", "agent", ""), row("c-a", "a", "app", ""), row("c-agent-b", "b", "agent", ""), row("c-b", "b", "app", ",weft.probes=zz")];
+        docker.answer(&["ps"], &ps.join("\n"));
+        let stop = |name: &str| {
+            format!(
+                r#"{{"name":"/{name}","restartCount":0,"state":{{"Status":"running","OOMKilled":false,"ExitCode":0,"StartedAt":"2026-10-27T12:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"}}}}"#
+            )
+        };
+        docker.answer(&["inspect"], &format!("{}\n{}\n", stop("c-a"), stop("c-b")));
+        let seen = h.observe("local", node_ref().project).await.unwrap();
+        let state = |u: &str| seen.iter().find(|o| o.unit == u).unwrap().state.clone();
+        let UnitRunState::Failed { why } = state("b") else { panic!("{seen:?}") };
+        assert!(why.contains("probe label is not hex"), "{why}");
+        assert!(!matches!(state("a"), UnitRunState::Failed { .. }), "{seen:?}");
     }
 
     /// What the host keeps about a container goes once a look at its

@@ -93,8 +93,9 @@ channel is special, and it lives in the worker rather than on the wire.
 
 Every participant registers a name, which is the stamp on everything it sends
 and what other nodes wait for. Registering is the "I am here and ready" moment,
-so a node with a slow warmup holds the bus and registers when it is genuinely
-ready rather than when it starts.
+so a node with a slow warmup registers when it is genuinely ready rather than
+when it starts. Registering is also what makes a node a member of the bus,
+which decides when the bus ends (below).
 
 Each reader has its own position. Reading does not consume, so ten readers all
 see everything.
@@ -132,27 +133,96 @@ run up opens each one again from it (below).
 ### How a bus ends
 
 Picture a reader at the end of a model's answer. Did the model finish, or did
-it stop halfway through a sentence? A bus says which. It ends when the node
-that made it is done, or when a node that joined it is, and it ends one of two
-ways:
+it stop halfway through a sentence? A bus says which.
 
-- **finished**, when that node's work completed, or when the node closed the
-  bus early on purpose;
-- **failed**, with the reason, when that node failed or was cancelled. weft
-  also ends a bus failed when the run got stuck, when it ended while the bus
-  was still open, and when a node was still running as its worker died.
+Nobody owns a bus. Every node that registered a name on it, the one that made
+it and every one that joined it, is a member until it is done, and a member
+paused on a wait is still on it. When a member is done, its name leaves and
+nothing else happens: the others carry on.
+
+Once nobody is on it, the bus ends as soon as no node can still join it. A node
+can join only through the bus's marker, so the bus stays open while its marker
+is still somewhere a node could get it:
+
+- on a wire, on its way to a node that has not started yet, including one still
+  waiting on its other inputs;
+- in a loop that has not ended: in the value every iteration gets, a value
+  carried to the next iteration, the list the loop goes over, or a list the
+  loop is gathering, which it hands on to the node after it when it ends;
+- in the input of a node that is running, or paused on a wait, and has not used
+  the bus yet. A node uses a bus by registering on it, reading it, or calling
+  `wait_for` or `until_end` on it, so a node that only passes the marker on
+  keeps the bus open until it returns and hands it on;
+- with the node that made it, until it sent the marker out.
+
+A node that was skipped never gets the marker, so it keeps nothing open. A
+node that only reads, like `Debug` or `Stream`, registers nothing, so it is no
+member. Once it starts reading it stops keeping the bus open, otherwise a
+reader waiting for the end would hold the bus open forever.
+
+When the bus ends, it ends one of two ways:
+
+- **finished**, when its last member's work completed, or when nobody ever
+  joined it;
+- **failed**, with the reason, when its last member failed or was cancelled.
+
+So a stream whose one producer dies halfway ends failed, and its readers know
+it is incomplete. A member that fails while others are still on the bus just
+leaves, because one of them may be how the conversation recovers.
+
+Any node can also end a bus on purpose: a member done talking before it is
+done working, or a `CloseBus`. If somebody is still on the bus, it ends
+finished. If nobody is, it ends the way its last member left, so a stream
+whose only producer failed still reads as failed when a `CloseBus` runs after. weft ends
+a bus failed itself when the run got stuck, when the run ended while the bus
+was still open, and when a node was still running as its worker died.
 
 Each reader decides what a failed end means for it. `Stream` fails the answer
 to its caller ([what the caller
 sees](triggers-and-routes.md#when-a-run-ends-before-it-answers)), even on a
 route whose `whenChunkFails` is `drop_chunk`, because that setting skips one
 message and a failed bus has no next one to go on to. `Debug` logs
-a warning naming the reason, and the bus's panel in the inspector ends with
+every message that came, then fails naming the reason, and the bus's panel in the inspector ends with
 `* the bus failed here: <reason>` instead of `* the bus closed here`.
 
 If a producer fails before its first piece, it may not have opened its bus
 yet. For what the program can do then, go and read [when a node
 fails](how-a-program-runs.md#when-a-node-fails).
+
+### A bus that outlives the loop that sends on it
+
+Picture a node holding a session with a coding agent for the whole run. It
+opens a bus and waits until the bus ends, and a loop asks the agent one thing
+per turn, each turn joining the bus to put what the agent does on it. Every
+turn is done long before the session is, and its name leaves the bus then, but
+the session's node is still on it, so the bus stays open for the next turn
+(for how a node that joins on every turn is written, go and read [joining the
+same bus on every run](../nodes/streams-and-buses.md#joining-the-same-bus-on-every-run)).
+What ends the bus is a `CloseBus` after the loop:
+
+```weft
+end = CloseBus { bus: session.stream }
+end._should_flow = turns.replies
+```
+
+Here `session` is the node that opened the bus and `turns` is the loop.
+`turns.replies` comes out once the last turn has written its reply, and only a
+literal `false` on `_should_flow` stops a node, so `end` runs after the last
+reply. Make sure whatever sends on the bus inside a turn feeds `replies`:
+work that does not feed it can still be running when the list comes out. `end`
+ends the bus as finished, so every reader comes to the end, and the session's
+node, which reads until then, returns. If the session failed and nothing was on
+the bus after it (no turn still on it, and none joining later), nobody is on the
+bus when `end` runs, so `end` ends it the way the session left it, failed, and
+the failure still shows.
+
+If you leave `CloseBus` out, the run fails instead of finishing. Once the last
+turn is done, the session's node is the last member, waiting on a bus that
+only its own leaving could end, and nothing else in the run moves, so weft
+finds the run stuck and ends the bus failed. The session's node then fails
+with `node failed: the bus ended failed: the run was stuck: every node on this
+bus waited on another, and nothing could end the wait`, and so does the run: a
+node that already opened a bus cannot hand its failure to `_error`.
 
 ### A bus pauses with its run
 
@@ -173,6 +243,11 @@ stopped to wait on something else carries on where it stopped, and if the
 messages it had not read did not come back, its first read fails, saying
 so. A node that must not stop reading at all holds the run
 instead (`ctx.hold()`), which keeps the run from pausing while it reads.
+
+A bus that had already ended comes back too, ended the way it ended, and
+keeps the same last messages an open one would. A node handed its marker
+after the pause reads those messages and comes to the same end, finished or
+failed, that it would have reached before the pause.
 
 A worker that dies is different, because the last messages it carried may
 never have reached the record. If a durable run carries on in another worker

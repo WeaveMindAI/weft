@@ -48,6 +48,43 @@ pub fn hex_of(bytes: &[u8]) -> String {
     out
 }
 
+/// The refusal of a renewal from a node that did not open the
+/// connection first in its firing: the worker's, and the node-test rig's.
+pub fn renew_without_open(service: &str) -> String {
+    format!(
+        "renew the '{service}' connection: this node has not opened it in this firing, so nothing says which \
+         values stopped working; open it (`ctx.open`) first"
+    )
+}
+
+/// What a node was handed when it opened a connection, as the one
+/// short text both sides of a renewal compute: the worker over the
+/// values it handed the node, the access store over the values the row
+/// hands now (`AccessSpec::handoff_values`). A renewal (`ctx.renew`)
+/// carries it as the values the service refused, and the store renews
+/// only while the row still hands exactly those: a node whose values
+/// another node's renewal already replaced is handed the newer ones, and
+/// the provider sees one renewal however many nodes ask.
+///
+/// A digest of the handed values, not a version column: it costs no
+/// query and no schema, the store already unseals the row it reads, and
+/// any change to what a node is handed moves it, whatever made the
+/// change (a renewal, a person's paste). It travels only between the
+/// worker, which holds the values themselves, and the broker, which
+/// stores them. Each name and value is length-prefixed, so no two maps
+/// share an input.
+pub fn handed_digest(values: &std::collections::BTreeMap<String, String>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for (name, value) in values {
+        for part in [name, value] {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part.as_bytes());
+        }
+    }
+    hex_of(&hash.finalize())
+}
+
 /// Decode a hex string; `None` on anything that is not hex.
 pub fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
@@ -118,6 +155,8 @@ pub struct OpenedConnection {
     auth: Vec<spec::AuthStep>,
     identity: Option<String>,
     owner: CredentialOwner,
+    /// The way to sign in it was made with; see [`Self::way`].
+    way: Option<String>,
     client: reqwest_middleware::ClientWithMiddleware,
     /// The runtime's WebSocket dialer for this connection (signed
     /// handshake, routing, session metering). Behind [`Self::socket`].
@@ -127,16 +166,18 @@ pub struct OpenedConnection {
 #[cfg(feature = "runtime")]
 impl OpenedConnection {
     /// Assembled by the runtime after a resolve; never by node code.
+    #[allow(clippy::too_many_arguments)]
     pub fn assemble(
         service: impl Into<String>,
         values: std::collections::BTreeMap<String, String>,
         auth: Vec<spec::AuthStep>,
         identity: Option<String>,
         owner: CredentialOwner,
+        way: Option<String>,
         client: reqwest_middleware::ClientWithMiddleware,
         socket: std::sync::Arc<dyn socket::SocketDial>,
     ) -> Self {
-        Self { service: service.into(), values, auth, identity, owner, client, socket }
+        Self { service: service.into(), values, auth, identity, owner, way, client, socket }
     }
 
     pub fn service(&self) -> &str {
@@ -161,6 +202,16 @@ impl OpenedConnection {
 
     pub fn owner(&self) -> &CredentialOwner {
         &self.owner
+    }
+
+    /// The id of the way to sign in a pasted connection was made with
+    /// (`spec::LoginWay::id`), for a node whose service offers several
+    /// and hands each credential on differently (a subscription's token
+    /// and an API key go into different variables). `None` for a
+    /// connection signed in any other way (a consent, a minted JWT, the
+    /// runtime's own key), which has no ways.
+    pub fn way(&self) -> Option<&str> {
+        self.way.as_deref()
     }
 
     /// The signed-in HTTP client: use it directly, or hand it to any
@@ -310,6 +361,7 @@ mod tests {
             auth,
             None,
             CredentialOwner::Author,
+            None,
             client,
             std::sync::Arc::new(NoDial),
         )

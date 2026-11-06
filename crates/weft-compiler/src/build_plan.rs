@@ -112,17 +112,16 @@ pub trait TagPolicy {
 /// stands for. The project MUST already contain its own nodes (the seeded
 /// `nodes/base_catalog/` included); nothing is injected from outside the
 /// folder. `fs` is the view the definition was compiled through
-/// (`build::build_project` places its findings with it), and `contents`
-/// the value of each file content the definition names (its gate reads
-/// them).
+/// (`build::build_project` places its findings with it); `compiled`
+/// carries the install it was compiled for and the value of each file
+/// content the definition names, which its gate reads.
 ///
 /// Pure + blocking (filesystem); run it on a blocking thread from async
 /// callers. The returned worker `context_dir` lives under a temp dir the caller
 /// must keep alive until it has built the worker.
 pub fn plan_build_from(
     project: &Project,
-    definition: &weft_core::project::ProjectDefinition,
-    contents: &weft_core::content::ContentValues,
+    compiled: &crate::Compiled,
     catalog: &weft_catalog::FsCatalog,
     fs: crate::CompileFs,
     packaging: &weft_core::builds::WorkerPackaging,
@@ -130,6 +129,7 @@ pub fn plan_build_from(
     node_set: weft_core::builds::NodeSet,
     fingerprints: &crate::hash::Fingerprints,
 ) -> BuildResult<BuildPlan> {
+    let definition = &compiled.definition;
     let weft_root = crate::build::resolve_weft_root()?;
     let implementations = crate::hash::implementation_hashes(definition, project, &weft_root, catalog, node_set, packaging, fingerprints)?;
 
@@ -148,7 +148,7 @@ pub fn plan_build_from(
     // definition, whose `@asset` refs the caller already resolved into
     // concrete file values.
     let staged =
-        crate::build::build_project(project, definition, contents, catalog, fs, packaging, node_set, fingerprints)?;
+        crate::build::build_project(project, compiled, catalog, fs, packaging, node_set, fingerprints)?;
     let binary_hash = staged.content_hash.clone();
     let hold = staged.hold.clone();
 

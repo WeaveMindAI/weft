@@ -80,6 +80,12 @@ pub struct DoorsStatus {
     /// every consent button and shows this instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consent_blocked: Option<String>,
+    /// The ids of the spec's ways to sign in this install offers, in the
+    /// spec's order (`spec::LoginWay::offered_on`): a local-only way is
+    /// left out on a cloud install. Empty for a service that takes no
+    /// pasted credential, and for one none of whose ways works here.
+    #[serde(default)]
+    pub offered_ways: Vec<String>,
 }
 
 /// A connection row as the EDITOR sees it: names, ids, identity,
@@ -106,6 +112,10 @@ pub struct GrantSummary {
     /// else the app's label, else the service's own. `None` only for a
     /// connection a node published without one.
     pub label: Option<String>,
+    /// The way to sign in a pasted connection was made with
+    /// (`spec::LoginWay::id`); `None` for one signed in any other way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub way: Option<String>,
     /// The granted permission set (the "what it can do" column).
     pub scopes: Vec<String>,
     /// Whether `scopes` came from the provider (verified) or from the
@@ -203,6 +213,13 @@ pub struct ConnectDirect {
     /// acquisition over the paste fields).
     #[serde(default)]
     pub paste: bool,
+    /// Which way to sign in `values` were filled for
+    /// (`spec::LoginWay::id`), on the own door of a `static` service: what
+    /// the connection records. May be left out when the service offers
+    /// one way, which the paste section always is; a connect of any other
+    /// kind names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub way: Option<String>,
     /// The connecting project (grants are per-project by default; an
     /// exclusive-class OAuth grant ignores it, but direct connects are
     /// per-paste anyway).
@@ -316,7 +333,7 @@ mod wire_tests {
     fn spec() -> AccessSpec {
         serde_json::from_value(json!({
             "service": "openrouter",
-            "acquisition": { "kind": "static", "fields": [{ "name": "key" }] }
+            "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "key" }] }] }
         }))
         .expect("minimal spec")
     }
@@ -333,13 +350,16 @@ mod wire_tests {
             },
             redirect_uri: Some("http://h/access/oauth/callback".into()),
             consent_blocked: None,
+            offered_ways: vec!["apiKey".into()],
         };
         let v = serde_json::to_value(&doors).unwrap();
         // The broker's answer is FLATTENED onto the status: clients read
         // `shared_apps` at the top level, never under a `doors` key.
         assert!(v.get("sharedApps").is_some() && v.get("doors").is_none(), "{v}");
+        assert_eq!(v["offeredWays"], serde_json::json!(["apiKey"]), "{v}");
         let back: DoorsStatus = serde_json::from_value(v).unwrap();
         assert_eq!(back.doors.shared_apps[0].label, "App");
+        assert_eq!(back.offered_ways, vec!["apiKey"]);
 
         let grant = GrantSummary {
             id: uuid::Uuid::nil(),
@@ -348,6 +368,7 @@ mod wire_tests {
             instance: None,
             identity: Some("Q".into()),
             label: None,
+            way: Some("apiKey".into()),
             scopes: vec!["s".into()],
             permissions_verified: true,
             value_names: vec!["key".into()],
@@ -361,6 +382,7 @@ mod wire_tests {
         assert_eq!(back.id, grant.id);
         assert_eq!(back.owner, CredentialOwner::Platform);
         assert_eq!(back.door, Door::Shared);
+        assert_eq!(back.way.as_deref(), Some("apiKey"));
 
         let done = CompletedConnect { grant };
         let back: CompletedConnect =
@@ -411,6 +433,7 @@ mod wire_tests {
                 permissions: vec![],
                 registration: None,
                 paste: false,
+                way: None,
                 project_id: None,
                 instance: None,
             },
@@ -451,6 +474,7 @@ mod wire_tests {
                 permissions: vec!["read".into()],
                 registration: Some(reg.clone()),
                 paste: true,
+                way: Some("apiKey".into()),
                 project_id: Some(uuid::Uuid::nil()),
                 instance: None,
             },
@@ -463,6 +487,7 @@ mod wire_tests {
         assert_eq!(back.inner.label.as_deref(), Some("named"));
         assert_eq!(back.inner.permissions, vec!["read"]);
         assert!(back.inner.paste);
+        assert_eq!(back.inner.way.as_deref(), Some("apiKey"));
         assert_eq!(back.inner.project_id, Some(uuid::Uuid::nil()));
         let breg = back.inner.registration.expect("registration survives");
         assert_eq!(breg.client_id, "cid");

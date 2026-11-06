@@ -162,6 +162,11 @@ impl PostgresStore {
 /// news its worker hears it by). The run's row is locked before the signal
 /// is touched, the order every writer of a run takes them in. The caller
 /// pokes the outbox once it commits.
+///
+/// A branch of a wait on the first of several signals
+/// (`weft_core::signal::first_of`) answers that wait: under the wait's
+/// token, as `{ branch, value }`, and every branch goes with it, so the
+/// first to answer is the only one that does.
 pub(crate) async fn answer_in(
     tx: &impl Client,
     token: &str,
@@ -172,38 +177,72 @@ pub(crate) async fn answer_in(
     let Some(run) = run else { return Ok(Answered::Gone) };
     let run_id = run.with_context(|| format!("the wait {token} names no run"))?;
     let locked = weft_journal::record::lock_in(tx, run_id).await?;
+    let Some(wait) = wait_rows_in(tx, run_id, token).await? else { return Ok(Answered::Gone) };
     if from == AnswerFrom::Sender {
         // An answer queued while the run's trigger was not live is the
         // wait's one answer (its sender was told so): the queue's drain
-        // hands it over, and this one finds the wait answered. The signal's
-        // row is locked first, and `park` holds that lock while it queues
-        // one, so one queued meanwhile is seen here.
-        let signal: Option<i32> = tx.scalar_opt("SELECT 1 FROM signal WHERE token = $1 AND is_resume FOR UPDATE", &[&token]).await?;
+        // hands it over, and this one finds the wait answered. The wait's
+        // rows were locked first (`wait_rows_in`), and `park` holds that
+        // lock while it queues one, so one queued meanwhile is seen here.
         let queued: bool = tx
-            .scalar("SELECT EXISTS (SELECT 1 FROM parked_fire WHERE token = $1 AND is_resume AND run_id IS NULL)", &[&token])
+            .scalar("SELECT EXISTS (SELECT 1 FROM parked_fire WHERE token = ANY($1) AND is_resume AND run_id IS NULL)", &[&wait.tokens])
             .await?;
-        if signal.is_none() || queued {
+        if queued {
             return Ok(Answered::Gone);
         }
     }
-    let Some(row) = tx
-        .opt::<SignalRow>(SIGNAL_DELETE_RESUME_BY_TOKEN_RETURNING, &[&token])
+    let rows: Vec<SignalRow> = tx
+        .all(SIGNAL_DELETE_RESUME_BY_TOKENS_RETURNING, &[&wait.tokens])
         .await
-        .context("answer a wait: read its signal row")?
-    else {
-        return Ok(Answered::Gone);
-    };
-    let consumed = row_to_signal(row)?;
+        .context("answer a wait: read its signal rows")?;
+    let consumed = rows.into_iter().map(row_to_signal).collect::<anyhow::Result<Vec<_>>>()?;
     let Some(locked) = locked.filter(|locked| locked.state != "ended") else { return Ok(Answered::RunEnded { consumed }) };
+    let (waited, answer) = match &wait.branch_of {
+        None => (token.to_string(), answer.clone()),
+        Some(of) => (of.wait.clone(), match answer {
+            weft_core::primitive::WaitAnswer::Given { value } => {
+                weft_core::primitive::WaitAnswer::Given { value: weft_core::signal::first_of::branch_answer(of.branch, value.clone()) }
+            }
+            weft_core::primitive::WaitAnswer::Skipped => weft_core::primitive::WaitAnswer::Skipped,
+        }),
+    };
     if locked.owner.is_some() {
-        weft_task_store::parked_fires::hand_answer_in(tx, token, run_id, answer).await?;
+        weft_task_store::parked_fires::hand_answer_in(tx, &waited, run_id, &answer).await?;
         return Ok(Answered::Reached { consumed });
     }
-    let resolved = RunEvent::wait_answered(run_id, token.to_string(), answer.clone(), crate::lease::now_unix() as u64);
+    let resolved = RunEvent::wait_answered(run_id, waited, answer, crate::lease::now_unix() as u64);
     match weft_journal::record::append_locked_in(tx, run_id, &locked, std::slice::from_ref(&resolved), weft_journal::record::DISPATCHER, Then::Queued).await? {
         Appended::At(_) => Ok(Answered::Reached { consumed }),
         other => anyhow::bail!("run {run_id} was locked with no owner, yet its answer was not written: {other:?}"),
     }
+}
+
+/// The signal rows that answer the same wait as the resume row `token` of
+/// run `run_id`, locked ([`answer_in`]): that row alone, or, for a branch of
+/// a wait on the first of several, every branch of that wait still there.
+/// `None` when `token` is no resume row any more.
+async fn wait_rows_in(tx: &impl Client, run_id: RunId, token: &str) -> anyhow::Result<Option<WaitRows>> {
+    let Some(row) = tx.opt::<SignalRow>(SIGNAL_LOCK_RESUME_BY_TOKEN, &[&token]).await.context("answer a wait: read its signal row")? else {
+        return Ok(None);
+    };
+    let branch_of = crate::store::branch_of(&row_to_signal(row)?)?;
+    let Some(of) = branch_of else { return Ok(Some(WaitRows { tokens: vec![token.to_string()], branch_of: None })) };
+    let rows: Vec<SignalRow> =
+        tx.all(SIGNAL_LOCK_WHERE_RUN_ID_RESUME, &[&run_id]).await.context("answer a wait: read the run's waits")?;
+    let mut tokens = Vec::new();
+    for row in rows {
+        let sig = row_to_signal(row)?;
+        if crate::store::branch_of(&sig)?.is_some_and(|other| other.wait == of.wait) {
+            tokens.push(sig.token);
+        }
+    }
+    Ok(Some(WaitRows { tokens, branch_of: Some(of) }))
+}
+
+/// What [`wait_rows_in`] found.
+struct WaitRows {
+    tokens: Vec<String>,
+    branch_of: Option<weft_core::signal::first_of::BranchOf>,
 }
 
 /// Who answers a wait, for [`answer_in`].
@@ -1819,13 +1858,28 @@ impl SignalStore for PostgresStore {
         row.map(row_to_signal).transpose()
     }
 
-    async fn signal_withdraw(&self, run_id: RunId, token: &str) -> anyhow::Result<Option<SignalRegistration>> {
-        let row: Option<SignalRow> = self
-            .pool
-            .opt(SIGNAL_DELETE_WAIT_OF_RUN_RETURNING, &[&token, &run_id])
-            .await
-            .context("signal_withdraw: read the signal row")?;
-        row.map(row_to_signal).transpose()
+    async fn signal_withdraw(&self, run_id: RunId, token: &str) -> anyhow::Result<Vec<SignalRegistration>> {
+        // The run's own waits, read for the ones that answer `token`: its
+        // row, or the rows of its branches, whose spec names it.
+        let mut tokens = Vec::new();
+        for sig in self.signal_list_for_run_id(run_id).await? {
+            if crate::store::answers_wait(&sig, token)? {
+                tokens.push(sig.token);
+            }
+        }
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The run's row first, the order every writer of a run takes them
+        // in: an answer to a branch locks the run, then every branch
+        // (`answer_in`), so the two never hold the rows crosswise.
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        weft_journal::record::lock_in(&tx, run_id).await?;
+        let rows: Vec<SignalRow> =
+            tx.all(SIGNAL_DELETE_WAITS_OF_RUN_RETURNING, &[&tokens, &run_id]).await.context("signal_withdraw: read the signal rows")?;
+        tx.commit().await?;
+        rows.into_iter().map(row_to_signal).collect()
     }
 
     async fn signal_list_for_run_id(&self, run_id: RunId) -> anyhow::Result<Vec<SignalRegistration>> {
@@ -2595,8 +2649,8 @@ const HELD_ON_ACTIVATIONS: &str = concat!(
         AND (r.fired_by, COALESCE(r.instance_id, '')) IN (SELECT * FROM unnest($2::text[], $3::text[])))::bigint"
 );
 
-const SIGNAL_DELETE_WAIT_OF_RUN_RETURNING: &str =
-    concat!("DELETE FROM signal WHERE token = $1 AND is_resume AND run_id = $2 RETURNING ", signal_columns!(""));
+const SIGNAL_DELETE_WAITS_OF_RUN_RETURNING: &str =
+    concat!("DELETE FROM signal WHERE token = ANY($1) AND is_resume AND run_id = $2 RETURNING ", signal_columns!(""));
 
 /// One registration of a row, only while the row still is it.
 const SIGNAL_DELETE_REGISTRATION_RETURNING: &str =
@@ -2610,10 +2664,16 @@ const SIGNAL_DELETE_RESUME_BY_RUN_IDS_RETURNING: &str = concat!(
     signal_columns!("")
 );
 
-const SIGNAL_DELETE_RESUME_BY_TOKEN_RETURNING: &str = concat!(
-    "DELETE FROM signal WHERE token = $1 AND is_resume = TRUE RETURNING ",
+const SIGNAL_DELETE_RESUME_BY_TOKENS_RETURNING: &str = concat!(
+    "DELETE FROM signal WHERE token = ANY($1) AND is_resume = TRUE RETURNING ",
     signal_columns!("")
 );
+
+const SIGNAL_LOCK_RESUME_BY_TOKEN: &str =
+    concat!("SELECT ", signal_columns!(""), " FROM signal WHERE token = $1 AND is_resume FOR UPDATE");
+
+const SIGNAL_LOCK_WHERE_RUN_ID_RESUME: &str =
+    concat!("SELECT ", signal_columns!(""), " FROM signal WHERE run_id = $1 AND is_resume ORDER BY token FOR UPDATE");
 
 /// Row shape for signal SELECTs ([`signal_columns!`]): a struct, since
 /// the row is wider than a tuple reads.

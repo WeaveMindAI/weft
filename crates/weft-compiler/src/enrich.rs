@@ -717,6 +717,9 @@ pub fn enrich_collecting(
         // stays too.
         let own_one_of = std::mem::take(&mut node.features.one_of_required);
         node.features = meta.features.clone();
+        // On the node, so a rule of a node it is wired into reads them
+        // off the program (`weft_core::node::ValueList::Wired`).
+        node.lists = meta.lists.clone();
         // A group the catalog declares and the author repeats at the
         // call site is ONE constraint; appending both would report one
         // unsatisfied node twice at the same span.

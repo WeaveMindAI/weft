@@ -72,5 +72,21 @@
       "port_snapshot": {},
       "at_unix": 1760000400
     }
+  ],
+  [
+    {
+      "kind": "bus_joined",
+      "bus_id": "5b1e2c3d-4f5a-4b6c-8d7e-9f0a1b2c3d4e",
+      "offset": 0,
+      "name": "host",
+      "at_unix": 1760000000
+    },
+    {
+      "kind": "bus_left",
+      "bus_id": "5b1e2c3d-4f5a-4b6c-8d7e-9f0a1b2c3d4e",
+      "offset": 1,
+      "name": "host",
+      "at_unix": 1760000001
+    }
   ]
 ]

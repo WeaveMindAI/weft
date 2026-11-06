@@ -33,6 +33,8 @@ fn builder(pool: &Pool, images: Arc<FakeImageBuilder>) -> VersionBuilder {
 fn builder_on(pool: &Pool, images: Arc<dyn ImageBuilder>) -> VersionBuilder {
     VersionBuilder {
         images,
+        // The fake builds images, as a cloud does.
+        install: weft_core::install::InstallKind::Cloud,
         pool: pool.clone(),
         prunes: Default::default(),
         blobs: weft_dispatcher::build::blob_cache::BlobCache::in_temp_dir(false),

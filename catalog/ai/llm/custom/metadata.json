@@ -18,11 +18,21 @@
     "doors": ["own"],
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "key",
-          "label": "API key",
-          "placeholder": "..."
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "..."
+            }
+          ],
+          "guide": {
+            "steps": [
+              "Paste the endpoint's API key below and name the connection.",
+              "The endpoint's address lives on the Custom Provider node itself, not here."
+            ]
+          }
         }
       ]
     },
@@ -36,14 +46,6 @@
     "verification": {
       "rung": "silent",
       "cost": "free"
-    },
-    "ownPage": {
-      "guide": {
-        "steps": [
-          "Paste the endpoint's API key below and name the connection.",
-          "The endpoint's address lives on the Custom Provider node itself, not here."
-        ]
-      }
     }
   },
   "inputs": [

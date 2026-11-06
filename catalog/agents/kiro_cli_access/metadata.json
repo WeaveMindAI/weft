@@ -1,0 +1,61 @@
+{
+  "type": "KiroCliAccess",
+  "label": "Kiro CLI Access",
+  "description": "A Kiro login, for the KiroCli nodes' `access`: a Kiro API key (Pro plans and up). One access for however many KiroCli nodes.",
+  "tags": [
+    "agent",
+    "kiro",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#7b42f6",
+  "service": {
+    "service": "kiro_cli",
+    "label": "Kiro CLI",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "id": "apiKey",
+          "label": "API key",
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "ksk_..."
+            }
+          ],
+          "guide": {
+            "link": "https://kiro.dev/docs/getting-started/authentication/",
+            "steps": [
+              "Sign in at app.kiro.dev and create an API key (Pro plans and up).",
+              "Paste it below and name the connection. Calls are billed to that account's credits."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": []
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[kiro_cli]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[kiro_cli]",
+      "description": "Wire into the KiroCli nodes' `access` input."
+    }
+  ]
+}

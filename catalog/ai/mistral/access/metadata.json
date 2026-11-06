@@ -18,11 +18,22 @@
     ],
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "key",
-          "label": "API key",
-          "placeholder": "..."
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "..."
+            }
+          ],
+          "guide": {
+            "link": "https://console.mistral.ai/api-keys",
+            "steps": [
+              "Open console.mistral.ai, API Keys, and create a key.",
+              "Paste it below and name the connection."
+            ]
+          }
         }
       ]
     },
@@ -40,15 +51,6 @@
     "verification": {
       "rung": "reports_validity",
       "cost": "free"
-    },
-    "ownPage": {
-      "guide": {
-        "link": "https://console.mistral.ai/api-keys",
-        "steps": [
-          "Open console.mistral.ai, API Keys, and create a key.",
-          "Paste it below and name the connection."
-        ]
-      }
     }
   },
   "inputs": [

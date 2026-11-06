@@ -10,26 +10,34 @@
 	// store through the transport and are never kept here. The "Your own"
 	// door is ONE page with up to three optional parts (a mint button, a
 	// foldable guide unfolded by default, the paste fields); there is
-	// deliberately no mode switch and no second tab.
+	// deliberately no mode switch and no second tab. A pasted-credential
+	// service offering several ways to sign in shows them as a choice at
+	// the top of that page; the guide and fields are the chosen way's.
 	//
 	// The host decides where it talks (`transport`): the weft editor
 	// through its host bridge, an instance's page through the instance door.
 	// The look is set with CSS custom properties (`--wc-accent`,
 	// `--wc-font-size`, ...) on any ancestor.
-	import type { AppRegistration, AccessSpecWire, Door, GrantSummary, SharedAppChoice } from '../core/wire';
+	import type { AppRegistration, AccessSpecWire, Door, GrantSummary, LoginWayWire, SharedAppChoice } from '../core/wire';
 	import type { ConnectTransport } from '../core/transport';
 	import {
 		canDo,
+		connectionWayLabel,
 		defaultPermissions,
 		displayLabel,
 		guideLink,
 		guideSteps,
 		needsConsent,
+		offeredWays,
 		ownFields,
+		ownGuide,
 		ownRegistration,
 		permissionLabels,
 		permissionSummary,
 		tickablePermissions,
+		wayId,
+		wayLabel,
+		ways,
 	} from '../core/recipe';
 	import { runConsent } from '../core/consent';
 	import { onDestroy } from 'svelte';
@@ -64,6 +72,7 @@
 	const isConsent = $derived(needsConsent(spec));
 	const hasPermissions = $derived(tickablePermissions(spec).length > 0);
 	const declaredDoors = $derived<Door[]>(spec.doors ?? ['own']);
+	const isStatic = $derived(spec.acquisition.kind === 'static');
 
 	let open = $state(false);
 	let busy = $state(false);
@@ -87,8 +96,25 @@
 	/// connects stay available, every consent button hides.
 	let consentBlocked = $state<string | null>(null);
 	let ticked = $state<string[]>([]);
-	/// The own-page guide link with the ticked permission ids interpolated.
-	const providerGuideLink = $derived(guideLink(spec, ticked));
+	/// The ways to sign in this install offers a pasted-credential
+	/// service (the doors answer), in the spec's order.
+	let offered = $state.raw<LoginWayWire[]>([]);
+	/// Whether the doors answered this opening, so an empty `offered`
+	/// means "none works here" rather than "not asked yet".
+	let doorsKnown = $state(false);
+	/// The way the "Your own" page fills: the only one when one is
+	/// offered, the person's pick when several are, `null` until then
+	/// (and always for a service that pastes no credential).
+	let chosenWay = $state.raw<LoginWayWire | null>(null);
+	/// The own-page guide (the chosen way's for a pasted-credential
+	/// service) and its link with the ticked permission ids interpolated.
+	const guide = $derived(ownGuide(spec, chosenWay));
+	const providerGuideLink = $derived(guideLink(spec, chosenWay, ticked));
+	const fields = $derived(ownFields(spec, chosenWay));
+	/// The capability groups the shown fields can fill.
+	const capabilities = $derived(
+		(spec.capabilities ?? []).filter((c) => c.fields.every((n) => fields.some((f) => f.name === n))),
+	);
 	let formValues = $state<Record<string, string>>({});
 	/// The paste-a-credential section's own values, separate from the
 	/// app fields: the two sections submit independently.
@@ -131,6 +157,7 @@
 		surface = 'list';
 		if (!open) return;
 		ticked = defaultPermissions(spec);
+		doorsKnown = false;
 		busy = true;
 		try {
 			connections = await transport.connections(spec.service);
@@ -139,6 +166,10 @@
 			sharedCredential = doors.sharedCredential && transport.allowsSharedKey;
 			redirectUri = doors.redirectUri ?? '';
 			consentBlocked = doors.consentBlocked ?? null;
+			offered = offeredWays(spec, doors.offeredWays);
+			// One way offered: it is the way, with nothing to pick.
+			chosenWay = offered.length === 1 ? (offered[0] ?? null) : null;
+			doorsKnown = true;
 		} catch (e) {
 			fail(e);
 		} finally {
@@ -187,6 +218,15 @@
 		void choose({ id: c.id, identity: c.identity ?? undefined });
 	}
 
+	/// Pick a way to sign in. What was typed was for the other way's
+	/// fields, so it goes.
+	function chooseWay(e: MouseEvent, way: LoginWayWire) {
+		e.stopPropagation();
+		if (chosenWay === way) return;
+		chosenWay = way;
+		formValues = {};
+	}
+
 	function disconnect(e: MouseEvent) {
 		e.stopPropagation();
 		void choose(null);
@@ -214,6 +254,7 @@
 				door,
 				paste,
 				values: paste ? { ...pasteValues } : door === 'own' ? { ...formValues } : {},
+				way: door === 'own' && !paste && chosenWay ? wayId(chosenWay) : null,
 				label: door === 'own' && ownName.trim() ? ownName.trim() : null,
 				permissions: ticked,
 				sharedApp: door === 'shared' ? (chosenApp?.label ?? null) : null,
@@ -333,7 +374,7 @@
 					<div class="wc-row">
 						<button type="button" class="wc-connection" title={c.id} onclick={(e) => pick(e, c)}>
 							<span class="wc-ellipsis">{c.identity ?? c.label ?? label}</span>
-							<span class="wc-ellipsis wc-muted">{c.label ?? label}</span>
+							<span class="wc-ellipsis wc-muted">{c.label ?? label}{#if connectionWayLabel(spec, c)}<span class="wc-faint"> ({connectionWayLabel(spec, c)})</span>{/if}</span>
 							<span class="wc-ellipsis wc-end {c.hasCredential ? 'wc-muted' : 'wc-danger'}">{canDo(spec, c)}</span>
 						</button>
 						{#if forgetPending === c.id}
@@ -442,17 +483,33 @@
 				{#if spec.ownPage?.mint && transport.mintApp}
 					<button type="button" class="wc-primary wc-go" disabled={busy} onclick={mintApp}>Create it for me</button>
 				{/if}
-				{#if spec.ownPage?.guide}
+				{#if isStatic && doorsKnown && offered.length === 0}
+					<div class="wc-notice">
+						{#if ways(spec).length === 1}
+							{label} signs in only on a local install, so this install cannot connect it.
+						{:else}
+							None of {label}'s ways to sign in works on this install: each works only on a local install.
+						{/if}
+					</div>
+				{:else if offered.length > 1}
+					<div class="wc-muted">How do you sign in?</div>
+					{#each offered as way (wayId(way))}
+						<button type="button" class="wc-option" class:wc-chosen={chosenWay === way} onclick={(e) => chooseWay(e, way)}>
+							{wayLabel(way)}
+						</button>
+					{/each}
+				{/if}
+				{#if guide}
 					<button type="button" class="wc-fold" onclick={(e) => { e.stopPropagation(); guideOpen = !guideOpen; }}>
 						<span>{guideOpen ? '▾' : '▸'}</span>
-						<span>How to create one</span>
+						<span>{isStatic ? 'How to get one' : 'How to create one'}</span>
 					</button>
 					{#if guideOpen}
 						<div class="wc-guide">
 							{#if providerGuideLink}
 								<button type="button" class="wc-link" onclick={(e) => { e.stopPropagation(); transport.openExternal(providerGuideLink); }}>Open the provider's page</button>
 							{/if}
-							{#each guideSteps(spec, ticked) as step, i}
+							{#each guideSteps(spec, chosenWay, ticked) as step, i}
 								<p>{i + 1}. {step}</p>
 							{/each}
 							{#if redirectUri && isConsent}
@@ -483,15 +540,17 @@
 				     declares: it is the connection list's middle column. Left
 				     empty, the store names it after the service, which is
 				     what the placeholder shows. -->
-				<div class="wc-field">
-					<label class="wc-muted" for={`wc-${spec.service}-own-name`}>Name</label>
-					<input id={`wc-${spec.service}-own-name`} type="text" class="wc-input" placeholder={label} bind:value={ownName} />
-				</div>
-				{#if (spec.capabilities ?? []).length > 0}
-					<div class="wc-warn">Fill the fields of at least one of: {(spec.capabilities ?? []).map((c) => c.label).join(', ')}.</div>
+				{#if !isStatic || chosenWay}
+					<div class="wc-field">
+						<label class="wc-muted" for={`wc-${spec.service}-own-name`}>Name</label>
+						<input id={`wc-${spec.service}-own-name`} type="text" class="wc-input" placeholder={label} bind:value={ownName} />
+					</div>
 				{/if}
-				{#each ownFields(spec) as f (f.name)}
-					{@const group = (spec.capabilities ?? []).find((c) => c.fields.includes(f.name))}
+				{#if capabilities.length > 0}
+					<div class="wc-warn">Fill the fields of at least one of: {capabilities.map((c) => c.label).join(', ')}.</div>
+				{/if}
+				{#each fields as f (f.name)}
+					{@const group = capabilities.find((c) => c.fields.includes(f.name))}
 					<div class="wc-field">
 						<label class="wc-muted" for={`wc-${spec.service}-${f.name}`}>
 							{f.label ?? f.name}{#if group}<span class="wc-faint"> ({group.label})</span>{/if}
@@ -511,7 +570,7 @@
 					{:else}
 						<button type="button" class="wc-primary" disabled={busy} onclick={(e) => connectConsent(e, 'own')}>Sign in with {label}</button>
 					{/if}
-				{:else}
+				{:else if !isStatic || chosenWay}
 					<button type="button" class="wc-primary" disabled={busy} onclick={(e) => connectDirect(e, 'own')}>Connect</button>
 				{/if}
 				{#if spec.ownPage?.paste}
@@ -690,6 +749,9 @@
 		border: none;
 		border-radius: var(--wc-radius, 0.25rem);
 		background: var(--wc-muted-bg, #f4f4f5);
+	}
+	.wc-chosen {
+		outline: 1px solid var(--wc-accent, #3b82f6);
 	}
 	.wc-list {
 		margin: 0;

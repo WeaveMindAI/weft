@@ -104,7 +104,7 @@ async fn migrate_import(
             shared_keys.insert(grant.service().to_string());
         }
     }
-    weft_access_store::migrate::import(import, &req.tenant, &shared_keys)
+    weft_access_store::migrate::import(import, state.install, &req.tenant, &shared_keys)
         .await
         .map(Json)
         .map_err(crate::handlers::store_err)
@@ -237,7 +237,7 @@ async fn connect_direct(
                 .map_err(|e| (StatusCode::PRECONDITION_FAILED, e))?;
         }
     }
-    weft_access_store::connect_direct(&state.pool, &req.tenant, inner)
+    weft_access_store::connect_direct(&state.pool, state.install, &req.tenant, inner)
         .await
         .map(Json)
         .map_err(crate::handlers::store_err)
@@ -453,6 +453,7 @@ async fn lookup(
     };
     let mut resolved = weft_access_store::resolve_for_worker(
         &state.pool,
+        state.install,
         &req.tenant,
         weft_access_store::GrantUser::of(inner.for_instance.as_ref()),
         access_id,
@@ -514,6 +515,7 @@ async fn granted(
     control_plane(&state, &headers).await?;
     weft_access_store::granted_items(
         &state.pool,
+        state.install,
         &req.tenant,
         weft_access_store::GrantUser::of(req.inner.for_instance.as_ref()),
         req.inner.access_id,
@@ -563,6 +565,7 @@ async fn picker_token(
     control_plane(&state, &headers).await?;
     let resolved = weft_access_store::resolve_for_worker(
         &state.pool,
+        state.install,
         &req.tenant,
         weft_access_store::GrantUser::of(req.inner.for_instance.as_ref()),
         req.inner.access_id,

@@ -1343,7 +1343,9 @@
         let project = bus_plus_waiter_topology();
         let pid = project.id;
         // Counts how many times the waiter has resumed (0 -> 1 -> 2). The
-        // creator holds the bus open until BOTH resumes have landed.
+        // creator closes the bus only after BOTH resumes have landed: until
+        // then it keeps working, so the run never pauses and each answer
+        // goes into the waiter's waiting call.
         let resumes = Arc::new(tokio::sync::watch::Sender::new(0u32));
 
         let c_resumes = resumes.clone();
@@ -1358,7 +1360,8 @@
                     bus.register("creator").expect("register creator");
                     emit_bus_marker(&ctx, "ch", marker).await?;
                     bus.wait_for("peer", &mut state).await.expect("peer joins");
-                    // Hold the bus open until BOTH awaits have resumed.
+                    // Close only after BOTH resumes, so the run never
+                    // pauses while the waiter waits.
                     resumes.subscribe().wait_for(|n| *n >= 2).await.expect("the count outlives the creator");
                     bus.close();
                     Ok(())
@@ -1459,6 +1462,8 @@
                     bus.register("creator").expect("register creator");
                     emit_bus_marker(&ctx, "ch", marker).await?;
                     bus.wait_for("peer", &mut state).await.expect("peer joins");
+                    // Close only after BOTH resumes, so the run never
+                    // pauses while the waiter waits.
                     resumes.subscribe().wait_for(|n| *n >= 2).await.expect("the count outlives the creator");
                     bus.close();
                     Ok(())

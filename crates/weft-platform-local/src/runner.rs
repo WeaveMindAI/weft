@@ -323,24 +323,15 @@ impl LocalRunner {
     /// outside): its log's last lines go to the runtime's log before the
     /// log goes with it.
     async fn stop(&self, entry: &Entry) -> anyhow::Result<()> {
-        if !self.still_there(entry).await? {
+        if !crate::processes::stop(self.processes.as_ref(), entry.pid, &entry.started, WORKER_STOP_GRACE).await? {
+            // A worker that died still leaves in its group whatever it
+            // started (a node's own program), so that goes too.
+            crate::processes::kill_leftovers(self.processes.as_ref(), entry.pid, &entry.started).await?;
             tracing::warn!(
                 target: "weft_platform_local::runner",
                 worker = %entry.name, last_lines = %log_tail(&self.registry.log_of(&entry.name)),
                 "a worker had ended on its own before weft stopped it"
             );
-        } else {
-            self.processes.signal(entry.pid, Signal::Term)?;
-            let asked = Instant::now();
-            while self.still_there(entry).await? && asked.elapsed() < WORKER_STOP_GRACE {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            // Its process group, whether it exited within the grace or
-            // not: a program a node started can outlive the worker that
-            // started it. Sent the moment the worker was seen gone (or
-            // still there), so its group's number is still its own: one
-            // found long dead above is never sent this.
-            self.processes.signal(entry.pid, Signal::Kill)?;
         }
         self.forget(entry)
     }

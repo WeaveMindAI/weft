@@ -106,7 +106,8 @@ pub enum FileKind {
 
 impl FileKind {
     /// The on-wire sentinel key that tags a value of this kind.
-    // SYNC: FileKind::marker_key <-> packages/weft-graph/src/protocol.ts STORED_FILE_MARKER_TYPES
+    // SYNC: FileKind::marker_key <-> packages/weft-graph/src/protocol.ts STORED_FILE_MARKER_TYPES,
+    //       extension-browser/src/lib/chat-history.ts MARKERS
     pub fn marker_key(self) -> &'static str {
         match self {
             FileKind::Image => "__weft_image__",
@@ -1721,6 +1722,21 @@ impl WeftType {
             serde_json::Value::Array(items) => items.iter().any(Self::contains_bus_handle),
             serde_json::Value::Object(fields) => fields.values().any(Self::contains_bus_handle),
             _ => false,
+        }
+    }
+
+    /// The id of every bus whose marker `value` carries, on its own or
+    /// nested in a record or a list, each handed to `found`: the buses a
+    /// value hands on to whoever takes it.
+    pub fn buses_in<'a>(value: &'a serde_json::Value, found: &mut impl FnMut(&'a str)) {
+        if let Some(id) = Self::bus_marker_id(value) {
+            found(id);
+            return;
+        }
+        match value {
+            serde_json::Value::Array(items) => items.iter().for_each(|item| Self::buses_in(item, found)),
+            serde_json::Value::Object(fields) => fields.values().for_each(|field| Self::buses_in(field, found)),
+            _ => {}
         }
     }
 

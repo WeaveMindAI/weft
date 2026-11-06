@@ -4,17 +4,18 @@
 //!
 //! There is no envelope. The bus's `Closed` entry IS the end-of-
 //! conversation signal: the guest's cursor returns `None` when it
-//! reaches it. A bus from `ctx.join_bus` ends with the guest's body on
-//! EVERY exit path (happy, error, or early-return; a pause is no exit,
-//! the bus stays open for the resumed body), so a half-broken guest can
-//! never leave the host parked forever on its reply cursor.
+//! reaches it. `ctx.join_bus` makes the guest a member like the host:
+//! when its body returns, on any exit path, its name leaves and the host
+//! stays on the bus (a pause is no exit, the name stays for the resumed
+//! body). A guest that fails halfway leaves the host waiting for a reply
+//! until the run's stuck check ends the bus failed.
 //!
 //! Flow:
-//!   1. join_bus (resolve marker + register "guest", ends with the body)
+//!   1. join_bus (resolve marker + register "guest": a member)
 //!   2. wait_for("host")
 //!   3. loop: pull the next host message; reply with the next scripted
 //!      line. Exits when the cursor returns None (host closed).
-//!   4. close the bus, pulse_downstream(done=true)
+//!   4. pulse_downstream(done=true)
 //!
 //! The run can pause while the guest waits for the host's next message.
 //! The state keeps how many replies went out, so the resumed guest (its
@@ -69,7 +70,6 @@ impl Node for BusChatGuestNode {
             bus.send("msg", json!(reply)).node_err(format!("guest send '{reply}'"))?;
             state.replies += 1;
         }
-        bus.close();
 
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await?;
         Ok(())

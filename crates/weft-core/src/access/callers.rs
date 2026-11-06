@@ -203,7 +203,7 @@ impl CallerScheme {
         serde_json::from_value(serde_json::json!({
             "service": self.service(),
             "label": label,
-            "acquisition": { "kind": "static", "fields": fields },
+            "acquisition": { "kind": "static", "ways": [{ "fields": fields }] },
             "identity": label,
         }))
         .expect("a scheme's recipe is a valid recipe")
@@ -238,7 +238,7 @@ pub fn parse_auth(value: Option<&Value>) -> Result<Option<VerifyKind>, String> {
             };
             verify.validate(scheme.service(), VerifySide::Caller)?;
             let recipe = scheme.recipe();
-            let held = recipe.own_fields();
+            let held = &recipe.chosen_way(None)?.fields;
             for name in verify.required_value_names()? {
                 if !held.iter().any(|f| f.name == name) {
                     return Err(format!(
@@ -406,7 +406,7 @@ mod tests {
         for named in NAMED_CHECKS {
             let verify = named.verify();
             let recipe = CallerScheme::of(&verify).unwrap().recipe();
-            let held: Vec<String> = recipe.own_fields().iter().map(|f| f.name.clone()).collect();
+            let held: Vec<String> = recipe.chosen_way(None).unwrap().fields.iter().map(|f| f.name.clone()).collect();
             for name in verify.required_value_names().unwrap() {
                 assert!(held.contains(&name), "{}: {name} not in {held:?}", named.name);
             }

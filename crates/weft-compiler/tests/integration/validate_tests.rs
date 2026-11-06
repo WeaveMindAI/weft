@@ -2702,7 +2702,7 @@ fn declared_picker_rule_suppresses_the_synthesized_twin() {
   "label": "Legacy access",
   "description": "a copied catalog predating the synthesized rule",
   "service": { "service": "legacy",
-               "acquisition": { "kind": "static", "fields": [{ "name": "key" }] } },
+               "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "key" }] }] } },
   "inputs": [
     { "name": "account", "type": "Access[legacy]",
       "widget": { "kind": "access" } }
@@ -2745,7 +2745,7 @@ fn unrelated_picker_rule_does_not_suppress_the_synthesized_one() {
   "label": "Legacy access",
   "description": "declares its own unrelated runtime rule on the picker field",
   "service": { "service": "legacy",
-               "acquisition": { "kind": "static", "fields": [{ "name": "key" }] } },
+               "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "key" }] }] } },
   "inputs": [
     { "name": "account", "type": "Access[legacy]",
       "widget": { "kind": "access" } }

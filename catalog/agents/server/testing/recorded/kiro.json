@@ -1,0 +1,2312 @@
+{
+ "kind": "kiro",
+ "command": "kiro-cli",
+ "source": "Real, on Kiro CLI 3.0.0 (`kiro-cli acp --agent-engine v3`) on this machine's own `kiro-cli login`, model qwen3-coder-next, driven through weft's own agent server and this spec, every line teed (scratchpad acp12/drive.py): hello is acp12/kiro/transcript.jsonl; tool and permission are cut from acp12/kiro2/transcript.jsonl, one real turn (the model first called `weft::lookup` directly and was told to load it, then `tool_load`, shown only by its end, then the program's tool as `@weft/lookup`, asked and allowed, through weft's route; later `touch made.txt`, asked). Composed: the end of both turns (tool: the reply and the prompt's answer after the call completed; permission: the command's completed update, the reply and the answer), because that real turn was left waiting on the `touch` question. Real from the earlier run with a made-up key (rec/kiro1.jsonl): the answers of initialize, session/new, session/set_mode, session/load and its replay, session/set_config_option, and the `bad key` turn. Composed from Kiro's ACP migration guide and its bundled acp-server.js: reject and ask.",
+ "answers": {
+  "initialize": {
+   "protocolVersion": 1,
+   "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {
+     "image": true,
+     "embeddedContext": true
+    },
+    "mcpCapabilities": {
+     "http": true,
+     "sse": true
+    },
+    "sessionCapabilities": {
+     "list": {},
+     "close": {},
+     "delete": {},
+     "fork": {
+      "_meta": {
+       "kiro": {
+        "messageId": true
+       }
+      }
+     }
+    },
+    "_meta": {
+     "kiro": {
+      "checkpoints": true,
+      "sessionList": true,
+      "policyNotifications": true,
+      "extensionMethods": [
+       "_kiro/knowledge",
+       "_kiro/memory/list",
+       "_kiro/memory/get",
+       "_kiro/memory/create",
+       "_kiro/memory/update",
+       "_kiro/memory/delete",
+       "_kiro/memory/getSyncStatus",
+       "_kiro/codeIntelligence",
+       "_kiro/environment/start_ssh_session",
+       "_kiro/session/context",
+       "_kiro/session/compact",
+       "_kiro/session/export",
+       "_kiro/session/history",
+       "_kiro/config/template",
+       "_kiro/configuration/getState",
+       "_kiro/configuration/set",
+       "_kiro/workflow/new",
+       "_kiro/workflow/invoke",
+       "_kiro/workflow/load",
+       "_kiro/workflow/inspect",
+       "_kiro/workflow/list",
+       "_kiro/workflow/pause",
+       "_kiro/workflow/cancel",
+       "_kiro/workflow/delete",
+       "_kiro/workflow/listRecipes",
+       "_kiro/workflow/listWatchHandlers",
+       "_kiro/workflow/resumeAll",
+       "_kiro/workflow/retry",
+       "_kiro/workflow/update",
+       "_kiro/workflow/resume",
+       "_kiro/sourceProviders/list",
+       "_kiro/sourceProviders/listResources"
+      ],
+      "sessionSources": [
+       "local",
+       "remote"
+      ],
+      "sessionListScopes": [
+       "workspace",
+       "user"
+      ],
+      "executionTargets": [
+       "local",
+       "cloud-sandbox"
+      ],
+      "sourceProviders": true,
+      "replayMarking": true,
+      "autoCompactionThreshold": {
+       "min": 0,
+       "max": 80,
+       "default": 80
+      },
+      "modelFallbackReporting": true,
+      "logging": {
+       "logDir": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/rec/kiro1/home/kiro-home/logs/20261104T073118936",
+       "channels": [
+        {
+         "name": "kiro",
+         "filePath": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/rec/kiro1/home/kiro-home/logs/20261104T073118936/kiro.log"
+        },
+        {
+         "name": "mcp",
+         "filePath": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/rec/kiro1/home/kiro-home/logs/20261104T073118936/mcp.log"
+        },
+        {
+         "name": "powers",
+         "filePath": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/rec/kiro1/home/kiro-home/logs/20261104T073118936/powers.log"
+        }
+       ]
+      }
+     }
+    }
+   },
+   "authMethods": [
+    {
+     "id": "aws-builder-id",
+     "name": "AWS Builder ID"
+    },
+    {
+     "id": "aws-iam-identity-center",
+     "name": "AWS IAM Identity Center"
+    }
+   ]
+  },
+  "session/new": {
+   "_meta": {
+    "schemaVersion": "1.0.0",
+    "id": "$SESSION",
+    "title": "New Session",
+    "agentMode": "vibe",
+    "workspacePaths": [
+     "/home/me/work"
+    ],
+    "createdAt": "2026-11-04T07:31:20.009Z",
+    "lastModifiedAt": "2026-11-04T07:31:20.009Z",
+    "semanticReviewEnabled": true,
+    "memoryConfig": {
+     "mode": "disabled",
+     "reflection": false
+    },
+    "disableAutoCompaction": false,
+    "ftaEnabled": false,
+    "workflowsEnabled": false,
+    "specPlanEnabled": false,
+    "specWorkflow": "quick",
+    "specSkipClarificationEnabled": true,
+    "_meta": {
+     "kiro": {}
+    },
+    "source": "local"
+   },
+   "sessionId": "$SESSION",
+   "modes": {
+    "availableModes": [
+     {
+      "id": "vibe",
+      "name": "Default",
+      "description": "General coding assistance",
+      "_meta": {
+       "kiro": {
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     },
+     {
+      "id": "spec",
+      "name": "Spec",
+      "description": "Structured feature development",
+      "_meta": {
+       "kiro": {
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     },
+     {
+      "id": "quick-spec",
+      "name": "Quick Spec",
+      "description": "Fast spec workflow: clarify, then auto-generate requirements, design, and tasks",
+      "_meta": {
+       "kiro": {
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     },
+     {
+      "id": "bug-fix",
+      "name": "Bug Fix",
+      "description": "Structured bug-fix workflow: investigate, diagnose, and resolve bugs",
+      "_meta": {
+       "kiro": {
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     },
+     {
+      "id": "plan",
+      "name": "Plan",
+      "description": "Plan-only mode that helps break ideas down into an implementation plan without making any changes",
+      "_meta": {
+       "kiro": {
+        "welcomeMessage": "Transform any idea into fully working code. What do you want to build today?",
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     },
+     {
+      "id": "autonomous",
+      "name": "Autonomous",
+      "description": "Autonomous agent execution",
+      "_meta": {
+       "kiro": {
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     },
+     {
+      "id": "semantic_reviewer",
+      "name": "semantic_reviewer",
+      "description": "Behavioral, narrative code review of a local or PR diff. Writes a review document and a verdict.",
+      "_meta": {
+       "kiro": {
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     }
+    ],
+    "currentModeId": "vibe"
+   },
+   "configOptions": [
+    {
+     "type": "select",
+     "id": "mode",
+     "name": "Mode",
+     "category": "mode",
+     "currentValue": "vibe",
+     "options": [
+      {
+       "value": "vibe",
+       "name": "Default",
+       "description": "General coding assistance",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "spec",
+       "name": "Spec",
+       "description": "Structured feature development",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "quick-spec",
+       "name": "Quick Spec",
+       "description": "Fast spec workflow: clarify, then auto-generate requirements, design, and tasks",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "bug-fix",
+       "name": "Bug Fix",
+       "description": "Structured bug-fix workflow: investigate, diagnose, and resolve bugs",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Plan-only mode that helps break ideas down into an implementation plan without making any changes",
+       "_meta": {
+        "kiro": {
+         "welcomeMessage": "Transform any idea into fully working code. What do you want to build today?",
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "autonomous",
+       "name": "Autonomous",
+       "description": "Autonomous agent execution",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "semantic_reviewer",
+       "name": "semantic_reviewer",
+       "description": "Behavioral, narrative code review of a local or PR diff. Writes a review document and a verdict.",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "type": "select",
+     "id": "memoryReflection",
+     "name": "Memory reflection",
+     "description": "Allow this session to reflect on new memory",
+     "currentValue": "off",
+     "options": [
+      {
+       "value": "on",
+       "name": "On"
+      },
+      {
+       "value": "off",
+       "name": "Off"
+      }
+     ]
+    },
+    {
+     "type": "select",
+     "id": "autopilot",
+     "name": "Autopilot",
+     "currentValue": "on",
+     "options": [
+      {
+       "value": "on",
+       "name": "Autopilot",
+       "description": "Agent executes tools without confirmation"
+      },
+      {
+       "value": "off",
+       "name": "Supervised",
+       "description": "Agent asks for approval before file changes"
+      }
+     ]
+    },
+    {
+     "type": "select",
+     "id": "contentCollection",
+     "name": "Content Collection",
+     "currentValue": "enabled",
+     "options": [
+      {
+       "value": "enabled",
+       "name": "Enabled",
+       "description": "Allow content to be used for service improvement"
+      },
+      {
+       "value": "disabled",
+       "name": "Disabled",
+       "description": "Opt out of content collection"
+      }
+     ]
+    }
+   ]
+  },
+  "session/set_mode": {},
+  "session/set_config_option": {
+   "configOptions": [
+    {
+     "type": "select",
+     "id": "mode",
+     "name": "Mode",
+     "category": "mode",
+     "currentValue": "vibe",
+     "options": [
+      {
+       "value": "vibe",
+       "name": "Default",
+       "description": "General coding assistance",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "spec",
+       "name": "Spec",
+       "description": "Structured feature development",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "quick-spec",
+       "name": "Quick Spec",
+       "description": "Fast spec workflow: clarify, then auto-generate requirements, design, and tasks",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "bug-fix",
+       "name": "Bug Fix",
+       "description": "Structured bug-fix workflow: investigate, diagnose, and resolve bugs",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Plan-only mode that helps break ideas down into an implementation plan without making any changes",
+       "_meta": {
+        "kiro": {
+         "welcomeMessage": "Transform any idea into fully working code. What do you want to build today?",
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "autonomous",
+       "name": "Autonomous",
+       "description": "Autonomous agent execution",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "semantic_reviewer",
+       "name": "semantic_reviewer",
+       "description": "Behavioral, narrative code review of a local or PR diff. Writes a review document and a verdict.",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "type": "select",
+     "id": "model",
+     "name": "Model",
+     "category": "model",
+     "currentValue": "claude-sonnet-4.5",
+     "options": [
+      {
+       "value": "claude-sonnet-4.5",
+       "name": "claude-sonnet-4.5"
+      }
+     ]
+    },
+    {
+     "type": "select",
+     "id": "memoryReflection",
+     "name": "Memory reflection",
+     "description": "Allow this session to reflect on new memory",
+     "currentValue": "off",
+     "options": [
+      {
+       "value": "on",
+       "name": "On"
+      },
+      {
+       "value": "off",
+       "name": "Off"
+      }
+     ]
+    },
+    {
+     "type": "select",
+     "id": "autopilot",
+     "name": "Autopilot",
+     "currentValue": "on",
+     "options": [
+      {
+       "value": "on",
+       "name": "Autopilot",
+       "description": "Agent executes tools without confirmation"
+      },
+      {
+       "value": "off",
+       "name": "Supervised",
+       "description": "Agent asks for approval before file changes"
+      }
+     ]
+    },
+    {
+     "type": "select",
+     "id": "contentCollection",
+     "name": "Content Collection",
+     "currentValue": "enabled",
+     "options": [
+      {
+       "value": "enabled",
+       "name": "Enabled",
+       "description": "Allow content to be used for service improvement"
+      },
+      {
+       "value": "disabled",
+       "name": "Disabled",
+       "description": "Opt out of content collection"
+      }
+     ]
+    }
+   ]
+  },
+  "session/load": {
+   "_meta": {
+    "agentMode": "vibe",
+    "memoryConfig": {
+     "mode": "disabled",
+     "reflection": false
+    },
+    "contextUsage": {
+     "summarizationThreshold": 80,
+     "truncationThreshold": 95
+    },
+    "createdAt": "2026-11-04T07:31:20.009Z",
+    "id": "$SESSION",
+    "lastModifiedAt": "2026-11-04T07:31:20.429Z",
+    "title": "Hello",
+    "workspacePaths": [
+     "/home/me/work"
+    ],
+    "source": "local",
+    "executionTarget": {
+     "kind": "local"
+    },
+    "kiro": {
+     "loadTiming": {
+      "schema": 1,
+      "totalMs": 1035,
+      "startedAt": 1793777487985,
+      "phases": [
+       {
+        "id": "init-wait",
+        "label": "Wait for agent init",
+        "startMs": 0,
+        "endMs": 0
+       },
+       {
+        "id": "read-session",
+        "label": "Read session record",
+        "startMs": 1,
+        "endMs": 7
+       },
+       {
+        "id": "shell-type",
+        "label": "Resolve shell type",
+        "startMs": 8,
+        "endMs": 9
+       },
+       {
+        "id": "experiment-ready",
+        "label": "Wait for experiment allocation",
+        "startMs": 9,
+        "endMs": 928
+       },
+       {
+        "id": "hooks",
+        "label": "Load hooks",
+        "startMs": 930,
+        "endMs": 930
+       },
+       {
+        "id": "agent-registry",
+        "label": "Load agent profiles",
+        "startMs": 930,
+        "endMs": 949
+       },
+       {
+        "id": "policy",
+        "label": "Load and compile policy",
+        "startMs": 949,
+        "endMs": 952
+       },
+       {
+        "id": "knowledge",
+        "label": "Init knowledge registry",
+        "startMs": 953,
+        "endMs": 957
+       },
+       {
+        "id": "sandbox",
+        "label": "Create session sandbox",
+        "startMs": 957,
+        "endMs": 957
+       },
+       {
+        "id": "memory",
+        "label": "Load memory learnings",
+        "startMs": 957,
+        "endMs": 957
+       },
+       {
+        "id": "workspace-connection",
+        "label": "Build workspace connection",
+        "startMs": 957,
+        "endMs": 960
+       },
+       {
+        "id": "governance",
+        "label": "Refresh governance",
+        "startMs": 966,
+        "endMs": 966
+       },
+       {
+        "id": "mcp-connect",
+        "label": "Connect MCP servers",
+        "startMs": 968,
+        "endMs": 1035,
+        "detail": "weft connecting"
+       },
+       {
+        "id": "user-agent-gate",
+        "label": "Wait for user-agent experiment",
+        "startMs": 991,
+        "endMs": 991
+       },
+       {
+        "id": "read-messages",
+        "label": "Read transcript",
+        "startMs": 992,
+        "endMs": 1028
+       },
+       {
+        "id": "replay",
+        "label": "Replay history to client",
+        "startMs": 1028,
+        "endMs": 1029
+       },
+       {
+        "id": "build-context",
+        "label": "Rebuild model context",
+        "startMs": 1031,
+        "endMs": 1032
+       },
+       {
+        "id": "tools",
+        "label": "Build tool list",
+        "startMs": 1032,
+        "endMs": 1033
+       }
+      ],
+      "counts": {
+       "mcpServers": 1,
+       "events": 3
+      }
+     }
+    }
+   },
+   "modes": {
+    "availableModes": [
+     {
+      "id": "vibe",
+      "name": "Default",
+      "description": "General coding assistance",
+      "_meta": {
+       "kiro": {
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     },
+     {
+      "id": "spec",
+      "name": "Spec",
+      "description": "Structured feature development",
+      "_meta": {
+       "kiro": {
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     },
+     {
+      "id": "quick-spec",
+      "name": "Quick Spec",
+      "description": "Fast spec workflow: clarify, then auto-generate requirements, design, and tasks",
+      "_meta": {
+       "kiro": {
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     },
+     {
+      "id": "bug-fix",
+      "name": "Bug Fix",
+      "description": "Structured bug-fix workflow: investigate, diagnose, and resolve bugs",
+      "_meta": {
+       "kiro": {
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     },
+     {
+      "id": "plan",
+      "name": "Plan",
+      "description": "Plan-only mode that helps break ideas down into an implementation plan without making any changes",
+      "_meta": {
+       "kiro": {
+        "welcomeMessage": "Transform any idea into fully working code. What do you want to build today?",
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     },
+     {
+      "id": "autonomous",
+      "name": "Autonomous",
+      "description": "Autonomous agent execution",
+      "_meta": {
+       "kiro": {
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     },
+     {
+      "id": "semantic_reviewer",
+      "name": "semantic_reviewer",
+      "description": "Behavioral, narrative code review of a local or PR diff. Writes a review document and a verdict.",
+      "_meta": {
+       "kiro": {
+        "source": "bundled",
+        "resource": {
+         "resourceType": "agent",
+         "source": {
+          "origin": "bundled"
+         }
+        }
+       }
+      }
+     }
+    ],
+    "currentModeId": "vibe"
+   },
+   "configOptions": [
+    {
+     "type": "select",
+     "id": "mode",
+     "name": "Mode",
+     "category": "mode",
+     "currentValue": "vibe",
+     "options": [
+      {
+       "value": "vibe",
+       "name": "Default",
+       "description": "General coding assistance",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "spec",
+       "name": "Spec",
+       "description": "Structured feature development",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "quick-spec",
+       "name": "Quick Spec",
+       "description": "Fast spec workflow: clarify, then auto-generate requirements, design, and tasks",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "bug-fix",
+       "name": "Bug Fix",
+       "description": "Structured bug-fix workflow: investigate, diagnose, and resolve bugs",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "plan",
+       "name": "Plan",
+       "description": "Plan-only mode that helps break ideas down into an implementation plan without making any changes",
+       "_meta": {
+        "kiro": {
+         "welcomeMessage": "Transform any idea into fully working code. What do you want to build today?",
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "autonomous",
+       "name": "Autonomous",
+       "description": "Autonomous agent execution",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      },
+      {
+       "value": "semantic_reviewer",
+       "name": "semantic_reviewer",
+       "description": "Behavioral, narrative code review of a local or PR diff. Writes a review document and a verdict.",
+       "_meta": {
+        "kiro": {
+         "source": "bundled",
+         "resource": {
+          "resourceType": "agent",
+          "source": {
+           "origin": "bundled"
+          }
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "type": "select",
+     "id": "memoryReflection",
+     "name": "Memory reflection",
+     "description": "Allow this session to reflect on new memory",
+     "currentValue": "off",
+     "options": [
+      {
+       "value": "on",
+       "name": "On"
+      },
+      {
+       "value": "off",
+       "name": "Off"
+      }
+     ]
+    },
+    {
+     "type": "select",
+     "id": "autopilot",
+     "name": "Autopilot",
+     "currentValue": "on",
+     "options": [
+      {
+       "value": "on",
+       "name": "Autopilot",
+       "description": "Agent executes tools without confirmation"
+      },
+      {
+       "value": "off",
+       "name": "Supervised",
+       "description": "Agent asks for approval before file changes"
+      }
+     ]
+    },
+    {
+     "type": "select",
+     "id": "contentCollection",
+     "name": "Content Collection",
+     "currentValue": "enabled",
+     "options": [
+      {
+       "value": "enabled",
+       "name": "Enabled",
+       "description": "Allow content to be used for service improvement"
+      },
+      {
+       "value": "disabled",
+       "name": "Disabled",
+       "description": "Opt out of content collection"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "replay": {
+  "before": [
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "hello"
+    },
+    "_meta": {
+     "kiro": {
+      "userMessageTag": "prompt_eafacab7-a0d8-4d02-898e-4cdbe590fdb2",
+      "messageId": "5b339124-5555-48da-af9b-bd62314f4a25",
+      "timestamp": "2026-11-04T07:31:20.206Z",
+      "replay": true
+     }
+    }
+   },
+   {
+    "sessionUpdate": "session_info_update",
+    "_meta": {
+     "kiro": {
+      "turnStart": true,
+      "kind": "turn_start",
+      "executionId": "5b339124-5555-48da-af9b-bd62314f4a25-orphan-turn",
+      "timestamp": "2026-11-04T07:31:29.014Z",
+      "boundarySource": "recovered",
+      "replay": true
+     }
+    }
+   },
+   {
+    "sessionUpdate": "session_info_update",
+    "_meta": {
+     "kiro": {
+      "turnEnd": {
+       "stopReason": "cancelled"
+      },
+      "kind": "turn_end",
+      "stopReason": "cancelled",
+      "executionId": "5b339124-5555-48da-af9b-bd62314f4a25-orphan-turn",
+      "timestamp": "2026-11-04T07:31:29.014Z",
+      "boundarySource": "recovered",
+      "replay": true
+     }
+    }
+   }
+  ],
+  "after": [
+   {
+    "sessionUpdate": "session_info_update",
+    "_meta": {
+     "kiro": {
+      "contextUsage": {
+       "usagePercentage": 0.8,
+       "summarizationThreshold": 80
+      },
+      "breakdown": {
+       "contextFiles": {
+        "tokens": 0,
+        "percent": 0,
+        "items": []
+       },
+       "tools": {
+        "tokens": 3885,
+        "percent": 0.4,
+        "mcp": {
+         "tokens": 0,
+         "percent": 0
+        },
+        "builtin": {
+         "tokens": 3885,
+         "percent": 0.4
+        }
+       },
+       "memory": {
+        "tokens": 0,
+        "percent": 0
+       },
+       "kiroResponses": {
+        "tokens": 0,
+        "percent": 0
+       },
+       "yourPrompts": {
+        "tokens": 4334,
+        "percent": 0.4
+       },
+       "sessionFiles": {
+        "tokens": 0,
+        "percent": 0,
+        "items": []
+       }
+      },
+      "kind": "context_usage",
+      "usagePercentage": 0.8,
+      "summarizationThreshold": 80
+     }
+    }
+   },
+   {
+    "sessionUpdate": "session_info_update",
+    "_meta": {
+     "kiro": {
+      "focus": {
+       "status": "idle"
+      },
+      "kind": "focus_update",
+      "status": "idle",
+      "activity": {
+       "turnActive": false,
+       "runningWorkflows": 0,
+       "pausedWorkflows": 0
+      }
+     }
+    }
+   }
+  ]
+ },
+ "settings": [
+  {
+   "name": "ask",
+   "given": {
+    "permission": "ask"
+   },
+   "expect": {
+    "args": [
+     [
+      "acp",
+      "--agent-engine",
+      "v3"
+     ]
+    ],
+    "env": {
+     "KIRO_DISABLE_SESSION_TITLE_LLM": "true"
+    },
+    "unset": [
+     "KIRO_API_KEY",
+     "KIRO_HOME"
+    ],
+    "requests": [
+     {
+      "method": "initialize",
+      "params": {
+       "clientCapabilities": {
+        "_meta": {
+         "kiro": {
+          "userInput": true
+         }
+        }
+       }
+      }
+     },
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "vibe"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "accept_edits",
+   "given": {
+    "permission": "accept_edits"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/new",
+      "params": {
+       "_meta": {
+        "kiro": {
+         "policyPreset": [
+          "edit-workspace"
+         ]
+        }
+       }
+      }
+     },
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "vibe"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "plan",
+   "given": {
+    "permission": "plan"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "plan"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "bypass",
+   "given": {
+    "permission": "bypass"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/new",
+      "params": {
+       "_meta": {
+        "kiro": {
+         "policyPreset": [
+          "allow-all"
+         ]
+        }
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "model_and_options",
+   "given": {
+    "model": "claude-sonnet-4.5",
+    "options": {
+     "effort": "high",
+     "addDirs": [
+      "/a",
+      "/b"
+     ]
+    }
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/new",
+      "params": {
+       "additionalDirectories": [
+        "/a",
+        "/b"
+       ]
+      }
+     },
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "model",
+       "value": "claude-sonnet-4.5"
+      }
+     },
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "effortLevel",
+       "value": "high"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "api_key",
+   "given": {
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "ksk_test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "KIRO_API_KEY": "ksk_test",
+     "KIRO_HOME": "$HOME"
+    }
+   }
+  }
+ ],
+ "turns": {
+  "hello": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Hello there."
+      },
+      "_meta": {
+       "kiro": {
+        "executionId": "7605e804-0c2c-4da3-a3db-63959fc6f530",
+        "turnId": "7605e804-0c2c-4da3-a3db-63959fc6f530",
+        "replayId": "7fe782a4-38bc-4b50-ad0f-168eb12ce220-say"
+       }
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "text",
+     "done"
+    ],
+    "reply": "Hello there."
+   }
+  },
+  "permission": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "run_command_tooluse_Qyg5tktTwB7c6R56eEzFeV",
+      "title": "Create empty file made.txt",
+      "kind": "execute",
+      "status": "pending",
+      "rawInput": {
+       "command": "touch made.txt",
+       "description": "Create empty file made.txt",
+       "run_in_background": false
+      },
+      "_meta": {
+       "kiro": {
+        "toolOrigin": "default"
+       }
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "run_command_tooluse_Qyg5tktTwB7c6R56eEzFeV",
+        "status": "pending",
+        "title": "touch made.txt"
+       },
+       "options": [
+        {
+         "optionId": "accept",
+         "name": "Allow",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "always-accept",
+         "name": "Always allow",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "reject",
+         "name": "Deny",
+         "kind": "reject_once"
+        },
+        {
+         "optionId": "always-reject",
+         "name": "Always deny",
+         "kind": "reject_always"
+        }
+       ],
+       "_meta": {
+        "kiro": {
+         "toolId": "run_command",
+         "command": "touch made.txt",
+         "consent": {
+          "capability": "shell",
+          "resource": "touch made.txt",
+          "askType": "implicit",
+          "triggeringResource": "touch made.txt",
+          "workspaceRoot": "/home/me/work"
+         },
+         "consentRound": 1
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "run_command_tooluse_Qyg5tktTwB7c6R56eEzFeV",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": ""
+        }
+       }
+      ]
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done."
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "Done.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "title": "touch made.txt",
+        "detail": "touch made.txt",
+        "choices": [
+         {
+          "id": "accept",
+          "kind": "allow_once"
+         },
+         {
+          "id": "always-accept",
+          "kind": "allow_always"
+         },
+         {
+          "id": "reject",
+          "kind": "reject"
+         },
+         {
+          "id": "always-reject",
+          "kind": "reject"
+         }
+        ]
+       }
+      },
+      "answer": {
+       "choice": "accept"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "accept"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "reject": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "tooluse_2",
+      "title": "Running: npm run test",
+      "kind": "execute",
+      "status": "pending",
+      "rawInput": {
+       "command": "npm run test"
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "tooluse_2",
+        "title": "Running: npm run test",
+        "kind": "execute",
+        "status": "pending",
+        "rawInput": {
+         "command": "npm run test"
+        }
+       },
+       "options": [
+        {
+         "optionId": "accept",
+         "name": "Allow",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "always-accept",
+         "name": "Always allow",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "reject",
+         "name": "Deny",
+         "kind": "reject_once"
+        },
+        {
+         "optionId": "always-reject",
+         "name": "Always deny",
+         "kind": "reject_always"
+        }
+       ],
+       "_meta": {
+        "kiro": {
+         "consent": {
+          "capability": "shell",
+          "resource": "npm run test",
+          "triggeringResource": "npm run test",
+          "workspaceRoot": "/home/me/work",
+          "persistableConsent": true
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "tooluse_2",
+      "status": "failed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "The user rejected this tool call: run the unit tests only"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Running "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "the "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "unit "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "tests "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "only, "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "then."
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "Running the unit tests only, then.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission"
+      },
+      "answer": {
+       "choice": "reject",
+       "note": "run the unit tests only"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "reject"
+       },
+       "_meta": {
+        "kiro": {
+         "rejectionReason": "run the unit tests only"
+        }
+       }
+      }
+     }
+    ]
+   }
+  },
+  "ask": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "tooluse_3",
+      "title": "Which database should the service use?",
+      "kind": "other",
+      "status": "pending",
+      "_meta": {
+       "kiro": {
+        "toolId": "user_input",
+        "userInputOptions": [
+         {
+          "title": "Postgres",
+          "description": "Relational",
+          "recommended": true
+         },
+         {
+          "title": "SQLite",
+          "subOptionsLabel": "Where",
+          "subOptions": [
+           {
+            "title": "In memory"
+           },
+           {
+            "title": "On disk"
+           }
+          ]
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "_kiro/userInput",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCallId": "tooluse_3",
+       "question": "Which database should the service use?",
+       "options": [
+        {
+         "title": "Postgres",
+         "description": "Relational",
+         "recommended": true
+        },
+        {
+         "title": "SQLite",
+         "subOptionsLabel": "Where",
+         "subOptions": [
+          {
+           "title": "In memory"
+          },
+          {
+           "title": "On disk"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "tooluse_3",
+      "status": "completed"
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Postgres "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "it "
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "is."
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "Postgres it is.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "question",
+       "questions": [
+        {
+         "id": "answer",
+         "question": "Which database should the service use?",
+         "options": [
+          {
+           "label": "Postgres",
+           "description": "Relational"
+          },
+          {
+           "label": "SQLite",
+           "description": "Where: In memory, On disk"
+          }
+         ],
+         "multiSelect": false,
+         "allowOther": true
+        }
+       ]
+      },
+      "answer": {
+       "answers": {
+        "answer": [
+         "Postgres"
+        ]
+       }
+      },
+      "agentGot": {
+       "action": "answered",
+       "answer": "Postgres"
+      }
+     }
+    ]
+   }
+  },
+  "tool": {
+   "tools": true,
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "tooluse_2xrta1moazPX80AQOTUzu5",
+      "title": "weft::lookup",
+      "kind": "other",
+      "status": "in_progress",
+      "_meta": {
+       "kiro": {}
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "tooluse_2xrta1moazPX80AQOTUzu5",
+      "status": "failed",
+      "rawOutput": "Tool \"weft::lookup\" is deferred and cannot be called directly. Load it first: tool_load with { \"tool_ids\": [\"weft::lookup\"] } \u2014 the load result explains how to run it.",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "Tool \"weft::lookup\" is deferred and cannot be called directly. Load it first: tool_load with { \"tool_ids\": [\"weft::lookup\"] } \u2014 the load result explains how to run it."
+        }
+       }
+      ],
+      "_meta": {
+       "kiro": {}
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "tooluse_eAqGYEP6SdSoLi5DkWrXyi",
+      "status": "completed",
+      "title": "Tool Load",
+      "rawInput": {
+       "tool_ids": [
+        "weft::lookup"
+       ]
+      },
+      "rawOutput": {
+       "message": "{\n  \"loaded\": [\n    {\n      \"tool_id\": \"weft::lookup\",\n      \"description\": \"Look up the magic number\",\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"properties\": {}\n      }\n    }\n  ],\n  \"not_found\": [],\n  \"note\": \"These tools are now loaded for the rest of this session. To RUN one, call tool_call with { \\\"tool_id\\\": \\\"namespace::tool\\\", \\\"arguments\\\": { ... } } (use the tool_id shown for each result, and arguments matching its input_schema). Do not call tool_load again for tools you have already loaded.\"\n}"
+      },
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "{\n  \"loaded\": [\n    {\n      \"tool_id\": \"weft::lookup\",\n      \"description\": \"Look up the magic number\",\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"properties\": {}\n      }\n    }\n  ],\n  \"not_found\": [],\n  \"note\": \"These tools are now loaded for the rest of this session. To RUN one, call tool_call with { \\\"tool_id\\\": \\\"namespace::tool\\\", \\\"arguments\\\": { ... } } (use the tool_id shown for each result, and arguments matching its input_schema). Do not call tool_load again for tools you have already loaded.\"\n}"
+        }
+       }
+      ],
+      "_meta": {
+       "kiro": {
+        "toolOrigin": "default"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "tooluse_29NbVYirOhseALHMCRsSRt",
+      "title": "@weft/lookup",
+      "kind": "other",
+      "status": "pending",
+      "rawInput": {
+       "tool_id": "weft::lookup",
+       "arguments": {}
+      },
+      "_meta": {
+       "kiro": {
+        "serverName": "weft",
+        "toolOrigin": "default"
+       }
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "tooluse_29NbVYirOhseALHMCRsSRt",
+        "status": "pending",
+        "title": "@weft/lookup"
+       },
+       "options": [
+        {
+         "optionId": "accept",
+         "name": "Allow",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "always-accept",
+         "name": "Always allow",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "reject",
+         "name": "Deny",
+         "kind": "reject_once"
+        },
+        {
+         "optionId": "always-reject",
+         "name": "Always deny",
+         "kind": "reject_always"
+        }
+       ],
+       "_meta": {
+        "kiro": {
+         "toolId": "mcp_weft_lookup",
+         "agentManagesTrust": true,
+         "consent": {
+          "capability": "mcp",
+          "resource": "weft/lookup",
+          "askType": "implicit",
+          "workspaceRoot": "/home/me/work"
+         },
+         "consentRound": 1,
+         "mcpTool": {
+          "version": 1,
+          "identity": {
+           "serverName": "weft",
+           "toolName": "lookup"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "tooluse_29NbVYirOhseALHMCRsSRt",
+      "status": "in_progress",
+      "rawInput": {
+       "tool_id": "weft::lookup",
+       "arguments": {}
+      },
+      "_meta": {
+       "kiro": {
+        "serverName": "weft",
+        "toolOrigin": "default"
+       }
+      }
+     }
+    },
+    {
+     "tool": {
+      "name": "lookup",
+      "arguments": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "tooluse_29NbVYirOhseALHMCRsSRt",
+      "status": "completed",
+      "title": "@weft/lookup",
+      "rawInput": {
+       "tool_id": "weft::lookup",
+       "arguments": {}
+      },
+      "rawOutput": {
+       "response": "42",
+       "imageBase64Urls": [],
+       "message": "42"
+      },
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "42"
+        }
+       }
+      ],
+      "_meta": {
+       "kiro": {
+        "serverName": "weft",
+        "toolOrigin": "default"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "It is 42."
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "tool_result",
+     "tool_use",
+     "tool_result",
+     "tool_use",
+     "question",
+     "tool_call",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "It is 42.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "title": "@weft/lookup"
+       }
+      },
+      "answer": {
+       "choice": "accept"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "accept"
+       }
+      }
+     },
+     {
+      "tool": "lookup",
+      "result": "42"
+     }
+    ]
+   }
+  },
+  "bad key": {
+   "steps": [
+    {
+     "send": {
+      "method": "_kiro/mcp/status",
+      "params": {
+       "sessionId": "$SESSION",
+       "servers": [
+        {
+         "name": "weft",
+         "status": "connected",
+         "tools": [
+          {
+           "name": "lookup",
+           "description": "Look up the magic number",
+           "disabled": false,
+           "inputSchema": {
+            "type": "object",
+            "properties": {}
+           }
+          }
+         ],
+         "prompts": [],
+         "resources": [],
+         "resourceTemplates": [],
+         "_meta": {
+          "kiro": {
+           "resource": {
+            "resourceType": "mcpServer",
+            "source": {
+             "origin": "client"
+            },
+            "krn": "krn:session:$SESSION:mcp-server/mcpServers/weft",
+            "layer": "session",
+            "standing": {
+             "kind": "active"
+            }
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    },
+    {
+     "send": {
+      "method": "_kiro/tools/didChange",
+      "params": {
+       "sessionId": "$SESSION",
+       "tags": [
+        {
+         "source": "builtin",
+         "tag": "read",
+         "description": "read-file, diagnostics, search tools"
+        },
+        {
+         "source": "builtin",
+         "tag": "write",
+         "description": "write-file tools"
+        },
+        {
+         "source": "builtin",
+         "tag": "shell",
+         "description": "run-commands tools"
+        },
+        {
+         "source": "builtin",
+         "tag": "web",
+         "description": "web search tools"
+        },
+        {
+         "source": "mcp",
+         "tag": "@weft/lookup",
+         "description": "Look up the magic number"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "kiro": {
+        "contextUsage": {
+         "usagePercentage": 0.8,
+         "summarizationThreshold": 80
+        },
+        "breakdown": {
+         "contextFiles": {
+          "tokens": 0,
+          "percent": 0,
+          "items": []
+         },
+         "tools": {
+          "tokens": 4194,
+          "percent": 0.4,
+          "mcp": {
+           "tokens": 0,
+           "percent": 0
+          },
+          "builtin": {
+           "tokens": 4194,
+           "percent": 0.4
+          }
+         },
+         "memory": {
+          "tokens": 0,
+          "percent": 0
+         },
+         "kiroResponses": {
+          "tokens": 0,
+          "percent": 0
+         },
+         "yourPrompts": {
+          "tokens": 0,
+          "percent": 0.4
+         },
+         "sessionFiles": {
+          "tokens": 0,
+          "percent": 0,
+          "items": []
+         }
+        },
+        "kind": "context_usage",
+        "usagePercentage": 0.8,
+        "summarizationThreshold": 80
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "kiro": {
+        "userMessageId": "5b339124-5555-48da-af9b-bd62314f4a25",
+        "kind": "user_message_id_assigned"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "title": "Hello",
+      "_meta": {
+       "kiro": {
+        "focus": {
+         "title": "Hello"
+        },
+        "kind": "focus_update",
+        "title": "Hello"
+       }
+      }
+     }
+    },
+    {
+     "send": {
+      "method": "_kiro/sessions/changed",
+      "params": {
+       "upserted": [
+        {
+         "sessionId": "$SESSION",
+         "title": "Hello",
+         "updatedAt": "2026-11-04T07:31:20.427Z"
+        }
+       ],
+       "deleted": []
+      }
+     }
+    },
+    {
+     "fail": {
+      "code": -32000,
+      "message": "Kiro could not load the available models because this account does not have access to them.",
+      "data": {
+       "errorType": "ModelRegistryAccessDeniedError",
+       "retryErrorType": "CLIENT_ERROR",
+       "detail": "AccessDeniedException"
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "error"
+    ],
+    "status": "failed",
+    "error": "Kiro could not load the available models because this account does not have access to them"
+   }
+  }
+ }
+}

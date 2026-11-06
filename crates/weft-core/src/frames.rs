@@ -179,4 +179,53 @@ impl FiringLocation {
     pub fn new(node_id: impl Into<String>, frames: LoopFrames) -> Self {
         Self { node_id: node_id.into(), frames }
     }
+
+    /// This firing's place in the run `run`, as one opaque text: the same
+    /// every time its body runs again (after a pause or a crash), and
+    /// different for every other firing, every loop iteration and every
+    /// other run, because a firing is exactly a node under its frames in
+    /// one run. What a node hands a service that must refuse a duplicate
+    /// (`crate::context::RunContext::firing_key`).
+    ///
+    /// A SHA-256 in hex (64 characters) of the run id, the node id and
+    /// the frames, so it has one length whatever the nesting, fits the
+    /// idempotency keys services take, and shows no name of the program.
+    pub fn key(&self, run: crate::RunId) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"weft-firing-key-v1\n");
+        hash.update(run.as_bytes());
+        // JSON keeps the parts apart: no node id and frames can spell
+        // another pair's text.
+        hash.update(serde_json::to_vec(&(&self.node_id, &self.frames)).expect("an id and frames always write as JSON"));
+        crate::project::hash::hex(&hash.finalize())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A firing's key is the same for the same run, node and frames, and
+    /// differs when any of them does: another loop iteration, another
+    /// call site, another node, another run.
+    #[test]
+    fn a_firing_key_names_one_firing_of_one_run() {
+        let run = crate::RunId::new_v4();
+        let at = |id: &str, frames: LoopFrames| FiringLocation::new(id, frames);
+        let first = at("ask", vec![Frame::Loop { index: 0 }]);
+        assert_eq!(first.key(run), at("ask", vec![Frame::Loop { index: 0 }]).key(run), "run again, the same key");
+        assert_eq!(first.key(run).len(), 64);
+        let others = [
+            at("ask", vec![Frame::Loop { index: 1 }]),
+            at("ask", vec![Frame::Loop { index: 0 }, Frame::Loop { index: 0 }]),
+            at("ask", vec![Frame::Call { site: "one".into() }, Frame::Loop { index: 0 }]),
+            at("ask", vec![]),
+            at("ask2", vec![Frame::Loop { index: 0 }]),
+        ];
+        for other in &others {
+            assert_ne!(first.key(run), other.key(run), "{other:?}");
+        }
+        assert_ne!(first.key(run), first.key(crate::RunId::new_v4()), "another run");
+    }
 }

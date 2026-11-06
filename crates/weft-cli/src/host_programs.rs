@@ -110,8 +110,7 @@ fn stage_standard_program() -> Result<(weft_compiler::build::StockProject, weft_
     let staged = tokio::task::block_in_place(|| {
         weft_compiler::build::build_project(
             &stock.project,
-            &stock.definition,
-            &stock.contents,
+            &stock.compiled,
             &stock.catalog,
             weft_compiler::CompileFs::disk(&stock.project.root),
             &packaging,

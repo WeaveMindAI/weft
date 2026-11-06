@@ -42,7 +42,7 @@ use weft_core::run::{
 use weft_core::frames::{FiringLocation, Located, LoopFrames};
 use weft_core::primitive::{
     AwaitEnd, CorruptionSite, RunSnapshot, JournalCorruption, KickedNode,
-    LoopInstanceKey, LoopTerminationReason, OpenBus, RecordedWait, SuspensionInfo,
+    LoopInstanceKey, LoopTerminationReason, RecordedBus, RecordedWait, SuspensionInfo,
 };
 use weft_core::project::scopes::ScopeCopy;
 use weft_core::project::{loop_in_id, loop_out_id, GivenOrigin, GivenPort, ProgramIndex, NodeDefinition, ProjectDefinition};
@@ -193,7 +193,7 @@ impl Fold {
                 pending_deliveries: HashMap::new(),
                 recorded_waits: HashMap::new(),
                 saved_states: HashMap::new(),
-                open_buses: Default::default(),
+                buses: Default::default(),
                 corruptions: Vec::new(),
             },
             outputs: HashMap::new(),
@@ -1040,14 +1040,15 @@ impl Fold {
                 }
             }
             // The run's buses, as far as a worker opening them again after
-            // a pause needs them (`RunSnapshot::open_buses`): how each was
-            // made, where its next entry lands, who ever joined, and the
-            // messages a journaled one's record kept whole.
+            // a pause needs them (`RunSnapshot::buses`): how each was
+            // made, where its next entry lands, who ever joined, who is
+            // on it now, the messages a journaled one's record kept
+            // whole, and how it ended once it did.
             RunEvent::BusCreated { bus_id, node_id, frames, port, payload, meta, window, journal, .. } => {
                 let Some(id) = self.bus_id(bus_id, ev) else { return effects };
-                self.snap.open_buses.insert(
+                self.snap.buses.insert(
                     id,
-                    OpenBus {
+                    RecordedBus {
                         creator: FiringLocation::new(node_id.clone(), frames.clone()),
                         port: port.clone(),
                         payload: *payload,
@@ -1056,24 +1057,30 @@ impl Fold {
                         journal: *journal,
                         next_offset: 0,
                         joined: Default::default(),
+                        members: Default::default(),
+                        last_left: None,
                         retained: Default::default(),
                         lost_through: 0,
+                        end: None,
                     },
                 );
             }
             RunEvent::BusJoined { bus_id, offset, name, .. } => {
-                if let Some(bus) = self.open_bus(bus_id, ev) {
+                if let Some(bus) = self.recorded_bus(bus_id, ev) {
                     bus.next_offset = bus.next_offset.max(offset + 1);
                     bus.joined.insert(name.clone());
+                    bus.members.insert(name.clone());
                 }
             }
-            RunEvent::BusLeft { bus_id, offset, .. } => {
-                if let Some(bus) = self.open_bus(bus_id, ev) {
+            RunEvent::BusLeft { bus_id, offset, name, end, .. } => {
+                if let Some(bus) = self.recorded_bus(bus_id, ev) {
                     bus.next_offset = bus.next_offset.max(offset + 1);
+                    bus.members.remove(name);
+                    bus.last_left = Some(end.clone());
                 }
             }
             RunEvent::BusWindow { bus_id, last_offset, messages, .. } => {
-                if let Some(bus) = self.open_bus(bus_id, ev) {
+                if let Some(bus) = self.recorded_bus(bus_id, ev) {
                     bus.next_offset = bus.next_offset.max(last_offset + 1);
                     // Only a message kept whole can be read again; one cut
                     // short or kept without its bytes (every message of an
@@ -1101,9 +1108,13 @@ impl Fold {
                     bus.retained.retain(|message| message.offset >= lost_through);
                 }
             }
-            RunEvent::BusClosed { bus_id, .. } => {
-                if let Some(id) = self.bus_id(bus_id, ev) {
-                    self.snap.open_buses.remove(&id);
+            // An ended bus stays, with its end and the `Closed` entry's
+            // offset: a node given its marker after a pause finds it ended
+            // as it was, never missing.
+            RunEvent::BusClosed { bus_id, offset, end, .. } => {
+                if let Some(bus) = self.recorded_bus(bus_id, ev) {
+                    bus.next_offset = bus.next_offset.max(*offset);
+                    bus.end.get_or_insert_with(|| end.clone());
                 }
             }
             // Observability-only events: they carry no state the resume
@@ -1533,13 +1544,13 @@ impl Fold {
         }
     }
 
-    /// The open bus a bus row is about. `None` for a bus the run never
+    /// The bus a bus row is about. `None` for a bus the run never
     /// recorded creating, which is a run recorded before buses were
     /// (`RunEvent::BusCreated`): such a bus is never opened again, so its
     /// rows are only for the inspector.
-    fn open_bus(&mut self, bus_id: &str, ev: &RunEvent) -> Option<&mut OpenBus> {
+    fn recorded_bus(&mut self, bus_id: &str, ev: &RunEvent) -> Option<&mut RecordedBus> {
         let id = self.bus_id(bus_id, ev)?;
-        self.snap.open_buses.get_mut(&id)
+        self.snap.buses.get_mut(&id)
     }
 
     fn firing_record_id(&mut self, node_id: &str, frames: &LoopFrames, site: CorruptionSite, ev: &RunEvent) -> Option<Uuid> {
@@ -2222,12 +2233,13 @@ mod tests {
         assert_eq!(orphan.corruptions.len(), 1, "{:?}", orphan.corruptions);
     }
 
-    /// The record tells a resume which buses are open, as they stand:
+    /// The record tells a resume every bus the run created, as it stands:
     /// where each was created, the offset its next entry lands at, who
-    /// joined, and the messages a journaled one kept whole (at most its
-    /// window); a closed one is gone, an ephemeral one keeps no content.
+    /// joined, who is on it now (joined and not left since), and the
+    /// messages a journaled one kept whole (at most its window); an
+    /// ephemeral one keeps no content.
     #[test]
-    fn open_buses_are_folded_from_their_rows() {
+    fn buses_are_folded_from_their_rows() {
         let bus = uuid::Uuid::from_u128(9);
         let created = |id: uuid::Uuid, journal: weft_core::stream_journal::JournalPolicy| RunEvent::BusCreated {
             run_id: run_id(),
@@ -2264,7 +2276,8 @@ mod tests {
             created(bus, Default::default()),
             RunEvent::BusJoined { run_id: run_id(), bus_id: bus.to_string(), offset: 0, name: "host".into(), at_unix: 0 },
             window(bus, vec![message(1, false), message(2, true), message(3, false), message(4, false)]),
-            RunEvent::BusLeft { run_id: run_id(), bus_id: bus.to_string(), offset: 5, name: "guest".into(), at_unix: 0 },
+            RunEvent::BusJoined { run_id: run_id(), bus_id: bus.to_string(), offset: 5, name: "guest".into(), at_unix: 0 },
+            RunEvent::BusLeft { run_id: run_id(), bus_id: bus.to_string(), offset: 6, name: "guest".into(), end: weft_core::bus::StreamEnd::Finished, at_unix: 0 },
             created(closed, weft_core::stream_journal::JournalPolicy::ephemeral()),
             RunEvent::BusClosed { run_id: run_id(), bus_id: closed.to_string(), offset: 0, end: weft_core::bus::StreamEnd::Finished, at_unix: 0 },
             // A bus the record never created (a run from before buses
@@ -2273,19 +2286,21 @@ mod tests {
         ];
         let snap = fold_to_snapshot(run_id(), fan_out_project(), &events);
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
-        assert_eq!(snap.open_buses.keys().collect::<Vec<_>>(), vec![&bus]);
-        let open = &snap.open_buses[&bus];
+        assert_eq!(snap.buses.keys().collect::<Vec<_>>(), vec![&bus, &closed]);
+        let open = &snap.buses[&bus];
+        assert_eq!(open.end, None, "still open");
         assert_eq!(open.creator, FiringLocation::new("a", vec![]));
         assert_eq!(open.port, "out");
-        assert_eq!(open.next_offset, 6);
-        assert_eq!(open.joined.iter().collect::<Vec<_>>(), vec!["host"]);
+        assert_eq!(open.next_offset, 7);
+        assert_eq!(open.joined.iter().collect::<Vec<_>>(), vec!["guest", "host"]);
+        assert_eq!(open.members.iter().collect::<Vec<_>>(), vec!["host"], "the guest left, the host is still on it");
         assert_eq!(open.retained.iter().map(|m| m.offset).collect::<Vec<_>>(), vec![3, 4], "the whole ones after the newest one lost");
         assert_eq!(open.lost_through, 3, "message 2 was cut short, so a reader behind it cannot read on");
         let held_whole = fold_to_snapshot(run_id(), fan_out_project(), &[
             created(bus, Default::default()),
             window(bus, vec![message(1, false), message(2, false), message(3, false)]),
         ]);
-        let open = &held_whole.open_buses[&bus];
+        let open = &held_whole.buses[&bus];
         assert_eq!(open.retained.iter().map(|m| m.offset).collect::<Vec<_>>(), vec![2, 3]);
         assert_eq!(open.lost_through, 2, "the message that fell out of the window is lost");
         let ephemeral = fold_to_snapshot(run_id(), fan_out_project(), &[
@@ -2293,7 +2308,7 @@ mod tests {
             window(bus, Vec::new()),
             RunEvent::BusWindow { run_id: run_id(), bus_id: bus.to_string(), first_offset: 1, last_offset: 4, messages: vec![], totals: vec![], at_unix: 0 },
         ]);
-        let open = &ephemeral.open_buses[&bus];
+        let open = &ephemeral.buses[&bus];
         assert!(open.retained.is_empty());
         assert_eq!(open.lost_through, 5, "an ephemeral bus brings back none of its messages");
 
@@ -2305,6 +2320,62 @@ mod tests {
             at_unix: 0,
         }]);
         assert_eq!(bad.corruptions[0].site, CorruptionSite::Bus);
+    }
+
+    /// A bus that ended stays on the record's account of the run's buses,
+    /// with how it ended (finished, or failed with why), its `Closed`
+    /// entry's offset as where it stopped, and the messages a journaled
+    /// one kept whole, so a resume opens it again ended and its readers
+    /// come to that end as they would have before the pause.
+    #[test]
+    fn an_ended_bus_is_folded_with_its_end() {
+        let ended = |end: weft_core::bus::StreamEnd| {
+            let bus = uuid::Uuid::from_u128(12);
+            let events = vec![
+                RunEvent::BusCreated {
+                    run_id: run_id(),
+                    bus_id: bus.to_string(),
+                    node_id: "a".into(),
+                    frames: vec![],
+                    port: "out".into(),
+                    payload: weft_core::bus::BusPayloadKind::Json,
+                    meta: Value::Null,
+                    window: 4,
+                    journal: Default::default(),
+                    at_unix: 0,
+                },
+                RunEvent::BusJoined { run_id: run_id(), bus_id: bus.to_string(), offset: 0, name: "host".into(), at_unix: 0 },
+                RunEvent::BusWindow {
+                    run_id: run_id(),
+                    bus_id: bus.to_string(),
+                    first_offset: 1,
+                    last_offset: 1,
+                    messages: vec![weft_core::bus::WindowedBusMessage {
+                        offset: 1,
+                        from: "host".into(),
+                        msg_kind: "msg".into(),
+                        payload: Some(weft_core::bus::WirePayload::Json(json!("last"))),
+                        payload_byte_size: 6,
+                        trimmed: false,
+                        at_unix: 0,
+                    }],
+                    totals: vec![],
+                    at_unix: 0,
+                },
+                RunEvent::BusLeft { run_id: run_id(), bus_id: bus.to_string(), offset: 2, name: "host".into(), end: weft_core::bus::StreamEnd::Finished, at_unix: 0 },
+                RunEvent::BusClosed { run_id: run_id(), bus_id: bus.to_string(), offset: 3, end: end.clone(), at_unix: 0 },
+            ];
+            let snap = fold_to_snapshot(run_id(), fan_out_project(), &events);
+            assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
+            snap.buses[&bus].clone()
+        };
+        for end in [weft_core::bus::StreamEnd::Finished, weft_core::bus::StreamEnd::Failed { error: "the session went away".into() }] {
+            let bus = ended(end.clone());
+            assert_eq!(bus.end, Some(end), "it ended as it did");
+            assert_eq!(bus.next_offset, 3, "its `Closed` entry is where it stopped");
+            assert_eq!(bus.retained.iter().map(|m| m.offset).collect::<Vec<_>>(), vec![1], "what a reader handed it after the pause reads");
+            assert_eq!(bus.joined.iter().collect::<Vec<_>>(), vec!["host"]);
+        }
     }
 
     /// `gen.rows` streams into loop `lp` over its `rows` port; the body

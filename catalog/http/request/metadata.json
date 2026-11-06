@@ -19,17 +19,27 @@
     ],
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "header",
-          "label": "Header name",
-          "secret": false,
-          "placeholder": "Authorization, or X-Api-Key"
-        },
-        {
-          "name": "value",
-          "label": "Header value",
-          "placeholder": "Bearer sk-..., or the bare key"
+          "fields": [
+            {
+              "name": "header",
+              "label": "Header name",
+              "secret": false,
+              "placeholder": "Authorization, or X-Api-Key"
+            },
+            {
+              "name": "value",
+              "label": "Header value",
+              "placeholder": "Bearer sk-..., or the bare key"
+            }
+          ],
+          "guide": {
+            "steps": [
+              "Name the header the API reads its key from (`Authorization` for most, `X-Api-Key` for some).",
+              "Paste the header's whole value, with its prefix when the API wants one (`Bearer sk-...`)."
+            ]
+          }
         }
       ]
     },
@@ -39,15 +49,7 @@
         "name": "{header}",
         "value": "{value}"
       }
-    ],
-    "ownPage": {
-      "guide": {
-        "steps": [
-          "Name the header the API reads its key from (`Authorization` for most, `X-Api-Key` for some).",
-          "Paste the header's whole value, with its prefix when the API wants one (`Bearer sk-...`)."
-        ]
-      }
-    }
+    ]
   },
   "inputs": [
     {

@@ -1122,7 +1122,7 @@ mod tests {
             group_boundary: None,
             requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
             images: Vec::new(),
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
@@ -1160,7 +1160,7 @@ mod tests {
             id: uuid::Uuid::nil(), nodes: vec![source, node.clone()],
             edges: vec![serde_json::from_value(json!({"id":"wire", "source":"source", "target":"k", "sourceHandle":"out", "targetHandle":"p"})).unwrap()],
             groups: vec![], created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            defaults: Default::default(), given: Default::default(), broken: Vec::new(), metadata_wires: Vec::new(),
+            defaults: Default::default(), given: Default::default(), broken: Vec::new(), install: None, metadata_wires: Vec::new(),
         };
         let mut given = crate::project::Given::default();
         given.inputs.insert(Located::top("k"), [("p".into(), json!("handed"))].into());
@@ -1184,7 +1184,7 @@ mod tests {
         let project = ProjectDefinition {
             id: uuid::Uuid::nil(), nodes: vec![node.clone()], edges: vec![], groups: vec![],
             created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            defaults: Default::default(), given: Default::default(), broken: Vec::new(), metadata_wires: Vec::new(),
+            defaults: Default::default(), given: Default::default(), broken: Vec::new(), install: None, metadata_wires: Vec::new(),
         };
         let index = ProgramIndex::build(&project);
         let kick = crate::primitive::KickedNode::new(false, None, None, None);
@@ -1207,7 +1207,7 @@ mod tests {
         let mut project = ProjectDefinition {
             id: uuid::Uuid::nil(), nodes: vec![node.clone()], edges: vec![], groups: vec![],
             created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            defaults: Default::default(), given: Default::default(), broken: Vec::new(), metadata_wires: Vec::new(),
+            defaults: Default::default(), given: Default::default(), broken: Vec::new(), install: None, metadata_wires: Vec::new(),
         };
         let mut given = crate::project::Given::default();
         given.inputs.insert(Located::top("k"), [("a".into(), json!("handed in"))].into());

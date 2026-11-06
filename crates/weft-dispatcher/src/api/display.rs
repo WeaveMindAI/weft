@@ -917,7 +917,7 @@ mod display_kind_tests {
             failure_message: None,
             applied_spec_hash: None,
             applied_at_unix: None,
-            endpoints: [("http".to_string(), "http://panel-ada:8080".to_string())].into(),
+            endpoints: [("http".to_string(), weft_core::infra::EndpointRecord::Url("http://panel-ada:8080".into()))].into(),
             public_paths: Default::default(),
             doors: Default::default(),
             keep_disks: Vec::new(),
@@ -938,7 +938,7 @@ mod display_kind_tests {
         use crate::infra_node::InfraNodeStatus;
         let running = ada_copy(InfraNodeStatus::Running);
         assert_eq!(copy_status(Some(&running)), "running");
-        assert_eq!(crate::api::infra::live_endpoint_of(&running, "panel", "http").unwrap(), "http://panel-ada:8080");
+        assert_eq!(crate::api::infra::live_endpoint_of(&running, "panel", "http").unwrap(), weft_core::infra::EndpointRecord::Url("http://panel-ada:8080".into()));
 
         let stopped = ada_copy(InfraNodeStatus::Stopped);
         assert_eq!(copy_status(Some(&stopped)), "stopped");

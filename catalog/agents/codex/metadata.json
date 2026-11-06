@@ -1,0 +1,343 @@
+{
+  "type": "Codex",
+  "label": "Codex",
+  "description": "One conversation with Codex, OpenAI's coding agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, Codex runs on your machine (a local install only) with your own login, working in `folder`, from your own install of `codex` when there is one on PATH; when there is none, weft installs Codex itself, once, into a folder of its own shared by every program on the machine. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs, and it logs in with the connection on `access`. Its model is always named: left out, it is the one Codex lists as the default for the login, never the one a machine's own `config.toml` names, which a plan may refuse. A ChatGPT login is kept alive by weft, never by Codex: every Codex node on one connection gets the same fresh token, and when it is about to die or is refused this node asks weft for a new one, which it hears on `stream`, so wire `stream` into every AskAgent. While one of your tools is unanswered, Codex asks its model again every half minute or so, so a tool that waits on a person costs model requests while it waits: put a person behind `question` instead. Its card shows what it is doing and a Start over button. What is exposed: the permission policy, the sandbox, the model, the reasoning effort and a system prompt to append; the rest of Codex's own settings stay in its `config.toml`. Your program's tools reach Codex under their plain names. A tool named like one of its own that Codex can turn off by itself (`web_search`, `view_image`, `update_plan`, `image_generation`) takes that one's place; a name it cannot give up alone (`apply_patch`, its shell's `exec_command`, `shell_command` and `write_stdin`, its goal tools, `request_plugin_install`, and the rest of this node's list) is refused when the program is built, and so is a name Codex keeps for itself: one starting `mcp__`, or holding a character other than a letter, a digit, `_` or `-`.",
+  "tags": [
+    "agent",
+    "coding",
+    "codex",
+    "openai",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run Codex in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[codex]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A CodexAccess's `access`: your ChatGPT login file (on a local install) or an API key. Required with a `computer`. Left out on your machine, Codex uses the login already on it (`codex login`)."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder Codex works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`codex` on your PATH",
+      "description": "On your machine: the Codex program to run, when it is not the `codex` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "on_request",
+          "never",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "When Codex asks before acting. `ask`: before anything it does not already trust, every request coming out of AskAgent as a question. `on_request`: when the model decides to ask. `never`: it never asks, and the sandbox decides what it can do. `bypass`: it never asks and has no sandbox; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "the login's default",
+      "description": "The model Codex uses (`gpt-6-luna`, ...). Left out, the one Codex lists as the default for its login."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "label": "Reasoning effort",
+      "description": "How hard the model reasons each turn: one of the efforts the model offers (`low`, `medium`, `high`, and for some models more). Left out, the model's default.",
+      "placeholder": "the model's default"
+    },
+    {
+      "name": "sandbox",
+      "type": "String",
+      "default": "workspace_write",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "read_only",
+          "workspace_write",
+          "full_access"
+        ]
+      },
+      "label": "Sandbox",
+      "description": "What Codex's commands may touch on your machine: `read_only`, `workspace_write` (the folder and nothing outside it) or `full_access`. In a computer there is no sandbox to run (no bubblewrap), so it has full access there, the computer being the wall, and this changes nothing."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "appendSystemPrompt",
+      "type": "String",
+      "widget": {
+        "kind": "textarea"
+      },
+      "label": "Add to the system prompt",
+      "description": "Instructions added to Codex's own, for the whole conversation."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Codex '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "access"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Codex '{id}' runs in a computer, where no login is waiting for it; give it a CodexAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Codex '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "on_request",
+                "never",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Codex '{id}' has a `permission` it does not know; pick one of ask, on_request, never, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Codex '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "sandbox"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "sandbox",
+              "oneOf": [
+                "read_only",
+                "workspace_write",
+                "full_access"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Codex '{id}' has a `sandbox` it does not know; pick one of read_only, workspace_write, full_access.",
+        "level": "structural",
+        "severity": "error",
+        "port": "sandbox"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "Codex '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs Codex itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "apply_patch",
+      "exec_command",
+      "shell_command",
+      "exec",
+      "wait",
+      "request_user_input",
+      "list_mcp_resources",
+      "list_mcp_resource_templates",
+      "read_mcp_resource",
+      "tool_search",
+      "clock__curr_time",
+      "mcp",
+      "write_stdin",
+      "create_goal",
+      "get_goal",
+      "update_goal",
+      "request_plugin_install",
+      "list_available_plugins_to_install"
+    ],
+    "reservedToolNamePatterns": [
+      "^mcp__",
+      "[^A-Za-z0-9_-]"
+    ]
+  }
+}

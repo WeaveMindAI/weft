@@ -2015,8 +2015,11 @@ export type WirePayload =
 // SYNC: BusInspectorEvent 'message' <-> crates/weft-core/src/bus.rs WindowedBusMessage, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_window' messages
 // SYNC: BusInspectorEvent 'window' totals <-> crates/weft-core/src/bus.rs BusWindowTotal, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_window' totals
 export type BusInspectorEvent =
+  // SYNC: BusInspectorEvent 'joined' <-> crates/weft-journal/src/events.rs BusJoined, crates/weft-core/src/live_event.rs BusJoined, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_joined'
   | { kind: 'joined'; busId: string; offset: number; name: string; atUnix: number }
-  | { kind: 'left'; busId: string; offset: number; name: string; atUnix: number }
+  /// A member left, and how its body returned: finished, or failed and why.
+  // SYNC: BusInspectorEvent 'left' <-> crates/weft-journal/src/events.rs BusLeft, crates/weft-core/src/live_event.rs BusLeft, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_left'
+  | { kind: 'left'; busId: string; offset: number; name: string; end: StreamEnd; atUnix: number }
   | {
       kind: 'message';
       busId: string;

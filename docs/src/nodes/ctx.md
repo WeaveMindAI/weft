@@ -46,7 +46,9 @@ error rather than a trigger that quietly never fires.
 | `node_type` | `String` | Its catalog type, such as `ExecPython` |
 | `node_label` | `Option<String>` | The title shown on the box, if it has one |
 | `frames` | `LoopFrames` | Which loop iterations this firing sits inside |
+| `firing_key()` | `String` | A key for this firing: the same every time its body runs again (after a pause or a crash), and different on every loop iteration, at every place an included file is used, and in every other run. If a service must not see your call twice, send it this as the idempotency key (see [doing something only once](durable-execution.md#doing-something-only-once)) |
 | `instance()` | `Option<&InstanceId>` | Which instance this run is for, when it is for one instance of the program (see [programs with instances](../running/instances.md)) |
+| `is_setup()` | `bool` | `true` when this body runs in a setup: right after an apply, or while the program's triggers are set up. `false` in every run a trigger, a call or `weft run` starts (see [baking](infrastructure.md#outputs-saved-with-the-infrastructure-baking)) |
 
 ## Reading inputs
 
@@ -116,6 +118,7 @@ you like until you close it.
 | `state.once(\|s\| &mut s.field, async \|st\| work).await` | The value in the field if it is filled, running nothing; otherwise runs `work`, which gets the state as `st` (so it can read a bus or a stream with it), stores its result there and saves | `work` fails, or its result saves as JSON null (a `()`, a `None`) |
 | `state.read(\|s\| &mut s.field, &mut reader).await` | The item in the field if it is filled, reading nothing; otherwise reads the next one off a bus reader (a `BusEntry`) or a stream (its item), stores it there and hands it back, `None` at the end. Saves nothing by itself: the field goes on record at the next pause, `save()`, or end of a `once` or `wait` ([reading across a pause](durable-execution.md#reading-a-bus-or-a-stream-across-a-pause)) | The read fails |
 | `state.wait(\|s\| &mut s.field, signal).await` | The answer in the field if it is filled; otherwise waits on the signal (pausing the run when it can), stores the answer there and saves. `signal.cancel_with(call)` also sends `call` once if the run is cancelled while it waits | The wait was given up (`WeftError::WaitGaveUp`), the answer is JSON null or does not read as the field's type, or the body read a bus or a stream directly before reaching this wait the first time in its run ([reading across a pause](durable-execution.md#reading-a-bus-or-a-stream-across-a-pause)). A wait somebody skipped ends the firing skipped |
+| `state.wait(\|s\| &mut s.field, FirstOf::either(a, b)).await` | Waits on both signals and ends with whichever answers first, as `Either::First(answer)` or `Either::Second(answer)`; the other is taken down at that moment ([whichever comes first](durable-execution.md#waiting-on-whichever-comes-first)) | As `state.wait`; a person skipping either one skips the wait |
 | `state.save().await` | Writes the state now | The write fails |
 | `hold()` | A `Holding` to hand bus reads, a bus's `wait_for`, stream pulls and yields instead of your state, for work that cannot be picked up from the middle: while it exists, no wait of your node pauses (its `state.wait`s and helpers' waits included), and once it is dropped the node can pause again. It saves nothing ([holding the run](durable-execution.md#holding-the-run-instead-of-keeping-a-state)) | never |
 | `register_signal(kind).await` | Sets up a trigger that starts a new run on every fire. Called during setup | Called twice for one node in one setup |
@@ -138,10 +141,12 @@ also covers the cancel call.
 | `http()` | The shared plain HTTP client, no credentials | never |
 | `publish_access(values).await` | Publishes a connection to something this node runs itself, such as a database it provisioned | A field the service does not declare, or a required one missing |
 | `published_access().await` | What this node published before, or `None` | The broker cannot answer |
+| `renew(&access).await` | The connection opened again and renewed, after the values this firing was handed stopped working. Renewed once however many nodes ask, and only while the connection still holds what this firing was handed; otherwise you get the values that replaced them ([when the service refuses the values](../connections/using-one-in-a-node.md#when-the-service-refuses-the-values)) | This firing has not opened the connection, weft has nothing to renew it with (a pasted key), or the provider refuses the renewal |
 | `endpoint("name").await` | A handle on one of this node's declared infra endpoints, once something answers there | The endpoint is not declared, or the infra is not running |
 
 On an opened connection: `client()`, `credential()`, `value(name)`,
-`identity()`, `owner()`. On an endpoint handle: `url()`,
+`identity()`, `owner()`, and `way()`, which way to sign in it was made with
+([telling the credentials apart](../connections/using-one-in-a-node.md#what-an-opened-connection-knows)). On an endpoint handle: `url()`,
 `host_and_port()`, and `call(method, path, body)`, whose `path` starts with
 `/`.
 
@@ -429,20 +434,21 @@ links expire. Hand it to whoever asked and do not store it.
 | Call | What it does | It fails when |
 |---|---|---|
 | `journal_policy()` | What your node's users set on `journalEphemeral` and `journalWindowMs`, as the `journal` option of a bus. Only a node with `features.journalSettings` (or a live-connection trigger) has them; for any other node it is the default | A setting is out of range or the wrong shape |
-| `create_bus("port", opts)` | Makes a bus whose marker goes out on that output, and gives you a handle and the marker to emit. A body run again after a pause gets the same bus back. The bus ends when your body does | `port` is not one of your `Bus` outputs, the options do not make sense, or `opts.journal` has a window outside 100 to 60000 ms |
+| `create_bus("port", opts)` | Makes a bus whose marker goes out on that output, and gives you a handle and the marker to emit. A body run again after a pause gets the same bus back. Making it does not put your node on it: registering a name does. A bus nobody ever registers on ends finished once its marker is nowhere a node could still join from ([how a bus ends](streams-and-buses.md#how-a-bus-ends)) | `port` is not one of your `Bus` outputs, the options do not make sense, or `opts.journal` has a window outside 100 to 60000 ms |
 | `bus(&marker)` | Turns a marker value back into a live handle | The bus is gone, or that is not a marker |
-| `open_bus("port", opts, "name").await` | The whole producer move: make it, emit the marker, register your name. The bus ends when your body does | Emitting or registering fails |
+| `open_bus("port", opts, "name").await` | The whole producer move: make it, emit the marker, register your name, which makes your node a member until your body returns. The bus ends once nobody is on it and no node can still join it, so you can return at once ([how a bus ends](streams-and-buses.md#how-a-bus-ends)) | Emitting or registering fails |
 | `pending_bus("port", opts, "name")` | A bus that opens only on your first `open().await`, so the work that can fail runs first and its failure can still reach `_error` | never; `open()` fails as `open_bus` does |
-| `join_bus("port", "name")` | The consumer twin: registers your name, and the bus ends when your body does | The input is not a live bus |
-| `bus_from_input("port")` | A handle whose bus does **not** end with your body. For an observer | Same |
+| `join_bus("port", "name")` | The consumer twin: registers your name on the bus on that input, which makes your node a member like the one that made it. When your body returns, however it returns, your name leaves, and the bus stays open for whoever is still on it. Call it before you read or wait on the bus: once your node has done either without joining, it no longer keeps the bus open, so with nobody else on it the bus can end first and this call is refused | The input is not a live bus, the bus already ended, or another member holds that name |
+| `bus_from_input("port")` | A handle that registers nothing, so your node is no member, and once it reads or waits it keeps nothing open. For an observer | The input is not a live bus |
 
 On the bus handle:
 
 | Call | What it does | It fails when |
 |---|---|---|
 | `cursor()?`, `cursor_from_start()?`, `cursor_at(offset)?` | Your reader on the bus: from now (from your own join, once you registered), from the oldest message the bus still holds, or from that offset. A body run again after a pause gets its reader back where it stopped | Your body already opened a reader on this bus ([one reader per bus](streams-and-buses.md#one-reader-per-bus)) |
+| `until_end(&mut state).await` | Waits until the bus ends, reading nothing (the run can pause there): for a node that stays on a bus while others use it. Not a reader, so it keeps no place on the bus ([how a bus ends](streams-and-buses.md#how-a-bus-ends)) | The bus ended failed (`the bus ended failed: <why>`), or the run was cancelled |
 | `wait_for(name, &mut state).await` | Waits until that name has joined the bus (the run can pause there). A body run again after a pause gets past it at once: the list of who joined comes back with the bus | The bus closes first |
-| `reader.next(&mut state).await`, `next_json(kind, &mut state)`, `next_message(..)`, `next_bytes(..)` | The next entry, or the next message of that kind, waiting (the run can pause there). `None` once the bus ends | The payload is the other shape (`next_json` on a bytes bus), the read breaks the rule of [reading across a pause](durable-execution.md#reading-a-bus-or-a-stream-across-a-pause), or the bus came back from a pause without messages this reader had not read yet |
+| `reader.next(&mut state).await`, `next_json(kind, &mut state)`, `next_message(..)`, `next_bytes(..)` | The next entry, or the next message of that kind, waiting (the run can pause there). `None` once the bus ended finished | The bus ended failed (`the bus ended failed: <why>`), the payload is the other shape (`next_json` on a bytes bus), the read breaks the rule of [reading across a pause](durable-execution.md#reading-a-bus-or-a-stream-across-a-pause), or the bus came back from a pause without messages this reader had not read yet |
 | `entry.as_json()` | On an entry a reader handed you: a JSON message's kind and value, or `None` for a join, a leave or a bytes message | never |
 
 For how a bus ends and what a reader does about it, go and read [streams and

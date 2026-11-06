@@ -83,7 +83,8 @@ bus.send("text", json!({ "text": "hello" })).node_err("sending the greeting")?;
 ```
 
 `open_bus` does the whole producer move: makes the bus, emits the marker on
-that port, and registers your name.
+that port, and registers your name, which makes your node a member of the bus
+until your body returns ([how a bus ends](#how-a-bus-ends)).
 
 If the work that makes your pieces can fail (a provider's call, a handshake, a
 first query), open the bus on the first piece instead of before the work.
@@ -122,13 +123,16 @@ while let Some(msg) = cursor.next(&mut state).await? {
 the run pauses later, the body run again gets past it at once, because the
 list of who joined comes back with the bus.
 
-`join_bus` resolves the bus on that input and registers your name. A bus you
-joined ends with your body, as one you made does, so a reader that dies
-mid-conversation never leaves the producer waiting on it.
+`join_bus` resolves the bus on that input and registers your name, which makes
+your node a member, exactly as the node that made the bus is one.
 
-For an observer that must **not** end the bus when it is done (a debug tap, or
-a node streaming the bus out to a caller), use `ctx.bus_from_input("channel")`
-instead.
+If your node only reads the bus (a debug tap, or a node streaming the bus out
+to a caller), use `ctx.bus_from_input("channel")` instead. The handle can read
+straight away. It registers nothing, so your node is no member, and once it
+reads or waits on the bus it no longer keeps it open ([how a bus
+ends](#how-a-bus-ends)). To send on it, call
+`bus.register("name")` first, which is what
+`join_bus` does for you.
 
 If your node has a slow warmup, call `join_bus` only once it is ready, because
 registering is what everybody else's `wait_for` waits on. Each reader has its
@@ -145,6 +149,31 @@ A name that joined and left since still counts for `wait_for`, and the wait
 fails the node if the bus closed first. You never have to decide whether a name will ever turn up: the
 engine watches the run, and when a wait can no longer be satisfied it ends the
 bus, failed and saying the run was stuck, and every waiting cursor wakes.
+
+## Joining the same bus on every run
+
+If your node runs many times and sends on the same bus each time (each turn of
+a loop sending on a session's stream, say), join it every time:
+
+```rust
+let bus = ctx.join_bus("stream", "turn")?;
+bus.send("event", json!(event)).node_err("sending an event")?;
+```
+
+When your body returns, your name leaves and the bus stays open for the node
+that is still on it, the one that made it. That node, or a `CloseBus` the
+program puts after the last firing, ends it (for the pattern, go and read [a
+bus that outlives the loop that sends on
+it](../language/streams-and-buses.md#a-bus-that-outlives-the-loop-that-sends-on-it)).
+
+If your body pauses and runs again from the top, calling `join_bus` with the
+same name gives you the name back, and nobody on the bus sees you leave.
+Running again from the top also repeats every `send` your body made before it
+paused, so keep in your state how far you got and skip what already went out,
+the way [a stream producer that
+pauses](durable-execution.md#a-stream-producer-that-pauses) does. A name is
+held by one member at a time, so two firings on the bus at once need two
+names.
 
 ## One reader per bus
 
@@ -172,32 +201,70 @@ time.
 
 ## How a bus ends
 
-weft ends every bus your firing made or joined when your body returns, and
-says how: **finished** if the body returned `Ok`, **failed** with the error if
-it returned one, panicked, or was cancelled. A pause ends nothing: the bus
-stays open through it, and your body gets it back when it runs again. A task
-you spawned does not keep a bus open: the bus ends with the body, whoever
-still holds a handle.
+Nobody owns a bus. If your node registered a name on it (with `open_bus`,
+`pending_bus`, `join_bus`, or `register` on any handle), it is a member until
+your body returns. Then, however the body returns (`Ok`, an error, a panic, a
+cancel), your name leaves the bus, and that is all that happens to it: the
+others on it carry on.
 
-Dropping a handle ends nothing. If you are done sending before your body is
-done working, `bus.close()` ends the bus now, and always as finished. To end
-it failed, return the error from your body.
+The bus ends once nobody is on it and no node can still join it: finished if
+its last member's body returned `Ok` (or if nobody ever joined), failed with
+its error if it returned one, panicked or was cancelled. For the whole rule,
+including where a node can still join from, go and read [how a bus
+ends](../language/streams-and-buses.md#how-a-bus-ends).
 
-A reader finds out once its cursor runs out. `next` returns `None` at the
-end either way, so ask `bus.end()`:
+So if your node opens a bus and returns at once, the nodes it handed the bus to
+still get to join it, so there is no need to `wait_for` them before you
+return. A bus you made with
+`create_bus` that nobody ever registers on ends on its own too, finished, once
+its marker is nowhere a node could still join from.
+
+If your node joins a bus, join it first: call `join_bus` before you read it or
+wait on it. Once your node reads or waits without having joined, it no longer
+keeps the bus open, so if nobody else is on it the bus can end before you join,
+and `join_bus` is refused with `bus is closed; cannot register`.
+
+A pause is not leaving: your name stays on the bus through it, so a bus whose
+members are all paused stays open, and your body gets its name back when it
+runs again. Dropping a handle is not leaving either, and nor is a task you
+spawned still holding one: your names leave when the body returns, and that
+task cannot register on a bus after.
+
+If you are done before the others are, `bus.close()` ends the bus now, for
+everyone: finished while anybody is still on it. Any handle can do it, so a node that is no member can end
+it too, which is all `CloseBus` does. If nobody is on the bus by then, it ends
+the way its last member left, failed if that member failed. If the bus already
+ended, the end it had stands.
+
+A reader finds out from its cursor. `next` returns `None` once the bus ended
+finished, and fails with `the bus ended failed: <why>` once it ended failed, so
+the `?` on your read is where your node fails with it instead of taking a
+broken stream for a whole one. If your node handles the failure itself instead
+of passing it on, match on that error; `bus.end()` says how the bus ended, and
+is `None` while it is open. A node answering a caller from a bus ends the
+answer with `fail` (go and read [talking to a live caller](live-callers.md)).
+
+If your node stays on a bus while other nodes use it and has nothing to read
+on it (it holds a session for the run, and a `CloseBus` downstream says when
+the run is done with it), wait for the end instead of opening a reader:
 
 ```rust
-while let Some(msg) = cursor.next(&mut state).await? {
-    // ...
-}
-if let Some(StreamEnd::Failed { error }) = bus.end() {
-    weft::node_bail!("the stream broke off: {error}");
-}
+let bus = ctx.open_bus("stream", BusOptions::default(), "agent").await?;
+bus.until_end(&mut state).await?;
 ```
 
-`end()` is `None` while the bus is open. What a failed end means is up to your
-node. If it answers a caller from a bus, end the answer with `fail` (go and
-read [talking to a live caller](live-callers.md)).
+`until_end` returns once the bus ended finished, and fails with `the bus ended
+failed: <why>` once it ended failed, the same as a read. The run can pause
+while it waits, so it takes your node's state. It is not a reader: it keeps no
+place on the bus, so however many messages go by while your node is paused,
+the body run again just waits on, and your node can still open its one reader
+on that bus.
+
+If your node waits on a bus it is the last member of (`until_end`, a read, a
+`wait_for` on a name that never joined), it keeps waiting: it is still on the
+bus, so the bus is open, and a node handed the marker later could still join.
+It does not hang for good. Once nothing else in the run can move, weft ends the
+bus failed, saying the run was stuck, and your wait fails with that.
 
 ## Choosing options
 
@@ -256,8 +323,16 @@ any new one.
 A node holds one name per bus, the one its state carries over a pause, so a
 second `register` under another name is refused.
 
-A worker that dies is different: its buses can end failed, and each reader
-then finds that in `bus.end()`. For when, go and read [when the worker dies
+If the bus ended while your node was paused (another node closed it, say),
+your body run again still gets it back from `open_bus`, `pending_bus` or
+`join_bus`, ended, with your name back, and nothing new goes
+on the bus. Your reader then comes to the end, so a body that reads until the
+bus ends returns. Registering on an ended bus is refused only for a name your
+node never held there.
+
+A worker that dies is different: its buses can end failed, and each reader's
+next read then fails with `the bus ended failed: the worker holding this bus
+went away, so messages it carried may be lost`. For when, go and read [when the worker dies
 mid-run](durable-execution.md#when-the-worker-dies-mid-run). Anything that
 has to survive a crash goes in [storage](storage.md), or out as an ordinary
 output of a node that finishes.

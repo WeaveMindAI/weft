@@ -16,6 +16,7 @@ use weft_core::access::spec::{
     lookup_path, AccessSpec, Acquisition, AnswerReader, AppRegistration, Door, OAuthGrant, Template,
     TemplateError, TokenExpiry, TokenLife,
 };
+use weft_core::install::InstallKind;
 use weft_core::net::EmptyBody;
 use weft_core::node::Lookup;
 
@@ -59,6 +60,9 @@ pub struct ResolvedAccess {
     /// did: its values were made by that node's infra setup, and a failure
     /// using them may mean they changed where weft could not see.
     pub published_by: Option<String>,
+    /// The way to sign in a pasted connection was made with
+    /// (`access_grant.way`); `None` for one signed in any other way.
+    pub way: Option<String>,
 }
 
 /// The permission drift backstop, pure: a VERIFIED connection short of
@@ -138,6 +142,8 @@ struct GrantRow {
     instance_id: Option<String>,
     project_id: Option<uuid::Uuid>,
     published_by_node: Option<String>,
+    label: Option<String>,
+    way: Option<String>,
 }
 
 impl FromRow for GrantRow {
@@ -160,6 +166,8 @@ impl FromRow for GrantRow {
             instance_id: row.try_get("instance_id")?,
             project_id: row.try_get("project_id")?,
             published_by_node: row.try_get("published_by_node")?,
+            label: row.try_get("label")?,
+            way: row.try_get("way")?,
         })
     }
 }
@@ -182,6 +190,8 @@ struct WalledGrant {
     fresh_until: Option<chrono::DateTime<chrono::Utc>>,
     /// See [`ResolvedAccess::published_by`].
     published_by: Option<String>,
+    /// See [`ResolvedAccess::way`].
+    way: Option<String>,
 }
 
 /// Who is about to use a connection. An instance's connection is its own,
@@ -246,11 +256,15 @@ fn walled(
 
 /// Whether a walled read renews a token that is due. A `Stored` read
 /// makes no provider call and writes nothing: what a read of a captured
-/// list or of pasted material wants, which never expires.
+/// list or of pasted material wants, which never expires. A `Renewed`
+/// read is a node saying the values it was handed (`stale`, as
+/// [`weft_core::access::handed_digest`]) stopped working: they are
+/// renewed whatever their expiry says, unless the row hands others now.
 #[derive(Clone, Copy, PartialEq)]
-enum Freshness {
+enum Freshness<'a> {
     Refreshed,
     Stored,
+    Renewed { stale: &'a str },
 }
 
 /// The columns a walled read selects, in [`GrantRow`]'s order: a plain
@@ -258,7 +272,7 @@ enum Freshness {
 const WALLED_COLUMNS: &str = "tenant_id, service, registration_sealed, spec, spec_version, \
                               values_sealed, granted_scopes, permissions_verified, owner, door, \
                               identity, provider_account, expires_at, token_lifetime_secs, \
-                              instance_id, project_id, published_by_node";
+                              instance_id, project_id, published_by_node, label, way";
 
 /// How long a renewal may take before it counts as not answered (tried
 /// again later, like a provider that is down), so a claim on a renewal
@@ -277,15 +291,18 @@ const RENEWAL_LOOK_FIRST: std::time::Duration = std::time::Duration::from_millis
 const RENEWAL_LOOK_LONGEST: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A walled grant whose token is due a renewal: when the row says it
-/// dies, and the lifetime a renewal naming no expiry gets again.
+/// dies (`None` for one renewed because a node said it stopped working,
+/// whose row named no expiry), and the lifetime a renewal naming no
+/// expiry gets again.
 struct Due {
-    expires_at: chrono::DateTime<chrono::Utc>,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
     lifetime: Option<chrono::Duration>,
 }
 
 /// Read one grant row for a resolution: tenant wall (missing and
 /// cross-tenant answer identically, so the wall leaks no existence),
-/// service check, required-permission drift backstop, sealed open,
+/// service check, required-permission drift backstop, the floor of a
+/// way to sign in this install (`install`) does not offer, sealed open,
 /// spec parse, and (for a `Refreshed` read) the lazy single-flight
 /// renewal with rotated-token write-back. Every read that opens a
 /// row's values goes through here, so none of them can fork the wall.
@@ -295,32 +312,47 @@ struct Due {
 /// resolution claims the renewal on the row (`renewal_claimed_until`,
 /// one statement); the others wait, holding nothing, and read the row
 /// again until it is fresh, so the provider sees one renewal however
-/// many resolutions ask at once.
+/// many resolutions ask at once. A `Renewed` read is due exactly while
+/// the row hands what its node was handed, so of several nodes saying
+/// the same values stopped working, one renews and the others read what
+/// it wrote.
+#[allow(clippy::too_many_arguments)]
 async fn read_walled_grant(
     pool: &Pool,
+    install: InstallKind,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
     service: &str,
     required_permissions: &[String],
-    freshness: Freshness,
+    freshness: Freshness<'_>,
 ) -> anyhow::Result<WalledGrant> {
-    let open = |row: Option<GrantRow>| open_walled_grant(row, tenant, user, access_id, service, required_permissions);
+    let stale = match freshness {
+        Freshness::Renewed { stale } => Some(stale),
+        _ => None,
+    };
+    let open = |row: Option<GrantRow>| open_walled_grant(row, install, tenant, user, access_id, service, required_permissions, stale);
     let mut look = RENEWAL_LOOK_FIRST;
     loop {
         let row = pool.opt(&format!("SELECT {WALLED_COLUMNS} FROM access_grant WHERE id = $1"), &[&access_id]).await?;
         let (grant, due) = open(row)?;
-        let Some(due) = due.filter(|_| freshness == Freshness::Refreshed) else {
+        let Some(due) = due.filter(|_| freshness != Freshness::Stored) else {
             return Ok(grant);
         };
         // Taken before the claim is asked for, so the claim, which the
         // database starts later, lapses no sooner than this says.
         let claim_lapses = std::time::Instant::now() + RENEWAL_CLAIM;
         if let Some((row, claim)) = claim_renewal(pool, access_id, due.expires_at).await? {
-            // Renewed from the row as the claim found it, which still dies
-            // when `due` says (the claim was won on that).
+            // Renewed from the row as the claim found it, and only while
+            // that row is still due. The claim was won on the expiry the
+            // read saw, which another renewal can leave as it was (a token
+            // issued within the same second dies the same second), so a
+            // renewal asked for values a node was handed (`stale`) checks
+            // the claimed row still hands them; one that no longer does was
+            // renewed meanwhile, and is read as it is.
             let renewed = match open(Some(row)) {
-                Ok((grant, _)) => renew(pool, access_id, grant, due, claim, claim_lapses).await,
+                Ok((grant, Some(due))) => renew(pool, access_id, grant, due, claim, claim_lapses).await,
+                Ok((_, None)) => Ok(None),
                 Err(e) => Err(e),
             };
             if !matches!(renewed, Ok(Some(_))) {
@@ -328,8 +360,8 @@ async fn read_walled_grant(
             }
             match renewed? {
                 Some(grant) => return Ok(grant),
-                // The connection was made again while it renewed: read
-                // what that wrote.
+                // The connection was renewed, or made again, since the
+                // read: read what that wrote.
                 None => continue,
             }
         }
@@ -341,14 +373,18 @@ async fn read_walled_grant(
 /// The wall and the opening of one read row, pure: what every
 /// resolution starts from, and whether its token is due a renewal
 /// (`None` for a runtime-supplied credential, or a token that lives
-/// past [`REFRESH_MARGIN`]).
+/// past [`REFRESH_MARGIN`] and is not `stale`: the digest of values a
+/// node says stopped working, which the row still hands).
+#[allow(clippy::too_many_arguments)]
 fn open_walled_grant(
     row: Option<GrantRow>,
+    install: InstallKind,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
     service: &str,
     required_permissions: &[String],
+    stale: Option<&str>,
 ) -> anyhow::Result<(WalledGrant, Option<Due>)> {
     let Some(GrantRow {
         tenant_id: row_tenant,
@@ -368,6 +404,8 @@ fn open_walled_grant(
         instance_id: instance,
         project_id: row_project,
         published_by_node: published_by,
+        label,
+        way,
     }) = row
     else {
         return Err(AccessError::NotFound.into());
@@ -388,6 +426,9 @@ fn open_walled_grant(
     }
 
     let spec = spec_of(format_args!("connection {access_id}"), spec_json, spec_json_version)?;
+    if let Some(reason) = not_offered_here(&spec, way.as_deref(), install, access_id, label.as_deref())? {
+        return Err(AccessError::NeedsReconnect { service: service.to_string(), reason }.into());
+    }
     if let Some(reason) = own_only_refusal(&owner, &spec, required_permissions) {
         return Err(AccessError::NeedsReconnect { service: service.to_string(), reason }.into());
     }
@@ -403,9 +444,24 @@ fn open_walled_grant(
     // auth values.
     let runtime = matches!(spec.acquisition, Acquisition::Runtime {});
     let values = if runtime { BTreeMap::new() } else { values_of(&crate::open_json(&values_sealed)?) };
-    let due = expires_at
-        .filter(|at| !runtime && *at < chrono::Utc::now() + REFRESH_MARGIN)
-        .map(|expires_at| Due { expires_at, lifetime: token_lifetime_secs.map(chrono::Duration::seconds) });
+    let lifetime = token_lifetime_secs.map(chrono::Duration::seconds);
+    let expiring = expires_at.filter(|at| !runtime && *at < chrono::Utc::now() + REFRESH_MARGIN);
+    // A node saying the values it holds stopped working is believed while
+    // the row still hands them: the service is the judge of a token, and
+    // a row that changed since was renewed (or connected again) already.
+    let refused = stale.is_some_and(|stale| weft_core::access::handed_digest(&spec.handoff_values(&values)) == stale);
+    if refused && !spec.renews(way.as_deref()) {
+        let named = label.as_deref().map_or_else(|| format!("connection {access_id}"), |label| format!("the '{label}' connection"));
+        return Err(AccessError::NeedsReconnect {
+            service: service.to_string(),
+            reason: format!(
+                "the service refused what {named} holds, and weft holds nothing to renew it with; connect the \
+                 account again (Connect on its access node in the editor, or `weft connect` in the project's folder)"
+            ),
+        }
+        .into());
+    }
+    let due = (expiring.is_some() || refused).then_some(Due { expires_at, lifetime });
     let grant = WalledGrant {
         service: row_service,
         spec,
@@ -417,8 +473,38 @@ fn open_walled_grant(
         provider_account,
         fresh_until: if runtime { None } else { expires_at.map(|at| at - REFRESH_MARGIN) },
         published_by,
+        way,
     };
     Ok((grant, due))
+}
+
+/// The floor under every opening of a connection, pure: a pasted
+/// connection made with a way to sign in that this install does not
+/// offer (a local-only way, on a cloud install, which a connection
+/// copied from a local install can be) is refused, naming the
+/// connection and the ways that work here. `Some(reason)` = refuse. A
+/// pasted connection naming no way, or one its recipe does not declare,
+/// is a row no weft writes, and fails as one.
+pub fn not_offered_here(
+    spec: &AccessSpec,
+    way: Option<&str>,
+    install: InstallKind,
+    access_id: uuid::Uuid,
+    label: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let way = match (way, spec.ways().is_empty()) {
+        (None, true) => return Ok(None),
+        (Some(way), false) => spec
+            .way(way)
+            .ok_or_else(|| anyhow::anyhow!("connection {access_id} records the way to sign in '{way}', which its recipe does not declare"))?,
+        (None, false) => anyhow::bail!("connection {access_id} is a pasted one, and records no way to sign in"),
+        (Some(way), true) => anyhow::bail!("connection {access_id} records the way to sign in '{way}', but its recipe takes no pasted credential"),
+    };
+    if way.offered_on(install) {
+        return Ok(None);
+    }
+    let named = label.map_or_else(|| format!("connection {access_id}"), |label| format!("the '{label}' connection"));
+    Ok(Some(format!("{named} was made on a local install; {}", spec.cloud_refusal(way))))
 }
 
 /// Claim the renewal of connection `access_id`, whose token the row said
@@ -429,13 +515,13 @@ fn open_walled_grant(
 async fn claim_renewal(
     pool: &Pool,
     access_id: uuid::Uuid,
-    due: chrono::DateTime<chrono::Utc>,
+    due: Option<chrono::DateTime<chrono::Utc>>,
 ) -> anyhow::Result<Option<(GrantRow, chrono::DateTime<chrono::Utc>)>> {
     let claimed: Option<Row> = pool
         .opt(
             &format!(
                 "UPDATE access_grant SET renewal_claimed_until = now() + make_interval(secs => $3)
-                 WHERE id = $1 AND expires_at = $2
+                 WHERE id = $1 AND expires_at IS NOT DISTINCT FROM $2
                    AND (renewal_claimed_until IS NULL OR renewal_claimed_until < now())
                  RETURNING {WALLED_COLUMNS}, renewal_claimed_until"
             ),
@@ -472,7 +558,8 @@ async fn renew(
     claim: chrono::DateTime<chrono::Utc>,
     claim_lapses: std::time::Instant,
 ) -> anyhow::Result<Option<WalledGrant>> {
-    let life = tokio::time::timeout(RENEWAL_WAIT, refresh(&grant.spec, grant.registration.clone(), &mut grant.values, due.lifetime))
+    let renewal = refresh(&grant.spec, grant.way.as_deref(), grant.registration.clone(), &mut grant.values, due.lifetime);
+    let life = tokio::time::timeout(RENEWAL_WAIT, renewal)
         .await
         .unwrap_or_else(|_| {
             Err(AccessError::Unreached(format!(
@@ -584,8 +671,10 @@ async fn let_go_of_renewal(pool: &Pool, access_id: uuid::Uuid, claim: chrono::Da
 /// filter and the consumer's shortfall checks. An `Ours`-owned row
 /// (runtime-supplied credential) skips refresh and hands back empty
 /// values; the caller fills them.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_for_worker(
     pool: &Pool,
+    install: InstallKind,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
@@ -594,8 +683,34 @@ pub async fn resolve_for_worker(
     required_values: &[String],
 ) -> anyhow::Result<ResolvedAccess> {
     let grant =
-        read_walled_grant(pool, tenant, user, access_id, service, required_permissions, Freshness::Refreshed)
+        read_walled_grant(pool, install, tenant, user, access_id, service, required_permissions, Freshness::Refreshed)
             .await?;
+    worker_handoff(grant, service, required_values)
+}
+
+/// [`resolve_for_worker`] for a node whose values stopped working
+/// (`ctx.renew`): `stale` is what it was handed
+/// ([`weft_core::access::handed_digest`]). While the row still hands
+/// that, the connection is renewed whatever its expiry says, under the
+/// same claim as every renewal, so of several nodes saying so at once the
+/// provider sees one renewal and each is handed its result; a row that
+/// hands something else already (renewed, or connected again) is handed
+/// as it is. A connection nothing can renew (a pasted key with no
+/// renewal) is [`AccessError::NeedsReconnect`].
+#[allow(clippy::too_many_arguments)]
+pub async fn renew_for_worker(
+    pool: &Pool,
+    install: InstallKind,
+    tenant: &str,
+    user: GrantUser<'_>,
+    access_id: uuid::Uuid,
+    service: &str,
+    required_permissions: &[String],
+    required_values: &[String],
+    stale: &str,
+) -> anyhow::Result<ResolvedAccess> {
+    let freshness = Freshness::Renewed { stale };
+    let grant = read_walled_grant(pool, install, tenant, user, access_id, service, required_permissions, freshness).await?;
     worker_handoff(grant, service, required_values)
 }
 
@@ -606,7 +721,7 @@ fn worker_handoff(
     service: &str,
     required_values: &[String],
 ) -> anyhow::Result<ResolvedAccess> {
-    let WalledGrant { service: row_service, spec, registration, values, identity, owner, fresh_until, published_by, .. } =
+    let WalledGrant { service: row_service, spec, registration, values, identity, owner, fresh_until, published_by, way, .. } =
         grant;
     let app_client_id = registration.as_ref().map(|r| r.client_id.clone());
     if matches!(spec.acquisition, Acquisition::Runtime {}) {
@@ -619,6 +734,7 @@ fn worker_handoff(
             app_client_id,
             fresh_until,
             published_by,
+            way,
         });
     }
 
@@ -667,6 +783,7 @@ fn worker_handoff(
         app_client_id,
         fresh_until,
         published_by,
+        way,
     })
 }
 
@@ -682,6 +799,7 @@ fn worker_handoff(
 /// subscription's own handling, naming the topic.
 pub async fn resolve_event_source(
     pool: &Pool,
+    install: InstallKind,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
@@ -689,7 +807,7 @@ pub async fn resolve_event_source(
     required_values: &[String],
 ) -> anyhow::Result<ResolvedEventSource> {
     let grant =
-        read_walled_grant(pool, tenant, user, access_id, service, &[], Freshness::Refreshed).await?;
+        read_walled_grant(pool, install, tenant, user, access_id, service, &[], Freshness::Refreshed).await?;
     // A recipe value may live on the GRANT (a pasted token) or on the
     // APP the connection was made through. The app's values join ONLY
     // for an own-door grant, where the app is the user's; a
@@ -731,13 +849,14 @@ pub async fn resolve_event_source(
 /// material, so no refresh and no provider call.
 pub async fn caller_values(
     pool: &Pool,
+    install: InstallKind,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
     service: &str,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     let grant =
-        read_walled_grant(pool, tenant, user, access_id, service, &[], Freshness::Stored).await?;
+        read_walled_grant(pool, install, tenant, user, access_id, service, &[], Freshness::Stored).await?;
     Ok(grant.spec.handoff_values(&grant.values))
 }
 
@@ -909,6 +1028,7 @@ pub fn recipe_value_names(
 /// recoverable.
 async fn refresh(
     spec: &AccessSpec,
+    way: Option<&str>,
     registration: Option<AppRegistration>,
     values: &mut BTreeMap<String, String>,
     lifetime: Option<chrono::Duration>,
@@ -925,14 +1045,22 @@ async fn refresh(
         _ => anyhow::Error::from(reconnect(format!("the refresh was refused ({e})"))),
     };
     let expiry = match &spec.acquisition {
-        Acquisition::Static { .. } => {
-            return Err(reconnect(
-                "its pasted credential expired (a static credential has no refresh); paste a \
-                 fresh one"
-                    .into(),
-            )
-            .into())
-        }
+        // A pasted sign-in weft keeps alive renews through its declared
+        // call, over what the paste stored (`{refresh_token}`): the same
+        // reader and the same write-back as a consent's declared renewal.
+        Acquisition::Static { .. } => match way.and_then(|id| spec.way(id)).and_then(|way| way.renewal.as_deref()) {
+            Some(renewal) => run_token_call(&spec.service, &renewal.call, &BTreeMap::new(), values, AnswerOf::Renewal)
+                .await
+                .map_err(refused)?,
+            None => {
+                return Err(reconnect(
+                    "its pasted credential expired (a static credential has no refresh); paste a \
+                     fresh one"
+                        .into(),
+                )
+                .into())
+            }
+        },
         Acquisition::MintJwt { .. } => return mint_and_exchange(spec, values).await,
         // A runtime-supplied credential is never refreshed here: the
         // resolve path answers before reaching refresh.
@@ -1111,8 +1239,10 @@ pub use weft_core::access::lookup::{GrantedQuery, LookupItem, LookupPage, Lookup
 /// `label_path` / `value_path` address one item (same vocabulary as a
 /// [`Lookup`]). Free: no provider call at all. Only the id/label pairs
 /// leave; the rest of the stored values never do.
+#[allow(clippy::too_many_arguments)]
 pub async fn granted_items(
     pool: &Pool,
+    install: InstallKind,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
@@ -1126,7 +1256,7 @@ pub async fn granted_items(
     // STORED freshness: a captured list has no expiry, so reading it
     // never needs the provider.
     let grant =
-        read_walled_grant(pool, tenant, user, access_id, service, &[], Freshness::Stored).await?;
+        read_walled_grant(pool, install, tenant, user, access_id, service, &[], Freshness::Stored).await?;
     let Some(raw) = grant.values.get(from) else {
         // The connection recorded nothing under that name: an empty
         // list, so the editor falls through to the next source.
@@ -1434,7 +1564,7 @@ mod tests {
     fn own_only_gate_refuses_the_runtime_credential_only() {
         let spec: AccessSpec = serde_json::from_value(serde_json::json!({
             "service": "elevenlabs",
-            "acquisition": { "kind": "static", "fields": [{ "name": "key" }] },
+            "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "key" }] }] },
             "auth": [{ "kind": "header", "name": "xi-api-key", "value": "{key}" }],
             "permissions": [
                 { "id": "generate", "label": "Generate audio", "description": "x" },

@@ -30,10 +30,9 @@
 //!
 //! ## A bus outlives a pause
 //!
-//! A run pauses with a bus open: a node holding it that pauses on a wait
-//! leaves the bus open (its names stay registered, nobody reads it
-//! leave), and when every node of the run waits, the whole run pauses
-//! around its buses. Every read and membership wait is a place the run
+//! A run pauses with a bus open: a member that pauses on a wait stays
+//! one (its names stay registered, nobody reads it leave), and when
+//! every node of the run waits, the whole run pauses around its buses. Every read and membership wait is a place the run
 //! can pause, so it takes the firing's state
 //! (`crate::context::PausePoint`); a firing opens one reader per bus a
 //! run of its body, and its [`FiringBuses`] keeps how far that reader
@@ -112,9 +111,10 @@
 //! name). The registered name is the sender stamp on every `send`, and
 //! is what peers wait on via `wait_for("llm")`. Registration is the
 //! explicit "I am here and ready" act: a node that needs a long warmup
-//! (download a model, open a socket) holds the bus the whole time and
+//! (download a model, open a socket) has the bus the whole time and
 //! only registers once it is truly ready, so peers waiting on it do not
-//! release early.
+//! release early. Registering is also what makes a node a member: the
+//! bus lives until nobody is on it and no node can still join it (below).
 //!
 //! ## Waiting
 //!
@@ -132,16 +132,46 @@
 //! closes the bus, failed, naming why. Every waiting cursor wakes, and
 //! its `next()` returns that failure.
 //!
+//! A member waiting on its own bus (`wait_for`, a read, `until_end`)
+//! after every other member left keeps waiting: it is a member, so the
+//! bus is open, and a node given the marker later may still join and
+//! talk. Nothing hangs for good: once nothing else in the run can move,
+//! that same stuck check closes the bus failed and the wait ends with
+//! that failure.
+//!
 //! ## How a bus ends
 //!
 //! The close carries an end ([`StreamEnd`]): `Finished`, or `Failed`
-//! with an error. Every bus a firing creates or joins is held by that
-//! firing ([`FiringBuses`]) and ended by weft when the body does, with
-//! how the body returned: a reader of a producer that failed halfway
-//! learns the stream is incomplete instead of reading a short one as
-//! whole. A body may end a bus early with [`BusHandle::close`], which
-//! only ever says finished. The engine's own closes (a stuck run, the
-//! run's end) say failed, naming why.
+//! with an error. Nobody owns a bus. A firing that registers a name on
+//! it (creating it with `ctx.open_bus`, joining it with `ctx.join_bus`,
+//! or registering on any handle it got) is a member until its body
+//! returns, however it returns, and then its names leave
+//! ([`FiringBuses::leave`]). A member leaving does nothing else to the
+//! bus, failed or not: the others carry on, and one of them may be the
+//! way the conversation recovers. Once nobody is on it, the bus ends as
+//! soon as no node can still join it, as its last member's body returned:
+//! finished, or failed with its error, so a reader of a stream whose only
+//! producer failed halfway learns it is incomplete instead of reading a
+//! short one as whole. A bus nobody ever joined ends finished. A node can
+//! still join while the bus's marker is on its way to it (on a wire, in a
+//! loop that will hand it to an iteration still to come) or in the input
+//! of a firing that has not ended and has not used the bus yet: the
+//! engine looks ([`crate::run::bus_reach`]) once it hears the bus is
+//! unattended ([`crate::liveness::WaitLiveness::unattended`]), and ends it
+//! ([`BusInner::end_unattended`]) when nothing can. A firing uses a bus by
+//! registering on it, opening its reader, or waiting on it; one that only
+//! hands the marker on holds the bus until it returns.
+//! Any node holding the bus may end it sooner with [`BusHandle::close`]:
+//! finished while somebody is on it, the way its last member left once
+//! nobody is. A reader that never registers (`ctx.bus_from_input`, a
+//! debug tap) is no member, and once it reads it keeps nothing open. A
+//! member that pauses stays one across the pause. The engine's
+//! own closes (a stuck run, the run's end) say failed, naming why.
+//!
+//! Membership is the log's `Joined` / `Left` entries, which the run's
+//! record folds into who is on each bus (`RecordedBus::members`); a bus
+//! opened again after a pause starts from that, so every worker reads
+//! the same members. A send touches none of it.
 //!
 //! ## Waiting and the engine
 //!
@@ -357,8 +387,11 @@ pub struct BusEntry {
 pub enum BusEntryKind {
     /// A handle registered `name`.
     Joined { name: String },
-    /// A registered handle dropped while the bus was open.
-    Left { name: String },
+    /// A name left the open bus: its firing's body returned
+    /// ([`BusInner::leave`]), or its handle outside every firing dropped.
+    /// `end` is how it left, which is how the bus ends if nobody else
+    /// joins it after ([`BusInner::end_unattended`]).
+    Left { name: String, end: StreamEnd },
     /// A successful `send` landed. `from` is the sender's registered
     /// name (the bus stamps it). For journaled buses, `payload` is
     /// `Some(value)`; for ephemeral buses, `payload` is `None` and the
@@ -382,10 +415,10 @@ pub enum BusEntryKind {
 }
 
 /// How a bus ended: the same vocabulary a generator's stream ends with.
-/// `Finished` when the body of the firing that held it returned
-/// normally (or the bus was closed on purpose), `Failed` with the
-/// firing's error otherwise. Weft writes it ([`FiringBuses::end`]); a
-/// node can only end a bus as finished ([`BusHandle::close`]).
+/// `Finished` when the body of its last member to leave returned
+/// normally (or the bus was closed on purpose), `Failed` with that body's
+/// error otherwise. Weft writes it ([`FiringBuses::leave`]); a node can
+/// only end a bus as finished ([`BusHandle::close`]).
 pub use crate::primitive::StreamEnd;
 
 /// One message inside a journal window row: who sent it, when, and
@@ -594,6 +627,11 @@ pub enum RegisterError {
     /// the one its saved state carries over a pause.
     #[error("this node already holds the name '{0}' on the bus; a node holds one name per bus")]
     FiringHoldsAnother(String),
+    /// The body of the handle's firing already returned, taking its names
+    /// off every bus ([`BusInner::leave`]): a task the body left running
+    /// cannot join for it after.
+    #[error("cannot register '{0}': this node's body already returned, and a node is on a bus only while its body runs")]
+    FiringLeft(String),
 }
 
 // ----- Wait liveness (shared with every in-process wait) --------------
@@ -702,9 +740,9 @@ impl EphemeralStore {
 }
 
 /// Shared bus state behind every handle. The log is the source of
-/// truth for ordering and content; `present_names` is a denormalized
-/// view of currently-registered identities (kept in sync with the log
-/// under the same lock as appends).
+/// truth for ordering and content; `members` is a denormalized view of
+/// who is on the bus now (kept in sync with the log's `Joined` / `Left`
+/// entries under the same lock as appends).
 ///
 /// `liveness` and `journal_pump_notify` are `Weak` on purpose: the
 /// engine's `BusCoordinator` pins each bus via `BusRegistry::inner:
@@ -749,13 +787,6 @@ pub struct BusInner {
     /// entries. The single source of truth for membership waits
     /// (`wait_for*`). Maintained under the log lock.
     ever_joined: Mutex<HashSet<String>>,
-    /// Names whose firing paused while holding them, with that firing
-    /// and the offset of the name's `Joined` entry: still present (no
-    /// `Left` was written, nobody reads them leave), and taken back by
-    /// the same firing's resumed body ([`BusHandle::register`]), or let
-    /// go with a `Left` once that firing ends for good
-    /// ([`BusInner::release_held`]). Maintained under the log lock.
-    held_over: Mutex<HashMap<String, (FiringLocation, u64)>>,
     /// One past the newest message the bus no longer holds in RAM: one a
     /// bus opened again after a pause could not bring back (an ephemeral
     /// bus keeps none, a journaled one only its last window of messages
@@ -791,11 +822,23 @@ pub struct BusInner {
     /// `Notify` drives every cursor wait; the cursor re-reads state on
     /// every wake. Cheap because `notify_waiters` stores no permits.
     log_notify: Notify,
-    /// Denormalized: who's registered right now. Kept in sync with the
-    /// log under the same `log` lock so a `register`/`drop` race
-    /// against `close()` cannot produce a Joined without a matching
-    /// log entry.
-    present_names: Mutex<HashSet<String>>,
+    /// Who is on the bus now, by name: every name whose `Joined` has no
+    /// `Left` yet, the same set the run's record folds from those entries
+    /// (`RecordedBus::members`), which is what a bus opened again after a
+    /// pause starts from. When the last one leaves, the bus ends
+    /// ([`BusInner::leave`]). Kept in sync with the log under the same
+    /// `log` lock, so a `register` / leave racing `close()` cannot produce
+    /// a `Joined` without its entry.
+    members: Mutex<HashMap<String, Member>>,
+    /// How the last name to leave left (its `Left` entry's end), `None`
+    /// while none has: how the bus ends once nobody can still join it
+    /// ([`Self::end_unattended`]). Written under the `log` lock.
+    last_left: Mutex<Option<StreamEnd>>,
+    /// The firings whose bodies used this bus (registered on it, opened
+    /// its reader, or waited on it) and have not returned: a firing
+    /// holding the marker in its input that used the bus already is no
+    /// node that may still join it ([`crate::run::bus_reach`]).
+    used_by: Mutex<HashSet<FiringLocation>>,
     /// Engine node-liveness hook. `Weak::new()` outside an engine-driven
     /// run; set once at bus creation via
     /// `BusHandle::create_with_engine`. Fired at every cursor wait via
@@ -831,6 +874,23 @@ pub struct BusInner {
     window: usize,
 }
 
+/// One name on a bus ([`BusInner::members`]).
+struct Member {
+    /// The firing whose body registered it, `None` for a handle outside
+    /// every firing (a test's, a bus seeded from outside a body). A
+    /// firing's name stays its own until its body returns, through every
+    /// handle it drops and every pause; a name outside a firing leaves
+    /// with its handle.
+    firing: Option<FiringLocation>,
+    /// The offset of its `Joined` entry: where a handle taking the name
+    /// back anchors its reader.
+    joined_offset: u64,
+    /// A live handle carries it now. A firing's name whose handle went
+    /// (dropped mid-body, or by a pause) is taken back by the next handle
+    /// of the same firing registering it, with nothing appended.
+    in_hand: bool,
+}
+
 /// A bus to open again where a paused run left it
 /// ([`BusHandle::reopen`]), as the run's record tells it.
 pub struct ReopenedBus {
@@ -840,9 +900,12 @@ pub struct ReopenedBus {
     pub next_offset: u64,
     /// Every name that ever joined it.
     pub joined: Vec<String>,
-    /// The names firings that paused hold on it: the name, the firing,
-    /// and the offset of the name's `Joined` entry.
-    pub held_over: Vec<(String, FiringLocation, u64)>,
+    /// Who was on it when the run paused: each name, the paused firing
+    /// it belongs to, and the offset of its `Joined` entry. Every one of
+    /// them is a firing that paused, since a run pauses only once every
+    /// node of it waits, and each body that returned before took its
+    /// names off with it.
+    pub members: Vec<(String, FiringLocation, u64)>,
     /// The messages a journaled bus's record kept whole (each with its
     /// payload, untrimmed), oldest first, at most its window, every one
     /// after `lost_through`.
@@ -850,6 +913,13 @@ pub struct ReopenedBus {
     /// One past the newest message it cannot bring back
     /// ([`BusInner::lost_through`]).
     pub lost_through: u64,
+    /// How it ended before the pause, `None` for a bus still open: an
+    /// ended one comes back ended, its `Closed` entry at `next_offset`
+    /// and already on the record.
+    pub end: Option<StreamEnd>,
+    /// How the last name to leave it left, `None` while none has: how an
+    /// open bus nobody is on ends once no node can still join it.
+    pub last_left: Option<StreamEnd>,
 }
 
 impl BusInner {
@@ -875,7 +945,6 @@ impl BusInner {
             log: Mutex::new(Vec::new()),
             next_offset: AtomicU64::new(0),
             ever_joined: Mutex::new(HashSet::new()),
-            held_over: Mutex::new(HashMap::new()),
             lost_through: AtomicU64::new(0),
             filtered_cursors: Mutex::new(Vec::new()),
             journaled_through: AtomicU64::new(0),
@@ -885,7 +954,9 @@ impl BusInner {
             degraded_reason: Mutex::new(String::new()),
             log_notify: Notify::new(),
             append_gen: AtomicU64::new(0),
-            present_names: Mutex::new(HashSet::new()),
+            members: Mutex::new(HashMap::new()),
+            last_left: Mutex::new(None),
+            used_by: Mutex::new(HashSet::new()),
             liveness,
             journal_pump_notify,
             ephemeral_store,
@@ -1112,11 +1183,15 @@ impl BusInner {
     /// Close this bus as `end`. Appends a `Closed` entry carrying it
     /// (idempotent: the first close's end stands), sets the closed
     /// flag, wakes every cursor waiting on the log and the engine's
-    /// liveness hook. Public so the engine can end a firing's buses
-    /// with how its body returned, and fire the stuck-detection close
-    /// via a raw `Arc<BusInner>` it pins for the pump's lifetime.
+    /// liveness hook. Public so the engine can fire the stuck-detection
+    /// close via a raw `Arc<BusInner>` it pins for the pump's lifetime.
     pub fn close(&self, end: StreamEnd) {
         let mut log = self.lock_log();
+        self.close_in(&mut log, end);
+    }
+
+    /// [`Self::close`] with the log already locked.
+    fn close_in(&self, log: &mut Vec<BusEntry>, end: StreamEnd) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
@@ -1124,7 +1199,99 @@ impl BusInner {
         // also reads the end.
         let _ = self.end.set(end.clone());
         self.closed.store(true, Ordering::Release);
-        self.push_entry(&mut log, BusEntryKind::Closed { end });
+        self.push_entry(log, BusEntryKind::Closed { end });
+    }
+
+    /// The firing at `at` left: its body returned (`end` says how), so
+    /// every name it has on the bus leaves, each with its `Left` entry,
+    /// whether a handle still carries it or not, and it no longer counts
+    /// as having used the bus. Nothing else happens to the bus, unless
+    /// that left nobody on it: then it ends once no node can still join
+    /// it ([`Self::unattended`]), as the last name to leave left. A firing
+    /// with no name on the bus leaves none, and tells of a bus it made
+    /// with nobody on it.
+    pub fn leave(&self, at: &FiringLocation, end: StreamEnd) {
+        self.used_by.lock().expect("bus users poisoned").remove(at);
+        let mut log = self.lock_log();
+        self.leave_in(&mut log, |_, member| member.firing.as_ref() == Some(at), end);
+    }
+
+    /// Take every member `which` picks off the bus, each with its `Left`
+    /// entry carrying `end`. The one way a name leaves: a firing's body
+    /// returning ([`Self::leave`]) and a handle outside every firing
+    /// dropping ([`BusHandle`]'s drop) both come through here. A bus left
+    /// with nobody on it is unattended ([`Self::unattended`]), whether a
+    /// name just left or none was there. A closed bus takes no entry any
+    /// more, so nothing is written on one.
+    fn leave_in(&self, log: &mut Vec<BusEntry>, which: impl Fn(&str, &Member) -> bool, end: StreamEnd) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let (gone, nobody_left) = {
+            let mut members = self.members.lock().expect("bus members poisoned");
+            let gone: Vec<String> = members.iter().filter(|(name, member)| which(name, member)).map(|(name, _)| name.clone()).collect();
+            for name in &gone {
+                members.remove(name);
+            }
+            (gone, members.is_empty())
+        };
+        if !gone.is_empty() {
+            *self.last_left.lock().expect("bus last leave poisoned") = Some(end.clone());
+        }
+        let left_now = !gone.is_empty();
+        for name in gone {
+            self.push_entry(log, BusEntryKind::Left { name, end: end.clone() });
+        }
+        if !nobody_left {
+            return;
+        }
+        match self.liveness.upgrade() {
+            Some(engine) => engine.unattended(self.id),
+            // Outside a run (a test's bus, a run whose engine is gone) no
+            // node can still join it, so the last name leaving ends it.
+            None if left_now => self.close_in(log, end),
+            None => {}
+        }
+    }
+
+    /// End the bus if nobody is on it, as the last name to leave left
+    /// (finished when none ever did): the engine's call, once no node of
+    /// the run can still join it ([`crate::run::bus_reach`]). A bus a node
+    /// joined meanwhile stays open. Answers whether it ended now.
+    pub fn end_unattended(&self) -> bool {
+        let mut log = self.lock_log();
+        if self.closed.load(Ordering::Acquire) || !self.members.lock().expect("bus members poisoned").is_empty() {
+            return false;
+        }
+        let end = self.last_left.lock().expect("bus last leave poisoned").clone().unwrap_or(StreamEnd::Finished);
+        self.close_in(&mut log, end);
+        true
+    }
+
+    /// Whether anybody is on the bus.
+    pub fn attended(&self) -> bool {
+        !self.members.lock().expect("bus members poisoned").is_empty()
+    }
+
+    /// The firing at `at` used the bus (registered on it, opened its
+    /// reader, or waited on it): from here on, holding its marker is no
+    /// reason for the bus to stay open. With nobody on the bus the engine
+    /// is told again, since this may be what kept it open.
+    fn used(&self, at: &FiringLocation) {
+        if !self.used_by.lock().expect("bus users poisoned").insert(at.clone()) {
+            return;
+        }
+        if !self.is_closed() && !self.attended() {
+            if let Some(engine) = self.liveness.upgrade() {
+                engine.unattended(self.id);
+            }
+        }
+    }
+
+    /// Whether the firing at `at` used the bus ([`Self::used`]) in a body
+    /// that has not returned.
+    pub fn used_by(&self, at: &FiringLocation) -> bool {
+        self.used_by.lock().expect("bus users poisoned").contains(at)
     }
 
     /// How the bus ended, `None` while it is open.
@@ -1232,29 +1399,6 @@ impl BusInner {
         log.first().map(|e| e.offset).unwrap_or_else(|| self.next_offset.load(Ordering::Acquire))
     }
 
-    /// Let go of every name the firing at `at` held over a pause
-    /// ([`BusInner::held_over`]) and never took back: its firing ended for
-    /// good, so each leaves now, with the `Left` entry it did not write
-    /// when it paused.
-    pub fn release_held(&self, at: &FiringLocation) {
-        let mut log = self.lock_log();
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-        let names: Vec<String> = {
-            let mut held = self.held_over.lock().expect("held_over poisoned");
-            let names: Vec<String> = held.iter().filter(|(_, (holder, _))| holder == at).map(|(name, _)| name.clone()).collect();
-            for name in &names {
-                held.remove(name);
-            }
-            names
-        };
-        for name in names {
-            self.present_names.lock().expect("present_names poisoned").remove(&name);
-            self.push_entry(&mut log, BusEntryKind::Left { name });
-        }
-    }
-
     /// The pump's `journaled_through` cursor (one past the highest
     /// journaled offset). Used by the engine's shutdown to wait
     /// until every Closed entry has been shipped.
@@ -1292,7 +1436,7 @@ pub struct BusHandle {
     node: Option<FiringLocation>,
     /// That firing's side of every bus it touches ([`FiringBuses`]): where
     /// its one reader on the bus starts and how far it read, the name it
-    /// holds, whether the firing paused. `None` outside a firing.
+    /// holds, whether its body returned. `None` outside a firing.
     firing: Option<Arc<FiringBuses>>,
 }
 
@@ -1357,9 +1501,12 @@ impl BusHandle {
     /// ([`ReopenedBus`]): the same id, so every marker handed out still
     /// names it, the next entry at the offset the bus stopped at,
     /// everything before it already on the run's record, its members
-    /// known, the names its paused firings hold still held by them, and
+    /// on it again, each its paused firing's to take back, and
     /// for a journaled bus the messages its record kept whole, so a reader
-    /// reaching back finds them. The handle is the run's, attributed to
+    /// reaching back finds them. A bus that ended before the pause comes
+    /// back ended the same way: its readers read what it kept and come to
+    /// its end, and a close or a register meets an ended bus, as they
+    /// would have before the pause. The handle is the run's, attributed to
     /// no firing; the bodies reach the bus by marker or port as before.
     pub fn reopen(
         bus: ReopenedBus,
@@ -1384,15 +1531,33 @@ impl BusHandle {
                     },
                 });
             }
-            inner.next_offset.store(bus.next_offset, Ordering::Release);
-            inner.journaled_through.store(bus.next_offset, Ordering::Release);
+            let mut next_offset = bus.next_offset;
+            if let Some(end) = bus.end {
+                // Its `Closed` entry, already on the record: past it, so
+                // the pump writes it no second time.
+                log.push(BusEntry { offset: next_offset, at_unix: now_unix(), kind: BusEntryKind::Closed { end: end.clone() } });
+                let _ = inner.end.set(end);
+                inner.closed.store(true, Ordering::Release);
+                next_offset += 1;
+            }
+            inner.next_offset.store(next_offset, Ordering::Release);
+            inner.journaled_through.store(next_offset, Ordering::Release);
             inner.lost_through.store(bus.lost_through, Ordering::Release);
             *inner.ever_joined.lock().expect("ever_joined poisoned") = bus.joined.into_iter().collect();
-            let mut present = inner.present_names.lock().expect("present_names poisoned");
-            let mut held = inner.held_over.lock().expect("held_over poisoned");
-            for (name, holder, joined_offset) in bus.held_over {
-                present.insert(name.clone());
-                held.insert(name, (holder, joined_offset));
+            *inner.last_left.lock().expect("bus last leave poisoned") = bus.last_left;
+            if !inner.closed.load(Ordering::Acquire) {
+                let mut members = inner.members.lock().expect("bus members poisoned");
+                for (name, firing, joined_offset) in bus.members {
+                    members.insert(name, Member { firing: Some(firing), joined_offset, in_hand: false });
+                }
+            }
+        }
+        // Open with nobody on it (its last member left, or it never had
+        // one, before the pause): the engine looks again at whether a node
+        // can still join it.
+        if !inner.is_closed() && !inner.attended() {
+            if let Some(engine) = inner.liveness.upgrade() {
+                engine.unattended(inner.id);
             }
         }
         Ok(Self { inner: Arc::new(inner), registration: None, node: None, firing: None })
@@ -1448,71 +1613,102 @@ impl BusHandle {
         self.inner.clone()
     }
 
-    /// Claim `name` as this handle's identity. Errors if the bus is
-    /// closed (`Closed`), the name is already held (`NameTaken`), or
-    /// this handle already registered (`AlreadyRegistered`).
+    /// Claim `name` as this handle's identity, which makes its firing a
+    /// member of the bus until its body returns ([`BusInner::leave`]).
+    /// Errors if the bus is closed (`Closed`), the name is already held
+    /// (`NameTaken`), this handle already registered
+    /// (`AlreadyRegistered`), or its firing's body already returned
+    /// (`FiringLeft`).
     ///
-    /// The append to the log AND the `present_names` insert AND the
+    /// The append to the log AND the `members` insert AND the
     /// closed-flag re-check all happen under the SAME `log` lock. A
     /// `close()` in flight either lands before (this register sees
     /// `closed=true` and errors), or after (this register has finished
     /// inserting, the close appends the `Closed` entry next). No
     /// register-then-close race producing an orphan Joined.
     ///
-    /// A name this handle's firing held when it paused is taken back
-    /// as it was, at its first `Joined` offset, with nothing appended:
-    /// to its peers the firing never left.
+    /// A name this handle's firing already has on the bus with no handle
+    /// carrying it (one it dropped, or held over its pause) is taken back
+    /// as it was, at its first `Joined` offset, with nothing appended: to
+    /// its peers the firing never left. That holds on a bus that ended
+    /// while the firing was paused too: the resumed body gets its name
+    /// back on the ended bus, and only a name it never held is refused
+    /// (`Closed`).
     pub fn register(&mut self, name: impl Into<String>) -> Result<(), RegisterError> {
         if let Some((existing, _)) = &self.registration {
             return Err(RegisterError::AlreadyRegistered(existing.clone()));
         }
         let name = name.into();
         let mut log = self.inner.lock_log();
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(RegisterError::Closed);
-        }
-        if let Some(held) = self.firing.as_ref().and_then(|firing| firing.held_name(self.inner.id)) {
-            if held != name {
-                return Err(RegisterError::FiringHoldsAnother(held));
+        if let Some(firing) = &self.firing {
+            if firing.has_left() {
+                return Err(RegisterError::FiringLeft(name));
             }
-        }
-        {
-            let mut held = self.inner.held_over.lock().expect("held_over poisoned");
-            if let Some((holder, joined_offset)) = held.get(&name).cloned() {
-                if self.node.as_ref() != Some(&holder) {
-                    return Err(RegisterError::NameTaken(name));
+            if let Some(held) = firing.held_name(self.inner.id) {
+                if held != name {
+                    return Err(RegisterError::FiringHoldsAnother(held));
                 }
-                held.remove(&name);
-                drop(log);
-                self.note_registered(&name, joined_offset);
-                self.registration = Some((name, joined_offset));
-                return Ok(());
             }
         }
-        {
-            let mut present = self
-                .inner
-                .present_names
-                .lock()
-                .expect("present_names poisoned");
-            if present.contains(&name) {
-                return Err(RegisterError::NameTaken(name));
-            }
-            present.insert(name.clone());
+        if self.inner.closed.load(Ordering::Acquire) {
+            // The bus ended while the firing was paused holding this name
+            // (here, or before the run was picked up): the resumed body
+            // gets the name back as it held it, the bus ended, so its
+            // reader comes to that end. Only a name it never held is
+            // refused.
+            let Some(held) = self.firing.as_ref().and_then(|firing| firing.held_over_its_pause(self.inner.id)).filter(|held| held.name == name)
+            else {
+                return Err(RegisterError::Closed);
+            };
+            drop(log);
+            self.note_registered(&name, held.joined_offset);
+            self.registration = Some((name, held.joined_offset));
+            self.note_use();
+            return Ok(());
         }
-        self.inner
-            .ever_joined
-            .lock()
-            .expect("ever_joined poisoned")
-            .insert(name.clone());
-        let joined_offset = self.inner.push_entry(
-            &mut log,
-            BusEntryKind::Joined { name: name.clone() },
-        );
+        let firing = self.member_firing();
+        let joined_offset = {
+            let mut members = self.inner.members.lock().expect("bus members poisoned");
+            match members.get_mut(&name) {
+                Some(member) if !member.in_hand && firing.is_some() && member.firing == firing => {
+                    member.in_hand = true;
+                    Some(member.joined_offset)
+                }
+                Some(_) => return Err(RegisterError::NameTaken(name)),
+                None => None,
+            }
+        };
+        let joined_offset = match joined_offset {
+            Some(taken_back) => taken_back,
+            None => {
+                self.inner.ever_joined.lock().expect("ever_joined poisoned").insert(name.clone());
+                let joined_offset = self.inner.push_entry(&mut log, BusEntryKind::Joined { name: name.clone() });
+                self.inner.members.lock().expect("bus members poisoned").insert(name.clone(), Member { firing, joined_offset, in_hand: true });
+                joined_offset
+            }
+        };
         drop(log);
         self.note_registered(&name, joined_offset);
         self.registration = Some((name, joined_offset));
+        self.note_use();
         Ok(())
+    }
+
+    /// The firing a name this handle registers belongs to: the handle's
+    /// own, `None` for a handle outside every firing.
+    fn member_firing(&self) -> Option<FiringLocation> {
+        self.firing.as_ref().and(self.node.clone())
+    }
+
+    /// This handle's firing used the bus (registered on it, opened its
+    /// reader, or waited on it): holding its marker no longer keeps the
+    /// bus open for it ([`BusInner::used`]), and its body returning takes
+    /// that back ([`FiringBuses::leave`]).
+    fn note_use(&self) {
+        if let (Some(firing), Some(at)) = (&self.firing, &self.node) {
+            firing.touched(self.inner.id);
+            self.inner.used(at);
+        }
     }
 
     /// Tell this handle's firing it holds `name` on this bus, for its
@@ -1741,6 +1937,7 @@ impl BusHandle {
             }
             None => (CursorStart::Fresh(offset), None),
         };
+        self.note_use();
         let behind = matches!(start, CursorStart::Saved(saved) if saved < self.inner.lost_through.load(Ordering::Acquire));
         let cancellation = self.firing.as_ref().and_then(|firing| firing.cancellation.clone());
         Ok(BusCursor::new(Arc::downgrade(&self.inner), self.inner.id, start.offset(), None, self.node.clone(), slot, behind, cancellation))
@@ -1773,11 +1970,59 @@ impl BusHandle {
 
     async fn wait_for_at<P: PausePoint>(&self, name: &str, at: &mut P, point: Point) -> WeftResult<()> {
         at.before(&point, self.node.is_some())?;
+        self.note_use();
         let name_owned = name.to_string();
         match self.wait_for_joins(at.pausable(), move |seen| seen.contains(&name_owned)).await {
             Some(Ok(())) => Ok(()),
             Some(Err(())) => Err(WeftError::NodeFailed(format!("the bus closed before '{name}' joined it"))),
             None => Err(at.paused().await),
+        }
+    }
+
+    /// Wait until the bus ends, for a node that keeps a bus open while
+    /// others use it and has nothing to read on it: a member waiting for
+    /// the node that closes it. `Ok` once it ended finished; an error once
+    /// it ended failed (`the bus ended failed: <why>`), as a reader's read
+    /// fails there, so the `?` fails the node rather than letting a broken
+    /// stream pass as a whole one (a body handling the failure itself
+    /// matches the error, and [`Self::end`] says why).
+    ///
+    /// The run can pause while it waits, so it takes the firing's state
+    /// (or the `Holding`). It is no reader: it keeps no place on the bus,
+    /// so a resumed body waits on, however many messages the bus dropped
+    /// meanwhile, and the firing may still open its one reader on the bus.
+    /// Ends with the cancelled error when the run is cancelled.
+    #[track_caller]
+    pub fn until_end<'a, P: PausePoint>(&'a self, at: &'a mut P) -> impl std::future::Future<Output = WeftResult<()>> + 'a {
+        self.until_end_at(at, Point::unchecked("waited for a bus to end", std::panic::Location::caller()))
+    }
+
+    async fn until_end_at<P: PausePoint>(&self, at: &mut P, point: Point) -> WeftResult<()> {
+        at.before(&point, self.node.is_some())?;
+        self.note_use();
+        let inner = self.inner.clone();
+        let check = move || -> Option<()> {
+            let _log = inner.lock_log();
+            inner.closed.load(Ordering::Acquire).then_some(())
+        };
+        let source = self.inner.clone() as Arc<dyn WaitSource>;
+        let wait = wait_or_pause(&self.inner.liveness, &self.node, &source, at.pausable(), check);
+        let cancellation = self.firing.as_ref().and_then(|firing| firing.cancellation.clone());
+        let ended = match cancellation.as_deref() {
+            Some(cancellation) => tokio::select! {
+                biased;
+                () = cancellation.cancelled() => None,
+                ended = wait => Some(ended),
+            },
+            None => Some(wait.await),
+        };
+        match ended {
+            None => Err(WeftError::Cancelled),
+            Some(Ok(())) => match self.inner.end() {
+                Some(StreamEnd::Failed { error }) => Err(WeftError::NodeFailed(format!("the bus ended failed: {error}"))),
+                Some(StreamEnd::Finished) | None => Ok(()),
+            },
+            Some(Err(crate::liveness::Paused)) => Err(at.paused().await),
         }
     }
 
@@ -1837,11 +2082,18 @@ impl BusHandle {
 
     // ----- lifecycle ---------------------------------------------
 
-    /// End the bus now, as finished: "no more messages". A failed end is
-    /// never a node's to write; weft writes it from how the body of the
-    /// firing holding the bus returned ([`FiringBuses`]).
+    /// End the bus now: "no more messages", whoever calls it and whoever
+    /// is still on it. With somebody on it, it ends finished. With nobody
+    /// on it, it ends as it would have ended itself: as its last member
+    /// left, so a stream whose producer failed halfway still reads as
+    /// failed however a node later closes it (finished when nobody ever
+    /// joined). A failed end is never a node's to write; weft writes it
+    /// from how the body of the last member to leave returned
+    /// ([`FiringBuses::leave`]).
     pub fn close(&self) {
-        self.inner.close(StreamEnd::Finished);
+        if !self.inner.end_unattended() {
+            self.inner.close(StreamEnd::Finished);
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -1864,14 +2116,14 @@ impl BusHandle {
 
 /// One firing's side of every bus it touches. Two jobs:
 ///
-/// - The buses it ends when its body does: every bus it created
-///   (`ctx.create_bus`, `ctx.open_bus`) and every bus it joined
-///   (`ctx.join_bus`). Weft ends them with how the body returned
-///   ([`Self::end`]): finished when it returned normally, failed with its
-///   error otherwise, so a reader learns whether the stream it read is
-///   complete and no node writes that itself. A bus the body closed
-///   earlier keeps the end it was closed with. A body that paused ends
-///   none of them: it carries on from its state, and so do its buses
+/// - Taking its names off every bus when its body returns
+///   ([`Self::leave`]), however it returns: a firing that registered a
+///   name on a bus (by creating it, `ctx.open_bus`, or joining it,
+///   `ctx.join_bus`) is a member of it until then, and nobody owns a bus.
+///   A bus ends once nobody is on it and no node can still join it,
+///   the way its last member's body returned: finished, or failed with
+///   its error. A body that paused
+///   leaves nothing: it carries on from its state, its names with it
 ///   ([`body_end`]).
 /// - Where it stands on each bus, saved with its state
 ///   ([`crate::run::saved::BusPosition`]): how far its reader read (a
@@ -1884,27 +2136,23 @@ impl BusHandle {
 /// firing gets.
 #[derive(Default)]
 pub struct FiringBuses {
-    held: Mutex<HeldBuses>,
     /// Where the firing stood on each bus when it last saved, by bus id.
     restored: std::collections::BTreeMap<String, BusPosition>,
     /// Where it stands now, by bus id: its reader (its next offset,
     /// shared with the cursor) and the name it holds.
     positions: Mutex<HashMap<Uuid, LivePosition>>,
-    /// The firing paused: its names stay held over the pause
-    /// ([`BusHandle`]'s drop).
-    paused: AtomicBool,
+    /// Its body returned and its names left ([`Self::leave`]): a handle
+    /// of it registering after that is refused.
+    left: AtomicBool,
+    /// The buses it used this run of its body ([`BusHandle::note_use`])
+    /// and the ones it made: each is told when its body returns, so one
+    /// it used stops counting it, and one it made that nobody joined
+    /// learns it is unattended.
+    touched: Mutex<HashSet<Uuid>>,
     /// The run's cancel: a reader of the firing ends with the cancelled
     /// error the moment it trips ([`BusCursor::next`]). `None` outside a
     /// run (a test's firing).
     cancellation: Option<Arc<CancellationFlag>>,
-}
-
-#[derive(Default)]
-struct HeldBuses {
-    buses: Vec<Weak<BusInner>>,
-    /// The body's end, once it came: a bus taken after it (by a task
-    /// the body left running) ends at once the same way.
-    ended: Option<StreamEnd>,
 }
 
 /// Where a firing's reader starts ([`FiringBuses::open_cursor`]): where
@@ -1963,16 +2211,16 @@ struct LivePosition {
     /// the body dropped it (how far it read is where a save leaves it),
     /// and the line that opened it.
     cursor: Option<(Arc<CursorSlot>, &'static std::panic::Location<'static>)>,
-    /// The name it took or let go since it resumed: `None` while it did
-    /// neither (its saved one stands), `Some(None)` once it let it go.
-    registered: Option<Option<Registration>>,
+    /// The name it took since it resumed: `None` while it took none (its
+    /// saved one stands).
+    registered: Option<Registration>,
 }
 
-/// How a body's return ends the buses it holds (it created them, or
-/// joined them as a party to the conversation): `Finished` when it
-/// returned, `Failed` with its error otherwise, and nothing when it
-/// paused: the body carries on from its saved state, and the buses with
-/// it.
+/// How a body's return takes it off the buses it is a member of
+/// ([`FiringBuses::leave`]), which is how a bus it leaves last ends:
+/// `Finished` when it returned, `Failed` with its error otherwise, and
+/// nothing when it paused: the body carries on from its saved state, a
+/// member of its buses still.
 pub fn body_end(result: &WeftResult<()>) -> Option<StreamEnd> {
     match result {
         Ok(()) => Some(StreamEnd::Finished),
@@ -1995,39 +2243,70 @@ impl FiringBuses {
         self
     }
 
-    /// Hold `bus` until the body ends.
-    pub fn hold(&self, bus: &BusHandle) {
-        let mut held = self.held.lock().expect("firing buses poisoned");
-        match &held.ended {
-            Some(end) => bus.inner.close(end.clone()),
-            None => held.buses.push(Arc::downgrade(&bus.inner)),
+    /// The body of the firing at `at` returned as `end`: its names leave
+    /// every bus it has one on ([`BusInner::leave`]), the ones it took
+    /// this run of its body and the ones it held over a pause and never
+    /// took back, and every bus it used or made hears it is done. `bus`
+    /// finds a bus of the run by id. A bus this left with nobody on it
+    /// ends as `end` once no node can still join it; any other stays open.
+    /// Once only: a later call (the engine's failure path after the body's
+    /// own end) changes nothing.
+    pub fn leave(&self, at: &FiringLocation, end: StreamEnd, bus: impl Fn(Uuid) -> Option<Arc<BusInner>>) {
+        if self.left.swap(true, Ordering::AcqRel) {
+            return;
         }
-    }
-
-    /// End every bus still open as `end`. The first end stands: a
-    /// later call (the engine's failure path after the body's own end)
-    /// changes nothing.
-    pub fn end(&self, end: StreamEnd) {
-        let buses = {
-            let mut held = self.held.lock().expect("firing buses poisoned");
-            if held.ended.is_some() {
-                return;
+        let mut buses = self.named_on();
+        buses.extend(self.touched.lock().expect("touched buses poisoned").iter().copied());
+        buses.sort_unstable();
+        buses.dedup();
+        for id in buses {
+            if let Some(inner) = bus(id) {
+                inner.leave(at, end.clone());
             }
-            held.ended = Some(end.clone());
-            std::mem::take(&mut held.buses)
-        };
-        for bus in buses.iter().filter_map(Weak::upgrade) {
-            bus.close(end.clone());
         }
     }
 
-    /// The firing is pausing: the names it holds stay held over the pause.
-    pub fn pause(&self) {
-        self.paused.store(true, Ordering::Release);
+    /// Its body paused (`body_end` answered `None`): it keeps its names,
+    /// and the buses it used forget that it did. A parked firing holding a
+    /// bus's marker counts as one that may still join it
+    /// ([`crate::run::bus_reach`]), as it would on a worker picking the run
+    /// up, whose buses know nothing of who used them.
+    pub fn paused(&self, at: &FiringLocation, bus: impl Fn(Uuid) -> Option<Arc<BusInner>>) {
+        for id in self.touched.lock().expect("touched buses poisoned").iter() {
+            if let Some(inner) = bus(*id) {
+                inner.used_by.lock().expect("bus users poisoned").remove(at);
+            }
+        }
     }
 
-    pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Acquire)
+    /// The firing at `at` resumed: each bus its saved positions say it read
+    /// or held a name on before its pause counts it as having used it, as
+    /// its body goes on past that use without making it again. Read off
+    /// the state its record keeps, so any worker counts the same.
+    pub fn used_before_its_pause(&self, at: &FiringLocation, bus: impl Fn(Uuid) -> Option<Arc<BusInner>>) {
+        let used: Vec<Uuid> = self
+            .restored
+            .iter()
+            .filter(|(_, position)| position.cursor.is_some() || position.registered.is_some())
+            .filter_map(|(id, _)| Uuid::parse_str(id).ok())
+            .collect();
+        for id in used {
+            if let Some(inner) = bus(id) {
+                self.touched(id);
+                inner.used(at);
+            }
+        }
+    }
+
+    /// It used bus `id`, or made it: its body returning tells that bus
+    /// ([`Self::leave`]).
+    pub fn touched(&self, id: Uuid) {
+        self.touched.lock().expect("touched buses poisoned").insert(id);
+    }
+
+    /// Whether its body returned and took its names off its buses.
+    fn has_left(&self) -> bool {
+        self.left.load(Ordering::Acquire)
     }
 
     /// Where the firing stands on every bus it touched, this run of its
@@ -2046,19 +2325,15 @@ impl FiringBuses {
                 position.cursor = Some(cursor.saved_offset());
             }
             if let Some(registered) = registered {
-                position.registered = registered;
+                position.registered = Some(registered);
             }
         }
         positions
     }
 
-    /// The buses the firing holds a name on, this run of its body or
-    /// before a pause: the only ones a name of its held over a pause can
-    /// be on.
-    pub fn named_on(&self) -> Vec<Uuid> {
-        // Both what it held before the pause and what it took or let go
-        // since: a name held over stays held over until released, whatever
-        // other name the firing took or let go on that bus meanwhile.
+    /// The buses the firing has a name on, taken this run of its body or
+    /// before a pause: the ones it leaves when its body returns.
+    fn named_on(&self) -> Vec<Uuid> {
         let mut buses: Vec<Uuid> = self
             .restored
             .iter()
@@ -2105,63 +2380,46 @@ impl FiringBuses {
 
     /// The firing holds `registration` on `bus`.
     fn registered(&self, bus: Uuid, registration: Registration) {
-        self.positions.lock().expect("bus positions poisoned").entry(bus).or_default().registered = Some(Some(registration));
+        self.positions.lock().expect("bus positions poisoned").entry(bus).or_default().registered = Some(registration);
     }
 
     /// The name the firing holds on `bus` now: taken this run of its body,
     /// else held over its pause and not let go.
     fn held_name(&self, bus: Uuid) -> Option<String> {
         let live = self.positions.lock().expect("bus positions poisoned").get(&bus).and_then(|live| live.registered.clone());
-        match live {
-            Some(registered) => registered,
-            None => self.restored.get(&bus.to_string()).and_then(|saved| saved.registered.clone()),
-        }
-        .map(|registration| registration.name)
+        live.or_else(|| self.restored.get(&bus.to_string()).and_then(|saved| saved.registered.clone())).map(|registration| registration.name)
     }
 
-    /// The firing let go of the name it held on `bus` (its handle dropped
-    /// with the firing not paused): a later save holds none there.
-    fn let_go(&self, bus: Uuid) {
-        self.positions.lock().expect("bus positions poisoned").entry(bus).or_default().registered = Some(None);
+    /// The name the firing held on `bus` when it paused, if this run of its
+    /// body has neither taken it back nor let it go yet.
+    fn held_over_its_pause(&self, bus: Uuid) -> Option<Registration> {
+        let touched = self.positions.lock().expect("bus positions poisoned").get(&bus).is_some_and(|live| live.registered.is_some());
+        if touched {
+            return None;
+        }
+        self.restored.get(&bus.to_string()).and_then(|saved| saved.registered.clone())
     }
+
 }
 
 impl Drop for BusHandle {
-    /// When a registered handle goes away, append a `Left` entry and
-    /// remove the name from the live set. Unregistered handles drop
-    /// with no log effect. A handle of a firing that paused keeps its
-    /// name held over the pause instead ([`BusInner::held_over`]): no
-    /// `Left`, nobody reads it leave, and its resumed body takes it back.
-    ///
-    /// The append and the `present_names` removal happen under the
-    /// same `log` lock as everything else. If the bus has already
-    /// been closed (the `Closed` entry has landed), we bail without
-    /// touching either: a closed bus does not accept further log
-    /// entries, and neither `wait_for*` nor a fresh `register` will
-    /// ever read `present_names` again on a closed bus, so the
-    /// cleanup would be dead work.
+    /// A registered handle going away leaves its name where it belongs.
+    /// A firing's name stays on the bus, the firing's, until its body
+    /// returns ([`FiringBuses::leave`]): dropping a handle mid-body, or
+    /// with a pause, is not leaving, and the firing's next handle
+    /// registering the name takes it back. A handle outside every firing
+    /// leaves with its name now, with its `Left` entry, ending the bus if
+    /// it was the last one on it ([`BusInner::leave_in`]).
     fn drop(&mut self) {
-        let Some((name, joined_offset)) = self.registration.take() else { return };
+        let Some((name, _)) = self.registration.take() else { return };
         let mut log = self.inner.lock_log();
-        if self.inner.closed.load(Ordering::Acquire) {
-            // The bus is dead; no cursor or wait_for can read state
-            // from here on, so neither the Left entry nor the
-            // present_names removal is observable. Bail.
+        if self.member_firing().is_some() {
+            if let Some(member) = self.inner.members.lock().expect("bus members poisoned").get_mut(&name) {
+                member.in_hand = false;
+            }
             return;
         }
-        if let (Some(firing), Some(node)) = (&self.firing, &self.node) {
-            if firing.is_paused() {
-                self.inner.held_over.lock().expect("held_over poisoned").insert(name, (node.clone(), joined_offset));
-                return;
-            }
-            firing.let_go(self.inner.id);
-        }
-        self.inner
-            .present_names
-            .lock()
-            .expect("present_names poisoned")
-            .remove(&name);
-        self.inner.push_entry(&mut log, BusEntryKind::Left { name });
+        self.inner.leave_in(&mut log, |member_name, _| member_name == name, StreamEnd::Finished);
     }
 }
 
@@ -2558,8 +2816,12 @@ impl BusRegistry {
     /// A handle on the bus `id` for the firing `node`, if the run holds
     /// it.
     pub fn handle(&self, id: Uuid, node: Option<FiringLocation>, firing: Option<Arc<FiringBuses>>) -> Option<BusHandle> {
-        let inner = self.inner.lock().expect("BusRegistry mutex poisoned").get(&id).map(Arc::clone)?;
-        Some(BusHandle::from_inner(inner, node, firing))
+        Some(BusHandle::from_inner(self.bus(id)?, node, firing))
+    }
+
+    /// The bus `id`, if the run holds it.
+    pub fn bus(&self, id: Uuid) -> Option<Arc<BusInner>> {
+        self.inner.lock().expect("BusRegistry mutex poisoned").get(&id).map(Arc::clone)
     }
 
     /// Snapshot every currently-live bus as `Weak<BusInner>` for the
@@ -2775,24 +3037,169 @@ mod tests {
         assert_eq!(c.next_bytes("msg", &mut HarnessRead).await.unwrap_err().to_string(), wrong_payload("json", "bytes").to_string());
     }
 
-    /// A firing's buses end with its body: a reader drains what was sent,
-    /// then reads the failure the bus ended with as an error. Dropping the
-    /// handle ends nothing on its own; the body's end does.
+    /// `firing`'s body, at `node`, returned as `end`: its names leave
+    /// `bus`, the one bus the test knows.
+    fn left(firing: &FiringBuses, node: &str, end: StreamEnd, bus: &BusHandle) {
+        let inner = bus.inner_arc();
+        firing.leave(&at(node), end, |id| (id == inner.id()).then(|| inner.clone()));
+    }
+
+    /// A member of `bus` at `node`, registered as `node`, with its firing.
+    fn member(bus: &BusHandle, node: &str) -> (BusHandle, Arc<FiringBuses>) {
+        let firing = Arc::new(FiringBuses::default());
+        let mut handle = firing_handle(bus, node, &firing);
+        handle.register(node).unwrap();
+        (handle, firing)
+    }
+
+    /// The creator returning leaves the bus to a member still on it: its
+    /// name leaves, and nothing else happens. The last one leaving ends it
+    /// finished.
     #[tokio::test]
-    async fn a_firings_buses_end_with_its_body() {
-        let firing = FiringBuses::default();
+    async fn a_bus_lives_until_its_last_member_leaves() {
         let bus = BusHandle::create();
-        let mut cursor = bus.cursor().unwrap();
-        let host = registered(&bus, "host");
-        firing.hold(&host);
+        let mut reader = bus.cursor().unwrap();
+        let (host, host_firing) = member(&bus, "host");
+        let (guest, guest_firing) = member(&bus, "guest");
         host.send("hi", json!(1)).unwrap();
         drop(host);
-        assert!(!bus.is_closed(), "a dropped handle leaves the bus to the body's end");
-        firing.end(StreamEnd::Failed { error: "the model went away".into() });
-        assert!(matches!(cursor.next_json("hi", &mut HarnessRead).await, Ok(Some((_, v))) if v == json!(1)));
-        let failed = cursor.next_json("hi", &mut HarnessRead).await.unwrap_err();
+        left(&host_firing, "host", StreamEnd::Finished, &bus);
+        assert!(!bus.is_closed(), "the guest is still on it");
+        assert!(matches!(&bus.inner.lock_log().last().unwrap().kind, BusEntryKind::Left { name, .. } if name == "host"));
+        guest.send("hi", json!(2)).unwrap();
+        drop(guest);
+        left(&guest_firing, "guest", StreamEnd::Finished, &bus);
+        assert_eq!(bus.end(), Some(StreamEnd::Finished), "the last member left");
+        let mut read = Vec::new();
+        while let Some((_, value)) = reader.next_json("hi", &mut HarnessRead).await.unwrap() {
+            read.push(value);
+        }
+        assert_eq!(read, vec![json!(1), json!(2)], "both messages, then the end");
+    }
+
+    /// A bus whose last member left failing ends failed with its error: a
+    /// reader drains what was sent, then reads the failure, so a stream
+    /// whose only producer crashed never reads as whole.
+    #[tokio::test]
+    async fn the_last_member_leaving_failed_ends_the_bus_failed() {
+        let bus = BusHandle::create();
+        let mut reader = bus.cursor().unwrap();
+        let (host, firing) = member(&bus, "host");
+        host.send("hi", json!(1)).unwrap();
+        drop(host);
+        assert!(!bus.is_closed(), "a firing dropping its handle is not leaving");
+        left(&firing, "host", StreamEnd::Failed { error: "the model went away".into() }, &bus);
+        assert!(matches!(reader.next_json("hi", &mut HarnessRead).await, Ok(Some((_, v))) if v == json!(1)));
+        let failed = reader.next_json("hi", &mut HarnessRead).await.unwrap_err();
         assert!(matches!(&failed, WeftError::NodeFailed(why) if why.contains("the model went away")), "{failed}");
         assert_eq!(bus.end(), Some(StreamEnd::Failed { error: "the model went away".into() }));
+    }
+
+    /// A member that fails just leaves: the others stay on an open bus (one
+    /// of them may be how the conversation recovers), and the bus ends as
+    /// its last member returns, finished here, not as the earlier failure.
+    #[test]
+    fn a_failing_member_leaves_the_others_an_open_bus() {
+        let bus = BusHandle::create();
+        let (_host, host_firing) = member(&bus, "host");
+        let (_guest, guest_firing) = member(&bus, "guest");
+        left(&guest_firing, "guest", StreamEnd::Failed { error: "the guest broke".into() }, &bus);
+        assert!(!bus.is_closed(), "a member failing does not end the bus");
+        left(&host_firing, "host", StreamEnd::Finished, &bus);
+        assert_eq!(bus.end(), Some(StreamEnd::Finished), "it ends as the last one to leave returned");
+    }
+
+    /// Any node holding the bus may end it, a member or not, whoever is
+    /// still on it; the first end stands, so members leaving after (failed
+    /// or not) change nothing, and a firing leaves only once.
+    #[test]
+    fn a_close_ends_the_bus_for_everyone_and_the_first_end_stands() {
+        let bus = BusHandle::create();
+        let (_host, host_firing) = member(&bus, "host");
+        let (_guest, guest_firing) = member(&bus, "guest");
+        let closer = firing_handle(&bus, "closer", &Arc::new(FiringBuses::default()));
+        closer.close();
+        assert_eq!(bus.end(), Some(StreamEnd::Finished));
+        let after = bus.inner.log_len();
+        left(&guest_firing, "guest", StreamEnd::Failed { error: "boom".into() }, &bus);
+        left(&host_firing, "host", StreamEnd::Failed { error: "boom".into() }, &bus);
+        assert_eq!(bus.end(), Some(StreamEnd::Finished), "the close stands");
+        assert_eq!(bus.inner.log_len(), after, "an ended bus takes no entry");
+
+        let open = BusHandle::create();
+        let (_a, firing) = member(&open, "a");
+        let (_b, _) = member(&open, "b");
+        left(&firing, "a", StreamEnd::Finished, &open);
+        let after = open.inner.log_len();
+        left(&firing, "a", StreamEnd::Failed { error: "again".into() }, &open);
+        assert_eq!(open.inner.log_len(), after, "a firing leaves once");
+        let mut late = firing_handle(&open, "a", &firing);
+        assert_eq!(late.register("a"), Err(RegisterError::FiringLeft("a".into())), "a body that returned cannot join for it after");
+        assert_eq!(BusHandle::create().end(), None, "an open bus has no end yet");
+    }
+
+    /// A close on an open bus nobody is on ends it the way its last member
+    /// left: failed with that member's error here, a bus that paused while
+    /// a node could still join it after its only member left failing. A
+    /// bus nobody ever joined ends finished.
+    #[tokio::test]
+    async fn a_close_with_nobody_on_the_bus_ends_it_as_its_last_member_left() {
+        let failure = StreamEnd::Failed { error: "the producer broke off".into() };
+        let bus = BusHandle::reopen(
+            ReopenedBus {
+                id: Uuid::new_v4(),
+                opts: BusOptions::default(),
+                next_offset: 3,
+                joined: vec!["host".into()],
+                members: Vec::new(),
+                retained: Vec::new(),
+                lost_through: 3,
+                end: None,
+                last_left: Some(failure.clone()),
+            },
+            no_liveness(),
+            Weak::<Notify>::new(),
+        )
+        .unwrap();
+        assert!(!bus.is_closed(), "open, with nobody on it");
+        firing_handle(&bus, "closer", &Arc::new(FiringBuses::default())).close();
+        assert_eq!(bus.end(), Some(failure), "it ends as its last member left");
+        let error = bus.cursor_from_start().unwrap().next(&mut HarnessRead).await.unwrap_err().to_string();
+        assert!(error.contains("the bus ended failed: the producer broke off"), "{error}");
+
+        let never_joined = BusHandle::create();
+        never_joined.close();
+        assert_eq!(never_joined.end(), Some(StreamEnd::Finished), "nobody ever joined");
+    }
+
+    /// A reader that never registers is no member: it keeps nothing open,
+    /// and its firing leaving changes nothing on the bus.
+    #[test]
+    fn an_observer_keeps_nothing_open() {
+        let bus = BusHandle::create();
+        let watcher_firing = Arc::new(FiringBuses::default());
+        let watcher = firing_handle(&bus, "watcher", &watcher_firing);
+        let _cursor = watcher.cursor().unwrap();
+        let (_host, host_firing) = member(&bus, "host");
+        left(&watcher_firing, "watcher", StreamEnd::Failed { error: "the tap broke".into() }, &bus);
+        assert!(!bus.is_closed(), "the watcher was never on it");
+        left(&host_firing, "host", StreamEnd::Finished, &bus);
+        assert_eq!(bus.end(), Some(StreamEnd::Finished), "the host was its only member, whoever still reads");
+    }
+
+    /// A name outside every firing (a test's handle) leaves with its
+    /// handle, and the last one leaving that way ends the bus finished.
+    #[test]
+    fn a_handle_outside_a_firing_leaves_with_its_name() {
+        let bus = BusHandle::create();
+        let a = registered(&bus, "a");
+        let b = registered(&bus, "b");
+        drop(a);
+        let _again = registered(&bus, "a");
+        drop(b);
+        assert!(!bus.is_closed(), "the second 'a' is still on it");
+        drop(_again);
+        assert_eq!(bus.end(), Some(StreamEnd::Finished));
     }
 
     /// A bus that finished reads to `None` after its last message; one
@@ -2835,30 +3242,9 @@ mod tests {
         assert!(matches!(reader.next(&mut HarnessRead).await, Err(WeftError::Cancelled)));
     }
 
-    /// The first end stands: a bus closed on purpose stays finished when
-    /// the body then fails, a second end changes nothing, and a bus taken
-    /// after the body ended ends at once the same way.
-    #[test]
-    fn the_first_end_stands() {
-        let firing = FiringBuses::default();
-        let done_early = BusHandle::create();
-        let open = BusHandle::create();
-        firing.hold(&done_early);
-        firing.hold(&open);
-        done_early.close();
-        firing.end(StreamEnd::Failed { error: "boom".into() });
-        firing.end(StreamEnd::Finished);
-        assert_eq!(done_early.end(), Some(StreamEnd::Finished));
-        assert_eq!(open.end(), Some(StreamEnd::Failed { error: "boom".into() }));
-        let late = BusHandle::create();
-        firing.hold(&late);
-        assert_eq!(late.end(), Some(StreamEnd::Failed { error: "boom".into() }));
-        assert_eq!(BusHandle::create().end(), None, "an open bus has no end yet");
-    }
-
-    /// Only a body that returned ends its buses finished; a skip or any
-    /// failure ends them failed, and a pause ends nothing (the body
-    /// carries on from its state, and its buses with it).
+    /// Only a body that returned leaves its buses finished; a skip or any
+    /// failure leaves them failed, and a pause leaves nothing (the body
+    /// carries on from its state, a member still).
     #[test]
     fn a_body_end_follows_how_it_returned() {
         assert_eq!(body_end(&Ok(())), Some(StreamEnd::Finished));
@@ -3052,20 +3438,6 @@ mod tests {
             }
         }
     );
-
-    #[tokio::test]
-    async fn dropping_a_registered_handle_unregisters_it() {
-        let bus = BusHandle::create();
-        let llm = registered(&bus, "llm");
-        assert!(bus.wait_for("llm", &mut HarnessRead).await.is_ok());
-        drop(llm);
-        // The new wait_for reads the `ever_joined` set, so it would still
-        // find the past Joined. The honest "is the name live RIGHT NOW"
-        // signal is `present_names`; we exercise it indirectly via
-        // wait_for_all_releases_on_complete_set.
-        // For this regression we assert membership-set hygiene:
-        let _new_llm = registered(&bus, "llm"); // not NameTaken
-    }
 
     // ----- New shape: cursors + offsets + log entries -------------
 
@@ -3612,10 +3984,9 @@ mod tests {
         let mut host = firing_handle(&bus, "host", &firing);
         host.register("host").unwrap();
         let joined = host.registration.as_ref().unwrap().1;
-        firing.pause();
         let before = bus.inner.log_len();
         drop(host);
-        assert_eq!(bus.inner.log_len(), before, "a paused firing writes no Left");
+        assert_eq!(bus.inner.log_len(), before, "a firing's handle going writes no Left");
 
         let mut other = firing_handle(&bus, "intruder", &Arc::new(FiringBuses::default()));
         assert_eq!(other.register("host"), Err(RegisterError::NameTaken("host".into())));
@@ -3628,22 +3999,25 @@ mod tests {
         assert_eq!(resumed.positions()[&bus.id().to_string()].registered, Some(Registration { name: "host".into(), joined_offset: joined }));
     }
 
-    /// A name held over a pause leaves, with its `Left`, once its firing
-    /// ends for good without taking it back.
+    /// A name held over a pause leaves, with its `Left`, once its firing's
+    /// body returns without taking it back; another firing returning lets
+    /// go of nothing.
     #[test]
-    fn a_name_held_over_leaves_once_its_firing_ends() {
+    fn a_name_held_over_leaves_once_its_firing_returns() {
         let bus = BusHandle::create();
+        let (_guest, _) = member(&bus, "guest");
         let firing = Arc::new(FiringBuses::default());
         let mut host = firing_handle(&bus, "host", &firing);
         host.register("host").unwrap();
-        firing.pause();
         drop(host);
         let before = bus.inner.log_len();
-        bus.inner.release_held(&at("someone-else"));
+        bus.inner.leave(&at("someone-else"), StreamEnd::Finished);
         assert_eq!(bus.inner.log_len(), before, "another firing's end lets go of nothing");
-        bus.inner.release_held(&at("host"));
+        let saved = firing.positions();
+        left(&FiringBuses::resumed(saved), "host", StreamEnd::Finished, &bus);
         assert_eq!(bus.inner.log_len(), before + 1);
-        assert!(matches!(&bus.inner.lock_log().last().unwrap().kind, BusEntryKind::Left { name } if name == "host"));
+        assert!(matches!(&bus.inner.lock_log().last().unwrap().kind, BusEntryKind::Left { name, .. } if name == "host"));
+        assert!(!bus.is_closed(), "the guest is still on it");
         let mut newcomer = firing_handle(&bus, "other", &Arc::new(FiringBuses::default()));
         newcomer.register("host").expect("the name is free again");
     }
@@ -3670,9 +4044,11 @@ mod tests {
                 opts: BusOptions::default(),
                 next_offset: 10,
                 joined: vec!["host".into(), "guest".into()],
-                held_over: vec![("guest".into(), at("guest"), 3)],
+                members: vec![("guest".into(), at("guest"), 3)],
                 retained: vec![kept(7, "a"), kept(8, "b")],
                 lost_through: 7,
+                end: None,
+                last_left: None,
             },
             no_liveness(),
             Weak::<Notify>::new(),
@@ -3695,6 +4071,62 @@ mod tests {
         assert_eq!(host.registration.as_ref().unwrap().1, 10, "the next entry lands where the bus stopped");
         host.send("msg", json!("c")).unwrap();
         assert_eq!(next_message(&mut back).await.unwrap().2, json!("c"));
+    }
+
+    /// A bus that ended before the pause comes back ended, as it was: a
+    /// reader reads what it kept and comes to its end (`None` when it
+    /// finished, the failure when it failed), a close changes nothing, a
+    /// register is refused as on any ended bus, the name a paused firing
+    /// held on it is not held any more, and nothing is left for the pump
+    /// to write again.
+    #[tokio::test]
+    async fn a_bus_that_ended_before_the_pause_comes_back_ended() {
+        let kept = WindowedBusMessage {
+            offset: 4,
+            from: "host".into(),
+            msg_kind: "msg".into(),
+            payload: Some(WirePayload::Json(json!("last"))),
+            payload_byte_size: 6,
+            trimmed: false,
+            at_unix: 1,
+        };
+        let ended = |end: StreamEnd| {
+            BusHandle::reopen(
+                ReopenedBus {
+                    id: Uuid::new_v4(),
+                    opts: BusOptions::default(),
+                    next_offset: 5,
+                    joined: vec!["host".into()],
+                    members: vec![("guest".into(), at("guest"), 3)],
+                    retained: vec![kept.clone()],
+                    lost_through: 4,
+                    end: Some(end),
+                    last_left: None,
+                },
+                no_liveness(),
+                Weak::<Notify>::new(),
+            )
+            .unwrap()
+        };
+        let finished = ended(StreamEnd::Finished);
+        assert!(finished.is_closed());
+        assert_eq!(finished.end(), Some(StreamEnd::Finished));
+        assert_eq!(finished.inner.journaled_through(), finished.inner.log_len(), "its end is on record already");
+        assert!(finished.inner.drain_journal_tail().is_empty(), "the pump writes nothing again");
+        let mut reader = finished.cursor_from_start().unwrap();
+        assert_eq!(next_message(&mut reader).await.unwrap().2, json!("last"));
+        assert!(reader.next(&mut crate::context::kept::FiringRead).await.unwrap().is_none(), "a finished end");
+        finished.close();
+        assert_eq!(finished.end(), Some(StreamEnd::Finished), "a close changes nothing");
+        let mut guest = firing_handle(&finished, "guest", &Arc::new(FiringBuses::default()));
+        assert_eq!(guest.register("guest"), Err(RegisterError::Closed));
+
+        let failed = ended(StreamEnd::Failed { error: "the session went away".into() });
+        failed.close();
+        let mut reader = failed.cursor_from_start().unwrap();
+        assert_eq!(next_message(&mut reader).await.unwrap().2, json!("last"));
+        let error = reader.next(&mut crate::context::kept::FiringRead).await.unwrap_err().to_string();
+        assert!(error.contains("the bus ended failed: the session went away"), "{error}");
     }
 
     /// A resumed firing's reader starts where it stopped, and its position
@@ -3732,9 +4164,11 @@ mod tests {
                 opts: BusOptions { journal: crate::stream_journal::JournalPolicy::ephemeral(), ..Default::default() },
                 next_offset: 10,
                 joined: vec!["host".into()],
-                held_over: Vec::new(),
+                members: Vec::new(),
                 retained: Vec::new(),
                 lost_through: 10,
+                end: None,
+                last_left: None,
             },
             no_liveness(),
             Weak::<Notify>::new(),
@@ -3817,23 +4251,26 @@ mod tests {
         assert_eq!(firing.positions()[&bus.id().to_string()].cursor, Some(wanted), "a message it would read stops the carry");
     }
 
-    /// A name the firing let go is not saved as held: a resumed firing
-    /// that drops its handle (not pausing) writes its `Left` once, and its
-    /// next save holds no name there, so no next worker brings it back.
+    /// A firing's name stays its own until its body returns, through a
+    /// handle it dropped: no `Left`, the save still holds it, another name
+    /// on the bus is refused, and the firing's next handle takes it back.
     #[tokio::test]
-    async fn a_name_let_go_is_not_saved_as_held() {
+    async fn a_dropped_handle_leaves_the_name_with_its_firing() {
         let bus = BusHandle::create();
-        let saved = std::collections::BTreeMap::from([(
-            bus.id().to_string(),
-            BusPosition { cursor: None, registered: Some(Registration { name: "a".into(), joined_offset: 0 }) },
-        )]);
-        let firing = Arc::new(FiringBuses::resumed(saved));
+        let firing = Arc::new(FiringBuses::default());
         let mut handle = firing_handle(&bus, "a", &firing);
         handle.register("a").unwrap();
+        let joined = handle.registration.as_ref().unwrap().1;
+        let before = bus.inner.log_len();
         drop(handle);
-        assert_eq!(firing.positions()[&bus.id().to_string()].registered, None, "let go, nothing to hold over the next pause");
-        let mut handle = firing_handle(&bus, "a", &firing);
-        handle.register("b").expect("a name let go frees the firing to take another");
+        assert_eq!(bus.inner.log_len(), before, "no Left");
+        assert_eq!(firing.positions()[&bus.id().to_string()].registered, Some(Registration { name: "a".into(), joined_offset: joined }));
+        let mut other = firing_handle(&bus, "a", &firing);
+        assert_eq!(other.register("b"), Err(RegisterError::FiringHoldsAnother("a".into())));
+        let mut back = firing_handle(&bus, "a", &firing);
+        back.register("a").unwrap();
+        assert_eq!(back.registration.as_ref().unwrap().1, joined, "taken back at its first Joined offset");
+        assert_eq!(bus.inner.log_len(), before, "taking it back appends nothing");
     }
 
     /// A firing holds one name per bus: a second handle of it taking

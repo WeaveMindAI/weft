@@ -41,9 +41,22 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // Whether the program runs infra of its own, for the first deploy's
     // order (its infra first, then its triggers).
     let mut declares_infra = false;
+    //
+    // Compiled for the install's kind, as its own build compiles it: what
+    // is broken and the rules recorded for the run (hashed with the
+    // program) depend on it, so a compile for no install would read as a
+    // different program wherever a node's rule asks `local_install`.
+    let compiled = match ctx.install_kind().await {
+        Ok(install) => Some(weft_compiler::hash::load_program(project, Some(install))),
+        Err(e) => {
+            warn_no_drift("the install did not say which kind it is", &e);
+            None
+        }
+    };
     let (desired_binary_hash, desired_full_binary_hash, desired_definition_hash, desired_trigger_cuts, desired_infra_places) =
-        match weft_compiler::hash::load_program(project) {
-            Ok((mut def, catalog)) => {
+        match compiled {
+            None => (None, None, None, None, None),
+            Some(Ok((mut def, catalog))) => {
                 declares_infra = weft_core::project::has_infra(&def);
                 let resolved = crate::commands::assets::resolve_project_assets(&ctx.client()?, &project.root, &mut def).await;
                 // Both node sets: a worker built with the full catalog is as
@@ -87,7 +100,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                     }
                 }
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 warn_no_drift("the project does not compile", &e);
                 (None, None, None, None, None)
             }

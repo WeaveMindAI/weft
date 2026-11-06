@@ -586,43 +586,47 @@
         "grants": "coexisting",
         "acquisition": {
           "kind": "static",
-          "fields": [
+          "ways": [
             {
-              "name": "host",
-              "label": "Host",
-              "secret": false,
-              "placeholder": "db.example.com"
-            },
-            {
-              "name": "port",
-              "label": "Port",
-              "optional": true,
-              "secret": false,
-              "placeholder": "5432"
-            },
-            {
-              "name": "database",
-              "label": "Database",
-              "secret": false,
-              "placeholder": "postgres"
-            },
-            {
-              "name": "user",
-              "label": "User",
-              "secret": false,
-              "placeholder": "postgres"
-            },
-            {
-              "name": "password",
-              "label": "Password",
-              "secret": true
-            },
-            {
-              "name": "sslmode",
-              "label": "TLS",
-              "optional": true,
-              "secret": false,
-              "placeholder": "require (or verify-ca / verify-full; disable turns TLS off)"
+              "fields": [
+                {
+                  "name": "host",
+                  "label": "Host",
+                  "secret": false,
+                  "placeholder": "db.example.com"
+                },
+                {
+                  "name": "port",
+                  "label": "Port",
+                  "optional": true,
+                  "secret": false,
+                  "placeholder": "5432"
+                },
+                {
+                  "name": "database",
+                  "label": "Database",
+                  "secret": false,
+                  "placeholder": "postgres"
+                },
+                {
+                  "name": "user",
+                  "label": "User",
+                  "secret": false,
+                  "placeholder": "postgres"
+                },
+                {
+                  "name": "password",
+                  "label": "Password",
+                  "secret": true
+                },
+                {
+                  "name": "sslmode",
+                  "label": "TLS",
+                  "optional": true,
+                  "secret": false,
+                  "placeholder": "require (or verify-ca / verify-full; disable turns TLS off)"
+                }
+              ]
             }
           ]
         },

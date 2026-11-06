@@ -1,0 +1,300 @@
+{
+  "type": "Pi",
+  "label": "Pi",
+  "description": "One conversation with Pi, the pi coding agent by Earendil Works: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, Pi runs on your machine (a local install only), working in `folder`. If `pi` is missing, weft installs it into a folder of its own, shared by the whole machine, before the node runs. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs. Either way it logs in with the connection on `access`. It runs on a model provider's API key, never on a login of your machine's own Pi, so `access` is always required, and `model` too, since a key names no model. Pi asks nothing before a tool and has no question tool of its own: weft loads an extension into it that asks before the tool calls the permission setting says, with Allow once, Allow that tool from now on (kept with the conversation) or Refuse with a note the model reads, and that gives it a tool to ask you a question. Its settings and sessions live in a home of the conversation's own, and the folder's `.pi/` settings, extensions and MCP servers are never loaded. Your program's tools reach Pi under their plain names, through weft's extension, and a tool named like one of Pi's own (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `powershell`, its `codemode` and `tool_search`, or weft's `ask_user`) takes that one's place. Its card shows what it is doing and a Start over button. What is exposed: the permission setting, the model, the effort (how hard it thinks), text added to its system prompt, and whether it reads the folder's `AGENTS.md` and `CLAUDE.md`.",
+  "tags": [
+    "agent",
+    "coding",
+    "pi",
+    "earendil",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run Pi in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[pi]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A PiAccess's `access`: a model provider's API key (Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Mistral, xAI, Groq, or an OpenAI-compatible server). Required, because this agent never runs on a login already on your machine."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder Pi works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`pi` on your PATH",
+      "description": "On your machine: the Pi program to run, when it is not the `pi` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "accept_edits",
+          "read_only",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What Pi may do without asking; Pi itself never asks, the asking is weft's extension's. `ask`: reading inside `folder` goes ahead; every other tool call (an edit, a command, a read outside `folder`) comes out of AskAgent as a question. `accept_edits`: reading and editing inside `folder` go ahead; commands and anything outside `folder` ask. `read_only`: it gets only its reading and searching tools, its question tool and your program's tools, and nothing asks. `bypass`: nothing asks, nothing is refused; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "claude-opus-4-8",
+      "description": "One of the connection's provider's model ids, as Pi names it (`pi --list-models` lists them). Required."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "off",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "label": "Effort",
+      "description": "How hard the model thinks, brought down to what the model takes. Left out, `medium`, brought down the same way."
+    },
+    {
+      "name": "appendSystemPrompt",
+      "type": "String",
+      "widget": {
+        "kind": "textarea"
+      },
+      "label": "Add to the system prompt",
+      "description": "Text added to Pi's system prompt, for the whole conversation."
+    },
+    {
+      "name": "noContextFiles",
+      "type": "Boolean",
+      "default": false,
+      "label": "Skip context files",
+      "description": "Do not read `AGENTS.md` and `CLAUDE.md` from `folder` and the folders above it."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Pi '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "input_satisfied",
+          "port": "access"
+        }
+      },
+      "then": {
+        "message": "Pi '{id}' runs only on a model provider's API key; give it a PiAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Pi '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "value",
+          "field": "model"
+        }
+      },
+      "then": {
+        "message": "Pi '{id}' runs on the connection's provider key, which names no model; set `model` to one of that provider's model ids.",
+        "level": "structural",
+        "severity": "error",
+        "port": "model"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "accept_edits",
+                "read_only",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Pi '{id}' has a `permission` it does not know; pick one of ask, accept_edits, read_only, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Pi '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "Pi '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs Pi itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": []
+  }
+}

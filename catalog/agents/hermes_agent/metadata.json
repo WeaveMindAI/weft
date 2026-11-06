@@ -1,0 +1,294 @@
+{
+  "type": "HermesAgent",
+  "label": "Hermes Agent",
+  "description": "One conversation with Hermes Agent, Nous Research's agent: three conversations are three nodes. Wire `agent` and `stream` into an AskAgent and talk to it in a Loop; end the loop with a CloseBus on `stream`, which ends this node's part of the run. With no `computer`, Hermes Agent runs on your machine (a local install only), working in `folder`. If `hermes` is missing, weft installs it into a folder of its own, shared by the whole machine, before the node runs. With a `computer` wired, it is installed and run inside that computer, which a cloud install needs. Either way it logs in with the connection on `access`. It always runs on the connection's login, in a home of its own: your machine's own Hermes may borrow your Claude Code and Codex logins, and its background daemon is shared with everything else that runs Hermes there. So `model` is always required, and the first start of a conversation sets up that home, which takes about 130 MB and some 11 seconds when weft installed Hermes (the downloads come from a cache every conversation shares), and about 440 MB with your own Hermes. Ordinary commands never ask in any setting; a command on its dangerous list does. The background model calls it makes on every turn (a better title, a self review) are off. Your program's tools reach the model under their own names, and one named like a Hermes tool takes that tool's place, except the tools Hermes runs itself whatever is registered (`clarify`, `delegate_task`, `manage_connections`, `memory`, `patch`, `session_search`, `todo_list`, `write_file`): a program tool with one of those names is refused. Its card shows what it is doing and a Start over button. What is exposed: the permission mode, the model and the reasoning effort.",
+  "tags": [
+    "agent",
+    "coding",
+    "hermes",
+    "nous-research",
+    "infra"
+  ],
+  "icon": "Bot",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A Computer to run Hermes Agent in. Left out, it runs on your machine, which only a local install has. Several agents may share one computer."
+    },
+    {
+      "name": "access",
+      "type": "Access[hermes_agent]",
+      "accepts": [
+        "wire"
+      ],
+      "description": "A HermesAgentAccess's `access`: a model provider's key (OpenRouter, Anthropic, OpenAI, Gemini, or an OpenAI-compatible server). Required, because this agent never runs on a login already on your machine."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "label": "Folder",
+      "placeholder": "/home/you/projects/app",
+      "description": "The folder Hermes Agent works in. On your machine it is required, and must exist. In a computer it is a path inside the computer, its home folder when left out."
+    },
+    {
+      "name": "program",
+      "type": "String",
+      "label": "Program",
+      "placeholder": "`hermes` on your PATH",
+      "description": "On your machine: the Hermes Agent program to run, when it is not the `hermes` on your PATH or the one weft installs (an install of your own, a version you keep for this). A path on your machine, so it cannot go with a `computer`."
+    },
+    {
+      "name": "permission",
+      "type": "String",
+      "default": "ask",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "ask",
+          "accept_edits",
+          "auto",
+          "bypass"
+        ]
+      },
+      "label": "Permissions",
+      "description": "What Hermes Agent may do without asking. `ask`: every edit and every dangerous command comes out of AskAgent as a question. `accept_edits`: edits in the folder go ahead, dangerous commands ask. `auto`: every edit goes ahead, dangerous commands still ask. `bypass`: nothing asks, nothing is refused; for a computer, which is the wall around it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "anthropic/claude-sonnet-4.5",
+      "description": "The model id its provider names it by: `anthropic/claude-sonnet-4.5` on OpenRouter, `claude-sonnet-4-5` with an Anthropic key. Required."
+    },
+    {
+      "name": "streamBy",
+      "type": "String",
+      "default": "message",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "message",
+          "token"
+        ]
+      },
+      "label": "Stream by",
+      "description": "What goes out on `stream`: `message`, one event per whole message, tool use and result, so a run waiting on a long step sleeps; `token`, every piece of text as it is written too, which keeps the run awake while the agent writes."
+    },
+    {
+      "name": "effort",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "none",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultra"
+        ]
+      },
+      "label": "Reasoning effort",
+      "description": "How hard the model reasons; a model that does not reason ignores it. Left out, the model's default."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agent",
+      "type": "Infra",
+      "description": "The agent's handle: wire it into AskAgent's `agent`. Baked: made when the infra is started.",
+      "baked": true
+    },
+    {
+      "name": "stream",
+      "type": "Bus",
+      "description": "Everything the agent does in this run, as AskAgent sends it. Wire it into every AskAgent of the loop, and into a CloseBus after the loop: the run's part of this node ends when it does."
+    }
+  ],
+  "requiresInfra": true,
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "local_install"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "HermesAgent '{id}' runs on the machine weft runs on, which a cloud install does not have; wire a Computer into `computer`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "computer"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "input_satisfied",
+          "port": "access"
+        }
+      },
+      "then": {
+        "message": "HermesAgent '{id}' runs only on a connection's login: your machine's own Hermes may borrow your other agents' logins; give it a HermesAgentAccess on `access`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "access"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "computer"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "folder"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "HermesAgent '{id}' works on your machine, so it needs a `folder` to work in.",
+        "level": "structural",
+        "severity": "error",
+        "port": "folder"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "value",
+          "field": "model"
+        }
+      },
+      "then": {
+        "message": "HermesAgent '{id}' refuses a conversation with no model; set `model` to the model id its provider names it by.",
+        "level": "structural",
+        "severity": "error",
+        "port": "model"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "permission"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "permission",
+              "oneOf": [
+                "ask",
+                "accept_edits",
+                "auto",
+                "bypass"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "HermesAgent '{id}' has a `permission` it does not know; pick one of ask, accept_edits, auto, bypass.",
+        "level": "structural",
+        "severity": "error",
+        "port": "permission"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "streamBy"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "streamBy",
+              "oneOf": [
+                "message",
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "HermesAgent '{id}' has a `streamBy` it does not know; pick message or token.",
+        "level": "structural",
+        "severity": "error",
+        "port": "streamBy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_wired",
+            "port": "computer"
+          },
+          {
+            "kind": "value",
+            "field": "program"
+          }
+        ]
+      },
+      "then": {
+        "message": "HermesAgent '{id}' runs in a computer, where `program`, a path on your machine, means nothing; leave `program` out, the computer installs Hermes Agent itself.",
+        "level": "structural",
+        "severity": "error",
+        "port": "program"
+      }
+    }
+  ],
+  "lists": {
+    "reservedToolNames": [
+      "clarify",
+      "delegate_task",
+      "manage_connections",
+      "memory",
+      "patch",
+      "session_search",
+      "todo_list",
+      "write_file"
+    ]
+  }
+}

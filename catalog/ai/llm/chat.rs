@@ -13,7 +13,8 @@
 // SYNC: types.ChatMessage/ChatContentPart/ToolCall (metadata.json) <->
 //       MiniLLMLibRS/src/message/mod.rs Message,
 //       MiniLLMLibRS/src/message/content.rs ContentPart,
-//       MiniLLMLibRS/src/tools/mod.rs ToolCall
+//       MiniLLMLibRS/src/tools/mod.rs ToolCall,
+//       extension-browser/src/lib/chat-history.ts (readConversation, which draws it)
 
 use serde_json::{json, Value};
 

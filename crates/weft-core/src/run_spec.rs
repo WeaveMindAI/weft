@@ -1425,6 +1425,8 @@ pub fn instance_run_values(
     let mut values = crate::instance::InstanceValues::new();
     let mut refusal = Refusal { errors: Vec::new() };
     let mut seen = BTreeSet::new();
+    // The worker checks again what the install checked, and knows no
+    // install: the install's kind is the version build's to answer.
     let rules = crate::rules::RuleContext::new(project);
     // Only what runs reads its instance's values: a stand-in never does.
     for place in &crate::project::places::running_places(project) {

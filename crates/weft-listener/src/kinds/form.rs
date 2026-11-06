@@ -199,21 +199,9 @@ mod tests {
         let spec = weft_core::signal::to_spec(Form {
             form_type: "human-query".into(),
             schema: FormSchema {
-                fields: vec![weft_core::signal::FormField {
-                    field_type: "display_image".into(),
-                    key: "pic".into(),
-                    label: String::new(),
-                    render: weft_core::node::FormFieldRender {
-                        component: "image".into(),
-                        source: None,
-                        multiple: false,
-                        prefilled: false,
-                    },
-                    value: Some(serde_json::json!({ "__weft_image__": {
+                fields: vec![weft_core::signal::FormField::display_image("pic", "", serde_json::json!({ "__weft_image__": {
                         "key": "t/project/p/cat", "mimeType": "image/png", "sizeBytes": 7, "filename": "cat.png"
-                    } })),
-                    config: Default::default(),
-                }],
+                    } }))],
             },
             title: None,
             description: None,

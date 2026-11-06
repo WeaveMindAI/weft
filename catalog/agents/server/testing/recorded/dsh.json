@@ -1,0 +1,746 @@
+{
+ "kind": "dsh",
+ "command": "dsh",
+ "source": "The real dsh 0.2.1-rc.5 (`dsh --profile acp`) driven through weft's own agent server and this spec, against a local fake OpenAI-compatible model (scratchpad dsh/live/live.py and fake_model.py, a `fake` provider patched into the private home's profiles/acp/cordis.patch.yml; every line teed to dsh/live/wire.out.jsonl). initialize line 1, session/new line 2, session/resume line 21, session/set_config_option line 37; turns: hello lines 3-5, permission 6-12, reject 13-19, tool 22-27 (the `tool` step marks where dsh called weft's HTTP MCP server, between lines 23 and 24), bad key line 30, failed midway 31-34. `no key` is agents/dsh.transcript.jsonl line 12 (run1, no credentials). Nothing is composed. The tool turn was recorded again for real on DeepSeek Harness 0.2.1-rc.5, the program's tools weft's plugin (dsh_weft.mjs, inserted by the patch acp_dsh.py writes and hands over with --patch) forwarding to a stand-in of the MCP route, against a local scripted Anthropic Messages model through DEEPSEEK_BASE_URL (scratchpad rig/mock_model.py, acp_drive.py, rec_dsh.jsonl lines 6-11); the tool step stands where the plugin's call reached the route, and the patch's plugin config is where the stand-in finds the route (mcpFrom.list). `no balance` is real, on dsh 0.2.1-rc.5 with a real DeepSeek key whose account had no balance left (deepseek-official/deepseek-v4-flash; scratchpad acp12/dsh/transcript.jsonl): every prompt failed so, before any model output.",
+ "answers": {
+  "initialize": {
+   "protocolVersion": 1,
+   "agentInfo": {
+    "name": "deepseek-harness-acp",
+    "version": "0.0.1"
+   },
+   "agentCapabilities": {
+    "mcpCapabilities": {
+     "http": true
+    },
+    "promptCapabilities": {
+     "image": false,
+     "audio": false,
+     "embeddedContext": false
+    },
+    "sessionCapabilities": {
+     "close": {},
+     "list": {},
+     "resume": {}
+    }
+   },
+   "authMethods": []
+  },
+  "session/new": {
+   "sessionId": "$SESSION",
+   "configOptions": [
+    {
+     "id": "model",
+     "name": "Model",
+     "category": "model",
+     "type": "select",
+     "currentValue": "[\"fake\",\"fake-model\"]",
+     "options": [
+      {
+       "group": "deepseek-official",
+       "name": "DeepSeek",
+       "options": [
+        {
+         "value": "[\"deepseek-official\",\"deepseek-flash\"]",
+         "name": "DeepSeek-V4.1-Flash"
+        },
+        {
+         "value": "[\"deepseek-official\",\"deepseek-v4-pro\"]",
+         "name": "DeepSeek-V4-Pro",
+         "description": "Stronger agentic coding, knowledge, and difficult reasoning; suited to complex or quality-critical tasks at higher cost."
+        }
+       ]
+      },
+      {
+       "group": "fake",
+       "name": "fake",
+       "options": [
+        {
+         "value": "[\"fake\",\"fake-model\"]",
+         "name": "fake-model"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  "session/resume": {
+   "configOptions": [
+    {
+     "id": "model",
+     "name": "Model",
+     "category": "model",
+     "type": "select",
+     "currentValue": "[\"fake\",\"fake-model\"]",
+     "options": [
+      {
+       "group": "deepseek-official",
+       "name": "DeepSeek",
+       "options": [
+        {
+         "value": "[\"deepseek-official\",\"deepseek-flash\"]",
+         "name": "DeepSeek-V4.1-Flash"
+        },
+        {
+         "value": "[\"deepseek-official\",\"deepseek-v4-pro\"]",
+         "name": "DeepSeek-V4-Pro",
+         "description": "Stronger agentic coding, knowledge, and difficult reasoning; suited to complex or quality-critical tasks at higher cost."
+        }
+       ]
+      },
+      {
+       "group": "fake",
+       "name": "fake",
+       "options": [
+        {
+         "value": "[\"fake\",\"fake-model\"]",
+         "name": "fake-model"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  "session/set_config_option": {
+   "configOptions": [
+    {
+     "id": "model",
+     "name": "Model",
+     "category": "model",
+     "type": "select",
+     "currentValue": "[\"fake\",\"fake-model\"]",
+     "options": [
+      {
+       "group": "deepseek-official",
+       "name": "DeepSeek",
+       "options": [
+        {
+         "value": "[\"deepseek-official\",\"deepseek-flash\"]",
+         "name": "DeepSeek-V4.1-Flash"
+        },
+        {
+         "value": "[\"deepseek-official\",\"deepseek-v4-pro\"]",
+         "name": "DeepSeek-V4-Pro",
+         "description": "Stronger agentic coding, knowledge, and difficult reasoning; suited to complex or quality-critical tasks at higher cost."
+        }
+       ]
+      },
+      {
+       "group": "fake",
+       "name": "fake",
+       "options": [
+        {
+         "value": "[\"fake\",\"fake-model\"]",
+         "name": "fake-model"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "turns": {
+  "hello": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "e25c0e7b-230c-4220-8336-e69fb3dcbbbe",
+      "content": {
+       "type": "text",
+       "text": "Hello there."
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 5758,
+      "size": 128000
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "text",
+     "done"
+    ],
+    "reply": "Hello there."
+   }
+  },
+  "permission": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 5825,
+      "size": 128000
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_p1",
+      "title": "bash",
+      "kind": "other",
+      "status": "in_progress",
+      "rawInput": {
+       "description": "Write a file outside the folder",
+       "command": "echo x > $HOME/dsh-outside.txt",
+       "sandbox_permissions": "danger-full-access",
+       "justification": "the file lives outside the folder"
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "call_p1"
+       },
+       "options": [
+        {
+         "optionId": "allow-once",
+         "name": "Allow once",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "reject-once",
+         "name": "Reject",
+         "kind": "reject_once"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_p1",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "(no output)"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "f1f31f26-1471-4d51-9598-20a7401fa13a",
+      "content": {
+       "type": "text",
+       "text": "Done."
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 5846,
+      "size": 128000
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "Done.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "bash",
+        "title": "Write a file outside the folder (outside the sandbox: danger-full-access)",
+        "detail": "echo x > $HOME/dsh-outside.txt\nthe file lives outside the folder",
+        "choices": [
+         {
+          "id": "allow-once",
+          "kind": "allow_once"
+         },
+         {
+          "id": "reject-once",
+          "kind": "reject"
+         }
+        ]
+       }
+      },
+      "answer": {
+       "choice": "allow-once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "allow-once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "reject": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 5912,
+      "size": 128000
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_p1",
+      "title": "bash",
+      "kind": "other",
+      "status": "in_progress",
+      "rawInput": {
+       "description": "Write a file outside the folder",
+       "command": "echo x > $HOME/dsh-outside.txt",
+       "sandbox_permissions": "danger-full-access",
+       "justification": "the file lives outside the folder"
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "call_p1"
+       },
+       "options": [
+        {
+         "optionId": "allow-once",
+         "name": "Allow once",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "reject-once",
+         "name": "Reject",
+         "kind": "reject_once"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_p1",
+      "status": "failed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "Error: the user rejected escalating this command to \"danger-full-access\"; it stays denied, so stop and explain instead of working around it"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "1785b8e4-c239-4871-a574-0c78e36b1337",
+      "content": {
+       "type": "text",
+       "text": "Done."
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 5965,
+      "size": 128000
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "Done.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "bash",
+        "title": "Write a file outside the folder (outside the sandbox: danger-full-access)",
+        "detail": "echo x > $HOME/dsh-outside.txt\nthe file lives outside the folder",
+        "choices": [
+         {
+          "id": "allow-once",
+          "kind": "allow_once"
+         },
+         {
+          "id": "reject-once",
+          "kind": "reject"
+         }
+        ]
+       }
+      },
+      "answer": {
+       "choice": "reject-once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "reject-once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "tool": {
+   "tools": true,
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 5782,
+      "size": 1000000
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "toolu_38c95b16",
+      "title": "lookup",
+      "kind": "other",
+      "status": "in_progress",
+      "rawInput": {}
+     }
+    },
+    {
+     "tool": {
+      "name": "lookup",
+      "arguments": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "toolu_38c95b16",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "$TOOL"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "6206939c-8125-490e-a902-751a4e0f3044",
+      "content": {
+       "type": "text",
+       "text": "DONE after tool: [[{\"type\": \"text\", \"text\": \"$TOOL\"}]]"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 5821,
+      "size": 1000000
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "tool_call",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "DONE after tool: [[{\"type\": \"text\", \"text\": \"42\"}]]",
+    "blocks": [
+     {
+      "tool": "lookup",
+      "result": "42"
+     }
+    ]
+   }
+  },
+  "bad key": {
+   "steps": [
+    {
+     "fail": {
+      "code": -32603,
+      "message": "Internal error: turn failed: 401: {\"message\":\"Incorrect API key provided: sk-bad.\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "error"
+    ],
+    "status": "failed",
+    "error": "Incorrect API key provided"
+   }
+  },
+  "failed midway": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 6206,
+      "size": 128000
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_m1",
+      "title": "bash",
+      "kind": "other",
+      "status": "in_progress",
+      "rawInput": {
+       "description": "List the folder",
+       "command": "ls"
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_m1",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "(no output)"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "fail": {
+      "code": -32603,
+      "message": "Internal error: turn failed: 401: {\"message\":\"Incorrect API key provided: sk-bad.\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "tool_result",
+     "error"
+    ],
+    "status": "failed",
+    "error": "invalid_api_key"
+   }
+  },
+  "no key": {
+   "steps": [
+    {
+     "fail": {
+      "code": -32603,
+      "message": "Internal error: turn failed: llm-deepseek: no API key for provider route \"deepseek-official\"; store DEEPSEEK_API_KEY through the credentials service (the web Models page writes it), or export DEEPSEEK_API_KEY in the launching environment"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "error"
+    ],
+    "status": "failed",
+    "error": "no API key for provider route"
+   }
+  },
+  "no balance": {
+   "steps": [
+    {
+     "fail": {
+      "code": -32603,
+      "message": "Internal error: turn failed: Insufficient Balance (request_id: 43080175-9e42-45fb-bb30-8e1ecc9e5b5a)"
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "error"
+    ],
+    "status": "failed",
+    "error": "Insufficient Balance"
+   }
+  }
+ },
+ "settings": [
+  {
+   "name": "ask",
+   "given": {
+    "permission": "ask"
+   },
+   "expect": {
+    "args": [
+     [
+      "--profile",
+      "acp"
+     ]
+    ],
+    "env": {
+     "DSH_PERMISSION_MODE": "workspace-write",
+     "DSH_TELEMETRY_MODE": "DISABLED"
+    },
+    "unset": [
+     "DSH_HOME",
+     "DEEPSEEK_API_KEY"
+    ]
+   }
+  },
+  {
+   "name": "read_only",
+   "given": {
+    "permission": "read_only"
+   },
+   "expect": {
+    "env": {
+     "DSH_PERMISSION_MODE": "read-only"
+    }
+   }
+  },
+  {
+   "name": "bypass",
+   "given": {
+    "permission": "bypass"
+   },
+   "expect": {
+    "env": {
+     "DSH_PERMISSION_MODE": "danger-full-access"
+    }
+   }
+  },
+  {
+   "name": "model_and_options",
+   "given": {
+    "model": "deepseek-official/deepseek-v4-pro",
+    "options": {
+     "effort": "high"
+    }
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "model",
+       "value": "[\"deepseek-official\",\"deepseek-v4-pro\"]"
+      }
+     },
+     {
+      "method": "session/set_config_option",
+      "params": {
+       "configId": "reasoning_effort",
+       "value": "high"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "api_key",
+   "given": {
+    "credentials": {
+     "way": "apiKey",
+     "values": {
+      "key": "sk-test"
+     }
+    }
+   },
+   "expect": {
+    "env": {
+     "DEEPSEEK_API_KEY": "sk-test",
+     "DSH_HOME": "$HOME",
+     "DSH_TELEMETRY_MODE": "DISABLED"
+    }
+   }
+  },
+  {
+   "name": "model_without_route",
+   "given": {
+    "model": "deepseek-v4-pro"
+   },
+   "expect": {
+    "error": "is `<route>/<model>`"
+   }
+  },
+  {
+   "name": "bad_option_value",
+   "given": {
+    "options": {
+     "effort": "medium"
+    }
+   },
+   "expect": {
+    "error": "takes off, low, high, max"
+   }
+  }
+ ],
+ "mcpFrom": {
+  "list": {
+   "flag": "--patch",
+   "key": [
+    0,
+    "insert",
+    0,
+    "config"
+   ]
+  }
+ }
+}

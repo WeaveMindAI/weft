@@ -135,6 +135,10 @@ impl ContextHandle for PureHandle {
         self.refused("read a published connection")
     }
 
+    async fn renew_connection(&self, _access: &crate::access::Access, _window: std::time::Duration) -> WeftResult<crate::access::OpenedConnection> {
+        self.refused("renew a connection")
+    }
+
     async fn after_node(&self, _call: crate::signal::CancelCall, _access: Option<crate::primitive::AccessRef>) -> WeftResult<()> {
         self.refused("owe a call to a provider when it ends")
     }
@@ -191,8 +195,8 @@ impl ContextHandle for PureHandle {
         self.inner.wired_output_ports()
     }
 
-    fn firing_buses(&self) -> &crate::bus::FiringBuses {
-        self.inner.firing_buses()
+    fn leave_buses(&self, end: crate::bus::StreamEnd) {
+        self.inner.leave_buses(end)
     }
 
     async fn pulse_downstream(&self, output: crate::node::NodeOutput, delivery: crate::context::Delivery) -> WeftResult<()> {

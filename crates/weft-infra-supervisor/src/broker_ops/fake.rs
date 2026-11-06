@@ -586,7 +586,7 @@ impl FakeBroker {
         copy_id: &str,
         status: weft_broker_client::protocol::InfraNodeStatus,
         applied_spec_hash: Option<String>,
-        endpoints: BTreeMap<String, String>,
+        endpoints: BTreeMap<String, weft_core::infra::EndpointRecord>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) {
         self.inner.lock().infra_nodes.insert(

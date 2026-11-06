@@ -289,6 +289,9 @@ async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let said = ProviderEvents::new(&account, "messages", vec![Predicate::eq("thread", thread.clone())]);
         let message = state.wait(|s| &mut s.next, said).await?;
         if message["text"] == "bye" {
+            // The answering node is on the bus too, so returning would
+            // leave it open for that node: end it for both.
+            bus.close();
             return Ok(());
         }
         bus.send("message", message).node_err("passing the message on")?;
@@ -548,6 +551,13 @@ save landed, the body runs `work` again. If the service on the other end must
 never see it twice (a payment, say), it has to refuse the duplicate itself,
 usually through an idempotency key you send with the request.
 
+`ctx.firing_key()` is that key. It is built from the run id, the node and the
+loop iterations and call sites it fires under, so the body run again after the
+crash sends the same one, and the next loop iteration or the next run sends
+another. It is 64 characters of hex and gives away no name from your program.
+It names the firing, so if one body makes two calls that each must not
+repeat, give each its own key, such as `format!("{}-refund", ctx.firing_key())`.
+
 If the thing you must not repeat is not in a `once`, set a field that says it
 is done, call `state.save()` right after, and skip the thing when that field
 is set. Otherwise a body run again after a crash does it again.
@@ -746,6 +756,54 @@ the provider sent it. A failed check does not replace it, and an answer over
 - in a program, with the `GetNodeState` node, which takes a run's id (a run
   gets its own id from the `GetRunId` node);
 - in your own node's code, with `ctx.run_by_id(run).node_state(node)`.
+
+## Waiting on whichever comes first
+
+Sometimes a wait has two ways to end. Your node asks a person something with a
+form, and the thing it asks about can stop needing an answer while the form is
+still up: a coding agent asked a question and then went on without one. If you
+wait on the form alone, the run waits on that person for ever, for an answer
+nothing will read.
+
+If you want the wait to end on either, wait on `FirstOf::either(a, b)`:
+
+```rust
+use weft::signal::{Either, FirstOf, PollEndpoint, Predicate};
+
+#[derive(Default, Serialize, Deserialize)]
+struct Asked {
+    ended: Option<Either<Value, Value>>,
+}
+
+let still_asked = PollEndpoint {
+    url: status_url,
+    filters: vec![Predicate::eq("gone", "true")],
+    ..Default::default()
+};
+let mut state = ctx.keep(Asked::default()).await?;
+match state.wait(|s| &mut s.ended, FirstOf::either(form, still_asked)).await? {
+    Either::First(submission) => { /* the person answered */ }
+    Either::Second(gone) => { /* nothing waits for the answer any more */ }
+}
+```
+
+The first of the two to answer ends the wait, and the other is taken down in
+the same step: the form leaves every list a person answers from, and the poll
+stops. An answer that still comes for the one that lost is refused, the way an
+answer to any wait that already ended is. A person skipping the form skips the
+whole wait. Each signal is registered as if you had waited on it alone, so
+`cancel_with`, a connection and filters go on the signal they are about, never
+on the `FirstOf`.
+
+To the run it is still one wait, so it pauses, resumes and is replayed like
+any other, and the field keeps which of the two answered: `{ "branch": 0 }`
+for the first, `{ "branch": 1 }` for the second, beside its answer. A
+`FirstOf` with fewer than two signals, or with a `FirstOf` inside it, fails
+the wait at once with `invalid signal spec`. A trigger cannot use one: it
+listens on its one signal.
+
+In a node test, the answer you queue says which one answered:
+`rig.signal(json!({ "branch": 1, "value": { "gone": true } }))`.
 
 ## Cleaning up what your node made at a provider
 

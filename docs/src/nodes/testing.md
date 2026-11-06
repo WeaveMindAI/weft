@@ -78,6 +78,7 @@ attaches, a signal nobody answers.
 |---|---|
 | Run the node | `rig.run(&node, json!({...}))` |
 | Run its trigger setup, or its infra | `rig.run_setup_trigger(...)`, `rig.run_provision_infra(...)` |
+| Run its body the way weft does right after an apply (`ctx.is_setup()` true) | `rig.run_infra_setup(&node, json!({...}))` |
 | Canned HTTP | `rig.respond(method, path, body)`, `rig.respond_status(...)`, `rig.respond_raw(...)`, `rig.respond_with_headers(...)` for an answer that lives partly in a header (a created id, an ETag) |
 | A server it cannot reach at all | `rig.fail_connection(method, path)`: the call errors with no status and no body |
 | Check what it sent | `rig.requests()`, `rig.assert_sent(method, path)` |
@@ -169,6 +170,10 @@ Setting the run up:
 | `seed_bus(&self, opts: BusOptions) -> WeftResult<(BusHandle, Value)>` | A bus you write into, and its marker to put on a `Bus` input |
 | `access(&self, service: &str) -> Value` | A connection marker for an access input |
 | `connection_value(&self, service: &str, name: &str, value: &str)` | A value the opened connection answers (`conn.value(name)`) |
+| `connection_way(&self, service: &str, way: &str)` | The way to sign in the connection was made with, what `conn.way()` answers. With none declared, `way()` answers `None` |
+| `connection_renewal(&self, service: &str, renewal: Result<&[(&str, &str)], &str>)` | What renewing the connection hands (`ctx.renew`): `Ok(values)` replaces those values, `Err(why)` is the provider refusing. With none declared, the connection is one weft cannot renew (a pasted key), and a renewal fails the way it does in a real run |
+| `connection_renewals(&self, service: &str) -> usize` | How many renewals reached the provider. A node handed values another renewal already replaced gets the new ones and adds none |
+| `stored_connection_values(&self, service: &str)` | What the connection holds now, after the renewals |
 | `connection_permissions(&self, service: &str, granted: &[&str])` | What the connection has granted, checked against what the input requires |
 | `published_connection(&self, service: &str, values: &[(&str, &str)])` | Says the node already published this connection on an earlier run |
 | `output_type(&self, port: &str, ty: WeftType)` | Declares the type of an output, the way a program does on a narrowable output (`-> (response: Verdict)`) or on one it adds. If the compiler would refuse that type (an output that is not narrowable takes only its own), the run fails with `the case declares output ...` |
@@ -190,6 +195,7 @@ Running it:
 | `run(&self, node: &dyn Node, inputs: Value) -> RigOutcome` (async) | Runs the node's body with `inputs` (a JSON object of input name to value). A second call for the same node picks its firing up from the state it saved |
 | `run_setup_trigger(&self, node: &dyn Node, inputs: Value) -> RigOutcome` (async) | Runs a trigger's setup |
 | `run_provision_infra(&self, node: &dyn Node, inputs: Value) -> RigOutcome` (async) | Runs an infra node's `provision_infra` |
+| `run_infra_setup(&self, node: &dyn Node, inputs: Value) -> RigOutcome` (async) | Runs the node's body the way weft runs it right after an apply, with `ctx.is_setup()` true. It keeps its saved state separately from `run`'s |
 
 Looking at what happened:
 

@@ -116,6 +116,9 @@ pub struct MovedGrant {
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     token_lifetime_secs: Option<i64>,
     created_at: chrono::DateTime<chrono::Utc>,
+    /// The way to sign in a pasted connection was made with
+    /// (`access_grant.way`).
+    way: Option<String>,
 }
 
 impl MovedGrant {
@@ -155,6 +158,7 @@ struct GrantRow {
     token_lifetime_secs: Option<i64>,
     created_at: chrono::DateTime<chrono::Utc>,
     published_by_node: Option<String>,
+    way: Option<String>,
 }
 
 impl FromRow for GrantRow {
@@ -179,13 +183,14 @@ impl FromRow for GrantRow {
             token_lifetime_secs: row.try_get("token_lifetime_secs")?,
             created_at: row.try_get("created_at")?,
             published_by_node: row.try_get("published_by_node")?,
+            way: row.try_get("way")?,
         })
     }
 }
 
 const GRANT_COLUMNS: &str = "id, tenant_id, service, project_id, instance_id, spec, spec_version, values_sealed, \
     registration_sealed, granted_scopes, permissions_verified, owner, door, label, identity, expires_at, \
-    token_lifetime_secs, created_at, published_by_node";
+    token_lifetime_secs, created_at, published_by_node, way";
 
 impl GrantRow {
     /// The row as it travels, its secrets opened.
@@ -213,6 +218,7 @@ impl GrantRow {
             expires_at: self.expires_at,
             token_lifetime_secs: self.token_lifetime_secs,
             created_at: self.created_at,
+            way: self.way,
         })
     }
 
@@ -296,7 +302,13 @@ fn recipe(grant: &MovedGrant) -> anyhow::Result<weft_core::AccessSpec> {
 /// matches.
 fn same_connection(a: &MovedGrant, b: &MovedGrant) -> anyhow::Result<bool> {
     let comparable = |g: &MovedGrant| -> anyhow::Result<MovedGrant> {
-        Ok(MovedGrant { spec: serde_json::to_value(recipe(g)?)?, spec_version: weft_core::AccessSpec::STORED.version(), ..g.clone() })
+        let spec = recipe(g)?;
+        Ok(MovedGrant {
+            way: crate::way_made_with(&spec, g.way.as_deref(), g.id)?,
+            spec: serde_json::to_value(spec)?,
+            spec_version: weft_core::AccessSpec::STORED.version(),
+            ..g.clone()
+        })
     };
     Ok(comparable(a)? == comparable(b)?)
 }
@@ -310,9 +322,16 @@ fn same_connection(a: &MovedGrant, b: &MovedGrant) -> anyhow::Result<bool> {
 /// naming how to replace it; one whose account this install already has
 /// a connection to (a service with one connection per account) is left
 /// alone too; one spending the runtime's own key copies only when this
-/// install holds that key (`shared_keys`, the services it does); one this
-/// weft cannot read is skipped, saying why.
-pub async fn import(import: Import, tenant: &str, shared_keys: &BTreeSet<String>) -> anyhow::Result<ImportedConnections> {
+/// install holds that key (`shared_keys`, the services it does); one made
+/// with a way to sign in this install does not offer (`install`: a
+/// local-only way, on a cloud install) is left alone, naming the ways
+/// that work here; one this weft cannot read is skipped, saying why.
+pub async fn import(
+    import: Import,
+    install: weft_core::install::InstallKind,
+    tenant: &str,
+    shared_keys: &BTreeSet<String>,
+) -> anyhow::Result<ImportedConnections> {
     let Import { pool, key_id, batch } = import;
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
@@ -329,7 +348,7 @@ pub async fn import(import: Import, tenant: &str, shared_keys: &BTreeSet<String>
     }
     let mut connections = Vec::with_capacity(batch.len());
     for grant in batch {
-        let outcome = import_one(&tx, tenant, &grant, shared_keys).await?;
+        let outcome = import_one(&tx, install, tenant, &grant, shared_keys).await?;
         connections.push(ImportedConnection { id: grant.id, service: grant.service, outcome });
     }
     tx.execute("DELETE FROM access_transfer_key WHERE id = $1", &[&key_id]).await?;
@@ -343,25 +362,42 @@ struct Readable {
     spec: weft_core::AccessSpec,
     instance: Option<weft_core::instance::InstanceId>,
     door: weft_core::access::spec::Door,
+    /// The way it was made with, filled the way this weft fills its own
+    /// rows' ([`crate::way_made_with`]): one exported by a weft from
+    /// before ways names none.
+    way: Option<String>,
 }
 
 fn readable(grant: &MovedGrant) -> Result<Readable, String> {
     let spec = recipe(grant).map_err(|e| format!("{e:#}"))?;
     let instance = grant.instance_id.as_deref().map(weft_core::instance::InstanceId::new).transpose()?;
     let door = door_of(&grant.door).map_err(|e| format!("{e:#}"))?;
-    Ok(Readable { spec, instance, door })
+    let way = crate::way_made_with(&spec, grant.way.as_deref(), grant.id).map_err(|e| format!("{e:#}"))?;
+    Ok(Readable { spec, instance, door, way })
 }
 
 async fn import_one(
     tx: &Transaction<'_>,
+    install: weft_core::install::InstallKind,
     tenant: &str,
     grant: &MovedGrant,
     shared_keys: &BTreeSet<String>,
 ) -> anyhow::Result<Outcome> {
-    let Readable { spec, instance, door } = match readable(grant) {
+    let Readable { spec, instance, door, way } = match readable(grant) {
         Ok(readable) => readable,
         Err(why) => return Ok(Outcome::Skipped { why: format!("it does not read on this install ({why}); the two installs may run different wefts") }),
     };
+    // The floor every opening of it would meet here, met before it is
+    // copied: a connection nothing on this install could open is junk.
+    match crate::resolve::not_offered_here(&spec, way.as_deref(), install, grant.id, grant.label.as_deref()) {
+        Ok(None) => {}
+        Ok(Some(why)) => return Ok(Outcome::Skipped { why }),
+        Err(e) => {
+            return Ok(Outcome::Skipped {
+                why: format!("it does not read on this install ({e:#}); the two installs may run different wefts"),
+            })
+        }
+    }
     let here: Option<GrantRow> = tx.opt(&format!("SELECT {GRANT_COLUMNS} FROM access_grant WHERE id = $1"), &[&grant.id]).await?;
     if let Some(row) = here {
         if row.tenant_id != tenant {
@@ -427,6 +463,7 @@ async fn import_one(
             label: grant.label.clone(),
             identity: grant.identity.clone(),
             life: None,
+            way,
         },
     )
     .await?;

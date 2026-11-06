@@ -283,6 +283,8 @@ async fn the_lift_rebuilds_from_the_version_the_running_build_came_from(pool: Po
     let fake = Arc::new(FakeImageBuilder::new());
     let builder = VersionBuilder {
         images: fake.clone(),
+        // The fake builds images, as a cloud does.
+        install: weft_core::install::InstallKind::Cloud,
         pool: pool.clone(),
         prunes: Default::default(),
         blobs: weft_dispatcher::build::blob_cache::BlobCache::in_temp_dir(false),

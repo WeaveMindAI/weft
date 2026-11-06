@@ -59,6 +59,24 @@ enum AgentCommand {
     Own { gid: u32, paths: Vec<PathBuf> },
     /// Run the unit this cloud machine was given, and answer about it.
     Host,
+    /// Run a process unit's process, started again whenever it exits,
+    /// until told to stop.
+    // SYNC: AgentCommand::Process <-> crates/weft-platform-traits/src/unit_agent.rs (PROCESS_AGENT_COMMAND)
+    Process {
+        /// Where to keep how the process is doing.
+        #[arg(long)]
+        state: PathBuf,
+        /// Where to write what it prints, stamped.
+        #[arg(long)]
+        log: PathBuf,
+        /// The needs to meet before the process first starts
+        /// (`ProcessSetup`), when it has any weft installs.
+        #[arg(long)]
+        setup: Option<PathBuf>,
+        /// The process's command.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 // jemalloc hands freed memory back to the system, as it does for every
@@ -130,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
             AgentCommand::Serve => weft_runtime::unit_agent::serve().await,
             AgentCommand::Own { gid, paths } => weft_runtime::unit_agent::own(gid, &paths),
             AgentCommand::Host => weft_runtime::unit_agent::host().await,
+            AgentCommand::Process { state, log, setup, command } => weft_runtime::unit_agent::process(&state, &log, setup.as_deref(), &command).await,
         },
     }
 }

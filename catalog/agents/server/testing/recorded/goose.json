@@ -1,0 +1,4971 @@
+{
+ "kind": "goose",
+ "command": "goose",
+ "source": "Real, on goose 1.57.0 (`goose acp`) with an OpenRouter key (login way openrouterKey, model deepseek/deepseek-v4-flash), driven through weft's own agent server and this spec, every line teed (scratchpad acp12/drive.py, acp12/goose/transcript.jsonl): hello, tool (the program's lookup over HTTP MCP, asked and allowed) and permission (`touch made.txt`, allowed); it streams its thinking a token per chunk. Earlier, against a local fake OpenAI-compatible model (login way openaiCompatible), every line teed (scratchpad goose/real.jsonl, goose/real3.jsonl, goose/real4.jsonl): initialize line 3, session/new line 5, session/set_mode line 10, session/load line 129 with its replay lines 115-128 before and 130-131 after; reject lines 35-76 (reject_once, line 39); bad key, real4.jsonl lines 9-10 (the fake model answering 401); provider error, real3.jsonl lines 9-10 (the fake model answering 400). Nothing is composed.",
+ "answers": {
+  "initialize": {
+   "protocolVersion": 1,
+   "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {
+     "image": true,
+     "audio": false,
+     "embeddedContext": true
+    },
+    "mcpCapabilities": {
+     "http": true,
+     "sse": false
+    },
+    "sessionCapabilities": {
+     "list": {},
+     "delete": {},
+     "close": {}
+    },
+    "auth": {},
+    "_meta": {
+     "goose": {
+      "recipeParameterScopes": {},
+      "localInference": {}
+     }
+    }
+   },
+   "authMethods": [
+    {
+     "id": "goose-provider",
+     "name": "Configure Provider",
+     "description": "Run `goose configure` to set up your AI provider and API key"
+    }
+   ],
+   "agentInfo": {
+    "name": "goose",
+    "version": "1.57.0"
+   }
+  },
+  "session/new": {
+   "sessionId": "$SESSION",
+   "modes": {
+    "currentModeId": "auto",
+    "availableModes": [
+     {
+      "id": "auto",
+      "name": "auto",
+      "description": "Automatically approve tool calls"
+     },
+     {
+      "id": "approve",
+      "name": "approve",
+      "description": "Ask before every tool call"
+     },
+     {
+      "id": "smart_approve",
+      "name": "smart_approve",
+      "description": "Ask only for sensitive tool calls"
+     },
+     {
+      "id": "chat",
+      "name": "chat",
+      "description": "Chat only, no tool calls"
+     }
+    ]
+   },
+   "configOptions": [
+    {
+     "id": "provider",
+     "name": "Provider",
+     "type": "select",
+     "currentValue": "openai",
+     "options": [
+      {
+       "value": "goose",
+       "name": "Goose (Default)"
+      },
+      {
+       "value": "aigateway",
+       "name": "AIgateway"
+      },
+      {
+       "value": "aimlapi",
+       "name": "AI/ML API"
+      },
+      {
+       "value": "alibaba",
+       "name": "Alibaba (Qwen)"
+      },
+      {
+       "value": "amp-acp",
+       "name": "Amp"
+      },
+      {
+       "value": "anthropic",
+       "name": "Anthropic"
+      },
+      {
+       "value": "atomic_chat",
+       "name": "Atomic Chat"
+      },
+      {
+       "value": "avian",
+       "name": "Avian"
+      },
+      {
+       "value": "aws_bedrock",
+       "name": "Amazon Bedrock"
+      },
+      {
+       "value": "azure_foundry",
+       "name": "Azure AI Foundry"
+      },
+      {
+       "value": "azure_openai",
+       "name": "Azure OpenAI"
+      },
+      {
+       "value": "celeris",
+       "name": "Celeris"
+      },
+      {
+       "value": "cerebras",
+       "name": "Cerebras"
+      },
+      {
+       "value": "chatgpt_codex",
+       "name": "ChatGPT Codex"
+      },
+      {
+       "value": "claude-acp",
+       "name": "Claude Code ACP"
+      },
+      {
+       "value": "claude-code",
+       "name": "Claude Code CLI"
+      },
+      {
+       "value": "codex",
+       "name": "OpenAI Codex CLI"
+      },
+      {
+       "value": "codex-acp",
+       "name": "Codex ACP"
+      },
+      {
+       "value": "copilot-acp",
+       "name": "GitHub Copilot CLI (ACP)"
+      },
+      {
+       "value": "cursor-agent",
+       "name": "Cursor Agent"
+      },
+      {
+       "value": "custom_deepseek",
+       "name": "DeepSeek"
+      },
+      {
+       "value": "custom_tensorix",
+       "name": "Tensorix"
+      },
+      {
+       "value": "databricks",
+       "name": "Databricks"
+      },
+      {
+       "value": "databricks_v2",
+       "name": "Databricks AI Gateway"
+      },
+      {
+       "value": "empiriolabs",
+       "name": "EmpirioLabs AI"
+      },
+      {
+       "value": "eurouter",
+       "name": "EUrouter"
+      },
+      {
+       "value": "fireworks-ai",
+       "name": "Fireworks AI"
+      },
+      {
+       "value": "friendli",
+       "name": "Friendli AI"
+      },
+      {
+       "value": "futurmix",
+       "name": "FuturMix"
+      },
+      {
+       "value": "gcp_vertex_ai",
+       "name": "GCP Vertex AI"
+      },
+      {
+       "value": "gemini-cli",
+       "name": "Gemini CLI"
+      },
+      {
+       "value": "gemini_oauth",
+       "name": "Gemini"
+      },
+      {
+       "value": "github_copilot",
+       "name": "GitHub Copilot"
+      },
+      {
+       "value": "gondola",
+       "name": "Gondola"
+      },
+      {
+       "value": "google",
+       "name": "Google Gemini (API Key)"
+      },
+      {
+       "value": "groq",
+       "name": "Groq"
+      },
+      {
+       "value": "huggingface",
+       "name": "Hugging Face"
+      },
+      {
+       "value": "iflytek",
+       "name": "iFlytek Spark"
+      },
+      {
+       "value": "iflytek_astron",
+       "name": "iFlytek Astron MaaS"
+      },
+      {
+       "value": "inception",
+       "name": "Inception"
+      },
+      {
+       "value": "ionet",
+       "name": "IO Intelligence"
+      },
+      {
+       "value": "kimi_code",
+       "name": "Kimi Code"
+      },
+      {
+       "value": "litellm",
+       "name": "LiteLLM"
+      },
+      {
+       "value": "llama_swap",
+       "name": "Llama Swap"
+      },
+      {
+       "value": "lmstudio",
+       "name": "LM Studio"
+      },
+      {
+       "value": "local",
+       "name": "Local Inference"
+      },
+      {
+       "value": "lynkr",
+       "name": "Lynkr"
+      },
+      {
+       "value": "meta",
+       "name": "Meta"
+      },
+      {
+       "value": "minimax",
+       "name": "MiniMax"
+      },
+      {
+       "value": "mistral",
+       "name": "Mistral AI"
+      },
+      {
+       "value": "moonshot",
+       "name": "Moonshot"
+      },
+      {
+       "value": "muse_code",
+       "name": "Meta Muse Code"
+      },
+      {
+       "value": "nano-gpt",
+       "name": "NanoGPT"
+      },
+      {
+       "value": "nearai",
+       "name": "NEAR AI Cloud"
+      },
+      {
+       "value": "novita",
+       "name": "Novita AI"
+      },
+      {
+       "value": "nvidia",
+       "name": "NVIDIA"
+      },
+      {
+       "value": "ollama",
+       "name": "Ollama"
+      },
+      {
+       "value": "ollama_cloud",
+       "name": "Ollama Cloud"
+      },
+      {
+       "value": "omlx",
+       "name": "oMLX"
+      },
+      {
+       "value": "openai",
+       "name": "OpenAI"
+      },
+      {
+       "value": "opencode_go",
+       "name": "OpenCode Go"
+      },
+      {
+       "value": "opencode_zen",
+       "name": "OpenCode Zen"
+      },
+      {
+       "value": "openrouter",
+       "name": "OpenRouter"
+      },
+      {
+       "value": "opper",
+       "name": "Opper"
+      },
+      {
+       "value": "orcarouter",
+       "name": "OrcaRouter"
+      },
+      {
+       "value": "ovhcloud",
+       "name": "OVHcloud"
+      },
+      {
+       "value": "perplexity",
+       "name": "Perplexity"
+      },
+      {
+       "value": "pi-acp",
+       "name": "Pi"
+      },
+      {
+       "value": "pleumrouter",
+       "name": "PleumRouter"
+      },
+      {
+       "value": "routstr",
+       "name": "Routstr"
+      },
+      {
+       "value": "sagemaker_tgi",
+       "name": "Amazon SageMaker TGI"
+      },
+      {
+       "value": "sakana",
+       "name": "Sakana AI"
+      },
+      {
+       "value": "saladcloud",
+       "name": "SaladCloud AI Gateway"
+      },
+      {
+       "value": "saygm",
+       "name": "SayGM"
+      },
+      {
+       "value": "scaleway",
+       "name": "Scaleway"
+      },
+      {
+       "value": "snowflake",
+       "name": "Snowflake"
+      },
+      {
+       "value": "tanzu_ai",
+       "name": "VMware Tanzu Platform"
+      },
+      {
+       "value": "tetrate",
+       "name": "Tetrate Agent Router Service"
+      },
+      {
+       "value": "together",
+       "name": "Together AI"
+      },
+      {
+       "value": "trustedrouter",
+       "name": "TrustedRouter"
+      },
+      {
+       "value": "venice",
+       "name": "Venice.ai"
+      },
+      {
+       "value": "vercel_ai_gateway",
+       "name": "Vercel AI Gateway"
+      },
+      {
+       "value": "xai",
+       "name": "xAI"
+      },
+      {
+       "value": "xai_oauth",
+       "name": "xAI (SuperGrok Subscription)"
+      },
+      {
+       "value": "zai",
+       "name": "Z.AI"
+      },
+      {
+       "value": "zai_coding_plan",
+       "name": "Z.AI Coding Plan"
+      },
+      {
+       "value": "zhipu",
+       "name": "Zhipu AI"
+      }
+     ]
+    },
+    {
+     "id": "mode",
+     "name": "Mode",
+     "category": "mode",
+     "type": "select",
+     "currentValue": "auto",
+     "options": [
+      {
+       "value": "auto",
+       "name": "auto",
+       "description": "Automatically approve tool calls"
+      },
+      {
+       "value": "approve",
+       "name": "approve",
+       "description": "Ask before every tool call"
+      },
+      {
+       "value": "smart_approve",
+       "name": "smart_approve",
+       "description": "Ask only for sensitive tool calls"
+      },
+      {
+       "value": "chat",
+       "name": "chat",
+       "description": "Chat only, no tool calls"
+      }
+     ]
+    },
+    {
+     "id": "model",
+     "name": "Model",
+     "category": "model",
+     "type": "select",
+     "currentValue": "fake-model",
+     "options": [
+      {
+       "value": "fake-model",
+       "name": "fake-model"
+      },
+      {
+       "value": "gpt-6.1-terra",
+       "name": "GPT-6.1 Terra"
+      },
+      {
+       "value": "gpt-6.1-sol",
+       "name": "GPT-6.1 Sol"
+      },
+      {
+       "value": "gpt-6-luna",
+       "name": "GPT-6 Luna"
+      },
+      {
+       "value": "gpt-6-sol",
+       "name": "GPT-6 Sol"
+      },
+      {
+       "value": "gpt-6-astra",
+       "name": "GPT-6 Astra"
+      },
+      {
+       "value": "gpt-daybreak-blue",
+       "name": "Daybreak Blue"
+      },
+      {
+       "value": "gpt-daybreak-red",
+       "name": "Daybreak Red"
+      },
+      {
+       "value": "gpt-5.6",
+       "name": "GPT-5.6"
+      },
+      {
+       "value": "gpt-5.6-luna",
+       "name": "GPT-5.6 Luna"
+      },
+      {
+       "value": "gpt-5.6-sol",
+       "name": "GPT-5.6 Sol"
+      },
+      {
+       "value": "gpt-5.6-terra",
+       "name": "GPT-5.6 Terra"
+      },
+      {
+       "value": "gpt-5.5",
+       "name": "GPT-5.5"
+      },
+      {
+       "value": "gpt-5.5-pro",
+       "name": "GPT-5.5 Pro"
+      },
+      {
+       "value": "gpt-5.4-mini",
+       "name": "GPT-5.4 mini"
+      },
+      {
+       "value": "gpt-5.4-nano",
+       "name": "GPT-5.4 nano"
+      },
+      {
+       "value": "gpt-5.4",
+       "name": "GPT-5.4"
+      },
+      {
+       "value": "gpt-5.4-pro",
+       "name": "GPT-5.4 Pro"
+      },
+      {
+       "value": "gpt-5.3-codex",
+       "name": "GPT-5.3 Codex"
+      },
+      {
+       "value": "gpt-5.3-codex-spark",
+       "name": "GPT-5.3 Codex Spark"
+      },
+      {
+       "value": "gpt-5.2",
+       "name": "GPT-5.2"
+      },
+      {
+       "value": "gpt-5.2-pro",
+       "name": "GPT-5.2 Pro"
+      },
+      {
+       "value": "gpt-5.1",
+       "name": "GPT-5.1"
+      },
+      {
+       "value": "gpt-5-pro",
+       "name": "GPT-5 Pro"
+      },
+      {
+       "value": "gpt-5",
+       "name": "GPT-5"
+      },
+      {
+       "value": "gpt-5-mini",
+       "name": "GPT-5 Mini"
+      },
+      {
+       "value": "gpt-5-nano",
+       "name": "GPT-5 Nano"
+      },
+      {
+       "value": "o3-pro",
+       "name": "o3-pro"
+      },
+      {
+       "value": "o3",
+       "name": "o3"
+      },
+      {
+       "value": "o4-mini",
+       "name": "o4-mini"
+      },
+      {
+       "value": "gpt-4.1",
+       "name": "GPT-4.1"
+      },
+      {
+       "value": "gpt-4.1-mini",
+       "name": "GPT-4.1 mini"
+      },
+      {
+       "value": "gpt-4.1-nano",
+       "name": "GPT-4.1 nano"
+      },
+      {
+       "value": "o1-pro",
+       "name": "o1-pro"
+      },
+      {
+       "value": "o3-mini",
+       "name": "o3-mini"
+      },
+      {
+       "value": "o1",
+       "name": "o1"
+      },
+      {
+       "value": "gpt-4o-mini",
+       "name": "GPT-4o mini"
+      },
+      {
+       "value": "gpt-4o",
+       "name": "GPT-4o"
+      },
+      {
+       "value": "gpt-4",
+       "name": "GPT-4"
+      },
+      {
+       "value": "gpt-4-turbo",
+       "name": "GPT-4 Turbo"
+      }
+     ]
+    },
+    {
+     "id": "thinking_effort",
+     "name": "Thinking effort",
+     "description": "Controls reasoning effort for models that support extended thinking.",
+     "category": "thought_level",
+     "type": "select",
+     "currentValue": "off",
+     "options": [
+      {
+       "value": "off",
+       "name": "off"
+      }
+     ]
+    }
+   ],
+   "_meta": {
+    "extensionResults": [
+     {
+      "name": "scheduler",
+      "success": true
+     },
+     {
+      "name": "summon",
+      "success": true
+     },
+     {
+      "name": "skills",
+      "success": true
+     },
+     {
+      "name": "developer",
+      "success": true
+     },
+     {
+      "name": "apps",
+      "success": true
+     },
+     {
+      "name": "tom",
+      "success": true
+     },
+     {
+      "name": "analyze",
+      "success": true
+     },
+     {
+      "name": "Extension Manager",
+      "success": true
+     }
+    ],
+    "workingDir": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/goose/realroot/work"
+   }
+  },
+  "session/set_mode": {},
+  "session/load": {
+   "modes": {
+    "currentModeId": "approve",
+    "availableModes": [
+     {
+      "id": "auto",
+      "name": "auto",
+      "description": "Automatically approve tool calls"
+     },
+     {
+      "id": "approve",
+      "name": "approve",
+      "description": "Ask before every tool call"
+     },
+     {
+      "id": "smart_approve",
+      "name": "smart_approve",
+      "description": "Ask only for sensitive tool calls"
+     },
+     {
+      "id": "chat",
+      "name": "chat",
+      "description": "Chat only, no tool calls"
+     }
+    ]
+   },
+   "configOptions": [
+    {
+     "id": "provider",
+     "name": "Provider",
+     "type": "select",
+     "currentValue": "openai",
+     "options": [
+      {
+       "value": "goose",
+       "name": "Goose (Default)"
+      },
+      {
+       "value": "aigateway",
+       "name": "AIgateway"
+      },
+      {
+       "value": "aimlapi",
+       "name": "AI/ML API"
+      },
+      {
+       "value": "alibaba",
+       "name": "Alibaba (Qwen)"
+      },
+      {
+       "value": "amp-acp",
+       "name": "Amp"
+      },
+      {
+       "value": "anthropic",
+       "name": "Anthropic"
+      },
+      {
+       "value": "atomic_chat",
+       "name": "Atomic Chat"
+      },
+      {
+       "value": "avian",
+       "name": "Avian"
+      },
+      {
+       "value": "aws_bedrock",
+       "name": "Amazon Bedrock"
+      },
+      {
+       "value": "azure_foundry",
+       "name": "Azure AI Foundry"
+      },
+      {
+       "value": "azure_openai",
+       "name": "Azure OpenAI"
+      },
+      {
+       "value": "celeris",
+       "name": "Celeris"
+      },
+      {
+       "value": "cerebras",
+       "name": "Cerebras"
+      },
+      {
+       "value": "chatgpt_codex",
+       "name": "ChatGPT Codex"
+      },
+      {
+       "value": "claude-acp",
+       "name": "Claude Code ACP"
+      },
+      {
+       "value": "claude-code",
+       "name": "Claude Code CLI"
+      },
+      {
+       "value": "codex",
+       "name": "OpenAI Codex CLI"
+      },
+      {
+       "value": "codex-acp",
+       "name": "Codex ACP"
+      },
+      {
+       "value": "copilot-acp",
+       "name": "GitHub Copilot CLI (ACP)"
+      },
+      {
+       "value": "cursor-agent",
+       "name": "Cursor Agent"
+      },
+      {
+       "value": "custom_deepseek",
+       "name": "DeepSeek"
+      },
+      {
+       "value": "custom_tensorix",
+       "name": "Tensorix"
+      },
+      {
+       "value": "databricks",
+       "name": "Databricks"
+      },
+      {
+       "value": "databricks_v2",
+       "name": "Databricks AI Gateway"
+      },
+      {
+       "value": "empiriolabs",
+       "name": "EmpirioLabs AI"
+      },
+      {
+       "value": "eurouter",
+       "name": "EUrouter"
+      },
+      {
+       "value": "fireworks-ai",
+       "name": "Fireworks AI"
+      },
+      {
+       "value": "friendli",
+       "name": "Friendli AI"
+      },
+      {
+       "value": "futurmix",
+       "name": "FuturMix"
+      },
+      {
+       "value": "gcp_vertex_ai",
+       "name": "GCP Vertex AI"
+      },
+      {
+       "value": "gemini-cli",
+       "name": "Gemini CLI"
+      },
+      {
+       "value": "gemini_oauth",
+       "name": "Gemini"
+      },
+      {
+       "value": "github_copilot",
+       "name": "GitHub Copilot"
+      },
+      {
+       "value": "gondola",
+       "name": "Gondola"
+      },
+      {
+       "value": "google",
+       "name": "Google Gemini (API Key)"
+      },
+      {
+       "value": "groq",
+       "name": "Groq"
+      },
+      {
+       "value": "huggingface",
+       "name": "Hugging Face"
+      },
+      {
+       "value": "iflytek",
+       "name": "iFlytek Spark"
+      },
+      {
+       "value": "iflytek_astron",
+       "name": "iFlytek Astron MaaS"
+      },
+      {
+       "value": "inception",
+       "name": "Inception"
+      },
+      {
+       "value": "ionet",
+       "name": "IO Intelligence"
+      },
+      {
+       "value": "kimi_code",
+       "name": "Kimi Code"
+      },
+      {
+       "value": "litellm",
+       "name": "LiteLLM"
+      },
+      {
+       "value": "llama_swap",
+       "name": "Llama Swap"
+      },
+      {
+       "value": "lmstudio",
+       "name": "LM Studio"
+      },
+      {
+       "value": "local",
+       "name": "Local Inference"
+      },
+      {
+       "value": "lynkr",
+       "name": "Lynkr"
+      },
+      {
+       "value": "meta",
+       "name": "Meta"
+      },
+      {
+       "value": "minimax",
+       "name": "MiniMax"
+      },
+      {
+       "value": "mistral",
+       "name": "Mistral AI"
+      },
+      {
+       "value": "moonshot",
+       "name": "Moonshot"
+      },
+      {
+       "value": "muse_code",
+       "name": "Meta Muse Code"
+      },
+      {
+       "value": "nano-gpt",
+       "name": "NanoGPT"
+      },
+      {
+       "value": "nearai",
+       "name": "NEAR AI Cloud"
+      },
+      {
+       "value": "novita",
+       "name": "Novita AI"
+      },
+      {
+       "value": "nvidia",
+       "name": "NVIDIA"
+      },
+      {
+       "value": "ollama",
+       "name": "Ollama"
+      },
+      {
+       "value": "ollama_cloud",
+       "name": "Ollama Cloud"
+      },
+      {
+       "value": "omlx",
+       "name": "oMLX"
+      },
+      {
+       "value": "openai",
+       "name": "OpenAI"
+      },
+      {
+       "value": "opencode_go",
+       "name": "OpenCode Go"
+      },
+      {
+       "value": "opencode_zen",
+       "name": "OpenCode Zen"
+      },
+      {
+       "value": "openrouter",
+       "name": "OpenRouter"
+      },
+      {
+       "value": "opper",
+       "name": "Opper"
+      },
+      {
+       "value": "orcarouter",
+       "name": "OrcaRouter"
+      },
+      {
+       "value": "ovhcloud",
+       "name": "OVHcloud"
+      },
+      {
+       "value": "perplexity",
+       "name": "Perplexity"
+      },
+      {
+       "value": "pi-acp",
+       "name": "Pi"
+      },
+      {
+       "value": "pleumrouter",
+       "name": "PleumRouter"
+      },
+      {
+       "value": "routstr",
+       "name": "Routstr"
+      },
+      {
+       "value": "sagemaker_tgi",
+       "name": "Amazon SageMaker TGI"
+      },
+      {
+       "value": "sakana",
+       "name": "Sakana AI"
+      },
+      {
+       "value": "saladcloud",
+       "name": "SaladCloud AI Gateway"
+      },
+      {
+       "value": "saygm",
+       "name": "SayGM"
+      },
+      {
+       "value": "scaleway",
+       "name": "Scaleway"
+      },
+      {
+       "value": "snowflake",
+       "name": "Snowflake"
+      },
+      {
+       "value": "tanzu_ai",
+       "name": "VMware Tanzu Platform"
+      },
+      {
+       "value": "tetrate",
+       "name": "Tetrate Agent Router Service"
+      },
+      {
+       "value": "together",
+       "name": "Together AI"
+      },
+      {
+       "value": "trustedrouter",
+       "name": "TrustedRouter"
+      },
+      {
+       "value": "venice",
+       "name": "Venice.ai"
+      },
+      {
+       "value": "vercel_ai_gateway",
+       "name": "Vercel AI Gateway"
+      },
+      {
+       "value": "xai",
+       "name": "xAI"
+      },
+      {
+       "value": "xai_oauth",
+       "name": "xAI (SuperGrok Subscription)"
+      },
+      {
+       "value": "zai",
+       "name": "Z.AI"
+      },
+      {
+       "value": "zai_coding_plan",
+       "name": "Z.AI Coding Plan"
+      },
+      {
+       "value": "zhipu",
+       "name": "Zhipu AI"
+      }
+     ]
+    },
+    {
+     "id": "mode",
+     "name": "Mode",
+     "category": "mode",
+     "type": "select",
+     "currentValue": "approve",
+     "options": [
+      {
+       "value": "auto",
+       "name": "auto",
+       "description": "Automatically approve tool calls"
+      },
+      {
+       "value": "approve",
+       "name": "approve",
+       "description": "Ask before every tool call"
+      },
+      {
+       "value": "smart_approve",
+       "name": "smart_approve",
+       "description": "Ask only for sensitive tool calls"
+      },
+      {
+       "value": "chat",
+       "name": "chat",
+       "description": "Chat only, no tool calls"
+      }
+     ]
+    },
+    {
+     "id": "model",
+     "name": "Model",
+     "category": "model",
+     "type": "select",
+     "currentValue": "fake-model",
+     "options": [
+      {
+       "value": "fake-model",
+       "name": "fake-model"
+      }
+     ]
+    },
+    {
+     "id": "thinking_effort",
+     "name": "Thinking effort",
+     "description": "Controls reasoning effort for models that support extended thinking.",
+     "category": "thought_level",
+     "type": "select",
+     "currentValue": "off",
+     "options": [
+      {
+       "value": "off",
+       "name": "off"
+      }
+     ]
+    }
+   ],
+   "_meta": {
+    "extensionResults": [
+     {
+      "name": "scheduler",
+      "success": true
+     },
+     {
+      "name": "summon",
+      "success": true
+     },
+     {
+      "name": "skills",
+      "success": true
+     },
+     {
+      "name": "developer",
+      "success": true
+     },
+     {
+      "name": "apps",
+      "success": true
+     },
+     {
+      "name": "tom",
+      "success": true
+     },
+     {
+      "name": "analyze",
+      "success": true
+     },
+     {
+      "name": "Extension Manager",
+      "success": true
+     },
+     {
+      "name": "weft",
+      "success": false,
+      "error": "failed to initialize MCP client: Send message error Transport [rmcp::transport::worker::WorkerTransport<rmcp::transport::streamable_http_client::StreamableHttpClientWorker<reqwest::async_impl::client::Client>>] error: Client error: error sending request for url (http://127.0.0.1:57146/mcp), when send discover request"
+     }
+    ],
+    "workingDir": "/tmp/claude-1000/-home-quent-projekt-Weavemind-weft-trees-agent-nodes/aaed3bfd-c92a-4974-adf0-05cea1ae404c/scratchpad/goose/realroot/work"
+   }
+  }
+ },
+ "replay": {
+  "before": [
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "hello"
+    },
+    "messageId": "msg_8c320ce9-e437-43fe-ae81-be5cf07bd901",
+    "_meta": {
+     "goose": {
+      "created": 1793744415,
+      "messageId": "msg_8c320ce9-e437-43fe-ae81-be5cf07bd901"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "Hello there."
+    },
+    "messageId": "chatcmpl-62ff7857",
+    "_meta": {
+     "goose": {
+      "created": 1793744415,
+      "messageId": "chatcmpl-62ff7857",
+      "inference": {
+       "provider": "openai",
+       "requestedModel": "fake-model"
+      }
+     }
+    }
+   },
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "permission"
+    },
+    "messageId": "msg_12e406a1-fe67-4da3-a8b2-e8111c4a26ea",
+    "_meta": {
+     "goose": {
+      "created": 1793744415,
+      "messageId": "msg_12e406a1-fe67-4da3-a8b2-e8111c4a26ea"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call_683eeb1d",
+    "title": "shell \u00b7 ls",
+    "rawInput": {
+     "command": "ls"
+    },
+    "_meta": {
+     "goose": {
+      "toolCall": {
+       "toolName": "shell",
+       "extensionName": "developer"
+      },
+      "created": 1793744415,
+      "messageId": "chatcmpl-ed8847a0",
+      "inference": {
+       "provider": "openai",
+       "requestedModel": "fake-model"
+      }
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call_683eeb1d",
+    "status": "completed",
+    "content": [
+     {
+      "type": "content",
+      "content": {
+       "type": "text",
+       "text": "notes.md"
+      }
+     }
+    ],
+    "rawOutput": {
+     "stdout": "notes.md",
+     "stderr": "",
+     "exit_code": 0
+    },
+    "_meta": {
+     "goose": {
+      "created": 1793744415,
+      "messageId": "msg_67d6db6c-07da-4fe6-9705-7c13fc94ba98"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "It is notes.md."
+    },
+    "messageId": "chatcmpl-8a91d20a",
+    "_meta": {
+     "goose": {
+      "created": 1793744415,
+      "messageId": "chatcmpl-8a91d20a",
+      "inference": {
+       "provider": "openai",
+       "requestedModel": "fake-model"
+      }
+     }
+    }
+   },
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "reject"
+    },
+    "messageId": "msg_248f43bf-ee5d-4b0e-b398-8b979201e669",
+    "_meta": {
+     "goose": {
+      "created": 1793744415,
+      "messageId": "msg_248f43bf-ee5d-4b0e-b398-8b979201e669"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call_96e0007d",
+    "title": "shell \u00b7 ls",
+    "rawInput": {
+     "command": "ls"
+    },
+    "_meta": {
+     "goose": {
+      "toolCall": {
+       "toolName": "shell",
+       "extensionName": "developer"
+      },
+      "created": 1793744415,
+      "messageId": "chatcmpl-7ad9c5dc",
+      "inference": {
+       "provider": "openai",
+       "requestedModel": "fake-model"
+      }
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call_96e0007d",
+    "status": "failed",
+    "content": [
+     {
+      "type": "content",
+      "content": {
+       "type": "text",
+       "text": "The user has declined to run this tool. DO NOT attempt to call this tool again. If there are no alternative methods to proceed, clearly explain the situation and STOP."
+      }
+     }
+    ],
+    "_meta": {
+     "goose": {
+      "created": 1793744415,
+      "messageId": "msg_3321de39-1cd8-46b1-957a-48c9b39f1ecd"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "It is The user has declined to run this tool. DO NOT attempt to call this tool again. If there are no alternative methods to proceed, clearly explain the situation and STOP.."
+    },
+    "messageId": "chatcmpl-6008f04f",
+    "_meta": {
+     "goose": {
+      "created": 1793744415,
+      "messageId": "chatcmpl-6008f04f",
+      "inference": {
+       "provider": "openai",
+       "requestedModel": "fake-model"
+      }
+     }
+    }
+   },
+   {
+    "sessionUpdate": "user_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "tool"
+    },
+    "messageId": "msg_b732408a-2748-45b1-8eb6-9c898103d8f0",
+    "_meta": {
+     "goose": {
+      "created": 1793744417,
+      "messageId": "msg_b732408a-2748-45b1-8eb6-9c898103d8f0"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call_a1d68aa1",
+    "title": "weft: lookup",
+    "rawInput": {},
+    "_meta": {
+     "goose": {
+      "toolCall": {
+       "toolName": "weft__lookup",
+       "extensionName": "weft"
+      },
+      "created": 1793744417,
+      "messageId": "chatcmpl-6fefc7ae",
+      "inference": {
+       "provider": "openai",
+       "requestedModel": "fake-model"
+      }
+     }
+    }
+   },
+   {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call_a1d68aa1",
+    "status": "completed",
+    "content": [
+     {
+      "type": "content",
+      "content": {
+       "type": "text",
+       "text": "42"
+      }
+     }
+    ],
+    "_meta": {
+     "goose": {
+      "created": 1793744417,
+      "messageId": "msg_ca8bb06c-ba2e-47a8-a8a0-1718afc1c7a1"
+     }
+    }
+   },
+   {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {
+     "type": "text",
+     "text": "It is 42."
+    },
+    "messageId": "chatcmpl-350d62c2",
+    "_meta": {
+     "goose": {
+      "created": 1793744417,
+      "messageId": "chatcmpl-350d62c2",
+      "inference": {
+       "provider": "openai",
+       "requestedModel": "fake-model"
+      }
+     }
+    }
+   }
+  ],
+  "after": [
+   {
+    "sessionUpdate": "usage_update",
+    "used": 12,
+    "size": 128000
+   },
+   {
+    "sessionUpdate": "available_commands_update",
+    "availableCommands": [
+     {
+      "name": "prompts",
+      "description": "List available prompts, optionally filtered by extension",
+      "_meta": {
+       "commandType": "Builtin"
+      }
+     },
+     {
+      "name": "prompt",
+      "description": "Execute a prompt or show its info with --info",
+      "_meta": {
+       "commandType": "Builtin"
+      }
+     },
+     {
+      "name": "compact",
+      "description": "Compact the conversation history",
+      "_meta": {
+       "commandType": "Builtin"
+      }
+     },
+     {
+      "name": "clear",
+      "description": "Clear the conversation history",
+      "_meta": {
+       "commandType": "Builtin"
+      }
+     },
+     {
+      "name": "skills",
+      "description": "List installed skills and other available sources",
+      "_meta": {
+       "commandType": "Builtin"
+      }
+     },
+     {
+      "name": "doctor",
+      "description": "Check that your Goose setup is working",
+      "_meta": {
+       "commandType": "Builtin"
+      }
+     },
+     {
+      "name": "goal",
+      "description": "Set a goal the agent must satisfy before finishing, or clear with /goal off",
+      "_meta": {
+       "commandType": "Builtin"
+      }
+     },
+     {
+      "name": "grind",
+      "description": "Set a goal the agent pursues relentlessly until max_turns, or clear with /grind off",
+      "_meta": {
+       "commandType": "Builtin"
+      }
+     },
+     {
+      "name": "status",
+      "description": "Show session status: model, provider, mode, and token usage",
+      "_meta": {
+       "commandType": "Builtin"
+      }
+     },
+     {
+      "name": "goose-doc-guide",
+      "description": "Reference goose documentation to create, configure, or explain goose-specific features like recipes, extensions, sessions, and providers. You MUST read the relevant goose docs before answering. You MUST NOT rely on training data or assumptions for any goose-specific fields, values, names, syntax, or commands.",
+      "_meta": {
+       "commandType": "Skill"
+      }
+     },
+     {
+      "name": "web-search",
+      "description": "Search the web and extract page content using DuckDuckGo (no API key required), Tavily, or SearXNG. Use whenever the task needs current information, facts not in training data, or content from a specific URL.",
+      "_meta": {
+       "commandType": "Skill"
+      }
+     }
+    ]
+   }
+  ]
+ },
+ "turns": {
+  "hello": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "The"
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888146,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " user"
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888146,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " wants"
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888146,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " me"
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888146,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " to"
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888146,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " reply"
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888146,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with"
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888146,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " exactly"
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888146,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888146,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "Hello"
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888146,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " there"
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888146,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".\""
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888147,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Hello"
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888147,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": " there"
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888147,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "."
+      },
+      "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+      "_meta": {
+       "goose": {
+        "created": 1793888147,
+        "messageId": "gen-1793888146-Wx0iGaQrRVmQ32G8EAFc",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "totalTokens": 4362,
+       "inputTokens": 4345,
+       "outputTokens": 17
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "text",
+     "done"
+    ],
+    "reply": "Hello there."
+   }
+  },
+  "permission": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "The"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " user"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " wants"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " me"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " to"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " run"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " `"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "touch"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " made"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".txt"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "`"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " and"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " then"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " reply"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done"
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".\""
+      },
+      "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+      "_meta": {
+       "goose": {
+        "created": 1793888154,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_236f4813b64b4ab4a710199d",
+      "title": "shell \u00b7 touch made.txt",
+      "rawInput": {
+       "command": "touch made.txt"
+      },
+      "_meta": {
+       "goose": {
+        "toolCall": {
+         "toolName": "shell",
+         "extensionName": "developer"
+        },
+        "created": 1793888155,
+        "messageId": "gen-1793888153-Rx8DJPNz4LnUiTLhInr8",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "call_236f4813b64b4ab4a710199d",
+        "kind": "other",
+        "status": "pending",
+        "title": "shell \u00b7 touch made.txt",
+        "rawInput": {
+         "command": "touch made.txt"
+        }
+       },
+       "options": [
+        {
+         "optionId": "allow_always",
+         "name": "allow_always",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "allow_once",
+         "name": "allow_once",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "reject_once",
+         "name": "reject_once",
+         "kind": "reject_once"
+        },
+        {
+         "optionId": "reject_always",
+         "name": "reject_always",
+         "kind": "reject_always"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_236f4813b64b4ab4a710199d",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "(no output)"
+        }
+       }
+      ],
+      "rawOutput": {
+       "stdout": "",
+       "stderr": "",
+       "exit_code": 0
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "Command"
+      },
+      "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+      "_meta": {
+       "goose": {
+        "created": 1793888155,
+        "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " executed"
+      },
+      "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+      "_meta": {
+       "goose": {
+        "created": 1793888155,
+        "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " successfully"
+      },
+      "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+      "_meta": {
+       "goose": {
+        "created": 1793888155,
+        "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "."
+      },
+      "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+      "_meta": {
+       "goose": {
+        "created": 1793888155,
+        "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " Now"
+      },
+      "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+      "_meta": {
+       "goose": {
+        "created": 1793888156,
+        "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " I"
+      },
+      "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+      "_meta": {
+       "goose": {
+        "created": 1793888156,
+        "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " reply"
+      },
+      "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+      "_meta": {
+       "goose": {
+        "created": 1793888156,
+        "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with"
+      },
+      "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+      "_meta": {
+       "goose": {
+        "created": 1793888156,
+        "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      },
+      "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+      "_meta": {
+       "goose": {
+        "created": 1793888156,
+        "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done"
+      },
+      "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+      "_meta": {
+       "goose": {
+        "created": 1793888156,
+        "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".\""
+      },
+      "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+      "_meta": {
+       "goose": {
+        "created": 1793888156,
+        "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Done"
+      },
+      "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+      "_meta": {
+       "goose": {
+        "created": 1793888156,
+        "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "."
+      },
+      "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+      "_meta": {
+       "goose": {
+        "created": 1793888156,
+        "messageId": "gen-1793888155-Qm2LyYA49mxkq04I5njU",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "totalTokens": 4805,
+       "inputTokens": 4790,
+       "outputTokens": 15
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "tool_use",
+     "question",
+     "tool_result",
+     "thinking",
+     "text",
+     "done"
+    ],
+    "reply": "Done.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "title": "shell \u00b7 touch made.txt",
+        "detail": "touch made.txt"
+       }
+      },
+      "answer": {
+       "choice": "allow_once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "allow_once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "reject": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "goose": {
+        "activeRunId": "run_e2747453-a7ea-488b-8f66-8702b7754625"
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_96e0007d",
+      "title": "shell \u00b7 ls",
+      "rawInput": {
+       "command": "ls"
+      },
+      "_meta": {
+       "goose": {
+        "toolCall": {
+         "toolName": "shell",
+         "extensionName": "developer"
+        },
+        "created": 1793744415,
+        "messageId": "chatcmpl-7ad9c5dc",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 12,
+      "size": 128000
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "call_96e0007d",
+        "kind": "other",
+        "status": "pending",
+        "title": "shell \u00b7 ls",
+        "rawInput": {
+         "command": "ls"
+        }
+       },
+       "options": [
+        {
+         "optionId": "allow_always",
+         "name": "allow_always",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "allow_once",
+         "name": "allow_once",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "reject_once",
+         "name": "reject_once",
+         "kind": "reject_once"
+        },
+        {
+         "optionId": "reject_always",
+         "name": "reject_always",
+         "kind": "reject_always"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_96e0007d",
+      "status": "failed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "The user has declined to run this tool. DO NOT attempt to call this tool again. If there are no alternative methods to proceed, clearly explain the situation and STOP."
+        }
+       }
+      ]
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "It "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "is "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "The "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "user "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "has "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "declined "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "to "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "run "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "this "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "tool. "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "DO "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "NOT "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "attempt "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "to "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "call "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "this "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "tool "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "again. "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "If "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "there "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "are "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "no "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "alternative "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "methods "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "to "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "proceed, "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "clearly "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "explain "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "the "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "situation "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "and "
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "STOP.."
+      },
+      "messageId": "chatcmpl-6008f04f",
+      "_meta": {
+       "goose": {
+        "created": 1793744415,
+        "messageId": "chatcmpl-6008f04f",
+        "inference": {
+         "provider": "openai",
+         "requestedModel": "fake-model"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 12,
+      "size": 128000
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "session_info_update",
+      "_meta": {
+       "goose": {
+        "activeRunId": null
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "usage_update",
+      "used": 12,
+      "size": 128000
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "totalTokens": 12,
+       "inputTokens": 10,
+       "outputTokens": 2
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "tool_use",
+     "question",
+     "tool_result",
+     "text",
+     "done"
+    ],
+    "reply": "It is The user has declined to run this tool. DO NOT attempt to call this tool again. If there are no alternative methods to proceed, clearly explain the situation and STOP..",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "tool": "other",
+        "title": "shell \u00b7 ls",
+        "detail": "ls",
+        "choices": [
+         {
+          "id": "allow_always",
+          "kind": "allow_always"
+         },
+         {
+          "id": "allow_once",
+          "kind": "allow_once"
+         },
+         {
+          "id": "reject_once",
+          "kind": "reject"
+         },
+         {
+          "id": "reject_always",
+          "kind": "reject"
+         }
+        ]
+       }
+      },
+      "answer": {
+       "choice": "reject_once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "reject_once"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "tool": {
+   "tools": true,
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "The"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " user"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " wants"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " me"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " to"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " call"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " the"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " `"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "we"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "ft"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "__"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "look"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "up"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "`"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " tool"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " no"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " arguments"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ","
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " then"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " reply"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "It"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " is"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " <"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "its"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " answer"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ">"
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888149,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".\""
+      },
+      "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+      "_meta": {
+       "goose": {
+        "created": 1793888150,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_3c825f37fb9547b991fc80d6",
+      "title": "weft: lookup",
+      "rawInput": {},
+      "_meta": {
+       "goose": {
+        "toolCall": {
+         "toolName": "weft__lookup",
+         "extensionName": "weft"
+        },
+        "created": 1793888150,
+        "messageId": "gen-1793888148-AjEXscKZifKWjszTXkoR",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "ask": {
+      "method": "session/request_permission",
+      "params": {
+       "sessionId": "$SESSION",
+       "toolCall": {
+        "toolCallId": "call_3c825f37fb9547b991fc80d6",
+        "kind": "other",
+        "status": "pending",
+        "title": "weft: lookup",
+        "rawInput": {}
+       },
+       "options": [
+        {
+         "optionId": "allow_always",
+         "name": "allow_always",
+         "kind": "allow_always"
+        },
+        {
+         "optionId": "allow_once",
+         "name": "allow_once",
+         "kind": "allow_once"
+        },
+        {
+         "optionId": "reject_once",
+         "name": "reject_once",
+         "kind": "reject_once"
+        },
+        {
+         "optionId": "reject_always",
+         "name": "reject_always",
+         "kind": "reject_always"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "tool": {
+      "name": "lookup",
+      "arguments": {}
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_3c825f37fb9547b991fc80d6",
+      "status": "completed",
+      "content": [
+       {
+        "type": "content",
+        "content": {
+         "type": "text",
+         "text": "42"
+        }
+       }
+      ],
+      "rawOutput": {
+       "result": 42
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "The"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " tool"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " returned"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "42"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "\"."
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " So"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " I"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " need"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " to"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " reply"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " with"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " \""
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "It"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888151,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " is"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888152,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": " "
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888152,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": "42"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888152,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_thought_chunk",
+      "content": {
+       "type": "text",
+       "text": ".\""
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888152,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "It"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888152,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": " is"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888152,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": " "
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888152,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "42"
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888152,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "."
+      },
+      "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+      "_meta": {
+       "goose": {
+        "created": 1793888152,
+        "messageId": "gen-1793888151-ReF20YtMmgdbpq2NzSYp",
+        "inference": {
+         "provider": "openrouter",
+         "requestedModel": "deepseek/deepseek-v4-flash"
+        }
+       }
+      }
+     }
+    },
+    {
+     "end": {
+      "stopReason": "end_turn",
+      "usage": {
+       "totalTokens": 4632,
+       "inputTokens": 4607,
+       "outputTokens": 25
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "thinking",
+     "tool_use",
+     "question",
+     "tool_call",
+     "tool_result",
+     "thinking",
+     "text",
+     "done"
+    ],
+    "reply": "It is 42.",
+    "blocks": [
+     {
+      "question": {
+       "kind": "permission",
+       "permission": {
+        "title": "weft: lookup"
+       }
+      },
+      "answer": {
+       "choice": "allow_once"
+      },
+      "agentGot": {
+       "outcome": {
+        "outcome": "selected",
+        "optionId": "allow_once"
+       }
+      }
+     },
+     {
+      "tool": "lookup",
+      "result": "42"
+     }
+    ]
+   }
+  },
+  "bad key": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Ran into this error: Authentication error: Authentication failed for http://127.0.0.1:18931/v1/chat/completions. Status: 401 Unauthorized. Response: Incorrect API key provided: sk-bad..\n\nPlease retry if you think this is a transient or recoverable error."
+      },
+      "messageId": "msg_587bf589-b035-4ade-b00b-00ab8a6dac28",
+      "_meta": {
+       "goose": {
+        "created": 1793744330,
+        "messageId": "msg_587bf589-b035-4ade-b00b-00ab8a6dac28"
+       }
+      }
+     }
+    },
+    {
+     "fail": {
+      "code": -32000,
+      "message": "Authentication required",
+      "data": {
+       "reason": "turn_failed"
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "text",
+     "error"
+    ],
+    "status": "failed",
+    "error": "Authentication required"
+   }
+  },
+  "provider error": {
+   "steps": [
+    {
+     "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+       "type": "text",
+       "text": "Ran into this error: Request failed: Bad request (400): The server had an error.\n\nPlease retry if you think this is a transient or recoverable error."
+      },
+      "messageId": "msg_9f760a2c-b95b-4a96-9a07-d9903b44df68",
+      "_meta": {
+       "goose": {
+        "created": 1793744320,
+        "messageId": "msg_9f760a2c-b95b-4a96-9a07-d9903b44df68"
+       }
+      }
+     }
+    },
+    {
+     "fail": {
+      "code": -32603,
+      "message": "Ran into this error: Request failed: Bad request (400): The server had an error.\n\nPlease retry if you think this is a transient or recoverable error.",
+      "data": {
+       "reason": "turn_failed"
+      }
+     }
+    }
+   ],
+   "expect": {
+    "events": [
+     "text",
+     "error"
+    ],
+    "status": "failed",
+    "error": "Bad request (400): The server had an error"
+   }
+  }
+ },
+ "settings": [
+  {
+   "name": "ask",
+   "given": {
+    "permission": "ask"
+   },
+   "expect": {
+    "args": [
+     [
+      "acp"
+     ]
+    ],
+    "env": {
+     "GOOSE_TELEMETRY_OFF": "true",
+     "GOOSE_DISABLE_SESSION_NAMING": "true"
+    },
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "approve"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "smart_approve",
+   "given": {
+    "permission": "smart_approve"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "smart_approve"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "chat",
+   "given": {
+    "permission": "chat"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "chat"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "bypass",
+   "given": {
+    "permission": "bypass"
+   },
+   "expect": {
+    "requests": [
+     {
+      "method": "session/set_mode",
+      "params": {
+       "modeId": "auto"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "model_and_options",
+   "given": {
+    "model": "claude-sonnet-4-5",
+    "options": {
+     "effort": "high",
+     "maxTurns": 50
+    }
+   },
+   "expect": {
+    "env": {
+     "GOOSE_MODEL": "claude-sonnet-4-5",
+     "GOOSE_THINKING_EFFORT": "high",
+     "GOOSE_MAX_TURNS": "50"
+    }
+   }
+  },
+  {
+   "name": "anthropic_key",
+   "given": {
+    "credentials": {
+     "way": "anthropicKey",
+     "values": {
+      "key": "sk-ant-test"
+     }
+    },
+    "model": "some-model"
+   },
+   "expect": {
+    "env": {
+     "ANTHROPIC_API_KEY": "sk-ant-test",
+     "HOME": "$HOME",
+     "GOOSE_MODEL": "some-model"
+    },
+    "unset": [
+     "OPENAI_API_KEY",
+     "GOOSE_PROVIDER",
+     "GOOSE_MODE",
+     "GOOSE_PATH_ROOT",
+     "XDG_CONFIG_HOME"
+    ],
+    "files": {
+     ".config/goose/config.yaml": [
+      "GOOSE_PROVIDER: anthropic\n",
+      "GOOSE_DISABLE_KEYRING: true\n"
+     ]
+    }
+   }
+  },
+  {
+   "name": "openai_key",
+   "given": {
+    "credentials": {
+     "way": "openaiKey",
+     "values": {
+      "key": "sk-test"
+     }
+    },
+    "model": "some-model"
+   },
+   "expect": {
+    "env": {
+     "OPENAI_API_KEY": "sk-test",
+     "HOME": "$HOME",
+     "GOOSE_MODEL": "some-model"
+    },
+    "unset": [
+     "OPENAI_HOST",
+     "ANTHROPIC_API_KEY",
+     "GOOSE_PROVIDER",
+     "GOOSE_MODE",
+     "GOOSE_PATH_ROOT",
+     "XDG_CONFIG_HOME"
+    ],
+    "files": {
+     ".config/goose/config.yaml": [
+      "GOOSE_PROVIDER: openai\n",
+      "GOOSE_DISABLE_KEYRING: true\n"
+     ]
+    }
+   }
+  },
+  {
+   "name": "google_key",
+   "given": {
+    "credentials": {
+     "way": "googleKey",
+     "values": {
+      "key": "AIza-test"
+     }
+    },
+    "model": "some-model"
+   },
+   "expect": {
+    "env": {
+     "GOOGLE_API_KEY": "AIza-test",
+     "HOME": "$HOME",
+     "GOOSE_MODEL": "some-model"
+    },
+    "unset": [
+     "OPENAI_API_KEY",
+     "GOOSE_PROVIDER",
+     "GOOSE_MODE",
+     "GOOSE_PATH_ROOT",
+     "XDG_CONFIG_HOME"
+    ],
+    "files": {
+     ".config/goose/config.yaml": [
+      "GOOSE_PROVIDER: google\n",
+      "GOOSE_DISABLE_KEYRING: true\n"
+     ]
+    }
+   }
+  },
+  {
+   "name": "openrouter_key",
+   "given": {
+    "credentials": {
+     "way": "openrouterKey",
+     "values": {
+      "key": "sk-or-test"
+     }
+    },
+    "model": "some-model"
+   },
+   "expect": {
+    "env": {
+     "OPENROUTER_API_KEY": "sk-or-test",
+     "HOME": "$HOME",
+     "GOOSE_MODEL": "some-model"
+    },
+    "unset": [
+     "OPENAI_API_KEY",
+     "GOOSE_PROVIDER",
+     "GOOSE_MODE",
+     "GOOSE_PATH_ROOT",
+     "XDG_CONFIG_HOME"
+    ],
+    "files": {
+     ".config/goose/config.yaml": [
+      "GOOSE_PROVIDER: openrouter\n",
+      "GOOSE_DISABLE_KEYRING: true\n"
+     ]
+    }
+   }
+  },
+  {
+   "name": "openai_compatible",
+   "given": {
+    "credentials": {
+     "way": "openaiCompatible",
+     "values": {
+      "host": "http://127.0.0.1:11434",
+      "key": "sk-local"
+     }
+    },
+    "model": "some-model"
+   },
+   "expect": {
+    "env": {
+     "OPENAI_HOST": "http://127.0.0.1:11434",
+     "OPENAI_API_KEY": "sk-local",
+     "HOME": "$HOME",
+     "GOOSE_MODEL": "some-model"
+    },
+    "unset": [
+     "ANTHROPIC_API_KEY",
+     "GOOSE_PROVIDER",
+     "GOOSE_MODE",
+     "GOOSE_PATH_ROOT",
+     "XDG_CONFIG_HOME"
+    ],
+    "files": {
+     ".config/goose/config.yaml": [
+      "GOOSE_PROVIDER: openai\n",
+      "GOOSE_DISABLE_KEYRING: true\n"
+     ]
+    }
+   }
+  },
+  {
+   "name": "a_key_needs_a_model",
+   "given": {
+    "credentials": {
+     "way": "anthropicKey",
+     "values": {
+      "key": "sk-ant-test"
+     }
+    }
+   },
+   "expect": {
+    "error": "goose needs a model for a connection's key"
+   }
+  },
+  {
+   "name": "bad_effort",
+   "given": {
+    "options": {
+     "effort": "extreme"
+    }
+   },
+   "expect": {
+    "error": "takes off, low, medium, high, max"
+   }
+  },
+  {
+   "name": "bad_turns",
+   "given": {
+    "options": {
+     "maxTurns": "lots"
+    }
+   },
+   "expect": {
+    "error": "is a whole number, 1 or more"
+   }
+  }
+ ]
+}

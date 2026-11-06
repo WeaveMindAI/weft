@@ -44,8 +44,8 @@ pub use subscriptions::{
 };
 pub use resolve::{
     caller_values, connections_for_event, events_recipe_hash, events_recipes_of, granted_items,
-    lookup, lookup_url, recipe_value_names, record_events_recipes, resolve_event_source,
-    resolve_for_worker, EventTarget, GrantUser, GrantedQuery, LookupItem, LookupPage,
+    lookup, lookup_url, not_offered_here, recipe_value_names, record_events_recipes, resolve_event_source,
+    renew_for_worker, resolve_for_worker, EventTarget, GrantUser, GrantedQuery, LookupItem, LookupPage,
     LookupRequest, RecordedEventsRecipe, ResolvedAccess, ResolvedEventSource,
 };
 
@@ -210,6 +210,12 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- Which door created it ('shared' / 'own'); drives the
             -- shared-door displacement warning.
             door TEXT NOT NULL DEFAULT 'own',
+            -- The way to sign in a pasted connection was made with (its
+            -- recipe's `acquisition.ways[].id`): which credential its
+            -- values are, for the node reading them, and whether a
+            -- cloud install may open it at all (a local-only way). Set
+            -- exactly when `spec` is a static acquisition.
+            way TEXT,
             -- The connection list's middle column: the app's label, or
             -- the name the user typed for a pasted credential.
             label TEXT,
@@ -544,7 +550,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 /// with whether it is exclusive: the fill before `access_grant.spec`'s
 /// first step (`weft_runtime::schema::documents`), so the rows it copies
 /// are carried to today's shape with the rest and their recipes hashed
-/// again ([`rehash_grant_recipes`]). A data step would copy them only after
+/// again ([`rederive_grant_columns`]). A data step would copy them only after
 /// the carry. The rows there came out of `JSONB`, so none holds a NUL
 /// character the cast would refuse. A database whose `spec_json` is gone
 /// (a fresh one, one this ran on) has nothing to copy.
@@ -623,25 +629,52 @@ const EXCLUSIVE_FOLD: weft_task_store::DataStep = weft_task_store::DataStep {
     "#),
 };
 
-/// A connection's `events_recipe_hash` is the hash of the recipe in its
-/// own snapshot, which is what routes a push to it: hashed again from
-/// each snapshot once the snapshots are in today's shape, so a connection
-/// keeps matching the recipe [`rekey_events_recipes`] keeps it under.
 /// What `access_grant.spec` re-derives once its documents are carried to
-/// today's shape (`weft_runtime::schema::documents`).
-pub fn rehash_grant_recipes<'c>(tx: &'c Transaction<'c>) -> Rederived<'c> {
+/// today's shape (`weft_runtime::schema::documents`), from each row's
+/// snapshot:
+/// - its `events_recipe_hash`, the hash of the recipe in its own
+///   snapshot, which is what routes a push to it, so a connection keeps
+///   matching the recipe [`rekey_events_recipes`] keeps it under;
+/// - its `way`, for a pasted connection made before recipes offered ways
+///   to sign in: it was made with its recipe's one way, which the carry
+///   named [`weft_core::access::spec::DEFAULT_WAY`].
+pub fn rederive_grant_columns<'c>(tx: &'c Transaction<'c>) -> Rederived<'c> {
     Box::pin(async move {
-        let rows: Vec<(uuid::Uuid, JsonText<serde_json::Value>, weft_core::stored::Version, Option<String>)> = tx
-            .all("SELECT id, spec, spec_version, events_recipe_hash FROM access_grant", &[])
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(uuid::Uuid, JsonText<serde_json::Value>, weft_core::stored::Version, Option<String>, Option<String>)> = tx
+            .all("SELECT id, spec, spec_version, events_recipe_hash, way FROM access_grant", &[])
             .await?;
-        for (id, JsonText(spec), version, stored) in rows {
-            let hash = resolve::events_recipe_hash(&spec_of(format_args!("connection {id}"), spec, version)?.events);
+        for (id, JsonText(spec), version, stored, way) in rows {
+            let spec = spec_of(format_args!("connection {id}"), spec, version)?;
+            let hash = resolve::events_recipe_hash(&spec.events);
             if hash != stored {
                 tx.execute("UPDATE access_grant SET events_recipe_hash = $2 WHERE id = $1", &[&id, &hash]).await?;
+            }
+            let filled = way_made_with(&spec, way.as_deref(), id)?;
+            if filled != way {
+                tx.execute("UPDATE access_grant SET way = $2 WHERE id = $1", &[&id, &filled]).await?;
             }
         }
         Ok(())
     })
+}
+
+/// The way to sign in connection `id` was made with, as its row records
+/// it today: the one it names, or, for a pasted connection made before
+/// recipes offered ways (it names none), the recipe's one way, which the
+/// carry of its recipe named [`weft_core::access::spec::DEFAULT_WAY`].
+/// `None` for a connection whose recipe takes no pasted credential.
+///
+/// ONE definition, because a connection from before ways reaches this
+/// weft two ways and both must fill it the same: a row of this database,
+/// at boot ([`rederive_grant_columns`]), and a row another weft exported,
+/// on import (`migrate::import`).
+pub(crate) fn way_made_with(spec: &weft_core::AccessSpec, way: Option<&str>, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
+    if way.is_some() || spec.ways().is_empty() {
+        return Ok(way.map(str::to_string));
+    }
+    let only = spec.chosen_way(None).map_err(|why| anyhow::anyhow!("connection {id} names no way to sign in: {why}"))?;
+    Ok(Some(only.id.clone()))
 }
 
 /// A recorded recipe is kept under the hash of its JSON: keyed again

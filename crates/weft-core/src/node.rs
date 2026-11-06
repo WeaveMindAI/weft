@@ -294,6 +294,17 @@ pub struct NodeMetadata {
     /// wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validate: Vec<ValidationRule>,
+    /// Named lists of values this node declares for ANOTHER node's rules
+    /// to read: a node wired into one of that node's inputs is asked
+    /// through a `noneOf` or `noneMatch` check naming the list
+    /// (`{ "list": "reservedToolNames", "ofNodeWiredInto": "agent" }`,
+    /// [`ValueList::Wired`]). List name to its items, camelCase names,
+    /// text items (`"lists": { "reservedToolNames": ["Task", "Read"] }`).
+    /// Mirrored onto the node in the program
+    /// (`crate::project::NodeDefinition::lists`), where the rule finds it
+    /// without a catalog. Backend-only, absent from the wire when empty.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub lists: std::collections::BTreeMap<String, Vec<String>>,
     /// This node's ports come from a LIST in its own config: which
     /// config key holds the list, which entry kinds it may use, and
     /// what ports each kind materializes. `None` for everything else.
@@ -1290,6 +1301,9 @@ impl NodeMetadata {
                 }
             }
         }
+        for name in self.lists.keys() {
+            crate::casing::Casing::Camel.check("list", name).map_err(|why| format!("lists: {why}"))?;
+        }
         for rule in &self.validate {
             self.check_condition(&rule.when)?;
         }
@@ -1327,7 +1341,13 @@ impl NodeMetadata {
             | Condition::InputNames { port, .. } => input(port),
             Condition::Value { field, checks } => {
                 input(field)?;
-                checks.check_declaration().map_err(|why| format!("a validate rule on '{field}': {why}"))
+                checks.check_declaration().map_err(|why| format!("a validate rule on '{field}': {why}"))?;
+                // The input a wired list is read through is one of this
+                // node's, or the list is never found and the check never
+                // refuses anything.
+                checks.wired_lists().try_for_each(|wired| {
+                    input(&wired.of_node_wired_into).map_err(|why| format!("a validate rule on '{field}' reads a list through `ofNodeWiredInto`: {why}"))
+                })
             }
             Condition::OutputWired { port } | Condition::OutputTypeFits { port, .. } => output(port),
             Condition::All { of } | Condition::Any { of } => {
@@ -1345,7 +1365,8 @@ impl NodeMetadata {
             | Condition::CustomOutputsDeclared {}
             | Condition::RunReaches { .. }
             | Condition::DownstreamOf { .. }
-            | Condition::PerInstance {} => Ok(()),
+            | Condition::PerInstance {}
+            | Condition::LocalInstall {} => Ok(()),
         }
     }
 
@@ -2040,7 +2061,7 @@ impl NodeMetadata {
 /// Free-form values (a `default`'s contents, a rule's `equals`
 /// payload, a list source's `where`) keep every key name and every
 /// null they hold.
-pub const COMPACT_KEEP_TOP_LEVEL: [&str; 13] = [
+pub const COMPACT_KEEP_TOP_LEVEL: [&str; 14] = [
     "type",
     "description",
     "inputs",
@@ -2050,6 +2071,9 @@ pub const COMPACT_KEEP_TOP_LEVEL: [&str; 13] = [
     "requiresInfra",
     "features",
     "validate",
+    // What another node's rule refuses when this node is wired into it
+    // (the tool names an agent keeps): a builder naming a tool needs them.
+    "lists",
     "portsFromConfig",
     "publishes",
     "types",
@@ -2370,8 +2394,9 @@ pub enum RuleSeverity {
 
 /// Closed-grammar condition language. Each variant is evaluated
 /// against a `RuleContext` (the node being validated + the enriched
-/// project). No loops, no recursion on user data; only structural
-/// boolean combinators plus a small set of graph/config queries. A
+/// project). No loops, no recursion on user data: a small set of
+/// graph/config queries, each answering yes, no or not yet known, and
+/// combinators that fold those three answers (`crate::rules`). A
 /// `value` query on a field a wire fills is answered when the node
 /// fires, with the value that arrived (`crate::rules::recheck`).
 /// Read through [`Condition`]'s own `Deserialize`, which refuses a kind
@@ -2495,6 +2520,18 @@ pub enum Condition {
     /// the rule does not fire. Wrap in `not` to refuse a bad name;
     /// `{names}` in the message lists the ones that fail.
     InputNames { port: String, names: Named },
+    /// The program is being built for a local install: one that runs what
+    /// it runs on the machine weft itself runs on, where a cloud install
+    /// has no such machine (`crate::install::InstallKind`). Answered from
+    /// the install the program was compiled for
+    /// (`crate::project::ProjectDefinition::install`): the install's own
+    /// version build compiles for it, and a run reads it off the program
+    /// it runs, so a rule pairing it with a value a wire fills is asked
+    /// again when the node fires like any other. A compile for no install
+    /// (`weft validate`, the editor, a command's own compile) has no
+    /// answer, and neither has `not` around it: a rule leaning on it does
+    /// not fire there. Braced (`{}`) so a stray field on it is refused.
+    LocalInstall {},
     /// All sub-conditions must hold.
     All { of: Vec<Condition> },
     /// At least one sub-condition must hold.
@@ -2581,6 +2618,15 @@ pub struct ValueChecks {
     /// Equals one of these JSON values.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub one_of: Option<Vec<Value>>,
+    /// Equals none of these values ([`ValueList`]): listed here, or a
+    /// list the node wired into one of this node's inputs declares.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub none_of: Option<ValueList>,
+    /// A text none of these regexes matches ([`ValueList`], each item a
+    /// regex): listed here, or a list the node wired into one of this
+    /// node's inputs declares.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub none_match: Option<ValueList>,
     /// A text this regex matches.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matches: Option<String>,
@@ -2604,7 +2650,7 @@ pub struct ValueChecks {
 
 impl ValueChecks {
     /// The keys a `value` condition takes beside `kind` and `field`.
-    const KEYS: &'static str = "nonempty, equals, oneOf, matches, count, range, length, unique and each";
+    const KEYS: &'static str = "nonempty, equals, oneOf, noneOf, noneMatch, matches, count, range, length, unique and each";
 
     /// No check: the condition asks only whether a value is there.
     pub fn is_empty(&self) -> bool {
@@ -2627,6 +2673,8 @@ impl ValueChecks {
             nonempty: take(map, "nonempty")?.unwrap_or(false),
             equals: take(map, "equals")?,
             one_of: take(map, "oneOf")?,
+            none_of: take(map, "noneOf")?,
+            none_match: take(map, "noneMatch")?,
             matches: take(map, "matches")?,
             count: take(map, "count")?,
             range: take(map, "range")?,
@@ -2641,8 +2689,9 @@ impl ValueChecks {
     }
 
     /// What is wrong with these checks as written in a node's metadata: a
-    /// regex that does not compile, bounds with neither end or the ends
-    /// crossed, an `each` checking nothing.
+    /// regex that does not compile (in `matches` or a written
+    /// `noneMatch`), bounds with neither end or the ends crossed, an
+    /// `each` checking nothing, a wired list whose name is not camelCase.
     pub fn check_declaration(&self) -> Result<(), String> {
         if let Some(regex) = &self.matches {
             regex::Regex::new(regex).map_err(|e| format!("`matches` is no regex ({e})"))?;
@@ -2662,7 +2711,169 @@ impl ValueChecks {
             }
             each.checks.check_declaration().map_err(|why| format!("in `each`, {why}"))?;
         }
+        if let Some(ValueList::Listed(patterns)) = &self.none_match {
+            patterns.iter().try_for_each(|pattern| pattern_fault(pattern).map_err(|why| format!("`noneMatch`: {why}")))?;
+        }
+        for (refusal, list) in self.lists() {
+            if let ValueList::Wired(wired) = list {
+                crate::casing::Casing::Camel.check("the list", &wired.list).map_err(|why| format!("`{}`: {why}", refusal.key()))?;
+            }
+        }
         Ok(())
+    }
+
+    /// Every list these checks read off a wired node ([`ValueList::Wired`]),
+    /// inside `each` too.
+    pub fn wired_lists(&self) -> impl Iterator<Item = &WiredList> {
+        self.levels().flat_map(|checks| checks.lists().filter_map(|(_, list)| list.wired()))
+    }
+
+    /// The lists a value is refused by at this level, each with what
+    /// reads it ([`Refusal`]).
+    pub fn lists(&self) -> impl Iterator<Item = (Refusal, &ValueList)> {
+        Refusal::ALL.into_iter().filter_map(|refusal| refusal.of(self).map(|list| (refusal, list)))
+    }
+
+    /// These checks, then the ones of their `each`, and down.
+    pub fn levels(&self) -> impl Iterator<Item = &ValueChecks> {
+        std::iter::successors(Some(self), |checks| checks.each.as_ref().map(|each| &each.checks))
+    }
+}
+
+/// What is wrong with `pattern` as an item of a `noneMatch` list: not
+/// text, or no regex. Asked of a written list when the metadata loads,
+/// and of a list a wired node declares when the program is built
+/// (`crate::rules::wired_list_faults`).
+pub fn pattern_fault(pattern: &Value) -> Result<(), String> {
+    let Value::String(text) = pattern else { return Err(format!("{pattern} is no regex, a regex is text")) };
+    regex::Regex::new(text).map(drop).map_err(|e| format!("'{text}' is no regex ({e})"))
+}
+
+/// The two checks that refuse a value by a list ([`ValueList`]): `noneOf`
+/// refuses a value its list holds, `noneMatch` a text one of its regexes
+/// matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    NoneOf,
+    NoneMatch,
+}
+
+impl Refusal {
+    pub const ALL: [Refusal; 2] = [Refusal::NoneOf, Refusal::NoneMatch];
+
+    /// The check's key in a `value` condition.
+    pub fn key(self) -> &'static str {
+        match self {
+            Refusal::NoneOf => "noneOf",
+            Refusal::NoneMatch => "noneMatch",
+        }
+    }
+
+    /// The message hole naming the values this check refused.
+    pub fn hole(self) -> &'static str {
+        match self {
+            Refusal::NoneOf => "{noneOfFound}",
+            Refusal::NoneMatch => "{noneMatchFound}",
+        }
+    }
+
+    /// The list `checks` holds for this check.
+    pub fn of(self, checks: &ValueChecks) -> Option<&ValueList> {
+        match self {
+            Refusal::NoneOf => checks.none_of.as_ref(),
+            Refusal::NoneMatch => checks.none_match.as_ref(),
+        }
+    }
+
+    /// The list `checks` holds for this check, to write into.
+    pub fn of_mut(self, checks: &mut ValueChecks) -> &mut Option<ValueList> {
+        match self {
+            Refusal::NoneOf => &mut checks.none_of,
+            Refusal::NoneMatch => &mut checks.none_match,
+        }
+    }
+
+    /// Whether `listed` (written in, [`ValueList::Listed`]) refuses
+    /// `value`: `noneOf` when it holds the value, `noneMatch` when the
+    /// value is text one of its regexes matches. A malformed regex
+    /// matches nothing (the load and the build refuse one).
+    pub fn refuses(self, listed: &[Value], value: &Value) -> bool {
+        match self {
+            Refusal::NoneOf => listed.contains(value),
+            Refusal::NoneMatch => value.as_str().is_some_and(|text| listed.iter().filter_map(Value::as_str).any(|pattern| regex_matches(pattern, text))),
+        }
+    }
+}
+
+/// Whether `regex` matches `text`; a malformed regex matches nothing (the
+/// metadata load and the build refuse one, so only a hand-made rule holds
+/// one).
+pub(crate) fn regex_matches(regex: &str, text: &str) -> bool {
+    regex::Regex::new(regex).is_ok_and(|r| r.is_match(text))
+}
+
+/// The values a `noneOf` or `noneMatch` check refuses by ([`Refusal`]).
+/// Written as a JSON list (`"noneOf": ["root", "admin"]`, `"noneMatch":
+/// ["^mcp__"]`), or as the list another node declares (`"noneOf": {
+/// "list": "reservedToolNames", "ofNodeWiredInto": "agent" }`): the one
+/// named `list` in the `lists` of the node whose output is wired into this
+/// node's input `ofNodeWiredInto` ([`NodeMetadata::lists`]).
+///
+/// The wired form is resolved by the compile, which sees the wires: a
+/// rule it leaves to the run is recorded with the values the wired node
+/// lists written in ([`ValueList::Listed`]), so a run reads no other node.
+/// Followed through groups, included files and a loop's `LoopIn`, to the
+/// node the value comes from. An input nothing is wired into lists
+/// nothing, so the check holds (the input's own rules say it is missing).
+/// A node wired in that declares no list of that name breaks the program
+/// (`crate::rules::wired_list_faults`), unless the rule marks the list
+/// `optional`: a misspelled list would otherwise refuse nothing. Several
+/// nodes wired in (a body included at several sites) list every value
+/// any of them lists.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ValueList {
+    Listed(Vec<Value>),
+    Wired(WiredList),
+}
+
+impl ValueList {
+    /// The list another node declares, when this is one.
+    pub fn wired(&self) -> Option<&WiredList> {
+        match self {
+            ValueList::Wired(wired) => Some(wired),
+            ValueList::Listed(_) => None,
+        }
+    }
+}
+
+/// A list another node declares, read through the input it is wired
+/// into ([`ValueList::Wired`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WiredList {
+    /// The list's name in the wired node's `lists`.
+    pub list: String,
+    /// This node's input the node declaring the list is wired into.
+    pub of_node_wired_into: String,
+    /// A node wired in may declare no list of this name, which then lists
+    /// nothing: for a list only some of the nodes that fit the input have
+    /// (an agent's reserved tool name patterns). Left out, such a node
+    /// breaks the program, naming the list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
+}
+
+impl<'de> Deserialize<'de> for ValueList {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match Value::deserialize(deserializer)? {
+            Value::Array(items) => Ok(ValueList::Listed(items)),
+            wired @ Value::Object(_) => serde_json::from_value(wired).map(ValueList::Wired).map_err(D::Error::custom),
+            other => Err(D::Error::custom(format!(
+                "a list of values, or `{{ \"list\": \"...\", \"ofNodeWiredInto\": \"...\" }}`, and {other} is neither"
+            ))),
+        }
     }
 }
 
@@ -6255,8 +6466,8 @@ mod input_semantics_tests {
             m.service = Some(
                 serde_json::from_value(json!({
                     "service": "tg",
-                    "acquisition": {"kind": "static", "fields": [
-                        {"name": "token", "label": "Token"}]}
+                    "acquisition": {"kind": "static", "ways": [{"fields": [
+                        {"name": "token", "label": "Token"}]}]}
                 }))
                 .expect("spec"),
             );
@@ -6375,6 +6586,65 @@ mod input_semantics_tests {
     }
 
     /// One name = one input; a duplicate is a metadata error.
+    /// A node's `lists` load with camelCase names and text items; a
+    /// `noneOf` reading a wired node's list names one of this node's
+    /// inputs and a camelCase list; a `noneOf` of any other shape is
+    /// refused saying what it takes.
+    #[test]
+    fn validate_semantics_holds_lists_and_wired_none_of() {
+        let read = |lists: Value| serde_json::from_value::<std::collections::BTreeMap<String, Vec<String>>>(lists);
+        let mut meta = metadata_with(vec![input("agent", WeftType::primitive(WeftPrimitive::String))]);
+        meta.lists = read(json!({ "reservedToolNames": ["Task", "Read"] })).unwrap();
+        meta.validate_semantics().expect("camelCase names load");
+        assert!(read(json!({ "reservedToolNames": ["Task", 3] })).is_err(), "an item is text");
+        meta.lists = read(json!({ "reserved_tool_names": [] })).unwrap();
+        let e = meta.validate_semantics().unwrap_err();
+        assert!(e.contains("lists: list 'reserved_tool_names' is not camelCase: write 'reservedToolNames'"), "{e}");
+        meta.lists.clear();
+        let rule = |none_of: Value| -> Result<ValidationRule, serde_json::Error> {
+            serde_json::from_value(json!({
+                "when": { "kind": "value", "field": "agent", "each": { "key": "name", "noneOf": none_of } },
+                "then": { "message": "m" }
+            }))
+        };
+        meta.validate = vec![rule(json!({ "list": "reservedToolNames", "ofNodeWiredInto": "agent" })).unwrap()];
+        meta.validate_semantics().expect("a wired list through one of its inputs loads");
+        meta.validate = vec![rule(json!({ "list": "reservedToolNames", "ofNodeWiredInto": "brain" })).unwrap()];
+        let e = meta.validate_semantics().unwrap_err();
+        assert!(e.contains("reads a list through `ofNodeWiredInto`") && e.contains("input 'brain'"), "{e}");
+        meta.validate = vec![rule(json!({ "list": "Reserved", "ofNodeWiredInto": "agent" })).unwrap()];
+        let e = meta.validate_semantics().unwrap_err();
+        assert!(e.contains("the list 'Reserved' is not camelCase"), "{e}");
+        meta.validate = vec![rule(json!(["root", "admin"])).unwrap()];
+        meta.validate_semantics().expect("a written list loads");
+        let e = rule(json!("root")).unwrap_err().to_string();
+        assert!(e.contains("`noneOf`: a list of values, or"), "{e}");
+        let e = rule(json!({ "list": "x", "ofNode": "agent" })).unwrap_err().to_string();
+        assert!(e.contains("unknown field `ofNode`"), "{e}");
+        // `noneMatch` takes the same two shapes; a written one holds
+        // regexes, each compiled when the metadata loads.
+        let matching = |patterns: Value| -> ValidationRule {
+            serde_json::from_value(json!({
+                "when": { "kind": "value", "field": "agent", "each": { "key": "name", "noneMatch": patterns } },
+                "then": { "message": "m" }
+            }))
+            .unwrap()
+        };
+        meta.validate = vec![matching(json!(["^mcp__", "[^a-zA-Z0-9_-]"]))];
+        meta.validate_semantics().expect("written regexes load");
+        meta.validate = vec![matching(json!({ "list": "reservedToolNamePatterns", "ofNodeWiredInto": "agent", "optional": true }))];
+        meta.validate_semantics().expect("an optional wired list loads");
+        meta.validate = vec![matching(json!(["^mcp__", "("]))];
+        let e = meta.validate_semantics().unwrap_err();
+        assert!(e.contains("a validate rule on 'agent': in `each`, `noneMatch`: '(' is no regex ("), "{e}");
+        meta.validate = vec![matching(json!([3]))];
+        let e = meta.validate_semantics().unwrap_err();
+        assert!(e.contains("`noneMatch`: 3 is no regex, a regex is text"), "{e}");
+        meta.validate = vec![matching(json!({ "list": "Patterns", "ofNodeWiredInto": "agent" }))];
+        let e = meta.validate_semantics().unwrap_err();
+        assert!(e.contains("`noneMatch`: the list 'Patterns' is not camelCase"), "{e}");
+    }
+
     #[test]
     fn validate_semantics_rejects_duplicate_input_names() {
         let meta = metadata_with(vec![
@@ -6830,12 +7100,13 @@ mod compact_view_tests {
             .keys()
             .map(|k| k.as_str())
             .collect();
-        const SERIALIZED_WHEN_NON_EMPTY: [&str; 13] = [
+        const SERIALIZED_WHEN_NON_EMPTY: [&str; 14] = [
             "metadataPorts",
             "images",
             "publishes",
             "display",
             "validate",
+            "lists",
             "portsFromConfig",
             "service",
             "accessApps",

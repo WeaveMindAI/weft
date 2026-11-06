@@ -48,8 +48,11 @@ process uses. Workers, listeners and supervisors ask it; only it and the
 dispatcher touch Postgres.
 
 **Bus.** A live channel between nodes that are running at the same time. Any
-number of participants, each with its own position. It lives exactly as long as
-its worker.
+number of participants, each with its own position. It stays open while any
+node that registered a name on it is still on it, through a pause of the run
+too, and ends once nobody is on it and no node can still join it, or when a node
+closes it (go and read [how a bus
+ends](../language/streams-and-buses.md#how-a-bus-ends)).
 
 **Closure.** A pulse carrying no value, meaning nothing will ever arrive here
 for this run. It is how a node says no rather than saying nothing. Not `null`,

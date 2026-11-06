@@ -304,6 +304,10 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 own_base_url: config.own_base_url().to_string(),
                 container_files_base: config.container_files_base(),
                 object_store_public_internet: config.object_store.public_internet(),
+                install: match config.platform {
+                    PlatformConfig::Local(_) => weft_core::install::InstallKind::Local,
+                    PlatformConfig::Gcp(_) => weft_core::install::InstallKind::Cloud,
+                },
                 slot_key: weft_core::storage::slot::SlotKey::of(&install_secret()?),
                 line_max_age: platform::line_max_age(&config, serverless),
                 dispatcher_alarm: (config.roles.of(CoreRole::Dispatcher) == Placement::Serverless).then(|| parts.alarm.clone()),
@@ -467,6 +471,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             broker: weft_broker_client::BrokerSupervisorClient::new(weft_broker_client::BrokerLink::new(addresses.broker.clone(), token)),
             replica: replica.clone(),
             host: parts.host.clone(),
+            inside: Arc::new(weft_infra_supervisor::inside::HttpInsideRemover::new().context("build the supervisor's HTTP client")?),
             clock: Arc::new(weft_platform_traits::SystemClock),
             ownership_interval: weft_core::time_scale::scaled(SUPERVISOR_OWNERSHIP_EVERY),
             health_interval: weft_core::time_scale::scaled(SUPERVISOR_HEALTH_EVERY),

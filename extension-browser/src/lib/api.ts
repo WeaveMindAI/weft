@@ -47,6 +47,13 @@ export interface FormField {
   value?: unknown;
   /// Always on the wire, `{}` when the source set nothing.
   config: Record<string, unknown>;
+  /// The person must answer this field before the form can be sent.
+  /// Absent when false.
+  required?: boolean;
+  /// The key of the field this one is a second way of answering (a box
+  /// for an answer of the person's own beside a list of options): an
+  /// answer here counts as one there for `required`.
+  answersFor?: string;
 }
 
 export interface FormSchema {

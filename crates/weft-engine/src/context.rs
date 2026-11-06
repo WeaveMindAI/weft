@@ -723,6 +723,7 @@ impl FakeAccessBroker {
             owner,
             keep_until_unix: None,
             published_by: None,
+            way: None,
         });
     }
 }
@@ -859,11 +860,27 @@ pub struct BusCoordinator {
     pump: Option<BusPump>,
     /// The bus each firing created on each output port: what a resumed
     /// body creating its bus there again gets ([`Self::bus_on`]).
-    created: Mutex<HashMap<(FiringLocation, String), uuid::Uuid>>,
+    created: Mutex<Created>,
     /// The buses the pump has to tell the record were created
     /// (`RunEvent::BusCreated`), before any row of their own: each with
     /// its creator and port.
     unannounced: Mutex<Vec<(std::sync::Weak<BusInner>, FiringLocation, String)>>,
+}
+
+/// The buses the run's firings created ([`BusCoordinator::bus_on`]), found
+/// by where they were made (the firing and the port its marker goes out
+/// on) and by bus.
+#[derive(Default)]
+struct Created {
+    by_place: HashMap<(FiringLocation, String), uuid::Uuid>,
+    by_bus: HashMap<uuid::Uuid, (FiringLocation, String)>,
+}
+
+impl Created {
+    fn insert(&mut self, place: (FiringLocation, String), bus: uuid::Uuid) {
+        self.by_bus.insert(bus, place.clone());
+        self.by_place.insert(place, bus);
+    }
 }
 
 /// A run's bus pump ([`run_bus_journal_task`]): started by the run's first
@@ -900,7 +917,7 @@ impl BusCoordinator {
             pump_should_exit: std::sync::atomic::AtomicBool::new(false),
             flush_now: std::sync::atomic::AtomicBool::new(false),
             pump,
-            created: Mutex::new(HashMap::new()),
+            created: Mutex::new(Created::default()),
             unannounced: Mutex::new(Vec::new()),
         })
     }
@@ -937,9 +954,9 @@ impl BusCoordinator {
     /// once gone, the bus's hooks no-op. Errors on an invalid `window`.
     ///
     /// `sent_before`: the firing put a marker on `port` before a pause.
-    /// The run holds that bus unless it closed before the pause, and a
-    /// fresh one in its place would reach none of the readers holding the
-    /// marker, so that is refused.
+    /// The run holds that bus, open or ended, unless its record lost it;
+    /// a fresh one in its place would reach none of the readers holding
+    /// the marker, so that is refused.
     pub fn bus_on(
         self: &Arc<Self>,
         opts: BusOptions,
@@ -950,20 +967,24 @@ impl BusCoordinator {
     ) -> Result<BusHandle, String> {
         let mut created = self.created.lock().expect("created buses poisoned");
         let key = (node.clone(), port.to_string());
-        if let Some(id) = created.get(&key) {
+        if let Some(id) = created.by_place.get(&key) {
+            // Its body returning tells the bus, which may be left with
+            // nobody on it.
+            firing.touched(*id);
             return self.registry.handle(*id, Some(node), Some(firing)).ok_or_else(|| {
                 format!("the bus this firing created on '{port}' is no longer held by the run")
             });
         }
         if sent_before {
             return Err(format!(
-                "this firing sent a bus on '{port}' before it paused, and that bus closed before the pause; a body \
-                 resumed from its saved state must not open its bus again once it closed (keep in the state that it is done)"
+                "this firing sent a bus on '{port}' before it paused, and the run's record no longer holds that bus, so \
+                 the readers holding its marker cannot be reached; run the program again"
             ));
         }
         let weak = Arc::downgrade(&self.waits) as std::sync::Weak<dyn WaitLiveness>;
         let pump_notify_weak = Arc::downgrade(&self.journal_pump_notify);
-        let bus = BusHandle::create_with_engine(opts, weak, pump_notify_weak, Some(node.clone()), Some(firing))?;
+        let bus = BusHandle::create_with_engine(opts, weak, pump_notify_weak, Some(node.clone()), Some(firing.clone()))?;
+        firing.touched(bus.id());
         // Queued for its announcement before the pump can see it: the
         // pump reads the buses it drains before it takes the ones to
         // announce, so a bus it drains is always announced first.
@@ -975,17 +996,18 @@ impl BusCoordinator {
         Ok(bus)
     }
 
-    /// Open again every bus `open` (a paused run's, from its record),
-    /// before any body runs, with the names each held-over firing still
-    /// holds on it (`held`, by bus: name, firing, `Joined` offset). Each
+    /// Open again every bus of `buses` (a paused run's, from its record),
+    /// before any body runs, with who is on it (`members`, by bus: each
+    /// name, the paused firing it belongs to, its `Joined` offset). Each
     /// keeps its id, so the markers handed out still name it, and its
-    /// creator's port, so a resumed creator gets it back.
+    /// creator's port, so a resumed creator gets it back as it is: open
+    /// where it stood, or ended the way it ended.
     pub fn reopen(
         self: &Arc<Self>,
-        open: &std::collections::BTreeMap<uuid::Uuid, weft_core::primitive::OpenBus>,
-        mut held: HashMap<uuid::Uuid, Vec<(String, FiringLocation, u64)>>,
+        buses: &std::collections::BTreeMap<uuid::Uuid, weft_core::primitive::RecordedBus>,
+        mut members: HashMap<uuid::Uuid, Vec<(String, FiringLocation, u64)>>,
     ) -> Result<(), String> {
-        for (id, bus) in open {
+        for (id, bus) in buses {
             let reopened = weft_core::bus::ReopenedBus {
                 id: *id,
                 opts: BusOptions {
@@ -996,9 +1018,11 @@ impl BusCoordinator {
                 },
                 next_offset: bus.next_offset,
                 joined: bus.joined.iter().cloned().collect(),
-                held_over: held.remove(id).unwrap_or_default(),
+                members: members.remove(id).unwrap_or_default(),
                 retained: bus.retained.iter().cloned().collect(),
                 lost_through: bus.lost_through,
+                end: bus.end.clone(),
+                last_left: bus.last_left.clone(),
             };
             let weak = Arc::downgrade(&self.waits) as std::sync::Weak<dyn WaitLiveness>;
             let handle = BusHandle::reopen(reopened, weak, Arc::downgrade(&self.journal_pump_notify))
@@ -1006,22 +1030,22 @@ impl BusCoordinator {
             self.registry.insert(&handle);
             self.created.lock().expect("created buses poisoned").insert((bus.creator.clone(), bus.port.clone()), *id);
         }
-        if !open.is_empty() {
+        // An ended bus has nothing left to write.
+        if buses.values().any(|bus| bus.end.is_none()) {
             self.start_pump();
         }
         Ok(())
     }
 
-    /// The firing at `at` ended for good: every name it held over a pause
-    /// and did not take back leaves the bus it was on. `buses`: the buses
-    /// the firing holds a name on (`FiringBuses::named_on`), the only ones
-    /// a held-over name of its can be on.
-    pub fn release_held(&self, at: &FiringLocation, buses: &[uuid::Uuid]) {
-        for &id in buses {
-            if let Some(bus) = self.registry.handle(id, None, None) {
-                bus.inner_arc().release_held(at);
-            }
-        }
+    /// The run's bus `id`, if it holds it.
+    pub fn bus(&self, id: uuid::Uuid) -> Option<Arc<BusInner>> {
+        self.registry.bus(id)
+    }
+
+    /// The firing that made bus `id` and the output port its marker goes
+    /// out on, `None` for a bus no firing of the run made.
+    pub fn maker_of(&self, id: uuid::Uuid) -> Option<(FiringLocation, String)> {
+        self.created.lock().expect("created buses poisoned").by_bus.get(&id).cloned()
     }
 
     /// End bus `id` as `end`, whoever holds it.
@@ -1544,11 +1568,12 @@ fn membership_event(run_id: RunId, bus_id: &str, entry: &BusEntry) -> RunEvent {
             name: name.clone(),
             at_unix,
         },
-        BusEntryKind::Left { name } => RunEvent::BusLeft {
+        BusEntryKind::Left { name, end } => RunEvent::BusLeft {
             run_id,
             bus_id: bus_id.to_string(),
             offset,
             name: name.clone(),
+            end: end.clone(),
             at_unix,
         },
         BusEntryKind::Closed { end } => RunEvent::BusClosed {
@@ -1775,9 +1800,9 @@ pub struct RunnerHandle {
     /// handle another node shared resolves only to one of these.
     declared_infra: Arc<weft_core::project::DeclaredInfra>,
     /// This firing's side of every bus it touches
-    /// (`weft_core::bus::FiringBuses`): the buses it ends when its body
-    /// does ([`Self::end_body`]), and where it stands on each, saved
-    /// with its state. Shared with every bus handle it gets.
+    /// (`weft_core::bus::FiringBuses`): the buses its names leave when its
+    /// body returns ([`Self::end_body`]), and where it stands on each,
+    /// saved with its state. Shared with every bus handle it gets.
     buses: Arc<weft_core::bus::FiringBuses>,
     /// The node's baked outputs (`weft_core::infra::bake`), and what the
     /// body emitted on them this firing: what an infra setup saves.
@@ -1943,9 +1968,102 @@ pub struct RunnerHandle {
     /// of the runtime's to retire, and the user's own secrets must
     /// not travel back on a release.
     opened_accesses: Mutex<Vec<(String, std::collections::BTreeMap<String, String>)>>,
+    /// What this firing was last handed for each connection it opened,
+    /// by connection id, as [`weft_core::access::handed_digest`]. A
+    /// renewal (`ctx.renew`) carries it as the values that stopped
+    /// working, so the store renews only while the connection still
+    /// hands them and otherwise hands what replaced them. The LAST open
+    /// counts: those are the values the node is using.
+    handed: Mutex<HashMap<String, String>>,
 }
 
 impl RunnerHandle {
+    /// One resolve of `access` for this firing, opened: the lease
+    /// remembered, what it handed recorded ([`Self::handed`]), the
+    /// signed-in client built. `stale` makes it a renewal
+    /// ([`weft_core::context::RunHandle::renew_connection`]).
+    async fn resolve_and_open(
+        &self,
+        access: &weft_core::access::Access,
+        window: std::time::Duration,
+        stale: Option<String>,
+    ) -> WeftResult<weft_core::access::OpenedConnection> {
+        let renewing = stale.is_some();
+        let service = access.service().to_string();
+        let req = weft_broker_client::protocol::ResolveConnectionRequest {
+            run_id: self.run_id,
+            node_id: self.node_id.clone(),
+            frames: self.node_frames.clone(),
+            node_type: self.node_type.clone(),
+            connection_id: access.access_id().to_string(),
+            service: service.clone(),
+            required_permissions: access.required_permissions().to_vec(),
+            required_values: access.required_values().to_vec(),
+            expected_duration_secs: window.as_secs(),
+            stale,
+        };
+        let resp = self.clients.access_broker.resolve_connection(&req, self.run_instance.as_ref()).await.map_err(|e| {
+            WeftError::NodeFailed(format!("{} the '{service}' connection: {e:#}", if renewing { "renew" } else { "open" }))
+        })?;
+        // Remember the lease so the loop driver releases it when this
+        // node's body finishes (`close_opened_accesses`). Only an
+        // Ours-owned connection is remembered: a release retires a
+        // runtime-supplied credential, and a their-own connection's
+        // stored values are the user's own and never travel back.
+        if let Some(node) = &resp.published_by {
+            self.infra_made.lock().expect("infra connections poisoned").insert(node.clone());
+        }
+        self.handed.lock().unwrap().insert(access.access_id().to_string(), weft_core::access::handed_digest(&resp.values));
+        if resp.owner.is_platform() {
+            self.opened_accesses
+                .lock()
+                .unwrap()
+                .push((access.access_id().to_string(), resp.values.clone()));
+        }
+
+        let steps = weft_core::access::client::resolve_steps(&resp.auth, &resp.values)
+            .map_err(|e| {
+                WeftError::NodeFailed(format!(
+                    "the '{service}' connection's auth steps do not resolve: {e}"
+                ))
+            })?;
+        let sink = Arc::new(crate::metering::CostSink {
+            journal: self.record.journal.clone(),
+            writer: self.clients.writer.clone(),
+            replica: self.worker_replica.clone(),
+            pending: self.record.costs.clone(),
+            open_charges: self.clients.open_charges.clone(),
+            run_id: self.run_id,
+            node_id: self.node_id.clone(),
+            frames: self.node_frames.clone(),
+            service: service.clone(),
+            origin: resp.owner.clone(),
+            cancellation: self.cancellation.clone(),
+        });
+        let client = crate::metering::connection_client(
+            &service,
+            steps.clone(),
+            resp.relay_url.as_deref(),
+            sink.clone(),
+            self.clients.shared.clone(),
+        )?;
+        let dialer = Arc::new(crate::socket::ConnectionSocketDial::new(
+            steps,
+            resp.relay_url.clone(),
+            sink,
+        ));
+        Ok(weft_core::access::OpenedConnection::assemble(
+            service,
+            resp.values,
+            resp.auth,
+            resp.identity,
+            resp.owner,
+            resp.way,
+            client,
+            dialer,
+        ))
+    }
+
     /// This firing's wait-liveness identity: the node id plus its loop
     /// frame stack. A loop running the same body N times in parallel has
     /// N distinct firings (one per frame), so their wait liveness never
@@ -2019,6 +2137,7 @@ impl RunnerHandle {
             wake_payload: None,
             caller_connection: None,
             opened_accesses: Mutex::new(Vec::new()),
+            handed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2288,6 +2407,7 @@ impl RunnerHandle {
             *self.counters.lock().expect("counters poisoned") = saved.counters;
             *self.resumed_helper.lock().expect("resumed helper poisoned") = saved.helper.clone();
             self.buses = Arc::new(weft_core::bus::FiringBuses::resumed(saved.positions.buses.clone()).cancelled_by(self.cancellation.clone()));
+            self.buses.used_before_its_pause(&self.firing_location(), |id| self.bus_coordinator.bus(id));
             self.lock_port_claims().stream_items = saved.positions.yielded;
         }
         self.lock_port_claims().items_on_record = resume.items_on_record;
@@ -2349,16 +2469,18 @@ impl RunnerHandle {
     /// with a clone of its ctx) is refused, because the firing it would
     /// belong to is no longer running. Taken under the claims lock every
     /// emission sends under, so an emission is either on the channel
-    /// before the firing's terminal or refused. The buses the body held
-    /// end with `end`, how it returned (`weft_core::bus::body_end`), and
-    /// the names it held over an earlier pause and did not take back
-    /// leave with it; a body that paused (`None`) ends nothing, and
-    /// carries on from its state.
+    /// before the firing's terminal or refused. Every name the firing has
+    /// on a bus leaves with `end`, how it returned
+    /// (`weft_core::bus::body_end`), the ones it took this run of its body
+    /// and the ones it held over an earlier pause alike, and a bus left
+    /// with nobody on it ends that way; a body that paused (`None`) leaves
+    /// nothing, and carries on from its state, a member still.
     pub fn end_body(&self, end: Option<weft_core::bus::StreamEnd>) {
         self.lock_port_claims().body_returned = true;
-        if let Some(end) = end {
-            self.buses.end(end);
-            self.bus_coordinator.release_held(&self.firing_location(), &self.buses.named_on());
+        match end {
+            Some(end) => self.leave_buses(end),
+            // Paused: what it used, its saved positions say from here on.
+            None => self.buses.paused(&self.firing_location(), |id| self.bus_coordinator.bus(id)),
         }
     }
 
@@ -2989,9 +3111,6 @@ impl ContextHandle for RunnerHandle {
             at_unix: now_unix(),
         });
         let (positions, counters) = self.standing(pausing.is_some(), streams);
-        if pausing.is_some() {
-            self.buses.pause();
-        }
         let saved = RunEvent::NodeStateSaved {
             run_id: self.run_id,
             node_id: self.node_id.clone(),
@@ -3616,76 +3735,18 @@ impl ContextHandle for RunnerHandle {
         access: &weft_core::access::Access,
         window: std::time::Duration,
     ) -> WeftResult<weft_core::access::OpenedConnection> {
-        let service = access.service().to_string();
-        let req = weft_broker_client::protocol::ResolveConnectionRequest {
-            run_id: self.run_id,
-            node_id: self.node_id.clone(),
-            frames: self.node_frames.clone(),
-            node_type: self.node_type.clone(),
-            connection_id: access.access_id().to_string(),
-            service: service.clone(),
-            required_permissions: access.required_permissions().to_vec(),
-            required_values: access.required_values().to_vec(),
-            expected_duration_secs: window.as_secs(),
-        };
-        let resp = self.clients.access_broker.resolve_connection(&req, self.run_instance.as_ref()).await.map_err(|e| {
-            WeftError::NodeFailed(format!("open the '{service}' connection: {e:#}"))
-        })?;
-        // Remember the lease so the loop driver releases it when this
-        // node's body finishes (`close_opened_accesses`). Only an
-        // Ours-owned connection is remembered: a release retires a
-        // runtime-supplied credential, and a their-own connection's
-        // stored values are the user's own and never travel back.
-        if let Some(node) = &resp.published_by {
-            self.infra_made.lock().expect("infra connections poisoned").insert(node.clone());
-        }
-        if resp.owner.is_platform() {
-            self.opened_accesses
-                .lock()
-                .unwrap()
-                .push((access.access_id().to_string(), resp.values.clone()));
-        }
+        self.resolve_and_open(access, window, None).await
+    }
 
-        let steps = weft_core::access::client::resolve_steps(&resp.auth, &resp.values)
-            .map_err(|e| {
-                WeftError::NodeFailed(format!(
-                    "the '{service}' connection's auth steps do not resolve: {e}"
-                ))
-            })?;
-        let sink = Arc::new(crate::metering::CostSink {
-            journal: self.record.journal.clone(),
-            writer: self.clients.writer.clone(),
-            replica: self.worker_replica.clone(),
-            pending: self.record.costs.clone(),
-            open_charges: self.clients.open_charges.clone(),
-            run_id: self.run_id,
-            node_id: self.node_id.clone(),
-            frames: self.node_frames.clone(),
-            service: service.clone(),
-            origin: resp.owner.clone(),
-            cancellation: self.cancellation.clone(),
-        });
-        let client = crate::metering::connection_client(
-            &service,
-            steps.clone(),
-            resp.relay_url.as_deref(),
-            sink.clone(),
-            self.clients.shared.clone(),
-        )?;
-        let dialer = Arc::new(crate::socket::ConnectionSocketDial::new(
-            steps,
-            resp.relay_url.clone(),
-            sink,
-        ));
-        Ok(weft_core::access::OpenedConnection::assemble(
-            service,
-            resp.values,
-            resp.auth,
-            resp.identity,
-            resp.owner,
-            client,
-            dialer,
-        ))
+    async fn renew_connection(
+        &self,
+        access: &weft_core::access::Access,
+        window: std::time::Duration,
+    ) -> WeftResult<weft_core::access::OpenedConnection> {
+        let Some(stale) = self.handed.lock().unwrap().get(access.access_id()).cloned() else {
+            return Err(WeftError::NodeFailed(weft_core::access::renew_without_open(access.service())));
+        };
+        self.resolve_and_open(access, window, Some(stale)).await
     }
 
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()> {
@@ -3901,8 +3962,8 @@ impl ContextHandle for RunnerHandle {
         &self.wired_outputs
     }
 
-    fn firing_buses(&self) -> &weft_core::bus::FiringBuses {
-        self.buses.as_ref()
+    fn leave_buses(&self, end: weft_core::bus::StreamEnd) {
+        self.buses.leave(&self.firing_location(), end, |id| self.bus_coordinator.bus(id));
     }
 
     /// Fire downstream. Each output port the node mentions in
@@ -4693,6 +4754,7 @@ mod runner_tests {
             weft_core::frames::LoopFrames::default(),
             None,
             weft_core::context::ValueBag::inputs(Default::default(), Default::default(), Vec::new()),
+            weft_core::context::Phase::Fire,
             handle,
         )
     }
@@ -4738,6 +4800,31 @@ mod runner_tests {
         // Idempotent: a second sweep has nothing left to release.
         handle.close_opened_accesses().await;
         assert_eq!(fake.released.lock().unwrap().len(), 1);
+    }
+
+    /// A renewal names what the firing was last handed, which the store
+    /// renews only while the row still hands it, and a renewal of a
+    /// connection never opened in the firing is refused before any call.
+    #[tokio::test]
+    async fn a_renewal_names_what_the_last_open_handed() {
+        let fake = FakeAccessBroker::new();
+        fake.set_bearer_connection("conn-1", "sk-r0");
+        let ctx = ctx_over(handle_with_access_broker(fake.clone()));
+        let access = weft_core::Access::new("conn-1", "openrouter", None);
+
+        let never = ctx.renew(&access).await.map(|_| ()).expect_err("a renewal with no open is refused").to_string();
+        assert!(never.contains("has not opened it in this firing"), "{never}");
+        assert!(fake.resolved.lock().unwrap().is_empty(), "refused before any call");
+
+        ctx.open_within(&access, CALL_WINDOW).await.unwrap();
+        fake.set_bearer_connection("conn-1", "sk-r1");
+        ctx.open_within(&access, CALL_WINDOW).await.unwrap();
+        fake.set_bearer_connection("conn-1", "sk-r2");
+        let renewed = ctx.renew(&access).await.unwrap();
+        assert_eq!(renewed.credential().unwrap(), "sk-r2", "the renewal's answer is what the node is handed");
+        let last: std::collections::BTreeMap<String, String> = [("token".to_string(), "sk-r1".to_string())].into_iter().collect();
+        let sent = fake.resolved.lock().unwrap().clone();
+        assert_eq!(sent.iter().map(|r| r.stale.clone()).collect::<Vec<_>>(), [None, None, Some(weft_core::access::handed_digest(&last))]);
     }
 
     /// A their-own connection is never released back: the stored

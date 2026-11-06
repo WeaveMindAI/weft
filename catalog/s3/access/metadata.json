@@ -15,27 +15,31 @@
     "label": "S3",
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "endpoint",
-          "label": "Endpoint",
-          "secret": false,
-          "placeholder": "https://s3.us-east-1.amazonaws.com"
-        },
-        {
-          "name": "region",
-          "label": "Region",
-          "secret": false,
-          "placeholder": "us-east-1"
-        },
-        {
-          "name": "accessKeyId",
-          "label": "Access key ID",
-          "secret": false
-        },
-        {
-          "name": "secretAccessKey",
-          "label": "Secret access key"
+          "fields": [
+            {
+              "name": "endpoint",
+              "label": "Endpoint",
+              "secret": false,
+              "placeholder": "https://s3.us-east-1.amazonaws.com"
+            },
+            {
+              "name": "region",
+              "label": "Region",
+              "secret": false,
+              "placeholder": "us-east-1"
+            },
+            {
+              "name": "accessKeyId",
+              "label": "Access key ID",
+              "secret": false
+            },
+            {
+              "name": "secretAccessKey",
+              "label": "Secret access key"
+            }
+          ]
         }
       ]
     },
