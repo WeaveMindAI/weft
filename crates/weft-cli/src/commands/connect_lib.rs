@@ -47,7 +47,7 @@ pub async fn install(ctx: Ctx, into: Option<PathBuf>) -> Result<()> {
         std::fs::copy(source.join(rel), &to).with_context(|| format!("copy {} to {}", rel.display(), to.display()))?;
     }
     println!(
-        "copied the connect library ({} files) into {}\n  import {{ InstanceDoor }} from '$lib/weft-connect';\n  import {{ InstanceSettings }} from '$lib/weft-connect/svelte';\n  import {{ weftPassThrough }} from '$lib/weft-connect/server';\nmount the pass-through at src/routes/weft/[...path]/+server.ts (its README shows the route) and set WEFT_DISPATCHER_URL in the server env: pages call their own site at /weft/..., never the dispatcher\nrun `weft connect-lib` again after updating weft; edits made inside that folder are replaced",
+        "copied the connect library ({} files) into {}\n  import {{ InstanceDoor }} from '$lib/weft-connect';\n  import {{ DoorSettings }} from '$lib/weft-connect/svelte';\n  import {{ weftPassThrough }} from '$lib/weft-connect/server';\nmount the pass-through at src/routes/weft/[...path]/+server.ts (its README shows the route) and set WEFT_DISPATCHER_URL in the server env: pages call their own site at /weft/..., never the dispatcher\nfor an admin page that sets the program's own connections: `ProgramDoor` and `weftProgramPassThrough`, mounted at /weft-admin and handed your own admin check on every call, with WEFT_CONNECTIONS_KEY from `weft token mint --connections` (its README shows it)\nrun `weft connect-lib` again after updating weft; edits made inside that folder are replaced",
         files.len(),
         dest.display()
     );
@@ -90,7 +90,7 @@ mod tests {
         let names: Vec<String> = files.iter().map(|p| p.to_string_lossy().replace('\\', "/")).collect();
         assert!(names.contains(&"README.md".to_string()));
         assert!(names.contains(&"src/index.ts".to_string()));
-        assert!(names.contains(&"src/svelte/InstanceSettings.svelte".to_string()));
+        assert!(names.contains(&"src/svelte/DoorSettings.svelte".to_string()));
         assert!(names.iter().all(|n| !n.ends_with(".test.ts")), "{names:?}");
     }
 }

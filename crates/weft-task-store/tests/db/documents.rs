@@ -2,12 +2,14 @@
 //! (`weft_task_store::documents`), against a real Postgres: a database
 //! from before the column was registered, one interrupted midway (rows at
 //! several versions), one a newer weft carried, a fresh one, a step that
-//! moves a value out to a column, and the boot with nothing to do.
+//! moves a value out to a column, the boot with nothing to do, and batches
+//! bounded by the size of the documents they carry.
 
 use serde_json::{json, Value};
 use weft_core::stored::{Kind, Op};
 use weft_task_store::db::{Client as _, Json, Pool, Transaction};
-use weft_task_store::documents::{Encoding, Fill, Rederived};
+use weft_task_store::documents::{apply_documents_in, Encoding, Fill, Rederived};
+use weft_task_store::pages::PageCaps;
 use weft_task_store::{apply_documents, Document};
 
 /// Version 2 renames `a` to `b`; version 3 adds `c`. `AddKey` refuses a
@@ -319,4 +321,88 @@ async fn a_keyless_table_is_walked_only_when_a_row_is_behind(pool: Pool) {
     pool.execute("DELETE FROM weft_document_version WHERE table_name = 'probe_unkeyed'", &[]).await.unwrap();
     let err = format!("{:#}", apply_documents(&pool, &[&KEYLESS_DOC]).await.unwrap_err());
     assert!(err.contains("no primary key"), "{err}");
+}
+
+/// Documents kept as JSON text, like a stored program, on a table that
+/// notes every statement writing to it: how many rows it wrote, their
+/// size, and the biggest one's.
+static SIZED_DOC: Document = Document::of(&PROBE, "probe_sized", "body", Encoding::Json, &[], None);
+
+const TINY: PageCaps = PageCaps { rows: 500, bytes: 1000 };
+
+/// `probe_sized` holding one row per entry of `pads`, `{"a": id, "pad": ...}`
+/// with a pad that many characters long, ids from 1.
+async fn sized(pool: &Pool, pads: &[usize]) {
+    ledger(pool).await;
+    pool.batch_execute(
+        "CREATE TABLE probe_sized (id INTEGER PRIMARY KEY, body TEXT NOT NULL, body_version INTEGER NOT NULL DEFAULT 1);
+         CREATE TABLE probe_batch (seq BIGSERIAL PRIMARY KEY, rows BIGINT NOT NULL, bytes BIGINT NOT NULL, biggest BIGINT NOT NULL);
+         CREATE FUNCTION probe_note_batch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+             INSERT INTO probe_batch (rows, bytes, biggest)
+                 SELECT count(*), coalesce(sum(octet_length(body)), 0), coalesce(max(octet_length(body)), 0) FROM changed;
+             RETURN NULL;
+         END $$;
+         CREATE TRIGGER probe_note_batch AFTER UPDATE ON probe_sized REFERENCING NEW TABLE AS changed
+             FOR EACH STATEMENT EXECUTE FUNCTION probe_note_batch()",
+    )
+    .await
+    .unwrap();
+    for (at, pad) in pads.iter().enumerate() {
+        let id = at as i32 + 1;
+        pool.execute(
+            "INSERT INTO probe_sized (id, body) VALUES ($1, $2)",
+            &[&id, &json!({ "a": id, "pad": "x".repeat(*pad) }).to_string()],
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// Every statement that wrote to `probe_sized`, in order: (rows, bytes, biggest).
+async fn batches(pool: &Pool) -> Vec<(i64, i64, i64)> {
+    pool.all("SELECT rows, bytes, biggest FROM probe_batch ORDER BY seq", &[]).await.unwrap()
+}
+
+async fn sized_versions(pool: &Pool) -> Vec<(i32, Value, i32)> {
+    pool.all::<(i32, String, i32)>("SELECT id, body, body_version FROM probe_sized ORDER BY id", &[])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(id, body, version)| (id, serde_json::from_str(&body).unwrap(), version))
+        .collect()
+}
+
+/// A column of documents of mixed sizes is carried in batches bounded by
+/// their size, far under the row cap: each batch holds rows while what it
+/// already holds is under the byte cap, so only its last row may pass it,
+/// and every row reaches today's version.
+#[weft_db_macros::test]
+async fn documents_are_carried_in_batches_bounded_by_their_size(pool: Pool) {
+    let pads: Vec<usize> = (0..30).map(|n| (n * 37) % 900 + 10).collect();
+    sized(&pool, &pads).await;
+    apply_documents_in(&pool, &[&SIZED_DOC], TINY).await.unwrap();
+    let rows = sized_versions(&pool).await;
+    assert_eq!(rows.len(), 30);
+    assert!(
+        rows.iter().all(|(id, b, v)| *v == 3 && b.get("a").is_none() && b["b"] == json!(id) && b["c"] == json!(true)),
+        "{rows:?}"
+    );
+    let batches = batches(&pool).await;
+    assert!(batches.len() > 10, "two steps over about 14 KB each, in batches of about 1 KB: {batches:?}");
+    assert_eq!(batches.iter().map(|(rows, ..)| rows).sum::<i64>(), 60, "every row takes each step once: {batches:?}");
+    // What the rows before the last held was under the cap as the batch
+    // read them; the second step adds `"c": true` (16 bytes) to each.
+    for &(rows, bytes, biggest) in &batches {
+        assert!(bytes - biggest < TINY.bytes + 16 * rows, "a batch passed the cap by more than one row: {batches:?}");
+    }
+}
+
+/// A document bigger than the byte cap is carried, alone in its batch.
+#[weft_db_macros::test]
+async fn a_document_bigger_than_the_cap_is_carried_alone(pool: Pool) {
+    sized(&pool, &[5000, 10, 10]).await;
+    apply_documents_in(&pool, &[&SIZED_DOC], TINY).await.unwrap();
+    assert!(sized_versions(&pool).await.iter().all(|(_, _, v)| *v == 3));
+    let rows: Vec<i64> = batches(&pool).await.into_iter().map(|(rows, ..)| rows).collect();
+    assert_eq!(rows, vec![1, 2, 1, 2], "per step: the big row alone, then the two small ones");
 }

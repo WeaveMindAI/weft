@@ -137,6 +137,65 @@ impl SavedPorts {
 /// The file an install keeps its ports in, in its dir.
 const PORTS_FILE: &str = "ports.json";
 
+/// One of an infra unit's ports, as the unit names it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UnitPort {
+    /// A process's port, by its name (`infra::ProcessPort`).
+    Process(String),
+    /// A container port, by its number: a unit's containers share one
+    /// network, so a number is one port of the whole unit.
+    Container(u16),
+}
+
+/// The host port a local install keeps for one port of one of its infra
+/// units, from the unit's first start until it is removed or its copy
+/// terminated. Every one an install keeps is in its `infra-ports.json`,
+/// written by its runtime (`weft_platform_local::kept_ports`), and taken
+/// for every port any install on the machine picks after
+/// ([`PortsTurn::free_ports`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KeptInfraPort {
+    pub copy_id: String,
+    pub unit: String,
+    pub port: UnitPort,
+    pub host: u16,
+}
+
+/// The file an install keeps its infra units' ports in, in its dir.
+const INFRA_PORTS_FILE: &str = "infra-ports.json";
+
+impl KeptInfraPort {
+    /// Where an install whose files live in `dir` keeps them.
+    pub fn path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(INFRA_PORTS_FILE)
+    }
+
+    /// Every port the install in `dir` keeps; none when it kept none yet.
+    /// A file that exists and cannot be read is an error.
+    pub fn read(dir: &std::path::Path) -> Result<Vec<Self>, String> {
+        let path = Self::path(dir);
+        match std::fs::read(&path) {
+            Ok(raw) => serde_json::from_slice(&raw).map_err(|e| {
+                format!(
+                    "{} is not the list of infra ports weft keeps ({e}); delete it, and every infra started again gets new ports",
+                    path.display()
+                )
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+        }
+    }
+
+    /// `all`, as every port the install in `dir` keeps, written whole
+    /// ([`crate::infra::write_whole`]): another install's start reads the
+    /// file while it picks its ports.
+    pub fn save(dir: &std::path::Path, all: &[Self]) -> std::io::Result<()> {
+        crate::infra::write_whole(dir, INFRA_PORTS_FILE, &serde_json::to_vec_pretty(all)?, 0o644)
+    }
+}
+
 impl InstallPorts {
     /// The block's ports: what the default install starts on.
     pub const DEFAULT: Self =
@@ -205,13 +264,15 @@ impl PortsTurn {
     }
 
     /// `N` free ports, all different, for an install beside the default
-    /// one, from [`NAMED`] minus whatever part of it this machine hands
-    /// out on its own. None is in `besides` or saved in the `ports.json`
-    /// of any install on this machine (a stopped install's ports are free
-    /// right now only because its runtime is down, and two installs given
-    /// the same one could never run at once), and each binds right now
-    /// both on loopback and on every address, since an install listens
-    /// on either. The caller saves them before it lets go of the turn.
+    /// one or for an infra unit's port ([`KeptInfraPort`]), from [`NAMED`]
+    /// minus whatever part of it this machine hands out on its own. None
+    /// is in `besides`, saved in the `ports.json` of any install on this
+    /// machine (a stopped install's ports are free right now only because
+    /// its runtime is down, and two installs given the same one could
+    /// never run at once), or kept in its `infra-ports.json` (the same for
+    /// a stopped unit's), and each binds right now both on loopback and on
+    /// every address, since an install listens on either. The caller saves
+    /// them before it lets go of the turn.
     pub fn free_ports<const N: usize>(&self, besides: &[u16]) -> Result<[u16; N], String> {
         let taken: std::collections::HashSet<u16> = saved_under(&self.root)?.into_iter().chain(besides.iter().copied()).collect();
         let os = os_handed_out()?;
@@ -275,8 +336,9 @@ fn parse_range(raw: &str) -> Option<std::ops::RangeInclusive<u16>> {
     }
 }
 
-/// Every port a `ports.json` under `root` saves: the default install's,
-/// in weft's data dir, and each named one's under `installs/`.
+/// Every port a `ports.json` or an `infra-ports.json` under `root` saves:
+/// the default install's, in weft's data dir, and each named one's under
+/// `installs/`.
 #[cfg(feature = "runtime")]
 fn saved_under(root: &std::path::Path) -> Result<Vec<u16>, String> {
     let installs = root.join("installs");
@@ -295,6 +357,7 @@ fn saved_under(root: &std::path::Path) -> Result<Vec<u16>, String> {
         if let Some(saved) = SavedPorts::read(&dir)? {
             ports.extend(saved.all());
         }
+        ports.extend(KeptInfraPort::read(&dir)?.into_iter().map(|k| k.host));
     }
     Ok(ports)
 }
@@ -419,6 +482,26 @@ mod tests {
         all.sort();
         all.dedup();
         assert_eq!(all.len(), n, "a port went to two installs: {picks:?}");
+    }
+
+    /// A port an install keeps for one of its infra units is taken for
+    /// every pick on the machine, its own install's and every other's, as
+    /// much as the ports an install saved for itself.
+    #[test]
+    fn a_port_an_install_keeps_for_its_infra_is_never_handed_out() {
+        let root = tempfile::tempdir().unwrap();
+        let turn = PortsTurn::take_in(root.path()).unwrap();
+        let [a, b] = turn.free_ports(&[]).unwrap();
+        let kept = |host, copy: &str| KeptInfraPort { copy_id: copy.into(), unit: "main".into(), port: UnitPort::Container(5432), host };
+        KeptInfraPort::save(root.path(), &[kept(a, "wn-1")]).unwrap();
+        KeptInfraPort::save(&root.path().join("installs/x"), &[kept(b, "wn-2")]).unwrap();
+        assert_eq!(KeptInfraPort::read(&root.path().join("installs/x")).unwrap(), [kept(b, "wn-2")]);
+        let taken = saved_under(root.path()).unwrap();
+        assert!(taken.contains(&a) && taken.contains(&b), "{taken:?}");
+        let again: [u16; 8] = turn.free_ports(&[]).unwrap();
+        assert!(again.iter().all(|p| ![a, b].contains(p)));
+        std::fs::write(KeptInfraPort::path(root.path()), "{").unwrap();
+        assert!(saved_under(root.path()).unwrap_err().contains("delete it"), "a file weft cannot read stops the pick");
     }
 
     #[test]

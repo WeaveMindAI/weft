@@ -11,6 +11,13 @@
 // read or write of a stored file asks (a range, a version it holds). The
 // site's cookies stay behind, and so does `Weft-Instance`, the header only
 // the site's server may send to name an instance.
+//
+// Apart from it, `weftProgramPassThrough` passes a site's ADMIN page on to
+// the program door, adding the connections key the server holds. It is
+// mounted on its own route (`WEFT_PROGRAM_PASS_THROUGH_PATH`), and every call
+// carries the answer of the site's own admin check, which it reads first:
+// whoever reaches that route can replace the program's keys, and weft cannot
+// tell a site's admin from its visitors.
 
 import { COMPLETING_HEADER } from '../core/upload';
 import { trimTrailingSlashes } from '../core/url';
@@ -110,6 +117,10 @@ const FORWARDED_PROTO = 'x-forwarded-proto';
 const WEFT_FORWARDED_PROTO = 'x-weft-forwarded-proto';
 const FORWARDED_PREFIX = 'x-forwarded-prefix';
 
+/** The program door, which `weftProgramPassThrough` alone passes.
+ *  SYNC: PROGRAM_DOOR <-> crates/weft-dispatcher/src/api/program_door.rs, crates/weft-dispatcher/src/api/mod.rs outside_caller_routes */
+const PROGRAM_DOOR = 'program';
+
 export interface PassThroughOptions {
 	/** The dispatcher's address as the site's SERVER reaches it (for a local
 	 *  install `http://127.0.0.1:14111`), read on every call, so a function
@@ -127,64 +138,136 @@ export interface PassThroughOptions {
 export function weftPassThrough(options: PassThroughOptions): (request: Request, path: string) => Promise<Response> {
 	const fetcher = options.fetcher ?? ((...args) => fetch(...args));
 	return async (request, path) => {
-		const base = (typeof options.dispatcher === 'function' ? options.dispatcher() : options.dispatcher)?.trim();
-		if (!base) {
+		const base = dispatcherOf(options);
+		if (base instanceof Response) return base;
+		const segments = path.split('/').filter((s) => s !== '');
+		const refused = refusal(segments, request.method);
+		if (refused) return new Response(`weft pass-through: ${refused}`, { status: 404 });
+		return passOn(fetcher, base, request, segments, request.headers.get('authorization'));
+	};
+}
+
+export interface ProgramPassThroughOptions extends PassThroughOptions {
+	/** The connections key (`weft token mint --connections`), read on every
+	 *  call like `dispatcher`. It lives in the server's environment only. */
+	connectionsKey: string | (() => string | undefined);
+}
+
+/** Who is calling the program pass-through, as the site's own admin check
+ *  answered for this request. It is asked per call because that check
+ *  usually reads what the site attached to the request (SvelteKit's
+ *  `locals.user`), which the bare `Request` does not carry. */
+export interface ProgramCaller {
+	admin: boolean;
+}
+
+/** Pass one call of a site's admin page on to the program door, presenting
+ *  the connections key in place of anything the page sent. Mount it on its
+ *  own route (`WEFT_PROGRAM_PASS_THROUGH_PATH`, `/weft-admin`) and hand every
+ *  call the site's own admin check (`caller.admin`): weft cannot tell a
+ *  site's admin from its visitors, and this route stores the program's keys.
+ *  Anything but `admin: true` answers 403 and reaches nothing. `path` is
+ *  what follows the mount point (`program/connections`). Only the program
+ *  door passes (anything else answers 404); a key that is not set answers
+ *  500. */
+export function weftProgramPassThrough(
+	options: ProgramPassThroughOptions,
+): (request: Request, path: string, caller: ProgramCaller) => Promise<Response> {
+	const fetcher = options.fetcher ?? ((...args) => fetch(...args));
+	return async (request, path, caller) => {
+		// A plain JavaScript site can still leave `caller` out; that is a refusal too.
+		if (caller?.admin !== true) {
 			return new Response(
-				"weft pass-through: the dispatcher's address is not set in the server environment (WEFT_DISPATCHER_URL)",
+				"weft pass-through: the site's admin check refused this call, so it was not passed on (only the site's admin may change the program's connections)",
+				{ status: 403 },
+			);
+		}
+		const base = dispatcherOf(options);
+		if (base instanceof Response) return base;
+		const key = (typeof options.connectionsKey === 'function' ? options.connectionsKey() : options.connectionsKey)?.trim();
+		if (!key) {
+			return new Response(
+				'weft pass-through: the connections key is not set in the server environment (WEFT_CONNECTIONS_KEY)',
 				{ status: 500 },
 			);
 		}
 		const segments = path.split('/').filter((s) => s !== '');
-		const refused = refusal(segments, request.method);
-		if (refused) return new Response(`weft pass-through: ${refused}`, { status: 404 });
-
-		const url = new URL(request.url);
-		const target = `${trimTrailingSlashes(base)}/${segments.map(encodeSegment).join('/')}${url.search}`;
-		const headers = new Headers();
-		for (const name of PASSED_REQUEST_HEADERS) {
-			const value = request.headers.get(name);
-			if (value !== null) headers.set(name, value);
+		if (segments[0] !== PROGRAM_DOOR || segments.some((s) => s === '.' || s === '..')) {
+			return new Response(`weft pass-through: only /${PROGRAM_DOOR}/ passes through here, not /${segments.join('/')}`, {
+				status: 404,
+			});
 		}
-		// Built from the site's own request, never passed through: a
-		// browser's `X-Forwarded-*` would let it choose the links it is given.
-		headers.set(FORWARDED_HOST, url.host);
-		headers.set(FORWARDED_PROTO, url.protocol.replace(/:$/, ''));
-		headers.set(WEFT_FORWARDED_PROTO, url.protocol.replace(/:$/, ''));
-		headers.set(FORWARDED_PREFIX, mountOf(url.pathname, segments.length));
-		const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
-		// A part of an upload goes with its exact length: the length is
-		// signed into its link, and a streamed body goes out chunked, with
-		// none, which the store refuses. Every other body streams.
-		let body: ArrayBuffer | ReadableStream<Uint8Array> | null | undefined;
-		if (!hasBody) body = undefined;
-		else if (isFilePut(request.method, segments)) {
-			const part = await partBody(request);
-			if (part instanceof Response) return part;
-			body = part;
-		} else body = request.body;
-		let answer: Response;
-		try {
-			answer = await fetcher(target, {
-				method: request.method,
-				headers,
-				body,
-				redirect: 'manual',
-				// A streamed request body needs this in Node's fetch.
-				...(body instanceof ReadableStream ? { duplex: 'half' } : {}),
-			} as RequestInit);
-		} catch (e) {
-			return new Response(
-				`weft pass-through: the dispatcher at ${base} did not answer (${failureOf(e)})`,
-				{ status: 502 },
-			);
-		}
-		const out = new Headers();
-		for (const name of PASSED_RESPONSE_HEADERS) {
-			const value = answer.headers.get(name);
-			if (value !== null) out.set(name, value);
-		}
-		return new Response(answer.body, { status: answer.status, statusText: answer.statusText, headers: out });
+		return passOn(fetcher, base, request, segments, `Bearer ${key}`);
 	};
+}
+
+/** The dispatcher's address, or the answer saying it is not set. */
+function dispatcherOf(options: PassThroughOptions): string | Response {
+	const base = (typeof options.dispatcher === 'function' ? options.dispatcher() : options.dispatcher)?.trim();
+	if (base) return base;
+	return new Response(
+		"weft pass-through: the dispatcher's address is not set in the server environment (WEFT_DISPATCHER_URL)",
+		{ status: 500 },
+	);
+}
+
+/** Send `request` on to `segments` at the dispatcher `base`, presenting
+ *  `authorization` (none when `null`), and hand its answer back. */
+async function passOn(
+	fetcher: typeof fetch,
+	base: string,
+	request: Request,
+	segments: string[],
+	authorization: string | null,
+): Promise<Response> {
+	const url = new URL(request.url);
+	const target = `${trimTrailingSlashes(base)}/${segments.map(encodeSegment).join('/')}${url.search}`;
+	const headers = new Headers();
+	for (const name of PASSED_REQUEST_HEADERS) {
+		const value = request.headers.get(name);
+		if (value !== null) headers.set(name, value);
+	}
+	if (authorization === null) headers.delete('authorization');
+	else headers.set('authorization', authorization);
+	// Built from the site's own request, never passed through: a
+	// browser's `X-Forwarded-*` would let it choose the links it is given.
+	headers.set(FORWARDED_HOST, url.host);
+	headers.set(FORWARDED_PROTO, url.protocol.replace(/:$/, ''));
+	headers.set(WEFT_FORWARDED_PROTO, url.protocol.replace(/:$/, ''));
+	headers.set(FORWARDED_PREFIX, mountOf(url.pathname, segments.length));
+	const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
+	// A part of an upload goes with its exact length: the length is
+	// signed into its link, and a streamed body goes out chunked, with
+	// none, which the store refuses. Every other body streams.
+	let body: ArrayBuffer | ReadableStream<Uint8Array> | null | undefined;
+	if (!hasBody) body = undefined;
+	else if (isFilePut(request.method, segments)) {
+		const part = await partBody(request);
+		if (part instanceof Response) return part;
+		body = part;
+	} else body = request.body;
+	let answer: Response;
+	try {
+		answer = await fetcher(target, {
+			method: request.method,
+			headers,
+			body,
+			redirect: 'manual',
+			// A streamed request body needs this in Node's fetch.
+			...(body instanceof ReadableStream ? { duplex: 'half' } : {}),
+		} as RequestInit);
+	} catch (e) {
+		return new Response(
+			`weft pass-through: the dispatcher at ${base} did not answer (${failureOf(e)})`,
+			{ status: 502 },
+		);
+	}
+	const out = new Headers();
+	for (const name of PASSED_RESPONSE_HEADERS) {
+		const value = answer.headers.get(name);
+		if (value !== null) out.set(name, value);
+	}
+	return new Response(answer.body, { status: answer.status, statusText: answer.statusText, headers: out });
 }
 
 /** What a failed fetch says, with every cause beneath it: Node's fetch

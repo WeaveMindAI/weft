@@ -411,8 +411,13 @@ pub struct InstanceFilled<'a> {
     /// The value for an instance that gave none
     /// (`@instance_filled(<value>)`); `None`: such an instance leaves the
     /// field unwritten, and the node's default, optionality or required
-    /// refusal decides.
+    /// refusal decides. Never a null: that is [`Self::may_stay_empty`].
     pub fallback: Option<&'a serde_json::Value>,
+    /// Written `@instance_filled(null)`: an instance may leave the field
+    /// empty, and then the node gets a null there. A node that needs the
+    /// field skips ([`left_empty`]); one that takes it as optional runs
+    /// and reads the null.
+    pub may_stay_empty: bool,
 }
 
 /// The literal `@instance_filled` lowers to.
@@ -433,12 +438,52 @@ pub fn as_instance_filled(value: &serde_json::Value) -> Option<InstanceFilled<'_
         return None;
     }
     let inner = map.get(INSTANCE_FILLED_KEY)?.as_object()?;
-    Some(InstanceFilled { fallback: inner.get("fallback") })
+    let fallback = inner.get("fallback");
+    Some(InstanceFilled {
+        fallback: fallback.filter(|value| !value.is_null()),
+        may_stay_empty: fallback.is_some_and(serde_json::Value::is_null),
+    })
 }
 
 /// Every field of `node` written `@instance_filled`, with its marker.
 pub fn instance_filled_fields(node: &crate::project::NodeDefinition) -> impl Iterator<Item = (&str, InstanceFilled<'_>)> {
     node.port_literals.iter().filter_map(|(field, value)| Some((field.as_str(), as_instance_filled(value)?)))
+}
+
+/// Whether the program lets an instance leave `field` of `node` empty:
+/// written `field: @instance_filled(null)` ([`InstanceFilled::may_stay_empty`]).
+pub fn may_stay_empty(node: &crate::project::NodeDefinition, field: &str) -> bool {
+    instance_filled_fields(node).any(|(filled, marker)| filled == field && marker.may_stay_empty)
+}
+
+/// Whether `input` of `node` takes no run without a value: required, with
+/// no default, and not marked `?` by the program.
+fn required_here(node: &crate::project::NodeDefinition, input: &crate::project::InputDefinition) -> bool {
+    input.required && input.default.is_none() && !node.optional_ports.contains(&input.name)
+}
+
+/// Whether `node` cannot run without a value on `input`: required here
+/// ([`required_here`]), or a connection its recipe needs (the access
+/// widget the compiler stamped, not marked optional).
+fn needs_value(node: &crate::project::NodeDefinition, input: &crate::project::InputDefinition) -> bool {
+    required_here(node, input) || matches!(input.widget, Some(crate::node::Widget::Access { service: Some(_), optional: false }))
+}
+
+/// The first field of `node` an instance may leave empty
+/// ([`may_stay_empty`]) that the node cannot run without and that
+/// `value_of` (what one run holds for each field once its instance's
+/// values are in) has nothing but a null for. Such a node never runs: the
+/// engine skips it, as on a required input that closed. A field the node
+/// takes as optional is never one: the node runs and reads the null.
+pub fn left_empty<'n, 'v>(
+    node: &'n crate::project::NodeDefinition,
+    value_of: impl Fn(&str) -> Option<&'v serde_json::Value>,
+) -> Option<&'n str> {
+    instance_filled_fields(node)
+        .filter(|(_, marker)| marker.may_stay_empty)
+        .map(|(field, _)| field)
+        .filter(|field| node.inputs.iter().any(|input| input.name == *field && needs_value(node, input)))
+        .find(|field| value_of(field).is_none_or(serde_json::Value::is_null))
 }
 
 /// One instance's values: field -> value, for the node at one place.
@@ -505,6 +550,9 @@ pub fn fill_literals(
             Some(value) => {
                 literals.insert(field.to_string(), value.clone());
             }
+            None if filled.may_stay_empty => {
+                literals.insert(field.to_string(), serde_json::Value::Null);
+            }
             None => {
                 literals.remove(field);
             }
@@ -552,7 +600,9 @@ pub fn check_instance_value(
 /// The instance-filled fields of `original` that `filled` (the node as
 /// one instance's run at `place` sees it, [`filled_node`]) leaves with
 /// nothing where the node needs a value: required, no default, not
-/// optional. One sentence each, naming the instance and the place.
+/// optional. One sentence each, naming the instance and the place. A
+/// field the program lets stay empty ([`may_stay_empty`]) is never one:
+/// [`filled_node`] keeps its marker.
 pub fn unfilled_gaps(
     original: &crate::project::NodeDefinition,
     filled: &crate::project::NodeDefinition,
@@ -561,13 +611,7 @@ pub fn unfilled_gaps(
 ) -> Vec<String> {
     instance_filled_fields(original)
         .filter(|(field, _)| !filled.port_literals.contains_key(*field))
-        .filter(|(field, _)| {
-            original
-                .inputs
-                .iter()
-                .find(|i| i.name == *field)
-                .is_some_and(|i| i.required && i.default.is_none() && !original.optional_ports.contains(*field))
-        })
+        .filter(|(field, _)| original.inputs.iter().find(|i| i.name == *field).is_some_and(|i| required_here(original, i)))
         .map(|(field, _)| format!("instance '{instance}' has not filled '{place}.{field}'"))
         .collect()
 }
@@ -580,7 +624,11 @@ pub fn unfilled_gaps(
 /// value not known yet, exactly as at compile time. A rule about a
 /// `@instance_filled` field the instance left empty (the node's "connect
 /// one on the node", say) is said the way whoever fills the instance can
-/// act on: that it has not been filled.
+/// act on: that it has not been filled. A field the program lets stay
+/// empty ([`may_stay_empty`]) and the instance left empty keeps its marker
+/// in `filled` ([`filled_node`]): what a rule asks of it is known only when
+/// the node fires, so the compile left that question for the run
+/// (`crate::rules::recheck`), and it never refuses the run here.
 pub fn rule_gaps(
     cx: &crate::rules::RuleContext,
     original: &crate::project::NodeDefinition,
@@ -611,7 +659,8 @@ pub fn rule_gaps(
 /// one of the node's error rules about that field fires. The same two
 /// checks a run's birth makes ([`unfilled_gaps`], [`rule_gaps`]), so a
 /// settings page for an instance marks exactly the fields a run would
-/// refuse without.
+/// refuse without. A field the program lets stay empty
+/// ([`may_stay_empty`]) never is: [`filled_node`] keeps its marker.
 pub fn instance_field_needed(
     cx: &crate::rules::RuleContext,
     node: &crate::project::NodeDefinition,
@@ -621,11 +670,7 @@ pub fn instance_field_needed(
     if empty.port_literals.contains_key(field) {
         return false;
     }
-    let required = node
-        .inputs
-        .iter()
-        .find(|i| i.name == field)
-        .is_some_and(|i| i.required && i.default.is_none() && !node.optional_ports.contains(field));
+    let required = node.inputs.iter().find(|i| i.name == field).is_some_and(|i| required_here(node, i));
     required
         || node.instance_rules.as_ref().is_some_and(|rules| {
             rules.rules.iter().any(|rule| {
@@ -640,11 +685,20 @@ pub fn instance_field_needed(
 /// `@instance_filled` literals replaced by [`fill_literals`]. What an
 /// instance's value is checked
 /// against (the node's rules, its port types, its required inputs) is
-/// this node, so the check and the run read the same thing.
+/// this node, so the check and the run read the same thing. A field the
+/// program lets stay empty ([`may_stay_empty`]) that the instance left
+/// empty keeps its marker: the run gets a null there, and what that means
+/// is the node's to say when it fires (`crate::run::skip::unfilled`,
+/// `crate::rules::recheck`), never a refusal before the run starts.
 pub fn filled_node(node: &crate::project::NodeDefinition, values: Option<&PlaceValues>) -> crate::project::NodeDefinition {
     let mut filled = node.clone();
     let mut literals: serde_json::Map<String, serde_json::Value> = std::mem::take(&mut filled.port_literals).into_iter().collect();
     fill_literals(node, &mut literals, values);
+    for (field, marker) in instance_filled_fields(node) {
+        if marker.may_stay_empty && literals.get(field).is_some_and(serde_json::Value::is_null) {
+            literals.insert(field.to_string(), node.port_literals[field].clone());
+        }
+    }
     filled.port_literals = literals.into_iter().collect();
     filled
 }

@@ -45,6 +45,15 @@ pub const PROJECT_DEFINITION_UPGRADES: &[&[crate::stored::Op]] = &[
         crate::stored::Op::Within { at: "nodes.*.publishedService", ops: crate::access::spec::ACCESS_SPEC_V4 },
         crate::stored::Op::Within { at: "nodes.*.instanceService", ops: crate::access::spec::ACCESS_SPEC_V4 },
     ],
+    &[
+        // Version 5: a node carries its connection's recipe when the
+        // connection is picked on the install too, not only when an
+        // instance fills it, so the key says what it holds. A program
+        // stored before carries none for a picked field until it is built
+        // again (`weft maintenance off` builds every project it brings
+        // back).
+        crate::stored::Op::RenameKey { at: "nodes.*", from: "instanceService", to: "connectionService" },
+    ],
 ];
 
 /// The [`Op::Code`](crate::stored::Op::Code) steps of
@@ -900,14 +909,17 @@ pub struct NodeDefinition {
     /// the whole catalog.
     #[serde(default, rename = "publishedService", skip_serializing_if = "Option::is_none")]
     pub published_service: Option<crate::access::spec::AccessSpec>,
-    /// The recipe of the service this access node's connection field
-    /// connects to, carried when that field is `@instance_filled`: an instance's
-    /// connection is made through the instance door (a browser holding its
-    /// token, never the editor), and that door has only the program to read
-    /// the recipe from. It drives the instance's connect page exactly as the catalog
-    /// entry drives the editor's.
-    #[serde(default, rename = "instanceService", skip_serializing_if = "Option::is_none")]
-    pub instance_service: Option<crate::access::spec::AccessSpec>,
+    /// The recipe of the service this node's connection field connects
+    /// to, carried when that field is filled after the build: by an
+    /// instance (`@instance_filled`, through the instance door) or on the
+    /// install (picked, through `weft connect` or the program connections
+    /// door). Both doors are reached by a browser or a site's server that
+    /// holds a token, never the editor, and have only the program to read
+    /// the recipe from. It drives their connect page exactly as the
+    /// catalog entry drives the editor's. A wired connection field carries
+    /// none: whatever is wired to it brings its connection.
+    #[serde(default, rename = "connectionService", skip_serializing_if = "Option::is_none")]
+    pub connection_service: Option<crate::access::spec::AccessSpec>,
     /// The node type's validation rules, carried when a field of this
     /// node is `@instance_filled`: an instance's value is checked against them
     /// with the value swapped in (`weft_core::rules`), where no catalog
@@ -2545,7 +2557,7 @@ mod trigger_dependency_tests {
             per_instance_paths: Default::default(),
             images: vec![],
             published_service: None,
-            instance_service: None,
+            connection_service: None,
             instance_rules: None,
             recheck: Vec::new(),
             span: None,
@@ -2885,7 +2897,7 @@ mod project_wire_tests {
             images: vec![],
             fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             published_service: None,
-            instance_service: None,
+            connection_service: None,
             instance_rules: None,
             recheck: Vec::new(),
             span: Some(Span::single_line(1, 0, 5)),
@@ -3026,7 +3038,7 @@ mod project_wire_tests {
             images: vec![],
             fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             published_service: None,
-            instance_service: None,
+            connection_service: None,
             instance_rules: None,
             recheck: Vec::new(),
             span: None,

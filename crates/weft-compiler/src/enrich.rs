@@ -772,6 +772,26 @@ pub fn enrich_collecting(
                 None if !wired => {
                     node.port_literals.insert(input.name.clone(), weft_core::picks::install_picked_literal());
                 }
+                // With no connection, a node checking its callers would
+                // check nobody: every instance has to bring one.
+                Some(value)
+                    if meta.features.checks_callers
+                        && weft_core::instance::as_instance_filled(value).is_some_and(|filled| filled.may_stay_empty) =>
+                {
+                    let span = node.written_span(&input.name).map(|s| s.span).unwrap_or(node_span);
+                    errors.push(EnrichError {
+                        code: "enrich",
+                        span,
+                        file: node.source_file.clone(),
+                        subjects: vec![node.id.clone()],
+                        message: format!(
+                            "'{id}.{field}' checks its callers against the instance's connection, so an instance \
+                             cannot leave it empty (with none it would check nobody); write `@instance_filled` alone",
+                            id = node.id,
+                            field = input.name,
+                        ),
+                    });
+                }
                 // An instance's fallback is a connection written in the
                 // source too, with the same id that means nothing elsewhere.
                 Some(value)
@@ -786,8 +806,8 @@ pub fn enrich_collecting(
                         message: format!(
                             "'{id}.{field}' falls back to a connection written in the source. That was the \
                              old way: a connection lives in one install, so its id means nothing on any \
-                             other. Write `@instance_filled` alone; an instance that connected none is refused, \
-                             naming the field. See {doc}",
+                             other. Write `@instance_filled` alone, and an instance that connected none is refused, \
+                             naming the field; or `@instance_filled(null)`, and the node skips for it. See {doc}",
                             id = node.id,
                             field = input.name,
                             doc = weft_core::picks::PICKS_DOC,
@@ -817,17 +837,24 @@ pub fn enrich_collecting(
             }
         }
         // A node with an `@instance_filled` field carries what checking an
-        // instance's value needs (its rules) and, when the field is its
-        // connection, what the instance's connect page needs (the
-        // service's recipe): the instance door has only the program to
-        // read them from.
+        // instance's value needs (its rules): the instance door has only
+        // the program to read them from. A connection field filled after
+        // the build, by an instance or picked on the install, carries what
+        // its connect page needs (the service's recipe), for the same
+        // reason: the instance door and the program connections door read
+        // it off the program.
         let filled: Vec<String> = weft_core::instance::instance_filled_fields(node).map(|(field, _)| field.to_string()).collect();
         node.instance_rules = (!filled.is_empty()).then(|| weft_core::project::InstanceRules {
             rules: crate::validate::node_rules(meta, node),
             custom: weft_core::rules::CustomPorts::of(node, meta),
         });
-        node.instance_service = match connection {
-            Some(field) if filled.contains(&field.input) => Some(field.spec),
+        node.connection_service = match connection {
+            Some(field)
+                if filled.contains(&field.input)
+                    || node.port_literals.get(&field.input).is_some_and(weft_core::picks::is_install_picked) =>
+            {
+                Some(field.spec)
+            }
             _ => None,
         };
     }

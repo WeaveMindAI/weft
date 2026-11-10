@@ -137,8 +137,9 @@ fn the_mark_is_refused_where_it_means_nothing() {
 /// An instance-filled connection carries its service's recipe on the
 /// definition, and every instance-filled node its rules: an instance is
 /// connected and filled from its own page, and the program is all that
-/// door has to read them from. A shared access node, and a node the slice
-/// only reached, carry neither.
+/// door has to read them from. A connection picked on the install carries
+/// the recipe too (the program connections door reads it) but no rules,
+/// and a node the slice only reached carries neither.
 #[test]
 fn an_instance_filled_node_carries_what_the_instance_door_reads() {
     let project = build(
@@ -150,11 +151,11 @@ d.data = slack.access
 "#,
     );
     let node = |id: &str| project.nodes.iter().find(|n| n.id == id).unwrap();
-    assert_eq!(node("slack").instance_service.as_ref().map(|s| s.service.as_str()), Some("slack"));
+    assert_eq!(node("slack").connection_service.as_ref().map(|s| s.service.as_str()), Some("slack"));
     assert!(node("slack").instance_rules.as_ref().is_some_and(|r| !r.rules.is_empty()), "the connection rule rides along");
-    for id in ["shared", "d"] {
-        assert!(node(id).instance_service.is_none() && node(id).instance_rules.is_none(), "{id}");
-    }
+    assert_eq!(node("shared").connection_service.as_ref().map(|s| s.service.as_str()), Some("slack"));
+    assert!(node("shared").instance_rules.is_none());
+    assert!(node("d").connection_service.is_none() && node("d").instance_rules.is_none());
     let places: Vec<String> = weft_core::project::instance_filled_places(&project).into_iter().map(|filled| filled.spelled).collect();
     assert_eq!(places, vec!["slack".to_string()]);
 }
@@ -528,4 +529,69 @@ d.data = g.out
     assert_eq!(at("g.m"), vec!["it sits inside group 'g', whose gate reads 'bridge'".to_string()]);
     assert_eq!(at("d"), vec!["it reads 'g.m'".to_string()]);
     assert_eq!(at("bridge"), vec!["it is marked `@per_instance`".to_string()]);
+}
+
+fn try_build(source: &str) -> Result<weft_core::ProjectDefinition, String> {
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).map_err(|e| format!("{e:?}"))?;
+    enrich(&mut project, &catalog())?;
+    Ok(project)
+}
+
+/// Whether a run of `project` for an instance that filled nothing is
+/// refused before it starts.
+fn refused_for_an_empty_instance(project: &weft_core::ProjectDefinition) -> bool {
+    let ada = weft_core::instance::InstanceId::new("ada").unwrap();
+    weft_core::run_spec::instance_run_values(project, &ada, &Default::default()).is_err()
+}
+
+/// `@instance_filled(null)` lets an instance leave a field empty: a run
+/// for it is not refused (the node gets a null, or skips when it needs the
+/// field), and the field is not marked as one the instance must fill. The
+/// same for a connection as for any other field. `@instance_filled` alone,
+/// the instance has to fill both.
+#[test]
+fn a_field_filled_with_a_null_fallback_may_stay_empty() {
+    use weft_compiler::validate::{validate_with_mode, ValidationMode};
+    for (marked, unmarked, id, field) in [
+        ("ws = SlackAccess { account: @instance_filled(null) }\n", "ws = SlackAccess { account: @instance_filled }\n", "ws", "account"),
+        ("get = HttpRequest { url: @instance_filled(null) }\n", "get = HttpRequest { url: @instance_filled }\n", "get", "url"),
+        ("get = HttpRequest { url: \"http://localhost:1\", body: @instance_filled(null) }\n", "", "get", "body"),
+    ] {
+        let project = build(marked);
+        let runtime = validate_with_mode(&project, &catalog(), ValidationMode::Runtime);
+        assert!(runtime.is_empty(), "{marked}: {runtime:?}");
+        let node = project.nodes.iter().find(|n| n.id == id).unwrap();
+        assert!(weft_core::instance::may_stay_empty(node, field), "{marked}");
+        let cx = weft_core::rules::RuleContext::new(&project);
+        assert!(!weft_core::instance::instance_field_needed(&cx, node, field), "{marked}: an instance may leave it empty");
+        assert!(!refused_for_an_empty_instance(&project), "{marked}");
+        if id == "ws" {
+            // Whether the connection is there is known only when the node
+            // fires, so its rule is asked then, on what arrived.
+            let rules = node.instance_rules.as_ref().expect("an instance-filled node carries its rules");
+            let undecided = weft_core::rules::undecided(&rules.rules, node, &cx, &rules.custom);
+            assert!(!undecided.is_empty(), "the connection rule waits for the run");
+        }
+        if unmarked.is_empty() {
+            continue;
+        }
+        let project = build(unmarked);
+        let node = project.nodes.iter().find(|n| n.id == id).unwrap();
+        let cx = weft_core::rules::RuleContext::new(&project);
+        assert!(weft_core::instance::instance_field_needed(&cx, node, field), "{unmarked}");
+        assert!(refused_for_an_empty_instance(&project), "{unmarked}");
+    }
+}
+
+/// A route checking its callers against the instance's connection cannot
+/// let an instance leave it empty: with none it would check nobody.
+#[test]
+fn a_connection_its_callers_are_checked_against_may_not_stay_empty() {
+    let refused = try_build(
+        "door = Route { path: \"hi\", method: \"GET\", auth: \"api_keys\", connection: @instance_filled(null) }\n",
+    )
+    .unwrap_err();
+    assert!(refused.contains("cannot leave it empty"), "{refused}");
+    try_build("door = Route { path: \"hi\", method: \"GET\", auth: \"api_keys\", connection: @instance_filled }\n")
+        .expect("`@instance_filled` alone is fine");
 }

@@ -141,17 +141,17 @@ A page then builds its door with the instance's token alone, and it calls
 
 ```ts
 import { InstanceDoor } from '@weft/connect';
-import { InstanceSettings } from '@weft/connect/svelte';
+import { DoorSettings } from '@weft/connect/svelte';
 
 const door = new InstanceDoor(instanceToken);
-// <InstanceSettings {door} />
+// <DoorSettings {door} />
 ```
 
 If the page reaches the dispatcher some other way (the browser extension
 does, with the address the token was minted at), pass it as
 `new InstanceDoor(token, { base: dispatcherUrl })`.
 
-`InstanceSettings` lists every field the program gives each instance its own
+`DoorSettings` lists every field the program gives each instance its own
 value for (the ones it writes `@instance_filled`), grouped by node, each with
 its own control: the connection picker for a connection, the searchable list
 and the provider's chooser for a list field, a plain input for anything else.
@@ -167,12 +167,70 @@ the program's author. Name what your visitors read in your own words with
 anything you leave out keeps the program's label:
 
 ```svelte
-<InstanceSettings {door} labels={{ greet: 'Your greeting', 'greet.value': 'How the bot greets you' }} />
+<DoorSettings {door} labels={{ greet: 'Your greeting', 'greet.value': 'How the bot greets you' }} />
 ```
 
 If you build your own page instead, `door.fields()` lists the fields,
 `door.setValues(set, clear)` stores values, and `ResourceSelect` with
 `door.resources(node, field)` draws one list field.
+
+## An admin page for the program's own keys
+
+If your site's admin should paste the keys the program itself uses (the ones
+you would otherwise set with `weft connect`, like the key of a `VapiAccess`
+node), give `DoorSettings` a `ProgramDoor` and it becomes that admin page.
+It lists every key the program uses on the install. The admin sets one by
+pasting it, and weft stores it for the program.
+
+The page needs a connections key: mint it with `weft token mint
+--connections` and keep it in the server's environment as
+`WEFT_CONNECTIONS_KEY`. Then mount a second pass-through on its own route.
+Every call to it takes your own answer to "is this caller my admin?", because
+weft cannot tell your admin from your visitors:
+
+```ts
+// front/src/routes/weft-admin/[...path]/+server.ts
+import { env } from '$env/dynamic/private';
+import { weftProgramPassThrough } from '@weft/connect/server';
+import type { RequestHandler } from './$types';
+
+const pass = weftProgramPassThrough({
+	dispatcher: () => env.WEFT_DISPATCHER_URL,
+	connectionsKey: () => env.WEFT_CONNECTIONS_KEY,
+});
+
+export const fallback: RequestHandler = ({ request, params, locals }) =>
+	pass(request, params.path, { admin: locals.user?.isAdmin === true }); // your own check
+```
+
+If `admin` is anything but `true`, it answers 403 saying your admin check
+refused the call, and weft never sees it. It passes on only calls under
+`/program/` (anything else answers 404), and sends your connections key in
+place of any `Authorization` the page sent. If `WEFT_CONNECTIONS_KEY` is not
+set, it answers 500 naming it. The admin page
+then calls `/weft-admin/program/...` on your site with no key of its own:
+
+```ts
+import { ProgramDoor } from '@weft/connect';
+import { DoorSettings } from '@weft/connect/svelte';
+
+const door = new ProgramDoor();
+// <DoorSettings {door} />
+```
+
+If you mount the route somewhere other than `/weft-admin`, pass that path:
+`new ProgramDoor({ base: '/your-path' })`.
+
+Pasting a key there stores it and picks it in one go, and if weft refuses the
+pick, it deletes the key it just stored and the page shows why. If you build
+your own admin page instead, that is the whole of picking: the connect of
+`door.connectTransport(field)` answers `picked` with what the pick changed,
+and `door.clear(field)` clears it. A `ProgramDoor` has no `save`, since there
+is nothing to pick on it but a key you just pasted. Replacing or
+clearing a key deletes the old one from weft once nothing else on the install
+uses it. If a service signs in through its own page in the browser
+instead of taking a pasted key, this page cannot connect it: do that from the
+editor's Connect button or with `weft connect`.
 
 ## How it looks
 

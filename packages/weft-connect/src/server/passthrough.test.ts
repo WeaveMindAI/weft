@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { LARGEST_PART_BYTES, RUN_ID_HEADER, weftPassThrough, type PlainFailure } from './passthrough';
+import { LARGEST_PART_BYTES, RUN_ID_HEADER, weftPassThrough, weftProgramPassThrough, type PlainFailure } from './passthrough';
 
 /** A dispatcher that records what reached it and echoes the body back. */
 function fakeDispatcher(answer: (req: Request) => Response | Promise<Response> = () => new Response('ok')) {
@@ -352,5 +352,73 @@ describe('the pass-through', () => {
 			'instance/fields',
 		);
 		expect(await res.text()).toContain('fetch failed: connect ECONNREFUSED 10.10.0.2:14113');
+	});
+});
+
+describe('the program pass-through', () => {
+	it('presents the connections key the server holds, never what the page sent', async () => {
+		const { fetcher, seen } = fakeDispatcher(() => new Response('[]', { headers: { 'content-type': 'application/json' } }));
+		const pass = weftProgramPassThrough({ dispatcher: 'http://d', connectionsKey: () => 'wft-key', fetcher });
+		const res = await pass(
+			new Request('https://site.example/weft-admin/program/connections', {
+				headers: { Authorization: 'Bearer from-the-page', Cookie: 'admin=1' },
+			}),
+			'program/connections',
+			{ admin: true },
+		);
+		expect(res.status).toBe(200);
+		expect(seen[0].url).toBe('http://d/program/connections');
+		expect(seen[0].headers.get('authorization')).toBe('Bearer wft-key');
+		expect(seen[0].headers.get('cookie')).toBeNull();
+		expect(seen[0].headers.get('x-forwarded-prefix')).toBe('/weft-admin');
+	});
+
+	it('passes the program door alone', async () => {
+		const { fetcher, seen } = fakeDispatcher();
+		const pass = weftProgramPassThrough({ dispatcher: 'http://d', connectionsKey: 'wft-key', fetcher });
+		for (const path of ['instance/fields', 'signal-token/signals', 'program/../instance/fields']) {
+			const res = await pass(new Request(`https://site.example/weft-admin/${path}`), path, { admin: true });
+			expect(res.status).toBe(404);
+		}
+		expect(seen).toHaveLength(0);
+	});
+
+	it("passes nothing on when the site's admin check refuses the caller", async () => {
+		const { fetcher, seen } = fakeDispatcher();
+		const pass = weftProgramPassThrough({ dispatcher: 'http://d', connectionsKey: 'wft-key', fetcher });
+		const call = () => new Request('https://site.example/weft-admin/program/connections', { method: 'POST', body: '{}' });
+		const refused = await pass(call(), 'program/connections', { admin: false });
+		expect(refused.status).toBe(403);
+		expect(await refused.text()).toContain("the site's admin check refused this call");
+		// A plain JavaScript site that leaves the check out is refused the same way.
+		const unchecked = pass as unknown as (request: Request, path: string) => Promise<Response>;
+		expect((await unchecked(call(), 'program/connections')).status).toBe(403);
+		expect(seen).toHaveLength(0);
+	});
+
+	it("passes the call on once the site's admin check lets it through", async () => {
+		const { fetcher, seen } = fakeDispatcher();
+		const pass = weftProgramPassThrough({ dispatcher: 'http://d', connectionsKey: 'wft-key', fetcher });
+		const res = await pass(new Request('https://site.example/weft-admin/program/connections'), 'program/connections', { admin: true });
+		expect(res.status).toBe(200);
+		expect(seen).toHaveLength(1);
+		expect(seen[0].url).toBe('http://d/program/connections');
+	});
+
+	it('says so when the key is not set', async () => {
+		const { fetcher, seen } = fakeDispatcher();
+		const pass = weftProgramPassThrough({ dispatcher: 'http://d', connectionsKey: () => undefined, fetcher });
+		const res = await pass(new Request('https://site.example/weft-admin/program/connections'), 'program/connections', { admin: true });
+		expect(res.status).toBe(500);
+		expect(await res.text()).toContain('WEFT_CONNECTIONS_KEY');
+		expect(seen).toHaveLength(0);
+	});
+
+	it("never passes the program door on a visitor's route", async () => {
+		const { fetcher, seen } = fakeDispatcher();
+		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
+		const res = await pass(new Request(`${site}/program/connections`), 'program/connections');
+		expect(res.status).toBe(404);
+		expect(seen).toHaveLength(0);
 	});
 });

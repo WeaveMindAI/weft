@@ -10,7 +10,10 @@
 //! unit's readiness checks from inside it. The agent's container is on
 //! the install's Docker network under the unit's name, which is how
 //! another unit reaches the unit's ports; a project's worker, a process on
-//! the machine, reaches them where the agent publishes them (`Publish`).
+//! the machine, reaches them where the agent publishes them (`Publish`):
+//! on a laptop, at the host port the install keeps for each
+//! (`kept_ports`), so a container made again, or brought back by Docker,
+//! answers where it did.
 //!
 //! Every name carries the install on a laptop, where installs share one
 //! Docker daemon (`infra_names`).
@@ -38,6 +41,7 @@ use weft_platform_traits::{EndpointAt, InfraHost, RestartCause, UnitObservation,
 
 use crate::docker::{self, labels, roles, ContainerRow, Docker};
 use crate::infra_names::{self, DiskLook, DiskPlan};
+use crate::kept_ports::{KeptPorts, UnitPort};
 
 /// Which part of a unit a container is.
 const PART: &str = "weft.part";
@@ -136,14 +140,15 @@ pub enum DiskBacking {
 }
 
 /// Which ports of a unit the machine publishes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum Publish {
-    /// Every port, on loopback at a port Docker picks (a laptop): weft's
-    /// runtime and the project's workers are processes on the machine,
-    /// off the Docker network, and they reach the unit here. Another
-    /// program of this machine's can reach a loopback port too, which is
-    /// why a unit's own credentials (a database password) guard it.
-    Loopback,
+    /// Every port, on loopback at the port the install keeps for it (a
+    /// laptop): weft's runtime and the project's workers are processes on
+    /// the machine, off the Docker network, and they reach the unit here.
+    /// Another program of this machine's can reach a loopback port too,
+    /// which is why a unit's own credentials (a database password) guard
+    /// it.
+    Loopback(Arc<KeptPorts>),
     /// Every port of every container, on every interface at the same
     /// number (a cloud machine running one unit: the workers and the
     /// install's network reach the unit at the machine's address, and the
@@ -333,10 +338,18 @@ impl LocalInfraHost {
             docker::run(self.docker.as_ref(), own_args(&self.cfg, r, name, gid, &owned)).await?;
         }
 
+        let published = self.published(r, unit)?;
         let env_file = self.write_env_file(&format!("{}-agent", agent_name(&self.cfg, r, name)), &self.cfg.agent_broker.env(r))?;
-        let started = docker::run(self.docker.as_ref(), agent_args(node, unit, &env_file, &self.cfg)).await;
+        let args = agent_args(node, unit, &env_file, &self.cfg, &published);
+        let started = self.docker.exec(&args).await;
         let _ = std::fs::remove_file(&env_file);
-        started.map_err(|e| e.context(format!("start the agent of unit '{name}' of '{}'", r.node)))?;
+        let started = started.map_err(|e| e.context(format!("start the agent of unit '{name}' of '{}'", r.node)))?;
+        if !started.success() {
+            if let Some((port, host)) = taken_port(&started.stderr, &self.cfg.publish, &published) {
+                anyhow::bail!("{}", crate::kept_ports::taken_by_another_program(r, name, &UnitPort::Container(port), host));
+            }
+            return Err(started.ok(&args).expect_err("a call that did not succeed is an error").context(format!("start the agent of unit '{name}' of '{}'", r.node)));
+        }
         for c in &unit.unit.init_containers {
             let env_file = self.env_file(r, name, c)?;
             let args = container_args(node, unit, c, &env_file, ContainerRun::Init, &self.cfg);
@@ -367,6 +380,24 @@ impl LocalInfraHost {
             started.map_err(|e| e.context(format!("start container '{}' of unit '{name}' of '{}'", c.name, r.node)))?;
         }
         Ok(())
+    }
+
+    /// The host port the agent of `unit` of `node`'s copy publishes each
+    /// of the unit's ports at, by its number in the unit: the port the
+    /// install keeps for it on a laptop, the same number on a cloud
+    /// machine.
+    fn published(&self, node: &NodeRef, unit: &ResolvedUnit) -> anyhow::Result<BTreeMap<u16, u16>> {
+        let ports = all_ports(unit);
+        let Publish::Loopback(kept) = &self.cfg.publish else { return Ok(ports.into_iter().map(|p| (p, p)).collect()) };
+        let wanted: Vec<UnitPort> = ports.into_iter().map(UnitPort::Container).collect();
+        Ok(kept
+            .keep(node, &unit.unit.name, &wanted)?
+            .into_iter()
+            .filter_map(|(port, host)| match port {
+                UnitPort::Container(number) => Some((number, host)),
+                UnitPort::Process(_) => None,
+            })
+            .collect())
     }
 
     /// What to do with the disk `volume` of `node`'s copy, from what the
@@ -816,7 +847,11 @@ impl InfraHost for LocalInfraHost {
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        self.remove_volumes(&scratch).await
+        self.remove_volumes(&scratch).await?;
+        match &self.cfg.publish {
+            Publish::Loopback(kept) => kept.release_unit(node, unit),
+            Publish::AllPorts => Ok(()),
+        }
     }
 
     async fn terminate(&self, node: &NodeRef, keep_disks: &[String]) -> anyhow::Result<()> {
@@ -834,7 +869,11 @@ impl InfraHost for LocalInfraHost {
             .filter(|(_, l)| !(l.get(VOLUME_KIND).map(String::as_str) == Some("disk") && l.get(VOLUME).is_some_and(|v| keep_disks.contains(v))))
             .map(|(name, _)| name)
             .collect();
-        self.remove_volumes(&gone).await
+        self.remove_volumes(&gone).await?;
+        match &self.cfg.publish {
+            Publish::Loopback(kept) => kept.release_copy(node),
+            Publish::AllPorts => Ok(()),
+        }
     }
 
     async fn observe(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<Vec<UnitObservation>> {
@@ -924,32 +963,25 @@ impl InfraHost for LocalInfraHost {
             EndpointTarget::Unit { unit, container, port } => {
                 let port = port_number(node, unit, container, port)?;
                 let agent = agent_name(&self.cfg, &node.node, unit);
-                let url = format!("http://{agent}:{port}");
-                let on_machine = match self.cfg.publish {
-                    Publish::Loopback => {
-                        let printed = match docker::run(self.docker.as_ref(), vec!["port".into(), agent.clone(), format!("{port}/tcp")]).await {
-                            Ok(printed) => printed,
-                            Err(e) if under_old_names(&self.cfg, &self.unit_containers(&node.node, unit).await?) => {
-                                anyhow::bail!(
-                                    "the infra '{}' still runs under the names an older weft gave it, so its doors cannot be \
-                                     found: run `weft infra stop`, then `weft infra start`, to move it onto this weft's names \
-                                     (its disks stay and come along) ({e:#})",
-                                    node.node.node
-                                )
-                            }
-                            Err(e) => return Err(e),
-                        };
-                        loopback(&printed)
-                            .ok_or_else(|| anyhow::anyhow!("{agent} publishes no loopback port for {port}: {printed:?}"))?
-                            .to_string()
+                let (url, on_machine) = match &self.cfg.publish {
+                    // On a laptop the workers and weft's runtime are
+                    // processes on the machine, so they reach the unit on
+                    // loopback, where its agent publishes the port.
+                    Publish::Loopback(kept) => {
+                        let host = kept.kept(&node.node, unit, &UnitPort::Container(port))?.ok_or_else(|| {
+                            // A container a weft from before kept ports
+                            // made: Docker picked its port, and only making
+                            // it again gives it a kept one.
+                            anyhow::anyhow!(
+                                "unit '{unit}' of '{}' keeps no port for its port {port} (it was started by a weft that did \
+                                 not keep ports); run `weft infra stop` then `weft infra start` once to give it one",
+                                node.node.node
+                            )
+                        })?;
+                        let on_machine = format!("127.0.0.1:{host}");
+                        (format!("http://{on_machine}"), on_machine)
                     }
-                    Publish::AllPorts => format!("{agent}:{port}"),
-                };
-                // On a laptop the workers and weft's runtime are processes
-                // on the machine, so they reach the unit on loopback.
-                let url = match self.cfg.publish {
-                    Publish::Loopback => format!("http://{on_machine}"),
-                    Publish::AllPorts => url,
+                    Publish::AllPorts => (format!("http://{agent}:{port}"), format!("{agent}:{port}")),
                 };
                 let same_network = matches!(ep.expose, Expose::SameNetwork).then_some(on_machine);
                 Ok(EndpointAt { url, same_network })
@@ -1154,8 +1186,10 @@ fn all_ports(unit: &ResolvedUnit) -> Vec<u16> {
 
 /// `docker run` for the unit's agent: it owns the unit's network, joins
 /// the install's under the unit's name, and publishes its own port on
-/// loopback and the unit's ports as the machine publishes them.
-fn agent_args(node: &ResolvedNode, unit: &ResolvedUnit, env_file: &std::path::Path, cfg: &LocalInfraHostConfig) -> Vec<String> {
+/// loopback (at a port Docker picks: only this host reads it, afresh at
+/// every look) and each of the unit's ports at its host port in
+/// `published` ([`LocalInfraHost::published`]), on loopback on a laptop.
+fn agent_args(node: &ResolvedNode, unit: &ResolvedUnit, env_file: &std::path::Path, cfg: &LocalInfraHostConfig, published: &BTreeMap<u16, u16>) -> Vec<String> {
     let name = agent_name(cfg, &node.node, &unit.unit.name);
     let mut l = base_labels(&cfg.install, &node.node, &unit.unit.name);
     l.insert(labels::UNIT_HASH, unit.hash.clone());
@@ -1179,17 +1213,12 @@ fn agent_args(node: &ResolvedNode, unit: &ResolvedUnit, env_file: &std::path::Pa
         "--publish".into(),
         format!("127.0.0.1::{UNIT_AGENT}"),
     ]);
-    match cfg.publish {
-        Publish::Loopback => {
-            for port in all_ports(unit) {
-                args.extend(["--publish".into(), format!("127.0.0.1::{port}")]);
-            }
-        }
-        Publish::AllPorts => {
-            for port in all_ports(unit) {
-                args.extend(["--publish".into(), format!("{port}:{port}")]);
-            }
-        }
+    let on = match cfg.publish {
+        Publish::Loopback(_) => "127.0.0.1:",
+        Publish::AllPorts => "",
+    };
+    for (port, host) in published {
+        args.extend(["--publish".into(), format!("{on}{host}:{port}")]);
     }
     args.extend(docker::label_args(&l));
     args.extend(["--env-file".into(), env_file.display().to_string()]);
@@ -1335,6 +1364,22 @@ fn decode_probes(raw: &str) -> anyhow::Result<Probes> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Of `published` (each unit port and the host port the install keeps for
+/// it), the one Docker refused to publish because something else holds its
+/// host port, from what a failed `docker run` printed (`stderr`): Docker
+/// says "Bind for 127.0.0.1:<port> failed: port is already allocated" when
+/// a container holds it, and "... 127.0.0.1:<port>: bind: address already
+/// in use" when another program does.
+fn taken_port(stderr: &str, publish: &Publish, published: &BTreeMap<u16, u16>) -> Option<(u16, u16)> {
+    if !matches!(publish, Publish::Loopback(_)) || !(stderr.contains("already allocated") || stderr.contains("already in use")) {
+        return None;
+    }
+    published.iter().map(|(port, host)| (*port, *host)).find(|(_, host)| {
+        let at = format!("127.0.0.1:{host}");
+        stderr.match_indices(&at).any(|(i, _)| !stderr[i + at.len()..].starts_with(|c: char| c.is_ascii_digit()))
+    })
+}
+
 /// `127.0.0.1:<port>` from what `docker port` printed.
 fn loopback(printed: &str) -> Option<&str> {
     printed.lines().map(str::trim).find(|l| l.starts_with("127.0.0.1:"))
@@ -1398,13 +1443,16 @@ mod tests {
         resolve(&spec(), &node_ref(), &BTreeMap::new()).unwrap()
     }
 
+    /// The first host port a test's kept ports hand out.
+    const FIRST_KEPT: u16 = 20000;
+
     fn cfg(gpu: GpuAccess) -> LocalInfraHostConfig {
         let dir = std::env::temp_dir().join(format!("weft-infra-test-{}", uuid::Uuid::new_v4().simple()));
         LocalInfraHostConfig {
             agent_image: "weft-runtime:t".into(),
             gpu,
             disks: DiskBacking::Volumes,
-            publish: Publish::Loopback,
+            publish: Publish::Loopback(crate::kept_ports::fake::counting_in(&dir, FIRST_KEPT)),
             install: weft_core::infra::Install::default_install(),
             names: infra_names::Names::PerInstall { claims: dir.join("claims") },
             scratch_dir: dir,
@@ -1426,7 +1474,7 @@ mod tests {
     #[test]
     fn the_agent_reaches_the_machine_by_name() {
         let node = resolved();
-        let args = agent_args(&node, node.unit("main").unwrap(), std::path::Path::new("/tmp/e.env"), &cfg(GpuAccess::None));
+        let args = agent_args(&node, node.unit("main").unwrap(), std::path::Path::new("/tmp/e.env"), &cfg(GpuAccess::None), &BTreeMap::new());
         assert!(args.windows(2).any(|w| w == crate::docker::host_gateway_args()), "{args:?}");
     }
 
@@ -1491,13 +1539,18 @@ mod tests {
     #[test]
     fn the_agent_publishes_its_port_and_the_units_on_loopback_or_as_is_on_a_cloud_machine() {
         let node = resolved();
-        let args = agent_args(&node, node.unit("main").unwrap(), std::path::Path::new("/e"), &cfg(GpuAccess::None));
+        let laptop = host(Arc::new(FakeDocker::new()), false);
+        let kept = laptop.published(&node.node, node.unit("main").unwrap()).unwrap();
+        assert_eq!(kept, BTreeMap::from([(5432, FIRST_KEPT)]), "the port the install keeps for it");
+        let args = agent_args(&node, node.unit("main").unwrap(), std::path::Path::new("/e"), &laptop.cfg, &kept);
         let published: Vec<&String> = args.windows(2).filter(|w| w[0] == "--publish").map(|w| &w[1]).collect();
-        assert_eq!(published, [&format!("127.0.0.1::{UNIT_AGENT}"), &"127.0.0.1::5432".to_string()]);
+        assert_eq!(published, [&format!("127.0.0.1::{UNIT_AGENT}"), &format!("127.0.0.1:{FIRST_KEPT}:5432")]);
         assert_eq!(args[args.len() - 3..], ["weft-runtime:t", "unit-agent", "serve"]);
 
         let machine = LocalInfraHostConfig { publish: Publish::AllPorts, names: infra_names::Names::Machine, ..cfg(GpuAccess::None) };
-        let args = agent_args(&node, node.unit("main").unwrap(), std::path::Path::new("/e"), &machine);
+        let cloud = LocalInfraHost::new(Arc::new(FakeDocker::new()), machine.clone());
+        let as_is = cloud.published(&node.node, node.unit("main").unwrap()).unwrap();
+        let args = agent_args(&node, node.unit("main").unwrap(), std::path::Path::new("/e"), &machine, &as_is);
         let published: Vec<&String> = args.windows(2).filter(|w| w[0] == "--publish").map(|w| &w[1]).collect();
         assert_eq!(published, [&format!("127.0.0.1::{UNIT_AGENT}"), &"5432:5432".to_string()], "a cloud machine publishes every port as is");
     }
@@ -1592,6 +1645,83 @@ mod tests {
         let before = docker.calls_to("run").len();
         h.apply_unit(&node, "main").await.unwrap();
         assert_eq!(docker.calls_to("run").len(), before, "running as asked: nothing restarts");
+    }
+
+    /// The host ports `--publish` names for the unit's ports, from the
+    /// agent's `docker run`.
+    fn published_ports(docker: &FakeDocker, agent: &str) -> Vec<String> {
+        let runs = docker.calls_to("run");
+        let run = runs.iter().rev().find(|c| c.windows(2).any(|w| w == ["--name", agent])).expect("the agent ran");
+        run.windows(2).filter(|w| w[0] == "--publish" && !w[1].ends_with(&format!(":{UNIT_AGENT}"))).map(|w| w[1].clone()).collect()
+    }
+
+    /// A unit's port is published at the host port the install keeps for
+    /// it, which is the endpoint's address; the unit made again (a new
+    /// version, a start after a stop) publishes it at the same one, so
+    /// Docker bringing it back keeps it there too. A removed unit or a
+    /// terminated copy lets go of it.
+    #[tokio::test]
+    async fn a_units_port_keeps_its_host_port_until_the_unit_is_removed() {
+        let docker = Arc::new(FakeDocker::new());
+        let h = host(docker.clone(), false);
+        let node = resolved();
+        let agent = agent_name(&h.cfg, &node.node, "main");
+        let kept = format!("127.0.0.1:{FIRST_KEPT}");
+        h.apply_unit(&node, "main").await.unwrap();
+        assert_eq!(published_ports(&docker, &agent), [format!("{kept}:5432")]);
+        let at = h.endpoint(&node, "sql").await.unwrap();
+        assert_eq!(at, EndpointAt { url: format!("http://{kept}"), same_network: Some(kept.clone()) });
+        assert!(docker.calls_to("port").is_empty(), "the address is the kept port, never Docker's say");
+
+        h.apply_unit(&node, "main").await.unwrap();
+        assert_eq!(docker.calls_to("run").iter().filter(|c| c.contains(&agent)).count(), 2, "made again");
+        assert_eq!(published_ports(&docker, &agent), [format!("{kept}:5432")], "at the same port");
+
+        let Publish::Loopback(ports) = &h.cfg.publish else { unreachable!() };
+        let pg = UnitPort::Container(5432);
+        for gone in ["remove", "terminate"] {
+            h.apply_unit(&node, "main").await.unwrap();
+            assert!(ports.kept(&node.node, "main", &pg).unwrap().is_some());
+            match gone {
+                "remove" => h.remove_unit(&node.node, "main").await.unwrap(),
+                _ => h.terminate(&node.node, &[]).await.unwrap(),
+            }
+            assert_eq!(ports.kept(&node.node, "main", &pg).unwrap(), None, "{gone}");
+            assert!(h.endpoint(&node, "sql").await.is_err(), "{gone}: no address until it starts again");
+        }
+    }
+
+    /// A kept port another program took meanwhile fails the start, naming
+    /// the port, the unit's port and the infra, and what to do; the port
+    /// stays kept, never quietly swapped for another.
+    #[tokio::test]
+    async fn a_kept_port_taken_by_another_program_fails_the_start_saying_so() {
+        let docker = Arc::new(FakeDocker::new());
+        let node = resolved();
+        let agent = agent_name(&cfg(GpuAccess::None), &node.node, "main");
+        docker.fail(
+            &["run", "--detach", "--name", &agent],
+            &format!("docker: Error response from daemon: driver failed programming external connectivity on endpoint {agent}: Bind for 127.0.0.1:{FIRST_KEPT} failed: port is already allocated."),
+        );
+        let h = host(docker.clone(), false);
+        let err = h.apply_unit(&node, "main").await.unwrap_err().to_string();
+        assert!(err.contains(&format!("port {FIRST_KEPT} of this machine")) && err.contains("its port 5432") && err.contains("of 'db'"), "{err}");
+        assert!(err.contains(&format!("lsof -i :{FIRST_KEPT}")) && err.contains("weft infra terminate"), "{err}");
+        let Publish::Loopback(ports) = &h.cfg.publish else { unreachable!() };
+        assert_eq!(ports.kept(&node.node, "main", &UnitPort::Container(5432)).unwrap(), Some(FIRST_KEPT));
+    }
+
+    #[test]
+    fn a_taken_port_is_read_from_either_refusal_docker_prints() {
+        let laptop = cfg(GpuAccess::None);
+        // The port at 2000 is looked for first, and 20001 starts with it.
+        let published = BTreeMap::from([(80, 2000), (5432, 20001)]);
+        let allocated = "Bind for 127.0.0.1:20001 failed: port is already allocated";
+        assert_eq!(taken_port(allocated, &laptop.publish, &published), Some((5432, 20001)), "never 2000 for 20001");
+        let in_use = "Error starting userland proxy: listen tcp4 127.0.0.1:2000: bind: address already in use";
+        assert_eq!(taken_port(in_use, &laptop.publish, &published), Some((80, 2000)));
+        assert_eq!(taken_port("Bind for 127.0.0.1:20001 failed: no such image", &laptop.publish, &published), None);
+        assert_eq!(taken_port(allocated, &Publish::AllPorts, &published), None, "a cloud machine keeps no port");
     }
 
     /// A disk an older weft named without the install, which only this

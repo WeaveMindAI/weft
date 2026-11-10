@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use weft_task_store::db::{self, Client, Pool};
+use weft_task_store::pages::PageCaps;
 
 use weft_core::ProjectDefinition;
 
@@ -600,47 +601,69 @@ async fn record_trigger_cuts(db: &impl Client, id: uuid::Uuid, hash: &str, cuts:
     Ok(())
 }
 
-/// How many programs [`walk_trigger_cuts`] reads at once.
-const WALK_PAGE: i64 = 50;
+/// How much one page of [`walk_trigger_cuts`] reads: at most 50 programs,
+/// and about [`weft_task_store::pages::PAGE_BYTES`] of them, since every
+/// program of a page is held at once and one may be 19 MB.
+pub const WALK_PAGE: PageCaps = PageCaps { rows: 50, bytes: weft_task_store::pages::PAGE_BYTES };
 
 /// The data step behind `project_definition.trigger_cuts_walked`: every
-/// program kept with no answer yet, read a page at a time (a program may
-/// be megabytes), has its triggers' cuts walked and recorded when it is a
-/// version a build registered, as [`ProjectStoreOps::register_with_hashes`]
-/// walks them, and none when it is a cut a run kept. A program that does
-/// not read fails the boot, naming it.
+/// program kept with no answer yet, read a page at a time
+/// ([`WALK_PAGE`]), has its triggers' cuts walked and recorded when it is
+/// a version a build registered, as
+/// [`ProjectStoreOps::register_with_hashes`] walks them, and none when it
+/// is a cut a run kept. A program that does not read fails the boot,
+/// naming it.
 fn walk_trigger_cuts<'c>(tx: &'c db::Transaction<'c>) -> futures::future::BoxFuture<'c, anyhow::Result<()>> {
-    Box::pin(async move {
-        loop {
-            let rows = tx
-                .query(
-                    "SELECT project_id, definition_hash, project_json, project_json_version, cut_from IS NOT NULL \
-                     FROM project_definition WHERE trigger_cuts_walked IS NULL \
-                     ORDER BY project_id, definition_hash LIMIT $1",
-                    &[&WALK_PAGE],
-                )
-                .await?;
-            if rows.is_empty() {
-                return Ok(());
+    Box::pin(walk_trigger_cuts_in(tx, WALK_PAGE))
+}
+
+/// [`walk_trigger_cuts`] in pages of `caps`. The rows it answers leave the
+/// walk (`trigger_cuts_walked` is the cursor), so each page starts from
+/// the first row still unanswered. Only a registered version's program is
+/// read, and only it counts toward a page's bytes.
+pub async fn walk_trigger_cuts_in(tx: &db::Transaction<'_>, caps: PageCaps) -> anyhow::Result<()> {
+    const UNANSWERED: &str = "FROM project_definition WHERE trigger_cuts_walked IS NULL";
+    const PROGRAM: &str = "CASE WHEN cut_from IS NULL THEN project_json ELSE '' END";
+    loop {
+        let Some(page) =
+            weft_task_store::pages::next_page(tx, UNANSWERED, &["project_id", "definition_hash"], PROGRAM, &[], caps).await?
+        else {
+            return Ok(());
+        };
+        let (last_id, last_hash) = (page.last[0].parse::<uuid::Uuid>()?, &page.last[1]);
+        let rows = tx
+            .query(
+                &format!(
+                    "SELECT project_id, definition_hash, {PROGRAM}, project_json_version, cut_from IS NOT NULL \
+                     {UNANSWERED} AND (project_id, definition_hash) <= ($1, $2) \
+                     ORDER BY project_id, definition_hash"
+                ),
+                &[&last_id, last_hash],
+            )
+            .await?;
+        let (mut ids, mut hashes, mut answers) = (Vec::with_capacity(rows.len()), Vec::with_capacity(rows.len()), Vec::with_capacity(rows.len()));
+        for row in &rows {
+            let (id, hash): (uuid::Uuid, String) = (row.get(0), row.get(1));
+            let registered = !row.get::<_, bool>(4);
+            if registered {
+                let json: String = row.get(2);
+                let program = ProjectDefinition::STORED
+                    .decode(json.as_str(), row.get(3))
+                    .map_err(|e| e.at(format_args!("program {hash} of project {id}")))?;
+                record_trigger_cuts(tx, id, &hash, &weft_core::run_spec::trigger_cuts(&program)).await?;
             }
-            for row in &rows {
-                let (id, hash): (uuid::Uuid, String) = (row.get(0), row.get(1));
-                let registered = !row.get::<_, bool>(4);
-                if registered {
-                    let json: String = row.get(2);
-                    let program = ProjectDefinition::STORED
-                        .decode(json.as_str(), row.get(3))
-                        .map_err(|e| e.at(format_args!("program {hash} of project {id}")))?;
-                    record_trigger_cuts(tx, id, &hash, &weft_core::run_spec::trigger_cuts(&program)).await?;
-                }
-                tx.execute(
-                    "UPDATE project_definition SET trigger_cuts_walked = $3 WHERE project_id = $1 AND definition_hash = $2",
-                    &[&id, &hash, &registered],
-                )
-                .await?;
-            }
+            ids.push(id);
+            hashes.push(hash);
+            answers.push(registered);
         }
-    })
+        tx.execute(
+            "UPDATE project_definition AS d SET trigger_cuts_walked = u.registered \
+             FROM unnest($1::uuid[], $2::text[], $3::bool[]) AS u(project_id, definition_hash, registered) \
+             WHERE d.project_id = u.project_id AND d.definition_hash = u.definition_hash",
+            &[&ids, &hashes, &answers],
+        )
+        .await?;
+    }
 }
 
 /// The `project`, `project_definition` and `program_trigger_cut` tables.
@@ -1322,9 +1345,10 @@ impl ProjectStoreOps for PostgresProjectStore {
         crate::infra_lifecycle_command::remove_project(&tx, id).await?;
         // An instance lives inside this project only: its connections,
         // picks and tokens reach nothing once the project is gone, and
-        // nobody could list them to delete them.
+        // nobody could list them to delete them. The program's
+        // connections keys reach nothing either.
         weft_access_store::forget_project_access(&tx, id).await?;
-        crate::store::postgres::revoke_project_instance_tokens(&tx, id).await?;
+        crate::store::postgres::revoke_project_bound_tokens(&tx, id).await?;
         tx.commit().await?;
         // The erased runs' files were queued through the announcement
         // outbox (`erase_run_ids`), which goes out once poked.

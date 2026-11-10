@@ -81,9 +81,9 @@ pub fn picked_places(project: &ProjectDefinition) -> Vec<(String, &NodeDefinitio
     places_of(project).into_iter().filter(|(_, node)| picked_fields(node).next().is_some()).collect()
 }
 
-/// The service a picked field connects to, off its widget (the compiler
-/// stamps it).
-fn service_of<'a>(node: &'a NodeDefinition, field: &str) -> Option<&'a str> {
+/// The service a connection field connects to, picked on the install or
+/// filled by each instance, off its widget (the compiler stamps it).
+pub fn service_of<'a>(node: &'a NodeDefinition, field: &str) -> Option<&'a str> {
     match node.inputs.iter().find(|i| i.name == field).and_then(|i| i.widget.as_ref()) {
         Some(crate::node::Widget::Access { service: Some(service), .. }) => Some(service),
         _ => None,
@@ -92,7 +92,7 @@ fn service_of<'a>(node: &'a NodeDefinition, field: &str) -> Option<&'a str> {
 
 /// Whether a run can go without a pick for `field` (its node's recipe
 /// declares the connection optional).
-fn optional(node: &NodeDefinition, field: &str) -> bool {
+pub fn may_stay_unpicked(node: &NodeDefinition, field: &str) -> bool {
     matches!(
         node.inputs.iter().find(|i| i.name == field).and_then(|i| i.widget.as_ref()),
         Some(crate::node::Widget::Access { optional: true, .. })
@@ -123,7 +123,7 @@ pub fn run_picks(program: &ProjectDefinition, stored: &Picks) -> Result<Picks, R
                 Some(handle) => {
                     kept.insert(field.to_string(), handle.clone());
                 }
-                None if optional(node, field) => {}
+                None if may_stay_unpicked(node, field) => {}
                 None => refusal.errors.push(missing_pick(node, field, &spelled)),
             }
         }

@@ -2313,6 +2313,39 @@ async fn drive(
                 None => Default::default(),
             };
             let is_resume = resuming.is_some();
+            // Where this firing runs, spelled: the node under the call
+            // sites on its frames (`one.db` inside the file the site
+            // `one` includes). What a person is told, what an infra
+            // node's row is keyed by, and where the run's picks and its
+            // instance's values for this node are kept.
+            let place = {
+                let call_path: Vec<String> =
+                    weft_core::frames::call_path(&group.frames).into_iter().map(str::to_string).collect();
+                weft_core::project::address_of(project, &node_id, &call_path)
+            };
+            let loop_boundary = matches!(
+                node_def.node_type.as_str(),
+                weft_core::project::boundary_types::LOOP_IN | weft_core::project::boundary_types::LOOP_OUT
+            );
+            // The input bag of a dispatch that will run a body: what the
+            // ready paths delivered (wired pulses + body literals), a
+            // `@instance_filled` field taking what the run's instance
+            // provides at this place, and a connection picked on the
+            // install taking the install's pick, both as the run was born
+            // with them, in the place a value written in the source would
+            // sit. Filled BEFORE anything is absorbed, because what it
+            // holds can skip the node: a field the program lets an
+            // instance leave empty, empty here (`unfilled`).
+            let mut filled = (group.skip.is_none() && group.error.is_none() && !loop_boundary).then(|| {
+                let mut bag = owned_bag(&group.received.input);
+                weft_core::picks::fill_picks(node_def, &mut bag, picks.get(&place));
+                with_instance_values(node_def, &place, instance, instance_values, bag)
+            });
+            if let Some(Ok(bag)) = &filled {
+                if !is_resume {
+                    group.skip = weft_core::run::skip::unfilled(node_def, bag);
+                }
+            }
             // Absorb input pulses for this dispatch, EXCEPT pulses on
             // generator-typed input ports of a dispatch that will RUN:
             // those are the stream's items (and its end), delivered to
@@ -2449,7 +2482,7 @@ async fn drive(
             // by the common path above; these ship NodeCompleted here
             // after the inline handler returns, and run synchronously
             // (there is no async body to spawn).
-            if matches!(node_def.node_type.as_str(), weft_core::project::boundary_types::LOOP_IN | weft_core::project::boundary_types::LOOP_OUT) {
+            if loop_boundary {
                 let outcome = handle_loop_boundary_firing(
                     node_def,
                     &group,
@@ -2548,7 +2581,9 @@ async fn drive(
                                 !group.received.closed_ports.iter().any(|p| p == port),
                                 "a generator port must never list as closed"
                             );
-                            group.received.input.insert(port.to_string(), Arc::new(marker));
+                            if let Some(Ok(bag)) = &mut filled {
+                                bag.insert(port.to_string(), marker);
+                            }
                         }
                         Err(e) => {
                             feed_error = Some(e);
@@ -2575,32 +2610,14 @@ async fn drive(
                     continue;
                 }
             }
-            //
-            // The node's ONE input bag: everything the ready paths
-            // delivered (wired pulses + body literals), the remaining
-            // braces config values, and declared defaults for whatever
-            // is still absent (a closed wire is never defaulted).
-            // Where this firing runs, spelled: the node under the call
-            // sites on its frames (`one.db` inside the file the site
-            // `one` includes). What a person is told, and what an infra
-            // node's row is keyed by.
-            let place = {
-                let call_path: Vec<String> =
-                    weft_core::frames::call_path(&group.frames).into_iter().map(str::to_string).collect();
-                weft_core::project::address_of(project, &node_id, &call_path)
-            };
             // Whether the node exists once per instance HERE: a node inside
             // a file included twice can be at one site and not the other.
             let per_instance = node_def.per_instance_at(&weft_core::frames::call_path(&group.frames));
             //
-            // A `@instance_filled` field takes what the run's instance
-            // provides at this place, and a connection picked on the
-            // install takes the install's pick, both as the run was born
-            // with them, in the place a value written in the source
-            // would sit.
-            let mut bag = owned_bag(&group.received.input);
-            weft_core::picks::fill_picks(node_def, &mut bag, picks.get(&place));
-            let delivered = with_instance_values(node_def, &place, instance, instance_values, bag);
+            // The node's ONE input bag: the one filled above, the
+            // remaining braces config values, and declared defaults for
+            // whatever is still absent (a closed wire is never defaulted).
+            let delivered = filled.expect("a dispatch that runs its body filled its bag before absorbing");
             let inputs = match delivered.and_then(|delivered| {
                 weft_core::context::node_input_bag(node_def, &group.frames, delivered, &group.received.closed_ports)
             }).and_then(|bag| {
@@ -6326,6 +6343,13 @@ mod bus_comm_tests;
 #[cfg(test)]
 #[path = "run_driver_tests/branching.rs"]
 mod branching_tests;
+
+// Layer 3: a connection the program lets stay empty that has none skips
+// its node before the body runs, and the nodes behind it decide on the
+// closure.
+#[cfg(test)]
+#[path = "run_driver_tests/unfilled.rs"]
+mod unfilled_tests;
 
 // Layer 3: a node's failure goes to its wired `_error` until it opened a
 // bus, a bus ends the way its body returned, and a firing a dead worker

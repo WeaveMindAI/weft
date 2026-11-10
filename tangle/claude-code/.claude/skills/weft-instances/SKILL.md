@@ -36,7 +36,14 @@ instance's field empty. The fallback may be a file,
 `@instance_filled(@file("prompts/default.md"))` (or `@asset(...)`), read the
 way a written one is; no other marker goes inside. An empty field then takes
 the node's default if it has one, stays empty if the field is optional, and
-otherwise the run is refused, naming the field. A wired field cannot be
+otherwise the run is refused, naming the field. If some instances will never
+fill a field, write `@instance_filled(null)` (`null` goes nowhere else): such
+an instance's run starts, the node gets a `null` there, and a node that needs
+the field skips (its outputs close, as on a required input that closed) while
+one taking it as optional runs and reads the `null`. On an access node's
+connection (`account: @instance_filled(null)`), an instance with no account
+skips that node and every node that needs its output. A route checking its
+callers refuses it on its connection. A wired field cannot be
 `@instance_filled` (`instance-filled-wired`), nor a group's, loop's or
 included file's own port (`instance-filled-boundary`), nor a key that is not
 an input (`instance-filled-not-an-input`). For a group, loop or include port,
@@ -409,7 +416,7 @@ the rest.
 
 An instance's values (connecting its accounts is one of them) are filled in
 on a settings page, never in the editor: the browser extension's **Your
-settings** page with the instance token, or the `InstanceSettings` component
+settings** page with the instance token, or the `DoorSettings` component
 on the user's own site, copied into the frontend with `weft connect-lib`; for
 mounting it, go and read the `weft-frontend` skill. It draws each field with
 its own control, and a list field (its spreadsheets, its models) is read

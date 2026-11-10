@@ -2658,7 +2658,7 @@ async fn removing_a_project_takes_what_its_instances_had(pool: Pool) {
          VALUES ($1, $2, 'ada', 'post', 'account', '{}', $3), ($1, $2, 'ada', 'digest', 'cron', '\"0 0 3 * * *\"', NULL)",
         &[&TENANT, &id, &adas],
     ).await.expect("values");
-    let token = |hash: &str, instance: Option<InstanceId>, expires_at: Option<u64>| weft_dispatcher::store::SignalToken {
+    let token = |hash: &str, instance: Option<InstanceId>, connections: bool, expires_at: Option<u64>| weft_dispatcher::store::SignalToken {
         id: Uuid::new_v4(),
         token_hash: hash.into(),
         recognizer: "wft-test-...".into(),
@@ -2670,11 +2670,13 @@ async fn removing_a_project_takes_what_its_instances_had(pool: Pool) {
         all_displays: false,
         created_at: 0,
         instance,
+        connections,
         expires_at,
         kind: weft_core::signal_token::TokenKind::Caller,
     };
-    store.mint_signal_token(&token("ada-token", Some(InstanceId::new("ada").unwrap()), Some(10))).await.unwrap();
-    store.mint_signal_token(&token("author-token", None, None)).await.unwrap();
+    store.mint_signal_token(&token("ada-token", Some(InstanceId::new("ada").unwrap()), false, Some(10))).await.unwrap();
+    store.mint_signal_token(&token("site-key", None, true, None)).await.unwrap();
+    store.mint_signal_token(&token("author-token", None, false, None)).await.unwrap();
 
     projects.remove(id).await.unwrap();
     let grants: Vec<Uuid> = pool.scalars("SELECT id FROM access_grant", &[]).await.unwrap();
@@ -2682,6 +2684,7 @@ async fn removing_a_project_takes_what_its_instances_had(pool: Pool) {
     let values: i64 = pool.scalar("SELECT COUNT(*) FROM instance_value", &[]).await.unwrap();
     assert_eq!(values, 0, "an instance's values go with the project, connections or not");
     assert!(store.get_signal_token("ada-token").await.unwrap().is_none());
+    assert!(store.get_signal_token("site-key").await.unwrap().is_none(), "a connections key acts in the removed project only");
     assert!(store.get_signal_token("author-token").await.unwrap().is_some(), "the author revokes their own tokens");
 }
 

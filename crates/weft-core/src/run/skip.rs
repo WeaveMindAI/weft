@@ -108,6 +108,15 @@ pub enum SkipReason {
     /// A person skipped what the node was waiting for (a form's skip):
     /// it ended there, with nothing to send on.
     WaitSkipped,
+    /// The field `field`, which the program lets each instance leave
+    /// empty (`field: @instance_filled(null)`), is empty for this run's
+    /// instance, and the node cannot run without it ([`unfilled`]).
+    /// `service` names what a connection field connects to.
+    Unfilled {
+        field: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service: Option<String>,
+    },
 }
 
 impl SkipReason {
@@ -122,7 +131,7 @@ impl SkipReason {
     /// failure), so it carries none.
     pub fn inherited_failure(&self) -> Option<&Failure> {
         match self {
-            Self::DidNotFlow | Self::DidFlow | Self::ScopeSkipped { .. } | Self::WaitSkipped => None,
+            Self::DidNotFlow | Self::DidFlow | Self::ScopeSkipped { .. } | Self::WaitSkipped | Self::Unfilled { .. } => None,
             Self::WatchedNodeFailed { failure } => Some(failure),
             Self::FlowClosed { failure }
             | Self::RequiredInputClosed { failure, .. }
@@ -172,6 +181,12 @@ impl std::fmt::Display for SkipReason {
                 write!(f, "the scope '{scope}' it lives in did not run")
             }
             Self::WaitSkipped => write!(f, "a person skipped what it was waiting for"),
+            Self::Unfilled { field, service: Some(service) } => {
+                write!(f, "not connected: this instance has no {service} connection for '{field}'")
+            }
+            Self::Unfilled { field, service: None } => {
+                write!(f, "not filled: this instance left '{field}' empty")
+            }
         }
     }
 }
@@ -376,6 +391,22 @@ pub fn check_should_skip(
     }
 
     None
+}
+
+/// Whether `node` skips because a field the program lets each instance
+/// leave empty (`field: @instance_filled(null)`) is empty in `filled`, the
+/// firing's inputs once the instance's values are in
+/// (`crate::instance::fill_literals`), and the node cannot run without
+/// it: the skip a required input that closed gets, asked before the node
+/// runs, so its outputs close and the inputs downstream decide as they do
+/// on any closure. A field the node takes as optional never skips it: the
+/// node runs and reads the null.
+pub fn unfilled(node: &NodeDefinition, filled: &serde_json::Map<String, serde_json::Value>) -> Option<SkipReason> {
+    let field = crate::instance::left_empty(node, |field| filled.get(field))?;
+    Some(SkipReason::Unfilled {
+        field: field.to_string(),
+        service: crate::picks::service_of(node, field).map(str::to_string),
+    })
 }
 
 /// Whether what arrived on `port_name` is a blank text the input counts
@@ -806,5 +837,68 @@ mod tests {
             check_should_skip(&node, &view(&pulses), &required, &wired, &filled).is_none(),
             "user-emitted null is data; one null + one closed must NOT skip"
         );
+    }
+
+    /// A node whose required `field` each instance fills, written
+    /// `@instance_filled(null)` when `marked`, a connection to Slack when
+    /// `access` (its widget is what makes it needed, not `required`).
+    fn instance_filled_node(field: &str, marked: bool, access: bool) -> crate::project::NodeDefinition {
+        let mut node = node_one_required();
+        node.inputs[0].name = field.into();
+        if access {
+            node.inputs[0].required = false;
+            node.inputs[0].widget = Some(crate::node::Widget::Access { service: Some("slack".into()), optional: false });
+        }
+        let empty = marked.then_some(serde_json::Value::Null);
+        node.port_literals.insert(field.into(), crate::instance::instance_filled_literal(empty));
+        node
+    }
+
+    fn bag(field: &str, value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        [(field.to_string(), value)].into_iter().collect()
+    }
+
+    /// A field the program lets an instance leave empty skips its node when
+    /// it is empty, and only then; an unmarked one is never this
+    /// function's to decide (the run was refused before it was born).
+    #[test]
+    fn a_marked_field_left_empty_skips_as_unfilled() {
+        let empty = serde_json::Map::new();
+        let channel = instance_filled_node("channel", true, false);
+        assert_eq!(unfilled(&channel, &empty), Some(SkipReason::Unfilled { field: "channel".into(), service: None }));
+        assert!(unfilled(&channel, &bag("channel", json!(null))).is_some(), "a null is no value");
+        assert_eq!(unfilled(&channel, &bag("channel", json!("#support"))), None);
+        assert_eq!(unfilled(&instance_filled_node("channel", false, false), &empty), None);
+        // A connection names what it connects to.
+        let account = instance_filled_node("account", true, true);
+        assert_eq!(
+            unfilled(&account, &empty),
+            Some(SkipReason::Unfilled { field: "account".into(), service: Some("slack".into()) })
+        );
+        assert_eq!(unfilled(&account, &bag("account", json!({ "id": uuid::Uuid::nil(), "identity": "me" }))), None);
+    }
+
+    /// A field the node takes as optional never skips it: the node runs
+    /// and reads the null.
+    #[test]
+    fn an_optional_field_left_empty_runs_the_node() {
+        let mut node = instance_filled_node("notes", true, false);
+        node.inputs[0].required = false;
+        assert_eq!(unfilled(&node, &bag("notes", json!(null))), None);
+    }
+
+    #[test]
+    fn unfilled_keeps_its_wire_spelling() {
+        let account = SkipReason::Unfilled { field: "account".into(), service: Some("slack".into()) };
+        let wire = serde_json::to_value(&account).unwrap();
+        assert_eq!(wire, json!({ "kind": "unfilled", "field": "account", "service": "slack" }));
+        assert_eq!(serde_json::from_value::<SkipReason>(wire).unwrap(), account);
+        assert_eq!(account.to_string(), "not connected: this instance has no slack connection for 'account'");
+        assert_eq!(account.inherited_failure(), None);
+        let channel = SkipReason::Unfilled { field: "channel".into(), service: None };
+        let wire = serde_json::to_value(&channel).unwrap();
+        assert_eq!(wire, json!({ "kind": "unfilled", "field": "channel" }));
+        assert_eq!(serde_json::from_value::<SkipReason>(wire).unwrap(), channel);
+        assert_eq!(channel.to_string(), "not filled: this instance left 'channel' empty");
     }
 }

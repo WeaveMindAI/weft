@@ -327,10 +327,14 @@ export type PickerOutcome = { picked?: LookupItem; cancelled?: boolean; error?: 
 // SYNC: FieldConnection <-> crates/weft-core/src/instance_door.rs FieldConnection
 export type FieldConnection = 'none' | 'own' | 'shared';
 
-/** One field that takes a value of each instance's own, at one place of
- *  the program, as the instance door lists it. */
-// SYNC: InstanceField <-> crates/weft-core/src/instance_door.rs InstanceField
-export interface InstanceField {
+/** One field a door fills, at one place of the program: a field each
+ *  instance fills, as the instance door lists it, or a connection the
+ *  program picks on the install, as the program door lists it (there
+ *  `value` is the picked connection's handle, `needed` whether a run is
+ *  refused without one, `fallback` is never set and `connection` is
+ *  `none`). */
+// SYNC: FilledField <-> crates/weft-core/src/instance_door.rs FilledField
+export interface FilledField {
   /** The node, spelled the way the program writes it; with `field`, the
    *  key the instance's value is stored under. */
   node: string;
@@ -395,12 +399,20 @@ export interface InstancePickerRequest {
   source: number;
 }
 
-/** What a change of an instance's values did beyond storing: the
- *  instance's triggers set up again because they read a changed value. */
+/** What a change of the fields a door fills did beyond storing: the
+ *  triggers set up again because they read a changed value, and the
+ *  connections forgotten because the change left nothing on the install
+ *  using them (only the program door forgets any; absent when none). */
 // SYNC: ValuesChanged <-> crates/weft-core/src/instance_door.rs ValuesChanged
 export interface ValuesChanged {
   rearmed: string[];
+  forgotten?: string[];
 }
+
+/** `POST /program/connections/direct`'s answer: the connection made, and
+ *  what picking it did. */
+// SYNC: ProgramConnected <-> crates/weft-core/src/instance_door.rs ProgramConnected
+export interface ProgramConnected extends CompletedConnect, ValuesChanged {}
 
 /// One of the two things that can drive an input: a constant written in
 /// the source (any spelling: braces, statement, `@file`, `@asset`), or a

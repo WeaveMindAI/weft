@@ -311,45 +311,15 @@ mod tests {
     /// A fake Cloud Tasks on a local port: records each request and answers
     /// the statuses in `answers` in order (then 200).
     async fn fake_cloud_tasks(answers: Vec<u16>) -> (String, Seen) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let seen: Seen = Arc::default();
         let recorded = seen.clone();
-        tokio::spawn(async move {
-            let mut answers = answers.into_iter();
-            loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                let mut buf = [0u8; 4096];
-                loop {
-                    let n = socket.read(&mut buf).await.unwrap();
-                    request.extend_from_slice(&buf[..n]);
-                    let text = String::from_utf8_lossy(&request).to_string();
-                    if let Some(head_end) = text.find("\r\n\r\n") {
-                        let length = text[..head_end]
-                            .lines()
-                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
-                            .unwrap_or(0);
-                        if request.len() >= head_end + 4 + length {
-                            break;
-                        }
-                    }
-                    if n == 0 {
-                        break;
-                    }
-                }
-                let text = String::from_utf8_lossy(&request).to_string();
-                let mut line = text.lines().next().unwrap_or_default().split(' ');
-                let (method, path) = (line.next().unwrap_or_default().to_string(), line.next().unwrap_or_default().to_string());
-                recorded.lock().push((method, path));
-                let status = answers.next().unwrap_or(200);
-                let body = "{}";
-                let answer = format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
-                socket.write_all(answer.as_bytes()).await.unwrap();
-            }
-        });
-        (format!("http://{addr}"), seen)
+        let answers = parking_lot::Mutex::new(answers.into_iter());
+        let api = crate::api::fake::serve(move |method, path, _| {
+            recorded.lock().push((method.to_string(), path.to_string()));
+            (answers.lock().next().unwrap_or(200), json!({}))
+        })
+        .await;
+        (api, seen)
     }
 
     fn alarm_at(api: String) -> CloudTasksAlarm {

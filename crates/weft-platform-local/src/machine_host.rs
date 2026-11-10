@@ -125,6 +125,7 @@ mod tests {
 
     use crate::docker::fake::FakeDocker;
     use crate::infra_host::{AgentBroker, AgentIdentity, DiskBacking, GpuAccess, LocalInfraHostConfig, Publish};
+    use crate::kept_ports::KeptPorts;
     use crate::process_units::ProcessUnitsConfig;
     use crate::processes::fake::{Behaviour, FakeProcesses};
     use weft_core::infra::{Container, Image, InfraSpec, Process, Unit};
@@ -145,13 +146,13 @@ mod tests {
         weft_core::infra::resolve(&InfraSpec { units: vec![unit], ..Default::default() }, &copy(), &BTreeMap::new()).unwrap()
     }
 
-    fn docker_cfg(dir: &std::path::Path) -> LocalInfraHostConfig {
+    fn docker_cfg(dir: &std::path::Path, ports: Arc<KeptPorts>) -> LocalInfraHostConfig {
         LocalInfraHostConfig {
             agent_image: "weft-runtime:t".into(),
             scratch_dir: dir.join("run"),
             gpu: GpuAccess::None,
             disks: DiskBacking::Volumes,
-            publish: Publish::Loopback,
+            publish: Publish::Loopback(ports),
             install: weft_core::infra::Install::default_install(),
             names: crate::infra_names::Names::Machine,
             agent_broker: AgentBroker { url: "http://broker".into(), identity: AgentIdentity::Machine },
@@ -172,11 +173,14 @@ mod tests {
         docker.fail(&["volume", "inspect"], "Error response from daemon: get x: no such volume");
         let processes = Arc::new(FakeProcesses::new());
         processes.behave(Behaviour::Runs);
-        let containers = Arc::new(LocalInfraHost::new(docker.clone(), docker_cfg(dir.path())));
+        // One install's kept ports, for both hosts, as the runtime has it.
+        let ports = Arc::new(KeptPorts::new(dir.path().to_path_buf(), processes.clone()));
+        let containers = Arc::new(LocalInfraHost::new(docker.clone(), docker_cfg(dir.path(), ports.clone())));
         let units = Arc::new(ProcessUnits::new(
             processes.clone(),
             Arc::new(weft_platform_traits::FakeMachineNeeds::new()),
             weft_platform_traits::FakeClock::new(),
+            ports,
             ProcessUnitsConfig {
                 dir: dir.path().join("infra-processes"),
                 agent_program: "/opt/weft/weft-runtime".into(),
@@ -185,7 +189,8 @@ mod tests {
                 stop_grace: Duration::from_millis(100),
                 needs_root: dir.path().join("needs"),
             },
-        ));
+        )
+        .unwrap());
         Rig { dir, docker, processes, host: MachineInfraHost::new(containers, units) }
     }
 
@@ -198,7 +203,8 @@ mod tests {
         let r = rig();
         r.host.check(&node(true)).unwrap();
         r.host.check(&node(false)).unwrap();
-        let docker_alone = LocalInfraHost::new(Arc::new(FakeDocker::new()), docker_cfg(r.dir.path()));
+        let ports = crate::kept_ports::fake::counting_in(r.dir.path(), 20000);
+        let docker_alone = LocalInfraHost::new(Arc::new(FakeDocker::new()), docker_cfg(r.dir.path(), ports));
         let refused = docker_alone.check(&node(true)).unwrap_err();
         assert!(refused.contains("runs a process") && refused.contains("only a local install runs one"), "{refused}");
         assert!(r.host.processes.check(&node(false)).unwrap_err().contains("runs containers"));

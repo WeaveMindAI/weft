@@ -11,13 +11,21 @@
 //!
 //! The machine has no public address; the workers and the install reach
 //! the unit's ports at the machine's address on the install's network,
-//! and the network's firewall keeps the rest out. It runs as the project's
-//! own service account, never weft's: what a unit's containers can ask the
-//! metadata server for is that project's identity and nothing more.
+//! and the network's firewall keeps the rest out. That address is a static
+//! internal one weft reserves for the unit in the install's subnet, so it
+//! outlives the machine: a new shape, disk or GPU makes a new machine at
+//! the same address, and anything that copied it (a frontend's database
+//! host) keeps working. It is released when the unit is removed or its
+//! copy terminated, never when it is stopped.
+//!
+//! The machine runs as the project's own service account, never weft's:
+//! what a unit's containers can ask the metadata server for is that
+//! project's identity and nothing more.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use weft_core::infra::wire::{LogStream, LogsFrom};
@@ -28,7 +36,7 @@ use weft_core::ports::UNIT_AGENT;
 use weft_platform_traits::{EndpointAt, InfraHost, UnitObservation, UnitRunState};
 
 use crate::accounts::Access;
-use crate::api::Google;
+use crate::api::{Google, COMPUTE};
 use crate::names;
 
 /// The metadata keys the startup script and the host agent read.
@@ -118,15 +126,26 @@ pub struct ComputeInfraHost {
     install: weft_core::infra::Install,
     /// Where a machine's agent reaches the broker ([`MD_BROKER_URL`]).
     broker_url: String,
+    /// Compute Engine's API root ([`COMPUTE`], or a test's own server).
+    api: String,
 }
 
 impl ComputeInfraHost {
     pub fn new(google: Google, gcp: GcpPlatform, install: weft_core::infra::Install, broker_url: String) -> Self {
-        Self { google, gcp, install, broker_url }
+        Self { google, gcp, install, broker_url, api: COMPUTE.to_string() }
     }
 
     fn zone_base(&self) -> String {
-        format!("https://compute.googleapis.com/compute/v1/projects/{}/zones/{}", self.gcp.project, self.gcp.zone)
+        format!("{}/projects/{}/zones/{}", self.api, self.gcp.project, self.gcp.zone)
+    }
+
+    /// Where the install's subnet is, and with it every unit's address.
+    fn region_base(&self) -> String {
+        format!("{}/projects/{}/regions/{}", self.api, self.gcp.project, self.gcp.region)
+    }
+
+    fn address_url(&self, name: &str) -> String {
+        format!("{}/addresses/{name}", self.region_base())
     }
 
     fn instance_url(&self, name: &str) -> String {
@@ -141,12 +160,12 @@ impl ComputeInfraHost {
     async fn machines(&self, labels: &[(&str, &str)]) -> anyhow::Result<Vec<Value>> {
         let mut filter = vec![format!("labels.{}={}", weft_core::infra::INSTALL_LABEL, self.install.label_value())];
         filter.extend(labels.iter().map(|(k, v)| format!("labels.{k}={v}")));
-        self.list("instances", &filter.join(" AND ")).await
+        self.list(&self.zone_base(), "instances", &filter.join(" AND ")).await
     }
 
-    /// Every `kind` (`instances`, `disks`) in the zone matching `filter`,
-    /// page after page.
-    async fn list(&self, kind: &str, filter: &str) -> anyhow::Result<Vec<Value>> {
+    /// Every `kind` under `base` (`instances` and `disks` in the zone,
+    /// `addresses` in the region) matching `filter`, page after page.
+    async fn list(&self, base: &str, kind: &str, filter: &str) -> anyhow::Result<Vec<Value>> {
         let mut out = Vec::new();
         let mut page: Option<String> = None;
         loop {
@@ -154,7 +173,7 @@ impl ComputeInfraHost {
             if let Some(token) = page.take() {
                 query.push(("pageToken", token));
             }
-            let listed = self.google.get_query(&format!("{}/{kind}", self.zone_base()), &query).await?;
+            let listed = self.google.get_query(&format!("{base}/{kind}"), &query).await?;
             out.extend(listed.get("items").and_then(Value::as_array).into_iter().flatten().cloned());
             page = listed.get("nextPageToken").and_then(Value::as_str).map(str::to_string);
             if page.is_none() {
@@ -193,6 +212,70 @@ impl ComputeInfraHost {
         Ok(attached)
     }
 
+    /// The IP of `unit`'s reserved internal address, reserved first when
+    /// it is not yet: found by its name, so a reservation an earlier apply
+    /// made (one that stopped before its machine was made) is the one
+    /// used, never a second. `in_use` is the address the unit's machine
+    /// has now, for a machine made before weft reserved addresses:
+    /// reserving that very address makes it static where it is, so the
+    /// machine keeps it.
+    async fn ensure_address(&self, node: &NodeRef, unit: &str, in_use: Option<&str>) -> anyhow::Result<String> {
+        let name = names::unit_address(&node.resource_base(), unit);
+        let url = self.address_url(&name);
+        let address = match self.google.get_opt(&url).await? {
+            Some(address) => address,
+            None => {
+                let mut body = json!({
+                    "name": name,
+                    "addressType": "INTERNAL",
+                    "purpose": "GCE_ENDPOINT",
+                    "subnetwork": self.gcp.subnet,
+                    "labels": labels(&self.install, node, unit, None),
+                    // The copy the address belongs to, whole, as a disk
+                    // carries it: how `copies` finds a copy whose address
+                    // outlived the rest.
+                    "description": serde_json::to_string(node)?,
+                });
+                if let Some(ip) = in_use {
+                    body["address"] = json!(ip);
+                }
+                async {
+                    let op = self.google.post(&format!("{}/addresses", self.region_base()), &body).await?;
+                    self.google.wait(&self.region_base(), op).await
+                }
+                .await
+                // Compute Engine's own refusal, kept underneath, says why
+                // (the IP taken by another reservation, the subnet full, a
+                // permission missing).
+                .with_context(|| {
+                    format!(
+                        "could not reserve an internal address for unit '{unit}' of '{}' in the subnet {}",
+                        node.node, self.gcp.subnet
+                    )
+                })?;
+                self.google.get(&url).await?
+            }
+        };
+        address
+            .get("address")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("the internal address '{name}' of unit '{unit}' holds no IP: {address}"))
+    }
+
+    /// Release `unit`'s reserved address. Its machine must be gone:
+    /// Compute Engine refuses to release an address a machine still has.
+    async fn release_address(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {
+        self.release(&names::unit_address(&node.resource_base(), unit)).await
+    }
+
+    async fn release(&self, name: &str) -> anyhow::Result<()> {
+        if let Some(op) = self.google.delete(&self.address_url(name)).await? {
+            self.google.wait(&self.region_base(), op).await?;
+        }
+        Ok(())
+    }
+
     /// Every metadata item weft writes on a unit's machine: what the
     /// startup script and the host agent read. Written whole when the
     /// machine is made, and written again over a machine that exists each
@@ -213,7 +296,7 @@ impl ComputeInfraHost {
         ])
     }
 
-    fn instance_body(&self, node: &ResolvedNode, unit: &ResolvedUnit, disks: &[String], account: &str) -> anyhow::Result<Value> {
+    fn instance_body(&self, node: &ResolvedNode, unit: &ResolvedUnit, disks: &[String], account: &str, ip: &str) -> anyhow::Result<Value> {
         let shape = machine_shape(&self.gcp.zone, unit)?;
         let base = node.node.resource_base();
         let metadata: Vec<Value> =
@@ -236,7 +319,7 @@ impl ComputeInfraHost {
             "machineType": format!("zones/{}/machineTypes/{}", self.gcp.zone, shape.machine_type),
             "labels": labels(&self.install, &node.node, &unit.unit.name, Some(&unit.hash)),
             "disks": attached,
-            "networkInterfaces": [{ "network": self.gcp.network, "subnetwork": self.gcp.subnet }],
+            "networkInterfaces": [{ "network": self.gcp.network, "subnetwork": self.gcp.subnet, "networkIP": ip }],
             "tags": { "items": [self.gcp.infra_network_tag] },
             "serviceAccounts": [{ "email": account, "scopes": ["https://www.googleapis.com/auth/cloud-platform"] }],
             "metadata": { "items": metadata },
@@ -252,10 +335,11 @@ impl ComputeInfraHost {
         Ok(body)
     }
 
-    /// Create the machine for `unit`. Right after its account is new,
-    /// Compute Engine may not know the account yet; that is waited out.
-    async fn create_machine(&self, node: &ResolvedNode, unit: &ResolvedUnit, disks: &[String], account: &str) -> anyhow::Result<()> {
-        let body = self.instance_body(node, unit, disks, account)?;
+    /// Create the machine for `unit` at `ip`, its reserved address. Right
+    /// after its account is new, Compute Engine may not know the account
+    /// yet; that is waited out.
+    async fn create_machine(&self, node: &ResolvedNode, unit: &ResolvedUnit, disks: &[String], account: &str, ip: &str) -> anyhow::Result<()> {
+        let body = self.instance_body(node, unit, disks, account, ip)?;
         let url = format!("{}/instances", self.zone_base());
         crate::accounts::until_account_is_known(|| async {
             let op = self.google.post(&url, &body).await?;
@@ -355,6 +439,69 @@ impl ComputeInfraHost {
                 )
                 .await?;
             self.wait(op).await?;
+        }
+        Ok(())
+    }
+
+    /// Bring `unit`'s machine to what it should be, given its disks and the
+    /// account it runs as: made at its reserved address when it has none,
+    /// made again there when its shape, disks or GPU changed, or when it is
+    /// not at that address, else refreshed and started.
+    async fn place_machine(&self, node: &ResolvedNode, resolved: &ResolvedUnit, disks: &[String], account: &str) -> anyhow::Result<()> {
+        let unit = resolved.unit.name.as_str();
+        let Some(machine) = self.machine(&node.node, unit).await? else {
+            let ip = self.ensure_address(&node.node, unit, None).await?;
+            return self.create_machine(node, resolved, disks, account, &ip).await;
+        };
+        // A machine made before weft reserved addresses has none yet: the
+        // one it has is reserved for it here.
+        let ip = self.ensure_address(&node.node, unit, internal_ip(&machine)).await?;
+        let want = machine_shape(&self.gcp.zone, resolved)?;
+        let has_type = machine.get("machineType").and_then(Value::as_str).unwrap_or_default();
+        let same_disks = {
+            let attached: Vec<&str> = machine
+                .get("disks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|d| d.get("deviceName").and_then(Value::as_str))
+                .collect();
+            disks.iter().all(|d| attached.contains(&d.as_str()))
+        };
+        let has_gpus = machine
+            .pointer("/guestAccelerators/0")
+            .map(|a| {
+                let kind = a.get("acceleratorType").and_then(Value::as_str).unwrap_or_default();
+                (kind.rsplit('/').next().unwrap_or_default().to_string(), a.get("acceleratorCount").and_then(Value::as_u64).unwrap_or(0) as u32)
+            });
+        // Only an attached GPU is compared: a G2 machine's GPUs come with its
+        // type, which is compared already, and what Compute Engine reports
+        // for them is not what weft set.
+        let gpus_differ = want.accelerator.is_some() && has_gpus != want.accelerator.clone().map(|k| (k, want.gpus));
+        // A machine away from its reserved address was moved by something
+        // other than weft; it is made again there, as a changed one is.
+        let moved = internal_ip(&machine) != Some(ip.as_str());
+        if !has_type.ends_with(&format!("/{}", want.machine_type)) || !same_disks || gpus_differ || moved {
+            // A new shape, a new disk or an accelerator is a new machine;
+            // its disks and its address carry over (neither is deleted
+            // with it).
+            if let Some(op) = self.google.delete(&self.instance_url(name_of(&machine))).await? {
+                self.wait(op).await?;
+            }
+            return self.create_machine(node, resolved, disks, account, &ip).await;
+        }
+        self.refresh_machine(&machine, node, resolved, disks, want.gpus).await?;
+        match machine.get("status").and_then(Value::as_str) {
+            // Its agent applies the unit again; the agent itself stays the
+            // one its machine booted, until the machine restarts.
+            Some("RUNNING") => {
+                self.agent(&machine, reqwest::Method::POST, HOST_APPLY).await?;
+            }
+            _ => {
+                // Its agent applies the unit as it boots.
+                let op = self.google.post(&format!("{}/start", self.instance_url(name_of(&machine))), &json!({})).await?;
+                self.wait(op).await?;
+            }
         }
         Ok(())
     }
@@ -595,14 +742,15 @@ fn labels(install: &weft_core::infra::Install, node: &NodeRef, unit: &str, hash:
     l
 }
 
-/// The copy a disk belongs to, from its description. Every disk of an
-/// install is created with one, so a disk without it is refused loudly.
-fn disk_copy(disk: &Value) -> anyhow::Result<NodeRef> {
-    let raw = disk
+/// The copy a disk or an address (`kind`) belongs to, from its
+/// description. Every one of a copy's is created with one, so one without
+/// it is refused loudly.
+fn described_copy(kind: &str, resource: &Value) -> anyhow::Result<NodeRef> {
+    let raw = resource
         .get("description")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("disk '{}' carries no description naming its copy", name_of(disk)))?;
-    serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("disk '{}': its description is not a copy: {e}", name_of(disk)))
+        .ok_or_else(|| anyhow::anyhow!("{kind} '{}' carries no description naming its copy", name_of(resource)))?;
+    serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("{kind} '{}': its description is not a copy: {e}", name_of(resource)))
 }
 
 /// How often a stop someone else asked for is looked at until it lands,
@@ -682,53 +830,7 @@ impl InfraHost for ComputeInfraHost {
         let resolved = node.unit(unit).ok_or_else(|| anyhow::anyhow!("node '{}' declares no unit '{unit}'", node.node.node))?;
         let account = crate::accounts::ensure_project_account(&self.google, &self.gcp, node.node.project, &[Access::ImageRegistry, Access::Logging]).await?;
         let disks = self.ensure_disks(node, resolved).await?;
-        let Some(machine) = self.machine(&node.node, unit).await? else {
-            return self.create_machine(node, resolved, &disks, &account).await;
-        };
-        let want = machine_shape(&self.gcp.zone, resolved)?;
-        let has_type = machine.get("machineType").and_then(Value::as_str).unwrap_or_default();
-        let same_disks = {
-            let attached: Vec<&str> = machine
-                .get("disks")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|d| d.get("deviceName").and_then(Value::as_str))
-                .collect();
-            disks.iter().all(|d| attached.contains(&d.as_str()))
-        };
-        let has_gpus = machine
-            .pointer("/guestAccelerators/0")
-            .map(|a| {
-                let kind = a.get("acceleratorType").and_then(Value::as_str).unwrap_or_default();
-                (kind.rsplit('/').next().unwrap_or_default().to_string(), a.get("acceleratorCount").and_then(Value::as_u64).unwrap_or(0) as u32)
-            });
-        // Only an attached GPU is compared: a G2 machine's GPUs come with its
-        // type, which is compared already, and what Compute Engine reports
-        // for them is not what weft set.
-        let gpus_differ = want.accelerator.is_some() && has_gpus != want.accelerator.clone().map(|k| (k, want.gpus));
-        if !has_type.ends_with(&format!("/{}", want.machine_type)) || !same_disks || gpus_differ {
-            // A new shape, a new disk or an accelerator is a new machine;
-            // its disks carry over (they are never deleted with it).
-            if let Some(op) = self.google.delete(&self.instance_url(name_of(&machine))).await? {
-                self.wait(op).await?;
-            }
-            return self.create_machine(node, resolved, &disks, &account).await;
-        }
-        self.refresh_machine(&machine, node, resolved, &disks, want.gpus).await?;
-        match machine.get("status").and_then(Value::as_str) {
-            // Its agent applies the unit again; the agent itself stays the
-            // one its machine booted, until the machine restarts.
-            Some("RUNNING") => {
-                self.agent(&machine, reqwest::Method::POST, HOST_APPLY).await?;
-            }
-            _ => {
-                // Its agent applies the unit as it boots.
-                let op = self.google.post(&format!("{}/start", self.instance_url(name_of(&machine))), &json!({})).await?;
-                self.wait(op).await?;
-            }
-        }
-        Ok(())
+        self.place_machine(node, resolved, &disks, &account).await
     }
 
     /// Returns once the machine is off: a stop someone else asked for (a
@@ -748,11 +850,12 @@ impl InfraHost for ComputeInfraHost {
         self.until_off(node, unit).await
     }
 
+    /// The unit's machine and its address go; its disks stay.
     async fn remove_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {
         if let Some(op) = self.google.delete(&self.instance_url(&names::unit_machine(&node.resource_base(), unit))).await? {
             self.wait(op).await?;
         }
-        Ok(())
+        self.release_address(node, unit).await
     }
 
     async fn terminate(&self, node: &NodeRef, keep_disks: &[String]) -> anyhow::Result<()> {
@@ -762,8 +865,12 @@ impl InfraHost for ComputeInfraHost {
                 self.wait(op).await?;
             }
         }
+        // Every unit's address, once no machine has it.
+        for a in self.list(&self.region_base(), "addresses", &format!("labels.weft-copy={copy}")).await? {
+            self.release(name_of(&a)).await?;
+        }
         let keep: Vec<String> = keep_disks.iter().map(|d| names::unit_disk(&copy, d)).collect();
-        for d in self.list("disks", &format!("labels.weft-copy={copy}")).await? {
+        for d in self.list(&self.zone_base(), "disks", &format!("labels.weft-copy={copy}")).await? {
             let name = name_of(&d);
             if keep.iter().any(|k| k == name) {
                 continue;
@@ -826,15 +933,18 @@ impl InfraHost for ComputeInfraHost {
             }
         }
         // A terminated copy that kept disks has no machine left; its
-        // disks name it. Only a copy's disks carry `weft-copy` (the
-        // install's own machine disks do not).
+        // disks name it, as its addresses do when a terminate stopped
+        // before releasing them. Only a copy's disks and addresses carry
+        // `weft-copy` (the install's own machine disks do not).
         let install = format!("labels.{}={}", weft_core::infra::INSTALL_LABEL, self.install.label_value());
-        for d in self.list("disks", &install).await?.iter().filter(|d| label(d, "weft-copy").is_some()) {
-            match disk_copy(d) {
+        let disks = self.list(&self.zone_base(), "disks", &install).await?;
+        let addresses = self.list(&self.region_base(), "addresses", &install).await?;
+        for (kind, r) in disks.iter().map(|d| ("disk", d)).chain(addresses.iter().map(|a| ("address", a))).filter(|(_, r)| label(r, "weft-copy").is_some()) {
+            match described_copy(kind, r) {
                 Ok(copy) => {
                     seen.entry(copy.copy_id.clone()).or_insert(copy);
                 }
-                Err(e) => tracing::error!(disk = %name_of(d), error = %e, "a copy's disk names no copy; leaving it alone"),
+                Err(e) => tracing::error!(resource = %name_of(r), error = %e, "a copy's {kind} names no copy; leaving it alone"),
             }
         }
         Ok(seen.into_values().collect())
@@ -1068,8 +1178,206 @@ mod tests {
     fn a_disk_names_its_copy_by_its_description() {
         let copy = NodeRef { tenant: "t".into(), project: uuid::Uuid::from_u128(1), node: "one.db".into(), copy_id: "wn-1".into() };
         let disk = json!({ "name": "d", "description": serde_json::to_string(&copy).unwrap() });
-        assert_eq!(disk_copy(&disk).unwrap(), copy);
-        let err = disk_copy(&json!({ "name": "d" })).unwrap_err().to_string();
-        assert!(err.contains("carries no description"), "{err}");
+        assert_eq!(described_copy("disk", &disk).unwrap(), copy);
+        let err = described_copy("address", &json!({ "name": "d" })).unwrap_err().to_string();
+        assert!(err.starts_with("address 'd' carries no description"), "{err}");
+    }
+
+    /// A fake Compute Engine: the machines and addresses it holds by name,
+    /// and every call that changed one, in order.
+    #[derive(Default)]
+    struct Compute {
+        machines: BTreeMap<String, Value>,
+        addresses: BTreeMap<String, Value>,
+        calls: Vec<String>,
+    }
+
+    type Shared = std::sync::Arc<parking_lot::Mutex<Compute>>;
+
+    /// A host on a fake Compute Engine holding `compute`. Every machine it
+    /// makes is off, so a kept one is started rather than its agent called.
+    async fn host_on(compute: Shared) -> ComputeInfraHost {
+        let api = crate::api::fake::serve(move |method, path, body| {
+            let mut c = compute.lock();
+            let done = json!({ "status": "DONE" });
+            let gone = (404, json!({ "error": { "message": "not found" } }));
+            let path = path.split_once('?').map_or(path, |(p, _)| p);
+            // `/projects/p/<zones|regions>/<where>/<kind>[/<name>[/<verb>]]`
+            let parts: Vec<&str> = path.trim_start_matches('/').split('/').skip(4).collect();
+            match (method, parts.as_slice()) {
+                ("GET", ["addresses"]) => (200, json!({ "items": c.addresses.values().collect::<Vec<_>>() })),
+                ("GET", ["addresses", name]) => c.addresses.get(*name).map_or(gone, |a| (200, a.clone())),
+                ("POST", ["addresses"]) => {
+                    let mut a = body;
+                    let name = a["name"].as_str().unwrap().to_string();
+                    if a.get("address").is_none() {
+                        a["address"] = json!(format!("10.10.0.{}", 10 + c.addresses.len()));
+                    }
+                    c.calls.push(format!("reserve {name} at {}", a["address"].as_str().unwrap()));
+                    c.addresses.insert(name, a);
+                    (200, done)
+                }
+                ("DELETE", ["addresses", name]) => match c.addresses.remove(*name) {
+                    Some(_) => {
+                        c.calls.push(format!("release {name}"));
+                        (200, done)
+                    }
+                    None => gone,
+                },
+                ("GET", ["instances"]) => (200, json!({ "items": c.machines.values().collect::<Vec<_>>() })),
+                ("GET", ["instances", name]) => c.machines.get(*name).map_or(gone, |m| (200, m.clone())),
+                ("POST", ["instances"]) => {
+                    let mut m = body;
+                    let name = m["name"].as_str().unwrap().to_string();
+                    m["status"] = json!("TERMINATED");
+                    m["metadata"]["fingerprint"] = json!("f");
+                    m["labelFingerprint"] = json!("f");
+                    c.calls.push(format!("make {name} at {}", m.pointer("/networkInterfaces/0/networkIP").and_then(Value::as_str).unwrap_or("no address")));
+                    c.machines.insert(name, m);
+                    (200, done)
+                }
+                ("POST", ["instances", name, "start"]) => {
+                    c.calls.push(format!("start {name}"));
+                    (200, done)
+                }
+                ("DELETE", ["instances", name]) => match c.machines.remove(*name) {
+                    Some(_) => {
+                        c.calls.push(format!("delete {name}"));
+                        (200, done)
+                    }
+                    None => gone,
+                },
+                ("GET", ["disks"]) => (200, json!({})),
+                _ => panic!("the fake Compute Engine has no {method} {path}"),
+            }
+        })
+        .await;
+        let gcp = GcpPlatform {
+            name: "weft".into(),
+            project: "p".into(),
+            region: "r".into(),
+            zone: "r-a".into(),
+            network: "n".into(),
+            subnet: "projects/p/regions/r/subnetworks/s".into(),
+            artifact_registry: "a".into(),
+            build_bucket: "b".into(),
+            builder_service_account: "builder@p".into(),
+            builder_base_image: "base".into(),
+            tasks_queue: "wakes".into(),
+            wake_attempts: 20,
+            ticks_queue: "ticks".into(),
+            news_topic: "news".into(),
+            holders_topic: "holders".into(),
+            core_service_account: "core@p".into(),
+            holder_pool: "h".into(),
+            dispatcher_service: "d".into(),
+            runtime_image: "i".into(),
+            deployer_service_account: "deployer@p".into(),
+            frontend_service_account: "frontend@p".into(),
+            workload_identity_provider: "w".into(),
+            infra_network_tag: "t".into(),
+            build_machine: None,
+            alerts: true,
+        };
+        let google = Google::new(std::sync::Arc::new(crate::metadata::MetadataTokens::with_access_token("test-token")));
+        ComputeInfraHost { google, gcp, install: weft_core::infra::Install::default_install(), broker_url: "https://b".into(), api }
+    }
+
+    fn copy() -> NodeRef {
+        NodeRef { tenant: "t".into(), project: uuid::Uuid::from_u128(1), node: "db".into(), copy_id: "wn-1".into() }
+    }
+
+    /// The node `db` with one unit, `main`, on a machine of `kind`.
+    fn db_on(kind: &str) -> ResolvedNode {
+        let spec = weft_core::infra::InfraSpec {
+            units: vec![Unit {
+                name: "main".into(),
+                containers: vec![Container::new("postgres", weft_core::infra::Image::Upstream { reference: "postgres:18".into() })],
+                machine: MachineShape { kind: Some(kind.into()), ..Default::default() },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        weft_core::infra::resolve(&spec, &copy(), &Default::default()).unwrap()
+    }
+
+    async fn place(host: &ComputeInfraHost, node: &ResolvedNode) {
+        host.place_machine(node, node.unit("main").unwrap(), &[], "acct@p").await.unwrap();
+    }
+
+    fn calls(compute: &Shared) -> Vec<String> {
+        std::mem::take(&mut compute.lock().calls)
+    }
+
+    /// A unit's first machine is made at an address reserved for it, and a
+    /// new shape makes a new machine at that same address, reserving
+    /// nothing more: what copied the address keeps reaching the unit.
+    #[tokio::test]
+    async fn a_new_shape_makes_the_machine_again_at_the_address_reserved_for_it() {
+        let compute = Shared::default();
+        let host = host_on(compute.clone()).await;
+        let machine = names::unit_machine(&copy().resource_base(), "main");
+        place(&host, &db_on("e2-small")).await;
+        assert_eq!(calls(&compute), vec![format!("reserve {machine} at 10.10.0.10"), format!("make {machine} at 10.10.0.10")]);
+        let reserved = compute.lock().addresses[&names::unit_address(&copy().resource_base(), "main")].clone();
+        assert_eq!(
+            (&reserved["addressType"], &reserved["purpose"], &reserved["subnetwork"]),
+            (&json!("INTERNAL"), &json!("GCE_ENDPOINT"), &json!("projects/p/regions/r/subnetworks/s"))
+        );
+        place(&host, &db_on("n2-standard-2")).await;
+        assert_eq!(calls(&compute), vec![format!("delete {machine}"), format!("make {machine} at 10.10.0.10")]);
+        place(&host, &db_on("n2-standard-2")).await;
+        assert_eq!(calls(&compute), vec![format!("start {machine}")], "an unchanged machine is kept where it is");
+    }
+
+    /// A reservation an earlier apply made before stopping short of the
+    /// machine is found by its name and used, never reserved twice.
+    #[tokio::test]
+    async fn a_reservation_already_there_is_used_and_never_made_twice() {
+        let compute = Shared::default();
+        let name = names::unit_address(&copy().resource_base(), "main");
+        compute.lock().addresses.insert(name.clone(), json!({ "name": name, "address": "10.10.0.99" }));
+        let host = host_on(compute.clone()).await;
+        place(&host, &db_on("e2-small")).await;
+        assert_eq!(calls(&compute), vec![format!("make {} at 10.10.0.99", names::unit_machine(&copy().resource_base(), "main"))]);
+    }
+
+    /// A machine made before weft reserved addresses keeps the address it
+    /// has: that one is reserved for it, and the machine is not made again.
+    #[tokio::test]
+    async fn a_machine_from_before_reservations_keeps_its_address() {
+        let compute = Shared::default();
+        let host = host_on(compute.clone()).await;
+        let node = db_on("e2-small");
+        let mut body = host.instance_body(&node, node.unit("main").unwrap(), &[], "acct@p", "10.10.0.7").unwrap();
+        body["status"] = json!("TERMINATED");
+        body["metadata"]["fingerprint"] = json!("f");
+        body["labelFingerprint"] = json!("f");
+        let machine = names::unit_machine(&copy().resource_base(), "main");
+        compute.lock().machines.insert(machine.clone(), body);
+        place(&host, &node).await;
+        assert_eq!(calls(&compute), vec![format!("reserve {machine} at 10.10.0.7"), format!("start {machine}")]);
+    }
+
+    /// A unit dropped from the spec takes its address with its machine; a
+    /// stop keeps both; a terminate releases every address of the copy.
+    #[tokio::test]
+    async fn removing_a_unit_or_terminating_its_copy_releases_its_address_and_a_stop_keeps_it() {
+        let compute = Shared::default();
+        let host = host_on(compute.clone()).await;
+        let machine = names::unit_machine(&copy().resource_base(), "main");
+        let address = names::unit_address(&copy().resource_base(), "main");
+        place(&host, &db_on("e2-small")).await;
+        calls(&compute);
+        host.stop_unit(&copy(), "main").await.unwrap();
+        assert_eq!(calls(&compute), Vec::<String>::new(), "a stopped unit keeps its machine and its address");
+        host.remove_unit(&copy(), "main").await.unwrap();
+        assert_eq!(calls(&compute), vec![format!("delete {machine}"), format!("release {address}")]);
+        host.remove_unit(&copy(), "main").await.unwrap();
+        assert_eq!(calls(&compute), Vec::<String>::new(), "removing a removed unit does nothing");
+        place(&host, &db_on("e2-small")).await;
+        calls(&compute);
+        host.terminate(&copy(), &[]).await.unwrap();
+        assert_eq!(calls(&compute), vec![format!("delete {machine}"), format!("release {address}")]);
     }
 }

@@ -58,6 +58,13 @@ pub fn unit_machine(base: &str, unit: &str) -> String {
     format!("{base}-{unit}")
 }
 
+/// The static internal address the machine running `unit` keeps through
+/// every machine weft makes for it: named as the machine is, one address
+/// per machine.
+pub fn unit_address(base: &str, unit: &str) -> String {
+    unit_machine(base, unit)
+}
+
 /// A persistent disk of the copy whose resource base is `base`.
 pub fn unit_disk(base: &str, volume: &str) -> String {
     format!("{base}-d-{volume}")

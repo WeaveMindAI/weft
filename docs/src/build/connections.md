@@ -82,6 +82,14 @@ the same way before any trigger moves, so a missing pick is caught there and
 not at the first call. Forgetting a stored connection takes every pick of it
 with it.
 
+An access node whose connection each instance brings
+(`account: @instance_filled`, see [programs with
+instances](../running/instances.md)) can let an instance have none: write
+`account: @instance_filled(null)`, and for an instance with no account the
+node skips instead of the run being refused. For what happens then, go and read [a
+field an instance may leave
+empty](../running/instances.md#a-field-an-instance-may-leave-empty).
+
 A pick is kept under the node's full address, and the file a node is written
 in is part of that address. So if you move `chat.weft` into a `studio/`
 folder, the node that was `chat.send.agent` is now `studio.chat.send.agent`,
@@ -107,6 +115,33 @@ If a build refuses a line like `account: {"id": "...", "identity": "..."}`
 with "that was the old way of connecting a node", the connection was written
 into the source by an older weft. Erase that line and connect the node again;
 the install keeps the pick from then on.
+
+## From your own website's admin page
+
+If your program runs behind a website and you want the site's admin to paste
+the keys the program uses (a Vapi key, say) on an admin page of your site,
+instead of you running `weft connect`, here is how:
+
+1. In the project's folder, run `weft token mint --connections`. It prints a
+   key that can change this program's connections and do nothing else. Copy
+   it now, because it is never shown again.
+2. Keep that key in the site's server environment as `WEFT_CONNECTIONS_KEY`,
+   never in a page: anybody holding it can replace the program's keys.
+3. Run `weft connect-lib` to copy weft's connect library into your frontend.
+   Add a server route that passes the admin page's calls on to weft with that
+   key (the library's `weftProgramPassThrough`). Every call to it takes the
+   answer of your own check that the caller is your admin, and it passes
+   nothing on unless that answer is yes. weft knows nothing about your
+   site's users, so that check has to be yours. Then put the
+   library's `DoorSettings` with a `ProgramDoor` on the admin page.
+
+For the code of that route and page, go and read
+`front/src/lib/weft-connect/README.md`.
+
+If you were going to write a route in your weft program that receives the
+key and stores it, don't: whatever a run receives is written to its journal
+in plain text, where anybody who can open the project reads it. The page
+above sends the key straight to weft's store, and no run ever sees it.
 
 ## Never paste a key into a node's field
 

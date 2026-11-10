@@ -968,6 +968,12 @@ pub struct SignalToken {
     /// project. It starts that instance's runs, answers its waits, reads
     /// its displays, and connects its accounts; nothing else.
     pub instance: Option<weft_core::instance::InstanceId>,
+    /// A connections key: it manages the connections its one project's
+    /// program uses on the install, at the program door, and reaches
+    /// nothing else (every other door a caller token opens refuses it,
+    /// [`SignalToken::refused_at_caller_doors`]). It carries no instance,
+    /// tag or display.
+    pub connections: bool,
     /// When it stops working (unix seconds); `None` never. An instance
     /// token always has one.
     pub expires_at: Option<u64>,
@@ -977,6 +983,31 @@ impl SignalToken {
     /// Whether the token has stopped working at `now` (unix seconds).
     pub fn expired(&self, now: u64) -> bool {
         self.expires_at.is_some_and(|at| now >= at)
+    }
+
+    /// Why this token may not come in at a door that takes a caller
+    /// token (signals, displays, the instance door), or `None` when it may:
+    /// a connections key opens the program door alone. The one check every
+    /// such door makes, through `crate::api::signal::token_from_bearer`.
+    pub fn refused_at_caller_doors(&self) -> Option<String> {
+        self.connections.then(|| {
+            "this is a connections key (`weft token mint --connections`): it reaches only the program door \
+             (/program/connections) of its one project. Mint a caller token for signals and displays, or an \
+             instance token for an instance's door"
+                .to_string()
+        })
+    }
+
+    /// The one project a connections key manages the connections of, or
+    /// why this token is no connections key.
+    pub fn connections_project(&self) -> Result<uuid::Uuid, String> {
+        match (self.connections, self.allowed_projects.as_slice()) {
+            (true, [project]) => Ok(*project),
+            (true, _) => Err(format!("connections key {} names no single project; mint it again for one project", self.id)),
+            (false, _) => Err("this door takes a connections key (`weft token mint --connections`, in the project's folder); \
+                               this token is not one"
+                .to_string()),
+        }
     }
 
     /// The instance and project an instance token acts inside.

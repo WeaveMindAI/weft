@@ -72,6 +72,37 @@ pub trait Processes: Send + Sync {
 
     /// A loopback port nothing listens on right now.
     fn free_port(&self) -> anyhow::Result<u16>;
+
+    /// Whether another program holds the loopback port `port` right now:
+    /// binding it there is refused as an address in use.
+    fn port_taken(&self, port: u16) -> anyhow::Result<bool>;
+
+    /// Whether any process is left in the process group whose leader was
+    /// `pid` (a process [`Self::spawn`] started).
+    fn group_left(&self, pid: u32) -> anyhow::Result<bool>;
+}
+
+/// How long a killed process group may take to be gone. `SIGKILL` cannot
+/// be caught, so a group still there past this is stuck in the kernel,
+/// and saying so beats starting its unit again on ports it still holds.
+const KILLED_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Kill the process group of `pid` ([`Signal::Kill`]) and answer once
+/// none of it is left, so whatever starts next (the same unit again, on
+/// its kept ports) never finds the killed one still holding them.
+async fn kill_group(processes: &dyn Processes, pid: u32) -> anyhow::Result<()> {
+    processes.signal(pid, Signal::Kill)?;
+    let killed = std::time::Instant::now();
+    while processes.group_left(pid)? {
+        if killed.elapsed() >= KILLED_WITHIN {
+            anyhow::bail!(
+                "process group {pid} is still there {}s after it was killed; end it by hand with `kill -9 -- -{pid}` (as root, `sudo`, when part of it runs as another user)",
+                KILLED_WITHIN.as_secs()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Ok(())
 }
 
 /// Whether the process `pid` that started at the mark `started`
@@ -99,7 +130,7 @@ pub async fn stop(processes: &dyn Processes, pid: u32, started: &str, grace: std
     // program it started can outlive it. Sent the moment it was seen gone
     // (or still there), so its group's number is still its own: one found
     // long dead above is never sent this.
-    processes.signal(pid, Signal::Kill)?;
+    kill_group(processes, pid).await?;
     Ok(true)
 }
 
@@ -120,7 +151,7 @@ pub async fn stop(processes: &dyn Processes, pid: u32, started: &str, grace: std
 pub async fn kill_leftovers(processes: &dyn Processes, pid: u32, started: &str) -> anyhow::Result<bool> {
     match processes.started(pid).await? {
         None => {
-            processes.signal(pid, Signal::Kill)?;
+            kill_group(processes, pid).await?;
             Ok(true)
         }
         Some(mark) if mark == started => anyhow::bail!("process {pid} still runs, so what it started is not left over: stop it instead"),
@@ -194,6 +225,36 @@ impl Processes for MachineProcesses {
     fn free_port(&self) -> anyhow::Result<u16> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| anyhow::anyhow!("find a free loopback port: {e}"))?;
         Ok(listener.local_addr()?.port())
+    }
+
+    fn port_taken(&self, port: u16) -> anyhow::Result<bool> {
+        loopback_taken(port)
+    }
+
+    fn group_left(&self, pid: u32) -> anyhow::Result<bool> {
+        let group = libc::pid_t::try_from(pid).map_err(|_| anyhow::anyhow!("pid {pid} is out of range"))?;
+        // Signal 0 sends nothing and only says whether the group exists.
+        // SAFETY: kill(2) takes plain integers and touches no memory of ours.
+        if unsafe { libc::kill(-group, 0) } == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            // Some of it is there, run by a user weft may not signal.
+            Some(libc::EPERM) => Ok(true),
+            _ => anyhow::bail!("look for process group {pid}: {e}"),
+        }
+    }
+}
+
+/// Whether the loopback port `port` is held right now: binding it is
+/// refused as an address in use. The bind is let go at once.
+fn loopback_taken(port: u16) -> anyhow::Result<bool> {
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(true),
+        Err(e) => anyhow::bail!("bind loopback port {port}: {e}"),
     }
 }
 
@@ -284,6 +345,8 @@ pub mod fake {
         /// process serves on it, so no other test on the machine takes it
         /// in between.
         reserved: Mutex<HashMap<u16, std::net::TcpListener>>,
+        /// Ports a test listens on in place of this fake's processes.
+        stand_ins: Mutex<HashSet<u16>>,
     }
 
     impl Default for FakeProcesses {
@@ -300,6 +363,7 @@ pub mod fake {
                 driving: Default::default(),
                 seen_key: Default::default(),
                 reserved: Mutex::default(),
+                stand_ins: Mutex::default(),
             }
         }
     }
@@ -316,6 +380,13 @@ pub mod fake {
         /// A process this fake did not start (an earlier life's worker).
         pub fn running(&self, pid: u32, started: &str) {
             self.alive.lock().insert(pid, started.to_string());
+        }
+
+        /// The test listens on `port` in place of this fake's processes
+        /// (to answer a readiness check itself): never taken by another
+        /// program.
+        pub fn stand_in_on(&self, port: u16) {
+            self.stand_ins.lock().insert(port);
         }
 
         /// `pid` ignores being told to stop.
@@ -435,6 +506,40 @@ pub mod fake {
             self.reserved.lock().insert(port, listener);
             Ok(port)
         }
+
+        /// A port this fake handed out is its own until a process serves
+        /// on it, and one a test stands in on is its processes', neither
+        /// taken; any other is the machine's say.
+        fn port_taken(&self, port: u16) -> anyhow::Result<bool> {
+            if self.reserved.lock().contains_key(&port) || self.stand_ins.lock().contains(&port) {
+                return Ok(false);
+            }
+            super::loopback_taken(port)
+        }
+
+        /// A process of this fake is its whole group, gone once it ended.
+        fn group_left(&self, pid: u32) -> anyhow::Result<bool> {
+            Ok(self.alive.lock().contains_key(&pid))
+        }
+    }
+
+    /// The ports a process unit keeps come from the same machine, held
+    /// the same way until its process serves on one.
+    impl crate::kept_ports::PickPorts for FakeProcesses {
+        fn turn(&self) -> anyhow::Result<Box<dyn crate::kept_ports::Turn + '_>> {
+            Ok(Box::new(self))
+        }
+    }
+
+    impl crate::kept_ports::Turn for &FakeProcesses {
+        fn free_port(&self, besides: &[u16]) -> anyhow::Result<u16> {
+            loop {
+                let port = Processes::free_port(*self)?;
+                if !besides.contains(&port) {
+                    return Ok(port);
+                }
+            }
+        }
     }
 }
 
@@ -459,5 +564,28 @@ mod tests {
         assert!(mark.is_some());
         assert_eq!(MachineProcesses.started(me).await.unwrap(), mark);
         assert_eq!(MachineProcesses.started(u32::MAX / 2).await.unwrap(), None);
+    }
+
+    /// A stop answers only once the whole group is gone, the program its
+    /// process started included, so nothing of it still holds a port the
+    /// next start binds.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_stop_answers_once_nothing_of_the_group_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = Spawn {
+            program: PathBuf::from("/bin/sh"),
+            // The shell ignores the stop it is told, and leaves a child of
+            // its own in the group.
+            args: vec!["-c".into(), "trap '' TERM; sleep 30 & wait".into()],
+            cwd: dir.path().to_path_buf(),
+            env: BTreeMap::from([("PATH".to_string(), "/bin:/usr/bin".to_string())]),
+            log: dir.path().join("log"),
+        };
+        let spawned = MachineProcesses.spawn(&spec).unwrap();
+        let started = MachineProcesses.started(spawned.pid).await.unwrap().unwrap();
+        assert!(MachineProcesses.group_left(spawned.pid).unwrap());
+        assert!(stop(&MachineProcesses, spawned.pid, &started, std::time::Duration::from_millis(100)).await.unwrap());
+        assert!(!MachineProcesses.group_left(spawned.pid).unwrap(), "the shell's sleep went with it");
     }
 }

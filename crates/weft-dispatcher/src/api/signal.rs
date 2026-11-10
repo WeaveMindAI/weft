@@ -866,13 +866,25 @@ fn bearer_token(headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
 }
 
 /// Resolve and load a signal token from its PRESENTED value, returning a
-/// typed scope helper. The DB stores only the sha256 of the value
-/// (show-once), so the lookup hashes first: a fixed-width digest match,
-/// never a raw-secret equality. 401 if the token doesn't exist.
+/// typed scope helper. A connections key is refused here (403, naming
+/// what it is): it opens the program door alone
+/// ([`crate::store::SignalToken::refused_at_caller_doors`]).
 async fn require_scoped_signal_token(
     state: &DispatcherState,
     token: &str,
 ) -> Result<TokenScope, (StatusCode, String)> {
+    let row = caller_token(state, token).await?;
+    if let Some(why) = row.refused_at_caller_doors() {
+        return Err((StatusCode::FORBIDDEN, why));
+    }
+    Ok(TokenScope { row })
+}
+
+/// The live caller token a PRESENTED value names, whatever it grants. The
+/// DB stores only the sha256 of the value (show-once), so the lookup
+/// hashes first: a fixed-width digest match, never a raw-secret equality.
+/// 401 if the token doesn't exist, expired, or is an operator key.
+async fn caller_token(state: &DispatcherState, token: &str) -> Result<crate::store::SignalToken, (StatusCode, String)> {
     let hash = weft_core::signal_token::token_hash(token);
     let row = state
         .tokens
@@ -888,7 +900,7 @@ async fn require_scoped_signal_token(
     if row.kind != weft_core::signal_token::TokenKind::Caller {
         return Err((StatusCode::UNAUTHORIZED, "unknown signal token".into()));
     }
-    Ok(TokenScope { row })
+    Ok(row)
 }
 
 /// The signal token a request presents, loaded. The doors that are not
@@ -900,6 +912,17 @@ pub(crate) async fn token_from_bearer(
 ) -> Result<crate::store::SignalToken, (StatusCode, String)> {
     let presented = bearer_token(headers)?;
     Ok(require_scoped_signal_token(state, &presented).await?.row)
+}
+
+/// The connections key a request presents, loaded: the program door's one
+/// way in. Any other caller token is refused there (403, naming what the
+/// door takes).
+pub(crate) async fn connections_key_from_bearer(
+    state: &DispatcherState,
+    headers: &HeaderMap,
+) -> Result<crate::store::SignalToken, (StatusCode, String)> {
+    let presented = bearer_token(headers)?;
+    caller_token(state, &presented).await
 }
 
 struct TokenScope {
@@ -1658,6 +1681,7 @@ mod can_cancel_tests {
                 all_displays: false,
                 created_at: 0,
                 instance: None,
+                connections: false,
                 expires_at: None,
             },
         }

@@ -229,6 +229,7 @@ pub(crate) mod display;
 pub mod signal;
 pub mod access;
 pub mod instance_door;
+pub mod program_door;
 mod picks;
 mod workers;
 pub mod node_tests;
@@ -494,6 +495,13 @@ fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
         .route("/instance/connections/status", get(instance_door::connect_status))
         .route("/instance/doors", post(instance_door::doors))
         .route("/instance/runs", get(instance_door::runs))
+        // The program door: the connections the program itself uses on the
+        // install (its picks), with a connections key in
+        // `Authorization: Bearer` (see `api/program_door.rs`).
+        .route("/program/connections", get(program_door::connections))
+        .route("/program/connections/direct", post(program_door::connect_direct))
+        .route("/program/connections/{node}/{field}", axum::routing::delete(program_door::clear))
+        .route("/program/doors", post(program_door::doors))
         // What a node is SHOWING, for a client built on top of a weft
         // program (a website that renders the bridge's QR code rather
         // than sending its user to the editor). The same two feeds the

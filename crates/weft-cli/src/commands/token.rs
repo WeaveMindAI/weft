@@ -22,6 +22,11 @@
 //! can never show it again. `ls` shows metadata + the
 //! recognizer prefix; `revoke` addresses the token's id.
 //!
+//! A connections key (`--connections`) is the other caller token: it
+//! manages the connections one program uses on the install, through the
+//! program door (`/program/connections`), for a website's admin page, and
+//! reaches nothing else.
+//!
 //! Tokens are general (not tied to one consumer kind). An external
 //! listener picks the `human_in_the_loop` scope at setup time; a
 //! future Slack bot would pick its own kind. Same dispatcher surface
@@ -42,6 +47,8 @@ pub enum TokenAction {
         all_displays: bool,
         /// An instance token for this instance of the project in the folder.
         instance: Option<weft_core::instance::InstanceId>,
+        /// A connections key for one project's program (`--connections`).
+        connections: bool,
         expires_in_secs: Option<u64>,
         /// An operator key rather than a caller token (`--operator`).
         operator: bool,
@@ -55,9 +62,9 @@ pub enum TokenAction {
 pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
     let client = ctx.client()?;
     match action {
-        TokenAction::Mint { name, projects, tags, displays, all_displays, instance, expires_in_secs, operator } => {
+        TokenAction::Mint { name, projects, tags, displays, all_displays, instance, connections, expires_in_secs, operator } => {
             let displays = grants_for(&ctx, &displays)?;
-            let projects = instance_projects(&ctx, instance.as_ref(), projects)?;
+            let projects = if connections { connections_project(&ctx, projects)? } else { instance_projects(&ctx, instance.as_ref(), projects)? };
             let allowed_projects = projects
                 .iter()
                 .map(|p| p.parse::<uuid::Uuid>().map_err(|_| anyhow::anyhow!("--projects takes project ids, and '{p}' is not one")))
@@ -69,6 +76,7 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
                 allowed_displays: displays,
                 all_displays,
                 instance,
+                connections,
                 expires_in_secs,
                 kind: if operator { TokenKind::Operator } else { TokenKind::Caller },
             };
@@ -104,6 +112,14 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
             if let Some(name) = minted.name.as_deref().filter(|n| !n.is_empty()) {
                 eprintln!("Name: {name}");
             }
+            if minted.connections {
+                print_connections_summary(&minted.allowed_projects, minted.expires_at_unix);
+                eprintln!(
+                    "Keep it on your site's server, behind your own admin check: anybody holding it can replace \
+                     the program's keys."
+                );
+                return Ok(());
+            }
             print_scope_summary(
                 &minted.allowed_projects,
                 &minted.allowed_tags,
@@ -133,6 +149,10 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
                 println!("  id: {}", t.id);
                 if t.kind == TokenKind::Operator {
                     println!("  operator key: administers the whole install");
+                    continue;
+                }
+                if t.connections {
+                    print_connections_summary(&t.allowed_projects, t.expires_at_unix);
                     continue;
                 }
                 print_scope_summary(
@@ -179,6 +199,31 @@ fn instance_projects(ctx: &Ctx, instance: Option<&weft_core::instance::InstanceI
         );
     }
     Ok(vec![here])
+}
+
+/// The one project a connections key manages: the one --projects names,
+/// else the one the person is standing in.
+fn connections_project(ctx: &Ctx, projects: Vec<String>) -> anyhow::Result<Vec<String>> {
+    match projects.as_slice() {
+        [_] => Ok(projects),
+        [] => {
+            let here = ctx.project().map_err(|e| {
+                anyhow::anyhow!(
+                    "--connections makes a key for one program's connections, and there is no project here: {e}. \
+                     Run this from the project's folder, or name it with --projects <id>."
+                )
+            })?;
+            Ok(vec![here.id().to_string()])
+        }
+        _ => anyhow::bail!("a connections key manages exactly one program's connections; name one project with --projects"),
+    }
+}
+
+/// A connections key's summary: the program whose connections it manages.
+fn print_connections_summary(projects: &[uuid::Uuid], expires_at_unix: Option<u64>) {
+    let project = projects.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    eprintln!("  connections key: manages the connections of project {project}'s program, and reaches nothing else");
+    print_instance_summary(None, expires_at_unix);
 }
 
 /// The instance line of a token's summary, when it is an instance token.

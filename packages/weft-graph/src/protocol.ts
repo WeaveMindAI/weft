@@ -1324,7 +1324,8 @@ export type SkipReason =
   | { kind: 'every_input_closed'; failure?: Failure }
   | { kind: 'one_of_group_closed'; ports: string[]; failure?: Failure }
   | { kind: 'scope_skipped'; scope: string }
-  | { kind: 'wait_skipped' };
+  | { kind: 'wait_skipped' }
+  | { kind: 'unfilled'; field: string; service?: string };
 
 /// A node that broke, as the closures it leaves carry it: the node spelled
 /// the way the program reads it, and its error. Passed on unchanged through
@@ -1460,16 +1461,26 @@ export interface InstanceFilledValue {
   [INSTANCE_FILLED_KEY]: { fallback?: unknown };
 }
 
-/// `value` read as an `@instance_filled` literal (its fallback, when any),
-/// `null` for any other value.
+/// An `@instance_filled` literal, read: `fallback` is the value an
+/// instance that gave none gets (never a null), and `mayStayEmpty` says the
+/// source wrote `@instance_filled(null)`, so an instance may leave the
+/// field empty (the node gets a null there).
+export interface InstanceFilled {
+  fallback?: unknown;
+  mayStayEmpty: boolean;
+}
+
+/// `value` read as an `@instance_filled` literal, `null` for any other
+/// value.
 // SYNC: instanceFilled <-> crates/weft-core/src/instance.rs as_instance_filled
-export function instanceFilled(value: unknown): { fallback?: unknown } | null {
+export function instanceFilled(value: unknown): InstanceFilled | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
   const keys = Object.keys(value);
   if (keys.length !== 1 || keys[0] !== INSTANCE_FILLED_KEY) return null;
   const inner = (value as Record<string, unknown>)[INSTANCE_FILLED_KEY];
   if (typeof inner !== 'object' || inner === null || Array.isArray(inner)) return null;
-  return inner as { fallback?: unknown };
+  const fallback = (inner as { fallback?: unknown }).fallback;
+  return fallback === null ? { mayStayEmpty: true } : { fallback, mayStayEmpty: false };
 }
 
 /// The literal an access node's connection field compiles to when the

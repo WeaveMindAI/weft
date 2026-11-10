@@ -74,6 +74,10 @@ export function skipReasonText(reason: SkipReason | undefined): string {
 			return `every input of the group (${reason.ports.join(', ')}) closed${afterFailure(reason.failure)}`;
 		case 'scope_skipped': return `the scope '${reason.scope}' it lives in did not run`;
 		case 'wait_skipped': return 'a person skipped what it was waiting for';
+		case 'unfilled':
+			return reason.service
+				? `not connected: this instance has no ${reason.service} connection for '${reason.field}'`
+				: `not filled: this instance left '${reason.field}' empty`;
 		default: {
 			// Compile-time exhaustiveness; at runtime (a dispatcher newer
 			// than this webview sending a new kind) say so honestly

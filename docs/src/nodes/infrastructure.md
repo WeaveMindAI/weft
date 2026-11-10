@@ -392,7 +392,7 @@ arrives, after the other node is up. weft keeps the handle and the path, not
 an address: every `ctx.endpoint("api")`, `ctx.endpoint_of`, and read of a
 [live panel](#a-live-panel) asks where the other node's endpoint answers at
 that moment and adds the path, so your endpoint still works after the other
-node is made again on another port. If the other node is not running, the
+node's address changes (terminated and started again, it gets new ports). If the other node is not running, the
 lookup fails saying so and naming it. The path must be a plain path with at
 least one segment, the endpoint can only be `Expose::Project`, and the
 endpoint it lives inside must have an address of its own, so a `Within`
@@ -453,7 +453,10 @@ set `expose`:
 - `Expose::SameNetwork` opens it to programs on the install's own network:
   anything running on your machine locally, the install's private network on
   a cloud, but never the internet. A frontend uses this to reach a program's
-  database.
+  database. On your machine the address is `127.0.0.1:<port>`, at a port weft
+  picks when the unit first starts and keeps until the unit is removed or the
+  infra terminated, so a copy of it in a frontend's `.env` keeps working
+  through restarts and upgrades.
 - `Expose::Public { path: "/hooks" }` opens it to the internet, over HTTP, at
   the install's public address. Hand the caller (a provider delivering
   webhooks, say) `public_url()`.
@@ -625,9 +628,9 @@ infra](../running/lifecycles.md#infra-commands-take-down-only-what-reads-the-inf
 
 If other nodes need to talk to your service (say, a WhatsApp bridge that
 every send node goes through), pass them a handle instead of `url()`. The
-address changes every time your service is set up again. The handle names
-your node, as it is named in the program, and its endpoint, so it still
-finds the service after that.
+handle names your node, as it is named in the program, and its endpoint, so
+it still finds the service if its address changes (a terminated infra
+started again gets new ports, for one).
 
 Declare an output typed `Infra` and set it to the endpoint's handle:
 

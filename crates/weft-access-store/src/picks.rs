@@ -150,3 +150,57 @@ pub async fn move_stored(
         .await?;
     Ok((picks, values))
 }
+
+/// The connections picked at `fields` (node, field) of `project_id`, on
+/// `db` (the caller's transaction, before it changes them): what a change
+/// that forgets the connections it leaves unused
+/// ([`forget_if_unused`]) asks first.
+pub async fn picked_grants(
+    db: &impl Client,
+    tenant: &str,
+    project_id: uuid::Uuid,
+    fields: &[(String, String)],
+) -> anyhow::Result<Vec<uuid::Uuid>> {
+    let nodes: Vec<&str> = fields.iter().map(|(node, _)| node.as_str()).collect();
+    let names: Vec<&str> = fields.iter().map(|(_, field)| field.as_str()).collect();
+    let rows: Vec<(uuid::Uuid,)> = db
+        .all(
+            "SELECT DISTINCT p.grant_id FROM install_pick p
+             JOIN unnest($3::text[], $4::text[]) AS f(node, field) ON f.node = p.node AND f.field = p.field
+             WHERE p.tenant_id = $1 AND p.project_id = $2",
+            &[&tenant, &project_id, &nodes, &names],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Forget the author's connection `grant_id` of `tenant` when nothing this
+/// store keeps uses it any more: no pick of any of the tenant's projects
+/// names it, and no provider subscription acts as it (an instance's value
+/// only ever names that instance's own connection,
+/// `change_instance_values`). A signal set up on it is the dispatcher's
+/// to ask before calling this. Answers whether it was forgotten (a
+/// connection already gone is not). On `db`, the caller's transaction:
+/// the row is locked first, so a pick of it landing at the same moment
+/// either is seen here (and keeps it) or waits and then finds it gone
+/// (and is refused), never left pointing at nothing.
+pub async fn forget_if_unused(db: &impl Client, tenant: &str, grant_id: uuid::Uuid) -> anyhow::Result<bool> {
+    let held: Option<uuid::Uuid> = db
+        .scalar_opt(
+            "SELECT id FROM access_grant WHERE tenant_id = $1 AND id = $2 AND instance_id IS NULL FOR UPDATE",
+            &[&tenant, &grant_id],
+        )
+        .await?;
+    if held.is_none() {
+        return Ok(false);
+    }
+    let forgotten = db
+        .execute(
+            "DELETE FROM access_grant WHERE id = $1 \
+             AND NOT EXISTS (SELECT 1 FROM install_pick WHERE grant_id = $1) \
+             AND NOT EXISTS (SELECT 1 FROM signal_subscription WHERE access_id = $1)",
+            &[&grant_id],
+        )
+        .await?;
+    Ok(forgotten > 0)
+}

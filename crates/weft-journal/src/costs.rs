@@ -11,6 +11,7 @@ use weft_core::program::{CostFilter, CostRecord, PaidBy};
 use weft_core::project::ProjectDefinition;
 use weft_core::{CredentialOwner, RunId};
 use weft_task_store::db::{self, Client, FromRow, Row, Transaction};
+use weft_task_store::pages::{next_page, PageCaps};
 
 use crate::events::RunEvent;
 
@@ -291,9 +292,11 @@ impl FromRow for Listed {
     }
 }
 
-/// How many rows of the records one page of [`carry_from_records`] reads:
-/// a page is decoded whole, so this bounds what it holds at once.
-const CARRY_PAGE: i64 = 200;
+/// How much of the records one page of [`carry_from_records`] reads: a
+/// page is decoded whole, so this bounds what it holds at once. At most
+/// 200 rows, and about 16 MB of them as stored: a row is compressed, and
+/// decodes to several times its size.
+pub const CARRY_PAGE: PageCaps = PageCaps { rows: 200, bytes: 16 * 1024 * 1024 };
 
 /// The data step that fills `run_cost` from the records an older weft
 /// left, which kept only each run's total (`run.cost_micro_usd`): every
@@ -303,32 +306,40 @@ const CARRY_PAGE: i64 = 200;
 /// there stays as it is. A row that does not decode is said and left out,
 /// as every reader of costs before it would have failed on it.
 pub fn carry_from_records<'c>(tx: &'c Transaction<'c>) -> BoxFuture<'c, anyhow::Result<()>> {
-    Box::pin(async move {
-        let mut after = (RunId::nil(), -1);
-        loop {
-            let rows: Vec<(RunId, i32, Vec<u8>, weft_core::stored::Version)> = tx
-                .all(
-                    "SELECT run_id, seq, events, events_version FROM run_log \
-                     WHERE (run_id, seq) > ($1, $2) ORDER BY run_id, seq LIMIT $3",
-                    &[&after.0, &after.1, &CARRY_PAGE],
-                )
-                .await?;
-            let Some(last) = rows.last() else { return Ok(()) };
-            after = (last.0, last.1);
-            let full = rows.len() as i64 == CARRY_PAGE;
-            let costs = crate::on_blocking_pool(move || costs_of_rows(rows)).await;
-            let mut columns = CostColumns::default();
-            for (run_id, seq, costs) in &costs {
-                for cost in costs {
-                    columns.push(*run_id, *seq, cost);
-                }
-            }
-            insert_columns_in(tx, &columns).await?;
-            if !full {
-                return Ok(());
+    Box::pin(carry_from_records_in(tx, CARRY_PAGE))
+}
+
+/// [`carry_from_records`] in pages of `caps`, walked in the records' key
+/// order from the last row of the page before.
+pub async fn carry_from_records_in(tx: &Transaction<'_>, caps: PageCaps) -> anyhow::Result<()> {
+    const AFTER: &str = "FROM run_log WHERE (run_id, seq) > ($1, $2)";
+    let mut after = (RunId::nil(), -1);
+    loop {
+        let Some(page) = next_page(tx, AFTER, &["run_id", "seq"], "events", &[&after.0, &after.1], caps).await? else {
+            return Ok(());
+        };
+        let last = (page.last[0].parse::<RunId>()?, page.last[1].parse::<i32>()?);
+        let rows: Vec<(RunId, i32, Vec<u8>, weft_core::stored::Version)> = tx
+            .all(
+                &format!(
+                    "SELECT run_id, seq, events, events_version {AFTER} AND (run_id, seq) <= ($3, $4) ORDER BY run_id, seq"
+                ),
+                &[&after.0, &after.1, &last.0, &last.1],
+            )
+            .await?;
+        after = last;
+        let costs = crate::on_blocking_pool(move || costs_of_rows(rows)).await;
+        let mut columns = CostColumns::default();
+        for (run_id, seq, costs) in &costs {
+            for cost in costs {
+                columns.push(*run_id, *seq, cost);
             }
         }
-    })
+        insert_columns_in(tx, &columns).await?;
+        if !page.more {
+            return Ok(());
+        }
+    }
 }
 
 /// The costs each of `rows` (rows of records, with their run, seq and

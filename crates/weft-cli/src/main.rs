@@ -1186,6 +1186,16 @@ enum TokenAction {
         /// accounts. Needs --expires.
         #[arg(long, value_name = "id")]
         instance: Option<weft_core::instance::InstanceId>,
+        /// Make a connections key: it manages the connections the program
+        /// uses on this install (what `weft connect` picks), for the
+        /// project you are standing in (or the one --projects names), and
+        /// reaches nothing else. It is what a website's server holds for
+        /// an admin page where the admin pastes the program's own keys
+        /// (the connect library's `ProgramDoor`). Keep it on the server,
+        /// behind your own admin check: anybody holding it can replace the
+        /// program's keys. --expires is optional.
+        #[arg(long, conflicts_with_all = ["tags", "displays", "all_displays", "instance"])]
+        connections: bool,
         /// How long the token works (`30m`, `12h`, `7d`). Required with
         /// --instance; without it a token works until revoked.
         #[arg(long, value_name = "duration", value_parser = parse_duration_secs)]
@@ -1194,7 +1204,7 @@ enum TokenAction {
         /// (every CLI and editor verb), for a teammate or CI
         /// (`WEFT_OPERATOR_KEY`). Takes no scope and acts in no instance.
         /// Never put one in a frontend: its server holds a caller token.
-        #[arg(long, conflicts_with_all = ["projects", "tags", "displays", "all_displays", "instance"])]
+        #[arg(long, conflicts_with_all = ["projects", "tags", "displays", "all_displays", "instance", "connections"])]
         operator: bool,
     },
     /// List existing signal tokens (metadata + recognizer; the full
@@ -1207,7 +1217,7 @@ enum TokenAction {
 impl From<TokenAction> for commands::token::TokenAction {
     fn from(value: TokenAction) -> Self {
         match value {
-            TokenAction::Mint { name, projects, tags, displays, all_displays, instance, expires, operator } => {
+            TokenAction::Mint { name, projects, tags, displays, all_displays, instance, connections, expires, operator } => {
                 commands::token::TokenAction::Mint {
                     name,
                     projects,
@@ -1215,6 +1225,7 @@ impl From<TokenAction> for commands::token::TokenAction {
                     displays,
                     all_displays,
                     instance,
+                    connections,
                     expires_in_secs: expires,
                     operator,
                 }

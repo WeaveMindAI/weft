@@ -60,6 +60,7 @@ pub mod infra_copies;
 pub mod install_address;
 pub mod kinds;
 pub mod locks;
+pub mod pages;
 pub mod parked_fires;
 pub mod pg_signal;
 pub mod runs;
