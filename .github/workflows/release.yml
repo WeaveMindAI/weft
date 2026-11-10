@@ -14,9 +14,9 @@
 #     release with a manifest.json naming the exact commit and a sha256 per
 #     asset (setup.sh downloads them when its checkout matches); the browser
 #     zips ride along as the record of what went to the stores and for
-#     sideloading the targets that have no store (Opera, Safari),
-#   - the extension stores (VS Code Marketplace, Open VSX, Chrome, Firefox,
-#     Edge), but ONLY when the extension's version moved: a per-store
+#     sideloading the targets that have no store (Edge, Opera, Safari),
+#   - the extension stores (VS Code Marketplace, Open VSX, Chrome,
+#     Firefox), but ONLY when the extension's version moved: a per-store
 #     `*-v<version>` tag records each successful publish, so bumping the
 #     version (setup.sh --bump) is the whole release gesture, ordinary
 #     pushes never spam store reviews, and one store failing retries alone
@@ -347,7 +347,7 @@ jobs:
         with:
           workspace: extension-browser
           tag-prefix: browser
-          stores: chrome firefox edge
+          stores: chrome firefox
       - uses: actions/upload-artifact@v7
         with:
           name: browser-zips
@@ -616,7 +616,6 @@ jobs:
           case "$STORE" in
             chrome)  args="--chrome-zip build/weft-extension-chrome.zip" ;;
             firefox) args="--firefox-zip build/weft-extension-firefox.zip --firefox-sources-zip build/weft-extension-sources.zip" ;;
-            edge)    args="--edge-zip build/weft-extension-edge.zip" ;;
             *) echo "::error::no submit shape for store '$STORE'"; exit 1 ;;
           esac
           echo "value=$args" >> "$GITHUB_OUTPUT"
@@ -634,9 +633,6 @@ jobs:
           FIREFOX_JWT_ISSUER: ${{ secrets.WEB_EXT_API_KEY }}
           FIREFOX_JWT_SECRET: ${{ secrets.WEB_EXT_API_SECRET }}
           FIREFOX_CHANNEL: listed
-          EDGE_PRODUCT_ID: ${{ secrets.EDGE_PRODUCT_ID }}
-          EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
-          EDGE_API_KEY: ${{ secrets.EDGE_API_KEY }}
         with:
           store: ${{ matrix.store }}
           # `exec` (not a bare command): pnpm only keeps -C for builtins

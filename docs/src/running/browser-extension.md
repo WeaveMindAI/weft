@@ -6,6 +6,12 @@ the run parks and the question shows up here as a card.
 Install it from
 [Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/weft-tasks/) or the
 [Chrome Web Store](https://chromewebstore.google.com/detail/weavemind/mddobmalhoelphnmhbenmbmeibfpoppm).
+If you use Edge, Opera or Safari, it is not in their stores: Edge installs it
+from the Chrome Web Store once you turn on "Allow extensions from other stores",
+or you can download your browser's zip (`weft-extension-edge.zip`, for
+example) from the [latest release](https://github.com/WeaveMindAI/weft/releases/tag/latest),
+unzip it and load the folder from the browser's extensions page with Developer
+mode on.
 To build it from your checkout instead, `./setup.sh --browser --no-sign` writes
 an unpacked build per browser under `extension-browser/build/`, and Chrome loads
 it from `chrome://extensions` with Developer mode on.
