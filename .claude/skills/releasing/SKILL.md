@@ -168,7 +168,7 @@ It has never refused anything. Its namespace must exist before the
 first publish and creating it twice is refused, which the workflow
 handles.
 
-**Chrome, Firefox, Edge** go through `wxt submit` from
+**Chrome and Firefox** go through `wxt submit` from
 `extension-browser`. AMO refuses a duplicate version with a 409 naming
 the version, which is the case the self-heal was written for. Firefox
 also needs a sources zip (`zip:firefox` writes it) because AMO reviews

@@ -75,7 +75,7 @@
 #                 --vscode; the browser extension with --browser). The
 #                 version is what makes CI publish the pushed build to
 #                 the stores (VS Code Marketplace, Open VSX, Chrome,
-#                 Firefox, Edge), so this is the deliberate "release
+#                 Firefox), so this is the deliberate "release
 #                 the extension" switch; a plain rebuild never bumps.
 #
 # Default-on knobs you opt OUT of:
@@ -526,7 +526,7 @@ target_flag_seen=0
 
 # The extension versions in package.json are what gate the STORE
 # publishes in CI (a pushed commit whose version moved gets submitted
-# to the VS Code Marketplace / Open VSX / Chrome / Firefox / Edge), so
+# to the VS Code Marketplace / Open VSX / Chrome / Firefox), so
 # bumping is the deliberate release gesture (--bump), never a side
 # effect of a rebuild.
 do_bump=0
