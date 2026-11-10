@@ -65,3 +65,56 @@ async fn a_version_an_older_weft_registered_has_its_triggers_cuts_walked(pool: P
     weft_runtime::schema::apply(&pool).await.expect("a boot with nothing to do");
     assert_eq!(projects.trigger_cuts(id, "version").await.unwrap(), Some(walked), "a second boot walks nothing again");
 }
+
+/// The migration that adds `project_definition.trigger_cuts_walked`, still
+/// nullable: its expand part (its contract part, which makes the column
+/// NOT NULL once the data step answered every row, sorts after it).
+const ADDS_THE_ANSWER: &str = "20261101T205558_project_trigger_cuts_walked";
+
+/// The walk reads its programs a page at a time, each page bounded by the
+/// size of the programs it holds as well as by their count: with a byte
+/// cap under one program, every page holds one, and every version still
+/// has its cuts walked. A page answers its rows in one statement, which a
+/// trigger counts here.
+#[weft_db_macros::test]
+async fn the_walk_reads_its_programs_in_pages_bounded_by_their_size(pool: Pool) {
+    weft_task_store::schema_guard::build_as_of(&pool, &weft_runtime::schema::groups(), |m| m.id <= ADDS_THE_ANSWER)
+        .await
+        .unwrap();
+    pool.batch_execute(
+        "CREATE TABLE probe_page (seq BIGSERIAL PRIMARY KEY);
+         CREATE FUNCTION probe_note_page() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+             INSERT INTO probe_page DEFAULT VALUES; RETURN NULL;
+         END $$;
+         CREATE TRIGGER probe_note_page AFTER UPDATE ON project_definition FOR EACH STATEMENT EXECUTE FUNCTION probe_note_page()",
+    )
+    .await
+    .unwrap();
+    let id = uuid::Uuid::new_v4();
+    let program = program(id);
+    let json = serde_json::to_string(&program).unwrap();
+    let hashes = ["a", "b", "c"];
+    for hash in hashes {
+        pool.execute(
+            "INSERT INTO project_definition (project_id, definition_hash, project_json, project_json_version, recorded_at_unix) \
+             VALUES ($1, $2, $3, $4, 0)",
+            &[&id, &hash, &json, &weft_core::ProjectDefinition::STORED.version()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut conn = pool.get().await.unwrap();
+    let tx = conn.transaction().await.unwrap();
+    let one_program = weft_task_store::pages::PageCaps { rows: 50, bytes: 1 };
+    weft_dispatcher::project_store::walk_trigger_cuts_in(&tx, one_program).await.expect("the walk");
+    tx.commit().await.unwrap();
+
+    let pages: i64 = pool.scalar("SELECT count(*) FROM probe_page", &[]).await.unwrap();
+    assert_eq!(pages, 3, "one program a page");
+    let projects = weft_dispatcher::PostgresProjectStore::new(pool.clone());
+    let walked = weft_core::run_spec::trigger_cuts(&program);
+    for hash in hashes {
+        assert_eq!(projects.trigger_cuts(id, hash).await.unwrap(), Some(walked.clone()), "version {hash}");
+    }
+}

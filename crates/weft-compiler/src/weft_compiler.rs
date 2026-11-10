@@ -3654,7 +3654,9 @@ fn node_config_key_ok(key: &str, span: Span, errors: &mut Vec<SourceError>) -> b
 /// lowered to [`weft_core::instance::instance_filled_literal`]. The fallback is
 /// any literal a field takes, read by the same reader, `@file`/`@asset`
 /// included (resolved like a written one, inside the marker); any other
-/// marker inside it is refused.
+/// marker inside it is refused. `null` is the one value only a fallback
+/// takes: an instance may leave the field empty
+/// (`weft_core::instance::InstanceFilled::may_stay_empty`).
 fn instance_filled_value(key: &str, raw: &str, span: Span, errors: &mut Vec<SourceError>) -> Option<serde_json::Value> {
     use crate::cst::marker::{args, MarkerArgs};
     if key.starts_with('_') {
@@ -3673,6 +3675,7 @@ fn instance_filled_value(key: &str, raw: &str, span: Span, errors: &mut Vec<Sour
             )));
             return None;
         }
+        MarkerArgs::Args(body) if body.trim() == "null" => Some(serde_json::Value::Null),
         MarkerArgs::Args(body) => {
             let body = body.trim();
             if body.starts_with('@') && !matches!(crate::cst::marker::directive(body), "file" | "asset") {
@@ -4281,7 +4284,7 @@ fn push_loop_boundaries(group: &ParsedGroup, nodes: &mut Vec<NodeDefinition>) {
         images: Vec::new(),
         fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
         published_service: None,
-        instance_service: None,
+        connection_service: None,
         instance_rules: None,
         recheck: Vec::new(),
         span: None,
@@ -4375,7 +4378,7 @@ fn push_loop_boundaries(group: &ParsedGroup, nodes: &mut Vec<NodeDefinition>) {
         images: Vec::new(),
         fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
         published_service: None,
-        instance_service: None,
+        connection_service: None,
         instance_rules: None,
         recheck: Vec::new(),
         span: None,
@@ -4455,7 +4458,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         images: Vec::new(),
         fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
         published_service: None,
-        instance_service: None,
+        connection_service: None,
         instance_rules: None,
         recheck: Vec::new(),
         span: pn.span,

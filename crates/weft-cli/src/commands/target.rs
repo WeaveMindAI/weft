@@ -1000,6 +1000,7 @@ mod tests {
             allowed_displays: vec![],
             all_displays: false,
             instance: None,
+            connections: false,
             expires_at_unix: None,
         };
         let token = |id: &str, kind: TokenKind, name: &str| scoped(id, kind, name, vec![]);

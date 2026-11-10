@@ -2635,6 +2635,54 @@ async fn the_install_keeps_the_authors_picks(pool: Pool) {
     assert!(install_picks(&pool, TENANT_A, PROJECT_1).await.unwrap().is_empty(), "the pick goes with its connection");
 }
 
+/// A connection the program door leaves unpicked is forgotten only when
+/// nothing on the install uses it: a pick of another project keeps it, the
+/// last pick gone lets it go, and an instance's connection or another
+/// tenant's is never this to forget.
+#[weft_db_macros::test]
+async fn a_connection_is_forgotten_only_once_nothing_picks_it(pool: Pool) {
+    use weft_access_store::{change_install_picks, forget_if_unused, picked_grants, PickWrite};
+    use weft_core::instance::InstanceId;
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let connect = |instance: Option<InstanceId>| ConnectDirect {
+        paste: false,
+        way: None,
+        spec: static_spec(&base),
+        door: Door::Own,
+        registration: None,
+        values: [("token".to_string(), "tok-abc".to_string())].into_iter().collect(),
+        label: None,
+        permissions: Vec::new(),
+        project_id: Some(PROJECT_1),
+        instance,
+    };
+    let key = connect_direct(&pool, InstallKind::Local, TENANT_A, connect(None)).await.expect("the author connects").grant;
+    let adas = connect_direct(&pool, InstallKind::Local, TENANT_A, connect(Some(InstanceId::new("ada").unwrap())))
+        .await
+        .expect("ada connects")
+        .grant;
+    let other_project = uuid::Uuid::from_u128(0xbeef);
+    let pick = PickWrite { node: "vapi".into(), field: "account".into(), grant_id: key.id, service: "fakestatic".into() };
+    let field = [("vapi".to_string(), "account".to_string())];
+    let conn = pool.get().await.unwrap();
+    change_install_picks(&conn, TENANT_A, PROJECT_1, std::slice::from_ref(&pick), &[]).await.unwrap();
+    change_install_picks(&conn, TENANT_A, other_project, std::slice::from_ref(&pick), &[]).await.unwrap();
+    assert_eq!(picked_grants(&conn, TENANT_A, PROJECT_1, &field).await.unwrap(), vec![key.id]);
+    assert!(picked_grants(&conn, TENANT_A, PROJECT_1, &[("vapi".into(), "other".into())]).await.unwrap().is_empty());
+
+    change_install_picks(&conn, TENANT_A, PROJECT_1, &[], &field).await.unwrap();
+    assert!(!forget_if_unused(&conn, TENANT_A, key.id).await.unwrap(), "another project still picks it");
+    change_install_picks(&conn, TENANT_A, other_project, &[], &field).await.unwrap();
+    assert!(!forget_if_unused(&conn, TENANT_B, key.id).await.unwrap(), "another tenant's is not this to forget");
+    assert!(!forget_if_unused(&conn, TENANT_A, adas.id).await.unwrap(), "an instance's is its own");
+    assert!(forget_if_unused(&conn, TENANT_A, key.id).await.unwrap(), "nothing uses it any more");
+    assert!(!forget_if_unused(&conn, TENANT_A, key.id).await.unwrap(), "a connection already gone is not forgotten again");
+    let left = list_grants(&pool, TENANT_A, None, weft_access_store::GrantOwnerScope::Author).await.unwrap();
+    assert!(left.is_empty(), "{left:?}");
+}
+
 /// A move carries a place's pick and every instance's values to the new
 /// place at once, and reading back shows them there with their services.
 #[weft_db_macros::test]

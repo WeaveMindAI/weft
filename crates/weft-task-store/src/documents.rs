@@ -25,7 +25,7 @@
 //! join compares, a value moved out to a column of its own). For each
 //! column, one step at a time, the rows at the step's version are read in
 //! key order, carried, and written back with the next version, in batches
-//! of [`BATCH`], each batch its own transaction under the schema's
+//! bounded by [`BATCH`], each batch its own transaction under the schema's
 //! advisory lock. The version column is the cursor: a boot that stops
 //! midway, or a second copy booting beside it, finds exactly the rows
 //! still to carry, and no row takes a step twice. A step whose ops change
@@ -47,10 +47,12 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 
 use crate::db::{Client, Param, Pool, Transaction};
+use crate::pages::{next_page, PageCaps, PAGE_BYTES};
 use weft_core::stored::{apply, current_version, round_trip, Kind, Op, Version};
 
-/// How many rows one batch carries forward.
-const BATCH: i64 = 500;
+/// How much one batch carries forward: at most 500 rows, and about
+/// [`PAGE_BYTES`] of documents, which its one write statement sends back.
+pub const BATCH: PageCaps = PageCaps { rows: 500, bytes: PAGE_BYTES };
 
 /// One column of JSON documents and what carries its rows to today. Made
 /// from the type it holds ([`Document::of`]), so its steps and the check
@@ -183,7 +185,12 @@ enum Work<'a> {
 /// contract parts (`crate::schema_guard::apply_schema`), before any role
 /// serves.
 pub async fn apply_documents(pool: &Pool, documents: &[&Document]) -> anyhow::Result<()> {
-    bring(Work::Boot(pool), documents).await
+    apply_documents_in(pool, documents, BATCH).await
+}
+
+/// [`apply_documents`] in batches of `caps`.
+pub async fn apply_documents_in(pool: &Pool, documents: &[&Document], caps: PageCaps) -> anyhow::Result<()> {
+    bring(Work::Boot(pool), documents, caps).await
 }
 
 /// [`apply_documents`] inside the caller's transaction, which holds the
@@ -191,10 +198,10 @@ pub async fn apply_documents(pool: &Pool, documents: &[&Document]) -> anyhow::Re
 /// until the caller does (a release on a working database,
 /// `crate::schema_guard::settle_release`).
 pub(crate) async fn apply_documents_within(tx: &Transaction<'_>, documents: &[&Document]) -> anyhow::Result<()> {
-    bring(Work::Within(tx), documents).await
+    bring(Work::Within(tx), documents, BATCH).await
 }
 
-async fn bring(work: Work<'_>, documents: &[&Document]) -> anyhow::Result<()> {
+async fn bring(work: Work<'_>, documents: &[&Document], caps: PageCaps) -> anyhow::Result<()> {
     if documents.is_empty() {
         return Ok(());
     }
@@ -223,7 +230,7 @@ async fn bring(work: Work<'_>, documents: &[&Document]) -> anyhow::Result<()> {
             document.name()
         );
         for from in at(document).unwrap_or(1)..document.version() {
-            carry(&work, document, from).await?;
+            carry(&work, document, from, caps).await?;
         }
         match work {
             Work::Boot(pool) => {
@@ -297,7 +304,7 @@ fn refuse_newer(document: &Document, at: Version) -> anyhow::Result<()> {
 
 /// Carry every row of `document` at version `from` to `from + 1`, batch by
 /// batch (see the module doc).
-async fn carry(work: &Work<'_>, document: &Document, from: Version) -> anyhow::Result<()> {
+async fn carry(work: &Work<'_>, document: &Document, from: Version, caps: PageCaps) -> anyhow::Result<()> {
     let mut after: Option<Vec<String>> = None;
     let mut first = true;
     let mut moved = 0usize;
@@ -310,18 +317,18 @@ async fn carry(work: &Work<'_>, document: &Document, from: Version) -> anyhow::R
                     async move {
                         let mut conn = pool.get().await?;
                         let tx = crate::schema_guard::locked_tx(&mut conn).await?;
-                        let batch = next_batch(&tx, document, from, first, after).await?;
+                        let batch = next_batch(&tx, document, from, first, after, caps).await?;
                         tx.commit().await?;
                         Ok(batch)
                     }
                 })
                 .await?
             }
-            Work::Within(tx) => next_batch(tx, document, from, first, after.clone()).await?,
+            Work::Within(tx) => next_batch(tx, document, from, first, after.clone(), caps).await?,
         };
         first = false;
         let Batch { rows, last } = batch;
-        if rows == 0 && moved == 0 {
+        if rows == 0 && moved == 0 && last.is_none() {
             return Ok(());
         }
         moved += rows;
@@ -358,13 +365,15 @@ struct Batch {
 }
 
 /// One batch of one step, in a transaction that holds the schema's
-/// advisory lock. The step's fills run in its first one.
+/// advisory lock, holding what `caps` allows. The step's fills run in its
+/// first one.
 async fn next_batch(
     tx: &Transaction<'_>,
     document: &Document,
     from: Version,
     first: bool,
     after: Option<Vec<String>>,
+    caps: PageCaps,
 ) -> anyhow::Result<Batch> {
     let (table, column) = (document.table, document.column);
     let version_column = document.version_column();
@@ -413,44 +422,63 @@ async fn next_batch(
         .await?;
     let key_list = keys.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", ");
     let key_text = keys.iter().map(|(name, _)| format!("{name}::text")).collect::<Vec<_>>().join(", ");
-    // The walk goes on from the last row's key, as text: each part cast
-    // back to its column's type, so it uses the key's own order (and
-    // index). Rows before it took the step already, or were written at
-    // another version since; the version column decides, the key only
-    // keeps the walk from reading the table from its start each time.
-    let after_clause = if after.is_some() {
-        let after_key = keys
-            .iter()
+    // A key travels as text, the parameter `$param`: each part cast back
+    // to its column's type, so it uses the key's own order (and index).
+    let key_at = |param: usize| {
+        keys.iter()
             .enumerate()
-            .map(|(i, (_, ty))| format!("(($2::text[])[{}])::{ty}", i + 1))
+            .map(|(i, (_, ty))| format!("((${param}::text[])[{}])::{ty}", i + 1))
             .collect::<Vec<_>>()
-            .join(", ");
-        format!("AND ({key_list}) > ({after_key})")
-    } else {
-        String::new()
+            .join(", ")
     };
+    // The walk goes on from the last row's key. Rows before it took the
+    // step already, or were written at another version since; the version
+    // column decides, the key only keeps the walk from reading the table
+    // from its start each time.
+    let after_clause = |param: usize| match after {
+        Some(_) => format!("AND ({key_list}) > ({})", key_at(param)),
+        None => String::new(),
+    };
+    let behind = format!("{version_column} = $1 AND {column} IS NOT NULL");
     let read = match document.encoding {
         Encoding::Json => format!("{column}::text"),
         Encoding::Zstd { .. } => column.to_string(),
     };
+
+    // Which rows this batch takes, measured before any is read
+    // (`crate::pages`). The lock below takes the same rows again by key,
+    // and a row can only leave them meanwhile (the code writes at today's
+    // version), never join them or grow in them.
+    let names: Vec<&str> = keys.iter().map(|(name, _)| name.as_str()).collect();
+    let behind_rows = format!("FROM {table} WHERE {behind} {}", after_clause(2));
+    let page = match &after {
+        Some(after) => next_page(tx, &behind_rows, &names, &read, &[&from, after], caps).await?,
+        None => next_page(tx, &behind_rows, &names, &read, &[&from], caps).await?,
+    };
+    let Some(page) = page else {
+        return Ok(Batch { rows: 0, last: None });
+    };
+    let upto = &page.last;
+
     let select = format!(
         "SELECT ARRAY[{key_text}] AS key, {read} AS doc FROM {table} \
-         WHERE {version_column} = $1 AND {column} IS NOT NULL {after_clause} ORDER BY {key_list} LIMIT {BATCH} \
-         FOR UPDATE"
+         WHERE {behind} AND ({key_list}) <= ({}) {} ORDER BY {key_list} FOR UPDATE",
+        key_at(2),
+        after_clause(3)
     );
     let rows = match &after {
-        Some(after) => tx.query(&select, &[&from, after]).await?,
-        None => tx.query(&select, &[&from]).await?,
+        Some(after) => tx.query(&select, &[&from, upto, after]).await?,
+        None => tx.query(&select, &[&from, upto]).await?,
     };
 
     // The rows are locked until the batch commits, so a write the code
     // makes meanwhile (at today's version) waits, and is never written
     // over. Every row of the batch is carried in memory, then written in
-    // one statement: one round trip per batch, however large the column.
+    // one statement: one round trip per batch, which `caps` keeps far
+    // under what Postgres takes in one message.
     let mut keys_out: Vec<Vec<String>> = vec![Vec::with_capacity(rows.len()); keys.len()];
     let mut texts: Vec<String> = Vec::new();
     let mut packed: Vec<Vec<u8>> = Vec::new();
-    let mut last: Option<Vec<String>> = None;
     for row in &rows {
         let key: Vec<String> = row.try_get("key")?;
         let what = || format!("{table}.{column} row ({})", key.join(", "));
@@ -470,10 +498,9 @@ async fn next_batch(
             Encoding::Json => texts.push(serde_json::to_string(&doc)?),
             Encoding::Zstd { level } => packed.push(zstd::bulk::compress(&serde_json::to_vec(&doc)?, level)?),
         }
-        for (at, part) in key.iter().enumerate() {
-            keys_out[at].push(part.clone());
+        for (at, part) in key.into_iter().enumerate() {
+            keys_out[at].push(part);
         }
-        last = Some(key);
     }
     if !rows.is_empty() {
         let doc_param = keys.len() + 1;
@@ -503,8 +530,7 @@ async fn next_batch(
         params.push(&to);
         tx.execute(&write, &params).await?;
     }
-    let more = rows.len() as i64 == BATCH;
-    Ok(Batch { rows: rows.len(), last: if more { last } else { None } })
+    Ok(Batch { rows: rows.len(), last: page.more.then_some(page.last) })
 }
 
 /// Record `document` at today's version, once every step has run, re-deriving

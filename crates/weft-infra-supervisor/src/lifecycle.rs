@@ -1172,7 +1172,9 @@ async fn execute_apply(
     let addresses = match apply_result {
         Ok(addresses) => addresses,
         Err(e) => {
-            let msg = e.to_string();
+            // The whole chain: the outer context names what failed, the
+            // causes under it say why (a provider's own refusal, say).
+            let msg = format!("{e:#}");
             // Best-effort row-status hint. The PRIMARY error record is
             // `infra_lifecycle_command.outcome=failed` (written after we
             // bubble); the action bar reads from there. This write
@@ -1286,8 +1288,10 @@ async fn endpoint_addresses(
     let mut out = weft_broker_client::protocol::AppliedEndpoints::default();
     for ep in &resolved.spec.endpoints {
         // Inside another node's endpoint: kept as that endpoint and the
-        // path, followed at every lookup, since the other node's address
-        // moves whenever it is made again (`infra::EndpointRecord`).
+        // path, followed at every lookup, since the other node's own row
+        // holds its address: a lookup reads it as it is then, a new one
+        // once the other node was terminated and started again, and fails
+        // naming it while it is not running (`infra::EndpointRecord`).
         // Resolve refused any expose but the project's.
         if let infra::EndpointTarget::Within { infra: within, path } = &ep.target {
             let record = infra::WithinRecord { within: within.clone(), path: path.clone() };

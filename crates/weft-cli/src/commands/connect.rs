@@ -157,6 +157,10 @@ pub(crate) struct AccessTarget {
     /// What the node's connection is at the place it is named by: this
     /// install's pick, or what the source says instead.
     pub(crate) picked: Pick,
+    /// The program lets the connection stay empty
+    /// (`@instance_filled(null)`) and the node needs one: with none, the
+    /// node skips as not connected instead of refusing the run.
+    may_stay_empty: bool,
     /// Every way a person names this node: one per place it is at in
     /// the program (see [`spellings_of`]). A node of the entry file has
     /// one; a node inside a file included twice has two, and both work.
@@ -574,7 +578,7 @@ async fn instance_connect(cx: &Connecting<'_>, opts: &ConnectOpts) -> Result<()>
 /// What the instance picked for `target`'s connection field, read off
 /// the instance door's own list of the fields it fills.
 async fn instance_pick(door: &DispatcherClient, target: &AccessTarget) -> Result<Pick> {
-    let fields: Vec<weft_core::instance_door::InstanceField> =
+    let fields: Vec<weft_core::instance_door::FilledField> =
         crate::client::read_answer(door.get_json("/instance/fields").await?, "the instance's fields")?;
     let node = target.spelling();
     let value = fields.into_iter().find(|f| f.node == node && f.field == target.input).and_then(|f| f.value);
@@ -910,6 +914,9 @@ fn collect_targets(
         // an INPUT PORT has two homes in source and enrich moves it from
         // one to the other (`normalize_port_literals`).
         let picked = source_pick(node.written_value(&input));
+        // Left empty, a node that needs its connection skips; one whose
+        // recipe runs without one just runs, and reads as any unpicked one.
+        let may_stay_empty = weft_core::instance::may_stay_empty(node, &input) && !spec.connection_optional;
         out.push(AccessTarget {
             rel_file: rel_file.clone(),
             node: node.id.clone(),
@@ -918,6 +925,7 @@ fn collect_targets(
             project_app: meta.access_apps.get(&spec.service).cloned(),
             spec,
             picked,
+            may_stay_empty,
             spellings,
         });
     }
@@ -1107,6 +1115,7 @@ fn choose_target(
     for (i, t) in targets.iter().enumerate() {
         let status = match &t.picked {
             Pick::Handle(p) => format!("connected as {}", p.who()),
+            Pick::None if t.may_stay_empty => "not connected, which the program allows (it skips until one is picked)".to_string(),
             Pick::None => "NOT connected".to_string(),
             Pick::InstanceFilled => "each instance connects its own (see --instance)".to_string(),
             Pick::WrittenInSource => "written in the source the old way: erase that line and connect again".to_string(),
@@ -1224,6 +1233,10 @@ fn grants_listing(target: &AccessTarget, picked: &Pick, place: Place<'_>, label:
             let who = grants.iter().find(|g| g.id == p.id).map_or_else(|| p.who(), |g| grant_title(g, label));
             format!("'{node}' is connected as {who}{for_instance}.\n")
         }
+        Pick::None if target.may_stay_empty => format!(
+            "'{node}' has no connection picked{for_instance}, which the program allows: it may stay empty, \
+             and the node skips as not connected until one is picked.\n"
+        ),
         Pick::None => format!("'{node}' has no connection picked{for_instance}.\n"),
         Pick::InstanceFilled => {
             format!("'{node}' is connected separately in each instance of the program; see one with --instance <id>.\n")
@@ -2323,6 +2336,7 @@ mod tests {
             .unwrap(),
             project_app: None,
             picked: Pick::None,
+            may_stay_empty: false,
             spellings: vec!["mail".into()],
         };
         let g = GrantSummary {
@@ -2349,6 +2363,10 @@ mod tests {
         assert!(listing.contains("ada@example.com (named \"Fake\")"), "{listing}");
         let empty = grants_listing(&target, &Pick::None, place, "Fake", &[]);
         assert!(empty.contains("`weft connect mail --instance ada --door own`"), "{empty}");
+        // A connection the program lets stay empty reads as allowed, not missing.
+        let allowed = AccessTarget { may_stay_empty: true, ..target };
+        let listing = grants_listing(&allowed, &Pick::None, place, "Fake", &[]);
+        assert!(listing.contains("for instance 'ada', which the program allows: it may stay empty"), "{listing}");
     }
 
     #[test]
@@ -2465,6 +2483,9 @@ mod tests {
             read("ws = SlackAccess { account: @instance_filled({\"id\": \"g-1\"}) }\n"),
             Pick::WrittenInSource
         ));
+        std::fs::write(project.main_weft(), "ws = SlackAccess { account: @instance_filled(null) }\n").unwrap();
+        let (targets, _) = discover(&project, &catalog, &mut Vec::new()).unwrap();
+        assert!(matches!(targets[0].picked, Pick::InstanceFilled) && targets[0].may_stay_empty);
     }
 
     /// A pick the install keeps that this CLI cannot read is an error

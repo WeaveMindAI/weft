@@ -24,9 +24,8 @@ use weft_platform_traits::config::GcpPlatform;
 use weft_core::install::Certificate;
 use weft_platform_traits::DomainHosting;
 
-use crate::api::{is_status, Google};
+use crate::api::{is_status, Google, COMPUTE};
 
-const COMPUTE: &str = "https://compute.googleapis.com/compute/v1";
 const CERTIFICATES: &str = "https://certificatemanager.googleapis.com/v1";
 
 pub struct LoadBalancerDomains {

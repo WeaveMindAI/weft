@@ -73,6 +73,29 @@ impl Connection {
         self.finished = true;
         Ok(())
     }
+
+    /// End-of-test bookkeeping for a connection weft itself forgot (the
+    /// answer of the call that forgot it named it): nothing is left to
+    /// delete.
+    pub fn forgotten(mut self) -> Result<()> {
+        crate::kept::grant_gone(&self.grant_id)?;
+        self.finished = true;
+        Ok(())
+    }
+
+    /// A connection a door other than `/access` made (its answer's
+    /// `grant`), owned from here on like one [`connect_direct`] made.
+    pub fn adopt(disp: &Dispatcher, grant: &Value) -> Result<Self> {
+        let grant_id = grant.get("id").and_then(Value::as_str).context("grant without id")?.to_string();
+        let identity = grant.get("identity").cloned().context("a grant without an identity")?;
+        crate::kept::grant_made(disp, &grant_id)?;
+        Ok(Connection { handle: json!({ "id": grant_id, "identity": identity }), grant_id, disp: disp.clone(), finished: false })
+    }
+
+    /// The connection's id.
+    pub fn id(&self) -> &str {
+        &self.grant_id
+    }
 }
 
 impl Drop for Connection {

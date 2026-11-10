@@ -40,7 +40,7 @@
 	import FlowDock from './FlowDock.svelte';
 	import ErrorDock from './ErrorDock.svelte';
 	import type { FileValueWire } from "../../../../protocol";
-	import { parseFileValue, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, instanceFilled, instanceFilledValue, installPicked, portVar } from "../../../../protocol";
+	import { parseFileValue, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, instanceFilled, type InstanceFilled, instanceFilledValue, installPicked, portVar } from "../../../../protocol";
 
 	const edgesState = useEdges();
 	const nodesState = useNodes();
@@ -687,7 +687,7 @@
 	/// The `@instance_filled` marker a port field's written value is, or
 	/// null. Only a port can be instance-filled (a config key is refused by
 	/// the compiler), so only the port literal is read.
-	function instanceFilledField(field: FieldDefinition): { fallback?: unknown } | null {
+	function instanceFilledField(field: FieldDefinition): InstanceFilled | null {
 		return field.portDriven ? instanceFilled(ownValue(portLiterals, field.key)) : null;
 	}
 
@@ -2204,7 +2204,7 @@
 							     its own page or through the program; the source holds
 							     no value of its own to edit here. -->
 							<div class="text-[10px] text-sky-700 bg-sky-50 border border-sky-200 rounded px-2 py-1.5">
-								Filled per instance{#if filled?.fallback !== undefined}; an instance with none gets
+								Filled per instance{#if filled?.mayStayEmpty}; an instance may leave it empty{:else if filled?.fallback !== undefined}; an instance with none gets
 									<span class="font-mono">{JSON.stringify(filled.fallback)}</span>{/if}.
 							</div>
 						{:else if field.type === "code" && fileNotice(field.key) !== undefined}

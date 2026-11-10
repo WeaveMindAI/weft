@@ -155,6 +155,7 @@ export function formatConfigValue(value: unknown): string {
   // fallback written the way any value is.
   const filled = instanceFilled(value);
   if (filled) {
+    if (filled.mayStayEmpty) return '@instance_filled(null)';
     return filled.fallback === undefined ? '@instance_filled' : `@instance_filled(${formatConfigValue(filled.fallback)})`;
   }
   // A port that holds several files: one marker per file, in order. A
@@ -216,6 +217,9 @@ export function parseConfigToken(token: string): unknown {
     const inner = token.slice('@instance_filled('.length, -1).trim();
     // A fallback is a value or a file (`@file`/`@asset`), never another marker.
     if (inner === '' || (inner.startsWith('@') && !fileRefFromToken(inner))) throw new Error(`not a config value token: ${token.slice(0, 40)}`);
+    // `null`, the one value only a fallback takes: an instance may leave
+    // the field empty.
+    if (inner === 'null') return instanceFilledValue(null);
     return instanceFilledValue(parseConfigToken(inner));
   }
   // A list of markers: what a port holding several files writes.

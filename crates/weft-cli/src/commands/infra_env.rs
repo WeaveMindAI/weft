@@ -2,8 +2,9 @@
 //! [--door NAME=endpoint ...]`: write what an infra node's card shows, and
 //! the whole address (host and port) its doors answer at, into an env
 //! file, every name in one go, a secret without its value ever passing
-//! through a screen. A door's port may change when the infra restarts or
-//! is upgraded; running this again writes the new address.
+//! through a screen. On a local install a door keeps its port until the
+//! infra is terminated; if its address does change, running this again
+//! writes the new one.
 //!
 //! Generic over nodes: the card is whatever the node's display (`/live`)
 //! serves. `--set NAME=Label` takes the item under that label, whatever

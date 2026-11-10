@@ -64,9 +64,32 @@ async fn instance_door(
     token: &str,
     body: Option<&Value>,
 ) -> anyhow::Result<(reqwest::StatusCode, String)> {
+    door(disp, method, &format!("instance/{path}"), token, body).await
+}
+
+/// One call at the program connections door with `token`, whatever it
+/// answers.
+async fn program_door(
+    disp: &Dispatcher,
+    method: Method,
+    path: &str,
+    token: &str,
+    body: Option<&Value>,
+) -> anyhow::Result<(reqwest::StatusCode, String)> {
+    door(disp, method, &format!("program/{path}"), token, body).await
+}
+
+/// One call at `path` of the install with `token`, whatever it answers.
+async fn door(
+    disp: &Dispatcher,
+    method: Method,
+    path: &str,
+    token: &str,
+    body: Option<&Value>,
+) -> anyhow::Result<(reqwest::StatusCode, String)> {
     let mut req = weft_core::net::http_client()
         .build()?
-        .request(method, format!("{}/instance/{path}", disp.base()))
+        .request(method, format!("{}/{path}", disp.base()))
         .bearer_auth(token);
     if let Some(body) = body {
         req = req.json(body);
@@ -252,7 +275,67 @@ async fn an_instance_picks_its_connection_and_runs_with_it() -> anyhow::Result<(
     let refused = project.weft_refused(&["resync"]).await?;
     anyhow::ensure!(refused.contains("falls back to a connection written in the source"), "{refused}");
 
-    keys.finish().await?;
+    // The program's own connection, from its site's server: a
+    // connections key lists what the program picks on the install,
+    // stores a pasted key set for `hook` and picks it (the author's old
+    // one, used by nothing else, is forgotten), and opens no other door.
+    // Picking sets `hook` up again from the source, so the source
+    // compiles again first.
+    project.set_node_config("theirs", "account", "@instance_filled")?;
+    project.weft(&["resync"]).await?;
+    let site = minted(&project.weft(&["token", "mint", "--connections", "--json"]).await?)?;
+    let (status, listed) = program_door(&disp, Method::GET, "connections", &site, None).await?;
+    anyhow::ensure!(status == 200, "{status}: {listed}");
+    let listed: Value = serde_json::from_str(&listed)?;
+    let entry = listed
+        .as_array()
+        .and_then(|fields| fields.iter().find(|f| f["node"] == json!("hook")))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("the door lists `hook`: {listed}"))?;
+    anyhow::ensure!(
+        entry["needed"] == json!(true) && entry["value"]["id"] == json!(keys.id()) && entry["spec"].is_object(),
+        "{entry}"
+    );
+    let paste = json!({ "node": "hook", "field": entry["field"], "spec": entry["spec"], "door": "own", "values": { "keys": "k-site" } });
+    let (status, body) = program_door(&disp, Method::POST, "connections/direct", &site, Some(&paste)).await?;
+    anyhow::ensure!(status == 200, "{status}: {body}");
+    let stored: Value = serde_json::from_str(&body)?;
+    let site_keys = weft_e2e::access::Connection::adopt(&disp, &stored["grant"])?;
+    anyhow::ensure!(stored["forgotten"] == json!([keys.id()]), "the old key set was forgotten: {stored}");
+    keys.forgotten()?;
+    let (status, _, body) = live::http_json(
+        &disp,
+        Method::POST,
+        &hook,
+        &[("x-api-key", "k-site"), ("Weft-Instance", "bob")],
+        &json!({ "text": "hi" }),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "the route takes the key the site pasted: {status}: {}", String::from_utf8_lossy(&body));
+    let (status, _) = call(vec![("Weft-Instance", "bob".into())]).await?;
+    anyhow::ensure!(status == 401, "the forgotten key set no longer opens the route: {status}");
+    let (status, body) = instance_door(&disp, Method::GET, "fields", &site, None).await?;
+    anyhow::ensure!(status == 403, "a connections key opens no other door: {status}: {body}");
+    let (status, body) = program_door(&disp, Method::GET, "connections", &token, None).await?;
+    anyhow::ensure!(status == 403, "an instance token opens no program door: {status}: {body}");
+    // Clearing a connection the program needs leaves `hook` set up on the
+    // one it had, so that one is still in use and is not forgotten, and
+    // a run through `hook` is refused naming the pick it lacks.
+    let field = entry["field"].as_str().unwrap_or_default();
+    let (status, body) = program_door(&disp, Method::DELETE, &format!("connections/hook/{field}"), &site, None).await?;
+    anyhow::ensure!(status == 409 && body.contains("still set up with the connection they had"), "{status}: {body}");
+    let (status, _, body) = live::http_json(
+        &disp,
+        Method::POST,
+        &hook,
+        &[("x-api-key", "k-site"), ("Weft-Instance", "bob")],
+        &json!({ "text": "hi" }),
+    )
+    .await?;
+    let body = String::from_utf8_lossy(&body);
+    anyhow::ensure!(status == 422 && body.contains("has no connection; run `weft connect hook`"), "{status}: {body}");
+    site_keys.finish().await?;
+
     project.finish().await
 }
 

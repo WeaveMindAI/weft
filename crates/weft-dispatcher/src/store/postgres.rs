@@ -648,6 +648,16 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- instance). Checked at every door.
             -- SYNC: kind values <-> weft_core::signal_token::TokenKind::as_str
             kind TEXT NOT NULL DEFAULT 'caller' CHECK (kind IN ('caller', 'operator')),
+            -- A connections key (`weft token mint --connections`): it
+            -- manages the connections its one project's program uses on
+            -- the install, at the program door, and reaches nothing else,
+            -- so it is a caller token of exactly one project with no
+            -- instance, tag or display.
+            connections BOOLEAN NOT NULL DEFAULT FALSE,
+            CONSTRAINT signal_token_connections_is_one_program
+                CHECK (NOT connections OR (kind = 'caller' AND instance_id IS NULL
+                    AND cardinality(allowed_projects) = 1 AND cardinality(allowed_tags) = 0
+                    AND cardinality(allowed_displays) = 0 AND NOT all_displays)),
             CONSTRAINT signal_token_instance_has_one_project
                 CHECK (instance_id IS NULL OR cardinality(allowed_projects) = 1),
             CONSTRAINT signal_token_instance_expires
@@ -1948,8 +1958,8 @@ impl TokenStore for PostgresStore {
             .execute(
                 "INSERT INTO signal_token \
                  (id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-                  allowed_displays, all_displays, created_at, instance_id, expires_at, kind) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                  allowed_displays, all_displays, created_at, instance_id, expires_at, kind, connections) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
                 &[
                     &tok.id,
                     &tok.token_hash,
@@ -1964,6 +1974,7 @@ impl TokenStore for PostgresStore {
                     &instance,
                     &expires_at,
                     &tok.kind.as_str(),
+                    &tok.connections,
                 ],
             )
             .await?;
@@ -1975,7 +1986,7 @@ impl TokenStore for PostgresStore {
             .pool
             .opt(
                 "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-                        allowed_displays, all_displays, created_at, instance_id, expires_at, kind \
+                        allowed_displays, all_displays, created_at, instance_id, expires_at, kind, connections \
                  FROM signal_token WHERE token_hash = $1",
                 &[&token_hash],
             )
@@ -1988,7 +1999,7 @@ impl TokenStore for PostgresStore {
             .pool
             .all(
                 "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-                        allowed_displays, all_displays, created_at, instance_id, expires_at, kind \
+                        allowed_displays, all_displays, created_at, instance_id, expires_at, kind, connections \
                  FROM signal_token WHERE tenant_id = $1 ORDER BY created_at DESC",
                 &[&tenant],
             )
@@ -2812,13 +2823,13 @@ pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration
     })
 }
 
-/// Revoke every instance token of `project_id`: an instance token acts in
-/// its one project, so it outlives a removed project as nothing anybody
-/// could use.
-pub(crate) async fn revoke_project_instance_tokens(db: &impl Client, project_id: uuid::Uuid) -> anyhow::Result<u64> {
+/// Revoke every token bound to `project_id` alone: its instance tokens
+/// and its connections keys. Each acts in that one project only, so it
+/// outlives a removed project as nothing anybody could use.
+pub(crate) async fn revoke_project_bound_tokens(db: &impl Client, project_id: uuid::Uuid) -> anyhow::Result<u64> {
     Ok(db
         .execute(
-            "DELETE FROM signal_token WHERE instance_id IS NOT NULL AND allowed_projects = ARRAY[$1::uuid]",
+            "DELETE FROM signal_token WHERE (instance_id IS NOT NULL OR connections) AND allowed_projects = ARRAY[$1::uuid]",
             &[&project_id],
         )
         .await?)
@@ -2826,7 +2837,7 @@ pub(crate) async fn revoke_project_instance_tokens(db: &impl Client, project_id:
 
 /// The `signal_token` SELECT row shape (id, token_hash, recognizer, tenant_id,
 /// name, allowed_projects, allowed_tags, allowed_displays, all_displays,
-/// created_at, instance_id, expires_at, kind). One tuple type so both readers decode it through the single
+/// created_at, instance_id, expires_at, kind, connections). One tuple type so both readers decode it through the single
 /// fallible `row_to_signal_token`.
 type SignalTokenRow = (
     uuid::Uuid,
@@ -2842,6 +2853,7 @@ type SignalTokenRow = (
     Option<String>,
     Option<i64>,
     String,
+    bool,
 );
 
 fn row_to_signal_token(row: SignalTokenRow) -> anyhow::Result<SignalToken> {
@@ -2859,6 +2871,7 @@ fn row_to_signal_token(row: SignalTokenRow) -> anyhow::Result<SignalToken> {
         instance,
         expires_at,
         kind,
+        connections,
     ) = row;
     let kind = weft_core::signal_token::TokenKind::parse(&kind).ok_or_else(|| anyhow::anyhow!(
         "signal_token row {id} has unknown kind '{kind}'; must be one of: {}",
@@ -2880,6 +2893,7 @@ fn row_to_signal_token(row: SignalTokenRow) -> anyhow::Result<SignalToken> {
             .map(weft_core::instance::InstanceId::new)
             .transpose()
             .map_err(|e| anyhow::anyhow!("signal_token {id}: corrupt instance_id: {e}"))?,
+        connections,
         expires_at: expires_at.map(|at| at as u64),
     })
 }

@@ -189,6 +189,10 @@ pub struct TokenSummary {
     pub all_displays: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<crate::instance::InstanceId>,
+    /// A connections key: it reaches the program door of its one project
+    /// and nothing else (see [`MintTokenRequest::connections`]).
+    #[serde(default)]
+    pub connections: bool,
     #[serde(rename = "expiresAtUnix", default, skip_serializing_if = "Option::is_none")]
     pub expires_at_unix: Option<u64>,
 }
@@ -217,6 +221,15 @@ pub struct MintTokenRequest {
     /// (`allowedProjects` names exactly that one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<crate::instance::InstanceId>,
+    /// A connections key: it manages the connections the program of its one
+    /// project uses on the install (its picks), through the program door
+    /// (`/program/connections`), and reaches nothing else. What a website's
+    /// server holds for its admin page, where the admin pastes the program's
+    /// own keys. `allowedProjects` names exactly that one project, and it
+    /// takes no instance, tag or display: those would make it a key to other
+    /// doors too.
+    #[serde(default)]
+    pub connections: bool,
     /// How long the token works, in seconds from now. Required for an
     /// instance token (it lives in a browser); optional otherwise.
     #[serde(default, rename = "expiresInSecs", skip_serializing_if = "Option::is_none")]
@@ -237,6 +250,7 @@ impl MintTokenRequest {
             allowed_displays: Vec::new(),
             all_displays: false,
             instance: None,
+            connections: false,
             expires_in_secs: None,
             kind: TokenKind::Caller,
         }
@@ -272,6 +286,8 @@ pub struct MintedToken {
     pub all_displays: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<crate::instance::InstanceId>,
+    #[serde(default)]
+    pub connections: bool,
     #[serde(rename = "expiresAtUnix", default, skip_serializing_if = "Option::is_none")]
     pub expires_at_unix: Option<u64>,
 }
@@ -281,6 +297,59 @@ mod tests {
     use super::*;
 
     crate::wire_enum_roundtrip_tests!(TokenKind);
+
+    /// The connections grant travels as `connections` on the mint, the
+    /// listing and the mint's answer, and a token that says nothing of it
+    /// has none.
+    #[test]
+    fn the_connections_grant_round_trips_on_every_token_shape() {
+        let project = uuid::Uuid::from_u128(7);
+        let mint = MintTokenRequest { connections: true, allowed_projects: vec![project], ..MintTokenRequest::caller("site") };
+        let wire = serde_json::to_value(&mint).unwrap();
+        assert_eq!(wire["connections"], serde_json::json!(true));
+        assert_eq!(wire["allowedProjects"], serde_json::json!([project]));
+        let back: MintTokenRequest = serde_json::from_value(wire).unwrap();
+        assert!(back.connections);
+        let plain: MintTokenRequest = serde_json::from_value(serde_json::json!({ "name": "x" })).unwrap();
+        assert!(!plain.connections, "a mint that says nothing of it grants none");
+
+        let summary = TokenSummary {
+            id: uuid::Uuid::nil(),
+            kind: TokenKind::Caller,
+            recognizer: "wft-azure-…".into(),
+            name: None,
+            created_at_unix: 1,
+            allowed_projects: vec![project],
+            allowed_tags: Vec::new(),
+            allowed_displays: Vec::new(),
+            all_displays: false,
+            instance: None,
+            connections: true,
+            expires_at_unix: None,
+        };
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["connections"], serde_json::json!(true));
+        assert!(serde_json::from_value::<TokenSummary>(wire).unwrap().connections);
+
+        let minted = MintedToken {
+            id: uuid::Uuid::nil(),
+            kind: TokenKind::Caller,
+            token: "wft-a-b".into(),
+            recognizer: "wft-a-…".into(),
+            name: None,
+            url: "https://x/signal-token/wft-a-b".into(),
+            allowed_projects: vec![project],
+            allowed_tags: Vec::new(),
+            allowed_displays: Vec::new(),
+            all_displays: false,
+            instance: None,
+            connections: true,
+            expires_at_unix: None,
+        };
+        let wire = serde_json::to_value(&minted).unwrap();
+        assert_eq!(wire["connections"], serde_json::json!(true));
+        assert!(serde_json::from_value::<MintedToken>(wire).unwrap().connections);
+    }
 
     #[test]
     fn an_expiry_is_between_a_second_and_a_year_from_now() {

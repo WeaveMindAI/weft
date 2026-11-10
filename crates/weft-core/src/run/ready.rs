@@ -1124,7 +1124,7 @@ mod tests {
             images: Vec::new(),
             fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             published_service: None,
-            instance_service: None,
+            connection_service: None,
             instance_rules: None,
             recheck: Vec::new(),
             span: None,

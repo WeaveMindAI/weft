@@ -310,6 +310,7 @@ pub async fn signal_tokens_list(state: &DispatcherState, actor: &Actor) -> Resul
             allowed_displays: t.allowed_displays,
             all_displays: t.all_displays,
             instance: t.instance,
+            connections: t.connections,
             expires_at_unix: t.expires_at,
         })
         .collect())
@@ -347,24 +348,48 @@ pub async fn signal_token_mint(state: &DispatcherState, actor: &Actor, body: Min
 /// Why a mint request cannot make the token it asks for. An instance token
 /// names exactly one project and an expiry; how long an expiry may be is
 /// `weft_core::signal_token::expiry_at`'s, checked at the mint. An
-/// operator key is the tenant's admin: a scope or an instance on it would
-/// read as a limit it does not have.
+/// operator key is the tenant's admin: a scope, an instance or a grant on
+/// it would read as a limit it does not have. A connections key manages
+/// one program's connections and opens no other door, so it names exactly
+/// one project and takes no instance (an instance's connections are its
+/// own door's), and no tag or display (a key that also reached signals or
+/// displays would be a second credential living on the same server, and
+/// every door for those refuses a connections key anyway). Its expiry is
+/// optional: it lives on a website's server, as a caller token does.
 fn check_mint_shape(body: &MintTokenRequest) -> Result<(), String> {
     if body.kind == TokenKind::Operator
         && (!body.allowed_projects.is_empty()
             || !body.allowed_tags.is_empty()
             || !body.allowed_displays.is_empty()
             || body.all_displays
-            || body.instance.is_some())
+            || body.instance.is_some()
+            || body.connections)
     {
-        return Err("an operator key administers the whole install and takes no scope and no \
-                    instance; mint a caller token for scoped access"
+        return Err("an operator key administers the whole install and takes no scope, no \
+                    instance and no grant; mint a caller token for scoped access"
             .into());
+    }
+    if body.connections {
+        if body.instance.is_some() {
+            return Err("a connections key manages the program's own connections, and an instance's are its \
+                        own (`weft token mint --instance`); mint them apart"
+                .into());
+        }
+        if body.allowed_projects.len() != 1 {
+            return Err("a connections key manages exactly one program's connections: name its project \
+                        (`--projects <id>`, or mint it from the project's folder)"
+                .into());
+        }
+        if !body.allowed_tags.is_empty() || !body.allowed_displays.is_empty() || body.all_displays {
+            return Err("a connections key reaches the program door alone, and a tag or a display would make it \
+                        a key to other doors too; mint a separate caller token for those"
+                .into());
+        }
     }
     if let Some(instance) = &body.instance {
         if body.allowed_projects.len() != 1 {
             return Err(format!(
-                "an instance token acts in exactly one project: name it (--project) for instance '{instance}'"
+                "an instance token acts in exactly one project: name it (--projects) for instance '{instance}'"
             ));
         }
         if body.expires_in_secs.is_none() {
@@ -467,6 +492,7 @@ pub(crate) async fn mint(state: &DispatcherState, owner: &TenantId, body: MintTo
                 // keeping a placeholder.
                 created_at: now,
                 instance: None,
+                connections: body.connections,
                 expires_at,
             };
             state.tokens.mint_signal_token(&signal_token).await.map_err(failed("tokens"))?;
@@ -486,6 +512,7 @@ pub(crate) async fn mint(state: &DispatcherState, owner: &TenantId, body: MintTo
         allowed_displays,
         all_displays: body.all_displays,
         instance: body.instance,
+        connections: body.connections,
         expires_at_unix: expires_at,
     })
 }
@@ -502,9 +529,14 @@ mod tests {
             allowed_displays: vec![],
             all_displays: false,
             instance: instance.map(|m| weft_core::instance::InstanceId::new(m).unwrap()),
+            connections: false,
             expires_in_secs: expires,
             kind: TokenKind::Caller,
         }
+    }
+
+    fn connections(projects: usize, expires: Option<u64>) -> MintTokenRequest {
+        MintTokenRequest { connections: true, ..body(None, projects, expires) }
     }
 
     fn program() -> Actor {
@@ -517,6 +549,23 @@ mod tests {
         assert!(check_mint_shape(&operator(body(None, 0, None))).is_ok());
         assert!(check_mint_shape(&operator(body(None, 1, None))).unwrap_err().contains("no scope"));
         assert!(check_mint_shape(&operator(body(Some("ada"), 1, Some(60)))).is_err());
+        assert!(check_mint_shape(&operator(connections(0, None))).unwrap_err().contains("no grant"));
+    }
+
+    #[test]
+    fn a_connections_key_names_one_project_and_nothing_else() {
+        assert!(check_mint_shape(&connections(1, None)).is_ok(), "no expiry: it lives on a server");
+        assert!(check_mint_shape(&connections(1, Some(3600))).is_ok());
+        assert!(check_mint_shape(&connections(0, None)).unwrap_err().contains("--project"));
+        assert!(check_mint_shape(&connections(2, None)).unwrap_err().contains("exactly one program"));
+        let with_instance = MintTokenRequest { connections: true, ..body(Some("ada"), 1, Some(3600)) };
+        assert!(check_mint_shape(&with_instance).unwrap_err().contains("--instance"));
+        let operator = MintTokenRequest { kind: TokenKind::Operator, ..connections(1, None) };
+        assert!(check_mint_shape(&operator).unwrap_err().contains("operator key"));
+        let tags = MintTokenRequest { allowed_tags: vec!["t".into()], ..connections(1, None) };
+        assert!(check_mint_shape(&tags).unwrap_err().contains("separate caller token"));
+        let displays = MintTokenRequest { all_displays: true, ..connections(1, None) };
+        assert!(check_mint_shape(&displays).unwrap_err().contains("separate caller token"));
     }
 
     #[test]

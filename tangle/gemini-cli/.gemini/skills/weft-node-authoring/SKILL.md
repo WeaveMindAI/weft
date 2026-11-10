@@ -1040,8 +1040,9 @@ wires it through `KeepFile` (or your node `copy`s it into
   handle, to put on the input; `rig.answer_infra("bridge", "api", method,
   path, answer)` queues its answers the way `answer_endpoint` does.
 - `rig.logs()` is every `ctx.log` line as `(LogLevel, String)`.
-- `rig.stored_meta(key)?.keep` and `.keep_ttl_secs` say whether a stored
-  file was kept, and `rig.stored_files(&scope)?` lists them.
+- `rig.stored_meta(key)?.keep_ttl_secs` and `.expires_at_unix` say how long
+  a stored file is kept (`None`: no deadline), and `rig.stored_files(&scope)?`
+  lists them.
 
 **Trigger**: `"features": { "isTrigger": true }` and implement
 `async fn setup_trigger(&self, ctx)`, called instead of `run` at activation,

@@ -4,6 +4,66 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-11-10 (0.2.292)
+
+**What breaks after this update:**
+
+**If your site imports `InstanceSettings` from `@weft/connect`,
+rename it to `DoorSettings`.** The same component now also draws a program's
+own connections (below), so it is named after the door you hand it. The
+`InstanceField` type it lists is now `FilledField`.
+
+**What to do once after the update:**
+
+**Restart each local infra node once: `weft infra stop`, then `weft infra
+start`.** A door on a local install used to get a new host port every time its
+container was made, and after Docker Desktop restarted the containers, weft
+kept handing out the old port ("Connection refused" while `weft infra status`
+said running). Now weft picks a door's host port the first time and keeps it
+until the node is terminated, so restarts, upgrades and Docker's own restarts
+all keep the same address. An infra node already running keeps its old random
+port until its containers are made again, which the stop and start does. Then
+copy the door into your frontend's `.env` one last time (`weft infra env`).
+
+**Nothing else to do for these:**
+
+- **The update no longer loops on large programs.** The boot carries stored
+  documents in batches of at most about 64 MB instead of 500 rows, so a
+  project with programs of several MB each no longer sends one write over
+  Postgres' 1 GB limit and retries it on every boot. If you lowered the batch
+  size in your own copy of weft to get past it, drop that change.
+- **`weft daemon start` on macOS** waits until launchd has really removed the
+  old runtime before starting the new one, instead of failing with
+  `launchctl bootstrap` exit 5. If launchd never lets go, it says which
+  command to run by hand.
+- **A local infra service that runs outside Docker says when its port is
+  taken.** If another program holds the port weft keeps for it, the start
+  fails naming the port and how to find who holds it, the same as a
+  container does, instead of showing the service as exited.
+- **An infra machine on a GCP install keeps its internal address** when a
+  change of machine type, disks or GPU replaces it. The first apply after the
+  update reserves the address the machine already has, so a frontend that
+  copied it keeps working, and every later replacement comes back on it.
+
+**New:**
+
+- **A program's own connections from its website.** `weft token mint
+  --connections` makes a key that can only list, store and remove the
+  connections one program picks on the install. Your site's server holds it
+  (never a browser) and mounts `DoorSettings` with a `ProgramDoor` behind its
+  own admin check, so an admin can paste the program's API keys from the
+  site. The key never passes through a run, so it never lands in a run's
+  journal. For the steps, go and read [from your own website's admin
+  page](docs/src/build/connections.md#from-your-own-websites-admin-page).
+- **A field an instance fills may stay empty** when the program gives it
+  `null` as the value an instance with none gets
+  (`spreadsheet: @instance_filled(null)`, or
+  `account: @instance_filled(null)` for a connection): an instance that
+  leaves it empty no longer has its run refused. The node gets a `null`
+  there: one that needs the field skips, and one that takes it as optional
+  runs and reads the `null`. For the details, go and read
+  [a field an instance may leave empty](docs/src/running/instances.md#a-field-an-instance-may-leave-empty).
+
 ## 2026-11-06 (0.2.291)
 
 **What breaks after this update:**

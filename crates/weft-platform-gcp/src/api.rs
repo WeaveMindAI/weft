@@ -13,6 +13,9 @@ use serde_json::Value;
 
 use crate::metadata::MetadataTokens;
 
+/// Where Compute Engine's API is.
+pub const COMPUTE: &str = "https://compute.googleapis.com/compute/v1";
+
 /// How much of an upload goes in one request ([`Google::upload_streamed`]):
 /// a multiple of 256 KiB, as Cloud Storage asks of every part of a
 /// resumable upload but the last, and the 8 MiB it recommends.
@@ -499,6 +502,55 @@ impl Google {
             tokio::time::sleep(OPERATION_POLL).await;
             op = self.get(&url).await?;
         }
+    }
+}
+
+/// A fake Google API on a local port, for a module's tests.
+#[cfg(test)]
+pub(crate) mod fake {
+    use serde_json::Value;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serve every request with `answer`, given its method, its path
+    /// (with its query) and its JSON body (`Null` for none), which says
+    /// the status and the body to send back. Answers the API's root, to
+    /// put where the real one would be.
+    pub async fn serve(answer: impl Fn(&str, &str, Value) -> (u16, Value) + Send + 'static) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                let (head, body) = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some(head_end) = text.find("\r\n\r\n") {
+                        let length = text[..head_end]
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                            .unwrap_or(0);
+                        if request.len() >= head_end + 4 + length || n == 0 {
+                            break (text[..head_end].to_string(), request[head_end + 4..].to_vec());
+                        }
+                    }
+                    assert!(n != 0, "the request ended before its head did");
+                };
+                let mut line = head.lines().next().unwrap_or_default().split(' ');
+                let (method, path) = (line.next().unwrap_or_default(), line.next().unwrap_or_default());
+                let body = if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap() };
+                let (status, answer) = answer(method, path, body);
+                let answer = answer.to_string();
+                let sent = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                socket.write_all(sent.as_bytes()).await.unwrap();
+            }
+        });
+        format!("http://{addr}")
     }
 }
 

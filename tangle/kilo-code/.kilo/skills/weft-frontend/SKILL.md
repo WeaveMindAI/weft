@@ -567,7 +567,7 @@ wrong`). A page fetches
   weft checks it.
 - **Each person fills in what the program asks of their instance** (every field it
   writes `@instance_filled`: their accounts, their spreadsheet, their model,
-  their schedule) on a settings page you mount with `InstanceSettings` and an
+  their schedule) on a settings page you mount with `DoorSettings` and an
   `InstanceDoor` from the connect library: the same pickers and list fields the
   weft editor shows, restyled to the site, and never the author's shared key.
   A save that changes a value one of their live triggers reads re-arms it
@@ -575,7 +575,7 @@ wrong`). A page fetches
   titles each node with the program's own label and each field with the
   node's own name for it ("Value"), both written for the program's author,
   so you name every field a person sees in your own words:
-  `<InstanceSettings {door} labels={{ 'greet': 'Your greeting', 'greet.value': 'How the bot greets you' }} />`,
+  `<DoorSettings {door} labels={{ 'greet': 'Your greeting', 'greet.value': 'How the bot greets you' }} />`,
   a node's name for its title and `node.field` for a field (`door.fields()`
   lists both). If the page
   must look different, build it from `door.fields()`, `door.setValues(..)` and

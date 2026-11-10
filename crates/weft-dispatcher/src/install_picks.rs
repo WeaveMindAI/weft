@@ -12,6 +12,12 @@
 //! when a setup fails: the answer then says so and names the triggers
 //! still armed on the old connection, which turning them off and on again
 //! sets up again (`weft resync` leaves them: they are not behind a build).
+//!
+//! The program door (`crate::api::program_door`) changes picks through
+//! here too, and also forgets each connection a change moves a pick off
+//! once nothing on the install uses it ([`change_forgetting`]). A live
+//! trigger still set up on a connection uses it, so a connection is only
+//! forgotten once every trigger reading the change was set up again.
 
 use axum::http::StatusCode;
 
@@ -37,6 +43,113 @@ pub async fn change(
     set: &[PickInput],
     clear: &[(String, String)],
 ) -> Result<ValuesChanged, ApiError> {
+    let Some(checked) = check_change(state, project_id, set, clear).await? else {
+        return Ok(ValuesChanged::default());
+    };
+    let (_, live) = store(state, project_id, checked.project.as_deref(), checked.store(Replaced::Kept)).await?;
+    settle(state, project_id, &live).await
+}
+
+/// [`change`], then forgetting each connection the change moved a pick
+/// off (a clear, or a pick of another connection) once nothing on the
+/// install uses it (`weft_access_store::forget_if_unused`): the program
+/// door's change, whose caller manages the program's connections and no
+/// other. Forgotten only after every trigger reading the change was set up
+/// again: one that could not be is still set up on the connection it had
+/// (a clear of a connection the program needs, say), so that connection
+/// is still in use and stays. `made` is a connection made for this change
+/// (a pasted key it picks): when the change is not stored, it is forgotten
+/// again, so a refused pick leaves nothing behind.
+pub(crate) async fn change_forgetting(
+    state: &DispatcherState,
+    project_id: uuid::Uuid,
+    set: &[PickInput],
+    clear: &[(String, String)],
+    made: Option<uuid::Uuid>,
+) -> Result<ValuesChanged, ApiError> {
+    let checked = match check_change(state, project_id, set, clear).await {
+        Ok(Some(checked)) => checked,
+        Ok(None) => return Ok(ValuesChanged::default()),
+        Err(refused) => return Err(forget_made(state, project_id, made, refused).await),
+    };
+    let (wrote, live) =
+        match store(state, project_id, checked.project.as_deref(), checked.store(Replaced::ForgottenWhenUnused)).await {
+            Ok(stored) => stored,
+            Err(refused) => return Err(forget_made(state, project_id, made, refused).await),
+        };
+    let changed = settle(state, project_id, &live).await?;
+    let forgotten = forget_unused(state, &checked.tenant, &wrote.moved_off).await?;
+    Ok(ValuesChanged { forgotten, ..changed })
+}
+
+/// Forget each of `grants` that nothing on the install uses any more, in
+/// one transaction; answers the ones forgotten.
+async fn forget_unused(state: &DispatcherState, tenant: &str, grants: &[uuid::Uuid]) -> Result<Vec<uuid::Uuid>, ApiError> {
+    if grants.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut conn = state.pg_pool.get().await.map_err(|e| access_store_error(e.into()))?;
+    let tx = conn.transaction().await.map_err(|e| access_store_error(e.into()))?;
+    let mut forgotten = Vec::new();
+    for grant in grants {
+        // A signal set up on the connection (a run waiting on its
+        // provider's events, say) uses it as surely as a pick does. The
+        // signal table is this crate's, so it is asked here.
+        let signalled: bool = tx
+            .scalar("SELECT EXISTS (SELECT 1 FROM signal WHERE access_id = $1)", &[&grant.to_string()])
+            .await
+            .map_err(|e| access_store_error(e.into()))?;
+        if !signalled && weft_access_store::forget_if_unused(&tx, tenant, *grant).await.map_err(access_store_error)? {
+            forgotten.push(*grant);
+        }
+    }
+    tx.commit().await.map_err(|e| access_store_error(e.into()))?;
+    Ok(forgotten)
+}
+
+/// Forget `made`, the connection made for a change that was not stored,
+/// when nothing else uses it ([`forget_unused`]): storing a key can land
+/// on a connection the owner already had (one they connected before with
+/// the same app and account), which other places may pick. Answers
+/// `refused`, with the connection's id when forgetting it failed, so it
+/// can be forgotten by hand.
+async fn forget_made(state: &DispatcherState, project_id: uuid::Uuid, made: Option<uuid::Uuid>, refused: ApiError) -> ApiError {
+    let Some(made) = made else { return refused };
+    let stays = |why: String| (refused.0, format!("{}; and the connection {made} made for it stays stored ({why}): forget it with `weft connect --forget {made}`", refused.1));
+    let tenant = match owning_tenant(state, project_id).await {
+        Ok(tenant) => tenant,
+        Err((_, why)) => return stays(why),
+    };
+    match forget_unused(state, &tenant, &[made]).await {
+        Ok(_) => refused,
+        Err((_, why)) => stays(why),
+    }
+}
+
+/// A change of the install's picks held to the program, ready to store.
+struct CheckedChange {
+    tenant: String,
+    /// The program the install last built (none before the first build).
+    project: Option<std::sync::Arc<weft_core::ProjectDefinition>>,
+    writes: Vec<weft_access_store::PickWrite>,
+    cleared: Vec<(String, String)>,
+    changes: ValueChanges,
+}
+
+impl CheckedChange {
+    fn store(&self, replaced: Replaced) -> Store<'_> {
+        Store::Change { tenant: &self.tenant, writes: &self.writes, cleared: &self.cleared, changes: &self.changes, replaced }
+    }
+}
+
+/// Hold `set` and `clear` to the program the install last built; `None`
+/// when they change nothing.
+async fn check_change(
+    state: &DispatcherState,
+    project_id: uuid::Uuid,
+    set: &[PickInput],
+    clear: &[(String, String)],
+) -> Result<Option<CheckedChange>, ApiError> {
     let tenant = owning_tenant(state, project_id).await?;
     // Connecting often comes before the first build: then there is no
     // program to hold a pick to, and no trigger reading one.
@@ -81,16 +194,9 @@ pub async fn change(
         changes.set.entry(c.node.clone()).or_default().insert(c.field.clone(), serde_json::Value::Null);
     }
     if changes.is_empty() {
-        return Ok(ValuesChanged::default());
+        return Ok(None);
     }
-    let (_, rearmed) = store_then_rearm(
-        state,
-        project_id,
-        project.as_deref(),
-        Store::Change { tenant: &tenant, writes: &writes, cleared: &cleared, changes: &changes },
-    )
-    .await?;
-    Ok(rearmed)
+    Ok(Some(CheckedChange { tenant, project, writes, cleared, changes }))
 }
 
 /// Carry everything the install keeps at the place `request.from` (its
@@ -120,9 +226,31 @@ pub async fn move_picks(
         ));
     }
     let project = crate::api::project::coherent_definition(state, project_id).await?.1;
-    let ((picks, instance_values), ValuesChanged { rearmed }) =
-        store_then_rearm(state, project_id, Some(&project), Store::Move { tenant: &tenant, request, project: &project }).await?;
+    let (wrote, live) = store(state, project_id, Some(&project), Store::Move { tenant: &tenant, request, project: &project }).await?;
+    let ValuesChanged { rearmed, .. } = settle(state, project_id, &live).await?;
+    let (picks, instance_values) = wrote.moved;
     Ok(weft_core::picks::PicksMoved { picks, instance_values, rearmed })
+}
+
+/// What a change of the install's picks does to a connection it moves a
+/// pick off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Replaced {
+    /// Kept: `weft connect` and the editor pick among the owner's
+    /// connections, and an unpicked one is theirs to keep for later.
+    Kept,
+    /// Forgotten once nothing on the install uses it ([`change_forgetting`]).
+    ForgottenWhenUnused,
+}
+
+/// What one write of the install's picks did: how many picks and instance
+/// values a move carried, and the connections a change that forgets what
+/// it leaves unused moved a pick off ([`change_forgetting`] forgets them
+/// once the triggers are set up again).
+#[derive(Debug, Default)]
+struct Wrote {
+    moved: (u64, u64),
+    moved_off: Vec<uuid::Uuid>,
 }
 
 /// One write of the install's picks, done under the project lock.
@@ -133,6 +261,7 @@ enum Store<'a> {
         writes: &'a [weft_access_store::PickWrite],
         cleared: &'a [(String, String)],
         changes: &'a ValueChanges,
+        replaced: Replaced,
     },
     /// Held to `project` and to what is stored under the lock, so two
     /// moves at once cannot both pass the check and then both write.
@@ -160,20 +289,19 @@ impl Store<'_> {
 }
 
 /// Store `store` once, with no trigger reading what it changes
-/// mid-setup, then set up again every live trigger that reads it.
-/// Answers how many picks and instance values a move carried ((0, 0)
-/// for a change) and the triggers set up again.
-async fn store_then_rearm(
+/// mid-setup. Answers what it wrote and the live triggers that read it,
+/// which [`settle`] sets up again; an error means nothing was stored.
+async fn store(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     project: Option<&weft_core::ProjectDefinition>,
     store: Store<'_>,
-) -> Result<((u64, u64), ValuesChanged), ApiError> {
+) -> Result<(Wrote, Vec<ActivationKey>), ApiError> {
     // Stored first, once: no activation claims a trigger while the
     // project row is locked, and none reading these fields is mid-setup
     // (it would land on the old picks), so every trigger found live here
-    // is re-armed below on what this stores.
-    let (moved, live) = loop {
+    // is re-armed on what this stores.
+    loop {
         // Subscribed before looking, so a claim ending between the look
         // and the wait still wakes it.
         let mut heard = state.signals.subscribe();
@@ -202,30 +330,43 @@ async fn store_then_rearm(
             wait_for_activations(&mut heard).await?;
             continue;
         }
-        let moved = match &store {
-            Store::Change { tenant, writes, cleared, .. } => {
+        let wrote = match &store {
+            Store::Change { tenant, writes, cleared, replaced, .. } => {
+                // What the touched fields held before, for a change that
+                // forgets what it leaves unused.
+                let before = match replaced {
+                    Replaced::Kept => Vec::new(),
+                    Replaced::ForgottenWhenUnused => {
+                        let touched: Vec<(String, String)> =
+                            writes.iter().map(|w| (w.node.clone(), w.field.clone())).chain(cleared.iter().cloned()).collect();
+                        weft_access_store::picked_grants(&tx, tenant, project_id, &touched).await.map_err(access_store_error)?
+                    }
+                };
                 weft_access_store::change_install_picks(&tx, tenant, project_id, writes, cleared)
                     .await
                     .map_err(access_store_error)?;
-                (0, 0)
+                let moved_off = before.into_iter().filter(|grant| !writes.iter().any(|w| w.grant_id == *grant)).collect();
+                Wrote { moved: (0, 0), moved_off }
             }
-            Store::Move { tenant, request, .. } => {
-                weft_access_store::move_stored(&tx, tenant, project_id, &request.from, &request.to)
+            Store::Move { tenant, request, .. } => Wrote {
+                moved: weft_access_store::move_stored(&tx, tenant, project_id, &request.from, &request.to)
                     .await
-                    .map_err(access_store_error)?
-            }
+                    .map_err(access_store_error)?,
+                moved_off: Vec::new(),
+            },
         };
         tx.commit().await.map_err(|e| access_store_error(e.into()))?;
-        break (
-            moved,
-            reading
-                .into_iter()
-                .filter(|a| a.lifecycle.status == ProjectStatus::Active)
-                .map(|a| a.key.clone())
-                .collect::<Vec<ActivationKey>>(),
-        );
-    };
-    let rearmed = rearm(state, project_id, &live).await;
+        return Ok((
+            wrote,
+            reading.into_iter().filter(|a| a.lifecycle.status == ProjectStatus::Active).map(|a| a.key.clone()).collect(),
+        ));
+    }
+}
+
+/// After a write [`store`] made: set up again every live trigger that
+/// reads it, and hand the events that waited on a pick over again.
+async fn settle(state: &DispatcherState, project_id: uuid::Uuid, live: &[ActivationKey]) -> Result<ValuesChanged, ApiError> {
+    let rearmed = rearm(state, project_id, live).await;
     // The events that waited on a pick go again on what is stored now,
     // whichever trigger they wait in (a pick a run reads re-arms nothing):
     // each waits again if what it lacks is still not picked.
@@ -235,7 +376,7 @@ async fn store_then_rearm(
             format!("the pick is stored, but the events that waited on it could not be handed over ({e:#}); the next change of a pick hands them over"),
         )
     })?;
-    Ok((moved, rearmed?))
+    rearmed
 }
 
 /// What an activation checks of the install's picks before any trigger
@@ -335,7 +476,7 @@ async fn rearm(state: &DispatcherState, project_id: uuid::Uuid, live: &[Activati
         }
     }
     if failed.is_empty() {
-        return Ok(ValuesChanged { rearmed });
+        return Ok(ValuesChanged { rearmed, ..Default::default() });
     }
     Err((
         StatusCode::CONFLICT,

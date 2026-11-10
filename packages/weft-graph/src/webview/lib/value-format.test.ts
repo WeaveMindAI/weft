@@ -26,6 +26,9 @@ describe('formatConfigValue / parseConfigToken round-trip', () => {
     expect(formatConfigValue(fromFile)).toBe('@instance_filled(@file("prompts/default.md"))');
     expect(roundTrip(fromFile)).toEqual(fromFile);
     expect(() => parseConfigToken('@instance_filled(@instance_filled)')).toThrow();
+    const mayStayEmpty = { __weft_instance_filled__: { fallback: null } };
+    expect(formatConfigValue(mayStayEmpty)).toBe('@instance_filled(null)');
+    expect(roundTrip(mayStayEmpty)).toEqual(mayStayEmpty);
   });
 
   it('round-trips a multi-line string as a heredoc', () => {

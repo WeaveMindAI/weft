@@ -1,15 +1,18 @@
 <script lang="ts">
-	// An instance's settings page: every field that takes a value of the
-	// instance's own (`@instance_filled`), grouped by the node it belongs
-	// to, each drawn with its own control: a connection picker for a
+	// A settings page for the fields a door fills, grouped by the node they
+	// belong to, each drawn with its own control: a connection picker for a
 	// connection, the searchable list and chooser for a `remote_select`
-	// field, a plain input for anything else. Everything goes through the
-	// instance door with the instance's token, so the page reaches that
-	// instance's values and connections and nothing else. A save that
-	// changes a value a live trigger of the instance reads re-arms that
+	// field, a plain input for anything else. Given the instance door (an
+	// instance's token), it is the instance's page: every field the
+	// instance fills (`@instance_filled`), and nothing but that instance's
+	// values and connections. Given the program door (through the site's
+	// server, which holds a connections key), it is the program's admin
+	// page: the connections the program picks on the install, each picked
+	// by pasting its key (the connect picks it, so the page stores nothing
+	// after it). A change to a value a live trigger reads re-arms that
 	// trigger before it answers, and the page says so.
-	import type { InstanceDoor } from '../core/transport';
-	import type { InstanceField, Widget } from '../core/wire';
+	import { fillField, pickConnection, type FieldsDoor } from '../core/transport';
+	import type { FilledField, ValuesChanged, Widget } from '../core/wire';
 	import ConnectPicker from './ConnectPicker.svelte';
 	import ResourceSelect from './ResourceSelect.svelte';
 
@@ -17,16 +20,16 @@
 	// a node's place (its title) and by `node.field` (a field). Anything it does
 	// not name keeps the program's own label, which is written for the
 	// program's author.
-	let { door, labels = {} }: { door: InstanceDoor; labels?: Record<string, string> } = $props();
+	let { door, labels = {} }: { door: FieldsDoor; labels?: Record<string, string> } = $props();
 
-	let fields = $state<InstanceField[]>([]);
+	let fields = $state<FilledField[]>([]);
 	let error = $state<string | null>(null);
 	let notice = $state<string | null>(null);
 	let loading = $state(true);
 
 	/// The fields, one group per node, in the program's order.
 	const nodes = $derived.by(() => {
-		const groups: { node: string; title: string; fields: InstanceField[] }[] = [];
+		const groups: { node: string; title: string; fields: FilledField[] }[] = [];
 		for (const field of fields) {
 			let group = groups.find((g) => g.node === field.node);
 			if (!group) {
@@ -54,30 +57,43 @@
 		void load();
 	});
 
-	/// Store one value (or clear it with `null`), then show what the
-	/// program now holds. A refusal (a value the node's rules refuse)
+	/// Store one value (an empty one clears the field), then show what the
+	/// program now holds.
+	function save(field: FilledField, value: unknown) {
+		return settle(() => fillField(door, field, value === '' ? null : value));
+	}
+
+	/// Store a connection field's new pick, unless the connect already
+	/// picked it (`picked`, the program door), then show what it changed.
+	function pick(field: FilledField, handle: { id: string } | null, picked: ValuesChanged | null) {
+		return settle(() => pickConnection(door, field, handle, picked));
+	}
+
+	/// Run one change, say what it set up again or forgot, and reload what
+	/// the program now holds. A refusal (a value the node's rules refuse)
 	/// stays on the page, naming what is wrong.
-	async function save(field: InstanceField, value: unknown) {
+	async function settle(change: () => Promise<ValuesChanged>) {
 		error = null;
 		notice = null;
 		try {
-			const changed =
-				value === null || value === undefined || value === ''
-					? await door.setValues([], [{ node: field.node, field: field.field }])
-					: await door.setValues([{ node: field.node, field: field.field, value }]);
-			if (changed.rearmed.length > 0) notice = `Set up again with your new value: ${changed.rearmed.join(', ')}.`;
+			const changed = await change();
+			const notices = [
+				changed.rearmed.length > 0 ? `Set up again with your new value: ${changed.rearmed.join(', ')}.` : null,
+				(changed.forgotten ?? []).length > 0 ? 'The key it held is forgotten: nothing else used it.' : null,
+			].filter((n) => n !== null);
+			if (notices.length > 0) notice = notices.join(' ');
 			fields = await door.fields();
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		}
 	}
 
-	function widgetOf(field: InstanceField): Widget | null {
+	function widgetOf(field: FilledField): Widget | null {
 		return field.input.widget ?? null;
 	}
 
 	/// The picked ids of the fields a list depends on, at the same node.
-	function parentsOf(field: InstanceField, dependsOn: string[] | undefined): Record<string, string> {
+	function parentsOf(field: FilledField, dependsOn: string[] | undefined): Record<string, string> {
 		const parents: Record<string, string> = {};
 		for (const name of dependsOn ?? []) {
 			const parent = fields.find((f) => f.node === field.node && f.field === name);
@@ -89,12 +105,12 @@
 	/// Whether the field draws a control of its own with the field's id. A
 	/// connection picker and a resource list draw several controls, so their
 	/// title is a heading rather than a label.
-	function drawsOwnInput(field: InstanceField): boolean {
+	function drawsOwnInput(field: FilledField): boolean {
 		const kind = widgetOf(field)?.kind;
 		return !((kind === 'access' && field.spec) || kind === 'remote_select');
 	}
 
-	function labelOf(field: InstanceField): string {
+	function labelOf(field: FilledField): string {
 		return labels[`${field.node}.${field.field}`] ?? field.input.label ?? field.field;
 	}
 
@@ -110,7 +126,7 @@
 	/// empty (the program's fallback, else the node's default), and only
 	/// with neither the node's own example. An example shown where a
 	/// fallback applies read as the value a run would use.
-	function hintOf(field: InstanceField): string {
+	function hintOf(field: FilledField): string {
 		if (field.fallback !== undefined) return textOf(field.fallback);
 		if (field.input.default !== undefined && field.input.default !== null) return textOf(field.input.default);
 		return field.input.placeholder ?? '';
@@ -122,7 +138,7 @@
 	}
 </script>
 
-{#snippet title(field: InstanceField)}
+{#snippet title(field: FilledField)}
 	{labelOf(field)}{#if field.needed && field.value === undefined}<span class="wc-settings-needed"> (needed)</span>{/if}
 {/snippet}
 
@@ -154,12 +170,12 @@
 						{/if}
 						{#if widget?.kind === 'access' && field.spec}
 							<ConnectPicker
-								transport={door}
+								transport={door.connectTransport(field)}
 								spec={field.spec}
 								value={handleOf(field.value)}
-								onUpdate={(handle) => save(field, handle ? { id: handle.id } : null)}
+								onUpdate={(handle, picked) => pick(field, handle, picked)}
 							/>
-						{:else if widget?.kind === 'remote_select'}
+						{:else if widget?.kind === 'remote_select' && door.resources}
 							<ResourceSelect
 								sources={widget.sources}
 								value={typeof field.value === 'string' ? field.value : undefined}

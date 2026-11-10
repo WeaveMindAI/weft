@@ -500,6 +500,7 @@ async fn an_instance_token_is_one_project_and_expires(pool: Pool) {
         all_displays: false,
         created_at: 0,
         instance: instance.cloned(),
+        connections: false,
         expires_at,
         kind: weft_core::signal_token::TokenKind::Caller,
     };
@@ -532,6 +533,53 @@ async fn an_instance_token_is_one_project_and_expires(pool: Pool) {
     let left: Vec<String> = store.list_signal_tokens(TENANT).await.unwrap().into_iter().map(|t| t.token_hash).collect();
     assert_eq!(left.len(), 2, "{left:?}");
     assert!(left.contains(&"bob-1".to_string()) && left.contains(&"author".to_string()));
+}
+
+/// A connections key is a caller token of exactly one project with no
+/// instance, tag or display, whatever reaches the table, and it reads back
+/// with its grant.
+#[weft_db_macros::test]
+async fn a_connections_key_is_one_program_and_nothing_else(pool: Pool) {
+    use weft_dispatcher::store::SignalToken;
+    let (store, _) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    let key = |hash: &str| SignalToken {
+        id: Uuid::new_v4(),
+        token_hash: hash.into(),
+        recognizer: "wft-test-...".into(),
+        tenant_id: TENANT.into(),
+        name: None,
+        allowed_projects: vec![project],
+        allowed_tags: Vec::new(),
+        allowed_displays: Vec::new(),
+        all_displays: false,
+        created_at: 0,
+        instance: None,
+        connections: true,
+        expires_at: None,
+        kind: weft_core::signal_token::TokenKind::Caller,
+    };
+    let refused = [
+        SignalToken { allowed_projects: vec![project, Uuid::new_v4()], ..key("two") },
+        SignalToken { allowed_projects: Vec::new(), ..key("none") },
+        SignalToken {
+            instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()),
+            expires_at: Some(10),
+            ..key("instance")
+        },
+        SignalToken { allowed_tags: vec!["t".into()], ..key("tags") },
+        SignalToken { all_displays: true, ..key("displays") },
+        SignalToken { kind: weft_core::signal_token::TokenKind::Operator, ..key("operator") },
+    ];
+    for token in &refused {
+        let err = store.mint_signal_token(token).await.unwrap_err();
+        assert!(format!("{err:#}").contains("signal_token_connections_is_one_program"), "{}: {err:#}", token.token_hash);
+    }
+    store.mint_signal_token(&key("site")).await.unwrap();
+    let read = store.get_signal_token("site").await.unwrap().expect("stored");
+    assert!(read.connections);
+    assert_eq!(read.connections_project(), Ok(project));
+    assert!(read.refused_at_caller_doors().is_some(), "a connections key opens no caller door");
 }
 
 /// The listing's `node` and `search` filters, both read from the search

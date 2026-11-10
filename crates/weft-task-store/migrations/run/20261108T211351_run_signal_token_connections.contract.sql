@@ -1,0 +1,1 @@
+ALTER TABLE signal_token ADD CONSTRAINT signal_token_connections_is_one_program CHECK (((NOT connections) OR ((kind = 'caller'::text) AND (instance_id IS NULL) AND (cardinality(allowed_projects) = 1) AND (cardinality(allowed_tags) = 0) AND (cardinality(allowed_displays) = 0) AND (NOT all_displays))));

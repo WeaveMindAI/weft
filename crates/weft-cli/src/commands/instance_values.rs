@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use weft_core::instance::InstanceId;
-use weft_core::instance_door::{InstanceField, ValuesChanged, ValuesRequest};
+use weft_core::instance_door::{FilledField, ValuesChanged, ValuesRequest};
 use weft_core::run_spec::{InstanceFieldRef, InstanceValueInput};
 use weft_core::signal_token::{MintTokenRequest, MintedToken};
 
@@ -243,7 +243,7 @@ pub async fn run(ctx: Ctx, instance: InstanceId, set: Vec<String>, clear: Vec<St
             return Ok(());
         }
         let answer = door.get_json("/instance/fields").await?;
-        let fields: Vec<InstanceField> = crate::client::read_answer(answer.clone(), "the instance's fields")?;
+        let fields: Vec<FilledField> = crate::client::read_answer(answer.clone(), "the instance's fields")?;
         if json {
             println!("{}", serde_json::json!({ "instance": instance, "fields": answer }));
             return Ok(());

@@ -107,6 +107,7 @@ fn token(hash: &str, tenant: &str) -> SignalToken {
         all_displays: false,
         created_at: 0,
         instance: None,
+        connections: false,
         expires_at: None,
     }
 }

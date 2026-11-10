@@ -310,11 +310,14 @@ impl std::fmt::Debug for OpenedConnection {
 ///
 /// The macro requires the input to be named `account` (a node writing
 /// its own body picks its own name; the compiler finds the picker by
-/// its `access` widget, never by name). The connection is ALWAYS
-/// required here: this body's whole output is the connection, so an
-/// "optional" one would only starve everything downstream silently. A
-/// recipe wanting `connectionOptional` writes its own body saying
-/// what unconnected means (see the custom LLM provider).
+/// its `access` widget, never by name). This body never runs without a
+/// connection: its whole output is the connection. Where the program lets
+/// it stay empty (`account: @instance_filled(null)`), the engine skips the
+/// node as not connected before this body runs, as on any required input
+/// that closed, and its closed output is what the nodes downstream decide
+/// on. A recipe wanting `connectionOptional`
+/// writes its own body saying what unconnected means (see the custom LLM
+/// provider).
 #[macro_export]
 macro_rules! access_node {
     ($name:ident) => {
@@ -326,9 +329,10 @@ macro_rules! access_node {
             async fn run(&self, ctx: $crate::RunContext) -> $crate::WeftResult<()> {
                 let access = ctx.inputs.access("account")?.ok_or_else(|| {
                     $crate::WeftError::Input(
-                        "this access node's recipe declares connectionOptional, but its \
-                         pass-through body has no meaning without a connection; pick one \
-                         on the node, or give the node type its own body"
+                        "this access node ran with no connection: the engine skips an \
+                         unconnected access node before it runs, so this is a bug in weft \
+                         (or a recipe declaring connectionOptional on the pass-through \
+                         body, which needs a body of its own)"
                             .into(),
                     )
                 })?;

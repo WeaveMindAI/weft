@@ -9,7 +9,7 @@
   // has nothing to fill. An instance token whose door fails (its runtime
   // unreachable, the token expired) stays, with what went wrong.
   import { InstanceDoor, InstanceDoorError } from '@weft/connect';
-  import { InstanceSettings } from '@weft/connect/svelte';
+  import { DoorSettings } from '@weft/connect/svelte';
   import { getTokens, type ApiToken } from '../../lib/api';
 
   type Entry = { token: ApiToken; door: InstanceDoor; failed: string | null };
@@ -71,7 +71,7 @@
         {#if entry.failed}
           <p class="error">{entry.failed}</p>
         {:else}
-          <InstanceSettings door={entry.door} />
+          <DoorSettings door={entry.door} />
         {/if}
       </section>
     {/each}

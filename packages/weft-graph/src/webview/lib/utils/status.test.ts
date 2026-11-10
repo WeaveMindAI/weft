@@ -42,6 +42,11 @@ describe('skipReasonText', () => {
 		],
 		[{ kind: 'scope_skipped', scope: 'triage' }, "the scope 'triage' it lives in did not run"],
 		[{ kind: 'wait_skipped' }, 'a person skipped what it was waiting for'],
+		[
+			{ kind: 'unfilled', field: 'account', service: 'slack' },
+			"not connected: this instance has no slack connection for 'account'",
+		],
+		[{ kind: 'unfilled', field: 'channel' }, "not filled: this instance left 'channel' empty"],
 	];
 
 	it.each(cases)('renders %j', (reason, expected) => {

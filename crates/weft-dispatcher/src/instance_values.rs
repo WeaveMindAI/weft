@@ -230,7 +230,7 @@ async fn apply(
         match crate::api::project::activate_with(state, project_id, request, crate::api::project::ActivateAsker::Rearm(&rearm)).await {
             Ok(_) => {
                 route_waiting_fires(state, project_id, instance).await;
-                return Ok(ValuesChanged { rearmed: keys.into_iter().map(|k| k.trigger).collect() });
+                return Ok(ValuesChanged { rearmed: keys.into_iter().map(|k| k.trigger).collect(), ..Default::default() });
             }
             // The claim was refused between the look above and it:
             // another claim holds one of these triggers (wait for it), or

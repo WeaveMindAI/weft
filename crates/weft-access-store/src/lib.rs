@@ -37,7 +37,7 @@ pub use flows::{
     take_connect_result, BeginPicker, GrantOwnerScope, OAuthComplete, PickerSession,
     PublishAccess, write_pushed_values,
 };
-pub use picks::{change_install_picks, install_picks, move_stored, stored_fields, PickWrite};
+pub use picks::{change_install_picks, forget_if_unused, install_picks, move_stored, picked_grants, stored_fields, PickWrite};
 pub use subscriptions::{
     check_subscription, drop_subscriptions_for_signal, ensure_subscription, needs_renewal, no_public_url_error,
     run_connect_call, subscription_by_id, EnsureSubscription, EnsuredSubscription, Subscription,

@@ -138,6 +138,24 @@ out.data = svc.status
         .await?;
     anyhow::ensure!(body.contains("ready"), "the sidecar answered through the door: {body}");
 
+    // The door keeps its address when the node's containers are made
+    // again, so a client that copied it (a frontend's `.env`) keeps
+    // working.
+    project.weft(&["infra", "stop"]).await?;
+    infra::start_and_wait_running(&mut project, "svc").await?;
+    let again: weft_core::infra::wire::DoorsResponse =
+        serde_json::from_str(project.weft(&["infra", "list-doors", "--json"]).await?.trim())?;
+    anyhow::ensure!(again.doors.len() == 1 && again.doors[0].address == *address, "the same door after a stop and a start: {again:?}");
+    let body = weft_core::net::http_client()
+        .build()?
+        .get(format!("http://{address}/outputs"))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    anyhow::ensure!(body.contains("ready"), "the door answers at its kept address: {body}");
+
     // And back off: a door is not a one-way door.
     project.write_file("src/main.weft", r#"
 svc = MiniService

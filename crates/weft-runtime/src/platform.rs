@@ -77,6 +77,12 @@ pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Po
             )?);
             let gpu = weft_platform_local::LocalInfraHost::detect_gpu(docker.as_ref()).await?;
             let needs: Arc<dyn weft_platform_traits::MachineNeeds> = Arc::new(weft_platform_local::LocalNeeds);
+            // The host port each infra unit's port keeps on the machine,
+            // container units' and process units' alike.
+            let kept_ports = Arc::new(weft_platform_local::KeptPorts::new(
+                local.data_dir.clone(),
+                Arc::new(weft_platform_local::MachinePorts),
+            ));
             let containers = Arc::new(weft_platform_local::LocalInfraHost::new(
                 docker.clone(),
                 weft_platform_local::LocalInfraHostConfig {
@@ -84,7 +90,7 @@ pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Po
                     scratch_dir: scratch,
                     gpu,
                     disks: weft_platform_local::DiskBacking::Volumes,
-                    publish: weft_platform_local::Publish::Loopback,
+                    publish: weft_platform_local::Publish::Loopback(kept_ports.clone()),
                     install: config.install.clone(),
                     // Every install on this machine shares its Docker.
                     names: weft_platform_local::infra_names::Names::PerInstall {
@@ -102,6 +108,7 @@ pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Po
                 Arc::new(weft_platform_local::MachineProcesses),
                 needs.clone(),
                 Arc::new(weft_platform_traits::SystemClock),
+                kept_ports,
                 weft_platform_local::ProcessUnitsConfig {
                     dir: weft_platform_local::InstallLayout::new(local.data_dir.clone()).process_units(),
                     // A unit's agent is this very program.
@@ -111,7 +118,7 @@ pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Po
                     stop_grace: PROCESS_STOP_GRACE,
                     needs_root: weft_platform_local::MachineLayout::here().needs(),
                 },
-            ));
+            )?);
             let host = Arc::new(weft_platform_local::MachineInfraHost::new(containers, processes));
             let alarm = Arc::new(weft_platform_local::LocalAlarm::new(pool.clone()));
             // A local install's one process delivers its wakes.

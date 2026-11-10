@@ -76,7 +76,7 @@ into that group through the group's inputs.
    for the one they open, and removes one with `WipeInstance`.
 3. **A settings page** where each person fills in what the program asks of
    their instance: their connections, their spreadsheet, their model, their
-   schedule. It is `InstanceSettings` on the frontend with that instance's
+   schedule. It is `DoorSettings` on the frontend with that instance's
    token (the `weft-frontend` skill mounts it), or the browser extension's
    **Your settings** page. If a trigger needs a value with no fallback, the
    page calls the admin route again to turn the triggers on once the values

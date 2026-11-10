@@ -18,7 +18,7 @@
 	// through its host bridge, an instance's page through the instance door.
 	// The look is set with CSS custom properties (`--wc-accent`,
 	// `--wc-font-size`, ...) on any ancestor.
-	import type { AppRegistration, AccessSpecWire, Door, GrantSummary, LoginWayWire, SharedAppChoice } from '../core/wire';
+	import type { AppRegistration, AccessSpecWire, Door, GrantSummary, LoginWayWire, SharedAppChoice, ValuesChanged } from '../core/wire';
 	import type { ConnectTransport } from '../core/transport';
 	import {
 		canDo,
@@ -63,9 +63,12 @@
 		nodeType?: string | null;
 		/// The handle of the picked connection, if any.
 		value: { id: string; identity?: string } | undefined;
-		/// Called with the new pick, or `null` for none. A pick the host
-		/// cannot store throws; the error shows under the picker.
-		onUpdate: (v: { id: string; identity?: string } | null) => void | Promise<void>;
+		/// Called with the new pick, or `null` for none, and with what the
+		/// connect's own pick changed when the transport picked the new
+		/// connection in the same request (`ConnectAnswer.picked`), else
+		/// `null`: then the host stores the pick. A pick the host cannot
+		/// store throws; the error shows under the picker.
+		onUpdate: (v: { id: string; identity?: string } | null, picked: ValuesChanged | null) => void | Promise<void>;
 	} = $props();
 
 	const label = $derived(displayLabel(spec));
@@ -191,7 +194,7 @@
 			connections = connections.filter((x) => x.id !== c.id);
 			// The pick pointed at exactly this row: clear it, so it never
 			// references a connection that is gone.
-			if (value?.id === c.id) await onUpdate(null);
+			if (value?.id === c.id) await onUpdate(null, null);
 		} catch (e) {
 			fail(e);
 		} finally {
@@ -199,9 +202,9 @@
 		}
 	}
 
-	async function choose(handle: { id: string; identity?: string } | null) {
+	async function choose(handle: { id: string; identity?: string } | null, picked: ValuesChanged | null) {
 		try {
-			await onUpdate(handle);
+			await onUpdate(handle, picked);
 		} catch (e) {
 			fail(e);
 		}
@@ -215,7 +218,7 @@
 		busy = false;
 		waitingConsent = false;
 		open = false;
-		void choose({ id: c.id, identity: c.identity ?? undefined });
+		void choose({ id: c.id, identity: c.identity ?? undefined }, null);
 	}
 
 	/// Pick a way to sign in. What was typed was for the other way's
@@ -229,16 +232,18 @@
 
 	function disconnect(e: MouseEvent) {
 		e.stopPropagation();
-		void choose(null);
+		void choose(null, null);
 	}
 
-	function finish(grant: GrantSummary) {
+	/// A connect landed: `picked` is what the transport's own pick of it
+	/// changed, `null` when the host is left to pick it.
+	function finish(grant: GrantSummary, picked: ValuesChanged | null) {
 		waitSeq++;
 		open = false;
 		formValues = {};
 		pasteValues = {};
 		ownName = '';
-		void choose({ id: grant.id, identity: grant.identity ?? undefined });
+		void choose({ id: grant.id, identity: grant.identity ?? undefined }, picked);
 	}
 
 	/// The one-request connects (paste / server-to-server / shared key).
@@ -260,7 +265,7 @@
 				sharedApp: door === 'shared' ? (chosenApp?.label ?? null) : null,
 				registration: door === 'own' && !paste ? ownRegistration(spec, formValues, ownName, projectApp) : null,
 			});
-			finish(done.grant);
+			finish(done.grant, done.picked ?? null);
 		} catch (e) {
 			fail(e);
 		} finally {
@@ -294,7 +299,7 @@
 				},
 				{ stopped: () => seq !== waitSeq, onWaiting: () => (waitingConsent = true) },
 			);
-			if (grant && seq === waitSeq) finish(grant);
+			if (grant && seq === waitSeq) finish(grant, null);
 		} catch (e) {
 			if (seq === waitSeq) fail(e);
 		} finally {

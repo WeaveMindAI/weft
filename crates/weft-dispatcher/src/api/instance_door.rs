@@ -16,6 +16,15 @@
 //! An instance connects its OWN account: the shared door of a paste-less
 //! service (the runtime's own key, spending the runtime's credit) is the
 //! author's to use, never an instance's, and is refused here.
+//!
+//! The program door (`api/program_door.rs`) fills the program's own
+//! connections, its picks on the install, with a connections key. The
+//! two answer the same question for two owners ([`ConnectionOwner`]): the
+//! connection fields a door may fill, drawn the same way
+//! ([`field_entry`]), and a pasted key stored as the owner's
+//! ([`store_direct`]). What only an instance has (its other
+//! `@instance_filled` fields, the lists and choosers they fill from, its
+//! runs, browser consents) stays here.
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -28,13 +37,80 @@ use weft_core::access::wire::{
     SharedDoorPick, StartedOAuth,
 };
 use weft_core::instance::InstanceId;
-use weft_core::instance_door::{InstanceField, ValuesChanged};
+use weft_core::instance_door::{FilledField, ValuesChanged};
 use weft_core::storage::Tenanted;
 
 use super::access_store_error;
 use crate::state::DispatcherState;
 
 type ApiError = (StatusCode, String);
+
+/// Whose connections a door makes: one instance's in its project, or the
+/// program's own (the owner's, picked on the install).
+pub(crate) enum ConnectionOwner {
+    Instance(weft_core::instance::InstanceScope),
+    Program(uuid::Uuid),
+}
+
+impl ConnectionOwner {
+    fn project(&self) -> uuid::Uuid {
+        match self {
+            ConnectionOwner::Instance(scope) => scope.project_id,
+            ConnectionOwner::Program(project) => *project,
+        }
+    }
+
+    /// Why this owner never connects through the shared door, which runs
+    /// on the runtime's own key and spends its credit.
+    fn shared_refused(&self) -> &'static str {
+        match self {
+            ConnectionOwner::Instance(_) => "an instance connects its own account; the shared key is the program author's",
+            ConnectionOwner::Program(_) => {
+                "the program door stores the program's own key; the shared key spends the runtime's credit, and only \
+                 the program's author picks it (the editor's Connect button, or `weft connect`)"
+            }
+        }
+    }
+}
+
+/// Store the pasted connect `req` as `owner`'s connection, in `owner`'s
+/// project: the paste door every caller door shares with the editor's
+/// `/access/connect/direct`, through the broker.
+pub(crate) async fn store_direct(
+    state: &DispatcherState,
+    tenant: String,
+    owner: ConnectionOwner,
+    mut req: SharedDoorPick<ConnectDirect>,
+) -> Result<CompletedConnect, ApiError> {
+    if req.inner.door == Door::Shared {
+        return Err((StatusCode::FORBIDDEN, owner.shared_refused().into()));
+    }
+    req.inner.project_id = Some(owner.project());
+    req.inner.instance = match owner {
+        ConnectionOwner::Instance(scope) => Some(scope.instance),
+        ConnectionOwner::Program(_) => None,
+    };
+    crate::broker_admin::forward_json(state, weft_broker_client::protocol::ADMIN_CONNECT_DIRECT, &Tenanted { tenant, inner: req }).await
+}
+
+/// The field `input` of `node` at the place `place`, as a door lists it,
+/// before what the door's owner gave: a connection field carries its
+/// service's recipe (what drives the connect page), any other none.
+pub(crate) fn field_entry(place: &str, node: &weft_core::project::NodeDefinition, input: &weft_core::project::InputDefinition) -> FilledField {
+    let is_connection = matches!(input.widget, Some(weft_core::node::Widget::Access { .. }));
+    FilledField {
+        node: place.to_string(),
+        field: input.name.clone(),
+        node_type: node.node_type.clone(),
+        label: node.label.clone(),
+        input: input.clone(),
+        fallback: None,
+        needed: false,
+        spec: if is_connection { node.connection_service.clone() } else { None },
+        connection: weft_core::instance_door::FieldConnection::None,
+        value: None,
+    }
+}
 
 /// Who is at the door: one instance of one project, from its token.
 pub(crate) struct InstanceCaller {
@@ -77,7 +153,7 @@ pub(crate) async fn instance_caller(state: &DispatcherState, headers: &HeaderMap
 
 /// `GET /instance/fields`: every field the program asks the instance to fill,
 /// in the program's order, with what they gave.
-pub async fn fields(State(state): State<DispatcherState>, headers: HeaderMap) -> Result<Json<Vec<InstanceField>>, ApiError> {
+pub async fn fields(State(state): State<DispatcherState>, headers: HeaderMap) -> Result<Json<Vec<FilledField>>, ApiError> {
     let caller = instance_caller(&state, &headers).await?;
     let project = caller_project(&state, &caller).await?;
     let values = weft_access_store::instance_values(&state.pg_pool, &caller.tenant, caller.project, &caller.instance)
@@ -94,7 +170,6 @@ pub async fn fields(State(state): State<DispatcherState>, headers: HeaderMap) ->
             let Some(filled) = node.port_literals.get(&input.name).and_then(weft_core::instance::as_instance_filled) else {
                 continue;
             };
-            let is_connection = matches!(input.widget, Some(weft_core::node::Widget::Access { .. }));
             let connection = match input.widget {
                 Some(weft_core::node::Widget::RemoteSelect { .. }) => {
                     weft_core::instance::lookup_connection(&project, &at, &input.name, &values, &picks)
@@ -103,17 +178,12 @@ pub async fn fields(State(state): State<DispatcherState>, headers: HeaderMap) ->
                 }
                 _ => weft_core::instance_door::FieldConnection::None,
             };
-            out.push(InstanceField {
-                field: input.name.clone(),
-                node_type: node.node_type.clone(),
-                label: node.label.clone(),
+            out.push(FilledField {
                 fallback: filled.fallback.cloned(),
                 needed: weft_core::instance::instance_field_needed(&rules, node, &input.name),
-                spec: if is_connection { node.instance_service.clone() } else { None },
                 connection,
                 value: values.get(&place).and_then(|fields| fields.get(&input.name)).cloned(),
-                input: input.clone(),
-                node: place.clone(),
+                ..field_entry(&place, node, input)
             });
         }
     }
@@ -122,8 +192,16 @@ pub async fn fields(State(state): State<DispatcherState>, headers: HeaderMap) ->
 
 /// The program the caller's token is for, as it runs now.
 async fn caller_project(state: &DispatcherState, caller: &InstanceCaller) -> Result<std::sync::Arc<weft_core::ProjectDefinition>, ApiError> {
+    token_program(state, caller.project).await
+}
+
+/// The program of `project`, a token's one project, as it runs now.
+pub(crate) async fn token_program(
+    state: &DispatcherState,
+    project: uuid::Uuid,
+) -> Result<std::sync::Arc<weft_core::ProjectDefinition>, ApiError> {
     state
-        .registered(caller.project)
+        .registered(project)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e:#}")))?
         .map(|registered| registered.program)
@@ -188,24 +266,11 @@ pub async fn doors(
 pub async fn connect_direct(
     State(state): State<DispatcherState>,
     headers: HeaderMap,
-    Json(mut req): Json<SharedDoorPick<ConnectDirect>>,
+    Json(req): Json<SharedDoorPick<ConnectDirect>>,
 ) -> Result<Json<CompletedConnect>, ApiError> {
     let caller = instance_caller(&state, &headers).await?;
-    if req.inner.door == Door::Shared {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "an instance connects its own account; the shared key is the program author's".into(),
-        ));
-    }
-    req.inner.project_id = Some(caller.project);
-    req.inner.instance = Some(caller.instance);
-    crate::broker_admin::forward_json(
-        &state,
-        weft_broker_client::protocol::ADMIN_CONNECT_DIRECT,
-        &Tenanted { tenant: caller.tenant, inner: req },
-    )
-    .await
-    .map(Json)
+    let owner = ConnectionOwner::Instance(caller.scope());
+    store_direct(&state, caller.tenant, owner, req).await.map(Json)
 }
 
 /// `POST /instance/connections/begin`: start a browser consent for the

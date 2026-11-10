@@ -667,6 +667,7 @@ mod scope_tests {
             all_displays: all,
             created_at: 0,
             instance: None,
+            connections: false,
             expires_at: None,
         }
     }

@@ -324,7 +324,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         images: Vec::new(),
         fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
         published_service: None,
-        instance_service: None,
+        connection_service: None,
         instance_rules: None,
         recheck: Vec::new(),
         span: None,

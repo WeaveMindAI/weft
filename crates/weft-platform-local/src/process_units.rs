@@ -32,8 +32,11 @@
 //!   folder, shared by every install on the machine, the unit reading as
 //!   starting ("installing ...") meanwhile.
 //!
+//! The port each of a unit's ports listens on is the install's to keep
+//! (`kept_ports`), from the unit's first start until it is removed.
+//!
 //! Stop ends the agent and its process and keeps the folder; remove and
-//! terminate take the folder too.
+//! terminate take the folder too, and let go of the unit's ports.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +51,7 @@ use weft_core::needs::System;
 use weft_platform_traits::unit_agent::{ProcessAgentState, ProcessSetup, PROCESS_AGENT_COMMAND};
 use weft_platform_traits::{Clock, EndpointAt, InfraHost, MachineNeeds, RestartCause, UnitObservation, UnitRestart, UnitRunState};
 
+use crate::kept_ports::{KeptPorts, UnitPort};
 use crate::processes::{Processes, Signal, Spawn};
 
 /// The variables of the machine's own environment a process gets besides
@@ -140,10 +144,6 @@ pub struct Held {
     /// The process as applied: what a start after the agent was found
     /// gone runs again, with no spec at hand.
     pub process: Process,
-    /// The loopback port picked for each of the process's ports, by name:
-    /// kept for as long as the unit is held, so the address its endpoints
-    /// were given stays its address across restarts and stops.
-    pub ports: BTreeMap<String, u16>,
     /// What of it runs.
     pub run: Run,
     /// The latest time the host found the agent gone (the machine
@@ -229,6 +229,31 @@ fn load(dir: &Path) -> anyhow::Result<Vec<Held>> {
     })
 }
 
+/// Move the ports a registry an older weft wrote in `dir` kept on each
+/// unit (its `ports`, by name) into `kept`, and write the registry again
+/// without them. A registry with none is left as it is.
+fn carry_old_ports(dir: &Path, kept: &KeptPorts) -> anyhow::Result<()> {
+    let path = dir.join(REGISTRY);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => anyhow::bail!("read {}: {e}", path.display()),
+    };
+    let not_ours = |e: &dyn std::fmt::Display| anyhow::anyhow!("{} is not the list of process units weft keeps ({e})", path.display());
+    let mut units: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_slice(&bytes).map_err(|e| not_ours(&e))?;
+    if !units.iter().any(|u| u.contains_key("ports")) {
+        return Ok(());
+    }
+    for unit in &mut units {
+        let Some(ports) = unit.remove("ports") else { continue };
+        let ports: BTreeMap<String, u16> = serde_json::from_value(ports).map_err(|e| not_ours(&e))?;
+        let node: NodeRef = serde_json::from_value(unit.get("node").cloned().unwrap_or_default()).map_err(|e| not_ours(&e))?;
+        let name = unit.get("unit").and_then(serde_json::Value::as_str).ok_or_else(|| not_ours(&"a unit with no name"))?;
+        kept.carry(&node, name, ports.into_iter().map(|(port, host)| (UnitPort::Process(port), host)))?;
+    }
+    crate::registry::write_private(&path, &serde_json::to_vec_pretty(&units).expect("units serialize"))
+}
+
 /// Kill every unit's agent the registry in `dir` names, at once, with its
 /// process and whatever that started (`SIGKILL` to its group), and what
 /// is left of an agent found gone (`processes::kill_leftovers`): what a
@@ -264,6 +289,10 @@ pub struct ProcessUnits {
     processes: Arc<dyn Processes>,
     needs: Arc<dyn MachineNeeds>,
     clock: Arc<dyn Clock>,
+    /// The loopback port each unit's ports listen on, kept for as long as
+    /// the unit is held, so the address its endpoints were given stays its
+    /// address across restarts and stops.
+    ports: Arc<KeptPorts>,
     cfg: ProcessUnitsConfig,
     /// Held across every read and write of the registry: an apply, a stop
     /// and a look at the same units never interleave.
@@ -271,8 +300,33 @@ pub struct ProcessUnits {
 }
 
 impl ProcessUnits {
-    pub fn new(processes: Arc<dyn Processes>, needs: Arc<dyn MachineNeeds>, clock: Arc<dyn Clock>, cfg: ProcessUnitsConfig) -> Self {
-        Self { processes, needs, clock, cfg, changing: tokio::sync::Mutex::new(()) }
+    /// The units held in `cfg.dir`, their ports kept in `ports`. A
+    /// registry an older weft wrote kept each unit's ports on the unit;
+    /// they move to `ports` here ([`carry_old_ports`]).
+    pub fn new(
+        processes: Arc<dyn Processes>,
+        needs: Arc<dyn MachineNeeds>,
+        clock: Arc<dyn Clock>,
+        ports: Arc<KeptPorts>,
+        cfg: ProcessUnitsConfig,
+    ) -> anyhow::Result<Self> {
+        carry_old_ports(&cfg.dir, &ports)?;
+        Ok(Self { processes, needs, clock, ports, cfg, changing: tokio::sync::Mutex::new(()) })
+    }
+
+    /// The port each of `held`'s process's ports listens on, kept from
+    /// the unit's first start (a port it did not have yet picked now).
+    fn ports_of(&self, held: &Held) -> anyhow::Result<BTreeMap<String, u16>> {
+        let names: Vec<UnitPort> = held.process.ports.iter().map(|p| UnitPort::Process(p.name.clone())).collect();
+        Ok(self
+            .ports
+            .keep(&held.node, &held.unit, &names)?
+            .into_iter()
+            .filter_map(|(port, host)| match port {
+                UnitPort::Process(name) => Some((name, host)),
+                UnitPort::Container(_) => None,
+            })
+            .collect())
     }
 
     fn save(&self, held: &[Held]) -> anyhow::Result<()> {
@@ -347,6 +401,8 @@ impl ProcessUnits {
     async fn start_agent(&self, held: &Held) -> anyhow::Result<Agent> {
         self.find_program(&held.node, &held.unit, &held.process)?;
         let (node, unit) = (&held.node, held.unit.as_str());
+        let ports = self.ports_of(held)?;
+        self.ports_free(held, &ports)?;
         let work = self.work_dir(node, unit);
         std::fs::create_dir_all(&work).map_err(|e| anyhow::anyhow!("create {}: {e}", work.display()))?;
         for (path, content) in &held.process.files {
@@ -369,7 +425,7 @@ impl ProcessUnits {
             std::fs::write(path, serde_json::to_vec_pretty(&setup).expect("a setup serializes")).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
         }
         let agent_log = self.unit_dir(node, unit).join("agent.log");
-        let spawn = agent_spawn(&self.cfg, held, &work, &state, &self.log_path(node, unit), &agent_log, setup.as_deref());
+        let spawn = agent_spawn(&self.cfg, held, &ports, &work, &state, &self.log_path(node, unit), &agent_log, setup.as_deref());
         let spawned = self
             .processes
             .spawn(&spawn)
@@ -408,6 +464,21 @@ impl ProcessUnits {
              (`weft daemon start`)",
             weft_core::project::plain_id(&node.node)
         )
+    }
+
+    /// Refuse to start `held`'s process when another program holds one of
+    /// its kept `ports` (by name, at their port of this machine) on
+    /// loopback, where its endpoints reach it: started anyway, it would exit failing to listen and be started
+    /// again for ever, the reason only in its own log. Asked only right
+    /// before a spawn, once whatever of this unit ran before was stopped,
+    /// so a port held is never one of its own. The port stays kept.
+    fn ports_free(&self, held: &Held, ports: &BTreeMap<String, u16>) -> anyhow::Result<()> {
+        for (name, host) in ports {
+            if self.processes.port_taken(*host)? {
+                anyhow::bail!("{}", crate::kept_ports::taken_by_another_program(&held.node, &held.unit, &UnitPort::Process(name.clone()), *host));
+            }
+        }
+        Ok(())
     }
 
     /// Stop `held`'s agent, and its process with it, when it runs; when
@@ -521,9 +592,9 @@ impl ProcessUnits {
             return Ok((Seen::Exited { how }, restart));
         };
         let Some(readiness) = &held.process.readiness else { return Ok((Seen::Is(UnitRunState::Ready), restart)) };
-        let port = *held
+        let port = self
             .ports
-            .get(&readiness.port)
+            .kept(&held.node, &held.unit, &UnitPort::Process(readiness.port.clone()))?
             .ok_or_else(|| anyhow::anyhow!("unit '{}' of '{}' holds no port '{}'", held.unit, held.node.node, readiness.port))?;
         let check = Check {
             probe: ProbeKind::Http { path: readiness.path.clone(), port },
@@ -581,8 +652,9 @@ fn registered(run: &Run) -> UnitRunState {
 /// What starts `held`'s agent: this install's `weft-runtime` as the agent,
 /// told where to keep its state and the process's log (and its `setup`,
 /// when the process has needs weft installs), then the process's command;
-/// in the process's folder, with the process's environment.
-fn agent_spawn(cfg: &ProcessUnitsConfig, held: &Held, work: &Path, state: &Path, log: &Path, agent_log: &Path, setup: Option<&Path>) -> Spawn {
+/// in the process's folder, with the process's environment, its ports at
+/// `ports`.
+fn agent_spawn(cfg: &ProcessUnitsConfig, held: &Held, ports: &BTreeMap<String, u16>, work: &Path, state: &Path, log: &Path, agent_log: &Path, setup: Option<&Path>) -> Spawn {
     let mut args: Vec<String> = PROCESS_AGENT_COMMAND.iter().map(|word| word.to_string()).collect();
     args.extend(["--state".into(), state.display().to_string(), "--log".into(), log.display().to_string()]);
     if let Some(setup) = setup {
@@ -594,7 +666,7 @@ fn agent_spawn(cfg: &ProcessUnitsConfig, held: &Held, work: &Path, state: &Path,
         program: cfg.agent_program.clone(),
         args,
         cwd: work.to_path_buf(),
-        env: process_env(&cfg.machine_env, &held.process, &held.ports),
+        env: process_env(&cfg.machine_env, &held.process, ports),
         log: agent_log.to_path_buf(),
     }
 }
@@ -671,21 +743,12 @@ impl InfraHost for ProcessUnits {
                 unit: unit.to_string(),
                 hash: String::new(),
                 process: process.clone(),
-                ports: BTreeMap::new(),
                 run: Run::Stopped,
                 revived: None,
             },
         };
         self.stop_agent(&mut held).await?;
-        let mut ports = BTreeMap::new();
-        for p in &process.ports {
-            let number = match held.ports.get(&p.name) {
-                Some(number) => *number,
-                None => self.processes.free_port()?,
-            };
-            ports.insert(p.name.clone(), number);
-        }
-        held = Held { node: node.node.clone(), hash: resolved.hash.clone(), process: process.clone(), ports, revived: None, ..held };
+        held = Held { node: node.node.clone(), hash: resolved.hash.clone(), process: process.clone(), revived: None, ..held };
         // A failure is kept on the unit (`Run::Failed`) as well as
         // answered, so every look says it until the next apply.
         let started = self.start(&mut held, |why| Run::Failed { why }).await;
@@ -710,7 +773,8 @@ impl InfraHost for ProcessUnits {
         let mut held = all.remove(at);
         self.stop_agent(&mut held).await?;
         remove_dir(&self.unit_dir(node, unit))?;
-        self.save(&all)
+        self.save(&all)?;
+        self.ports.release_unit(node, unit)
     }
 
     async fn terminate(&self, node: &NodeRef, _keep_disks: &[String]) -> anyhow::Result<()> {
@@ -720,7 +784,8 @@ impl InfraHost for ProcessUnits {
             self.stop_agent(held).await?;
         }
         remove_dir(&self.cfg.dir.join(&node.copy_id))?;
-        self.save(&kept)
+        self.save(&kept)?;
+        self.ports.release_copy(node)
     }
 
     async fn observe(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<Vec<UnitObservation>> {
@@ -808,13 +873,12 @@ impl InfraHost for ProcessUnits {
         };
         let _changing = self.changing.lock().await;
         let all = load(&self.cfg.dir)?;
-        let held = all
-            .iter()
-            .find(|h| h.is(&node.node, unit))
-            .ok_or_else(|| anyhow::anyhow!("unit '{unit}' of '{}' has not started yet", node.node.node))?;
-        let number = held
+        if !all.iter().any(|h| h.is(&node.node, unit)) {
+            anyhow::bail!("unit '{unit}' of '{}' has not started yet", node.node.node);
+        }
+        let number = self
             .ports
-            .get(port)
+            .kept(&node.node, unit, &UnitPort::Process(port.clone()))?
             .ok_or_else(|| anyhow::anyhow!("unit '{unit}' of '{}' holds no port '{port}'; start its infra again", node.node.node))?;
         // The process is on the machine: weft's runtime and the project's
         // workers reach it on loopback, and so does the install's network,
@@ -1047,12 +1111,19 @@ pub(crate) mod tests {
             self.dir.path().join("bin").display().to_string()
         }
 
+        /// The install's kept ports, on the rig's folder, picked by the
+        /// fake machine.
+        fn ports(&self) -> Arc<KeptPorts> {
+            Arc::new(KeptPorts::new(self.dir.path().to_path_buf(), self.processes.clone()))
+        }
+
         /// One life of the runtime's host, on the rig's folder.
         fn host(&self) -> ProcessUnits {
             ProcessUnits::new(
                 self.processes.clone(),
                 self.needs.clone(),
                 self.clock.clone(),
+                self.ports(),
                 ProcessUnitsConfig {
                     dir: self.dir.path().join("infra-processes"),
                     agent_program: "/opt/weft/weft-runtime".into(),
@@ -1062,6 +1133,7 @@ pub(crate) mod tests {
                     needs_root: self.dir.path().join("needs"),
                 },
             )
+            .unwrap()
         }
 
         fn unit_dir(&self) -> PathBuf {
@@ -1164,6 +1236,70 @@ pub(crate) mod tests {
         let again = &rig.processes.spawns()[1];
         assert_eq!(again.env["PORT"], port.to_string());
         assert_eq!(std::fs::read_to_string(unit.join("work/server.py")).unwrap(), "serve(2)\n");
+    }
+
+    /// A removed unit lets go of its port, and so does a terminated copy:
+    /// started again, it is given a port the install picks anew.
+    #[tokio::test]
+    async fn a_removed_or_terminated_unit_lets_go_of_its_port() {
+        let rig = Rig::new(Behaviour::Runs);
+        let host = rig.host();
+        let node = node("serve()\n", "/health");
+        let http = UnitPort::Process("http".into());
+        for gone in ["remove", "terminate"] {
+            host.apply_unit(&node, "server").await.unwrap();
+            assert!(rig.ports().kept(&copy(), "server", &http).unwrap().is_some());
+            match gone {
+                "remove" => host.remove_unit(&copy(), "server").await.unwrap(),
+                _ => host.terminate(&copy(), &[]).await.unwrap(),
+            }
+            assert_eq!(rig.ports().kept(&copy(), "server", &http).unwrap(), None, "{gone}");
+        }
+    }
+
+    /// A kept port another program holds on loopback fails the start before
+    /// anything is spawned, naming the port, the unit's port and the infra,
+    /// and what to do, kept on the unit for every look to say; the port
+    /// stays kept, and once it is free the next apply starts on it.
+    #[tokio::test]
+    async fn a_kept_port_taken_by_another_program_fails_the_start_saying_so() {
+        let rig = Rig::new(Behaviour::Runs);
+        let host = rig.host();
+        let node = node("serve()\n", "/health");
+        let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let taken = other.local_addr().unwrap().port();
+        let http = UnitPort::Process("http".into());
+        host.ports.carry(&copy(), "server", [(http.clone(), taken)]).unwrap();
+        let err = format!("{:#}", host.apply_unit(&node, "server").await.unwrap_err());
+        assert!(err.contains(&format!("port {taken} of this machine")) && err.contains("its port 'http'") && err.contains("of 'agent'"), "{err}");
+        assert!(err.contains(&format!("lsof -i :{taken}")) && err.contains("weft infra terminate"), "{err}");
+        assert!(rig.processes.spawns().is_empty(), "nothing started");
+        assert_eq!(look(&host).await[0].state, UnitRunState::Failed { why: err });
+        assert_eq!(rig.ports().kept(&copy(), "server", &http).unwrap(), Some(taken), "kept, never swapped");
+
+        drop(other);
+        host.apply_unit(&node, "server").await.unwrap();
+        assert_eq!(rig.processes.spawns()[0].env["PORT"], taken.to_string());
+    }
+
+    /// A registry an older weft wrote, which kept each unit's ports on the
+    /// unit, is read by this one with its ports carried into the install's
+    /// kept ports, at the same numbers.
+    #[tokio::test]
+    async fn an_old_registry_carries_its_units_ports() {
+        let rig = Rig::new(Behaviour::Runs);
+        let node = node("serve()\n", "/health");
+        rig.host().apply_unit(&node, "server").await.unwrap();
+        let path = rig.dir.path().join("infra-processes").join(REGISTRY);
+        let mut old: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        old[0]["ports"] = serde_json::json!({ "http": 15123 });
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        std::fs::remove_file(weft_core::ports::KeptInfraPort::path(rig.dir.path())).unwrap();
+
+        let host = rig.host();
+        assert_eq!(load(&host.cfg.dir).unwrap().len(), 1, "read as this weft's registry");
+        let at = host.endpoint(&node, "api").await.unwrap();
+        assert_eq!(at.url, "http://127.0.0.1:15123");
     }
 
     /// A need weft installs itself is never refused at the apply, even
@@ -1588,9 +1724,9 @@ pub(crate) mod tests {
         // The check goes to a port the test answers itself, so the test
         // knows when it is in flight.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut all = load(&host.cfg.dir).unwrap();
-        all[0].ports.insert("http".into(), listener.local_addr().unwrap().port());
-        host.save(&all).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        host.ports.carry(&copy(), "server", [(UnitPort::Process("http".into()), port)]).unwrap();
+        rig.processes.stand_in_on(port);
         let running = || {
             let pid = *rig.processes.pids().last().unwrap();
             rig.agent_state(&ProcessAgentState { running: Some(ProcessRun { pid: pid + 1, started_at_unix: rig.clock.now_unix() }), ..Default::default() });

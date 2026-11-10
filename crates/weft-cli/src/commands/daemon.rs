@@ -794,18 +794,16 @@ async fn ensure_postgres(install: &Install, port: u16) -> Result<()> {
     let published = PortUse::of(install, ([127, 0, 0, 1], port).into(), "its database", "WEFT_POSTGRES_PORT");
     ensure_container(&name, &args, &install.dir, Some(published)).await?;
     // Ready before the runtime connects: it applies the schema at boot.
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    loop {
-        let ready = images::docker().args(["exec", &name, "pg_isready", "-U", PG_USER, "-d", PG_DB]).output().await?;
-        if ready.status.success() {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "Postgres did not become ready; its log: docker logs {name}"
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    let container = name.as_str();
+    wait_until(
+        move || async move {
+            Ok(images::docker().args(["exec", container, "pg_isready", "-U", PG_USER, "-d", PG_DB]).output().await?.status.success())
+        },
+        Duration::from_secs(120),
+        Duration::from_secs(1),
+        format!("Postgres did not become ready; its log: docker logs {name}"),
+    )
+    .await
 }
 
 /// Whether the host can reach the Postgres container through a socket in
@@ -1650,7 +1648,8 @@ async fn start_runtime(install: &Install) -> Result<()> {
             let label = launchd_label(install);
             std::fs::write(&plist, launchd_plist(&label, &line, &install.log_path().display().to_string()))?;
             // Booted out already: the start stops the runtime before it
-            // gets here (`stop_runtime`), and says so when it could not.
+            // gets here (`stop_runtime`, which waits until launchd has let
+            // go of the job), and says so when it could not.
             let domain = format!("gui/{}", current_uid().await?);
             run_checked(Command::new("launchctl").args(["bootstrap", &domain, &plist.display().to_string()]), "launchctl bootstrap").await
         }
@@ -1675,6 +1674,27 @@ async fn current_uid() -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// How long a stopped runtime gets to be gone, and how often that is asked.
+/// Bounded: a runtime still there after a minute is stuck, and saying so
+/// beats waiting forever.
+const STOP_WITHIN: Duration = Duration::from_secs(60);
+const STOP_EVERY: Duration = Duration::from_millis(200);
+
+/// Ask `done` every `every` until it says yes; once `within` has passed and
+/// it still says no, fail with `stuck`, which names what to do by hand.
+async fn wait_until<F, Fut>(mut done: F, within: Duration, every: Duration, stuck: String) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    let deadline = std::time::Instant::now() + within;
+    while !done().await? {
+        anyhow::ensure!(std::time::Instant::now() < deadline, "{stuck}");
+        tokio::time::sleep(every).await;
+    }
+    Ok(())
+}
+
 /// Stop the runtime a detached start left, named by its pid file. The pid
 /// is only signalled while it still runs this install's runtime: a pid
 /// file outlives a reboot or a crash, and by then the number may belong to
@@ -1682,20 +1702,20 @@ async fn current_uid() -> Result<String> {
 async fn stop_detached(install: &Install) -> Result<()> {
     let path = pid_path(install);
     let Ok(pid) = std::fs::read_to_string(&path) else { return Ok(()) };
-    let pid = pid.trim().to_string();
-    if runs_this_runtime(install, &pid).await? {
-        run_checked(Command::new("kill").arg(&pid), &format!("kill weft's runtime (pid {pid})")).await?;
-        // Gone before anything starts again on its ports. Bounded: a
-        // runtime that ignores the signal this long is stuck, and saying
-        // so beats waiting forever.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        while runs_this_runtime(install, &pid).await? {
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "weft's runtime (pid {pid}) did not stop within a minute of being asked to; `kill -9 {pid}` ends it"
-            );
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+    let pid = pid.trim();
+    if runs_this_runtime(install, pid).await? {
+        run_checked(Command::new("kill").arg(pid), &format!("kill weft's runtime (pid {pid})")).await?;
+        // Gone before anything starts again on its ports.
+        wait_until(
+            move || async move { Ok(!runs_this_runtime(install, pid).await?) },
+            STOP_WITHIN,
+            STOP_EVERY,
+            format!(
+                "weft's runtime (pid {pid}) did not stop within {}s of being asked to; `kill -9 {pid}` ends it",
+                STOP_WITHIN.as_secs()
+            ),
+        )
+        .await?;
     }
     std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
     Ok(())
@@ -1737,30 +1757,54 @@ async fn stop_runtime(install: &Install) -> Result<()> {
             // A service that was not loaded is already stopped; one still
             // loaded after a failed bootout is not.
             if !out.status.success() {
-                let loaded = Command::new("launchctl").args(["print", &target]).output().await?.status.success();
-                anyhow::ensure!(!loaded, "{}", failed(&format!("launchctl bootout {target}"), &out));
+                anyhow::ensure!(!launchd_loaded(&target).await?, "{}", failed(&format!("launchctl bootout {target}"), &out));
             }
+            // `bootout` can return while launchd is still tearing the job
+            // down, and a `bootstrap` of the same label before it is gone
+            // fails with "5: Input/output error".
+            let target = target.as_str();
+            wait_until(
+                move || async move { Ok(!launchd_loaded(target).await?) },
+                STOP_WITHIN,
+                STOP_EVERY,
+                launchd_never_let_go(target),
+            )
+            .await?;
         }
         Manager::Detached => stop_detached(install).await?,
     }
     Ok(())
 }
 
+/// Whether launchd still has the service `target` (`gui/<uid>/<label>`)
+/// loaded: `launchctl print` exits non-zero for one it does not know.
+async fn launchd_loaded(target: &str) -> Result<bool> {
+    Ok(Command::new("launchctl").args(["print", target]).output().await.context("run launchctl print")?.status.success())
+}
+
+/// What a stop says (on its own, or before a start or a removal) when
+/// launchd still holds `target` once [`STOP_WITHIN`] has passed after its
+/// bootout.
+fn launchd_never_let_go(target: &str) -> String {
+    format!(
+        "launchd still had {target} loaded {}s after `launchctl bootout` returned; \
+         run `launchctl bootout {target}` by hand, then run this command again",
+        STOP_WITHIN.as_secs()
+    )
+}
+
 /// Wait until the runtime answers, naming its log when it does not.
 async fn wait_for_runtime(install: &Install, public: u16) -> Result<()> {
-    let client = weft_core::net::http_client().timeout(Duration::from_secs(3)).build()?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(180);
-    loop {
-        if client.get(format!("http://127.0.0.1:{public}/health")).send().await.is_ok_and(|r| r.status().is_success()) {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "weft's runtime did not answer on 127.0.0.1:{public}; its log: {}",
-            install.log_path().display()
-        );
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let client = &weft_core::net::http_client().timeout(Duration::from_secs(3)).build()?;
+    wait_until(
+        move || async move {
+            Ok(client.get(format!("http://127.0.0.1:{public}/health")).send().await.is_ok_and(|r| r.status().is_success()))
+        },
+        Duration::from_secs(180),
+        Duration::from_millis(500),
+        format!("weft's runtime did not answer on 127.0.0.1:{public}; its log: {}", install.log_path().display()),
+    )
+    .await
 }
 
 // ----- an older weft on this machine ------------------------------------
@@ -2094,6 +2138,53 @@ fn which(ctx: &Ctx, wanted: &Wanted) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Asks `wait_until` with a probe that says done on its `gone_on`th
+    /// answer (never when `None`), and returns what it gave and how many
+    /// times it asked.
+    async fn wait_with_gone_on(gone_on: Option<usize>) -> (Result<()>, usize) {
+        let mut asked = 0;
+        let waited = wait_until(
+            || {
+                asked += 1;
+                let done = gone_on.is_some_and(|n| asked >= n);
+                async move { Ok(done) }
+            },
+            Duration::from_millis(30),
+            Duration::from_millis(1),
+            launchd_never_let_go("gui/501/ai.weavemind.weft"),
+        )
+        .await;
+        (waited, asked)
+    }
+
+    /// A job already gone is asked about once, and nothing is waited for.
+    #[tokio::test]
+    async fn a_job_already_gone_is_not_waited_for() {
+        let (waited, asked) = wait_with_gone_on(Some(1)).await;
+        waited.unwrap();
+        assert_eq!(asked, 1);
+    }
+
+    /// A job launchd lets go of a few answers later is waited for, and the
+    /// wait ends on the first answer that says it is gone.
+    #[tokio::test]
+    async fn a_job_gone_after_a_few_answers_is_waited_for() {
+        let (waited, asked) = wait_with_gone_on(Some(4)).await;
+        waited.unwrap();
+        assert_eq!(asked, 4);
+    }
+
+    /// A job never let go of fails once the deadline passes, naming the
+    /// label and the command that boots it out by hand.
+    #[tokio::test]
+    async fn a_job_never_let_go_of_fails_naming_the_hand_command() {
+        let (waited, asked) = wait_with_gone_on(None).await;
+        let error = waited.unwrap_err().to_string();
+        assert!(asked > 1, "asked {asked} times");
+        assert!(error.contains("ai.weavemind.weft"), "{error}");
+        assert!(error.contains("`launchctl bootout gui/501/ai.weavemind.weft`"), "{error}");
+    }
 
     /// The job's command line and log path reach launchd as written, with
     /// every character XML gives a meaning escaped.

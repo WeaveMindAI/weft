@@ -1546,7 +1546,7 @@ pub fn check_instance_values(
             .iter()
             .any(|i| i.name == input.field && matches!(i.widget, Some(crate::node::Widget::Access { .. })));
         let connection = if is_connection {
-            let Some(service) = node.instance_service.as_ref().map(|spec| spec.service.clone()) else {
+            let Some(service) = node.connection_service.as_ref().map(|spec| spec.service.clone()) else {
                 refusal.errors.push(format!("'{}.{}' is a connection field with no service recipe", input.node, input.field));
                 continue;
             };

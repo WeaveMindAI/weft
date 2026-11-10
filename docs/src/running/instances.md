@@ -89,7 +89,7 @@ A field holds one of four things:
 | a value (`"0 0 3 * * *"`, a picked connection) | that value, for everyone |
 | nothing | the node's default; if it has none, nothing when the field is optional, and a refused run when it is required |
 | `@instance_filled` | the instance's value; if none was given, the field acts as if nothing were written (the row above) |
-| `@instance_filled(<value>)` | the instance's value; an instance with none gets `<value>`, even when the node has a default of its own |
+| `@instance_filled(<value>)` | the instance's value; an instance with none gets `<value>`, even when the node has a default of its own (with `null`, see [a field an instance may leave empty](#a-field-an-instance-may-leave-empty)) |
 | `@instance_filled(@file("prompts/default.md"))` | the same, with the file's content as the value an instance with none gets (`@asset(...)` works too) |
 
 On a connection field (`account` above), what you write decides whose key pays
@@ -116,6 +116,37 @@ a loop's or an included file's own port is refused too
 (`instance-filled-boundary`); put the mark on the node inside that reads the
 value. A key that is not one of the node's inputs cannot take the mark either
 (`instance-filled-not-an-input`).
+
+### A field an instance may leave empty
+
+If some instances will never fill a field, give it `null` as the value an
+instance with none gets:
+
+```weft
+google = GoogleAccess { account: @instance_filled(null) }
+read = GoogleSheetsRead {
+  account: google.access
+  spreadsheet: @instance_filled(null)
+}
+```
+
+An instance that leaves such a field empty can still run the program. The node
+gets a `null` there, and then its own inputs decide, the same way they decide on
+a wire that closed:
+
+- if the node needs the field (it is required, like `spreadsheet` above or an
+  access node's connection), the node skips, with a reason like `not filled:
+  this instance left 'spreadsheet' empty` (or, for a connection, `not
+  connected: this instance has no google connection for 'account'`). A node
+  behind it that requires its output skips too, and one that takes it as
+  optional runs without it;
+- if the node takes the field as optional, it runs and reads the `null`.
+
+Written `@instance_filled` alone, a field the node needs and the instance left
+empty refuses the run before it starts, naming the field.
+
+A route checking its callers against the instance's connection cannot take
+`@instance_filled(null)`, because with no connection it would check nobody.
 
 You do not mark the other nodes: a node that reads an instance's value or copy,
 directly or through nodes before it, runs per instance too. Above, `read` needs
@@ -199,7 +230,8 @@ there is never for an instance, and weft refuses an instance header sent there.
 weft refuses a run before it starts, and says why, when:
 
 - it reaches something per instance and is for no instance;
-- it reaches a field the node needs and the instance has not filled;
+- it reaches a field the node needs and the instance has not filled, unless
+  the program [lets it stay empty](#a-field-an-instance-may-leave-empty);
 - it reaches a value the instance has that the node's rules refuse;
 - it reads an instance's copy that is not running.
 
@@ -337,7 +369,7 @@ If you want to show it to your customers, there are two places:
 
 - the browser extension's **Your settings** page, for somebody who has added
   an instance token to the extension;
-- the `InstanceSettings` component, for your own website. `weft connect-lib`
+- the `DoorSettings` component, for your own website. `weft connect-lib`
   copies the library into your frontend (`front/src/lib/weft-connect` unless
   `--into` names another folder); for how to mount it, go and read the README
   it copies along.

@@ -20,7 +20,10 @@
 //! optional wired input that may close empty) is left undecided, recorded
 //! on the node ([`Recheck`], folded down to the questions about values),
 //! and asked again by the same evaluator before the node's body runs,
-//! with the values that arrived ([`recheck`]).
+//! with the values that arrived ([`recheck`]). A field written
+//! `@instance_filled(null)` reads the same way: an instance may leave it
+//! empty without its run being refused, so even whether it is set is
+//! known only when the node fires.
 //!
 //! Every condition answers yes, no or not yet known, and the combinators
 //! fold those answers: one no settles an `all` and one yes an `any`;
@@ -275,11 +278,13 @@ enum Written<'a> {
     /// only by the worker that runs it (the compile ruled on the content
     /// itself before naming it).
     Unknown,
-    /// Fed by a wire: what arrives is known only when the node fires.
-    /// `may_be_absent` when the node can run with nothing there (an
-    /// optional input whose wire closed empty, or a blank text where a
-    /// blank is no value), so even whether it is set is unknown.
-    Wired { may_be_absent: bool },
+    /// Known only when the node fires: fed by a wire, or an instance's
+    /// value the instance may leave empty (`@instance_filled(null)`).
+    /// `may_be_absent` when the node can fire with nothing there (an
+    /// optional input whose wire closed empty, a blank text where a blank
+    /// is no value, an instance's value left empty), so even whether it is
+    /// set is unknown.
+    Arrives { may_be_absent: bool },
 }
 
 /// The values that arrived at one firing, as the run-time recheck reads
@@ -322,11 +327,12 @@ fn written<'a>(node: &'a NodeDefinition, field: &str, at: &Reading<'a>) -> Writt
     };
     // A wire is authoritative over a written value (`ready::fill_input_from_literals`).
     if has_incoming_edge(node, &cx.graph, field) {
-        return Written::Wired { may_be_absent: wired_may_arrive_empty(node, field) };
+        return Written::Arrives { may_be_absent: wired_may_arrive_empty(node, field) };
     }
     match node.written_value(field) {
         Some(value) if crate::picks::is_install_picked(value) || crate::content::ContentRef::from_value(value).is_some() => Written::Unknown,
         Some(value) => match crate::instance::as_instance_filled(value) {
+            Some(filled) if filled.may_stay_empty => Written::Arrives { may_be_absent: true },
             Some(filled) => match filled.fallback {
                 Some(fallback) => Written::Known(as_given(node, field, fallback)),
                 None => Written::Unknown,
@@ -580,17 +586,18 @@ fn answer(cond: &Condition, node: &NodeDefinition, at: &Reading) -> Option<bool>
         Condition::Value { field, checks } => match written(node, field, at) {
             Written::Known(value) => Some(value_holds(checks, value)),
             Written::Unknown => (!checks.reads_content()).then_some(true),
-            Written::Wired { may_be_absent } => (checks.is_empty() && !may_be_absent).then_some(true),
+            Written::Arrives { may_be_absent } => (checks.is_empty() && !may_be_absent).then_some(true),
         },
         Condition::InputNames { port, names } => match written(node, port, at) {
             Written::Known(value) => Some(misnamed(value, at.project(), *names).is_empty()),
-            Written::Unknown | Written::Wired { .. } => None,
+            Written::Unknown | Written::Arrives { .. } => None,
         },
         Condition::InputSatisfied { port } => match at {
             Reading::Arrived { values, .. } => Some(values.value(port).is_some_and(|v| !v.is_null())),
             Reading::Program { cx, .. } if has_incoming_edge(node, &cx.graph, port) => {
                 (!wired_may_arrive_empty(node, port)).then_some(true)
             }
+            Reading::Program { .. } if crate::instance::may_stay_empty(node, port) => None,
             Reading::Program { .. } => Some(literal_fills(node, port)),
         },
         // The install the program was compiled for, read off the program

@@ -1066,7 +1066,7 @@ pub async fn claim(db: &impl Client, run_id: RunId, project_id: uuid::Uuid, owne
 /// of them decoded stays small next to what a reader keeps.
 pub const PAGE_ROWS: i64 = 512;
 
-/// The most stored bytes one page of a record holds ([`read_page`]). One
+/// The most bytes one page of a record carries ([`read_page`]). One
 /// row is one write, which can weigh as much as a whole batch of a
 /// worker's writes (`weft_broker_client::protocol::JOURNAL_RECORD_BODY_LIMIT`),
 /// so a page is cut by weight as well as by count; a single row heavier
@@ -1104,14 +1104,16 @@ pub async fn read_first_row(db: &impl Client, run_id: RunId) -> anyhow::Result<O
 /// At most `rows` rows of `run_id`'s record after `after`, cut at
 /// [`PAGE_BYTES`] ([`read_page`]).
 async fn read_rows_after(db: &impl Client, run_id: RunId, after: Option<i32>, rows: i64) -> anyhow::Result<RawRecord> {
-    // The weight is the row's stored size (`pg_column_size`, read
-    // without fetching the value): the events are compressed already, so
-    // it is what the row costs to carry.
+    // The weight is what the row carries (`octet_length`, which Postgres
+    // knows without unpacking the value), counted the way
+    // `weft_task_store::pages` counts every other page. It stays one query
+    // rather than going through that pager's measure-then-fetch, because
+    // a worker reads a run's record this way each time it picks the run up.
     let rows: Vec<(i32, Vec<u8>, weft_core::stored::Version)> = db
         .all(
             "SELECT seq, events, events_version FROM ( \
                  SELECT seq, events, events_version, \
-                        sum(pg_column_size(events)) OVER (ORDER BY seq) - pg_column_size(events) AS before \
+                        sum(octet_length(events)) OVER (ORDER BY seq) - octet_length(events) AS before \
                  FROM (SELECT seq, events, events_version FROM run_log \
                        WHERE run_id = $1 AND seq > $2 ORDER BY seq LIMIT $3) next \
              ) page WHERE before < $4 ORDER BY seq",
