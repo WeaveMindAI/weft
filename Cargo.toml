@@ -81,7 +81,7 @@ repository = "https://github.com/WeaveMindAI/weft"
 # `rsa` crate (an advisory with no fix), aws-lc-rs compiles a C library
 # into the build. `weft_core::jwt` hands it ring instead, and is the only
 # crate that names it.
-jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "12", default-features = false, features = ["use_pem"] }
 # The crypto every TLS client here already runs on, used directly where a
 # library takes its crypto from its caller (`weft_core::jwt`).
 ring = "0.17"
