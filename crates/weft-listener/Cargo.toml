@@ -25,7 +25,7 @@ inventory = { workspace = true }
 libc = "0.2"
 # The folder watch kind hears a folder through the operating system's
 # change events (inotify on Linux).
-notify = "8"
+notify = "9"
 futures-util = "0.3"
 regex = { workspace = true }
 # The KindHandler trait spawns async (a fresh registration may make

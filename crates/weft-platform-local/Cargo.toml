@@ -33,7 +33,7 @@ tracing = { workspace = true }
 # One pass of a folder's sync (`folders`), and the walk it watches by.
 weft-assets = { workspace = true }
 # A folder's change events (`folders`).
-notify = "8"
+notify = "9"
 hex = "0.4"
 # Signals to worker processes (`processes`).
 libc = "0.2"
