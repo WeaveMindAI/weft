@@ -42,7 +42,7 @@ num-integer = { version = "0.1", features = ["i128"] }
 num-traits = { version = "0.2", default-features = false, features = ["i128", "std"] }
 once_cell = { version = "1" }
 p256 = { version = "0.14", features = ["ecdh"] }
-phf_shared = { version = "0.11", default-features = false, features = ["std"] }
+phf_shared = { version = "0.13", default-features = false, features = ["std"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
@@ -98,7 +98,7 @@ num-integer = { version = "0.1", features = ["i128"] }
 num-traits = { version = "0.2", default-features = false, features = ["i128", "std"] }
 once_cell = { version = "1" }
 p256 = { version = "0.14", features = ["ecdh"] }
-phf_shared = { version = "0.11", default-features = false, features = ["std"] }
+phf_shared = { version = "0.13", default-features = false, features = ["std"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
@@ -133,7 +133,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 miniz_oxide = { version = "0.9", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["fs", "termios"] }
-spin = { version = "0.10" }
+spin = { version = "0.12" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
@@ -144,7 +144,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 miniz_oxide = { version = "0.9", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["fs", "termios"] }
-spin = { version = "0.10" }
+spin = { version = "0.12" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
@@ -155,7 +155,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 miniz_oxide = { version = "0.9", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["fs", "termios"] }
-spin = { version = "0.10" }
+spin = { version = "0.12" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
@@ -166,7 +166,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 miniz_oxide = { version = "0.9", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["fs", "termios"] }
-spin = { version = "0.10" }
+spin = { version = "0.12" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
@@ -179,7 +179,7 @@ miniz_oxide = { version = "0.9", features = ["simd"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFDate", "CFDictionary", "CFError", "CFRunLoop", "CFString", "CFURL", "CFUUID", "std"] }
 rustix = { version = "1", features = ["fs", "termios"] }
 security-framework-sys = { version = "2" }
-spin = { version = "0.10" }
+spin = { version = "0.12" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
@@ -192,7 +192,7 @@ miniz_oxide = { version = "0.9", features = ["simd"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFDate", "CFDictionary", "CFError", "CFRunLoop", "CFString", "CFURL", "CFUUID", "std"] }
 rustix = { version = "1", features = ["fs", "termios"] }
 security-framework-sys = { version = "2" }
-spin = { version = "0.10" }
+spin = { version = "0.12" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
@@ -205,7 +205,7 @@ miniz_oxide = { version = "0.9", features = ["simd"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFDate", "CFDictionary", "CFError", "CFRunLoop", "CFString", "CFURL", "CFUUID", "std"] }
 rustix = { version = "1", features = ["fs", "termios"] }
 security-framework-sys = { version = "2" }
-spin = { version = "0.10" }
+spin = { version = "0.12" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
@@ -218,7 +218,7 @@ miniz_oxide = { version = "0.9", features = ["simd"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFDate", "CFDictionary", "CFError", "CFRunLoop", "CFString", "CFURL", "CFUUID", "std"] }
 rustix = { version = "1", features = ["fs", "termios"] }
 security-framework-sys = { version = "2" }
-spin = { version = "0.10" }
+spin = { version = "0.12" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
