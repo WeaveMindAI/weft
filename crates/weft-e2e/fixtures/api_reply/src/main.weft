@@ -17,7 +17,7 @@
 
 type Signup = { email: String, age?: Number }
 
-hello = Route -> (body: { name: String, .. }) { path: "__E2E_PATH__/hello", method: "POST" }
+hello = Route -> (body: { name: String, .. }) { path: "__E2E_PATH__/hello", method: "POST", auth: "none" }
 greet = ExecPython(name: String, path: String, headers: Dict[String, String]) -> (body: JsonDict) {
   code: "return {'body': {'greeting': 'hello ' + name, 'path': path, 'agent': headers.get('user-agent', '')}}"
 }
@@ -27,7 +27,7 @@ greet.headers = hello.headers
 answer = Reply { status: 201, headers: { "x-run": "e2e" } }
 answer.body = greet.body
 
-user = Route -> (id: String) { path: "__E2E_PATH__/users/{id}", method: "GET" }
+user = Route -> (id: String) { path: "__E2E_PATH__/users/{id}", method: "GET", auth: "none" }
 lookup = ExecPython(id: String, query: Dict[String, String]) -> (body: JsonDict, status: Number) {
   code: "uid = id\nif uid == '42':\n    return {'body': {'id': uid, 'name': 'Ada', 'verbose': query.get('verbose')}, 'status': 200}\nreturn {'body': {'error': 'no user ' + uid}, 'status': 404}"
 }
@@ -37,13 +37,13 @@ found = Reply
 found.body = lookup.body
 found.status = lookup.status
 
-say = Route -> (body: String) { path: "__E2E_PATH__/say", method: "POST", dataType: "text" }
+say = Route -> (body: String) { path: "__E2E_PATH__/say", method: "POST", dataType: "text", auth: "none" }
 shout = ExecPython(line: String) -> (out: String) { code: "return {'out': line.upper()}" }
 shout.line = say.body
 loud = Reply
 loud.body = shout.out
 
-gone = Route { path: "__E2E_PATH__/gone", method: "DELETE" }
+gone = Route { path: "__E2E_PATH__/gone", method: "DELETE", auth: "none" }
 when_gone = ExecPython(method: String) -> (ok: Boolean) { code: "return {'ok': method == 'DELETE'}" }
 when_gone.method = gone.method
 bye = Close { status: 204 }
@@ -52,7 +52,7 @@ bye._should_flow = when_gone.ok
 # The pattern the skills teach for "do this, and if it did not work, stop
 # here": a Switch on the outcome, the passing case gating the Reply and the
 # failing case gating a Close whose `reason` is the body under its `status`.
-sweep = Route -> (what: String) { path: "__E2E_PATH__/sweep/{what}", method: "DELETE" }
+sweep = Route -> (what: String) { path: "__E2E_PATH__/sweep/{what}", method: "DELETE", auth: "none" }
 clear = ExecPython(what: String) -> (removed: Number) {
   code: "return {'removed': 3 if what == 'cards' else 0}"
 }
@@ -74,7 +74,7 @@ nothing._should_flow = outcome.none
 # caching header is the whole point of answering one. Before Close
 # took headers, this had to be a Reply with an empty body, or the
 # client had to reuse the tag it stored.
-fresh = Route { path: "__E2E_PATH__/cached", method: "GET" }
+fresh = Route { path: "__E2E_PATH__/cached", method: "GET", auth: "none" }
 tag = ExecPython(method: String) -> (head: Dict[String, String]) {
   code: "return {'head': {'etag': 'v1', 'cache-control': 'max-age=60'}}"
 }
@@ -82,18 +82,18 @@ tag.method = fresh.method
 unchanged = Close { status: 304 }
 unchanged.headers = tag.head
 
-slow = Route { path: "__E2E_PATH__/slow", method: "GET" }
+slow = Route { path: "__E2E_PATH__/slow", method: "GET", auth: "none" }
 nap = ExecPython(path: String) -> (body: JsonDict) { code: "import time\ntime.sleep(4)\nreturn {'body': {'slept': True}}" }
 nap.path = slow.path
 rested = Reply
 rested.body = nap.body
 
-note = Route -> (body: { title?: String, note?: String }) { path: "__E2E_PATH__/note", method: "POST" }
+note = Route -> (body: { title?: String, note?: String }) { path: "__E2E_PATH__/note", method: "POST", auth: "none" }
 echo = JsonObject { title?: note.body.title, note?: note.body.note }
 echo._should_flow = note.fired
 noted = Reply
 noted.body = echo.object
 
-signup = Route -> (body: Signup) { path: "__E2E_PATH__/signup", method: "POST" }
+signup = Route -> (body: Signup) { path: "__E2E_PATH__/signup", method: "POST", auth: "none" }
 welcome = Reply
 welcome.body = signup.body

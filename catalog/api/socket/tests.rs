@@ -30,7 +30,7 @@ fn request() -> LiveRequest {
 }
 
 async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
-    rig.run_setup_trigger(&SocketNode, json!({ "path": "chat/{room}" })).await.ok()?;
+    rig.run_setup_trigger(&SocketNode, json!({ "path": "chat/{room}", "auth": "none" })).await.ok()?;
     let registered = rig.registered_signals();
     assert_eq!(registered.len(), 1);
     let spec = serde_json::to_value(&registered[0].0).expect("spec serializes");
@@ -42,20 +42,20 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
 
     rig.run_setup_trigger(
         &SocketNode,
-        json!({ "path": "frames", "whenChunkFails": "drop_chunk", "whenCallerIsSlow": "drop_newest" }),
+        json!({ "path": "frames", "whenChunkFails": "drop_chunk", "whenCallerIsSlow": "drop_newest", "auth": "none" }),
     )
     .await
     .ok()?;
     let spec = serde_json::to_value(&rig.registered_signals().last().expect("a second socket").0).expect("spec serializes");
     assert_eq!(spec["config"]["error_mode"], "drop_chunk");
     assert_eq!(spec["config"]["backpressure"], "drop_newest");
-    let err = rig.run_setup_trigger(&SocketNode, json!({ "path": "frames", "whenCallerIsSlow": "skip" })).await.failure()?;
+    let err = rig.run_setup_trigger(&SocketNode, json!({ "path": "frames", "whenCallerIsSlow": "skip", "auth": "none" })).await.failure()?;
     assert!(err.contains("'skip'") && err.contains("drop_oldest"), "a word outside the set is refused, naming the set: {err}");
 
-    rig.run_setup_trigger(&SocketNode, json!({ "path": "frames", "journalWindowMs": 5000 })).await.ok()?;
+    rig.run_setup_trigger(&SocketNode, json!({ "path": "frames", "journalWindowMs": 5000, "auth": "none" })).await.ok()?;
     let spec = serde_json::to_value(&rig.registered_signals().last().expect("a slow-window socket").0).expect("spec serializes");
     assert_eq!(spec["config"]["journal_window_ms"], 5000, "the window reaches the socket");
-    let err = rig.run_setup_trigger(&SocketNode, json!({ "path": "frames", "journalWindowMs": 20 })).await.failure()?;
+    let err = rig.run_setup_trigger(&SocketNode, json!({ "path": "frames", "journalWindowMs": 20, "auth": "none" })).await.failure()?;
     assert!(err.contains("journalWindowMs"), "a window under the floor is refused, naming the setting: {err}");
     Ok(())
 }

@@ -13,8 +13,8 @@
 //! One is the install's own, kept among its secrets
 //! (`weft_core::signal_token::INSTALL_KEY_SECRET`) and checked against its
 //! hash, never stored: retired by rotating the secret. Every other is a row
-//! of the signal-token table with kind `operator` (`weft token mint
-//! --operator`, `weft target export`), looked up by its hash on every
+//! of the signal-token table with kind `operator` (`weft token
+//! mint-operator`, `weft target export`), looked up by its hash on every
 //! request, so a revoked key stops working on the next request on every
 //! replica. A local install is no exception: being on loopback keeps the
 //! internet out, never a web page the person has open (its browser reaches

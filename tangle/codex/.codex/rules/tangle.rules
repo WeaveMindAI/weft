@@ -88,6 +88,14 @@ prefix_rule(
         "weft instance-values --instance alice",
     ],
 )
+# An admin key for the whole install: always the user's call. The
+# strictest matching rule wins, so this holds over the allow above.
+prefix_rule(
+    pattern = ["weft", "token", "mint-operator"],
+    decision = "prompt",
+    justification = "an operator key administers the whole install",
+    match = ["weft token mint-operator --name ci"],
+)
 prefix_rule(
     pattern = ["weft", "files", ["ls", "inspect"]],
     decision = "allow",

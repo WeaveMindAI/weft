@@ -114,7 +114,7 @@ fn source() -> String {
         let template = format!("{} {{{{p}}}} {}", text(i + 1000, 200), text(i + 2000, 100));
         let code = format!("return {{'out': x + ' {}'}}", text(i + 3000, 250));
         source.push_str(&format!(
-            "r{i} = Route {{ path: \"t{i}/items\", method: \"POST\" }}\n\
+            "r{i} = Route {{ path: \"t{i}/items\", method: \"POST\", auth: \"none\" }}\n\
              q{i} = PostgresExecuteQuery(tenant: String) {{ query: \"{query}\", tenant: r{i}.path }}\n\
              q{i}.account = pg.access\n\
              f{i} = Format(p: String) {{ template: \"{template}\", p: r{i}.path }}\n\

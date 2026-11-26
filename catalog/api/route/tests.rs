@@ -683,7 +683,7 @@ async fn null_body(rig: FakeRig) -> WeftResult<()> {
 async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
     rig.run_setup_trigger(
         &RouteNode,
-        json!({ "path": "chat/{room}", "method": "post", "dataType": "text", "outlivesCaller": true }),
+        json!({ "path": "chat/{room}", "method": "post", "dataType": "text", "outlivesCaller": true, "auth": "none" }),
     )
     .await
     .ok()?;
@@ -701,7 +701,7 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(spec["config"]["journal_mode"], "journaled", "a route that says nothing is written down");
     assert_eq!(spec["config"]["journal_window_ms"], 1000, "on the window every channel starts from");
 
-    rig.run_setup_trigger(&RouteNode, json!({ "path": "quiet", "journalEphemeral": true, "journalWindowMs": 250 }))
+    rig.run_setup_trigger(&RouteNode, json!({ "path": "quiet", "journalEphemeral": true, "journalWindowMs": 250, "auth": "none" }))
         .await
         .ok()?;
     let spec = serde_json::to_value(&rig.registered_signals().last().expect("a quiet route").0).expect("spec serializes");
@@ -710,7 +710,7 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
 
     rig.run_setup_trigger(
         &RouteNode,
-        json!({ "path": "feed", "whenChunkFails": "drop_chunk", "whenCallerIsSlow": "drop_oldest" }),
+        json!({ "path": "feed", "whenChunkFails": "drop_chunk", "whenCallerIsSlow": "drop_oldest", "auth": "none" }),
     )
     .await
     .ok()?;
@@ -731,6 +731,9 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
     );
     let err = rig.run_setup_trigger(&RouteNode, json!({ "path": "secure", "auth": "hmac_sha256" })).await.failure()?;
     assert!(err.contains("checks callers with hmac but has no connection") && err.contains("weft connect"), "{err}");
+    // A route that never says who may call is never served open.
+    let err = rig.run_setup_trigger(&RouteNode, json!({ "path": "unsaid" })).await.failure()?;
+    assert!(err.contains("has no `auth`") && err.contains("auth: \"none\""), "{err}");
     Ok(())
 }
 

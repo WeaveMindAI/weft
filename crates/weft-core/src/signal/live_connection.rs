@@ -328,7 +328,19 @@ impl LiveConnectionConfig {
         // in where the compiler marked it) holds what it checks against;
         // the routing keeps the check and what finds the connection again.
         use crate::access::callers;
-        let auth = match callers::parse_auth(fields.get(callers::AUTH_FIELD))? {
+        // Required with no default: a program that compiles writes it, so
+        // one without it is a program from before that, refused rather
+        // than read as an open door.
+        let written = fields.get(callers::AUTH_FIELD).ok_or_else(|| {
+            format!(
+                "'{place}' has no `{}`, which says who may call it; write `{}: \"{}\"` to let anyone, \
+                 or the check its callers pass, then rebuild",
+                callers::AUTH_FIELD,
+                callers::AUTH_FIELD,
+                callers::NO_AUTH
+            )
+        })?;
+        let auth = match callers::parse_auth(written)? {
             None => super::PublicEntryAuth::None,
             Some(verify) => match fields.get(callers::CONNECTION_FIELD) {
                 None | Some(serde_json::Value::Null) => return Err(callers::no_connection(place, &verify)),
@@ -610,6 +622,7 @@ mod tests {
         let with = |extra: serde_json::Value| {
             let mut fields = serde_json::Map::new();
             fields.insert("path".to_string(), serde_json::json!("chat"));
+            fields.insert("auth".to_string(), serde_json::json!("none"));
             fields.extend(extra.as_object().unwrap().clone());
             LiveConnectionConfig::from_node_fields(&fields, "chat")
         };
@@ -688,7 +701,7 @@ mod tests {
             "the node that opens the call path says how long a caller may go silent"
         );
 
-        let empty = serde_json::json!({ "path": "x", "method": "", "dataType": "" });
+        let empty = serde_json::json!({ "path": "x", "method": "", "dataType": "", "auth": "none" });
         let cfg = LiveConnectionConfig::from_node_fields(empty.as_object().unwrap(), "x").expect("builds");
         assert!(cfg.methods.is_empty(), "an empty method is any method");
         assert_eq!(cfg.data_type, DataType::Json);
@@ -719,7 +732,8 @@ mod tests {
             ("whenCallerIsSlow", serde_json::json!("drop")),
             ("whenCallerIsSlow", serde_json::json!(2)),
         ] {
-            let bad = serde_json::json!({ "path": "x", field: value });
+            let mut bad = serde_json::json!({ "path": "x", "auth": "none" });
+            bad[field] = value;
             assert!(
                 LiveConnectionConfig::from_node_fields(bad.as_object().unwrap(), "x").is_err(),
                 "{field} must be refused"
@@ -743,6 +757,10 @@ mod tests {
         assert!(matches!(cfg.auth, PublicEntryAuth::Connection { ref verify, .. } if verify.credential_headers() == ["X-Hub-Signature-256"]));
         let open = with(serde_json::json!({ "path": "x", "auth": "none" })).unwrap();
         assert_eq!(open.auth, PublicEntryAuth::None);
+        // Unwritten is never read as open: the compiler requires it, so a
+        // node without it is refused naming the word that opens it.
+        let unwritten = with(serde_json::json!({ "path": "x" })).unwrap_err();
+        assert!(unwritten.contains("'secure' has no `auth`") && unwritten.contains("auth: \"none\""), "{unwritten}");
     }
 
     /// A gate whose check an older weft did not keep is never served:
@@ -760,7 +778,7 @@ mod tests {
     #[test]
     fn node_fields_pick_what_gives_on_a_live_exchange() {
         let with = |field: &str, value: &str| {
-            let fields = serde_json::json!({ "path": "feed", field: value });
+            let fields = serde_json::json!({ "path": "feed", "auth": "none", field: value });
             LiveConnectionConfig::from_node_fields(fields.as_object().unwrap(), "feed").expect("builds")
         };
         assert_eq!(with("whenChunkFails", "surface").error_mode, ErrorMode::Surface);
@@ -783,7 +801,7 @@ mod tests {
         }
 
         let refusal = LiveConnectionConfig::from_node_fields(
-            serde_json::json!({ "path": "feed", "whenCallerIsSlow": "skip" }).as_object().unwrap(),
+            serde_json::json!({ "path": "feed", "auth": "none", "whenCallerIsSlow": "skip" }).as_object().unwrap(),
             "feed",
         )
         .expect_err("not one of the modes");

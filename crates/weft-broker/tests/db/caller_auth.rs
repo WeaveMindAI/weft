@@ -215,7 +215,7 @@ async fn a_standard_webhooks_signature_admits_from_any_header_copy(pool: Pool) {
         "secret": { "stripPrefix": "whsec_", "decode": "base64" },
         "encoding": "base64"
     });
-    let standard = weft_core::access::callers::parse_auth(Some(&record)).expect("a valid auth").expect("a check");
+    let standard = weft_core::access::callers::parse_auth(&record).expect("a valid auth").expect("a check");
     let id = store(&pool, TENANT, CallerScheme::Hmac.recipe(), &[("signingSecret", "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw")]).await;
     let body = br#"{"test": 2432232314}"#;
     let ts = 1614265330;

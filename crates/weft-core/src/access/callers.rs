@@ -20,7 +20,8 @@ pub const AUTH_FIELD: &str = "auth";
 /// The field holding the connection a scheme checks against.
 pub const CONNECTION_FIELD: &str = "connection";
 
-/// The `auth` value that checks nobody (the default).
+/// The `auth` value that checks nobody. It is written, never defaulted:
+/// an open door is a choice the source shows.
 pub const NO_AUTH: &str = "none";
 
 /// One check `auth` names by a word: exactly one algorithm and one layout.
@@ -215,20 +216,20 @@ pub fn auth_options() -> Vec<&'static str> {
     std::iter::once(NO_AUTH).chain(NAMED_CHECKS.iter().map(|check| check.name)).collect()
 }
 
-/// Read the `auth` setting: `None` when it checks nobody (absent, empty,
-/// or `"none"`), else the check it runs. A name is its entry in
-/// [`NAMED_CHECKS`]; a record is the check itself, refused when it cannot check a caller or reads a value its
-/// scheme's connection does not hold.
-pub fn parse_auth(value: Option<&Value>) -> Result<Option<VerifyKind>, String> {
+/// Read the `auth` setting: `None` when it checks nobody (`"none"`), else
+/// the check it runs. A name is its entry in [`NAMED_CHECKS`]; a record is
+/// the check itself, refused when it cannot check a caller or reads a
+/// value its scheme's connection does not hold. Nothing else means "check
+/// nobody": an empty or null value is refused like any other word.
+pub fn parse_auth(value: &Value) -> Result<Option<VerifyKind>, String> {
     let words = || auth_options().join(", ");
     match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) if s.trim().is_empty() || s == NO_AUTH => Ok(None),
-        Some(Value::String(s)) => match named_check(s) {
+        Value::String(s) if s == NO_AUTH => Ok(None),
+        Value::String(s) => match named_check(s) {
             Some(check) => Ok(Some(check.verify())),
             None => Err(format!("auth must be one of {}, or a scheme written as a record; got '{s}'", words())),
         },
-        Some(record @ Value::Object(_)) => {
+        record @ Value::Object(_) => {
             let verify: VerifyKind =
                 serde_json::from_value(record.clone()).map_err(|e| format!("auth is not a scheme weft knows: {e}"))?;
             let Some(scheme) = CallerScheme::of(&verify) else {
@@ -251,7 +252,7 @@ pub fn parse_auth(value: Option<&Value>) -> Result<Option<VerifyKind>, String> {
             }
             Ok(Some(verify))
         }
-        Some(other) => Err(format!("auth must be one of {}, or a scheme written as a record; got {other}", words())),
+        other => Err(format!("auth must be one of {}, or a scheme written as a record; got {other}", words())),
     }
 }
 
@@ -275,8 +276,9 @@ pub struct ConnectionField {
 /// and the editor's mirror of it. An access node: its access widget, to
 /// its own `service` recipe. A node that checks its callers: its
 /// `connection` field, to the recipe of the scheme `auth` (its written
-/// value) names, and nothing while `auth` checks nobody. `None` for any
-/// other node.
+/// value) names, and nothing while `auth` checks nobody or is not written
+/// yet (a required input, so the compiler refuses that node on its own).
+/// `None` for any other node.
 pub fn connection_field(meta: &NodeMetadata, auth: Option<&Value>) -> Result<Option<ConnectionField>, String> {
     let Some(input) = meta.access_input() else { return Ok(None) };
     if let Some(spec) = &meta.service {
@@ -285,6 +287,7 @@ pub fn connection_field(meta: &NodeMetadata, auth: Option<&Value>) -> Result<Opt
     if !meta.features.checks_callers {
         return Ok(None);
     }
+    let Some(auth) = auth else { return Ok(None) };
     Ok(parse_auth(auth)?.map(|verify| ConnectionField {
         input: input.name.clone(),
         spec: CallerScheme::of(&verify).expect("parse_auth answers caller schemes only").recipe(),
@@ -292,9 +295,10 @@ pub fn connection_field(meta: &NodeMetadata, auth: Option<&Value>) -> Result<Opt
 }
 
 /// The rules a node declaring `checksCallers` is held to at metadata
-/// load: an `auth` setting written as a literal, and a `connection` input
-/// with the access widget, and no recipe of its own (the scheme brings
-/// it).
+/// load: an `auth` setting every program writes (required, with no
+/// default: leaving the door open is `auth: "none"`, written where a
+/// reader sees it), and a `connection` input with the access widget, and
+/// no recipe of its own (the scheme brings it).
 pub fn check_metadata(meta: &NodeMetadata) -> Result<(), String> {
     if meta.service.is_some() {
         return Err(
@@ -303,8 +307,14 @@ pub fn check_metadata(meta: &NodeMetadata) -> Result<(), String> {
                 .into(),
         );
     }
-    if !meta.inputs.iter().any(|i| i.name == AUTH_FIELD) {
+    let Some(auth) = meta.inputs.iter().find(|i| i.name == AUTH_FIELD) else {
         return Err(format!("a node that checks its callers declares the `{AUTH_FIELD}` input its scheme is named in"));
+    };
+    if !auth.required || auth.default.is_some() {
+        return Err(format!(
+            "a node that checks its callers declares `{AUTH_FIELD}` required with no default, so every \
+             program says who may call it (`\"{NO_AUTH}\"` to let anyone)"
+        ));
     }
     match meta.access_input() {
         Some(input) if input.name == CONNECTION_FIELD => Ok(()),
@@ -328,22 +338,24 @@ mod tests {
     /// reads its connection; `none` checks nobody.
     #[test]
     fn each_name_is_its_check_and_none_checks_nobody() {
-        for absent in [None, Some(&Value::Null), Some(&json!("")), Some(&json!("none"))] {
-            assert_eq!(parse_auth(absent).unwrap(), None, "{absent:?}");
+        assert_eq!(parse_auth(&json!("none")).unwrap(), None);
+        // Only the word opens the door: nothing else is read as it.
+        for blank in [Value::Null, json!(""), json!(" ")] {
+            assert!(parse_auth(&blank).is_err(), "{blank:?}");
         }
         for named in NAMED_CHECKS {
-            let verify = parse_auth(Some(&json!(named.name))).unwrap().unwrap();
+            let verify = parse_auth(&json!(named.name)).unwrap().unwrap();
             assert_eq!(verify, named.verify());
             let scheme = CallerScheme::of(&verify).unwrap_or_else(|| panic!("{} checks no caller", named.name));
             verify.validate(scheme.service(), VerifySide::Caller).unwrap_or_else(|e| panic!("{}: {e}", named.name));
         }
-        let refused = parse_auth(Some(&json!("hmac"))).unwrap_err();
+        let refused = parse_auth(&json!("hmac")).unwrap_err();
         assert!(
             refused.contains("none, api_keys, hmac_sha256, hmac_sha1, hmac_sha512, ed25519, ecdsa_p256, oidc")
                 && refused.contains("'hmac'"),
             "{refused}"
         );
-        assert!(parse_auth(Some(&json!(3))).is_err());
+        assert!(parse_auth(&json!(3)).is_err());
     }
 
     /// Each name fixes its algorithm; the layout is the one the access
@@ -368,28 +380,28 @@ mod tests {
     #[test]
     fn a_record_is_the_check_itself() {
         let record = json!({ "kind": "hmac", "signature": { "in": "header:X-Hub-Signature-256" }, "concat": "{body}" });
-        let verify = parse_auth(Some(&record)).unwrap().unwrap();
+        let verify = parse_auth(&record).unwrap().unwrap();
         assert_eq!(serde_json::to_value(&verify).unwrap(), record);
         let header = json!({ "kind": "api_keys", "header": "X-Team-Key", "bearer": false });
-        assert_eq!(parse_auth(Some(&header)).unwrap().unwrap().credential_headers()[0], "X-Team-Key");
+        assert_eq!(parse_auth(&header).unwrap().unwrap().credential_headers()[0], "X-Team-Key");
     }
 
     #[test]
     fn a_record_that_cannot_check_a_caller_is_refused() {
-        let echo = parse_auth(Some(&json!({ "kind": "token_echo" }))).unwrap_err();
+        let echo = parse_auth(&json!({ "kind": "token_echo" })).unwrap_err();
         assert!(echo.contains("token_echo"), "{echo}");
-        let unknown = parse_auth(Some(&json!({ "kind": "magic" }))).unwrap_err();
+        let unknown = parse_auth(&json!({ "kind": "magic" })).unwrap_err();
         assert!(unknown.starts_with("auth is not a scheme weft knows"), "{unknown}");
-        let stray = parse_auth(Some(&json!({ "kind": "oidc", "issuers": ["{tenant}"], "jwksUrl": "{jwksUrl}" }))).unwrap_err();
+        let stray = parse_auth(&json!({ "kind": "oidc", "issuers": ["{tenant}"], "jwksUrl": "{jwksUrl}" })).unwrap_err();
         assert!(stray.contains("'tenant'") && stray.contains("'issuer'"), "{stray}");
         // A record meets the rules a push recipe does: signing a
         // {timestamp} with nowhere to read it from is refused here, never
         // checked at the door with no replay check.
         let unsourced = json!({ "kind": "hmac", "signature": { "in": "header:X-Signature" }, "concat": "{timestamp}.{body}" });
-        let err = parse_auth(Some(&unsourced)).unwrap_err();
+        let err = parse_auth(&unsourced).unwrap_err();
         assert!(err.contains("no timestamp source"), "{err}");
         let literal = json!({ "kind": "oidc", "issuers": ["https://id.example.com/"], "jwksUrl": "https://id.example.com/jwks" });
-        assert!(parse_auth(Some(&literal)).is_ok(), "a literal issuer reads only the audience");
+        assert!(parse_auth(&literal).is_ok(), "a literal issuer reads only the audience");
     }
 
     /// Each kind's recipe is a valid recipe of its service, and holds
@@ -426,7 +438,8 @@ mod tests {
             let auth = meta["inputs"].as_array().unwrap().iter().find(|i| i["name"] == AUTH_FIELD).expect("an auth input");
             let listed: Vec<&str> = auth["widget"]["options"].as_array().unwrap().iter().map(|o| o.as_str().unwrap()).collect();
             assert_eq!(listed, auth_options(), "{}", path.display());
-            assert_eq!(auth["default"], NO_AUTH, "{}", path.display());
+            assert_eq!(auth["required"], true, "{}", path.display());
+            assert!(auth.get("default").is_none(), "an open door is written, never defaulted: {}", path.display());
         }
     }
 

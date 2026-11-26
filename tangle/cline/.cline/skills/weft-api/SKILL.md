@@ -22,7 +22,7 @@ storage, the only way bytes travel a wire.
 ## The URL is known before anything runs
 
 A [route] answers at `<install>/connect/local/<project id>/<path>`, and every part of that address is fixed before the route is ever activated: the install, and the project id, which is the `id` under `[package]` in the project's `weft.toml` (the same on every install, so two projects can serve the same path). On this machine the install
-is `http://127.0.0.1:14111`, so `hello = Route { path: "hello" }` answers at
+is `http://127.0.0.1:14111`, so `hello = Route { path: "hello", auth: "none" }` answers at
 `http://127.0.0.1:14111/connect/local/<project id>/hello`, and a socket at the same
 address with `ws://`. On a cloud install it is the target's `url` in
 `weft.toml` (`https://weft-role-dispatcher-123456789.us-central1.run.app/connect/local/<project id>/hello`,
@@ -51,7 +51,7 @@ The run ends when it has sent its [answer]. The body arrives whole on the
 [route]'s `body` port, and you declare on the arrow what shape it has:
 
 ```weft
-hello = Route -> (body: { name: String }) { path: "hello", method: "POST" }
+hello = Route -> (body: { name: String }) { path: "hello", method: "POST", auth: "none" }
 answer = Reply { status: 201, body: hello.body.name }
 ```
 
@@ -89,7 +89,7 @@ What you declare on `body` depends on the body shape the [route] is set to
 Declare the capture as an output, and read it as `card.id`:
 
 ```weft
-card = Route -> (id: String) { path: "cards/{id}", method: "GET" }
+card = Route -> (id: String) { path: "cards/{id}", method: "GET", auth: "none" }
 ```
 
 Every output you add to a `Route` must be a capture of its path, typed
@@ -146,7 +146,7 @@ The graph decides the status. A Python node reading the `id` capture and
 `query` returns the body and the status together:
 
 ```weft
-user = Route -> (id: String) { path: "users/{id}", method: "GET" }
+user = Route -> (id: String) { path: "users/{id}", method: "GET", auth: "none" }
 lookup = ExecPython(uid: String, query: Dict[String, String]) -> (body: JsonDict, status: Number) {
   uid: user.id
   query: user.query
@@ -157,7 +157,7 @@ found = Reply { body: lookup.body, status: lookup.status }
 
 A `GET` route has no body: declare nothing on `body` and read the other
 ports. A `text` route: `say = Route -> (body: String) { path: "say",
-dataType: "text" }`, and the `Reply` body must be a `String`. A request that
+dataType: "text", auth: "none" }`, and the `Reply` body must be a `String`. A request that
 carries no body closes `body`, whatever the `dataType`, and a json body that is `null` comes out on a `body` whose type takes `Null`
 (`Json` does) and closes it on any other.
 
@@ -176,7 +176,7 @@ wiring. So the shape for "do this, and if it did not work, stop here" is a
 and status already written on it, the passing case gating the rest.
 
 ```weft
-sweep = Route -> (what: String) { path: "sweep/{what}", method: "DELETE" }
+sweep = Route -> (what: String) { path: "sweep/{what}", method: "DELETE", auth: "none" }
 clear = ExecPython(what: String) -> (removed: Number) {
   what: sweep.what
   code: "return {'removed': 3 if what == 'cards' else 0}"
@@ -251,7 +251,7 @@ the port. A picture a caller sends inside a JSON body lands on a field of the
 body's record declared as its kind, and the [route] stores it on the way in:
 
 ```weft
-upload = Route -> (body: { photo: Image, caption: String }) { path: "cards", method: "POST" }
+upload = Route -> (body: { photo: Image, caption: String }) { path: "cards", method: "POST", auth: "none" }
 ```
 
 The body key `photo` holds a `data:image/png;base64,...` URL (the media type
@@ -310,7 +310,7 @@ call, which resets its clock. The route that serves it, with `db` the
 program's `PostgresDatabase`:
 
 ```weft
-preview = Route -> (view: String) { path: "session/preview/{view}", method: "GET" }
+preview = Route -> (view: String) { path: "session/preview/{view}", method: "GET", auth: "none" }
 latest = PostgresExecuteQuery(view: String) -> (row: { picture: JsonDict }) {
   account: db.access
   view: preview.view
@@ -334,7 +334,7 @@ own ports say which output is a `Bus`; a model streaming its answer is the
 one you will reach for most:
 
 ```weft
-ask = Route -> (body: { prompt: String }) { path: "chat", method: "POST" }
+ask = Route -> (body: { prompt: String }) { path: "chat", method: "POST", auth: "none" }
 router = OpenRouterAccess
 prov = OpenRouterModel { access: router.access, model: "openai/gpt-4.1-nano" }
 live = LlmStream { provider: prov.provider, prompt: ask.body.prompt }
@@ -395,6 +395,7 @@ prices = Route -> (symbol: String) {
   path: "prices/{symbol}"
   method: "GET"
   whenCallerIsSlow: "drop_oldest"
+  auth: "none"
 }
 latest = PostgresWatchQuery(symbol: String) {
   account: db.access
@@ -456,7 +457,7 @@ answer's `done`, and set `outlivesCaller: true` so the caller leaving does not
 kill the work you promised to do.
 
 ```weft
-door = Route -> (body: { text: String }) { path: "ingest", method: "POST", outlivesCaller: true }
+door = Route -> (body: { text: String }) { path: "ingest", method: "POST", outlivesCaller: true, auth: "none" }
 ack = Reply { status: 202, body: door.body.text }
 slow = ExecPython(text: String) -> (done: Boolean) {
   text: door.body.text
@@ -532,7 +533,7 @@ the route names one caller apart from another, that route wants no tagging at
 all.
 
 ```weft
-feed = Route -> (room: String) { path: "live/{room}", method: "GET" }
+feed = Route -> (room: String) { path: "live/{room}", method: "GET", auth: "none" }
 
 claim = TagRun { room: feed.room }
 
@@ -558,7 +559,7 @@ not a surprise, and the count is one command you never have to guess at.
 ```weft
 type Said = { text: String }
 
-sock = Socket -> (inbound: Generator[Said]) { path: "chat/{room}" }
+sock = Socket -> (inbound: Generator[Said]) { path: "chat/{room}", auth: "none" }
 turn = Loop(msg: Generator[Said]) -> (results: List[Boolean | Null]) {
   parallel: false
   over: ["msg"]
@@ -640,7 +641,8 @@ the route's own address.
 
 ## Auth
 
-A [route] is open while its `auth` is `"none"`, the default. Set it and
+Every [route] writes its `auth`, and one that leaves it out does not build.
+`"none"` lets in anyone with the address; name a check instead and
 the gateway checks every caller before a run starts, and what the check
 established comes out on the trigger's `caller` port. Which you want depends
 on who calls: `"api_keys"` (a key in `X-Api-Key`, or `Authorization: Bearer`)

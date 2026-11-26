@@ -2618,6 +2618,53 @@ fn starts_at_group_constant(project: &ProjectDefinition, wire: &weft_core::proje
         && project.groups.iter().any(|g| g.id == wire.source && g.port_literals.get(&own.port).is_some_and(|v| !v.is_null()))
 }
 
+/// What an input its node's metadata requires is for, and what may be
+/// written in it, appended to the refusal when nothing drives it: the
+/// first sentence of its description, and a fixed select's choices when
+/// it takes a written value. A node requires an input with no default when
+/// nobody should pick its value silently, so the refusal is where the
+/// choice gets explained. (An input the program made required, `x: T`,
+/// gets none: the author asked for it and knows what it is.)
+fn what_it_takes(input: &weft_core::project::InputDefinition, spec: &weft_core::node::InputSpec) -> String {
+    let mut out = String::new();
+    if let Some(sentence) = spec.description.as_deref().and_then(first_sentence) {
+        out.push_str(&format!(". `{}`: {sentence}", input.name));
+    }
+    if let Some(choices) = input.widget.as_ref().filter(|_| input.accepts.literal).and_then(|w| w.named_options()) {
+        out.push_str(&format!(". Write one of {choices}"));
+    }
+    if !out.is_empty() {
+        out.push('.');
+    }
+    out
+}
+
+/// The first sentence of `text`: up to the first full stop followed by
+/// the end, or by a space and a capital letter, so a stop inside
+/// backticks (`a.b`) or an abbreviation (`e.g. {`) does not count. `None`
+/// when the text is blank.
+fn first_sentence(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let mut in_code = false;
+    for (at, c) in text.char_indices() {
+        match c {
+            '`' => in_code = !in_code,
+            '.' if !in_code && ends_a_sentence(&text[at + 1..]) => {
+                return Some(text[..at].trim_end()).filter(|s| !s.is_empty());
+            }
+            _ => {}
+        }
+    }
+    Some(text).filter(|s| !s.is_empty())
+}
+
+/// Whether what follows a full stop ends the sentence before it: nothing
+/// at all, or a space and then a capital letter.
+fn ends_a_sentence(rest: &str) -> bool {
+    let after = rest.trim_start();
+    after.is_empty() || (after.len() < rest.len() && after.starts_with(char::is_uppercase))
+}
+
 /// required-port-unmet: required input with no driver (no edge + no
 ///   body value).
 /// require-one-of-unmet: each @require_one_of group must have at
@@ -2786,8 +2833,13 @@ fn check_port_coverage(
                     Severity::Error,
                     "required-port-unmet",
                     format!(
-                        "required input '{}.{}' has no driver (no edge, no body value, no default)",
-                        author_name(node), input.name
+                        "required input '{}.{}' has no driver (no edge, no body value, no default){}",
+                        author_name(node),
+                        input.name,
+                        meta.and_then(|m| m.inputs.iter().find(|spec| spec.name == input.name))
+                            .filter(|spec| spec.required)
+                            .map(|spec| what_it_takes(input, spec))
+                            .unwrap_or_default()
                     ),
                 );
             }
@@ -4504,3 +4556,19 @@ mod validation_mode_wire_tests {
     }
 }
 
+
+#[cfg(test)]
+mod first_sentence_tests {
+    use super::first_sentence;
+
+    /// A sentence ends at a stop before a capital letter or the end; a
+    /// stop in code or an abbreviation does not end it.
+    #[test]
+    fn a_sentence_ends_where_the_next_one_starts() {
+        assert_eq!(first_sentence("Who may call. Anything else."), Some("Who may call"));
+        assert_eq!(first_sentence("Fields by column, e.g. { \"Name\": 1 }. More."), Some("Fields by column, e.g. { \"Name\": 1 }"));
+        assert_eq!(first_sentence("Reads `a.b` first. Then."), Some("Reads `a.b` first"));
+        assert_eq!(first_sentence("No stop at all"), Some("No stop at all"));
+        assert_eq!(first_sentence("  "), None);
+    }
+}

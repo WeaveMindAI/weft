@@ -6,7 +6,7 @@
 #   POST front   answers {"heard": <text>}
 #   POST back    would answer through Shout
 
-front = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/front", method: "POST" }
+front = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/front", method: "POST", auth: "none" }
 front_body = ExecPython(text: String) -> (body: JsonDict) {
   code: "return {'body': {'heard': text}}"
 }
@@ -14,7 +14,7 @@ front_body.text = front.body.text
 front_answer = Reply
 front_answer.body = front_body.body
 
-back = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/back", method: "POST" }
+back = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/back", method: "POST", auth: "none" }
 loud = Shout
 loud.text = back.body.text
 back_body = ExecPython(text: String) -> (body: JsonDict) {

@@ -2639,7 +2639,7 @@ mod tests {
         std::fs::write(
             project.main_weft(),
             "secure = Route { path: \"secure\", auth: \"api_keys\" }\nsigned = Route { path: \"signed\", auth: \"hmac_sha256\" }\n\
-             open = Route { path: \"open\" }\n",
+             open = Route { path: \"open\", auth: \"none\" }\n",
         )
         .unwrap();
         let choose = |name: &str| {

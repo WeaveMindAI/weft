@@ -5,7 +5,7 @@
 # is broadcast to every ctx reader (no node steals messages from another), so
 # every message the caller sends must come back twice, once from each echo.
 
-sock = Socket { path: "__E2E_PATH__" }
+sock = Socket { path: "__E2E_PATH__", auth: "none" }
 echo = LiveWsEcho
 echo2 = LiveWsEcho
 out = Debug

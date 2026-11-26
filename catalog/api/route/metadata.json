@@ -55,7 +55,7 @@
     {
       "name": "auth",
       "type": "String | JsonDict",
-      "default": "none",
+      "required": true,
       "accepts": [
         "literal"
       ],
@@ -73,7 +73,7 @@
         ]
       },
       "label": "Check callers with",
-      "description": "How a caller is checked before a run starts. `none` (the default): anyone with the URL may call. `api_keys`: the caller sends one of the connection's keys in `X-Api-Key` or `Authorization: Bearer`, and `caller` says which matched (`{\"key\": 0}` for the first). `hmac_sha256`: `X-Signature` holds the hex HMAC-SHA256 of `<X-Timestamp>.<raw body>` under the connection's secret, and a timestamp more than five minutes off is refused as a replay; `caller` is `{}`. `hmac_sha1` and `hmac_sha512`: the same with that hash. `ed25519`: the same layout, signed with the Ed25519 key whose public half the connection holds; `ecdsa_p256`: signed with ECDSA P-256, the signature in base64 DER. `oidc`: a bearer identity token from the connection's issuer, for its audience; `caller` is the token's claims. A provider's own layout is written as the scheme itself (`{\"kind\": \"hmac\", \"signature\": {\"in\": \"header:X-Hub-Signature-256\"}, \"concat\": \"{body}\"}`). The secret goes on `connection`."
+      "description": "Who may call, written on every route: `none` lets anyone with the URL call, any other choice checks the caller before a run starts. `api_keys`: the caller sends one of the connection's keys in `X-Api-Key` or `Authorization: Bearer`, and `caller` says which matched (`{\"key\": 0}` for the first). `hmac_sha256`: `X-Signature` holds the hex HMAC-SHA256 of `<X-Timestamp>.<raw body>` under the connection's secret, and a timestamp more than five minutes off is refused as a replay; `caller` is `{}`. `hmac_sha1` and `hmac_sha512`: the same with that hash. `ed25519`: the same layout, signed with the Ed25519 key whose public half the connection holds; `ecdsa_p256`: signed with ECDSA P-256, the signature in base64 DER. `oidc`: a bearer identity token from the connection's issuer, for its audience; `caller` is the token's claims. A provider's own layout is written as the scheme itself (`{\"kind\": \"hmac\", \"signature\": {\"in\": \"header:X-Hub-Signature-256\"}, \"concat\": \"{body}\"}`). The secret goes on `connection`."
     },
     {
       "name": "connection",

@@ -10,7 +10,7 @@
 
 db = PostgresDatabase { database: "watch.me", reachable: true }
 
-feed = Route { path: "__E2E_PATH__/count", method: "GET" }
+feed = Route { path: "__E2E_PATH__/count", method: "GET", auth: "none" }
 
 count = PostgresWatchQuery {
   query: "SELECT count(*)::int AS n FROM notes"

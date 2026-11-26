@@ -88,7 +88,7 @@ fn source() -> String {
     for i in 0..TRIGGERS {
         let query = if i == 0 { "@file(\"sql/import.sql\")".to_string() } else { format!("\"select * from t{i} where tenant = $tenant\"") };
         source.push_str(&format!(
-            "r{i} = Route {{ path: \"t{i}/items\", method: \"POST\" }}\n\
+            "r{i} = Route {{ path: \"t{i}/items\", method: \"POST\", auth: \"none\" }}\n\
              q{i} = PostgresExecuteQuery(tenant: String) {{ query: {query}, tenant: r{i}.path }}\n\
              q{i}.account = pg.access\n\
              a{i} = Reply {{ status: 200 }}\n\

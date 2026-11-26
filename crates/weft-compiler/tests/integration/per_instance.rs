@@ -454,7 +454,7 @@ fn a_shared_route_reaching_per_instance_places_builds() {
 bridge = BaileyBridge {
   @per_instance
 }
-door = Route { path: "send", method: "POST" }
+door = Route { path: "send", method: "POST", auth: "none" }
 send = BaileySend { message: "hi", to: "x" }
 send.bridge = bridge.bridge
 send._should_flow = door.fired

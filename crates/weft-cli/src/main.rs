@@ -4,6 +4,30 @@
 
 use clap::{Parser, Subcommand};
 
+// `print!` and `println!` for the whole CLI, in place of std's, which
+// panic ("failed printing to stdout: Broken pipe") when whatever reads the
+// output has stopped (`weft describe-nodes | grep -q X`, `| head`).
+// Defined before every module, so each one gets these instead of std's.
+macro_rules! print {
+    ($($arg:tt)*) => { crate::write_stdout(format_args!($($arg)*)) };
+}
+macro_rules! println {
+    () => { crate::write_stdout(format_args!("\n")) };
+    ($($arg:tt)*) => { crate::write_stdout(format_args!("{}\n", format_args!($($arg)*))) };
+}
+
+/// Write to stdout. A reader that went away wanted no more output, so the
+/// command ends there, quietly and successfully; any other failure to
+/// write is as loud as std's own `println!`.
+fn write_stdout(args: std::fmt::Arguments) {
+    use std::io::Write;
+    match std::io::stdout().lock().write_fmt(args) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(e) => panic!("failed printing to stdout: {e}"),
+    }
+}
+
 mod client;
 mod credentials;
 mod commands;
@@ -1200,12 +1224,21 @@ enum TokenAction {
         /// --instance; without it a token works until revoked.
         #[arg(long, value_name = "duration", value_parser = parse_duration_secs)]
         expires: Option<u64>,
-        /// Mint an operator key instead: full admin of the install
-        /// (every CLI and editor verb), for a teammate or CI
-        /// (`WEFT_OPERATOR_KEY`). Takes no scope and acts in no instance.
-        /// Never put one in a frontend: its server holds a caller token.
-        #[arg(long, conflicts_with_all = ["projects", "tags", "displays", "all_displays", "instance", "connections"])]
-        operator: bool,
+    },
+    /// Mint an operator key: full admin of the install (every CLI and
+    /// editor verb), for a teammate or CI (`WEFT_OPERATOR_KEY`). It takes
+    /// no scope and acts in no instance. Never put one in a frontend: its
+    /// server holds a signal token. A command of its own, apart from
+    /// `mint`, so an assistant allowed to mint scoped tokens without
+    /// asking is never allowed this one by the same rule.
+    MintOperator {
+        /// Optional human label, shown by `weft token ls`.
+        #[arg(long)]
+        name: Option<String>,
+        /// How long the key works (`30m`, `12h`, `7d`); without it, until
+        /// revoked.
+        #[arg(long, value_name = "duration", value_parser = parse_duration_secs)]
+        expires: Option<u64>,
     },
     /// List existing signal tokens (metadata + recognizer; the full
     /// value is shown only once, at mint).
@@ -1217,7 +1250,7 @@ enum TokenAction {
 impl From<TokenAction> for commands::token::TokenAction {
     fn from(value: TokenAction) -> Self {
         match value {
-            TokenAction::Mint { name, projects, tags, displays, all_displays, instance, connections, expires, operator } => {
+            TokenAction::Mint { name, projects, tags, displays, all_displays, instance, connections, expires } => {
                 commands::token::TokenAction::Mint {
                     name,
                     projects,
@@ -1227,9 +1260,9 @@ impl From<TokenAction> for commands::token::TokenAction {
                     instance,
                     connections,
                     expires_in_secs: expires,
-                    operator,
                 }
             }
+            TokenAction::MintOperator { name, expires } => commands::token::TokenAction::MintOperator { name, expires_in_secs: expires },
             TokenAction::Ls => commands::token::TokenAction::Ls,
             TokenAction::Revoke { id } => commands::token::TokenAction::Revoke { id },
         }
@@ -1623,6 +1656,12 @@ enum DaemonAction {
         #[arg(long, short = 'f', default_value_t = false)]
         follow: bool,
     },
+    /// Bring up what the runtime needs before it starts (its database and
+    /// the object store), waiting for Docker to answer. The runtime's own
+    /// service runs it at every start, a reboot included; a person never
+    /// needs to.
+    #[command(hide = true)]
+    Prepare,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1962,6 +2001,7 @@ impl From<DaemonAction> for commands::daemon::DaemonAction {
             DaemonAction::Logs { tail, follow } => {
                 commands::daemon::DaemonAction::Logs { tail, follow }
             }
+            DaemonAction::Prepare => commands::daemon::DaemonAction::Prepare,
         }
     }
 }
@@ -2333,6 +2373,18 @@ mod command_contract_tests {
     #[test]
     fn the_command_line_holds_together() {
         <Cli as clap::CommandFactory>::command().debug_assert();
+    }
+
+    /// An operator key is minted by a command of its own, so a permission
+    /// rule can tell it from a scoped token: `mint` no longer takes
+    /// `--operator`.
+    #[test]
+    fn an_operator_key_has_its_own_command() {
+        let cli = Cli::try_parse_from(["weft", "token", "mint-operator", "--name", "ci", "--expires", "7d"]).unwrap();
+        let Cmd::Token { action: TokenAction::MintOperator { name, expires } } = cli.command else { panic!("token mint-operator") };
+        assert_eq!((name.as_deref(), expires), (Some("ci"), Some(7 * 24 * 3600)));
+        assert!(Cli::try_parse_from(["weft", "token", "mint", "--operator"]).is_err());
+        assert!(Cli::try_parse_from(["weft", "token", "mint-operator", "--projects", "x"]).is_err(), "an operator key takes no scope");
     }
 
     /// `deps-install --stage` takes a stage by its own name, and refuses
