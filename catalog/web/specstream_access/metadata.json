@@ -1,0 +1,71 @@
+{
+  "type": "SpecStreamAccess",
+  "label": "SpecStream Access",
+  "description": "Connect SpecStream, the web-search API behind SpecStream: Web Search, with an API key.",
+  "tags": [
+    "web",
+    "search",
+    "access"
+  ],
+  "icon": "KeyRound",
+  "color": "#111111",
+  "service": {
+    "service": "specstream",
+    "label": "SpecStream",
+    "acquisition": {
+      "kind": "static",
+      "ways": [
+        {
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "ss_..."
+            }
+          ],
+          "guide": {
+            "link": "https://specstream.ai/docs",
+            "steps": [
+              "Sign in at specstream.ai and create a key under Agents & API.",
+              "Paste it below and name the connection."
+            ]
+          }
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {key}"
+      }
+    ],
+    "test": {
+      "url": "https://api.specstream.ai/v1/web-search",
+      "method": "POST",
+      "expectStatus": 400
+    },
+    "identity": "specstream",
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[specstream]",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access[specstream]",
+      "description": "Wire into SpecStream: Web Search."
+    }
+  ]
+}

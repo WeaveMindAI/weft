@@ -1,0 +1,70 @@
+{
+  "type": "SpecStreamSearch",
+  "label": "SpecStream: Web Search",
+  "description": "Search the live web through SpecStream and get results with the passage of each page that best matches the query, ready for an LLM node. Wire a SpecStreamAccess node. Each text is cut at `maxTextChars`, and the longest ones shorter still when the results would weigh more than the 100 KB a wire carries.",
+  "tags": [
+    "web",
+    "search"
+  ],
+  "icon": "Globe",
+  "color": "#111111",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access[specstream]", "accepts": ["wire"],
+      "required": true,
+      "description": "The SpecStream access (wire a SpecStreamAccess node)."
+    },
+    {
+      "name": "query",
+      "type": "String",
+      "required": true,
+      "label": "Query",
+      "description": "Everyday words in any language. Operators such as `site:`, `-site:`, `\"exact phrase\"`, `after:2026-01` and `before:2026-06` hold on every result."
+    },
+    {
+      "name": "numResults",
+      "type": "Number",
+      "default": 10,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 100,
+        "step": 1
+      },
+      "label": "Results",
+      "description": "How many results (1-100)."
+    },
+    {
+      "name": "maxTextChars",
+      "type": "Number",
+      "default": 4000,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 10000,
+        "step": 1
+      },
+      "label": "Text per result",
+      "description": "Max page-text characters per result (1-10,000). When the results would still weigh more than the 100 KB a wire carries, the longest texts are cut shorter until they fit."
+    },
+    {
+      "name": "site",
+      "type": "String",
+      "label": "Site",
+      "placeholder": "docs.rs",
+      "description": "Only results from this one domain. Empty = the whole web."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "results",
+      "type": "List[{ title: String | Null, url: String, publishedDate: String | Null, text: String | Null }]",
+      "description": "Each result: title, url, the date the page says it was published, text."
+    },
+    {
+      "name": "count",
+      "type": "Number"
+    }
+  ]
+}
