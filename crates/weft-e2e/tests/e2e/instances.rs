@@ -355,25 +355,25 @@ async fn a_program_manages_its_instances_through_the_instance_nodes() -> anyhow:
 out = Debug
 out.data = svc.status
 
-up = Route -> (body: { instance: String }) { path: "__E2E_PATH__/up", method: "POST" }
+up = Route -> (body: { instance: String }) { path: "__E2E_PATH__/up", method: "POST", auth: "none" }
 start = StartInfra { node: "svc" }
 start.instance = up.body.instance
 upReply = Reply
 upReply.body = start.done
 
-look = Route -> (body: { instance: String }) { path: "__E2E_PATH__/look", method: "POST" }
+look = Route -> (body: { instance: String }) { path: "__E2E_PATH__/look", method: "POST", auth: "none" }
 state = InstanceInfraStatus { node: "svc" }
 state.instance = look.body.instance
 lookReply = Reply
 lookReply.body = state.status
 
-mint = Route -> (body: { instance: String }) { path: "__E2E_PATH__/mint", method: "POST" }
+mint = Route -> (body: { instance: String }) { path: "__E2E_PATH__/mint", method: "POST", auth: "none" }
 token = MintInstanceToken { expiresInHours: 1 }
 token.instance = mint.body.instance
 mintReply = Reply
 mintReply.body = token.token
 
-wipe = Route -> (body: { instance: String }) { path: "__E2E_PATH__/wipe", method: "POST" }
+wipe = Route -> (body: { instance: String }) { path: "__E2E_PATH__/wipe", method: "POST", auth: "none" }
 gone = WipeInstance { infra: ["svc"] }
 gone.instance = wipe.body.instance
 wipeReply = Reply

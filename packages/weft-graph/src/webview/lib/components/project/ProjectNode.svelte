@@ -2265,9 +2265,17 @@
 									value={effectiveAccessValue(declaredValue(field), data.placeOf?.(id) ?? id, field.key) as { id: string; identity?: string } | undefined}
 									onUpdate={(v) => pickConnection(field.key, v)}
 								/>
-							{:else if typeConfig.features?.checksCallers}
+							{:else if typeConfig.features?.checksCallers && ownValue(portLiterals, 'auth') === undefined}
+								<div class="text-[10px] text-muted-foreground">
+									Pick who may call in `auth` first: `none` lets anyone with the address call, any other choice checks the caller.
+								</div>
+							{:else if typeConfig.features?.checksCallers && ownValue(portLiterals, 'auth') === 'none'}
 								<div class="text-[10px] text-muted-foreground">
 									Anyone with the address may call. Pick how callers are checked in `auth` to connect what they are checked against.
+								</div>
+							{:else if typeConfig.features?.checksCallers}
+								<div class="text-[10px] text-red-500">
+									`auth` names no check weft knows: pick one of its choices, or `none` to let anyone call.
 								</div>
 							{:else}
 								<div class="text-[10px] text-red-500">

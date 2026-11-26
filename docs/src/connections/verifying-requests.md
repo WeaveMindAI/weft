@@ -32,12 +32,13 @@ in constant time.
 
 ## On a route
 
-A `Route` or a `Socket` answers anybody who has its address until you set its
-`auth`:
+Every `Route` and `Socket` writes its `auth`, and one that leaves it out does
+not build. `"none"` answers anybody who has the address; every other value
+checks the caller first:
 
 | `auth` | What the caller sends |
 |---|---|
-| `"none"` (the default) | Nothing |
+| `"none"` | Nothing |
 | `"api_keys"` | One of the keys you hand out, in `X-Api-Key` or as `Authorization: Bearer <key>` |
 | `"hmac_sha256"` | A hex HMAC-SHA256 of `<timestamp>.<body>` in `X-Signature`, with the unix-seconds timestamp in `X-Timestamp`, refused when it is more than five minutes off |
 | `"hmac_sha1"`, `"hmac_sha512"` | The same layout, with HMAC-SHA1 or HMAC-SHA512 |

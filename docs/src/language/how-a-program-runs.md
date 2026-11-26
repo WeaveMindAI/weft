@@ -110,7 +110,7 @@ value arriving means the node stays off, and a closure, the structural "nothing
 is coming", is what runs it.
 
 ```weft
-route = Route -> (body: { title: String, photo?: File }) { path: "cards", method: "POST" }
+route = Route -> (body: { title: String, photo?: File }) { path: "cards", method: "POST", auth: "none" }
 
 # A card sent with no picture: the wire reading `photo` closes, so this runs.
 defaultArt = FetchToStorage {

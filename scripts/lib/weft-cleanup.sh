@@ -409,6 +409,7 @@ weft_remove_containers_and_volumes() {
     fi
   fi
   remove_docker_object volume weft-object-store-data
+  remove_docker_object volume weft-object-store-config
   docker network inspect weft >/dev/null 2>&1 && remove_docker_object network weft
   return 0
 }

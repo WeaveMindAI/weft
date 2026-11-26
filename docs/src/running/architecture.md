@@ -729,7 +729,7 @@ This key lives in `secrets.env`, not in the install's database, so `weft
 token ls` does not list it and `weft token revoke` cannot retire it. If you
 want a new one, delete its line from `secrets.env` and run `./setup.sh`
 again. The keys you mint with `weft
-token mint --operator` are rows, and those you can list and revoke.
+token mint-operator` are rows, and those you can list and revoke.
 
 The addresses other people call check their own credential instead, and
 answer any origin: a fire URL checks the token inside it, the browser

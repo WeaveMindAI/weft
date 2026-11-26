@@ -8,7 +8,7 @@
 #   POST receive  { doc: "weft-upload:..." }: the file the page uploaded
 #                 through that slot, received once, answered as its text
 
-file = Route { path: "__E2E_PATH__/file", method: "GET" }
+file = Route { path: "__E2E_PATH__/file", method: "GET", auth: "none" }
 pick = ExecPython(doc: Blob) -> (out: Blob) {
   code: "return {'out': doc}"
   doc: @asset("assets/clip.txt", Blob)
@@ -17,13 +17,13 @@ pick._should_flow = file.fired
 send = Reply
 send.body = pick.out
 
-slot = Route { path: "__E2E_PATH__/slot", method: "GET" }
+slot = Route { path: "__E2E_PATH__/slot", method: "GET", auth: "none" }
 grant = UploadSlot { maxMb: 1, types: "File", minutes: 10, scope: "run" }
 grant._should_flow = slot.fired
 hand = Reply
 hand.body = grant.slot
 
-receive = Route -> (body: { doc: Blob }) { path: "__E2E_PATH__/receive", method: "POST" }
+receive = Route -> (body: { doc: Blob }) { path: "__E2E_PATH__/receive", method: "POST", auth: "none" }
 read = FileToText
 read.file = receive.body.doc
 said = Reply

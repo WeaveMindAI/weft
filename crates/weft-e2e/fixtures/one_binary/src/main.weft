@@ -6,7 +6,7 @@
 #   POST front   answers {"heard": <text, as Echo says it>}
 #   POST back    the same
 
-front = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/front", method: "POST" }
+front = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/front", method: "POST", auth: "none" }
 front_echo = Echo
 front_echo.text = front.body.text
 front_body = ExecPython(text: String) -> (body: JsonDict) {
@@ -16,7 +16,7 @@ front_body.text = front_echo.text
 front_answer = Reply
 front_answer.body = front_body.body
 
-back = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/back", method: "POST" }
+back = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/back", method: "POST", auth: "none" }
 back_echo = Echo
 back_echo.text = back.body.text
 back_body = ExecPython(text: String) -> (body: JsonDict) {

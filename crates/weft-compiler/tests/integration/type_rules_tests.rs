@@ -456,15 +456,15 @@ use.signup = src.signup
 #[test]
 fn a_narrowable_output_takes_a_fitting_type_and_a_fixed_one_only_its_own() {
     let (project, enrich_errors, _) = check(
-        "r = Route -> (body: { email: String, .. }) { path: \"signup\", method: \"POST\" }\n",
+        "r = Route -> (body: { email: String, .. }) { path: \"signup\", method: \"POST\", auth: \"none\" }\n",
     );
     assert!(enrich_errors.is_empty(), "{enrich_errors:?}");
     assert_eq!(output_type(&project, "r", "body"), ty("{ email: String, .. }"));
 
-    let (_, enrich_errors, _) = check("r = Route -> (body: Access) { path: \"signup\" }\n");
+    let (_, enrich_errors, _) = check("r = Route -> (body: Access) { path: \"signup\", auth: \"none\" }\n");
     assert!(enrich_errors.iter().any(|e| e.contains("widest type")), "{enrich_errors:?}");
 
-    let (_, enrich_errors, _) = check("r = Route -> (path: Number) { path: \"signup\" }\n");
+    let (_, enrich_errors, _) = check("r = Route -> (path: Number) { path: \"signup\", auth: \"none\" }\n");
     assert!(enrich_errors.iter().any(|e| e.contains("always gives it String")), "{enrich_errors:?}");
 }
 
@@ -472,15 +472,15 @@ fn a_narrowable_output_takes_a_fitting_type_and_a_fixed_one_only_its_own() {
 /// time by the route's own rules.
 #[test]
 fn a_route_body_type_must_suit_its_data_type() {
-    let (_, _, d) = check("r = Route { path: \"say\", method: \"POST\", dataType: \"text\" }\n");
+    let (_, _, d) = check("r = Route { path: \"say\", method: \"POST\", dataType: \"text\", auth: \"none\" }\n");
     assert!(message_of(&d, "rule-structural").contains("text body"), "{d:?}");
-    let (_, _, d) = check("r = Route -> (body: String) { path: \"say\", method: \"POST\", dataType: \"text\" }\n");
+    let (_, _, d) = check("r = Route -> (body: String) { path: \"say\", method: \"POST\", dataType: \"text\", auth: \"none\" }\n");
     assert!(!codes(&d).contains(&"rule-structural"), "{d:?}");
-    let (_, _, d) = check("r = Route -> (body: Image) { path: \"say\", method: \"POST\" }\n");
+    let (_, _, d) = check("r = Route -> (body: Image) { path: \"say\", method: \"POST\", auth: \"none\" }\n");
     assert!(message_of(&d, "rule-structural").contains("json body"), "{d:?}");
     // A json body may be any JSON, a list or a bare value too, once declared so.
     for body in ["Json", "List[List[Number]]", "String"] {
-        let (_, _, d) = check(&format!("r = Route -> (body: {body}) {{ path: \"say\", method: \"POST\" }}\n"));
+        let (_, _, d) = check(&format!("r = Route -> (body: {body}) {{ path: \"say\", method: \"POST\", auth: \"none\" }}\n"));
         assert!(!codes(&d).contains(&"rule-structural"), "{body}: {d:?}");
     }
 }
@@ -489,12 +489,12 @@ fn a_route_body_type_must_suit_its_data_type() {
 /// the path does not capture, or one typed other than text, is refused.
 #[test]
 fn a_route_port_reads_a_capture_of_its_path() {
-    let (_, _, d) = check("r = Route -> (id: String) { path: \"cards/{id}\", method: \"GET\" }\n");
+    let (_, _, d) = check("r = Route -> (id: String) { path: \"cards/{id}\", method: \"GET\", auth: \"none\" }\n");
     assert!(!codes(&d).contains(&"route-output-not-a-capture"), "{d:?}");
-    let (_, _, d) = check("r = Route -> (name: String) { path: \"cards/{id}\", method: \"GET\" }\n");
+    let (_, _, d) = check("r = Route -> (name: String) { path: \"cards/{id}\", method: \"GET\", auth: \"none\" }\n");
     let message = message_of(&d, "route-output-not-a-capture");
     assert!(message.contains("`name`") && message.contains("`id`"), "{message}");
-    let (_, _, d) = check("r = Route -> (id: Number) { path: \"cards/{id}\", method: \"GET\" }\n");
+    let (_, _, d) = check("r = Route -> (id: Number) { path: \"cards/{id}\", method: \"GET\", auth: \"none\" }\n");
     assert!(message_of(&d, "route-output-not-a-capture").contains("text"), "{d:?}");
 }
 
@@ -503,8 +503,8 @@ fn a_route_port_reads_a_capture_of_its_path() {
 #[test]
 fn a_capture_may_not_share_a_name_with_an_output_of_the_node() {
     for source in [
-        "r = Route { path: \"cards/{body}\", method: \"GET\" }\n",
-        "r = Route -> (body: { title: String }) { path: \"cards/{body}\", method: \"POST\" }\n",
+        "r = Route { path: \"cards/{body}\", method: \"GET\", auth: \"none\" }\n",
+        "r = Route -> (body: { title: String }) { path: \"cards/{body}\", method: \"POST\", auth: \"none\" }\n",
     ] {
         let (_, _, d) = check(source);
         let message = message_of(&d, "route-capture-shadows-output");
@@ -593,7 +593,7 @@ f.name = src.name
 #[test]
 fn a_node_with_only_optional_inputs_wired_needs_its_gate() {
     let ungated = r#"
-r = Route -> (body: { title?: String }) { path: "note", method: "POST" }
+r = Route -> (body: { title?: String }) { path: "note", method: "POST", auth: "none" }
 o = JsonObject { title?: r.body.title }
 "#;
     let (_, _, d) = check(ungated);
@@ -701,7 +701,7 @@ m.v = h.x
 fn the_words_file_and_asset_are_plain_values() {
     let (_, enrich_errors, d) = check(
         r#"
-r = Route { path: "file", method: "GET" }
+r = Route { path: "file", method: "GET", auth: "none" }
 t = Text { value: "asset" }
 "#,
     );

@@ -424,7 +424,7 @@ route's run takes the whole group along, and everything the group needs
 (a database wired into it from outside), exactly as it takes a node.
 
 ````weft
-live = Route { path: "live/count", method: "GET" }
+live = Route { path: "live/count", method: "GET", auth: "none" }
 work = Group(db: Access[postgres]) {
   rows = PostgresExecuteQuery { account: self.db, query: "select count(*) from cards" }
   out = Reply { body: rows.rows }
@@ -929,6 +929,7 @@ pay = Route -> (body: JsonDict) {
   path: "pay"
   method: "POST"
   durable: true
+  auth: "none"
 }
 ```
 
@@ -1077,7 +1078,7 @@ that read that input; those skip, and everything else in the group runs. A
 card whose picture is optional:
 
 ````weft
-look = Route -> (body: { text: String, photo?: Image }) { path: "cards", method: "POST" }
+look = Route -> (body: { text: String, photo?: Image }) { path: "cards", method: "POST", auth: "none" }
 
 card = Group(text: String, picture: Image) -> (saved: String) {
   store = ExecPython(text: String, shot?: Image) -> (line: String) {

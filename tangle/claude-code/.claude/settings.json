@@ -101,6 +101,9 @@
       "Bash(weft options:*)",
       "Bash(weft instance-values:*)",
       "Bash(sleep 1200)"
+    ],
+    "ask": [
+      "Bash(weft token mint-operator:*)"
     ]
   }
 }

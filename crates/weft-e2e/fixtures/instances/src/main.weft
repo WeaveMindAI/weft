@@ -14,6 +14,6 @@ probe.key = theirs.access
 answer = Reply
 answer.body = probe.body
 
-open = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/open", method: "POST" }
+open = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/open", method: "POST", auth: "none" }
 echo = Reply
 echo.body = open.body.text

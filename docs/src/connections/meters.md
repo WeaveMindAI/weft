@@ -103,7 +103,7 @@ weft puts no cap on spending. If you want one, check the total before the paid
 node and gate that node on the answer:
 
 ```weft
-question = Route -> (body: { text: String }) { path: "ask", method: "POST" }
+question = Route -> (body: { text: String }) { path: "ask", method: "POST", auth: "none" }
 openrouter = OpenRouterAccess
 model = OpenRouterModel { access: openrouter.access, model: "z-ai/glm-5.3" }
 

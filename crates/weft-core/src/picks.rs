@@ -142,8 +142,9 @@ fn missing_pick(node: &NodeDefinition, field: &str, spelled: &str) -> String {
     let scheme = node
         .features
         .checks_callers
-        .then(|| crate::access::callers::parse_auth(node.port_literals.get(crate::access::callers::AUTH_FIELD)).ok().flatten())
-        .flatten();
+        .then(|| node.port_literals.get(crate::access::callers::AUTH_FIELD))
+        .flatten()
+        .and_then(|auth| crate::access::callers::parse_auth(auth).ok().flatten());
     match scheme {
         Some(verify) => crate::access::callers::no_connection(spelled, &verify),
         None => format!(

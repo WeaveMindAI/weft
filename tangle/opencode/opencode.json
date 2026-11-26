@@ -50,6 +50,7 @@
       "weft files inspect*": "allow",
       "weft connect*": "allow",
       "weft token*": "allow",
+      "weft token mint-operator*": "ask",
       "weft deactivate*": "allow",
       "weft resync*": "allow",
       "weft rm*": "allow",

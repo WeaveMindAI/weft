@@ -138,12 +138,12 @@ that holds the per-instance part. A route inside that file would be per
 instance itself, and the build refuses it.
 
 ```weft
-ask = Route -> (body: JsonDict) { path: "ask", method: "POST" }
+ask = Route -> (body: JsonDict) { path: "ask", method: "POST", auth: "none" }
 askWork = @include("work.weft")
 askWork.request = ask.body
 askReply = Reply { body: askWork.answer }
 
-sum = Route -> (body: JsonDict) { path: "summary", method: "POST" }
+sum = Route -> (body: JsonDict) { path: "summary", method: "POST", auth: "none" }
 sumWork = @include("work.weft")
 sumWork.request = sum.body
 sumReply = Reply { body: sumWork.answer }
@@ -232,7 +232,7 @@ instance, so a container that is down cannot get it refused. For example,
 reading the container's state with `InstanceInfraStatus`:
 
 ```weft
-status = Route -> (id: String) { path: "session/status/{id}", method: "GET" }
+status = Route -> (id: String) { path: "session/status/{id}", method: "GET", auth: "none" }
 state = InstanceInfraStatus { node: "sandbox", instance: status.id }
 answer = Reply { body: state.status }
 ```

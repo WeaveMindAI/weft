@@ -311,11 +311,27 @@
           "action": "allow"
         },
         {
-          "pattern": "weft token",
+          "pattern": "weft token mint",
           "action": "allow"
         },
         {
-          "prefix": "weft token ",
+          "prefix": "weft token mint ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft token ls",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft token ls ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft token revoke",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft token revoke ",
           "action": "allow"
         },
         {

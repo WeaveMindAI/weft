@@ -485,7 +485,7 @@ fn top_level_include_does_not_make_project_look_like_a_component() {
 #[test]
 fn a_value_matches_rule_fires_only_when_the_pattern_matches() {
     // path starts with `/` -> the rule fires (warning).
-    let with_slash = parse_enrich("t = Route { path: \"/hook\" }\n");
+    let with_slash = parse_enrich("t = Route { path: \"/hook\", auth: \"none\" }\n");
     let d = validate(&with_slash, &catalog());
     assert!(
         d.iter().any(|x| x.message.contains("path starts with '/'")),
@@ -493,7 +493,7 @@ fn a_value_matches_rule_fires_only_when_the_pattern_matches() {
     );
 
     // path without a leading slash -> no rule.
-    let no_slash = parse_enrich("t = Route { path: \"hook\" }\n");
+    let no_slash = parse_enrich("t = Route { path: \"hook\", auth: \"none\" }\n");
     let d2 = validate(&no_slash, &catalog());
     assert!(
         !d2.iter().any(|x| x.message.contains("path starts with '/'")),
@@ -503,7 +503,7 @@ fn a_value_matches_rule_fires_only_when_the_pattern_matches() {
     // path absent entirely -> no rule (fail-closed: an absent field is not a
     // match, matching every sibling ConfigX condition; the old `unwrap_or(true)`
     // wrongly fired this).
-    let absent = parse_enrich("t = Route {}\n");
+    let absent = parse_enrich("t = Route { auth: \"none\" }\n");
     let d3 = validate(&absent, &catalog());
     assert!(
         !d3.iter().any(|x| x.message.contains("path starts with '/'")),
@@ -516,7 +516,7 @@ fn a_value_matches_rule_fires_only_when_the_pattern_matches() {
 /// handed to another call), and the refusal says which to turn back.
 #[test]
 fn an_unrecorded_route_that_outlives_its_caller_is_refused() {
-    let both = parse_enrich("t = Route { path: \"status\", recorded: false, outlivesCaller: true }\n");
+    let both = parse_enrich("t = Route { path: \"status\", recorded: false, outlivesCaller: true, auth: \"none\" }\n");
     let d = validate(&both, &catalog());
     let hit = errors(&d).into_iter().find(|x| x.code.as_deref() == Some("run-settings")).unwrap_or_else(|| panic!("{d:?}"));
     assert!(hit.message.contains("outlivesCaller") && hit.message.contains("recorded"), "{}", hit.message);
@@ -528,14 +528,14 @@ fn an_unrecorded_route_that_outlives_its_caller_is_refused() {
 #[test]
 fn a_durable_trigger_that_is_not_recorded_is_refused() {
     for source in [
-        "t = Route { path: \"pay\", durable: true, recorded: false }\n",
+        "t = Route { path: \"pay\", durable: true, recorded: false, auth: \"none\" }\n",
         "t = Cron { cron: \"0 * * * *\", durable: true, recorded: false }\n",
     ] {
         let d = validate(&parse_enrich(source), &catalog());
         let hit = errors(&d).into_iter().find(|x| x.code.as_deref() == Some("run-settings")).unwrap_or_else(|| panic!("{source}: {d:?}"));
         assert!(hit.message.contains("durable") && hit.message.contains("recorded"), "{}", hit.message);
     }
-    let fine = parse_enrich("t = Route { path: \"pay\", durable: true }\n");
+    let fine = parse_enrich("t = Route { path: \"pay\", durable: true, auth: \"none\" }\n");
     assert!(!validate(&fine, &catalog()).iter().any(|x| x.code.as_deref() == Some("run-settings")));
 }
 
@@ -1609,7 +1609,7 @@ use.n = c.value
 fn a_declared_socket_inbound_drives_a_loop_clean() {
     let (project, errs) = parse_enrich_lenient(
         r#"
-sock = Socket -> (inbound: Generator[JsonDict]) { path: "chat" }
+sock = Socket -> (inbound: Generator[JsonDict]) { path: "chat", auth: "none" }
 turn = Loop(msg: Generator[JsonDict]) -> (results: List[Boolean | Null]) {
     parallel: false
     over: ["msg"]
@@ -1645,11 +1645,11 @@ turn = Loop(msg: Generator[JsonDict]) -> (results: List[Boolean | Null]) {
 }
 turn.msg = sock.inbound
 "#;
-    let (project, _) = parse_enrich_lenient(&format!("sock = Socket {{ path: \"chat\" }}\n{loop_over}"));
+    let (project, _) = parse_enrich_lenient(&format!("sock = Socket {{ path: \"chat\", auth: \"none\" }}\n{loop_over}"));
     let d = validate(&project, &catalog());
     assert!(!codes(&d).contains(&"unresolved-typevar") && !codes(&d).contains(&"type-mismatch"), "{:?}", errors(&d));
 
-    let (project, _) = parse_enrich_lenient("sock = Socket { path: \"chat\", dataType: \"text\" }\n");
+    let (project, _) = parse_enrich_lenient("sock = Socket { path: \"chat\", dataType: \"text\", auth: \"none\" }\n");
     let d = validate(&project, &catalog());
     assert!(
         errors(&d).iter().any(|x| x.message.contains("text messages")),
@@ -1665,7 +1665,7 @@ turn.msg = sock.inbound
 fn a_route_with_a_typed_body_and_one_with_none_both_validate() {
     let (project, errs) = parse_enrich_lenient(
         r#"
-hello = Route -> (body: { name: String }) { path: "hello", method: "POST" }
+hello = Route -> (body: { name: String }) { path: "hello", method: "POST", auth: "none" }
 answer = Reply { status: 201 }
 answer.body = hello.body.name
 "#,
@@ -1676,7 +1676,7 @@ answer.body = hello.body.name
 
     let (project, errs) = parse_enrich_lenient(
         r#"
-ping = Route { path: "ping", method: "GET" }
+ping = Route { path: "ping", method: "GET", auth: "none" }
 answer = Reply
 answer.body = ping.path
 "#,
@@ -1692,7 +1692,7 @@ answer.body = ping.path
 fn a_bus_into_a_stream_node_validates_clean() {
     let (project, errs) = parse_enrich_lenient(
         r#"
-ask = Route -> (body: { prompt: String }) { path: "chat", method: "POST" }
+ask = Route -> (body: { prompt: String }) { path: "chat", method: "POST", auth: "none" }
 ai = OpenRouterAccess
 prov = OpenRouterModel { model: "openai/gpt-4.1-nano" }
 prov.access = ai.access
@@ -3906,16 +3906,16 @@ fn a_route_whose_run_answers_nobody_is_flagged_and_a_gated_group_counts() {
         d.iter().any(|x| x.message.contains("answers nobody"))
     };
     // Wired by data: fine both ways.
-    let wired = "t = Route -> (body: { text: String }) { path: \"hook\" }\nr = Reply\nr.body = t.body.text\n";
+    let wired = "t = Route -> (body: { text: String }) { path: \"hook\", auth: \"none\" }\nr = Reply\nr.body = t.body.text\n";
     assert!(answers(wired) && !orphaned(wired));
     // Nothing behind the route, and a reply nothing reaches.
-    let alone = "t = Route { path: \"hook\" }\nr = Reply { body: \"x\" }\n";
+    let alone = "t = Route { path: \"hook\", auth: \"none\" }\nr = Reply { body: \"x\" }\n";
     assert!(!answers(alone) && orphaned(alone), "{:?}", validate(&parse_enrich(alone), &catalog()));
     // The reply inside a group the route runs through `_should_flow`.
-    let gated = "t = Route { path: \"hook\" }\nwork = Group() {\n  r = Reply { body: \"x\" }\n}\nwork._should_flow = t.method\n";
+    let gated = "t = Route { path: \"hook\", auth: \"none\" }\nwork = Group() {\n  r = Reply { body: \"x\" }\n}\nwork._should_flow = t.method\n";
     assert!(answers(gated) && !orphaned(gated), "{:?}", validate(&parse_enrich(gated), &catalog()));
     // A route whose only connection is to a group's door, with nothing inside.
-    let empty = "t = Route { path: \"hook\" }\nwork = Group() {\n  n = ExecPython() -> (out: String) { code: \"return {'out': 'x'}\" }\n}\nwork._should_flow = t.method\n";
+    let empty = "t = Route { path: \"hook\", auth: \"none\" }\nwork = Group() {\n  n = ExecPython() -> (out: String) { code: \"return {'out': 'x'}\" }\n}\nwork._should_flow = t.method\n";
     assert!(!answers(empty));
 }
 
@@ -3964,11 +3964,11 @@ fn a_decision_input_holding_a_file_inside_a_value_is_refused() {
 /// fine.
 #[test]
 fn a_route_that_ended_up_per_instance_is_refused_naming_why() {
-    let per_instance = "gate = PostgresAccess { account: @instance_filled }\nt = Route { path: \"hook\" }\nt._should_flow = gate.access\nr = Reply { body: \"x\" }\nr._should_flow = t.method\n";
+    let per_instance = "gate = PostgresAccess { account: @instance_filled }\nt = Route { path: \"hook\", auth: \"none\" }\nt._should_flow = gate.access\nr = Reply { body: \"x\" }\nr._should_flow = t.method\n";
     let found = messages(per_instance);
     let hit = found.iter().find(|m| m.contains("would exist once per instance"));
     assert!(hit.is_some_and(|m| m.contains("because it reads 'gate'") && m.contains("Weft-Instance")), "{found:?}");
-    let shared = "gate = PostgresAccess {}\nt = Route { path: \"hook\" }\nt._should_flow = gate.access\nr = Reply { body: \"x\" }\nr._should_flow = t.method\n";
+    let shared = "gate = PostgresAccess {}\nt = Route { path: \"hook\", auth: \"none\" }\nt._should_flow = gate.access\nr = Reply { body: \"x\" }\nr._should_flow = t.method\n";
     assert!(!messages(shared).iter().any(|m| m.contains("would exist once per instance")));
 }
 
@@ -3984,15 +3984,15 @@ fn the_per_instance_refusal_names_the_path_through_a_group() {
         let found = messages(source);
         found.into_iter().find(|m| m.contains("would exist once per instance")).expect("the route is refused")
     };
-    let through_port = "gate = PostgresAccess { account: @instance_filled }\nwork = Group(k: Access) {\n  t = Route { path: \"hook\" }\n  t._should_flow = self.k\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\nwork.k = gate.access\n";
+    let through_port = "gate = PostgresAccess { account: @instance_filled }\nwork = Group(k: Access) {\n  t = Route { path: \"hook\", auth: \"none\" }\n  t._should_flow = self.k\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\nwork.k = gate.access\n";
     let m = refusal(through_port);
     assert!(m.contains("because it reads 'gate', but"), "{m}");
 
-    let beside = "gate = PostgresAccess { account: @instance_filled }\nshared = PostgresAccess {}\nwork = Group(k: Access, o: Access) {\n  t = Route { path: \"hook\" }\n  t._should_flow = self.o\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n  d = Debug\n  d.data = self.k\n}\nwork.k = gate.access\nwork.o = shared.access\n";
+    let beside = "gate = PostgresAccess { account: @instance_filled }\nshared = PostgresAccess {}\nwork = Group(k: Access, o: Access) {\n  t = Route { path: \"hook\", auth: \"none\" }\n  t._should_flow = self.o\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n  d = Debug\n  d.data = self.k\n}\nwork.k = gate.access\nwork.o = shared.access\n";
     let found = messages(beside);
     assert!(!found.iter().any(|m| m.contains("would exist once per instance")), "{found:?}");
 
-    let gated = "gate = PostgresAccess { account: @instance_filled }\nshared = PostgresAccess {}\nwork = Group(o: Access) {\n  t = Route { path: \"hook\" }\n  t._should_flow = self.o\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\nwork.o = shared.access\nwork._should_flow = gate.access\n";
+    let gated = "gate = PostgresAccess { account: @instance_filled }\nshared = PostgresAccess {}\nwork = Group(o: Access) {\n  t = Route { path: \"hook\", auth: \"none\" }\n  t._should_flow = self.o\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\nwork.o = shared.access\nwork._should_flow = gate.access\n";
     let m = refusal(gated);
     assert!(m.contains("because it sits inside group 'work', whose gate reads 'gate', but"), "{m}");
     assert!(!m.contains("it reads"), "{m}");
@@ -4006,7 +4006,7 @@ fn the_per_instance_refusal_names_the_call_site_whose_gate_reads_it() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("hook.weft"),
-        "Group() {\n  t = Route { path: \"hook\" }\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\n",
+        "Group() {\n  t = Route { path: \"hook\", auth: \"none\" }\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\n",
     ).unwrap();
     let src = "gate = PostgresAccess { account: @instance_filled }\none = @include(\"hook.weft\")\none._should_flow = gate.access\n";
     let found: Vec<String> = entry_program(src, dir.path()).into_iter().map(|d| d.message).collect();
@@ -4019,7 +4019,7 @@ fn the_per_instance_refusal_names_the_call_site_whose_gate_reads_it() {
 /// instance, and the refusal names the loop.
 #[test]
 fn the_per_instance_refusal_names_the_loop_whose_list_reads_it() {
-    let src = "gate = PostgresAccess { account: @instance_filled }\nlist = ExecPython(a: Access) -> (items: List[String]) { code: \"x\" }\nlist.a = gate.access\neach = Loop(items: List[String]) -> (seen: List[String | Null]) {\n  parallel: false\n  over: [\"items\"]\n  t = Route { path: \"hook\" }\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n  self.seen = self.items\n}\neach.items = list.items\n";
+    let src = "gate = PostgresAccess { account: @instance_filled }\nlist = ExecPython(a: Access) -> (items: List[String]) { code: \"x\" }\nlist.a = gate.access\neach = Loop(items: List[String]) -> (seen: List[String | Null]) {\n  parallel: false\n  over: [\"items\"]\n  t = Route { path: \"hook\", auth: \"none\" }\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n  self.seen = self.items\n}\neach.items = list.items\n";
     let found = messages(src);
     let m = found.iter().find(|m| m.contains("would exist once per instance")).unwrap_or_else(|| panic!("the route is refused: {found:?}"));
     assert!(m.contains("because it sits inside loop 'each', which runs on what 'gate' gives it, but"), "{m}");
@@ -4031,7 +4031,7 @@ fn the_per_instance_refusal_names_the_loop_whose_list_reads_it() {
 #[test]
 fn a_route_counts_any_node_that_answers_its_caller() {
     for answer in ["Reply { body: \"x\" }", "Close { status: 404 }", "Stream {}"] {
-        let source = format!("t = Route {{ path: \"hook\" }}\na = {answer}\na._should_flow = t.method\n");
+        let source = format!("t = Route {{ path: \"hook\", auth: \"none\" }}\na = {answer}\na._should_flow = t.method\n");
         let found = messages(&source);
         assert!(!found.iter().any(|m| m.contains("never answers its caller") || m.contains("answers nobody")), "{answer}: {found:?}");
     }
@@ -4044,7 +4044,7 @@ fn a_route_counts_any_node_that_answers_its_caller() {
 fn a_second_response_head_after_a_stream_is_refused() {
     let after = |trigger: &str, next: &str| -> Vec<String> {
         messages(&format!(
-            "t = {trigger} {{ path: \"hook\" }}\ns = Stream {{}}\ns._should_flow = t.method\nn = {next}\nn._should_flow = s.done\n"
+            "t = {trigger} {{ path: \"hook\", auth: \"none\" }}\ns = Stream {{}}\ns._should_flow = t.method\nn = {next}\nn._should_flow = s.done\n"
         ))
     };
     let reply = after("Route", "Reply { body: \"x\" }");
@@ -4055,7 +4055,7 @@ fn a_second_response_head_after_a_stream_is_refused() {
     assert!(!after("Socket", "Reply { body: \"x\" }").iter().any(|m| m.contains("runs after")));
     // A Reply BEFORE the stream (the stream waits on it) is no second head.
     let before = messages(
-        "t = Route { path: \"hook\" }\nr = Reply { body: \"x\" }\nr._should_flow = t.method\ns = Stream {}\ns._should_flow = r.done\n",
+        "t = Route { path: \"hook\", auth: \"none\" }\nr = Reply { body: \"x\" }\nr._should_flow = t.method\ns = Stream {}\ns._should_flow = r.done\n",
     );
     assert!(!before.iter().any(|m| m.contains("'r' runs after")), "{before:?}");
 }
@@ -4124,7 +4124,7 @@ fn a_trigger_is_never_asked_when_it_runs() {
     let project = parse_enrich(
         r#"
 gate = PostgresAccess {}
-t = Route { path: "hook" }
+t = Route { path: "hook", auth: "none" }
 t._should_flow = gate.access
 "#,
     );
@@ -4142,7 +4142,7 @@ fn a_wired_gate_decides_when_an_all_optional_node_runs() {
     let undecided = |source: &str| -> bool {
         validate(&parse_enrich(source), &catalog()).iter().any(|d| d.code.as_deref() == Some("run-undecided"))
     };
-    let base = "t = Route -> (body: { why?: String }) { path: \"gone\", method: \"DELETE\" }\n\
+    let base = "t = Route -> (body: { why?: String }) { path: \"gone\", method: \"DELETE\", auth: \"none\" }\n\
                 obj = JsonObject { why?: t.body.why }\n";
     assert!(undecided(base), "every wired input of the object is optional and nothing gates it");
     assert!(!undecided(&format!("{base}obj._should_flow = t.fired\n")), "the gate is the author's decision");
@@ -4156,14 +4156,14 @@ fn close_says_at_edit_time_which_wire_its_fields_belong_to() {
     let says = |source: &str, needle: &str| -> bool {
         validate(&parse_enrich(source), &catalog()).iter().any(|d| d.message.contains(needle))
     };
-    let route = "t = Route { path: \"gone\", method: \"DELETE\" }\nstep = ExecPython(method: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.method = t.method\nbye = Close ";
+    let route = "t = Route { path: \"gone\", method: \"DELETE\", auth: \"none\" }\nstep = ExecPython(method: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.method = t.method\nbye = Close ";
     // A reason under a 204 cannot reach the caller.
     assert!(says(&format!("{route}{{ status: 204, reason: \"gone\" }}\nbye._should_flow = step.n\n"), "carries no body"));
     assert!(!says(&format!("{route}{{ status: 404, reason: \"gone\" }}\nbye._should_flow = step.n\n"), "carries no body"));
     assert!(!says(&format!("{route}{{ status: 204 }}\nbye._should_flow = step.n\n"), "carries no body"));
     // A socket's close code behind a Route, and an HTTP status behind a socket.
     assert!(says(&format!("{route}{{ code: 4001 }}\nbye._should_flow = step.n\n"), "WebSocket close code"));
-    let socket = "s = Socket { path: \"chat\" }\nstep = ExecPython(path: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.path = s.path\nbye = Close { status: 404 }\nbye._should_flow = step.n\n";
+    let socket = "s = Socket { path: \"chat\", auth: \"none\" }\nstep = ExecPython(path: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.path = s.path\nbye = Close { status: 404 }\nbye._should_flow = step.n\n";
     assert!(says(socket, "an HTTP status"));
     assert!(!says(socket, "WebSocket close code"));
 }
@@ -4386,8 +4386,8 @@ fn both_gates_on_an_included_file_are_refused() {
 #[test]
 fn a_literal_route_lives_beside_the_capture_that_would_swallow_it() {
     let p = parse_enrich(
-        "count = Route { path: \"cards/count\", method: \"GET\" }\n\
-         one = Route { path: \"cards/{id}\", method: \"GET\" }\n",
+        "count = Route { path: \"cards/count\", method: \"GET\", auth: \"none\" }\n\
+         one = Route { path: \"cards/{id}\", method: \"GET\", auth: \"none\" }\n",
     );
     let d = validate(&p, &catalog());
     assert!(
@@ -4401,8 +4401,8 @@ fn a_literal_route_lives_beside_the_capture_that_would_swallow_it() {
 #[test]
 fn two_captures_on_one_shape_are_refused() {
     let p = parse_enrich(
-        "by_id = Route { path: \"cards/{id}\", method: \"GET\" }\n\
-         by_slug = Route { path: \"cards/{slug}\", method: \"GET\" }\n",
+        "by_id = Route { path: \"cards/{id}\", method: \"GET\", auth: \"none\" }\n\
+         by_slug = Route { path: \"cards/{slug}\", method: \"GET\", auth: \"none\" }\n",
     );
     let d = validate(&p, &catalog());
     let found: Vec<&Diagnostic> =
@@ -4424,8 +4424,8 @@ fn two_captures_on_one_shape_are_refused() {
 #[test]
 fn two_routes_that_each_win_a_position_are_refused() {
     let p = parse_enrich(
-        "mid = Route { path: \"a/{x}/c\", method: \"GET\" }\n\
-         last = Route { path: \"a/b/{y}\", method: \"GET\" }\n",
+        "mid = Route { path: \"a/{x}/c\", method: \"GET\", auth: \"none\" }\n\
+         last = Route { path: \"a/b/{y}\", method: \"GET\", auth: \"none\" }\n",
     );
     let d = validate(&p, &catalog());
     assert!(
@@ -4439,8 +4439,8 @@ fn two_routes_that_each_win_a_position_are_refused() {
 #[test]
 fn one_path_under_two_methods_is_fine() {
     let p = parse_enrich(
-        "read = Route { path: \"cards/{id}\", method: \"GET\" }\n\
-         drop = Route { path: \"cards/{id}\", method: \"DELETE\" }\n",
+        "read = Route { path: \"cards/{id}\", method: \"GET\", auth: \"none\" }\n\
+         drop = Route { path: \"cards/{id}\", method: \"DELETE\", auth: \"none\" }\n",
     );
     let d = validate(&p, &catalog());
     assert!(
@@ -4454,8 +4454,8 @@ fn one_path_under_two_methods_is_fine() {
 #[test]
 fn a_route_serving_every_method_collides_with_a_named_one() {
     let p = parse_enrich(
-        "any = Route { path: \"cards\" }\n\
-         post = Route { path: \"cards\", method: \"POST\" }\n",
+        "any = Route { path: \"cards\", auth: \"none\" }\n\
+         post = Route { path: \"cards\", method: \"POST\", auth: \"none\" }\n",
     );
     let d = validate(&p, &catalog());
     assert!(
@@ -4469,9 +4469,9 @@ fn a_route_serving_every_method_collides_with_a_named_one() {
 #[test]
 fn routes_that_cannot_take_the_same_call_are_left_alone() {
     let p = parse_enrich(
-        "a = Route { path: \"cards\", method: \"GET\" }\n\
-         b = Route { path: \"cards/{id}\", method: \"GET\" }\n\
-         c = Route { path: \"decks/{id}\", method: \"GET\" }\n",
+        "a = Route { path: \"cards\", method: \"GET\", auth: \"none\" }\n\
+         b = Route { path: \"cards/{id}\", method: \"GET\", auth: \"none\" }\n\
+         c = Route { path: \"decks/{id}\", method: \"GET\", auth: \"none\" }\n",
     );
     let d = validate(&p, &catalog());
     assert!(
@@ -4486,7 +4486,7 @@ fn routes_that_cannot_take_the_same_call_are_left_alone() {
 #[test]
 fn a_path_that_is_not_a_pattern_is_refused() {
     for path in ["cards/{id", "a//b", "/cards"] {
-        let p = parse_enrich(&format!("r = Route {{ path: \"{path}\", method: \"GET\" }}\n"));
+        let p = parse_enrich(&format!("r = Route {{ path: \"{path}\", method: \"GET\", auth: \"none\" }}\n"));
         let d = validate(&p, &catalog());
         let found = d
             .iter()
@@ -4505,9 +4505,9 @@ fn a_path_that_is_not_a_pattern_is_refused() {
 #[test]
 fn a_route_with_no_address_is_refused() {
     for source in [
-        "r = Route { method: \"GET\" }\n",
-        "r = Route { path: \"\", method: \"GET\" }\n",
-        "s = Socket { }\n",
+        "r = Route { method: \"GET\", auth: \"none\" }\n",
+        "r = Route { path: \"\", method: \"GET\", auth: \"none\" }\n",
+        "s = Socket { auth: \"none\" }\n",
     ] {
         let p = parse_enrich(source);
         let d = validate(&p, &catalog());
@@ -4525,13 +4525,48 @@ fn a_route_with_no_address_is_refused() {
     }
 }
 
+/// A route or socket that never says who may call it does not build:
+/// leaving it open is `auth: "none"`, written, and the refusal says so,
+/// naming the choices, through the generic required-input check (the
+/// input's description and its select's options, nothing Route-specific).
+#[test]
+fn a_route_or_socket_without_auth_is_refused_naming_the_choices() {
+    for (source, place) in [
+        ("r = Route { path: \"cards\", method: \"GET\" }\n", "'r.auth'"),
+        ("s = Socket { path: \"chat\" }\n", "'s.auth'"),
+    ] {
+        let d = validate(&parse_enrich(source), &catalog());
+        let unmet: Vec<&Diagnostic> = d.iter().filter(|x| x.code.as_deref() == Some("required-port-unmet")).collect();
+        assert_eq!(unmet.len(), 1, "{source}: {d:?}");
+        let message = &unmet[0].message;
+        assert_eq!(unmet[0].severity, Severity::Error, "{message}");
+        assert!(message.contains(place), "{message}");
+        assert!(message.contains("`none` lets anyone with the URL"), "it says what `none` means: {message}");
+        assert!(
+            message.contains("'none', 'api_keys', 'hmac_sha256', 'hmac_sha1', 'hmac_sha512', 'ed25519', 'ecdsa_p256', 'oidc'"),
+            "it names every choice: {message}"
+        );
+    }
+}
+
+/// Written, either answer builds: `"none"` keeps the door open, a check
+/// closes it (its connection is the install's pick, not the source's).
+#[test]
+fn a_route_with_auth_written_builds() {
+    for auth in ["\"none\"", "\"api_keys\""] {
+        let source = format!("r = Route {{ path: \"cards\", method: \"GET\", auth: {auth} }}\nok = Reply {{ body: \"x\" }}\nok._should_flow = r.method\n");
+        let d = validate(&parse_enrich(&source), &catalog());
+        assert!(!d.iter().any(|x| x.severity == Severity::Error), "{auth}: {d:?}");
+    }
+}
+
 /// Two triggers that both forgot their address are the reason the one
 /// above is an error: this is what used to compile clean.
 #[test]
 fn two_addressless_routes_do_not_compile() {
     let p = parse_enrich(
-        "a = Route { method: \"GET\" }\n\
-         b = Route { method: \"GET\" }\n",
+        "a = Route { method: \"GET\", auth: \"none\" }\n\
+         b = Route { method: \"GET\", auth: \"none\" }\n",
     );
     let d = validate(&p, &catalog());
     assert_eq!(
@@ -4547,7 +4582,7 @@ fn two_addressless_routes_do_not_compile() {
 fn a_wired_path_is_not_called_missing() {
     let p = parse_enrich(
         "src = Text { value: \"hooks/stripe\" }\n\
-         r = Route { method: \"GET\" }\n\
+         r = Route { method: \"GET\", auth: \"none\" }\n\
          r.path = src.out\n",
     );
     let d = validate(&p, &catalog());
@@ -4562,7 +4597,7 @@ fn a_wired_path_is_not_called_missing() {
 /// node claims to every verb.
 #[test]
 fn a_method_that_is_not_an_http_method_is_refused() {
-    let p = parse_enrich("r = Route { path: \"cards\", method: \"GTE\" }\n");
+    let p = parse_enrich("r = Route { path: \"cards\", method: \"GTE\", auth: \"none\" }\n");
     let d = validate(&p, &catalog());
     let found = d
         .iter()
@@ -4580,8 +4615,8 @@ fn a_method_that_is_not_an_http_method_is_refused() {
     // And the broken claim is out of the overlap comparison, so the
     // author reads one finding about one mistake.
     let p = parse_enrich(
-        "bad = Route { path: \"cards\", method: \"GTE\" }\n\
-         ok = Route { path: \"cards\", method: \"GET\" }\n",
+        "bad = Route { path: \"cards\", method: \"GTE\", auth: \"none\" }\n\
+         ok = Route { path: \"cards\", method: \"GET\", auth: \"none\" }\n",
     );
     let d = validate(&p, &catalog());
     assert!(
@@ -4595,8 +4630,8 @@ fn a_method_that_is_not_an_http_method_is_refused() {
 #[test]
 fn a_socket_and_a_route_claiming_one_path_collide() {
     let p = parse_enrich(
-        "live = Socket { path: \"chat/{room}\" }\n\
-         http = Route { path: \"chat/{room}\", method: \"GET\" }\n",
+        "live = Socket { path: \"chat/{room}\", auth: \"none\" }\n\
+         http = Route { path: \"chat/{room}\", method: \"GET\", auth: \"none\" }\n",
     );
     let d = validate(&p, &catalog());
     assert!(
@@ -4624,10 +4659,10 @@ fn compile_with_files(main: &str, files: &[(&str, &str)]) -> weft_core::ProjectD
 }
 
 /// An included file that serves the address it spells out.
-const DOOR_WRITTEN: &str = "Group() -> (out: String) {\n  door = Route { path: \"hooks/in\", method: \"POST\" }\n  self.out = door.method\n}\n";
+const DOOR_WRITTEN: &str = "Group() -> (out: String) {\n  door = Route { path: \"hooks/in\", method: \"POST\", auth: \"none\" }\n  self.out = door.method\n}\n";
 
 /// An included file whose address each site gives through its input.
-const DOOR_WIRED: &str = "Group(path: String) -> (out: String) {\n  door = Route { method: \"POST\" }\n  door.path = self.path\n  self.out = door.method\n}\n";
+const DOOR_WIRED: &str = "Group(path: String) -> (out: String) {\n  door = Route { method: \"POST\", auth: \"none\" }\n  door.path = self.path\n  self.out = door.method\n}\n";
 
 fn overlaps(d: &[Diagnostic]) -> Vec<&Diagnostic> {
     d.iter().filter(|x| x.code.as_deref() == Some("route-overlap")).collect()
@@ -4714,7 +4749,7 @@ fn a_route_included_twice_inside_an_included_file_is_refused_there() {
 /// of both).
 #[test]
 fn two_colliding_routes_in_a_file_included_twice_are_each_named_once() {
-    let pair = "Group() -> (out: String) {\n  a = Route { path: \"cards/{id}\", method: \"GET\" }\n  b = Route { path: \"cards/{slug}\", method: \"GET\" }\n  self.out = a.method\n}\n";
+    let pair = "Group() -> (out: String) {\n  a = Route { path: \"cards/{id}\", method: \"GET\", auth: \"none\" }\n  b = Route { path: \"cards/{slug}\", method: \"GET\", auth: \"none\" }\n  self.out = a.method\n}\n";
     let d = validate_with_files(
         "one = @include(\"pair.weft\")\ntwo = @include(\"pair.weft\")\n",
         &[("pair.weft", pair)],
@@ -4741,7 +4776,7 @@ fn two_colliding_routes_in_a_file_included_twice_are_each_named_once() {
 /// instance's value is known, so two includes of it are not refused here.
 #[test]
 fn an_instance_filled_route_in_a_file_included_twice_compiles() {
-    let door = "Group() -> (out: String) {\n  door = Route { path: @instance_filled, method: \"POST\" }\n  self.out = door.method\n}\n";
+    let door = "Group() -> (out: String) {\n  door = Route { path: @instance_filled, method: \"POST\", auth: \"none\" }\n  self.out = door.method\n}\n";
     let d = validate_with_files(
         "one = @include(\"door.weft\")\ntwo = @include(\"door.weft\")\n",
         &[("door.weft", door)],
@@ -4754,9 +4789,9 @@ fn an_instance_filled_route_in_a_file_included_twice_compiles() {
 /// parse is still reported, because the author wrote it.
 #[test]
 fn a_route_in_a_body_nothing_calls_claims_nothing_but_is_still_checked() {
-    let lib = "Group() -> (out: String) {\n  same = Route { path: \"hooks/in\", method: \"POST\" }\n  bad = Route { path: \"a//b\", method: \"POST\" }\n  self.out = same.method\n}\n";
+    let lib = "Group() -> (out: String) {\n  same = Route { path: \"hooks/in\", method: \"POST\", auth: \"none\" }\n  bad = Route { path: \"a//b\", method: \"POST\", auth: \"none\" }\n  self.out = same.method\n}\n";
     let mut project = compile_with_files(
-        "lib = @include(\"lib.weft\")\nmine = Route { path: \"hooks/in\", method: \"POST\" }\n",
+        "lib = @include(\"lib.weft\")\nmine = Route { path: \"hooks/in\", method: \"POST\", auth: \"none\" }\n",
         &[("lib.weft", lib)],
     );
     // Drop the only site, leaving its body uncalled.

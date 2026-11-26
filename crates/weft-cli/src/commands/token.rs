@@ -1,4 +1,4 @@
-//! Token management: operator keys (`--operator`, an install's admin
+//! Token management: operator keys (`mint-operator`, an install's admin
 //! credential, the one `weft login` stores) and signal tokens. A signal
 //! token grants scoped access to the dispatcher's signal enumeration +
 //! reply surface (`GET /signal-token/signals`, Bearer-authenticated): a
@@ -50,8 +50,11 @@ pub enum TokenAction {
         /// A connections key for one project's program (`--connections`).
         connections: bool,
         expires_in_secs: Option<u64>,
-        /// An operator key rather than a caller token (`--operator`).
-        operator: bool,
+    },
+    /// An operator key: the install's admin credential, no scope.
+    MintOperator {
+        name: Option<String>,
+        expires_in_secs: Option<u64>,
     },
     Ls,
     Revoke {
@@ -62,7 +65,31 @@ pub enum TokenAction {
 pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
     let client = ctx.client()?;
     match action {
-        TokenAction::Mint { name, projects, tags, displays, all_displays, instance, connections, expires_in_secs, operator } => {
+        TokenAction::MintOperator { name, expires_in_secs } => {
+            let body = MintTokenRequest {
+                name,
+                allowed_projects: Vec::new(),
+                allowed_tags: Vec::new(),
+                allowed_displays: Vec::new(),
+                all_displays: false,
+                instance: None,
+                connections: false,
+                expires_in_secs,
+                kind: TokenKind::Operator,
+            };
+            let Some(minted) = mint(&ctx, &client, &body).await? else { return Ok(()) };
+            // An operator key is a credential for the CLI, not a connect
+            // string: the bare key is all there is to copy.
+            println!("{}", minted.token);
+            eprintln!("Copy it now: the server stores only a hash and cannot show it again.");
+            eprintln!("Id: {} (use this to revoke)", minted.id);
+            eprintln!(
+                "Hand it to `weft login <target>`, or to CI as WEFT_OPERATOR_KEY. It \
+                 administers the whole install: never put it in a frontend."
+            );
+            Ok(())
+        }
+        TokenAction::Mint { name, projects, tags, displays, all_displays, instance, connections, expires_in_secs } => {
             let displays = grants_for(&ctx, &displays)?;
             let projects = if connections { connections_project(&ctx, projects)? } else { instance_projects(&ctx, instance.as_ref(), projects)? };
             let allowed_projects = projects
@@ -78,29 +105,9 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
                 instance,
                 connections,
                 expires_in_secs,
-                kind: if operator { TokenKind::Operator } else { TokenKind::Caller },
+                kind: TokenKind::Caller,
             };
-            let resp: serde_json::Value = client.post_json("/signal-tokens", &serde_json::to_value(&body)?).await?;
-            // Decoded strictly: a field this command cannot find is a
-            // token the user can never obtain, so the shape has to fail
-            // loudly rather than print a blank.
-            let minted: MintedToken = serde_json::from_value(resp.clone())
-                .map_err(|e| anyhow::anyhow!("unexpected /signal-tokens mint response shape: {e}"))?;
-            if ctx.json_out(&resp)? {
-                return Ok(());
-            }
-            if minted.kind == TokenKind::Operator {
-                // An operator key is a credential for the CLI, not a
-                // connect string: the bare key is all there is to copy.
-                println!("{}", minted.token);
-                eprintln!("Copy it now: the server stores only a hash and cannot show it again.");
-                eprintln!("Id: {} (use this to revoke)", minted.id);
-                eprintln!(
-                    "Hand it to `weft login <target>`, or to CI as WEFT_OPERATOR_KEY. It \
-                     administers the whole install: never put it in a frontend."
-                );
-                return Ok(());
-            }
+            let Some(minted) = mint(&ctx, &client, &body).await? else { return Ok(()) };
             // The ONE time the full token is visible. The connect string is
             // what a client (e.g. the browser extension) pastes; it parses out
             // the token and presents it via `Authorization: Bearer`. The bare
@@ -174,6 +181,18 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Ask the install for a token or key and decode its answer. `None` when
+/// `--json` already printed the answer whole.
+async fn mint(ctx: &Ctx, client: &crate::client::DispatcherClient, body: &MintTokenRequest) -> anyhow::Result<Option<MintedToken>> {
+    let resp: serde_json::Value = client.post_json("/signal-tokens", &serde_json::to_value(body)?).await?;
+    // Decoded strictly: a field this command cannot find is a token the
+    // user can never obtain, so the shape has to fail loudly rather than
+    // print a blank.
+    let minted: MintedToken =
+        serde_json::from_value(resp.clone()).map_err(|e| anyhow::anyhow!("unexpected /signal-tokens mint response shape: {e}"))?;
+    Ok((!ctx.json_out(&resp)?).then_some(minted))
 }
 
 /// The projects a token is scoped to. An instance token acts in exactly

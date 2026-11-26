@@ -68,7 +68,7 @@ A bus is a channel any number of nodes join. One node makes it and emits a
 marker, and anything that gets the marker can join.
 
 ```weft
-ask = Route -> (body: { question: String }) { path: "ask", method: "POST" }
+ask = Route -> (body: { question: String }) { path: "ask", method: "POST", auth: "none" }
 answer = LlmStream {
   prompt: ask.body.question
   provider: model.provider

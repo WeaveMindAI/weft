@@ -579,7 +579,7 @@ url = "https://weft-role-dispatcher-123456789.us-west1.run.app"
 `weft login prod` takes an operator key (from its hidden prompt, or piped in
 with `--key-stdin`), checks it against the install, and keeps it in `~/.config/weft/credentials.toml`, which only you
 can read. If a teammate needs their own key, run
-`weft token mint --operator --on prod` and send them what it prints. To see
+`weft token mint-operator --on prod` and send them what it prints. To see
 the keys you have handed out, run `weft token ls --on prod`, and to cancel
 one right away, `weft token revoke <id> --on prod`. The install's own key,
 the one the workflow gave you, is not among them: it is no row in the

@@ -2177,11 +2177,17 @@ fn check_option(options: &[String], picked: &str) -> Result<(), String> {
     if options.iter().any(|o| o == picked) {
         return Ok(());
     }
-    let mut allowed: Vec<String> = options.iter().take(REFUSAL_OPTIONS_SHOWN).map(|o| format!("'{o}'")).collect();
-    if options.len() > REFUSAL_OPTIONS_SHOWN {
-        allowed.push(format!("and {} more", options.len() - REFUSAL_OPTIONS_SHOWN));
+    Err(format!("'{picked}' is not one of the options; give one of {}", name_options(&options.iter().collect::<Vec<_>>())))
+}
+
+/// A select's `options` as a refusal names them: quoted, the first
+/// [`REFUSAL_OPTIONS_SHOWN`], then how many more.
+fn name_options(choices: &[&String]) -> String {
+    let mut named: Vec<String> = choices.iter().take(REFUSAL_OPTIONS_SHOWN).map(|o| format!("'{o}'")).collect();
+    if choices.len() > REFUSAL_OPTIONS_SHOWN {
+        named.push(format!("and {} more", choices.len() - REFUSAL_OPTIONS_SHOWN));
     }
-    Err(format!("'{picked}' is not one of the options; give one of {}", allowed.join(", ")))
+    named.join(", ")
 }
 
 /// How many of a select's options the compact view shows before it
@@ -4453,6 +4459,21 @@ impl Widget {
             return Err(format!("{n} is not a whole number"));
         }
         Ok(())
+    }
+
+    /// The choices a fixed select (or multiselect) offers, named the way
+    /// a refusal names them (`'none', 'api_keys'`), for a message telling
+    /// somebody what they may write; `None` for any other widget.
+    pub fn named_options(&self) -> Option<String> {
+        match self {
+            Widget::Select { options, free_text: false } | Widget::Multiselect { options, free_text: false } => {
+                // The empty option (an optional select's "nothing picked")
+                // is no choice to tell somebody to write.
+                let choices: Vec<&String> = options.iter().filter(|o| !o.is_empty()).collect();
+                Some(name_options(&choices)).filter(|named| !named.is_empty())
+            }
+            _ => None,
+        }
     }
 
     /// Whether a refusal of [`Widget::check_value`] is about a list of

@@ -13,14 +13,14 @@ const DEEP: &str = "Group() {
 }
 ";
 
-const MAIN: &str = "grouped = Route { path: \"grouped\", method: \"POST\" }
+const MAIN: &str = "grouped = Route { path: \"grouped\", method: \"POST\", auth: \"none\" }
 work = Group() {
   body = ExecPython() -> (body: JsonDict) { code: \"x\" }
   answer = Reply
   answer.body = body.body
 }
 work._should_flow = grouped.method
-included = Route { path: \"included\", method: \"POST\" }
+included = Route { path: \"included\", method: \"POST\", auth: \"none\" }
 deep = @include(\"deep.weft\")
 deep._should_flow = included.method
 ";

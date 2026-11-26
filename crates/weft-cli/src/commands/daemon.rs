@@ -17,7 +17,10 @@
 //! `start` is one reconcile: whatever exists is left as it is, whatever is
 //! missing or out of date is made, and the runtime is (re)started on the
 //! config it wrote. The config and the secrets live in the install's
-//! directory (`config.json`, `secrets.env`).
+//! directory (`config.json`, `secrets.env`). The runtime's own start line
+//! runs `weft daemon prepare` first (hidden), which brings the containers
+//! back to what that start made, so a start the service manager makes on
+//! its own (a reboot) finds them right too.
 //!
 //! A machine that still holds the Kubernetes install an older weft ran is
 //! refused: its database cannot be carried forward, and
@@ -74,6 +77,11 @@ pub enum DaemonAction {
     Logs { tail: usize, follow: bool },
     /// Say which install this command acts on, touching nothing.
     Which,
+    /// Bring the install's database and the machine's object store up as
+    /// the last start left them: the runtime's own start line runs this
+    /// before the runtime, at every start a service manager makes (a
+    /// reboot included).
+    Prepare,
 }
 
 /// `wanted` is the install the command acts on, as the front door chose
@@ -92,6 +100,7 @@ pub async fn run(ctx: Ctx, action: DaemonAction, wanted: Wanted) -> Result<()> {
         DaemonAction::Status => status(&ctx, &install).await,
         DaemonAction::Logs { tail, follow } => logs(&install, tail, follow).await,
         DaemonAction::Which => which(&ctx, &wanted),
+        DaemonAction::Prepare => prepare(&install).await,
     }
 }
 
@@ -666,9 +675,8 @@ fn stale_network(stderr: &str) -> bool {
 /// or image in place, so when the arguments move it is made again (its
 /// named volumes and bind-mounted directories are untouched).
 async fn ensure_container(name: &str, args: &[String], stamp_dir: &Path, published: Option<PortUse>) -> Result<()> {
-    let stamp = stamp_dir.join(format!("{name}.run.sha256"));
-    let want = weft_core::project::hash::sha256_hex(args.join("\u{1f}").as_bytes());
-    let current = std::fs::read_to_string(&stamp).ok().map(|s| s.trim().to_string()) == Some(want.clone());
+    let (stamp, want) = run_stamp(name, args, stamp_dir);
+    let current = made_from(name, args, stamp_dir);
     let state = container_state(name).await?;
     // A container of ours at the wanted spec that runs holds the port
     // itself; any other case is about to take it, so the port is checked
@@ -700,6 +708,18 @@ async fn ensure_container(name: &str, args: &[String], stamp_dir: &Path, publish
     std::fs::create_dir_all(stamp_dir)?;
     std::fs::write(&stamp, want)?;
     Ok(())
+}
+
+/// Where [`ensure_container`] records the arguments `name` was last made
+/// from, and the record `args` would leave.
+fn run_stamp(name: &str, args: &[String], stamp_dir: &Path) -> (PathBuf, String) {
+    (stamp_dir.join(format!("{name}.run.sha256")), weft_core::project::hash::sha256_hex(args.join("\u{1f}").as_bytes()))
+}
+
+/// Whether `name` was last made from exactly `args`.
+fn made_from(name: &str, args: &[String], stamp_dir: &Path) -> bool {
+    let (stamp, want) = run_stamp(name, args, stamp_dir);
+    std::fs::read_to_string(stamp).ok().is_some_and(|s| s.trim() == want)
 }
 
 /// A one-shot container over `dir`, for a path the host user cannot touch
@@ -859,6 +879,17 @@ fn object_store_s3_config(access_key: &str, secret_key: &str) -> String {
     .to_string()
 }
 
+/// The Docker volume that holds the object store's S3 identities file,
+/// and where the store sees it. A volume of its own, never a file shared
+/// from the host: a file Docker mounts on its own breaks when Docker
+/// starts the container before the host's files are reachable (on WSL,
+/// at a Windows boot), where Docker makes an empty directory in its
+/// place and the store dies on start. Beside the image's own
+/// `/etc/seaweedfs`, which holds its `filer.toml`.
+const OBJECT_STORE_CONFIG_VOLUME: &str = "weft-object-store-config";
+const OBJECT_STORE_CONFIG_DIR: &str = "/etc/weft";
+const OBJECT_STORE_CONFIG_FILE: &str = "s3.config.json";
+
 /// The `docker run` arguments of the object store. Its master, volume and
 /// filer servers answer without any key (the filer serves and takes every
 /// file in the bucket, and its user service makes new S3 identities), so
@@ -869,16 +900,16 @@ fn object_store_s3_config(access_key: &str, secret_key: &str) -> String {
 /// request against the keys, and its gRPC port beside it refuses any
 /// caller from outside the container. The container joins no network of
 /// weft's, so an infra container cannot even reach that.
-fn object_store_run_args(port: u16, config_label: &str, cfg_path: &Path) -> Vec<String> {
+fn object_store_run_args(port: u16, config_label: &str) -> Vec<String> {
     [
         "run", "-d", "--name", OBJECT_STORE_CONTAINER, "--restart", "unless-stopped",
         "--label", config_label,
         "-p", &format!("127.0.0.1:{port}:8333"),
         "-v", &format!("{OBJECT_STORE_CONTAINER}-data:/data"),
-        "-v", &format!("{}:/etc/seaweedfs/s3.config.json:ro", cfg_path.display()),
+        "-v", &format!("{OBJECT_STORE_CONFIG_VOLUME}:{OBJECT_STORE_CONFIG_DIR}:ro"),
         OBJECT_STORE_IMAGE,
         "server", "-dir=/data", "-ip=127.0.0.1",
-        "-s3", "-s3.ip.bind=0.0.0.0", "-s3.port=8333", "-s3.config=/etc/seaweedfs/s3.config.json",
+        "-s3", "-s3.ip.bind=0.0.0.0", "-s3.port=8333", &format!("-s3.config={OBJECT_STORE_CONFIG_DIR}/{OBJECT_STORE_CONFIG_FILE}"),
         "-master.volumeSizeLimitMB=1024",
         // No usage reports leave the machine, and the Iceberg and Lance
         // servers 4.x starts beside S3 stay off: weft speaks only S3.
@@ -887,6 +918,61 @@ fn object_store_run_args(port: u16, config_label: &str, cfg_path: &Path) -> Vec<
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+/// Write the S3 identities file into [`OBJECT_STORE_CONFIG_VOLUME`]
+/// through a one-shot container, handing it the file on stdin so it never
+/// lands on the host. Written beside and moved into place, so a store
+/// that starts meanwhile reads the old file or the new one, never half.
+async fn write_object_store_config(s3_config: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let file = format!("/cfg/{OBJECT_STORE_CONFIG_FILE}");
+    let mut child = images::docker()
+        // The store's own image, which is on this machine whenever the
+        // store is: nothing to pull at a boot with no network yet.
+        .args(["run", "--rm", "-i", "--entrypoint", "sh", "-v", &format!("{OBJECT_STORE_CONFIG_VOLUME}:/cfg"), OBJECT_STORE_IMAGE, "-c"])
+        .arg(format!("cat > {file}.new && mv {file}.new {file}"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("run docker to write the object store's config")?;
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    stdin.write_all(s3_config.as_bytes()).await.context("hand the object store's config to docker")?;
+    drop(stdin);
+    let out = child.wait_with_output().await?;
+    anyhow::ensure!(
+        out.status.success(),
+        "writing the object store's config into the volume {OBJECT_STORE_CONFIG_VOLUME} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(())
+}
+
+/// Remove the S3 identities file an older weft kept on the host and
+/// shared into the store, so no copy of the keys outlives it there. It
+/// may be a root-owned directory Docker made in its place, which only a
+/// container can remove.
+async fn remove_old_host_config(cfg_dir: &Path) -> Result<()> {
+    let old = cfg_dir.join(OBJECT_STORE_CONFIG_FILE);
+    match std::fs::symlink_metadata(&old) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("look at {}", old.display())),
+        Ok(meta) if !meta.is_dir() => std::fs::remove_file(&old).with_context(|| format!("remove {}", old.display())),
+        Ok(_) => {
+            if std::fs::remove_dir_all(&old).is_ok() {
+                return Ok(());
+            }
+            let out = run_in_alpine(cfg_dir, "/heal", &format!("rm -rf /heal/{OBJECT_STORE_CONFIG_FILE}")).await?;
+            anyhow::ensure!(
+                out.status.success(),
+                "{} is a directory Docker made and could not be removed; remove it by hand: sudo rm -rf {}",
+                old.display(),
+                old.display()
+            );
+            Ok(())
+        }
+    }
 }
 
 /// The object store: SeaweedFS's S3 gateway, one per machine. Only
@@ -904,30 +990,23 @@ async fn ensure_object_store(port: u16) -> Result<(String, String)> {
     let _turn =
         images::hold_file_lock(data_dir().join("object-store.lock"), "another weft daemon start is setting up the object store; waiting for it")
             .await?;
-    let cfg_dir = data_dir().join("object-store");
-    let cfg_path = cfg_dir.join("s3.config.json");
-    // Docker makes a missing bind-mount source a root-owned DIRECTORY,
-    // which then cannot be mounted onto a file: heal it.
-    if cfg_path.is_dir() && std::fs::remove_dir_all(&cfg_path).is_err() {
-        let out = run_in_alpine(&cfg_dir, "/heal", "rm -rf /heal/s3.config.json").await?;
-        anyhow::ensure!(
-            out.status.success(),
-            "the object-store config path {} is a directory Docker made and could not be removed; remove it by hand: sudo rm -rf {}",
-            cfg_path.display(),
-            cfg_dir.display()
-        );
-    }
-    std::fs::create_dir_all(&cfg_dir)?;
     let (access, secret) = object_store_keys()?;
     let s3_config = object_store_s3_config(&access, &secret);
-    std::fs::write(&cfg_path, &s3_config)?;
     // The store reads its keys once, at start: a label of their digest makes
     // new keys a new container spec, so the store starts again with them.
     let config_label = format!("weft.config={}", weft_core::project::hash::sha256_hex(s3_config.as_bytes()));
-    let args = object_store_run_args(port, &config_label, &cfg_path);
+    let args = object_store_run_args(port, &config_label);
+    // A store made from these same arguments, still there, mounts the
+    // volume with these same keys in it: writing it again at every runtime
+    // start would only cost a container run.
+    if !(made_from(OBJECT_STORE_CONTAINER, &args, &data_dir()) && container_state(OBJECT_STORE_CONTAINER).await?.is_some()) {
+        write_object_store_config(&s3_config).await?;
+    }
     // Shared by every install on this machine, so one variable moves it.
     let published = PortUse { addr: ([127, 0, 0, 1], port).into(), what: "its file store", move_it: "WEFT_SEAWEED_PORT=<port> ./setup.sh".into() };
     ensure_container(OBJECT_STORE_CONTAINER, &args, &data_dir(), Some(published)).await?;
+    // Only once no container of ours mounts it any more.
+    remove_old_host_config(&data_dir().join("object-store")).await?;
     Ok((access, secret))
 }
 
@@ -1577,22 +1656,47 @@ fn pid_path(install: &Install) -> PathBuf {
     install.dir.join("runtime.pid")
 }
 
+/// This `weft`, resolved through links (`~/.local/bin/weft` is a link
+/// into the install's `bin`), for the runtime's start line to run again.
+fn cli_binary() -> Result<PathBuf> {
+    let here = std::env::current_exe().context("find this weft binary")?;
+    here.canonicalize().with_context(|| format!("resolve {}", here.display()))
+}
+
+/// `text` as it goes inside the double quotes of a systemd `ExecStart`,
+/// so the shell receives it exactly: systemd reads backslash escapes
+/// there, and expands `%` specifiers and `$` variables itself.
+fn systemd_quoted(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%").replace('$', "$$")
+}
+
+/// `text` inside a shell's single quotes.
+fn sh_quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 /// The shell line every manager runs: the person's PATH as this start
 /// sees it (a systemd or launchd service starts with a bare one, and the
 /// runtime's builds, needs checks and workers use the person's own tools:
-/// cargo, python3, Homebrew's), the secrets into the environment, then the
+/// cargo, python3, Homebrew's), then `cli daemon prepare` on this install
+/// (the stores as the last start left them, [`prepare`]; the runtime does
+/// not start when it fails), the secrets into the environment, then the
 /// runtime, which keeps its log bounded itself (`--log`); what escapes it
 /// (a panic's last words) is appended to the same file, which the runtime
-/// keeps its stderr on across each roll (`weft_runtime::log_file`).
-fn runtime_command(install: &Install, bin: &Path) -> String {
-    let path = std::env::var("PATH").unwrap_or_default().replace('\'', "'\\''");
+/// keeps its stderr on across each roll (`weft_runtime::log_file`). A
+/// bare `exit` ends with the prepare's own status.
+fn runtime_command(install: &Install, cli: &Path, bin: &Path) -> String {
+    let log = sh_quoted(&install.log_path().display().to_string());
     format!(
-        "export PATH='{path}'; set -a; . '{}'; set +a; exec '{}' serve --config '{}' --log '{}' >> '{}' 2>&1",
-        install.secrets_path().display(),
-        bin.display(),
-        install.config_path().display(),
-        install.log_path().display(),
-        install.log_path().display()
+        "export PATH={path}; {env}={install_name} {cli} daemon prepare >> {log} 2>&1 || exit; \
+         set -a; . {secrets}; set +a; exec {bin} serve --config {config} --log {log} >> {log} 2>&1",
+        path = sh_quoted(&std::env::var("PATH").unwrap_or_default()),
+        env = weft_core::infra::INSTALL_ENV,
+        install_name = sh_quoted(install.id.env_value()),
+        cli = sh_quoted(&cli.display().to_string()),
+        secrets = sh_quoted(&install.secrets_path().display().to_string()),
+        bin = sh_quoted(&bin.display().to_string()),
+        config = sh_quoted(&install.config_path().display().to_string()),
     )
 }
 
@@ -1619,8 +1723,7 @@ fn failed(what: &str, out: &std::process::Output) -> String {
 }
 
 async fn start_runtime(install: &Install) -> Result<()> {
-    let bin = runtime_binary()?;
-    let line = runtime_command(install, &bin);
+    let line = runtime_command(install, &cli_binary()?, &runtime_binary()?);
     match manager().await? {
         Manager::Systemd => {
             let unit = systemd_unit_path(install);
@@ -1628,18 +1731,24 @@ async fn start_runtime(install: &Install) -> Result<()> {
             // `KillMode=process`: a restart stops the runtime alone, and the
             // project workers it started (processes of their own) finish
             // their runs for its next life to find and let go, the way the
-            // launchd and detached managers already leave them.
+            // launchd and detached managers already leave them. The start
+            // limit ends a crash loop (a runtime or a prepare that fails at
+            // once, every time) after ten tries in five minutes instead of
+            // retrying forever; its log says why, and the next `weft
+            // daemon start` clears the limit (`reset-failed` below).
             std::fs::write(
                 &unit,
                 format!(
-                    "[Unit]\nDescription=weft runtime ({})\nAfter=network-online.target\n\n[Service]\nExecStart=/bin/sh -c \"{}\"\nRestart=always\nRestartSec=2\nKillMode=process\n\n[Install]\nWantedBy=default.target\n",
+                    "[Unit]\nDescription=weft runtime ({})\nAfter=network-online.target\nStartLimitIntervalSec=300\nStartLimitBurst=10\n\n[Service]\nExecStart=/bin/sh -c \"{}\"\nRestart=always\nRestartSec=2\nKillMode=process\n\n[Install]\nWantedBy=default.target\n",
                     install.id.label_value(),
-                    line.replace('"', "\\\"")
+                    systemd_quoted(&line)
                 ),
             )?;
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]), "systemctl --user daemon-reload").await?;
             let name = format!("{}.service", install.service_name());
             run_checked(Command::new("systemctl").args(["--user", "enable", &name]), "systemctl --user enable").await?;
+            // A unit that hit its start limit refuses a restart until this.
+            run_checked(Command::new("systemctl").args(["--user", "reset-failed", &name]), "systemctl --user reset-failed").await?;
             run_checked(Command::new("systemctl").args(["--user", "restart", &name]), "systemctl --user restart").await
         }
         Manager::Launchd => {
@@ -1733,8 +1842,12 @@ async fn runs_this_runtime(install: &Install, pid: &str) -> Result<bool> {
     Ok(is_runtime_command_line(install, command.trim()))
 }
 
+/// Also true of the shell that runs it while that shell still prepares
+/// the install (waiting for Docker can take a while): stopping the shell
+/// then is what keeps the runtime from starting after the stop.
 fn is_runtime_command_line(install: &Install, command: &str) -> bool {
-    command.contains(&format!(" serve --config {} ", install.config_path().display()))
+    let config = install.config_path().display().to_string();
+    command.contains(&format!(" serve --config {config} ")) || command.contains(&format!(" serve --config {} ", sh_quoted(&config)))
 }
 
 /// Stop the runtime, however this machine's service manager runs it, and
@@ -1877,9 +1990,7 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     .save(&install.dir)?;
     runtime_image.ensure(rebuild).await?;
     crate::host_programs::ensure_standard_program(&install.id, &standard_hash, rebuild).await?;
-    weft_platform_local::docker::ensure_network(&weft_platform_local::DockerCli).await?;
-    ensure_postgres(install, ports.postgres).await?;
-    let object_store_keys = ensure_object_store(object_store_port()?).await?;
+    let object_store_keys = ensure_stores(install, ports.postgres, object_store_port()?).await?;
     let tunnel = reconcile_tunnel(install, ports).await?;
 
     let config = install_config(install, ports, runtime, tunnel.as_ref(), previous)?;
@@ -1922,6 +2033,104 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     }
     println!("weft is running at http://127.0.0.1:{} (install '{}')", ports.public, install.id.label_value());
     Ok(())
+}
+
+/// The containers that hold an install's state, as they should run: weft's
+/// Docker network, the install's Postgres on `postgres_port`, and the
+/// machine's object store on `object_store_port`. Both a start and a
+/// prepare bring them up through here. Answers the object store's keys.
+async fn ensure_stores(install: &Install, postgres_port: u16, object_store_port: u16) -> Result<(String, String)> {
+    weft_platform_local::docker::ensure_network(&weft_platform_local::DockerCli).await?;
+    ensure_postgres(install, postgres_port).await?;
+    ensure_object_store(object_store_port).await
+}
+
+/// Bring the stores up again on what the last start of `install` wrote,
+/// before its runtime starts ([`runtime_command`] runs this first). A
+/// service manager starts the runtime on its own at boot, where Docker
+/// restarts the containers by itself, sometimes before what they mount
+/// is there; this puts right whatever came up wrong. Waits for Docker for
+/// as long as it takes: at boot Docker Desktop starts only once a person
+/// logs in.
+async fn prepare(install: &Install) -> Result<()> {
+    let config = InstallConfig::load(&install.config_path())
+        .with_context(|| format!("install '{}' has no config to prepare from; run `weft daemon start`", install.id.label_value()))?;
+    let saved = Ports::path(&install.dir);
+    let ports: Ports = std::fs::read_to_string(&saved)
+        .map_err(anyhow::Error::from)
+        .and_then(|raw| Ok(serde_json::from_str(&raw)?))
+        .with_context(|| format!("read the ports the last start saved in {}; run `weft daemon start`", saved.display()))?;
+    let store_port = object_store_port_of(&config)?;
+    // The shell that runs the start line is what a stop signals, and only
+    // it: a prepare left running after it would bring the stores back
+    // (a remove's included) once Docker answers.
+    let shell = std::os::unix::process::parent_id();
+    let stopped = || std::os::unix::process::parent_id() != shell;
+    wait_for_docker(&stopped).await?;
+    anyhow::ensure!(!stopped(), "the runtime's start was stopped while it waited for Docker; the stores are left as they are");
+    let (access, secret) = ensure_stores(install, ports.postgres, store_port).await?;
+    // The keys the store now runs on must be the ones the runtime is about
+    // to read; putting new keys in the secrets is a start's job.
+    let held = read_env_file(&install.secrets_path());
+    anyhow::ensure!(
+        held.get(OBJECT_STORE_ACCESS_KEY_ENV) == Some(&access) && held.get(OBJECT_STORE_SECRET_KEY_ENV) == Some(&secret),
+        "the object store runs on keys {} does not hold; run `weft daemon start` to hand them to install '{}'",
+        install.secrets_path().display(),
+        install.id.label_value()
+    );
+    Ok(())
+}
+
+/// The port of the object store a config reaches, which a start wrote
+/// from [`object_store_port`].
+fn object_store_port_of(config: &InstallConfig) -> Result<u16> {
+    let ObjectStoreSettings::S3(store) = &config.object_store else {
+        anyhow::bail!("a local install's config names an S3 object store, and this one names another kind");
+    };
+    url::Url::parse(&store.endpoint)
+        .ok()
+        .and_then(|url| url.port())
+        .ok_or_else(|| anyhow::anyhow!("the object store endpoint '{}' in the install config names no port", store.endpoint))
+}
+
+/// How often a wait for Docker says it is still waiting.
+const DOCKER_BREADCRUMB_EVERY: Duration = Duration::from_secs(30);
+
+/// Wait until Docker answers, with no deadline, saying once that it waits
+/// and then every [`DOCKER_BREADCRUMB_EVERY`] that it still does, with
+/// what Docker last said. Each ask is bounded: a Docker that is coming up
+/// can take a `docker info` and never answer it.
+/// Ends with an error once `stopped` says the start that ran it is gone.
+async fn wait_for_docker(stopped: &dyn Fn() -> bool) -> Result<()> {
+    let ask = || async {
+        let asked = images::docker().arg("info").kill_on_drop(true).output();
+        match tokio::time::timeout(Duration::from_secs(10), asked).await {
+            Err(_) => Err("docker info did not answer within 10s".to_string()),
+            Ok(Err(e)) => Err(format!("cannot run docker: {e}")),
+            Ok(Ok(out)) if out.status.success() => Ok(()),
+            Ok(Ok(out)) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        }
+    };
+    let Err(said) = ask().await else { return Ok(()) };
+    let what = "waiting for Docker to answer before starting weft's database and object store";
+    eprintln!("{what} (docker said: {said})");
+    let began = std::time::Instant::now();
+    let mut said_at = began;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        anyhow::ensure!(!stopped(), "the runtime's start was stopped while it waited for Docker; nothing was started");
+        match ask().await {
+            Ok(()) => {
+                eprintln!("Docker answered after {}s", began.elapsed().as_secs());
+                return Ok(());
+            }
+            Err(said) if said_at.elapsed() >= DOCKER_BREADCRUMB_EVERY => {
+                eprintln!("still {what}, {}s so far (docker said: {said})", began.elapsed().as_secs());
+                said_at = std::time::Instant::now();
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 /// Every container of `install` (everything carrying its install label),
@@ -2228,12 +2437,26 @@ mod tests {
     /// address, published on the machine's loopback.
     #[test]
     fn object_store_answers_outside_only_through_s3() {
-        let args = object_store_run_args(14115, "weft.config=abc", Path::new("/data/object-store/s3.config.json"));
+        let args = object_store_run_args(14115, "weft.config=abc");
         assert!(!args.iter().any(|a| a == "--network" || a.starts_with("--network=")), "{args:?}");
         assert!(args.windows(2).any(|w| w == ["-p", "127.0.0.1:14115:8333"]), "{args:?}");
         assert!(args.iter().any(|a| a == "-ip=127.0.0.1"), "{args:?}");
         assert!(!args.iter().any(|a| a.starts_with("-ip.bind") || a.starts_with("-master.ip") || a.starts_with("-filer.ip") || a.starts_with("-volume.ip")), "{args:?}");
         assert!(args.iter().any(|a| a == "-s3.ip.bind=0.0.0.0"), "{args:?}");
+    }
+
+    /// The store reads its keys from a volume of its own, read-only, and
+    /// mounts nothing from the host: a host file Docker mounts on its own
+    /// broke the store when Docker started it at boot before the file was
+    /// reachable. The volume sits beside the image's `/etc/seaweedfs`,
+    /// whose `filer.toml` it would otherwise hide.
+    #[test]
+    fn the_object_store_reads_its_keys_from_a_volume_of_its_own() {
+        let args = object_store_run_args(14115, "weft.config=abc");
+        let mounts: Vec<&str> = args.windows(2).filter(|w| w[0] == "-v").map(|w| w[1].as_str()).collect();
+        assert_eq!(mounts, ["weft-object-store-data:/data", "weft-object-store-config:/etc/weft:ro"], "{args:?}");
+        assert!(args.iter().any(|a| a == "-s3.config=/etc/weft/s3.config.json"), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["--label", "weft.config=abc"]), "{args:?}");
     }
 
     fn install(name: Option<&str>) -> Install {
@@ -2330,6 +2553,9 @@ mod tests {
         assert!(!is_runtime_command_line(&d, "/usr/bin/vim notes.txt"));
         let other = Install { id: d.id.clone(), dir: "/elsewhere".into() };
         assert!(!is_runtime_command_line(&other, &line), "another install's runtime");
+        let preparing = runtime_command(&d, Path::new("/opt/weft/bin/weft"), Path::new("/opt/weft/bin/weft-runtime"));
+        assert!(is_runtime_command_line(&d, &format!("/bin/sh -c {preparing}")), "the shell still preparing it");
+        assert!(!is_runtime_command_line(&other, &format!("/bin/sh -c {preparing}")));
     }
 
     #[test]
@@ -2344,10 +2570,49 @@ mod tests {
 
     #[test]
     fn the_runtime_line_takes_this_path_loads_its_secrets_then_runs() {
-        let line = runtime_command(&install(None), Path::new("/bin/weft-runtime"));
+        let line = runtime_command(&install(None), Path::new("/bin/weft"), Path::new("/bin/weft-runtime"));
         let path = std::env::var("PATH").unwrap_or_default().replace('\'', "'\\''");
-        assert!(line.starts_with(&format!("export PATH='{path}'; set -a; . '/home/u/.local/share/weft/secrets.env'; set +a; exec '/bin/weft-runtime' serve --config")), "{line}");
+        assert!(line.starts_with(&format!("export PATH='{path}'; ")), "{line}");
+        assert!(line.contains(" || exit; set -a; . '/home/u/.local/share/weft/secrets.env'; set +a; exec '/bin/weft-runtime' serve --config '/home/u/.local/share/weft/config.json' --log"), "{line}");
         assert!(line.ends_with(">> '/home/u/.local/share/weft/runtime.log' 2>&1"));
+    }
+
+    /// Before the runtime, the line runs `weft daemon prepare` on the same
+    /// install (named the way `WEFT_INSTALL` reads it back), logging to the
+    /// runtime's log, and stops when it fails. Nothing in it is a `$`,
+    /// which a systemd unit would expand.
+    #[test]
+    fn the_runtime_line_prepares_its_install_first() {
+        let default = runtime_command(&install(None), Path::new("/opt/weft's/weft"), Path::new("/bin/weft-runtime"));
+        assert!(
+            default.contains("; WEFT_INSTALL='default' '/opt/weft'\\''s/weft' daemon prepare >> '/home/u/.local/share/weft/runtime.log' 2>&1 || exit; set -a;"),
+            "{default}"
+        );
+        let named = runtime_command(&install(Some("cell3")), Path::new("/bin/weft"), Path::new("/bin/weft-runtime"));
+        assert!(named.contains("; WEFT_INSTALL='cell3' '/bin/weft' daemon prepare >> "), "{named}");
+        assert_eq!(
+            weft_core::infra::Install::from_env_value(Some("default")).unwrap(),
+            weft_core::infra::Install::default_install(),
+            "the value the line sets names the default install back"
+        );
+        let without_path = default.split_once("; ").unwrap().1;
+        assert!(!without_path.contains('$'), "{default}");
+    }
+
+    /// What systemd would read as its own (an escape, a specifier, a
+    /// variable) reaches the shell as written: a home folder with a quote
+    /// in its name, a PATH entry with a `%` or a `$`.
+    #[test]
+    fn the_unit_hands_the_line_to_the_shell_as_written() {
+        let line = r#"export PATH='/a%b:/c$d'; '/home/o'\''brien/weft' "x""#;
+        assert_eq!(systemd_quoted(line), r#"export PATH='/a%%b:/c$$d'; '/home/o'\\''brien/weft' \"x\""#);
+    }
+
+    #[test]
+    fn the_object_store_port_is_read_back_off_the_config_a_start_wrote() {
+        let ports = Ports { public: 14111, internal: 14113, outside: 14112, postgres: 14114, tunnel_metrics: 14117 };
+        let config = install_config(&install(None), ports, "weft-runtime:x".into(), None, Levers::default()).unwrap();
+        assert_eq!(object_store_port_of(&config).unwrap(), object_store_port().unwrap());
     }
 
     #[test]

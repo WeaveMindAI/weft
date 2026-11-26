@@ -41,10 +41,10 @@ schema = PostgresExecuteQuery {
   query: "create table if not exists cards (id text primary key, title text)"
 }
 
-add = Route { path: "cards", method: "POST" }
+add = Route { path: "cards", method: "POST", auth: "none" }
 add._should_flow = schema.rows
 
-list = Route { path: "cards", method: "GET" }
+list = Route { path: "cards", method: "GET", auth: "none" }
 list._should_flow = schema.rows
 ```
 
@@ -72,6 +72,7 @@ type Card = { title: String, color?: String }
 post = Route -> (body: Card) {
   path: "cards"
   method: "POST"
+  auth: "none"
 }
 
 answer = JsonObject {
@@ -86,8 +87,10 @@ The caller is held open while your program works, and `Reply` is what answers
 them. For streaming an answer as it is produced, and for the Rust side, go and
 read [talking to a live caller](../nodes/live-callers.md).
 
-If only some callers may call it, set its `auth` (`auth: "api_keys"`, say)
-and pick the connection holding the keys with `weft connect post`. For every
+Every route says who may call it, and one that leaves `auth` out does not
+build. `auth: "none"`, as above, lets in anyone who has the address. If only
+some callers may call it, name a check instead (`auth: "api_keys"`, say) and
+pick the connection holding the keys with `weft connect post`. For every
 scheme, go and read [checking a signed request](../connections/verifying-requests.md#on-a-route).
 
 The request's body comes out whole on `body`. Left undeclared, it is a
@@ -111,6 +114,7 @@ an output of the same name:
 card = Route -> (id: String) {
   path: "cards/{id}"
   method: "GET"
+  auth: "none"
 }
 ```
 
@@ -134,7 +138,7 @@ sends them revealed. Here a route hands its caller's credentials on to your
 own backend:
 
 ```weft
-me = Route { path: "me", method: "GET" }
+me = Route { path: "me", method: "GET", auth: "none" }
 profile = HttpRequest {
   url: "https://api.internal.example/me"
   method: "GET"
@@ -200,6 +204,7 @@ pay = Route -> (body: JsonDict) {
   path: "pay"
   method: "POST"
   durable: true
+  auth: "none"
 }
 ```
 
@@ -537,6 +542,7 @@ prices = Route -> (symbol: String) {
   path: "prices/{symbol}"
   method: "GET"
   whenCallerIsSlow: "drop_oldest"
+  auth: "none"
 }
 latest = PostgresWatchQuery(symbol: String) {
   account: db.access

@@ -4,6 +4,40 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-11-26 (0.2.293)
+
+**What breaks after this update:**
+
+**A `Route` or a `Socket` must now say who may call it.** It used to let
+anyone with the URL call it when `auth` was left out. Now a program that
+leaves `auth` out fails to build. To keep one open as it was, write
+`auth: "none"` on it; otherwise name the check it should make. Do this
+before `weft maintenance off`: it builds every project again, and a project
+still missing `auth` stays off until you add it and run `weft resync`.
+
+**`weft token mint --operator` is now `weft token mint-operator`.** Same key,
+same `--name` and `--expires`. If a script of yours mints operator keys,
+change it to the new command.
+
+**What gets better:**
+
+**A local install comes back by itself after a reboot.** Before the runtime
+starts, it now waits for Docker and brings up its database and file store
+itself, so a restart of the machine no longer leaves the file store broken
+and the runtime restarting over and over. The file store's keys now live in
+a Docker volume instead of a file on your disk.
+
+**Piping weft's output into another command no longer prints a crash.**
+`weft ... | grep -q X` and `| head` now end quietly.
+
+**Tangle asks you before it mints an admin key for your install.**
+
+**Tangle no longer goes around a block to read a secret.** If you keep a file
+or a command away from your assistant (a permission rule, a sandbox), Tangle
+will not write a graph or a script that reads it for it; it tells you what it
+needed and lets you decide. Run `weft tangle update` in a project to get
+this and the change above.
+
 ## 2026-11-10 (0.2.292)
 
 **What breaks after this update:**

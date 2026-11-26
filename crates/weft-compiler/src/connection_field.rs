@@ -27,7 +27,9 @@ pub fn resolve(meta: &NodeMetadata, node: &NodeDefinition, node_span: Span, erro
         });
     };
     match callers::connection_field(meta, auth) {
-        Ok(None) if meta.features.checks_callers && node.written_value(callers::CONNECTION_FIELD).is_some() => {
+        // An `auth` not written at all is the required-input check's to
+        // report; this one is about an `auth` that checks nobody.
+        Ok(None) if auth.is_some() && node.written_value(callers::CONNECTION_FIELD).is_some() => {
             refuse(
                 callers::CONNECTION_FIELD,
                 format!(

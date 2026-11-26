@@ -5,13 +5,13 @@
 # fails: before its first piece with nothing handling it, before its first
 # piece with a backup branch gated on its `_error`, and halfway through.
 
-sse = Route { path: "__E2E_PATH__/sse", method: "GET" }
+sse = Route { path: "__E2E_PATH__/sse", method: "GET", auth: "none" }
 ticks = TickBus
 ticks.start = sse.path
 events = Stream { format: "sse" }
 events.bus = ticks.ticks
 
-lines = Route { path: "__E2E_PATH__/lines", method: "GET" }
+lines = Route { path: "__E2E_PATH__/lines", method: "GET", auth: "none" }
 ticks2 = TickBus
 ticks2.start = lines.path
 rows = Stream { format: "ndjson", headers: { "x-run": "e2e" } }
@@ -20,7 +20,7 @@ rows.bus = ticks2.ticks
 # A feed that says one thing and then goes quiet. The rig reads the
 # first event, hangs up, and asserts the run is cancelled: a caller who
 # left is found without the program writing anything.
-quiet = Route { path: "__E2E_PATH__/quiet", method: "GET" }
+quiet = Route { path: "__E2E_PATH__/quiet", method: "GET", auth: "none" }
 silence = QuietBus
 silence.start = quiet.path
 feed = Stream { format: "sse" }
@@ -28,7 +28,7 @@ feed.bus = silence.feed
 
 # The producer fails before its bus opens and nothing handles it: the run
 # fails without answering, and the caller is told so plainly.
-refused = Route { path: "__E2E_PATH__/refused", method: "GET" }
+refused = Route { path: "__E2E_PATH__/refused", method: "GET", auth: "none" }
 early = TickBus { failAt: 0 }
 early.start = refused.path
 lost = Stream { format: "sse" }
@@ -36,7 +36,7 @@ lost.bus = early.ticks
 
 # The same failure caught: no bus opened, so the stream never starts, and
 # the branch gated on `_error` answers instead.
-backup = Route { path: "__E2E_PATH__/backup", method: "GET" }
+backup = Route { path: "__E2E_PATH__/backup", method: "GET", auth: "none" }
 flaky = TickBus { failAt: 0 }
 flaky.start = backup.path
 primary = Stream { format: "sse" }
@@ -46,7 +46,7 @@ fallback._should_flow = flaky._error
 
 # The producer breaks off after two pieces: what went out stays sent, and
 # the stream ends with its format's error marker.
-broken = Route { path: "__E2E_PATH__/broken", method: "GET" }
+broken = Route { path: "__E2E_PATH__/broken", method: "GET", auth: "none" }
 halfway = TickBus { failAt: 2 }
 halfway.start = broken.path
 cut = Stream { format: "sse" }
